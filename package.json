@@ -1,0 +1,75 @@
+{
+  "name": "turbine-orm",
+  "version": "0.3.1",
+  "description": "TypeScript ORM with json_agg nested queries — 2-3x faster than Prisma, 1.5x faster than Drizzle",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./cli": {
+      "import": "./dist/cli/config.js",
+      "types": "./dist/cli/config.d.ts"
+    },
+    "./serverless": {
+      "import": "./dist/serverless.js",
+      "types": "./dist/serverless.d.ts"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "turbine": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/test",
+    "!dist/**/*.js.map",
+    "!dist/examples.*",
+    "LICENSE",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "generate": "tsx src/cli/index.ts generate",
+    "status": "tsx src/cli/index.ts status",
+    "examples": "tsx src/examples.ts",
+    "test": "node --test --experimental-strip-types src/test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.11",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0"
+  },
+  "keywords": [
+    "orm",
+    "postgres",
+    "postgresql",
+    "typescript",
+    "json-agg",
+    "query-builder",
+    "database",
+    "sql",
+    "turbine",
+    "batadata",
+    "nested-queries"
+  ],
+  "author": "ZVN DEV <dev@zvndev.com>",
+  "license": "MIT",
+  "homepage": "https://turbine.batadata.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zvndev/turbine-orm"
+  }
+}

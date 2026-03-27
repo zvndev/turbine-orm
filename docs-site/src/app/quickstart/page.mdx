@@ -1,0 +1,171 @@
+# Quick Start
+
+Get from zero to your first typed query in under 2 minutes.
+
+## Prerequisites
+
+- **Node.js** >= 22.0.0
+- **PostgreSQL** >= 14 (local, Docker, Neon, Supabase, or any Postgres provider)
+- An existing database with tables (Turbine introspects your schema)
+
+## 1. Install
+
+```bash
+npm install turbine-orm
+```
+
+Turbine's only runtime dependency is `pg` (node-postgres). No binary engines, no WASM, no query engine process.
+
+## 2. Initialize Your Project
+
+```bash
+npx turbine init --url postgres://user:pass@localhost:5432/mydb
+```
+
+This creates:
+- `turbine.config.ts` -- configuration file with your database URL
+- `turbine/migrations/` -- directory for SQL migration files
+- `turbine/seed.ts` -- seed file template
+- `turbine/schema.ts` -- schema builder template
+- `generated/turbine/` -- output directory for generated types
+
+If your `DATABASE_URL` is available in the environment or a `.env` file, you can skip the `--url` flag:
+
+```bash
+npx turbine init
+```
+
+## 3. Generate the Typed Client
+
+```bash
+npx turbine generate
+```
+
+Turbine connects to your database, introspects all tables, columns, types, and foreign key relations, then generates:
+
+- **TypeScript types** for every table (e.g., `User`, `Post`, `Comment`)
+- **Schema metadata** with relation mappings
+- **A configured client factory** that returns typed table accessors
+
+Output goes to `./generated/turbine/` by default. You can change this in `turbine.config.ts` or with the `--out` flag.
+
+```
+[turbine] Connecting to postgres://user:***@host:5432/mydb
+[turbine] Schema: public
+[turbine] Introspecting database...
+[turbine] Found 4 tables, 27 columns, 8 relations
+  organizations -- 5 cols, PK: id, 1 relation
+  users         -- 8 cols, PK: id, 3 relations
+  posts         -- 9 cols, PK: id, 3 relations
+  comments      -- 5 cols, PK: id, 2 relations
+[turbine] Generated 3 files to ./generated/turbine/
+```
+
+## 4. Connect and Query
+
+```typescript
+import { turbine } from './generated/turbine';
+
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+});
+
+// Optional: verify the connection
+await db.connect();
+```
+
+The `turbine()` factory creates a `TurbineClient` with a `pg.Pool` under the hood. Connection pooling, idle timeouts, and automatic reconnection are built in.
+
+### Configuration Options
+
+```typescript
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  poolSize: 10,               // max connections in pool (default: 10)
+  idleTimeoutMs: 30_000,      // close idle connections after 30s
+  connectionTimeoutMs: 5_000, // timeout for new connections
+  logging: true,              // log queries to console (default: false)
+});
+```
+
+You can also connect with individual fields:
+
+```typescript
+const db = turbine({
+  host: 'localhost',
+  port: 5432,
+  database: 'mydb',
+  user: 'postgres',
+  password: 'postgres',
+});
+```
+
+## 5. Your First Query
+
+```typescript
+const users = await db.users.findMany({
+  where: { role: 'admin' },
+  orderBy: { createdAt: 'desc' },
+  limit: 10,
+});
+
+console.log(users);
+// [{ id: 1, email: 'alice@example.com', name: 'Alice', role: 'admin', ... }]
+```
+
+Column names are automatically converted between `snake_case` (Postgres) and `camelCase` (TypeScript). The column `created_at` in your database becomes `createdAt` in your code.
+
+## 6. Nested Relations
+
+This is the core feature. Load related data in a **single SQL query**:
+
+```typescript
+const user = await db.users.findUnique({
+  where: { id: 1 },
+  with: {
+    posts: {
+      with: { comments: true },
+      where: { published: true },
+      orderBy: { createdAt: 'desc' },
+      limit: 5,
+    },
+  },
+});
+
+// user.posts[0].comments -- fully typed, single round-trip
+```
+
+Turbine compiles this into a single `SELECT` with `json_agg` subqueries. No N+1 queries. No extra round-trips.
+
+## 7. Pipeline
+
+Batch multiple independent queries into a single round-trip:
+
+```typescript
+const [user, postCount, recentPosts] = await db.pipeline(
+  db.users.buildFindUnique({ where: { id: 1 } }),
+  db.posts.buildCount({ where: { orgId: 1 } }),
+  db.posts.buildFindMany({ orderBy: { createdAt: 'desc' }, limit: 5 }),
+);
+
+// Each result is fully typed:
+// user:        User | null
+// postCount:   number
+// recentPosts: Post[]
+```
+
+## 8. Disconnect
+
+```typescript
+await db.disconnect();
+// or equivalently:
+await db.end();
+```
+
+## Next Steps
+
+- [API Reference](/queries) -- every query method with examples
+- [Schema & Migrations](/schema) -- define schemas, run migrations
+- [CLI Reference](/cli) -- all commands and flags
+- [Transactions & Pipeline](/transactions) -- batch queries, typed transactions
+- [Benchmarks](/benchmarks) -- performance comparisons vs Prisma and Drizzle

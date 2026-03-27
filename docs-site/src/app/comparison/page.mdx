@@ -1,0 +1,195 @@
+# Turbine vs Prisma vs Drizzle
+
+An honest comparison of three TypeScript ORMs. Each has strengths in different areas.
+
+---
+
+## Architecture
+
+| | Turbine | Prisma | Drizzle |
+|---|---|---|---|
+| **Query approach** | json_agg subqueries | Multiple queries, stitched in Rust engine | LATERAL joins, stitched in JS |
+| **Runtime** | Pure TypeScript + pg | Rust binary (query engine) | Pure TypeScript |
+| **Schema source** | Live DB introspection | `.prisma` schema file | TypeScript schema definition |
+| **Dependencies** | `pg` only | `@prisma/client` + engine binary | `postgres` or `pg` |
+| **Bundle size** | ~95KB (zero binary deps) | ~2MB (engine binary) | ~50KB |
+| **Cold start** | Near zero | ~300-500ms (engine boot) | Near zero |
+
+---
+
+## Nested Queries
+
+This is where the three ORMs diverge most significantly.
+
+### Prisma: Multiple Queries
+
+```typescript
+const user = await prisma.user.findUnique({
+  where: { id: 1 },
+  include: {
+    posts: { include: { comments: true } },
+  },
+});
+```
+
+Prisma sends 3 separate SQL queries and stitches results in its Rust engine:
+
+```sql
+SELECT * FROM users WHERE id = $1;
+SELECT * FROM posts WHERE user_id IN ($1);
+SELECT * FROM comments WHERE post_id IN ($1, $2, ...);
+```
+
+### Drizzle: LATERAL Joins
+
+```typescript
+const result = await db.query.users.findFirst({
+  where: eq(users.id, 1),
+  with: {
+    posts: { with: { comments: true } },
+  },
+});
+```
+
+Drizzle uses LATERAL joins, returning a flat result set that is de-duplicated in JavaScript.
+
+### Turbine: Single json_agg Query
+
+```typescript
+const user = await db.users.findUnique({
+  where: { id: 1 },
+  with: {
+    posts: { with: { comments: true } },
+  },
+});
+```
+
+Turbine generates one SQL query:
+
+```sql
+SELECT u.*,
+  (SELECT COALESCE(json_agg(sub), '[]'::json) FROM (
+    SELECT p.*,
+      (SELECT COALESCE(json_agg(sub2), '[]'::json) FROM (
+        SELECT c.* FROM comments c WHERE c.post_id = p.id
+      ) sub2) AS comments
+    FROM posts p WHERE p.user_id = u.id
+  ) sub) AS posts
+FROM users u WHERE u.id = $1
+```
+
+One query, one round-trip, one parse.
+
+---
+
+## Performance
+
+### Serverless (Vercel + Neon)
+
+| Scenario | Turbine | Drizzle | Prisma |
+|---|---|---|---|
+| **L3 nested (median)** | **5.3ms** | 6.5ms | 7.4ms |
+| **L2 nested (median)** | **6.5ms** | 9.1ms | 10.2ms |
+| Simple select | 5.6ms | 7.1ms | **3.9ms** |
+
+### Local Docker (50K iterations)
+
+| Scenario | Turbine | Drizzle | Prisma |
+|---|---|---|---|
+| **L2 nested p50** | **201us** | 523us | 835us |
+| **RPS (c=50)** | **24,041** | 6,360 | 3,784 |
+| Memory | **109MB** | 117MB | 233MB |
+
+---
+
+## Feature Comparison
+
+| Feature | Turbine | Prisma | Drizzle |
+|---|---|---|---|
+| findUnique / findMany | Yes | Yes | Yes |
+| create / createMany | Yes (UNNEST) | Yes (VALUES) | Yes (VALUES) |
+| update / updateMany | Yes | Yes | Yes |
+| delete / deleteMany | Yes | Yes | Yes |
+| upsert | Yes | Yes | Yes |
+| count / groupBy / aggregate | Yes | Yes | Yes |
+| Nested relations | `with` (1 query) | `include` (N queries) | `with` (LATERAL) |
+| select / omit | Yes | Yes (`select`) | Yes |
+| OR / AND / NOT filters | Yes | Yes | Yes |
+| String operators | Yes | Yes | Yes |
+| JSONB operators | Yes | Yes | Limited |
+| Array operators | Yes | Yes | Limited |
+| Relation filters (some/every/none) | Yes | Yes | Yes |
+| Raw SQL | Tagged template | `$queryRaw` | `sql` template |
+| Transactions | `$transaction()` | `$transaction()` | `db.transaction()` |
+| Nested transactions | SAVEPOINTs | Interactive only | No |
+| Middleware | `$use()` | `$use()` | No |
+| Pipeline batching | `db.pipeline()` | No | No |
+| Cursor pagination | Yes | Yes | Manual |
+| Distinct | Yes | Yes | Yes |
+| Migrations | SQL files | Prisma Migrate | drizzle-kit |
+| Schema builder | `defineSchema()` | `.prisma` file | TypeScript tables |
+| Type generation | `turbine generate` | `prisma generate` | Manual schema |
+| Studio / GUI | Coming soon | Prisma Studio | Drizzle Studio |
+
+---
+
+## Developer Experience
+
+### Schema Management
+
+**Prisma:** Requires maintaining a `.prisma` schema file that is the source of truth. Your DB must match the schema file. Changes go through `prisma migrate`.
+
+**Drizzle:** Schema is defined in TypeScript using Drizzle's schema API. Like Prisma, you must keep it in sync with your database.
+
+**Turbine:** Database-first by default. Run `turbine generate` to introspect your live database and generate types. Optionally define schemas with `defineSchema()` and push with `turbine push`.
+
+### Type Safety
+
+All three provide strong TypeScript types. The main difference:
+
+- **Prisma:** Types generated from `.prisma` schema file
+- **Drizzle:** Types inferred from TypeScript schema definitions
+- **Turbine:** Types generated from live database introspection
+
+### API Style
+
+**Prisma** and **Turbine** share a nearly identical API:
+
+```typescript
+// Prisma
+await prisma.user.findMany({ where: { role: 'admin' }, orderBy: { name: 'asc' } });
+
+// Turbine
+await db.users.findMany({ where: { role: 'admin' }, orderBy: { name: 'asc' } });
+```
+
+**Drizzle** uses a SQL-like builder:
+
+```typescript
+await db.select().from(users).where(eq(users.role, 'admin')).orderBy(asc(users.name));
+```
+
+---
+
+## When to Choose Each
+
+### Choose Turbine when:
+- Nested queries are a significant part of your workload
+- You need maximum throughput on relational data
+- You want to batch independent queries (pipeline)
+- You prefer database-first schema management
+- You want minimal dependencies and fast cold starts
+
+### Choose Prisma when:
+- You want the largest ecosystem and community
+- Prisma Studio is important to your workflow
+- You need Prisma Accelerate for edge caching
+- Your team is already experienced with Prisma
+- Simple queries dominate your workload
+
+### Choose Drizzle when:
+- You prefer SQL-like syntax over object-based queries
+- You want maximum control over generated SQL
+- You value a lightweight, pure-JS solution
+- You need broad database support (MySQL, SQLite, etc.)
+- You want to define schemas entirely in TypeScript

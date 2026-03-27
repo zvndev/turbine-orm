@@ -1,0 +1,220 @@
+# Middleware
+
+Turbine middleware lets you intercept and modify all queries before and after execution. Use it for logging, soft-deletes, audit trails, timing, multi-tenancy, and more.
+
+---
+
+## Registering Middleware
+
+Register middleware with `db.$use()`:
+
+```typescript
+db.$use(async (params, next) => {
+  // params.model  => 'users', 'posts', etc.
+  // params.action => 'findUnique', 'create', 'update', etc.
+  // params.args   => the query arguments
+
+  // Call next() to continue the chain
+  const result = await next(params);
+
+  // Optionally modify the result
+  return result;
+});
+```
+
+Multiple middleware functions run in the order they are registered. Each must call `next(params)` to pass control to the next middleware (or the actual query execution).
+
+---
+
+## Examples
+
+### Query Timing
+
+Log how long each query takes:
+
+```typescript
+db.$use(async (params, next) => {
+  const start = Date.now();
+  const result = await next(params);
+  const duration = Date.now() - start;
+  console.log(`${params.model}.${params.action} took ${duration}ms`);
+  return result;
+});
+```
+
+### Soft Deletes
+
+Automatically filter out soft-deleted rows and convert `delete` operations to `update`:
+
+```typescript
+db.$use(async (params, next) => {
+  // For reads, automatically exclude soft-deleted rows
+  if (params.action === 'findMany' || params.action === 'findUnique') {
+    params.args.where = {
+      ...params.args.where,
+      deletedAt: null,
+    };
+  }
+
+  // Convert delete to soft-delete
+  if (params.action === 'delete' || params.action === 'deleteMany') {
+    params.action = params.action === 'delete' ? 'update' : 'updateMany';
+    params.args = {
+      where: params.args.where,
+      data: { deletedAt: new Date() },
+    };
+  }
+
+  return next(params);
+});
+```
+
+### Multi-Tenancy
+
+Automatically scope all queries to the current organization:
+
+```typescript
+function tenantMiddleware(orgId: number) {
+  return async (params: MiddlewareParams, next: MiddlewareNext) => {
+    // Skip tables that don't have org_id
+    const tablesWithOrg = ['users', 'posts', 'comments'];
+    if (!tablesWithOrg.includes(params.model)) {
+      return next(params);
+    }
+
+    // Add org_id filter to reads
+    if (params.action.startsWith('find') || params.action === 'count') {
+      params.args.where = {
+        ...params.args.where,
+        orgId,
+      };
+    }
+
+    // Add org_id to creates
+    if (params.action === 'create' || params.action === 'createMany') {
+      if (Array.isArray(params.args.data)) {
+        params.args.data = params.args.data.map((d: Record<string, unknown>) => ({
+          ...d,
+          orgId,
+        }));
+      } else {
+        params.args.data = { ...params.args.data, orgId };
+      }
+    }
+
+    return next(params);
+  };
+}
+
+// Usage
+db.$use(tenantMiddleware(currentOrgId));
+```
+
+### Audit Trail
+
+Log all write operations for compliance:
+
+```typescript
+db.$use(async (params, next) => {
+  const writeActions = ['create', 'createMany', 'update', 'updateMany', 'delete', 'deleteMany'];
+
+  if (writeActions.includes(params.action)) {
+    console.log(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      model: params.model,
+      action: params.action,
+      args: params.args,
+    }));
+  }
+
+  return next(params);
+});
+```
+
+### Result Transformation
+
+Transform results after query execution:
+
+```typescript
+db.$use(async (params, next) => {
+  const result = await next(params);
+
+  // Redact sensitive fields from user queries
+  if (params.model === 'users' && result) {
+    const redact = (user: Record<string, unknown>) => {
+      const { password, ...safe } = user;
+      return safe;
+    };
+
+    if (Array.isArray(result)) {
+      return result.map(redact);
+    }
+    return redact(result as Record<string, unknown>);
+  }
+
+  return result;
+});
+```
+
+---
+
+## Middleware API
+
+### MiddlewareParams
+
+```typescript
+interface MiddlewareParams {
+  /** The table being queried (e.g., 'users') */
+  model: string;
+
+  /** The operation (e.g., 'findUnique', 'create', 'update') */
+  action: string;
+
+  /** The query arguments (where, data, orderBy, etc.) */
+  args: Record<string, unknown>;
+}
+```
+
+### MiddlewareNext
+
+```typescript
+type MiddlewareNext = (params: MiddlewareParams) => Promise<unknown>;
+```
+
+### Middleware
+
+```typescript
+type Middleware = (
+  params: MiddlewareParams,
+  next: MiddlewareNext,
+) => Promise<unknown>;
+```
+
+---
+
+## Middleware in Transactions
+
+Middleware registered on the main client also runs within transactions:
+
+```typescript
+db.$use(async (params, next) => {
+  console.log(`[${params.action}] ${params.model}`);
+  return next(params);
+});
+
+await db.$transaction(async (tx) => {
+  // This query goes through the middleware
+  await tx.users.create({ data: { name: 'Alice' } });
+  // Logs: [create] users
+});
+```
+
+---
+
+## Important Notes
+
+- Middleware runs in registration order. The first registered middleware is the outermost wrapper.
+- Always call `next(params)` exactly once. Skipping it will prevent the query from executing.
+- You can modify `params.action` to change the operation type (e.g., convert `delete` to `update` for soft-deletes).
+- Registering new middleware clears the internal table cache, so subsequent queries pick up the new middleware.
+- Middleware adds minimal overhead -- the chain is a simple function composition with no allocation per query.

@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+:root {
+  --background: #09090b;
+  --foreground: #f4f4f5;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #18181b;
+}
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+/* Article body prose styling */
+.article-body {
+  line-height: 1.8;
+  font-size: 1.0625rem;
+  color: #d4d4d8;
+}
+
+.article-body p {
+  margin-bottom: 1.5em;
+}
+
+.article-body h2 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin-top: 2.5em;
+  margin-bottom: 0.75em;
+  color: #f4f4f5;
+  letter-spacing: -0.01em;
+}
+
+.article-body h3 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-top: 2em;
+  margin-bottom: 0.5em;
+  color: #e4e4e7;
+}
+
+.article-body ul,
+.article-body ol {
+  margin-bottom: 1.5em;
+  padding-left: 1.5em;
+}
+
+.article-body li {
+  margin-bottom: 0.5em;
+}
+
+.article-body ul li {
+  list-style-type: disc;
+}
+
+.article-body ol li {
+  list-style-type: decimal;
+}
+
+.article-body blockquote {
+  border-left: 3px solid #10b981;
+  padding-left: 1.25em;
+  margin: 1.5em 0;
+  color: #a1a1aa;
+  font-style: italic;
+}
+
+.article-body code {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 0.875em;
+  background: #18181b;
+  border: 1px solid #27272a;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  color: #10b981;
+}
+
+.article-body pre {
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 8px;
+  padding: 1.25em;
+  overflow-x: auto;
+  margin: 1.5em 0;
+}
+
+.article-body pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.85em;
+  color: #d4d4d8;
+}
+
+.article-body a {
+  color: #34d399;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.article-body a:hover {
+  color: #6ee7b7;
+}
+
+.article-body hr {
+  border: none;
+  border-top: 1px solid #27272a;
+  margin: 2.5em 0;
+}
+
+.article-body strong {
+  font-weight: 600;
+  color: #f4f4f5;
+}
+
+/* Gradient accent line used on featured cards */
+.gradient-accent {
+  background: linear-gradient(135deg, #10b981, #06b6d4, #8b5cf6);
+}
+
+/* Subtle grid background pattern */
+.bg-grid {
+  background-image:
+    linear-gradient(to right, rgba(39, 39, 42, 0.3) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(39, 39, 42, 0.3) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* Glow effect for featured items */
+.glow-emerald {
+  box-shadow: 0 0 60px -12px rgba(16, 185, 129, 0.15);
+}

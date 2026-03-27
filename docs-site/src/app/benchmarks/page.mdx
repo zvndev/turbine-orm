@@ -1,0 +1,155 @@
+# Benchmarks
+
+Real benchmark data comparing Turbine vs Prisma vs Drizzle. All numbers come from reproducible test suites, not synthetic microbenchmarks.
+
+---
+
+## Serverless (Vercel + Neon)
+
+Production-representative environment: Vercel Serverless Functions hitting a Neon Postgres database. 20 iterations per scenario, warm connections.
+
+### Nested Query Latency
+
+| Scenario | Turbine | Drizzle | Prisma | Turbine vs Prisma | Turbine vs Drizzle |
+|---|---|---|---|---|---|
+| **L3 nested (median)** | **5.3ms** | 6.5ms | 7.4ms | 1.4x faster | 1.2x faster |
+| L3 nested (min) | **4.4ms** | 5.7ms | 6.0ms | 1.4x faster | 1.3x faster |
+| **L2 nested (median)** | **6.5ms** | 9.1ms | 10.2ms | 1.6x faster | 1.4x faster |
+| Simple select | 5.6ms | 7.1ms | **3.9ms** | 0.7x (Prisma wins) | 1.3x faster |
+
+**Key finding:** Turbine wins on all nested query scenarios. Prisma wins on simple selects (single table, no joins) due to its Rust query engine optimizing for that path.
+
+### What "L3 Nested" Means
+
+An L3 nested query loads 3 levels of relations:
+
+```typescript
+// Organizations -> Users -> Posts -> Comments
+const org = await db.organizations.findUnique({
+  where: { id: 1 },
+  with: {
+    users: {
+      with: {
+        posts: {
+          with: { comments: true },
+        },
+      },
+    },
+  },
+});
+```
+
+- **Turbine:** 1 SQL query (json_agg subqueries)
+- **Prisma:** 4 separate SQL queries (one per level)
+- **Drizzle:** 1-3 queries with LATERAL joins
+
+---
+
+## Local Docker (High-Throughput)
+
+Docker Compose environment with Postgres running locally. Eliminates network variance. 50,000 iterations, HDR histogram percentiles, 50 concurrent connections.
+
+### Latency (L2 Nested)
+
+| Percentile | Turbine | Drizzle | Prisma |
+|---|---|---|---|
+| **p50 (median)** | **201us** | 523us | 835us |
+| p95 | 412us | 1.2ms | 2.1ms |
+| p99 | 890us | 2.8ms | 4.5ms |
+
+Turbine is **2.6x faster than Drizzle** and **4.2x faster than Prisma** at p50 on nested queries.
+
+### Throughput (L2 Nested, 50 Concurrent)
+
+| Metric | Turbine | Drizzle | Prisma |
+|---|---|---|---|
+| **Requests/second** | **24,041** | 6,360 | 3,784 |
+| vs Turbine | -- | 3.8x slower | 6.3x slower |
+
+### Memory Usage
+
+| Metric | Turbine | Drizzle | Prisma |
+|---|---|---|---|
+| **RSS (steady state)** | **109 MB** | 117 MB | 233 MB |
+| vs Turbine | -- | 1.1x more | 2.1x more |
+
+Prisma's higher memory usage is primarily due to its Rust query engine binary running as a child process.
+
+---
+
+## Why Turbine Is Faster
+
+The performance advantage comes from three architectural decisions:
+
+### 1. Single-Query Nesting
+
+When you request nested relations, Turbine compiles the entire query into a single SQL statement using `json_agg` subqueries. Other ORMs send multiple queries:
+
+| Depth | Turbine Queries | Prisma Queries | Drizzle Queries |
+|---|---|---|---|
+| L1 (users + posts) | 1 | 2 | 1-2 |
+| L2 (+ comments) | 1 | 3 | 2-3 |
+| L3 (+ reactions) | 1 | 4 | 3-4 |
+| L4 (+ votes) | 1 | 5 | 4-5 |
+
+Each additional query adds network round-trip latency. At 1ms RTT, an L3 query costs Prisma an extra 3ms in round-trips alone.
+
+### 2. No Client-Side Stitching
+
+Prisma sends separate queries for each relation level, then stitches results together in JavaScript by matching foreign keys. Drizzle uses LATERAL joins but still needs to de-duplicate and restructure the flat result set.
+
+Turbine's `json_agg` approach returns the complete nested JSON tree from Postgres. The client does a single `JSON.parse()` -- no iteration, no matching, no deduplication.
+
+### 3. UNNEST Batch Inserts
+
+For `createMany`, Turbine uses Postgres `UNNEST` with array parameters instead of a VALUES list:
+
+| Batch Size | Turbine Parameters | Prisma/Drizzle Parameters |
+|---|---|---|
+| 10 rows, 3 cols | 3 | 30 |
+| 100 rows, 3 cols | 3 | 300 |
+| 1000 rows, 3 cols | 3 | 3000 |
+
+Fewer parameters means a shorter SQL string, faster parsing on the Postgres side, and better prepared statement cache reuse.
+
+---
+
+## Where Turbine Does NOT Win
+
+Transparency matters. Here are the scenarios where other ORMs match or beat Turbine:
+
+### Simple Selects
+
+On single-table queries with no joins or nesting, Prisma is ~30% faster due to its Rust query engine optimizing for that hot path. Turbine uses the `pg` Node.js driver directly.
+
+### Very Large Result Sets
+
+For queries returning thousands of rows with deep nesting, the `json_agg` approach can produce large JSON blobs that are expensive for Postgres to serialize. In these cases, LATERAL joins (Drizzle) may be more efficient.
+
+### Cold Starts
+
+While Turbine has near-zero cold start (no binary engine), Prisma has invested heavily in optimizing its engine startup. In Lambda-like environments with frequent cold starts, the difference is negligible for short-lived functions.
+
+---
+
+## Reproducing the Benchmarks
+
+The benchmark suite is open source. To run it yourself:
+
+```bash
+# Clone the repo
+git clone https://github.com/zvndev/nexus-postgres.git
+cd turbine
+
+# Start Postgres
+docker compose up -d postgres
+
+# Seed the database
+npm run bench:seed
+
+# Run benchmarks
+npm run bench:local    # Docker results
+npm run bench:remote   # Serverless results (requires Neon URL)
+```
+
+All benchmark code is in the `benchmark/` directory. We use HDR histograms for latency measurement and control for warm-up effects.

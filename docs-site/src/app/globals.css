@@ -1,0 +1,224 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ========================================================================= */
+/* Base theme                                                                */
+/* ========================================================================= */
+
+:root {
+  --bg-primary: #09090b;
+  --bg-secondary: #0c0c0f;
+  --bg-tertiary: #18181b;
+  --bg-code: #111114;
+  --border: #27272a;
+  --border-subtle: #1e1e22;
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --green: #22c55e;
+  --yellow: #eab308;
+  --red: #ef4444;
+  --orange: #f97316;
+  --purple: #a855f7;
+  --sidebar-width: 260px;
+  --content-max: 52rem;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  @apply antialiased;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+/* ========================================================================= */
+/* Scrollbar                                                                 */
+/* ========================================================================= */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* ========================================================================= */
+/* MDX typography                                                            */
+/* ========================================================================= */
+
+.mdx-content h1 {
+  @apply text-4xl font-extrabold tracking-tight leading-tight mb-4;
+}
+
+.mdx-content h2 {
+  @apply text-2xl font-bold tracking-tight mt-12 mb-4 pb-2;
+  border-bottom: 1px solid var(--border);
+}
+
+.mdx-content h3 {
+  @apply text-xl font-semibold mt-8 mb-3;
+}
+
+.mdx-content h4 {
+  @apply text-base font-semibold mt-6 mb-2;
+  color: var(--text-secondary);
+}
+
+.mdx-content p {
+  @apply mb-4 leading-relaxed;
+  color: var(--text-secondary);
+}
+
+.mdx-content strong {
+  @apply font-semibold;
+  color: var(--text-primary);
+}
+
+.mdx-content ul,
+.mdx-content ol {
+  @apply mb-4 pl-6;
+}
+
+.mdx-content li {
+  @apply mb-1.5;
+  color: var(--text-secondary);
+}
+
+.mdx-content li strong {
+  color: var(--text-primary);
+}
+
+.mdx-content hr {
+  @apply my-8;
+  border: none;
+  border-top: 1px solid var(--border);
+}
+
+.mdx-content blockquote {
+  @apply my-4 rounded-r-lg;
+  border-left: 3px solid var(--accent);
+  padding: 12px 16px;
+  background: rgba(59, 130, 246, 0.05);
+}
+
+.mdx-content blockquote p {
+  @apply mb-0;
+}
+
+.mdx-content a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.mdx-content a:hover {
+  text-decoration: underline;
+}
+
+/* ========================================================================= */
+/* Inline code                                                               */
+/* ========================================================================= */
+
+.mdx-content code {
+  @apply text-sm rounded px-1.5 py-0.5;
+  font-family: 'Geist Mono', 'SF Mono', 'Fira Code', monospace;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--orange);
+}
+
+.mdx-content pre code {
+  @apply bg-transparent border-none p-0;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+/* ========================================================================= */
+/* Code blocks                                                               */
+/* ========================================================================= */
+
+.mdx-content pre {
+  @apply rounded-lg mb-4 overflow-x-auto relative;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  padding: 16px 20px;
+  font-family: 'Geist Mono', 'SF Mono', 'Fira Code', monospace;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+/* ========================================================================= */
+/* Tables                                                                    */
+/* ========================================================================= */
+
+.mdx-content table {
+  @apply w-full mb-6 text-sm;
+  border-collapse: collapse;
+}
+
+.mdx-content th {
+  @apply text-left font-semibold text-xs;
+  padding: 10px 14px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+}
+
+.mdx-content td {
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.mdx-content tr:hover td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* ========================================================================= */
+/* Custom component styles                                                   */
+/* ========================================================================= */
+
+.install-block {
+  @apply flex items-center gap-2 rounded-lg mb-6;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  padding: 14px 20px;
+  font-family: 'Geist Mono', monospace;
+  font-size: 14px;
+}
+
+.note {
+  @apply rounded-lg my-4 text-sm;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.2);
+  padding: 14px 18px;
+}
+.note p { @apply mb-0; }
+
+.warning {
+  @apply rounded-lg my-4 text-sm;
+  background: rgba(234, 179, 8, 0.08);
+  border: 1px solid rgba(234, 179, 8, 0.2);
+  padding: 14px 18px;
+}
+.warning p { @apply mb-0; }
+
+.tip {
+  @apply rounded-lg my-4 text-sm;
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.2);
+  padding: 14px 18px;
+}
+.tip p { @apply mb-0; }

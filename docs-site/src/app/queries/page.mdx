@@ -1,0 +1,681 @@
+# API Reference
+
+Complete reference for all query methods, operators, and filters available on Turbine table accessors.
+
+Every table in your database is available as a typed accessor on the `db` object (e.g., `db.users`, `db.posts`). Each accessor is a `QueryInterface<T>` with the methods documented below.
+
+---
+
+## findUnique
+
+Fetch a single row matching the `where` clause. Returns `T | null`.
+
+```typescript
+const user = await db.users.findUnique({
+  where: { id: 42 },
+});
+// => User | null
+```
+
+With nested relations:
+
+```typescript
+const user = await db.users.findUnique({
+  where: { id: 42 },
+  with: { posts: true },
+});
+// => (User & { posts: Post[] }) | null
+```
+
+With field selection:
+
+```typescript
+const user = await db.users.findUnique({
+  where: { id: 42 },
+  select: { id: true, email: true, name: true },
+});
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | **Required.** Filter conditions |
+| `with` | `WithClause` | Include nested relations |
+| `select` | `Record<string, boolean>` | Only include these fields |
+| `omit` | `Record<string, boolean>` | Exclude these fields |
+
+---
+
+## findMany
+
+Fetch multiple rows. Returns `T[]`.
+
+```typescript
+const users = await db.users.findMany({
+  where: { orgId: 1, role: 'admin' },
+  orderBy: { createdAt: 'desc' },
+  limit: 20,
+  offset: 0,
+});
+```
+
+With nested relations, filters, and pagination:
+
+```typescript
+const usersWithPosts = await db.users.findMany({
+  where: { orgId: 1 },
+  with: {
+    posts: {
+      where: { published: true },
+      orderBy: { createdAt: 'desc' },
+      limit: 5,
+      with: { comments: true },
+    },
+  },
+  orderBy: { name: 'asc' },
+  limit: 10,
+});
+```
+
+### Cursor-based Pagination
+
+```typescript
+const nextPage = await db.posts.findMany({
+  cursor: { id: lastPostId },
+  take: 20,
+  orderBy: { id: 'asc' },
+});
+```
+
+### Distinct
+
+```typescript
+const uniqueRoles = await db.users.findMany({
+  distinct: ['role'],
+  orderBy: { role: 'asc' },
+});
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | Filter conditions |
+| `with` | `WithClause` | Include nested relations |
+| `select` | `Record<string, boolean>` | Only include these fields |
+| `omit` | `Record<string, boolean>` | Exclude these fields |
+| `orderBy` | `Record<string, 'asc' \| 'desc'>` | Sort order |
+| `limit` | `number` | Maximum rows to return |
+| `offset` | `number` | Skip this many rows |
+| `cursor` | `Partial<T>` | Start after this row (cursor pagination) |
+| `take` | `number` | Number of records (used with cursor) |
+| `distinct` | `(keyof T)[]` | De-duplicate by these fields |
+
+---
+
+## findFirst
+
+Fetch the first row matching the `where` clause. Accepts the same arguments as `findMany` but forces `limit: 1` and returns `T | null` instead of `T[]`.
+
+```typescript
+const user = await db.users.findFirst({
+  where: { role: 'admin' },
+  orderBy: { createdAt: 'desc' },
+});
+// => User | null
+```
+
+With nested relations:
+
+```typescript
+const user = await db.users.findFirst({
+  where: { orgId: 1 },
+  with: { posts: true },
+  orderBy: { name: 'asc' },
+});
+// => (User & { posts: Post[] }) | null
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | Filter conditions |
+| `with` | `WithClause` | Include nested relations |
+| `select` | `Record<string, boolean>` | Only include these fields |
+| `omit` | `Record<string, boolean>` | Exclude these fields |
+| `orderBy` | `Record<string, 'asc' \| 'desc'>` | Sort order |
+| `distinct` | `(keyof T)[]` | De-duplicate by these fields |
+
+---
+
+## findFirstOrThrow
+
+Same as `findFirst`, but throws an `Error('Record not found')` if no row matches instead of returning `null`. Returns `T`.
+
+```typescript
+const user = await db.users.findFirstOrThrow({
+  where: { role: 'admin' },
+  orderBy: { createdAt: 'desc' },
+});
+// => User (throws if no admin exists)
+```
+
+### Arguments
+
+Same as `findFirst`.
+
+---
+
+## findUniqueOrThrow
+
+Same as `findUnique`, but throws an `Error('Record not found')` if no row matches instead of returning `null`. Returns `T`.
+
+```typescript
+const user = await db.users.findUniqueOrThrow({
+  where: { id: 42 },
+});
+// => User (throws if id 42 does not exist)
+```
+
+With nested relations:
+
+```typescript
+const user = await db.users.findUniqueOrThrow({
+  where: { id: 42 },
+  with: { posts: true },
+});
+// => User & { posts: Post[] } (throws if id 42 does not exist)
+```
+
+### Arguments
+
+Same as `findUnique`.
+
+---
+
+## create
+
+Insert a single row. Returns the full row with generated fields (id, timestamps, etc).
+
+```typescript
+const newUser = await db.users.create({
+  data: {
+    email: 'alice@example.com',
+    name: 'Alice',
+    orgId: 1,
+  },
+});
+// Returns the full row with generated id, createdAt, etc.
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `data` | `Partial<T>` | **Required.** Column values to insert |
+
+---
+
+## createMany
+
+Batch insert using Postgres `UNNEST` for optimal performance. Returns `T[]`.
+
+```typescript
+const users = await db.users.createMany({
+  data: [
+    { email: 'a@b.com', name: 'A', orgId: 1 },
+    { email: 'b@b.com', name: 'B', orgId: 1 },
+    { email: 'c@b.com', name: 'C', orgId: 1 },
+  ],
+});
+// Single INSERT with UNNEST -- not 3 separate inserts
+```
+
+Unlike Prisma and Drizzle which generate a VALUES list with N*columns parameters, Turbine uses `UNNEST` with just columns-count array parameters regardless of batch size:
+
+```sql
+INSERT INTO users (email, name, org_id)
+SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[])
+RETURNING *
+```
+
+### Skip Duplicates
+
+```typescript
+const users = await db.users.createMany({
+  data: [...],
+  skipDuplicates: true, // adds ON CONFLICT DO NOTHING
+});
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `data` | `Partial<T>[]` | **Required.** Array of rows to insert |
+| `skipDuplicates` | `boolean` | Add ON CONFLICT DO NOTHING |
+
+---
+
+## update
+
+Update a single row matching the `where` clause. Returns the updated row.
+
+```typescript
+const updated = await db.users.update({
+  where: { id: 42 },
+  data: { name: 'Alice Updated' },
+});
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | **Required.** Filter for the row to update |
+| `data` | `Partial<T>` | **Required.** Fields to update |
+
+---
+
+## updateMany
+
+Update all rows matching the `where` clause. Returns `T[]` (all updated rows).
+
+```typescript
+const updated = await db.posts.updateMany({
+  where: { orgId: 1, published: false },
+  data: { published: true },
+});
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | **Required.** Filter conditions |
+| `data` | `Partial<T>` | **Required.** Fields to update |
+
+---
+
+## delete
+
+Delete a single row. Returns the deleted row.
+
+```typescript
+const deleted = await db.users.delete({
+  where: { id: 42 },
+});
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | **Required.** Filter for the row to delete |
+
+---
+
+## deleteMany
+
+Delete all rows matching the `where` clause. Returns `T[]` (deleted rows).
+
+```typescript
+const deleted = await db.comments.deleteMany({
+  where: { postId: { in: [1, 2, 3] } },
+});
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | **Required.** Filter conditions |
+
+---
+
+## upsert
+
+Insert a row or update it if a conflict occurs. Returns the row.
+
+```typescript
+const user = await db.users.upsert({
+  where: { email: 'alice@example.com' },
+  create: { email: 'alice@example.com', name: 'Alice', orgId: 1 },
+  update: { name: 'Alice Updated' },
+});
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | **Required.** Conflict detection filter |
+| `create` | `Partial<T>` | **Required.** Data for INSERT |
+| `update` | `Partial<T>` | **Required.** Data for UPDATE on conflict |
+
+---
+
+## count
+
+Count rows matching a filter. Returns `number`.
+
+```typescript
+const total = await db.posts.count({
+  where: { orgId: 1, published: true },
+});
+// => 42
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | Filter conditions (optional) |
+
+---
+
+## groupBy
+
+Group rows and compute aggregates per group.
+
+```typescript
+const stats = await db.users.groupBy({
+  by: ['orgId', 'role'],
+  _count: true,
+  _sum: { score: true },
+  where: { orgId: 1 },
+  orderBy: { role: 'asc' },
+});
+// => [{ orgId: 1, role: 'admin', _count: 3, _sum: { score: 150 } }, ...]
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `by` | `(keyof T)[]` | **Required.** Fields to group by |
+| `where` | `WhereClause<T>` | Filter before grouping |
+| `_count` | `true` | Include count per group |
+| `_sum` | `Record<string, boolean>` | Sum numeric fields |
+| `_avg` | `Record<string, boolean>` | Average numeric fields |
+| `_min` | `Record<string, boolean>` | Minimum value per group |
+| `_max` | `Record<string, boolean>` | Maximum value per group |
+| `having` | `Record<string, unknown>` | Filter after grouping |
+| `orderBy` | `Record<string, 'asc' \| 'desc'>` | Sort groups |
+
+---
+
+## aggregate
+
+Compute aggregates across all matching rows.
+
+```typescript
+const result = await db.posts.aggregate({
+  where: { published: true },
+  _count: true,
+  _sum: { viewCount: true },
+  _avg: { viewCount: true },
+  _min: { createdAt: true },
+  _max: { createdAt: true },
+});
+// => { _count: 100, _sum: { viewCount: 5000 }, _avg: { viewCount: 50 }, ... }
+```
+
+### Arguments
+
+| Field | Type | Description |
+|---|---|---|
+| `where` | `WhereClause<T>` | Filter conditions |
+| `_count` | `true \| Record<string, boolean>` | Count all or specific fields |
+| `_sum` | `Record<string, boolean>` | Sum numeric fields |
+| `_avg` | `Record<string, boolean>` | Average numeric fields |
+| `_min` | `Record<string, boolean>` | Minimum values |
+| `_max` | `Record<string, boolean>` | Maximum values |
+
+---
+
+## with (Nested Relations)
+
+The `with` clause is the core feature of Turbine. It resolves related data using `json_agg` subqueries in a single SQL statement.
+
+### Basic Usage
+
+```typescript
+// Load all posts for a user
+const user = await db.users.findUnique({
+  where: { id: 1 },
+  with: { posts: true },
+});
+
+// With filtering and ordering on the relation
+const user = await db.users.findUnique({
+  where: { id: 1 },
+  with: {
+    posts: {
+      where: { published: true },
+      orderBy: { createdAt: 'desc' },
+      limit: 10,
+    },
+  },
+});
+```
+
+### Deep Nesting
+
+```typescript
+// 3 levels deep -- still a single SQL query
+const user = await db.users.findUnique({
+  where: { id: 1 },
+  with: {
+    posts: {
+      with: {
+        comments: {
+          orderBy: { createdAt: 'desc' },
+          limit: 5,
+        },
+      },
+    },
+  },
+});
+```
+
+### Relation Options
+
+Each relation in the `with` clause accepts:
+
+| Field | Type | Description |
+|---|---|---|
+| `with` | `WithClause` | Nest deeper relations |
+| `where` | `Record<string, unknown>` | Filter the related rows |
+| `orderBy` | `Record<string, 'asc' \| 'desc'>` | Sort related rows |
+| `limit` | `number` | Limit related rows |
+| `select` | `Record<string, boolean>` | Only include these fields |
+| `omit` | `Record<string, boolean>` | Exclude these fields |
+
+---
+
+## Where Operators
+
+### Equality
+
+```typescript
+// Implicit equality
+where: { role: 'admin' }
+
+// Null check (IS NULL)
+where: { deletedAt: null }
+```
+
+### Comparison Operators
+
+```typescript
+where: {
+  age: { gt: 18 },             // > 18
+  score: { gte: 90 },          // >= 90
+  price: { lt: 100 },          // < 100
+  quantity: { lte: 0 },        // <= 0
+  status: { not: 'archived' }, // != 'archived'
+  role: { not: null },         // IS NOT NULL
+}
+```
+
+### List Operators
+
+```typescript
+where: {
+  id: { in: [1, 2, 3] },        // id IN (1, 2, 3)
+  status: { notIn: ['banned'] }, // status NOT IN ('banned')
+}
+```
+
+### String Operators
+
+```typescript
+where: {
+  name: { contains: 'alice' },     // LIKE '%alice%'
+  email: { startsWith: 'admin' },  // LIKE 'admin%'
+  domain: { endsWith: '.com' },    // LIKE '%.com'
+}
+```
+
+### Logical Operators
+
+```typescript
+// OR -- match any condition
+where: {
+  OR: [
+    { role: 'admin' },
+    { role: 'moderator' },
+  ],
+}
+
+// AND -- match all conditions
+where: {
+  AND: [
+    { age: { gte: 18 } },
+    { age: { lte: 65 } },
+  ],
+}
+
+// NOT -- negate a condition
+where: {
+  NOT: { role: 'banned' },
+}
+```
+
+### JSONB Operators
+
+For `jsonb` columns:
+
+```typescript
+// Access nested path: metadata #>> '{address,city}'
+where: {
+  metadata: {
+    path: ['address', 'city'],
+    equals: 'New York',
+  },
+}
+
+// Containment: settings @> '{"theme":"dark"}'::jsonb
+where: {
+  settings: {
+    contains: { theme: 'dark' },
+  },
+}
+
+// Key existence: config ? 'notifications'
+where: {
+  config: {
+    hasKey: 'notifications',
+  },
+}
+```
+
+### Array Operators
+
+For Postgres array columns:
+
+```typescript
+// Contains value: 'typescript' = ANY(tags)
+where: { tags: { has: 'typescript' } }
+
+// Contains all: tags @> ARRAY['ts','pg']
+where: { tags: { hasEvery: ['ts', 'pg'] } }
+
+// Overlaps: tags && ARRAY['react','vue']
+where: { tags: { hasSome: ['react', 'vue'] } }
+
+// Empty check: array_length(tags, 1) IS NULL
+where: { tags: { isEmpty: true } }
+```
+
+### Relation Filters
+
+Filter parent rows based on their related data:
+
+```typescript
+// Has at least one published post
+where: { posts: { some: { published: true } } }
+
+// All comments are approved
+where: { comments: { every: { approved: true } } }
+
+// No failed orders
+where: { orders: { none: { status: 'failed' } } }
+```
+
+---
+
+## Raw SQL
+
+For queries that no query builder can express, use tagged template literals:
+
+```typescript
+const stats = await db.raw<{ day: Date; count: number }>`
+  SELECT DATE_TRUNC('day', created_at) AS day, COUNT(*)::int AS count
+  FROM posts WHERE org_id = ${orgId}
+  GROUP BY day ORDER BY day
+`;
+```
+
+Interpolated values become parameterized `$N` placeholders. No SQL injection is possible.
+
+---
+
+## Build Methods (for Pipeline)
+
+Every query method has a `build*` counterpart that returns a `DeferredQuery` for use with `db.pipeline()`:
+
+```typescript
+const query = db.users.buildFindMany({
+  where: { orgId: 1 },
+  limit: 10,
+});
+// query.sql    => 'SELECT users.* FROM users WHERE ...'
+// query.params => [1, 10]
+// query.tag    => 'users.findMany'
+```
+
+Available build methods:
+
+| Method | Returns |
+|---|---|
+| `buildFindUnique(args)` | `DeferredQuery<T \| null>` |
+| `buildFindFirst(args)` | `DeferredQuery<T \| null>` |
+| `buildFindFirstOrThrow(args)` | `DeferredQuery<T>` |
+| `buildFindUniqueOrThrow(args)` | `DeferredQuery<T>` |
+| `buildFindMany(args)` | `DeferredQuery<T[]>` |
+| `buildCreate(args)` | `DeferredQuery<T>` |
+| `buildCreateMany(args)` | `DeferredQuery<T[]>` |
+| `buildUpdate(args)` | `DeferredQuery<T>` |
+| `buildUpdateMany(args)` | `DeferredQuery<T[]>` |
+| `buildDelete(args)` | `DeferredQuery<T>` |
+| `buildDeleteMany(args)` | `DeferredQuery<T[]>` |
+| `buildUpsert(args)` | `DeferredQuery<T>` |
+| `buildCount(args)` | `DeferredQuery<number>` |
+| `buildGroupBy(args)` | `DeferredQuery<Record[]>` |
+| `buildAggregate(args)` | `DeferredQuery<AggregateResult>` |
+
+See [Transactions & Pipeline](/transactions) for usage examples.

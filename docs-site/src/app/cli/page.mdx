@@ -1,0 +1,299 @@
+# CLI Reference
+
+Turbine ships a zero-dependency CLI for project initialization, database introspection, code generation, schema management, and migrations.
+
+```bash
+npx turbine <command> [options]
+```
+
+---
+
+## Commands
+
+### init
+
+Initialize a new Turbine project. Creates config files, directories, and templates.
+
+```bash
+npx turbine init
+npx turbine init --url postgres://user:pass@localhost:5432/mydb
+npx turbine init --force  # overwrite existing config
+```
+
+**What it creates:**
+
+| File / Directory | Purpose |
+|---|---|
+| `turbine.config.ts` | Configuration file |
+| `turbine/migrations/` | SQL migration files directory |
+| `turbine/seed.ts` | Seed file template |
+| `turbine/schema.ts` | Schema builder template |
+| `generated/turbine/` | Output directory for generated types |
+
+If a database URL is provided (via `--url` or `DATABASE_URL` environment variable), `init` will also run introspection and generate the typed client.
+
+---
+
+### generate (alias: pull)
+
+Introspect your database and generate TypeScript types + client.
+
+```bash
+npx turbine generate
+npx turbine pull  # same command, alias for Prisma users
+```
+
+Connects to your database, reads `information_schema` and `pg_catalog`, and generates:
+
+- **`types.ts`** -- entity interfaces, create/update input types, relation types
+- **`metadata.ts`** -- runtime schema metadata (column maps, relations, Postgres types)
+- **`index.ts`** -- configured client factory with typed table accessors
+
+```bash
+# Custom output directory
+npx turbine generate --out ./src/db/generated
+
+# Specific Postgres schema
+npx turbine generate --schema myapp
+
+# Include only specific tables
+npx turbine generate --include users,posts,comments
+
+# Exclude specific tables
+npx turbine generate --exclude _migrations,_sessions
+
+# Verbose output
+npx turbine generate --verbose
+```
+
+---
+
+### push
+
+Apply schema builder definitions to the database. Reads your `turbine/schema.ts` file, diffs it against the live database, and applies changes.
+
+```bash
+npx turbine push
+npx turbine push --dry-run  # show SQL without executing
+```
+
+The push command:
+1. Loads your schema file (default: `turbine/schema.ts`)
+2. Introspects the live database
+3. Computes a diff (new tables, new columns, type changes)
+4. Generates and executes DDL statements
+
+<div className="warning">
+<p><strong>Warning:</strong> <code>push</code> is intended for development. For production, use migrations.</p>
+</div>
+
+---
+
+### migrate create
+
+Create a new SQL migration file.
+
+```bash
+npx turbine migrate create add_users_table
+npx turbine migrate create add_email_index
+```
+
+Creates a timestamped `.sql` file in your migrations directory:
+
+```
+turbine/migrations/
+  20240315120000_add_users_table.sql
+```
+
+The file contains `-- UP` and `-- DOWN` sections:
+
+```sql
+-- UP
+CREATE TABLE users (
+  id BIGSERIAL PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL
+);
+
+-- DOWN
+DROP TABLE IF EXISTS users;
+```
+
+---
+
+### migrate up
+
+Apply pending migrations.
+
+```bash
+npx turbine migrate up          # apply all pending
+npx turbine migrate up --step 1 # apply only the next migration
+npx turbine migrate up --verbose
+```
+
+Turbine tracks applied migrations in a `_turbine_migrations` table. Migrations run inside a transaction -- if one fails, the entire batch is rolled back.
+
+---
+
+### migrate down
+
+Rollback the last applied migration.
+
+```bash
+npx turbine migrate down          # rollback last migration
+npx turbine migrate down --step 3 # rollback last 3 migrations
+```
+
+---
+
+### migrate status
+
+Show which migrations have been applied and which are pending.
+
+```bash
+npx turbine migrate status
+```
+
+```
+Migration Status:
+  [applied] 20240315120000_add_users_table.sql       (applied 2024-03-15 12:00:00)
+  [applied] 20240316090000_add_posts_table.sql        (applied 2024-03-16 09:00:00)
+  [pending] 20240317140000_add_comments_table.sql
+```
+
+---
+
+### seed
+
+Run the seed file to populate your database with test data.
+
+```bash
+npx turbine seed
+```
+
+Executes the file at `turbine/seed.ts` (configurable in `turbine.config.ts`). The seed file is a regular TypeScript file -- import your Turbine client and use it:
+
+```typescript
+// turbine/seed.ts
+import { turbine } from '../generated/turbine';
+
+const db = turbine({ connectionString: process.env.DATABASE_URL });
+
+async function seed() {
+  console.log('Seeding database...');
+
+  const org = await db.organizations.create({
+    data: { name: 'Acme Inc', slug: 'acme', plan: 'pro' },
+  });
+
+  await db.users.createMany({
+    data: [
+      { email: 'alice@acme.com', name: 'Alice', orgId: org.id },
+      { email: 'bob@acme.com', name: 'Bob', orgId: org.id },
+    ],
+  });
+
+  console.log('Done!');
+  await db.disconnect();
+}
+
+seed();
+```
+
+---
+
+### status
+
+Show a summary of your database schema.
+
+```bash
+npx turbine status
+npx turbine status --verbose
+```
+
+Displays table names, column counts, primary keys, and relation counts.
+
+---
+
+### studio
+
+Launch a web-based database explorer.
+
+```bash
+npx turbine studio
+```
+
+<div className="note">
+<p><strong>Coming soon.</strong> Studio is currently in development.</p>
+</div>
+
+---
+
+## Global Options
+
+These flags work with any command:
+
+| Flag | Short | Description |
+|---|---|---|
+| `--url <url>` | `-u` | Postgres connection string |
+| `--out <dir>` | `-o` | Output directory (default: `./generated/turbine`) |
+| `--schema <name>` | `-s` | Postgres schema (default: `public`) |
+| `--include <tables>` | | Comma-separated list of tables to include |
+| `--exclude <tables>` | | Comma-separated list of tables to exclude |
+| `--dry-run` | | Show SQL without executing |
+| `--force` | `-f` | Force overwrite existing files |
+| `--verbose` | `-v` | Detailed output |
+| `--step <n>` | `-n` | Number of migrations to apply/rollback |
+
+---
+
+## Configuration File
+
+Create `turbine.config.ts` in your project root (or run `npx turbine init`):
+
+```typescript
+import type { TurbineCliConfig } from 'turbine-orm/cli';
+
+const config: TurbineCliConfig = {
+  // Postgres connection string
+  url: process.env.DATABASE_URL,
+
+  // Output directory for generated types + client
+  out: './generated/turbine',
+
+  // Postgres schema to introspect (default: public)
+  schema: 'public',
+
+  // Tables to include (empty = all)
+  // include: ['users', 'posts'],
+
+  // Tables to exclude
+  // exclude: ['_migrations', '_sessions'],
+
+  // Directory for SQL migration files
+  migrationsDir: './turbine/migrations',
+
+  // Path to seed file
+  seedFile: './turbine/seed.ts',
+
+  // Schema builder file path (for push command)
+  schemaFile: './turbine/schema.ts',
+};
+
+export default config;
+```
+
+Supported file names (in priority order):
+- `turbine.config.ts`
+- `turbine.config.mts`
+- `turbine.config.js`
+- `turbine.config.mjs`
+
+### Priority Order
+
+Configuration values are resolved in this order (highest priority first):
+
+1. CLI flags (`--url`, `--out`, etc.)
+2. Environment variables (`DATABASE_URL`)
+3. Config file values
+4. Defaults

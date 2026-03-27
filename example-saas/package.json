@@ -1,0 +1,23 @@
+{
+  "name": "example-saas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DX validation project: a mini project management tool built with @batadata/turbine",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "seed": "tsx turbine/seed.ts",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "turbine migrate",
+    "db:generate": "turbine generate"
+  },
+  "dependencies": {
+    "@batadata/turbine": "file:../turbine-ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0"
+  }
+}
