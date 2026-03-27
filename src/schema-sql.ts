@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Schema SQL Generator
+ * turbine-orm — Schema SQL Generator
  *
  * Converts a SchemaDef (from defineSchema) into executable DDL statements.
  * Also provides diff and push commands for syncing schema to a live database.

@@ -5,7 +5,7 @@
  * used by `turbine generate` to produce typed client code.
  */
 
-import { defineSchema } from '@batadata/turbine';
+import { defineSchema } from 'turbine-orm';
 
 export default defineSchema({
   teams: {

@@ -236,7 +236,7 @@ export function divider(): void {
 
 export function banner(): void {
   console.log('');
-  console.log(`  ${bold(cyan('turbine'))} ${dim('by')} ${bold('BataData')}`);
+  console.log(`  ${bold(cyan('Turbine ORM'))}`);
   console.log(`  ${dim('TypeScript ORM with json_agg nested queries')}`);
   console.log('');
 }

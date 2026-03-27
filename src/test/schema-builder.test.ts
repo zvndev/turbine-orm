@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Schema builder tests
+ * turbine-orm — Schema builder tests
  *
  * Tests the schema definition API and SQL generation:
  *   1. Builds the benchmark schema using defineSchema + table + column

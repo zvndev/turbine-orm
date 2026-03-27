@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Generated entity types
+ * turbine-orm — Generated entity types
  *
  * These types mirror the Postgres schema and would normally be auto-generated
  * by `npx turbine generate` from your database schema or Rust entity definitions.

@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Schema Builder
+ * turbine-orm — Schema Builder
  *
  * TypeScript-first schema definition API. Define your database schema
  * as plain objects — no method chaining, no DSL. Fully type-checked,
@@ -7,7 +7,7 @@
  *
  * @example
  * ```ts
- * import { defineSchema } from '@batadata/turbine';
+ * import { defineSchema } from 'turbine-orm';
  *
  * export default defineSchema({
  *   users: {

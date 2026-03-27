@@ -70,7 +70,7 @@ export default async function HomePage() {
         <div className="max-w-2xl">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-mono mb-6">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            Powered by @batadata/turbine
+            Powered by turbine-orm
           </div>
           <h1 className="text-4xl md:text-5xl font-bold tracking-tight mb-4 leading-[1.1]">
             The Turbine

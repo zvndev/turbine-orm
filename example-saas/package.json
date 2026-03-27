@@ -2,7 +2,7 @@
   "name": "example-saas",
   "version": "0.1.0",
   "private": true,
-  "description": "DX validation project: a mini project management tool built with @batadata/turbine",
+  "description": "DX validation project: a mini project management tool built with turbine-orm",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -13,7 +13,7 @@
     "db:generate": "turbine generate"
   },
   "dependencies": {
-    "@batadata/turbine": "file:../turbine-ts"
+    "turbine-orm": "file:.."
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

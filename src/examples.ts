@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — SDK Examples
+ * turbine-orm — SDK Examples
  *
  * Comprehensive examples showing every query pattern.
  * Run with: npx tsx src/examples.ts

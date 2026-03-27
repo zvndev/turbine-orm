@@ -126,7 +126,7 @@ export function Sidebar() {
         {/* Footer */}
         <div className="px-5 py-4 mt-auto" style={{ borderTop: '1px solid var(--border)' }}>
           <a
-            href="https://github.com/zvndev/nexus-postgres"
+            href="https://github.com/zvndev/turbine-orm"
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-2 text-xs no-underline"

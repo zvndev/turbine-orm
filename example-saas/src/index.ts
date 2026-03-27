@@ -1,7 +1,7 @@
 /**
  * Turbine DX Validation — Project Management SaaS
  *
- * This script exercises every feature of @batadata/turbine to validate
+ * This script exercises every feature of turbine-orm to validate
  * the developer experience before npm publish. Structured as a series
  * of labeled examples that a real developer would write.
  */

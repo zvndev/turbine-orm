@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "TypeScript ORM with json_agg nested queries — 2-3x faster than Prisma, 1.5x faster than Drizzle",
   "type": "module",
   "exports": {
@@ -62,12 +62,12 @@
     "database",
     "sql",
     "turbine",
-    "batadata",
+    "turbine-orm",
     "nested-queries"
   ],
   "author": "ZVN DEV <dev@zvndev.com>",
   "license": "MIT",
-  "homepage": "https://turbine.batadata.com",
+  "homepage": "https://github.com/zvndev/turbine-orm",
   "repository": {
     "type": "git",
     "url": "https://github.com/zvndev/turbine-orm"

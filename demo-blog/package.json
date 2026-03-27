@@ -9,7 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@batadata/turbine": "file:./batadata-turbine-0.2.0.tgz",
+    "turbine-orm": "file:./turbine-orm-0.3.1.tgz",
     "next": "16.2.1",
     "pg": "^8.20.0",
     "react": "19.2.4",

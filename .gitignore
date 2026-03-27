@@ -8,3 +8,9 @@ out/
 .env*.local
 .vercel/
 .npmrc
+
+# Root-level generated output (sample data, not for distribution)
+/generated/
+
+# Test app (uses local generated client, not for distribution)
+/test-app.ts

@@ -19,7 +19,7 @@ export const metadata: Metadata = {
     template: "%s | Turbine Blog",
   },
   description:
-    "A demo blog powered by @batadata/turbine — deep nested Postgres queries, single round-trip.",
+    "A demo blog powered by turbine-orm — deep nested Postgres queries, single round-trip.",
 };
 
 export default function RootLayout({
@@ -94,7 +94,7 @@ export default function RootLayout({
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-zinc-400">Built with</span>
                   <code className="text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-0.5 rounded-md text-xs font-mono font-medium">
-                    @batadata/turbine
+                    turbine-orm
                   </code>
                 </div>
                 <p className="text-xs text-zinc-600">
@@ -113,7 +113,7 @@ export default function RootLayout({
                 </Link>
                 <span className="text-zinc-800">|</span>
                 <a
-                  href="https://github.com/ZVN-DEV/nexus-postgres"
+                  href="https://github.com/zvndev/turbine-orm"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hover:text-zinc-400 transition-colors"

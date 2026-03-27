@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — TurbineClient
+ * turbine-orm — TurbineClient
  *
  * The main entry point for the Turbine TypeScript SDK.
  * Manages connection pooling and provides typed table accessors.
@@ -16,7 +16,7 @@
  * const user = await db.users.findUnique({ where: { id: 1 } });
  *
  * // With base client (dynamic):
- * import { TurbineClient } from '@batadata/turbine';
+ * import { TurbineClient } from 'turbine-orm';
  * const db = new TurbineClient({ connectionString: '...' }, schema);
  * const users = db.table<User>('users');
  * ```

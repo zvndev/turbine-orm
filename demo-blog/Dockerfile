@@ -4,7 +4,7 @@ FROM node:22-slim AS base
 FROM base AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-COPY batadata-turbine-0.2.0.tgz ./
+COPY turbine-orm-0.3.1.tgz ./
 RUN npm ci
 
 # --- build stage ---

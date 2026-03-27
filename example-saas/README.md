@@ -1,6 +1,6 @@
 # example-saas: Project Management Tool
 
-DX validation project for `@batadata/turbine`. This is a fake SaaS app (mini Linear/Jira)
+DX validation project for `turbine-orm`. This is a fake SaaS app (mini Linear/Jira)
 that exercises every feature of the Turbine ORM to validate the developer experience
 before npm publish.
 

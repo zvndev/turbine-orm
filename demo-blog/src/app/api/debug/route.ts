@@ -105,7 +105,7 @@ export async function GET() {
     {
       _meta: {
         description:
-          "4-level nested query executed as a SINGLE SQL statement via @batadata/turbine",
+          "4-level nested query executed as a SINGLE SQL statement via turbine-orm",
         slug,
         queryTimeMs: Math.round((endTime - startTime) * 100) / 100,
         nestingLevels: [

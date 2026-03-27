@@ -1,6 +1,6 @@
 # Turbine DX Report
 
-Honest assessment of the @batadata/turbine developer experience, written from the
+Honest assessment of the turbine-orm developer experience, written from the
 perspective of a TypeScript developer building a project management SaaS (mini Linear/Jira).
 
 **Date:** 2026-03-26

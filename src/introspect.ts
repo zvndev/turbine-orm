@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Schema introspection
+ * turbine-orm — Schema introspection
  *
  * Connects to a live Postgres database, reads information_schema + pg_catalog,
  * and produces a SchemaMetadata object describing every table, column, relation,

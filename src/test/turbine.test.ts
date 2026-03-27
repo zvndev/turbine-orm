@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Integration test suite
+ * turbine-orm — Integration test suite
  *
  * Tests against a real Postgres database (seeded with 5K users, 46K posts, 432K comments).
  * Covers: CRUD, nested relations (L2-L4), pagination, filtering, ordering,

@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine
+ * turbine-orm
  *
  * Turbine TypeScript SDK — type-safe Postgres queries with nested relations
  * and pipeline batching. Feels like Prisma, runs at raw-SQL speed.

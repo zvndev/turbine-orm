@@ -306,7 +306,7 @@ export default async function ArticlePage({
                   Article + author + category + {recs.length} recommendations + {commentCount} comments (nested {getMaxCommentDepth(comments)} levels deep) + {articleTags.length} tags --
                   all resolved in one SQL round-trip via{" "}
                   <code className="text-emerald-400 bg-zinc-800 px-1 py-0.5 rounded text-[11px] font-mono">
-                    @batadata/turbine
+                    turbine-orm
                   </code>.
                 </p>
               </div>

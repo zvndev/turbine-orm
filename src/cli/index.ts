@@ -306,7 +306,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
  * Define your database schema in TypeScript.
  * Use \`npx turbine push\` to sync it to your database.
  *
- * @see https://batadata.com/docs/turbine/schema
+ * @see https://github.com/zvndev/turbine-orm
  */
 
 import { defineSchema } from 'turbine-orm';
@@ -957,7 +957,7 @@ async function cmdStudio(_args: CliArgs, _config: ResolvedConfig): Promise<void>
         'A local web UI for browsing your database,',
         'exploring relations, and managing data.',
         '',
-        `Follow ${cyan('@batadata')} for updates.`,
+        `Follow ${cyan('@zvndev')} for updates.`,
       ].join('\n'),
       { title: bold(cyan('Studio')), padding: 2 },
     ),

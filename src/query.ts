@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Query builder
+ * turbine-orm — Query builder
  *
  * Each table accessor (db.users, db.posts, etc.) returns a QueryInterface<T>
  * that builds parameterized SQL and executes it through the connection pool.
@@ -309,6 +309,10 @@ export class QueryInterface<T extends object> {
   private readonly sqlCache = new Map<string, string>();
   private readonly middlewares: MiddlewareFn[];
 
+  // Fast path: pre-computed flag — true when this table has zero date/timestamp columns.
+  // When true, parseRow can skip the per-field dateCols.has() check entirely.
+  private readonly hasNoDateColumns: boolean;
+
   constructor(
     private readonly pool: pg.Pool,
     private readonly table: string,
@@ -323,6 +327,7 @@ export class QueryInterface<T extends object> {
     }
     this.tableMeta = meta;
     this.middlewares = middlewares ?? [];
+    this.hasNoDateColumns = meta.dateColumns.size === 0;
   }
 
   /**
@@ -383,12 +388,16 @@ export class QueryInterface<T extends object> {
 
     // Check if all where values are simple (plain equality, no operators/null/OR)
     const whereKeys = Object.keys(whereObj).filter((k) => whereObj[k] !== undefined);
-    const isSimpleWhere = !whereObj['OR'] && whereKeys.every((k) => {
+    const isSimpleWhere = !whereObj['OR'] && !whereObj['AND'] && !whereObj['NOT'] && whereKeys.every((k) => {
       const v = whereObj[k];
-      return v !== null && !isWhereOperator(v);
+      return v !== null && !isWhereOperator(v) && !isJsonFilter(v) && !isArrayFilter(v);
     });
 
-    // For simple queries (no nested with, no operators), use cached SQL template
+    // -----------------------------------------------------------------------
+    // Fast path: no relations, simple equality where — cache SQL template.
+    // Generates: SELECT col1, col2 FROM "table" WHERE "id" = $1 LIMIT 1
+    // No json_build_object, no subqueries, no COALESCE wrappers.
+    // -----------------------------------------------------------------------
     if (!args.with && isSimpleWhere) {
       const colKey = columnsList ? columnsList.join(',') : '*';
       const ck = `fu:${whereKeys.sort().join(',')}:c=${colKey}`;
@@ -406,12 +415,17 @@ export class QueryInterface<T extends object> {
         this.sqlCache.set(ck, sql);
       }
 
+      // Fast path: skip date coercion when table has no date columns
+      const transformRow = this.hasNoDateColumns
+        ? (row: Record<string, unknown>) => this.parseRowFast(row) as T
+        : (row: Record<string, unknown>) => this.parseRow(row, this.table) as T;
+
       return {
         sql,
         params,
         transform: (result) => {
           const row = result.rows[0];
-          return row ? (this.parseRow(row, this.table) as T) : null;
+          return row ? transformRow(row) : null;
         },
         tag: `${this.table}.findUnique`,
       };
@@ -420,6 +434,7 @@ export class QueryInterface<T extends object> {
     // General path: supports operators, null, OR, nested with
     const { sql: whereSql, params } = this.buildWhere(args.where);
 
+    // Fast path: no relations, skip json_agg (but where has operators/null/OR)
     if (!args.with) {
       const qt = quoteIdent(this.table);
       const selectExpr = columnsList
@@ -465,13 +480,93 @@ export class QueryInterface<T extends object> {
   }
 
   buildFindMany(args?: FindManyArgs<T>): DeferredQuery<T[]> {
+    const columnsList = this.resolveColumns(args?.select, args?.omit);
+    const qt = quoteIdent(this.table);
+    const hasWith = !!(args?.with);
+
+    // -----------------------------------------------------------------------
+    // Fast path: no relations, no cursor, no distinct — cache SQL template
+    // Skip json_agg subquery machinery entirely for simple table scans.
+    // -----------------------------------------------------------------------
+    if (!hasWith && !args?.cursor && !args?.distinct) {
+      const whereObj = args?.where as Record<string, unknown> | undefined;
+      const whereKeys = whereObj
+        ? Object.keys(whereObj).filter((k) => whereObj[k] !== undefined)
+        : [];
+
+      // Check if all where values are simple equality (no operators, null, OR/AND/NOT)
+      const isSimpleWhere = !whereObj || (
+        !whereObj['OR'] && !whereObj['AND'] && !whereObj['NOT'] && whereKeys.every((k) => {
+          const v = whereObj[k];
+          return v !== null && !isWhereOperator(v) && !isJsonFilter(v) && !isArrayFilter(v);
+        })
+      );
+
+      if (isSimpleWhere) {
+        // Build cache key: operation + where keys + columns + orderBy + hasLimit + hasOffset
+        const colKey = columnsList ? columnsList.join(',') : '*';
+        const orderKey = args?.orderBy ? Object.entries(args.orderBy).map(([k, d]) => `${k}:${d}`).join(',') : '';
+        const hasLimit = args?.limit !== undefined || args?.take !== undefined;
+        const hasOffset = args?.offset !== undefined;
+        const ck = `fm:${whereKeys.sort().join(',')}:c=${colKey}:o=${orderKey}:l=${hasLimit ? '1' : '0'}:off=${hasOffset ? '1' : '0'}`;
+
+        let sql = this.sqlCache.get(ck);
+        const params: unknown[] = whereKeys.map((k) => whereObj![k]);
+
+        if (!sql) {
+          // Build SQL template once and cache it
+          const selectExpr = columnsList
+            ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ')
+            : `${qt}.*`;
+          const whereClauses = whereKeys.map((k, i) => `${this.toSqlColumn(k)} = $${i + 1}`);
+          const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
+
+          sql = `SELECT ${selectExpr} FROM ${qt}${whereSql}`;
+
+          if (args?.orderBy) {
+            sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
+          }
+
+          // Placeholders for LIMIT/OFFSET — positions are stable since where params come first
+          if (hasLimit) {
+            sql += ` LIMIT $${params.length + 1}`;
+          }
+          if (hasOffset) {
+            sql += ` OFFSET $${params.length + (hasLimit ? 2 : 1)}`;
+          }
+
+          this.sqlCache.set(ck, sql);
+        }
+
+        // Append runtime param values for LIMIT and OFFSET
+        const effectiveLimit = args?.take ?? args?.limit;
+        if (effectiveLimit !== undefined) {
+          params.push(Number(effectiveLimit));
+        }
+        if (args?.offset !== undefined) {
+          params.push(Number(args.offset));
+        }
+
+        // Fast path: no relations, use parseRow (or parseRowFast when no date columns)
+        const parseRow = this.hasNoDateColumns
+          ? (row: Record<string, unknown>) => this.parseRowFast(row) as T
+          : (row: Record<string, unknown>) => this.parseRow(row, this.table) as T;
+
+        return {
+          sql,
+          params,
+          transform: (result) => result.rows.map(parseRow),
+          tag: `${this.table}.findMany`,
+        };
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // General path: supports operators, null, OR, cursor, distinct, nested with
+    // -----------------------------------------------------------------------
     const { sql: whereSql, params } = args?.where
       ? this.buildWhere(args.where)
       : { sql: '', params: [] as unknown[] };
-
-    const columnsList = this.resolveColumns(args?.select, args?.omit);
-
-    const qt = quoteIdent(this.table);
 
     // Distinct support
     let distinctPrefix = '';
@@ -481,8 +576,8 @@ export class QueryInterface<T extends object> {
     }
 
     let selectClause: string;
-    if (args?.with) {
-      selectClause = this.buildSelectWithRelations(this.table, args.with, params, columnsList);
+    if (hasWith) {
+      selectClause = this.buildSelectWithRelations(this.table, args!.with!, params, columnsList);
     } else if (columnsList) {
       selectClause = columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ');
     } else {
@@ -534,7 +629,7 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) =>
         result.rows.map((row) =>
-          args?.with
+          hasWith
             ? (this.parseNestedRow(row, this.table) as T)
             : (this.parseRow(row, this.table) as T),
         ),
@@ -1578,6 +1673,23 @@ export class QueryInterface<T extends object> {
       for (const [col, value] of Object.entries(row)) {
         parsed[snakeToCamel(col)] = value;
       }
+    }
+    return parsed;
+  }
+
+  /**
+   * Fast path: parse a flat row when the table has NO date columns.
+   * Only renames snake_case -> camelCase via the pre-computed reverseMap.
+   * Skips all date coercion checks — avoids Set.has() per field per row.
+   * Used by findUnique/findMany fast paths when hasNoDateColumns is true.
+   */
+  private parseRowFast(row: Record<string, unknown>): Record<string, unknown> {
+    const parsed: Record<string, unknown> = {};
+    const reverseMap = this.tableMeta.reverseColumnMap;
+    const keys = Object.keys(row);
+    for (let i = 0; i < keys.length; i++) {
+      const col = keys[i]!;
+      parsed[reverseMap[col] ?? col] = row[col];
     }
     return parsed;
   }

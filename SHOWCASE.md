@@ -1,8 +1,8 @@
 # Turbine SDK — Developer Experience Showcase
 
-**batadata + Turbine: the fastest end-to-end path from a serverless function to nested relational data and back.**
+**Turbine ORM: the fastest end-to-end path from a serverless function to nested relational data and back.**
 
-Turbine is batadata's native TypeScript SDK. It gives you Prisma's developer experience with the performance characteristics of hand-tuned SQL. One `npm install`, one `generate` command, and you're writing fully type-safe queries that compile to optimal Postgres — including nested relations in a single query, pipelined batches in a single round-trip, and batch inserts that don't generate 100 INSERT statements.
+Turbine is a TypeScript ORM that gives you Prisma's developer experience with the performance characteristics of hand-tuned SQL. One `npm install`, one `generate` command, and you're writing fully type-safe queries that compile to optimal Postgres — including nested relations in a single query, pipelined batches in a single round-trip, and batch inserts that don't generate 100 INSERT statements.
 
 > **Status transparency:** This document describes the target developer experience for the TypeScript SDK. Features marked with **[Proven]** are backed by established Postgres techniques and working Rust implementations. Features marked with **[In Validation]** are being benchmarked in the POC phase. See the "What's Proven vs Aspirational" section at the end for the full breakdown.
 
@@ -11,18 +11,18 @@ Turbine is batadata's native TypeScript SDK. It gives you Prisma's developer exp
 ## Setup (30 seconds)
 
 ```bash
-npm install @batadata/turbine
+npm install turbine-orm
 ```
 
 ```bash
-# Point at your batadata database and generate types
+# Point at your Postgres database and generate types
 npx turbine generate
 
 # Output:
-# ✓ Connected to batadata (us-east-1)
+# ✓ Connected to Postgres
 # ✓ Introspected 4 tables, 27 columns, 6 indexes
 # ✓ Generated types → node_modules/.turbine/generated.ts
-# ✓ Ready. Import from '@batadata/turbine' and start querying.
+# ✓ Ready. Import from 'turbine-orm' and start querying.
 ```
 
 That's it. No `prisma migrate`, no schema file to maintain, no binary to download. Turbine reads your live database schema and generates TypeScript types directly. When your schema changes, run `generate` again.
@@ -33,14 +33,14 @@ That's it. No `prisma migrate`, no schema file to maintain, no binary to downloa
 
 ```typescript
 // lib/db.ts
-import { createTurbineClient } from '@batadata/turbine';
+import { createTurbineClient } from 'turbine-orm';
 
 export const db = createTurbineClient({
   connectionString: process.env.DATABASE_URL,
 });
 ```
 
-The client is lightweight — no Rust binary, no WASM blob, no query engine process. It connects to your batadata database through the Turbine proxy, which handles connection pooling, prepared statement caching, and TLS session resumption.
+The client is lightweight — no Rust binary, no WASM blob, no query engine process. It connects to your Postgres database directly, with built-in connection pooling and prepared statement caching.
 
 For development, you can point it at any Postgres instance:
 
@@ -535,7 +535,7 @@ await db.comments.deleteMany({
 Sometimes you need SQL that no query builder can express. Turbine provides a tagged template literal that gives you parameterized queries with full type safety:
 
 ```typescript
-import { sql } from '@batadata/turbine';
+import { sql } from 'turbine-orm';
 
 // The sql tag automatically parameterizes interpolated values
 const results = await db.query<{
@@ -799,7 +799,7 @@ For a dashboard page making 5 queries, one with 2-level nesting (same-AZ, ~1ms R
 │                                                          │
 │  ↓ Routes to optimal connection                          │
 ├──────────────────────────────────────────────────────────┤
-│  POSTGRES (batadata compute)                             │
+│  POSTGRES                                                │
 │                                                          │
 │  • Executes json_agg query in a single plan              │
 │  • Uses indexes on foreign keys                          │
@@ -856,7 +856,7 @@ We believe in earning claims with benchmarks, not marketing slides. Here's where
 
 ```bash
 # Install
-npm install @batadata/turbine
+npm install turbine-orm
 
 # Generate types from your database
 npx turbine generate
@@ -865,7 +865,7 @@ npx turbine generate
 ```
 
 ```typescript
-import { createTurbineClient } from '@batadata/turbine';
+import { createTurbineClient } from 'turbine-orm';
 
 const db = createTurbineClient({
   connectionString: process.env.DATABASE_URL,
