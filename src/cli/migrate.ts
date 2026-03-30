@@ -13,7 +13,7 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join } from 'node:path';
 import pg from 'pg';
 
 // ---------------------------------------------------------------------------
@@ -21,16 +21,14 @@ import pg from 'pg';
 // ---------------------------------------------------------------------------
 
 export interface MigrationFile {
-  /** Full filename (e.g. "20260325_001_create_users.sql") */
+  /** Full filename (e.g. "20260325120000_create_users.sql") */
   filename: string;
   /** Absolute path to the file */
   path: string;
-  /** Extracted name portion (e.g. "create_users") */
+  /** Extracted name portion (e.g. "20260325120000_create_users") */
   name: string;
-  /** Timestamp prefix (e.g. "20260325") */
+  /** Timestamp prefix (e.g. "20260325120000") — YYYYMMDDHHMMSS */
   timestamp: string;
-  /** Sequence number (e.g. "001") */
-  sequence: string;
 }
 
 export interface AppliedMigration {
@@ -81,18 +79,51 @@ async function getAppliedMigrations(client: pg.Client): Promise<AppliedMigration
 
 /**
  * Parse a migration filename into its components.
- * Expected format: YYYYMMDD_NNN_description.sql
+ * Expected format: YYYYMMDDHHMMSS_description.sql
  */
-function parseMigrationFilename(filename: string): MigrationFile | null {
-  const match = filename.match(/^(\d{8})_(\d{3})_(.+)\.sql$/);
+export function parseMigrationFilename(filename: string): MigrationFile | null {
+  const match = filename.match(/^(\d{14})_(.+)\.sql$/);
   if (!match) return null;
   return {
     filename,
     path: '', // Set by caller
     name: filename.replace(/\.sql$/, ''),
     timestamp: match[1]!,
-    sequence: match[2]!,
   };
+}
+
+/**
+ * Sanitize a migration name: lowercase, replace non-alnum with _, collapse duplicates, trim.
+ */
+export function sanitizeName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '');
+}
+
+/**
+ * Generate a YYYYMMDDHHMMSS timestamp string from a Date.
+ */
+export function formatTimestamp(date: Date): string {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+    String(date.getHours()).padStart(2, '0'),
+    String(date.getMinutes()).padStart(2, '0'),
+    String(date.getSeconds()).padStart(2, '0'),
+  ].join('');
+}
+
+/**
+ * Get pending migration files — those not yet applied.
+ * Returns files sorted by timestamp (ascending).
+ */
+export function getPendingMigrations(migrationsDir: string, applied: string[]): MigrationFile[] {
+  const appliedSet = new Set(applied);
+  return listMigrationFiles(migrationsDir).filter((f) => !appliedSet.has(f.name));
 }
 
 /**
@@ -117,10 +148,10 @@ export function listMigrationFiles(migrationsDir: string): MigrationFile[] {
 }
 
 /**
- * Parse a migration file into UP and DOWN sections.
+ * Parse migration content string into UP and DOWN sections.
+ * Exported for unit testing.
  */
-export function parseMigrationSQL(filePath: string): { up: string; down: string } {
-  const content = readFileSync(filePath, 'utf-8');
+export function parseMigrationContent(content: string): { up: string; down: string } {
   const lines = content.split('\n');
 
   let section: 'none' | 'up' | 'down' = 'none';
@@ -149,6 +180,14 @@ export function parseMigrationSQL(filePath: string): { up: string; down: string 
 }
 
 /**
+ * Parse a migration file into UP and DOWN sections.
+ */
+export function parseMigrationSQL(filePath: string): { up: string; down: string } {
+  const content = readFileSync(filePath, 'utf-8');
+  return parseMigrationContent(content);
+}
+
+/**
  * Simple checksum for a migration file (for drift detection).
  */
 function checksum(content: string): string {
@@ -173,36 +212,21 @@ export function createMigration(
 ): MigrationFile {
   mkdirSync(migrationsDir, { recursive: true });
 
-  // Get today's date as YYYYMMDD
   const now = new Date();
-  const datePart = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, '0'),
-    String(now.getDate()).padStart(2, '0'),
-  ].join('');
+  const ts = formatTimestamp(now);
+  const safeName = sanitizeName(name);
 
-  // Find the next sequence number for today
-  const existing = listMigrationFiles(migrationsDir);
-  const todayMigrations = existing.filter((f) => f.timestamp === datePart);
-  const nextSeq = String(todayMigrations.length + 1).padStart(3, '0');
-
-  // Sanitize name: lowercase, replace spaces/special chars with underscores
-  const safeName = name
-    .toLowerCase()
-    .replace(/[^a-z0-9_]/g, '_')
-    .replace(/_+/g, '_')
-    .replace(/^_|_$/g, '');
-
-  const filename = `${datePart}_${nextSeq}_${safeName}.sql`;
+  const filename = `${ts}_${safeName}.sql`;
   const filePath = join(migrationsDir, filename);
 
-  const template = `-- UP
+  const template = `-- Migration: ${name}
+-- Created: ${now.toISOString()}
+
+-- UP
 -- Write your migration SQL here
 
-
 -- DOWN
--- Write the rollback SQL here
-
+-- Write your rollback SQL here
 `;
 
   writeFileSync(filePath, template, 'utf-8');
@@ -211,8 +235,7 @@ export function createMigration(
     filename,
     path: filePath,
     name: filename.replace(/\.sql$/, ''),
-    timestamp: datePart,
-    sequence: nextSeq,
+    timestamp: ts,
   };
 }
 
@@ -293,7 +316,7 @@ export async function migrateUp(
       return {
         applied: [],
         errors: [{
-          file: { filename: '', path: '', name: '', timestamp: '', sequence: '' },
+          file: { filename: '', path: '', name: '', timestamp: '' },
           error: 'Could not acquire migration lock — another migration is already running',
         }],
       };
@@ -309,7 +332,7 @@ export async function migrateUp(
         return {
           applied: [],
           errors: [{
-            file: { filename: '', path: '', name: '', timestamp: '', sequence: '' },
+            file: { filename: '', path: '', name: '', timestamp: '' },
             error: `Checksum mismatch: migration file(s) modified after application: ${names}. This is dangerous — applied migrations should be immutable. Use --force to skip this check.`,
           }],
         };
@@ -387,7 +410,7 @@ export async function migrateDown(
       return {
         rolledBack: [],
         errors: [{
-          file: { filename: '', path: '', name: '', timestamp: '', sequence: '' },
+          file: { filename: '', path: '', name: '', timestamp: '' },
           error: 'Could not acquire migration lock — another migration is already running',
         }],
       };
@@ -414,7 +437,7 @@ export async function migrateDown(
         const file = fileMap.get(migration.name);
         if (!file) {
           errors.push({
-            file: { filename: migration.name + '.sql', path: '', name: migration.name, timestamp: '', sequence: '' },
+            file: { filename: migration.name + '.sql', path: '', name: migration.name, timestamp: '' },
             error: `Migration file not found for "${migration.name}"`,
           });
           continue;

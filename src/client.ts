@@ -1,5 +1,5 @@
 /**
- * turbine-orm — TurbineClient
+ * @batadata/turbine — TurbineClient
  *
  * The main entry point for the Turbine TypeScript SDK.
  * Manages connection pooling and provides typed table accessors.
@@ -16,30 +16,36 @@
  * const user = await db.users.findUnique({ where: { id: 1 } });
  *
  * // With base client (dynamic):
- * import { TurbineClient } from 'turbine-orm';
+ * import { TurbineClient } from '@batadata/turbine';
  * const db = new TurbineClient({ connectionString: '...' }, schema);
  * const users = db.table<User>('users');
  * ```
  */
 
 import pg from 'pg';
-import { QueryInterface, type DeferredQuery } from './query.js';
+import { QueryInterface, type DeferredQuery, type QueryInterfaceOptions } from './query.js';
 import { executePipeline, type PipelineResults } from './pipeline.js';
 import type { SchemaMetadata } from './schema.js';
 
-// Parse int8 (bigint, OID 20) as JavaScript number instead of string.
-// Safe for values up to Number.MAX_SAFE_INTEGER (9,007,199,254,740,991).
+/**
+ * Parse int8 (bigint, OID 20) as JavaScript number instead of string.
+ * Safe for values up to Number.MAX_SAFE_INTEGER (9,007,199,254,740,991).
+ *
+ * NOTE: For values exceeding Number.MAX_SAFE_INTEGER, the parser falls back
+ * to returning the raw string to avoid precision loss. The generated TypeScript
+ * type maps int8/bigint to `number`, which is correct for the vast majority of
+ * use cases (IDs, counts, timestamps). If you store values > 2^53 - 1 in a
+ * bigint column, the runtime return type will be `string` for those rows.
+ */
 pg.types.setTypeParser(20, (val: string) => {
   const n = Number(val);
   return Number.isSafeInteger(n) ? n : val; // fall back to string for huge values
 });
 
-// Parse numeric (OID 1700) as number when safe, string otherwise
-pg.types.setTypeParser(1700, (val: string) => {
-  const n = Number(val);
-  if (val.includes('.') && Number.isFinite(n)) return n;
-  return Number.isSafeInteger(n) ? n : val;
-});
+// NOTE: We intentionally do NOT register a parser for numeric (OID 1700).
+// Postgres numeric is arbitrary-precision, so the default pg driver behavior
+// of returning a string is correct and matches the generated TypeScript type
+// (numeric → string). Users who want number can cast explicitly in SQL.
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -66,6 +72,10 @@ export interface TurbineConfig {
   connectionTimeoutMs?: number;
   /** Enable query logging to console (default: false) */
   logging?: boolean;
+  /** Default LIMIT applied to findMany() when no limit is specified (opt-in, default: undefined) */
+  defaultLimit?: number;
+  /** Log a warning when findMany() is called without a limit (default: false) */
+  warnOnUnlimited?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +134,7 @@ export class TransactionClient {
     private readonly client: pg.PoolClient,
     readonly schema: SchemaMetadata,
     private readonly middlewares: Middleware[],
+    private readonly queryOptions?: QueryInterfaceOptions,
   ) {
     // Auto-create typed table accessors for all tables in the schema
     for (const tableName of Object.keys(schema.tables)) {
@@ -147,7 +158,7 @@ export class TransactionClient {
       // Create a QueryInterface that uses the transaction client as its "pool"
       // We use a proxy pool that routes queries through the transaction client
       const txPool = this.createTxPool();
-      qi = new QueryInterface<object>(txPool, name, this.schema, this.middlewares);
+      qi = new QueryInterface<object>(txPool, name, this.schema, this.middlewares, this.queryOptions);
       this.tableCache.set(name, qi);
     }
     return qi as QueryInterface<T>;
@@ -218,10 +229,15 @@ export class TurbineClient {
   private readonly logging: boolean;
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private readonly middlewares: Middleware[] = [];
+  private readonly queryOptions: QueryInterfaceOptions;
 
   constructor(config: TurbineConfig = {}, schema: SchemaMetadata) {
     this.logging = config.logging ?? false;
     this.schema = schema;
+    this.queryOptions = {
+      defaultLimit: config.defaultLimit,
+      warnOnUnlimited: config.warnOnUnlimited,
+    };
 
     const poolConfig: pg.PoolConfig = {
       max: config.poolSize ?? 10,
@@ -270,6 +286,11 @@ export class TurbineClient {
   /**
    * Register a middleware function that runs before/after every query.
    *
+   * Middleware can inspect and log query parameters, modify results after execution,
+   * and measure timing. Note: query SQL is generated before middleware runs, so
+   * modifying params.args in middleware will NOT affect the executed SQL.
+   * To intercept queries before SQL generation, use the raw() method instead.
+   *
    * @example
    * ```ts
    * // Query timing middleware
@@ -310,7 +331,7 @@ export class TurbineClient {
   table<T extends object = Record<string, unknown>>(name: string): QueryInterface<T> {
     let qi = this.tableCache.get(name);
     if (!qi) {
-      qi = new QueryInterface<object>(this.pool, name, this.schema, this.middlewares);
+      qi = new QueryInterface<object>(this.pool, name, this.schema, this.middlewares, this.queryOptions);
       this.tableCache.set(name, qi);
     }
     return qi as QueryInterface<T>;
@@ -442,7 +463,7 @@ export class TurbineClient {
       await client.query(beginSQL);
 
       // Create the transaction client with typed table accessors
-      const tx = new TransactionClient(client, this.schema, this.middlewares);
+      const tx = new TransactionClient(client, this.schema, this.middlewares, this.queryOptions);
 
       // Dynamically attach table accessors to tx
       for (const tableName of Object.keys(this.schema.tables)) {

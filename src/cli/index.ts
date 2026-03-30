@@ -306,7 +306,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
  * Define your database schema in TypeScript.
  * Use \`npx turbine push\` to sync it to your database.
  *
- * @see https://github.com/zvndev/turbine-orm
+ * @see https://batadata.com/docs/turbine/schema
  */
 
 import { defineSchema } from 'turbine-orm';
@@ -326,13 +326,20 @@ export default defineSchema({
     success(`Created ${cyan(config.schemaFile)}`);
   }
 
-  // Add .gitignore entry for generated output
+  // Add .gitignore entries for generated output and config (may contain connection strings)
   const gitignorePath = '.gitignore';
   if (existsSync(gitignorePath)) {
     const gitignoreContent = readFileSync(gitignorePath, 'utf-8');
+    const additions: string[] = [];
     if (!gitignoreContent.includes('generated/turbine')) {
-      appendFileSync(gitignorePath, '\n# Turbine generated client\ngenerated/turbine/\n');
-      success(`Added ${cyan('generated/turbine/')} to ${cyan('.gitignore')}`);
+      additions.push('generated/turbine/');
+    }
+    if (!gitignoreContent.includes('turbine.config.ts')) {
+      additions.push('turbine.config.ts');
+    }
+    if (additions.length > 0) {
+      appendFileSync(gitignorePath, `\n# Turbine generated client & config\n${additions.join('\n')}\n`);
+      success(`Added ${cyan(additions.join(', '))} to ${cyan('.gitignore')}`);
     }
   }
 
@@ -836,10 +843,13 @@ async function cmdSeed(args: CliArgs, config: ResolvedConfig): Promise<void> {
       { cmd: 'node --experimental-strip-types', name: 'node' },
     ];
 
+    // Shell-escape the seed file path to prevent injection
+    const escapedSeedFile = seedFile.replace(/'/g, "'\\''");
+
     let ran = false;
     for (const runner of runners) {
       try {
-        execSync(`${runner.cmd} ${seedFile}`, {
+        execSync(`${runner.cmd} '${escapedSeedFile}'`, {
           stdio: 'inherit',
           env: {
             ...process.env,
@@ -957,7 +967,7 @@ async function cmdStudio(_args: CliArgs, _config: ResolvedConfig): Promise<void>
         'A local web UI for browsing your database,',
         'exploring relations, and managing data.',
         '',
-        `Follow ${cyan('@zvndev')} for updates.`,
+        `Follow ${cyan('@batadata')} for updates.`,
       ].join('\n'),
       { title: bold(cyan('Studio')), padding: 2 },
     ),
@@ -1020,8 +1030,7 @@ function showHelp(): void {
 // ---------------------------------------------------------------------------
 
 function showVersion(): void {
-  // Read version from package.json at build time
-  console.log(`turbine-orm v0.3.0`);
+  console.log(`turbine-orm v0.5.0`);
 }
 
 // ---------------------------------------------------------------------------

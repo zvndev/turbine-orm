@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Schema metadata types
+ * @batadata/turbine — Schema metadata types
  *
  * These types represent the introspected database schema at runtime.
  * They're used by the query builder, code generator, and CLI.
