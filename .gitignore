@@ -1,16 +1,9 @@
 node_modules/
 dist/
-.next/
-out/
-*.tgz
 .env
 .env.local
-.env*.local
-.vercel/
+.env.*.local
 .npmrc
-
-# Root-level generated output (sample data, not for distribution)
-/generated/
-
-# Test app (uses local generated client, not for distribution)
-/test-app.ts
+generated/
+turbine.config.ts
+*.tgz

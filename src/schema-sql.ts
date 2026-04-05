@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Schema SQL Generator
+ * @batadata/turbine — Schema SQL Generator
  *
  * Converts a SchemaDef (from defineSchema) into executable DDL statements.
  * Also provides diff and push commands for syncing schema to a live database.
@@ -7,6 +7,7 @@
 
 import pg from 'pg';
 import { camelToSnake } from './schema.js';
+import { quoteIdent } from './query.js';
 import type { SchemaDef, TableDef, ColumnConfig } from './schema-builder.js';
 
 // ---------------------------------------------------------------------------
@@ -21,7 +22,6 @@ import type { SchemaDef, TableDef, ColumnConfig } from './schema-builder.js';
  */
 export function schemaToSQL(schema: SchemaDef): string[] {
   const statements: string[] = [];
-  const tableNames = Object.keys(schema.tables);
 
   // Topologically sort tables by their foreign key references
   const sorted = topologicalSort(schema);
@@ -97,7 +97,7 @@ function generateCreateTable(table: TableDef): string {
   }
 
   const body = columnDefs.map((d) => `    ${d}`).join(',\n');
-  return `CREATE TABLE ${tableName} (\n${body}\n);`;
+  return `CREATE TABLE ${quoteIdent(tableName)} (\n${body}\n);`;
 }
 
 /**
@@ -105,7 +105,7 @@ function generateCreateTable(table: TableDef): string {
  */
 function generateColumnDef(fieldName: string, config: ColumnConfig): string {
   const snakeName = camelToSnake(fieldName);
-  const parts: string[] = [snakeName];
+  const parts: string[] = [quoteIdent(snakeName)];
 
   // Type
   if (config.type === 'VARCHAR' && config.maxLength != null) {
@@ -146,7 +146,7 @@ function generateColumnDef(fieldName: string, config: ColumnConfig): string {
   if (config.referencesTarget) {
     const refParts = config.referencesTarget.split('.');
     if (refParts.length === 2) {
-      parts.push(`REFERENCES ${refParts[0]}(${refParts[1]})`);
+      parts.push(`REFERENCES ${quoteIdent(refParts[0]!)}(${quoteIdent(refParts[1]!)})`);
     }
   }
 
@@ -163,11 +163,34 @@ function generateColumnDef(fieldName: string, config: ColumnConfig): string {
  *   '0'      → 0
  */
 function normalizeDefault(val: string): string {
-  // Recognize function calls like now(), gen_random_uuid(), etc.
-  if (/^[a-z_]+\(\)$/i.test(val)) {
-    return val.toUpperCase();
+  const upper = val.toUpperCase().trim();
+
+  // Known SQL constants
+  if (['TRUE', 'FALSE', 'NULL'].includes(upper)) {
+    return upper;
   }
-  return val;
+
+  // Known SQL function calls: NOW(), CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, GEN_RANDOM_UUID()
+  const allowedFunctions = [
+    'NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME', 'GEN_RANDOM_UUID()',
+  ];
+  if (allowedFunctions.includes(upper)) {
+    return upper;
+  }
+
+  // Numeric literals (integer or decimal, optionally negative)
+  if (/^-?\d+(\.\d+)?$/.test(val.trim())) {
+    return val.trim();
+  }
+
+  // Simple single-quoted string literals (no nested quotes)
+  if (/^'[^']*'$/.test(val.trim())) {
+    return val.trim();
+  }
+
+  throw new Error(
+    `Unsupported default value: ${val}. Use a SQL function, numeric, string literal, or NULL.`,
+  );
 }
 
 /**
@@ -182,7 +205,7 @@ function generateForeignKeyIndexes(table: TableDef): string[] {
       const snakeName = camelToSnake(fieldName);
       const indexName = `idx_${table.name}_${snakeName}`;
       indexes.push(
-        `CREATE INDEX ${indexName} ON ${table.name}(${snakeName});`
+        `CREATE INDEX ${quoteIdent(indexName)} ON ${quoteIdent(table.name)}(${quoteIdent(snakeName)});`
       );
     }
   }
@@ -321,7 +344,7 @@ export async function schemaDiff(
         if (!dbCol) {
           // Column exists in schema but not in DB — ADD COLUMN
           const colDef = generateColumnDef(fieldName, config);
-          const sql = `ALTER TABLE ${tableName} ADD COLUMN ${colDef};`;
+          const sql = `ALTER TABLE ${quoteIdent(tableName)} ADD COLUMN ${colDef};`;
           alterDef.columns.push({ column: snakeName, action: 'add', sql });
           result.statements.push(sql);
           continue;
@@ -333,7 +356,7 @@ export async function schemaDiff(
           const sqlType = config.type === 'VARCHAR' && config.maxLength
             ? `VARCHAR(${config.maxLength})`
             : config.type;
-          const sql = `ALTER TABLE ${tableName} ALTER COLUMN ${snakeName} TYPE ${sqlType};`;
+          const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} TYPE ${sqlType};`;
           alterDef.columns.push({ column: snakeName, action: 'alter_type', sql });
           result.statements.push(sql);
         }
@@ -343,11 +366,11 @@ export async function schemaDiff(
           config.isNotNull || config.isPrimaryKey || config.type === 'BIGSERIAL';
         const isCurrentlyNullable = dbCol.isNullable;
         if (shouldBeNotNull && isCurrentlyNullable && !config.isNullable) {
-          const sql = `ALTER TABLE ${tableName} ALTER COLUMN ${snakeName} SET NOT NULL;`;
+          const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET NOT NULL;`;
           alterDef.columns.push({ column: snakeName, action: 'set_not_null', sql });
           result.statements.push(sql);
         } else if (!shouldBeNotNull && !isCurrentlyNullable && config.isNullable) {
-          const sql = `ALTER TABLE ${tableName} ALTER COLUMN ${snakeName} DROP NOT NULL;`;
+          const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} DROP NOT NULL;`;
           alterDef.columns.push({ column: snakeName, action: 'drop_not_null', sql });
           result.statements.push(sql);
         }
@@ -359,7 +382,7 @@ export async function schemaDiff(
           ([fieldName]) => camelToSnake(fieldName) === dbColName
         );
         if (!hasField) {
-          const sql = `ALTER TABLE ${tableName} DROP COLUMN ${dbColName};`;
+          const sql = `ALTER TABLE ${quoteIdent(tableName)} DROP COLUMN ${quoteIdent(dbColName)};`;
           alterDef.columns.push({ column: dbColName, action: 'drop', sql });
           // Don't auto-add drops to statements for safety — user must opt in
         }

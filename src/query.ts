@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Query builder
+ * @batadata/turbine — Query builder
  *
  * Each table accessor (db.users, db.posts, etc.) returns a QueryInterface<T>
  * that builds parameterized SQL and executes it through the connection pool.
@@ -37,6 +37,14 @@ export function quoteIdent(name: string): string {
 }
 
 /**
+ * Escape single quotes for use as string keys in json_build_object().
+ * Doubles single quotes per SQL quoting rules.
+ */
+function escSingleQuote(s: string): string {
+  return s.replace(/'/g, "''");
+}
+
+/**
  * Escape LIKE pattern metacharacters: %, _, and \.
  * Must be used with `ESCAPE '\'` in the LIKE clause.
  */
@@ -62,12 +70,14 @@ export interface WhereOperator<V = unknown> {
   contains?: string;
   startsWith?: string;
   endsWith?: string;
+  /** Set to 'insensitive' to use ILIKE instead of LIKE for string comparisons */
+  mode?: 'default' | 'insensitive';
 }
 
 /** Known operator keys — used to detect operator objects vs plain values */
 const OPERATOR_KEYS = new Set<string>([
   'gt', 'gte', 'lt', 'lte', 'not', 'in', 'notIn',
-  'contains', 'startsWith', 'endsWith',
+  'contains', 'startsWith', 'endsWith', 'mode',
 ]);
 
 /** Check if a value is a where operator object (has at least one known operator key) */
@@ -124,6 +134,8 @@ export interface FindUniqueArgs<T> {
   select?: Record<string, boolean>;
   omit?: Record<string, boolean>;
   with?: WithClause;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface FindManyArgs<T> {
@@ -140,44 +152,62 @@ export interface FindManyArgs<T> {
   take?: number;
   /** De-duplicate results by specified fields */
   distinct?: (keyof T & string)[];
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface CreateArgs<T> {
   data: Partial<T>;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface CreateManyArgs<T> {
   data: Partial<T>[];
   /** When true, adds ON CONFLICT DO NOTHING to skip duplicate rows */
   skipDuplicates?: boolean;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface UpdateArgs<T> {
   where: WhereClause<T>;
   data: Partial<T>;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface UpdateManyArgs<T> {
   where: WhereClause<T>;
   data: Partial<T>;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface DeleteArgs<T> {
   where: WhereClause<T>;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface DeleteManyArgs<T> {
   where: WhereClause<T>;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface UpsertArgs<T> {
   where: WhereClause<T>;
   create: Partial<T>;
   update: Partial<T>;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface CountArgs<T> {
   where?: WhereClause<T>;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 export interface GroupByArgs<T> {
@@ -197,6 +227,8 @@ export interface GroupByArgs<T> {
   having?: Record<string, unknown>;
   /** Order groups */
   orderBy?: Record<string, OrderDirection>;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 /** Arguments for the standalone aggregate method */
@@ -212,6 +244,8 @@ export interface AggregateArgs<T> {
   _min?: Partial<Record<keyof T & string, boolean>>;
   /** Maximum value of fields */
   _max?: Partial<Record<keyof T & string, boolean>>;
+  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
+  timeout?: number;
 }
 
 /** Result type for aggregate queries */
@@ -279,6 +313,43 @@ function isArrayFilter(value: unknown): value is ArrayFilter {
 }
 
 // ---------------------------------------------------------------------------
+// LRU cache — bounded SQL template cache to prevent memory leaks
+// ---------------------------------------------------------------------------
+
+/**
+ * Simple LRU (Least Recently Used) cache with a fixed maximum size.
+ * When the cache exceeds maxSize, the oldest (least recently used) entry is evicted.
+ * Uses Map insertion order for O(1) eviction.
+ */
+class LRUCache<K, V> {
+  private cache = new Map<K, V>();
+  constructor(private maxSize: number) {}
+
+  get(key: K): V | undefined {
+    const value = this.cache.get(key);
+    if (value !== undefined) {
+      // Move to end (most recently used)
+      this.cache.delete(key);
+      this.cache.set(key, value);
+    }
+    return value;
+  }
+
+  set(key: K, value: V): void {
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    } else if (this.cache.size >= this.maxSize) {
+      // Delete oldest (first) entry
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey !== undefined) this.cache.delete(firstKey);
+    }
+    this.cache.set(key, value);
+  }
+
+  get size() { return this.cache.size; }
+}
+
+// ---------------------------------------------------------------------------
 // Deferred query descriptor (for pipeline batching)
 // ---------------------------------------------------------------------------
 
@@ -303,21 +374,32 @@ type MiddlewareFn = (
   next: (params: { model: string; action: string; args: Record<string, unknown> }) => Promise<unknown>,
 ) => Promise<unknown>;
 
+/** Options passed from TurbineClient to QueryInterface */
+export interface QueryInterfaceOptions {
+  /** Default LIMIT applied to findMany() when no limit is specified */
+  defaultLimit?: number;
+  /** Log a warning when findMany() is called without a limit */
+  warnOnUnlimited?: boolean;
+}
+
 export class QueryInterface<T extends object> {
   private readonly tableMeta: TableMetadata;
   /** SQL template cache: cacheKey → sql string (params are always positional $1,$2,...) */
-  private readonly sqlCache = new Map<string, string>();
+  private readonly sqlCache = new LRUCache<string, string>(1000);
   private readonly middlewares: MiddlewareFn[];
+  private readonly defaultLimit?: number;
+  private readonly warnOnUnlimited: boolean;
 
-  // Fast path: pre-computed flag — true when this table has zero date/timestamp columns.
-  // When true, parseRow can skip the per-field dateCols.has() check entirely.
-  private readonly hasNoDateColumns: boolean;
+  /** Pre-computed column type lookups (avoids linear scans per query) */
+  private readonly columnPgTypeMap: Map<string, string>;
+  private readonly columnArrayTypeMap: Map<string, string>;
 
   constructor(
     private readonly pool: pg.Pool,
     private readonly table: string,
     private readonly schema: SchemaMetadata,
     middlewares?: MiddlewareFn[],
+    options?: QueryInterfaceOptions,
   ) {
     const meta = schema.tables[table];
     if (!meta) {
@@ -327,12 +409,48 @@ export class QueryInterface<T extends object> {
     }
     this.tableMeta = meta;
     this.middlewares = middlewares ?? [];
-    this.hasNoDateColumns = meta.dateColumns.size === 0;
+    this.defaultLimit = options?.defaultLimit;
+    this.warnOnUnlimited = options?.warnOnUnlimited ?? false;
+
+    // Pre-compute column type lookup maps (TASK-26)
+    this.columnPgTypeMap = new Map();
+    this.columnArrayTypeMap = new Map();
+    for (const col of this.tableMeta.columns) {
+      this.columnPgTypeMap.set(col.name, col.pgType);
+      this.columnArrayTypeMap.set(col.name, col.pgArrayType);
+    }
+  }
+
+  /**
+   * Execute a pool.query with an optional timeout.
+   * If timeout is set, races the query against a timer and rejects on expiry.
+   */
+  private async queryWithTimeout(sql: string, params: unknown[], timeout?: number): Promise<pg.QueryResult> {
+    if (!timeout) {
+      return this.pool.query(sql, params);
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`[turbine] Query timed out after ${timeout}ms`)),
+        timeout,
+      );
+    });
+    try {
+      return await Promise.race([this.pool.query(sql, params), timeoutPromise]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
    * Execute a query through the middleware chain.
    * If no middlewares are registered, executes directly.
+   *
+   * Middleware can inspect and log query parameters, modify results after execution,
+   * and measure timing. Note: query SQL is generated before middleware runs, so
+   * modifying params.args in middleware will NOT affect the executed SQL.
+   * To intercept queries before SQL generation, use the raw() method instead.
    */
   private async executeWithMiddleware<R>(
     action: string,
@@ -377,7 +495,7 @@ export class QueryInterface<T extends object> {
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUnique(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -388,16 +506,12 @@ export class QueryInterface<T extends object> {
 
     // Check if all where values are simple (plain equality, no operators/null/OR)
     const whereKeys = Object.keys(whereObj).filter((k) => whereObj[k] !== undefined);
-    const isSimpleWhere = !whereObj['OR'] && !whereObj['AND'] && !whereObj['NOT'] && whereKeys.every((k) => {
+    const isSimpleWhere = !whereObj['OR'] && whereKeys.every((k) => {
       const v = whereObj[k];
-      return v !== null && !isWhereOperator(v) && !isJsonFilter(v) && !isArrayFilter(v);
+      return v !== null && !isWhereOperator(v);
     });
 
-    // -----------------------------------------------------------------------
-    // Fast path: no relations, simple equality where — cache SQL template.
-    // Generates: SELECT col1, col2 FROM "table" WHERE "id" = $1 LIMIT 1
-    // No json_build_object, no subqueries, no COALESCE wrappers.
-    // -----------------------------------------------------------------------
+    // For simple queries (no nested with, no operators), use cached SQL template
     if (!args.with && isSimpleWhere) {
       const colKey = columnsList ? columnsList.join(',') : '*';
       const ck = `fu:${whereKeys.sort().join(',')}:c=${colKey}`;
@@ -415,17 +529,12 @@ export class QueryInterface<T extends object> {
         this.sqlCache.set(ck, sql);
       }
 
-      // Fast path: skip date coercion when table has no date columns
-      const transformRow = this.hasNoDateColumns
-        ? (row: Record<string, unknown>) => this.parseRowFast(row) as T
-        : (row: Record<string, unknown>) => this.parseRow(row, this.table) as T;
-
       return {
         sql,
         params,
         transform: (result) => {
           const row = result.rows[0];
-          return row ? transformRow(row) : null;
+          return row ? (this.parseRow(row, this.table) as T) : null;
         },
         tag: `${this.table}.findUnique`,
       };
@@ -434,7 +543,6 @@ export class QueryInterface<T extends object> {
     // General path: supports operators, null, OR, nested with
     const { sql: whereSql, params } = this.buildWhere(args.where);
 
-    // Fast path: no relations, skip json_agg (but where has operators/null/OR)
     if (!args.with) {
       const qt = quoteIdent(this.table);
       const selectExpr = columnsList
@@ -472,101 +580,29 @@ export class QueryInterface<T extends object> {
   // -------------------------------------------------------------------------
 
   async findMany(args?: FindManyArgs<T>): Promise<T[]> {
+    // Warn if no limit specified and warnOnUnlimited is enabled
+    const hasExplicitLimit = args?.limit !== undefined || args?.take !== undefined;
+    if (this.warnOnUnlimited && !hasExplicitLimit) {
+      console.warn(
+        `[turbine] findMany() called without limit on table "${this.table}". Set defaultLimit in config to prevent unbounded queries.`,
+      );
+    }
+
     return this.executeWithMiddleware('findMany', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindMany(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
       return deferred.transform(result);
     });
   }
 
   buildFindMany(args?: FindManyArgs<T>): DeferredQuery<T[]> {
-    const columnsList = this.resolveColumns(args?.select, args?.omit);
-    const qt = quoteIdent(this.table);
-    const hasWith = !!(args?.with);
-
-    // -----------------------------------------------------------------------
-    // Fast path: no relations, no cursor, no distinct — cache SQL template
-    // Skip json_agg subquery machinery entirely for simple table scans.
-    // -----------------------------------------------------------------------
-    if (!hasWith && !args?.cursor && !args?.distinct) {
-      const whereObj = args?.where as Record<string, unknown> | undefined;
-      const whereKeys = whereObj
-        ? Object.keys(whereObj).filter((k) => whereObj[k] !== undefined)
-        : [];
-
-      // Check if all where values are simple equality (no operators, null, OR/AND/NOT)
-      const isSimpleWhere = !whereObj || (
-        !whereObj['OR'] && !whereObj['AND'] && !whereObj['NOT'] && whereKeys.every((k) => {
-          const v = whereObj[k];
-          return v !== null && !isWhereOperator(v) && !isJsonFilter(v) && !isArrayFilter(v);
-        })
-      );
-
-      if (isSimpleWhere) {
-        // Build cache key: operation + where keys + columns + orderBy + hasLimit + hasOffset
-        const colKey = columnsList ? columnsList.join(',') : '*';
-        const orderKey = args?.orderBy ? Object.entries(args.orderBy).map(([k, d]) => `${k}:${d}`).join(',') : '';
-        const hasLimit = args?.limit !== undefined || args?.take !== undefined;
-        const hasOffset = args?.offset !== undefined;
-        const ck = `fm:${whereKeys.sort().join(',')}:c=${colKey}:o=${orderKey}:l=${hasLimit ? '1' : '0'}:off=${hasOffset ? '1' : '0'}`;
-
-        let sql = this.sqlCache.get(ck);
-        const params: unknown[] = whereKeys.map((k) => whereObj![k]);
-
-        if (!sql) {
-          // Build SQL template once and cache it
-          const selectExpr = columnsList
-            ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ')
-            : `${qt}.*`;
-          const whereClauses = whereKeys.map((k, i) => `${this.toSqlColumn(k)} = $${i + 1}`);
-          const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
-
-          sql = `SELECT ${selectExpr} FROM ${qt}${whereSql}`;
-
-          if (args?.orderBy) {
-            sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
-          }
-
-          // Placeholders for LIMIT/OFFSET — positions are stable since where params come first
-          if (hasLimit) {
-            sql += ` LIMIT $${params.length + 1}`;
-          }
-          if (hasOffset) {
-            sql += ` OFFSET $${params.length + (hasLimit ? 2 : 1)}`;
-          }
-
-          this.sqlCache.set(ck, sql);
-        }
-
-        // Append runtime param values for LIMIT and OFFSET
-        const effectiveLimit = args?.take ?? args?.limit;
-        if (effectiveLimit !== undefined) {
-          params.push(Number(effectiveLimit));
-        }
-        if (args?.offset !== undefined) {
-          params.push(Number(args.offset));
-        }
-
-        // Fast path: no relations, use parseRow (or parseRowFast when no date columns)
-        const parseRow = this.hasNoDateColumns
-          ? (row: Record<string, unknown>) => this.parseRowFast(row) as T
-          : (row: Record<string, unknown>) => this.parseRow(row, this.table) as T;
-
-        return {
-          sql,
-          params,
-          transform: (result) => result.rows.map(parseRow),
-          tag: `${this.table}.findMany`,
-        };
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // General path: supports operators, null, OR, cursor, distinct, nested with
-    // -----------------------------------------------------------------------
     const { sql: whereSql, params } = args?.where
       ? this.buildWhere(args.where)
       : { sql: '', params: [] as unknown[] };
+
+    const columnsList = this.resolveColumns(args?.select, args?.omit);
+
+    const qt = quoteIdent(this.table);
 
     // Distinct support
     let distinctPrefix = '';
@@ -576,8 +612,8 @@ export class QueryInterface<T extends object> {
     }
 
     let selectClause: string;
-    if (hasWith) {
-      selectClause = this.buildSelectWithRelations(this.table, args!.with!, params, columnsList);
+    if (args?.with) {
+      selectClause = this.buildSelectWithRelations(this.table, args.with, params, columnsList);
     } else if (columnsList) {
       selectClause = columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ');
     } else {
@@ -613,8 +649,8 @@ export class QueryInterface<T extends object> {
       sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
     }
 
-    // take overrides limit when cursor pagination is used
-    const effectiveLimit = args?.take ?? args?.limit;
+    // take overrides limit when cursor pagination is used; fall back to defaultLimit
+    const effectiveLimit = args?.take ?? args?.limit ?? this.defaultLimit;
     if (effectiveLimit !== undefined) {
       params.push(Number(effectiveLimit));
       sql += ` LIMIT $${params.length}`;
@@ -629,7 +665,7 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) =>
         result.rows.map((row) =>
-          hasWith
+          args?.with
             ? (this.parseNestedRow(row, this.table) as T)
             : (this.parseRow(row, this.table) as T),
         ),
@@ -644,7 +680,7 @@ export class QueryInterface<T extends object> {
   async findFirst(args?: FindManyArgs<T>): Promise<T | null> {
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirst(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
       return deferred.transform(result);
     });
   }
@@ -672,7 +708,7 @@ export class QueryInterface<T extends object> {
   async findFirstOrThrow(args?: FindManyArgs<T>): Promise<T> {
     return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirstOrThrow(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
       return deferred.transform(result);
     });
   }
@@ -701,7 +737,7 @@ export class QueryInterface<T extends object> {
   async findUniqueOrThrow(args: FindUniqueArgs<T>): Promise<T> {
     return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUniqueOrThrow(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -730,7 +766,7 @@ export class QueryInterface<T extends object> {
   async create(args: CreateArgs<T>): Promise<T> {
     return this.executeWithMiddleware('create', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildCreate(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -764,7 +800,7 @@ export class QueryInterface<T extends object> {
   async createMany(args: CreateManyArgs<T>): Promise<T[]> {
     return this.executeWithMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildCreateMany(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -824,7 +860,7 @@ export class QueryInterface<T extends object> {
   async update(args: UpdateArgs<T>): Promise<T> {
     return this.executeWithMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpdate(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -869,7 +905,7 @@ export class QueryInterface<T extends object> {
   async delete(args: DeleteArgs<T>): Promise<T> {
     return this.executeWithMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDelete(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -897,7 +933,7 @@ export class QueryInterface<T extends object> {
   async upsert(args: UpsertArgs<T>): Promise<T> {
     return this.executeWithMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpsert(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -955,7 +991,7 @@ export class QueryInterface<T extends object> {
   async updateMany(args: UpdateManyArgs<T>): Promise<{ count: number }> {
     return this.executeWithMiddleware('updateMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpdateMany(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -996,7 +1032,7 @@ export class QueryInterface<T extends object> {
   async deleteMany(args: DeleteManyArgs<T>): Promise<{ count: number }> {
     return this.executeWithMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDeleteMany(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -1020,7 +1056,7 @@ export class QueryInterface<T extends object> {
   async count(args?: CountArgs<T>): Promise<number> {
     return this.executeWithMiddleware('count', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildCount(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
       return deferred.transform(result);
     });
   }
@@ -1047,7 +1083,7 @@ export class QueryInterface<T extends object> {
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
     return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildGroupBy(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -1185,7 +1221,7 @@ export class QueryInterface<T extends object> {
   async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
     return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildAggregate(args);
-      const result = await this.pool.query(deferred.sql, deferred.params);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
     });
   }
@@ -1621,17 +1657,20 @@ export class QueryInterface<T extends object> {
       params.push(op.notIn);
       clauses.push(`${column} != ALL($${params.length})`);
     }
+    // Use ILIKE for case-insensitive mode, LIKE otherwise
+    const likeOp = op.mode === 'insensitive' ? 'ILIKE' : 'LIKE';
+
     if (op.contains !== undefined) {
       params.push(`%${escapeLike(op.contains)}%`);
-      clauses.push(`${column} LIKE $${params.length} ESCAPE '\\'`);
+      clauses.push(`${column} ${likeOp} $${params.length} ESCAPE '\\'`);
     }
     if (op.startsWith !== undefined) {
       params.push(`${escapeLike(op.startsWith)}%`);
-      clauses.push(`${column} LIKE $${params.length} ESCAPE '\\'`);
+      clauses.push(`${column} ${likeOp} $${params.length} ESCAPE '\\'`);
     }
     if (op.endsWith !== undefined) {
       params.push(`%${escapeLike(op.endsWith)}`);
-      clauses.push(`${column} LIKE $${params.length} ESCAPE '\\'`);
+      clauses.push(`${column} ${likeOp} $${params.length} ESCAPE '\\'`);
     }
 
     return clauses;
@@ -1673,23 +1712,6 @@ export class QueryInterface<T extends object> {
       for (const [col, value] of Object.entries(row)) {
         parsed[snakeToCamel(col)] = value;
       }
-    }
-    return parsed;
-  }
-
-  /**
-   * Fast path: parse a flat row when the table has NO date columns.
-   * Only renames snake_case -> camelCase via the pre-computed reverseMap.
-   * Skips all date coercion checks — avoids Set.has() per field per row.
-   * Used by findUnique/findMany fast paths when hasNoDateColumns is true.
-   */
-  private parseRowFast(row: Record<string, unknown>): Record<string, unknown> {
-    const parsed: Record<string, unknown> = {};
-    const reverseMap = this.tableMeta.reverseColumnMap;
-    const keys = Object.keys(row);
-    for (let i = 0; i < keys.length; i++) {
-      const col = keys[i]!;
-      parsed[reverseMap[col] ?? col] = row[col];
     }
     return parsed;
   }
@@ -1812,7 +1834,7 @@ export class QueryInterface<T extends object> {
 
     // Build json_build_object pairs for resolved columns
     const jsonPairs = targetColumns.map(
-      (col) => `'${targetMeta.reverseColumnMap[col] ?? snakeToCamel(col)}', ${alias}.${quoteIdent(col)}`,
+      (col) => `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${alias}.${quoteIdent(col)}`,
     );
 
     // Nested relations?
@@ -1829,7 +1851,7 @@ export class QueryInterface<T extends object> {
         const nestedSubquery = this.buildRelationSubquery(
           nestedRelDef, nestedSpec, params, alias, aliasCounter,
         );
-        jsonPairs.push(`'${nestedRelName}', COALESCE((${nestedSubquery}), '[]'::json)`);
+        jsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSubquery}), '[]'::json)`);
       }
     }
 
@@ -1894,7 +1916,7 @@ export class QueryInterface<T extends object> {
         const innerSql = `SELECT ${targetMeta.allColumns.map((c) => `${alias}.${quoteIdent(c)}`).join(', ')} FROM ${qTarget} ${alias} WHERE ${whereClause}${orderClause}${limitClause}`;
         // For the json_build_object, reference the inner alias — only include resolved columns
         const innerJsonPairs = targetColumns.map(
-          (col) => `'${targetMeta.reverseColumnMap[col] ?? snakeToCamel(col)}', ${innerAlias}.${quoteIdent(col)}`,
+          (col) => `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${innerAlias}.${quoteIdent(col)}`,
         );
         // Re-add nested relation subqueries referencing innerAlias
         if (spec !== true && spec.with) {
@@ -1904,7 +1926,7 @@ export class QueryInterface<T extends object> {
               const nestedSub = this.buildRelationSubquery(
                 nestedRelDef, spec.with[nestedRelName]!, params, innerAlias, aliasCounter,
               );
-              innerJsonPairs.push(`'${nestedRelName}', COALESCE((${nestedSub}), '[]'::json)`);
+              innerJsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSub}), '[]'::json)`);
             }
           }
         }
@@ -1921,10 +1943,10 @@ export class QueryInterface<T extends object> {
   /**
    * Get the Postgres type for a column (e.g. 'jsonb', 'text', '_int4').
    * Used to detect JSONB/array columns for specialized operators.
+   * Uses pre-computed Map for O(1) lookup instead of linear scan.
    */
   private getColumnPgType(column: string): string {
-    const col = this.tableMeta.columns.find((c) => c.name === column);
-    return col?.pgType ?? 'text';
+    return this.columnPgTypeMap.get(column) ?? 'text';
   }
 
   /**
@@ -2031,13 +2053,15 @@ export class QueryInterface<T extends object> {
     return clauses;
   }
 
-  /** Get the Postgres array type for a column (used by UNNEST in createMany) */
+  /**
+   * Get the Postgres array type for a column (used by UNNEST in createMany).
+   * Uses pre-computed Map for O(1) lookup instead of linear scan.
+   */
   private getColumnArrayType(column: string): string {
-    // Find the column metadata
-    const col = this.tableMeta.columns.find((c) => c.name === column);
-    if (col) return col.pgArrayType;
+    const arrayType = this.columnArrayTypeMap.get(column);
+    if (arrayType) return arrayType;
 
-    // Fallback heuristic
+    // Fallback heuristic for unknown columns
     if (column === 'id' || column.endsWith('_id')) return 'bigint[]';
     if (column.endsWith('_at')) return 'timestamptz[]';
     return 'text[]';

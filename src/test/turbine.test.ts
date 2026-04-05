@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Integration test suite
+ * @batadata/turbine — Integration test suite
  *
  * Tests against a real Postgres database (seeded with 5K users, 46K posts, 432K comments).
  * Covers: CRUD, nested relations (L2-L4), pagination, filtering, ordering,
@@ -19,17 +19,22 @@ import type { SchemaMetadata } from '../schema.js';
 // ---------------------------------------------------------------------------
 
 const DATABASE_URL = process.env['DATABASE_URL'];
-if (!DATABASE_URL) {
-  console.error('DATABASE_URL is required. Set it to a seeded Postgres database.');
-  process.exit(1);
+const SKIP = !DATABASE_URL;
+if (SKIP) {
+  console.log('\u26A0 Skipping integration tests: DATABASE_URL not set');
 }
 
 let db: TurbineClient;
 let schema: SchemaMetadata;
 
+// Guard: skip entire file if no DATABASE_URL (don't process.exit — it kills parallel test runners)
+const testFn = SKIP ? describe.skip : describe;
+
+testFn('turbine integration tests', () => {
+
 before(async () => {
-  schema = await introspect({ connectionString: DATABASE_URL });
-  db = new TurbineClient({ connectionString: DATABASE_URL, poolSize: 5 }, schema);
+  schema = await introspect({ connectionString: DATABASE_URL! });
+  db = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 5 }, schema);
   await db.connect();
 });
 
@@ -2381,3 +2386,5 @@ describe('orderBy direction safety', () => {
     }
   });
 });
+
+}); // end testFn wrapper

@@ -46,6 +46,16 @@ npx turbine init --url postgres://user:pass@localhost:5432/mydb
 npx turbine generate
 ```
 
+Works with both ESM and CommonJS:
+
+```typescript
+// ESM
+import { turbine } from './generated/turbine';
+
+// CommonJS
+const { turbine } = require('./generated/turbine');
+```
+
 This introspects your database and generates a fully-typed client at `./generated/turbine/`.
 
 ```typescript
@@ -167,6 +177,36 @@ const stats = await db.raw<{ day: Date; count: number }>`
 `;
 ```
 
+### Case-insensitive search
+
+```typescript
+const users = await db.users.findMany({
+  where: {
+    email: { contains: 'alice', mode: 'insensitive' },
+  },
+});
+// Generates: WHERE email ILIKE '%alice%'
+```
+
+### Query timeout
+
+```typescript
+const users = await db.users.findMany({
+  where: { orgId: 1 },
+  timeout: 5000, // 5 second timeout
+});
+```
+
+### Default limit
+
+```typescript
+// Set a default limit for all queries on a model
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  defaultLimit: 100,
+});
+```
+
 ### Middleware
 
 ```typescript
@@ -239,9 +279,17 @@ npx turbine generate         # Regenerate typed client
 ### Migration workflow
 
 ```bash
+# Create a new migration
 npx turbine migrate create add_users_table
-# Edit the generated .sql file with UP and DOWN sections
+# -> Creates turbine/migrations/001_add_users_table.sql with UP/DOWN sections
+
+# Apply all pending migrations
 npx turbine migrate up
+
+# Rollback the last applied migration
+npx turbine migrate down
+
+# Check migration status (applied vs pending)
 npx turbine migrate status
 ```
 
@@ -287,8 +335,9 @@ This resolves the entire 3-level object graph in one database round-trip. Prisma
 
 ## Requirements
 
-- Node.js >= 22.0.0
+- Node.js >= 18.0.0
 - PostgreSQL >= 14
+- Works with both ESM (`import`) and CommonJS (`require`)
 
 ## License
 

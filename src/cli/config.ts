@@ -156,7 +156,7 @@ export function configTemplate(connectionString?: string): string {
 
 /**
  * Turbine configuration
- * @see https://github.com/zvndev/turbine-orm
+ * @see https://batadata.com/docs/turbine/config
  */
 const config: TurbineCliConfig = {
   /** Postgres connection string */

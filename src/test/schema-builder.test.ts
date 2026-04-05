@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Schema builder tests
+ * @batadata/turbine — Schema builder tests
  *
  * Tests the schema definition API and SQL generation:
  *   1. Builds the benchmark schema using defineSchema + table + column
@@ -196,69 +196,69 @@ describe('schemaToSQL', () => {
 
   it('organizations table comes before users (dependency order)', () => {
     const createTables = statements.filter((s) => s.startsWith('CREATE TABLE'));
-    const orgIdx = createTables.findIndex((s) => s.includes('CREATE TABLE organizations'));
-    const userIdx = createTables.findIndex((s) => s.includes('CREATE TABLE users'));
+    const orgIdx = createTables.findIndex((s) => s.includes('"organizations"'));
+    const userIdx = createTables.findIndex((s) => s.includes('"users"'));
     assert.ok(orgIdx < userIdx, 'organizations should come before users');
   });
 
   it('users table comes before posts (dependency order)', () => {
     const createTables = statements.filter((s) => s.startsWith('CREATE TABLE'));
-    const userIdx = createTables.findIndex((s) => s.includes('CREATE TABLE users'));
-    const postIdx = createTables.findIndex((s) => s.includes('CREATE TABLE posts'));
+    const userIdx = createTables.findIndex((s) => s.includes('"users"'));
+    const postIdx = createTables.findIndex((s) => s.includes('"posts"'));
     assert.ok(userIdx < postIdx, 'users should come before posts');
   });
 
   it('posts table comes before comments (dependency order)', () => {
     const createTables = statements.filter((s) => s.startsWith('CREATE TABLE'));
-    const postIdx = createTables.findIndex((s) => s.includes('CREATE TABLE posts'));
-    const commentIdx = createTables.findIndex((s) => s.includes('CREATE TABLE comments'));
+    const postIdx = createTables.findIndex((s) => s.includes('"posts"'));
+    const commentIdx = createTables.findIndex((s) => s.includes('"comments"'));
     assert.ok(postIdx < commentIdx, 'posts should come before comments');
   });
 
   it('generates correct organizations table', () => {
-    const orgSQL = statements.find((s) => s.includes('CREATE TABLE organizations'));
+    const orgSQL = statements.find((s) => s.includes('"organizations"'));
     assert.ok(orgSQL, 'should have organizations CREATE TABLE');
-    assert.ok(orgSQL.includes('id BIGSERIAL PRIMARY KEY'), 'should have id BIGSERIAL PRIMARY KEY');
-    assert.ok(orgSQL.includes('name TEXT NOT NULL'), 'should have name TEXT NOT NULL');
-    assert.ok(orgSQL.includes('slug TEXT UNIQUE NOT NULL'), 'should have slug TEXT UNIQUE NOT NULL');
-    assert.ok(orgSQL.includes("plan TEXT NOT NULL DEFAULT 'free'"), "should have plan with default 'free'");
-    assert.ok(orgSQL.includes('created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()'), 'should have created_at with DEFAULT NOW()');
+    assert.ok(orgSQL.includes('"id" BIGSERIAL PRIMARY KEY'), 'should have id BIGSERIAL PRIMARY KEY');
+    assert.ok(orgSQL.includes('"name" TEXT NOT NULL'), 'should have name TEXT NOT NULL');
+    assert.ok(orgSQL.includes('"slug" TEXT UNIQUE NOT NULL'), 'should have slug TEXT UNIQUE NOT NULL');
+    assert.ok(orgSQL.includes("\"plan\" TEXT NOT NULL DEFAULT 'free'"), "should have plan with default 'free'");
+    assert.ok(orgSQL.includes('"created_at" TIMESTAMPTZ NOT NULL DEFAULT NOW()'), 'should have created_at with DEFAULT NOW()');
   });
 
   it('generates correct users table', () => {
-    const usersSQL = statements.find((s) => s.includes('CREATE TABLE users'));
+    const usersSQL = statements.find((s) => s.includes('"users"'));
     assert.ok(usersSQL, 'should have users CREATE TABLE');
-    assert.ok(usersSQL.includes('id BIGSERIAL PRIMARY KEY'), 'should have id column');
-    assert.ok(usersSQL.includes('org_id BIGINT NOT NULL'), 'should convert orgId to org_id');
-    assert.ok(usersSQL.includes('REFERENCES organizations(id)'), 'should have FK reference');
-    assert.ok(usersSQL.includes('email TEXT UNIQUE NOT NULL'), 'should have email');
-    assert.ok(usersSQL.includes("role TEXT NOT NULL DEFAULT 'member'"), 'should have role default');
-    assert.ok(usersSQL.includes('avatar_url TEXT'), 'should convert avatarUrl to avatar_url');
-    assert.ok(usersSQL.includes('last_login_at TIMESTAMPTZ'), 'should convert lastLoginAt to last_login_at');
+    assert.ok(usersSQL.includes('"id" BIGSERIAL PRIMARY KEY'), 'should have id column');
+    assert.ok(usersSQL.includes('"org_id" BIGINT NOT NULL'), 'should convert orgId to org_id');
+    assert.ok(usersSQL.includes('REFERENCES "organizations"("id")'), 'should have FK reference');
+    assert.ok(usersSQL.includes('"email" TEXT UNIQUE NOT NULL'), 'should have email');
+    assert.ok(usersSQL.includes("\"role\" TEXT NOT NULL DEFAULT 'member'"), 'should have role default');
+    assert.ok(usersSQL.includes('"avatar_url" TEXT'), 'should convert avatarUrl to avatar_url');
+    assert.ok(usersSQL.includes('"last_login_at" TIMESTAMPTZ'), 'should convert lastLoginAt to last_login_at');
   });
 
   it('generates correct posts table', () => {
-    const postsSQL = statements.find((s) => s.includes('CREATE TABLE posts'));
+    const postsSQL = statements.find((s) => s.includes('CREATE TABLE "posts"'));
     assert.ok(postsSQL, 'should have posts CREATE TABLE');
-    assert.ok(postsSQL.includes('user_id BIGINT NOT NULL REFERENCES users(id)'), 'should have user FK');
-    assert.ok(postsSQL.includes('org_id BIGINT NOT NULL REFERENCES organizations(id)'), 'should have org FK');
-    assert.ok(postsSQL.includes('published BOOLEAN NOT NULL DEFAULT false'), 'should have published boolean');
-    assert.ok(postsSQL.includes('view_count INTEGER NOT NULL DEFAULT 0'), 'should have view_count');
-    assert.ok(postsSQL.includes('updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()'), 'should have updated_at');
+    assert.ok(postsSQL.includes('"user_id" BIGINT NOT NULL REFERENCES "users"("id")'), 'should have user FK');
+    assert.ok(postsSQL.includes('"org_id" BIGINT NOT NULL REFERENCES "organizations"("id")'), 'should have org FK');
+    assert.ok(postsSQL.includes('"published" BOOLEAN NOT NULL DEFAULT FALSE'), 'should have published boolean');
+    assert.ok(postsSQL.includes('"view_count" INTEGER NOT NULL DEFAULT 0'), 'should have view_count');
+    assert.ok(postsSQL.includes('"updated_at" TIMESTAMPTZ NOT NULL DEFAULT NOW()'), 'should have updated_at');
   });
 
   it('generates correct comments table', () => {
-    const commentsSQL = statements.find((s) => s.includes('CREATE TABLE comments'));
+    const commentsSQL = statements.find((s) => s.includes('CREATE TABLE "comments"'));
     assert.ok(commentsSQL, 'should have comments CREATE TABLE');
-    assert.ok(commentsSQL.includes('post_id BIGINT NOT NULL REFERENCES posts(id)'), 'should have post FK');
-    assert.ok(commentsSQL.includes('user_id BIGINT NOT NULL REFERENCES users(id)'), 'should have user FK');
-    assert.ok(commentsSQL.includes('body TEXT NOT NULL'), 'should have body');
+    assert.ok(commentsSQL.includes('"post_id" BIGINT NOT NULL REFERENCES "posts"("id")'), 'should have post FK');
+    assert.ok(commentsSQL.includes('"user_id" BIGINT NOT NULL REFERENCES "users"("id")'), 'should have user FK');
+    assert.ok(commentsSQL.includes('"body" TEXT NOT NULL'), 'should have body');
   });
 
   it('generates FK indexes', () => {
     const indexes = statements.filter((s) => s.startsWith('CREATE INDEX'));
     const indexNames = indexes.map((s) => {
-      const match = s.match(/CREATE INDEX (\S+)/);
+      const match = s.match(/CREATE INDEX "([^"]+)"/);
       return match ? match[1] : '';
     });
     assert.ok(indexNames.includes('idx_users_org_id'), 'should index users.org_id');
@@ -298,41 +298,41 @@ describe('schemaToSQL', () => {
 describe('schema.sql compatibility', () => {
   it('generated SQL has all tables from reference schema', () => {
     const fullSQL = schemaToSQLString(benchmarkSchema);
-    assert.ok(fullSQL.includes('CREATE TABLE organizations'), 'has organizations');
-    assert.ok(fullSQL.includes('CREATE TABLE users'), 'has users');
-    assert.ok(fullSQL.includes('CREATE TABLE posts'), 'has posts');
-    assert.ok(fullSQL.includes('CREATE TABLE comments'), 'has comments');
+    assert.ok(fullSQL.includes('CREATE TABLE "organizations"'), 'has organizations');
+    assert.ok(fullSQL.includes('CREATE TABLE "users"'), 'has users');
+    assert.ok(fullSQL.includes('CREATE TABLE "posts"'), 'has posts');
+    assert.ok(fullSQL.includes('CREATE TABLE "comments"'), 'has comments');
   });
 
   it('generated SQL has all columns from reference schema', () => {
     const fullSQL = schemaToSQLString(benchmarkSchema);
 
     // organizations columns
-    assert.ok(fullSQL.includes('id BIGSERIAL PRIMARY KEY'), 'org.id');
-    assert.ok(fullSQL.includes('name TEXT NOT NULL'), 'org.name');
-    assert.ok(fullSQL.includes('slug TEXT UNIQUE NOT NULL'), 'org.slug');
+    assert.ok(fullSQL.includes('"id" BIGSERIAL PRIMARY KEY'), 'org.id');
+    assert.ok(fullSQL.includes('"name" TEXT NOT NULL'), 'org.name');
+    assert.ok(fullSQL.includes('"slug" TEXT UNIQUE NOT NULL'), 'org.slug');
 
     // users columns
-    assert.ok(fullSQL.includes('org_id BIGINT NOT NULL'), 'users.org_id');
-    assert.ok(fullSQL.includes('email TEXT UNIQUE NOT NULL'), 'users.email');
-    assert.ok(fullSQL.includes('avatar_url TEXT'), 'users.avatar_url');
-    assert.ok(fullSQL.includes('last_login_at TIMESTAMPTZ'), 'users.last_login_at');
+    assert.ok(fullSQL.includes('"org_id" BIGINT NOT NULL'), 'users.org_id');
+    assert.ok(fullSQL.includes('"email" TEXT UNIQUE NOT NULL'), 'users.email');
+    assert.ok(fullSQL.includes('"avatar_url" TEXT'), 'users.avatar_url');
+    assert.ok(fullSQL.includes('"last_login_at" TIMESTAMPTZ'), 'users.last_login_at');
 
     // posts columns
-    assert.ok(fullSQL.includes('title TEXT NOT NULL'), 'posts.title');
-    assert.ok(fullSQL.includes('content TEXT NOT NULL'), 'posts.content');
-    assert.ok(fullSQL.includes('published BOOLEAN NOT NULL DEFAULT false'), 'posts.published');
-    assert.ok(fullSQL.includes('view_count INTEGER NOT NULL DEFAULT 0'), 'posts.view_count');
+    assert.ok(fullSQL.includes('"title" TEXT NOT NULL'), 'posts.title');
+    assert.ok(fullSQL.includes('"content" TEXT NOT NULL'), 'posts.content');
+    assert.ok(fullSQL.includes('"published" BOOLEAN NOT NULL DEFAULT FALSE'), 'posts.published');
+    assert.ok(fullSQL.includes('"view_count" INTEGER NOT NULL DEFAULT 0'), 'posts.view_count');
 
     // comments columns
-    assert.ok(fullSQL.includes('body TEXT NOT NULL'), 'comments.body');
+    assert.ok(fullSQL.includes('"body" TEXT NOT NULL'), 'comments.body');
   });
 
   it('generated SQL has all FK references from reference schema', () => {
     const fullSQL = schemaToSQLString(benchmarkSchema);
-    assert.ok(fullSQL.includes('REFERENCES organizations(id)'), 'FK to organizations');
-    assert.ok(fullSQL.includes('REFERENCES users(id)'), 'FK to users');
-    assert.ok(fullSQL.includes('REFERENCES posts(id)'), 'FK to posts');
+    assert.ok(fullSQL.includes('REFERENCES "organizations"("id")'), 'FK to organizations');
+    assert.ok(fullSQL.includes('REFERENCES "users"("id")'), 'FK to users');
+    assert.ok(fullSQL.includes('REFERENCES "posts"("id")'), 'FK to posts');
   });
 
   it('generated SQL has all FK indexes from reference schema', () => {
@@ -501,8 +501,8 @@ describe('edge cases', () => {
     });
     const sql = schemaToSQL(schema);
     assert.equal(sql.length, 1);
-    assert.ok(sql[0]!.includes('CREATE TABLE settings'));
-    assert.ok(sql[0]!.includes('value JSONB'));
+    assert.ok(sql[0]!.includes('CREATE TABLE "settings"'));
+    assert.ok(sql[0]!.includes('"value" JSONB'));
   });
 
   it('varchar column with max length', () => {
@@ -513,7 +513,7 @@ describe('edge cases', () => {
       },
     });
     const sql = schemaToSQL(schema);
-    assert.ok(sql[0]!.includes('VARCHAR(10)'));
+    assert.ok(sql[0]!.includes('"code" VARCHAR(10)'));
   });
 
   it('uuid primary key', () => {
@@ -524,7 +524,7 @@ describe('edge cases', () => {
       },
     });
     const sql = schemaToSQL(schema);
-    assert.ok(sql[0]!.includes('id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID()'));
+    assert.ok(sql[0]!.includes('"id" UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID()'));
   });
 
   it('self-referencing table', () => {
@@ -536,8 +536,8 @@ describe('edge cases', () => {
       },
     });
     const sql = schemaToSQL(schema);
-    assert.ok(sql[0]!.includes('REFERENCES categories(id)'));
-    assert.ok(sql.some((s) => s.includes('idx_categories_parent_id')));
+    assert.ok(sql[0]!.includes('REFERENCES "categories"("id")'));
+    assert.ok(sql.some((s) => s.includes('"idx_categories_parent_id"')));
   });
 
   it('empty schema generates no statements', () => {
@@ -555,6 +555,6 @@ describe('edge cases', () => {
     });
     const sqlStr = schemaToSQLString(schema);
     assert.ok(sqlStr.endsWith('\n'), 'should end with newline');
-    assert.ok(sqlStr.includes('CREATE TABLE tags'), 'should have table');
+    assert.ok(sqlStr.includes('CREATE TABLE "tags"'), 'should have table');
   });
 });

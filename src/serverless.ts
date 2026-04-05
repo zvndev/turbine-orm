@@ -1,5 +1,5 @@
 /**
- * turbine-orm/serverless — HTTP-based query driver for edge functions
+ * @batadata/turbine/serverless — HTTP-based query driver for edge functions
  *
  * Use this driver when you cannot establish a direct TCP connection to Postgres
  * (e.g., Vercel Edge Functions, Cloudflare Workers, Deno Deploy).
@@ -13,7 +13,7 @@
  *
  * @example
  * ```ts
- * import { createServerlessClient } from 'turbine-orm/serverless';
+ * import { createServerlessClient } from '@batadata/turbine/serverless';
  *
  * const db = createServerlessClient({
  *   endpoint: 'https://your-turbine-proxy.fly.dev/query',
@@ -223,7 +223,7 @@ export class ServerlessClient {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${this.config.authToken}`,
-          'User-Agent': 'turbine-orm-serverless',
+          'User-Agent': '@batadata/turbine-serverless',
           ...this.config.headers,
         },
         body: JSON.stringify(body),
@@ -272,7 +272,7 @@ export class ServerlessClient {
  *
  * @example
  * ```ts
- * import { createServerlessClient } from 'turbine-orm/serverless';
+ * import { createServerlessClient } from '@batadata/turbine/serverless';
  *
  * const db = createServerlessClient({
  *   endpoint: process.env.TURBINE_ENDPOINT!,

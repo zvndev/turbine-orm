@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Pipeline execution
+ * @batadata/turbine — Pipeline execution
  *
  * Pipelines batch multiple independent queries into a single database round-trip.
  * Instead of N sequential awaits (N round-trips), you get 1 round-trip for all N queries.
