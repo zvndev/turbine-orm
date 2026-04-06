@@ -181,8 +181,12 @@ function normalizeDefault(val: string): string {
     return val.trim();
   }
 
-  // Simple single-quoted string literals (no nested quotes)
+  // Simple single-quoted string literals (no semicolons, no SQL statement keywords)
   if (/^'[^']*'$/.test(val.trim())) {
+    const inner = val.trim().slice(1, -1);
+    if (/[;]/.test(inner) || /\b(DROP|ALTER|CREATE|INSERT|UPDATE|DELETE|GRANT|REVOKE|TRUNCATE)\b/i.test(inner)) {
+      throw new Error(`Suspicious default value: ${val}. String literals must not contain SQL statements.`);
+    }
     return val.trim();
   }
 

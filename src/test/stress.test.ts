@@ -14,7 +14,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { CircularRelationError } from '../errors.js';
+import { CircularRelationError, ValidationError } from '../errors.js';
 import { QueryInterface } from '../query.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
@@ -670,5 +670,134 @@ describe('stress: wide with clause', () => {
     assert.ok(deferred.sql.includes('"comments"'), 'should include comments table');
     assert.ok(deferred.sql.includes('AS "organization"'), 'should alias organization');
     assert.ok(deferred.sql.includes('AS "posts"'), 'should alias posts');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. orderBy / groupBy column validation
+// ---------------------------------------------------------------------------
+
+describe('stress: orderBy / groupBy column validation', () => {
+  it('should throw ValidationError for unknown orderBy column in findMany', () => {
+    const schema = buildCoreSchema();
+    const q = makeQuery('users', schema);
+
+    assert.throws(
+      () => {
+        q.buildFindMany({
+          orderBy: { nonexistentColumn: 'asc' } as any,
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError, 'should be ValidationError');
+        assert.ok(err.message.includes('nonexistentColumn'), 'message should include the bad column name');
+        assert.ok(err.message.includes('orderBy'), 'message should mention orderBy');
+        return true;
+      },
+    );
+  });
+
+  it('should throw ValidationError for unknown groupBy column', () => {
+    const schema = buildCoreSchema();
+    const q = makeQuery('users', schema);
+
+    assert.throws(
+      () => {
+        q.buildGroupBy({
+          by: ['nonexistentField' as any],
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError, 'should be ValidationError');
+        assert.ok(err.message.includes('nonexistent'), 'message should include the bad column name');
+        return true;
+      },
+    );
+  });
+
+  it('should accept valid orderBy columns', () => {
+    const schema = buildCoreSchema();
+    const q = makeQuery('users', schema);
+
+    // 'id' and 'name' are valid columns on the users table
+    const deferred = q.buildFindMany({
+      orderBy: { id: 'asc', name: 'desc' } as any,
+    });
+
+    assert.ok(deferred.sql.length > 0, 'should produce non-empty SQL');
+    assert.ok(deferred.sql.includes('ORDER BY'), 'should have ORDER BY clause');
+    assert.ok(deferred.sql.includes('ASC'), 'should include ASC direction');
+    assert.ok(deferred.sql.includes('DESC'), 'should include DESC direction');
+  });
+
+  it('should accept valid groupBy columns', () => {
+    const schema = buildCoreSchema();
+    const q = makeQuery('users', schema);
+
+    // 'orgId' maps to 'org_id' which is a valid column
+    const deferred = q.buildGroupBy({
+      by: ['orgId' as any],
+    });
+
+    assert.ok(deferred.sql.length > 0, 'should produce non-empty SQL');
+    assert.ok(deferred.sql.includes('GROUP BY'), 'should have GROUP BY clause');
+    assert.ok(deferred.sql.includes('"org_id"'), 'should include the quoted column name');
+  });
+
+  it('should throw ValidationError for unknown orderBy column in nested relation', () => {
+    const schema = buildCoreSchema();
+    const q = makeQuery('users', schema);
+
+    assert.throws(
+      () => {
+        q.buildFindMany({
+          with: {
+            posts: {
+              orderBy: { fakeColumn: 'asc' } as any,
+            },
+          },
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError, 'should be ValidationError');
+        assert.ok(err.message.includes('fakeColumn'), 'message should include the bad column name');
+        return true;
+      },
+    );
+  });
+
+  it('should throw ValidationError for multiple invalid orderBy columns', () => {
+    const schema = buildCoreSchema();
+    const q = makeQuery('users', schema);
+
+    // The first invalid column encountered should trigger the error
+    assert.throws(
+      () => {
+        q.buildFindMany({
+          orderBy: { badCol1: 'asc', badCol2: 'desc' } as any,
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError, 'should be ValidationError');
+        return true;
+      },
+    );
+  });
+
+  it('should throw ValidationError for SQL injection attempts in orderBy', () => {
+    const schema = buildCoreSchema();
+    const q = makeQuery('users', schema);
+
+    assert.throws(
+      () => {
+        q.buildFindMany({
+          orderBy: { 'id; DROP TABLE users': 'asc' } as any,
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError, 'should be ValidationError');
+        return true;
+      },
+    );
   });
 });
