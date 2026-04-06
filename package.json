@@ -1,7 +1,7 @@
 {
   "name": "turbine-orm",
   "version": "0.5.0",
-  "description": "TypeScript ORM with json_agg nested queries — 2-3x faster than Prisma, 1.5x faster than Drizzle",
+  "description": "Postgres-native TypeScript ORM — single-query nested relations via json_agg, 1 dependency, 70KB",
   "type": "module",
   "exports": {
     ".": {

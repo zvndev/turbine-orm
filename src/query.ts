@@ -5,7 +5,7 @@
  * that builds parameterized SQL and executes it through the connection pool.
  *
  * Nested relations use json_build_object + json_agg subqueries for single-query
- * resolution — the technique that benchmarks proved 2-3x faster than Prisma.
+ * resolution — a PostgreSQL-native approach that eliminates N+1 query patterns.
  *
  * Schema-driven: all column names, types, and relations come from introspected
  * metadata — nothing is hardcoded.
