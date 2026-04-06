@@ -490,6 +490,205 @@ describe('defineSchema (object format)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Runtime type validation (object format)
+// ---------------------------------------------------------------------------
+
+describe('defineSchema runtime type validation', () => {
+  it('should throw for invalid column type', () => {
+    assert.throws(
+      () => {
+        defineSchema({
+          test: {
+            id: { type: 'serial', primaryKey: true },
+            bad: { type: 'invalidtype' as any },
+          },
+        });
+      },
+      /Invalid column type/,
+    );
+  });
+
+  it('should throw for empty string column type', () => {
+    assert.throws(
+      () => {
+        defineSchema({
+          test: {
+            id: { type: '' as any },
+          },
+        });
+      },
+      /Invalid column type/,
+    );
+  });
+
+  it('should throw for uppercase column type (must use lowercase shorthand)', () => {
+    assert.throws(
+      () => {
+        defineSchema({
+          test: {
+            id: { type: 'BIGSERIAL' as any, primaryKey: true },
+          },
+        });
+      },
+      /Invalid column type/,
+    );
+  });
+
+  it('should accept all valid column types without throwing', () => {
+    const validTypes = [
+      'serial', 'bigint', 'integer', 'smallint', 'text', 'varchar',
+      'boolean', 'timestamp', 'date', 'json', 'uuid', 'real',
+      'double', 'numeric', 'bytea',
+    ] as const;
+
+    for (const t of validTypes) {
+      // Should not throw
+      const schema = defineSchema({
+        test: {
+          col: { type: t },
+        },
+      });
+      assert.ok(schema.tables.test, `type "${t}" should produce a valid table`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEFAULT value validation edge cases
+// ---------------------------------------------------------------------------
+
+describe('DEFAULT value validation', () => {
+  it('should accept valid default string literals', () => {
+    // "'active'" — single-quoted string
+    const schema1 = defineSchema({
+      t: { id: { type: 'serial', primaryKey: true }, status: { type: 'text', default: "'active'" } },
+    });
+    const sql1 = schemaToSQL(schema1);
+    assert.ok(sql1[0]!.includes("DEFAULT 'active'"), 'should accept single-quoted string');
+
+    // "'hello world'" — single-quoted string with space
+    const schema2 = defineSchema({
+      t: { id: { type: 'serial', primaryKey: true }, msg: { type: 'text', default: "'hello world'" } },
+    });
+    const sql2 = schemaToSQL(schema2);
+    assert.ok(sql2[0]!.includes("DEFAULT 'hello world'"), 'should accept string with spaces');
+
+    // 'now()' — function call
+    const schema3 = defineSchema({
+      t: { id: { type: 'serial', primaryKey: true }, ts: { type: 'timestamp', default: 'now()' } },
+    });
+    const sql3 = schemaToSQL(schema3);
+    assert.ok(sql3[0]!.includes('DEFAULT NOW()'), 'should accept now() function');
+
+    // '0' — numeric literal
+    const schema4 = defineSchema({
+      t: { id: { type: 'serial', primaryKey: true }, n: { type: 'integer', default: '0' } },
+    });
+    const sql4 = schemaToSQL(schema4);
+    assert.ok(sql4[0]!.includes('DEFAULT 0'), 'should accept numeric zero');
+
+    // 'true' — boolean constant
+    const schema5 = defineSchema({
+      t: { id: { type: 'serial', primaryKey: true }, b: { type: 'boolean', default: 'true' } },
+    });
+    const sql5 = schemaToSQL(schema5);
+    assert.ok(sql5[0]!.includes('DEFAULT TRUE'), 'should accept boolean true');
+  });
+
+  it('should reject suspicious default values with SQL injection', () => {
+    const schema = defineSchema({
+      t: {
+        id: { type: 'serial', primaryKey: true },
+        bad: { type: 'text', default: "'; DROP TABLE users; --" },
+      },
+    });
+
+    assert.throws(
+      () => schemaToSQL(schema),
+      /Suspicious default value|Unsupported default value/,
+    );
+  });
+
+  it('should reject default values containing semicolons in string literals', () => {
+    const schema = defineSchema({
+      t: {
+        id: { type: 'serial', primaryKey: true },
+        bad: { type: 'text', default: "'value; malicious'" },
+      },
+    });
+
+    assert.throws(
+      () => schemaToSQL(schema),
+      /Suspicious default value/,
+    );
+  });
+
+  it('should reject default values with SQL keywords in string literals', () => {
+    const keywords = ['DROP', 'ALTER', 'CREATE', 'INSERT', 'UPDATE', 'DELETE', 'GRANT', 'REVOKE', 'TRUNCATE'];
+    for (const keyword of keywords) {
+      const schema = defineSchema({
+        t: {
+          id: { type: 'serial', primaryKey: true },
+          bad: { type: 'text', default: `'${keyword} TABLE users'` },
+        },
+      });
+
+      assert.throws(
+        () => schemaToSQL(schema),
+        /Suspicious default value/,
+        `should reject default containing ${keyword}`,
+      );
+    }
+  });
+
+  it('should accept negative numeric defaults', () => {
+    const schema = defineSchema({
+      t: { id: { type: 'serial', primaryKey: true }, n: { type: 'integer', default: '-1' } },
+    });
+    const sql = schemaToSQL(schema);
+    assert.ok(sql[0]!.includes('DEFAULT -1'), 'should accept negative integer');
+  });
+
+  it('should accept decimal numeric defaults', () => {
+    const schema = defineSchema({
+      t: { id: { type: 'serial', primaryKey: true }, n: { type: 'real', default: '3.14' } },
+    });
+    const sql = schemaToSQL(schema);
+    assert.ok(sql[0]!.includes('DEFAULT 3.14'), 'should accept decimal');
+  });
+
+  it('should reject arbitrary SQL expressions as defaults', () => {
+    const schema = defineSchema({
+      t: {
+        id: { type: 'serial', primaryKey: true },
+        bad: { type: 'text', default: 'some_random_function()' },
+      },
+    });
+
+    assert.throws(
+      () => schemaToSQL(schema),
+      /Unsupported default value/,
+    );
+  });
+
+  it('should accept gen_random_uuid() as default', () => {
+    const schema = defineSchema({
+      t: { id: { type: 'uuid', primaryKey: true, default: 'gen_random_uuid()' } },
+    });
+    const sql = schemaToSQL(schema);
+    assert.ok(sql[0]!.includes('DEFAULT GEN_RANDOM_UUID()'), 'should accept gen_random_uuid()');
+  });
+
+  it('should accept NULL as default', () => {
+    const schema = defineSchema({
+      t: { id: { type: 'serial', primaryKey: true }, opt: { type: 'text', nullable: true, default: 'NULL' } },
+    });
+    const sql = schemaToSQL(schema);
+    assert.ok(sql[0]!.includes('DEFAULT NULL'), 'should accept NULL default');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Edge cases (legacy builder format — still supported)
 // ---------------------------------------------------------------------------
 
