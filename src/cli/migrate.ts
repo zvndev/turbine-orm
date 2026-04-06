@@ -297,7 +297,10 @@ async function validateChecksums(client: pg.Client, migrationsDir: string): Prom
     if (currentHash !== migration.checksum) {
       // Auto-upgrade legacy djb2 checksums to SHA-256 without flagging as modified
       if (isLegacyChecksum(migration.checksum)) {
-        await client.query(`UPDATE ${QUOTED_TRACKING_TABLE} SET checksum = $1 WHERE name = $2`, [currentHash, migration.name]);
+        await client.query(`UPDATE ${QUOTED_TRACKING_TABLE} SET checksum = $1 WHERE name = $2`, [
+          currentHash,
+          migration.name,
+        ]);
         continue;
       }
       mismatches.push({

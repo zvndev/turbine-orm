@@ -1,6 +1,6 @@
 # turbine-orm
 
-The performance-first Postgres ORM. Prisma-inspired API, 2-3x faster nested queries, zero runtime overhead beyond `pg`.
+Postgres-native TypeScript ORM. Single-query nested relations via `json_agg`, Prisma-inspired API, 1 dependency, 70KB.
 
 ```
 npm install turbine-orm
@@ -8,9 +8,9 @@ npm install turbine-orm
 
 ## Why Turbine?
 
-ORMs like Prisma fetch nested relations with N+1 queries -- one query per nesting level. Turbine uses Postgres `json_agg` to resolve the entire object graph in **a single SQL query**. The result is fewer round-trips, less connection overhead, and significantly lower latency.
+Turbine uses Postgres `json_agg` to resolve nested relations in **a single SQL query** — no N+1, no WASM binary, no multi-database abstraction tax. One runtime dependency (`pg`), 70KB on npm.
 
-**One query instead of N+1.** When you write `db.users.findMany({ with: { posts: { with: { comments: true } } } })`, Turbine generates a single SQL statement that returns fully-nested JSON. Prisma sends 3 separate queries. Drizzle uses LATERAL joins which are competitive, but Turbine still wins on median latency.
+**One query for nested relations.** When you write `db.users.findMany({ with: { posts: { with: { comments: true } } } })`, Turbine generates a single SQL statement using correlated subqueries with `json_agg`. Modern ORMs like Prisma 7+ and Drizzle v2 use similar single-query approaches (LATERAL JOINs). Turbine's advantage is architectural simplicity: 1 dependency, no code generation DSL, and PostgreSQL-native depth.
 
 ## Benchmarks
 

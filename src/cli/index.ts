@@ -869,7 +869,7 @@ async function cmdSeed(_args: CliArgs, config: ResolvedConfig): Promise<void> {
   } catch (err) {
     spinner.fail('Seed failed');
     if (err instanceof Error) {
-      console.log(`  ${dim(err.message)}`);
+      console.log(`  ${dim(redactUrl(err.message))}`);
     }
     newline();
     process.exit(1);

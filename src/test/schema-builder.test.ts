@@ -495,50 +495,53 @@ describe('defineSchema (object format)', () => {
 
 describe('defineSchema runtime type validation', () => {
   it('should throw for invalid column type', () => {
-    assert.throws(
-      () => {
-        defineSchema({
-          test: {
-            id: { type: 'serial', primaryKey: true },
-            bad: { type: 'invalidtype' as any },
-          },
-        });
-      },
-      /Invalid column type/,
-    );
+    assert.throws(() => {
+      defineSchema({
+        test: {
+          id: { type: 'serial', primaryKey: true },
+          bad: { type: 'invalidtype' as any },
+        },
+      });
+    }, /Invalid column type/);
   });
 
   it('should throw for empty string column type', () => {
-    assert.throws(
-      () => {
-        defineSchema({
-          test: {
-            id: { type: '' as any },
-          },
-        });
-      },
-      /Invalid column type/,
-    );
+    assert.throws(() => {
+      defineSchema({
+        test: {
+          id: { type: '' as any },
+        },
+      });
+    }, /Invalid column type/);
   });
 
   it('should throw for uppercase column type (must use lowercase shorthand)', () => {
-    assert.throws(
-      () => {
-        defineSchema({
-          test: {
-            id: { type: 'BIGSERIAL' as any, primaryKey: true },
-          },
-        });
-      },
-      /Invalid column type/,
-    );
+    assert.throws(() => {
+      defineSchema({
+        test: {
+          id: { type: 'BIGSERIAL' as any, primaryKey: true },
+        },
+      });
+    }, /Invalid column type/);
   });
 
   it('should accept all valid column types without throwing', () => {
     const validTypes = [
-      'serial', 'bigint', 'integer', 'smallint', 'text', 'varchar',
-      'boolean', 'timestamp', 'date', 'json', 'uuid', 'real',
-      'double', 'numeric', 'bytea',
+      'serial',
+      'bigint',
+      'integer',
+      'smallint',
+      'text',
+      'varchar',
+      'boolean',
+      'timestamp',
+      'date',
+      'json',
+      'uuid',
+      'real',
+      'double',
+      'numeric',
+      'bytea',
     ] as const;
 
     for (const t of validTypes) {
@@ -603,10 +606,7 @@ describe('DEFAULT value validation', () => {
       },
     });
 
-    assert.throws(
-      () => schemaToSQL(schema),
-      /Suspicious default value|Unsupported default value/,
-    );
+    assert.throws(() => schemaToSQL(schema), /Suspicious default value|Unsupported default value/);
   });
 
   it('should reject default values containing semicolons in string literals', () => {
@@ -617,10 +617,7 @@ describe('DEFAULT value validation', () => {
       },
     });
 
-    assert.throws(
-      () => schemaToSQL(schema),
-      /Suspicious default value/,
-    );
+    assert.throws(() => schemaToSQL(schema), /Suspicious default value/);
   });
 
   it('should reject default values with SQL keywords in string literals', () => {
@@ -665,10 +662,7 @@ describe('DEFAULT value validation', () => {
       },
     });
 
-    assert.throws(
-      () => schemaToSQL(schema),
-      /Unsupported default value/,
-    );
+    assert.throws(() => schemaToSQL(schema), /Unsupported default value/);
   });
 
   it('should accept gen_random_uuid() as default', () => {

@@ -87,7 +87,7 @@ generates ONE query. Prisma sends 3.
 - GitHub: github.com/zvndev/turbine-orm
 - Only runtime dependency is `pg`
 
-180 tests, Prisma-compatible API, MIT license.
+180 tests, Prisma-inspired API, MIT license.
 Looking for feedback on the DX and what's missing.
 ```
 

@@ -21,7 +21,7 @@ Title: `Show HN: Turbine ORM – TypeScript Postgres ORM that resolves nested re
 > - Docs: turbineorm.dev
 > - Live demo: turbine-demo-blog.fly.dev/api/debug (shows the actual SQL)
 >
-> 180 tests, Prisma-compatible API, MIT license. Looking for feedback on the DX and what's missing.
+> 180 tests, Prisma-inspired API, MIT license. Looking for feedback on the DX and what's missing.
 
 ### Twitter/X thread
 1. Hook — "I built a Postgres ORM that does nested queries in 1 SQL statement. Here's what Prisma sends vs what Turbine sends:" + side-by-side SQL screenshot
@@ -62,7 +62,7 @@ Title: "How json_agg makes your Postgres ORM 2x faster on nested queries"
 - Framework guides: Next.js, Express
 
 ## Key message
-> "What if your ORM sent 1 SQL query instead of 3? Turbine uses Postgres json_agg to load users → posts → comments in a single round-trip. 70KB, zero binary deps, Prisma-compatible API."
+> "What if your ORM sent 1 SQL query instead of 3? Turbine uses Postgres json_agg to load users → posts → comments in a single round-trip. 70KB, zero binary deps, Prisma-inspired API."
 
 ## What NOT to do
 - Don't claim "10x faster" — honest numbers are compelling enough

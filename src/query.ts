@@ -1075,7 +1075,7 @@ export class QueryInterface<T extends object> {
     const meta = this.schema.tables[this.table];
     if (meta) {
       for (const key of args.by) {
-        if (!(key as string in meta.columnMap)) {
+        if (!((key as string) in meta.columnMap)) {
           throw new ValidationError(`Unknown column "${key as string}" in groupBy for table "${this.table}"`);
         }
       }
@@ -1716,7 +1716,9 @@ export class QueryInterface<T extends object> {
           try {
             parsed[relName] = JSON.parse(rawValue);
           } catch {
-            console.warn(`[turbine] Warning: Failed to parse JSON for relation "${relName}" on table "${this.table}". Using raw value.`);
+            console.warn(
+              `[turbine] Warning: Failed to parse JSON for relation "${relName}" on table "${this.table}". Using raw value.`,
+            );
             parsed[relName] = rawValue;
           }
         } else if (Array.isArray(rawValue)) {

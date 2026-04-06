@@ -20,6 +20,7 @@ You will receive a response within 48 hours. We will work with you to understand
 
 | Version | Supported |
 |---------|-----------|
+| 0.6.x   | Yes       |
 | 0.5.x   | Yes       |
 | < 0.5   | No        |
 
@@ -30,5 +31,7 @@ Turbine ORM takes SQL injection prevention seriously:
 - All user values are parameterized (`$1`, `$2`, ...)
 - LIKE patterns are escaped via `escapeLike()`
 - DDL DEFAULT values are validated against a strict allowlist
-- CLI seed paths are shell-escaped
+- CLI seed command uses `execFileSync` with array args (no shell parsing)
+- Migration tracking table name quoted via `quoteIdent()`
+- Connection strings redacted in all CLI error output
 - Generated output paths are validated against traversal
