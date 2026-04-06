@@ -1,0 +1,74 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["relationJoins"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Organization {
+  id        BigInt   @id @default(autoincrement())
+  name      String
+  slug      String   @unique
+  plan      String   @default("free")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  users     User[]
+  posts     Post[]
+
+  @@map("organizations")
+}
+
+model User {
+  id          BigInt    @id @default(autoincrement())
+  orgId       BigInt    @map("org_id")
+  email       String    @unique
+  name        String
+  role        String    @default("member")
+  avatarUrl   String?   @map("avatar_url")
+  lastLoginAt DateTime? @map("last_login_at") @db.Timestamptz()
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  organization Organization @relation(fields: [orgId], references: [id])
+  posts        Post[]
+  comments     Comment[]
+
+  @@index([orgId])
+  @@map("users")
+}
+
+model Post {
+  id        BigInt   @id @default(autoincrement())
+  userId    BigInt   @map("user_id")
+  orgId     BigInt   @map("org_id")
+  title     String
+  content   String
+  published Boolean  @default(false)
+  viewCount Int      @default(0) @map("view_count")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz()
+
+  user         User         @relation(fields: [userId], references: [id])
+  organization Organization @relation(fields: [orgId], references: [id])
+  comments     Comment[]
+
+  @@index([userId])
+  @@index([orgId])
+  @@index([createdAt(sort: Desc)])
+  @@map("posts")
+}
+
+model Comment {
+  id        BigInt   @id @default(autoincrement())
+  postId    BigInt   @map("post_id")
+  userId    BigInt   @map("user_id")
+  body      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  post Post @relation(fields: [postId], references: [id])
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([postId])
+  @@index([userId])
+  @@map("comments")
+}

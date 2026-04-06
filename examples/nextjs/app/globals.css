@@ -1,0 +1,23 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
+}
+
+body {
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Syntax highlighting for code blocks */
+.token-keyword { color: #c084fc; }
+.token-string { color: #86efac; }
+.token-comment { color: #6b7280; }
+.token-function { color: #93c5fd; }
+.token-type { color: #fbbf24; }
+.token-number { color: #f9a8d4; }
+.token-property { color: #7dd3fc; }
+.token-punctuation { color: #9ca3af; }
+.token-operator { color: #c084fc; }

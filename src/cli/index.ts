@@ -75,6 +75,7 @@ interface CliArgs {
   force?: boolean;
   verbose?: boolean;
   help?: boolean;
+  auto?: boolean;
 }
 
 function parseArgs(): CliArgs {
@@ -127,6 +128,9 @@ function parseArgs(): CliArgs {
         break;
       case '--dry-run':
         result.dryRun = true;
+        break;
+      case '--auto':
+        result.auto = true;
         break;
       case '--force':
       case '-f':
@@ -590,17 +594,20 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`  ${bold('turbine migrate')} ${dim('— SQL-first migration system')}`);
     newline();
     console.log(`  ${bold('Commands:')}`);
-    console.log(`    ${cyan('create <name>')}  Create a new migration file`);
-    console.log(`    ${cyan('up')}             Apply pending migrations`);
-    console.log(`    ${cyan('down')}           Rollback last migration`);
-    console.log(`    ${cyan('status')}         Show migration status`);
+    console.log(`    ${cyan('create <name>')}         Create a new migration file`);
+    console.log(`    ${cyan('create <name> --auto')}  Auto-generate from schema diff`);
+    console.log(`    ${cyan('up')}                    Apply pending migrations`);
+    console.log(`    ${cyan('down')}                  Rollback last migration`);
+    console.log(`    ${cyan('status')}                Show migration status`);
     newline();
     console.log(`  ${bold('Options:')}`);
+    console.log(`    ${cyan('--auto')}         Auto-generate UP/DOWN SQL from schema diff`);
     console.log(`    ${cyan('--step, -n')}     Number of migrations to apply/rollback`);
     console.log(`    ${cyan('--dry-run')}      Show SQL without executing`);
     newline();
     console.log(`  ${bold('Examples:')}`);
     console.log(`    ${dim('npx turbine migrate create add_users_table')}`);
+    console.log(`    ${dim('npx turbine migrate create add_email_index --auto')}`);
     console.log(`    ${dim('npx turbine migrate up')}`);
     console.log(`    ${dim('npx turbine migrate down --step 2')}`);
     newline();
@@ -636,8 +643,71 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     newline();
     console.log(`  ${dim('Usage:')} ${cyan('npx turbine migrate create <name>')}`);
     console.log(`  ${dim('Example:')} ${cyan('npx turbine migrate create add_users_table')}`);
+    console.log(`  ${dim('Auto:')}    ${cyan('npx turbine migrate create my_change --auto')}`);
     newline();
     process.exit(1);
+  }
+
+  if (args.auto) {
+    // Auto-generate migration from schema diff
+    const url = requireUrl(config);
+    label('Database', redactUrl(url));
+    label('Schema file', config.schemaFile);
+    newline();
+
+    const schemaDef = await loadSchemaFile(config.schemaFile);
+    const diffSpinner = new Spinner('Computing schema diff').start();
+    const diff = await schemaDiff(schemaDef, url);
+
+    if (diff.statements.length === 0) {
+      diffSpinner.succeed('Database is already in sync — nothing to migrate');
+      newline();
+      return;
+    }
+
+    diffSpinner.succeed(`Found ${bold(String(diff.statements.length))} change(s)`);
+    newline();
+
+    const upSQL = diff.statements.join('\n');
+    const downSQL = diff.reverseStatements.join('\n');
+    const file = createMigration(config.migrationsDir, name, { up: upSQL, down: downSQL });
+    const relPath = relative(process.cwd(), file.path);
+
+    success(`Created auto-migration: ${bold(file.filename)}`);
+    newline();
+    console.log(`  ${dim('File:')} ${cyan(relPath)}`);
+    newline();
+
+    // Show summary of changes
+    if (diff.create.length > 0) {
+      console.log(
+        `  ${green('+ Create')} ${diff.create.length} table(s): ${diff.create.map((t) => t.name).join(', ')}`,
+      );
+    }
+    if (diff.alter.length > 0) {
+      console.log(`  ${yellow('~ Alter')} ${diff.alter.length} table(s):`);
+      for (const a of diff.alter) {
+        for (const col of a.columns) {
+          const actionLabel =
+            col.action === 'add'
+              ? green('+ add')
+              : col.action === 'drop'
+                ? red('- drop')
+                : col.action === 'add_unique'
+                  ? green('+ unique')
+                  : col.action === 'drop_unique'
+                    ? red('- unique')
+                    : yellow(`~ ${col.action.replace(/_/g, ' ')}`);
+          console.log(`    ${actionLabel} ${a.table}.${col.column}`);
+        }
+      }
+    }
+    newline();
+
+    console.log(`  ${dim('Review the migration, then run:')}`);
+    console.log(`  ${cyan('npx turbine migrate up')}`);
+    newline();
+    return;
   }
 
   const file = createMigration(config.migrationsDir, name);

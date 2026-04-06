@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.1 (2026-04-06)
+
+### Added
+- **Streaming cursors:** `findManyStream()` returns `AsyncGenerator<T>` backed by PostgreSQL `DECLARE CURSOR` — constant memory for large result sets
+- Configurable `batchSize` (default: 100) for internal FETCH batching
+- Streaming supports all `findMany` options: `where`, `orderBy`, `limit`, `with` (nested relations)
+- Early termination via `break` automatically cleans up cursor and connection
+- **Next.js example app** (`examples/nextjs/`) — server-rendered demo with nested relations, code blocks, and streaming showcase
+- **Auto-diff migrations:** `npx turbine migrate create <name> --auto` generates UP + DOWN SQL from schema diff
+- Schema diff now detects DEFAULT value changes (SET DEFAULT / DROP DEFAULT)
+- Schema diff now detects UNIQUE constraint changes (ADD / DROP CONSTRAINT)
+- Schema diff generates reverse SQL for all operations (for DOWN migrations)
+- Type changes now include USING clause for safe casting
+- Fresh benchmark suite against Prisma 7.6 and Drizzle 0.45 (`benchmarks/`)
+- README benchmarks updated with current numbers — Turbine 1.4–1.9x faster across all scenarios
+- Reproducible benchmark harness: `cd benchmarks && npm install && npx prisma generate && npx tsx bench.ts`
+
+### Changed
+- `schemaDiff()` now returns `reverseStatements` alongside `statements`
+- `createMigration()` accepts optional `autoContent` for pre-populated UP/DOWN
+- README benchmark section replaced with fresh Prisma 7 / Drizzle v2 results (was Prisma 5.x / Drizzle v1)
+- Comparison section updated to reflect all three ORMs now using single-query approaches
+
 ## 0.6.0 (2026-04-05)
 
 ### Security

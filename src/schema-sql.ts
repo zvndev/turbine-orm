@@ -219,9 +219,20 @@ export interface AlterColumnDef {
   /** Column name in snake_case */
   column: string;
   /** What changed */
-  action: 'add' | 'drop' | 'alter_type' | 'set_not_null' | 'drop_not_null' | 'set_default' | 'drop_default';
+  action:
+    | 'add'
+    | 'drop'
+    | 'alter_type'
+    | 'set_not_null'
+    | 'drop_not_null'
+    | 'set_default'
+    | 'drop_default'
+    | 'add_unique'
+    | 'drop_unique';
   /** SQL fragment for the alteration */
   sql: string;
+  /** SQL to reverse this change (for DOWN migrations) */
+  reverseSql: string;
 }
 
 export interface AlterDef {
@@ -238,8 +249,10 @@ export interface DiffResult {
   alter: AlterDef[];
   /** Table names that exist in DB but not in schema — would need DROP TABLE */
   drop: string[];
-  /** SQL statements to execute the diff */
+  /** SQL statements to execute the diff (UP direction) */
   statements: string[];
+  /** SQL statements to reverse the diff (DOWN direction, for migrations) */
+  reverseStatements: string[];
 }
 
 /**
@@ -301,8 +314,37 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       };
     }
 
+    // Get single-column UNIQUE constraints (excluding PKs)
+    const uniqueResult = await client.query<{
+      table_name: string;
+      constraint_name: string;
+      column_name: string;
+    }>(
+      `SELECT tc.table_name, tc.constraint_name, kcu.column_name
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+       WHERE tc.table_schema = 'public'
+         AND tc.constraint_type = 'UNIQUE'
+         AND tc.constraint_name IN (
+           SELECT constraint_name
+           FROM information_schema.key_column_usage
+           WHERE table_schema = 'public'
+           GROUP BY constraint_name
+           HAVING COUNT(*) = 1
+         )`,
+    );
+
+    // Map: table → column → constraint_name for single-col uniques
+    const dbUniques: Record<string, Record<string, string>> = {};
+    for (const row of uniqueResult.rows) {
+      if (!dbUniques[row.table_name]) dbUniques[row.table_name] = {};
+      dbUniques[row.table_name]![row.column_name] = row.constraint_name;
+    }
+
     const schemaTableNames = new Set(Object.keys(schema.tables));
-    const result: DiffResult = { create: [], alter: [], drop: [], statements: [] };
+    const result: DiffResult = { create: [], alter: [], drop: [], statements: [], reverseStatements: [] };
 
     // Tables to create (in schema but not in DB)
     const sorted = topologicalSort(schema);
@@ -311,8 +353,10 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         const tableDef = schema.tables[tableName]!;
         result.create.push(tableDef);
         result.statements.push(generateCreateTable(tableDef));
-        // Also add FK indexes
-        result.statements.push(...generateForeignKeyIndexes(tableDef));
+        const fkIndexes = generateForeignKeyIndexes(tableDef);
+        result.statements.push(...fkIndexes);
+        // Reverse: DROP TABLE (with indexes — they drop automatically)
+        result.reverseStatements.unshift(`DROP TABLE IF EXISTS ${quoteIdent(tableName)} CASCADE;`);
       }
     }
 
@@ -330,6 +374,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
 
       const tableDef = schema.tables[tableName]!;
       const dbCols = dbColumns[tableName] ?? {};
+      const tableUniques = dbUniques[tableName] ?? {};
       const alterDef: AlterDef = { table: tableName, columns: [] };
 
       for (const [fieldName, config] of Object.entries(tableDef.columns)) {
@@ -340,8 +385,10 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
           // Column exists in schema but not in DB — ADD COLUMN
           const colDef = generateColumnDef(fieldName, config);
           const sql = `ALTER TABLE ${quoteIdent(tableName)} ADD COLUMN ${colDef};`;
-          alterDef.columns.push({ column: snakeName, action: 'add', sql });
+          const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} DROP COLUMN ${quoteIdent(snakeName)};`;
+          alterDef.columns.push({ column: snakeName, action: 'add', sql, reverseSql });
           result.statements.push(sql);
+          result.reverseStatements.unshift(reverseSql);
           continue;
         }
 
@@ -349,9 +396,12 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         const expectedUdt = schemaTypeToUdt(config);
         if (expectedUdt && dbCol.udtName !== expectedUdt) {
           const sqlType = config.type === 'VARCHAR' && config.maxLength ? `VARCHAR(${config.maxLength})` : config.type;
-          const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} TYPE ${sqlType};`;
-          alterDef.columns.push({ column: snakeName, action: 'alter_type', sql });
+          const oldSqlType = udtToSqlType(dbCol.udtName, dbCol.maxLength);
+          const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} TYPE ${sqlType} USING ${quoteIdent(snakeName)}::${sqlType};`;
+          const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} TYPE ${oldSqlType} USING ${quoteIdent(snakeName)}::${oldSqlType};`;
+          alterDef.columns.push({ column: snakeName, action: 'alter_type', sql, reverseSql });
           result.statements.push(sql);
+          result.reverseStatements.unshift(reverseSql);
         }
 
         // Check NOT NULL mismatch
@@ -359,12 +409,73 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         const isCurrentlyNullable = dbCol.isNullable;
         if (shouldBeNotNull && isCurrentlyNullable && !config.isNullable) {
           const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET NOT NULL;`;
-          alterDef.columns.push({ column: snakeName, action: 'set_not_null', sql });
+          const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} DROP NOT NULL;`;
+          alterDef.columns.push({ column: snakeName, action: 'set_not_null', sql, reverseSql });
           result.statements.push(sql);
+          result.reverseStatements.unshift(reverseSql);
         } else if (!shouldBeNotNull && !isCurrentlyNullable && config.isNullable) {
           const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} DROP NOT NULL;`;
-          alterDef.columns.push({ column: snakeName, action: 'drop_not_null', sql });
+          const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET NOT NULL;`;
+          alterDef.columns.push({ column: snakeName, action: 'drop_not_null', sql, reverseSql });
           result.statements.push(sql);
+          result.reverseStatements.unshift(reverseSql);
+        }
+
+        // Check DEFAULT value mismatch
+        const isSerial = config.type === 'BIGSERIAL';
+        if (!isSerial) {
+          const schemaDefault = config.defaultValue ? normalizeDefault(config.defaultValue) : null;
+          const dbDefault = dbCol.columnDefault;
+
+          if (schemaDefault && !dbDefault) {
+            // Schema has default, DB doesn't
+            const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET DEFAULT ${schemaDefault};`;
+            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} DROP DEFAULT;`;
+            alterDef.columns.push({ column: snakeName, action: 'set_default', sql, reverseSql });
+            result.statements.push(sql);
+            result.reverseStatements.unshift(reverseSql);
+          } else if (!schemaDefault && dbDefault && !isSequenceDefault(dbDefault)) {
+            // DB has a non-sequence default, schema doesn't
+            const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} DROP DEFAULT;`;
+            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET DEFAULT ${dbDefault};`;
+            alterDef.columns.push({ column: snakeName, action: 'drop_default', sql, reverseSql });
+            result.statements.push(sql);
+            result.reverseStatements.unshift(reverseSql);
+          } else if (
+            schemaDefault &&
+            dbDefault &&
+            !isSequenceDefault(dbDefault) &&
+            !defaultsMatch(schemaDefault, dbDefault)
+          ) {
+            // Both have defaults but they differ
+            const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET DEFAULT ${schemaDefault};`;
+            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET DEFAULT ${dbDefault};`;
+            alterDef.columns.push({ column: snakeName, action: 'set_default', sql, reverseSql });
+            result.statements.push(sql);
+            result.reverseStatements.unshift(reverseSql);
+          }
+        }
+
+        // Check UNIQUE constraint mismatch (skip PKs — they're implicitly unique)
+        if (!config.isPrimaryKey) {
+          const hasDbUnique = snakeName in tableUniques;
+          const wantsUnique = config.isUnique === true;
+
+          if (wantsUnique && !hasDbUnique) {
+            const constraintName = `${tableName}_${snakeName}_key`;
+            const sql = `ALTER TABLE ${quoteIdent(tableName)} ADD CONSTRAINT ${quoteIdent(constraintName)} UNIQUE (${quoteIdent(snakeName)});`;
+            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} DROP CONSTRAINT ${quoteIdent(constraintName)};`;
+            alterDef.columns.push({ column: snakeName, action: 'add_unique', sql, reverseSql });
+            result.statements.push(sql);
+            result.reverseStatements.unshift(reverseSql);
+          } else if (!wantsUnique && hasDbUnique) {
+            const constraintName = tableUniques[snakeName]!;
+            const sql = `ALTER TABLE ${quoteIdent(tableName)} DROP CONSTRAINT ${quoteIdent(constraintName)};`;
+            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ADD CONSTRAINT ${quoteIdent(constraintName)} UNIQUE (${quoteIdent(snakeName)});`;
+            alterDef.columns.push({ column: snakeName, action: 'drop_unique', sql, reverseSql });
+            result.statements.push(sql);
+            result.reverseStatements.unshift(reverseSql);
+          }
         }
       }
 
@@ -373,7 +484,8 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         const hasField = Object.entries(tableDef.columns).some(([fieldName]) => camelToSnake(fieldName) === dbColName);
         if (!hasField) {
           const sql = `ALTER TABLE ${quoteIdent(tableName)} DROP COLUMN ${quoteIdent(dbColName)};`;
-          alterDef.columns.push({ column: dbColName, action: 'drop', sql });
+          const reverseSql = `-- Cannot auto-reverse DROP COLUMN for "${dbColName}" — add it back manually`;
+          alterDef.columns.push({ column: dbColName, action: 'drop', sql, reverseSql });
           // Don't auto-add drops to statements for safety — user must opt in
         }
       }
@@ -411,6 +523,59 @@ function schemaTypeToUdt(config: ColumnConfig): string | null {
     BYTEA: 'bytea',
   };
   return map[config.type] ?? null;
+}
+
+/**
+ * Reverse map: PostgreSQL UDT name → SQL type (for generating reverse ALTER TYPE).
+ */
+function udtToSqlType(udtName: string, maxLength: number | null): string {
+  const map: Record<string, string> = {
+    int8: 'BIGINT',
+    int4: 'INTEGER',
+    int2: 'SMALLINT',
+    text: 'TEXT',
+    varchar: maxLength ? `VARCHAR(${maxLength})` : 'VARCHAR',
+    bool: 'BOOLEAN',
+    timestamptz: 'TIMESTAMPTZ',
+    date: 'DATE',
+    jsonb: 'JSONB',
+    uuid: 'UUID',
+    float4: 'REAL',
+    float8: 'DOUBLE PRECISION',
+    numeric: 'NUMERIC',
+    bytea: 'BYTEA',
+  };
+  return map[udtName] ?? udtName.toUpperCase();
+}
+
+/**
+ * Normalize a database default value for comparison.
+ * Strips PostgreSQL type casts (e.g. 'free'::text → 'free') and wrapping parens.
+ */
+function normalizeDbDefault(dbDefault: string): string {
+  let val = dbDefault;
+  // Strip type casts: 'free'::text → 'free', 0::integer → 0
+  val = val.replace(/::[\w\s"]+(\[\])?$/g, '').trim();
+  // Unwrap parens added by PostgreSQL: ('free') → 'free'
+  while (val.startsWith('(') && val.endsWith(')')) {
+    val = val.slice(1, -1).trim();
+  }
+  return val;
+}
+
+/** Check if a DB default is a sequence default (auto-generated for serial columns). */
+function isSequenceDefault(dbDefault: string): boolean {
+  return dbDefault.includes('nextval(');
+}
+
+/**
+ * Compare a schema default against a database default, accounting for
+ * PostgreSQL's normalization of default values.
+ */
+function defaultsMatch(schemaDefault: string, dbDefault: string): boolean {
+  const a = schemaDefault.toLowerCase().trim();
+  const b = normalizeDbDefault(dbDefault).toLowerCase().trim();
+  return a === b;
 }
 
 // ---------------------------------------------------------------------------

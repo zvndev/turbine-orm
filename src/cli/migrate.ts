@@ -210,8 +210,13 @@ function isLegacyChecksum(hash: string): boolean {
 
 /**
  * Create a new migration file.
+ * If `autoContent` is provided, the UP/DOWN sections are pre-populated with the given SQL.
  */
-export function createMigration(migrationsDir: string, name: string): MigrationFile {
+export function createMigration(
+  migrationsDir: string,
+  name: string,
+  autoContent?: { up: string; down: string },
+): MigrationFile {
   mkdirSync(migrationsDir, { recursive: true });
 
   const now = new Date();
@@ -221,7 +226,20 @@ export function createMigration(migrationsDir: string, name: string): MigrationF
   const filename = `${ts}_${safeName}.sql`;
   const filePath = join(migrationsDir, filename);
 
-  const template = `-- Migration: ${name}
+  let template: string;
+  if (autoContent) {
+    template = `-- Migration: ${name} (auto-generated from schema diff)
+-- Created: ${now.toISOString()}
+-- Review this file before running: npx turbine migrate up
+
+-- UP
+${autoContent.up}
+
+-- DOWN
+${autoContent.down}
+`;
+  } else {
+    template = `-- Migration: ${name}
 -- Created: ${now.toISOString()}
 
 -- UP
@@ -230,6 +248,7 @@ export function createMigration(migrationsDir: string, name: string): MigrationF
 -- DOWN
 -- Write your rollback SQL here
 `;
+  }
 
   writeFileSync(filePath, template, 'utf-8');
 

@@ -267,76 +267,63 @@ describe('stress: deep nesting (up to depth 9)', () => {
 // ---------------------------------------------------------------------------
 
 describe('stress: circular relation detection', () => {
-  it('throws CircularRelationError for users -> posts -> author (back to users)', () => {
+  it('allows back-references: users -> posts -> author (back to users)', () => {
+    // Back-references are legitimate queries (Prisma supports the same pattern).
+    // e.g. "fetch users with their posts, and for each post include the author"
     const schema = buildCoreSchema();
     const q = makeQuery('users', schema);
 
-    assert.throws(
-      () => {
-        q.buildFindMany({
+    const deferred = q.buildFindMany({
+      with: {
+        posts: {
           with: {
-            posts: {
+            author: true,
+          },
+        },
+      },
+    });
+    assert.ok(deferred.sql.length > 0, 'should produce SQL');
+    assert.ok(deferred.sql.includes('"users"'), 'should reference users table');
+    assert.ok(deferred.sql.includes('"posts"'), 'should reference posts table');
+  });
+
+  it('allows back-references: posts -> comments -> post (back to posts)', () => {
+    const schema = buildCoreSchema();
+    const q = makeQuery('posts', schema);
+
+    const deferred = q.buildFindMany({
+      with: {
+        comments: {
+          with: {
+            post: true,
+          },
+        },
+      },
+    });
+    assert.ok(deferred.sql.length > 0, 'should produce SQL');
+    assert.ok(deferred.sql.includes('"comments"'), 'should reference comments table');
+  });
+
+  it('allows multi-level back-references: users -> posts -> comments -> author', () => {
+    const schema = buildCoreSchema();
+    const q = makeQuery('users', schema);
+
+    const deferred = q.buildFindMany({
+      with: {
+        posts: {
+          with: {
+            comments: {
               with: {
                 author: true,
               },
             },
           },
-        });
-      },
-      (err: unknown) => {
-        assert.ok(err instanceof CircularRelationError, 'should be CircularRelationError');
-        assert.ok(err.path.includes('users'), 'path should include users');
-        return true;
-      },
-    );
-  });
-
-  it('throws CircularRelationError for posts -> comments -> post (back to posts)', () => {
-    const schema = buildCoreSchema();
-    const q = makeQuery('posts', schema);
-
-    assert.throws(
-      () => {
-        q.buildFindMany({
-          with: {
-            comments: {
-              with: {
-                post: true,
-              },
-            },
-          },
-        });
-      },
-      (err: unknown) => {
-        assert.ok(err instanceof CircularRelationError, 'should be CircularRelationError');
-        assert.ok(err.path.includes('posts'), 'path should include posts');
-        return true;
-      },
-    );
-  });
-
-  it('CircularRelationError contains the full path of the cycle', () => {
-    const schema = buildCoreSchema();
-    const q = makeQuery('users', schema);
-
-    try {
-      q.buildFindMany({
-        with: {
-          posts: {
-            with: {
-              author: true,
-            },
-          },
         },
-      });
-      assert.fail('should have thrown');
-    } catch (err) {
-      assert.ok(err instanceof CircularRelationError);
-      // The path should be something like ['users', 'posts', 'users']
-      assert.ok(err.path.length >= 3, `path length should be >= 3, got ${err.path.length}`);
-      const lastEntry = err.path[err.path.length - 1];
-      assert.equal(lastEntry, 'users', 'last entry should be the repeated table');
-    }
+      },
+    });
+    assert.ok(deferred.sql.length > 0, 'should produce SQL');
+    // Should include subqueries for all three levels
+    assert.ok(deferred.sql.includes('json_build_object'), 'should have json_build_object');
   });
 });
 

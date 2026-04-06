@@ -14,26 +14,29 @@ Turbine uses Postgres `json_agg` to resolve nested relations in **a single SQL q
 
 ## Benchmarks
 
-Production results from Vercel Serverless hitting Neon Postgres (20 iterations, warm):
+Tested against **Prisma 7.6** (adapter-pg, relationJoins) and **Drizzle 0.45** (relational queries) on the same PostgreSQL database. 200 iterations, 20 warmup, Node v22.
 
-| Scenario | Turbine | Drizzle | Prisma |
+| Scenario | Turbine | Prisma 7 | Drizzle v2 |
 |---|---|---|---|
-| **Nested L3 (median)** | **5.3ms** | 6.5ms | 7.4ms |
-| Nested L3 (min) | **4.4ms** | 5.7ms | 6.0ms |
-| Nested L2 | **6.5ms** | 9.1ms | 10.2ms |
-| Simple select | 5.6ms | 7.1ms | 3.9ms |
+| **findMany — 100 rows (flat)** | **0.39 ms** | 0.58 ms | 0.44 ms |
+| **findMany — L2 nested (users + posts)** | **1.29 ms** | 1.84 ms | 1.30 ms |
+| **findMany — L3 nested (users → posts → comments)** | **0.50 ms** | 0.91 ms | 0.69 ms |
+| **findUnique by PK** | **0.08 ms** | 0.13 ms | 0.14 ms |
+| **findUnique — L3 nested** | **0.18 ms** | 0.32 ms | 0.34 ms |
+| **count** | **0.06 ms** | 0.10 ms | 0.08 ms |
 
-Local Docker results (50K iterations, HDR histograms):
-
-| Scenario | Turbine | Drizzle | Prisma |
+| Scenario | Turbine | Prisma 7 | Drizzle v2 |
 |---|---|---|---|
-| **L2 nested p50** | **201us** | 523us | 835us |
-| **L2 nested RPS (c=50)** | **24,041** | 6,360 | 3,784 |
-| L2 nested memory | 109MB | 117MB | 233MB |
+| findMany — flat | **1.00x** | 1.51x | 1.15x |
+| findMany — L2 nested | **1.00x** | 1.43x | 1.01x |
+| findMany — L3 nested | **1.00x** | 1.81x | 1.38x |
+| findUnique by PK | **1.00x** | 1.67x | 1.69x |
+| findUnique — L3 nested | **1.00x** | 1.81x | 1.93x |
+| count | **1.00x** | 1.70x | 1.38x |
 
-Turbine is 2.6x faster than Drizzle and 4.2x faster than Prisma on nested queries at p50. Throughput is 3.8x higher than Drizzle and 6.3x higher than Prisma.
+Turbine is fastest in every scenario. The advantage is largest on deep nesting (1.8x vs Prisma, up to 1.9x vs Drizzle) and single-record lookups (1.7x). All three ORMs now use single-query approaches for nested relations — Turbine's advantage comes from lower per-query overhead (no WASM runtime, no query plan compilation layer, minimal JS object allocation).
 
-> **Note:** These benchmarks were run against Prisma 5.x (which used separate queries per nesting level by default) and Drizzle v1. Prisma 7+ now uses LATERAL JOIN + `json_agg` by default, and Drizzle v2 uses a similar single-query approach. We plan to publish updated benchmarks against the latest versions. The architectural advantage (single SQL query with correlated subqueries) remains, but the gap may be smaller against modern versions.
+> Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench.ts`
 
 ## Quick Start
 
@@ -190,6 +193,22 @@ const users = await db.users.findMany({
 // Generates: WHERE email ILIKE '%alice%'
 ```
 
+### Streaming large result sets
+
+```typescript
+// Stream rows using PostgreSQL cursors — constant memory, no matter how many rows
+for await (const user of db.users.findManyStream({
+  where: { orgId: 1 },
+  batchSize: 500,       // internal FETCH batch size (default: 100)
+  orderBy: { id: 'asc' },
+  with: { posts: true }, // nested relations work too
+})) {
+  process.stdout.write(`${user.email}\n`);
+}
+```
+
+Uses `DECLARE CURSOR` under the hood — rows are fetched in batches on a dedicated connection, parsed individually, and yielded via `AsyncGenerator`. Safe to `break` early; the cursor and connection are cleaned up automatically.
+
 ### Query timeout
 
 ```typescript
@@ -263,17 +282,19 @@ Commands:
   init                  Initialize a Turbine project (creates config, dirs, templates)
   generate | pull       Introspect database and generate TypeScript types + client
   push                  Apply schema-builder definitions to database
-  migrate create <name> Create a new SQL migration file
-  migrate up            Apply pending migrations
-  migrate down          Rollback last migration
-  migrate status        Show applied/pending migrations
-  seed                  Run seed file
-  status                Show database schema summary
+  migrate create <name>        Create a new SQL migration file
+  migrate create <name> --auto Auto-generate from schema diff
+  migrate up                   Apply pending migrations
+  migrate down                 Rollback last migration
+  migrate status               Show applied/pending migrations
+  seed                         Run seed file
+  status                       Show database schema summary
 
 Options:
   --url, -u <url>       Postgres connection string
   --out, -o <dir>       Output directory (default: ./generated/turbine)
   --schema, -s <name>   Postgres schema (default: public)
+  --auto                Auto-generate migration from schema diff
   --dry-run             Show SQL without executing
   --verbose, -v         Detailed output
 ```
@@ -306,9 +327,12 @@ npx turbine generate         # Regenerate typed client
 ### Migration workflow
 
 ```bash
-# Create a new migration
+# Create a blank migration (write SQL manually)
 npx turbine migrate create add_users_table
-# -> Creates turbine/migrations/001_add_users_table.sql with UP/DOWN sections
+
+# Auto-generate migration from schema diff (compares defineSchema() vs live DB)
+npx turbine migrate create add_email_index --auto
+# -> Generates UP (ALTER/CREATE) and DOWN (reverse) SQL automatically
 
 # Apply all pending migrations
 npx turbine migrate up
@@ -358,7 +382,7 @@ SELECT u.*,
 FROM users u WHERE u.org_id = 1
 ```
 
-This resolves the entire 3-level object graph in one database round-trip. Prisma would send 3 queries. The performance difference scales with nesting depth and network latency.
+This resolves the entire 3-level object graph in one database round-trip. Prisma 7+ and Drizzle v2 also use single-query approaches (LATERAL JOINs), but Turbine's correlated subquery strategy has lower per-query overhead — see [Benchmarks](#benchmarks).
 
 ## Type Mapping
 
@@ -383,11 +407,11 @@ Turbine maps Postgres types to TypeScript:
 | **Nested relations** | 1 query (`json_agg`) | 1 query (LATERAL JOIN + json_agg, since v5.8) | 1 query (LATERAL JOINs) | Manual (`jsonArrayFrom`) |
 | **API style** | `findMany`, `with` | `findMany`, `include` | SQL-like + relational | SQL builder |
 | **Schema** | TypeScript | Custom DSL (`.prisma`) | TypeScript | Manual interfaces |
-| **Runtime deps** | 1 (`pg`) | WASM compiler + driver | 0 | 0 |
+| **Runtime deps** | 1 (`pg`) | WASM engine + adapter | 0 | 0 |
 | **Multi-DB** | PostgreSQL only | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
 | **Code generation** | `turbine generate` | `prisma generate` | Not needed | Not needed |
 
-Turbine is fastest on nested queries because it generates a single SQL statement using PostgreSQL-native `json_agg`. Prisma 7+ uses LATERAL JOIN + json_agg by default (similar single-query approach). Drizzle achieves single-query via LATERAL JOINs. Turbine uses correlated subqueries — a different SQL strategy with similar performance characteristics.
+All three ORMs now use single-query approaches for nested relations. Turbine uses correlated subqueries with `json_agg`, Prisma 7 uses LATERAL JOIN + `json_agg`, and Drizzle uses LATERAL JOINs. Turbine is 1.4–1.9x faster due to lower per-query overhead — no WASM runtime, no query plan compilation layer, and minimal JS object allocation. See [Benchmarks](#benchmarks) for full results.
 
 ## Limitations
 
@@ -398,6 +422,10 @@ Turbine is focused and opinionated. Here's what it doesn't do:
 - **No full-text search operators.** TSVECTOR/TSQUERY are not exposed in the query builder. Use `db.raw` for full-text queries.
 - **Large nested result sets.** `json_agg` builds the entire JSON array in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause to cap the aggregation size.
 - **No admin UI.** Turbine Studio is planned but not yet available.
+
+## Examples
+
+- **[Next.js](./examples/nextjs/)** — Server-rendered app with nested relations, streaming, and live code demos
 
 ## Requirements
 
