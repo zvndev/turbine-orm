@@ -23,7 +23,7 @@
  */
 
 import pg from 'pg';
-import { TimeoutError } from './errors.js';
+import { TimeoutError, wrapPgError } from './errors.js';
 import { executePipeline, type PipelineResults } from './pipeline.js';
 import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from './query.js';
 import type { SchemaMetadata } from './schema.js';
@@ -196,21 +196,35 @@ export class TransactionClient {
         sql += `$${i + 1}`;
       }
     });
-    const result = await this.client.query(sql, values);
-    return result.rows as T[];
+    try {
+      const result = await this.client.query(sql, values);
+      return result.rows as T[];
+    } catch (err) {
+      throw wrapPgError(err);
+    }
   }
 
   /**
    * Create a pool-like wrapper around the transaction client.
    * This allows QueryInterface to work with the transaction connection
    * without knowing it's in a transaction.
+   *
+   * pg driver errors thrown by queries are translated into typed Turbine
+   * errors via wrapPgError so transaction-scoped queries surface the same
+   * typed errors as pool-scoped queries.
    */
   private createTxPool(): pg.Pool {
     const client = this.client;
     // Return a minimal pool-compatible object that routes queries
     // through the transaction client
     return {
-      query: (text: string, values?: unknown[]) => client.query(text, values),
+      query: async (text: string, values?: unknown[]) => {
+        try {
+          return await client.query(text, values);
+        } catch (err) {
+          throw wrapPgError(err);
+        }
+      },
       connect: () => Promise.resolve(client),
     } as unknown as pg.Pool;
   }
@@ -386,8 +400,12 @@ export class TurbineClient {
       console.log(`[turbine] Raw SQL: ${sql.trim().substring(0, 120)}...`);
     }
 
-    const result = await this.pool.query(sql, values);
-    return result.rows as T[];
+    try {
+      const result = await this.pool.query(sql, values);
+      return result.rows as T[];
+    } catch (err) {
+      throw wrapPgError(err);
+    }
   }
 
   // -------------------------------------------------------------------------

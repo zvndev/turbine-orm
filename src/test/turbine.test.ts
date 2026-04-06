@@ -254,7 +254,10 @@ testFn('turbine integration tests', () => {
 
     it('throws when not found', async () => {
       const users = db.table<{ id: number }>('users');
-      await assert.rejects(() => users.findFirstOrThrow({ where: { id: 999999999 } }), /Record not found/);
+      await assert.rejects(
+        () => users.findFirstOrThrow({ where: { id: 999999999 } }),
+        /findFirstOrThrow.*users.*999999999/,
+      );
     });
   });
 
@@ -273,7 +276,10 @@ testFn('turbine integration tests', () => {
 
     it('throws when not found', async () => {
       const users = db.table<{ id: number }>('users');
-      await assert.rejects(() => users.findUniqueOrThrow({ where: { id: 999999999 } }), /Record not found/);
+      await assert.rejects(
+        () => users.findUniqueOrThrow({ where: { id: 999999999 } }),
+        /findUniqueOrThrow.*users.*999999999/,
+      );
     });
   });
 
@@ -2341,6 +2347,85 @@ testFn('turbine integration tests', () => {
       // Verify descending order
       for (let i = 1; i < user.posts.length; i++) {
         assert.ok(user.posts[i]!.id < user.posts[i - 1]!.id, 'posts should be ordered by id DESC');
+      }
+    });
+  });
+  // ---------------------------------------------------------------------------
+  // findManyStream — cursor-based streaming
+  // ---------------------------------------------------------------------------
+
+  describe('findManyStream', () => {
+    it('streams all rows matching a query', async () => {
+      const users = db.table<{ id: number; name: string }>('users');
+      const rows: { id: number; name: string }[] = [];
+      for await (const user of users.findManyStream({ where: { role: 'admin' }, limit: 20 })) {
+        rows.push(user);
+      }
+      assert.ok(rows.length > 0, 'should stream at least one admin');
+      assert.ok(rows.length <= 20, 'should respect limit');
+      for (const row of rows) {
+        assert.ok(typeof row.id === 'number');
+        assert.ok(typeof row.name === 'string');
+      }
+    });
+
+    it('respects batchSize and yields individual rows', async () => {
+      const users = db.table<{ id: number }>('users');
+      const rows: { id: number }[] = [];
+      // Use a very small batch size to ensure multiple FETCH rounds
+      for await (const user of users.findManyStream({ limit: 10, batchSize: 3 })) {
+        rows.push(user);
+      }
+      assert.equal(rows.length, 10, 'should yield exactly 10 rows');
+    });
+
+    it('handles early termination (break)', async () => {
+      const users = db.table<{ id: number }>('users');
+      let count = 0;
+      for await (const _user of users.findManyStream({ orderBy: { id: 'asc' }, batchSize: 5 })) {
+        count++;
+        if (count >= 3) break;
+      }
+      assert.equal(count, 3, 'should stop after break');
+      // Verify pool is not leaked — subsequent query should work
+      const check = await users.findMany({ limit: 1 });
+      assert.ok(check.length === 1, 'pool should still work after early termination');
+    });
+
+    it('streams with nested relations', async () => {
+      const users = db.table<{ id: number; posts: { id: number }[] }>('users');
+      const rows: { id: number; posts: { id: number }[] }[] = [];
+      for await (const user of users.findManyStream({
+        limit: 5,
+        batchSize: 2,
+        with: { posts: { limit: 3 } },
+      })) {
+        rows.push(user);
+      }
+      assert.equal(rows.length, 5);
+      for (const row of rows) {
+        assert.ok(Array.isArray(row.posts), 'should have posts array');
+      }
+    });
+
+    it('returns empty iterable for no-match query', async () => {
+      const users = db.table<{ id: number }>('users');
+      const rows: { id: number }[] = [];
+      for await (const user of users.findManyStream({ where: { id: -999 } })) {
+        rows.push(user);
+      }
+      assert.equal(rows.length, 0, 'should yield nothing for non-matching query');
+    });
+
+    it('preserves ordering', async () => {
+      const users = db.table<{ id: number }>('users');
+      const rows: { id: number }[] = [];
+      for await (const user of users.findManyStream({ orderBy: { id: 'desc' }, limit: 20, batchSize: 5 })) {
+        rows.push(user);
+      }
+      assert.equal(rows.length, 20);
+      for (let i = 1; i < rows.length; i++) {
+        assert.ok(rows[i]!.id < rows[i - 1]!.id, 'should be descending');
       }
     });
   });

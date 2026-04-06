@@ -9,15 +9,20 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  CheckConstraintError,
   CircularRelationError,
   ConnectionError,
+  ForeignKeyError,
   MigrationError,
   NotFoundError,
+  NotNullViolationError,
   RelationError,
   TimeoutError,
   TurbineError,
   TurbineErrorCode,
+  UniqueConstraintError,
   ValidationError,
+  wrapPgError,
 } from '../errors.js';
 
 // ---------------------------------------------------------------------------
@@ -51,12 +56,12 @@ describe('TurbineError', () => {
 // ---------------------------------------------------------------------------
 
 describe('NotFoundError', () => {
-  it('has default message "Record not found"', () => {
+  it('has default message "Record not found" (back-compat, no args)', () => {
     const err = new NotFoundError();
     assert.equal(err.message, 'Record not found');
   });
 
-  it('accepts a custom message', () => {
+  it('accepts a custom string message (back-compat)', () => {
     const err = new NotFoundError('User 42 not found');
     assert.equal(err.message, 'User 42 not found');
   });
@@ -67,9 +72,73 @@ describe('NotFoundError', () => {
     assert.equal(err.code, 'TURBINE_E001');
   });
 
-  it('is instanceof TurbineError', () => {
+  it('is instanceof TurbineError and Error', () => {
     const err = new NotFoundError();
+    assert.ok(err instanceof NotFoundError);
     assert.ok(err instanceof TurbineError);
+    assert.ok(err instanceof Error);
+  });
+
+  it('options object: builds Prisma-style message with table, where, operation', () => {
+    const err = new NotFoundError({
+      table: 'users',
+      where: { id: 1 },
+      operation: 'findUniqueOrThrow',
+    });
+    assert.ok(err.message.includes('users'), 'message should include table name');
+    assert.ok(err.message.includes('findUniqueOrThrow'), 'message should include operation');
+    assert.ok(err.message.includes('{"id":1}'), 'message should include JSON where');
+  });
+
+  it('options object: populates .table, .where, .operation fields', () => {
+    const err = new NotFoundError({
+      table: 'posts',
+      where: { slug: 'hello' },
+      operation: 'findFirstOrThrow',
+    });
+    assert.equal(err.table, 'posts');
+    assert.deepEqual(err.where, { slug: 'hello' });
+    assert.equal(err.operation, 'findFirstOrThrow');
+  });
+
+  it('options object: explicit message override wins', () => {
+    const err = new NotFoundError({
+      table: 'users',
+      where: { id: 1 },
+      operation: 'findUniqueOrThrow',
+      message: 'custom override',
+    });
+    assert.equal(err.message, 'custom override');
+    // fields are still populated
+    assert.equal(err.table, 'users');
+    assert.equal(err.operation, 'findUniqueOrThrow');
+  });
+
+  it('options object: preserves cause', () => {
+    const cause = new Error('underlying');
+    const err = new NotFoundError({ table: 'users', cause });
+    assert.equal(err.cause, cause);
+  });
+
+  it('options object: empty object falls back to generic message', () => {
+    const err = new NotFoundError({});
+    assert.equal(err.message, '[turbine] Record not found');
+    assert.equal(err.table, undefined);
+    assert.equal(err.where, undefined);
+    assert.equal(err.operation, undefined);
+  });
+
+  it('options object: table alone (no operation, no where)', () => {
+    const err = new NotFoundError({ table: 'users' });
+    assert.ok(err.message.includes('users'));
+    assert.equal(err.table, 'users');
+  });
+
+  it('back-compat string variant does not populate context fields', () => {
+    const err = new NotFoundError('legacy message');
+    assert.equal(err.table, undefined);
+    assert.equal(err.where, undefined);
+    assert.equal(err.operation, undefined);
   });
 });
 
@@ -211,6 +280,10 @@ describe('inheritance — all errors are instanceof Error and TurbineError', () 
     new RelationError('r'),
     new MigrationError('m'),
     new CircularRelationError(['a', 'b']),
+    new UniqueConstraintError(),
+    new ForeignKeyError(),
+    new NotNullViolationError(),
+    new CheckConstraintError(),
   ];
 
   for (const err of errors) {
@@ -257,7 +330,298 @@ describe('TurbineErrorCode', () => {
     assert.equal(TurbineErrorCode.CIRCULAR_RELATION, 'TURBINE_E007');
   });
 
-  it('has exactly 7 error codes', () => {
-    assert.equal(Object.keys(TurbineErrorCode).length, 7);
+  it('has UNIQUE_VIOLATION = TURBINE_E008', () => {
+    assert.equal(TurbineErrorCode.UNIQUE_VIOLATION, 'TURBINE_E008');
+  });
+
+  it('has FOREIGN_KEY_VIOLATION = TURBINE_E009', () => {
+    assert.equal(TurbineErrorCode.FOREIGN_KEY_VIOLATION, 'TURBINE_E009');
+  });
+
+  it('has NOT_NULL_VIOLATION = TURBINE_E010', () => {
+    assert.equal(TurbineErrorCode.NOT_NULL_VIOLATION, 'TURBINE_E010');
+  });
+
+  it('has CHECK_VIOLATION = TURBINE_E011', () => {
+    assert.equal(TurbineErrorCode.CHECK_VIOLATION, 'TURBINE_E011');
+  });
+
+  it('has exactly 11 error codes', () => {
+    assert.equal(Object.keys(TurbineErrorCode).length, 11);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// UniqueConstraintError
+// ---------------------------------------------------------------------------
+
+describe('UniqueConstraintError', () => {
+  it('has .code === TURBINE_E008', () => {
+    const err = new UniqueConstraintError();
+    assert.equal(err.code, TurbineErrorCode.UNIQUE_VIOLATION);
+    assert.equal(err.code, 'TURBINE_E008');
+  });
+
+  it('has name "UniqueConstraintError"', () => {
+    const err = new UniqueConstraintError();
+    assert.equal(err.name, 'UniqueConstraintError');
+  });
+
+  it('default message is generic when no fields are passed', () => {
+    const err = new UniqueConstraintError();
+    assert.equal(err.message, '[turbine] Unique constraint violation');
+  });
+
+  it('default message includes constraint name when passed', () => {
+    const err = new UniqueConstraintError({ constraint: 'users_email_key' });
+    assert.ok(err.message.includes('users_email_key'));
+  });
+
+  it('default message includes column list when passed', () => {
+    const err = new UniqueConstraintError({ columns: ['email'] });
+    assert.ok(err.message.includes('(email)'));
+  });
+
+  it('stores constraint, columns, and table fields', () => {
+    const err = new UniqueConstraintError({
+      constraint: 'users_email_key',
+      columns: ['email'],
+      table: 'users',
+    });
+    assert.equal(err.constraint, 'users_email_key');
+    assert.deepEqual(err.columns, ['email']);
+    assert.equal(err.table, 'users');
+  });
+
+  it('preserves cause', () => {
+    const cause = new Error('original pg error');
+    const err = new UniqueConstraintError({ cause });
+    assert.equal(err.cause, cause);
+  });
+
+  it('appends pg detail to default message when cause has detail', () => {
+    const cause = { detail: 'Key (email)=(foo@bar) already exists.' };
+    const err = new UniqueConstraintError({ cause });
+    assert.ok(err.message.includes('Key (email)=(foo@bar) already exists.'));
+  });
+
+  it('honors explicit message override', () => {
+    const err = new UniqueConstraintError({ message: 'custom message' });
+    assert.equal(err.message, 'custom message');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ForeignKeyError
+// ---------------------------------------------------------------------------
+
+describe('ForeignKeyError', () => {
+  it('has .code === TURBINE_E009', () => {
+    const err = new ForeignKeyError();
+    assert.equal(err.code, TurbineErrorCode.FOREIGN_KEY_VIOLATION);
+    assert.equal(err.code, 'TURBINE_E009');
+  });
+
+  it('has name "ForeignKeyError"', () => {
+    const err = new ForeignKeyError();
+    assert.equal(err.name, 'ForeignKeyError');
+  });
+
+  it('default message includes constraint name', () => {
+    const err = new ForeignKeyError({ constraint: 'users_org_id_fkey' });
+    assert.ok(err.message.includes('users_org_id_fkey'));
+  });
+
+  it('stores constraint and table fields', () => {
+    const err = new ForeignKeyError({ constraint: 'fk1', table: 'users' });
+    assert.equal(err.constraint, 'fk1');
+    assert.equal(err.table, 'users');
+  });
+
+  it('preserves cause', () => {
+    const cause = new Error('pg fk error');
+    const err = new ForeignKeyError({ cause });
+    assert.equal(err.cause, cause);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NotNullViolationError
+// ---------------------------------------------------------------------------
+
+describe('NotNullViolationError', () => {
+  it('has .code === TURBINE_E010', () => {
+    const err = new NotNullViolationError();
+    assert.equal(err.code, TurbineErrorCode.NOT_NULL_VIOLATION);
+    assert.equal(err.code, 'TURBINE_E010');
+  });
+
+  it('has name "NotNullViolationError"', () => {
+    const err = new NotNullViolationError();
+    assert.equal(err.name, 'NotNullViolationError');
+  });
+
+  it('default message includes column name', () => {
+    const err = new NotNullViolationError({ column: 'email' });
+    assert.ok(err.message.includes('"email"'));
+  });
+
+  it('stores column and table fields', () => {
+    const err = new NotNullViolationError({ column: 'email', table: 'users' });
+    assert.equal(err.column, 'email');
+    assert.equal(err.table, 'users');
+  });
+
+  it('preserves cause', () => {
+    const cause = new Error('pg not null error');
+    const err = new NotNullViolationError({ cause });
+    assert.equal(err.cause, cause);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CheckConstraintError
+// ---------------------------------------------------------------------------
+
+describe('CheckConstraintError', () => {
+  it('has .code === TURBINE_E011', () => {
+    const err = new CheckConstraintError();
+    assert.equal(err.code, TurbineErrorCode.CHECK_VIOLATION);
+    assert.equal(err.code, 'TURBINE_E011');
+  });
+
+  it('has name "CheckConstraintError"', () => {
+    const err = new CheckConstraintError();
+    assert.equal(err.name, 'CheckConstraintError');
+  });
+
+  it('default message includes constraint name', () => {
+    const err = new CheckConstraintError({ constraint: 'price_positive' });
+    assert.ok(err.message.includes('price_positive'));
+  });
+
+  it('stores constraint and table fields', () => {
+    const err = new CheckConstraintError({ constraint: 'c1', table: 't' });
+    assert.equal(err.constraint, 'c1');
+    assert.equal(err.table, 't');
+  });
+
+  it('preserves cause', () => {
+    const cause = new Error('pg check error');
+    const err = new CheckConstraintError({ cause });
+    assert.equal(err.cause, cause);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wrapPgError
+// ---------------------------------------------------------------------------
+
+describe('wrapPgError', () => {
+  it('returns input unchanged when error is null', () => {
+    assert.equal(wrapPgError(null), null);
+  });
+
+  it('returns input unchanged when error is undefined', () => {
+    assert.equal(wrapPgError(undefined), undefined);
+  });
+
+  it('returns input unchanged when error is a primitive', () => {
+    assert.equal(wrapPgError('oops'), 'oops');
+    assert.equal(wrapPgError(42), 42);
+  });
+
+  it('returns input unchanged when error has no code', () => {
+    const err = new Error('plain');
+    assert.equal(wrapPgError(err), err);
+  });
+
+  it('returns input unchanged for unknown sqlstate codes', () => {
+    const err = Object.assign(new Error('weird'), { code: '99999' });
+    assert.equal(wrapPgError(err), err);
+  });
+
+  it('wraps 23505 into UniqueConstraintError', () => {
+    const err = Object.assign(new Error('dup'), {
+      code: '23505',
+      constraint: 'users_email_key',
+      table: 'users',
+      detail: 'Key (email)=(foo@bar) already exists.',
+    });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof UniqueConstraintError);
+    if (wrapped instanceof UniqueConstraintError) {
+      assert.equal(wrapped.constraint, 'users_email_key');
+      assert.deepEqual(wrapped.columns, ['email']);
+      assert.equal(wrapped.table, 'users');
+      assert.equal(wrapped.cause, err);
+    }
+  });
+
+  it('wraps 23505 with multi-column detail correctly', () => {
+    const err = Object.assign(new Error('dup'), {
+      code: '23505',
+      constraint: 'composite_key',
+      detail: 'Key (col1, col2)=(v1, v2) already exists.',
+    });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof UniqueConstraintError);
+    if (wrapped instanceof UniqueConstraintError) {
+      assert.deepEqual(wrapped.columns, ['col1', 'col2']);
+    }
+  });
+
+  it('wraps 23505 with no detail (columns undefined)', () => {
+    const err = Object.assign(new Error('dup'), { code: '23505' });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof UniqueConstraintError);
+    if (wrapped instanceof UniqueConstraintError) {
+      assert.equal(wrapped.columns, undefined);
+    }
+  });
+
+  it('wraps 23503 into ForeignKeyError', () => {
+    const err = Object.assign(new Error('fk'), {
+      code: '23503',
+      constraint: 'users_org_id_fkey',
+      table: 'users',
+    });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof ForeignKeyError);
+    if (wrapped instanceof ForeignKeyError) {
+      assert.equal(wrapped.constraint, 'users_org_id_fkey');
+      assert.equal(wrapped.table, 'users');
+      assert.equal(wrapped.cause, err);
+    }
+  });
+
+  it('wraps 23502 into NotNullViolationError', () => {
+    const err = Object.assign(new Error('nn'), {
+      code: '23502',
+      column: 'email',
+      table: 'users',
+    });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof NotNullViolationError);
+    if (wrapped instanceof NotNullViolationError) {
+      assert.equal(wrapped.column, 'email');
+      assert.equal(wrapped.table, 'users');
+      assert.equal(wrapped.cause, err);
+    }
+  });
+
+  it('wraps 23514 into CheckConstraintError', () => {
+    const err = Object.assign(new Error('ck'), {
+      code: '23514',
+      constraint: 'price_positive',
+      table: 'products',
+    });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof CheckConstraintError);
+    if (wrapped instanceof CheckConstraintError) {
+      assert.equal(wrapped.constraint, 'price_positive');
+      assert.equal(wrapped.table, 'products');
+      assert.equal(wrapped.cause, err);
+    }
   });
 });

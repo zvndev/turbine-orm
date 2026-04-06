@@ -17,6 +17,7 @@
  */
 
 import type pg from 'pg';
+import { wrapPgError } from './errors.js';
 import type { DeferredQuery } from './query.js';
 
 // ---------------------------------------------------------------------------
@@ -63,7 +64,12 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     // Future: use actual Postgres pipeline protocol for true pipelining.
     const results: unknown[] = [];
     for (const q of queries) {
-      const raw = await client.query(q.sql, q.params);
+      let raw: pg.QueryResult;
+      try {
+        raw = await client.query(q.sql, q.params);
+      } catch (err) {
+        throw wrapPgError(err);
+      }
       results.push(q.transform(raw));
     }
 

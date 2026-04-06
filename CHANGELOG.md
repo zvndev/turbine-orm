@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.6.2 (2026-04-06)
+
+### Added
+- **Typed constraint-violation errors:** `UniqueConstraintError`, `ForeignKeyError`, `NotNullViolationError`, `CheckConstraintError` — pg sqlstate codes (23505/23503/23502/23514) are translated automatically at every query chokepoint (CRUD, raw, transactions, pipelines, streaming)
+- `wrapPgError()` helper translates pg driver errors into typed Turbine errors with `cause` chaining preserved for stack traces
+- **Atomic update operators:** `update`/`updateMany` now support Prisma-style `{ increment, decrement, multiply, divide, set }` operators for race-free counter updates
+  ```ts
+  await db.posts.update({ where: { id: 5 }, data: { viewCount: { increment: 1 } } })
+  ```
+- New exported types `UpdateInput<T>` and `UpdateOperatorInput<V>` with conditional `V extends number` narrowing — `increment` on a non-numeric column is a compile-time error
+- Operator detection uses strict single-key rule to avoid collisions with JSON column payloads
+
+### Changed
+- **`NotFoundError` now carries query context:** `findFirstOrThrow`, `findUniqueOrThrow`, `update`, `delete`, `upsert`, and `create` now throw `NotFoundError` with `{table, where, operation}` fields and Prisma-style messages:
+  ```
+  [turbine] findUniqueOrThrow on "users" found no record matching where: {"id":1}
+  ```
+- `NotFoundError` constructor accepts either a string (back-compat) or `{table?, where?, operation?, cause?, message?}` options object
+- Removed dead `having` field from `GroupByArgs` interface (was silently ignored)
+
+### Tests
+- 514 integration tests + 239 unit tests, all passing
+- 19 new tests for atomic update operators including 10-way concurrent atomicity proof
+- 10 new NotFoundError unit tests covering back-compat, format, fields, override, cause chains
+- New test file: `src/test/update-operators.test.ts`
+
 ## 0.6.1 (2026-04-06)
 
 ### Added

@@ -12,7 +12,14 @@
  */
 
 import type pg from 'pg';
-import { CircularRelationError, NotFoundError, RelationError, TimeoutError, ValidationError } from './errors.js';
+import {
+  CircularRelationError,
+  NotFoundError,
+  RelationError,
+  TimeoutError,
+  ValidationError,
+  wrapPgError,
+} from './errors.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { camelToSnake, snakeToCamel } from './schema.js';
 
@@ -168,6 +175,11 @@ export interface FindManyArgs<T> {
   timeout?: number;
 }
 
+export interface FindManyStreamArgs<T> extends FindManyArgs<T> {
+  /** Number of rows to fetch per internal FETCH batch (default: 100) */
+  batchSize?: number;
+}
+
 export interface CreateArgs<T> {
   data: Partial<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
@@ -182,16 +194,46 @@ export interface CreateManyArgs<T> {
   timeout?: number;
 }
 
+/**
+ * Atomic update operators for a field.
+ *
+ * `set` works on any type; `increment`, `decrement`, `multiply`, and `divide`
+ * are only valid on numeric fields. They generate SQL like
+ * `col = col + $n` (and the corresponding `-`, `*`, `/` variants) instead of
+ * plain absolute assignments, so they are safe against concurrent writers —
+ * the database performs the math atomically.
+ *
+ * @example
+ *   db.posts.update({ where: { id: 5 }, data: { viewCount: { increment: 1 } } });
+ */
+export type UpdateOperatorInput<V> =
+  | { set: V }
+  | (V extends number ? { increment: number } : never)
+  | (V extends number ? { decrement: number } : never)
+  | (V extends number ? { multiply: number } : never)
+  | (V extends number ? { divide: number } : never);
+
+/**
+ * Update data — each field can be a plain value or an atomic operator object.
+ * Back-compatible with `Partial<T>`: plain values still typecheck unchanged.
+ */
+export type UpdateInput<T> = {
+  [K in keyof T]?: T[K] | UpdateOperatorInput<T[K]>;
+};
+
+/** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
+const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
+
 export interface UpdateArgs<T> {
   where: WhereClause<T>;
-  data: Partial<T>;
+  data: UpdateInput<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
 }
 
 export interface UpdateManyArgs<T> {
   where: WhereClause<T>;
-  data: Partial<T>;
+  data: UpdateInput<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
 }
@@ -235,8 +277,6 @@ export interface GroupByArgs<T> {
   _min?: Partial<Record<keyof T & string, boolean>>;
   /** Maximum value of fields in each group */
   _max?: Partial<Record<keyof T & string, boolean>>;
-  /** Having clause for filtering groups */
-  having?: Record<string, unknown>;
   /** Order groups */
   orderBy?: Record<string, OrderDirection>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
@@ -450,10 +490,15 @@ export class QueryInterface<T extends object> {
   /**
    * Execute a pool.query with an optional timeout.
    * If timeout is set, races the query against a timer and rejects on expiry.
+   * pg driver errors are translated to typed Turbine errors via wrapPgError.
    */
   private async queryWithTimeout(sql: string, params: unknown[], timeout?: number): Promise<pg.QueryResult> {
     if (!timeout) {
-      return this.pool.query(sql, params);
+      try {
+        return await this.pool.query(sql, params);
+      } catch (err) {
+        throw wrapPgError(err);
+      }
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -461,6 +506,8 @@ export class QueryInterface<T extends object> {
     });
     try {
       return await Promise.race([this.pool.query(sql, params), timeoutPromise]);
+    } catch (err) {
+      throw wrapPgError(err);
     } finally {
       clearTimeout(timer);
     }
@@ -678,6 +725,66 @@ export class QueryInterface<T extends object> {
   }
 
   // -------------------------------------------------------------------------
+  // findManyStream — async iterable using PostgreSQL cursors
+  // -------------------------------------------------------------------------
+
+  /**
+   * Stream rows from a findMany query using PostgreSQL cursors.
+   * Returns an AsyncIterable that yields individual rows, fetching in batches internally.
+   *
+   * Uses DECLARE CURSOR within a dedicated transaction on a single pooled connection.
+   * The cursor is automatically closed and the connection released when iteration
+   * completes or is terminated early (e.g. `break` from `for await`).
+   *
+   * @example
+   * ```ts
+   * for await (const user of db.users.findManyStream({ where: { orgId: 1 }, batchSize: 500 })) {
+   *   process.stdout.write(`${user.email}\n`);
+   * }
+   * ```
+   */
+  async *findManyStream(args?: FindManyStreamArgs<T>): AsyncGenerator<T, void, undefined> {
+    const batchSize = args?.batchSize ?? 100;
+    const deferred = this.buildFindMany(args);
+    const hasRelations = !!args?.with;
+
+    // Acquire a dedicated connection — cursors require a single connection in a transaction
+    const client = await this.pool.connect();
+    const cursorName = `turbine_cursor_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const quotedCursor = quoteIdent(cursorName);
+
+    try {
+      await client.query('BEGIN');
+      await client.query(`DECLARE ${quotedCursor} NO SCROLL CURSOR FOR ${deferred.sql}`, deferred.params);
+
+      while (true) {
+        const batch = await client.query(`FETCH ${batchSize} FROM ${quotedCursor}`);
+        if (batch.rows.length === 0) break;
+
+        for (const row of batch.rows) {
+          yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as T;
+        }
+
+        if (batch.rows.length < batchSize) break;
+      }
+
+      await client.query(`CLOSE ${quotedCursor}`);
+      await client.query('COMMIT');
+    } catch (err) {
+      // Rollback on error (also closes cursor implicitly)
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // Connection may already be broken — ignore rollback error
+      }
+      // Wrap pg constraint errors so streaming surfaces typed errors like the rest of the API
+      throw wrapPgError(err);
+    } finally {
+      client.release();
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // findFirst — like findMany but returns a single row or null
   // -------------------------------------------------------------------------
 
@@ -726,7 +833,11 @@ export class QueryInterface<T extends object> {
       transform: (result) => {
         const row = inner.transform(result);
         if (row === null) {
-          throw new NotFoundError();
+          throw new NotFoundError({
+            table: this.table,
+            where: args?.where,
+            operation: 'findFirstOrThrow',
+          });
         }
         return row;
       },
@@ -755,7 +866,11 @@ export class QueryInterface<T extends object> {
       transform: (result) => {
         const row = inner.transform(result);
         if (row === null) {
-          throw new NotFoundError();
+          throw new NotFoundError({
+            table: this.table,
+            where: args.where,
+            operation: 'findUniqueOrThrow',
+          });
         }
         return row;
       },
@@ -788,7 +903,13 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        if (!row) throw new NotFoundError('[turbine] Expected a row but query returned none');
+        if (!row) {
+          throw new NotFoundError({
+            table: this.table,
+            operation: 'create',
+            message: `[turbine] create on "${this.table}" returned no row from RETURNING * — this should never happen.`,
+          });
+        }
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.create`,
@@ -867,12 +988,9 @@ export class QueryInterface<T extends object> {
   buildUpdate(args: UpdateArgs<T>): DeferredQuery<T> {
     const setEntries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
 
-    // Build SET params first
+    // Build SET params first (supports atomic operators: set/increment/decrement/multiply/divide)
     const params: unknown[] = [];
-    const setClauses = setEntries.map(([k, v]) => {
-      params.push(v);
-      return `${this.toSqlColumn(k)} = $${params.length}`;
-    });
+    const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, params));
 
     // Build WHERE using the shared params array (continues numbering after SET params)
     const whereClause = this.buildWhereClause(args.where as Record<string, unknown>, params);
@@ -885,7 +1003,13 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        if (!row) throw new NotFoundError('[turbine] Expected a row but query returned none');
+        if (!row) {
+          throw new NotFoundError({
+            table: this.table,
+            where: args.where,
+            operation: 'update',
+          });
+        }
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.update`,
@@ -913,7 +1037,13 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        if (!row) throw new NotFoundError('[turbine] Expected a row but query returned none');
+        if (!row) {
+          throw new NotFoundError({
+            table: this.table,
+            where: args.where,
+            operation: 'delete',
+          });
+        }
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.delete`,
@@ -967,7 +1097,14 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        if (!row) throw new NotFoundError('[turbine] Expected a row but query returned none');
+        if (!row) {
+          throw new NotFoundError({
+            table: this.table,
+            where: args.where,
+            operation: 'upsert',
+            message: `[turbine] upsert on "${this.table}" returned no row from RETURNING * — this should never happen.`,
+          });
+        }
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.upsert`,
@@ -989,12 +1126,9 @@ export class QueryInterface<T extends object> {
   buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
     const setEntries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
 
-    // Build SET params first
+    // Build SET params first (supports atomic operators: set/increment/decrement/multiply/divide)
     const params: unknown[] = [];
-    const setClauses = setEntries.map(([k, v]) => {
-      params.push(v);
-      return `${this.toSqlColumn(k)} = $${params.length}`;
-    });
+    const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, params));
 
     // Build WHERE using the shared params array (continues numbering after SET params)
     const whereClause = this.buildWhereClause(args.where as Record<string, unknown>, params);
@@ -1388,6 +1522,77 @@ export class QueryInterface<T extends object> {
   /** Convert camelCase field name to a double-quoted SQL identifier */
   private toSqlColumn(field: string): string {
     return quoteIdent(this.toColumn(field));
+  }
+
+  /**
+   * Build a single SET clause entry for update/updateMany.
+   *
+   * Supports plain values and atomic operator objects ({ set, increment,
+   * decrement, multiply, divide }). An operator object is detected ONLY when
+   * it has EXACTLY one key that is one of the 5 operator keys — this avoids
+   * misinterpreting JSON column values like `{ set: 'x' }` as operators
+   * (real operator objects always have exactly one key, and a plain JSON
+   * payload that happens to have a single `set` key is extremely unusual).
+   * Multi-key objects are always treated as plain (JSON) values.
+   *
+   * Returns the SQL fragment (e.g., `"view_count" = "view_count" + $3`) and
+   * pushes any required params onto the shared params array so that WHERE
+   * clause numbering continues correctly afterward.
+   */
+  private buildSetClause(key: string, value: unknown, params: unknown[]): string {
+    const col = this.toSqlColumn(key);
+
+    // Detect atomic-operator object: plain object (not null, not array, not
+    // Date, not Buffer) with EXACTLY one key matching an operator name.
+    if (
+      value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      !(value instanceof Date) &&
+      !Buffer.isBuffer(value)
+    ) {
+      const v = value as Record<string, unknown>;
+      const keys = Object.keys(v);
+      if (keys.length === 1 && UPDATE_OPERATOR_KEYS.has(keys[0]!)) {
+        const op = keys[0]!;
+        const opValue = v[op];
+
+        if (op === 'set') {
+          params.push(opValue);
+          return `${col} = $${params.length}`;
+        }
+
+        // Arithmetic operators: must be finite numbers
+        if (typeof opValue !== 'number' || !Number.isFinite(opValue)) {
+          throw new ValidationError(
+            `[turbine] update operator "${op}" on "${this.table}.${key}" requires a finite number, got ${typeof opValue}`,
+          );
+        }
+
+        if (op === 'increment') {
+          params.push(opValue);
+          return `${col} = ${col} + $${params.length}`;
+        }
+        if (op === 'decrement') {
+          params.push(opValue);
+          return `${col} = ${col} - $${params.length}`;
+        }
+        if (op === 'multiply') {
+          params.push(opValue);
+          return `${col} = ${col} * $${params.length}`;
+        }
+        if (op === 'divide') {
+          params.push(opValue);
+          return `${col} = ${col} / $${params.length}`;
+        }
+      }
+      // Fall through: multi-key objects or non-operator single-key objects
+      // are treated as plain values (e.g., JSONB column payloads).
+    }
+
+    // Plain value (including null, Date, Buffer, arrays, JSON objects)
+    params.push(value);
+    return `${col} = $${params.length}`;
   }
 
   /** Build WHERE clause from a where object (supports operators, NULL, OR) */
@@ -1920,12 +2125,10 @@ export class QueryInterface<T extends object> {
 
     const targetTable = relDef.to;
 
-    // Detect actual cycles (same table appearing twice in the nesting path)
-    if (currentPath.includes(targetTable)) {
-      throw new CircularRelationError([...currentPath, targetTable]);
-    }
-
-    // Hard depth cap as a safety net for non-circular but extremely deep nesting
+    // Hard depth cap — the `with` clause is a finite JSON structure so users can't
+    // create true infinite recursion, but extremely deep nesting (10+ levels) produces
+    // unmanageably large SQL. Back-references (e.g. posts → user → posts) are allowed
+    // since they are legitimate queries (Prisma supports the same pattern).
     if (currentDepth >= 10) {
       throw new CircularRelationError([...currentPath, targetTable]);
     }
@@ -1957,8 +2160,14 @@ export class QueryInterface<T extends object> {
         `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${alias}.${quoteIdent(col)}`,
     );
 
-    // Nested relations?
-    if (spec !== true && spec.with) {
+    // Determine if this hasMany will take the wrapped subquery path (LIMIT or ORDER BY).
+    // When wrapping, nested relations are built in the wrapped path referencing innerAlias,
+    // so we must NOT build them here (they would push orphaned params).
+    const willWrap =
+      relDef.type === 'hasMany' && spec !== true && (spec.limit !== undefined || spec.orderBy !== undefined);
+
+    // Nested relations — only in the non-wrapped path (wrapped path builds them separately)
+    if (!willWrap && spec !== true && spec.with) {
       for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) {
@@ -2047,23 +2256,27 @@ export class QueryInterface<T extends object> {
           (col) =>
             `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${innerAlias}.${quoteIdent(col)}`,
         );
-        // Re-add nested relation subqueries referencing innerAlias
+        // Build nested relation subqueries referencing innerAlias
         if (spec !== true && spec.with) {
-          for (const [nestedRelName] of Object.entries(spec.with)) {
+          for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
             const nestedRelDef = targetMeta.relations[nestedRelName];
-            if (nestedRelDef) {
-              const nestedSub = this.buildRelationSubquery(
-                nestedRelDef,
-                spec.with[nestedRelName]!,
-                params,
-                innerAlias,
-                aliasCounter,
-                currentDepth + 1,
-                [...currentPath, relDef.name],
+            if (!nestedRelDef) {
+              throw new RelationError(
+                `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+                  `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
               );
-              const fallback = nestedRelDef.type === 'hasMany' ? "'[]'::json" : 'NULL';
-              innerJsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSub}), ${fallback})`);
             }
+            const nestedSub = this.buildRelationSubquery(
+              nestedRelDef,
+              nestedSpec,
+              params,
+              innerAlias,
+              aliasCounter,
+              currentDepth + 1,
+              [...currentPath, relDef.name],
+            );
+            const fallback = nestedRelDef.type === 'hasMany' ? "'[]'::json" : 'NULL';
+            innerJsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSub}), ${fallback})`);
           }
         }
         const innerJsonObj = `json_build_object(${innerJsonPairs.join(', ')})`;

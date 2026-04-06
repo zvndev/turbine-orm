@@ -45,15 +45,20 @@ export {
 } from './client.js';
 // Error types
 export {
+  CheckConstraintError,
   CircularRelationError,
   ConnectionError,
+  ForeignKeyError,
   MigrationError,
   NotFoundError,
+  NotNullViolationError,
   RelationError,
   TimeoutError,
   TurbineError,
   TurbineErrorCode,
+  UniqueConstraintError,
   ValidationError,
+  wrapPgError,
 } from './errors.js';
 // Code generation
 export { type GenerateOptions, generate } from './generate.js';
@@ -73,6 +78,7 @@ export {
   type DeleteArgs,
   type DeleteManyArgs,
   type FindManyArgs,
+  type FindManyStreamArgs,
   type FindUniqueArgs,
   type GroupByArgs,
   type JsonFilter,
@@ -80,7 +86,9 @@ export {
   QueryInterface,
   type RelationFilter,
   type UpdateArgs,
+  type UpdateInput,
   type UpdateManyArgs,
+  type UpdateOperatorInput,
   type UpsertArgs,
   type WithClause,
   type WithOptions,
