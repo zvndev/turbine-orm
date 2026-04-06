@@ -1,6 +1,6 @@
 # turbine-orm
 
-The performance-first Postgres ORM. Prisma-compatible API, 2-3x faster nested queries, zero runtime overhead beyond `pg`.
+The performance-first Postgres ORM. Prisma-inspired API, 2-3x faster nested queries, zero runtime overhead beyond `pg`.
 
 ```
 npm install turbine-orm
@@ -32,6 +32,8 @@ Local Docker results (50K iterations, HDR histograms):
 | L2 nested memory | 109MB | 117MB | 233MB |
 
 Turbine is 2.6x faster than Drizzle and 4.2x faster than Prisma on nested queries at p50. Throughput is 3.8x higher than Drizzle and 6.3x higher than Prisma.
+
+> **Note:** These benchmarks were run against Prisma 5.x (which used separate queries per nesting level by default) and Drizzle v1. Prisma 7+ now uses LATERAL JOIN + `json_agg` by default, and Drizzle v2 uses a similar single-query approach. We plan to publish updated benchmarks against the latest versions. The architectural advantage (single SQL query with correlated subqueries) remains, but the gap may be smaller against modern versions.
 
 ## Quick Start
 
@@ -227,6 +229,31 @@ db.$use(async (params, next) => {
 });
 ```
 
+### Error handling
+
+Turbine throws typed errors you can catch programmatically:
+
+```typescript
+import { NotFoundError, ValidationError, TimeoutError } from 'turbine-orm';
+
+try {
+  const user = await db.users.findUniqueOrThrow({ where: { id: 999 } });
+} catch (err) {
+  if (err instanceof NotFoundError) {
+    // err.code === 'TURBINE_E001'
+    console.log('User not found');
+  } else if (err instanceof TimeoutError) {
+    // err.code === 'TURBINE_E002'
+    console.log('Query timed out');
+  } else if (err instanceof ValidationError) {
+    // err.code === 'TURBINE_E003'
+    console.log('Invalid query:', err.message);
+  }
+}
+```
+
+Error codes: `TURBINE_E001` (NotFound), `TURBINE_E002` (Timeout), `TURBINE_E003` (Validation), `TURBINE_E004` (Connection), `TURBINE_E005` (Relation), `TURBINE_E006` (Migration), `TURBINE_E007` (CircularRelation).
+
 ## CLI
 
 ```
@@ -353,14 +380,14 @@ Turbine maps Postgres types to TypeScript:
 
 | | **Turbine** | **Prisma** | **Drizzle** | **Kysely** |
 |---|---|---|---|---|
-| **Nested relations** | 1 query (`json_agg`) | N+1 queries (default) | 1 query (LATERAL JOINs) | Manual (`jsonArrayFrom`) |
+| **Nested relations** | 1 query (`json_agg`) | 1 query (LATERAL JOIN + json_agg, since v5.8) | 1 query (LATERAL JOINs) | Manual (`jsonArrayFrom`) |
 | **API style** | `findMany`, `with` | `findMany`, `include` | SQL-like + relational | SQL builder |
 | **Schema** | TypeScript | Custom DSL (`.prisma`) | TypeScript | Manual interfaces |
 | **Runtime deps** | 1 (`pg`) | WASM compiler + driver | 0 | 0 |
 | **Multi-DB** | PostgreSQL only | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
 | **Code generation** | `turbine generate` | `prisma generate` | Not needed | Not needed |
 
-Turbine is fastest on nested queries because it generates a single SQL statement using PostgreSQL-native `json_agg`. Drizzle achieves single-query via LATERAL JOINs (competitive, different tradeoffs). Prisma defaults to separate queries per nesting level.
+Turbine is fastest on nested queries because it generates a single SQL statement using PostgreSQL-native `json_agg`. Prisma 7+ uses LATERAL JOIN + json_agg by default (similar single-query approach). Drizzle achieves single-query via LATERAL JOINs. Turbine uses correlated subqueries — a different SQL strategy with similar performance characteristics.
 
 ## Limitations
 
