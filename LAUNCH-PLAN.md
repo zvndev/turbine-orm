@@ -3,7 +3,7 @@
 ## Assets
 - npm: `turbine-orm@0.4.0`
 - GitHub: github.com/zvndev/turbine-orm (public)
-- Docs: turbine.batadata.com
+- Docs: turbineorm.dev
 - Demo: turbine-demo-blog.fly.dev
 - Debug endpoint: turbine-demo-blog.fly.dev/api/debug (shows generated SQL)
 
@@ -18,7 +18,7 @@ Title: `Show HN: Turbine ORM – TypeScript Postgres ORM that resolves nested re
 >
 > - npm: `npm install turbine-orm`
 > - GitHub: github.com/zvndev/turbine-orm
-> - Docs: turbine.batadata.com
+> - Docs: turbineorm.dev
 > - Live demo: turbine-demo-blog.fly.dev/api/debug (shows the actual SQL)
 >
 > 180 tests, Prisma-compatible API, MIT license. Looking for feedback on the DX and what's missing.

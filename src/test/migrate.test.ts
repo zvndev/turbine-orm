@@ -8,19 +8,19 @@
  * Run: node --test --experimental-strip-types src/test/migrate.test.ts
  */
 
-import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { after, before, describe, it } from 'node:test';
 import {
+  createMigration,
+  formatTimestamp,
+  getPendingMigrations,
+  listMigrationFiles,
   parseMigrationContent,
   parseMigrationFilename,
   sanitizeName,
-  formatTimestamp,
-  listMigrationFiles,
-  createMigration,
-  getPendingMigrations,
 } from '../cli/migrate.js';
 
 // ---------------------------------------------------------------------------
@@ -366,11 +366,7 @@ describe('getPendingMigrations', () => {
   });
 
   it('returns empty when all are applied', () => {
-    const applied = [
-      '20260326100000_init',
-      '20260327140500_create_users',
-      '20260327140600_create_posts',
-    ];
+    const applied = ['20260326100000_init', '20260327140500_create_users', '20260327140600_create_posts'];
     const pending = getPendingMigrations(testDir, applied);
     assert.equal(pending.length, 0);
   });

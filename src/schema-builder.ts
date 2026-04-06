@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Schema Builder
+ * turbine-orm — Schema Builder
  *
  * TypeScript-first schema definition API. Define your database schema
  * as plain objects — no method chaining, no DSL. Fully type-checked,
@@ -7,7 +7,7 @@
  *
  * @example
  * ```ts
- * import { defineSchema } from '@batadata/turbine';
+ * import { defineSchema } from 'turbine-orm';
  *
  * export default defineSchema({
  *   users: {
@@ -23,29 +23,27 @@
  * ```
  */
 
-import { camelToSnake } from './schema.js';
-
 // ---------------------------------------------------------------------------
 // Column types — lowercase shorthand mapped to Postgres types
 // ---------------------------------------------------------------------------
 
 /** Shorthand type names that map to Postgres column types */
 export type ColumnTypeName =
-  | 'serial'     // BIGSERIAL
-  | 'bigint'     // BIGINT
-  | 'integer'    // INTEGER
-  | 'smallint'   // SMALLINT
-  | 'text'       // TEXT
-  | 'varchar'    // VARCHAR(n)
-  | 'boolean'    // BOOLEAN
-  | 'timestamp'  // TIMESTAMPTZ
-  | 'date'       // DATE
-  | 'json'       // JSONB
-  | 'uuid'       // UUID
-  | 'real'       // REAL
-  | 'double'     // DOUBLE PRECISION
-  | 'numeric'    // NUMERIC
-  | 'bytea';     // BYTEA
+  | 'serial' // BIGSERIAL
+  | 'bigint' // BIGINT
+  | 'integer' // INTEGER
+  | 'smallint' // SMALLINT
+  | 'text' // TEXT
+  | 'varchar' // VARCHAR(n)
+  | 'boolean' // BOOLEAN
+  | 'timestamp' // TIMESTAMPTZ
+  | 'date' // DATE
+  | 'json' // JSONB
+  | 'uuid' // UUID
+  | 'real' // REAL
+  | 'double' // DOUBLE PRECISION
+  | 'numeric' // NUMERIC
+  | 'bytea'; // BYTEA
 
 /** Maps shorthand names to actual Postgres type strings */
 const TYPE_MAP: Record<ColumnTypeName, string> = {
@@ -221,36 +219,116 @@ export class ColumnBuilder {
     };
   }
 
-  serial(): this { this._config.type = 'BIGSERIAL'; return this; }
-  bigint(): this { this._config.type = 'BIGINT'; return this; }
-  integer(): this { this._config.type = 'INTEGER'; return this; }
-  smallint(): this { this._config.type = 'SMALLINT'; return this; }
-  text(): this { this._config.type = 'TEXT'; return this; }
-  varchar(length: number): this { this._config.type = 'VARCHAR'; this._config.maxLength = length; return this; }
-  boolean(): this { this._config.type = 'BOOLEAN'; return this; }
-  timestamp(): this { this._config.type = 'TIMESTAMPTZ'; return this; }
-  date(): this { this._config.type = 'DATE'; return this; }
-  json(): this { this._config.type = 'JSONB'; return this; }
-  uuid(): this { this._config.type = 'UUID'; return this; }
-  real(): this { this._config.type = 'REAL'; return this; }
-  doublePrecision(): this { this._config.type = 'DOUBLE PRECISION'; return this; }
-  numeric(): this { this._config.type = 'NUMERIC'; return this; }
-  bytea(): this { this._config.type = 'BYTEA'; return this; }
+  serial(): this {
+    this._config.type = 'BIGSERIAL';
+    return this;
+  }
+  bigint(): this {
+    this._config.type = 'BIGINT';
+    return this;
+  }
+  integer(): this {
+    this._config.type = 'INTEGER';
+    return this;
+  }
+  smallint(): this {
+    this._config.type = 'SMALLINT';
+    return this;
+  }
+  text(): this {
+    this._config.type = 'TEXT';
+    return this;
+  }
+  varchar(length: number): this {
+    this._config.type = 'VARCHAR';
+    this._config.maxLength = length;
+    return this;
+  }
+  boolean(): this {
+    this._config.type = 'BOOLEAN';
+    return this;
+  }
+  timestamp(): this {
+    this._config.type = 'TIMESTAMPTZ';
+    return this;
+  }
+  date(): this {
+    this._config.type = 'DATE';
+    return this;
+  }
+  json(): this {
+    this._config.type = 'JSONB';
+    return this;
+  }
+  uuid(): this {
+    this._config.type = 'UUID';
+    return this;
+  }
+  real(): this {
+    this._config.type = 'REAL';
+    return this;
+  }
+  doublePrecision(): this {
+    this._config.type = 'DOUBLE PRECISION';
+    return this;
+  }
+  numeric(): this {
+    this._config.type = 'NUMERIC';
+    return this;
+  }
+  bytea(): this {
+    this._config.type = 'BYTEA';
+    return this;
+  }
 
-  primaryKey(): this { this._config.isPrimaryKey = true; return this; }
-  notNull(): this { this._config.isNotNull = true; return this; }
-  nullable(): this { this._config.isNullable = true; return this; }
-  unique(): this { this._config.isUnique = true; return this; }
-  default(val: string): this { this._config.defaultValue = val; return this; }
-  references(target: string): this { this._config.referencesTarget = target; return this; }
+  primaryKey(): this {
+    this._config.isPrimaryKey = true;
+    return this;
+  }
+  notNull(): this {
+    this._config.isNotNull = true;
+    return this;
+  }
+  nullable(): this {
+    this._config.isNullable = true;
+    return this;
+  }
+  unique(): this {
+    this._config.isUnique = true;
+    return this;
+  }
+  default(val: string): this {
+    this._config.defaultValue = val;
+    return this;
+  }
+  references(target: string): this {
+    this._config.referencesTarget = target;
+    return this;
+  }
 
-  build(): ColumnConfig { return { ...this._config }; }
+  build(): ColumnConfig {
+    return { ...this._config };
+  }
 }
 
 /** @deprecated Use defineSchema() with plain objects instead */
 type ColumnProxy = {
-  [K in 'serial' | 'bigint' | 'integer' | 'smallint' | 'text' | 'boolean' | 'timestamp' | 'date' | 'json' | 'uuid' | 'real' | 'doublePrecision' | 'numeric' | 'bytea']: () => ColumnBuilder;
-} & { varchar: (length: number) => ColumnBuilder; };
+  [K in
+    | 'serial'
+    | 'bigint'
+    | 'integer'
+    | 'smallint'
+    | 'text'
+    | 'boolean'
+    | 'timestamp'
+    | 'date'
+    | 'json'
+    | 'uuid'
+    | 'real'
+    | 'doublePrecision'
+    | 'numeric'
+    | 'bytea']: () => ColumnBuilder;
+} & { varchar: (length: number) => ColumnBuilder };
 
 /** @deprecated Use defineSchema() with plain objects instead */
 export const column: ColumnProxy = new Proxy({} as ColumnProxy, {

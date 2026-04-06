@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — TurbineClient
+ * turbine-orm — TurbineClient
  *
  * The main entry point for the Turbine TypeScript SDK.
  * Manages connection pooling and provides typed table accessors.
@@ -16,15 +16,16 @@
  * const user = await db.users.findUnique({ where: { id: 1 } });
  *
  * // With base client (dynamic):
- * import { TurbineClient } from '@batadata/turbine';
+ * import { TurbineClient } from 'turbine-orm';
  * const db = new TurbineClient({ connectionString: '...' }, schema);
  * const users = db.table<User>('users');
  * ```
  */
 
 import pg from 'pg';
-import { QueryInterface, type DeferredQuery, type QueryInterfaceOptions } from './query.js';
+import { TimeoutError } from './errors.js';
 import { executePipeline, type PipelineResults } from './pipeline.js';
+import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from './query.js';
 import type { SchemaMetadata } from './schema.js';
 
 /**
@@ -346,13 +347,9 @@ export class TurbineClient {
    *
    * Pass the result of any `.build*()` method on a table accessor.
    */
-  async pipeline<T extends readonly DeferredQuery<unknown>[]>(
-    ...queries: T
-  ): Promise<PipelineResults<T>> {
+  async pipeline<T extends readonly DeferredQuery<unknown>[]>(...queries: T): Promise<PipelineResults<T>> {
     if (this.logging) {
-      console.log(
-        `[turbine] Pipeline: ${queries.length} queries — ${queries.map((q) => q.tag).join(', ')}`,
-      );
+      console.log(`[turbine] Pipeline: ${queries.length} queries — ${queries.map((q) => q.tag).join(', ')}`);
     }
     return executePipeline(this.pool, queries);
   }
@@ -446,10 +443,7 @@ export class TurbineClient {
    * }, { timeout: 5000, isolationLevel: 'Serializable' });
    * ```
    */
-  async $transaction<R>(
-    fn: (tx: TransactionClient) => Promise<R>,
-    options?: TransactionOptions,
-  ): Promise<R> {
+  async $transaction<R>(fn: (tx: TransactionClient) => Promise<R>, options?: TransactionOptions): Promise<R> {
     const client = await this.pool.connect();
     const timeout = options?.timeout;
 
@@ -483,7 +477,7 @@ export class TurbineClient {
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeoutPromise = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
-            reject(new Error(`[turbine] Transaction timed out after ${timeout}ms`));
+            reject(new TimeoutError(timeout, 'Transaction'));
           }, timeout);
         });
         try {

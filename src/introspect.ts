@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Schema introspection
+ * turbine-orm — Schema introspection
  *
  * Connects to a live Postgres database, reads information_schema + pg_catalog,
  * and produces a SchemaMetadata object describing every table, column, relation,
@@ -10,16 +10,16 @@
 
 import pg from 'pg';
 import {
-  type SchemaMetadata,
-  type TableMetadata,
   type ColumnMetadata,
-  type RelationDef,
   type IndexMetadata,
-  pgTypeToTs,
   isDateType,
   pgArrayType,
-  snakeToCamel,
+  pgTypeToTs,
+  type RelationDef,
+  type SchemaMetadata,
   singularize,
+  snakeToCamel,
+  type TableMetadata,
 } from './schema.js';
 
 // ---------------------------------------------------------------------------
@@ -137,15 +137,7 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
 
   try {
     // Run all information_schema queries in parallel
-    const [
-      tablesResult,
-      columnsResult,
-      pkResult,
-      fkResult,
-      uniqueResult,
-      indexResult,
-      enumResult,
-    ] = await Promise.all([
+    const [tablesResult, columnsResult, pkResult, fkResult, uniqueResult, indexResult, enumResult] = await Promise.all([
       pool.query(SQL_TABLES, [schema]),
       pool.query(SQL_COLUMNS, [schema]),
       pool.query(SQL_PRIMARY_KEYS, [schema]),
@@ -220,9 +212,7 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
       const isUnique = (row.indexdef as string).includes('UNIQUE');
       // Extract column names from indexdef (e.g. "CREATE INDEX idx ON tbl USING btree (col1, col2)")
       const colMatch = (row.indexdef as string).match(/\((.+)\)/);
-      const columns = colMatch
-        ? colMatch[1]!.split(',').map((c) => c.trim().replace(/ (ASC|DESC)/i, ''))
-        : [];
+      const columns = colMatch ? colMatch[1]!.split(',').map((c) => c.trim().replace(/ (ASC|DESC)/i, '')) : [];
 
       indexesByTable.get(row.tablename)!.push({
         name: row.indexname,

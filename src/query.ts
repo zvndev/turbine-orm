@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Query builder
+ * turbine-orm — Query builder
  *
  * Each table accessor (db.users, db.posts, etc.) returns a QueryInterface<T>
  * that builds parameterized SQL and executes it through the connection pool.
@@ -12,12 +12,9 @@
  */
 
 import type pg from 'pg';
-import type {
-  SchemaMetadata,
-  TableMetadata,
-  RelationDef,
-} from './schema.js';
-import { snakeToCamel, camelToSnake } from './schema.js';
+import { CircularRelationError, NotFoundError, RelationError, TimeoutError, ValidationError } from './errors.js';
+import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
+import { camelToSnake, snakeToCamel } from './schema.js';
 
 // ---------------------------------------------------------------------------
 // Identifier quoting — prevents SQL injection via table/column names
@@ -76,13 +73,28 @@ export interface WhereOperator<V = unknown> {
 
 /** Known operator keys — used to detect operator objects vs plain values */
 const OPERATOR_KEYS = new Set<string>([
-  'gt', 'gte', 'lt', 'lte', 'not', 'in', 'notIn',
-  'contains', 'startsWith', 'endsWith', 'mode',
+  'gt',
+  'gte',
+  'lt',
+  'lte',
+  'not',
+  'in',
+  'notIn',
+  'contains',
+  'startsWith',
+  'endsWith',
+  'mode',
 ]);
 
 /** Check if a value is a where operator object (has at least one known operator key) */
 function isWhereOperator(value: unknown): value is WhereOperator {
-  if (value === null || value === undefined || typeof value !== 'object' || Array.isArray(value) || value instanceof Date) {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    value instanceof Date
+  ) {
     return false;
   }
   const keys = Object.keys(value);
@@ -281,7 +293,13 @@ const JSONB_OPERATOR_KEYS = new Set<string>(['path', 'equals', 'contains', 'hasK
 
 /** Check if a value is a JSONB filter object */
 function isJsonFilter(value: unknown): value is JsonFilter {
-  if (value === null || value === undefined || typeof value !== 'object' || Array.isArray(value) || value instanceof Date) {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    value instanceof Date
+  ) {
     return false;
   }
   const keys = Object.keys(value);
@@ -305,7 +323,13 @@ const ARRAY_OPERATOR_KEYS = new Set<string>(['has', 'hasEvery', 'hasSome', 'isEm
 
 /** Check if a value is an Array filter object */
 function isArrayFilter(value: unknown): value is ArrayFilter {
-  if (value === null || value === undefined || typeof value !== 'object' || Array.isArray(value) || value instanceof Date) {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    value instanceof Date
+  ) {
     return false;
   }
   const keys = Object.keys(value);
@@ -346,7 +370,9 @@ class LRUCache<K, V> {
     this.cache.set(key, value);
   }
 
-  get size() { return this.cache.size; }
+  get size() {
+    return this.cache.size;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +429,7 @@ export class QueryInterface<T extends object> {
   ) {
     const meta = schema.tables[table];
     if (!meta) {
-      throw new Error(
+      throw new ValidationError(
         `[turbine] Unknown table "${table}". Available: ${Object.keys(schema.tables).join(', ')}`,
       );
     }
@@ -431,10 +457,7 @@ export class QueryInterface<T extends object> {
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {
-      timer = setTimeout(
-        () => reject(new Error(`[turbine] Query timed out after ${timeout}ms`)),
-        timeout,
-      );
+      timer = setTimeout(() => reject(new TimeoutError(timeout)), timeout);
     });
     try {
       return await Promise.race([this.pool.query(sql, params), timeoutPromise]);
@@ -477,17 +500,6 @@ export class QueryInterface<T extends object> {
     return next(params) as Promise<R>;
   }
 
-  /**
-   * Generate a cache key for a query shape.
-   * Same where-keys + same with-clause = same SQL template.
-   */
-  private cacheKey(op: string, whereKeys: string[], withClause?: WithClause, extra?: string): string {
-    let key = `${op}:${whereKeys.sort().join(',')}`;
-    if (withClause) key += `:w=${JSON.stringify(Object.keys(withClause).sort())}`;
-    if (extra) key += `:${extra}`;
-    return key;
-  }
-
   // -------------------------------------------------------------------------
   // findUnique
   // -------------------------------------------------------------------------
@@ -506,10 +518,12 @@ export class QueryInterface<T extends object> {
 
     // Check if all where values are simple (plain equality, no operators/null/OR)
     const whereKeys = Object.keys(whereObj).filter((k) => whereObj[k] !== undefined);
-    const isSimpleWhere = !whereObj['OR'] && whereKeys.every((k) => {
-      const v = whereObj[k];
-      return v !== null && !isWhereOperator(v);
-    });
+    const isSimpleWhere =
+      !whereObj.OR &&
+      whereKeys.every((k) => {
+        const v = whereObj[k];
+        return v !== null && !isWhereOperator(v);
+      });
 
     // For simple queries (no nested with, no operators), use cached SQL template
     if (!args.with && isSimpleWhere) {
@@ -522,9 +536,7 @@ export class QueryInterface<T extends object> {
         const qt = quoteIdent(this.table);
         const whereClauses = whereKeys.map((k, i) => `${this.toSqlColumn(k)} = $${i + 1}`);
         const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
-        const selectExpr = columnsList
-          ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ')
-          : `${qt}.*`;
+        const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ') : `${qt}.*`;
         sql = `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
         this.sqlCache.set(ck, sql);
       }
@@ -545,9 +557,7 @@ export class QueryInterface<T extends object> {
 
     if (!args.with) {
       const qt = quoteIdent(this.table);
-      const selectExpr = columnsList
-        ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ')
-        : `${qt}.*`;
+      const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ') : `${qt}.*`;
       const sql = `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
       return {
         sql,
@@ -596,9 +606,7 @@ export class QueryInterface<T extends object> {
   }
 
   buildFindMany(args?: FindManyArgs<T>): DeferredQuery<T[]> {
-    const { sql: whereSql, params } = args?.where
-      ? this.buildWhere(args.where)
-      : { sql: '', params: [] as unknown[] };
+    const { sql: whereSql, params } = args?.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
 
     const columnsList = this.resolveColumns(args?.select, args?.omit);
 
@@ -624,9 +632,7 @@ export class QueryInterface<T extends object> {
 
     // Cursor-based pagination: add WHERE condition for cursor
     if (args?.cursor) {
-      const cursorEntries = Object.entries(args.cursor as Record<string, unknown>).filter(
-        ([, v]) => v !== undefined,
-      );
+      const cursorEntries = Object.entries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
       if (cursorEntries.length > 0) {
         // Determine direction from orderBy (default 'asc')
         const cursorConditions = cursorEntries.map(([k, v]) => {
@@ -665,9 +671,7 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) =>
         result.rows.map((row) =>
-          args?.with
-            ? (this.parseNestedRow(row, this.table) as T)
-            : (this.parseRow(row, this.table) as T),
+          args?.with ? (this.parseNestedRow(row, this.table) as T) : (this.parseRow(row, this.table) as T),
         ),
       tag: `${this.table}.findMany`,
     };
@@ -722,7 +726,7 @@ export class QueryInterface<T extends object> {
       transform: (result) => {
         const row = inner.transform(result);
         if (row === null) {
-          throw new Error('Record not found');
+          throw new NotFoundError();
         }
         return row;
       },
@@ -751,7 +755,7 @@ export class QueryInterface<T extends object> {
       transform: (result) => {
         const row = inner.transform(result);
         if (row === null) {
-          throw new Error('Record not found');
+          throw new NotFoundError();
         }
         return row;
       },
@@ -772,9 +776,7 @@ export class QueryInterface<T extends object> {
   }
 
   buildCreate(args: CreateArgs<T>): DeferredQuery<T> {
-    const entries = Object.entries(args.data as Record<string, unknown>).filter(
-      ([, v]) => v !== undefined,
-    );
+    const entries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = entries.map(([k]) => this.toSqlColumn(k));
     const params = entries.map(([, v]) => v);
     const placeholders = entries.map((_, i) => `$${i + 1}`);
@@ -786,7 +788,7 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        if (!row) throw new Error('[turbine] Expected a row but query returned none');
+        if (!row) throw new NotFoundError('[turbine] Expected a row but query returned none');
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.create`,
@@ -816,9 +818,7 @@ export class QueryInterface<T extends object> {
       };
     }
 
-    const keys = Object.keys(args.data[0]!).filter(
-      (k) => (args.data[0] as Record<string, unknown>)[k] !== undefined,
-    );
+    const keys = Object.keys(args.data[0]!).filter((k) => (args.data[0] as Record<string, unknown>)[k] !== undefined);
     const columns = keys.map((k) => this.toColumn(k));
 
     // Build column arrays for UNNEST
@@ -847,8 +847,7 @@ export class QueryInterface<T extends object> {
     return {
       sql,
       params: columnArrays,
-      transform: (result) =>
-        result.rows.map((row) => this.parseRow(row, this.table) as T),
+      transform: (result) => result.rows.map((row) => this.parseRow(row, this.table) as T),
       tag: `${this.table}.createMany`,
     };
   }
@@ -866,9 +865,7 @@ export class QueryInterface<T extends object> {
   }
 
   buildUpdate(args: UpdateArgs<T>): DeferredQuery<T> {
-    const setEntries = Object.entries(args.data as Record<string, unknown>).filter(
-      ([, v]) => v !== undefined,
-    );
+    const setEntries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
 
     // Build SET params first
     const params: unknown[] = [];
@@ -878,10 +875,7 @@ export class QueryInterface<T extends object> {
     });
 
     // Build WHERE using the shared params array (continues numbering after SET params)
-    const whereClause = this.buildWhereClause(
-      args.where as Record<string, unknown>,
-      params,
-    );
+    const whereClause = this.buildWhereClause(args.where as Record<string, unknown>, params);
 
     const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
     const sql = `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql} RETURNING *`;
@@ -891,7 +885,7 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        if (!row) throw new Error('[turbine] Expected a row but query returned none');
+        if (!row) throw new NotFoundError('[turbine] Expected a row but query returned none');
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.update`,
@@ -919,7 +913,7 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        if (!row) throw new Error('[turbine] Expected a row but query returned none');
+        if (!row) throw new NotFoundError('[turbine] Expected a row but query returned none');
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.delete`,
@@ -940,9 +934,7 @@ export class QueryInterface<T extends object> {
 
   buildUpsert(args: UpsertArgs<T>): DeferredQuery<T> {
     // Build the INSERT part from create data
-    const createEntries = Object.entries(args.create as Record<string, unknown>).filter(
-      ([, v]) => v !== undefined,
-    );
+    const createEntries = Object.entries(args.create as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = createEntries.map(([k]) => this.toSqlColumn(k));
     const createParams = createEntries.map(([, v]) => v);
     const placeholders = createEntries.map((_, i) => `$${i + 1}`);
@@ -954,9 +946,7 @@ export class QueryInterface<T extends object> {
     const conflictColumns = conflictKeys.map((k) => this.toSqlColumn(k));
 
     // Build the UPDATE SET part
-    const updateEntries = Object.entries(args.update as Record<string, unknown>).filter(
-      ([, v]) => v !== undefined,
-    );
+    const updateEntries = Object.entries(args.update as Record<string, unknown>).filter(([, v]) => v !== undefined);
     let paramIdx = createParams.length + 1;
     const setClauses = updateEntries.map(([k]) => {
       const clause = `${this.toSqlColumn(k)} = $${paramIdx}`;
@@ -977,7 +967,7 @@ export class QueryInterface<T extends object> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        if (!row) throw new Error('[turbine] Expected a row but query returned none');
+        if (!row) throw new NotFoundError('[turbine] Expected a row but query returned none');
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.upsert`,
@@ -997,9 +987,7 @@ export class QueryInterface<T extends object> {
   }
 
   buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
-    const setEntries = Object.entries(args.data as Record<string, unknown>).filter(
-      ([, v]) => v !== undefined,
-    );
+    const setEntries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
 
     // Build SET params first
     const params: unknown[] = [];
@@ -1009,10 +997,7 @@ export class QueryInterface<T extends object> {
     });
 
     // Build WHERE using the shared params array (continues numbering after SET params)
-    const whereClause = this.buildWhereClause(
-      args.where as Record<string, unknown>,
-      params,
-    );
+    const whereClause = this.buildWhereClause(args.where as Record<string, unknown>, params);
 
     const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
     const sql = `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql}`;
@@ -1062,9 +1047,7 @@ export class QueryInterface<T extends object> {
   }
 
   buildCount(args?: CountArgs<T>): DeferredQuery<number> {
-    const { sql: whereSql, params } = args?.where
-      ? this.buildWhere(args.where)
-      : { sql: '', params: [] as unknown[] };
+    const { sql: whereSql, params } = args?.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
 
     const sql = `SELECT COUNT(*)::int AS count FROM ${quoteIdent(this.table)}${whereSql}`;
 
@@ -1091,9 +1074,7 @@ export class QueryInterface<T extends object> {
   buildGroupBy(args: GroupByArgs<T>): DeferredQuery<Record<string, unknown>[]> {
     const groupColsRaw = args.by.map((k) => this.toColumn(k as string));
     const groupCols = groupColsRaw.map((c) => quoteIdent(c));
-    const { sql: whereSql, params } = args.where
-      ? this.buildWhere(args.where)
-      : { sql: '', params: [] as unknown[] };
+    const { sql: whereSql, params } = args.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
 
     // Build SELECT expressions: group-by columns + aggregate functions
     const selectExprs = [...groupCols];
@@ -1177,7 +1158,10 @@ export class QueryInterface<T extends object> {
           const avgObj: Record<string, unknown> = {};
           const minObj: Record<string, unknown> = {};
           const maxObj: Record<string, unknown> = {};
-          let hasSums = false, hasAvgs = false, hasMins = false, hasMaxs = false;
+          let hasSums = false,
+            hasAvgs = false,
+            hasMins = false,
+            hasMaxs = false;
 
           for (const [rawKey, rawValue] of Object.entries(row)) {
             if (rawKey.startsWith('_sum_')) {
@@ -1227,9 +1211,7 @@ export class QueryInterface<T extends object> {
   }
 
   buildAggregate(args: AggregateArgs<T>): DeferredQuery<AggregateResult<T>> {
-    const { sql: whereSql, params } = args.where
-      ? this.buildWhere(args.where)
-      : { sql: '', params: [] as unknown[] };
+    const { sql: whereSql, params } = args.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
 
     const selectExprs: string[] = [];
 
@@ -1321,7 +1303,10 @@ export class QueryInterface<T extends object> {
         const avgObj: Record<string, number | null> = {};
         const minObj: Record<string, unknown> = {};
         const maxObj: Record<string, unknown> = {};
-        let hasSums = false, hasAvgs = false, hasMins = false, hasMaxs = false;
+        let hasSums = false,
+          hasAvgs = false,
+          hasMins = false,
+          hasMaxs = false;
 
         for (const [key, val] of Object.entries(row)) {
           if (key.startsWith('_sum_')) {
@@ -1366,10 +1351,7 @@ export class QueryInterface<T extends object> {
    * Resolve select/omit options into a list of snake_case column names.
    * Returns null if neither is provided (meaning all columns).
    */
-  private resolveColumns(
-    select?: Record<string, boolean>,
-    omit?: Record<string, boolean>,
-  ): string[] | null {
+  private resolveColumns(select?: Record<string, boolean>, omit?: Record<string, boolean>): string[] | null {
     if (select) {
       // Only include columns where value is true
       return Object.entries(select)
@@ -1413,10 +1395,7 @@ export class QueryInterface<T extends object> {
    * Returns null if no conditions exist.
    * Supports: equality, operators, NULL, OR, AND, NOT, relation filters (some/every/none).
    */
-  private buildWhereClause(
-    where: Record<string, unknown>,
-    params: unknown[],
-  ): string | null {
+  private buildWhereClause(where: Record<string, unknown>, params: unknown[]): string | null {
     const keys = Object.keys(where);
     if (keys.length === 0) return null;
 
@@ -1618,11 +1597,7 @@ export class QueryInterface<T extends object> {
    * Build SQL clauses for a single operator object on a column.
    * Each operator key becomes its own clause, all ANDed together.
    */
-  private buildOperatorClauses(
-    column: string,
-    op: WhereOperator,
-    params: unknown[],
-  ): string[] {
+  private buildOperatorClauses(column: string, op: WhereOperator, params: unknown[]): string[] {
     const clauses: string[] = [];
 
     if (op.gt !== undefined) {
@@ -1749,28 +1724,60 @@ export class QueryInterface<T extends object> {
   }
 
   /**
-   * Build a SELECT clause with nested relation subqueries.
+   * Build a SELECT clause that includes both base columns and nested relation subqueries.
    *
-   * Uses json_build_object + json_agg — the same approach as the raw-pg benchmark
-   * queries. Generates a single SQL statement that resolves the full object tree.
+   * For each relation specified in the `with` clause, this method generates a correlated
+   * subquery using PostgreSQL's `json_agg(json_build_object(...))` pattern. The result
+   * is a single SQL SELECT clause that resolves the full object tree in one query --
+   * no N+1 problem.
    *
-   * Nested where values are parameterized via the shared params array to prevent
-   * SQL injection.
+   * **How it works:**
+   * 1. Resolves the base columns for the root table (all columns, or a subset via `columnsList`).
+   * 2. Iterates over each key in the `with` clause, looking up the relation definition.
+   * 3. For each relation, delegates to {@link buildRelationSubquery} to generate a
+   *    correlated subquery that returns JSON (array for hasMany, object for belongsTo/hasOne).
+   * 4. Each subquery is aliased as the relation name in the final SELECT.
+   *
+   * **aliasCounter:** A shared `{ n: number }` object is passed through all nesting levels.
+   * Each call to `buildRelationSubquery` increments it to produce unique table aliases
+   * (`t0`, `t1`, `t2`, ...) across arbitrarily deep relation trees, preventing alias
+   * collisions in the generated SQL.
+   *
+   * **Example output:**
+   * ```sql
+   * "users"."id", "users"."name", "users"."email",
+   * (SELECT COALESCE(json_agg(json_build_object('id', t0."id", 'title', t0."title")), '[]'::json)
+   *   FROM "posts" t0 WHERE t0."user_id" = "users"."id") AS "posts"
+   * ```
+   *
+   * @param table - The root table name (e.g. `"users"`).
+   * @param withClause - An object mapping relation names to their include specs
+   *                     (`true` for default inclusion, or `WithOptions` for select/omit/where/orderBy/limit).
+   * @param params - Shared parameter array for parameterized values (`$1`, `$2`, ...).
+   *                 Nested where/limit values are pushed here to prevent SQL injection.
+   * @param columnsList - Optional subset of columns to include in the SELECT. When `null`
+   *                      or omitted, all columns from the table's schema metadata are used.
+   * @param depth - Current nesting depth, passed through to {@link buildRelationSubquery}
+   *                for circular-relation detection. Defaults to `0` at the top level.
+   * @param path - Breadcrumb trail of relation names traversed so far, used in error
+   *               messages when circular or too-deep nesting is detected.
+   * @returns A complete SELECT clause string (without the `SELECT` keyword) containing
+   *          base columns and relation subqueries.
    */
   private buildSelectWithRelations(
     table: string,
     withClause: WithClause,
     params: unknown[],
     columnsList?: string[] | null,
+    depth?: number,
+    path?: string[],
   ): string {
     const meta = this.schema.tables[table];
-    if (!meta) throw new Error(`[turbine] Unknown table "${table}"`);
+    if (!meta) throw new ValidationError(`[turbine] Unknown table "${table}"`);
 
     const cols = columnsList ?? meta.allColumns;
     const qtbl = quoteIdent(table);
-    const baseCols = cols
-      .map((col) => `${qtbl}.${quoteIdent(col)}`)
-      .join(', ');
+    const baseCols = cols.map((col) => `${qtbl}.${quoteIdent(col)}`).join(', ');
 
     const relationSelects: string[] = [];
     const aliasCounter = { n: 0 };
@@ -1778,14 +1785,14 @@ export class QueryInterface<T extends object> {
     for (const [relName, relSpec] of Object.entries(withClause)) {
       const relDef = meta.relations[relName];
       if (!relDef) {
-        throw new Error(
+        throw new RelationError(
           `[turbine] Unknown relation "${relName}" on table "${table}". ` +
             `Available: ${Object.keys(meta.relations).join(', ')}`,
         );
       }
 
       // The main table is not aliased, so pass table name as parentRef
-      const subquery = this.buildRelationSubquery(relDef, relSpec, params, table, aliasCounter);
+      const subquery = this.buildRelationSubquery(relDef, relSpec, params, table, aliasCounter, depth, path);
       relationSelects.push(`(${subquery}) AS ${quoteIdent(relName)}`);
     }
 
@@ -1793,14 +1800,96 @@ export class QueryInterface<T extends object> {
   }
 
   /**
-   * Build a json_agg subquery for a relation.
+   * Generate a correlated subquery that returns JSON for a single relation.
    *
-   * All user-supplied values in nested where clauses are parameterized
-   * through the shared params array — no string interpolation.
+   * This is the core of Turbine's single-query nested relation strategy. For a given
+   * relation (e.g. `posts` on a `users` query), it produces a self-contained SQL subquery
+   * that PostgreSQL evaluates per parent row, returning either a JSON array (hasMany) or
+   * a single JSON object (belongsTo / hasOne).
    *
-   * @param parentRef - The alias (or table name) of the parent in the outer query.
-   *                    Used for the correlated WHERE clause: `child.fk = parentRef.pk`.
-   * @param aliasCounter - Shared counter for generating unique aliases across nested levels.
+   * ### Algorithm overview
+   *
+   * 1. **Alias generation:** Allocates a unique alias (`t0`, `t1`, ...) from the shared
+   *    `aliasCounter` so that deeply nested subqueries never collide.
+   *
+   * 2. **Column resolution:** Honors `select` / `omit` options to control which columns
+   *    appear in the output JSON.
+   *
+   * 3. **`json_build_object`:** Builds a JSON object for each row by mapping camelCase
+   *    field names to their column values:
+   *    ```sql
+   *    json_build_object('id', t0."id", 'title', t0."title", 'createdAt', t0."created_at")
+   *    ```
+   *
+   * 4. **`json_agg` wrapping (hasMany):** For one-to-many relations, wraps the
+   *    `json_build_object` call in `json_agg(...)` to aggregate all matching child rows
+   *    into a JSON array. Uses `COALESCE(..., '[]'::json)` so the result is never NULL.
+   *    For belongsTo / hasOne, no aggregation is used -- just the single JSON object
+   *    with `LIMIT 1`.
+   *
+   * 5. **Correlation (WHERE clause):** Links the subquery to the parent row:
+   *    - **hasMany:** `alias.foreignKey = parentRef.referenceKey`
+   *      (e.g. `t0."user_id" = "users"."id"` -- child FK points to parent PK)
+   *    - **belongsTo / hasOne:** `alias.referenceKey = parentRef.foreignKey`
+   *      (e.g. `t0."id" = "posts"."author_id"` -- parent FK points to child PK)
+   *
+   * 6. **Recursion:** If the spec includes a nested `with` clause, this method calls
+   *    itself recursively for each nested relation, passing the current alias as
+   *    `parentRef`. The nested subquery appears as an additional key in the
+   *    `json_build_object` call, wrapped in `COALESCE(..., '[]'::json)`.
+   *    Depth is incremented and capped at 10 to guard against circular relations.
+   *
+   * 7. **LIMIT / ORDER BY wrapping:** For hasMany relations with `limit` or `orderBy`,
+   *    the query is restructured into a two-level form:
+   *    ```sql
+   *    SELECT COALESCE(json_agg(json_build_object(...)), '[]'::json)
+   *    FROM (
+   *      SELECT t0.* FROM "posts" t0
+   *      WHERE t0."user_id" = "users"."id"
+   *      ORDER BY t0."created_at" DESC
+   *      LIMIT $1
+   *    ) t0i
+   *    ```
+   *    This ensures LIMIT and ORDER BY apply to the raw rows *before* `json_agg`
+   *    aggregation. Without the inner subquery, LIMIT would be meaningless because
+   *    `json_agg` produces a single aggregated row.
+   *
+   * 8. **Parameter threading:** All user-supplied values (where filters, limit) are
+   *    pushed to the shared `params` array with `$N` placeholders. No string
+   *    interpolation of user data ever occurs -- all identifiers go through
+   *    `quoteIdent()` and all values are parameterized.
+   *
+   * ### Example output (hasMany with nested relation)
+   * ```sql
+   * SELECT COALESCE(json_agg(json_build_object(
+   *   'id', t0."id",
+   *   'title', t0."title",
+   *   'comments', COALESCE((
+   *     SELECT COALESCE(json_agg(json_build_object('id', t1."id", 'body', t1."body")), '[]'::json)
+   *     FROM "comments" t1 WHERE t1."post_id" = t0."id"
+   *   ), '[]'::json)
+   * )), '[]'::json) FROM "posts" t0 WHERE t0."user_id" = "users"."id"
+   * ```
+   *
+   * @param relDef - The relation definition from schema metadata (contains `to`, `type`,
+   *                 `foreignKey`, `referenceKey`).
+   * @param spec - Either `true` (include with defaults) or a `WithOptions` object that
+   *               can specify `select`, `omit`, `where`, `orderBy`, `limit`, and nested `with`.
+   * @param params - Shared parameter array. User-supplied values are pushed here and
+   *                 referenced as `$1`, `$2`, etc. in the generated SQL.
+   * @param parentRef - The alias (e.g. `"t0"`) or table name (e.g. `"users"`) of the
+   *                    parent query. Used to build the correlated WHERE clause that ties
+   *                    child rows to their parent row.
+   * @param aliasCounter - Shared mutable counter (`{ n: number }`) for generating unique
+   *                       table aliases (`t0`, `t1`, `t2`, ...) across all nesting levels.
+   *                       Each call increments `n` by 1.
+   * @param depth - Current nesting depth (starts at `0`). Incremented on each recursive
+   *                call. If it reaches 10, a {@link CircularRelationError} is thrown.
+   * @param path - Breadcrumb trail of relation/table names traversed so far
+   *               (e.g. `["users", "posts", "comments"]`). Used in the error message
+   *               when circular or too-deep nesting is detected.
+   * @returns A complete SQL subquery string (without surrounding parentheses) that
+   *          evaluates to a JSON array (hasMany) or a JSON object (belongsTo/hasOne).
    */
   private buildRelationSubquery(
     relDef: RelationDef,
@@ -1808,10 +1897,25 @@ export class QueryInterface<T extends object> {
     params: unknown[],
     parentRef: string,
     aliasCounter: { n: number },
+    depth?: number,
+    path?: string[],
   ): string {
+    const currentDepth = depth ?? 0;
+    const currentPath = path ?? [this.table];
+
     const targetTable = relDef.to;
+
+    // Detect actual cycles (same table appearing twice in the nesting path)
+    if (currentPath.includes(targetTable)) {
+      throw new CircularRelationError([...currentPath, targetTable]);
+    }
+
+    // Hard depth cap as a safety net for non-circular but extremely deep nesting
+    if (currentDepth >= 10) {
+      throw new CircularRelationError([...currentPath, targetTable]);
+    }
     const targetMeta = this.schema.tables[targetTable];
-    if (!targetMeta) throw new Error(`[turbine] Unknown relation target "${targetTable}"`);
+    if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${targetTable}"`);
 
     // Generate a unique alias: t0, t1, t2, ...
     const alias = `t${aliasCounter.n++}`;
@@ -1834,7 +1938,8 @@ export class QueryInterface<T extends object> {
 
     // Build json_build_object pairs for resolved columns
     const jsonPairs = targetColumns.map(
-      (col) => `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${alias}.${quoteIdent(col)}`,
+      (col) =>
+        `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${alias}.${quoteIdent(col)}`,
     );
 
     // Nested relations?
@@ -1842,16 +1947,24 @@ export class QueryInterface<T extends object> {
       for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) {
-          throw new Error(
+          throw new RelationError(
             `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
               `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
           );
         }
         // Recursively build nested subquery, passing THIS alias as the parent reference
         const nestedSubquery = this.buildRelationSubquery(
-          nestedRelDef, nestedSpec, params, alias, aliasCounter,
+          nestedRelDef,
+          nestedSpec,
+          params,
+          alias,
+          aliasCounter,
+          currentDepth + 1,
+          [...currentPath, relDef.name],
         );
-        jsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSubquery}), '[]'::json)`);
+        // Use '[]'::json for hasMany (empty array), NULL for belongsTo/hasOne (no object)
+        const fallback = nestedRelDef.type === 'hasMany' ? "'[]'::json" : 'NULL';
+        jsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSubquery}), ${fallback})`);
       }
     }
 
@@ -1868,7 +1981,7 @@ export class QueryInterface<T extends object> {
         .map(([k, dir]) => {
           const col = camelToSnake(k);
           if (!targetMeta.allColumns.includes(col)) {
-            throw new Error(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
+            throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
           }
           const safeDir = dir.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
           return `${alias}.${quoteIdent(col)} ${safeDir}`;
@@ -1892,7 +2005,7 @@ export class QueryInterface<T extends object> {
       for (const [k, v] of Object.entries(spec.where)) {
         const col = camelToSnake(k);
         if (!targetMeta.allColumns.includes(col)) {
-          throw new Error(`[turbine] Unknown column "${k}" in where for table "${targetTable}"`);
+          throw new ValidationError(`[turbine] Unknown column "${k}" in where for table "${targetTable}"`);
         }
         params.push(v);
         whereClause += ` AND ${alias}.${quoteIdent(col)} = $${params.length}`;
@@ -1916,7 +2029,8 @@ export class QueryInterface<T extends object> {
         const innerSql = `SELECT ${targetMeta.allColumns.map((c) => `${alias}.${quoteIdent(c)}`).join(', ')} FROM ${qTarget} ${alias} WHERE ${whereClause}${orderClause}${limitClause}`;
         // For the json_build_object, reference the inner alias — only include resolved columns
         const innerJsonPairs = targetColumns.map(
-          (col) => `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${innerAlias}.${quoteIdent(col)}`,
+          (col) =>
+            `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${innerAlias}.${quoteIdent(col)}`,
         );
         // Re-add nested relation subqueries referencing innerAlias
         if (spec !== true && spec.with) {
@@ -1924,9 +2038,16 @@ export class QueryInterface<T extends object> {
             const nestedRelDef = targetMeta.relations[nestedRelName];
             if (nestedRelDef) {
               const nestedSub = this.buildRelationSubquery(
-                nestedRelDef, spec.with[nestedRelName]!, params, innerAlias, aliasCounter,
+                nestedRelDef,
+                spec.with[nestedRelName]!,
+                params,
+                innerAlias,
+                aliasCounter,
+                currentDepth + 1,
+                [...currentPath, relDef.name],
               );
-              innerJsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSub}), '[]'::json)`);
+              const fallback = nestedRelDef.type === 'hasMany' ? "'[]'::json" : 'NULL';
+              innerJsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSub}), ${fallback})`);
             }
           }
         }
@@ -1977,11 +2098,7 @@ export class QueryInterface<T extends object> {
    * Build SQL clauses for JSONB filter operators on a column.
    * Supports: path, equals, contains, hasKey.
    */
-  private buildJsonFilterClauses(
-    column: string,
-    filter: JsonFilter,
-    params: unknown[],
-  ): string[] {
+  private buildJsonFilterClauses(column: string, filter: JsonFilter, params: unknown[]): string[] {
     const clauses: string[] = [];
 
     if (filter.path !== undefined && filter.equals !== undefined) {
@@ -2015,12 +2132,7 @@ export class QueryInterface<T extends object> {
    * Build SQL clauses for Array filter operators on a column.
    * Supports: has, hasEvery, hasSome, isEmpty.
    */
-  private buildArrayFilterClauses(
-    column: string,
-    filter: ArrayFilter,
-    params: unknown[],
-    pgType: string,
-  ): string[] {
+  private buildArrayFilterClauses(column: string, filter: ArrayFilter, params: unknown[], pgType: string): string[] {
     const clauses: string[] = [];
     const elementType = this.getArrayElementType(pgType);
 

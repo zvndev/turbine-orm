@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Schema builder tests
+ * turbine-orm — Schema builder tests
  *
  * Tests the schema definition API and SQL generation:
  *   1. Builds the benchmark schema using defineSchema + table + column
@@ -9,9 +9,9 @@
  * Run: npm run build && DATABASE_URL=postgres://localhost:5432/turbine_bench npx tsx --test src/test/schema-builder.test.ts
  */
 
-import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { defineSchema, table, column, ColumnBuilder } from '../schema-builder.js';
+import { describe, it } from 'node:test';
+import { column, defineSchema, table } from '../schema-builder.js';
 import { schemaToSQL, schemaToSQLString } from '../schema-sql.js';
 
 // ---------------------------------------------------------------------------
@@ -152,10 +152,10 @@ describe('ColumnBuilder', () => {
 
 describe('defineSchema', () => {
   it('stamps table names from keys', () => {
-    assert.equal(benchmarkSchema.tables['organizations']!.name, 'organizations');
-    assert.equal(benchmarkSchema.tables['users']!.name, 'users');
-    assert.equal(benchmarkSchema.tables['posts']!.name, 'posts');
-    assert.equal(benchmarkSchema.tables['comments']!.name, 'comments');
+    assert.equal(benchmarkSchema.tables.organizations!.name, 'organizations');
+    assert.equal(benchmarkSchema.tables.users!.name, 'users');
+    assert.equal(benchmarkSchema.tables.posts!.name, 'posts');
+    assert.equal(benchmarkSchema.tables.comments!.name, 'comments');
   });
 
   it('has correct number of tables', () => {
@@ -163,19 +163,19 @@ describe('defineSchema', () => {
   });
 
   it('organizations has 5 columns', () => {
-    assert.equal(Object.keys(benchmarkSchema.tables['organizations']!.columns).length, 5);
+    assert.equal(Object.keys(benchmarkSchema.tables.organizations!.columns).length, 5);
   });
 
   it('users has 8 columns', () => {
-    assert.equal(Object.keys(benchmarkSchema.tables['users']!.columns).length, 8);
+    assert.equal(Object.keys(benchmarkSchema.tables.users!.columns).length, 8);
   });
 
   it('posts has 9 columns', () => {
-    assert.equal(Object.keys(benchmarkSchema.tables['posts']!.columns).length, 9);
+    assert.equal(Object.keys(benchmarkSchema.tables.posts!.columns).length, 9);
   });
 
   it('comments has 5 columns', () => {
-    assert.equal(Object.keys(benchmarkSchema.tables['comments']!.columns).length, 5);
+    assert.equal(Object.keys(benchmarkSchema.tables.comments!.columns).length, 5);
   });
 });
 
@@ -221,8 +221,11 @@ describe('schemaToSQL', () => {
     assert.ok(orgSQL.includes('"id" BIGSERIAL PRIMARY KEY'), 'should have id BIGSERIAL PRIMARY KEY');
     assert.ok(orgSQL.includes('"name" TEXT NOT NULL'), 'should have name TEXT NOT NULL');
     assert.ok(orgSQL.includes('"slug" TEXT UNIQUE NOT NULL'), 'should have slug TEXT UNIQUE NOT NULL');
-    assert.ok(orgSQL.includes("\"plan\" TEXT NOT NULL DEFAULT 'free'"), "should have plan with default 'free'");
-    assert.ok(orgSQL.includes('"created_at" TIMESTAMPTZ NOT NULL DEFAULT NOW()'), 'should have created_at with DEFAULT NOW()');
+    assert.ok(orgSQL.includes('"plan" TEXT NOT NULL DEFAULT \'free\''), "should have plan with default 'free'");
+    assert.ok(
+      orgSQL.includes('"created_at" TIMESTAMPTZ NOT NULL DEFAULT NOW()'),
+      'should have created_at with DEFAULT NOW()',
+    );
   });
 
   it('generates correct users table', () => {
@@ -232,7 +235,7 @@ describe('schemaToSQL', () => {
     assert.ok(usersSQL.includes('"org_id" BIGINT NOT NULL'), 'should convert orgId to org_id');
     assert.ok(usersSQL.includes('REFERENCES "organizations"("id")'), 'should have FK reference');
     assert.ok(usersSQL.includes('"email" TEXT UNIQUE NOT NULL'), 'should have email');
-    assert.ok(usersSQL.includes("\"role\" TEXT NOT NULL DEFAULT 'member'"), 'should have role default');
+    assert.ok(usersSQL.includes('"role" TEXT NOT NULL DEFAULT \'member\''), 'should have role default');
     assert.ok(usersSQL.includes('"avatar_url" TEXT'), 'should convert avatarUrl to avatar_url');
     assert.ok(usersSQL.includes('"last_login_at" TIMESTAMPTZ'), 'should convert lastLoginAt to last_login_at');
   });
@@ -352,71 +355,71 @@ describe('schema.sql compatibility', () => {
 // Build same benchmark schema using object format
 const benchmarkSchemaObjects = defineSchema({
   organizations: {
-    id:        { type: 'serial', primaryKey: true },
-    name:      { type: 'text', notNull: true },
-    slug:      { type: 'text', unique: true, notNull: true },
-    plan:      { type: 'text', notNull: true, default: "'free'" },
+    id: { type: 'serial', primaryKey: true },
+    name: { type: 'text', notNull: true },
+    slug: { type: 'text', unique: true, notNull: true },
+    plan: { type: 'text', notNull: true, default: "'free'" },
     createdAt: { type: 'timestamp', notNull: true, default: 'now()' },
   },
   users: {
-    id:          { type: 'serial', primaryKey: true },
-    orgId:       { type: 'bigint', notNull: true, references: 'organizations.id' },
-    email:       { type: 'text', unique: true, notNull: true },
-    name:        { type: 'text', notNull: true },
-    role:        { type: 'text', notNull: true, default: "'member'" },
-    avatarUrl:   { type: 'text', nullable: true },
+    id: { type: 'serial', primaryKey: true },
+    orgId: { type: 'bigint', notNull: true, references: 'organizations.id' },
+    email: { type: 'text', unique: true, notNull: true },
+    name: { type: 'text', notNull: true },
+    role: { type: 'text', notNull: true, default: "'member'" },
+    avatarUrl: { type: 'text', nullable: true },
     lastLoginAt: { type: 'timestamp', nullable: true },
-    createdAt:   { type: 'timestamp', notNull: true, default: 'now()' },
+    createdAt: { type: 'timestamp', notNull: true, default: 'now()' },
   },
   posts: {
-    id:        { type: 'serial', primaryKey: true },
-    userId:    { type: 'bigint', notNull: true, references: 'users.id' },
-    orgId:     { type: 'bigint', notNull: true, references: 'organizations.id' },
-    title:     { type: 'text', notNull: true },
-    content:   { type: 'text', notNull: true },
+    id: { type: 'serial', primaryKey: true },
+    userId: { type: 'bigint', notNull: true, references: 'users.id' },
+    orgId: { type: 'bigint', notNull: true, references: 'organizations.id' },
+    title: { type: 'text', notNull: true },
+    content: { type: 'text', notNull: true },
     published: { type: 'boolean', notNull: true, default: 'false' },
     viewCount: { type: 'integer', notNull: true, default: '0' },
     createdAt: { type: 'timestamp', notNull: true, default: 'now()' },
     updatedAt: { type: 'timestamp', notNull: true, default: 'now()' },
   },
   comments: {
-    id:        { type: 'serial', primaryKey: true },
-    postId:    { type: 'bigint', notNull: true, references: 'posts.id' },
-    userId:    { type: 'bigint', notNull: true, references: 'users.id' },
-    body:      { type: 'text', notNull: true },
+    id: { type: 'serial', primaryKey: true },
+    postId: { type: 'bigint', notNull: true, references: 'posts.id' },
+    userId: { type: 'bigint', notNull: true, references: 'users.id' },
+    body: { type: 'text', notNull: true },
     createdAt: { type: 'timestamp', notNull: true, default: 'now()' },
   },
 });
 
 describe('defineSchema (object format)', () => {
   it('stamps table names from keys', () => {
-    assert.equal(benchmarkSchemaObjects.tables['organizations']!.name, 'organizations');
-    assert.equal(benchmarkSchemaObjects.tables['users']!.name, 'users');
-    assert.equal(benchmarkSchemaObjects.tables['posts']!.name, 'posts');
-    assert.equal(benchmarkSchemaObjects.tables['comments']!.name, 'comments');
+    assert.equal(benchmarkSchemaObjects.tables.organizations!.name, 'organizations');
+    assert.equal(benchmarkSchemaObjects.tables.users!.name, 'users');
+    assert.equal(benchmarkSchemaObjects.tables.posts!.name, 'posts');
+    assert.equal(benchmarkSchemaObjects.tables.comments!.name, 'comments');
   });
 
   it('resolves column types correctly', () => {
-    const orgCols = benchmarkSchemaObjects.tables['organizations']!.columns;
-    assert.equal(orgCols['id']!.type, 'BIGSERIAL');
-    assert.equal(orgCols['id']!.isPrimaryKey, true);
-    assert.equal(orgCols['name']!.type, 'TEXT');
-    assert.equal(orgCols['name']!.isNotNull, true);
-    assert.equal(orgCols['slug']!.isUnique, true);
-    assert.equal(orgCols['plan']!.defaultValue, "'free'");
-    assert.equal(orgCols['createdAt']!.defaultValue, 'now()');
+    const orgCols = benchmarkSchemaObjects.tables.organizations!.columns;
+    assert.equal(orgCols.id!.type, 'BIGSERIAL');
+    assert.equal(orgCols.id!.isPrimaryKey, true);
+    assert.equal(orgCols.name!.type, 'TEXT');
+    assert.equal(orgCols.name!.isNotNull, true);
+    assert.equal(orgCols.slug!.isUnique, true);
+    assert.equal(orgCols.plan!.defaultValue, "'free'");
+    assert.equal(orgCols.createdAt!.defaultValue, 'now()');
   });
 
   it('resolves references', () => {
-    const userCols = benchmarkSchemaObjects.tables['users']!.columns;
-    assert.equal(userCols['orgId']!.referencesTarget, 'organizations.id');
-    assert.equal(userCols['orgId']!.isNotNull, true);
+    const userCols = benchmarkSchemaObjects.tables.users!.columns;
+    assert.equal(userCols.orgId!.referencesTarget, 'organizations.id');
+    assert.equal(userCols.orgId!.isNotNull, true);
   });
 
   it('resolves nullable', () => {
-    const userCols = benchmarkSchemaObjects.tables['users']!.columns;
-    assert.equal(userCols['avatarUrl']!.isNullable, true);
-    assert.equal(userCols['lastLoginAt']!.isNullable, true);
+    const userCols = benchmarkSchemaObjects.tables.users!.columns;
+    assert.equal(userCols.avatarUrl!.isNullable, true);
+    assert.equal(userCols.lastLoginAt!.isNullable, true);
   });
 
   it('generates identical SQL to fluent builder format', () => {
@@ -445,23 +448,23 @@ describe('defineSchema (object format)', () => {
         o: { type: 'bytea' },
       },
     });
-    const cols = schema.tables['allTypes']!.columns;
-    assert.equal(cols['a']!.type, 'BIGSERIAL');
-    assert.equal(cols['b']!.type, 'BIGINT');
-    assert.equal(cols['c']!.type, 'INTEGER');
-    assert.equal(cols['d']!.type, 'SMALLINT');
-    assert.equal(cols['e']!.type, 'TEXT');
-    assert.equal(cols['f']!.type, 'VARCHAR');
-    assert.equal(cols['f']!.maxLength, 255);
-    assert.equal(cols['g']!.type, 'BOOLEAN');
-    assert.equal(cols['h']!.type, 'TIMESTAMPTZ');
-    assert.equal(cols['i']!.type, 'DATE');
-    assert.equal(cols['j']!.type, 'JSONB');
-    assert.equal(cols['k']!.type, 'UUID');
-    assert.equal(cols['l']!.type, 'REAL');
-    assert.equal(cols['m']!.type, 'DOUBLE PRECISION');
-    assert.equal(cols['n']!.type, 'NUMERIC');
-    assert.equal(cols['o']!.type, 'BYTEA');
+    const cols = schema.tables.allTypes!.columns;
+    assert.equal(cols.a!.type, 'BIGSERIAL');
+    assert.equal(cols.b!.type, 'BIGINT');
+    assert.equal(cols.c!.type, 'INTEGER');
+    assert.equal(cols.d!.type, 'SMALLINT');
+    assert.equal(cols.e!.type, 'TEXT');
+    assert.equal(cols.f!.type, 'VARCHAR');
+    assert.equal(cols.f!.maxLength, 255);
+    assert.equal(cols.g!.type, 'BOOLEAN');
+    assert.equal(cols.h!.type, 'TIMESTAMPTZ');
+    assert.equal(cols.i!.type, 'DATE');
+    assert.equal(cols.j!.type, 'JSONB');
+    assert.equal(cols.k!.type, 'UUID');
+    assert.equal(cols.l!.type, 'REAL');
+    assert.equal(cols.m!.type, 'DOUBLE PRECISION');
+    assert.equal(cols.n!.type, 'NUMERIC');
+    assert.equal(cols.o!.type, 'BYTEA');
   });
 
   it('defaults omitted flags to false/null', () => {
@@ -470,7 +473,7 @@ describe('defineSchema (object format)', () => {
         id: { type: 'serial' },
       },
     });
-    const col = schema.tables['minimal']!.columns['id']!;
+    const col = schema.tables.minimal!.columns.id!;
     assert.equal(col.isPrimaryKey, false);
     assert.equal(col.isNotNull, false);
     assert.equal(col.isNullable, false);

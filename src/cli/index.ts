@@ -20,51 +20,42 @@
  *   npx turbine migrate create add_users_table
  */
 
-import { existsSync, mkdirSync, writeFileSync, readFileSync, appendFileSync } from 'node:fs';
-import { resolve, relative } from 'node:path';
-import { introspect } from '../introspect.js';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { generate } from '../generate.js';
-import { schemaDiff, schemaPush } from '../schema-sql.js';
+import { introspect } from '../introspect.js';
 import type { SchemaDef } from '../schema-builder.js';
-import { loadConfig, resolveConfig, findConfigFile, configTemplate } from './config.js';
-import type { ResolvedConfig, CliOverrides } from './config.js';
+import { schemaDiff, schemaPush } from '../schema-sql.js';
+import type { CliOverrides, ResolvedConfig } from './config.js';
+import { configTemplate, findConfigFile, loadConfig, resolveConfig } from './config.js';
+import { createMigration, listMigrationFiles, migrateDown, migrateStatus, migrateUp } from './migrate.js';
 import {
-  createMigration,
-  migrateUp,
-  migrateDown,
-  migrateStatus,
-  listMigrationFiles,
-} from './migrate.js';
-import {
-  bold,
-  dim,
-  red,
-  green,
-  yellow,
+  banner,
   blue,
-  cyan,
-  gray,
-  magenta,
-  greenBright,
-  cyanBright,
-  yellowBright,
-  symbols,
+  bold,
   box,
-  table as formatTable,
-  Spinner,
-  header,
-  success,
+  cyan,
+  dim,
+  divider,
+  elapsed,
   error,
-  warn,
+  table as formatTable,
+  gray,
+  green,
+  header,
   info,
   label,
+  magenta,
   newline,
-  divider,
-  banner,
-  elapsed,
+  red,
   redactUrl,
+  Spinner,
+  success,
+  symbols,
+  warn,
+  yellow,
 } from './ui.js';
-import { pathToFileURL } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // Argument parsing (zero deps — just process.argv)
@@ -83,6 +74,7 @@ interface CliArgs {
   dryRun?: boolean;
   force?: boolean;
   verbose?: boolean;
+  help?: boolean;
 }
 
 function parseArgs(): CliArgs {
@@ -143,6 +135,10 @@ function parseArgs(): CliArgs {
       case '--verbose':
       case '-v':
         result.verbose = true;
+        break;
+      case '--help':
+      case '-h':
+        result.help = true;
         break;
       default:
         if (!arg.startsWith('-')) {
@@ -208,7 +204,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   header('Initializing Turbine project');
 
   // Detect environment
-  const envUrl = process.env['DATABASE_URL'];
+  const envUrl = process.env.DATABASE_URL;
   const hasEnvFile = existsSync('.env');
   const hasEnvLocal = existsSync('.env.local');
 
@@ -246,7 +242,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
     mkdirSync(migrDir, { recursive: true });
     // Create .gitkeep
     writeFileSync(`${migrDir}/.gitkeep`, '', 'utf-8');
-    success(`Created ${cyan(migrDir + '/')}`);
+    success(`Created ${cyan(`${migrDir}/`)}`);
   } else {
     info(`Migrations dir already exists: ${dim(migrDir)}`);
   }
@@ -254,7 +250,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   // Create output directory
   if (!existsSync(config.out)) {
     mkdirSync(config.out, { recursive: true });
-    success(`Created ${cyan(config.out + '/')}`);
+    success(`Created ${cyan(`${config.out}/`)}`);
   }
 
   // Create seed file template
@@ -306,7 +302,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
  * Define your database schema in TypeScript.
  * Use \`npx turbine push\` to sync it to your database.
  *
- * @see https://batadata.com/docs/turbine/schema
+ * @see https://turbineorm.dev
  */
 
 import { defineSchema } from 'turbine-orm';
@@ -364,14 +360,14 @@ export default defineSchema({
 
       const genSpinner = new Spinner('Generating TypeScript client').start();
       const result = generate({ schema, outDir: config.out, connectionString: url });
-      genSpinner.succeed(`Generated ${bold(String(result.files.length))} files to ${cyan(config.out + '/')}`);
+      genSpinner.succeed(`Generated ${bold(String(result.files.length))} files to ${cyan(`${config.out}/`)}`);
     } catch (err) {
       spinner.fail('Could not connect to database');
       if (err instanceof Error) {
         console.log(`  ${dim(err.message)}`);
       }
       newline();
-      info('You can run generation later with: ' + cyan('npx turbine generate'));
+      info(`You can run generation later with: ${cyan('npx turbine generate')}`);
     }
   }
 
@@ -385,7 +381,9 @@ export default defineSchema({
   if (!url) {
     console.log(`  ${dim('1.')} Set your database URL in ${cyan('turbine.config.ts')}`);
     if (!hasEnvFile && !hasEnvLocal) {
-      console.log(`     ${dim('or create a')} ${cyan('.env')} ${dim('file with')} ${cyan('DATABASE_URL=postgres://...')}`);
+      console.log(
+        `     ${dim('or create a')} ${cyan('.env')} ${dim('file with')} ${cyan('DATABASE_URL=postgres://...')}`,
+      );
     }
     console.log(`  ${dim('2.')} Run ${cyan('npx turbine generate')} to introspect your DB`);
   } else {
@@ -429,14 +427,8 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   });
 
   const tableNames = Object.keys(schema.tables);
-  const totalColumns = Object.values(schema.tables).reduce(
-    (sum, t) => sum + t.columns.length,
-    0,
-  );
-  const totalRelations = Object.values(schema.tables).reduce(
-    (sum, t) => sum + Object.keys(t.relations).length,
-    0,
-  );
+  const totalColumns = Object.values(schema.tables).reduce((sum, t) => sum + t.columns.length, 0);
+  const totalRelations = Object.values(schema.tables).reduce((sum, t) => sum + Object.keys(t.relations).length, 0);
 
   spinner.succeed(
     `Found ${bold(String(tableNames.length))} tables, ${bold(String(totalColumns))} columns, ${bold(String(totalRelations))} relations`,
@@ -472,7 +464,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
 
   // List files
   for (const file of result.files) {
-    console.log(`    ${dim(symbols.teeEnd)} ${cyan(result.outDir + '/' + file)}`);
+    console.log(`    ${dim(symbols.teeEnd)} ${cyan(`${result.outDir}/${file}`)}`);
   }
 
   // Usage hint
@@ -531,9 +523,11 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
       console.log(`    ${yellow(symbols.arrowRight)} ${a.table}`);
       for (const col of a.columns) {
         const actionLabel =
-          col.action === 'add' ? green('+ add') :
-          col.action === 'drop' ? red('- drop') :
-          yellow('~ ' + col.action.replace('_', ' '));
+          col.action === 'add'
+            ? green('+ add')
+            : col.action === 'drop'
+              ? red('- drop')
+              : yellow(`~ ${col.action.replace('_', ' ')}`);
         console.log(`      ${actionLabel} ${col.column}`);
       }
     }
@@ -570,9 +564,7 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
   // Execute
   const pushSpinner = new Spinner('Applying changes').start();
   const result = await schemaPush(schemaDef, url);
-  pushSpinner.succeed(
-    `Applied ${bold(String(result.statementsExecuted))} statement(s)`,
-  );
+  pushSpinner.succeed(`Applied ${bold(String(result.statementsExecuted))} statement(s)`);
 
   if (result.tablesCreated.length > 0) {
     success(`Created: ${result.tablesCreated.join(', ')}`);
@@ -748,7 +740,7 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
   newline();
 }
 
-async function cmdMigrateStatus(args: CliArgs, config: ResolvedConfig): Promise<void> {
+async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
   const url = requireUrl(config);
 
@@ -787,17 +779,22 @@ async function cmdMigrateStatus(args: CliArgs, config: ResolvedConfig): Promise<
   const rows = statuses.map((s) => {
     let status: string;
     if (s.applied && s.checksumValid === false) {
-      status = red(symbols.warning + ' Drifted');
+      status = red(`${symbols.warning} Drifted`);
     } else if (s.applied) {
-      status = green(symbols.check + ' Applied');
+      status = green(`${symbols.check} Applied`);
     } else {
-      status = yellow(symbols.dot + ' Pending');
+      status = yellow(`${symbols.dot} Pending`);
     }
     return [
       status,
       s.file.filename,
       s.appliedAt
-        ? dim(s.appliedAt.toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC'))
+        ? dim(
+            s.appliedAt
+              .toISOString()
+              .replace('T', ' ')
+              .replace(/\.\d+Z$/, ' UTC'),
+          )
         : dim('—'),
     ];
   });
@@ -815,7 +812,7 @@ async function cmdMigrateStatus(args: CliArgs, config: ResolvedConfig): Promise<
 // Command: seed
 // ---------------------------------------------------------------------------
 
-async function cmdSeed(args: CliArgs, config: ResolvedConfig): Promise<void> {
+async function cmdSeed(_args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
 
   const seedFile = resolve(config.seedFile);
@@ -853,7 +850,7 @@ async function cmdSeed(args: CliArgs, config: ResolvedConfig): Promise<void> {
           stdio: 'inherit',
           env: {
             ...process.env,
-            DATABASE_URL: config.url || process.env['DATABASE_URL'],
+            DATABASE_URL: config.url || process.env.DATABASE_URL,
           },
         });
         ran = true;
@@ -888,7 +885,7 @@ async function cmdSeed(args: CliArgs, config: ResolvedConfig): Promise<void> {
 // Command: status
 // ---------------------------------------------------------------------------
 
-async function cmdStatus(args: CliArgs, config: ResolvedConfig): Promise<void> {
+async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
   const url = requireUrl(config);
 
@@ -911,7 +908,7 @@ async function cmdStatus(args: CliArgs, config: ResolvedConfig): Promise<void> {
 
   for (const tbl of Object.values(schema.tables)) {
     const relCount = Object.keys(tbl.relations).length;
-    const pk = tbl.primaryKey.join(', ') || dim('(none)');
+    const _pk = tbl.primaryKey.join(', ') || dim('(none)');
 
     console.log(`  ${bold(cyan(tbl.name))}`);
 
@@ -923,7 +920,7 @@ async function cmdStatus(args: CliArgs, config: ResolvedConfig): Promise<void> {
       const def = col.hasDefault ? dim(' (default)') : '';
       const pkLabel = tbl.primaryKey.includes(col.name) ? ` ${magenta('PK')}` : '';
       console.log(
-        `    ${dim(prefix)} ${col.field}${nullable}: ${green(col.tsType)}${pkLabel}${def}  ${gray(symbols.arrow + ' ' + col.pgType)}`,
+        `    ${dim(prefix)} ${col.field}${nullable}: ${green(col.tsType)}${pkLabel}${def}  ${gray(`${symbols.arrow} ${col.pgType}`)}`,
       );
     }
 
@@ -967,11 +964,148 @@ async function cmdStudio(_args: CliArgs, _config: ResolvedConfig): Promise<void>
         'A local web UI for browsing your database,',
         'exploring relations, and managing data.',
         '',
-        `Follow ${cyan('@batadata')} for updates.`,
+        `Follow ${cyan('@turbineorm')} for updates.`,
       ].join('\n'),
       { title: bold(cyan('Studio')), padding: 2 },
     ),
   );
+  newline();
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand help
+// ---------------------------------------------------------------------------
+
+function showSubcommandHelp(command: string): boolean {
+  const helpMap: Record<string, () => void> = {
+    init: showInitHelp,
+    generate: showGenerateHelp,
+    pull: showGenerateHelp,
+    push: showPushHelp,
+    migrate: showMigrateHelp,
+    migration: showMigrateHelp,
+    seed: showSeedHelp,
+    status: showStatusHelp,
+  };
+  const fn = helpMap[command];
+  if (fn) {
+    fn();
+    return true;
+  }
+  return false;
+}
+
+function showInitHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine init')} — Initialize a Turbine project`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine init ${dim('[options]')}`);
+  newline();
+  console.log(`  Creates ${cyan('turbine.config.ts')}, migrations directory, seed file template,`);
+  console.log(`  and schema file template.`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string to embed in config`);
+  console.log(`    ${cyan('--force, -f')}        Overwrite existing config file`);
+  newline();
+}
+
+function showGenerateHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine generate')} — Introspect database and generate TypeScript types`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine generate ${dim('[options]')}`);
+  newline();
+  console.log(`  Connects to your database, reads the schema, and generates:`);
+  console.log(`    ${dim('•')} ${cyan('types.ts')}    — Entity interfaces, Create/Update input types`);
+  console.log(`    ${dim('•')} ${cyan('metadata.ts')} — Runtime schema metadata`);
+  console.log(`    ${dim('•')} ${cyan('index.ts')}    — Configured client with typed table accessors`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);
+  console.log(
+    `    ${cyan('--out, -o')} ${dim('<dir>')}       Output directory ${dim('(default: ./generated/turbine)')}`,
+  );
+  console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}   Postgres schema ${dim('(default: public)')}`);
+  console.log(`    ${cyan('--include')} ${dim('<tables>')}    Comma-separated tables to include`);
+  console.log(`    ${cyan('--exclude')} ${dim('<tables>')}    Comma-separated tables to exclude`);
+  newline();
+}
+
+function showPushHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine push')} — Apply schema-builder definitions to database`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine push ${dim('[options]')}`);
+  newline();
+  console.log(`  Reads your ${cyan('turbine/schema.ts')} file, diffs against the live database,`);
+  console.log(`  and applies CREATE/ALTER statements.`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
+  console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
+  console.log(`    ${cyan('--verbose, -v')}      Show detailed output`);
+  newline();
+}
+
+function showMigrateHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine migrate')} — SQL migration management`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine migrate ${cyan('<subcommand>')} ${dim('[options]')}`);
+  newline();
+  console.log(`  ${bold('Subcommands:')}`);
+  console.log(`    ${cyan('create')} ${dim('<name>')}   Create a new migration file`);
+  console.log(`    ${cyan('up')}              Apply pending migrations`);
+  console.log(`    ${cyan('down')}            Rollback last migration`);
+  console.log(`    ${cyan('status')}          Show applied/pending migrations`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
+  console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
+  console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
+  console.log(`    ${cyan('--verbose, -v')}      Show detailed output`);
+  newline();
+  console.log(`  ${bold('Examples:')}`);
+  console.log(`    ${dim('$')} npx turbine migrate create add_users_table`);
+  console.log(`    ${dim('$')} npx turbine migrate up`);
+  console.log(`    ${dim('$')} npx turbine migrate down --step 2`);
+  console.log(`    ${dim('$')} npx turbine migrate status`);
+  newline();
+}
+
+function showSeedHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine seed')} — Run seed file`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine seed ${dim('[options]')}`);
+  newline();
+  console.log(`  Runs the seed file specified in ${cyan('turbine.config.ts')}`);
+  console.log(`  ${dim('(default: ./turbine/seed.ts)')}`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
+  newline();
+}
+
+function showStatusHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine status')} — Show database schema summary`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine status ${dim('[options]')}`);
+  newline();
+  console.log(`  Introspects your database and displays tables, columns,`);
+  console.log(`  types, relations, and indexes.`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);
+  console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}   Postgres schema ${dim('(default: public)')}`);
   newline();
 }
 
@@ -1002,7 +1136,9 @@ function showHelp(): void {
 
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}      Postgres connection string`);
-  console.log(`    ${cyan('--out, -o')} ${dim('<dir>')}      Output directory ${dim('(default: ./generated/turbine)')}`);
+  console.log(
+    `    ${cyan('--out, -o')} ${dim('<dir>')}      Output directory ${dim('(default: ./generated/turbine)')}`,
+  );
   console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}  Postgres schema ${dim('(default: public)')}`);
   console.log(`    ${cyan('--include')} ${dim('<tables>')}   Comma-separated tables to include`);
   console.log(`    ${cyan('--exclude')} ${dim('<tables>')}   Comma-separated tables to exclude`);
@@ -1042,6 +1178,12 @@ async function main() {
 
   // Quick exits that don't need config
   if (args.command === 'help' || args.command === '--help' || args.command === '-h') {
+    showHelp();
+    return;
+  }
+  // Subcommand help: e.g. `turbine migrate --help`
+  if (args.help) {
+    if (showSubcommandHelp(args.command)) return;
     showHelp();
     return;
   }

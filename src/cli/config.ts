@@ -6,7 +6,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 // ---------------------------------------------------------------------------
@@ -36,12 +36,7 @@ export interface TurbineCliConfig {
 // Config file names, in priority order
 // ---------------------------------------------------------------------------
 
-const CONFIG_FILES = [
-  'turbine.config.ts',
-  'turbine.config.mts',
-  'turbine.config.js',
-  'turbine.config.mjs',
-] as const;
+const CONFIG_FILES = ['turbine.config.ts', 'turbine.config.mts', 'turbine.config.js', 'turbine.config.mjs'] as const;
 
 // ---------------------------------------------------------------------------
 // Load config
@@ -73,9 +68,7 @@ export async function loadConfig(cwd?: string): Promise<TurbineCliConfig> {
       if (filename.endsWith('.ts') || filename.endsWith('.mts')) {
         continue;
       }
-      throw new Error(
-        `Failed to load config from ${filename}: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      throw new Error(`Failed to load config from ${filename}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -122,16 +115,9 @@ export interface CliOverrides {
  * Merge config file values with CLI overrides and env vars.
  * Priority: CLI flags > env vars > config file > defaults.
  */
-export function resolveConfig(
-  fileConfig: TurbineCliConfig,
-  overrides: CliOverrides,
-): ResolvedConfig {
+export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverrides): ResolvedConfig {
   return {
-    url:
-      overrides.url ??
-      process.env['DATABASE_URL'] ??
-      fileConfig.url ??
-      '',
+    url: overrides.url ?? process.env.DATABASE_URL ?? fileConfig.url ?? '',
     out: overrides.out ?? fileConfig.out ?? './generated/turbine',
     schema: overrides.schema ?? fileConfig.schema ?? 'public',
     include: overrides.include ?? fileConfig.include ?? [],
@@ -147,16 +133,14 @@ export function resolveConfig(
 // ---------------------------------------------------------------------------
 
 export function configTemplate(connectionString?: string): string {
-  const url = connectionString ?? 'process.env.DATABASE_URL';
-  const urlLine = connectionString
-    ? `  url: '${connectionString}',`
-    : `  url: process.env.DATABASE_URL,`;
+  const _url = connectionString ?? 'process.env.DATABASE_URL';
+  const urlLine = connectionString ? `  url: '${connectionString}',` : `  url: process.env.DATABASE_URL,`;
 
   return `import type { TurbineCliConfig } from 'turbine-orm/cli';
 
 /**
  * Turbine configuration
- * @see https://batadata.com/docs/turbine/config
+ * @see https://turbineorm.dev
  */
 const config: TurbineCliConfig = {
   /** Postgres connection string */

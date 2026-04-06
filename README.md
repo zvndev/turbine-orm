@@ -333,6 +333,45 @@ FROM users u WHERE u.org_id = 1
 
 This resolves the entire 3-level object graph in one database round-trip. Prisma would send 3 queries. The performance difference scales with nesting depth and network latency.
 
+## Type Mapping
+
+Turbine maps Postgres types to TypeScript:
+
+| Postgres | TypeScript | Notes |
+|---|---|---|
+| `int2`, `int4`, `float4`, `float8` | `number` | Standard numeric types |
+| `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` (2^53 - 1) are returned as `string` at runtime to avoid precision loss. This affects < 0.01% of use cases (auto-increment IDs, counts, etc. are all safe). |
+| `numeric`, `money` | `string` | Arbitrary precision — kept as string to avoid JS float issues |
+| `text`, `varchar`, `uuid`, `citext` | `string` | |
+| `timestamptz`, `timestamp`, `date` | `Date` | |
+| `boolean` | `boolean` | |
+| `json`, `jsonb` | `unknown` | |
+| `bytea` | `Buffer` | |
+| Array types | `T[]` | e.g. `_text` → `string[]` |
+
+## Comparison
+
+| | **Turbine** | **Prisma** | **Drizzle** | **Kysely** |
+|---|---|---|---|---|
+| **Nested relations** | 1 query (`json_agg`) | N+1 queries (default) | 1 query (LATERAL JOINs) | Manual (`jsonArrayFrom`) |
+| **API style** | `findMany`, `with` | `findMany`, `include` | SQL-like + relational | SQL builder |
+| **Schema** | TypeScript | Custom DSL (`.prisma`) | TypeScript | Manual interfaces |
+| **Runtime deps** | 1 (`pg`) | WASM compiler + driver | 0 | 0 |
+| **Multi-DB** | PostgreSQL only | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
+| **Code generation** | `turbine generate` | `prisma generate` | Not needed | Not needed |
+
+Turbine is fastest on nested queries because it generates a single SQL statement using PostgreSQL-native `json_agg`. Drizzle achieves single-query via LATERAL JOINs (competitive, different tradeoffs). Prisma defaults to separate queries per nesting level.
+
+## Limitations
+
+Turbine is focused and opinionated. Here's what it doesn't do:
+
+- **PostgreSQL only.** No MySQL, SQLite, or MSSQL. This is by design — the `json_agg` approach is PostgreSQL-specific, and going deep on one database enables the performance advantage.
+- **No incremental updates.** Prisma's `{ count: { increment: 1 } }` syntax is not yet supported. Use raw SQL for atomic increments.
+- **No full-text search operators.** TSVECTOR/TSQUERY are not exposed in the query builder. Use `db.raw` for full-text queries.
+- **Large nested result sets.** `json_agg` builds the entire JSON array in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause to cap the aggregation size.
+- **No admin UI.** Turbine Studio is planned but not yet available.
+
 ## Requirements
 
 - Node.js >= 18.0.0

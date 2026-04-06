@@ -1,14 +1,14 @@
 /**
- * @batadata/turbine — Schema SQL Generator
+ * turbine-orm — Schema SQL Generator
  *
  * Converts a SchemaDef (from defineSchema) into executable DDL statements.
  * Also provides diff and push commands for syncing schema to a live database.
  */
 
 import pg from 'pg';
-import { camelToSnake } from './schema.js';
 import { quoteIdent } from './query.js';
-import type { SchemaDef, TableDef, ColumnConfig } from './schema-builder.js';
+import { camelToSnake } from './schema.js';
+import type { ColumnConfig, SchemaDef, TableDef } from './schema-builder.js';
 
 // ---------------------------------------------------------------------------
 // SQL Generation — SchemaDef → CREATE TABLE statements
@@ -171,9 +171,7 @@ function normalizeDefault(val: string): string {
   }
 
   // Known SQL function calls: NOW(), CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, GEN_RANDOM_UUID()
-  const allowedFunctions = [
-    'NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME', 'GEN_RANDOM_UUID()',
-  ];
+  const allowedFunctions = ['NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME', 'GEN_RANDOM_UUID()'];
   if (allowedFunctions.includes(upper)) {
     return upper;
   }
@@ -188,9 +186,7 @@ function normalizeDefault(val: string): string {
     return val.trim();
   }
 
-  throw new Error(
-    `Unsupported default value: ${val}. Use a SQL function, numeric, string literal, or NULL.`,
-  );
+  throw new Error(`Unsupported default value: ${val}. Use a SQL function, numeric, string literal, or NULL.`);
 }
 
 /**
@@ -204,9 +200,7 @@ function generateForeignKeyIndexes(table: TableDef): string[] {
     if (config.referencesTarget) {
       const snakeName = camelToSnake(fieldName);
       const indexName = `idx_${table.name}_${snakeName}`;
-      indexes.push(
-        `CREATE INDEX ${quoteIdent(indexName)} ON ${quoteIdent(table.name)}(${quoteIdent(snakeName)});`
-      );
+      indexes.push(`CREATE INDEX ${quoteIdent(indexName)} ON ${quoteIdent(table.name)}(${quoteIdent(snakeName)});`);
     }
   }
 
@@ -250,17 +244,14 @@ export interface DiffResult {
  * Connects to the database, inspects the public schema, and computes what
  * DDL is needed to make the database match the schema definition.
  */
-export async function schemaDiff(
-  schema: SchemaDef,
-  connectionString: string
-): Promise<DiffResult> {
+export async function schemaDiff(schema: SchemaDef, connectionString: string): Promise<DiffResult> {
   const client = new pg.Client({ connectionString });
   await client.connect();
 
   try {
     // Get existing tables in the public schema
     const tableResult = await client.query<{ tablename: string }>(
-      `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`
+      `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`,
     );
     const existingTables = new Set(tableResult.rows.map((r) => r.tablename));
 
@@ -277,7 +268,7 @@ export async function schemaDiff(
       `SELECT table_name, column_name, data_type, udt_name, is_nullable, column_default, character_maximum_length
        FROM information_schema.columns
        WHERE table_schema = 'public'
-       ORDER BY table_name, ordinal_position`
+       ORDER BY table_name, ordinal_position`,
     );
 
     const dbColumns: Record<
@@ -353,17 +344,14 @@ export async function schemaDiff(
         // Check type mismatch
         const expectedUdt = schemaTypeToUdt(config);
         if (expectedUdt && dbCol.udtName !== expectedUdt) {
-          const sqlType = config.type === 'VARCHAR' && config.maxLength
-            ? `VARCHAR(${config.maxLength})`
-            : config.type;
+          const sqlType = config.type === 'VARCHAR' && config.maxLength ? `VARCHAR(${config.maxLength})` : config.type;
           const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} TYPE ${sqlType};`;
           alterDef.columns.push({ column: snakeName, action: 'alter_type', sql });
           result.statements.push(sql);
         }
 
         // Check NOT NULL mismatch
-        const shouldBeNotNull =
-          config.isNotNull || config.isPrimaryKey || config.type === 'BIGSERIAL';
+        const shouldBeNotNull = config.isNotNull || config.isPrimaryKey || config.type === 'BIGSERIAL';
         const isCurrentlyNullable = dbCol.isNullable;
         if (shouldBeNotNull && isCurrentlyNullable && !config.isNullable) {
           const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET NOT NULL;`;
@@ -378,9 +366,7 @@ export async function schemaDiff(
 
       // Check for columns in DB that are not in schema
       for (const dbColName of Object.keys(dbCols)) {
-        const hasField = Object.entries(tableDef.columns).some(
-          ([fieldName]) => camelToSnake(fieldName) === dbColName
-        );
+        const hasField = Object.entries(tableDef.columns).some(([fieldName]) => camelToSnake(fieldName) === dbColName);
         if (!hasField) {
           const sql = `ALTER TABLE ${quoteIdent(tableName)} DROP COLUMN ${quoteIdent(dbColName)};`;
           alterDef.columns.push({ column: dbColName, action: 'drop', sql });
@@ -448,7 +434,7 @@ export interface PushResult {
 export async function schemaPush(
   schema: SchemaDef,
   connectionString: string,
-  options: { dryRun?: boolean } = {}
+  options: { dryRun?: boolean } = {},
 ): Promise<PushResult> {
   const diff = await schemaDiff(schema, connectionString);
 
@@ -494,5 +480,5 @@ export async function schemaPush(
  */
 export function schemaToSQLString(schema: SchemaDef): string {
   const statements = schemaToSQL(schema);
-  return statements.join('\n\n') + '\n';
+  return `${statements.join('\n\n')}\n`;
 }

@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine
+ * turbine-orm
  *
  * Turbine TypeScript SDK — type-safe Postgres queries with nested relations
  * and pipeline batching. Feels like Prisma, runs at raw-SQL speed.
@@ -35,92 +35,98 @@
 
 // Client
 export {
-  TurbineClient,
-  TransactionClient,
-  type TurbineConfig,
-  type TransactionOptions,
   type Middleware,
-  type MiddlewareParams,
   type MiddlewareNext,
+  type MiddlewareParams,
+  TransactionClient,
+  type TransactionOptions,
+  TurbineClient,
+  type TurbineConfig,
 } from './client.js';
-
-// Query builder
+// Error types
 export {
-  QueryInterface,
-  type DeferredQuery,
-  type FindUniqueArgs,
-  type FindManyArgs,
-  type CreateArgs,
-  type CreateManyArgs,
-  type UpdateArgs,
-  type UpdateManyArgs,
-  type DeleteArgs,
-  type DeleteManyArgs,
-  type UpsertArgs,
-  type CountArgs,
-  type GroupByArgs,
-  type AggregateArgs,
-  type AggregateResult,
-  type RelationFilter,
-  type JsonFilter,
-  type ArrayFilter,
-  type WithClause,
-  type WithOptions,
-  type OrderDirection,
-} from './query.js';
-
+  CircularRelationError,
+  ConnectionError,
+  MigrationError,
+  NotFoundError,
+  RelationError,
+  TimeoutError,
+  TurbineError,
+  TurbineErrorCode,
+  ValidationError,
+} from './errors.js';
+// Code generation
+export { type GenerateOptions, generate } from './generate.js';
+// Introspection
+export { type IntrospectOptions, introspect } from './introspect.js';
 // Pipeline
 export { executePipeline, type PipelineResults } from './pipeline.js';
-
+// Query builder
+export {
+  type AggregateArgs,
+  type AggregateResult,
+  type ArrayFilter,
+  type CountArgs,
+  type CreateArgs,
+  type CreateManyArgs,
+  type DeferredQuery,
+  type DeleteArgs,
+  type DeleteManyArgs,
+  type FindManyArgs,
+  type FindUniqueArgs,
+  type GroupByArgs,
+  type JsonFilter,
+  type OrderDirection,
+  QueryInterface,
+  type RelationFilter,
+  type UpdateArgs,
+  type UpdateManyArgs,
+  type UpsertArgs,
+  type WithClause,
+  type WithOptions,
+} from './query.js';
 // Schema metadata types
 export type {
+  ColumnMetadata,
+  IndexMetadata,
+  RelationDef,
   SchemaMetadata,
   TableMetadata,
-  ColumnMetadata,
-  RelationDef,
-  IndexMetadata,
 } from './schema.js';
-
 // Schema utilities
 export {
-  snakeToCamel,
   camelToSnake,
-  snakeToPascal,
-  singularize,
-  pgTypeToTs,
   isDateType,
   pgArrayType,
+  pgTypeToTs,
+  singularize,
+  snakeToCamel,
+  snakeToPascal,
 } from './schema.js';
-
-// Introspection
-export { introspect, type IntrospectOptions } from './introspect.js';
-
-// Code generation
-export { generate, type GenerateOptions } from './generate.js';
 
 // Schema builder — define schemas in TypeScript
 export {
+  ColumnBuilder,
+  type ColumnConfig,
+  type ColumnDef,
+  type ColumnType,
+  type ColumnTypeName,
+  column,
   defineSchema,
+  type SchemaDef,
+  type TableDef,
   // Legacy compat (deprecated — use object format with defineSchema)
   table,
-  column,
-  ColumnBuilder,
-  type ColumnDef,
-  type ColumnTypeName,
-  type ColumnConfig,
-  type ColumnType,
-  type TableDef,
-  type SchemaDef,
 } from './schema-builder.js';
 
 // Schema SQL — generate DDL, diff, and push
 export {
-  schemaToSQL,
-  schemaToSQLString,
+  type AlterColumnDef,
+  type AlterDef,
+  type DiffResult,
+  type PushResult,
   schemaDiff,
   schemaPush,
-  type DiffResult,
-  type AlterDef,
-  type AlterColumnDef,
-  type PushResult,
+  schemaToSQL,
+  schemaToSQLString,
 } from './schema-sql.js';

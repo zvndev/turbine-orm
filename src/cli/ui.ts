@@ -9,10 +9,7 @@
 // ANSI escape codes
 // ---------------------------------------------------------------------------
 
-const isColorSupported =
-  process.env['NO_COLOR'] == null &&
-  process.env['TERM'] !== 'dumb' &&
-  (process.stdout.isTTY ?? false);
+const isColorSupported = process.env.NO_COLOR == null && process.env.TERM !== 'dumb' && (process.stdout.isTTY ?? false);
 
 function code(open: string, close: string): (s: string) => string {
   if (!isColorSupported) return (s) => s;
@@ -118,9 +115,7 @@ export function table(headers: string[], rows: string[][]): string {
     })
     .join(dim(symbols.vertLine));
 
-  const separator = colWidths
-    .map((w) => symbols.line.repeat(w + 2))
-    .join(dim(symbols.line));
+  const separator = colWidths.map((w) => symbols.line.repeat(w + 2)).join(dim(symbols.line));
 
   const bodyLines = rows.map((row) =>
     row
@@ -218,7 +213,7 @@ export function info(msg: string): void {
 }
 
 export function label(key: string, value: string): void {
-  console.log(`  ${dim(key + ':')} ${value}`);
+  console.log(`  ${dim(`${key}:`)} ${value}`);
 }
 
 export function newline(): void {
@@ -236,7 +231,7 @@ export function divider(): void {
 
 export function banner(): void {
   console.log('');
-  console.log(`  ${bold(cyan('turbine'))} ${dim('by')} ${bold('BataData')}`);
+  console.log(`  ${bold(cyan('turbine-orm'))}`);
   console.log(`  ${dim('TypeScript ORM with json_agg nested queries')}`);
   console.log('');
 }
@@ -256,7 +251,7 @@ export function elapsed(startMs: number): string {
 // ---------------------------------------------------------------------------
 
 export function stripAnsi(s: string): string {
-  // eslint-disable-next-line no-control-regex
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape codes require control characters
   return s.replace(/\x1b\[[0-9;]*m/g, '');
 }
 

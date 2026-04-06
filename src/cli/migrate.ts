@@ -12,9 +12,11 @@
  *   DROP TABLE users;
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import pg from 'pg';
+import { MigrationError } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -188,15 +190,16 @@ export function parseMigrationSQL(filePath: string): { up: string; down: string 
 }
 
 /**
- * Simple checksum for a migration file (for drift detection).
+ * SHA-256 checksum for migration drift detection.
+ * Returns a hex-encoded hash of the file content.
  */
 function checksum(content: string): string {
-  let hash = 0;
-  for (let i = 0; i < content.length; i++) {
-    const chr = content.charCodeAt(i);
-    hash = ((hash << 5) - hash + chr) | 0;
-  }
-  return Math.abs(hash).toString(36);
+  return createHash('sha256').update(content, 'utf-8').digest('hex');
+}
+
+/** Detect legacy djb2 checksums (short alphanumeric strings, pre-v0.6) */
+function isLegacyChecksum(hash: string): boolean {
+  return hash.length < 64;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,10 +209,7 @@ function checksum(content: string): string {
 /**
  * Create a new migration file.
  */
-export function createMigration(
-  migrationsDir: string,
-  name: string,
-): MigrationFile {
+export function createMigration(migrationsDir: string, name: string): MigrationFile {
   mkdirSync(migrationsDir, { recursive: true });
 
   const now = new Date();
@@ -247,10 +247,9 @@ export function createMigration(
 const MIGRATION_LOCK_ID = 8_347_291; // arbitrary but stable
 
 async function acquireLock(client: pg.Client): Promise<boolean> {
-  const result = await client.query<{ pg_try_advisory_lock: boolean }>(
-    `SELECT pg_try_advisory_lock($1)`,
-    [MIGRATION_LOCK_ID],
-  );
+  const result = await client.query<{ pg_try_advisory_lock: boolean }>(`SELECT pg_try_advisory_lock($1)`, [
+    MIGRATION_LOCK_ID,
+  ]);
   return result.rows[0]?.pg_try_advisory_lock ?? false;
 }
 
@@ -262,29 +261,48 @@ async function releaseLock(client: pg.Client): Promise<void> {
 // Checksum validation
 // ---------------------------------------------------------------------------
 
+interface ChecksumMismatch {
+  name: string;
+  expected: string;
+  actual: string;
+  /** 'modified' if file changed, 'missing' if file deleted */
+  type: 'modified' | 'missing';
+}
+
 /**
- * Validate that applied migration files have not been modified since they were run.
+ * Validate that applied migration files have not been modified or deleted since they were run.
  * Returns an array of mismatched migrations (empty if all are clean).
  */
-async function validateChecksums(
-  client: pg.Client,
-  migrationsDir: string,
-): Promise<Array<{ name: string; expected: string; actual: string }>> {
+async function validateChecksums(client: pg.Client, migrationsDir: string): Promise<ChecksumMismatch[]> {
   const applied = await getAppliedMigrations(client);
   const allFiles = listMigrationFiles(migrationsDir);
   const fileMap = new Map(allFiles.map((f) => [f.name, f]));
-  const mismatches: Array<{ name: string; expected: string; actual: string }> = [];
+  const mismatches: ChecksumMismatch[] = [];
 
   for (const migration of applied) {
     const file = fileMap.get(migration.name);
-    if (!file) continue; // file deleted — not a checksum issue
+    if (!file) {
+      mismatches.push({
+        name: migration.name,
+        expected: migration.checksum,
+        actual: '',
+        type: 'missing',
+      });
+      continue;
+    }
     const content = readFileSync(file.path, 'utf-8');
     const currentHash = checksum(content);
     if (currentHash !== migration.checksum) {
+      // Auto-upgrade legacy djb2 checksums to SHA-256 without flagging as modified
+      if (isLegacyChecksum(migration.checksum)) {
+        await client.query(`UPDATE ${TRACKING_TABLE} SET checksum = $1 WHERE name = $2`, [currentHash, migration.name]);
+        continue;
+      }
       mismatches.push({
         name: migration.name,
         expected: migration.checksum,
         actual: currentHash,
+        type: 'modified',
       });
     }
   }
@@ -304,7 +322,7 @@ async function validateChecksums(
 export async function migrateUp(
   connectionString: string,
   migrationsDir: string,
-  options?: { step?: number },
+  options?: { step?: number; force?: boolean },
 ): Promise<{ applied: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
   const client = new pg.Client({ connectionString });
   await client.connect();
@@ -313,29 +331,25 @@ export async function migrateUp(
     // Acquire advisory lock to prevent concurrent migrations
     const gotLock = await acquireLock(client);
     if (!gotLock) {
-      return {
-        applied: [],
-        errors: [{
-          file: { filename: '', path: '', name: '', timestamp: '' },
-          error: 'Could not acquire migration lock — another migration is already running',
-        }],
-      };
+      throw new MigrationError('[turbine] Could not acquire migration lock — another migration is already running');
     }
 
     try {
       await ensureTrackingTable(client);
 
-      // Validate checksums of already-applied migrations
-      const mismatches = await validateChecksums(client, migrationsDir);
-      if (mismatches.length > 0) {
-        const names = mismatches.map((m) => m.name).join(', ');
-        return {
-          applied: [],
-          errors: [{
-            file: { filename: '', path: '', name: '', timestamp: '' },
-            error: `Checksum mismatch: migration file(s) modified after application: ${names}. This is dangerous — applied migrations should be immutable. Use --force to skip this check.`,
-          }],
-        };
+      // Validate checksums of already-applied migrations (skip with --force)
+      if (!options?.force) {
+        const mismatches = await validateChecksums(client, migrationsDir);
+        if (mismatches.length > 0) {
+          const modified = mismatches.filter((m) => m.type === 'modified');
+          const missing = mismatches.filter((m) => m.type === 'missing');
+          const parts: string[] = [];
+          if (modified.length > 0) parts.push(`modified: ${modified.map((m) => m.name).join(', ')}`);
+          if (missing.length > 0) parts.push(`deleted: ${missing.map((m) => m.name).join(', ')}`);
+          throw new MigrationError(
+            `[turbine] Migration integrity check failed — ${parts.join('; ')}. Applied migrations should be immutable. Use --force to skip this check.`,
+          );
+        }
       }
 
       const applied = await getAppliedMigrations(client);
@@ -407,13 +421,7 @@ export async function migrateDown(
   try {
     const gotLock = await acquireLock(client);
     if (!gotLock) {
-      return {
-        rolledBack: [],
-        errors: [{
-          file: { filename: '', path: '', name: '', timestamp: '' },
-          error: 'Could not acquire migration lock — another migration is already running',
-        }],
-      };
+      throw new MigrationError('[turbine] Could not acquire migration lock — another migration is already running');
     }
 
     try {
@@ -437,7 +445,7 @@ export async function migrateDown(
         const file = fileMap.get(migration.name);
         if (!file) {
           errors.push({
-            file: { filename: migration.name + '.sql', path: '', name: migration.name, timestamp: '' },
+            file: { filename: `${migration.name}.sql`, path: '', name: migration.name, timestamp: '' },
             error: `Migration file not found for "${migration.name}"`,
           });
           continue;
@@ -452,10 +460,7 @@ export async function migrateDown(
         try {
           await client.query('BEGIN');
           await client.query(down);
-          await client.query(
-            `DELETE FROM ${TRACKING_TABLE} WHERE name = $1`,
-            [migration.name],
-          );
+          await client.query(`DELETE FROM ${TRACKING_TABLE} WHERE name = $1`, [migration.name]);
           await client.query('COMMIT');
           results.push(file);
         } catch (err) {
@@ -479,10 +484,7 @@ export async function migrateDown(
  * Get the status of all migrations (applied vs pending).
  * Includes checksum validation for applied migrations.
  */
-export async function migrateStatus(
-  connectionString: string,
-  migrationsDir: string,
-): Promise<MigrationStatus[]> {
+export async function migrateStatus(connectionString: string, migrationsDir: string): Promise<MigrationStatus[]> {
   const client = new pg.Client({ connectionString });
   await client.connect();
 

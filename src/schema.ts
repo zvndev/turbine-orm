@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine — Schema metadata types
+ * turbine-orm — Schema metadata types
  *
  * These types represent the introspected database schema at runtime.
  * They're used by the query builder, code generator, and CLI.
@@ -91,6 +91,9 @@ const PG_TO_TS: Record<string, string> = {
   // Integers
   int2: 'number',
   int4: 'number',
+  // int8 maps to `number` for DX (auto-increment IDs, counts, etc.).
+  // Values exceeding Number.MAX_SAFE_INTEGER (2^53 - 1) are returned as
+  // `string` at runtime to avoid precision loss. See client.ts int8 parser.
   int8: 'number',
   float4: 'number',
   float8: 'number',
@@ -209,7 +212,7 @@ export function snakeToPascal(s: string): string {
 
 /** Naive singularize: "posts" → "post", "categories" → "category" */
 export function singularize(s: string): string {
-  if (s.endsWith('ies')) return s.slice(0, -3) + 'y';
+  if (s.endsWith('ies')) return `${s.slice(0, -3)}y`;
   if (s.endsWith('ses') || s.endsWith('xes') || s.endsWith('zes')) return s.slice(0, -2);
   if (s.endsWith('s') && !s.endsWith('ss')) return s.slice(0, -1);
   return s;

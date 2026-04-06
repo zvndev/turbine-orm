@@ -1,5 +1,5 @@
 /**
- * @batadata/turbine/serverless — HTTP-based query driver for edge functions
+ * turbine-orm/serverless — HTTP-based query driver for edge functions
  *
  * Use this driver when you cannot establish a direct TCP connection to Postgres
  * (e.g., Vercel Edge Functions, Cloudflare Workers, Deno Deploy).
@@ -13,7 +13,7 @@
  *
  * @example
  * ```ts
- * import { createServerlessClient } from '@batadata/turbine/serverless';
+ * import { createServerlessClient } from 'turbine-orm/serverless';
  *
  * const db = createServerlessClient({
  *   endpoint: 'https://your-turbine-proxy.fly.dev/query',
@@ -134,10 +134,7 @@ export class ServerlessClient {
    * console.log(result.rows);
    * ```
    */
-  async query<T = Record<string, unknown>>(
-    sql: string,
-    params?: unknown[],
-  ): Promise<QueryResponse<T>> {
+  async query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<QueryResponse<T>> {
     const request: QueryRequest = { sql, params, mode: 'rows' };
     const response = await this.post<QueryResponse<T>>('/query', request);
     return response;
@@ -146,10 +143,7 @@ export class ServerlessClient {
   /**
    * Execute a single SQL query and return the first row, or null.
    */
-  async queryOne<T = Record<string, unknown>>(
-    sql: string,
-    params?: unknown[],
-  ): Promise<T | null> {
+  async queryOne<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T | null> {
     const request: QueryRequest = { sql, params, mode: 'one' };
     const response = await this.post<QueryResponse<T>>('/query', request);
     return response.rows[0] ?? null;
@@ -171,10 +165,7 @@ export class ServerlessClient {
    * ], { transaction: true });
    * ```
    */
-  async batch(
-    queries: QueryRequest[],
-    options?: { transaction?: boolean },
-  ): Promise<BatchResponse> {
+  async batch(queries: QueryRequest[], options?: { transaction?: boolean }): Promise<BatchResponse> {
     const request: BatchRequest = {
       queries,
       transaction: options?.transaction ?? false,
@@ -192,10 +183,7 @@ export class ServerlessClient {
    * `;
    * ```
    */
-  async sql<T = Record<string, unknown>>(
-    strings: TemplateStringsArray,
-    ...values: unknown[]
-  ): Promise<T[]> {
+  async sql<T = Record<string, unknown>>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]> {
     let sqlStr = '';
     strings.forEach((str, i) => {
       sqlStr += str;
@@ -222,8 +210,8 @@ export class ServerlessClient {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.config.authToken}`,
-          'User-Agent': '@batadata/turbine-serverless',
+          Authorization: `Bearer ${this.config.authToken}`,
+          'User-Agent': 'turbine-orm/serverless',
           ...this.config.headers,
         },
         body: JSON.stringify(body),
@@ -241,17 +229,15 @@ export class ServerlessClient {
 
         const message = parsed?.error ?? `HTTP ${response.status}: ${errorBody.slice(0, 200)}`;
         const err = new Error(`[turbine/serverless] ${message}`) as unknown as Record<string, unknown>;
-        err['status'] = response.status;
-        err['code'] = parsed?.code;
+        err.status = response.status;
+        err.code = parsed?.code;
         throw err;
       }
 
       return (await response.json()) as T;
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
-        throw new Error(
-          `[turbine/serverless] Request timed out after ${this.config.timeout}ms`,
-        );
+        throw new Error(`[turbine/serverless] Request timed out after ${this.config.timeout}ms`);
       }
       throw err;
     } finally {
@@ -272,7 +258,7 @@ export class ServerlessClient {
  *
  * @example
  * ```ts
- * import { createServerlessClient } from '@batadata/turbine/serverless';
+ * import { createServerlessClient } from 'turbine-orm/serverless';
  *
  * const db = createServerlessClient({
  *   endpoint: process.env.TURBINE_ENDPOINT!,

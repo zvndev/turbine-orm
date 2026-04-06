@@ -1,0 +1,11 @@
+{
+  "all": true,
+  "include": ["src/**"],
+  "exclude": ["src/test/**"],
+  "reporter": ["text", "lcov"],
+  "check-coverage": true,
+  "lines": 25,
+  "functions": 15,
+  "branches": 15,
+  "statements": 25
+}
