@@ -1072,6 +1072,14 @@ export class QueryInterface<T extends object> {
   }
 
   buildGroupBy(args: GroupByArgs<T>): DeferredQuery<Record<string, unknown>[]> {
+    const meta = this.schema.tables[this.table];
+    if (meta) {
+      for (const key of args.by) {
+        if (!(key as string in meta.columnMap)) {
+          throw new ValidationError(`Unknown column "${key as string}" in groupBy for table "${this.table}"`);
+        }
+      }
+    }
     const groupColsRaw = args.by.map((k) => this.toColumn(k as string));
     const groupCols = groupColsRaw.map((c) => quoteIdent(c));
     const { sql: whereSql, params } = args.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
@@ -1653,8 +1661,12 @@ export class QueryInterface<T extends object> {
 
   /** Build ORDER BY clause from an object */
   private buildOrderBy(orderBy: Record<string, OrderDirection>): string {
+    const meta = this.schema.tables[this.table];
     return Object.entries(orderBy)
       .map(([key, dir]) => {
+        if (meta && !(key in meta.columnMap)) {
+          throw new ValidationError(`Unknown column "${key}" in orderBy for table "${this.table}"`);
+        }
         const safeDir = dir.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
         return `${this.toSqlColumn(key)} ${safeDir}`;
       })
@@ -1704,6 +1716,7 @@ export class QueryInterface<T extends object> {
           try {
             parsed[relName] = JSON.parse(rawValue);
           } catch {
+            console.warn(`[turbine] Warning: Failed to parse JSON for relation "${relName}" on table "${this.table}". Using raw value.`);
             parsed[relName] = rawValue;
           }
         } else if (Array.isArray(rawValue)) {
