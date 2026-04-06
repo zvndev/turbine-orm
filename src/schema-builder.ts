@@ -123,6 +123,9 @@ export interface ColumnConfig {
 
 /** Convert a user-facing ColumnDef to the internal ColumnConfig */
 function resolveColumn(def: ColumnDef): ColumnConfig {
+  if (!(def.type in TYPE_MAP)) {
+    throw new Error(`Invalid column type "${def.type}". Valid types: ${Object.keys(TYPE_MAP).join(', ')}`);
+  }
   return {
     type: TYPE_MAP[def.type] as ColumnType,
     isPrimaryKey: def.primaryKey ?? false,
