@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { join } from 'node:path';
 import pg from 'pg';
 import { MigrationError } from '../errors.js';
+import { quoteIdent } from '../query.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -53,9 +54,10 @@ export interface MigrationStatus {
 // ---------------------------------------------------------------------------
 
 const TRACKING_TABLE = '_turbine_migrations';
+const QUOTED_TRACKING_TABLE = quoteIdent(TRACKING_TABLE);
 
 const CREATE_TRACKING_TABLE = `
-  CREATE TABLE IF NOT EXISTS ${TRACKING_TABLE} (
+  CREATE TABLE IF NOT EXISTS ${QUOTED_TRACKING_TABLE} (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     checksum TEXT NOT NULL,
@@ -70,7 +72,7 @@ async function ensureTrackingTable(client: pg.Client): Promise<void> {
 async function getAppliedMigrations(client: pg.Client): Promise<AppliedMigration[]> {
   await ensureTrackingTable(client);
   const result = await client.query<AppliedMigration>(
-    `SELECT id, name, applied_at, checksum FROM ${TRACKING_TABLE} ORDER BY id ASC`,
+    `SELECT id, name, applied_at, checksum FROM ${QUOTED_TRACKING_TABLE} ORDER BY id ASC`,
   );
   return result.rows;
 }
@@ -295,7 +297,7 @@ async function validateChecksums(client: pg.Client, migrationsDir: string): Prom
     if (currentHash !== migration.checksum) {
       // Auto-upgrade legacy djb2 checksums to SHA-256 without flagging as modified
       if (isLegacyChecksum(migration.checksum)) {
-        await client.query(`UPDATE ${TRACKING_TABLE} SET checksum = $1 WHERE name = $2`, [currentHash, migration.name]);
+        await client.query(`UPDATE ${QUOTED_TRACKING_TABLE} SET checksum = $1 WHERE name = $2`, [currentHash, migration.name]);
         continue;
       }
       mismatches.push({
@@ -379,7 +381,7 @@ export async function migrateUp(
           await client.query('BEGIN');
           await client.query(up);
           await client.query(
-            `INSERT INTO ${TRACKING_TABLE} (name, checksum) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`,
+            `INSERT INTO ${QUOTED_TRACKING_TABLE} (name, checksum) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`,
             [file.name, hash],
           );
           await client.query('COMMIT');
@@ -460,7 +462,7 @@ export async function migrateDown(
         try {
           await client.query('BEGIN');
           await client.query(down);
-          await client.query(`DELETE FROM ${TRACKING_TABLE} WHERE name = $1`, [migration.name]);
+          await client.query(`DELETE FROM ${QUOTED_TRACKING_TABLE} WHERE name = $1`, [migration.name]);
           await client.query('COMMIT');
           results.push(file);
         } catch (err) {

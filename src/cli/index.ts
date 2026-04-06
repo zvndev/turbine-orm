@@ -364,7 +364,7 @@ export default defineSchema({
     } catch (err) {
       spinner.fail('Could not connect to database');
       if (err instanceof Error) {
-        console.log(`  ${dim(err.message)}`);
+        console.log(`  ${dim(redactUrl(err.message))}`);
       }
       newline();
       info(`You can run generation later with: ${cyan('npx turbine generate')}`);
@@ -832,21 +832,18 @@ async function cmdSeed(_args: CliArgs, config: ResolvedConfig): Promise<void> {
 
   try {
     // Use child_process to run the seed file via tsx or node
-    const { execSync } = await import('node:child_process');
+    const { execFileSync } = await import('node:child_process');
 
     // Try tsx first (most compatible with .ts files), fall back to node --experimental-strip-types
     const runners = [
-      { cmd: 'npx tsx', name: 'tsx' },
-      { cmd: 'node --experimental-strip-types', name: 'node' },
+      { cmd: 'npx', args: ['tsx', seedFile], name: 'tsx' },
+      { cmd: 'node', args: ['--experimental-strip-types', seedFile], name: 'node' },
     ];
-
-    // Shell-escape the seed file path to prevent injection
-    const escapedSeedFile = seedFile.replace(/'/g, "'\\''");
 
     let ran = false;
     for (const runner of runners) {
       try {
-        execSync(`${runner.cmd} '${escapedSeedFile}'`, {
+        execFileSync(runner.cmd, runner.args, {
           stdio: 'inherit',
           env: {
             ...process.env,
@@ -1261,7 +1258,7 @@ async function main() {
       if (err.message.includes('ECONNREFUSED') || err.message.includes('connection')) {
         newline();
         error(`Could not connect to database`);
-        console.log(`  ${dim(err.message)}`);
+        console.log(`  ${dim(redactUrl(err.message))}`);
         newline();
         console.log(`  ${dim('Check that:')}`);
         console.log(`    ${dim('1.')} Your database is running`);
@@ -1270,22 +1267,22 @@ async function main() {
       } else if (err.message.includes('authentication')) {
         newline();
         error(`Authentication failed`);
-        console.log(`  ${dim(err.message)}`);
+        console.log(`  ${dim(redactUrl(err.message))}`);
       } else if (err.message.includes('does not exist')) {
         newline();
         error(`Database or schema not found`);
-        console.log(`  ${dim(err.message)}`);
+        console.log(`  ${dim(redactUrl(err.message))}`);
       } else {
         newline();
-        error(err.message);
+        error(redactUrl(err.message));
         if (args.verbose && err.stack) {
           newline();
-          console.log(dim(err.stack));
+          console.log(dim(redactUrl(err.stack)));
         }
       }
     } else {
       newline();
-      error(`Unexpected error: ${String(err)}`);
+      error(`Unexpected error: ${redactUrl(String(err))}`);
     }
     newline();
     process.exit(1);
