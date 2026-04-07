@@ -11,6 +11,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
   typecheck:
     runs-on: ubuntu-latest
     steps:
@@ -20,7 +31,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx tsc --noEmit
+      - run: npm run typecheck
 
   unit-tests:
     runs-on: ubuntu-latest
@@ -34,7 +45,18 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
-      - run: npx tsx --test src/test/schema-builder.test.ts src/test/migrate.test.ts
+      - run: npm run test:unit
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:coverage
 
   integration-tests:
     runs-on: ubuntu-latest
@@ -78,4 +100,24 @@ jobs:
       - name: Verify ESM output
         run: test -f dist/index.js
       - name: Check package size
-        run: npm pack --dry-run 2>&1 | tail -5
+        run: |
+          SIZE=$(npm pack --dry-run 2>&1 | grep 'package size' | awk '{print $NF}')
+          echo "📦 Package size: $SIZE"
+          # Fail if package exceeds 150kB
+          SIZE_KB=$(npm pack --dry-run 2>&1 | grep 'package size' | awk '{print $(NF-1)}')
+          if [ "$(echo "$SIZE_KB > 150" | bc)" -eq 1 ]; then
+            echo "::error::Package size $SIZE exceeds 150kB limit"
+            exit 1
+          fi
+
+  security:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high

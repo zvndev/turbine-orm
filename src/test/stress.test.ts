@@ -15,58 +15,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { CircularRelationError, ValidationError } from '../errors.js';
-import { QueryInterface } from '../query.js';
-import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
-
-// ---------------------------------------------------------------------------
-// Helpers to build mock SchemaMetadata
-// ---------------------------------------------------------------------------
-
-/** Build a minimal ColumnMetadata for testing */
-function mockColumn(name: string, field: string, pgType = 'int8'): ColumnMetadata {
-  return {
-    name,
-    field,
-    pgType,
-    tsType: 'number',
-    nullable: false,
-    hasDefault: name === 'id',
-    isArray: false,
-    pgArrayType: 'bigint[]',
-  };
-}
-
-/** Build a minimal TableMetadata for testing */
-function mockTable(
-  tableName: string,
-  columns: { name: string; field: string; pgType?: string }[],
-  relations: Record<string, RelationDef> = {},
-): TableMetadata {
-  const cols = columns.map((c) => mockColumn(c.name, c.field, c.pgType ?? 'int8'));
-  const columnMap: Record<string, string> = {};
-  const reverseColumnMap: Record<string, string> = {};
-  const allColumns: string[] = [];
-
-  for (const col of cols) {
-    columnMap[col.field] = col.name;
-    reverseColumnMap[col.name] = col.field;
-    allColumns.push(col.name);
-  }
-
-  return {
-    name: tableName,
-    columns: cols,
-    columnMap,
-    reverseColumnMap,
-    dateColumns: new Set(),
-    pgTypes: Object.fromEntries(cols.map((c) => [c.name, c.pgType])),
-    allColumns,
-    primaryKey: ['id'],
-    uniqueColumns: [['id']],
-    relations,
-    indexes: [],
-  };
-}
+import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
+import { makeQuery, mockTable } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Core 4-table schema: organizations -> users -> posts -> comments
@@ -177,14 +127,6 @@ function buildCoreSchema(): SchemaMetadata {
   );
 
   return { tables, enums: {} };
-}
-
-/** Create a QueryInterface for a table in the given schema, with null pool */
-function makeQuery<T extends object = Record<string, unknown>>(
-  tableName: string,
-  schema: SchemaMetadata,
-): QueryInterface<T> {
-  return new QueryInterface<T>(null as any, tableName, schema);
 }
 
 // ---------------------------------------------------------------------------

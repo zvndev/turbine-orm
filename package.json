@@ -1,7 +1,7 @@
 {
   "name": "turbine-orm",
-  "version": "0.6.0",
-  "description": "Postgres-native TypeScript ORM — single-query nested relations via json_agg, 1 dependency, 70KB",
+  "version": "0.7.0",
+  "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. 1 dependency, ~110KB",
   "type": "module",
   "exports": {
     ".": {
@@ -9,15 +9,15 @@
       "require": "./dist/cjs/index.js",
       "types": "./dist/index.d.ts"
     },
-    "./cli": {
-      "import": "./dist/cli/config.js",
-      "require": "./dist/cjs/cli/config.js",
-      "types": "./dist/cli/config.d.ts"
-    },
     "./serverless": {
       "import": "./dist/serverless.js",
       "require": "./dist/cjs/serverless.js",
       "types": "./dist/serverless.d.ts"
+    },
+    "./cli": {
+      "import": "./dist/cli/config.js",
+      "require": "./dist/cjs/cli/config.js",
+      "types": "./dist/cli/config.d.ts"
     }
   },
   "main": "./dist/cjs/index.js",
@@ -38,17 +38,18 @@
   "scripts": {
     "build": "tsc && tsc --project tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
     "dev": "tsc --watch",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --project tsconfig.test.json",
     "generate": "tsx src/cli/index.ts generate",
     "status": "tsx src/cli/index.ts status",
     "examples": "tsx examples/examples.ts",
     "test": "tsx --test src/test/*.test.ts",
-    "test:unit": "tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts",
-    "test:coverage": "c8 tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts",
+    "test:unit": "tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts",
+    "test:coverage": "c8 tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
-    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit"
+    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit",
+    "prepare": "husky"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -61,6 +62,8 @@
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.11",
     "c8": "^11.0.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },
@@ -86,5 +89,10 @@
   },
   "bugs": {
     "url": "https://github.com/zvndev/turbine-orm/issues"
+  },
+  "lint-staged": {
+    "*.ts": [
+      "biome check --no-errors-on-unmatched"
+    ]
   }
 }

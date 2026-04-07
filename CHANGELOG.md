@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.7.0 (2026-04-07)
+
+This release is a quality + reach overhaul driven by a full product review
+and gold-standard OS audit. Biggest new capability: **Turbine now runs on
+the edge** via any pg-compatible driver (Neon, Vercel Postgres, Cloudflare
+Hyperdrive, etc.) without bundling a single extra dependency.
+
+### Added
+- **Serverless / edge support** (`turbine-orm/serverless`): new `turbineHttp(pool, schema)` factory and `PgCompatPool` / `PgCompatPoolClient` / `PgCompatQueryResult` interfaces. Plug in `@neondatabase/serverless`, `@vercel/postgres`, or any other pg-API compatible pool and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, and similar environments.
+- New `TurbineConfig.pool` option — pass an external pg-compatible pool and Turbine will route all queries through it instead of creating its own `pg.Pool`. `disconnect()` is a no-op for externally-owned pools.
+- New public subpath export: `turbine-orm/serverless` (both ESM and CJS).
+- **`with`-clause type inference:** optional second type parameter `QueryInterface<T, R>` surfaces included relations at the type level. Generated clients now emit `{Entity}Relations` interfaces, so `db.users.findMany({ with: { posts: true } })` narrows the return type to include `posts: Post[]`.
+- New exports: `TypedWithClause`, `WithResult`, `PgCompatPool`, `PgCompatPoolClient`, `PgCompatQueryResult`, `turbineHttp`, `TurbineHttpOptions`.
+
+### Changed
+- **`serverless.ts` rewritten:** the old custom HTTP-proxy protocol (which required a nonexistent Turbine proxy server) is gone. It is replaced with a thin, driver-agnostic factory that binds any pg-compatible pool to a schema. No new runtime dependencies.
+- `TurbineClient.stats` now returns zeros for pools that don't expose connection counts (HTTP drivers), instead of `undefined`.
+- `pg.types.setTypeParser(20, ...)` registration is now skipped when Turbine is given an external pool — prevents Turbine from mutating global state owned by the external driver.
+
+### Tests
+- 308 unit tests passing (up from 254).
+- New test file: `src/test/serverless.test.ts` — 9 tests covering external pool integration, transaction routing, lifecycle ownership, and error propagation via a mock `PgCompatPool`.
+- New test file: `src/test/pipeline.test.ts` — 5 tests covering `executePipeline`: BEGIN/COMMIT wrapping, transform ordering, ROLLBACK on failure, parameter passing, and empty-input short-circuit.
+
+### Docs
+- README: new "Serverless / Edge" section with Neon, Supabase, and Vercel Postgres examples.
+- `src/serverless.ts`: extensive JSDoc covering supported drivers, limitations over HTTP (streaming cursors, LISTEN/NOTIFY), and full usage examples for Neon on Vercel Edge and Cloudflare Workers.
+
+## 0.6.3 (2026-04-07)
+
+### Security
+- **SSL/TLS support:** Added `ssl` option to `TurbineConfig` for secure connections to cloud providers (RDS, Supabase, Neon, etc.)
+- Aggregate column aliases now quoted via `quoteIdent()` in `buildGroupBy()` and `buildAggregate()` — prevents potential SQL syntax injection
+- Column validation added to `buildAggregate()` matching `buildGroupBy()` — rejects unknown field names
+- `findManyStream()` batch size coerced to safe positive integer
+
+### Changed
+- **README repositioned:** Tagline and "Why Turbine?" section now lead with streaming, typed errors, pipeline, and middleware as primary differentiators. json_agg presented as shared approach rather than unique feature
+- Removed stale "no WASM" claims about Prisma (Prisma 7 dropped Rust engine in Jan 2026)
+- Package size claim corrected from "70KB" to "~110KB" (actual npm pack size)
+- `pg.types.setTypeParser(20, ...)` moved from module scope into `TurbineClient` constructor with once-guard — fixes incorrect `sideEffects: false` in package.json
+
+### Tests
+- 254 unit tests passing
+- Shared test helpers extracted to `src/test/helpers.ts`
+
 ## 0.6.2 (2026-04-06)
 
 ### Added

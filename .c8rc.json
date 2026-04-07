@@ -1,11 +1,18 @@
 {
   "all": true,
   "include": ["src/**"],
-  "exclude": ["src/test/**"],
+  "exclude": [
+    "src/test/**",
+    "src/cli/**",
+    "src/generate.ts",
+    "src/introspect.ts",
+    "src/serverless.ts",
+    "src/index.ts"
+  ],
   "reporter": ["text", "lcov"],
   "check-coverage": true,
-  "lines": 25,
-  "functions": 15,
-  "branches": 15,
-  "statements": 25
+  "lines": 57,
+  "functions": 64,
+  "branches": 84,
+  "statements": 57
 }

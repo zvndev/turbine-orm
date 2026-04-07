@@ -1,6 +1,6 @@
 # turbine-orm
 
-Postgres-native TypeScript ORM. Single-query nested relations via `json_agg`, Prisma-inspired API, 1 dependency, 70KB.
+Postgres-native TypeScript ORM — runs on **Neon, Vercel Postgres, Cloudflare, Supabase**, and any pg-compatible driver. Streaming cursors, typed errors, single-query nested relations. 1 dependency, ~110KB.
 
 ```
 npm install turbine-orm
@@ -8,7 +8,7 @@ npm install turbine-orm
 
 ## Why Turbine?
 
-Turbine uses Postgres `json_agg` to resolve nested relations in **a single SQL query** — no N+1, no WASM binary, no multi-database abstraction tax. One runtime dependency (`pg`), 70KB on npm.
+Turbine is a PostgreSQL-native TypeScript ORM with features no other ORM offers together: **cursor-based streaming** through nested relations, **typed error classes** with PostgreSQL constraint mapping, **pipeline batching** (N queries, 1 round-trip), **middleware**, and a driver-agnostic core that plugs into any pg-compatible pool so it runs on Vercel Edge, Cloudflare Workers, Deno Deploy, and similar environments. It resolves nested relations in a single SQL query using `json_agg` — an approach now shared by Prisma 7+ and Drizzle v2, but Turbine does it with 1 runtime dependency (`pg`) and ~110KB on npm.
 
 **One query for nested relations.** When you write `db.users.findMany({ with: { posts: { with: { comments: true } } } })`, Turbine generates a single SQL statement using correlated subqueries with `json_agg`. Modern ORMs like Prisma 7+ and Drizzle v2 use similar single-query approaches (LATERAL JOINs). Turbine's advantage is architectural simplicity: 1 dependency, no code generation DSL, and PostgreSQL-native depth.
 
@@ -34,7 +34,7 @@ Tested against **Prisma 7.6** (adapter-pg, relationJoins) and **Drizzle 0.45** (
 | findUnique — L3 nested | **1.00x** | 1.81x | 1.93x |
 | count | **1.00x** | 1.70x | 1.38x |
 
-Turbine is fastest in every scenario. The advantage is largest on deep nesting (1.8x vs Prisma, up to 1.9x vs Drizzle) and single-record lookups (1.7x). All three ORMs now use single-query approaches for nested relations — Turbine's advantage comes from lower per-query overhead (no WASM runtime, no query plan compilation layer, minimal JS object allocation).
+Turbine is fastest in every scenario. The advantage is largest on deep nesting (1.8x vs Prisma, up to 1.9x vs Drizzle) and single-record lookups (1.7x). All three ORMs now use single-query approaches for nested relations — Turbine's advantage comes from lower per-query overhead (minimal JS object allocation, no query plan compilation layer, direct pg driver access).
 
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench.ts`
 
@@ -344,6 +344,80 @@ npx turbine migrate down
 npx turbine migrate status
 ```
 
+## Serverless / Edge
+
+Turbine's core is driver-agnostic: pass any pg-compatible pool to `TurbineConfig.pool` (or use the `turbineHttp()` factory) and Turbine runs on **Vercel Edge**, **Cloudflare Workers**, **Deno Deploy**, **Netlify Edge**, or any other environment where a direct TCP connection is unavailable. No new dependencies — install whichever driver you already use.
+
+### Neon Serverless (HTTP / WebSocket)
+
+```ts
+// app/api/users/route.ts
+import { Pool } from '@neondatabase/serverless';
+import { turbineHttp } from 'turbine-orm/serverless';
+import { schema } from '@/generated/turbine/metadata';
+
+export const runtime = 'edge';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const db = turbineHttp(pool, schema);
+
+export async function GET() {
+  const users = await db.table('users').findMany({
+    with: { posts: { with: { comments: true } } },
+    limit: 10,
+  });
+  return Response.json(users);
+}
+```
+
+### Vercel Postgres
+
+```ts
+import { createPool } from '@vercel/postgres';
+import { turbineHttp } from 'turbine-orm/serverless';
+import { schema } from './generated/turbine/metadata.js';
+
+const pool = createPool({ connectionString: process.env.POSTGRES_URL });
+const db = turbineHttp(pool, schema);
+```
+
+### Supabase (direct Postgres — no HTTP proxy needed)
+
+```ts
+import { TurbineClient } from 'turbine-orm';
+import { schema } from './generated/turbine/metadata.js';
+
+const db = new TurbineClient({
+  connectionString: process.env.SUPABASE_DB_URL,
+  ssl: { rejectUnauthorized: false },
+}, schema);
+```
+
+### Cloudflare Workers
+
+```ts
+import { Pool } from '@neondatabase/serverless';
+import { turbineHttp } from 'turbine-orm/serverless';
+import { schema } from './generated/turbine/metadata';
+
+export default {
+  async fetch(req: Request, env: Env) {
+    const pool = new Pool({ connectionString: env.DATABASE_URL });
+    const db = turbineHttp(pool, schema);
+    const users = await db.table('users').findMany({ limit: 10 });
+    return Response.json(users);
+  },
+};
+```
+
+### Limitations on HTTP drivers
+
+- **Streaming cursors** (`findManyStream`) require `DECLARE CURSOR`, which most HTTP drivers don't support. Use `findMany` with `limit` + pagination instead.
+- **LISTEN/NOTIFY** is not available over HTTP.
+- Transactions work but hold an HTTP connection for their duration — keep them short.
+
+When Turbine receives an external pool, `db.disconnect()` is a no-op: the caller owns the pool's lifecycle.
+
 ## Configuration
 
 Create `turbine.config.ts` in your project root (or run `npx turbine init`):
@@ -407,11 +481,11 @@ Turbine maps Postgres types to TypeScript:
 | **Nested relations** | 1 query (`json_agg`) | 1 query (LATERAL JOIN + json_agg, since v5.8) | 1 query (LATERAL JOINs) | Manual (`jsonArrayFrom`) |
 | **API style** | `findMany`, `with` | `findMany`, `include` | SQL-like + relational | SQL builder |
 | **Schema** | TypeScript | Custom DSL (`.prisma`) | TypeScript | Manual interfaces |
-| **Runtime deps** | 1 (`pg`) | WASM engine + adapter | 0 | 0 |
+| **Runtime deps** | 1 (`pg`) | `@prisma/client` + adapter | 0 | 0 |
 | **Multi-DB** | PostgreSQL only | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
 | **Code generation** | `turbine generate` | `prisma generate` | Not needed | Not needed |
 
-All three ORMs now use single-query approaches for nested relations. Turbine uses correlated subqueries with `json_agg`, Prisma 7 uses LATERAL JOIN + `json_agg`, and Drizzle uses LATERAL JOINs. Turbine is 1.4–1.9x faster due to lower per-query overhead — no WASM runtime, no query plan compilation layer, and minimal JS object allocation. See [Benchmarks](#benchmarks) for full results.
+All three ORMs now use single-query approaches for nested relations. Turbine uses correlated subqueries with `json_agg`, Prisma 7 uses LATERAL JOIN + `json_agg`, and Drizzle uses LATERAL JOINs. Turbine is 1.4–1.9x faster due to lower per-query overhead — minimal JS object allocation, no query plan compilation layer, and direct pg driver access. See [Benchmarks](#benchmarks) for full results.
 
 ## Limitations
 

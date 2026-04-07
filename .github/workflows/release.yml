@@ -1,0 +1,102 @@
+name: Release
+
+# Publish turbine-orm to npm when a `v*` tag is pushed.
+#
+# Setup (one-time):
+#   1. Generate an npm automation token (Settings → Access Tokens → Generate New → Automation)
+#      https://docs.npmjs.com/creating-and-viewing-access-tokens
+#   2. Add it to this repo as a secret named NPM_TOKEN
+#      (Settings → Secrets and variables → Actions → New repository secret)
+#
+# Usage:
+#   npm version patch   # or minor / major — bumps package.json and creates a git tag
+#   git push --follow-tags
+#
+# The workflow runs the full CI suite first (lint → typecheck → unit tests →
+# build), verifies that package.json version matches the tag, and publishes
+# with `--provenance` so the npm registry can attest the build to this repo.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  # Required for npm provenance attestation
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: turbine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Integration tests
+        run: npm test
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+
+  publish:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG_VERSION=$(jq -r .version package.json)
+          if [ "$TAG" != "$PKG_VERSION" ]; then
+            echo "::error::Tag v$TAG does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "Publishing turbine-orm@$PKG_VERSION"
+
+      - name: Build
+        run: npm run build
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

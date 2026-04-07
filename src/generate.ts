@@ -144,9 +144,23 @@ function generateTypes(schema: SchemaMetadata): string {
     lines.push('};');
     lines.push('');
 
-    // --- Relation types ---
+    // --- Relations map (for type-safe `with` clauses) ---
     const hasRelations = Object.keys(table.relations).length > 0;
     if (hasRelations) {
+      lines.push(`/** Available relations for the \`${table.name}\` table */`);
+      lines.push(`export interface ${typeName}Relations {`);
+      for (const [relName, rel] of Object.entries(table.relations)) {
+        const targetType = entityName(rel.to);
+        if (rel.type === 'hasMany') {
+          lines.push(`  ${relName}: ${targetType}[];`);
+        } else {
+          lines.push(`  ${relName}: ${targetType} | null;`);
+        }
+      }
+      lines.push('}');
+      lines.push('');
+
+      // --- Legacy per-relation interfaces (kept for backward compatibility) ---
       for (const [relName, rel] of Object.entries(table.relations)) {
         const targetType = entityName(rel.to);
         if (rel.type === 'hasMany') {
@@ -277,8 +291,14 @@ function generateIndex(schema: SchemaMetadata): string {
     "import { SCHEMA } from './metadata.js';",
   ];
 
-  // Import all entity types
-  const typeImports = tableEntries.map((t) => entityName(t.name));
+  // Import all entity types and relations maps
+  const typeImports: string[] = [];
+  for (const t of tableEntries) {
+    typeImports.push(entityName(t.name));
+    if (Object.keys(t.relations).length > 0) {
+      typeImports.push(`${entityName(t.name)}Relations`);
+    }
+  }
   lines.push(`import type { ${typeImports.join(', ')} } from './types.js';`);
   lines.push('');
 
@@ -305,8 +325,10 @@ function generateIndex(schema: SchemaMetadata): string {
   for (const table of tableEntries) {
     const typeName = entityName(table.name);
     const accessor = snakeToCamelStr(table.name);
+    const hasRelations = Object.keys(table.relations).length > 0;
+    const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
     lines.push(`  /** Query interface for the \`${table.name}\` table */`);
-    lines.push(`  declare readonly ${accessor}: QueryInterface<${typeName}>;`);
+    lines.push(`  declare readonly ${accessor}: QueryInterface<${genericArgs}>;`);
   }
   lines.push('');
   lines.push('  constructor(config?: TurbineConfig) {');

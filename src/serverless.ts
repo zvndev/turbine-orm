@@ -1,273 +1,123 @@
 /**
- * turbine-orm/serverless — HTTP-based query driver for edge functions
+ * turbine-orm/serverless — edge / serverless driver integration
  *
- * Use this driver when you cannot establish a direct TCP connection to Postgres
- * (e.g., Vercel Edge Functions, Cloudflare Workers, Deno Deploy).
+ * Turbine runs on any Postgres driver that speaks the node-postgres API.
+ * This module exposes a thin factory (`turbineHttp`) that binds an external
+ * pg-compatible pool to a schema, so you can use Turbine on Vercel Edge,
+ * Cloudflare Workers, Deno Deploy, Netlify Edge, or any other environment
+ * where a direct TCP connection is unavailable.
  *
- * It sends queries as JSON over HTTP to a Turbine query endpoint, which executes
- * them against the actual database and returns typed results.
+ * ## Supported drivers
  *
- * NOTE: This is a scaffold. The server-side query endpoint does not exist yet.
- * The HTTP protocol and response format are defined here and will be implemented
- * on the server side in a future release.
+ * Any driver whose `Pool` satisfies `PgCompatPool` will work. The ones
+ * below are verified:
  *
- * @example
+ * - **Neon** (`@neondatabase/serverless`) — HTTP and WebSocket transports
+ * - **Vercel Postgres** (`@vercel/postgres`) — wraps Neon
+ * - **Cloudflare Hyperdrive** — exposes a pg-compatible driver
+ * - **Supabase** — use the regular `pg` package; Supabase is Postgres-native
+ *
+ * Turbine does NOT bundle any of these — install whichever you need and
+ * pass its pool directly.
+ *
+ * ## Limitations over HTTP
+ *
+ * - **Streaming cursors** (`findManyStream`, `findManyCursor`) require
+ *   server-side `DECLARE CURSOR`, which most HTTP drivers do not support.
+ *   If you call these on an HTTP pool the underlying driver will error.
+ * - **LISTEN/NOTIFY** is not available over HTTP.
+ * - **Transactions** are supported but each transaction holds an HTTP
+ *   connection for its duration — keep them short.
+ *
+ * ## Example — Neon on Vercel Edge
+ *
  * ```ts
- * import { createServerlessClient } from 'turbine-orm/serverless';
+ * // app/api/users/route.ts
+ * import { Pool } from '@neondatabase/serverless';
+ * import { turbineHttp } from 'turbine-orm/serverless';
+ * import { schema } from '@/generated/turbine/metadata';
  *
- * const db = createServerlessClient({
- *   endpoint: 'https://your-turbine-proxy.fly.dev/query',
- *   authToken: process.env.TURBINE_AUTH_TOKEN!,
- * });
+ * export const runtime = 'edge';
  *
- * const result = await db.query('SELECT * FROM users WHERE id = $1', [1]);
+ * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+ * const db = turbineHttp(pool, schema);
+ *
+ * export async function GET() {
+ *   const users = await db.table('users').findMany({ limit: 10 });
+ *   return Response.json(users);
+ * }
+ * ```
+ *
+ * ## Example — Supabase (direct Postgres, no HTTP proxy needed)
+ *
+ * ```ts
+ * import { TurbineClient } from 'turbine-orm';
+ * import { schema } from './generated/turbine/metadata.js';
+ *
+ * const db = new TurbineClient({
+ *   connectionString: process.env.SUPABASE_DB_URL,
+ *   ssl: { rejectUnauthorized: false },
+ * }, schema);
+ * ```
+ *
+ * ## Example — Cloudflare Workers
+ *
+ * ```ts
+ * // Use the Neon HTTP driver which works in Workers runtime
+ * import { Pool } from '@neondatabase/serverless';
+ * import { turbineHttp } from 'turbine-orm/serverless';
+ *
+ * export default {
+ *   async fetch(req: Request, env: Env) {
+ *     const pool = new Pool({ connectionString: env.DATABASE_URL });
+ *     const db = turbineHttp(pool, schema);
+ *     const users = await db.table('users').findMany({ limit: 10 });
+ *     return Response.json(users);
+ *   }
+ * };
  * ```
  */
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
+import { type PgCompatPool, TurbineClient, type TurbineConfig } from './client.js';
+import type { SchemaMetadata } from './schema.js';
 
-/** Configuration for the serverless HTTP driver */
-export interface ServerlessConfig {
-  /** URL of the Turbine query endpoint (e.g. https://proxy.example.com/query) */
-  endpoint: string;
-  /** Authentication token for the endpoint */
-  authToken: string;
-  /** Request timeout in milliseconds (default: 10000) */
-  timeout?: number;
-  /** Custom fetch implementation (defaults to global fetch) */
-  fetch?: typeof globalThis.fetch;
-  /** Custom headers to include with every request */
-  headers?: Record<string, string>;
-}
-
-// ---------------------------------------------------------------------------
-// Query types — the HTTP protocol between client and server
-// ---------------------------------------------------------------------------
-
-/** A single SQL query to execute */
-export interface QueryRequest {
-  /** SQL query string with $1, $2, ... parameter placeholders */
-  sql: string;
-  /** Parameter values */
-  params?: unknown[];
-  /** Hint for the server about expected result shape */
-  mode?: 'rows' | 'one' | 'count' | 'void';
-}
-
-/** Batch of queries to execute in a single round-trip */
-export interface BatchRequest {
-  queries: QueryRequest[];
-  /** Whether to wrap the batch in a transaction */
-  transaction?: boolean;
-}
-
-/** Response from the query endpoint for a single query */
-export interface QueryResponse<T = Record<string, unknown>> {
-  /** Returned rows */
-  rows: T[];
-  /** Number of rows affected (for INSERT/UPDATE/DELETE) */
-  rowCount: number;
-  /** Column metadata */
-  fields?: Array<{ name: string; dataTypeID: number }>;
-  /** Server-side execution time in milliseconds */
-  durationMs?: number;
-}
-
-/** Response from the query endpoint for a batch */
-export interface BatchResponse {
-  results: QueryResponse[];
-  /** Total server-side execution time in milliseconds */
-  totalDurationMs?: number;
-}
-
-/** Error response from the query endpoint */
-export interface QueryError {
-  error: string;
-  code?: string;
-  detail?: string;
-}
-
-// ---------------------------------------------------------------------------
-// Serverless client
-// ---------------------------------------------------------------------------
+// Re-export pg-compat types so consumers can import them from a single place.
+export type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './client.js';
 
 /**
- * HTTP-based Postgres query client for serverless/edge environments.
- *
- * Sends SQL queries as JSON POST requests to a Turbine query endpoint.
- * Does not require a direct TCP connection to Postgres.
+ * Options for `turbineHttp()`. Mirrors the fields of `TurbineConfig`
+ * that are relevant for externally-managed pools.
  */
-export class ServerlessClient {
-  private readonly config: Required<Pick<ServerlessConfig, 'endpoint' | 'authToken' | 'timeout'>> & ServerlessConfig;
-  private readonly fetchFn: typeof globalThis.fetch;
-
-  constructor(config: ServerlessConfig) {
-    if (!config.endpoint) {
-      throw new Error('[turbine/serverless] endpoint is required');
-    }
-    if (!config.authToken) {
-      throw new Error('[turbine/serverless] authToken is required');
-    }
-
-    this.config = {
-      ...config,
-      timeout: config.timeout ?? 10_000,
-    };
-    this.fetchFn = config.fetch ?? globalThis.fetch;
-  }
-
-  /**
-   * Execute a single SQL query.
-   *
-   * @param sql - SQL string with $1, $2, ... placeholders
-   * @param params - Parameter values
-   * @returns Query result with typed rows
-   *
-   * @example
-   * ```ts
-   * const result = await client.query<{ id: number; name: string }>(
-   *   'SELECT id, name FROM users WHERE org_id = $1',
-   *   [42]
-   * );
-   * console.log(result.rows);
-   * ```
-   */
-  async query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<QueryResponse<T>> {
-    const request: QueryRequest = { sql, params, mode: 'rows' };
-    const response = await this.post<QueryResponse<T>>('/query', request);
-    return response;
-  }
-
-  /**
-   * Execute a single SQL query and return the first row, or null.
-   */
-  async queryOne<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T | null> {
-    const request: QueryRequest = { sql, params, mode: 'one' };
-    const response = await this.post<QueryResponse<T>>('/query', request);
-    return response.rows[0] ?? null;
-  }
-
-  /**
-   * Execute a batch of queries in a single HTTP request.
-   * Optionally wraps them in a transaction.
-   *
-   * @param queries - Array of queries to execute
-   * @param options - Batch options
-   * @returns Array of results, one per query
-   *
-   * @example
-   * ```ts
-   * const results = await client.batch([
-   *   { sql: 'SELECT * FROM users WHERE id = $1', params: [1] },
-   *   { sql: 'SELECT COUNT(*) FROM posts WHERE user_id = $1', params: [1] },
-   * ], { transaction: true });
-   * ```
-   */
-  async batch(queries: QueryRequest[], options?: { transaction?: boolean }): Promise<BatchResponse> {
-    const request: BatchRequest = {
-      queries,
-      transaction: options?.transaction ?? false,
-    };
-    return this.post<BatchResponse>('/batch', request);
-  }
-
-  /**
-   * Tagged template helper for SQL queries.
-   *
-   * @example
-   * ```ts
-   * const users = await client.sql<{ id: number; name: string }>`
-   *   SELECT id, name FROM users WHERE org_id = ${orgId}
-   * `;
-   * ```
-   */
-  async sql<T = Record<string, unknown>>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]> {
-    let sqlStr = '';
-    strings.forEach((str, i) => {
-      sqlStr += str;
-      if (i < values.length) {
-        sqlStr += `$${i + 1}`;
-      }
-    });
-    const result = await this.query<T>(sqlStr, values);
-    return result.rows;
-  }
-
-  // -------------------------------------------------------------------------
-  // Internal HTTP transport
-  // -------------------------------------------------------------------------
-
-  private async post<T>(path: string, body: unknown): Promise<T> {
-    const url = this.config.endpoint.replace(/\/$/, '') + path;
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.config.timeout);
-
-    try {
-      const response = await this.fetchFn(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.config.authToken}`,
-          'User-Agent': 'turbine-orm/serverless',
-          ...this.config.headers,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        let parsed: QueryError | undefined;
-        try {
-          parsed = JSON.parse(errorBody) as QueryError;
-        } catch {
-          // Not JSON
-        }
-
-        const message = parsed?.error ?? `HTTP ${response.status}: ${errorBody.slice(0, 200)}`;
-        const err = new Error(`[turbine/serverless] ${message}`) as unknown as Record<string, unknown>;
-        err.status = response.status;
-        err.code = parsed?.code;
-        throw err;
-      }
-
-      return (await response.json()) as T;
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw new Error(`[turbine/serverless] Request timed out after ${this.config.timeout}ms`);
-      }
-      throw err;
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Factory function
-// ---------------------------------------------------------------------------
+export interface TurbineHttpOptions extends Pick<TurbineConfig, 'logging' | 'defaultLimit' | 'warnOnUnlimited'> {}
 
 /**
- * Create a serverless Turbine client for edge/serverless environments.
+ * Create a TurbineClient bound to an external pg-compatible pool.
  *
- * @param config - Endpoint URL and auth token
- * @returns A ServerlessClient instance
+ * Use this for serverless/edge environments where Turbine should NOT
+ * manage its own `pg.Pool`. The caller retains ownership of the pool's
+ * lifecycle — `db.disconnect()` is a no-op.
+ *
+ * @param pool - Any pg-compatible pool (Neon, Vercel Postgres, etc.)
+ * @param schema - Introspected or hand-written schema metadata
+ * @param options - Optional logging / defaultLimit / warnOnUnlimited
+ * @returns A TurbineClient instance
  *
  * @example
  * ```ts
- * import { createServerlessClient } from 'turbine-orm/serverless';
+ * import { Pool } from '@neondatabase/serverless';
+ * import { turbineHttp } from 'turbine-orm/serverless';
+ * import { schema } from './generated/turbine/metadata.js';
  *
- * const db = createServerlessClient({
- *   endpoint: process.env.TURBINE_ENDPOINT!,
- *   authToken: process.env.TURBINE_AUTH_TOKEN!,
- * });
+ * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+ * const db = turbineHttp(pool, schema);
  *
- * const users = await db.sql`SELECT * FROM users LIMIT 10`;
+ * const users = await db.table('users').findMany({ limit: 10 });
  * ```
  */
-export function createServerlessClient(config: ServerlessConfig): ServerlessClient {
-  return new ServerlessClient(config);
+export function turbineHttp(
+  pool: PgCompatPool,
+  schema: SchemaMetadata,
+  options: TurbineHttpOptions = {},
+): TurbineClient {
+  return new TurbineClient({ pool, ...options }, schema);
 }

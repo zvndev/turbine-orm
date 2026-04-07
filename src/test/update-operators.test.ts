@@ -22,50 +22,12 @@ import { after, before, describe, it } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
-import { QueryInterface } from '../query.js';
-import type { ColumnMetadata, SchemaMetadata, TableMetadata } from '../schema.js';
+import type { SchemaMetadata, TableMetadata } from '../schema.js';
+import { makeQuery, mockTable } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// Build-only test harness (no DB needed) — mirrors stress.test.ts helpers
+// Build-only test harness (no DB needed)
 // ---------------------------------------------------------------------------
-
-function mockColumn(name: string, field: string, pgType = 'int8'): ColumnMetadata {
-  return {
-    name,
-    field,
-    pgType,
-    tsType: 'number',
-    nullable: false,
-    hasDefault: name === 'id',
-    isArray: false,
-    pgArrayType: 'bigint[]',
-  };
-}
-
-function mockTable(tableName: string, columns: { name: string; field: string; pgType?: string }[]): TableMetadata {
-  const cols = columns.map((c) => mockColumn(c.name, c.field, c.pgType ?? 'int8'));
-  const columnMap: Record<string, string> = {};
-  const reverseColumnMap: Record<string, string> = {};
-  const allColumns: string[] = [];
-  for (const col of cols) {
-    columnMap[col.field] = col.name;
-    reverseColumnMap[col.name] = col.field;
-    allColumns.push(col.name);
-  }
-  return {
-    name: tableName,
-    columns: cols,
-    columnMap,
-    reverseColumnMap,
-    dateColumns: new Set(),
-    pgTypes: Object.fromEntries(cols.map((c) => [c.name, c.pgType])),
-    allColumns,
-    primaryKey: ['id'],
-    uniqueColumns: [['id']],
-    relations: {},
-    indexes: [],
-  };
-}
 
 function buildSchema(): SchemaMetadata {
   const tables: Record<string, TableMetadata> = {};
@@ -79,13 +41,6 @@ function buildSchema(): SchemaMetadata {
     { name: 'published', field: 'published', pgType: 'bool' },
   ]);
   return { tables, enums: {} };
-}
-
-function makeQuery<T extends object = Record<string, unknown>>(
-  tableName: string,
-  schema: SchemaMetadata,
-): QueryInterface<T> {
-  return new QueryInterface<T>(null as any, tableName, schema);
 }
 
 // ---------------------------------------------------------------------------

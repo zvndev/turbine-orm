@@ -8,5 +8,6 @@
     "declarationMap": false,
     "sourceMap": false,
     "verbatimModuleSyntax": false
-  }
+  },
+  "exclude": ["node_modules", "dist", "examples", "src/test"]
 }

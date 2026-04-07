@@ -38,6 +38,9 @@ export {
   type Middleware,
   type MiddlewareNext,
   type MiddlewareParams,
+  type PgCompatPool,
+  type PgCompatPoolClient,
+  type PgCompatQueryResult,
   TransactionClient,
   type TransactionOptions,
   TurbineClient,
@@ -85,6 +88,7 @@ export {
   type OrderDirection,
   QueryInterface,
   type RelationFilter,
+  type TypedWithClause,
   type UpdateArgs,
   type UpdateInput,
   type UpdateManyArgs,
@@ -92,6 +96,7 @@ export {
   type UpsertArgs,
   type WithClause,
   type WithOptions,
+  type WithResult,
 } from './query.js';
 // Schema metadata types
 export type {
@@ -111,7 +116,6 @@ export {
   snakeToCamel,
   snakeToPascal,
 } from './schema.js';
-
 // Schema builder — define schemas in TypeScript
 export {
   ColumnBuilder,
@@ -126,7 +130,6 @@ export {
   // Legacy compat (deprecated — use object format with defineSchema)
   table,
 } from './schema-builder.js';
-
 // Schema SQL — generate DDL, diff, and push
 export {
   type AlterColumnDef,
@@ -138,3 +141,5 @@ export {
   schemaToSQL,
   schemaToSQLString,
 } from './schema-sql.js';
+// Serverless / edge factory
+export { type TurbineHttpOptions, turbineHttp } from './serverless.js';

@@ -28,31 +28,64 @@ import { executePipeline, type PipelineResults } from './pipeline.js';
 import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from './query.js';
 import type { SchemaMetadata } from './schema.js';
 
-/**
- * Parse int8 (bigint, OID 20) as JavaScript number instead of string.
- * Safe for values up to Number.MAX_SAFE_INTEGER (9,007,199,254,740,991).
- *
- * NOTE: For values exceeding Number.MAX_SAFE_INTEGER, the parser falls back
- * to returning the raw string to avoid precision loss. The generated TypeScript
- * type maps int8/bigint to `number`, which is correct for the vast majority of
- * use cases (IDs, counts, timestamps). If you store values > 2^53 - 1 in a
- * bigint column, the runtime return type will be `string` for those rows.
- */
-pg.types.setTypeParser(20, (val: string) => {
-  const n = Number(val);
-  return Number.isSafeInteger(n) ? n : val; // fall back to string for huge values
-});
-
-// NOTE: We intentionally do NOT register a parser for numeric (OID 1700).
-// Postgres numeric is arbitrary-precision, so the default pg driver behavior
-// of returning a string is correct and matches the generated TypeScript type
-// (numeric → string). Users who want number can cast explicitly in SQL.
-
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
+/**
+ * Minimal pg-compatible query result.
+ * `pg.Pool`, `@neondatabase/serverless` Pool, `@vercel/postgres` Pool and
+ * any driver speaking the node-postgres API all satisfy this shape.
+ */
+export interface PgCompatQueryResult<R = Record<string, unknown>> {
+  rows: R[];
+  rowCount: number | null;
+  fields?: Array<{ name: string; dataTypeID: number }>;
+}
+
+/**
+ * Minimal pg-compatible client used by TurbineClient for transactions.
+ * `pg.PoolClient` satisfies this; so do Neon and Vercel's equivalents.
+ */
+export interface PgCompatPoolClient {
+  query<R = Record<string, unknown>>(text: string, values?: unknown[]): Promise<PgCompatQueryResult<R>>;
+  release(err?: Error | boolean): void;
+}
+
+/**
+ * Minimal pg-compatible pool. Pass any driver that satisfies this interface
+ * via `TurbineConfig.pool` — lets Turbine run on Neon HTTP, Vercel Postgres,
+ * Cloudflare Hyperdrive, or any other serverless Postgres driver.
+ *
+ * @example
+ * ```ts
+ * import { Pool } from '@neondatabase/serverless';
+ * import { TurbineClient } from 'turbine-orm';
+ *
+ * const neonPool = new Pool({ connectionString: process.env.DATABASE_URL });
+ * const db = new TurbineClient({ pool: neonPool }, schema);
+ * ```
+ */
+export interface PgCompatPool {
+  query<R = Record<string, unknown>>(text: string, values?: unknown[]): Promise<PgCompatQueryResult<R>>;
+  connect(): Promise<PgCompatPoolClient>;
+  end(): Promise<void>;
+  /** Optional — pools that expose stats (pg.Pool does; Neon HTTP does not) */
+  readonly totalCount?: number;
+  readonly idleCount?: number;
+  readonly waitingCount?: number;
+  /** Optional — pg.Pool supports 'error' event; HTTP drivers typically do not */
+  on?(event: 'error', listener: (err: Error) => void): this;
+}
+
 export interface TurbineConfig {
+  /**
+   * An external pg-compatible pool. Use this to plug in serverless drivers
+   * like `@neondatabase/serverless`, `@vercel/postgres`, or any other pg-API
+   * compatible pool. When provided, all connection-string fields are ignored
+   * and Turbine will NOT create its own pg.Pool.
+   */
+  pool?: PgCompatPool;
   /** Postgres connection string (e.g. postgres://user:pass@host:5432/db) */
   connectionString?: string;
   /** Host (used if connectionString is not set) */
@@ -65,6 +98,8 @@ export interface TurbineConfig {
   user?: string;
   /** Password */
   password?: string;
+  /** SSL/TLS options for the connection (required for most cloud providers) */
+  ssl?: boolean | { rejectUnauthorized?: boolean; ca?: string; key?: string; cert?: string };
   /** Maximum number of connections in the pool (default: 10) */
   poolSize?: number;
   /** Idle timeout in ms before a connection is closed (default: 30000) */
@@ -241,12 +276,42 @@ export class TurbineClient {
   /** The schema metadata this client was built from */
   readonly schema: SchemaMetadata;
 
+  private static int8ParserRegistered = false;
   private readonly logging: boolean;
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private readonly middlewares: Middleware[] = [];
   private readonly queryOptions: QueryInterfaceOptions;
+  /** True when Turbine created the pool and is responsible for tearing it down */
+  private readonly ownsPool: boolean = true;
 
   constructor(config: TurbineConfig = {}, schema: SchemaMetadata) {
+    /**
+     * Parse int8 (bigint, OID 20) as JavaScript number instead of string.
+     * Safe for values up to Number.MAX_SAFE_INTEGER (9,007,199,254,740,991).
+     *
+     * NOTE: For values exceeding Number.MAX_SAFE_INTEGER, the parser falls back
+     * to returning the raw string to avoid precision loss. The generated TypeScript
+     * type maps int8/bigint to `number`, which is correct for the vast majority of
+     * use cases (IDs, counts, timestamps). If you store values > 2^53 - 1 in a
+     * bigint column, the runtime return type will be `string` for those rows.
+     *
+     * NOTE: We intentionally do NOT register a parser for numeric (OID 1700).
+     * Postgres numeric is arbitrary-precision, so the default pg driver behavior
+     * of returning a string is correct and matches the generated TypeScript type
+     * (numeric → string). Users who want number can cast explicitly in SQL.
+     */
+    // Only register the int8 parser when we own the pg driver. External
+    // pools (Neon HTTP, Vercel Postgres) may ship their own pg-types fork
+    // and rely on their own parser configuration — don't mutate global state
+    // we don't own.
+    if (!config.pool && !TurbineClient.int8ParserRegistered) {
+      pg.types.setTypeParser(20, (val: string) => {
+        const n = Number(val);
+        return Number.isSafeInteger(n) ? n : val;
+      });
+      TurbineClient.int8ParserRegistered = true;
+    }
+
     this.logging = config.logging ?? false;
     this.schema = schema;
     this.queryOptions = {
@@ -254,32 +319,46 @@ export class TurbineClient {
       warnOnUnlimited: config.warnOnUnlimited,
     };
 
-    const poolConfig: pg.PoolConfig = {
-      max: config.poolSize ?? 10,
-      idleTimeoutMillis: config.idleTimeoutMs ?? 30_000,
-      connectionTimeoutMillis: config.connectionTimeoutMs ?? 5_000,
-    };
-
-    if (config.connectionString) {
-      poolConfig.connectionString = config.connectionString;
+    if (config.pool) {
+      // External pool — use directly. Turbine doesn't manage its lifecycle.
+      this.pool = config.pool as unknown as pg.Pool;
+      this.ownsPool = false;
+      if (this.logging) {
+        console.log(`[turbine] Using external pool — ${Object.keys(schema.tables).length} tables`);
+      }
     } else {
-      poolConfig.host = config.host ?? 'localhost';
-      poolConfig.port = config.port ?? 5432;
-      poolConfig.database = config.database ?? 'postgres';
-      poolConfig.user = config.user ?? 'postgres';
-      poolConfig.password = config.password;
-    }
+      const poolConfig: pg.PoolConfig = {
+        max: config.poolSize ?? 10,
+        idleTimeoutMillis: config.idleTimeoutMs ?? 30_000,
+        connectionTimeoutMillis: config.connectionTimeoutMs ?? 5_000,
+      };
 
-    this.pool = new pg.Pool(poolConfig);
+      if (config.connectionString) {
+        poolConfig.connectionString = config.connectionString;
+      } else {
+        poolConfig.host = config.host ?? 'localhost';
+        poolConfig.port = config.port ?? 5432;
+        poolConfig.database = config.database ?? 'postgres';
+        poolConfig.user = config.user ?? 'postgres';
+        poolConfig.password = config.password;
+      }
 
-    this.pool.on('error', (err) => {
-      console.error('[turbine] Unexpected pool error:', err.message);
-    });
+      if (config.ssl !== undefined) {
+        poolConfig.ssl = config.ssl;
+      }
 
-    if (this.logging) {
-      console.log(
-        `[turbine] Pool created — max ${poolConfig.max} connections, ${Object.keys(schema.tables).length} tables`,
-      );
+      this.pool = new pg.Pool(poolConfig);
+      this.ownsPool = true;
+
+      this.pool.on('error', (err) => {
+        console.error('[turbine] Unexpected pool error:', err.message);
+      });
+
+      if (this.logging) {
+        console.log(
+          `[turbine] Pool created — max ${poolConfig.max} connections, ${Object.keys(schema.tables).length} tables`,
+        );
+      }
     }
 
     // Auto-create typed table accessors for all tables in the schema
@@ -547,8 +626,17 @@ export class TurbineClient {
 
   /**
    * Gracefully shut down the connection pool.
+   *
+   * If Turbine was given an external pool via `TurbineConfig.pool`, this
+   * method is a no-op — the caller is responsible for the pool's lifecycle.
    */
   async disconnect(): Promise<void> {
+    if (!this.ownsPool) {
+      if (this.logging) {
+        console.log('[turbine] disconnect() skipped — external pool is not owned by Turbine');
+      }
+      return;
+    }
     await this.pool.end();
     if (this.logging) {
       console.log('[turbine] Pool disconnected');
@@ -560,12 +648,15 @@ export class TurbineClient {
     return this.disconnect();
   }
 
-  /** Pool statistics for monitoring. */
+  /**
+   * Pool statistics for monitoring. Returns zeros for pools that don't
+   * expose connection counts (e.g., stateless HTTP drivers like Neon).
+   */
   get stats() {
     return {
-      totalCount: this.pool.totalCount,
-      idleCount: this.pool.idleCount,
-      waitingCount: this.pool.waitingCount,
+      totalCount: this.pool.totalCount ?? 0,
+      idleCount: this.pool.idleCount ?? 0,
+      waitingCount: this.pool.waitingCount ?? 0,
     };
   }
 }

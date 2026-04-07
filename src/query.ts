@@ -133,11 +133,24 @@ export type WhereClause<T> = {
   [relationName: string]: unknown;
 };
 
+/**
+ * Unparameterized with clause — accepts any relation name.
+ * Used internally by the query builder at runtime.
+ */
 export interface WithClause {
   [relation: string]: true | WithOptions;
 }
 
-export interface WithOptions {
+/**
+ * Relation-aware with clause. When R (the relations map) is provided,
+ * only keys from R are autocompleted. Used in public method signatures
+ * so the compiler can narrow the return type.
+ */
+export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
+  ? WithClause
+  : { [K in keyof R]?: true | WithOptions };
+
+export interface WithOptions<_T = unknown> {
   with?: WithClause;
   where?: Record<string, unknown>;
   orderBy?: Record<string, OrderDirection>;
@@ -148,23 +161,44 @@ export interface WithOptions {
   omit?: Record<string, boolean>;
 }
 
-export interface FindUniqueArgs<T> {
+// ---------------------------------------------------------------------------
+// WithResult — compute return type based on included relations
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the result type when relations are included via `with`.
+ *
+ * - When R is the default ({}) or W is empty, resolves to plain T.
+ * - When R is a real relations map and W specifies relation keys, merges matching
+ *   relation types from R onto T.
+ *
+ * @typeParam T - Base entity type (e.g. User)
+ * @typeParam R - Relations map (e.g. { posts: Post[]; profile: Profile | null })
+ * @typeParam W - The with clause object (e.g. { posts: true })
+ */
+export type WithResult<T, R extends object, W> = [keyof R] extends [never]
+  ? T
+  : [keyof W & keyof R] extends [never]
+    ? T
+    : T & Pick<R, keyof W & keyof R>;
+
+export interface FindUniqueArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>> {
   where: WhereClause<T>;
   select?: Record<string, boolean>;
   omit?: Record<string, boolean>;
-  with?: WithClause;
+  with?: W;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
 }
 
-export interface FindManyArgs<T> {
+export interface FindManyArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>> {
   where?: WhereClause<T>;
   select?: Record<string, boolean>;
   omit?: Record<string, boolean>;
   orderBy?: Record<string, OrderDirection>;
   limit?: number;
   offset?: number;
-  with?: WithClause;
+  with?: W;
   /** Cursor-based pagination: start after this row */
   cursor?: Partial<T>;
   /** Number of records to take (used with cursor) */
@@ -175,7 +209,8 @@ export interface FindManyArgs<T> {
   timeout?: number;
 }
 
-export interface FindManyStreamArgs<T> extends FindManyArgs<T> {
+export interface FindManyStreamArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>>
+  extends FindManyArgs<T, R, W> {
   /** Number of rows to fetch per internal FETCH batch (default: 100) */
   batchSize?: number;
 }
@@ -229,6 +264,14 @@ export interface UpdateArgs<T> {
   data: UpdateInput<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /**
+   * Opt in to running this mutation when `where` resolves to an empty
+   * predicate (e.g. `{}` or `{ id: undefined }`). Default `false` — an
+   * empty predicate throws `ValidationError` to catch the common case of
+   * a filter value accidentally being `undefined`. Set this to `true` only
+   * when an unconditional mutation is the intended behaviour.
+   */
+  allowFullTableScan?: boolean;
 }
 
 export interface UpdateManyArgs<T> {
@@ -236,18 +279,24 @@ export interface UpdateManyArgs<T> {
   data: UpdateInput<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /** See {@link UpdateArgs.allowFullTableScan}. */
+  allowFullTableScan?: boolean;
 }
 
 export interface DeleteArgs<T> {
   where: WhereClause<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /** See {@link UpdateArgs.allowFullTableScan}. */
+  allowFullTableScan?: boolean;
 }
 
 export interface DeleteManyArgs<T> {
   where: WhereClause<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /** See {@link UpdateArgs.allowFullTableScan}. */
+  allowFullTableScan?: boolean;
 }
 
 export interface UpsertArgs<T> {
@@ -448,7 +497,7 @@ export interface QueryInterfaceOptions {
   warnOnUnlimited?: boolean;
 }
 
-export class QueryInterface<T extends object> {
+export class QueryInterface<T extends object, R extends object = {}> {
   private readonly tableMeta: TableMetadata;
   /** SQL template cache: cacheKey → sql string (params are always positional $1,$2,...) */
   private readonly sqlCache = new LRUCache<string, string>(1000);
@@ -551,15 +600,17 @@ export class QueryInterface<T extends object> {
   // findUnique
   // -------------------------------------------------------------------------
 
-  async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
+  async findUnique<W extends TypedWithClause<R> = {}>(
+    args: FindUniqueArgs<T, R, W>,
+  ): Promise<WithResult<T, R, W> | null> {
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUnique(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
-    });
+    }) as Promise<WithResult<T, R, W> | null>;
   }
 
-  buildFindUnique(args: FindUniqueArgs<T>): DeferredQuery<T | null> {
+  buildFindUnique<W extends TypedWithClause<R> = {}>(args: FindUniqueArgs<T, R, W>): DeferredQuery<T | null> {
     const columnsList = this.resolveColumns(args.select, args.omit);
     const whereObj = args.where as Record<string, unknown>;
 
@@ -618,7 +669,7 @@ export class QueryInterface<T extends object> {
     }
 
     // Nested queries: build fresh each time (with clause affects params)
-    const selectClause = this.buildSelectWithRelations(this.table, args.with, params, columnsList);
+    const selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, params, columnsList);
     const sql = `SELECT ${selectClause} FROM ${quoteIdent(this.table)}${whereSql} LIMIT 1`;
 
     return {
@@ -636,7 +687,7 @@ export class QueryInterface<T extends object> {
   // findMany
   // -------------------------------------------------------------------------
 
-  async findMany(args?: FindManyArgs<T>): Promise<T[]> {
+  async findMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): Promise<WithResult<T, R, W>[]> {
     // Warn if no limit specified and warnOnUnlimited is enabled
     const hasExplicitLimit = args?.limit !== undefined || args?.take !== undefined;
     if (this.warnOnUnlimited && !hasExplicitLimit) {
@@ -649,10 +700,10 @@ export class QueryInterface<T extends object> {
       const deferred = this.buildFindMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
       return deferred.transform(result);
-    });
+    }) as Promise<WithResult<T, R, W>[]>;
   }
 
-  buildFindMany(args?: FindManyArgs<T>): DeferredQuery<T[]> {
+  buildFindMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T[]> {
     const { sql: whereSql, params } = args?.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
 
     const columnsList = this.resolveColumns(args?.select, args?.omit);
@@ -668,7 +719,7 @@ export class QueryInterface<T extends object> {
 
     let selectClause: string;
     if (args?.with) {
-      selectClause = this.buildSelectWithRelations(this.table, args.with, params, columnsList);
+      selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, params, columnsList);
     } else if (columnsList) {
       selectClause = columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ');
     } else {
@@ -743,8 +794,10 @@ export class QueryInterface<T extends object> {
    * }
    * ```
    */
-  async *findManyStream(args?: FindManyStreamArgs<T>): AsyncGenerator<T, void, undefined> {
-    const batchSize = args?.batchSize ?? 100;
+  async *findManyStream<W extends TypedWithClause<R> = {}>(
+    args?: FindManyStreamArgs<T, R, W>,
+  ): AsyncGenerator<WithResult<T, R, W>, void, undefined> {
+    const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 100)));
     const deferred = this.buildFindMany(args);
     const hasRelations = !!args?.with;
 
@@ -762,7 +815,11 @@ export class QueryInterface<T extends object> {
         if (batch.rows.length === 0) break;
 
         for (const row of batch.rows) {
-          yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as T;
+          yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as WithResult<
+            T,
+            R,
+            W
+          >;
         }
 
         if (batch.rows.length < batchSize) break;
@@ -788,17 +845,19 @@ export class QueryInterface<T extends object> {
   // findFirst — like findMany but returns a single row or null
   // -------------------------------------------------------------------------
 
-  async findFirst(args?: FindManyArgs<T>): Promise<T | null> {
+  async findFirst<W extends TypedWithClause<R> = {}>(
+    args?: FindManyArgs<T, R, W>,
+  ): Promise<WithResult<T, R, W> | null> {
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirst(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
       return deferred.transform(result);
-    });
+    }) as Promise<WithResult<T, R, W> | null>;
   }
 
-  buildFindFirst(args?: FindManyArgs<T>): DeferredQuery<T | null> {
+  buildFindFirst<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T | null> {
     // Reuse findMany's SQL builder but force LIMIT 1
-    const findManyArgs: FindManyArgs<T> = { ...args, limit: 1 };
+    const findManyArgs: FindManyArgs<T, R, W> = { ...args, limit: 1 };
     const deferred = this.buildFindMany(findManyArgs);
 
     return {
@@ -816,15 +875,17 @@ export class QueryInterface<T extends object> {
   // findFirstOrThrow — like findFirst but throws if no record found
   // -------------------------------------------------------------------------
 
-  async findFirstOrThrow(args?: FindManyArgs<T>): Promise<T> {
+  async findFirstOrThrow<W extends TypedWithClause<R> = {}>(
+    args?: FindManyArgs<T, R, W>,
+  ): Promise<WithResult<T, R, W>> {
     return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirstOrThrow(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
       return deferred.transform(result);
-    });
+    }) as Promise<WithResult<T, R, W>>;
   }
 
-  buildFindFirstOrThrow(args?: FindManyArgs<T>): DeferredQuery<T> {
+  buildFindFirstOrThrow<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T> {
     const inner = this.buildFindFirst(args);
 
     return {
@@ -849,15 +910,17 @@ export class QueryInterface<T extends object> {
   // findUniqueOrThrow — like findUnique but throws if no record found
   // -------------------------------------------------------------------------
 
-  async findUniqueOrThrow(args: FindUniqueArgs<T>): Promise<T> {
+  async findUniqueOrThrow<W extends TypedWithClause<R> = {}>(
+    args: FindUniqueArgs<T, R, W>,
+  ): Promise<WithResult<T, R, W>> {
     return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUniqueOrThrow(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
       return deferred.transform(result);
-    });
+    }) as Promise<WithResult<T, R, W>>;
   }
 
-  buildFindUniqueOrThrow(args: FindUniqueArgs<T>): DeferredQuery<T> {
+  buildFindUniqueOrThrow<W extends TypedWithClause<R> = {}>(args: FindUniqueArgs<T, R, W>): DeferredQuery<T> {
     const inner = this.buildFindUnique(args);
 
     return {
@@ -996,6 +1059,7 @@ export class QueryInterface<T extends object> {
     const whereClause = this.buildWhereClause(args.where as Record<string, unknown>, params);
 
     const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
+    this.assertMutationHasPredicate('update', whereSql, args.allowFullTableScan);
     const sql = `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql} RETURNING *`;
 
     return {
@@ -1030,6 +1094,7 @@ export class QueryInterface<T extends object> {
 
   buildDelete(args: DeleteArgs<T>): DeferredQuery<T> {
     const { sql: whereSql, params } = this.buildWhere(args.where);
+    this.assertMutationHasPredicate('delete', whereSql, args.allowFullTableScan);
     const sql = `DELETE FROM ${quoteIdent(this.table)}${whereSql} RETURNING *`;
 
     return {
@@ -1134,6 +1199,7 @@ export class QueryInterface<T extends object> {
     const whereClause = this.buildWhereClause(args.where as Record<string, unknown>, params);
 
     const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
+    this.assertMutationHasPredicate('updateMany', whereSql, args.allowFullTableScan);
     const sql = `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql}`;
 
     return {
@@ -1158,6 +1224,7 @@ export class QueryInterface<T extends object> {
 
   buildDeleteMany(args: DeleteManyArgs<T>): DeferredQuery<{ count: number }> {
     const { sql: whereSql, params } = this.buildWhere(args.where);
+    this.assertMutationHasPredicate('deleteMany', whereSql, args.allowFullTableScan);
     const sql = `DELETE FROM ${quoteIdent(this.table)}${whereSql}`;
 
     return {
@@ -1232,7 +1299,7 @@ export class QueryInterface<T extends object> {
       for (const [field, enabled] of Object.entries(args._sum)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`SUM(${quoteIdent(col)}) AS _sum_${col}`);
+          selectExprs.push(`SUM(${quoteIdent(col)}) AS ${quoteIdent('_sum_' + col)}`);
         }
       }
     }
@@ -1242,7 +1309,7 @@ export class QueryInterface<T extends object> {
       for (const [field, enabled] of Object.entries(args._avg)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`AVG(${quoteIdent(col)})::float AS _avg_${col}`);
+          selectExprs.push(`AVG(${quoteIdent(col)})::float AS ${quoteIdent('_avg_' + col)}`);
         }
       }
     }
@@ -1252,7 +1319,7 @@ export class QueryInterface<T extends object> {
       for (const [field, enabled] of Object.entries(args._min)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MIN(${quoteIdent(col)}) AS _min_${col}`);
+          selectExprs.push(`MIN(${quoteIdent(col)}) AS ${quoteIdent('_min_' + col)}`);
         }
       }
     }
@@ -1262,7 +1329,7 @@ export class QueryInterface<T extends object> {
       for (const [field, enabled] of Object.entries(args._max)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MAX(${quoteIdent(col)}) AS _max_${col}`);
+          selectExprs.push(`MAX(${quoteIdent(col)}) AS ${quoteIdent('_max_' + col)}`);
         }
       }
     }
@@ -1355,6 +1422,26 @@ export class QueryInterface<T extends object> {
   buildAggregate(args: AggregateArgs<T>): DeferredQuery<AggregateResult<T>> {
     const { sql: whereSql, params } = args.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
 
+    const meta = this.schema.tables[this.table];
+    if (meta) {
+      for (const group of [args._sum, args._avg, args._min, args._max]) {
+        if (group && typeof group === 'object') {
+          for (const key of Object.keys(group)) {
+            if (!(key in meta.columnMap)) {
+              throw new ValidationError(`Unknown column "${key}" in aggregate for table "${this.table}"`);
+            }
+          }
+        }
+      }
+      if (args._count && typeof args._count === 'object') {
+        for (const key of Object.keys(args._count)) {
+          if (!(key in meta.columnMap)) {
+            throw new ValidationError(`Unknown column "${key}" in aggregate for table "${this.table}"`);
+          }
+        }
+      }
+    }
+
     const selectExprs: string[] = [];
 
     // _count
@@ -1364,7 +1451,7 @@ export class QueryInterface<T extends object> {
       for (const [field, enabled] of Object.entries(args._count)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`COUNT(${quoteIdent(col)})::int AS _count_${col}`);
+          selectExprs.push(`COUNT(${quoteIdent(col)})::int AS ${quoteIdent('_count_' + col)}`);
         }
       }
     }
@@ -1374,7 +1461,7 @@ export class QueryInterface<T extends object> {
       for (const [field, enabled] of Object.entries(args._sum)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`SUM(${quoteIdent(col)}) AS _sum_${col}`);
+          selectExprs.push(`SUM(${quoteIdent(col)}) AS ${quoteIdent('_sum_' + col)}`);
         }
       }
     }
@@ -1384,7 +1471,7 @@ export class QueryInterface<T extends object> {
       for (const [field, enabled] of Object.entries(args._avg)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`AVG(${quoteIdent(col)})::float AS _avg_${col}`);
+          selectExprs.push(`AVG(${quoteIdent(col)})::float AS ${quoteIdent('_avg_' + col)}`);
         }
       }
     }
@@ -1394,7 +1481,7 @@ export class QueryInterface<T extends object> {
       for (const [field, enabled] of Object.entries(args._min)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MIN(${quoteIdent(col)}) AS _min_${col}`);
+          selectExprs.push(`MIN(${quoteIdent(col)}) AS ${quoteIdent('_min_' + col)}`);
         }
       }
     }
@@ -1404,7 +1491,7 @@ export class QueryInterface<T extends object> {
       for (const [field, enabled] of Object.entries(args._max)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MAX(${quoteIdent(col)}) AS _max_${col}`);
+          selectExprs.push(`MAX(${quoteIdent(col)}) AS ${quoteIdent('_max_' + col)}`);
         }
       }
     }
@@ -1601,6 +1688,27 @@ export class QueryInterface<T extends object> {
     const clause = this.buildWhereClause(where as Record<string, unknown>, params);
     if (!clause) return { sql: '', params: [] };
     return { sql: ` WHERE ${clause}`, params };
+  }
+
+  /**
+   * Refuse mutations with an empty predicate unless explicitly opted in.
+   *
+   * An empty `where` (e.g. `{}` or `{ id: undefined }`) resolves to a
+   * mutation with no filter — a common footgun when a caller's filter
+   * value accidentally resolves to `undefined`. This guard throws
+   * `ValidationError` in that case unless `allowFullTableScan: true`.
+   */
+  private assertMutationHasPredicate(
+    operation: 'update' | 'updateMany' | 'delete' | 'deleteMany',
+    whereSql: string,
+    allowFullTableScan: boolean | undefined,
+  ): void {
+    if (whereSql.length > 0) return;
+    if (allowFullTableScan === true) return;
+    throw new ValidationError(
+      `[turbine] ${operation} on "${this.table}" refused: the \`where\` clause is empty. ` +
+        `Pass \`allowFullTableScan: true\` to opt in, or check that your filter values are defined.`,
+    );
   }
 
   /**

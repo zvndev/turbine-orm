@@ -34,7 +34,7 @@ npm run typecheck  # Type checking only
 - TypeScript strict mode
 - ESM imports with `.js` extensions (NodeNext resolution)
 - JSDoc on all public APIs with `@example` blocks
-- No external linter yet — match existing patterns
+- Biome for linting and formatting (`npm run lint`, `npm run format`)
 
 ## Pull Request Process
 
