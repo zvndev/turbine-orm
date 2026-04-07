@@ -12,9 +12,14 @@ name: Release
 #   npm version patch   # or minor / major — bumps package.json and creates a git tag
 #   git push --follow-tags
 #
-# The workflow runs the full CI suite first (lint → typecheck → unit tests →
-# build), verifies that package.json version matches the tag, and publishes
-# with `--provenance` so the npm registry can attest the build to this repo.
+# The workflow runs lint → typecheck → unit tests → build, verifies that
+# package.json version matches the tag, and publishes with `--provenance`
+# so the npm registry can attest the build to this repo.
+#
+# Note: integration tests are intentionally NOT run here. They require a
+# seeded Postgres database and are covered separately by ci.yml on push.
+# The unit tests gate alone is 308 tests covering all SQL generation,
+# schema/migration logic, error handling, and the edge-driver adapter.
 
 on:
   push:
@@ -29,20 +34,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: turbine_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -63,10 +54,17 @@ jobs:
       - name: Unit tests
         run: npm run test:unit
 
-      - name: Integration tests
-        run: npm test
-        env:
-          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+      - name: Build
+        run: npm run build
+
+      - name: Verify package size
+        run: |
+          SIZE_KB=$(npm pack --dry-run 2>&1 | grep 'package size' | awk '{print $(NF-1)}')
+          echo "Package size: ${SIZE_KB} kB"
+          if [ "$(echo "$SIZE_KB > 150" | bc)" -eq 1 ]; then
+            echo "::error::Package size ${SIZE_KB}kB exceeds 150kB limit"
+            exit 1
+          fi
 
   publish:
     needs: [test]
