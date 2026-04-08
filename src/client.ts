@@ -23,7 +23,7 @@
  */
 
 import pg from 'pg';
-import { TimeoutError, wrapPgError } from './errors.js';
+import { type ErrorMessageMode, setErrorMessageMode, TimeoutError, wrapPgError } from './errors.js';
 import { executePipeline, type PipelineResults } from './pipeline.js';
 import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from './query.js';
 import type { SchemaMetadata } from './schema.js';
@@ -112,6 +112,20 @@ export interface TurbineConfig {
   defaultLimit?: number;
   /** Log a warning when findMany() is called without a limit (default: false) */
   warnOnUnlimited?: boolean;
+  /**
+   * Controls how `NotFoundError` (and other where-aware errors) format their
+   * messages.
+   *
+   *   - `'safe'`    (default): the message includes only the keys of the where
+   *     clause (e.g. `where: { id, email }`). Values are redacted to avoid
+   *     leaking PII into error logs (Sentry, Datadog, etc.).
+   *   - `'verbose'`: the message includes the full JSON-serialized where
+   *     clause (e.g. `where: {"id":1,"email":"alice@x.com"}`).
+   *
+   * The full `where` object is always available as `err.where` for
+   * programmatic access regardless of mode.
+   */
+  errorMessages?: ErrorMessageMode;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +332,12 @@ export class TurbineClient {
       defaultLimit: config.defaultLimit,
       warnOnUnlimited: config.warnOnUnlimited,
     };
+
+    // Apply NotFoundError message redaction mode (default: safe — values are
+    // stripped from messages to avoid leaking PII into error logs).
+    if (config.errorMessages) {
+      setErrorMessageMode(config.errorMessages);
+    }
 
     if (config.pool) {
       // External pool — use directly. Turbine doesn't manage its lifecycle.
@@ -544,6 +564,24 @@ export class TurbineClient {
     const client = await this.pool.connect();
     const timeout = options?.timeout;
 
+    /**
+     * Track whether the connection has already been released so the finally
+     * block doesn't double-release. When a timeout fires we destroy the
+     * connection eagerly to abort the in-flight backend query.
+     */
+    let released = false;
+    const releaseOnce = (err?: Error | boolean): void => {
+      if (released) return;
+      released = true;
+      try {
+        client.release(err);
+      } catch {
+        // pg may throw if the client is already released — swallow.
+      }
+    };
+
+    let timedOut = false;
+
     try {
       // BEGIN with optional isolation level
       let beginSQL = 'BEGIN';
@@ -570,10 +608,22 @@ export class TurbineClient {
       let result: R;
 
       if (timeout) {
-        // Race between the function and a timeout
+        // Race between the function and a timeout. If the timeout fires we
+        // need to actually abort the in-flight query — otherwise the backend
+        // keeps running until pg's own timeout, holding a pool slot the whole
+        // time. The simplest reliable cancellation is to destroy the
+        // connection: passing a truthy argument to client.release() tells the
+        // pg pool to discard the client (its socket is closed, which causes
+        // Postgres to abort the active query and roll back the transaction).
+        // The pool will spin up a fresh connection on the next checkout.
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeoutPromise = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
+            timedOut = true;
+            // Destroy the connection to abort the in-flight backend query.
+            // We do this BEFORE rejecting so the socket is gone by the time
+            // the caller's catch block runs.
+            releaseOnce(new Error('[turbine] Transaction timeout — connection destroyed'));
             reject(new TimeoutError(timeout, 'Transaction'));
           }, timeout);
         });
@@ -594,13 +644,23 @@ export class TurbineClient {
 
       return result;
     } catch (err) {
-      await client.query('ROLLBACK');
+      // If the timeout fired we already destroyed the connection — issuing a
+      // ROLLBACK on a released client would throw "Client has already been
+      // released". Skip the rollback in that case (the backend rolled back
+      // when its socket was closed).
+      if (!timedOut && !released) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          // Best-effort rollback — the connection may have died mid-query.
+        }
+      }
       if (this.logging) {
         console.log('[turbine] Transaction rolled back');
       }
       throw err;
     } finally {
-      client.release();
+      releaseOnce();
     }
   }
 
