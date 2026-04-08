@@ -179,3 +179,136 @@ describe('mutation guard: non-empty where still works', () => {
     assert.deepEqual(deferred.params, [true, 5]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Hardening: OR / AND combinators that contain ONLY undefined sub-conditions
+// must trigger the same empty-where guard. Otherwise a caller doing
+//   db.users.update({ where: { OR: [{ id: maybeNull }, { email: maybeNull }] }, data: {...} })
+// could silently emit an unconditional UPDATE when both inputs are undefined.
+// ---------------------------------------------------------------------------
+
+describe('mutation guard: OR/AND all-undefined hardening', () => {
+  it('buildUpdate refuses OR with all-undefined sub-conditions', () => {
+    const q = makeQuery('users', buildSchema());
+    assert.throws(
+      () =>
+        q.buildUpdate({
+          where: { OR: [{ id: undefined }, { email: undefined }] },
+          data: { name: 'x' },
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError, 'should be ValidationError');
+        assert.match((err as Error).message, /update/);
+        assert.match((err as Error).message, /empty/);
+        return true;
+      },
+    );
+  });
+
+  it('buildDelete refuses OR with all-undefined sub-conditions', () => {
+    const q = makeQuery('users', buildSchema());
+    assert.throws(
+      () =>
+        q.buildDelete({
+          where: { OR: [{ id: undefined }, { name: undefined }] },
+        }),
+      ValidationError,
+    );
+  });
+
+  it('buildUpdate refuses AND with all-undefined sub-conditions', () => {
+    const q = makeQuery('users', buildSchema());
+    assert.throws(
+      () =>
+        q.buildUpdate({
+          where: { AND: [{ id: undefined }, { email: undefined }] },
+          data: { name: 'x' },
+        }),
+      ValidationError,
+    );
+  });
+
+  it('buildDelete refuses AND with all-undefined sub-conditions', () => {
+    const q = makeQuery('users', buildSchema());
+    assert.throws(
+      () =>
+        q.buildDelete({
+          where: { AND: [{ id: undefined }, { name: undefined }] },
+        }),
+      ValidationError,
+    );
+  });
+
+  it('buildUpdateMany refuses OR with all-undefined sub-conditions', () => {
+    const q = makeQuery('users', buildSchema());
+    assert.throws(
+      () =>
+        q.buildUpdateMany({
+          where: { OR: [{ id: undefined }, { name: undefined }] },
+          data: { active: false },
+        }),
+      ValidationError,
+    );
+  });
+
+  it('buildDeleteMany refuses AND with all-undefined sub-conditions', () => {
+    const q = makeQuery('users', buildSchema());
+    assert.throws(
+      () =>
+        q.buildDeleteMany({
+          where: { AND: [{ id: undefined }, { name: undefined }] },
+        }),
+      ValidationError,
+    );
+  });
+
+  it('OR with empty array (no sub-conditions at all) is also refused', () => {
+    const q = makeQuery('users', buildSchema());
+    assert.throws(() => q.buildUpdate({ where: { OR: [] }, data: { name: 'x' } }), ValidationError);
+  });
+
+  it('AND with empty array (no sub-conditions at all) is also refused', () => {
+    const q = makeQuery('users', buildSchema());
+    assert.throws(() => q.buildDelete({ where: { AND: [] } }), ValidationError);
+  });
+
+  it('mixed OR (all-undefined) + top-level undefined keys still refused', () => {
+    const q = makeQuery('users', buildSchema());
+    assert.throws(
+      () =>
+        q.buildUpdate({
+          where: {
+            id: undefined,
+            OR: [{ name: undefined }, { email: undefined }],
+          },
+          data: { name: 'x' },
+        }),
+      ValidationError,
+    );
+  });
+
+  it('OR with at least one defined sub-condition still works (regression guard)', () => {
+    // Sanity check — make sure the hardening above didn't over-fire on the
+    // legitimate case where one OR branch resolves to a real predicate.
+    const q = makeQuery('users', buildSchema());
+    const deferred = q.buildUpdate({
+      where: { OR: [{ id: 5 }, { name: undefined }] },
+      data: { name: 'x' },
+    });
+    assert.match(deferred.sql, /WHERE/);
+    assert.match(deferred.sql, /"id" = \$2/);
+  });
+
+  it('allowFullTableScan: true bypasses the OR/AND hardening too', () => {
+    // Belt-and-braces: a caller who explicitly opts in must still be able to
+    // run an unconditional mutation even when the OR/AND happens to be empty.
+    const q = makeQuery('users', buildSchema());
+    const deferred = q.buildUpdate({
+      where: { OR: [{ id: undefined }] },
+      data: { name: 'x' },
+      allowFullTableScan: true,
+    });
+    assert.match(deferred.sql, /^UPDATE "users" SET "name" = \$1 RETURNING \*$/);
+    assert.deepEqual(deferred.params, ['x']);
+  });
+});
