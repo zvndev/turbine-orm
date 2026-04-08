@@ -340,16 +340,24 @@ async function validateChecksums(client: pg.Client, migrationsDir: string): Prom
  * Features:
  * - Idempotent: running twice is safe (already-applied migrations are skipped)
  * - Advisory lock: prevents concurrent migration runs
- * - Checksum validation: detects modified migration files
+ * - Checksum validation: detects modified migration files (BLOCKING — use
+ *   `allowDrift: true` to bypass when intentionally rewriting history)
  * - Each migration runs in its own transaction
+ *
+ * Throws `MigrationError` if any applied migration has been modified or deleted
+ * on disk, listing the offending files. Pass `{ allowDrift: true }` to bypass
+ * this check (the CLI exposes this as `--allow-drift`).
  */
 export async function migrateUp(
   connectionString: string,
   migrationsDir: string,
-  options?: { step?: number; force?: boolean },
+  options?: { step?: number; allowDrift?: boolean /** @deprecated use allowDrift */; force?: boolean },
 ): Promise<{ applied: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
   const client = new pg.Client({ connectionString });
   await client.connect();
+
+  // Treat `force` as an alias for `allowDrift` for backwards compatibility.
+  const allowDrift = options?.allowDrift === true || options?.force === true;
 
   try {
     // Acquire advisory lock to prevent concurrent migrations
@@ -361,18 +369,37 @@ export async function migrateUp(
     try {
       await ensureTrackingTable(client);
 
-      // Validate checksums of already-applied migrations (skip with --force)
-      if (!options?.force) {
+      // Validate checksums of already-applied migrations.
+      // Drift = an APPLIED migration's on-disk file has changed (or been deleted)
+      // since it was run. Either situation means the database state and the
+      // migration history no longer agree, so we BLOCK the run by default.
+      // Users can pass `allowDrift: true` (CLI: `--allow-drift`) to force past
+      // the block when they are intentionally rewriting history.
+      if (!allowDrift) {
         const mismatches = await validateChecksums(client, migrationsDir);
         if (mismatches.length > 0) {
           const modified = mismatches.filter((m) => m.type === 'modified');
           const missing = mismatches.filter((m) => m.type === 'missing');
-          const parts: string[] = [];
-          if (modified.length > 0) parts.push(`modified: ${modified.map((m) => m.name).join(', ')}`);
-          if (missing.length > 0) parts.push(`deleted: ${missing.map((m) => m.name).join(', ')}`);
-          throw new MigrationError(
-            `[turbine] Migration integrity check failed — ${parts.join('; ')}. Applied migrations should be immutable. Use --force to skip this check.`,
+          const lines: string[] = [
+            '[turbine] Migration drift detected — refusing to apply pending migrations.',
+            '',
+            'Applied migrations should be immutable. The following files no longer match their applied state:',
+            '',
+          ];
+          for (const m of modified) {
+            lines.push(`  - ${m.name}.sql  (modified on disk)`);
+          }
+          for (const m of missing) {
+            lines.push(`  - ${m.name}.sql  (deleted from disk)`);
+          }
+          lines.push('');
+          lines.push('Fix one of these:');
+          lines.push('  1. Restore the file(s) to their original content, OR');
+          lines.push('  2. Roll back the affected migrations with `npx turbine migrate down`, OR');
+          lines.push(
+            '  3. Pass `--allow-drift` to bypass this check (advanced — make sure you know what you are doing).',
           );
+          throw new MigrationError(lines.join('\n'));
         }
       }
 

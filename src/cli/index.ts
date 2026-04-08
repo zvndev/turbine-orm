@@ -29,6 +29,7 @@ import type { SchemaDef } from '../schema-builder.js';
 import { schemaDiff, schemaPush } from '../schema-sql.js';
 import type { CliOverrides, ResolvedConfig } from './config.js';
 import { configTemplate, findConfigFile, loadConfig, resolveConfig } from './config.js';
+import { needsTsLoader, registerTsLoader } from './loader.js';
 import { createMigration, listMigrationFiles, migrateDown, migrateStatus, migrateUp } from './migrate.js';
 import {
   banner,
@@ -76,6 +77,7 @@ interface CliArgs {
   verbose?: boolean;
   help?: boolean;
   auto?: boolean;
+  allowDrift?: boolean;
 }
 
 function parseArgs(): CliArgs {
@@ -132,6 +134,9 @@ function parseArgs(): CliArgs {
       case '--auto':
         result.auto = true;
         break;
+      case '--allow-drift':
+        result.allowDrift = true;
+        break;
       case '--force':
       case '-f':
         result.force = true;
@@ -153,6 +158,39 @@ function parseArgs(): CliArgs {
   }
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// TypeScript loader — user-facing error helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Print a friendly error explaining how to install tsx, then exit.
+ * Called when we know we need to load a `.ts` file but the loader isn't available.
+ */
+function failMissingTsLoader(filePath: string, reason: 'missing' | 'unsupported'): never {
+  newline();
+  error(`Cannot load TypeScript file: ${filePath}`);
+  newline();
+  if (reason === 'unsupported') {
+    console.log(`  ${dim('Your Node.js version does not support')} ${cyan('module.register()')}.`);
+    console.log(
+      `  ${dim('Upgrade to Node.js')} ${cyan('20.6+')} ${dim('or use a')} ${cyan('.js')} ${dim('/')} ${cyan('.mjs')} ${dim('config file.')}`,
+    );
+  } else {
+    console.log(`  ${dim('Loading .ts config / schema files requires')} ${cyan('tsx')} ${dim('to be installed.')}`);
+    newline();
+    console.log(`  ${dim('Install it as a dev dependency:')}`);
+    console.log(`    ${cyan('npm install --save-dev tsx')}`);
+    console.log(`    ${dim('or')}`);
+    console.log(`    ${cyan('pnpm add -D tsx')}`);
+    console.log(`    ${dim('or')}`);
+    console.log(`    ${cyan('yarn add -D tsx')}`);
+    newline();
+    console.log(`  ${dim('Alternatively, rename your file to')} ${cyan('.js')} ${dim('or')} ${cyan('.mjs')}.`);
+  }
+  newline();
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +219,16 @@ async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
     process.exit(1);
   }
 
+  // If this is a TypeScript file, ensure the tsx ESM loader is registered
+  // before we attempt the dynamic import. Without this, Node throws
+  // ERR_UNKNOWN_FILE_EXTENSION for `.ts`.
+  if (needsTsLoader(absPath)) {
+    const status = await registerTsLoader();
+    if (status === 'missing' || status === 'unsupported') {
+      failMissingTsLoader(schemaFile, status);
+    }
+  }
+
   try {
     const fileUrl = pathToFileURL(absPath).href;
     const mod = await import(fileUrl);
@@ -194,6 +242,13 @@ async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
     error(`Failed to load schema file: ${schemaFile}`);
     if (err instanceof Error) {
       console.log(`  ${dim(err.message)}`);
+      // If the error is the classic ERR_UNKNOWN_FILE_EXTENSION, give a hint.
+      if (err.message.includes('ERR_UNKNOWN_FILE_EXTENSION') || err.message.includes('Unknown file extension')) {
+        newline();
+        console.log(
+          `  ${dim('Hint: install')} ${cyan('tsx')} ${dim('to load .ts files:')} ${cyan('npm install --save-dev tsx')}`,
+        );
+      }
     }
     process.exit(1);
   }
@@ -601,9 +656,12 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`    ${cyan('status')}                Show migration status`);
     newline();
     console.log(`  ${bold('Options:')}`);
-    console.log(`    ${cyan('--auto')}         Auto-generate UP/DOWN SQL from schema diff`);
-    console.log(`    ${cyan('--step, -n')}     Number of migrations to apply/rollback`);
-    console.log(`    ${cyan('--dry-run')}      Show SQL without executing`);
+    console.log(`    ${cyan('--auto')}           Auto-generate UP/DOWN SQL from schema diff`);
+    console.log(`    ${cyan('--step, -n')}       Number of migrations to apply/rollback`);
+    console.log(`    ${cyan('--dry-run')}        Show SQL without executing`);
+    console.log(
+      `    ${cyan('--allow-drift')}    Bypass checksum validation on ${cyan('migrate up')} ${dim('(advanced)')}`,
+    );
     newline();
     console.log(`  ${bold('Examples:')}`);
     console.log(`    ${dim('npx turbine migrate create add_users_table')}`);
@@ -738,10 +796,20 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
     return;
   }
 
+  // Big, loud warning when bypassing drift detection — this is a deliberately
+  // dangerous operation and the user should see it on every invocation.
+  if (args.allowDrift) {
+    warn('--allow-drift is set — checksum validation is DISABLED for this run.');
+    console.log(`  ${dim('Applied migrations may have been modified or deleted on disk.')}`);
+    console.log(`  ${dim('Proceed only if you are intentionally rewriting migration history.')}`);
+    newline();
+  }
+
   const spinner = new Spinner('Applying migrations').start();
 
   const result = await migrateUp(url, config.migrationsDir, {
     step: args.step,
+    allowDrift: args.allowDrift,
   });
 
   if (result.applied.length === 0 && result.errors.length === 0) {
@@ -1135,6 +1203,7 @@ function showMigrateHelp(): void {
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
   console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
+  console.log(`    ${cyan('--allow-drift')}      Bypass checksum validation ${dim('(migrate up only — advanced)')}`);
   console.log(`    ${cyan('--verbose, -v')}      Show detailed output`);
   newline();
   console.log(`  ${bold('Examples:')}`);
@@ -1257,6 +1326,17 @@ async function main() {
   if (args.command === 'version' || args.command === '--version' || args.command === '-V') {
     showVersion();
     return;
+  }
+
+  // If the user has a TypeScript config file, register the tsx ESM loader
+  // before we attempt to import it. Otherwise Node throws
+  // ERR_UNKNOWN_FILE_EXTENSION for `.ts`.
+  const configPath = findConfigFile();
+  if (needsTsLoader(configPath)) {
+    const status = await registerTsLoader();
+    if (status === 'missing' || status === 'unsupported') {
+      failMissingTsLoader(configPath ?? 'turbine.config.ts', status);
+    }
   }
 
   // Load config file
