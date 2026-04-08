@@ -1086,7 +1086,7 @@ testFn('comprehensive integration tests', () => {
 
       await warnDb.table('users').findMany(); // Without limit — should warn
       assert.ok(warnings.length > 0);
-      assert.ok(warnings[0]!.includes('without limit'));
+      assert.ok(warnings[0]!.includes('no limit'));
 
       console.warn = originalWarn;
       await warnDb.disconnect();

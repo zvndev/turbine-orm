@@ -87,6 +87,7 @@ export {
   type JsonFilter,
   type OrderDirection,
   QueryInterface,
+  type RelationDescriptor,
   type RelationFilter,
   type TypedWithClause,
   type UpdateArgs,
