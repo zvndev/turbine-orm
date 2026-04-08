@@ -143,19 +143,53 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
 // ---------------------------------------------------------------------------
 
 export interface TableDef {
-  /** Table name (set during defineSchema) */
+  /**
+   * DDL-facing table name (snake_case). This is the name used when generating
+   * `CREATE TABLE` and other DDL statements. Set automatically during
+   * `defineSchema()` by converting the JS-facing accessor key from camelCase
+   * to snake_case (e.g. `postTags` → `post_tags`).
+   */
   name: string;
+  /**
+   * JS-facing accessor name (camelCase). This is the original key the user
+   * supplied to `defineSchema({ ... })` and is used as the property name on
+   * the generated `TurbineClient` (e.g. `db.postTags`). For schemas that
+   * already use snake_case keys, this matches `name`.
+   */
+  accessor: string;
   /** Column definitions keyed by camelCase field name */
   columns: Record<string, ColumnConfig>;
+  /**
+   * Optional composite primary key. When present, takes precedence over any
+   * column-level `primaryKey: true` flags. Column names listed here are the
+   * camelCase JS-facing field names — they will be converted to snake_case
+   * when emitted as a `PRIMARY KEY (...)` table constraint.
+   */
+  primaryKey?: readonly string[];
+}
+
+/**
+ * User-facing input shape for a single table when using the object format.
+ * The optional `primaryKey` field declares a composite primary key.
+ */
+export interface TableInput {
+  /** Optional composite primary key (camelCase field names) */
+  primaryKey?: readonly string[];
+  /** Column definitions keyed by camelCase field name */
+  [columnName: string]: ColumnDef | readonly string[] | undefined;
 }
 
 export interface SchemaDef {
-  /** All tables keyed by table name */
+  /**
+   * All tables keyed by their JS-facing accessor name (camelCase, exactly as
+   * the user wrote them in `defineSchema({ ... })`). The DDL-facing snake_case
+   * name is available as `tables[key].name`.
+   */
   tables: Record<string, TableDef>;
 }
 
 /** Input format: table name -> column defs (object format) or TableDef (legacy builder) */
-type SchemaInput = Record<string, Record<string, ColumnDef> | TableDef>;
+type SchemaInput = Record<string, Record<string, ColumnDef> | TableDef | TableInput>;
 
 /** Check if a value is a TableDef (from legacy table() builder) */
 function isTableDef(v: unknown): v is TableDef {
@@ -184,22 +218,82 @@ function isTableDef(v: unknown): v is TableDef {
 export function defineSchema(input: SchemaInput): SchemaDef {
   const tables: Record<string, TableDef> = {};
 
-  for (const [tableName, value] of Object.entries(input)) {
+  for (const [accessor, value] of Object.entries(input)) {
+    // The user-facing key is the camelCase JS accessor; the DDL-facing
+    // table name is its snake_case form (e.g. `postTags` → `post_tags`).
+    const dbName = camelToSnakeLocal(accessor);
+
     if (isTableDef(value)) {
       // Legacy format: defineSchema({ users: table({ ... }) })
-      value.name = tableName;
-      tables[tableName] = value;
+      // Stamp both the DDL name and the JS accessor.
+      value.name = dbName;
+      value.accessor = accessor;
+      tables[accessor] = value;
     } else {
       // Object format: defineSchema({ users: { id: { type: 'serial' }, ... } })
+      const raw = value as TableInput;
       const columns: Record<string, ColumnConfig> = {};
-      for (const [fieldName, def] of Object.entries(value as Record<string, ColumnDef>)) {
-        columns[fieldName] = resolveColumn(def);
+      let pk: readonly string[] | undefined;
+
+      for (const [fieldName, def] of Object.entries(raw)) {
+        if (fieldName === 'primaryKey') {
+          // Top-level composite primary key declaration
+          if (def !== undefined) {
+            if (!Array.isArray(def)) {
+              throw new Error(
+                `Table "${accessor}": top-level "primaryKey" must be an array of column names (string[])`,
+              );
+            }
+            pk = def as readonly string[];
+          }
+          continue;
+        }
+        // Anything else is a ColumnDef
+        columns[fieldName] = resolveColumn(def as ColumnDef);
       }
-      tables[tableName] = { name: tableName, columns };
+
+      // Validate composite PK references real columns and clear column-level PKs
+      // for those columns so we don't double-emit `PRIMARY KEY` clauses.
+      // Composite PK members are implicitly NOT NULL — preserve that even
+      // when the user clears the column-level `primaryKey: true` flag.
+      if (pk && pk.length > 0) {
+        for (const colName of pk) {
+          if (!(colName in columns)) {
+            throw new Error(
+              `Table "${accessor}": composite primaryKey references unknown column "${colName}". ` +
+                `Known columns: ${Object.keys(columns).join(', ') || '(none)'}`,
+            );
+          }
+          // A composite PK at the table level supersedes any column-level
+          // `primaryKey: true` flag — silently clear it so DDL emission
+          // produces a single, valid table-level PRIMARY KEY constraint.
+          // Force NOT NULL since PK columns can never be nullable.
+          const c = columns[colName];
+          if (c) {
+            c.isPrimaryKey = false;
+            c.isNotNull = true;
+          }
+        }
+      }
+
+      tables[accessor] = {
+        name: dbName,
+        accessor,
+        columns,
+        ...(pk && pk.length > 0 ? { primaryKey: pk } : {}),
+      };
     }
   }
 
   return { tables };
+}
+
+/**
+ * Local copy of camelToSnake to avoid a circular import dependency at the
+ * top of the file. Mirrors the implementation in `./schema.ts`.
+ */
+function camelToSnakeLocal(s: string): string {
+  return s.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +445,7 @@ export function table(columns: Record<string, ColumnBuilder>): TableDef {
   for (const [fieldName, builder] of Object.entries(columns)) {
     built[fieldName] = builder.build();
   }
-  return { name: '', columns: built };
+  return { name: '', accessor: '', columns: built };
 }
 
 // ---------------------------------------------------------------------------
