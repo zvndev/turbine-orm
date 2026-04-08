@@ -58,14 +58,14 @@ jobs:
       - run: npm ci
       - run: npm run test:coverage
 
-  # Integration tests run against a real Postgres service container. They
-  # require a seeded schema (5K users / 46K posts / 432K comments from the
-  # benchmarks/ Prisma schema). CI does not seed that data yet, so this job
-  # is currently non-blocking — it runs for visibility but does not gate.
-  # See README / CHANGELOG for how to run them locally with DATABASE_URL set.
+  # Integration tests run against a real Postgres service container. The
+  # service is seeded from src/test/fixtures/seed.sql before the test run,
+  # which provides the schema + a small fixture dataset (5 orgs / 8 users /
+  # 10 posts / 20 comments) — enough to exercise nested relations, cursor
+  # pagination, JSONB / array operators, and the streaming cursor API.
+  # Failures gate PRs.
   integration-tests:
     runs-on: ubuntu-latest
-    continue-on-error: true
     services:
       postgres:
         image: postgres:16
@@ -87,6 +87,13 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Seed test database
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f src/test/fixtures/seed.sql
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+          PGPASSWORD: test
       - run: npm test
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
