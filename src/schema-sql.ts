@@ -25,11 +25,12 @@ export function schemaToSQL(schema: SchemaDef): string[] {
 
   // Topologically sort tables by their foreign key references
   const sorted = topologicalSort(schema);
+  const resolveRef = makeRefResolver(schema);
 
   // Generate CREATE TABLE statements
   for (const tableName of sorted) {
     const table = schema.tables[tableName]!;
-    statements.push(generateCreateTable(table));
+    statements.push(generateCreateTable(table, resolveRef));
   }
 
   // Generate CREATE INDEX for foreign key columns
@@ -43,11 +44,49 @@ export function schemaToSQL(schema: SchemaDef): string[] {
 }
 
 /**
+ * Build a function that resolves a raw `references: 'foo.id'` target name
+ * to the snake_case DDL table name. Accepts both the JS-facing camelCase
+ * accessor name and the snake_case DDL name; passes through unknown names
+ * unchanged so existing call sites continue to work.
+ */
+function makeRefResolver(schema: SchemaDef): (rawName: string) => string {
+  const lookup = buildTableLookup(schema);
+  return (rawName: string): string => {
+    const key = lookup[rawName];
+    if (key) {
+      const def = schema.tables[key];
+      if (def?.name) return def.name;
+    }
+    return rawName;
+  };
+}
+
+/**
+ * Build a lookup index from both DDL names (snake_case) and JS accessor
+ * names (camelCase) to table keys, so `references: 'post_tags.id'` and
+ * `references: 'postTags.id'` both resolve to the same TableDef.
+ */
+function buildTableLookup(schema: SchemaDef): Record<string, string> {
+  const lookup: Record<string, string> = {};
+  for (const [key, def] of Object.entries(schema.tables)) {
+    lookup[key] = key;
+    if (def.name && def.name !== key) lookup[def.name] = key;
+    if (def.accessor && def.accessor !== key) lookup[def.accessor] = key;
+  }
+  return lookup;
+}
+
+/**
  * Topologically sort tables so that referenced tables come before referencing ones.
+ * Returns the table keys (the same keys used in `schema.tables`). The keys are
+ * the JS-facing accessor names; consumers should still call `table.name` to get
+ * the snake_case DDL name when emitting SQL.
+ *
  * Falls back to input order for tables with no dependency ordering.
  */
 function topologicalSort(schema: SchemaDef): string[] {
   const tableNames = Object.keys(schema.tables);
+  const lookup = buildTableLookup(schema);
   const resolved = new Set<string>();
   const result: string[] = [];
   const visiting = new Set<string>();
@@ -65,9 +104,10 @@ function topologicalSort(schema: SchemaDef): string[] {
       // Visit all tables this table references
       for (const col of Object.values(table.columns)) {
         if (col.referencesTarget) {
-          const refTable = col.referencesTarget.split('.')[0]!;
-          if (refTable !== name && schema.tables[refTable]) {
-            visit(refTable);
+          const refRaw = col.referencesTarget.split('.')[0]!;
+          const refKey = lookup[refRaw];
+          if (refKey && refKey !== name) {
+            visit(refKey);
           }
         }
       }
@@ -87,13 +127,30 @@ function topologicalSort(schema: SchemaDef): string[] {
 
 /**
  * Generate a CREATE TABLE statement for a single table definition.
+ *
+ * If `table.primaryKey` is set (composite primary key), emits a table-level
+ * `PRIMARY KEY ("col1", "col2", ...)` constraint instead of column-level
+ * `PRIMARY KEY` clauses on each member column. The composite PK column
+ * names are camelCase JS field names; they are converted to snake_case
+ * here.
+ *
+ * `resolveRef` (when supplied) maps raw `references: 'foo.id'` table names
+ * to their snake_case DDL form, so users can write either camelCase JS
+ * accessor names or snake_case DDL names.
  */
-function generateCreateTable(table: TableDef): string {
+function generateCreateTable(table: TableDef, resolveRef?: (raw: string) => string): string {
   const tableName = table.name;
   const columnDefs: string[] = [];
+  const compositePk = table.primaryKey && table.primaryKey.length > 0 ? table.primaryKey : null;
 
   for (const [fieldName, config] of Object.entries(table.columns)) {
-    columnDefs.push(generateColumnDef(fieldName, config));
+    columnDefs.push(generateColumnDef(fieldName, config, resolveRef));
+  }
+
+  // Append a table-level PRIMARY KEY constraint when a composite PK is set.
+  if (compositePk) {
+    const cols = compositePk.map((c) => quoteIdent(camelToSnake(c))).join(', ');
+    columnDefs.push(`PRIMARY KEY (${cols})`);
   }
 
   const body = columnDefs.map((d) => `    ${d}`).join(',\n');
@@ -103,7 +160,7 @@ function generateCreateTable(table: TableDef): string {
 /**
  * Generate a single column definition line (e.g. "id BIGSERIAL PRIMARY KEY").
  */
-function generateColumnDef(fieldName: string, config: ColumnConfig): string {
+function generateColumnDef(fieldName: string, config: ColumnConfig, resolveRef?: (raw: string) => string): string {
   const snakeName = camelToSnake(fieldName);
   const parts: string[] = [quoteIdent(snakeName)];
 
@@ -142,11 +199,14 @@ function generateColumnDef(fieldName: string, config: ColumnConfig): string {
     parts.push(`DEFAULT ${sqlDefault}`);
   }
 
-  // REFERENCES
+  // REFERENCES — resolve the raw table name through the optional resolver so
+  // both camelCase accessor names and snake_case DDL names work.
   if (config.referencesTarget) {
     const refParts = config.referencesTarget.split('.');
     if (refParts.length === 2) {
-      parts.push(`REFERENCES ${quoteIdent(refParts[0]!)}(${quoteIdent(refParts[1]!)})`);
+      const rawTable = refParts[0]!;
+      const refTable = resolveRef ? resolveRef(rawTable) : rawTable;
+      parts.push(`REFERENCES ${quoteIdent(refTable)}(${quoteIdent(refParts[1]!)})`);
     }
   }
 
@@ -343,36 +403,41 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       dbUniques[row.table_name]![row.column_name] = row.constraint_name;
     }
 
-    const schemaTableNames = new Set(Object.keys(schema.tables));
+    // Build a set of DDL-facing snake_case table names that the schema defines.
+    const schemaDdlNames = new Set<string>();
+    for (const def of Object.values(schema.tables)) schemaDdlNames.add(def.name);
     const result: DiffResult = { create: [], alter: [], drop: [], statements: [], reverseStatements: [] };
+    const resolveRef = makeRefResolver(schema);
 
     // Tables to create (in schema but not in DB)
     const sorted = topologicalSort(schema);
-    for (const tableName of sorted) {
-      if (!existingTables.has(tableName)) {
-        const tableDef = schema.tables[tableName]!;
+    for (const tableKey of sorted) {
+      const tableDef = schema.tables[tableKey]!;
+      const ddlName = tableDef.name;
+      if (!existingTables.has(ddlName)) {
         result.create.push(tableDef);
-        result.statements.push(generateCreateTable(tableDef));
+        result.statements.push(generateCreateTable(tableDef, resolveRef));
         const fkIndexes = generateForeignKeyIndexes(tableDef);
         result.statements.push(...fkIndexes);
         // Reverse: DROP TABLE (with indexes — they drop automatically)
-        result.reverseStatements.unshift(`DROP TABLE IF EXISTS ${quoteIdent(tableName)} CASCADE;`);
+        result.reverseStatements.unshift(`DROP TABLE IF EXISTS ${quoteIdent(ddlName)} CASCADE;`);
       }
     }
 
     // Tables to drop (in DB but not in schema)
     for (const existingTable of existingTables) {
-      if (!schemaTableNames.has(existingTable)) {
+      if (!schemaDdlNames.has(existingTable)) {
         result.drop.push(existingTable);
         // We don't auto-generate DROP statements for safety
       }
     }
 
     // Tables to alter (exist in both)
-    for (const tableName of sorted) {
+    for (const tableKey of sorted) {
+      const tableDef = schema.tables[tableKey]!;
+      const tableName = tableDef.name;
       if (!existingTables.has(tableName)) continue;
 
-      const tableDef = schema.tables[tableName]!;
       const dbCols = dbColumns[tableName] ?? {};
       const tableUniques = dbUniques[tableName] ?? {};
       const alterDef: AlterDef = { table: tableName, columns: [] };
@@ -383,7 +448,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
 
         if (!dbCol) {
           // Column exists in schema but not in DB — ADD COLUMN
-          const colDef = generateColumnDef(fieldName, config);
+          const colDef = generateColumnDef(fieldName, config, resolveRef);
           const sql = `ALTER TABLE ${quoteIdent(tableName)} ADD COLUMN ${colDef};`;
           const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} DROP COLUMN ${quoteIdent(snakeName)};`;
           alterDef.columns.push({ column: snakeName, action: 'add', sql, reverseSql });

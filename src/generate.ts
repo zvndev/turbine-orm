@@ -91,6 +91,12 @@ function generatedFileHeader(): string[] {
 function generateTypes(schema: SchemaMetadata): string {
   const lines: string[] = [...generatedFileHeader()];
 
+  // We import UpdateOperatorInput so generated *Update types can express
+  // atomic increment / decrement / multiply / divide / set operators on
+  // numeric columns (TASK-3.4).
+  lines.push("import type { UpdateOperatorInput } from 'turbine-orm';");
+  lines.push('');
+
   // Generate enum types
   for (const [enumName, labels] of Object.entries(schema.enums)) {
     const typeName = snakeToPascal(enumName);
@@ -135,11 +141,13 @@ function generateTypes(schema: SchemaMetadata): string {
     lines.push('');
 
     // --- Update input type (all fields optional except PK) ---
+    // Numeric columns additionally accept `UpdateOperatorInput<number>` so
+    // users can write `{ viewCount: { increment: 1 } }` without an `as any`.
     const nonPkCols = table.columns.filter((c) => !table.primaryKey.includes(c.name));
     lines.push(`/** Input type for updating a row in \`${table.name}\` */`);
     lines.push(`export type ${typeName}Update = {`);
     for (const col of nonPkCols) {
-      lines.push(`  ${col.field}?: ${col.tsType};`);
+      lines.push(`  ${col.field}?: ${updateFieldType(col.tsType)};`);
     }
     lines.push('};');
     lines.push('');
@@ -286,8 +294,8 @@ function generateIndex(schema: SchemaMetadata): string {
   const tableEntries = Object.values(schema.tables);
   const lines: string[] = [
     ...generatedFileHeader(),
-    "import { TurbineClient as BaseTurbineClient, QueryInterface } from 'turbine-orm';",
-    "import type { TurbineConfig } from 'turbine-orm';",
+    "import { TurbineClient as BaseTurbineClient, TransactionClient as BaseTransactionClient, QueryInterface } from 'turbine-orm';",
+    "import type { TurbineConfig, TransactionOptions } from 'turbine-orm';",
     "import { SCHEMA } from './metadata.js';",
   ];
 
@@ -300,6 +308,42 @@ function generateIndex(schema: SchemaMetadata): string {
     }
   }
   lines.push(`import type { ${typeImports.join(', ')} } from './types.js';`);
+  lines.push('');
+
+  // -------------------------------------------------------------------------
+  // TypedTransactionClient — same typed table accessors as TurbineClient,
+  // but scoped to a single transaction connection. The runtime instance is
+  // an ordinary `TransactionClient` from turbine-orm; this declaration just
+  // teaches TypeScript about the auto-attached accessors so users get
+  // autocomplete inside `db.$transaction(async (tx) => tx.users.create(...))`.
+  // -------------------------------------------------------------------------
+  lines.push('/**');
+  lines.push(' * Transaction-scoped client with the same typed table accessors as TurbineClient.');
+  lines.push(' * Created automatically by `db.$transaction(async (tx) => ...)` — never instantiate');
+  lines.push(' * directly. All queries run on a dedicated connection within a BEGIN/COMMIT block.');
+  lines.push(' */');
+  lines.push('export class TypedTransactionClient extends BaseTransactionClient {');
+  for (const table of tableEntries) {
+    const typeName = entityName(table.name);
+    const accessor = snakeToCamelStr(table.name);
+    const hasRelations = Object.keys(table.relations).length > 0;
+    const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
+    lines.push(`  /** Query interface for the \`${table.name}\` table (transaction-scoped) */`);
+    lines.push(`  declare readonly ${accessor}: QueryInterface<${genericArgs}>;`);
+  }
+  lines.push('}');
+  lines.push('');
+  // Augment the class with a typed `$transaction` overload via interface
+  // merging. This adds an additional callable signature whose callback
+  // parameter is narrowed to `TypedTransactionClient`, while the base
+  // signature (callback parameter `BaseTransactionClient`) remains valid.
+  lines.push('export interface TypedTransactionClient {');
+  lines.push('  /**');
+  lines.push('   * Nested transaction via SAVEPOINT. The callback receives a typed');
+  lines.push('   * `TypedTransactionClient` so all table accessors auto-complete.');
+  lines.push('   */');
+  lines.push('  $transaction<R>(fn: (tx: TypedTransactionClient) => Promise<R>): Promise<R>;');
+  lines.push('}');
   lines.push('');
 
   // Generate the client class with JSDoc
@@ -334,6 +378,22 @@ function generateIndex(schema: SchemaMetadata): string {
   lines.push('  constructor(config?: TurbineConfig) {');
   lines.push('    super(config, SCHEMA);');
   lines.push('  }');
+  lines.push('}');
+  lines.push('');
+  // Augment TurbineClient via interface merging with a typed $transaction
+  // overload. The callback parameter is narrowed to `TypedTransactionClient`
+  // so users get autocomplete on `tx.users`, `tx.posts`, etc. The base
+  // signature (callback parameter `BaseTransactionClient`) remains valid as
+  // an overload, so prior usage continues to typecheck.
+  lines.push('export interface TurbineClient {');
+  lines.push('  /**');
+  lines.push('   * Run a callback inside a transaction. The callback receives a typed');
+  lines.push('   * `TypedTransactionClient` with autocompletion for every table accessor.');
+  lines.push('   */');
+  lines.push('  $transaction<R>(');
+  lines.push('    fn: (tx: TypedTransactionClient) => Promise<R>,');
+  lines.push('    options?: TransactionOptions,');
+  lines.push('  ): Promise<R>;');
   lines.push('}');
   lines.push('');
 
@@ -382,4 +442,34 @@ function quoteIfNeeded(s: string): string {
 
 function snakeToCamelStr(s: string): string {
   return s.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+}
+
+/**
+ * Build the update-input field type for a column. Numeric columns become
+ * `T | UpdateOperatorInput<number> | null?` so users can write atomic
+ * operators (`{ increment: 1 }`, `{ multiply: 2 }`, etc.) without casts.
+ *
+ * The check is purely structural — if the column's TS type contains
+ * `'number'` (e.g. `number`, `number | null`), it's eligible. Other
+ * scalar types (`string`, `boolean`, `Date`, `unknown`, `Buffer`,
+ * `Date | null`, etc.) pass through unchanged.
+ */
+function updateFieldType(tsType: string): string {
+  // Strip parens for the regex check; preserve the original string in the output.
+  if (containsNumberType(tsType)) {
+    return `${tsType} | UpdateOperatorInput<number>`;
+  }
+  return tsType;
+}
+
+/**
+ * Detect whether a TypeScript type expression contains the `number` primitive
+ * as a top-level union member. Conservative on purpose — only matches
+ * `number`, `number | null`, `null | number`, etc., not `number[]` or
+ * `Record<string, number>`.
+ */
+function containsNumberType(tsType: string): boolean {
+  // Tokenize on `|` and check each member.
+  const parts = tsType.split('|').map((p) => p.trim());
+  return parts.some((p) => p === 'number');
 }

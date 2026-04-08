@@ -754,3 +754,175 @@ describe('edge cases', () => {
     assert.ok(sqlStr.includes('CREATE TABLE "tags"'), 'should have table');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Composite primary keys (TASK-3.1)
+// ---------------------------------------------------------------------------
+
+describe('composite primary keys', () => {
+  it('emits a single table-level PRIMARY KEY constraint for join tables', () => {
+    const schema = defineSchema({
+      postTags: {
+        primaryKey: ['postId', 'tagId'],
+        postId: { type: 'bigint', notNull: true, references: 'posts.id' },
+        tagId: { type: 'bigint', notNull: true, references: 'tags.id' },
+      },
+      posts: {
+        id: { type: 'serial', primaryKey: true },
+        title: { type: 'text', notNull: true },
+      },
+      tags: {
+        id: { type: 'serial', primaryKey: true },
+        name: { type: 'text', notNull: true },
+      },
+    });
+
+    const sql = schemaToSQLString(schema);
+    const ptSql = schemaToSQL(schema).find((s) => s.includes('CREATE TABLE "post_tags"'));
+    assert.ok(ptSql, 'should emit a CREATE TABLE for post_tags');
+
+    // Composite PK is rendered as a table-level constraint, not column-level.
+    assert.ok(ptSql.includes('PRIMARY KEY ("post_id", "tag_id")'), 'should have table-level composite PK');
+
+    // Column-level PRIMARY KEY clauses must NOT be present on the member columns.
+    const postIdLine = ptSql.split('\n').find((l) => l.includes('"post_id"'));
+    const tagIdLine = ptSql.split('\n').find((l) => l.includes('"tag_id"'));
+    assert.ok(postIdLine && !postIdLine.includes('PRIMARY KEY'), 'post_id should not have column-level PK');
+    assert.ok(tagIdLine && !tagIdLine.includes('PRIMARY KEY'), 'tag_id should not have column-level PK');
+
+    // FK references should still be present on the join columns.
+    assert.ok(sql.includes('REFERENCES "posts"("id")'), 'should keep post_id FK');
+    assert.ok(sql.includes('REFERENCES "tags"("id")'), 'should keep tag_id FK');
+  });
+
+  it('table-level primaryKey supersedes column-level primaryKey: true on member columns', () => {
+    const schema = defineSchema({
+      bridge: {
+        primaryKey: ['a', 'b'],
+        a: { type: 'bigint', notNull: true, primaryKey: true },
+        b: { type: 'bigint', notNull: true, primaryKey: true },
+      },
+    });
+    const sql = schemaToSQL(schema)[0]!;
+    // Should produce exactly one PRIMARY KEY clause (the table-level one).
+    const pkOccurrences = sql.match(/PRIMARY KEY/g) ?? [];
+    assert.equal(pkOccurrences.length, 1, 'should produce exactly one PRIMARY KEY clause');
+    assert.ok(sql.includes('PRIMARY KEY ("a", "b")'));
+  });
+
+  it('throws when composite primaryKey references unknown column', () => {
+    assert.throws(() => {
+      defineSchema({
+        bad: {
+          primaryKey: ['x', 'missing'],
+          x: { type: 'bigint', notNull: true },
+        },
+      });
+    }, /unknown column "missing"/);
+  });
+
+  it('preserves composite PK on the TableDef object', () => {
+    const schema = defineSchema({
+      pivot: {
+        primaryKey: ['leftId', 'rightId'],
+        leftId: { type: 'bigint', notNull: true },
+        rightId: { type: 'bigint', notNull: true },
+      },
+    });
+    assert.deepEqual(schema.tables.pivot!.primaryKey, ['leftId', 'rightId']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// camelCase table name normalization (TASK-3.2)
+// ---------------------------------------------------------------------------
+
+describe('camelCase table name normalization', () => {
+  it('converts camelCase table keys to snake_case in DDL', () => {
+    const schema = defineSchema({
+      postTags: {
+        id: { type: 'serial', primaryKey: true },
+        label: { type: 'text', notNull: true },
+      },
+      apiKeys: {
+        id: { type: 'serial', primaryKey: true },
+        token: { type: 'text', unique: true, notNull: true },
+      },
+    });
+    const sql = schemaToSQLString(schema);
+    assert.ok(sql.includes('CREATE TABLE "post_tags"'), 'should emit snake_case post_tags');
+    assert.ok(sql.includes('CREATE TABLE "api_keys"'), 'should emit snake_case api_keys');
+    assert.ok(!sql.includes('"postTags"'), 'should NOT emit camelCase postTags');
+    assert.ok(!sql.includes('"apiKeys"'), 'should NOT emit camelCase apiKeys');
+  });
+
+  it('preserves the JS-facing accessor name on TableDef.accessor', () => {
+    const schema = defineSchema({
+      postTags: {
+        id: { type: 'serial', primaryKey: true },
+      },
+    });
+    const def = schema.tables.postTags!;
+    assert.equal(def.name, 'post_tags', 'name is the snake_case DDL form');
+    assert.equal(def.accessor, 'postTags', 'accessor is the camelCase JS form');
+  });
+
+  it('keeps schema.tables keyed by the JS accessor name', () => {
+    const schema = defineSchema({
+      postTags: {
+        id: { type: 'serial', primaryKey: true },
+      },
+    });
+    // Lookup by JS-facing accessor key works (the key remains camelCase).
+    assert.ok(schema.tables.postTags, 'tables map is keyed by accessor');
+    assert.equal(Object.keys(schema.tables)[0], 'postTags');
+  });
+
+  it('snake_case keys still work and round-trip unchanged', () => {
+    const schema = defineSchema({
+      post_tags: {
+        id: { type: 'serial', primaryKey: true },
+      },
+    });
+    const def = schema.tables.post_tags!;
+    assert.equal(def.name, 'post_tags');
+    assert.equal(def.accessor, 'post_tags');
+    const sql = schemaToSQLString(schema);
+    assert.ok(sql.includes('CREATE TABLE "post_tags"'));
+  });
+
+  it('camelCase references are resolved to snake_case in REFERENCES', () => {
+    const schema = defineSchema({
+      apiKeys: {
+        id: { type: 'serial', primaryKey: true },
+      },
+      apiKeyUsage: {
+        id: { type: 'serial', primaryKey: true },
+        // User wrote a camelCase reference target — generator should resolve
+        // it to the snake_case DDL form when emitting REFERENCES.
+        apiKeyId: { type: 'bigint', notNull: true, references: 'apiKeys.id' },
+      },
+    });
+    const sql = schemaToSQLString(schema);
+    assert.ok(sql.includes('REFERENCES "api_keys"("id")'), 'should resolve camelCase reference target');
+    assert.ok(!sql.includes('REFERENCES "apiKeys"'), 'should NOT keep camelCase in REFERENCES');
+  });
+
+  it('respects FK dependency order across camelCase tables', () => {
+    const schema = defineSchema({
+      apiKeyUsage: {
+        id: { type: 'serial', primaryKey: true },
+        apiKeyId: { type: 'bigint', notNull: true, references: 'apiKeys.id' },
+      },
+      apiKeys: {
+        id: { type: 'serial', primaryKey: true },
+      },
+    });
+    const stmts = schemaToSQL(schema);
+    const createTables = stmts.filter((s) => s.startsWith('CREATE TABLE'));
+    const apiKeysIdx = createTables.findIndex((s) => s.includes('"api_keys"'));
+    const usageIdx = createTables.findIndex((s) => s.includes('"api_key_usage"'));
+    assert.ok(apiKeysIdx !== -1 && usageIdx !== -1, 'both tables should be created');
+    assert.ok(apiKeysIdx < usageIdx, 'api_keys should come before api_key_usage');
+  });
+});
