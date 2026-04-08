@@ -5,7 +5,7 @@ import { getDb, type User } from '../lib/db';
 async function getUsers() {
   const { db } = await getDb();
 
-  const users = (await db.table<User>('users').findMany({
+  const users = (await db.users.findMany({
     limit: 50,
     orderBy: { createdAt: 'desc' },
     with: {

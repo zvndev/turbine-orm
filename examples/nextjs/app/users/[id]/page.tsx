@@ -6,7 +6,7 @@ import { getDb, type User, type Post, type Comment } from '../../lib/db';
 async function getUser(id: number) {
   const { db } = await getDb();
 
-  const user = (await db.table<User>('users').findUnique({
+  const user = (await db.users.findUnique({
     where: { id },
     with: {
       organization: true,

@@ -6,7 +6,7 @@ import { getDb, type User, type Post } from './lib/db';
 async function getHomeData() {
   const { db } = await getDb();
 
-  const users = (await db.table<User>('users').findMany({
+  const users = (await db.users.findMany({
     limit: 3,
     orderBy: { createdAt: 'desc' },
     with: {
@@ -18,7 +18,7 @@ async function getHomeData() {
     },
   })) as User[];
 
-  const postCount = await db.table<Post>('posts').count({});
+  const postCount = await db.posts.count({});
 
   return { users, postCount };
 }
@@ -40,7 +40,7 @@ export default async function Home() {
         <div className="max-w-3xl mx-auto text-center">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-zinc-100 text-zinc-600 text-xs font-medium mb-8">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-            1 dependency &middot; 70KB &middot; PostgreSQL native
+            1 dependency &middot; ~110KB &middot; PostgreSQL native
           </div>
 
           <h1 className="text-5xl sm:text-6xl font-semibold tracking-tight text-zinc-900 leading-[1.1]">
@@ -81,7 +81,7 @@ export default async function Home() {
             description="Full TypeScript types generated from your database. Autocomplete for columns, relations, and filters."
           />
           <FeatureCard
-            title="70KB"
+            title="~110KB"
             description="One runtime dependency (pg). No WASM engine, no query plan compiler, no code generation DSL."
           />
         </div>

@@ -147,6 +147,30 @@ const deleted = await db.users.delete({
 });
 ```
 
+### Atomic update operators
+
+For race-free counter updates, pass an operator object instead of a literal. Turbine generates `col = col + $n` style SQL so concurrent updates are safe.
+
+```typescript
+// Atomic increment — no read-modify-write race
+await db.posts.update({
+  where: { id: 1 },
+  data: { viewCount: { increment: 1 } },
+});
+
+// Other supported operators on numeric columns
+await db.posts.update({
+  where: { id: 1 },
+  data: {
+    viewCount:  { increment: 5 },
+    likesCount: { decrement: 1 },
+    score:      { multiply: 2 },
+    rank:       { divide: 2 },
+    title:      { set: 'New title' }, // explicit set, equivalent to a literal
+  },
+});
+```
+
 ### Transactions
 
 ```typescript
@@ -272,6 +296,73 @@ try {
 ```
 
 Error codes: `TURBINE_E001` (NotFound), `TURBINE_E002` (Timeout), `TURBINE_E003` (Validation), `TURBINE_E004` (Connection), `TURBINE_E005` (Relation), `TURBINE_E006` (Migration), `TURBINE_E007` (CircularRelation).
+
+## WHERE Operator Reference
+
+Every operator supported by the `where` clause. Operators compose freely with `AND`, `OR`, `NOT`, and the relation filters `some` / `every` / `none`.
+
+### Equality
+
+| Operator | Description | Example |
+|---|---|---|
+| literal | Implicit equality | `where: { email: 'a@b.com' }` |
+| `equals` | Explicit equality | `where: { email: { equals: 'a@b.com' } }` |
+| `not` | Inequality (or `not: null` for `IS NOT NULL`) | `where: { role: { not: 'admin' } }` |
+
+### Sets
+
+| Operator | Description | Example |
+|---|---|---|
+| `in` | Match any value in the array | `where: { id: { in: [1, 2, 3] } }` |
+| `notIn` | Match none of the values in the array | `where: { role: { notIn: ['banned', 'spam'] } }` |
+
+### Comparison
+
+| Operator | Description | Example |
+|---|---|---|
+| `gt` | Greater than | `where: { score: { gt: 100 } }` |
+| `gte` | Greater than or equal | `where: { score: { gte: 100 } }` |
+| `lt` | Less than | `where: { score: { lt: 100 } }` |
+| `lte` | Less than or equal | `where: { score: { lte: 100 } }` |
+
+### String
+
+| Operator | Description | Example |
+|---|---|---|
+| `contains` | Substring match (`LIKE %v%`) | `where: { title: { contains: 'sql' } }` |
+| `startsWith` | Prefix match (`LIKE v%`) | `where: { email: { startsWith: 'admin@' } }` |
+| `endsWith` | Suffix match (`LIKE %v`) | `where: { email: { endsWith: '@acme.com' } }` |
+| `mode: 'insensitive'` | Switch any string operator to `ILIKE` | `where: { title: { contains: 'SQL', mode: 'insensitive' } }` |
+
+LIKE wildcards in user input are escaped automatically — `%`, `_`, and `\` are treated as literals.
+
+### Relation filters
+
+Filter parent rows by predicates against their related child rows. Available on `hasMany` and `hasOne` relations.
+
+| Operator | Description | Example |
+|---|---|---|
+| `some` | At least one related row matches | `where: { posts: { some: { published: true } } }` |
+| `every` | Every related row matches | `where: { posts: { every: { published: true } } }` |
+| `none` | No related row matches | `where: { posts: { none: { published: false } } }` |
+
+### Array columns
+
+Operators for Postgres array columns (`text[]`, `int[]`, etc.).
+
+| Operator | Description | Example |
+|---|---|---|
+| `has` | Array contains the given element | `where: { tags: { has: 'sql' } }` |
+| `hasEvery` | Array contains every element in the list | `where: { tags: { hasEvery: ['sql', 'postgres'] } }` |
+| `hasSome` | Array contains at least one element from the list | `where: { tags: { hasSome: ['sql', 'mysql'] } }` |
+
+### Combinators
+
+| Operator | Description | Example |
+|---|---|---|
+| `AND` | All sub-clauses must match | `where: { AND: [{ orgId: 1 }, { role: 'admin' }] }` |
+| `OR` | Any sub-clause matches | `where: { OR: [{ role: 'admin' }, { role: 'owner' }] }` |
+| `NOT` | Negate a sub-clause | `where: { NOT: { role: 'banned' } }` |
 
 ## CLI
 
@@ -492,7 +583,6 @@ All three ORMs now use single-query approaches for nested relations. Turbine use
 Turbine is focused and opinionated. Here's what it doesn't do:
 
 - **PostgreSQL only.** No MySQL, SQLite, or MSSQL. This is by design — the `json_agg` approach is PostgreSQL-specific, and going deep on one database enables the performance advantage.
-- **No incremental updates.** Prisma's `{ count: { increment: 1 } }` syntax is not yet supported. Use raw SQL for atomic increments.
 - **No full-text search operators.** TSVECTOR/TSQUERY are not exposed in the query builder. Use `db.raw` for full-text queries.
 - **Large nested result sets.** `json_agg` builds the entire JSON array in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause to cap the aggregation size.
 - **No admin UI.** Turbine Studio is planned but not yet available.
@@ -500,6 +590,14 @@ Turbine is focused and opinionated. Here's what it doesn't do:
 ## Examples
 
 - **[Next.js](./examples/nextjs/)** — Server-rendered app with nested relations, streaming, and live code demos
+- **[Neon Edge](./examples/neon-edge/)** — Vercel Edge route handler talking to Neon over HTTP via `@neondatabase/serverless`
+- **[Vercel Postgres](./examples/vercel-postgres/)** — Next.js app router route handler on `@vercel/postgres`
+- **[Cloudflare Worker](./examples/cloudflare-worker/)** — Worker `fetch` handler with `pg` over Cloudflare Hyperdrive
+- **[Supabase](./examples/supabase/)** — Standalone script over the standard `pg` driver against Supabase
+
+## Guides
+
+- **[Migrating from Prisma](./docs/migrate-from-prisma.md)** — API mapping table, side-by-side `findMany`, and notes on the differences
 
 ## Requirements
 
