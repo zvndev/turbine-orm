@@ -1,0 +1,23 @@
+{
+  "name": "turbine-cloudflare-worker-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:push": "npx turbine push --schema ./schema.ts",
+    "db:generate": "npx turbine generate"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "turbine-orm": "^0.7.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240000.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^3.80.0"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "turbine-neon-edge-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:push": "npx turbine push --schema ./schema.ts",
+    "db:generate": "npx turbine generate"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.0",
+    "turbine-orm": "^0.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
