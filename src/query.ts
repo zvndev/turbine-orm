@@ -145,13 +145,29 @@ export interface WithClause {
  * Relation-aware with clause. When R (the relations map) is provided,
  * only keys from R are autocompleted. Used in public method signatures
  * so the compiler can narrow the return type.
+ *
+ * For typed maps, each relation accepts either `true` (default include) or a
+ * {@link WithOptions} object whose nested `with` is keyed against the relation
+ * target's own relations interface — this is what enables deep
+ * `WithResult` inference.
  */
 export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
   ? WithClause
-  : { [K in keyof R]?: true | WithOptions };
+  : {
+      [K in keyof R]?: true | WithOptions<RelationRelations<R[K]> & object>;
+    };
 
-export interface WithOptions<_T = unknown> {
-  with?: WithClause;
+/**
+ * Options for an included relation.
+ *
+ * Generic over `NestedR` — the relations interface of the *target* entity —
+ * so the nested `with` clause is autocompleted with the correct relation keys
+ * and so {@link WithResult} can recursively infer the return type. Defaults to
+ * `{}` (no relation suggestions) for callers that use the unparameterized
+ * {@link WithClause}.
+ */
+export interface WithOptions<NestedR extends object = {}> {
+  with?: TypedWithClause<NestedR>;
   where?: Record<string, unknown>;
   orderBy?: Record<string, OrderDirection>;
   limit?: number;
@@ -162,25 +178,122 @@ export interface WithOptions<_T = unknown> {
 }
 
 // ---------------------------------------------------------------------------
-// WithResult — compute return type based on included relations
+// WithResult — compute return type based on included relations (recursive)
 // ---------------------------------------------------------------------------
+
+/**
+ * A relation descriptor used by generated `*Relations` interfaces to make deep
+ * `with` clause inference work. It bundles three pieces of information that
+ * `WithResult` needs to recurse through nested relations:
+ *
+ *  - `__target`     — the target entity type (e.g. `Post`)
+ *  - `__cardinality`— `'many'` for hasMany, `'one'` for belongsTo / hasOne
+ *  - `__relations`  — the target entity's relations interface (for further recursion)
+ *
+ * **Generator contract (Track 3):** the code generator emits `*Relations`
+ * interfaces in the following shape so that `WithResult` can walk arbitrary
+ * nesting depth:
+ *
+ * ```ts
+ * export interface UserRelations {
+ *   posts:   RelationDescriptor<Post,    'many', PostRelations>;
+ *   profile: RelationDescriptor<Profile, 'one',  ProfileRelations>;
+ * }
+ * ```
+ *
+ * The brand fields are phantom — they exist only for type inference and have
+ * no runtime representation. The runtime always sees the parsed entity values
+ * (arrays for hasMany, single object or null for belongsTo / hasOne) — see the
+ * cardinality projection inside {@link WithResult}.
+ *
+ * **Backward compatibility:** legacy generated code emitted bare types
+ * (`posts: Post[]`, `profile: Profile | null`). `WithResult` still accepts that
+ * shape via a fallback branch — it just cannot recurse into nested `with` for
+ * those relations until the generator is updated.
+ *
+ * @typeParam Target      - The entity type the relation points at.
+ * @typeParam Cardinality - `'many'` (array) or `'one'` (single object | null).
+ * @typeParam Relations   - The target entity's own `*Relations` interface, or
+ *                          `{}` if the target has no relations of its own.
+ */
+export interface RelationDescriptor<Target, Cardinality extends 'one' | 'many', Relations extends object = {}> {
+  readonly __target?: Target;
+  readonly __cardinality?: Cardinality;
+  readonly __relations?: Relations;
+}
+
+/** Extract the target entity from a relation descriptor or bare relation type. */
+type RelationTarget<Rel> =
+  Rel extends RelationDescriptor<infer Target, infer _C, infer _R>
+    ? Target
+    : Rel extends Array<infer Item>
+      ? Item
+      : Rel extends infer One | null
+        ? One
+        : Rel;
+
+/** Extract the target's relations map from a relation descriptor (or `{}` for bare types). */
+type RelationRelations<Rel> = Rel extends RelationDescriptor<infer _T, infer _C, infer R> ? R : {};
+
+/** Project the target type into its runtime shape (array for many, single for one). */
+type ApplyCardinality<Rel, Resolved> =
+  Rel extends RelationDescriptor<infer _T, infer Cardinality, infer _R>
+    ? Cardinality extends 'many'
+      ? Resolved[]
+      : Resolved | null
+    : Rel extends Array<infer _Item>
+      ? Resolved[]
+      : Resolved | null;
 
 /**
  * Compute the result type when relations are included via `with`.
  *
- * - When R is the default ({}) or W is empty, resolves to plain T.
- * - When R is a real relations map and W specifies relation keys, merges matching
- *   relation types from R onto T.
+ * Recursively walks the `with` clause, looking up each relation in `R` and:
  *
- * @typeParam T - Base entity type (e.g. User)
- * @typeParam R - Relations map (e.g. { posts: Post[]; profile: Profile | null })
- * @typeParam W - The with clause object (e.g. { posts: true })
+ *  1. If the relation is included with `true` (or no nested `with`), the
+ *     relation's bare resolved type is grafted onto `T` (e.g. `posts: Post[]`).
+ *  2. If the relation is included with a nested `with: {...}`, the recursion
+ *     looks up the target entity's relations interface (via the
+ *     {@link RelationDescriptor} brand fields the generator emits) and
+ *     recursively applies `WithResult` to the nested target. Cardinality is
+ *     re-applied at each level so a hasMany relation stays an array even after
+ *     deep nesting.
+ *
+ * **When `R` is `{}` (the default):** the recursion short-circuits and the
+ * function returns plain `T` — preserving the existing untyped escape hatch
+ * for callers that have not generated typed clients.
+ *
+ * **When `R` does not contain the requested relations:** the unknown keys are
+ * ignored (the runtime will throw a `RelationError`, but the type system stays
+ * permissive so the legacy `WithClause` index signature still typechecks).
+ *
+ * @typeParam T - Base entity type (e.g. `User`).
+ * @typeParam R - Relations map for `T` (e.g.
+ *                `{ posts: RelationDescriptor<Post, 'many', PostRelations>; ... }`).
+ *                Legacy bare shapes (`{ posts: Post[]; profile: Profile | null }`)
+ *                are also accepted, but cannot recurse beyond one level.
+ * @typeParam W - The `with` clause the user passed (e.g. `{ posts: true }` or
+ *                `{ posts: { with: { comments: true } } }`).
  */
 export type WithResult<T, R extends object, W> = [keyof R] extends [never]
   ? T
-  : [keyof W & keyof R] extends [never]
-    ? T
-    : T & Pick<R, keyof W & keyof R>;
+  : W extends object
+    ? [keyof W & keyof R] extends [never]
+      ? T
+      : T & {
+          [K in keyof W & keyof R]: W[K] extends true
+            ? // Leaf inclusion — no further `with`. Project the relation's runtime shape.
+              ApplyCardinality<R[K], RelationTarget<R[K]>>
+            : W[K] extends { with?: infer NestedW }
+              ? NestedW extends object
+                ? // Recursive case — drill into the target's relations map.
+                  ApplyCardinality<R[K], WithResult<RelationTarget<R[K]>, RelationRelations<R[K]> & object, NestedW>>
+                : // `with` was passed but is not an object literal — treat as leaf.
+                  ApplyCardinality<R[K], RelationTarget<R[K]>>
+              : // `WithOptions` was passed without a nested `with` — treat as leaf.
+                ApplyCardinality<R[K], RelationTarget<R[K]>>;
+        }
+    : T;
 
 export interface FindUniqueArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>> {
   where: WhereClause<T>;
@@ -380,6 +493,15 @@ export interface JsonFilter {
 /** Known JSONB operator keys */
 const JSONB_OPERATOR_KEYS = new Set<string>(['path', 'equals', 'contains', 'hasKey']);
 
+/**
+ * JSONB operator keys that are *unique* to {@link JsonFilter} — they cannot
+ * appear in any other where-filter shape, so the presence of one of these is
+ * an unambiguous signal that the user meant a JSON filter. Used by the
+ * strict-validation path so that `{ contains: 'foo' }` (which is also a valid
+ * `WhereOperator` for LIKE) is not misclassified.
+ */
+const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'equals', 'hasKey']);
+
 /** Check if a value is a JSONB filter object */
 function isJsonFilter(value: unknown): value is JsonFilter {
   if (
@@ -393,6 +515,17 @@ function isJsonFilter(value: unknown): value is JsonFilter {
   }
   const keys = Object.keys(value);
   return keys.length > 0 && keys.some((k) => JSONB_OPERATOR_KEYS.has(k));
+}
+
+/**
+ * Returns the first JSON-unique key found in `value`, or `null` if none.
+ * Used to drive the strict-validation error message.
+ */
+function findJsonUniqueKey(value: object): string | null {
+  for (const k of Object.keys(value)) {
+    if (JSONB_UNIQUE_KEYS.has(k)) return k;
+  }
+  return null;
 }
 
 /** Array query operators for where clauses */
@@ -410,6 +543,15 @@ export interface ArrayFilter {
 /** Known Array operator keys */
 const ARRAY_OPERATOR_KEYS = new Set<string>(['has', 'hasEvery', 'hasSome', 'isEmpty']);
 
+/**
+ * Array operator keys that are *unique* to {@link ArrayFilter}. None of the
+ * array operators currently overlap with `WhereOperator` or `JsonFilter`, so
+ * this set equals {@link ARRAY_OPERATOR_KEYS}; it is kept as a separate
+ * constant so a future overlap (e.g. a `contains` for arrays) is easy to
+ * carve out.
+ */
+const ARRAY_UNIQUE_KEYS = new Set<string>(['has', 'hasEvery', 'hasSome', 'isEmpty']);
+
 /** Check if a value is an Array filter object */
 function isArrayFilter(value: unknown): value is ArrayFilter {
   if (
@@ -423,6 +565,17 @@ function isArrayFilter(value: unknown): value is ArrayFilter {
   }
   const keys = Object.keys(value);
   return keys.length > 0 && keys.some((k) => ARRAY_OPERATOR_KEYS.has(k));
+}
+
+/**
+ * Returns the first array-unique key found in `value`, or `null` if none.
+ * Used to drive the strict-validation error message.
+ */
+function findArrayUniqueKey(value: object): string | null {
+  for (const k of Object.keys(value)) {
+    if (ARRAY_UNIQUE_KEYS.has(k)) return k;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +646,13 @@ type MiddlewareFn = (
 export interface QueryInterfaceOptions {
   /** Default LIMIT applied to findMany() when no limit is specified */
   defaultLimit?: number;
-  /** Log a warning when findMany() is called without a limit */
+  /**
+   * Log a one-time warning when {@link QueryInterface.findMany} is called
+   * without a `limit`. Defaults to `true` so that accidental unbounded
+   * queries are surfaced loudly during development. Pass `false` to silence
+   * the warning entirely (e.g. for CLI tooling that intentionally streams
+   * full tables).
+   */
   warnOnUnlimited?: boolean;
 }
 
@@ -504,6 +663,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly middlewares: MiddlewareFn[];
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
+  /**
+   * Tracks tables that have already triggered an unlimited-query warning so
+   * the user is not spammed once per row. Per-instance state — each
+   * QueryInterface is bound to a single table, so this set will only ever
+   * contain at most one entry, but using a Set keeps the API consistent with
+   * the audit's "Set<string>" guidance and leaves room for future
+   * cross-table sharing.
+   */
+  private readonly warnedTables = new Set<string>();
 
   /** Pre-computed column type lookups (avoids linear scans per query) */
   private readonly columnPgTypeMap: Map<string, string>;
@@ -525,7 +693,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.tableMeta = meta;
     this.middlewares = middlewares ?? [];
     this.defaultLimit = options?.defaultLimit;
-    this.warnOnUnlimited = options?.warnOnUnlimited ?? false;
+    // Default to ON: surfacing accidental full-table scans is more valuable
+    // than the (small) risk of noisy logs. Callers explicitly opt out with
+    // `warnOnUnlimited: false`.
+    this.warnOnUnlimited = options?.warnOnUnlimited !== false;
 
     // Pre-compute column type lookup maps (TASK-26)
     this.columnPgTypeMap = new Map();
@@ -534,6 +705,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
       this.columnPgTypeMap.set(col.name, col.pgType);
       this.columnArrayTypeMap.set(col.name, col.pgArrayType);
     }
+  }
+
+  /**
+   * Reset the per-instance unlimited-query warning dedupe set.
+   * Exposed for tests so a single test process can verify the warning fires
+   * exactly once per table without bleeding state between assertions.
+   */
+  resetUnlimitedWarnings(): void {
+    this.warnedTables.clear();
   }
 
   /**
@@ -688,19 +868,36 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async findMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): Promise<WithResult<T, R, W>[]> {
-    // Warn if no limit specified and warnOnUnlimited is enabled
-    const hasExplicitLimit = args?.limit !== undefined || args?.take !== undefined;
-    if (this.warnOnUnlimited && !hasExplicitLimit) {
-      console.warn(
-        `[turbine] findMany() called without limit on table "${this.table}". Set defaultLimit in config to prevent unbounded queries.`,
-      );
-    }
+    this.maybeWarnUnlimited(args);
 
     return this.executeWithMiddleware('findMany', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
       return deferred.transform(result);
     }) as Promise<WithResult<T, R, W>[]>;
+  }
+
+  /**
+   * Emit a one-time `console.warn` when {@link findMany} is called without an
+   * explicit `limit`/`take` and `warnOnUnlimited` has not been disabled.
+   *
+   * Deduped per QueryInterface instance via {@link warnedTables} so a busy
+   * loop calling `db.users.findMany()` thousands of times only logs once.
+   * Suppressed when `defaultLimit` is configured (the caller has already
+   * opted in to a bounded query) and when the user passed an explicit
+   * `limit`, `take`, or `cursor`.
+   */
+  private maybeWarnUnlimited(args?: { limit?: number; take?: number; cursor?: unknown }): void {
+    if (!this.warnOnUnlimited) return;
+    if (this.defaultLimit !== undefined) return;
+    const hasExplicitLimit = args?.limit !== undefined || args?.take !== undefined || args?.cursor !== undefined;
+    if (hasExplicitLimit) return;
+    if (this.warnedTables.has(this.table)) return;
+    this.warnedTables.add(this.table);
+    console.warn(
+      `[turbine] warning: findMany on "${this.table}" has no limit — this will fetch every row. ` +
+        'Pass `limit` or set `warnOnUnlimited: false` in config to silence.',
+    );
   }
 
   buildFindMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T[]> {
@@ -1789,6 +1986,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
           andClauses.push(...jsonClauses);
           continue;
         }
+        // Strict validation: a JSON-only operator on a non-JSON column was almost
+        // certainly a typo or schema mismatch. Silently falling through to plain
+        // equality (the previous behaviour) wasted hours of debugging time. Only
+        // throw when the operator is unambiguously JSON-specific — `contains` is
+        // shared with WhereOperator's LIKE so it must continue to fall through.
+        const jsonKey = findJsonUniqueKey(value);
+        if (jsonKey) {
+          throw new ValidationError(
+            `[turbine] Column "${rawColumn}" on table "${this.table}" is not a JSON column ` +
+              `(actual type: ${colType}); cannot apply JSON operator '${jsonKey}'.`,
+          );
+        }
       }
 
       // Handle Array filter operators (for array columns)
@@ -1798,6 +2007,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
           const arrayClauses = this.buildArrayFilterClauses(column, value, params, colType);
           andClauses.push(...arrayClauses);
           continue;
+        }
+        // Strict validation: array operators (`has`, `hasEvery`, ...) on a
+        // non-array column always indicate a mistake. None of these keys
+        // overlap with other filter shapes so we can throw unconditionally.
+        const arrayKey = findArrayUniqueKey(value);
+        if (arrayKey) {
+          throw new ValidationError(
+            `[turbine] Column "${rawColumn}" on table "${this.table}" is not an array column ` +
+              `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
+          );
         }
       }
 
