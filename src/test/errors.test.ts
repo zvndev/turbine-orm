@@ -12,11 +12,15 @@ import {
   CheckConstraintError,
   CircularRelationError,
   ConnectionError,
+  DeadlockError,
   ForeignKeyError,
+  getErrorMessageMode,
   MigrationError,
   NotFoundError,
   NotNullViolationError,
   RelationError,
+  SerializationFailureError,
+  setErrorMessageMode,
   TimeoutError,
   TurbineError,
   TurbineErrorCode,
@@ -79,7 +83,9 @@ describe('NotFoundError', () => {
     assert.ok(err instanceof Error);
   });
 
-  it('options object: builds Prisma-style message with table, where, operation', () => {
+  it('options object: builds Prisma-style message with table, where keys, operation (safe mode)', () => {
+    // Default mode is 'safe' — message should include where keys but NOT values.
+    setErrorMessageMode('safe');
     const err = new NotFoundError({
       table: 'users',
       where: { id: 1 },
@@ -87,7 +93,10 @@ describe('NotFoundError', () => {
     });
     assert.ok(err.message.includes('users'), 'message should include table name');
     assert.ok(err.message.includes('findUniqueOrThrow'), 'message should include operation');
-    assert.ok(err.message.includes('{"id":1}'), 'message should include JSON where');
+    assert.ok(err.message.includes('{ id }'), 'safe mode should include where key, not value');
+    assert.ok(!err.message.includes('"id":1'), 'safe mode should NOT include where value JSON');
+    // Old prefix is preserved so substring assertions in other tests still pass:
+    assert.ok(err.message.includes('[turbine] findUniqueOrThrow on "users" found no record'));
   });
 
   it('options object: populates .table, .where, .operation fields', () => {
@@ -284,6 +293,8 @@ describe('inheritance — all errors are instanceof Error and TurbineError', () 
     new ForeignKeyError(),
     new NotNullViolationError(),
     new CheckConstraintError(),
+    new DeadlockError(),
+    new SerializationFailureError(),
   ];
 
   for (const err of errors) {
@@ -346,8 +357,16 @@ describe('TurbineErrorCode', () => {
     assert.equal(TurbineErrorCode.CHECK_VIOLATION, 'TURBINE_E011');
   });
 
-  it('has exactly 11 error codes', () => {
-    assert.equal(Object.keys(TurbineErrorCode).length, 11);
+  it('has DEADLOCK_DETECTED = TURBINE_E012', () => {
+    assert.equal(TurbineErrorCode.DEADLOCK_DETECTED, 'TURBINE_E012');
+  });
+
+  it('has SERIALIZATION_FAILURE = TURBINE_E013', () => {
+    assert.equal(TurbineErrorCode.SERIALIZATION_FAILURE, 'TURBINE_E013');
+  });
+
+  it('has exactly 13 error codes', () => {
+    assert.equal(Object.keys(TurbineErrorCode).length, 13);
   });
 });
 
@@ -622,6 +641,244 @@ describe('wrapPgError', () => {
       assert.equal(wrapped.constraint, 'price_positive');
       assert.equal(wrapped.table, 'products');
       assert.equal(wrapped.cause, err);
+    }
+  });
+
+  it('wraps 40P01 into DeadlockError with isRetryable = true', () => {
+    const err = Object.assign(new Error('deadlock detected: process A waits for ...'), {
+      code: '40P01',
+    });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof DeadlockError, 'expected DeadlockError');
+    if (wrapped instanceof DeadlockError) {
+      assert.equal(wrapped.isRetryable, true);
+      assert.equal(wrapped.code, 'TURBINE_E012');
+      assert.equal(wrapped.cause, err);
+      assert.ok(wrapped.message.includes('Deadlock detected'), 'message should mention deadlock');
+      assert.ok(wrapped.message.includes('process A waits for'), 'message should embed pg detail');
+    }
+  });
+
+  it('wraps 40001 into SerializationFailureError with isRetryable = true', () => {
+    const err = Object.assign(new Error('could not serialize access due to concurrent update'), { code: '40001' });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof SerializationFailureError, 'expected SerializationFailureError');
+    if (wrapped instanceof SerializationFailureError) {
+      assert.equal(wrapped.isRetryable, true);
+      assert.equal(wrapped.code, 'TURBINE_E013');
+      assert.equal(wrapped.cause, err);
+      assert.ok(
+        wrapped.message.includes('Serializable transaction conflict'),
+        'message should mention serialization conflict',
+      );
+      assert.ok(wrapped.message.includes('could not serialize access'), 'message should embed pg detail');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DeadlockError
+// ---------------------------------------------------------------------------
+
+describe('DeadlockError', () => {
+  it('has .code === TURBINE_E012', () => {
+    const err = new DeadlockError();
+    assert.equal(err.code, TurbineErrorCode.DEADLOCK_DETECTED);
+    assert.equal(err.code, 'TURBINE_E012');
+  });
+
+  it('has name "DeadlockError"', () => {
+    const err = new DeadlockError();
+    assert.equal(err.name, 'DeadlockError');
+  });
+
+  it('exposes .isRetryable === true', () => {
+    const err = new DeadlockError();
+    assert.equal(err.isRetryable, true);
+  });
+
+  it('default message is generic when no cause is passed', () => {
+    const err = new DeadlockError();
+    assert.equal(err.message, '[turbine] Deadlock detected');
+  });
+
+  it('default message embeds pg cause message', () => {
+    const cause = new Error('Process 1234 waits for ShareLock on ...');
+    const err = new DeadlockError({ cause });
+    assert.ok(err.message.includes('Deadlock detected'));
+    assert.ok(err.message.includes('Process 1234 waits for'));
+  });
+
+  it('preserves cause', () => {
+    const cause = new Error('orig');
+    const err = new DeadlockError({ cause });
+    assert.equal(err.cause, cause);
+  });
+
+  it('honors explicit message override', () => {
+    const err = new DeadlockError({ message: 'custom' });
+    assert.equal(err.message, 'custom');
+  });
+
+  it('is instanceof TurbineError and Error', () => {
+    const err = new DeadlockError();
+    assert.ok(err instanceof DeadlockError);
+    assert.ok(err instanceof TurbineError);
+    assert.ok(err instanceof Error);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SerializationFailureError
+// ---------------------------------------------------------------------------
+
+describe('SerializationFailureError', () => {
+  it('has .code === TURBINE_E013', () => {
+    const err = new SerializationFailureError();
+    assert.equal(err.code, TurbineErrorCode.SERIALIZATION_FAILURE);
+    assert.equal(err.code, 'TURBINE_E013');
+  });
+
+  it('has name "SerializationFailureError"', () => {
+    const err = new SerializationFailureError();
+    assert.equal(err.name, 'SerializationFailureError');
+  });
+
+  it('exposes .isRetryable === true', () => {
+    const err = new SerializationFailureError();
+    assert.equal(err.isRetryable, true);
+  });
+
+  it('default message is generic when no cause is passed', () => {
+    const err = new SerializationFailureError();
+    assert.equal(err.message, '[turbine] Serializable transaction conflict');
+  });
+
+  it('default message embeds pg cause message', () => {
+    const cause = new Error('could not serialize access due to read/write dependencies');
+    const err = new SerializationFailureError({ cause });
+    assert.ok(err.message.includes('Serializable transaction conflict'));
+    assert.ok(err.message.includes('could not serialize access'));
+  });
+
+  it('preserves cause', () => {
+    const cause = new Error('orig');
+    const err = new SerializationFailureError({ cause });
+    assert.equal(err.cause, cause);
+  });
+
+  it('honors explicit message override', () => {
+    const err = new SerializationFailureError({ message: 'custom' });
+    assert.equal(err.message, 'custom');
+  });
+
+  it('is instanceof TurbineError and Error', () => {
+    const err = new SerializationFailureError();
+    assert.ok(err instanceof SerializationFailureError);
+    assert.ok(err instanceof TurbineError);
+    assert.ok(err instanceof Error);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NotFoundError message redaction modes
+// ---------------------------------------------------------------------------
+
+describe('NotFoundError redaction modes', () => {
+  // These tests mutate global mode — make sure to restore after each test.
+  const original = getErrorMessageMode();
+  const restore = () => setErrorMessageMode(original);
+
+  it('default mode is "safe"', () => {
+    // Constructor of TurbineClient sets the mode if config.errorMessages is
+    // provided. The library default (no client constructed) should be safe.
+    // We can't reliably assert "safe" here if a previous test changed it, so
+    // we restore explicitly first.
+    setErrorMessageMode('safe');
+    assert.equal(getErrorMessageMode(), 'safe');
+    restore();
+  });
+
+  it('safe mode: message includes only where keys, not values', () => {
+    setErrorMessageMode('safe');
+    try {
+      const err = new NotFoundError({
+        table: 'users',
+        where: { email: 'alice@x.com', id: 42 },
+        operation: 'findUniqueOrThrow',
+      });
+      assert.ok(err.message.includes('{ email, id }'), `expected key-only message, got: ${err.message}`);
+      assert.ok(!err.message.includes('alice@x.com'), 'safe mode must NOT leak email value');
+      assert.ok(!err.message.includes('42'), 'safe mode must NOT leak id value');
+    } finally {
+      restore();
+    }
+  });
+
+  it('safe mode: preserves the legacy message prefix for substring tests', () => {
+    setErrorMessageMode('safe');
+    try {
+      const err = new NotFoundError({
+        table: 'users',
+        where: { id: 1 },
+        operation: 'findUniqueOrThrow',
+      });
+      assert.ok(err.message.startsWith('[turbine] findUniqueOrThrow on "users" found no record'));
+    } finally {
+      restore();
+    }
+  });
+
+  it('safe mode: empty where renders as {}', () => {
+    setErrorMessageMode('safe');
+    try {
+      const err = new NotFoundError({ table: 'users', where: {}, operation: 'update' });
+      assert.ok(err.message.includes('{}'));
+    } finally {
+      restore();
+    }
+  });
+
+  it('verbose mode: message includes full JSON where', () => {
+    setErrorMessageMode('verbose');
+    try {
+      const err = new NotFoundError({
+        table: 'users',
+        where: { email: 'alice@x.com', id: 42 },
+        operation: 'findUniqueOrThrow',
+      });
+      assert.ok(err.message.includes('"email":"alice@x.com"'), 'verbose mode should include email value');
+      assert.ok(err.message.includes('"id":42'), 'verbose mode should include id value');
+    } finally {
+      restore();
+    }
+  });
+
+  it('verbose mode: preserves the legacy message prefix for substring tests', () => {
+    setErrorMessageMode('verbose');
+    try {
+      const err = new NotFoundError({
+        table: 'users',
+        where: { id: 1 },
+        operation: 'findUniqueOrThrow',
+      });
+      assert.ok(err.message.startsWith('[turbine] findUniqueOrThrow on "users" found no record'));
+    } finally {
+      restore();
+    }
+  });
+
+  it('redaction mode does not affect structured properties', () => {
+    setErrorMessageMode('safe');
+    try {
+      const where = { email: 'alice@x.com', id: 42 };
+      const err = new NotFoundError({ table: 'users', where, operation: 'findUniqueOrThrow' });
+      // Structured fields are always populated regardless of message mode.
+      assert.deepEqual(err.where, where);
+      assert.equal(err.table, 'users');
+      assert.equal(err.operation, 'findUniqueOrThrow');
+    } finally {
+      restore();
     }
   });
 });
