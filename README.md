@@ -8,9 +8,9 @@ npm install turbine-orm
 
 ## Why Turbine?
 
-Turbine is a PostgreSQL-native TypeScript ORM with features no other ORM offers together: **cursor-based streaming** through nested relations, **typed error classes** with PostgreSQL constraint mapping, **pipeline batching** (N queries, 1 round-trip), **middleware**, and a driver-agnostic core that plugs into any pg-compatible pool so it runs on Vercel Edge, Cloudflare Workers, Deno Deploy, and similar environments. It resolves nested relations in a single SQL query using `json_agg` — an approach now shared by Prisma 7+ and Drizzle v2, but Turbine does it with 1 runtime dependency (`pg`) and ~110KB on npm.
+Turbine is a PostgreSQL-native TypeScript ORM with features no other ORM offers together: **deep typed `with` inference** (`users[0].posts[0].comments[0].author` autocompletes after one `findMany`), **cursor-based streaming** through nested relations, **typed error classes** with PostgreSQL constraint mapping, **pipeline batching** (N queries, 1 round-trip), **middleware**, and a driver-agnostic core that plugs into any pg-compatible pool so it runs on Vercel Edge, Cloudflare Workers, Deno Deploy, and similar environments. 1 runtime dependency (`pg`), ~110KB on npm.
 
-**One query for nested relations.** When you write `db.users.findMany({ with: { posts: { with: { comments: true } } } })`, Turbine generates a single SQL statement using correlated subqueries with `json_agg`. Modern ORMs like Prisma 7+ and Drizzle v2 use similar single-query approaches (LATERAL JOINs). Turbine's advantage is architectural simplicity: 1 dependency, no code generation DSL, and PostgreSQL-native depth.
+**One round-trip for nested relations.** `db.users.findMany({ with: { posts: { with: { comments: true } } } })` resolves the entire object graph in a single database round-trip, regardless of nesting depth. Prisma 7+ and Drizzle v2 also do single-query nested loads — Turbine's advantage is architectural simplicity: 1 dependency, no code generation DSL, no query plan compiler.
 
 ## Benchmarks
 
@@ -532,22 +532,9 @@ Priority order: CLI flags > environment variables (`DATABASE_URL`) > config file
 
 ## How It Works
 
-Turbine generates a single SQL query using Postgres `json_agg` + subqueries to fetch nested relations:
+Turbine resolves the entire object graph in a single database round-trip, regardless of nesting depth. The `with` clause is fully type-inferred end-to-end — `users[0].posts[0].comments[0].author.name` autocompletes from a single `findMany` call, with no manual type assertions.
 
-```sql
--- db.users.findMany({ where: { orgId: 1 }, with: { posts: { with: { comments: true } } } })
-SELECT u.*,
-  (SELECT COALESCE(json_agg(sub), '[]'::json) FROM (
-    SELECT p.*,
-      (SELECT COALESCE(json_agg(sub2), '[]'::json) FROM (
-        SELECT c.* FROM comments c WHERE c.post_id = p.id
-      ) sub2) AS comments
-    FROM posts p WHERE p.user_id = u.id
-  ) sub) AS posts
-FROM users u WHERE u.org_id = 1
-```
-
-This resolves the entire 3-level object graph in one database round-trip. Prisma 7+ and Drizzle v2 also use single-query approaches (LATERAL JOINs), but Turbine's correlated subquery strategy has lower per-query overhead — see [Benchmarks](#benchmarks).
+Prisma 7+ and Drizzle v2 also do single-query nested loads. Turbine's advantage is architectural simplicity (1 runtime dependency, no DSL compiler, no driver shim) plus lower per-query overhead — see [Benchmarks](#benchmarks).
 
 ## Type Mapping
 
@@ -569,22 +556,22 @@ Turbine maps Postgres types to TypeScript:
 
 | | **Turbine** | **Prisma** | **Drizzle** | **Kysely** |
 |---|---|---|---|---|
-| **Nested relations** | 1 query (`json_agg`) | 1 query (LATERAL JOIN + json_agg, since v5.8) | 1 query (LATERAL JOINs) | Manual (`jsonArrayFrom`) |
+| **Nested relations** | 1 query, deep type inference | 1 query (since v5.8), shallow inference | 1 query, requires `relations()` re-declaration | Manual (`jsonArrayFrom`) |
 | **API style** | `findMany`, `with` | `findMany`, `include` | SQL-like + relational | SQL builder |
 | **Schema** | TypeScript | Custom DSL (`.prisma`) | TypeScript | Manual interfaces |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + adapter | 0 | 0 |
 | **Multi-DB** | PostgreSQL only | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
 | **Code generation** | `turbine generate` | `prisma generate` | Not needed | Not needed |
 
-All three ORMs now use single-query approaches for nested relations. Turbine uses correlated subqueries with `json_agg`, Prisma 7 uses LATERAL JOIN + `json_agg`, and Drizzle uses LATERAL JOINs. Turbine is 1.4–1.9x faster due to lower per-query overhead — minimal JS object allocation, no query plan compilation layer, and direct pg driver access. See [Benchmarks](#benchmarks) for full results.
+All three ORMs now do single-query nested loads. Turbine is 1.4–1.9x faster due to lower per-query overhead — minimal JS object allocation, no query plan compilation layer, and direct `pg` driver access. See [Benchmarks](#benchmarks) for full results.
 
 ## Limitations
 
 Turbine is focused and opinionated. Here's what it doesn't do:
 
-- **PostgreSQL only.** No MySQL, SQLite, or MSSQL. This is by design — the `json_agg` approach is PostgreSQL-specific, and going deep on one database enables the performance advantage.
+- **PostgreSQL only.** No MySQL, SQLite, or MSSQL. By design — going deep on one database enables the performance advantage and the edge-runtime story.
 - **No full-text search operators.** TSVECTOR/TSQUERY are not exposed in the query builder. Use `db.raw` for full-text queries.
-- **Large nested result sets.** `json_agg` builds the entire JSON array in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause to cap the aggregation size.
+- **Large nested result sets.** Nested results are materialized server-side in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause — or stream the parents with `findManyStream` and resolve children per-row.
 - **No admin UI.** Turbine Studio is planned but not yet available.
 
 ## Examples

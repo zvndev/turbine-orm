@@ -62,4 +62,4 @@ The two main lexical differences: Prisma's `include` becomes `with`, and Prisma'
 - **Typed errors with codes.** Constraint violations come back as `UniqueConstraintError` / `ForeignKeyError` / `NotNullViolationError` / `CheckConstraintError`, all with `code` (`TURBINE_E008`–`E011`) and `cause` chaining. `findUniqueOrThrow` throws `NotFoundError` (`TURBINE_E001`) with the original `where` attached.
 - **Driver-agnostic edge support.** Pass any pg-compatible pool (Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase) to `turbineHttp(pool, schema)` and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, or Netlify Edge — no extra runtime dependencies.
 - **Single dependency.** Turbine ships with `pg` as its only runtime dep (~110KB on npm). No engine binary, no WASM, no `@prisma/client` package to keep in sync.
-- **Postgres only.** Turbine is intentionally PostgreSQL-only — no MySQL/SQLite/MSSQL — because the `json_agg` strategy is Postgres-specific.
+- **Postgres only.** Turbine is intentionally PostgreSQL-only — no MySQL/SQLite/MSSQL — because going deep on one database enables the performance and edge-runtime story.

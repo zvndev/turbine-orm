@@ -27,9 +27,9 @@ Open [http://localhost:3000](http://localhost:3000).
 ## What it demonstrates
 
 - **Server Components** fetching data with Turbine (zero client JS for data)
-- **Single-query nested relations** — users with posts with comments in one SQL statement
-- **4-level deep object graph** on the user detail page (user → org + posts → comments)
-- **Live code examples** showing the TypeScript query alongside the generated SQL
+- **Deep typed `with` inference** — `users[0].posts[0].comments[0].body` autocompletes after a single `findMany`, no casts
+- **4-level deep object graph** on the user detail page (user → org + posts → comments) in one round-trip
+- **Streaming cursors** demo for constant-memory iteration over large result sets
 - **Graceful fallback** when no database is connected
 
 ## Pages

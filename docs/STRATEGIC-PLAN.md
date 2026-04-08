@@ -1,14 +1,14 @@
 # Turbine ORM — Strategic Launch Plan
 
-> Updated: 2026-04-05 | Status: Pre-launch (v0.5.0)
+> Updated: 2026-04-08 | Status: v0.7.1 published, pre-launch promotion
 
 ## Positioning
 
-**One-liner:** "The Postgres ORM that sends 1 query instead of N+1 — Prisma's API, DBA-grade SQL."
+**One-liner:** "TypeScript Postgres ORM where deep nested queries autocomplete end-to-end and the same client runs on every Postgres host."
 
-**Core differentiator:** Turbine is the only TypeScript ORM that automatically resolves nested relations into `json_agg` + `json_build_object` correlated subqueries from a Prisma-like API. Not lateral joins (Drizzle), not multi-query batching (Prisma), not manual helpers (Kysely) — one query, automatically, from schema metadata.
+**Core differentiator:** Turbine is the only TypeScript ORM that combines (a) deep typed `with` inference — `users[0].posts[0].comments[0].author.name` autocompletes after a single `findMany` with no casts, (b) cursor streaming through nested relations, (c) typed Postgres errors with `isRetryable`, and (d) a driver-agnostic core that runs on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase from the same generated client. No re-engineering for the edge.
 
-**Position PostgreSQL-only as a feature:** "We go deeper on PostgreSQL than any alternative." Don't apologize for it. Hasura, PostGraphile, and Supabase all bet on Postgres-only. The depth enables the speed.
+**Position PostgreSQL-only as a feature:** "We go deeper on PostgreSQL than any alternative." Don't apologize for it. Hasura, PostGraphile, and Supabase all bet on Postgres-only. The depth enables the speed and the type story.
 
 ---
 
@@ -16,20 +16,20 @@
 
 ### 1. Prisma users on serverless (primary)
 - **Who:** TypeScript developers deploying to Vercel Functions, AWS Lambda, Cloudflare Workers
-- **Pain:** Prisma's N+1 queries + WASM engine overhead = high latency on cold starts
-- **Message:** "Drop-in Prisma-like API, 2-3x faster nested queries, 1 dependency instead of a WASM binary"
-- **Where to reach them:** r/nextjs, r/typescript, Vercel Discord, Next.js Discord, X/Twitter #nextjs
+- **Pain:** Prisma's WASM engine + driver-adapter dance for edge runtimes; type inference falls off a cliff at depth 3+
+- **Message:** "Drop-in Prisma-like API. Deep autocomplete chain. Runs on Cloudflare without an adapter package."
+- **Where to reach them:** r/nextjs, r/typescript, Vercel Discord, Next.js Discord
 
 ### 2. Performance-conscious Node.js developers
 - **Who:** Backend engineers building REST/tRPC APIs with deeply nested JSON responses
-- **Pain:** N+1 queries are the #1 performance problem in ORMs
-- **Message:** "Your ORM sends 3 queries. Turbine sends 1. Here's the SQL."
-- **Where to reach them:** r/node, r/PostgreSQL, HN Show HN, Dev.to, Hashnode
+- **Pain:** N+1 queries are the #1 ORM performance problem; existing fixes either re-shape the API or re-declare relations
+- **Message:** "One round-trip for the whole graph. Streaming cursors when the graph is too big to materialize."
+- **Where to reach them:** r/node, HN Show HN, Dev.to, Hashnode
 
 ### 3. Drizzle/Kysely evaluators
 - **Who:** Developers who want type-safe SQL but miss Prisma's DX for nested relations
-- **Pain:** Drizzle's relational API is powerful but requires more setup; Kysely's `jsonArrayFrom` is manual
-- **Message:** "Prisma's `with` clause + PostgreSQL-native performance. No compromises."
+- **Pain:** Drizzle's relational API requires re-declaring relations in a separate file; Kysely's `jsonArrayFrom` is manual; neither has typed Postgres error classes with `isRetryable`
+- **Message:** "Prisma's `with` clause + zero relation re-declaration + typed errors out of the box."
 
 ---
 
@@ -37,23 +37,30 @@
 
 ### Pillar Content (write before any promotion)
 
-1. **"How json_agg makes your Postgres ORM 2x faster on nested queries"**
-   - The N+1 problem explained with actual SQL
-   - What Prisma, Drizzle, and Turbine each generate (side-by-side)
-   - Honest benchmarks with methodology
-   - When NOT to use Turbine (large dataset caveats, non-Postgres needs)
+1. **"Deep typed `with` inference: how Turbine makes nested Postgres queries autocomplete end-to-end"**
+   - The pain: Prisma's `include` autocomplete falls off a cliff past depth 2-3
+   - The fix: a recursive `WithResult<T, R, W>` type bound to generated metadata
+   - Live screencast of the chain typing through
+   - Honest gap analysis vs Prisma 7 / Drizzle v2
    - Publish: Dev.to + Hashnode + own blog
-   - Cross-post: HN, r/PostgreSQL, r/typescript
+   - Cross-post: HN, r/typescript
 
-2. **"Migrating from Prisma to Turbine: A Complete Guide"**
+2. **"Postgres ORM on Cloudflare Workers without a driver adapter"**
+   - The pain: every other ORM ships a separate "edge" build or adapter package
+   - The Turbine approach: drive any pg-compatible pool through `turbineHttp(pool, schema)`
+   - End-to-end deploy walkthrough on Cloudflare Workers + Hyperdrive + Neon
+   - Publish: Dev.to + own blog
+   - Cross-post: r/nextjs, r/CloudFlare, Cloudflare Discord
+
+3. **"Migrating from Prisma to Turbine: A Complete Guide"**
    - Schema mapping (`.prisma` → `defineSchema()`)
    - API mapping (`include` → `with`, `$queryRaw` → `db.raw`)
    - Migration strategy (can run both in parallel)
-   - What Turbine can't do yet (incremental updates, full-text search)
-   - Publish: README section + standalone guide
+   - What Turbine can't do yet (full-text search, multi-DB)
+   - Publish: README section + standalone guide (already exists at `docs/migrate-from-prisma.md`)
 
-3. **Demo video (2-3 minutes)**
-   - `turbine init` → `turbine generate` → write nested query → show SQL → benchmark
+4. **Demo video (2-3 minutes)**
+   - `turbine init` → `turbine generate` → write nested query → screencast the autocomplete chain → deploy to Cloudflare Workers
    - Host on YouTube, embed in README
    - Share on X/Twitter as a thread
 
@@ -62,33 +69,39 @@
 | Channel | Content | Timing |
 |---------|---------|--------|
 | **Hacker News** | Show HN post (see template below) | Day 1 |
-| **r/typescript** | "I built a Postgres ORM focused on nested query performance" | Day 1 |
-| **r/node** | Same angle, emphasize zero-binary, 1 dep | Day 1 |
-| **r/PostgreSQL** | "Using json_agg for ORM-level nested relation loading" — technical angle | Day 2 |
-| **Dev.to** | Pillar article #1 | Day 2-3 |
-| **X/Twitter** | Thread: side-by-side SQL + benchmarks + install | Day 1 |
+| **r/typescript** | "I built a Postgres ORM with the deepest typed `with` inference I could manage" | Day 1 |
+| **r/node** | Same angle, emphasize zero-binary, 1 dep, edge support | Day 1 |
+| **r/nextjs** | "TypeScript Postgres on Vercel Edge without the Prisma adapter dance" | Day 2 |
+| **Dev.to** | Pillar article #1 (typed inference) | Day 2-3 |
+| **X/Twitter** | Thread: autocomplete screencast + four-runtime demo + install | Day 1 |
 | **TypeScript Discord** | #showcase channel | Day 1 |
 | **Next.js Discord** | #tools-and-libraries | Day 2 |
-| **Vercel community** | If community forum exists | Day 3 |
+| **Cloudflare Discord** | #workers | Day 3 |
 
 ### HN Show HN Template
 
 ```
-Title: Show HN: Turbine ORM – TypeScript Postgres ORM that resolves nested relations in 1 SQL query
+Title: Show HN: Turbine ORM – Postgres TypeScript ORM with deep typed nesting and edge support
 
-I built a TypeScript Postgres ORM that uses json_agg to fetch nested relations
-in a single SQL query instead of N+1. On production benchmarks (Vercel to Neon),
-it's 19-28% faster than Drizzle and 2-3x faster than Prisma on nested reads.
+I built a TypeScript Postgres ORM where users[0].posts[0].comments[0].author.name
+autocompletes after a single findMany — no casts, no manual generics. The whole
+object graph resolves in one database round-trip and the chain is fully type-inferred
+from the with clause.
 
-The pitch: `db.users.findMany({ with: { posts: { with: { comments: true } } } })`
-generates ONE query. Prisma sends 3.
+The other thing it gets right that I couldn't find elsewhere: it runs on every
+Postgres host without re-engineering. Same generated client works on Neon, Vercel
+Postgres, Cloudflare Hyperdrive, and Supabase — one import swap and you're on the edge.
 
-- npm: npm install turbine-orm
-- GitHub: github.com/zvndev/turbine-orm
-- Only runtime dependency is `pg`
+- Streaming cursors (findManyStream) for constant-memory iteration
+- Pipeline batching: N independent queries, 1 round-trip
+- Typed Postgres errors with isRetryable for clean retry loops
+- Atomic update operators ({ increment: 1 }) compile to race-free SQL
+- 1 runtime dep (pg), ~110KB, no WASM, no DSL compiler
 
-180 tests, Prisma-inspired API, MIT license.
-Looking for feedback on the DX and what's missing.
+npm: npm install turbine-orm
+GitHub: github.com/zvndev/turbine-orm
+
+398 tests, MIT license. Looking for feedback on the DX and what's missing.
 ```
 
 ---
@@ -98,10 +111,10 @@ Looking for feedback on the DX and what's missing.
 Before any public promotion, complete these:
 
 - [x] All `@batadata` references removed from codebase → `turbine-orm`
-- [x] Stale URLs removed from README (batadata.com, demo links)
+- [x] Stale URLs removed from README
 - [x] Biome linter + formatter configured and passing
-- [x] Custom error types with error codes (TurbineError hierarchy, TURBINE_E001-E007)
-- [x] Doc comments on core json_agg algorithm (buildSelectWithRelations, buildRelationSubquery)
+- [x] Custom error types with error codes (TurbineError hierarchy, TURBINE_E001-E011)
+- [x] Doc comments on core nested-relation algorithm
 - [x] Circular dependency detection (cycle check + depth cap at 10)
 - [x] "Limitations" section in README
 - [x] CLI subcommand `--help` working (init, generate, push, migrate, seed, status)
@@ -109,38 +122,50 @@ Before any public promotion, complete these:
 - [x] Int8 type safety fixed
 - [x] Competitive comparison table in README (vs Prisma, Drizzle, Kysely)
 - [x] Migration checksums upgraded (SHA-256, missing file detection, MigrationError)
-- [x] COALESCE fallback fixed for belongsTo/hasOne (NULL instead of '[]')
-- [ ] Blog post #1 written (json_agg deep dive)
-- [ ] Prisma migration guide written
+- [x] COALESCE fallback fixed for belongsTo/hasOne
+- [x] Deep typed `with` inference (recursive `WithResult` + generator emits `RelationDescriptor`)
+- [x] Edge / serverless example apps (Neon, Vercel, Cloudflare, Supabase)
+- [x] Streaming cursors (`findManyStream`)
+- [x] Pipeline batching
+- [x] Atomic update operators
+- [x] Typed Postgres errors (Deadlock / Serialization with `isRetryable`)
+- [x] Auto-diff migrations
+- [x] Prisma migration guide
+- [ ] Pillar blog post #1 written (deep typed inference)
+- [ ] Pillar blog post #2 written (edge runtime walkthrough)
 - [ ] Demo video recorded
 - [ ] GitHub Discussions enabled
 - [ ] README badges (npm version, CI status, license)
-- [ ] npm publish dry-run passes clean
 
 ---
 
 ## Competitive Positioning Matrix
 
-| | **Turbine** | **Prisma** | **Drizzle** | **Kysely** |
+| | **Turbine** | **Prisma 7** | **Drizzle v2** | **Kysely** |
 |---|---|---|---|---|
-| Nested query approach | `json_agg` (1 query) | Multi-query or opt-in JOIN | LATERAL JOINs (1 query) | Manual `jsonArrayFrom` |
+| Nested query approach | 1 round-trip | 1 round-trip | 1 round-trip | Manual `jsonArrayFrom` |
+| Deep type inference | Full chain (recursive) | Shallow (drops past depth 2-3) | Requires `relations()` re-declaration | Manual generics |
 | API ergonomics | Prisma-like | Prisma | SQL-like + relational | SQL builder |
-| Runtime deps | 1 (`pg`) | WASM compiler + driver | 0 | 0 |
-| Schema definition | TypeScript | Custom DSL | TypeScript | Manual interfaces |
-| PostgreSQL depth | Deep (native json_agg) | Shallow (raw SQL for JSONB) | Good (lateral joins) | Good (pg helpers) |
-| Serverless fit | Excellent (tiny) | Improving (v7) | Excellent (7.4KB) | Good |
+| Runtime deps | 1 (`pg`) | Engine + adapter package | 0 | 0 |
+| Schema definition | TypeScript | Custom DSL | TypeScript (split files) | Manual interfaces |
+| Edge runtime | Any pg-compatible pool | Driver Adapters (separate package) | HTTP drivers only | Manual |
+| Streaming cursors | ✓ | ✗ | ✗ | Manual |
+| Pipeline batching | ✓ | Serial in `$transaction` | ✗ | Manual |
+| Typed Postgres errors | ✓ (with `isRetryable`) | Generic `code` strings | Raw pg errors | Raw pg errors |
+| Atomic update operators | ✓ | ✓ | Raw SQL fragments | Manual |
 | Multi-DB | Postgres only | 6 databases | 5 databases | 4 databases |
 
 **Key talking points:**
-- vs Prisma: "Same API, 2-3x faster nested queries, no WASM binary, 1 dependency"
-- vs Drizzle: "Prisma-level DX with PostgreSQL-native performance"
-- vs Kysely: "Automatic relation resolution — no manual jsonArrayFrom wiring"
+- vs Prisma: "Same API. Deep autocomplete chain. Edge support without an adapter package."
+- vs Drizzle: "Same single-query approach. Zero relation re-declaration. Typed errors out of the box."
+- vs Kysely: "Automatic relation resolution. No manual jsonArrayFrom wiring."
 
 ---
 
 ## What NOT to Do
 
 - Don't claim "10x faster" — honest numbers are compelling enough
+- **Don't pitch "look at the SQL we generate"** — it's boring, obvious, and doesn't sell. The wow is the autocomplete chain and the runtime portability, not the query string.
 - Don't bash Prisma — respect it, differentiate from it
 - Don't launch on Product Hunt yet — save for v1.0
 - Don't spam — quality posts in 3-4 communities beats 20 low-effort ones
@@ -151,8 +176,8 @@ Before any public promotion, complete these:
 
 ## Post-Launch Roadmap (v1.0 targets)
 
-1. **Incremental updates** (`{ likes: { increment: 1 } }`) — Prisma parity
-2. **Full-text search** — TSVECTOR operators
-3. **Turbine Studio** — local web UI for schema browsing
-4. **Framework guides** — Next.js, Express, Fastify, Hono
-5. **Reproducible benchmark suite** — public repo, CI-driven
+1. **Full-text search** — TSVECTOR/TSQUERY operators in the query builder
+2. **Turbine Studio** — local web UI for schema browsing
+3. **Framework guides** — Next.js, Hono, Bun, Cloudflare Workers, Fastify
+4. **Reproducible benchmark suite** — public repo, CI-driven
+5. **Epic demo apps** — see `examples/` for the v0.7.1 expansion (streaming, ledger, leaderboard, dashboard pipeline)

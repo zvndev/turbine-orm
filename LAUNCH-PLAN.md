@@ -1,52 +1,60 @@
 # Turbine ORM Launch Plan
 
 ## Assets
-- npm: `turbine-orm@0.4.0`
-- GitHub: github.com/zvndev/turbine-orm (public)
+- npm: `turbine-orm@0.7.1`
+- GitHub: github.com/zvndev/turbine-orm
 - Docs: turbineorm.dev
-- Demo: turbine-demo-blog.fly.dev
-- Debug endpoint: turbine-demo-blog.fly.dev/api/debug (shows generated SQL)
+- Demo: turbine-demo-blog.fly.dev (Next.js example)
+- Edge demos: examples/{neon-edge,cloudflare-worker,vercel-postgres,supabase}
 
 ## Day 1: Soft Launch
 
 ### Hacker News — Show HN
-Title: `Show HN: Turbine ORM – TypeScript Postgres ORM that resolves nested relations in 1 SQL query`
+Title: `Show HN: Turbine ORM – Postgres TypeScript ORM with deep typed nesting and edge support`
 
-> I built a TypeScript Postgres ORM that uses `json_agg` to fetch nested relations in a single SQL query instead of N+1. On production benchmarks (Vercel to Neon), it's 19-28% faster than Drizzle and Prisma on nested reads.
+> I built a TypeScript Postgres ORM where `users[0].posts[0].comments[0].author.name` autocompletes after a single `findMany` — no casts, no manual generics. The whole object graph resolves in one database round-trip and the chain is fully type-inferred from the `with` clause.
 >
-> The pitch: `db.users.findMany({ with: { posts: { with: { comments: true } } } })` generates ONE query. Prisma sends 3. Only runtime dependency is `pg`.
+> The other thing it gets right that I couldn't find elsewhere: it runs on every Postgres host without re-engineering. Same generated client works on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase — one import swap and you're on the edge.
 >
-> - npm: `npm install turbine-orm`
-> - GitHub: github.com/zvndev/turbine-orm
-> - Docs: turbineorm.dev
-> - Live demo: turbine-demo-blog.fly.dev/api/debug (shows the actual SQL)
+> - Streaming cursors (`findManyStream`) for constant-memory iteration
+> - Pipeline batching: N independent queries, 1 round-trip
+> - Typed Postgres errors with `isRetryable` for clean retry loops
+> - Atomic update operators (`{ increment: 1 }`) compile to race-free SQL
+> - 1 runtime dep (`pg`), ~110KB, no WASM, no DSL compiler
 >
-> 180 tests, Prisma-inspired API, MIT license. Looking for feedback on the DX and what's missing.
+> npm: `npm install turbine-orm` · GitHub: github.com/zvndev/turbine-orm
+>
+> 398 tests, MIT, MIT-licensed. Looking for feedback on the DX and what's missing.
 
 ### Twitter/X thread
-1. Hook — "I built a Postgres ORM that does nested queries in 1 SQL statement. Here's what Prisma sends vs what Turbine sends:" + side-by-side SQL screenshot
-2. Benchmark numbers — production Vercel→Neon table
-3. Code example — the `with` clause
-4. "Only dependency is `pg`. No Rust binary. 70KB on npm." + install command
-5. Link to docs + demo + "What would make you switch from Prisma?"
+1. Hook — "I built a Postgres ORM where this autocompletes:" + screencast of `users[0].posts[0].comments[0].author.name` typing through with no casts
+2. The four runtimes — "Same client, four hosts" (Neon, Vercel, Cloudflare, Supabase)
+3. Streaming demo — `for await (const row of db.users.findManyStream(...))` with memory-flat chart
+4. "1 dep. ~110KB on npm. Reads like Prisma." + install command
+5. Link to docs + demo + "What's the worst thing about your current ORM?"
 
 ### Reddit
-- r/typescript — "I built a Postgres ORM focused on nested query performance"
-- r/node — same angle, emphasize zero-binary
-- r/PostgreSQL — "Using json_agg for ORM-level nested relation loading"
+- r/typescript — "I built a Postgres ORM with the deepest typed `with` inference I could manage"
+- r/node — same angle, emphasize the zero-binary footprint and edge support
+- r/nextjs — "TypeScript Postgres on Vercel Edge without the Prisma adapter dance"
 
 ## Day 2-3: Content
 
 ### Blog post (Dev.to + Hashnode)
-Title: "How json_agg makes your Postgres ORM 2x faster on nested queries"
-- The N+1 problem (what Prisma/Drizzle do)
-- What json_agg is and why it's faster
-- The actual SQL Turbine generates
-- Honest benchmarks (production numbers, not inflated local ones)
+Title: "Deep typed `with` inference: how Turbine makes nested Postgres queries autocomplete end-to-end"
+- The pain: Prisma's `include` autocomplete falls off a cliff at depth 3+
+- The fix: a recursive `WithResult<T, R, W>` type bound to the generated metadata
+- Live screencast of the autocomplete chain
+- The bonus: it's all in one round-trip
 - When to use Turbine vs Prisma vs Drizzle (honest about gaps)
 
+Companion post: "Postgres ORM on Cloudflare Workers without a driver adapter"
+- The pain: every other ORM needs a separate "edge" build
+- The Turbine approach: drive any pg-compatible pool via `turbineHttp`
+- Walkthrough deploying the example to Workers + Hyperdrive
+
 ### Demo video (optional, high-impact)
-- 2-minute Loom: init → generate → nested query → debug SQL
+- 2-minute Loom: init → generate → autocomplete chain → deploy to Cloudflare Workers
 - Post on Twitter + embed in README
 
 ## Week 1: Community
@@ -57,15 +65,16 @@ Title: "How json_agg makes your Postgres ORM 2x faster on nested queries"
 
 ## Week 2: Credibility
 
-- Run honest benchmarks with actual Turbine ORM (not raw pg)
-- Publish reproducible benchmark suite in repo
-- Framework guides: Next.js, Express
+- Reproducible benchmark suite (Prisma 7 vs Drizzle v2 vs Turbine on the same dataset)
+- Framework guides: Next.js, Hono, Bun, Cloudflare Workers
+- Cookbook: streaming exports, pipeline dashboards, retry loops, ledger transactions
 
 ## Key message
-> "What if your ORM sent 1 SQL query instead of 3? Turbine uses Postgres json_agg to load users → posts → comments in a single round-trip. 70KB, zero binary deps, Prisma-inspired API."
+> "TypeScript Postgres ORM where deep nested queries autocomplete end-to-end and the same client runs on Neon, Vercel, Cloudflare, and Supabase without re-engineering. ~110KB, one dep."
 
 ## What NOT to do
 - Don't claim "10x faster" — honest numbers are compelling enough
+- Don't pitch "look at the SQL we generate" — it's boring and obvious. The wow is the autocomplete chain and the runtime portability, not the query string.
 - Don't bash Prisma — respect it, differentiate from it
 - Don't launch on Product Hunt yet — save for v1.0
 - Don't spam — quality posts in 3-4 communities beats 20 low-effort ones

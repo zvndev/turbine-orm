@@ -44,15 +44,15 @@ export default async function Home() {
           </div>
 
           <h1 className="text-5xl sm:text-6xl font-semibold tracking-tight text-zinc-900 leading-[1.1]">
-            Single query.
+            Postgres ORM
             <br />
-            <span className="text-zinc-400">Full object graph.</span>
+            <span className="text-zinc-400">for the edge.</span>
           </h1>
 
           <p className="mt-6 text-lg text-zinc-500 leading-relaxed max-w-xl mx-auto">
-            Turbine resolves nested relations in one SQL statement using
-            PostgreSQL <code className="text-zinc-700 bg-zinc-100 px-1.5 py-0.5 rounded text-sm font-mono">json_agg</code>.
-            No N+1. No WASM. No magic.
+            Deep nested object graphs in one round-trip. Streaming cursors,
+            typed errors, pipeline batching. Runs anywhere <code className="text-zinc-700 bg-zinc-100 px-1.5 py-0.5 rounded text-sm font-mono">pg</code> runs —
+            Neon, Vercel, Cloudflare, Supabase.
           </p>
 
           <div className="mt-10 flex items-center justify-center gap-4">
@@ -73,16 +73,16 @@ export default async function Home() {
       <section className="pb-24 px-6">
         <div className="max-w-5xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-4">
           <FeatureCard
-            title="One Query"
-            description="Nested relations resolved via json_agg correlated subqueries. Users, posts, comments — one round-trip."
+            title="Deep typed nesting"
+            description="users[0].posts[0].comments[0].author — autocompletes the full chain. Inferred from your with clause, not asserted."
           />
           <FeatureCard
-            title="Type Safe"
-            description="Full TypeScript types generated from your database. Autocomplete for columns, relations, and filters."
+            title="Edge & serverless"
+            description="One import swap and your queries run on Cloudflare Workers, Vercel Edge, Neon HTTP, or Deno Deploy. No re-engineering."
           />
           <FeatureCard
-            title="~110KB"
-            description="One runtime dependency (pg). No WASM engine, no query plan compiler, no code generation DSL."
+            title="~110KB · 1 dep"
+            description="Just pg under the hood. No WASM engine, no DSL compiler, no query planner. Reads like Prisma, ships like a single file."
           />
         </div>
       </section>
@@ -95,7 +95,7 @@ export default async function Home() {
               See it in action
             </h2>
             <p className="mt-2 text-zinc-500">
-              This page is server-rendered with Turbine. Here&apos;s the query that powers it.
+              This page is server-rendered with Turbine. The result on the right comes from the query on the left — fully typed, no casts.
             </p>
           </div>
 
@@ -113,34 +113,12 @@ export default async function Home() {
       with: { comments: { limit: 3 } },
     },
   },
-});`}
-              />
-              <CodeBlock
-                title="Generated SQL (single query)"
-                language="sql"
-                code={`SELECT "users".*,
-  (SELECT COALESCE(json_agg(
-    json_build_object(
-      'id', t0."id",
-      'title', t0."title",
-      'comments', COALESCE((
-        SELECT json_agg(json_build_object(
-          'id', t1."id",
-          'body', t1."body"
-        )) FROM "comments" t1
-        WHERE t1."post_id" = t0."id"
-        LIMIT 3
-      ), '[]'::json)
-    )
-  ), '[]'::json)
-  FROM "posts" t0
-  WHERE t0."user_id" = "users"."id"
-  ORDER BY t0."created_at" DESC
-  LIMIT 2
-  ) AS "posts"
-FROM "users"
-ORDER BY "users"."created_at" DESC
-LIMIT 3`}
+});
+
+// users[0].posts[0].comments[0].body
+//        ^Post   ^Comment       ^string
+// Every level inferred from the with clause.
+// No \`as User & { posts: ... }\` cast.`}
               />
             </div>
 
