@@ -8,18 +8,23 @@
  */
 
 import { TurbineClient } from 'turbine-orm';
-// After running `npx turbine generate`, this file exposes a typed
-// `SchemaMetadata` constant called `schema`.
-import { schema } from './generated/turbine/metadata.js';
+// After running `npx turbine generate`, this file exposes the introspected
+// schema as `SCHEMA` (matching the generator's output convention).
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 async function main() {
   const db = new TurbineClient(
     {
       connectionString: process.env.SUPABASE_DB_URL,
-      // Supabase serves over TLS — accept the managed cert.
+      // Supabase serves over TLS via a managed cert. The pooler endpoint
+      // (`*.pooler.supabase.com:6543`) presents Supabase's own CA chain,
+      // which Node won't recognise out of the box. For production, prefer
+      // pinning Supabase's CA explicitly via `ca: <pem string>` rather
+      // than disabling verification — see Supabase docs for the current
+      // root certificate.
       ssl: { rejectUnauthorized: false },
     },
-    schema,
+    SCHEMA,
   );
 
   await db.connect();

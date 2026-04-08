@@ -12,9 +12,9 @@
 
 import { Pool } from 'pg';
 import { turbineHttp } from 'turbine-orm/serverless';
-// After running `npx turbine generate`, this file exposes a typed
-// `SchemaMetadata` constant called `schema`.
-import { schema } from './generated/turbine/metadata';
+// After running `npx turbine generate`, this file exposes the introspected
+// schema as `SCHEMA` (matching the generator's output convention).
+import { SCHEMA } from './generated/turbine/metadata';
 
 export interface Env {
   HYPERDRIVE: Hyperdrive;
@@ -27,7 +27,7 @@ interface Hyperdrive {
 export default {
   async fetch(_req: Request, env: Env): Promise<Response> {
     const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString });
-    const db = turbineHttp(pool, schema);
+    const db = turbineHttp(pool, SCHEMA);
 
     try {
       const users = await db.users.findMany({ limit: 10 });

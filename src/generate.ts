@@ -88,14 +88,34 @@ function generatedFileHeader(): string[] {
   ];
 }
 
-function generateTypes(schema: SchemaMetadata): string {
+/**
+ * Generate the contents of `types.ts` (entity interfaces, *Create / *Update,
+ * and *Relations brand-field interfaces). Exported so tests can pin the
+ * generator output without writing files to disk.
+ */
+export function generateTypes(schema: SchemaMetadata): string {
   const lines: string[] = [...generatedFileHeader()];
 
   // We import UpdateOperatorInput so generated *Update types can express
   // atomic increment / decrement / multiply / divide / set operators on
   // numeric columns (TASK-3.4).
-  lines.push("import type { UpdateOperatorInput } from 'turbine-orm';");
+  //
+  // RelationDescriptor is the brand-field interface that lets `WithResult`
+  // recurse through nested `with` clauses at any depth. The generator emits
+  // each `*Relations` member as a `RelationDescriptor<Target, Cardinality,
+  // TargetRelations>` so users get full deep `with`-clause type inference
+  // out of the box (TASK-2.1).
+  lines.push("import type { RelationDescriptor, UpdateOperatorInput } from 'turbine-orm';");
   lines.push('');
+
+  // Pre-compute which tables have relations so we know whether to thread
+  // `${TargetType}Relations` (for deep inference) or `{}` (the no-relations
+  // default) into each `RelationDescriptor`. Built once up-front because
+  // relations can point at tables we haven't iterated to yet.
+  const tablesWithRelations = new Set<string>();
+  for (const t of Object.values(schema.tables)) {
+    if (Object.keys(t.relations).length > 0) tablesWithRelations.add(t.name);
+  }
 
   // Generate enum types
   for (const [enumName, labels] of Object.entries(schema.enums)) {
@@ -153,17 +173,22 @@ function generateTypes(schema: SchemaMetadata): string {
     lines.push('');
 
     // --- Relations map (for type-safe `with` clauses) ---
+    //
+    // Each relation is emitted as a `RelationDescriptor<Target, Cardinality,
+    // TargetRelations>` brand-field interface. This is what enables the
+    // recursive `WithResult` type to walk through nested `with` clauses at
+    // any depth — `RelationRelations<R[K]>` reads the third type parameter
+    // and threads it into the next recursion step. If the target table has
+    // no relations of its own, the descriptor uses `{}` (the default).
     const hasRelations = Object.keys(table.relations).length > 0;
     if (hasRelations) {
       lines.push(`/** Available relations for the \`${table.name}\` table */`);
       lines.push(`export interface ${typeName}Relations {`);
       for (const [relName, rel] of Object.entries(table.relations)) {
         const targetType = entityName(rel.to);
-        if (rel.type === 'hasMany') {
-          lines.push(`  ${relName}: ${targetType}[];`);
-        } else {
-          lines.push(`  ${relName}: ${targetType} | null;`);
-        }
+        const cardinality = rel.type === 'hasMany' ? "'many'" : "'one'";
+        const targetRelations = tablesWithRelations.has(rel.to) ? `${targetType}Relations` : '{}';
+        lines.push(`  ${relName}: RelationDescriptor<${targetType}, ${cardinality}, ${targetRelations}>;`);
       }
       lines.push('}');
       lines.push('');

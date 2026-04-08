@@ -35,12 +35,12 @@
  * // app/api/users/route.ts
  * import { Pool } from '@neondatabase/serverless';
  * import { turbineHttp } from 'turbine-orm/serverless';
- * import { schema } from '@/generated/turbine/metadata';
+ * import { SCHEMA } from '../../generated/turbine/metadata';
  *
  * export const runtime = 'edge';
  *
  * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
- * const db = turbineHttp(pool, schema);
+ * const db = turbineHttp(pool, SCHEMA);
  *
  * export async function GET() {
  *   const users = await db.table('users').findMany({ limit: 10 });
@@ -52,12 +52,12 @@
  *
  * ```ts
  * import { TurbineClient } from 'turbine-orm';
- * import { schema } from './generated/turbine/metadata.js';
+ * import { SCHEMA } from './generated/turbine/metadata.js';
  *
  * const db = new TurbineClient({
  *   connectionString: process.env.SUPABASE_DB_URL,
  *   ssl: { rejectUnauthorized: false },
- * }, schema);
+ * }, SCHEMA);
  * ```
  *
  * ## Example — Cloudflare Workers
@@ -66,11 +66,12 @@
  * // Use the Neon HTTP driver which works in Workers runtime
  * import { Pool } from '@neondatabase/serverless';
  * import { turbineHttp } from 'turbine-orm/serverless';
+ * import { SCHEMA } from './generated/turbine/metadata';
  *
  * export default {
  *   async fetch(req: Request, env: Env) {
  *     const pool = new Pool({ connectionString: env.DATABASE_URL });
- *     const db = turbineHttp(pool, schema);
+ *     const db = turbineHttp(pool, SCHEMA);
  *     const users = await db.table('users').findMany({ limit: 10 });
  *     return Response.json(users);
  *   }
@@ -106,10 +107,10 @@ export interface TurbineHttpOptions extends Pick<TurbineConfig, 'logging' | 'def
  * ```ts
  * import { Pool } from '@neondatabase/serverless';
  * import { turbineHttp } from 'turbine-orm/serverless';
- * import { schema } from './generated/turbine/metadata.js';
+ * import { SCHEMA } from './generated/turbine/metadata.js';
  *
  * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
- * const db = turbineHttp(pool, schema);
+ * const db = turbineHttp(pool, SCHEMA);
  *
  * const users = await db.table('users').findMany({ limit: 10 });
  * ```

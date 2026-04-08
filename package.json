@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. 1 dependency, ~110KB",
   "type": "module",
   "exports": {
@@ -43,8 +43,8 @@
     "status": "tsx src/cli/index.ts status",
     "examples": "tsx examples/examples.ts",
     "test": "tsx --test src/test/*.test.ts",
-    "test:unit": "tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts src/test/with-inference.test.ts src/test/operator-validation.test.ts src/test/unlimited-warning.test.ts",
-    "test:coverage": "c8 tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts src/test/with-inference.test.ts src/test/operator-validation.test.ts src/test/unlimited-warning.test.ts",
+    "test:unit": "tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts src/test/with-inference.test.ts src/test/operator-validation.test.ts src/test/unlimited-warning.test.ts src/test/generate-relations.test.ts",
+    "test:coverage": "c8 tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts src/test/with-inference.test.ts src/test/operator-validation.test.ts src/test/unlimited-warning.test.ts src/test/generate-relations.test.ts",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",

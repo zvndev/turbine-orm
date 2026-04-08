@@ -463,9 +463,12 @@ testFn('high-priority gap tests', () => {
       assert.equal(caught.table, 'users');
       assert.deepEqual(caught.where, { id: 999_999_999 });
       assert.equal(caught.operation, 'findUniqueOrThrow');
-      // Message should mention the table and where
+      // Message should mention the table and the where keys (values are
+      // redacted in 'safe' mode by default to avoid leaking PII into logs).
       assert.match(caught.message, /users/);
-      assert.match(caught.message, /999999999/);
+      assert.match(caught.message, /\bid\b/);
+      // The actual value lives on caught.where, not in the message.
+      assert.doesNotMatch(caught.message, /999999999/);
     });
 
     it('findFirstOrThrow throws NotFoundError with where context', async () => {
