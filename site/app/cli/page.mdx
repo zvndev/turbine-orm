@@ -24,6 +24,7 @@ Commands:
   migrate status                 Show applied vs pending migrations
   seed                           Run the seed file
   status                         Show connection info + schema summary
+  studio                         Launch local read-only Studio web UI
 ```
 
 ## Global options
@@ -163,6 +164,32 @@ npx turbine status
 ```
 
 Outputs the detected database name, host, Postgres version, table count, and the path to the generated client — handy for verifying CI environments.
+
+## `turbine studio`
+
+Launch a local, read-only web UI for exploring your database. The only Postgres ORM Studio your DBA will approve — no mutations, no writes, no way around the transaction guard.
+
+```bash
+DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
+npx turbine studio --port 5173 --host 127.0.0.1 --no-open
+```
+
+Studio ships four tabs:
+
+- **Data** — browse rows, sort columns, open JSON/JSONB cells in a modal, and full-text search across every text column.
+- **Schema** — inspect tables, columns, indexes, and relations.
+- **SQL** — run ad-hoc `SELECT` statements. Everything executes inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`, so writes are impossible at the transaction level.
+- **Builder** — compose `where` / `orderBy` / `with` / `limit` visually, with a live TypeScript preview of the matching `db.table.findMany(...)` call to copy into your codebase.
+
+**Saved queries** persist to `.turbine/studio-queries.json` and surface in the SQL tab and the **Cmd+K command palette**, which also jumps to any table or tab in a single keystroke.
+
+**Security posture (read-only by design)**
+
+- Loopback by default (`127.0.0.1`), with a loud warning on non-loopback binds.
+- Per-process 24-byte random hex auth token, stored in a `SameSite=Strict` `HttpOnly` cookie.
+- Every query runs inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`.
+- SELECT/WITH-only SQL parser strips comments and rejects non-trailing semicolons — blocks statement-stacking.
+- Security headers on every response (`X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`).
 
 ## Config resolution
 
