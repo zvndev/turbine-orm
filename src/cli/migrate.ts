@@ -264,18 +264,47 @@ ${autoContent.down}
 // Advisory lock for concurrent migration safety
 // ---------------------------------------------------------------------------
 
-/** Fixed lock ID for Turbine migrations — prevents concurrent migrate runs */
-const MIGRATION_LOCK_ID = 8_347_291; // arbitrary but stable
-
-async function acquireLock(client: pg.Client): Promise<boolean> {
-  const result = await client.query<{ pg_try_advisory_lock: boolean }>(`SELECT pg_try_advisory_lock($1)`, [
-    MIGRATION_LOCK_ID,
-  ]);
-  return result.rows[0]?.pg_try_advisory_lock ?? false;
+/**
+ * Derive a Postgres advisory lock ID (positive int4) from the database name.
+ *
+ * Uses FNV-1a 32-bit hash — a well-known, stable, non-cryptographic hash with
+ * excellent distribution over short strings (database names are typically <64
+ * chars). Chosen over alternatives because it's:
+ *   - deterministic (same input → same output, across processes/machines)
+ *   - tiny (two lines, no allocations, no imports)
+ *   - well-distributed (low collision rate for typical DB-name distributions)
+ *
+ * The top bit is cleared so the result fits in a positive int4, which is the
+ * range `pg_advisory_lock` expects for the single-argument form. Two databases
+ * in the same Postgres cluster can now run `turbine migrate` concurrently
+ * without contending on a single hardcoded lock ID.
+ */
+export function deriveLockId(databaseName: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < databaseName.length; i++) {
+    hash ^= databaseName.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 1; // positive int4 (top bit cleared)
 }
 
-async function releaseLock(client: pg.Client): Promise<void> {
-  await client.query(`SELECT pg_advisory_unlock($1)`, [MIGRATION_LOCK_ID]);
+/**
+ * Fetch the current database name from the connected client. Used to derive
+ * the advisory lock ID so concurrent migrations in sibling databases do not
+ * contend on one another.
+ */
+async function getCurrentDatabaseName(client: pg.Client): Promise<string> {
+  const result = await client.query<{ current_database: string }>(`SELECT current_database()`);
+  return result.rows[0]?.current_database ?? '';
+}
+
+async function acquireLock(client: pg.Client, lockId: number): Promise<boolean> {
+  const result = await client.query<{ locked: boolean }>(`SELECT pg_try_advisory_lock($1) AS locked`, [lockId]);
+  return result.rows[0]?.locked ?? false;
+}
+
+async function releaseLock(client: pg.Client, lockId: number): Promise<void> {
+  await client.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,8 +389,13 @@ export async function migrateUp(
   const allowDrift = options?.allowDrift === true || options?.force === true;
 
   try {
+    // Derive an advisory lock ID per-database so concurrent migrations in
+    // sibling databases on the same Postgres cluster do not contend.
+    const dbName = await getCurrentDatabaseName(client);
+    const lockId = deriveLockId(dbName);
+
     // Acquire advisory lock to prevent concurrent migrations
-    const gotLock = await acquireLock(client);
+    const gotLock = await acquireLock(client, lockId);
     if (!gotLock) {
       throw new MigrationError('[turbine] Could not acquire migration lock — another migration is already running');
     }
@@ -446,7 +480,7 @@ export async function migrateUp(
 
       return { applied: results, errors };
     } finally {
-      await releaseLock(client);
+      await releaseLock(client, lockId);
     }
   } finally {
     await client.end();
@@ -470,7 +504,12 @@ export async function migrateDown(
   await client.connect();
 
   try {
-    const gotLock = await acquireLock(client);
+    // Derive a per-database advisory lock ID so concurrent migrations in
+    // sibling databases on the same cluster do not contend.
+    const dbName = await getCurrentDatabaseName(client);
+    const lockId = deriveLockId(dbName);
+
+    const gotLock = await acquireLock(client, lockId);
     if (!gotLock) {
       throw new MigrationError('[turbine] Could not acquire migration lock — another migration is already running');
     }
@@ -524,7 +563,7 @@ export async function migrateDown(
 
       return { rolledBack: results, errors };
     } finally {
-      await releaseLock(client);
+      await releaseLock(client, lockId);
     }
   } finally {
     await client.end();
