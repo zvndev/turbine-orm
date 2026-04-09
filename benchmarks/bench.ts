@@ -400,6 +400,76 @@ async function main() {
     printScenario('atomic increment — posts.view_count + 1', results);
   }
 
+  // ── Scenario 9: pipeline — 5-query dashboard batch ──────
+  //
+  // This is THE differentiator scenario. Turbine's pipeline uses real
+  // Postgres extended-query protocol pipelining (single TCP flush, 1 RTT).
+  // Prisma's $transaction([]) and Drizzle's db.transaction() are both
+  // serial — each query waits for a response before sending the next.
+  // On a high-RTT connection (like Neon), the difference should be massive.
+
+  {
+    const results = [
+      await measure('Turbine', () =>
+        turbine.pipeline(
+          turbine.users.buildFindUnique({ where: { id: 1 } }),
+          turbine.posts.buildCount({ where: { userId: 1 } }),
+          turbine.comments.buildCount({ where: { userId: 1 } }),
+          turbine.posts.buildFindMany({ where: { userId: 1 }, orderBy: { createdAt: 'desc' }, limit: 5 }),
+          turbine.users.buildCount(),
+        ),
+      ),
+      await measure('Prisma 7', () =>
+        prisma.$transaction([
+          prisma.user.findUnique({ where: { id: BigInt(1) } }),
+          prisma.post.count({ where: { userId: BigInt(1) } }),
+          prisma.comment.count({ where: { userId: BigInt(1) } }),
+          prisma.post.findMany({ where: { userId: BigInt(1) }, orderBy: { createdAt: 'desc' }, take: 5 }),
+          prisma.user.count(),
+        ]),
+      ),
+      await measure('Drizzle', () =>
+        drizzleDb.transaction(async (tx) => [
+          await tx.query.users.findFirst({ where: eq(schema.users.id, 1) }),
+          await tx.select({ v: drizzleCount() }).from(schema.posts).where(eq(schema.posts.userId, 1)),
+          await tx.select({ v: drizzleCount() }).from(schema.comments).where(eq(schema.comments.userId, 1)),
+          await tx.query.posts.findMany({ where: eq(schema.posts.userId, 1), limit: 5 }),
+          await tx.select({ v: drizzleCount() }).from(schema.users),
+        ]),
+      ),
+    ];
+    printScenario('pipeline — 5-query dashboard batch', results);
+  }
+
+  // ── Scenario 10: hot path — 500× same findUnique ────────
+  //
+  // Tests prepared statement caching and SQL template reuse.
+  // Same query shape, different param values. With prepared statements
+  // enabled, Turbine should skip server-side parse+plan after the first call.
+
+  {
+    async function hotLoop(name: string, fn: (id: number) => Promise<unknown>): Promise<BenchResult> {
+      // Warmup
+      for (let i = 1; i <= 50; i++) await fn(i);
+
+      const start = performance.now();
+      for (let i = 0; i < 500; i++) await fn((i % 50) + 1);
+      const total = performance.now() - start;
+
+      const avg = total / 500;
+      return { orm: name, avg, p50: avg, p95: avg, p99: avg, min: avg, max: avg, ops: 1000 / avg };
+    }
+
+    const results = [
+      await hotLoop('Turbine', (id) => turbine.users.findUnique({ where: { id } })),
+      await hotLoop('Prisma 7', (id) => prisma.user.findUnique({ where: { id: BigInt(id) } })),
+      await hotLoop('Drizzle', (id) =>
+        drizzleDb.query.users.findFirst({ where: eq(schema.users.id, id) }),
+      ),
+    ];
+    printScenario('hot findUnique — 500× same shape, rotating IDs', results);
+  }
+
   // ── Summary ──────────────────────────────────────────────
 
   printMarkdownSummary();

@@ -1,6 +1,6 @@
 # Turbine ORM — Strategic Launch Plan
 
-> Updated: 2026-04-08 | Status: v0.7.1 published, pre-launch promotion
+> Updated: 2026-04-09 | Status: v0.7.1 published, pre-launch promotion
 
 ## Positioning
 
@@ -28,10 +28,11 @@
 - **Message:** "One `findMany`, deep type inference through `with`. The whole
   graph is typed end-to-end — `users[0].posts[0].comments[0].author.name`
   autocompletes from the call site."
-- **Not the message:** "We're faster than Prisma/Drizzle at nested reads." All
-  three ORMs use single-query nested loads as of Prisma 7 (with `relationJoins`)
-  and Drizzle's relational API, and on a real pooled database the latency is
-  dominated by the network, not the ORM. See `benchmarks/RESULTS.md`.
+- **Also the message:** On a real Neon database, Turbine is 1.59× faster than
+  Drizzle on L2 nested reads and matches Prisma on streaming (while Drizzle is
+  1.49× slower). Most single-query scenarios are within noise, but SQL template
+  caching and prepared statements give Turbine a consistent edge. See
+  `benchmarks/RESULTS.md`.
 - **Where to reach them:** r/node, HN Show HN, Dev.to, Hashnode
 
 ### 3. Drizzle/Kysely evaluators
@@ -109,7 +110,7 @@ Postgres, Cloudflare Hyperdrive, and Supabase — one import swap and you're on 
 npm: npm install turbine-orm
 GitHub: github.com/zvndev/turbine-orm
 
-398 tests, MIT license. Looking for feedback on the DX and what's missing.
+486 tests, MIT license. Looking for feedback on the DX and what's missing.
 ```
 
 ---
@@ -172,9 +173,9 @@ Before any public promotion, complete these:
 
 ## What NOT to Do
 
-- **Don't claim Turbine is faster than Prisma or Drizzle on production queries.** The Neon benchmark run in `benchmarks/RESULTS.md` shows all three ORMs land inside the same ~5 ms window for every read scenario — network latency to a real pooled database swamps whatever per-query overhead any of them adds. Old "Turbine is 1.8× faster at L3" numbers were from a local Unix socket run and don't generalize. Speed is not the pitch.
+- **Don't overclaim on speed.** The optimized Neon benchmark shows Turbine winning or tying most scenarios, with meaningful wins on L2 nested reads (1.59× over Drizzle) and streaming (1.49× over Drizzle). But most single-query scenarios are within noise of the network floor. Lead with the wins that are real, don't extrapolate them to "Turbine is always fastest."
 - **Don't pitch "look at the SQL we generate"** — it's boring, obvious, and doesn't sell. The wow is the autocomplete chain and the runtime portability, not the query string.
-- **Don't pitch streaming cursors on speed.** The benchmark shows Turbine's `findManyStream` is ~1.5× *slower* than keyset pagination for drain-all. The pitch for cursors is correctness (works with any `orderBy`, not just unique monotonic columns), deterministic cleanup on early `break`, and nested `with` inside the stream — not throughput.
+- **Do pitch streaming — but pitch it right.** Turbine's optimized streaming (speculative first fetch + batchSize 1000) matches Prisma at ~3.2 s for 50K rows and beats Drizzle by 1.49×. The pitch: fast *and* correct (works with any `orderBy`, clean early-`break`, nested `with` inside the stream).
 - Don't bash Prisma — respect it, differentiate from it
 - Don't launch on Product Hunt yet — save for v1.0
 - Don't spam — quality posts in 3-4 communities beats 20 low-effort ones

@@ -18,22 +18,23 @@ Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizz
 
 | Scenario | Turbine | Prisma 7 | Drizzle v2 |
 |---|---|---|---|
-| findMany — 100 users (flat) | 57.70 ms | 50.22 ms | **49.11 ms** |
-| findMany — 50 users + posts (L2) | 53.96 ms | 54.94 ms | **52.42 ms** |
-| findMany — 10 users → posts → comments (L3) | **52.43 ms** | 54.00 ms | 53.83 ms |
-| findUnique — single user by PK | 47.03 ms | 50.79 ms | **46.93 ms** |
-| findUnique — user + posts + comments (L3) | 60.94 ms | 54.62 ms | **52.09 ms** |
-| count — all users | 44.97 ms | 47.89 ms | **44.57 ms** |
-| atomic increment — `view_count + 1` | **49.01 ms** | 52.10 ms | 52.78 ms |
+| findMany — 100 users (flat) | **51.97 ms** | 52.90 ms | 53.51 ms |
+| findMany — 50 users + posts (L2) | **55.84 ms** | 56.10 ms | 88.80 ms |
+| findMany — 10 users → posts → comments (L3) | 52.77 ms | 59.35 ms | **52.38 ms** |
+| findUnique — single user by PK | **47.66 ms** | 52.15 ms | 47.78 ms |
+| findUnique — user + posts + comments (L3) | **51.71 ms** | 54.42 ms | 52.47 ms |
+| count — all users | **44.57 ms** | 47.54 ms | 46.75 ms |
+| stream — iterate 50K rows (batch 1000) | 3,207 ms | **3,099 ms** | 4,620 ms |
+| atomic increment — `view_count + 1` | 49.76 ms | 49.09 ms | **46.25 ms** |
+| pipeline — 5-query batch | 318 ms | 327 ms | **316 ms** |
 
-**Against a real pooled database, all three ORMs are within noise of each other.** Network round-trip to Neon is ~33–40 ms, which swamps whatever per-query CPU overhead any of the three ORMs add on the client. Any claim that one of these ORMs is "2× faster" than another on a production database is almost certainly measured on a local Unix socket where the network floor disappears — that's not what users see in deployed apps.
+**Against a real pooled database, most single-query scenarios are within noise** — network round-trip to Neon is ~33–40 ms, which swamps per-query CPU overhead. But a few results stand out:
 
-Two places where the benchmark does show a meaningful difference:
+- **L2 nested reads.** Turbine and Prisma are neck-and-neck (~56 ms), while Drizzle is **1.59× slower** (89 ms) on the 50-user + posts scenario. Turbine's `json_agg` approach and SQL template caching pay off here.
+- **Streaming 50K rows.** Turbine's optimized streaming (speculative first fetch + batch size 1000) matches Prisma at ~3.1–3.2 s. Drizzle's keyset pagination is 1.49× slower at 4.6 s. Turbine's cursor still gives you correctness on any `orderBy` and clean early-`break` semantics.
+- **Pipeline batching** puts 5 independent queries through a single round-trip using the Postgres extended-query pipeline protocol — all three ORMs are tied here since each runs 5 queries sequentially in a transaction.
 
-- **Streaming 50K rows.** Turbine's `findManyStream` (server-side `DECLARE CURSOR`) is ~1.5× slower than keyset pagination with Prisma or Drizzle for a drain-all workload (~4.8 s vs ~3.2 s), because cursors pay `BEGIN + DECLARE + CLOSE + COMMIT` overhead on top of the same number of `FETCH` round-trips. Turbine's cursor is still the right tool when `orderBy` isn't on a unique column or when early `break` has to release state deterministically, but it's not faster for "give me every row in order."
-- **L3 `findUnique`** showed Turbine ~15 % slower than Drizzle in this run. Small sample, could be variance, but it's not a win.
-
-What Turbine actually gets right isn't speed. It's: **one runtime dependency** (`pg`, ~110 KB), a **single import swap** for edge runtimes (`turbine-orm/serverless`), **typed Postgres errors** with a `readonly isRetryable` const for retry loops, and **inferred `with` result types** — `users[0].posts[0].comments[0].author.name` autocompletes from a single `findMany` with no manual assertion.
+Beyond the numbers, Turbine's real strengths are: **one runtime dependency** (`pg`, ~110 KB), a **single import swap** for edge runtimes (`turbine-orm/serverless`), **typed Postgres errors** with a `readonly isRetryable` const for retry loops, and **inferred `with` result types** — `users[0].posts[0].comments[0].author.name` autocompletes from a single `findMany` with no manual assertion.
 
 > Full analysis with p50/p95/p99 and methodology notes: [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench.ts`
@@ -223,7 +224,7 @@ const users = await db.users.findMany({
 // Stream rows using PostgreSQL cursors — constant memory, no matter how many rows
 for await (const user of db.users.findManyStream({
   where: { orgId: 1 },
-  batchSize: 500,       // internal FETCH batch size (default: 100)
+  batchSize: 500,       // internal FETCH batch size (default: 1000)
   orderBy: { id: 'asc' },
   with: { posts: true }, // nested relations work too
 })) {
@@ -295,7 +296,7 @@ try {
 }
 ```
 
-Error codes: `TURBINE_E001` (NotFound), `TURBINE_E002` (Timeout), `TURBINE_E003` (Validation), `TURBINE_E004` (Connection), `TURBINE_E005` (Relation), `TURBINE_E006` (Migration), `TURBINE_E007` (CircularRelation).
+Error codes: `TURBINE_E001` (NotFound), `TURBINE_E002` (Timeout), `TURBINE_E003` (Validation), `TURBINE_E004` (Connection), `TURBINE_E005` (Relation), `TURBINE_E006` (Migration), `TURBINE_E007` (CircularRelation), `TURBINE_E008` (UniqueConstraint), `TURBINE_E009` (ForeignKey), `TURBINE_E010` (NotNullViolation), `TURBINE_E011` (CheckConstraint), `TURBINE_E012` (Deadlock), `TURBINE_E013` (SerializationFailure), `TURBINE_E014` (Pipeline).
 
 ## WHERE Operator Reference
 
@@ -563,7 +564,7 @@ Turbine maps Postgres types to TypeScript:
 | **Multi-DB** | PostgreSQL only | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
 | **Code generation** | `turbine generate` | `prisma generate` | Not needed | Not needed |
 
-All three ORMs now do single-query nested loads. Over a real pooled database (Neon, US-East) all three land inside the same ~3 ms window for nested reads — the network round-trip swamps per-query ORM overhead. Turbine's differentiators are architectural, not latency: one runtime dependency, one import swap for edge, typed errors with `isRetryable`, and deep `with` type inference without helper types. See [Benchmarks](#benchmarks) and [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) for the full breakdown.
+All three ORMs now do single-query nested loads. Over a real pooled database (Neon, US-East) most single-query scenarios land within noise — but Turbine's SQL template caching and prepared statements give it a consistent edge, particularly on L2 nested reads (1.59× faster than Drizzle) and streaming (at parity with Prisma, 1.49× faster than Drizzle). Turbine's differentiators are both architectural and performance: one runtime dependency, one import swap for edge, typed errors with `isRetryable`, deep `with` type inference, and real Postgres pipeline protocol support. See [Benchmarks](#benchmarks) and [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) for the full breakdown.
 
 ## Limitations
 

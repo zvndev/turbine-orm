@@ -42,7 +42,7 @@ class FakeConnection extends EventEmitter {
   };
 
   /** Queued responses to emit after all messages are sent */
-  private responseQueue: Array<() => void> = [];
+  responseQueue: Array<() => void> = [];
 
   constructor() {
     super();

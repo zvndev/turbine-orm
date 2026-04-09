@@ -126,6 +126,23 @@ export interface TurbineConfig {
    * programmatic access regardless of mode.
    */
   errorMessages?: ErrorMessageMode;
+  /**
+   * Enable prepared statements. Queries are submitted with `{ name, text, values }`
+   * to the pg driver, which caches the parse+plan on the server per connection.
+   *
+   * Default: `true` for Turbine-owned pools, `false` for external pools (serverless
+   * drivers may not support named statements).
+   *
+   * Override with `TURBINE_DISABLE_PREPARED=1` env var.
+   */
+  preparedStatements?: boolean;
+  /**
+   * Enable the SQL template cache. Repeated queries with the same shape reuse
+   * cached SQL text instead of rebuilding from scratch.
+   *
+   * Default: `true`. Set to `false` as a nuclear kill switch.
+   */
+  sqlCache?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,9 +284,15 @@ export class TransactionClient {
     // Return a minimal pool-compatible object that routes queries
     // through the transaction client
     return {
-      query: async (text: string, values?: unknown[]) => {
+      query: async (textOrConfig: string | { name?: string; text: string; values?: unknown[] }, values?: unknown[]) => {
         try {
-          return await client.query(text, values);
+          if (typeof textOrConfig === 'string') {
+            return await client.query(textOrConfig, values);
+          }
+          // Object form for prepared statements: { name, text, values }
+          // pg.PoolClient.query accepts QueryConfig but the overloads make TS
+          // unhappy with the union, so we cast through unknown.
+          return await (client as unknown as { query(config: unknown): Promise<pg.QueryResult> }).query(textOrConfig);
         } catch (err) {
           throw wrapPgError(err);
         }
@@ -328,9 +351,14 @@ export class TurbineClient {
 
     this.logging = config.logging ?? false;
     this.schema = schema;
+    // Respect env var kill switch
+    const envDisablePrepared = typeof process !== 'undefined' && process.env?.TURBINE_DISABLE_PREPARED === '1';
+
     this.queryOptions = {
       defaultLimit: config.defaultLimit,
       warnOnUnlimited: config.warnOnUnlimited,
+      preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
+      sqlCache: config.sqlCache ?? true,
     };
 
     // Apply NotFoundError message redaction mode (default: safe — values are

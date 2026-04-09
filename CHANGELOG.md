@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Added
+- **Real Postgres extended-query pipeline protocol.** `pipeline()` now uses
+  the wire-level pipeline protocol (parse/bind/describe/execute/sync in a
+  single TCP flush) on connections that support it, via `pipeline-submittable.ts`.
+  Falls back to sequential execution for HTTP drivers, mocks, and other
+  non-TCP connections. Verified 2.58× speedup over sequential on Neon.
+- **SQL template caching with shape-keyed fingerprinting.** Queries with the
+  same WHERE/WITH/ORDER BY structure (same keys and operators, different values)
+  reuse cached SQL text. FNV-1a 64-bit hashing generates deterministic prepared
+  statement names. LRU cache at 1,000 entries. Cache hit/miss stats via
+  `queryInterface.cacheStats()`.
+- **Prepared statement support.** When `preparedStatements: true` (default for
+  owned pools), queries use pg's `{ name, text, values }` object form. Postgres
+  caches the execution plan after the first call. Disable per-client or via
+  `TURBINE_DISABLE_PREPARED=1` env var. Automatically disabled for external
+  pools (serverless drivers).
+- **Streaming speculative first fetch.** `findManyStream` now issues a
+  `LIMIT batchSize+1` first query. If the result fits in one batch, rows are
+  yielded directly without `DECLARE CURSOR` overhead. Only large result sets
+  escalate to server-side cursors.
+- **Default `batchSize` increased from 100 to 1000.** Reduces FETCH round-trips
+  from 500 to 50 for a 50K-row drain, closing the streaming performance gap.
+- **`parseNestedRow` short-circuit.** Empty hasMany (`'[]'`), null belongsTo
+  (`'null'`, `null`), and pre-parsed arrays skip `JSON.parse` entirely.
+- **`PipelineError` (`TURBINE_E014`)** with per-query result status array
+  (`.results`), `.failedIndex`, and `.failedTag` for diagnosing partial
+  pipeline failures in non-transactional mode.
+- **`PipelineOptions`** type with `transactional` (default true) and `timeout`
+  fields. Non-transactional mode uses per-query Sync for error isolation.
+- **`pipelineSupported(pool)`** public probe — check at runtime whether a pool
+  supports the real pipeline protocol.
+- **`TurbineConfig` flags:** `preparedStatements` (boolean), `sqlCache` (boolean).
+- New benchmark scenarios: pipeline (5-query dashboard batch) and hot findUnique
+  (500× same shape, rotating IDs).
+- 88 new unit tests (pipeline-submittable: 12, sql-cache: 54, stream-and-parse: 19,
+  pipeline integration: 3). **486 tests total.**
+
+### Changed
+- **Benchmark results updated.** With SQL caching, prepared statements, and
+  streaming optimizations, Turbine now wins or ties 6/8 scenarios on Neon.
+  L2 nested reads: 1.59× faster than Drizzle. Streaming 50K rows: at parity
+  with Prisma (~3.2 s), 1.49× faster than Drizzle. See `benchmarks/RESULTS.md`.
+
 ### Docs
 - **Benchmarks reconciled against a real pooled database.** The
   README benchmark table and the "Turbine is fastest in every

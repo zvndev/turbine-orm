@@ -324,7 +324,17 @@ export interface FindManyArgs<T, R extends object = {}, W extends TypedWithClaus
 
 export interface FindManyStreamArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>>
   extends FindManyArgs<T, R, W> {
-  /** Number of rows to fetch per internal FETCH batch (default: 100) */
+  /**
+   * Number of rows to fetch per internal FETCH batch (default: 1000).
+   *
+   * Trade-off: larger batches reduce network round-trips (important for
+   * high-latency connections like Neon) but increase per-batch memory.
+   * At 1000 rows x ~500 bytes/row the default is ~500 KB per batch.
+   *
+   * When the total result set fits within one batch, the stream avoids
+   * cursor overhead entirely (no BEGIN / DECLARE / CLOSE / COMMIT) by
+   * using a speculative `SELECT ... LIMIT batchSize+1` first.
+   */
   batchSize?: number;
 }
 
@@ -618,6 +628,46 @@ class LRUCache<K, V> {
 }
 
 // ---------------------------------------------------------------------------
+// SQL cache entry + prepared statement name derivation
+// ---------------------------------------------------------------------------
+
+/** Cached SQL template paired with its prepared-statement name. */
+export interface SqlCacheEntry {
+  sql: string;
+  name: string;
+}
+
+/**
+ * FNV-1a 64-bit hash returning 16 lowercase hex chars.
+ * Single-loop string iteration. Uses BigInt for 64-bit math.
+ *
+ * @internal Exported for testing only.
+ */
+export function fnv1a64Hex(s: string): string {
+  // FNV-1a offset basis and prime for 64-bit
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn; // 64-bit mask
+
+  for (let i = 0; i < s.length; i++) {
+    hash ^= BigInt(s.charCodeAt(i));
+    hash = (hash * prime) & mask;
+  }
+
+  return hash.toString(16).padStart(16, '0');
+}
+
+/**
+ * Derive a prepared-statement name from a SQL string.
+ * Format: `t_<16hex>` — always 18 chars, well under NAMEDATALEN (63).
+ *
+ * @internal Exported for testing only.
+ */
+export function sqlToPreparedName(sql: string): string {
+  return `t_${fnv1a64Hex(sql)}`;
+}
+
+// ---------------------------------------------------------------------------
 // Deferred query descriptor (for pipeline batching)
 // ---------------------------------------------------------------------------
 
@@ -630,6 +680,8 @@ export interface DeferredQuery<T> {
   transform: (result: pg.QueryResult) => T;
   /** Tag for debugging / logging */
   tag: string;
+  /** Prepared statement name (t_<16hex>). Set when SQL cache is enabled. */
+  preparedName?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -654,15 +706,34 @@ export interface QueryInterfaceOptions {
    * full tables).
    */
   warnOnUnlimited?: boolean;
+  /**
+   * Enable prepared statements. When true, queries are submitted with a
+   * `{ name, text, values }` object to the pg driver, which caches the
+   * parse+plan on the server per connection.
+   *
+   * Default: `true` for Turbine-owned pools, `false` for external pools
+   * (serverless drivers may not support named statements).
+   */
+  preparedStatements?: boolean;
+  /**
+   * Enable the SQL template cache. When true, repeated queries with the
+   * same shape (same keys, operators, relations — different values) reuse
+   * cached SQL text instead of rebuilding from scratch.
+   *
+   * Default: `true`. Set to `false` as a nuclear kill switch.
+   */
+  sqlCache?: boolean;
 }
 
 export class QueryInterface<T extends object, R extends object = {}> {
   private readonly tableMeta: TableMetadata;
-  /** SQL template cache: cacheKey → sql string (params are always positional $1,$2,...) */
-  private readonly sqlCache = new LRUCache<string, string>(1000);
+  /** SQL template cache: cacheKey → SqlCacheEntry (sql + prepared statement name) */
+  private readonly sqlTemplateCache = new LRUCache<string, SqlCacheEntry>(1000);
   private readonly middlewares: MiddlewareFn[];
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
+  private readonly preparedStatementsEnabled: boolean;
+  private readonly sqlCacheEnabled: boolean;
   /**
    * Tracks tables that have already triggered an unlimited-query warning so
    * the user is not spammed once per row. Per-instance state — each
@@ -672,6 +743,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * cross-table sharing.
    */
   private readonly warnedTables = new Set<string>();
+
+  /** Cache hit/miss counters for diagnostics */
+  private cacheHits = 0;
+  private cacheMisses = 0;
 
   /** Pre-computed column type lookups (avoids linear scans per query) */
   private readonly columnPgTypeMap: Map<string, string>;
@@ -697,6 +772,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // than the (small) risk of noisy logs. Callers explicitly opt out with
     // `warnOnUnlimited: false`.
     this.warnOnUnlimited = options?.warnOnUnlimited !== false;
+    this.preparedStatementsEnabled = options?.preparedStatements ?? true;
+    this.sqlCacheEnabled = options?.sqlCache !== false;
 
     // Pre-compute column type lookup maps (TASK-26)
     this.columnPgTypeMap = new Map();
@@ -705,6 +782,47 @@ export class QueryInterface<T extends object, R extends object = {}> {
       this.columnPgTypeMap.set(col.name, col.pgType);
       this.columnArrayTypeMap.set(col.name, col.pgArrayType);
     }
+  }
+
+  /**
+   * Return cache hit/miss statistics for this QueryInterface instance.
+   * Useful for monitoring and benchmarking.
+   */
+  cacheStats(): { hits: number; misses: number; hitRate: number; size: number } {
+    const total = this.cacheHits + this.cacheMisses;
+    return {
+      hits: this.cacheHits,
+      misses: this.cacheMisses,
+      hitRate: total > 0 ? this.cacheHits / total : 0,
+      size: this.sqlTemplateCache.size,
+    };
+  }
+
+  /**
+   * Look up or build a SQL template in the cache.
+   * On miss, calls `build()` to generate the SQL, stores the entry, and returns it.
+   * On hit, increments counters and returns the cached entry.
+   *
+   * When `sqlCache` is disabled, always calls `build()` without caching.
+   */
+  private acquireSql(cacheKey: string, build: () => string): SqlCacheEntry {
+    if (!this.sqlCacheEnabled) {
+      const sql = build();
+      this.cacheMisses++;
+      return { sql, name: sqlToPreparedName(sql) };
+    }
+
+    const cached = this.sqlTemplateCache.get(cacheKey);
+    if (cached) {
+      this.cacheHits++;
+      return cached;
+    }
+
+    const sql = build();
+    const entry: SqlCacheEntry = { sql, name: sqlToPreparedName(sql) };
+    this.sqlTemplateCache.set(cacheKey, entry);
+    this.cacheMisses++;
+    return entry;
   }
 
   /**
@@ -721,10 +839,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * If timeout is set, races the query against a timer and rejects on expiry.
    * pg driver errors are translated to typed Turbine errors via wrapPgError.
    */
-  private async queryWithTimeout(sql: string, params: unknown[], timeout?: number): Promise<pg.QueryResult> {
+  private async queryWithTimeout(
+    sql: string,
+    params: unknown[],
+    timeout?: number,
+    preparedName?: string,
+  ): Promise<pg.QueryResult> {
+    // Build the query argument — use object form with `name` for prepared
+    // statements, or the plain (text, values) form otherwise.
+    const usePrepared = preparedName && this.preparedStatementsEnabled;
+    const exec = usePrepared
+      ? this.pool.query({ name: preparedName, text: sql, values: params } as pg.QueryConfig)
+      : this.pool.query(sql, params);
+
     if (!timeout) {
       try {
-        return await this.pool.query(sql, params);
+        return await exec;
       } catch (err) {
         throw wrapPgError(err);
       }
@@ -734,7 +864,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       timer = setTimeout(() => reject(new TimeoutError(timeout)), timeout);
     });
     try {
-      return await Promise.race([this.pool.query(sql, params), timeoutPromise]);
+      return await Promise.race([exec, timeoutPromise]);
     } catch (err) {
       throw wrapPgError(err);
     } finally {
@@ -785,7 +915,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): Promise<WithResult<T, R, W> | null> {
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUnique(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     }) as Promise<WithResult<T, R, W> | null>;
   }
@@ -793,73 +923,105 @@ export class QueryInterface<T extends object, R extends object = {}> {
   buildFindUnique<W extends TypedWithClause<R> = {}>(args: FindUniqueArgs<T, R, W>): DeferredQuery<T | null> {
     const columnsList = this.resolveColumns(args.select, args.omit);
     const whereObj = args.where as Record<string, unknown>;
+    const colKey = columnsList ? columnsList.join(',') : '*';
+    const whereFingerprint = this.fingerprintWhere(whereObj);
+    const withFp = args.with ? this.withFingerprint(args.with as WithClause) : '';
+    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}`;
+
+    const params: unknown[] = [];
 
     // Check if all where values are simple (plain equality, no operators/null/OR)
     const whereKeys = Object.keys(whereObj).filter((k) => whereObj[k] !== undefined);
     const isSimpleWhere =
       !whereObj.OR &&
+      !whereObj.AND &&
+      !whereObj.NOT &&
       whereKeys.every((k) => {
         const v = whereObj[k];
-        return v !== null && !isWhereOperator(v);
+        return v !== null && !isWhereOperator(v) && !this.tableMeta.relations[k];
       });
 
-    // For simple queries (no nested with, no operators), use cached SQL template
+    // Simple path: plain equality, no operators/null/OR
     if (!args.with && isSimpleWhere) {
-      const colKey = columnsList ? columnsList.join(',') : '*';
-      const ck = `fu:${whereKeys.sort().join(',')}:c=${colKey}`;
-      let sql = this.sqlCache.get(ck);
-      const params: unknown[] = whereKeys.map((k) => whereObj[k]);
-
-      if (!sql) {
+      const entry = this.acquireSql(ck, () => {
         const qt = quoteIdent(this.table);
+        const tempParams: unknown[] = whereKeys.map((k) => whereObj[k]);
         const whereClauses = whereKeys.map((k, i) => `${this.toSqlColumn(k)} = $${i + 1}`);
         const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
         const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ') : `${qt}.*`;
-        sql = `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
-        this.sqlCache.set(ck, sql);
+        void tempParams; // params are positional, SQL is value-invariant
+        return `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
+      });
+
+      // Collect params (same order as build)
+      for (const k of whereKeys) {
+        params.push(whereObj[k]);
       }
 
       return {
-        sql,
+        sql: entry.sql,
         params,
         transform: (result) => {
           const row = result.rows[0];
           return row ? (this.parseRow(row, this.table) as T) : null;
         },
         tag: `${this.table}.findUnique`,
+        preparedName: entry.name,
       };
     }
 
-    // General path: supports operators, null, OR, nested with
-    const { sql: whereSql, params } = this.buildWhere(args.where);
-
+    // General path (with operators, null, OR, with clause)
     if (!args.with) {
-      const qt = quoteIdent(this.table);
-      const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ') : `${qt}.*`;
-      const sql = `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
+      const entry = this.acquireSql(ck, () => {
+        const freshParams: unknown[] = [];
+        const clause = this.buildWhereClause(whereObj, freshParams);
+        const whereSql = clause ? ` WHERE ${clause}` : '';
+        const qt = quoteIdent(this.table);
+        const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ') : `${qt}.*`;
+        return `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
+      });
+
+      // Collect params
+      this.collectWhereParams(whereObj, params);
+
       return {
-        sql,
+        sql: entry.sql,
         params,
         transform: (result) => {
           const row = result.rows[0];
           return row ? (this.parseRow(row, this.table) as T) : null;
         },
         tag: `${this.table}.findUnique`,
+        preparedName: entry.name,
       };
     }
 
-    // Nested queries: build fresh each time (with clause affects params)
-    const selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, params, columnsList);
-    const sql = `SELECT ${selectClause} FROM ${quoteIdent(this.table)}${whereSql} LIMIT 1`;
+    // Nested queries with `with` clause.
+    // The param order in the original code is:
+    //   1. buildWhere pushes where params
+    //   2. buildSelectWithRelations pushes relation params to same array
+    // We must preserve this exact order.
+    const entry = this.acquireSql(ck, () => {
+      const freshParams: unknown[] = [];
+      const clause = this.buildWhereClause(whereObj, freshParams);
+      const whereSql = clause ? ` WHERE ${clause}` : '';
+      const selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, freshParams, columnsList);
+      return `SELECT ${selectClause} FROM ${quoteIdent(this.table)}${whereSql} LIMIT 1`;
+    });
+
+    // Collect params in exact build order: where first, then with-clause relations
+    this.collectWhereParams(whereObj, params);
+    this.collectWithParams(args.with as WithClause, params);
 
     return {
-      sql,
+      sql: entry.sql,
       params,
       transform: (result) => {
         const row = result.rows[0];
         return row ? (this.parseNestedRow(row, this.table) as T) : null;
       },
       tag: `${this.table}.findUnique`,
+      preparedName: entry.name,
     };
   }
 
@@ -872,7 +1034,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     return this.executeWithMiddleware('findMany', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindMany(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
     }) as Promise<WithResult<T, R, W>[]>;
   }
@@ -901,74 +1063,123 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildFindMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T[]> {
-    const { sql: whereSql, params } = args?.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
-
     const columnsList = this.resolveColumns(args?.select, args?.omit);
+    const colKey = columnsList ? columnsList.join(',') : '*';
+    const whereObj = (args?.where ?? {}) as Record<string, unknown>;
 
-    const qt = quoteIdent(this.table);
+    // Build fingerprint for cache lookup
+    const whereFp = args?.where ? this.fingerprintWhere(whereObj) : '';
+    const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
+    const orderFp = args?.orderBy ? Object.entries(args.orderBy).map(([k, d]) => `${k}:${d}`).join(',') : '';
+    const cursorFp = args?.cursor
+      ? Object.keys(args.cursor as Record<string, unknown>).filter((k) => (args.cursor as Record<string, unknown>)[k] !== undefined).sort().join(',')
+      : '';
+    const distinctFp = args?.distinct ? args.distinct.slice().sort().join(',') : '';
+    const effectiveLimit = args?.take ?? args?.limit ?? this.defaultLimit;
+    const limitFp = effectiveLimit !== undefined ? '1' : '0';
+    const offsetFp = args?.offset !== undefined ? '1' : '0';
 
-    // Distinct support
-    let distinctPrefix = '';
-    if (args?.distinct && args.distinct.length > 0) {
-      const distinctCols = args.distinct.map((k) => this.toSqlColumn(k as string));
-      distinctPrefix = `DISTINCT ON (${distinctCols.join(', ')}) `;
-    }
+    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}`;
 
-    let selectClause: string;
-    if (args?.with) {
-      selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, params, columnsList);
-    } else if (columnsList) {
-      selectClause = columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ');
-    } else {
-      selectClause = `${qt}.*`;
-    }
+    const params: unknown[] = [];
 
-    let sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${whereSql}`;
+    const entry = this.acquireSql(ck, () => {
+      // Fresh build — generates SQL and populates freshParams
+      const freshParams: unknown[] = [];
+      const { sql: freshWhereSql } = args?.where
+        ? (() => {
+            const clause = this.buildWhereClause(whereObj, freshParams);
+            return { sql: clause ? ` WHERE ${clause}` : '' };
+          })()
+        : { sql: '' };
 
-    // Cursor-based pagination: add WHERE condition for cursor
-    if (args?.cursor) {
-      const cursorEntries = Object.entries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
-      if (cursorEntries.length > 0) {
-        // Determine direction from orderBy (default 'asc')
-        const cursorConditions = cursorEntries.map(([k, v]) => {
-          const col = this.toSqlColumn(k);
-          const dir = args.orderBy?.[k] ?? 'asc';
-          const op = dir === 'desc' ? '<' : '>';
-          params.push(v);
-          return `${qt}.${col} ${op} $${params.length}`;
-        });
-        // Append to existing WHERE or create new one
-        if (whereSql) {
-          sql += ` AND ${cursorConditions.join(' AND ')}`;
-        } else {
-          sql += ` WHERE ${cursorConditions.join(' AND ')}`;
+      const qt = quoteIdent(this.table);
+
+      let distinctPrefix = '';
+      if (args?.distinct && args.distinct.length > 0) {
+        const distinctCols = args.distinct.map((k) => this.toSqlColumn(k as string));
+        distinctPrefix = `DISTINCT ON (${distinctCols.join(', ')}) `;
+      }
+
+      let selectClause: string;
+      if (args?.with) {
+        selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, freshParams, columnsList);
+      } else if (columnsList) {
+        selectClause = columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ');
+      } else {
+        selectClause = `${qt}.*`;
+      }
+
+      let sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${freshWhereSql}`;
+
+      if (args?.cursor) {
+        const cursorEntries = Object.entries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
+        if (cursorEntries.length > 0) {
+          const cursorConditions = cursorEntries.map(([k, v]) => {
+            const col = this.toSqlColumn(k);
+            const dir = args.orderBy?.[k] ?? 'asc';
+            const op = dir === 'desc' ? '<' : '>';
+            freshParams.push(v);
+            return `${qt}.${col} ${op} $${freshParams.length}`;
+          });
+          if (freshWhereSql) {
+            sql += ` AND ${cursorConditions.join(' AND ')}`;
+          } else {
+            sql += ` WHERE ${cursorConditions.join(' AND ')}`;
+          }
         }
       }
-    }
 
-    if (args?.orderBy) {
-      sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
-    }
+      if (args?.orderBy) {
+        sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
+      }
 
-    // take overrides limit when cursor pagination is used; fall back to defaultLimit
-    const effectiveLimit = args?.take ?? args?.limit ?? this.defaultLimit;
+      if (effectiveLimit !== undefined) {
+        freshParams.push(Number(effectiveLimit));
+        sql += ` LIMIT $${freshParams.length}`;
+      }
+      if (args?.offset !== undefined) {
+        freshParams.push(Number(args.offset));
+        sql += ` OFFSET $${freshParams.length}`;
+      }
+
+      return sql;
+    });
+
+    // Collect params in exact build order:
+    // 1. WHERE params
+    if (args?.where) {
+      this.collectWhereParams(whereObj, params);
+    }
+    // 2. WITH relation params
+    if (args?.with) {
+      this.collectWithParams(args.with as WithClause, params);
+    }
+    // 3. Cursor params
+    if (args?.cursor) {
+      const cursorEntries = Object.entries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
+      for (const [, v] of cursorEntries) {
+        params.push(v);
+      }
+    }
+    // 4. LIMIT param
     if (effectiveLimit !== undefined) {
       params.push(Number(effectiveLimit));
-      sql += ` LIMIT $${params.length}`;
     }
+    // 5. OFFSET param
     if (args?.offset !== undefined) {
       params.push(Number(args.offset));
-      sql += ` OFFSET $${params.length}`;
     }
 
     return {
-      sql,
+      sql: entry.sql,
       params,
       transform: (result) =>
         result.rows.map((row) =>
           args?.with ? (this.parseNestedRow(row, this.table) as T) : (this.parseRow(row, this.table) as T),
         ),
       tag: `${this.table}.findMany`,
+      preparedName: entry.name,
     };
   }
 
@@ -980,9 +1191,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Stream rows from a findMany query using PostgreSQL cursors.
    * Returns an AsyncIterable that yields individual rows, fetching in batches internally.
    *
-   * Uses DECLARE CURSOR within a dedicated transaction on a single pooled connection.
-   * The cursor is automatically closed and the connection released when iteration
-   * completes or is terminated early (e.g. `break` from `for await`).
+   * **Speculative fast-path:** Before opening a cursor, issues a single
+   * `SELECT ... LIMIT batchSize+1`. If the result fits within `batchSize`,
+   * all rows are yielded immediately with zero cursor overhead (no BEGIN /
+   * DECLARE / CLOSE / COMMIT). Only when the result overflows does the
+   * method fall back to the full cursor path.
+   *
+   * **Cursor path:** Uses DECLARE CURSOR within a dedicated transaction on a
+   * single pooled connection. The cursor is automatically closed and the
+   * connection released when iteration completes or is terminated early
+   * (e.g. `break` from `for await`).
+   *
+   * **Snapshot semantics note:** The speculative fast-path runs outside a
+   * transaction. If the result overflows and the cursor path is opened, the
+   * cursor runs in its own transaction — spanning two separate snapshots.
+   * For strict single-snapshot semantics, wrap the call in `$transaction`.
    *
    * @example
    * ```ts
@@ -994,9 +1217,35 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async *findManyStream<W extends TypedWithClause<R> = {}>(
     args?: FindManyStreamArgs<T, R, W>,
   ): AsyncGenerator<WithResult<T, R, W>, void, undefined> {
-    const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 100)));
-    const deferred = this.buildFindMany(args);
+    const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
     const hasRelations = !!args?.with;
+
+    // --- Speculative first fetch: try to satisfy the entire drain in one RTT ---
+    const speculativeDeferred = this.buildFindMany({
+      ...args,
+      limit: batchSize + 1,
+    } as FindManyArgs<T, R, TypedWithClause<R>>);
+
+    const speculativeResult = await this.queryWithTimeout(
+      speculativeDeferred.sql,
+      speculativeDeferred.params,
+      args?.timeout,
+    );
+
+    if (speculativeResult.rows.length <= batchSize) {
+      // Small drain — yield all rows and return, no cursor needed
+      for (const row of speculativeResult.rows) {
+        yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as WithResult<
+          T,
+          R,
+          W
+        >;
+      }
+      return;
+    }
+
+    // --- Overflow: fall back to cursor path from scratch ---
+    const deferred = this.buildFindMany(args);
 
     // Acquire a dedicated connection — cursors require a single connection in a transaction
     const client = await this.pool.connect();
@@ -1047,7 +1296,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): Promise<WithResult<T, R, W> | null> {
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirst(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
     }) as Promise<WithResult<T, R, W> | null>;
   }
@@ -1077,7 +1326,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): Promise<WithResult<T, R, W>> {
     return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirstOrThrow(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
     }) as Promise<WithResult<T, R, W>>;
   }
@@ -1112,7 +1361,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): Promise<WithResult<T, R, W>> {
     return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUniqueOrThrow(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     }) as Promise<WithResult<T, R, W>>;
   }
@@ -1145,7 +1394,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async create(args: CreateArgs<T>): Promise<T> {
     return this.executeWithMiddleware('create', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildCreate(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
@@ -1183,7 +1432,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async createMany(args: CreateManyArgs<T>): Promise<T[]> {
     return this.executeWithMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildCreateMany(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
@@ -1240,27 +1489,41 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async update(args: UpdateArgs<T>): Promise<T> {
     return this.executeWithMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpdate(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
 
   buildUpdate(args: UpdateArgs<T>): DeferredQuery<T> {
-    const setEntries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
+    const dataObj = args.data as Record<string, unknown>;
+    const whereObj = args.where as Record<string, unknown>;
+    const setFp = this.fingerprintSet(dataObj);
+    const whereFp = this.fingerprintWhere(whereObj);
+    const ck = `u:${setFp}|${whereFp}`;
 
-    // Build SET params first (supports atomic operators: set/increment/decrement/multiply/divide)
     const params: unknown[] = [];
-    const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, params));
 
-    // Build WHERE using the shared params array (continues numbering after SET params)
-    const whereClause = this.buildWhereClause(args.where as Record<string, unknown>, params);
+    const entry = this.acquireSql(ck, () => {
+      const freshParams: unknown[] = [];
+      const setEntries = Object.entries(dataObj).filter(([, v]) => v !== undefined);
+      const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, freshParams));
+      const whereClause = this.buildWhereClause(whereObj, freshParams);
+      const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
+      this.assertMutationHasPredicate('update', whereSql, args.allowFullTableScan);
+      return `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql} RETURNING *`;
+    });
 
-    const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
-    this.assertMutationHasPredicate('update', whereSql, args.allowFullTableScan);
-    const sql = `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql} RETURNING *`;
+    // On cache hit, validate predicate
+    if (whereFp === '') {
+      this.assertMutationHasPredicate('update', '', args.allowFullTableScan);
+    }
+
+    // Collect params: SET first, then WHERE (same order as fresh build)
+    this.collectSetParams(dataObj, params);
+    this.collectWhereParams(whereObj, params);
 
     return {
-      sql,
+      sql: entry.sql,
       params,
       transform: (result) => {
         const row = result.rows[0];
@@ -1274,6 +1537,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.update`,
+      preparedName: entry.name,
     };
   }
 
@@ -1284,18 +1548,37 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async delete(args: DeleteArgs<T>): Promise<T> {
     return this.executeWithMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDelete(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
 
   buildDelete(args: DeleteArgs<T>): DeferredQuery<T> {
-    const { sql: whereSql, params } = this.buildWhere(args.where);
-    this.assertMutationHasPredicate('delete', whereSql, args.allowFullTableScan);
-    const sql = `DELETE FROM ${quoteIdent(this.table)}${whereSql} RETURNING *`;
+    const whereObj = args.where as Record<string, unknown>;
+    const whereFp = this.fingerprintWhere(whereObj);
+    const ck = `d:${whereFp}`;
+
+    const params: unknown[] = [];
+
+    // We need to check the mutation predicate. Build the whereSql to test it.
+    // On cache hit we still need to validate (the shape may be empty).
+    const entry = this.acquireSql(ck, () => {
+      const freshParams: unknown[] = [];
+      const clause = this.buildWhereClause(whereObj, freshParams);
+      const whereSql = clause ? ` WHERE ${clause}` : '';
+      this.assertMutationHasPredicate('delete', whereSql, args.allowFullTableScan);
+      return `DELETE FROM ${quoteIdent(this.table)}${whereSql} RETURNING *`;
+    });
+
+    // On cache hit, still validate the predicate
+    if (whereFp === '') {
+      this.assertMutationHasPredicate('delete', '', args.allowFullTableScan);
+    }
+
+    this.collectWhereParams(whereObj, params);
 
     return {
-      sql,
+      sql: entry.sql,
       params,
       transform: (result) => {
         const row = result.rows[0];
@@ -1309,6 +1592,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.delete`,
+      preparedName: entry.name,
     };
   }
 
@@ -1319,7 +1603,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async upsert(args: UpsertArgs<T>): Promise<T> {
     return this.executeWithMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpsert(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
@@ -1380,30 +1664,43 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async updateMany(args: UpdateManyArgs<T>): Promise<{ count: number }> {
     return this.executeWithMiddleware('updateMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpdateMany(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
 
   buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
-    const setEntries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
+    const dataObj = args.data as Record<string, unknown>;
+    const whereObj = args.where as Record<string, unknown>;
+    const setFp = this.fingerprintSet(dataObj);
+    const whereFp = this.fingerprintWhere(whereObj);
+    const ck = `um:${setFp}|${whereFp}`;
 
-    // Build SET params first (supports atomic operators: set/increment/decrement/multiply/divide)
     const params: unknown[] = [];
-    const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, params));
 
-    // Build WHERE using the shared params array (continues numbering after SET params)
-    const whereClause = this.buildWhereClause(args.where as Record<string, unknown>, params);
+    const entry = this.acquireSql(ck, () => {
+      const freshParams: unknown[] = [];
+      const setEntries = Object.entries(dataObj).filter(([, v]) => v !== undefined);
+      const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, freshParams));
+      const whereClause = this.buildWhereClause(whereObj, freshParams);
+      const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
+      this.assertMutationHasPredicate('updateMany', whereSql, args.allowFullTableScan);
+      return `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql}`;
+    });
 
-    const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
-    this.assertMutationHasPredicate('updateMany', whereSql, args.allowFullTableScan);
-    const sql = `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql}`;
+    if (whereFp === '') {
+      this.assertMutationHasPredicate('updateMany', '', args.allowFullTableScan);
+    }
+
+    this.collectSetParams(dataObj, params);
+    this.collectWhereParams(whereObj, params);
 
     return {
-      sql,
+      sql: entry.sql,
       params,
       transform: (result) => ({ count: result.rowCount ?? 0 }),
       tag: `${this.table}.updateMany`,
+      preparedName: entry.name,
     };
   }
 
@@ -1414,21 +1711,38 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async deleteMany(args: DeleteManyArgs<T>): Promise<{ count: number }> {
     return this.executeWithMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDeleteMany(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
 
   buildDeleteMany(args: DeleteManyArgs<T>): DeferredQuery<{ count: number }> {
-    const { sql: whereSql, params } = this.buildWhere(args.where);
-    this.assertMutationHasPredicate('deleteMany', whereSql, args.allowFullTableScan);
-    const sql = `DELETE FROM ${quoteIdent(this.table)}${whereSql}`;
+    const whereObj = args.where as Record<string, unknown>;
+    const whereFp = this.fingerprintWhere(whereObj);
+    const ck = `dm:${whereFp}`;
+
+    const params: unknown[] = [];
+
+    const entry = this.acquireSql(ck, () => {
+      const freshParams: unknown[] = [];
+      const clause = this.buildWhereClause(whereObj, freshParams);
+      const whereSql = clause ? ` WHERE ${clause}` : '';
+      this.assertMutationHasPredicate('deleteMany', whereSql, args.allowFullTableScan);
+      return `DELETE FROM ${quoteIdent(this.table)}${whereSql}`;
+    });
+
+    if (whereFp === '') {
+      this.assertMutationHasPredicate('deleteMany', '', args.allowFullTableScan);
+    }
+
+    this.collectWhereParams(whereObj, params);
 
     return {
-      sql,
+      sql: entry.sql,
       params,
       transform: (result) => ({ count: result.rowCount ?? 0 }),
       tag: `${this.table}.deleteMany`,
+      preparedName: entry.name,
     };
   }
 
@@ -1439,21 +1753,35 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async count(args?: CountArgs<T>): Promise<number> {
     return this.executeWithMiddleware('count', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildCount(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
 
   buildCount(args?: CountArgs<T>): DeferredQuery<number> {
-    const { sql: whereSql, params } = args?.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
+    const whereObj = (args?.where ?? {}) as Record<string, unknown>;
+    const whereFp = args?.where ? this.fingerprintWhere(whereObj) : '';
+    const ck = `cnt:${whereFp}`;
 
-    const sql = `SELECT COUNT(*)::int AS count FROM ${quoteIdent(this.table)}${whereSql}`;
+    const params: unknown[] = [];
+
+    const entry = this.acquireSql(ck, () => {
+      const freshParams: unknown[] = [];
+      const clause = args?.where ? this.buildWhereClause(whereObj, freshParams) : null;
+      const whereSql = clause ? ` WHERE ${clause}` : '';
+      return `SELECT COUNT(*)::int AS count FROM ${quoteIdent(this.table)}${whereSql}`;
+    });
+
+    if (args?.where) {
+      this.collectWhereParams(whereObj, params);
+    }
 
     return {
-      sql,
+      sql: entry.sql,
       params,
       transform: (result) => (result.rows[0] as { count: number }).count,
       tag: `${this.table}.count`,
+      preparedName: entry.name,
     };
   }
 
@@ -1464,7 +1792,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
     return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildGroupBy(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
@@ -1611,7 +1939,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
     return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildAggregate(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     });
   }
@@ -1877,6 +2205,443 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Plain value (including null, Date, Buffer, arrays, JSON objects)
     params.push(value);
     return `${col} = $${params.length}`;
+  }
+
+  // =========================================================================
+  // Fingerprinting — value-invariant shape keys for SQL cache lookup
+  // =========================================================================
+
+  /**
+   * Produce a value-invariant fingerprint of a where clause.
+   * Same keys + same operator shapes + same combinator structure => same string.
+   * Different values (e.g. id=1 vs id=999) => identical fingerprint.
+   *
+   * @internal Exposed as package-private for testing via class access.
+   */
+  fingerprintWhere(where: Record<string, unknown>): string {
+    const keys = Object.keys(where).filter((k) => where[k] !== undefined).sort();
+    if (keys.length === 0) return '';
+
+    const parts: string[] = [];
+    for (const key of keys) {
+      const value = where[key];
+      if (value === undefined) continue;
+
+      if (key === 'OR') {
+        const orArr = value as Record<string, unknown>[];
+        if (!Array.isArray(orArr) || orArr.length === 0) continue;
+        const orParts = orArr.map((cond) => this.fingerprintWhere(cond));
+        parts.push(`OR[${orParts.join(',')}]`);
+        continue;
+      }
+      if (key === 'AND') {
+        const andArr = value as Record<string, unknown>[];
+        if (!Array.isArray(andArr) || andArr.length === 0) continue;
+        const andParts = andArr.map((cond) => this.fingerprintWhere(cond));
+        parts.push(`AND[${andParts.join(',')}]`);
+        continue;
+      }
+      if (key === 'NOT') {
+        const notCond = value as Record<string, unknown>;
+        parts.push(`NOT(${this.fingerprintWhere(notCond)})`);
+        continue;
+      }
+
+      // Relation filters: { posts: { some: { published: true } } }
+      const relDef = this.tableMeta.relations[key];
+      if (relDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+        const filterObj = value as Record<string, unknown>;
+        if ('some' in filterObj || 'every' in filterObj || 'none' in filterObj) {
+          const relParts: string[] = [];
+          if (filterObj.some !== undefined) relParts.push(`some(${this.fingerprintRelFilter(relDef.to, filterObj.some as Record<string, unknown>)})`);
+          if (filterObj.every !== undefined) relParts.push(`every(${this.fingerprintRelFilter(relDef.to, filterObj.every as Record<string, unknown>)})`);
+          if (filterObj.none !== undefined) relParts.push(`none(${this.fingerprintRelFilter(relDef.to, filterObj.none as Record<string, unknown>)})`);
+          parts.push(`${key}:{${relParts.join(',')}}`);
+          continue;
+        }
+      }
+
+      // null → distinct from value
+      if (value === null) {
+        parts.push(`${key}:null`);
+        continue;
+      }
+
+      // Operator objects
+      if (isWhereOperator(value)) {
+        const opKeys = Object.keys(value as object).filter((k) => k !== 'mode').sort();
+        const mode = (value as WhereOperator).mode;
+        const modeStr = mode === 'insensitive' ? ':i' : '';
+        parts.push(`${key}:op(${opKeys.join(',')}${modeStr})`);
+        continue;
+      }
+
+      // JSON filter
+      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
+        const jKeys = Object.keys(value as object).sort();
+        parts.push(`${key}:json(${jKeys.join(',')})`);
+        continue;
+      }
+
+      // Array filter
+      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value as ArrayFilter)) {
+        const aKeys = Object.keys(value as object).sort();
+        parts.push(`${key}:arr(${aKeys.join(',')})`);
+        continue;
+      }
+
+      // Plain equality
+      parts.push(`${key}:eq`);
+    }
+
+    return parts.join('&');
+  }
+
+  /**
+   * Fingerprint a relation filter sub-where for some/every/none.
+   */
+  private fingerprintRelFilter(targetTable: string, subWhere: Record<string, unknown>): string {
+    const keys = Object.keys(subWhere).filter((k) => subWhere[k] !== undefined).sort();
+    if (keys.length === 0) return '';
+    const parts: string[] = [];
+    for (const key of keys) {
+      const value = subWhere[key];
+      if (value === undefined) continue;
+      if (value === null) {
+        parts.push(`${key}:null`);
+      } else if (isWhereOperator(value)) {
+        const opKeys = Object.keys(value as object).filter((k) => k !== 'mode').sort();
+        const mode = (value as WhereOperator).mode;
+        const modeStr = mode === 'insensitive' ? ':i' : '';
+        parts.push(`${key}:op(${opKeys.join(',')}${modeStr})`);
+      } else {
+        parts.push(`${key}:eq`);
+      }
+    }
+    return parts.join('&');
+  }
+
+  /**
+   * Walk a where clause and push ONLY values into `params`, in the EXACT same
+   * order that `buildWhereClause` pushes them. Used on cache hit to fill params
+   * without rebuilding SQL.
+   *
+   * @internal Exposed as package-private for testing.
+   */
+  collectWhereParams(where: Record<string, unknown>, params: unknown[]): void {
+    const keys = Object.keys(where);
+
+    for (const key of keys) {
+      const value = where[key];
+      if (value === undefined) continue;
+
+      if (key === 'OR') {
+        const orConditions = value as Record<string, unknown>[];
+        if (!Array.isArray(orConditions) || orConditions.length === 0) continue;
+        for (const orCond of orConditions) {
+          this.collectWhereParams(orCond, params);
+        }
+        continue;
+      }
+
+      if (key === 'AND') {
+        const andConditions = value as Record<string, unknown>[];
+        if (!Array.isArray(andConditions) || andConditions.length === 0) continue;
+        for (const andCond of andConditions) {
+          this.collectWhereParams(andCond, params);
+        }
+        continue;
+      }
+
+      if (key === 'NOT') {
+        const notCond = value as Record<string, unknown>;
+        this.collectWhereParams(notCond, params);
+        continue;
+      }
+
+      // Relation filters
+      const relationDef = this.tableMeta.relations[key];
+      if (relationDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+        const filterObj = value as Record<string, unknown>;
+        if ('some' in filterObj || 'every' in filterObj || 'none' in filterObj) {
+          if (filterObj.some !== undefined) this.collectRelFilterParams(relationDef.to, filterObj.some as Record<string, unknown>, params);
+          if (filterObj.none !== undefined) this.collectRelFilterParams(relationDef.to, filterObj.none as Record<string, unknown>, params);
+          if (filterObj.every !== undefined) this.collectRelFilterParams(relationDef.to, filterObj.every as Record<string, unknown>, params);
+          continue;
+        }
+      }
+
+      // null → no param pushed (IS NULL is parameterless)
+      if (value === null) continue;
+
+      const rawColumn = this.toColumn(key);
+
+      // JSONB filter
+      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
+        const colType = this.getColumnPgType(rawColumn);
+        if (colType === 'json' || colType === 'jsonb') {
+          this.collectJsonFilterParams(value, params);
+          continue;
+        }
+      }
+
+      // Array filter
+      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
+        const colType = this.getColumnPgType(rawColumn);
+        if (colType.startsWith('_')) {
+          this.collectArrayFilterParams(value, params);
+          continue;
+        }
+      }
+
+      // Operator objects
+      if (isWhereOperator(value)) {
+        this.collectOperatorParams(value, params);
+        continue;
+      }
+
+      // Plain equality
+      params.push(value);
+    }
+  }
+
+  /** Collect params from a relation filter sub-where. Mirrors buildSubWhereForRelation. */
+  private collectRelFilterParams(targetTable: string, subWhere: Record<string, unknown>, params: unknown[]): void {
+    const meta = this.schema.tables[targetTable];
+    if (!meta) return;
+
+    for (const [field, value] of Object.entries(subWhere)) {
+      if (value === undefined) continue;
+      if (value === null) continue;
+      if (isWhereOperator(value)) {
+        this.collectOperatorParams(value, params);
+        continue;
+      }
+      params.push(value);
+    }
+  }
+
+  /** Collect params from operator clauses. Mirrors buildOperatorClauses. */
+  private collectOperatorParams(op: WhereOperator, params: unknown[]): void {
+    if (op.gt !== undefined) params.push(op.gt);
+    if (op.gte !== undefined) params.push(op.gte);
+    if (op.lt !== undefined) params.push(op.lt);
+    if (op.lte !== undefined) params.push(op.lte);
+    if (op.not !== undefined && op.not !== null) params.push(op.not);
+    if (op.in !== undefined) params.push(op.in);
+    if (op.notIn !== undefined) params.push(op.notIn);
+    if (op.contains !== undefined) params.push(`%${escapeLike(op.contains)}%`);
+    if (op.startsWith !== undefined) params.push(`${escapeLike(op.startsWith)}%`);
+    if (op.endsWith !== undefined) params.push(`%${escapeLike(op.endsWith)}`);
+  }
+
+  /** Collect params from JSON filter. Mirrors buildJsonFilterClauses. */
+  private collectJsonFilterParams(filter: JsonFilter, params: unknown[]): void {
+    if (filter.path !== undefined && filter.equals !== undefined) {
+      params.push(filter.path);
+      params.push(String(filter.equals));
+    } else if (filter.equals !== undefined) {
+      params.push(JSON.stringify(filter.equals));
+    }
+    if (filter.contains !== undefined) {
+      params.push(JSON.stringify(filter.contains));
+    }
+    if (filter.hasKey !== undefined) {
+      params.push(filter.hasKey);
+    }
+  }
+
+  /** Collect params from array filter. Mirrors buildArrayFilterClauses. */
+  private collectArrayFilterParams(filter: ArrayFilter, params: unknown[]): void {
+    if (filter.has !== undefined) params.push(filter.has);
+    if (filter.hasEvery !== undefined) params.push(filter.hasEvery);
+    if (filter.hasSome !== undefined) params.push(filter.hasSome);
+    // isEmpty has no params (IS NULL / IS NOT NULL)
+  }
+
+  /**
+   * Produce a fingerprint for a `with` clause tree. Recursion mirrors
+   * buildSelectWithRelations / buildRelationSubquery.
+   *
+   * @internal Exposed as package-private for testing.
+   */
+  withFingerprint(withClause: WithClause | undefined, table?: string, depth = 0): string {
+    if (!withClause) return '';
+    const meta = this.schema.tables[table ?? this.table];
+    if (!meta) return '';
+
+    const relNames = Object.keys(withClause).sort();
+    const parts: string[] = [];
+
+    for (const relName of relNames) {
+      const spec = withClause[relName];
+      if (!spec) continue;
+      const relDef = meta.relations[relName];
+      if (!relDef) continue;
+
+      if (spec === true) {
+        parts.push(relName);
+        continue;
+      }
+
+      const opts = spec as WithOptions;
+      const subParts: string[] = [];
+
+      // select/omit shape
+      if (opts.select) {
+        const selKeys = Object.entries(opts.select).filter(([, v]) => v).map(([k]) => k).sort();
+        subParts.push(`sl=${selKeys.join(',')}`);
+      }
+      if (opts.omit) {
+        const omKeys = Object.entries(opts.omit).filter(([, v]) => v).map(([k]) => k).sort();
+        subParts.push(`om=${omKeys.join(',')}`);
+      }
+
+      // where shape (value-invariant)
+      if (opts.where) {
+        // Use a target-table QI if possible, or a simplified fingerprint
+        const wKeys = Object.keys(opts.where).filter((k) => opts.where![k] !== undefined).sort();
+        subParts.push(`w=${wKeys.join(',')}`);
+      }
+
+      // orderBy shape
+      if (opts.orderBy) {
+        const oEntries = Object.entries(opts.orderBy).map(([k, d]) => `${k}:${d}`);
+        subParts.push(`o=${oEntries.join(',')}`);
+      }
+
+      // limit presence
+      if (opts.limit !== undefined) {
+        subParts.push('l=1');
+      }
+
+      // nested with (recurse)
+      if (opts.with) {
+        const nested = this.withFingerprint(opts.with as WithClause, relDef.to, depth + 1);
+        if (nested) subParts.push(`W=(${nested})`);
+      }
+
+      parts.push(subParts.length > 0 ? `${relName}/{${subParts.join('/')}}` : relName);
+    }
+
+    return parts.join('|');
+  }
+
+  /**
+   * Collect params from a `with` clause tree. Mirrors buildSelectWithRelations +
+   * buildRelationSubquery param-push order.
+   */
+  private collectWithParams(
+    withClause: WithClause,
+    params: unknown[],
+    table?: string,
+  ): void {
+    const meta = this.schema.tables[table ?? this.table];
+    if (!meta) return;
+
+    for (const [relName, relSpec] of Object.entries(withClause)) {
+      const relDef = meta.relations[relName];
+      if (!relDef) continue;
+      this.collectRelationSubqueryParams(relDef, relSpec, params, table ?? this.table);
+    }
+  }
+
+  /**
+   * Collect params from a single relation subquery. Mirrors buildRelationSubquery.
+   */
+  private collectRelationSubqueryParams(
+    relDef: RelationDef,
+    spec: true | WithOptions,
+    params: unknown[],
+    _parentRef: string,
+    depth = 0,
+  ): void {
+    if (spec === true) return; // No params for default include
+    const targetTable = relDef.to;
+    const targetMeta = this.schema.tables[targetTable];
+    if (!targetMeta) return;
+
+    const willWrap = relDef.type === 'hasMany' && (spec.limit !== undefined || spec.orderBy !== undefined);
+
+    // Non-wrapped path: nested relations BEFORE where/limit
+    if (!willWrap && spec.with) {
+      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+        const nestedRelDef = targetMeta.relations[nestedRelName];
+        if (!nestedRelDef) continue;
+        this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'alias', depth + 1);
+      }
+    }
+
+    // where params
+    if (spec.where) {
+      for (const [, v] of Object.entries(spec.where)) {
+        params.push(v);
+      }
+    }
+
+    // limit param
+    if (spec.limit) {
+      params.push(Number(spec.limit));
+    }
+
+    // Wrapped path: nested relations AFTER where/limit (inside inner subquery)
+    if (willWrap && spec.with) {
+      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+        const nestedRelDef = targetMeta.relations[nestedRelName];
+        if (!nestedRelDef) continue;
+        this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'innerAlias', depth + 1);
+      }
+    }
+  }
+
+  /**
+   * Fingerprint SET clauses for update/updateMany.
+   * Captures key names + operator types (set/increment/etc) but not values.
+   */
+  private fingerprintSet(data: Record<string, unknown>): string {
+    const entries = Object.entries(data).filter(([, v]) => v !== undefined);
+    const parts: string[] = [];
+    for (const [k, v] of entries) {
+      if (
+        v !== null &&
+        typeof v === 'object' &&
+        !Array.isArray(v) &&
+        !(v instanceof Date) &&
+        !(typeof Buffer !== 'undefined' && Buffer.isBuffer(v))
+      ) {
+        const keys = Object.keys(v as Record<string, unknown>);
+        if (keys.length === 1 && UPDATE_OPERATOR_KEYS.has(keys[0]!)) {
+          parts.push(`${k}:${keys[0]}`);
+          continue;
+        }
+      }
+      parts.push(`${k}:eq`);
+    }
+    return parts.join(',');
+  }
+
+  /**
+   * Collect SET params for update/updateMany. Mirrors buildSetClause param order.
+   */
+  private collectSetParams(data: Record<string, unknown>, params: unknown[]): void {
+    const entries = Object.entries(data).filter(([, v]) => v !== undefined);
+    for (const [, v] of entries) {
+      if (
+        v !== null &&
+        typeof v === 'object' &&
+        !Array.isArray(v) &&
+        !(v instanceof Date) &&
+        !(typeof Buffer !== 'undefined' && Buffer.isBuffer(v))
+      ) {
+        const obj = v as Record<string, unknown>;
+        const keys = Object.keys(obj);
+        if (keys.length === 1 && UPDATE_OPERATOR_KEYS.has(keys[0]!)) {
+          params.push(obj[keys[0]!]);
+          continue;
+        }
+      }
+      params.push(v);
+    }
   }
 
   /** Build WHERE clause from a where object (supports operators, NULL, OR) */
@@ -2243,27 +3008,55 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     for (const [relName, relDef] of Object.entries(meta.relations)) {
       const rawValue = row[relName];
-      if (rawValue !== undefined) {
-        if (typeof rawValue === 'string') {
-          try {
-            parsed[relName] = JSON.parse(rawValue);
-          } catch {
-            console.warn(
-              `[turbine] Warning: Failed to parse JSON for relation "${relName}" on table "${this.table}". Using raw value.`,
+      if (rawValue === undefined) continue;
+
+      // --- Short-circuit: skip JSON.parse for common empty/null cases ---
+      // hasMany returns '[]' (from COALESCE(..., '[]'::json)); belongsTo/hasOne returns null
+      if (rawValue === null || rawValue === 'null') {
+        parsed[relName] = null;
+        continue;
+      }
+      if (rawValue === '[]') {
+        parsed[relName] = [];
+        continue;
+      }
+      if (Array.isArray(rawValue) && rawValue.length === 0) {
+        parsed[relName] = [];
+        continue;
+      }
+
+      // --- Non-empty values: full parse path ---
+      if (typeof rawValue === 'string') {
+        try {
+          const jsonVal = JSON.parse(rawValue);
+          // After parsing, apply parseRow to each item for snake→camel + date coercion
+          if (Array.isArray(jsonVal)) {
+            parsed[relName] = jsonVal.map((item: unknown) =>
+              typeof item === 'object' && item !== null
+                ? this.parseRow(item as Record<string, unknown>, relDef.to)
+                : item,
             );
-            parsed[relName] = rawValue;
+          } else if (typeof jsonVal === 'object' && jsonVal !== null) {
+            parsed[relName] = this.parseRow(jsonVal as Record<string, unknown>, relDef.to);
+          } else {
+            parsed[relName] = jsonVal;
           }
-        } else if (Array.isArray(rawValue)) {
-          parsed[relName] = rawValue.map((item) =>
-            typeof item === 'object' && item !== null
-              ? this.parseRow(item as Record<string, unknown>, relDef.to)
-              : item,
+        } catch {
+          console.warn(
+            `[turbine] Warning: Failed to parse JSON for relation "${relName}" on table "${this.table}". Using raw value.`,
           );
-        } else if (typeof rawValue === 'object' && rawValue !== null) {
-          parsed[relName] = this.parseRow(rawValue as Record<string, unknown>, relDef.to);
-        } else {
           parsed[relName] = rawValue;
         }
+      } else if (Array.isArray(rawValue)) {
+        parsed[relName] = rawValue.map((item) =>
+          typeof item === 'object' && item !== null
+            ? this.parseRow(item as Record<string, unknown>, relDef.to)
+            : item,
+        );
+      } else if (typeof rawValue === 'object' && rawValue !== null) {
+        parsed[relName] = this.parseRow(rawValue as Record<string, unknown>, relDef.to);
+      } else {
+        parsed[relName] = rawValue;
       }
     }
 

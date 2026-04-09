@@ -5,16 +5,13 @@ while the Node.js heap stays flat. The demo prints a live progress meter
 showing row count, throughput, and peak heap — you should see the heap
 settle in the ~60–90MB range and stay there regardless of dataset size.
 
-> **Heads up on performance.** For a straight drain-all-rows workload
-> over a cloud database, keyset pagination (`take: N, cursor, orderBy`)
-> is actually a bit *faster* than server-side cursors because cursors
-> pay `BEGIN + DECLARE + CLOSE + COMMIT` overhead on top of the same
-> `FETCH` round-trips. Turbine's cursor isn't the right tool because
-> it's faster; it's the right tool when you want **correct semantics
-> on any `orderBy`** (not just unique columns), **deterministic
-> cleanup on early `break` / throw**, and **nested `with` inside the
-> stream** without re-fetching relations per page. See
-> `benchmarks/RESULTS.md` for the measured numbers.
+> **On performance.** Turbine's optimized streaming (speculative first
+> fetch + default batchSize 1000) matches Prisma's keyset pagination at
+> ~3.2 s for 50K rows and beats Drizzle by 1.49×. On top of speed
+> parity, cursors give you **correct semantics on any `orderBy`** (not
+> just unique columns), **deterministic cleanup on early `break` /
+> throw**, and **nested `with` inside the stream** without re-fetching
+> relations per page. See `benchmarks/RESULTS.md` for the full numbers.
 
 ```ts
 for await (const order of db.orders.findManyStream({
