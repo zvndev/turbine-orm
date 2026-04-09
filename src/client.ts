@@ -24,7 +24,7 @@
 
 import pg from 'pg';
 import { type ErrorMessageMode, setErrorMessageMode, TimeoutError, wrapPgError } from './errors.js';
-import { executePipeline, type PipelineResults } from './pipeline.js';
+import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from './query.js';
 import type { SchemaMetadata } from './schema.js';
 
@@ -458,13 +458,49 @@ export class TurbineClient {
   /**
    * Execute multiple queries in a single database round-trip.
    *
-   * Pass the result of any `.build*()` method on a table accessor.
+   * Two call styles:
+   *   - `db.pipeline(q1, q2, q3)` — rest params (backward-compatible)
+   *   - `db.pipeline([q1, q2, q3], { transactional: false })` — array + options
+   *
+   * On pg.Pool-backed connections with TCP, this uses the real Postgres
+   * extended-query pipeline protocol (one TCP flush, one round-trip).
+   * On HTTP-based drivers it falls back to sequential execution.
    */
-  async pipeline<T extends readonly DeferredQuery<unknown>[]>(...queries: T): Promise<PipelineResults<T>> {
+  async pipeline<T extends readonly DeferredQuery<unknown>[]>(
+    ...args: T | [T, PipelineOptions?]
+  ): Promise<PipelineResults<T>> {
+    let queries: T;
+    let options: PipelineOptions | undefined;
+
+    // Detect which overload was used
+    if (
+      args.length > 0 &&
+      Array.isArray(args[0]) &&
+      (args[0] as unknown[]).every(
+        (item) => item && typeof item === 'object' && 'sql' in (item as Record<string, unknown>),
+      )
+    ) {
+      // Array form: pipeline([q1, q2], opts?)
+      queries = args[0] as unknown as T;
+      options = args[1] as PipelineOptions | undefined;
+    } else {
+      // Rest-param form: pipeline(q1, q2, q3)
+      queries = args as unknown as T;
+    }
+
     if (this.logging) {
       console.log(`[turbine] Pipeline: ${queries.length} queries — ${queries.map((q) => q.tag).join(', ')}`);
     }
-    return executePipeline(this.pool, queries);
+    return executePipeline(this.pool, queries, options);
+  }
+
+  /**
+   * Check whether the underlying pool supports the real pipeline protocol.
+   * Returns `true` for standard pg.Pool TCP connections, `false` for HTTP
+   * drivers (Neon HTTP, Vercel Postgres, etc.) and mock pools.
+   */
+  async pipelineSupported(): Promise<boolean> {
+    return pipelineSupported(this.pool);
   }
 
   // -------------------------------------------------------------------------

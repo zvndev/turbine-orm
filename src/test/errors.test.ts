@@ -365,8 +365,12 @@ describe('TurbineErrorCode', () => {
     assert.equal(TurbineErrorCode.SERIALIZATION_FAILURE, 'TURBINE_E013');
   });
 
-  it('has exactly 13 error codes', () => {
-    assert.equal(Object.keys(TurbineErrorCode).length, 13);
+  it('has PIPELINE = TURBINE_E014', () => {
+    assert.equal(TurbineErrorCode.PIPELINE, 'TURBINE_E014');
+  });
+
+  it('has exactly 14 error codes', () => {
+    assert.equal(Object.keys(TurbineErrorCode).length, 14);
   });
 });
 

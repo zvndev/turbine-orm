@@ -20,6 +20,7 @@ export const TurbineErrorCode = {
   CHECK_VIOLATION: 'TURBINE_E011',
   DEADLOCK_DETECTED: 'TURBINE_E012',
   SERIALIZATION_FAILURE: 'TURBINE_E013',
+  PIPELINE: 'TURBINE_E014',
 } as const;
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
@@ -419,6 +420,64 @@ export class CheckConstraintError extends TurbineError {
     this.name = 'CheckConstraintError';
     this.constraint = constraint;
     this.table = table;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline error
+// ---------------------------------------------------------------------------
+
+/** Result slot for a single query in a non-transactional pipeline */
+export type PipelineResultSlot = { status: 'ok'; value: unknown } | { status: 'error'; error: Error };
+
+/**
+ * Thrown when a non-transactional pipeline has partial failures.
+ *
+ * In non-transactional mode (`{ transactional: false }`), each query executes
+ * independently. If one or more queries fail, the pipeline rejects with a
+ * `PipelineError` that carries per-query results so callers can inspect which
+ * succeeded and which failed.
+ *
+ * ```ts
+ * try {
+ *   await db.pipeline([q1, q2, q3], { transactional: false });
+ * } catch (err) {
+ *   if (err instanceof PipelineError) {
+ *     for (const slot of err.results) {
+ *       if (slot.status === 'error') console.error(slot.error);
+ *     }
+ *   }
+ * }
+ * ```
+ */
+export class PipelineError extends TurbineError {
+  /** Per-query results: each slot is either `{status:'ok', value}` or `{status:'error', error}` */
+  readonly results: PipelineResultSlot[];
+
+  /** Zero-based index of the first query that failed */
+  readonly failedIndex?: number;
+
+  /** Tag of the first query that failed (from DeferredQuery.tag) */
+  readonly failedTag?: string;
+
+  constructor(opts: {
+    message?: string;
+    results: PipelineResultSlot[];
+    failedIndex?: number;
+    failedTag?: string;
+    cause?: unknown;
+  }) {
+    const { results, failedIndex, failedTag, cause } = opts;
+    const failedCount = results.filter((r) => r.status === 'error').length;
+    const message =
+      opts.message ??
+      `[turbine] Pipeline completed with ${failedCount} error(s) out of ${results.length} queries` +
+        (failedTag ? ` (first failure: ${failedTag} at index ${failedIndex})` : '');
+    super(TurbineErrorCode.PIPELINE, message, { cause });
+    this.name = 'PipelineError';
+    this.results = results;
+    this.failedIndex = failedIndex;
+    this.failedTag = failedTag;
   }
 }
 
