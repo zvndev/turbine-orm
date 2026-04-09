@@ -427,13 +427,40 @@ type ColumnProxy = {
     | 'bytea']: () => ColumnBuilder;
 } & { varchar: (length: number) => ColumnBuilder };
 
+/** Nullary (no-arg) type methods on ColumnBuilder — everything except varchar */
+type NullaryColumnType = Exclude<keyof ColumnProxy, 'varchar'>;
+
+/** Type guard: is `prop` a known nullary ColumnBuilder type method? */
+function isNullaryColumnType(prop: string): prop is NullaryColumnType {
+  return (
+    prop === 'serial' ||
+    prop === 'bigint' ||
+    prop === 'integer' ||
+    prop === 'smallint' ||
+    prop === 'text' ||
+    prop === 'boolean' ||
+    prop === 'timestamp' ||
+    prop === 'date' ||
+    prop === 'json' ||
+    prop === 'uuid' ||
+    prop === 'real' ||
+    prop === 'doublePrecision' ||
+    prop === 'numeric' ||
+    prop === 'bytea'
+  );
+}
+
 /** @deprecated Use defineSchema() with plain objects instead */
 export const column: ColumnProxy = new Proxy({} as ColumnProxy, {
   get(_target, prop: string) {
     if (prop === 'varchar') return (length: number) => new ColumnBuilder().varchar(length);
+    if (isNullaryColumnType(prop)) {
+      return () => {
+        const builder = new ColumnBuilder();
+        return builder[prop]();
+      };
+    }
     return () => {
-      const builder = new ColumnBuilder();
-      if (typeof (builder as any)[prop] === 'function') return (builder as any)[prop].call(builder);
       throw new Error(`Unknown column type: ${prop}`);
     };
   },
