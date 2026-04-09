@@ -114,9 +114,7 @@ interface StreamTestHarness {
  * Creates a mock pool that records all queries and returns configurable rows.
  * `rowFactory` receives the SQL text and should return rows for that query.
  */
-function createStreamMockPool(
-  rowFactory: (sql: string) => unknown[],
-): StreamTestHarness {
+function createStreamMockPool(rowFactory: (sql: string) => unknown[]): StreamTestHarness {
   const queries: string[] = [];
   const released = { count: 0 };
 
@@ -265,9 +263,7 @@ describe('findManyStream: speculative fast-path', () => {
         }
         if (fetchCount === 2) {
           // Second FETCH returns remaining rows
-          return [
-            { id: 4, name: 'Dave', email: 'd@test.com' },
-          ];
+          return [{ id: 4, name: 'Dave', email: 'd@test.com' }];
         }
         return [];
       }

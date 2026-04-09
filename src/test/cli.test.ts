@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, before, describe, it } from 'node:test';
+import { describe, it } from 'node:test';
 import { configTemplate, findConfigFile, loadConfig, resolveConfig } from '../cli/config.js';
 import { _resetTsLoaderStateForTests, canResolveTsx, needsTsLoader, registerTsLoader } from '../cli/loader.js';
 import { parseMigrationContent } from '../cli/migrate.js';
