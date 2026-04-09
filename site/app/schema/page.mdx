@@ -1,0 +1,186 @@
+export const metadata = {
+  title: 'Schema & Migrations',
+  description:
+    'Code-first schema definitions, DDL generation, SQL-first migrations, and introspection in Turbine ORM.',
+};
+
+# Schema & Migrations
+
+Turbine supports two schema workflows:
+
+- **Code-first** — declare tables with `defineSchema(...)` in TypeScript, then `push` or auto-diff migrations.
+- **Introspection** — point Turbine at an existing database and generate a typed client from `information_schema`.
+
+Both workflows emit the same generated types (`types.ts`, `metadata.ts`, `index.ts`) so you can mix them freely.
+
+## Code-first with `defineSchema`
+
+Declare your tables in a TypeScript file. Turbine uses these definitions to generate DDL, run migrations, and emit the typed client.
+
+```ts
+// turbine/schema.ts
+import { defineSchema } from 'turbine-orm';
+
+export default defineSchema({
+  organizations: {
+    id: { type: 'serial', primaryKey: true },
+    name: { type: 'text', notNull: true },
+    createdAt: { type: 'timestamp', default: 'now()' },
+  },
+  users: {
+    id: { type: 'serial', primaryKey: true },
+    email: { type: 'text', unique: true, notNull: true },
+    name: { type: 'text', notNull: true },
+    orgId: { type: 'bigint', notNull: true, references: 'organizations.id' },
+    role: { type: 'text', notNull: true, default: "'member'" },
+    createdAt: { type: 'timestamp', default: 'now()' },
+  },
+  posts: {
+    id: { type: 'serial', primaryKey: true },
+    userId: { type: 'bigint', notNull: true, references: 'users.id' },
+    title: { type: 'text', notNull: true },
+    content: { type: 'text' },
+    published: { type: 'boolean', notNull: true, default: 'false' },
+    viewCount: { type: 'integer', notNull: true, default: '0' },
+    createdAt: { type: 'timestamp', default: 'now()' },
+  },
+});
+```
+
+### Composite primary keys
+
+Pass a table-level `primaryKey` array:
+
+```ts
+memberships: {
+  userId: { type: 'bigint', notNull: true, references: 'users.id' },
+  orgId: { type: 'bigint', notNull: true, references: 'organizations.id' },
+  role: { type: 'text', notNull: true },
+  primaryKey: ['userId', 'orgId'],
+}
+```
+
+`findUnique` accepts the composite key as an object: `where: { userId: 1, orgId: 2 }`.
+
+## DDL generation
+
+Turbine generates quoted, deterministic DDL from any `SchemaDef`. Every identifier is quoted via `quoteIdent()` so reserved words and mixed case are safe.
+
+```bash
+# Preview the SQL without running it
+npx turbine push --dry-run
+
+# Apply schema changes to the database
+npx turbine push
+```
+
+`push` is the fast path for development — it diffs your `defineSchema` output against the live database and applies the difference directly. For production, use migrations.
+
+## SQL-first migrations
+
+Turbine migrations are plain `.sql` files with `-- UP` and `-- DOWN` sections. The runner tracks them in a `_turbine_migrations` table keyed on timestamp + SHA-256 checksum.
+
+### Create a migration
+
+```bash
+# Blank migration — write SQL manually
+npx turbine migrate create add_users_table
+
+# Auto-generate from the diff between defineSchema() and the live database
+npx turbine migrate create add_email_index --auto
+```
+
+The resulting file looks like this:
+
+```sql
+-- 20260409143022_add_users_table.sql
+-- UP
+CREATE TABLE "users" (
+  "id" SERIAL PRIMARY KEY,
+  "email" TEXT UNIQUE NOT NULL,
+  "name" TEXT NOT NULL,
+  "created_at" TIMESTAMPTZ DEFAULT now()
+);
+
+-- DOWN
+DROP TABLE "users";
+```
+
+### Apply, rollback, inspect
+
+```bash
+npx turbine migrate up       # Apply all pending migrations
+npx turbine migrate down     # Roll back the last applied migration
+npx turbine migrate status   # Show applied vs pending
+```
+
+Each migration runs in its own transaction. If a migration fails halfway, the transaction rolls back and `_turbine_migrations` stays clean.
+
+### Concurrency safety
+
+Turbine uses `pg_try_advisory_lock()` before running any migration. If a second process tries to run `migrate up` simultaneously, it exits cleanly instead of racing. Safe to run from CI/CD pipelines and deployment hooks.
+
+### Checksums
+
+Every migration's file is SHA-256 hashed and stored alongside the timestamp. If you edit a migration that's already been applied, `migrate status` flags a checksum mismatch and refuses to proceed until you reconcile.
+
+## Schema diffing
+
+`schemaDiff()` compares a `SchemaDef` against live database metadata and returns the DDL operations needed to close the gap. This powers `migrate create --auto`:
+
+```ts
+import { schemaDiff } from 'turbine-orm';
+import schema from './turbine/schema';
+import { introspect } from 'turbine-orm/introspect';
+
+const live = await introspect({ connectionString: DATABASE_URL });
+const ops = schemaDiff(live, schema);
+// ops: [{ kind: 'addColumn', table: 'users', ... }, ...]
+```
+
+The auto-generated migrations are a starting point — always review them before committing.
+
+## Introspection
+
+If you already have a database, point Turbine at it:
+
+```bash
+npx turbine pull
+# or: npx turbine generate
+```
+
+Turbine reads `information_schema` and `pg_catalog` to discover:
+
+- Tables and columns (with types, nullability, defaults)
+- Primary keys, unique constraints, foreign keys
+- Indexes (including composite and partial)
+- Enum types
+- Inferred relations (hasMany / belongsTo / hasOne) from foreign keys
+
+Three files land in `./generated/turbine/`:
+
+- **`types.ts`** — entity interfaces (singularized PascalCase), `*Create` types, `*Update` types, and relation-included `*With*` types.
+- **`metadata.ts`** — runtime `SchemaMetadata` with column maps, relations, and indexes. Needed for `turbineHttp()` in edge runtimes.
+- **`index.ts`** — a `TurbineClient` subclass with typed `declare readonly` table accessors, plus a `turbine()` factory function.
+
+## Type mapping
+
+Turbine maps Postgres types to TypeScript:
+
+| Postgres | TypeScript | Notes |
+|---|---|---|
+| `int2`, `int4`, `float4`, `float8` | `number` | Standard numeric types |
+| `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` are returned as `string` to avoid precision loss |
+| `numeric`, `money` | `string` | Arbitrary precision — kept as string to avoid JS float issues |
+| `text`, `varchar`, `uuid`, `citext` | `string` | |
+| `timestamptz`, `timestamp`, `date` | `Date` | |
+| `boolean` | `boolean` | |
+| `json`, `jsonb` | `unknown` | |
+| `bytea` | `Buffer` | |
+| Array types | `T[]` | `_text` → `string[]` |
+
+## See also
+
+- **[CLI](/cli)** — every migration command with examples.
+- **[API Reference](/queries)** — how to query the tables you just defined.
+- **[Typed Errors](/errors)** — including `MigrationError` (TURBINE_E006).

@@ -1,0 +1,400 @@
+export const metadata = {
+  title: 'API Reference',
+  description:
+    'Every Turbine query method, WHERE operator, nested with option, transaction and pipeline API.',
+};
+
+# API Reference
+
+Every query method, operator, and API surface Turbine exposes. Generated clients attach `db.<table>` accessors with the full API below — the examples use `db.users` and `db.posts` but any introspected table works identically.
+
+## findMany
+
+Returns an array of rows matching the query. Supports `where`, `with`, `orderBy`, `take` / `limit`, `skip`, `select`, and `omit`.
+
+```ts
+const users = await db.users.findMany({
+  where: { role: 'admin', orgId: 1 },
+  orderBy: { createdAt: 'desc' },
+  take: 20,
+  skip: 0,
+});
+```
+
+With nested relations:
+
+```ts
+const users = await db.users.findMany({
+  where: { orgId: 1 },
+  with: {
+    posts: {
+      where: { published: true },
+      orderBy: { createdAt: 'desc' },
+      limit: 5,
+      with: { comments: true },
+    },
+  },
+});
+```
+
+The entire object graph resolves in one SQL statement. `users[0].posts[0].comments[0]` is fully typed.
+
+### select / omit
+
+Pick or drop columns at the query level. Either one — not both.
+
+```ts
+// Only return id and email
+const users = await db.users.findMany({
+  select: { id: true, email: true },
+});
+
+// Return everything except the password_hash column
+const users = await db.users.findMany({
+  omit: { passwordHash: true },
+});
+```
+
+## findUnique / findUniqueOrThrow
+
+Look up a row by a unique column (primary key or any `unique` constraint).
+
+```ts
+const user = await db.users.findUnique({
+  where: { id: 42 },
+  with: { posts: true },
+});
+// user is User | null
+
+const user2 = await db.users.findUniqueOrThrow({
+  where: { email: 'alice@example.com' },
+});
+// Throws NotFoundError (TURBINE_E001) if not found
+```
+
+Composite primary keys are passed as an object matching the keys:
+
+```ts
+const row = await db.memberships.findUnique({
+  where: { userId: 1, orgId: 2 },
+});
+```
+
+## findFirst / findFirstOrThrow
+
+First matching row by the given `where` + `orderBy`. Non-unique lookups.
+
+```ts
+const post = await db.posts.findFirst({
+  where: { authorId: 42, published: true },
+  orderBy: { createdAt: 'desc' },
+});
+```
+
+## create
+
+Insert a single row. Returns the full row (including generated columns).
+
+```ts
+const newUser = await db.users.create({
+  data: {
+    email: 'alice@example.com',
+    name: 'Alice',
+    orgId: 1,
+  },
+});
+```
+
+## createMany
+
+Batch insert with a single `INSERT ... UNNEST(...)` — not N separate inserts.
+
+```ts
+const users = await db.users.createMany({
+  data: [
+    { email: 'a@b.com', name: 'A', orgId: 1 },
+    { email: 'b@b.com', name: 'B', orgId: 1 },
+    { email: 'c@b.com', name: 'C', orgId: 1 },
+  ],
+});
+```
+
+## update / updateMany
+
+Update a single row by unique key, or every row matching a `where`.
+
+```ts
+await db.users.update({
+  where: { id: 42 },
+  data: { name: 'Alice Updated' },
+});
+
+await db.users.updateMany({
+  where: { role: 'guest' },
+  data: { role: 'member' },
+});
+```
+
+### Atomic update operators
+
+For race-safe counter updates, pass an operator object instead of a literal. Turbine generates `col = col + $n` style SQL so concurrent updates can't lose writes.
+
+```ts
+await db.posts.update({
+  where: { id: 1 },
+  data: {
+    viewCount: { increment: 1 },
+    likesCount: { decrement: 1 },
+    score: { multiply: 2 },
+    rank: { divide: 2 },
+    title: { set: 'New title' }, // explicit set — same as a literal
+  },
+});
+```
+
+Supported operators on numeric columns: `set`, `increment`, `decrement`, `multiply`, `divide`.
+
+## delete / deleteMany
+
+```ts
+await db.users.delete({ where: { id: 42 } });
+
+await db.users.deleteMany({
+  where: { createdAt: { lt: thirtyDaysAgo } },
+});
+```
+
+Empty `where` (or `where: {}`) throws `ValidationError` — Turbine blocks accidental mass deletes. Pass `{ allowFullTableScan: true }` if you really mean it.
+
+## count
+
+```ts
+const total = await db.users.count();
+const admins = await db.users.count({ where: { role: 'admin' } });
+```
+
+## aggregate
+
+```ts
+const stats = await db.posts.aggregate({
+  where: { orgId: 1 },
+  _sum: { viewCount: true },
+  _avg: { score: true },
+  _max: { createdAt: true },
+  _count: true,
+});
+```
+
+## findManyStream
+
+Stream rows using a PostgreSQL server-side cursor. Constant memory, works on any number of rows, and supports nested `with` clauses inside the stream.
+
+```ts
+for await (const user of db.users.findManyStream({
+  where: { orgId: 1 },
+  orderBy: { id: 'asc' },
+  batchSize: 1000,       // internal FETCH batch size (default: 1000)
+  with: { posts: true }, // nested relations work inside the stream
+})) {
+  process.stdout.write(`${user.email}\n`);
+}
+```
+
+Under the hood Turbine issues a speculative `LIMIT batchSize + 1` first fetch — if the result fits in one batch, rows are yielded directly without `DECLARE CURSOR` overhead. Larger result sets escalate to a cursor. Safe to `break` early; the cursor and connection are cleaned up deterministically.
+
+## WHERE operators
+
+Every operator composes freely with `AND`, `OR`, `NOT`, and relation filters.
+
+### Equality
+
+| Operator | Description | Example |
+|---|---|---|
+| literal | Implicit equality | `where: { email: 'a@b.com' }` |
+| `equals` | Explicit equality | `where: { email: { equals: 'a@b.com' } }` |
+| `not` | Inequality (or `not: null` for `IS NOT NULL`) | `where: { role: { not: 'admin' } }` |
+
+### Sets
+
+| Operator | Description | Example |
+|---|---|---|
+| `in` | Match any value in the array | `where: { id: { in: [1, 2, 3] } }` |
+| `notIn` | Match none of the values | `where: { role: { notIn: ['banned', 'spam'] } }` |
+
+### Comparison
+
+| Operator | Description | Example |
+|---|---|---|
+| `gt` | Greater than | `where: { score: { gt: 100 } }` |
+| `gte` | Greater than or equal | `where: { score: { gte: 100 } }` |
+| `lt` | Less than | `where: { score: { lt: 100 } }` |
+| `lte` | Less than or equal | `where: { score: { lte: 100 } }` |
+
+### String
+
+| Operator | Description | Example |
+|---|---|---|
+| `contains` | Substring match (`LIKE %v%`) | `where: { title: { contains: 'sql' } }` |
+| `startsWith` | Prefix match (`LIKE v%`) | `where: { email: { startsWith: 'admin@' } }` |
+| `endsWith` | Suffix match (`LIKE %v`) | `where: { email: { endsWith: '@acme.com' } }` |
+| `mode: 'insensitive'` | Switch any string operator to `ILIKE` | `where: { title: { contains: 'SQL', mode: 'insensitive' } }` |
+
+LIKE wildcards in user input (`%`, `_`, `\`) are escaped automatically.
+
+### Array columns
+
+| Operator | Description | Example |
+|---|---|---|
+| `has` | Array contains element | `where: { tags: { has: 'sql' } }` |
+| `hasEvery` | Array contains every element | `where: { tags: { hasEvery: ['sql', 'pg'] } }` |
+| `hasSome` | Array contains at least one element | `where: { tags: { hasSome: ['sql', 'mysql'] } }` |
+
+### Relation filters
+
+Filter parent rows by predicates on their child rows.
+
+| Operator | Description | Example |
+|---|---|---|
+| `some` | At least one related row matches | `where: { posts: { some: { published: true } } }` |
+| `every` | Every related row matches | `where: { posts: { every: { published: true } } }` |
+| `none` | No related row matches | `where: { posts: { none: { published: false } } }` |
+
+### Combinators
+
+```ts
+where: {
+  AND: [{ orgId: 1 }, { role: 'admin' }],
+  OR: [{ role: 'owner' }, { role: 'admin' }],
+  NOT: { deletedAt: { not: null } },
+}
+```
+
+## Nested `with`
+
+Relations in a `with` clause accept their own `where`, `orderBy`, `limit`, `select` / `omit`, and nested `with`.
+
+```ts
+const users = await db.users.findMany({
+  with: {
+    posts: {
+      where: { published: true },
+      orderBy: { createdAt: 'desc' },
+      limit: 10,
+      select: { id: true, title: true, createdAt: true },
+      with: {
+        comments: {
+          where: { deletedAt: null },
+          orderBy: { createdAt: 'asc' },
+          limit: 50,
+        },
+      },
+    },
+  },
+});
+```
+
+Nesting depth is capped at 10 — beyond that, Turbine throws `CircularRelationError` (TURBINE_E007) with the full relation path.
+
+## Transactions
+
+```ts
+await db.$transaction(async (tx) => {
+  const user = await tx.users.create({
+    data: { email: 'new@example.com', name: 'New', orgId: 1 },
+  });
+  await tx.posts.create({
+    data: { userId: user.id, orgId: 1, title: 'Hello', content: '...' },
+  });
+});
+```
+
+`tx` has the same typed table accessors as `db`. Nested `$transaction` calls create SAVEPOINTs automatically.
+
+### Isolation levels + timeout
+
+```ts
+await db.$transaction(
+  async (tx) => {
+    // ...
+  },
+  {
+    isolationLevel: 'Serializable',
+    timeout: 5000, // ms — destroys the connection on expiry
+  },
+);
+```
+
+Supported isolation levels: `'ReadCommitted'`, `'RepeatableRead'`, `'Serializable'`.
+
+## Pipeline
+
+Run N independent queries in a single database round-trip using the PostgreSQL extended-query pipeline protocol.
+
+```ts
+const [user, postCount, recentPosts] = await db.pipeline([
+  db.users.buildFindUnique({ where: { id: 1 } }),
+  db.posts.buildCount({ where: { orgId: 1 } }),
+  db.posts.buildFindMany({ where: { userId: 1 }, limit: 5 }),
+]);
+```
+
+The `build*` methods return `DeferredQuery` objects — generated SQL + params + a transform — without executing. `pipeline()` sends every statement in one TCP flush (parse/bind/execute/sync) and runs each transform on the result.
+
+### Non-transactional pipelines
+
+By default, pipelines run inside a transaction — any failure rolls back the batch. Opt out for error-isolated execution:
+
+```ts
+try {
+  await db.pipeline(queries, { transactional: false });
+} catch (err) {
+  if (err instanceof PipelineError) {
+    // err.results is a per-query [{status:'ok', value} | {status:'error', error}] array
+    // err.failedIndex / err.failedTag identify the first failure
+  }
+}
+```
+
+HTTP / serverless pools that don't support the pipeline protocol fall back to sequential execution automatically. Probe at runtime with `pipelineSupported(pool)`.
+
+## Middleware
+
+`db.$use(fn)` registers a middleware that runs around every query. It can log, time, mutate arguments, or transform results — but it cannot rewrite the SQL.
+
+```ts
+// Query timing
+db.$use(async (params, next) => {
+  const start = Date.now();
+  const result = await next(params);
+  console.log(`${params.model}.${params.action} took ${Date.now() - start}ms`);
+  return result;
+});
+
+// Soft-delete filter
+db.$use(async (params, next) => {
+  if (params.action === 'findMany' || params.action === 'findUnique') {
+    params.args.where = { ...params.args.where, deletedAt: null };
+  }
+  return next(params);
+});
+```
+
+## Raw SQL
+
+When you need something the query builder doesn't expose (full-text search, window functions, `WITH RECURSIVE`, etc.):
+
+```ts
+const stats = await db.raw<{ day: Date; count: number }>`
+  SELECT DATE_TRUNC('day', created_at) AS day, COUNT(*)::int AS count
+  FROM posts WHERE org_id = ${orgId}
+  GROUP BY day ORDER BY day
+`;
+```
+
+Parameters from `${}` interpolations become `$1, $2, ...` — never string-interpolated into the SQL text.
+
+## See also
+
+- **[Typed Errors](/errors)** — every error code and the retry patterns.
+- **[Schema & Migrations](/schema)** — code-first schemas and SQL migrations.
+- **[Benchmarks](/benchmarks)** — the numbers behind the query planner.

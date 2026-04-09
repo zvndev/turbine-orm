@@ -1070,9 +1070,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Build fingerprint for cache lookup
     const whereFp = args?.where ? this.fingerprintWhere(whereObj) : '';
     const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
-    const orderFp = args?.orderBy ? Object.entries(args.orderBy).map(([k, d]) => `${k}:${d}`).join(',') : '';
+    const orderFp = args?.orderBy
+      ? Object.entries(args.orderBy)
+          .map(([k, d]) => `${k}:${d}`)
+          .join(',')
+      : '';
     const cursorFp = args?.cursor
-      ? Object.keys(args.cursor as Record<string, unknown>).filter((k) => (args.cursor as Record<string, unknown>)[k] !== undefined).sort().join(',')
+      ? Object.keys(args.cursor as Record<string, unknown>)
+          .filter((k) => (args.cursor as Record<string, unknown>)[k] !== undefined)
+          .sort()
+          .join(',')
       : '';
     const distinctFp = args?.distinct ? args.distinct.slice().sort().join(',') : '';
     const effectiveLimit = args?.take ?? args?.limit ?? this.defaultLimit;
@@ -2219,7 +2226,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * @internal Exposed as package-private for testing via class access.
    */
   fingerprintWhere(where: Record<string, unknown>): string {
-    const keys = Object.keys(where).filter((k) => where[k] !== undefined).sort();
+    const keys = Object.keys(where)
+      .filter((k) => where[k] !== undefined)
+      .sort();
     if (keys.length === 0) return '';
 
     const parts: string[] = [];
@@ -2253,9 +2262,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const filterObj = value as Record<string, unknown>;
         if ('some' in filterObj || 'every' in filterObj || 'none' in filterObj) {
           const relParts: string[] = [];
-          if (filterObj.some !== undefined) relParts.push(`some(${this.fingerprintRelFilter(relDef.to, filterObj.some as Record<string, unknown>)})`);
-          if (filterObj.every !== undefined) relParts.push(`every(${this.fingerprintRelFilter(relDef.to, filterObj.every as Record<string, unknown>)})`);
-          if (filterObj.none !== undefined) relParts.push(`none(${this.fingerprintRelFilter(relDef.to, filterObj.none as Record<string, unknown>)})`);
+          if (filterObj.some !== undefined)
+            relParts.push(`some(${this.fingerprintRelFilter(relDef.to, filterObj.some as Record<string, unknown>)})`);
+          if (filterObj.every !== undefined)
+            relParts.push(`every(${this.fingerprintRelFilter(relDef.to, filterObj.every as Record<string, unknown>)})`);
+          if (filterObj.none !== undefined)
+            relParts.push(`none(${this.fingerprintRelFilter(relDef.to, filterObj.none as Record<string, unknown>)})`);
           parts.push(`${key}:{${relParts.join(',')}}`);
           continue;
         }
@@ -2269,7 +2281,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // Operator objects
       if (isWhereOperator(value)) {
-        const opKeys = Object.keys(value as object).filter((k) => k !== 'mode').sort();
+        const opKeys = Object.keys(value as object)
+          .filter((k) => k !== 'mode')
+          .sort();
         const mode = (value as WhereOperator).mode;
         const modeStr = mode === 'insensitive' ? ':i' : '';
         parts.push(`${key}:op(${opKeys.join(',')}${modeStr})`);
@@ -2301,7 +2315,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Fingerprint a relation filter sub-where for some/every/none.
    */
   private fingerprintRelFilter(targetTable: string, subWhere: Record<string, unknown>): string {
-    const keys = Object.keys(subWhere).filter((k) => subWhere[k] !== undefined).sort();
+    const keys = Object.keys(subWhere)
+      .filter((k) => subWhere[k] !== undefined)
+      .sort();
     if (keys.length === 0) return '';
     const parts: string[] = [];
     for (const key of keys) {
@@ -2310,7 +2326,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (value === null) {
         parts.push(`${key}:null`);
       } else if (isWhereOperator(value)) {
-        const opKeys = Object.keys(value as object).filter((k) => k !== 'mode').sort();
+        const opKeys = Object.keys(value as object)
+          .filter((k) => k !== 'mode')
+          .sort();
         const mode = (value as WhereOperator).mode;
         const modeStr = mode === 'insensitive' ? ':i' : '';
         parts.push(`${key}:op(${opKeys.join(',')}${modeStr})`);
@@ -2364,9 +2382,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (relationDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
         const filterObj = value as Record<string, unknown>;
         if ('some' in filterObj || 'every' in filterObj || 'none' in filterObj) {
-          if (filterObj.some !== undefined) this.collectRelFilterParams(relationDef.to, filterObj.some as Record<string, unknown>, params);
-          if (filterObj.none !== undefined) this.collectRelFilterParams(relationDef.to, filterObj.none as Record<string, unknown>, params);
-          if (filterObj.every !== undefined) this.collectRelFilterParams(relationDef.to, filterObj.every as Record<string, unknown>, params);
+          if (filterObj.some !== undefined)
+            this.collectRelFilterParams(relationDef.to, filterObj.some as Record<string, unknown>, params);
+          if (filterObj.none !== undefined)
+            this.collectRelFilterParams(relationDef.to, filterObj.none as Record<string, unknown>, params);
+          if (filterObj.every !== undefined)
+            this.collectRelFilterParams(relationDef.to, filterObj.every as Record<string, unknown>, params);
           continue;
         }
       }
@@ -2489,18 +2510,26 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // select/omit shape
       if (opts.select) {
-        const selKeys = Object.entries(opts.select).filter(([, v]) => v).map(([k]) => k).sort();
+        const selKeys = Object.entries(opts.select)
+          .filter(([, v]) => v)
+          .map(([k]) => k)
+          .sort();
         subParts.push(`sl=${selKeys.join(',')}`);
       }
       if (opts.omit) {
-        const omKeys = Object.entries(opts.omit).filter(([, v]) => v).map(([k]) => k).sort();
+        const omKeys = Object.entries(opts.omit)
+          .filter(([, v]) => v)
+          .map(([k]) => k)
+          .sort();
         subParts.push(`om=${omKeys.join(',')}`);
       }
 
       // where shape (value-invariant)
       if (opts.where) {
         // Use a target-table QI if possible, or a simplified fingerprint
-        const wKeys = Object.keys(opts.where).filter((k) => opts.where![k] !== undefined).sort();
+        const wKeys = Object.keys(opts.where)
+          .filter((k) => opts.where![k] !== undefined)
+          .sort();
         subParts.push(`w=${wKeys.join(',')}`);
       }
 
@@ -2531,11 +2560,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Collect params from a `with` clause tree. Mirrors buildSelectWithRelations +
    * buildRelationSubquery param-push order.
    */
-  private collectWithParams(
-    withClause: WithClause,
-    params: unknown[],
-    table?: string,
-  ): void {
+  private collectWithParams(withClause: WithClause, params: unknown[], table?: string): void {
     const meta = this.schema.tables[table ?? this.table];
     if (!meta) return;
 
@@ -3049,9 +3074,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       } else if (Array.isArray(rawValue)) {
         parsed[relName] = rawValue.map((item) =>
-          typeof item === 'object' && item !== null
-            ? this.parseRow(item as Record<string, unknown>, relDef.to)
-            : item,
+          typeof item === 'object' && item !== null ? this.parseRow(item as Record<string, unknown>, relDef.to) : item,
         );
       } else if (typeof rawValue === 'object' && rawValue !== null) {
         parsed[relName] = this.parseRow(rawValue as Record<string, unknown>, relDef.to);

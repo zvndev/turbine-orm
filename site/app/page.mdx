@@ -1,0 +1,74 @@
+export const metadata = {
+  title: 'Turbine ORM — Postgres-native TypeScript ORM',
+  description:
+    'Postgres-native TypeScript ORM. Single-query nested relations via json_agg. One runtime dependency.',
+};
+
+# Turbine ORM
+
+Postgres-native TypeScript ORM. Single-query nested relations via `json_agg`. One runtime dependency.
+
+<div className="install-block">
+  <span style={{ color: 'var(--green)', userSelect: 'none' }}>$</span>
+  <span style={{ color: '#fff' }}>npm install turbine-orm</span>
+</div>
+
+Turbine resolves an entire object graph in one database round-trip, no matter how deep the nesting. The `with` clause is fully type-inferred end-to-end — `users[0].posts[0].comments[0].author.name` autocompletes from a single `findMany` call with no manual assertions. One runtime dependency (`pg`), ~110 KB on npm, and a one-import swap for edge runtimes.
+
+<div className="card-grid">
+  <div className="card">
+    <h4>Single-query nested reads</h4>
+    <p>Deep `with` clauses compile to one SQL statement using `json_agg` and correlated subqueries. No N+1, no client-side stitching.</p>
+  </div>
+  <div className="card">
+    <h4>Streaming cursors</h4>
+    <p>`findManyStream` uses `DECLARE CURSOR` for constant-memory drains with a speculative first fetch for small results. Nested `with` works inside the stream.</p>
+  </div>
+  <div className="card">
+    <h4>Edge runtime support</h4>
+    <p>One import swap — `turbineHttp(pool, schema)` — and the same API runs on Neon HTTP, Vercel Postgres, Cloudflare Hyperdrive, and Supabase.</p>
+  </div>
+  <div className="card">
+    <h4>Typed Postgres errors</h4>
+    <p>`UniqueConstraintError`, `ForeignKeyError`, `SerializationFailureError` with `readonly isRetryable` — so your retry loop type-checks.</p>
+  </div>
+</div>
+
+## A minimal example
+
+```ts
+import { turbine } from './generated/turbine';
+
+const db = turbine({ connectionString: process.env.DATABASE_URL });
+
+// Single query — users, their posts, and each post's comments
+const users = await db.users.findMany({
+  where: { orgId: 1 },
+  with: {
+    posts: {
+      with: { comments: true },
+      orderBy: { createdAt: 'desc' },
+      limit: 5,
+    },
+  },
+});
+
+// users[0].posts[0].comments — fully typed, one round-trip
+```
+
+## Why Turbine
+
+Prisma 7+ and Drizzle v2 also do single-query nested loads — the N+1 framing is dead. Turbine's value is architectural simplicity combined with measurable performance on the scenarios that matter.
+
+- **One runtime dependency** (`pg`). No Rust binary, no WASM blob, no separate query engine process. ~110 KB on npm.
+- **Deep `with` inference.** Types narrow through arbitrarily nested relations without manual assertions or generated include helpers.
+- **Real pipeline protocol.** `db.pipeline([...])` uses Postgres extended-query parse/bind/execute/sync in a single TCP flush — verified 2.58× speedup over sequential on Neon.
+- **Edge-ready.** `turbine-orm/serverless` accepts any pg-compatible pool and runs on Vercel Edge, Cloudflare Workers, Deno Deploy.
+- **Honest benchmarks.** Tested against Prisma 7.6 and Drizzle 0.45 on a real pooled Neon database. Wins L2 nested reads by 1.59× over Drizzle, matches Prisma on streaming, beats Drizzle by 1.49×. See [Benchmarks](/benchmarks).
+
+## Next steps
+
+- **[Quick Start](/quickstart)** — install, connect, and run your first typed query.
+- **[API Reference](/queries)** — `findMany`, `where` operators, nested `with`, transactions, pipeline, middleware.
+- **[Schema & Migrations](/schema)** — code-first schemas, DDL generation, SQL migrations.
+- **[Benchmarks](/benchmarks)** — the post-optimization Neon results with p50/p95/p99.

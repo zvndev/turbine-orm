@@ -8,3 +8,4 @@ generated/
 coverage/
 turbine.config.ts
 *.tgz
+.vercel

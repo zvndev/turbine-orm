@@ -1,0 +1,192 @@
+export const metadata = {
+  title: 'Typed Errors',
+  description:
+    'Every Turbine ORM error class, error code, and retry pattern. Typed Postgres constraint violations and retryable transactions.',
+};
+
+# Typed Errors
+
+Turbine throws typed errors you can catch with `instanceof`. Every error extends `TurbineError` and carries a stable `readonly code` field you can use for programmatic handling. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes automatically via `wrapPgError()`.
+
+## Error code table
+
+| Code | Class | When thrown |
+|---|---|---|
+| `TURBINE_E001` | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, update/delete against a non-matching row |
+| `TURBINE_E002` | `TimeoutError` | Query or transaction exceeds its configured timeout |
+| `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete |
+| `TURBINE_E004` | `ConnectionError` | Pool connection failure |
+| `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
+| `TURBINE_E006` | `MigrationError` | Migration file parse error, checksum mismatch, apply failure |
+| `TURBINE_E007` | `CircularRelationError` | Relation nesting depth exceeds 10 |
+| `TURBINE_E008` | `UniqueConstraintError` | pg 23505 — translated via `wrapPgError()` |
+| `TURBINE_E009` | `ForeignKeyError` | pg 23503 — translated via `wrapPgError()` |
+| `TURBINE_E010` | `NotNullViolationError` | pg 23502 — translated via `wrapPgError()` |
+| `TURBINE_E011` | `CheckConstraintError` | pg 23514 — translated via `wrapPgError()` |
+| `TURBINE_E012` | `DeadlockError` | pg 40P01 — **retryable**, exposes `isRetryable: true` |
+| `TURBINE_E013` | `SerializationFailureError` | pg 40001 — **retryable**, exposes `isRetryable: true` |
+| `TURBINE_E014` | `PipelineError` | Non-transactional pipeline has partial failures |
+
+## Catching typed errors
+
+Import the classes from the package root and narrow with `instanceof`.
+
+```ts
+import {
+  NotFoundError,
+  ValidationError,
+  TimeoutError,
+  UniqueConstraintError,
+} from 'turbine-orm';
+
+try {
+  const user = await db.users.findUniqueOrThrow({ where: { id: 999 } });
+} catch (err) {
+  if (err instanceof NotFoundError) {
+    // err.code === 'TURBINE_E001'
+    // err.table, err.where, and err.operation are all populated
+    return { status: 404 };
+  }
+  if (err instanceof ValidationError) {
+    // err.code === 'TURBINE_E003'
+    return { status: 400, message: err.message };
+  }
+  if (err instanceof TimeoutError) {
+    // err.code === 'TURBINE_E002'
+    // err.timeoutMs is the configured limit
+    return { status: 504 };
+  }
+  throw err;
+}
+```
+
+## `wrapPgError` translation
+
+Every query execution runs its pg error through `wrapPgError()`. The original driver error is preserved as `.cause` on the wrapped error.
+
+| pg SQLSTATE | Name | Turbine class |
+|---|---|---|
+| `23505` | unique_violation | `UniqueConstraintError` |
+| `23503` | foreign_key_violation | `ForeignKeyError` |
+| `23502` | not_null_violation | `NotNullViolationError` |
+| `23514` | check_violation | `CheckConstraintError` |
+| `40P01` | deadlock_detected | `DeadlockError` (retryable) |
+| `40001` | serialization_failure | `SerializationFailureError` (retryable) |
+
+Other pg errors pass through unchanged.
+
+```ts
+import { UniqueConstraintError } from 'turbine-orm';
+
+try {
+  await db.users.create({ data: { email: 'taken@example.com', ... } });
+} catch (err) {
+  if (err instanceof UniqueConstraintError) {
+    // err.constraint — e.g. 'users_email_key'
+    // err.columns   — e.g. ['email']
+    // err.table     — e.g. 'users'
+    // err.cause     — the original pg error
+    return { status: 409, message: 'Email already in use' };
+  }
+  throw err;
+}
+```
+
+## Retryable errors
+
+`DeadlockError` and `SerializationFailureError` expose a `readonly isRetryable = true as const` field. This isn't just a comment — it's a type-level signal so your retry loop narrows correctly.
+
+```ts
+import {
+  DeadlockError,
+  SerializationFailureError,
+} from 'turbine-orm';
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxAttempts = 3,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (
+        (err instanceof DeadlockError && err.isRetryable) ||
+        (err instanceof SerializationFailureError && err.isRetryable)
+      ) {
+        // Exponential backoff with jitter
+        const backoff = 2 ** attempt * 50 + Math.random() * 25;
+        await new Promise((r) => setTimeout(r, backoff));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
+// Use it on a serializable transaction:
+await withRetry(() =>
+  db.$transaction(
+    async (tx) => {
+      const row = await tx.counters.findUniqueOrThrow({ where: { id: 1 } });
+      await tx.counters.update({
+        where: { id: 1 },
+        data: { value: row.value + 1 },
+      });
+    },
+    { isolationLevel: 'Serializable' },
+  ),
+);
+```
+
+Neither Prisma nor Drizzle surfaces a comparable typed retry signal — Prisma uses the stringly-typed `code: 'P2034'` on a generic `PrismaClientKnownRequestError`, and Drizzle bubbles up raw pg errors for you to grep SQL states from.
+
+## Pipeline errors
+
+`PipelineError` is only thrown when a pipeline runs in non-transactional mode (`{ transactional: false }`) and one or more queries fail. It carries a per-query result array so you can inspect exactly which succeeded and which failed.
+
+```ts
+import { PipelineError } from 'turbine-orm';
+
+try {
+  await db.pipeline(queries, { transactional: false });
+} catch (err) {
+  if (err instanceof PipelineError) {
+    // err.results: ({status:'ok', value} | {status:'error', error})[]
+    // err.failedIndex: zero-based index of the first failed query
+    // err.failedTag: DeferredQuery.tag of the first failure
+    for (const [i, slot] of err.results.entries()) {
+      if (slot.status === 'error') {
+        console.error(`Query ${i} failed:`, slot.error);
+      }
+    }
+  }
+}
+```
+
+Transactional pipelines (the default) either fully succeed or roll back — a failure surfaces as whichever typed error the failing query raised.
+
+## Safe error messages
+
+By default, `NotFoundError` messages include only the **keys** of the `where` clause — values are redacted so PII doesn't leak into logs (Sentry, Datadog, and friends).
+
+```
+[turbine] findUniqueOrThrow on "users" found no record matching where: { id, email }
+```
+
+The full `where` object is always available as `err.where` for programmatic access — only the human-readable message is redacted. Opt into verbose messages (useful in local development) by setting `errorMessages: 'verbose'` in your `TurbineConfig`, or by calling `setErrorMessageMode('verbose')` at startup.
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  errorMessages: process.env.NODE_ENV === 'development' ? 'verbose' : 'safe',
+});
+```
+
+## See also
+
+- **[API Reference](/queries)** — transactions, pipelines, and the queries that raise these errors.
+- **[Schema & Migrations](/schema)** — `MigrationError` fires here.

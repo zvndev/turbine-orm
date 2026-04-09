@@ -72,6 +72,15 @@ src/
   cli/              — CLI entry point and commands (see CLI Architecture below).
 ```
 
+## Site at site/
+
+This repo ships the library **and** its marketing/docs site. The site lives at `site/` (a standalone Next.js 15 App Router project with its own `package.json` and `node_modules`) and deploys to `turbineorm.dev` via the Vercel project `zvn-dev/turbine-docs`.
+
+- Library work stays in `src/`. Site work stays in `site/`. Don't cross the streams.
+- Every release updates **both** surfaces in a single commit: library + `site/` + `CHANGELOG.md` + version bump, then `npm publish` + `vercel --prod`.
+- Root-level helpers: `npm run site:dev`, `npm run site:build`, `npm run site:deploy`.
+- See `AGENTS.md` at the repo root for the full release playbook, the npm publish auth notes (granular token with bypass-2FA), and the verification checklist. Don't duplicate that content here — AGENTS.md is the source of truth.
+
 ## The json_agg Algorithm
 
 The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (query.ts ~line 2173). For each relation in a `with` clause, it generates a correlated subquery that PostgreSQL evaluates per parent row.

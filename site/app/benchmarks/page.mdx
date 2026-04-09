@@ -1,0 +1,129 @@
+export const metadata = {
+  title: 'Benchmarks',
+  description:
+    'Turbine ORM vs Prisma 7 vs Drizzle v2 on a real pooled Neon database. Honest numbers.',
+};
+
+# Benchmarks
+
+Three-way head-to-head against **Prisma 7.6** (`@prisma/adapter-pg`, `relationJoins` preview on) and **Drizzle 0.45** (node-postgres relational API) on a **Neon** PostgreSQL database (pooled endpoint, US-East-1, PostgreSQL 17.8). 100 iterations + 20 warmup per scenario, same schema, same data, same connection pool config.
+
+> **TL;DR.** After the 0.8.0 optimization work (SQL template caching, prepared statements, streaming speculative first fetch), Turbine wins or ties 6 of 8 single-query scenarios. Standout wins: **L2 nested reads 1.59× faster than Drizzle**, **streaming at parity with Prisma** and 1.49× faster than Drizzle. Most sub-60ms deltas sit inside the ~33–40ms network noise floor — but the L2 and streaming gaps are consistent across runs.
+
+## Setup
+
+- **Database.** Neon (PostgreSQL 17.8), pooled endpoint, US-East-1.
+- **Client.** MacBook (Node v22.13.1), US-East.
+- **Schema.** organizations / users / posts / comments.
+- **Data.** 5 orgs, 1,000 users, 10,000 posts, 50,000 comments — deterministic, identical for every ORM.
+- **Runs.** 100 iterations + 20 warmup per scenario (streaming: 3 runs + 1 warmup — each run drains 50K rows).
+- **Pool.** Plain `pg.Pool` size 10 for Prisma adapter-pg and Drizzle. Turbine uses its internal pool at default size.
+- **Network.** Every query round-trips US-East client → Neon pooler → US-East database over TLS. ~33–40 ms floor.
+
+## Raw results — April 9, 2026 (post-optimization)
+
+Average wall-clock ms per operation (lower is better). Bold = fastest.
+
+| Scenario | Turbine | Prisma 7 | Drizzle v2 |
+|---|---|---|---|
+| findMany — 100 users (flat) | **51.97 ms** | 52.90 ms | 53.51 ms |
+| findMany — 50 users + posts (L2) | **55.84 ms** | 56.10 ms | 88.80 ms |
+| findMany — 10 users → posts → comments (L3) | 52.77 ms | 59.35 ms | **52.38 ms** |
+| findUnique — single user by PK | **47.66 ms** | 52.15 ms | 47.78 ms |
+| findUnique — user + posts + comments (L3) | **51.71 ms** | 54.42 ms | 52.47 ms |
+| count — all users | **44.57 ms** | 47.54 ms | 46.75 ms |
+| stream — iterate 50K comments (batch 1000) | 3,207 ms | **3,099 ms** | 4,620 ms |
+| atomic increment — `view_count + 1` | 49.76 ms | 49.09 ms | **46.25 ms** |
+| pipeline — 5-query dashboard batch | 318 ms | 327 ms | **316 ms** |
+| hot findUnique — 500× same shape | 49.85 ms | 50.84 ms | **47.69 ms** |
+
+## Ratio vs fastest
+
+`1.00x` = fastest on that scenario. Higher = slower.
+
+| Scenario | Turbine | Prisma 7 | Drizzle v2 |
+|---|---|---|---|
+| findMany — flat | **1.00x** | 1.02x | 1.03x |
+| findMany — L2 | **1.00x** | 1.00x | 1.59x |
+| findMany — L3 | 1.01x | 1.13x | **1.00x** |
+| findUnique — PK | **1.00x** | 1.09x | 1.00x |
+| findUnique — L3 | **1.00x** | 1.05x | 1.01x |
+| count | **1.00x** | 1.07x | 1.05x |
+| stream — 50K | 1.03x | **1.00x** | 1.49x |
+| atomic increment | 1.08x | 1.06x | **1.00x** |
+| pipeline | 1.01x | 1.03x | **1.00x** |
+| hot findUnique | 1.05x | 1.07x | **1.00x** |
+
+## What changed in 0.8.0
+
+Three optimizations flipped the picture from the April 8 baseline (where Turbine lost or tied most scenarios):
+
+1. **SQL template caching.** Shape-keyed fingerprinting (WHERE structure + WITH + ORDER BY) caches the generated SQL string. Repeat queries with different parameter values skip SQL generation entirely. FNV-1a 64-bit hashing generates deterministic prepared statement names. LRU cache at 1,000 entries.
+2. **Prepared statements.** When `preparedStatements: true` (default for owned pools), queries use pg's `{ name, text, values }` object form. Postgres caches the execution plan after the first call, saving parse + plan time on hot paths. Automatically disabled for external pools (serverless drivers).
+3. **Streaming speculative first fetch.** `findManyStream` issues a `LIMIT batchSize + 1` first query. If the result fits in one batch, rows yield directly without `DECLARE CURSOR` overhead. Only large result sets escalate to server-side cursors. Default `batchSize` raised from 100 to 1000 — cuts FETCH round-trips from 500 to 50 on a 50K-row drain.
+
+## What the numbers actually mean
+
+### 1. Everything below ~60 ms is network, not the ORM
+
+The fastest single SELECT we measured — `findUnique` by primary key — averaged 47 ms, with p50 ~34 ms and p95 ~112 ms. That 34 ms floor is **two TLS round-trips to Neon**: the pooled connection hands off the SELECT and blocks on the reply. Nothing an ORM does at the JavaScript layer can shave more than a millisecond or two off that, and measurement noise between runs is ~±3 ms.
+
+**Conclusion.** Stop comparing ORMs on "simple query latency over a real pooled database." The signal is too small and the noise is too large.
+
+### 2. The L2 nested gap is real
+
+All three ORMs now compile nested reads to a single SQL statement (Prisma with `relationJoins`, Drizzle's relational API, Turbine's `json_agg`). The N+1 framing is dead — but the **L2 benchmark (50 users + their posts)** tells a different story: Turbine and Prisma land at ~56 ms, while **Drizzle is 1.59× slower at 89 ms**. This isn't noise; it's consistent across runs. Drizzle's relational API appears to generate less efficient SQL for this case, or its result parsing is heavier.
+
+On L3 (10 users → posts → comments), Turbine and Drizzle are tied while Prisma is 1.13× slower.
+
+### 3. Streaming is now at parity — and Drizzle is the slow one
+
+Post-optimization results for draining all 50,000 rows:
+
+- **Turbine — 3,207 ms.** Speculative first fetch + batchSize 1000.
+- **Prisma — 3,099 ms.** Keyset pagination loop.
+- **Drizzle — 4,620 ms.** Keyset pagination loop. **1.49× slower.**
+
+Turbine's cursor still has real advantages over keyset pagination:
+
+1. **Correctness without a monotonic key.** Keyset requires `orderBy` on a unique column. Cursors work with any `orderBy`.
+2. **Clean early break.** `for await ... break` closes server-side state and releases the connection deterministically.
+3. **Nested `with` inside the stream.** Cursor batches support full `with` clause resolution per batch.
+
+### 4. Atomic increment is a three-way tie
+
+All three ORMs support atomic `col = col + 1` updates without dropping to raw SQL:
+
+- **Turbine** — `{ viewCount: { increment: 1 } }`
+- **Prisma** — the identical syntax
+- **Drizzle** — a tagged `sql` template around the column expression (which gives up type inference on the column)
+
+Timings are within one standard deviation of each other.
+
+What's actually different about Turbine here isn't speed — it's the **typed retry loop**. See [Typed Errors](/errors) for `SerializationFailureError.isRetryable` and `DeadlockError.isRetryable`.
+
+## Caveats
+
+- **All measurements are wall-clock from the client.** They include network + Neon query + response serialization. Per-query CPU profiling would tell a different (and probably more favorable) story for Turbine on raw CPU.
+- **Single region.** Client and database both in US-East. A cross-region run would drown any per-query difference in a higher latency floor.
+- **Prisma 7's `relationJoins` is a preview feature.** Without it, Prisma falls back to N+1 and Turbine would win by 3–5× on the L3 scenario.
+- **We did not test connection pool starvation, long transactions, or write-heavy workloads.** Those are different benchmarks.
+- **The streaming scenario drains the full table.** A scenario that breaks out after the first match would show cursor advantages that a single-number benchmark can't capture.
+
+## Reproduce
+
+Raw data and the full p50 / p95 / p99 tables are committed to the repo:
+
+- **[`benchmarks/RESULTS.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS.md)** — the canonical writeup, updated per release.
+- **[`benchmarks/bench.ts`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/bench.ts)** — the harness.
+
+Run it yourself:
+
+```bash
+cd benchmarks
+npm install
+npx prisma generate
+DATABASE_URL=postgres://... npx tsx bench.ts
+```
+
+Any Postgres endpoint works — Neon, Vercel Postgres, Supabase, local.

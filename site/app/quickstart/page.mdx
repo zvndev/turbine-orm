@@ -1,0 +1,115 @@
+export const metadata = {
+  title: 'Quick Start',
+  description: 'Go from zero to your first typed Turbine ORM query in under 5 minutes.',
+};
+
+# Quick Start
+
+Install Turbine, point it at your database, generate a typed client, and run your first query.
+
+## Requirements
+
+- Node.js 18 or newer
+- PostgreSQL 14 or newer (Neon, Vercel Postgres, Supabase, or local all work)
+
+## 1. Install
+
+```bash
+npm install turbine-orm
+```
+
+Turbine has exactly one runtime dependency (`pg`). ESM and CommonJS both work.
+
+## 2. Set `DATABASE_URL`
+
+Set the standard Postgres connection string in your environment. For local development, use a `.env` file:
+
+```bash
+# .env
+DATABASE_URL=postgres://user:pass@localhost:5432/mydb
+```
+
+## 3. Initialize the project
+
+```bash
+npx turbine init
+```
+
+This creates `turbine.config.ts` at the project root and a `turbine/` directory for your schema and migrations. The config file looks like this:
+
+```ts
+// turbine.config.ts
+import type { TurbineCliConfig } from 'turbine-orm/cli';
+
+const config: TurbineCliConfig = {
+  url: process.env.DATABASE_URL,
+  out: './generated/turbine',
+  schema: 'public',
+  migrationsDir: './turbine/migrations',
+  schemaFile: './turbine/schema.ts',
+};
+
+export default config;
+```
+
+## 4. Generate the typed client
+
+If you already have tables in your database, introspect them and emit a fully-typed client:
+
+```bash
+npx turbine pull
+# or: npx turbine generate
+```
+
+Turbine reads `information_schema` + `pg_catalog`, discovers your tables, columns, relations, and indexes, then writes three files to `./generated/turbine/`:
+
+- `types.ts` — entity interfaces and `Create` / `Update` input types
+- `metadata.ts` — runtime schema metadata
+- `index.ts` — a typed `TurbineClient` subclass with table accessors
+
+## 5. Your first query
+
+```ts
+import { turbine } from './generated/turbine';
+
+const db = turbine({ connectionString: process.env.DATABASE_URL });
+
+const users = await db.users.findMany({
+  where: { role: 'admin' },
+  orderBy: { createdAt: 'desc' },
+  limit: 10,
+});
+
+console.log(users);
+
+await db.disconnect();
+```
+
+`db.users` is typed — autocompletion surfaces every column, every operator, every relation. `users[0].createdAt` is a `Date`, `users[0].email` is a `string`, everything is inferred from the generated types.
+
+## 6. Add nested relations
+
+```ts
+const usersWithPosts = await db.users.findMany({
+  where: { orgId: 1 },
+  with: {
+    posts: {
+      with: { comments: true },
+      orderBy: { createdAt: 'desc' },
+      limit: 5,
+    },
+  },
+});
+
+// Single SQL statement, one round-trip, fully typed:
+usersWithPosts[0].posts[0].comments[0].author;
+```
+
+Turbine compiles the `with` clause to a single SQL statement using PostgreSQL's `json_agg` and correlated subqueries. No client-side stitching, no N+1, no extra round-trips.
+
+## Next steps
+
+- **[API Reference](/queries)** — every query method, WHERE operator, and nested `with` option.
+- **[Schema & Migrations](/schema)** — define your schema in TypeScript and ship migrations.
+- **[CLI](/cli)** — every command with examples.
+- **[Benchmarks](/benchmarks)** — honest numbers against Prisma 7 and Drizzle v2 on Neon.
