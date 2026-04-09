@@ -1,0 +1,23 @@
+{
+  "name": "turbine-thread-machine-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx index.ts",
+    "db:push": "npx turbine push --schema ./schema.ts",
+    "db:seed": "npx tsx seed.ts",
+    "db:generate": "npx turbine generate",
+    "setup": "npm run db:push && npm run db:seed && npm run db:generate"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "turbine-orm": "^0.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

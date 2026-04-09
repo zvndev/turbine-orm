@@ -576,6 +576,14 @@ Turbine is focused and opinionated. Here's what it doesn't do:
 
 ## Examples
 
+**Feature demos**
+
+- **[Thread Machine](./examples/thread-machine/)** — HN clone rendered from a single `findMany`. 4-level object graph (stories → comments → replies → author), every property autocompletes through the chain
+- **[Streaming CSV](./examples/streaming-csv/)** — Export 100K orders + line items to CSV with constant memory. PostgreSQL cursors, live heap meter, nested `with` inside `findManyStream`
+- **[Clickstorm](./examples/clickstorm/)** — Side-by-side atomic-increment vs read-modify-write load test. 10K concurrent clicks. The atomic path wins every time
+
+**Runtime targets**
+
 - **[Next.js](./examples/nextjs/)** — Server-rendered app with nested relations, streaming, and live code demos
 - **[Neon Edge](./examples/neon-edge/)** — Vercel Edge route handler talking to Neon over HTTP via `@neondatabase/serverless`
 - **[Vercel Postgres](./examples/vercel-postgres/)** — Next.js app router route handler on `@vercel/postgres`
