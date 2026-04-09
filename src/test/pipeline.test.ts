@@ -3,11 +3,13 @@
  *
  * Verifies `executePipeline` against a mock pg-compat pool:
  *   - acquires a single connection
- *   - wraps the batch in BEGIN/COMMIT
+ *   - wraps the batch in BEGIN/COMMIT (sequential fallback path)
  *   - executes queries in order
  *   - runs each query's `transform`
  *   - ROLLBACK on error
  *   - empty array short-circuits
+ *   - non-transactional sequential mode (no BEGIN/COMMIT)
+ *   - capability detection routing
  */
 
 import assert from 'node:assert/strict';
@@ -180,5 +182,66 @@ describe('executePipeline', () => {
     );
 
     assert.deepEqual(seen, [[42], ['a', 'b']]);
+  });
+
+  it('non-transactional mode skips BEGIN/COMMIT in sequential fallback', async () => {
+    const { pool, calls, released } = createMockPool((sql) => {
+      if (sql.startsWith('SELECT 1')) return { rows: [{ n: 1 }] };
+      if (sql.startsWith('SELECT 2')) return { rows: [{ n: 2 }] };
+      return { rows: [] };
+    });
+
+    const results = await executePipeline(
+      // biome-ignore lint/suspicious/noExplicitAny: mock pool shape
+      pool as any,
+      [
+        defer('SELECT 1 AS n', [], (r) => (r.rows[0] as { n: number }).n),
+        defer('SELECT 2 AS n', [], (r) => (r.rows[0] as { n: number }).n),
+      ],
+      { transactional: false },
+    );
+
+    assert.deepEqual(results, [1, 2]);
+
+    // No BEGIN/COMMIT in calls
+    const texts = calls.map((c) => c.text);
+    assert.ok(!texts.includes('BEGIN'), 'no BEGIN in non-transactional mode');
+    assert.ok(!texts.includes('COMMIT'), 'no COMMIT in non-transactional mode');
+    assert.ok(!texts.includes('ROLLBACK'), 'no ROLLBACK in non-transactional mode');
+    assert.equal(released.value, 1, 'connection released exactly once');
+  });
+
+  it('non-transactional mode does not ROLLBACK on error', async () => {
+    const calls: string[] = [];
+    const released = { value: 0 };
+    const pool = {
+      async connect() {
+        return {
+          async query(text: string) {
+            calls.push(text);
+            if (text.includes('BOOM')) throw new Error('explode');
+            return { rows: [], rowCount: 0 };
+          },
+          release() {
+            released.value += 1;
+          },
+        };
+      },
+    };
+
+    await assert.rejects(
+      () =>
+        executePipeline(
+          // biome-ignore lint/suspicious/noExplicitAny: mock pool shape
+          pool as any,
+          [defer('SELECT BOOM', [], (r) => r.rows)],
+          { transactional: false },
+        ),
+      /explode/,
+    );
+
+    assert.ok(!calls.includes('BEGIN'), 'no BEGIN');
+    assert.ok(!calls.includes('ROLLBACK'), 'no ROLLBACK in non-transactional mode');
+    assert.equal(released.value, 1, 'connection released');
   });
 });

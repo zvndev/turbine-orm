@@ -58,6 +58,8 @@ export {
   MigrationError,
   NotFoundError,
   NotNullViolationError,
+  PipelineError,
+  type PipelineResultSlot,
   RelationError,
   SerializationFailureError,
   setErrorMessageMode,
@@ -73,7 +75,7 @@ export { type GenerateOptions, generate } from './generate.js';
 // Introspection
 export { type IntrospectOptions, introspect } from './introspect.js';
 // Pipeline
-export { executePipeline, type PipelineResults } from './pipeline.js';
+export { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 // Query builder
 export {
   type AggregateArgs,
