@@ -20,10 +20,18 @@
 - **Message:** "Drop-in Prisma-like API. Deep autocomplete chain. Runs on Cloudflare without an adapter package."
 - **Where to reach them:** r/nextjs, r/typescript, Vercel Discord, Next.js Discord
 
-### 2. Performance-conscious Node.js developers
-- **Who:** Backend engineers building REST/tRPC APIs with deeply nested JSON responses
-- **Pain:** N+1 queries are the #1 ORM performance problem; existing fixes either re-shape the API or re-declare relations
-- **Message:** "One round-trip for the whole graph. Streaming cursors when the graph is too big to materialize."
+### 2. Backend engineers building REST/tRPC APIs with nested JSON responses
+- **Who:** Backend engineers shipping APIs whose responses nest 2–4 levels deep
+- **Pain:** They want the whole object graph in one call, fully typed, without
+  writing `Prisma.UserGetPayload<{ include: ... }>` helpers or re-declaring
+  relations in a second file (Drizzle)
+- **Message:** "One `findMany`, deep type inference through `with`. The whole
+  graph is typed end-to-end — `users[0].posts[0].comments[0].author.name`
+  autocompletes from the call site."
+- **Not the message:** "We're faster than Prisma/Drizzle at nested reads." All
+  three ORMs use single-query nested loads as of Prisma 7 (with `relationJoins`)
+  and Drizzle's relational API, and on a real pooled database the latency is
+  dominated by the network, not the ORM. See `benchmarks/RESULTS.md`.
 - **Where to reach them:** r/node, HN Show HN, Dev.to, Hashnode
 
 ### 3. Drizzle/Kysely evaluators
@@ -164,8 +172,9 @@ Before any public promotion, complete these:
 
 ## What NOT to Do
 
-- Don't claim "10x faster" — honest numbers are compelling enough
+- **Don't claim Turbine is faster than Prisma or Drizzle on production queries.** The Neon benchmark run in `benchmarks/RESULTS.md` shows all three ORMs land inside the same ~5 ms window for every read scenario — network latency to a real pooled database swamps whatever per-query overhead any of them adds. Old "Turbine is 1.8× faster at L3" numbers were from a local Unix socket run and don't generalize. Speed is not the pitch.
 - **Don't pitch "look at the SQL we generate"** — it's boring, obvious, and doesn't sell. The wow is the autocomplete chain and the runtime portability, not the query string.
+- **Don't pitch streaming cursors on speed.** The benchmark shows Turbine's `findManyStream` is ~1.5× *slower* than keyset pagination for drain-all. The pitch for cursors is correctness (works with any `orderBy`, not just unique monotonic columns), deterministic cleanup on early `break`, and nested `with` inside the stream — not throughput.
 - Don't bash Prisma — respect it, differentiate from it
 - Don't launch on Product Hunt yet — save for v1.0
 - Don't spam — quality posts in 3-4 communities beats 20 low-effort ones

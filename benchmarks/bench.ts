@@ -24,7 +24,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 
 // ─── Drizzle ────────────────────────────────────────────────
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { eq, count as drizzleCount } from 'drizzle-orm';
+import { eq, count as drizzleCount, gt, asc, sql } from 'drizzle-orm';
 import * as schema from './schema.js';
 
 // ─── Config ─────────────────────────────────────────────────
@@ -274,6 +274,130 @@ async function main() {
       ),
     ];
     printScenario('count — all users', results);
+  }
+
+  // ── Scenario 7: streaming 50K rows ───────────────────────
+  //
+  // Iterate every row in the comments table (50K rows, ~4 MB raw text).
+  // Turbine uses its native server-side cursor (`findManyStream` →
+  // DECLARE CURSOR + FETCH). Prisma and Drizzle have no native stream,
+  // so the closest fair comparison is keyset pagination in a loop.
+  //
+  // Measured: wall-clock ms to drain the entire set. Not iterated via
+  // `measure()` because the work per call is ~1 second — we do 3 runs
+  // and take the median.
+
+  {
+    const BATCH = 1000;
+
+    async function turbineStream(): Promise<number> {
+      let n = 0;
+      for await (const _c of turbine.comments.findManyStream({ batchSize: BATCH })) {
+        n++;
+      }
+      return n;
+    }
+
+    async function prismaStream(): Promise<number> {
+      let n = 0;
+      let cursor: { id: bigint } | undefined;
+      while (true) {
+        const batch = await prisma.comment.findMany({
+          take: BATCH,
+          ...(cursor ? { cursor, skip: 1 } : {}),
+          orderBy: { id: 'asc' },
+        });
+        if (batch.length === 0) break;
+        for (const _c of batch) n++;
+        if (batch.length < BATCH) break;
+        cursor = { id: batch[batch.length - 1]!.id };
+      }
+      return n;
+    }
+
+    async function drizzleStream(): Promise<number> {
+      let n = 0;
+      let lastId = 0;
+      while (true) {
+        const batch = await drizzleDb
+          .select()
+          .from(schema.comments)
+          .where(gt(schema.comments.id, lastId))
+          .orderBy(asc(schema.comments.id))
+          .limit(BATCH);
+        if (batch.length === 0) break;
+        for (const c of batch) {
+          n++;
+          lastId = c.id;
+        }
+        if (batch.length < BATCH) break;
+      }
+      return n;
+    }
+
+    async function runStreamed(name: string, fn: () => Promise<number>): Promise<BenchResult> {
+      // Warmup once so connection is hot
+      await fn();
+      const samples: number[] = [];
+      for (let i = 0; i < 3; i++) {
+        const start = performance.now();
+        const n = await fn();
+        const ms = performance.now() - start;
+        samples.push(ms);
+        if (i === 0) console.log(`  ${name}: drained ${n} rows`);
+      }
+      const sorted = [...samples].sort((a, b) => a - b);
+      const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+      return {
+        orm: name,
+        avg,
+        p50: sorted[1]!,
+        p95: sorted[2]!,
+        p99: sorted[2]!,
+        min: sorted[0]!,
+        max: sorted[2]!,
+        ops: 1000 / avg,
+      };
+    }
+
+    const results = [
+      await runStreamed('Turbine', turbineStream),
+      await runStreamed('Prisma 7', prismaStream),
+      await runStreamed('Drizzle', drizzleStream),
+    ];
+    printScenario('stream — iterate 50K comments (batch 1000)', results);
+  }
+
+  // ── Scenario 8: atomic counter ───────────────────────────
+  //
+  // Atomic `view_count + 1` on a single row. All three ORMs support this
+  // without dropping to raw SQL; the point of the scenario isn't a perf
+  // duel, it's to confirm each ORM actually issues a single UPDATE with
+  // a column-reference rather than a read-modify-write round-trip.
+
+  {
+    const TARGET_POST_ID = 1;
+    const results = [
+      await measure('Turbine', () =>
+        turbine.posts.update({
+          where: { id: TARGET_POST_ID },
+          data: { viewCount: { increment: 1 } },
+        }),
+      ),
+      await measure('Prisma 7', () =>
+        prisma.post.update({
+          where: { id: BigInt(TARGET_POST_ID) },
+          data: { viewCount: { increment: 1 } },
+        }),
+      ),
+      await measure('Drizzle', () =>
+        drizzleDb
+          .update(schema.posts)
+          .set({ viewCount: sql`${schema.posts.viewCount} + 1` })
+          .where(eq(schema.posts.id, TARGET_POST_ID)),
+      ),
+    ];
+    printScenario('atomic increment — posts.view_count + 1', results);
   }
 
   // ── Summary ──────────────────────────────────────────────

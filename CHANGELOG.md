@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+- **Benchmarks reconciled against a real pooled database.** The
+  README benchmark table and the "Turbine is fastest in every
+  scenario" framing dated from a local Postgres run; a full three-way
+  head-to-head against Prisma 7.6 (with `relationJoins`) and Drizzle
+  0.45 on Neon (US-East, pooled, PostgreSQL 17.8) shows all three
+  ORMs land within ~5 ms of each other on every read scenario because
+  network latency dominates. Turbine's `findManyStream` is actually
+  ~1.5× *slower* than keyset pagination for drain-all workloads
+  because of `BEGIN/DECLARE/CLOSE/COMMIT` overhead. README, strategic
+  plan, and the `streaming-csv` example have all been rewritten to
+  pitch Turbine on architectural merits (one dep, edge import swap,
+  typed errors, `with` inference) rather than speed. Full writeup:
+  `benchmarks/RESULTS.md`.
+- Added `benchmarks/seed-neon.ts` so the benchmark harness is fully
+  reproducible against any Postgres endpoint (Neon, Vercel, local).
+- `benchmarks/bench.ts` gained two new scenarios: streaming (drain
+  50K rows three ways) and atomic counter (`view_count + 1`).
+
 ## 0.7.1 (2026-04-07)
 
 This release is a hardening + DX pass on top of 0.7.0. CLI now reliably loads

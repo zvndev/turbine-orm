@@ -14,28 +14,28 @@ Turbine is a PostgreSQL-native TypeScript ORM with features no other ORM offers 
 
 ## Benchmarks
 
-Tested against **Prisma 7.6** (adapter-pg, relationJoins) and **Drizzle 0.45** (relational queries) on the same PostgreSQL database. 200 iterations, 20 warmup, Node v22.
+Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizzle 0.45** (relational queries) on a **Neon** PostgreSQL database (pooled endpoint, US-East, PostgreSQL 17.8). 100 iterations, 20 warmup, Node v22. Same schema, same data (1K users, 10K posts, 50K comments), same connection pool config.
 
 | Scenario | Turbine | Prisma 7 | Drizzle v2 |
 |---|---|---|---|
-| **findMany — 100 rows (flat)** | **0.39 ms** | 0.58 ms | 0.44 ms |
-| **findMany — L2 nested (users + posts)** | **1.29 ms** | 1.84 ms | 1.30 ms |
-| **findMany — L3 nested (users → posts → comments)** | **0.50 ms** | 0.91 ms | 0.69 ms |
-| **findUnique by PK** | **0.08 ms** | 0.13 ms | 0.14 ms |
-| **findUnique — L3 nested** | **0.18 ms** | 0.32 ms | 0.34 ms |
-| **count** | **0.06 ms** | 0.10 ms | 0.08 ms |
+| findMany — 100 users (flat) | 57.70 ms | 50.22 ms | **49.11 ms** |
+| findMany — 50 users + posts (L2) | 53.96 ms | 54.94 ms | **52.42 ms** |
+| findMany — 10 users → posts → comments (L3) | **52.43 ms** | 54.00 ms | 53.83 ms |
+| findUnique — single user by PK | 47.03 ms | 50.79 ms | **46.93 ms** |
+| findUnique — user + posts + comments (L3) | 60.94 ms | 54.62 ms | **52.09 ms** |
+| count — all users | 44.97 ms | 47.89 ms | **44.57 ms** |
+| atomic increment — `view_count + 1` | **49.01 ms** | 52.10 ms | 52.78 ms |
 
-| Scenario | Turbine | Prisma 7 | Drizzle v2 |
-|---|---|---|---|
-| findMany — flat | **1.00x** | 1.51x | 1.15x |
-| findMany — L2 nested | **1.00x** | 1.43x | 1.01x |
-| findMany — L3 nested | **1.00x** | 1.81x | 1.38x |
-| findUnique by PK | **1.00x** | 1.67x | 1.69x |
-| findUnique — L3 nested | **1.00x** | 1.81x | 1.93x |
-| count | **1.00x** | 1.70x | 1.38x |
+**Against a real pooled database, all three ORMs are within noise of each other.** Network round-trip to Neon is ~33–40 ms, which swamps whatever per-query CPU overhead any of the three ORMs add on the client. Any claim that one of these ORMs is "2× faster" than another on a production database is almost certainly measured on a local Unix socket where the network floor disappears — that's not what users see in deployed apps.
 
-Turbine is fastest in every scenario. The advantage is largest on deep nesting (1.8x vs Prisma, up to 1.9x vs Drizzle) and single-record lookups (1.7x). All three ORMs now use single-query approaches for nested relations — Turbine's advantage comes from lower per-query overhead (minimal JS object allocation, no query plan compilation layer, direct pg driver access).
+Two places where the benchmark does show a meaningful difference:
 
+- **Streaming 50K rows.** Turbine's `findManyStream` (server-side `DECLARE CURSOR`) is ~1.5× slower than keyset pagination with Prisma or Drizzle for a drain-all workload (~4.8 s vs ~3.2 s), because cursors pay `BEGIN + DECLARE + CLOSE + COMMIT` overhead on top of the same number of `FETCH` round-trips. Turbine's cursor is still the right tool when `orderBy` isn't on a unique column or when early `break` has to release state deterministically, but it's not faster for "give me every row in order."
+- **L3 `findUnique`** showed Turbine ~15 % slower than Drizzle in this run. Small sample, could be variance, but it's not a win.
+
+What Turbine actually gets right isn't speed. It's: **one runtime dependency** (`pg`, ~110 KB), a **single import swap** for edge runtimes (`turbine-orm/serverless`), **typed Postgres errors** with a `readonly isRetryable` const for retry loops, and **inferred `with` result types** — `users[0].posts[0].comments[0].author.name` autocompletes from a single `findMany` with no manual assertion.
+
+> Full analysis with p50/p95/p99 and methodology notes: [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench.ts`
 
 ## Quick Start
@@ -534,7 +534,7 @@ Priority order: CLI flags > environment variables (`DATABASE_URL`) > config file
 
 Turbine resolves the entire object graph in a single database round-trip, regardless of nesting depth. The `with` clause is fully type-inferred end-to-end — `users[0].posts[0].comments[0].author.name` autocompletes from a single `findMany` call, with no manual type assertions.
 
-Prisma 7+ and Drizzle v2 also do single-query nested loads. Turbine's advantage is architectural simplicity (1 runtime dependency, no DSL compiler, no driver shim) plus lower per-query overhead — see [Benchmarks](#benchmarks).
+Prisma 7+ and Drizzle v2 also do single-query nested loads. Turbine's advantage isn't query latency (see [Benchmarks](#benchmarks) — all three are within noise over a real pooled database); it's architectural simplicity. One runtime dependency (`pg`), no DSL compiler, no driver adapter shim for edge, and deep `with` type inference without verbose helper types.
 
 ## Type Mapping
 
@@ -563,7 +563,7 @@ Turbine maps Postgres types to TypeScript:
 | **Multi-DB** | PostgreSQL only | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
 | **Code generation** | `turbine generate` | `prisma generate` | Not needed | Not needed |
 
-All three ORMs now do single-query nested loads. Turbine is 1.4–1.9x faster due to lower per-query overhead — minimal JS object allocation, no query plan compilation layer, and direct `pg` driver access. See [Benchmarks](#benchmarks) for full results.
+All three ORMs now do single-query nested loads. Over a real pooled database (Neon, US-East) all three land inside the same ~3 ms window for nested reads — the network round-trip swamps per-query ORM overhead. Turbine's differentiators are architectural, not latency: one runtime dependency, one import swap for edge, typed errors with `isRetryable`, and deep `with` type inference without helper types. See [Benchmarks](#benchmarks) and [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) for the full breakdown.
 
 ## Limitations
 
