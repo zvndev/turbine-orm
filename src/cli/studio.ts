@@ -27,6 +27,7 @@ import { introspect } from '../introspect.js';
 import type { FindManyArgs } from '../query.js';
 import { QueryInterface, quoteIdent } from '../query.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
+import { STUDIO_HTML } from './studio-ui.generated.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -53,7 +54,7 @@ export interface StudioHandle {
   url: string;
 }
 
-interface StudioContext {
+export interface StudioContext {
   pool: pg.Pool;
   metadata: SchemaMetadata;
   options: StudioOptions;
@@ -298,7 +299,7 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
 // API: /api/tables/:name?limit=&offset=&orderBy=&dir=
 // ---------------------------------------------------------------------------
 
-async function apiTableRows(
+export async function apiTableRows(
   res: ServerResponse,
   ctx: StudioContext,
   rawTableName: string,
@@ -386,14 +387,14 @@ async function apiTableRows(
   }
 }
 
-function resolveColumnName(table: TableMetadata, nameOrField: string): string | null {
+export function resolveColumnName(table: TableMetadata, nameOrField: string): string | null {
   for (const c of table.columns) {
     if (c.name === nameOrField || c.field === nameOrField) return c.name;
   }
   return null;
 }
 
-function isTextishType(pgType: string): boolean {
+export function isTextishType(pgType: string): boolean {
   return (
     pgType === 'text' ||
     pgType === 'varchar' ||
@@ -405,7 +406,7 @@ function isTextishType(pgType: string): boolean {
   );
 }
 
-function escapeLikePattern(s: string): string {
+export function escapeLikePattern(s: string): string {
   // Escape the LIKE wildcards so user input is treated literally.
   return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
@@ -461,7 +462,7 @@ async function apiQuery(req: IncomingMessage, res: ServerResponse, ctx: StudioCo
 // API: /api/builder — Turbine ORM findMany spec runner
 // ---------------------------------------------------------------------------
 
-async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
+export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
   const body = await readJsonBody(req);
   const tableName = typeof body?.table === 'string' ? body.table : '';
   const args = (body?.args ?? {}) as FindManyArgs<Record<string, unknown>>;
@@ -555,14 +556,18 @@ function writeSavedQueries(ctx: StudioContext, data: SavedQueriesFile): void {
   writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-function apiListSavedQueries(res: ServerResponse, ctx: StudioContext, params: URLSearchParams): void {
+export function apiListSavedQueries(res: ServerResponse, ctx: StudioContext, params: URLSearchParams): void {
   const { queries } = loadSavedQueries(ctx);
   const table = params.get('table');
   const filtered = table ? queries.filter((q) => q.table === table) : queries;
   sendJson(res, 200, { queries: filtered });
 }
 
-async function apiCreateSavedQuery(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
+export async function apiCreateSavedQuery(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: StudioContext,
+): Promise<void> {
   const body = await readJsonBody(req);
   const table = typeof body?.table === 'string' ? body.table : '';
   const name = typeof body?.name === 'string' ? body.name.trim() : '';
@@ -607,7 +612,7 @@ async function apiCreateSavedQuery(req: IncomingMessage, res: ServerResponse, ct
   sendJson(res, 200, { query: entry });
 }
 
-function apiDeleteSavedQuery(res: ServerResponse, ctx: StudioContext, id: string): void {
+export function apiDeleteSavedQuery(res: ServerResponse, ctx: StudioContext, id: string): void {
   const data = loadSavedQueries(ctx);
   const before = data.queries.length;
   data.queries = data.queries.filter((q) => q.id !== id);
@@ -736,333 +741,3 @@ function openUrl(url: string): void {
     // Non-fatal — user can click the URL manually.
   }
 }
-
-// ---------------------------------------------------------------------------
-// Embedded UI — vanilla HTML/CSS/JS, no deps, dark theme to match turbineorm.dev
-// ---------------------------------------------------------------------------
-
-const STUDIO_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Turbine Studio</title>
-<style>
-  :root {
-    --bg: #0a0a0b;
-    --bg-elev: #111113;
-    --bg-hover: #1a1a1d;
-    --border: #26262b;
-    --text: #e6e6ea;
-    --text-dim: #8a8a93;
-    --accent: #60a5fa;
-    --accent-hover: #93c5fd;
-    --green: #4ade80;
-    --orange: #fb923c;
-    --red: #f87171;
-    --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    --sans: Inter, system-ui, -apple-system, Segoe UI, sans-serif;
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--sans); height: 100%; }
-  body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; font-size: 13px; }
-  header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--bg-elev); flex: none; }
-  header .brand { font-family: var(--mono); font-weight: 600; letter-spacing: -0.01em; }
-  header .brand span { color: var(--accent); }
-  header .meta { color: var(--text-dim); font-family: var(--mono); font-size: 12px; }
-  main { display: flex; flex: 1; min-height: 0; }
-  aside { width: 280px; border-right: 1px solid var(--border); background: var(--bg-elev); overflow-y: auto; flex: none; }
-  aside h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); padding: 14px 16px 6px; margin: 0; font-weight: 600; }
-  aside .table-row { padding: 8px 16px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; font-family: var(--mono); font-size: 12px; border-left: 2px solid transparent; }
-  aside .table-row:hover { background: var(--bg-hover); }
-  aside .table-row.active { background: var(--bg-hover); border-left-color: var(--accent); color: var(--accent); }
-  aside .table-row .count { color: var(--text-dim); font-size: 11px; }
-  section.content { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg-elev); flex: none; }
-  .tabs button { background: transparent; border: none; color: var(--text-dim); padding: 10px 18px; font-family: var(--mono); font-size: 12px; cursor: pointer; border-bottom: 2px solid transparent; }
-  .tabs button:hover { color: var(--text); }
-  .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
-  .pane { flex: 1; overflow: auto; padding: 16px; min-height: 0; }
-  .pane.hidden { display: none; }
-  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-  .toolbar .title { font-family: var(--mono); font-size: 13px; color: var(--accent); margin-right: auto; }
-  button.btn, select.btn { background: var(--bg-elev); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 4px; cursor: pointer; font-family: var(--mono); font-size: 12px; }
-  button.btn:hover { border-color: var(--accent); }
-  button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12px; }
-  table th { text-align: left; padding: 8px 10px; background: var(--bg-elev); color: var(--text-dim); font-weight: 600; border-bottom: 1px solid var(--border); position: sticky; top: 0; }
-  table td { padding: 6px 10px; border-bottom: 1px solid var(--border); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  table tr:hover td { background: var(--bg-hover); }
-  .pk { color: var(--orange); }
-  .null { color: var(--text-dim); font-style: italic; }
-  .schema-block { margin-bottom: 24px; }
-  .schema-block h4 { margin: 0 0 8px; font-family: var(--mono); font-size: 13px; color: var(--accent); }
-  .col-list { list-style: none; padding: 0; margin: 0; font-family: var(--mono); font-size: 12px; }
-  .col-list li { padding: 3px 0; color: var(--text-dim); }
-  .col-list li .name { color: var(--text); }
-  .col-list li .type { color: var(--green); }
-  .rel-list { list-style: none; padding: 0; margin: 8px 0 0; font-family: var(--mono); font-size: 12px; }
-  .rel-list li { padding: 3px 0; color: var(--text-dim); }
-  .rel-list li .name { color: var(--accent); }
-  textarea#sql { width: 100%; min-height: 140px; background: var(--bg); border: 1px solid var(--border); color: var(--text); font-family: var(--mono); font-size: 13px; padding: 10px; border-radius: 4px; resize: vertical; }
-  textarea#sql:focus { outline: none; border-color: var(--accent); }
-  .query-meta { color: var(--text-dim); font-family: var(--mono); font-size: 11px; margin: 8px 0; }
-  .error { color: var(--red); font-family: var(--mono); font-size: 12px; padding: 10px; background: rgba(248, 113, 113, 0.1); border: 1px solid rgba(248, 113, 113, 0.3); border-radius: 4px; white-space: pre-wrap; }
-  .empty { color: var(--text-dim); text-align: center; padding: 40px; font-family: var(--mono); font-size: 12px; }
-  kbd { font-family: var(--mono); background: var(--bg-elev); border: 1px solid var(--border); padding: 1px 5px; border-radius: 3px; font-size: 11px; }
-</style>
-</head>
-<body>
-<header>
-  <div class="brand">turbine<span>·</span>studio</div>
-  <div class="meta" id="meta">loading&hellip;</div>
-</header>
-<main>
-  <aside>
-    <h3>Tables</h3>
-    <div id="tables"></div>
-    <h3 id="enums-header" style="display:none">Enums</h3>
-    <div id="enums"></div>
-  </aside>
-  <section class="content">
-    <div class="tabs">
-      <button data-tab="data" class="active">Data</button>
-      <button data-tab="schema">Schema</button>
-      <button data-tab="query">Query</button>
-    </div>
-    <div class="pane" id="pane-data">
-      <div class="empty">Select a table from the sidebar to browse rows.</div>
-    </div>
-    <div class="pane hidden" id="pane-schema">
-      <div class="empty">Select a table to view its schema.</div>
-    </div>
-    <div class="pane hidden" id="pane-query">
-      <div class="toolbar">
-        <div class="title">Read-only query runner</div>
-        <button class="btn" id="runQuery">Run <kbd>&#8984;&#9166;</kbd></button>
-      </div>
-      <textarea id="sql" placeholder="SELECT * FROM users LIMIT 10;"></textarea>
-      <div class="query-meta" id="queryMeta"></div>
-      <div id="queryResult"></div>
-    </div>
-  </section>
-</main>
-<script>
-  const state = { schema: null, current: null, offset: 0, limit: 50, orderBy: null, dir: 'asc' };
-
-  async function api(path, opts) {
-    const res = await fetch(path, { ...opts, headers: { 'content-type': 'application/json', ...(opts?.headers ?? {}) } });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: res.statusText }));
-      throw new Error(err.error || res.statusText);
-    }
-    return res.json();
-  }
-
-  function el(tag, attrs, children) {
-    const node = document.createElement(tag);
-    for (const [k, v] of Object.entries(attrs || {})) {
-      if (k === 'class') node.className = v;
-      else if (k === 'onclick') node.addEventListener('click', v);
-      else if (k === 'onchange') node.addEventListener('change', v);
-      else node.setAttribute(k, v);
-    }
-    for (const c of children || []) {
-      if (c == null) continue;
-      node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
-    }
-    return node;
-  }
-
-  function fmtCount(n) {
-    if (n == null) return '';
-    if (n < 1000) return String(n);
-    if (n < 1_000_000) return (n / 1000).toFixed(1).replace(/\\.0$/, '') + 'k';
-    return (n / 1_000_000).toFixed(1).replace(/\\.0$/, '') + 'M';
-  }
-
-  function fmtCell(v) {
-    if (v == null) return el('span', { class: 'null' }, ['null']);
-    if (typeof v === 'object') return el('span', {}, [JSON.stringify(v)]);
-    return el('span', {}, [String(v)]);
-  }
-
-  async function loadSchema() {
-    const data = await api('/api/schema');
-    state.schema = data;
-    const tables = document.getElementById('tables');
-    tables.innerHTML = '';
-    for (const t of data.tables) {
-      const row = el('div', { class: 'table-row', 'data-table': t.name, onclick: () => selectTable(t.name) }, [
-        el('span', {}, [t.name]),
-        el('span', { class: 'count' }, [fmtCount(t.estimatedRows)]),
-      ]);
-      tables.appendChild(row);
-    }
-    const enumKeys = Object.keys(data.enums || {});
-    if (enumKeys.length) {
-      document.getElementById('enums-header').style.display = 'block';
-      const enumsDiv = document.getElementById('enums');
-      enumsDiv.innerHTML = '';
-      for (const name of enumKeys) {
-        const labels = data.enums[name] || [];
-        enumsDiv.appendChild(
-          el('div', { class: 'table-row', style: 'cursor:default' }, [
-            el('span', { style: 'color: var(--accent)' }, [name]),
-            el('span', { class: 'count' }, [String(labels.length)]),
-          ]),
-        );
-      }
-    }
-    document.getElementById('meta').textContent = data.schema + ' · ' + data.tables.length + ' tables';
-  }
-
-  async function selectTable(name) {
-    state.current = name;
-    state.offset = 0;
-    state.orderBy = null;
-    for (const row of document.querySelectorAll('.table-row')) {
-      row.classList.toggle('active', row.getAttribute('data-table') === name);
-    }
-    await Promise.all([loadData(), renderSchemaPane()]);
-  }
-
-  async function loadData() {
-    if (!state.current) return;
-    const pane = document.getElementById('pane-data');
-    pane.innerHTML = '<div class="empty">Loading&hellip;</div>';
-    try {
-      const qs = new URLSearchParams({ limit: String(state.limit), offset: String(state.offset), dir: state.dir });
-      if (state.orderBy) qs.set('orderBy', state.orderBy);
-      const data = await api('/api/tables/' + encodeURIComponent(state.current) + '?' + qs.toString());
-      renderDataPane(pane, data);
-    } catch (err) {
-      pane.innerHTML = '';
-      pane.appendChild(el('div', { class: 'error' }, [err.message]));
-    }
-  }
-
-  function renderDataPane(pane, data) {
-    pane.innerHTML = '';
-    const toolbar = el('div', { class: 'toolbar' }, [
-      el('div', { class: 'title' }, [data.table + ' · ' + data.total + ' rows']),
-      el('button', { class: 'btn', onclick: prevPage }, ['<']),
-      el('span', { class: 'query-meta' }, [(data.offset + 1) + '-' + Math.min(data.offset + data.limit, data.total)]),
-      el('button', { class: 'btn', onclick: nextPage }, ['>']),
-    ]);
-    pane.appendChild(toolbar);
-
-    if (!data.rows.length) {
-      pane.appendChild(el('div', { class: 'empty' }, ['No rows.']));
-      return;
-    }
-
-    const table = el('table', {}, []);
-    const thead = el('thead', {}, [el('tr', {}, data.columns.map((c) => el('th', {}, [c.name])))]);
-    const tbody = el('tbody', {}, data.rows.map((row) =>
-      el('tr', {}, data.columns.map((c) => el('td', { title: row[c.name] == null ? 'null' : String(row[c.name]) }, [fmtCell(row[c.name])]))),
-    ));
-    table.appendChild(thead);
-    table.appendChild(tbody);
-    pane.appendChild(table);
-  }
-
-  function prevPage() {
-    if (state.offset <= 0) return;
-    state.offset = Math.max(0, state.offset - state.limit);
-    loadData();
-  }
-
-  function nextPage() {
-    state.offset += state.limit;
-    loadData();
-  }
-
-  function renderSchemaPane() {
-    const pane = document.getElementById('pane-schema');
-    if (!state.current || !state.schema) {
-      pane.innerHTML = '<div class="empty">Select a table.</div>';
-      return;
-    }
-    const t = state.schema.tables.find((x) => x.name === state.current);
-    if (!t) { pane.innerHTML = '<div class="empty">Table not found.</div>'; return; }
-    pane.innerHTML = '';
-    const block = el('div', { class: 'schema-block' }, [
-      el('h4', {}, [t.name]),
-      el('ul', { class: 'col-list' }, t.columns.map((c) =>
-        el('li', {}, [
-          el('span', { class: c.isPrimaryKey ? 'pk' : 'name' }, [c.field]),
-          ' ',
-          el('span', { class: 'type' }, [c.tsType + (c.nullable ? ' | null' : '')]),
-          '  ',
-          el('span', {}, ['(' + c.pgType + ')']),
-        ]),
-      )),
-    ]);
-    pane.appendChild(block);
-    if (t.relations.length) {
-      pane.appendChild(
-        el('div', { class: 'schema-block' }, [
-          el('h4', {}, ['Relations']),
-          el('ul', { class: 'rel-list' }, t.relations.map((r) =>
-            el('li', {}, [
-              el('span', { class: 'name' }, [r.name]),
-              ' → ' + r.to + ' (' + r.type + ', FK: ' + r.foreignKey + ')',
-            ]),
-          )),
-        ]),
-      );
-    }
-  }
-
-  async function runQuery() {
-    const sql = document.getElementById('sql').value.trim();
-    if (!sql) return;
-    const meta = document.getElementById('queryMeta');
-    const result = document.getElementById('queryResult');
-    meta.textContent = 'Running…';
-    result.innerHTML = '';
-    try {
-      const data = await api('/api/query', { method: 'POST', body: JSON.stringify({ sql }) });
-      meta.textContent = data.rowCount + ' row(s) · ' + data.elapsedMs + 'ms';
-      if (!data.rows.length) {
-        result.appendChild(el('div', { class: 'empty' }, ['No rows returned.']));
-        return;
-      }
-      const table = el('table', {}, []);
-      const thead = el('thead', {}, [el('tr', {}, data.columns.map((c) => el('th', {}, [c.name])))]);
-      const tbody = el('tbody', {}, data.rows.map((row) =>
-        el('tr', {}, data.columns.map((c) => el('td', {}, [fmtCell(row[c.name])]))),
-      ));
-      table.appendChild(thead);
-      table.appendChild(tbody);
-      result.appendChild(table);
-    } catch (err) {
-      meta.textContent = '';
-      result.appendChild(el('div', { class: 'error' }, [err.message]));
-    }
-  }
-
-  function switchTab(name) {
-    for (const btn of document.querySelectorAll('.tabs button')) {
-      btn.classList.toggle('active', btn.getAttribute('data-tab') === name);
-    }
-    document.getElementById('pane-data').classList.toggle('hidden', name !== 'data');
-    document.getElementById('pane-schema').classList.toggle('hidden', name !== 'schema');
-    document.getElementById('pane-query').classList.toggle('hidden', name !== 'query');
-  }
-
-  document.querySelectorAll('.tabs button').forEach((btn) => {
-    btn.addEventListener('click', () => switchTab(btn.getAttribute('data-tab')));
-  });
-  document.getElementById('runQuery').addEventListener('click', runQuery);
-  document.getElementById('sql').addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); runQuery(); }
-  });
-
-  loadSchema().catch((err) => {
-    document.getElementById('meta').textContent = 'error: ' + err.message;
-  });
-</script>
-</body>
-</html>`;

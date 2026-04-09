@@ -30,7 +30,8 @@
   },
   "files": {
     "includes": [
-      "src/**"
+      "src/**",
+      "!src/cli/studio-ui.generated.ts"
     ]
   }
 }

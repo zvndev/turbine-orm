@@ -9,3 +9,4 @@ coverage/
 turbine.config.ts
 *.tgz
 .vercel
+src/cli/studio-ui.generated.ts
