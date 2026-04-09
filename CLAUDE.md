@@ -22,7 +22,7 @@ The core insight: instead of N+1 queries for nested relations, Turbine generates
 
 ```
 src/
-  query.ts          — The heart (~2K LOC). SQL generation for all operations (findMany,
+  query.ts          — The heart (~3.5K LOC). SQL generation for all operations (findMany,
                       findUnique, create, update, delete, aggregate, count). Builds WHERE
                       clauses with operators (gt, in, contains, etc.), json_agg nested
                       relation subqueries, and parameterized queries. Contains LRUCache
@@ -136,11 +136,13 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 
 ## CLI Architecture
 
-The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `studio` (placeholder).
+The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `studio`.
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.js` / `.json`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 
 **Migration system** (`cli/migrate.ts`): SQL-first migrations stored as timestamp-prefixed `.sql` files with `-- UP` and `-- DOWN` sections. Tracked in a `_turbine_migrations` table with SHA-256 checksums. Uses `pg_try_advisory_lock()` to prevent concurrent migration runs. Each migration runs in its own transaction. Checksum validation detects modified migration files.
+
+**Studio** (`cli/studio.ts`): Local read-only web UI served over Node's built-in `http` module — no new runtime deps. Binds `127.0.0.1` by default (warns loudly on non-loopback hosts), authenticates via a random 24-byte hex token generated per process, and ships security headers (`X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`). Every DB query runs inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`, and `isReadOnlyStatement()` strips SQL comments then rejects anything whose first word isn't `SELECT`/`WITH` or that contains a non-trailing `;` (blocks statement stacking). UI is an embedded single-file HTML/CSS/JS with Data / Schema / Query tabs matching the turbineorm.dev dark theme.
 
 **UI module** (`cli/ui.ts`): Terminal formatting helpers — colors, spinners, tables, boxes. Imported throughout CLI but never by library code.
 

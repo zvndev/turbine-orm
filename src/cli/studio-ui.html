@@ -1,0 +1,3909 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Turbine Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
+  <style>
+    /* =====================================================================
+       Design tokens
+       ===================================================================== */
+    :root {
+      --bg: #0a0a0b;
+      --bg-elev: #111113;
+      --bg-hover: #1a1a1d;
+      --bg-active: #22222a;
+      --border: #26262b;
+      --border-strong: #3a3a42;
+      --text: #e6e6ea;
+      --text-dim: #8a8a93;
+      --text-muted: #5a5a63;
+      --accent: #60a5fa;
+      --accent-hover: #93c5fd;
+      --accent-dim: rgba(96, 165, 250, 0.1);
+      --green: #4ade80;
+      --orange: #fb923c;
+      --red: #f87171;
+      --yellow: #facc15;
+      --purple: #a78bfa;
+      --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+      --ease: cubic-bezier(0.4, 0, 0.2, 1);
+      --t: 150ms var(--ease);
+      --radius: 6px;
+      --radius-lg: 10px;
+      --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.6), 0 2px 6px rgba(0, 0, 0, 0.4);
+      --header-h: 48px;
+      --sidebar-w: 280px;
+    }
+
+    /* =====================================================================
+       Reset + base
+       ===================================================================== */
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 13px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    body {
+      overflow: hidden;
+    }
+    button {
+      font-family: inherit;
+      font-size: inherit;
+      color: inherit;
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 0;
+    }
+    input,
+    textarea,
+    select {
+      font-family: inherit;
+      font-size: inherit;
+      color: inherit;
+    }
+    ::selection {
+      background: var(--accent-dim);
+      color: var(--text);
+    }
+    ::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #2a2a30;
+      border-radius: 10px;
+      border: 2px solid var(--bg);
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #3a3a42;
+    }
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      border-radius: 3px;
+    }
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    a:hover {
+      color: var(--accent-hover);
+    }
+
+    /* =====================================================================
+       App shell
+       ===================================================================== */
+    .app {
+      display: grid;
+      grid-template-rows: var(--header-h) 1fr;
+      height: 100vh;
+      width: 100vw;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-elev);
+      height: var(--header-h);
+      user-select: none;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .brand-mark {
+      width: 18px;
+      height: 18px;
+      border-radius: 4px;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--purple) 100%);
+      position: relative;
+    }
+    .brand-mark::after {
+      content: "";
+      position: absolute;
+      inset: 4px;
+      border-radius: 2px;
+      background: var(--bg-elev);
+    }
+    .brand-dot {
+      color: var(--text-muted);
+    }
+    .brand-sub {
+      color: var(--text-dim);
+      font-weight: 400;
+    }
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .header-meta {
+      font-family: var(--mono);
+      font-size: 11.5px;
+    }
+    .header-meta .sep {
+      color: var(--text-muted);
+      margin: 0 6px;
+    }
+    .conn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-dim);
+    }
+    .conn-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      transition: background var(--t), box-shadow var(--t);
+    }
+    .conn-dot.ok {
+      background: var(--green);
+      box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.15);
+    }
+    .conn-dot.err {
+      background: var(--red);
+      box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.15);
+    }
+    .kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      border: 1px solid var(--border-strong);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      background: var(--bg-elev);
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--text-dim);
+    }
+    .header-cmd {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 8px 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg);
+      color: var(--text-dim);
+      font-size: 12px;
+      transition: border-color var(--t), color var(--t);
+    }
+    .header-cmd:hover {
+      border-color: var(--border-strong);
+      color: var(--text);
+    }
+    .icon-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: var(--radius);
+      color: var(--text-dim);
+      transition: background var(--t), color var(--t);
+    }
+    .icon-btn:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+    .hamburger {
+      display: none;
+    }
+
+    /* Body layout */
+    .body {
+      display: grid;
+      grid-template-columns: var(--sidebar-w) 1fr;
+      min-height: 0;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* =====================================================================
+       Sidebar
+       ===================================================================== */
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border);
+      background: var(--bg-elev);
+      min-width: 0;
+      position: relative;
+    }
+    .sidebar-header {
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .sidebar-title {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: 0.02em;
+      text-transform: lowercase;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .sidebar-meta {
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--text-muted);
+      margin-top: 4px;
+      letter-spacing: 0.02em;
+    }
+    .sidebar-search {
+      margin: 10px 12px 4px;
+      position: relative;
+    }
+    .sidebar-search input {
+      width: 100%;
+      padding: 7px 10px 7px 28px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 12px;
+      transition: border-color var(--t), background var(--t);
+    }
+    .sidebar-search input:focus {
+      outline: none;
+      border-color: var(--border-strong);
+    }
+    .sidebar-search input::placeholder {
+      color: var(--text-muted);
+    }
+    .sidebar-search-icon {
+      position: absolute;
+      left: 9px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      width: 13px;
+      height: 13px;
+      pointer-events: none;
+    }
+    .sidebar-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 0 16px;
+    }
+    .sidebar-group {
+      padding: 4px 0;
+    }
+    .sidebar-group-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px 4px;
+      font-family: var(--mono);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      cursor: pointer;
+      user-select: none;
+      transition: color var(--t);
+    }
+    .sidebar-group-header:hover {
+      color: var(--text-dim);
+    }
+    .sidebar-group-header .chev {
+      transition: transform var(--t);
+    }
+    .sidebar-group.collapsed .chev {
+      transform: rotate(-90deg);
+    }
+    .sidebar-group.collapsed .sidebar-group-body {
+      display: none;
+    }
+    .sidebar-group-body {
+      display: flex;
+      flex-direction: column;
+    }
+    .sidebar-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 16px 5px 22px;
+      font-size: 12.5px;
+      font-family: var(--mono);
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: background var(--t), color var(--t);
+      user-select: none;
+      min-width: 0;
+    }
+    .sidebar-item-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .sidebar-item-count {
+      margin-left: 8px;
+      font-size: 10.5px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+    .sidebar-item:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+    .sidebar-item.active {
+      background: var(--bg-active);
+      color: var(--text);
+      border-left: 2px solid var(--accent);
+      padding-left: 20px;
+    }
+    .sidebar-item.active .sidebar-item-count {
+      color: var(--text-dim);
+    }
+    .sidebar-empty {
+      padding: 6px 22px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      font-style: italic;
+    }
+
+    .saved-group {
+      margin-top: 6px;
+    }
+    .saved-table-header {
+      padding: 6px 16px 3px 16px;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--text-muted);
+      text-transform: lowercase;
+      letter-spacing: 0.02em;
+    }
+    .saved-query {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 16px 4px 22px;
+      font-size: 12px;
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: background var(--t), color var(--t);
+    }
+    .saved-query:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+    .saved-query .saved-kind {
+      font-family: var(--mono);
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      text-transform: uppercase;
+    }
+    .saved-query-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+    }
+    .saved-query-del {
+      opacity: 0;
+      transition: opacity var(--t);
+      color: var(--text-muted);
+      padding: 0 2px;
+    }
+    .saved-query:hover .saved-query-del {
+      opacity: 1;
+    }
+    .saved-query-del:hover {
+      color: var(--red);
+    }
+
+    /* Sidebar resizer */
+    .sidebar-resizer {
+      position: absolute;
+      top: 0;
+      right: -3px;
+      width: 6px;
+      height: 100%;
+      cursor: col-resize;
+      z-index: 10;
+      user-select: none;
+    }
+    .sidebar-resizer:hover::after,
+    .sidebar-resizer.dragging::after {
+      content: "";
+      position: absolute;
+      right: 2px;
+      top: 0;
+      width: 2px;
+      height: 100%;
+      background: var(--accent);
+    }
+
+    /* =====================================================================
+       Main area
+       ===================================================================== */
+    .main {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .tabs {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-elev);
+      height: 38px;
+      flex-shrink: 0;
+    }
+    .tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 12px;
+      height: 38px;
+      font-size: 12.5px;
+      color: var(--text-dim);
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+      transition: color var(--t), border-color var(--t);
+      user-select: none;
+    }
+    .tab:hover {
+      color: var(--text);
+    }
+    .tab.active {
+      color: var(--text);
+      border-bottom-color: var(--accent);
+    }
+    .tab-icon {
+      width: 13px;
+      height: 13px;
+      opacity: 0.7;
+    }
+    .tab.active .tab-icon {
+      opacity: 1;
+    }
+
+    .pane {
+      flex: 1;
+      min-height: 0;
+      display: none;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .pane.active {
+      display: flex;
+    }
+    .pane-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .pane-title {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      min-width: 0;
+    }
+    .pane-title h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+      font-family: var(--mono);
+      letter-spacing: -0.01em;
+      color: var(--text);
+    }
+    .pane-title .muted {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: var(--mono);
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .search-input {
+      position: relative;
+    }
+    .search-input input {
+      padding: 6px 10px 6px 28px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 12px;
+      width: 220px;
+      transition: border-color var(--t), width var(--t);
+      font-family: var(--mono);
+    }
+    .search-input input:focus {
+      outline: none;
+      border-color: var(--border-strong);
+      width: 280px;
+    }
+    .search-input-icon {
+      position: absolute;
+      left: 9px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      width: 13px;
+      height: 13px;
+      pointer-events: none;
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 12px;
+      transition: all var(--t);
+      white-space: nowrap;
+    }
+    .btn:hover {
+      background: var(--bg-hover);
+      border-color: var(--border-strong);
+    }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #0a0a0b;
+      font-weight: 500;
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+    .btn-ghost {
+      border-color: transparent;
+      background: transparent;
+      color: var(--text-dim);
+    }
+    .btn-ghost:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+    .btn-sm {
+      padding: 4px 8px;
+      font-size: 11px;
+    }
+
+    /* =====================================================================
+       Data table
+       ===================================================================== */
+    .data-wrap {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .data-scroll {
+      flex: 1;
+      overflow: auto;
+      min-height: 0;
+      position: relative;
+    }
+    table.data {
+      border-collapse: separate;
+      border-spacing: 0;
+      width: 100%;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    table.data thead th {
+      position: sticky;
+      top: 0;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 14px;
+      text-align: left;
+      font-weight: 500;
+      color: var(--text-dim);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+      z-index: 2;
+      user-select: none;
+    }
+    table.data thead th.sortable {
+      cursor: pointer;
+      transition: color var(--t), background var(--t);
+    }
+    table.data thead th.sortable:hover {
+      color: var(--text);
+      background: var(--bg-hover);
+    }
+    table.data thead th .sort-ind {
+      color: var(--accent);
+      margin-left: 4px;
+      font-size: 10px;
+    }
+    table.data tbody td {
+      padding: 7px 14px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+      max-width: 360px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    table.data tbody tr {
+      transition: background var(--t);
+    }
+    table.data tbody tr:hover {
+      background: var(--bg-hover);
+    }
+    .cell-null {
+      color: var(--text-muted);
+      font-style: italic;
+    }
+    .cell-json {
+      color: var(--purple);
+    }
+    .cell-json .expand-btn {
+      margin-left: 6px;
+      font-size: 10px;
+      color: var(--text-muted);
+      padding: 1px 4px;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      transition: all var(--t);
+    }
+    .cell-json .expand-btn:hover {
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .cell-number {
+      color: var(--green);
+    }
+    .cell-bool {
+      color: var(--orange);
+    }
+    .data-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 20px;
+      border-top: 1px solid var(--border);
+      background: var(--bg-elev);
+      font-size: 11.5px;
+      color: var(--text-dim);
+      flex-shrink: 0;
+      font-family: var(--mono);
+    }
+    .pagination {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* States */
+    .empty,
+    .error-box,
+    .loading {
+      padding: 40px 24px;
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 13px;
+    }
+    .empty-icon {
+      margin: 0 auto 10px;
+      width: 28px;
+      height: 28px;
+      color: var(--text-muted);
+    }
+    .error-box {
+      margin: 16px;
+      padding: 14px 18px;
+      border: 1px solid rgba(248, 113, 113, 0.35);
+      background: rgba(248, 113, 113, 0.06);
+      border-radius: var(--radius);
+      color: var(--red);
+      text-align: left;
+      font-family: var(--mono);
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+    .error-box-title {
+      font-weight: 600;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-size: 10.5px;
+    }
+
+    /* Skeleton */
+    @keyframes shimmer {
+      0% {
+        background-position: -200% 0;
+      }
+      100% {
+        background-position: 200% 0;
+      }
+    }
+    .skeleton-row {
+      display: flex;
+      gap: 16px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .skeleton-cell {
+      height: 10px;
+      border-radius: 3px;
+      background: linear-gradient(
+        90deg,
+        #1a1a1d 0%,
+        #22222a 50%,
+        #1a1a1d 100%
+      );
+      background-size: 200% 100%;
+      animation: shimmer 1.4s linear infinite;
+      flex: 1;
+    }
+
+    /* =====================================================================
+       Schema pane
+       ===================================================================== */
+    .schema-scroll {
+      flex: 1;
+      overflow: auto;
+      padding: 24px 32px 40px;
+    }
+    .schema-section {
+      margin-bottom: 32px;
+    }
+    .schema-section h2 {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+      margin: 0 0 12px;
+      font-family: var(--mono);
+    }
+    .col-table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--bg-elev);
+    }
+    .col-table th,
+    .col-table td {
+      padding: 9px 14px;
+      text-align: left;
+      font-family: var(--mono);
+      font-size: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .col-table th {
+      font-size: 10.5px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      background: var(--bg);
+    }
+    .col-table tr:last-child td {
+      border-bottom: none;
+    }
+    .col-name {
+      color: var(--text);
+      font-weight: 500;
+    }
+    .col-name.pk {
+      color: var(--orange);
+    }
+    .col-ts {
+      color: var(--green);
+    }
+    .col-pg {
+      color: var(--text-dim);
+    }
+    .col-rel-name {
+      color: var(--accent);
+    }
+    .badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 9.5px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-right: 4px;
+      font-family: var(--mono);
+      border: 1px solid transparent;
+    }
+    .badge.pk {
+      background: rgba(251, 146, 60, 0.12);
+      color: var(--orange);
+      border-color: rgba(251, 146, 60, 0.25);
+    }
+    .badge.nn {
+      background: rgba(248, 113, 113, 0.1);
+      color: var(--red);
+      border-color: rgba(248, 113, 113, 0.2);
+    }
+    .badge.def {
+      background: rgba(167, 139, 250, 0.1);
+      color: var(--purple);
+      border-color: rgba(167, 139, 250, 0.2);
+    }
+    .badge.nullable {
+      background: var(--bg);
+      color: var(--text-muted);
+      border-color: var(--border);
+    }
+    .badge.rel-type {
+      background: var(--accent-dim);
+      color: var(--accent);
+      border-color: rgba(96, 165, 250, 0.25);
+    }
+    .schema-details {
+      margin-top: 18px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg-elev);
+      overflow: hidden;
+    }
+    .schema-details summary {
+      padding: 10px 14px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .schema-details summary::-webkit-details-marker {
+      display: none;
+    }
+    .schema-details summary::before {
+      content: "›";
+      color: var(--text-muted);
+      transition: transform var(--t);
+      display: inline-block;
+    }
+    .schema-details[open] summary::before {
+      transform: rotate(90deg);
+    }
+    .schema-details pre {
+      margin: 0;
+      padding: 14px 16px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      line-height: 1.6;
+      color: var(--text-dim);
+      overflow-x: auto;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .sql-kw {
+      color: var(--accent);
+      font-weight: 500;
+    }
+    .sql-type {
+      color: var(--green);
+    }
+    .sql-ident {
+      color: var(--text);
+    }
+    .sql-str {
+      color: var(--yellow);
+    }
+
+    /* =====================================================================
+       SQL pane
+       ===================================================================== */
+    .sql-pane {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .sql-editor-wrap {
+      display: flex;
+      flex-direction: column;
+      border-bottom: 1px solid var(--border);
+      padding: 14px 20px;
+      gap: 10px;
+    }
+    .sql-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .sql-toolbar-left {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .sql-editor {
+      width: 100%;
+      min-height: 140px;
+      max-height: 320px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: var(--text);
+      line-height: 1.55;
+      resize: vertical;
+      transition: border-color var(--t);
+      tab-size: 2;
+    }
+    .sql-editor:focus {
+      outline: none;
+      border-color: var(--border-strong);
+    }
+    .sql-editor::placeholder {
+      color: var(--text-muted);
+    }
+    .sql-meta {
+      padding: 10px 20px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-elev);
+      display: flex;
+      gap: 14px;
+      flex-shrink: 0;
+    }
+    .sql-meta .sep {
+      color: var(--text-muted);
+    }
+    .sql-meta .ok {
+      color: var(--green);
+    }
+
+    /* =====================================================================
+       Builder pane
+       ===================================================================== */
+    .builder-wrap {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      min-width: 0;
+    }
+    .builder-left {
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 20px 24px;
+    }
+    .builder-right {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      background: var(--bg);
+      min-width: 0;
+    }
+    .builder-preview {
+      padding: 18px 22px;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.65;
+      color: var(--text);
+      white-space: pre;
+      overflow: auto;
+      flex: 1;
+      min-height: 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .tok-kw {
+      color: var(--accent);
+    }
+    .tok-fn {
+      color: var(--yellow);
+    }
+    .tok-str {
+      color: var(--green);
+    }
+    .tok-num {
+      color: var(--orange);
+    }
+    .tok-key {
+      color: var(--purple);
+    }
+    .tok-punc {
+      color: var(--text-dim);
+    }
+    .tok-comment {
+      color: var(--text-muted);
+      font-style: italic;
+    }
+    .builder-results {
+      flex: 1;
+      min-height: 200px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .builder-results-header {
+      padding: 10px 22px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-elev);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      flex-shrink: 0;
+    }
+
+    .builder-section {
+      margin-bottom: 18px;
+    }
+    .builder-section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-bottom: 8px;
+      margin-bottom: 10px;
+      border-bottom: 1px dashed var(--border);
+    }
+    .builder-section-title h3 {
+      margin: 0;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+      font-family: var(--mono);
+    }
+    .builder-field {
+      margin-bottom: 10px;
+    }
+    .builder-field label {
+      display: block;
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+      font-family: var(--mono);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .builder-input,
+    .builder-select {
+      width: 100%;
+      padding: 6px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 12px;
+      font-family: var(--mono);
+      transition: border-color var(--t);
+    }
+    .builder-input:focus,
+    .builder-select:focus {
+      outline: none;
+      border-color: var(--border-strong);
+    }
+    .builder-input.invalid,
+    .builder-select.invalid {
+      border-color: rgba(248, 113, 113, 0.5);
+    }
+    .field-hint {
+      font-size: 10.5px;
+      color: var(--red);
+      margin-top: 3px;
+      font-family: var(--mono);
+    }
+    .where-clauses {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .where-clause {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1.2fr auto;
+      gap: 6px;
+      align-items: center;
+    }
+    .where-clause .btn-ghost {
+      padding: 4px 6px;
+    }
+    .clause-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .combinator-pick {
+      display: flex;
+      gap: 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--bg);
+    }
+    .combinator-pick button {
+      padding: 4px 10px;
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--text-dim);
+      border-right: 1px solid var(--border);
+      transition: background var(--t), color var(--t);
+    }
+    .combinator-pick button:last-child {
+      border-right: none;
+    }
+    .combinator-pick button.active {
+      background: var(--accent-dim);
+      color: var(--accent);
+    }
+    .combinator-pick button:hover:not(.active) {
+      background: var(--bg-hover);
+    }
+    .with-rels {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .with-rel {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg);
+    }
+    .with-rel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 7px 10px;
+      cursor: pointer;
+      user-select: none;
+      gap: 8px;
+    }
+    .with-rel-header:hover {
+      background: var(--bg-hover);
+    }
+    .with-rel-name {
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--accent);
+    }
+    .with-rel-meta {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+    .with-rel-body {
+      padding: 10px;
+      border-top: 1px solid var(--border);
+      display: none;
+    }
+    .with-rel.expanded .with-rel-body {
+      display: block;
+    }
+    .with-rel .chev {
+      transition: transform var(--t);
+      color: var(--text-muted);
+    }
+    .with-rel.expanded .chev {
+      transform: rotate(90deg);
+    }
+    .chip-row {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: var(--bg);
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: all var(--t);
+    }
+    .chip:hover {
+      border-color: var(--border-strong);
+      color: var(--text);
+    }
+    .chip.active {
+      background: var(--accent-dim);
+      border-color: rgba(96, 165, 250, 0.35);
+      color: var(--accent);
+    }
+
+    /* =====================================================================
+       Modal / dialog
+       ===================================================================== */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      backdrop-filter: blur(4px);
+    }
+    .modal-backdrop.open {
+      display: flex;
+      animation: fade-in 150ms var(--ease);
+    }
+    @keyframes fade-in {
+      from {
+        opacity: 0;
+      }
+      to {
+        opacity: 1;
+      }
+    }
+    @keyframes slide-up {
+      from {
+        opacity: 0;
+        transform: translateY(8px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    .modal {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-lg);
+      min-width: 400px;
+      max-width: 90vw;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      animation: slide-up 180ms var(--ease);
+    }
+    .modal-header {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .modal-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      font-family: var(--mono);
+    }
+    .modal-body {
+      padding: 16px 18px;
+      overflow-y: auto;
+      flex: 1;
+      min-height: 0;
+    }
+    .modal-footer {
+      padding: 12px 18px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .modal-field {
+      margin-bottom: 12px;
+    }
+    .modal-field label {
+      display: block;
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-bottom: 5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-family: var(--mono);
+    }
+    .modal-field input,
+    .modal-field select {
+      width: 100%;
+      padding: 7px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .modal-field input:focus,
+    .modal-field select:focus {
+      outline: none;
+      border-color: var(--border-strong);
+    }
+    .json-view {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    /* =====================================================================
+       Command palette
+       ===================================================================== */
+    .palette {
+      width: 560px;
+      max-width: 92vw;
+    }
+    .palette-input {
+      width: 100%;
+      padding: 14px 18px;
+      background: transparent;
+      border: none;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+      font-size: 14px;
+      font-family: var(--sans);
+    }
+    .palette-input:focus {
+      outline: none;
+    }
+    .palette-input::placeholder {
+      color: var(--text-muted);
+    }
+    .palette-list {
+      max-height: 50vh;
+      overflow-y: auto;
+      padding: 6px 0;
+    }
+    .palette-section {
+      padding: 8px 16px 4px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-family: var(--mono);
+    }
+    .palette-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px;
+      cursor: pointer;
+      transition: background var(--t);
+      font-size: 13px;
+    }
+    .palette-item:hover,
+    .palette-item.selected {
+      background: var(--bg-hover);
+    }
+    .palette-item .pi-name {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .palette-item .pi-icon {
+      color: var(--text-dim);
+      width: 14px;
+      height: 14px;
+    }
+    .palette-item .pi-kbd {
+      display: flex;
+      gap: 3px;
+    }
+
+    /* =====================================================================
+       Responsive
+       ===================================================================== */
+    @media (max-width: 1024px) {
+      .body {
+        grid-template-columns: 1fr;
+      }
+      .sidebar {
+        position: fixed;
+        top: var(--header-h);
+        left: 0;
+        bottom: 0;
+        width: 280px;
+        transform: translateX(-100%);
+        transition: transform 200ms var(--ease);
+        z-index: 50;
+      }
+      .sidebar.open {
+        transform: translateX(0);
+      }
+      .hamburger {
+        display: inline-flex;
+      }
+      .sidebar-resizer {
+        display: none;
+      }
+      .search-input input {
+        width: 160px;
+      }
+      .search-input input:focus {
+        width: 200px;
+      }
+    }
+
+    .toast-wrap {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 200;
+    }
+    .toast {
+      padding: 10px 14px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      font-size: 12px;
+      color: var(--text);
+      box-shadow: var(--shadow-lg);
+      animation: slide-up 200ms var(--ease);
+      max-width: 320px;
+    }
+    .toast.ok {
+      border-left: 3px solid var(--green);
+    }
+    .toast.err {
+      border-left: 3px solid var(--red);
+    }
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <!-- Header -->
+    <header class="header">
+      <div class="brand">
+        <button class="icon-btn hamburger" id="hamburger" aria-label="Toggle sidebar">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 6h18M3 12h18M3 18h18" />
+          </svg>
+        </button>
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>turbine</span>
+        <span class="brand-dot">·</span>
+        <span class="brand-sub">studio</span>
+      </div>
+      <div class="header-right">
+        <button class="header-cmd" id="openPalette" aria-label="Open command palette">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m21 21-4.3-4.3" />
+          </svg>
+          <span>Jump to…</span>
+          <span class="kbd">⌘K</span>
+        </button>
+        <span class="header-meta" id="headerMeta">—</span>
+        <div class="conn" id="conn">
+          <span class="conn-dot" id="connDot"></span>
+          <span id="connLabel">connecting</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="body">
+      <!-- Sidebar -->
+      <aside class="sidebar" id="sidebar" aria-label="Schema sidebar">
+        <div class="sidebar-header">
+          <div class="sidebar-title">
+            <span>schema</span>
+          </div>
+          <div class="sidebar-meta" id="sidebarMeta">—</div>
+        </div>
+        <div class="sidebar-search">
+          <svg class="sidebar-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m21 21-4.3-4.3" />
+          </svg>
+          <input id="sidebarSearch" type="text" placeholder="Filter tables…" aria-label="Filter tables" />
+        </div>
+        <div class="sidebar-scroll">
+          <div class="sidebar-group" id="groupTables">
+            <div class="sidebar-group-header" data-group="groupTables">
+              <span>Tables</span>
+              <span class="chev">▾</span>
+            </div>
+            <div class="sidebar-group-body" id="tablesList"></div>
+          </div>
+          <div class="sidebar-group collapsed" id="groupEnums">
+            <div class="sidebar-group-header" data-group="groupEnums">
+              <span>Enums</span>
+              <span class="chev">▾</span>
+            </div>
+            <div class="sidebar-group-body" id="enumsList"></div>
+          </div>
+          <div class="sidebar-group" id="groupSaved">
+            <div class="sidebar-group-header" data-group="groupSaved">
+              <span>Saved Queries</span>
+              <span class="chev">▾</span>
+            </div>
+            <div class="sidebar-group-body" id="savedList"></div>
+          </div>
+        </div>
+        <div class="sidebar-resizer" id="sidebarResizer"></div>
+      </aside>
+
+      <!-- Main -->
+      <main class="main">
+        <nav class="tabs" role="tablist">
+          <button class="tab active" data-tab="data" role="tab" aria-selected="true">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
+            </svg>
+            Data
+          </button>
+          <button class="tab" data-tab="schema" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <ellipse cx="12" cy="5" rx="9" ry="3" />
+              <path d="M3 5v14a9 3 0 0 0 18 0V5" />
+              <path d="M3 12a9 3 0 0 0 18 0" />
+            </svg>
+            Schema
+          </button>
+          <button class="tab" data-tab="sql" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="16 18 22 12 16 6" />
+              <polyline points="8 6 2 12 8 18" />
+            </svg>
+            SQL
+          </button>
+          <button class="tab" data-tab="builder" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" />
+            </svg>
+            Builder
+          </button>
+        </nav>
+
+        <!-- Data pane -->
+        <section class="pane active" id="pane-data" role="tabpanel">
+          <div class="pane-header">
+            <div class="pane-title">
+              <h1 id="dataTitle">—</h1>
+              <span class="muted" id="dataTotal"></span>
+            </div>
+            <div class="toolbar">
+              <div class="search-input">
+                <svg class="search-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="m21 21-4.3-4.3" />
+                </svg>
+                <input id="dataSearch" type="text" placeholder="Search all text columns…" aria-label="Full text search" />
+              </div>
+              <button class="btn btn-ghost btn-sm" id="dataRefresh" aria-label="Refresh">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 12a9 9 0 1 1-3-6.7L21 8" />
+                  <path d="M21 3v5h-5" />
+                </svg>
+                Refresh
+              </button>
+            </div>
+          </div>
+          <div class="data-wrap">
+            <div class="data-scroll" id="dataScroll"></div>
+            <div class="data-footer">
+              <span id="dataRange">—</span>
+              <div class="pagination">
+                <button class="btn btn-sm" id="pagePrev">← Prev</button>
+                <span id="pageIndicator">—</span>
+                <button class="btn btn-sm" id="pageNext">Next →</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Schema pane -->
+        <section class="pane" id="pane-schema" role="tabpanel">
+          <div class="pane-header">
+            <div class="pane-title">
+              <h1 id="schemaTitle">—</h1>
+              <span class="muted" id="schemaSub"></span>
+            </div>
+          </div>
+          <div class="schema-scroll" id="schemaScroll"></div>
+        </section>
+
+        <!-- SQL pane -->
+        <section class="pane sql-pane" id="pane-sql" role="tabpanel">
+          <div class="pane-header">
+            <div class="pane-title">
+              <h1>SQL</h1>
+              <span class="muted">Read-only SELECT / WITH queries</span>
+            </div>
+          </div>
+          <div class="sql-editor-wrap">
+            <div class="sql-toolbar">
+              <div class="sql-toolbar-left">
+                <button class="btn btn-primary" id="sqlRun">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M8 5v14l11-7z" />
+                  </svg>
+                  Run <span class="kbd" style="margin-left:4px">⌘↵</span>
+                </button>
+                <button class="btn" id="sqlFormat">Format</button>
+                <button class="btn" id="sqlSave">
+                  Save <span class="kbd" style="margin-left:4px">⌘S</span>
+                </button>
+              </div>
+              <div class="sql-toolbar-left">
+                <span style="font-size:10.5px;color:var(--text-muted);font-family:var(--mono);text-transform:uppercase;letter-spacing:0.04em">
+                  select / with only
+                </span>
+              </div>
+            </div>
+            <textarea
+              class="sql-editor"
+              id="sqlEditor"
+              spellcheck="false"
+              placeholder="SELECT id, email FROM users ORDER BY created_at DESC LIMIT 10;"
+            ></textarea>
+          </div>
+          <div class="sql-meta" id="sqlMeta" style="display:none"></div>
+          <div class="data-wrap">
+            <div class="data-scroll" id="sqlResults"></div>
+          </div>
+        </section>
+
+        <!-- Builder pane -->
+        <section class="pane" id="pane-builder" role="tabpanel">
+          <div class="pane-header">
+            <div class="pane-title">
+              <h1>Builder</h1>
+              <span class="muted" id="builderSub">Visual findMany composer</span>
+            </div>
+            <div class="toolbar">
+              <button class="btn btn-primary" id="builderRun">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M8 5v14l11-7z" />
+                </svg>
+                Run
+              </button>
+              <button class="btn" id="builderSave">Save</button>
+              <button class="btn btn-ghost btn-sm" id="builderReset">Reset</button>
+            </div>
+          </div>
+          <div class="builder-wrap">
+            <div class="builder-left" id="builderLeft"></div>
+            <div class="builder-right">
+              <div class="builder-preview" id="builderPreview"></div>
+              <div class="builder-results">
+                <div class="builder-results-header" id="builderResultsHeader">Results</div>
+                <div class="data-scroll" id="builderResults" style="flex:1"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Modals -->
+  <div class="modal-backdrop" id="savePromptBackdrop" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="savePromptTitle">
+      <div class="modal-header">
+        <div class="modal-title" id="savePromptTitle">Save query</div>
+        <button class="icon-btn" data-close-modal="savePromptBackdrop" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-field">
+          <label for="savePromptName">Name</label>
+          <input id="savePromptName" type="text" placeholder="e.g. recent active users" />
+        </div>
+        <div class="modal-field">
+          <label for="savePromptTable">Target table</label>
+          <select id="savePromptTable"></select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" data-close-modal="savePromptBackdrop">Cancel</button>
+        <button class="btn btn-primary" id="savePromptConfirm">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="jsonModalBackdrop" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" style="width: 640px">
+      <div class="modal-header">
+        <div class="modal-title">JSON value</div>
+        <button class="icon-btn" data-close-modal="jsonModalBackdrop" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="json-view" id="jsonModalBody"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="paletteBackdrop" aria-hidden="true">
+    <div class="modal palette" role="dialog" aria-modal="true">
+      <input
+        class="palette-input"
+        id="paletteInput"
+        type="text"
+        placeholder="Jump to table, run command…"
+        aria-label="Command palette input"
+      />
+      <div class="palette-list" id="paletteList"></div>
+    </div>
+  </div>
+
+  <div class="toast-wrap" id="toastWrap" aria-live="polite"></div>
+
+  <script>
+    // =====================================================================
+    // State
+    // =====================================================================
+    const State = {
+      schema: null, // full /api/schema response
+      tables: [], // [{ name, columns, relations, estimatedRows, primaryKey }]
+      tablesByName: new Map(),
+      enums: {},
+      currentTable: null,
+      currentTab: 'data',
+      connOk: false,
+      // data pane
+      data: {
+        rows: [],
+        columns: [],
+        total: 0,
+        limit: 50,
+        offset: 0,
+        orderBy: null,
+        dir: 'asc',
+        search: '',
+        loading: false,
+        error: null,
+      },
+      // sql pane
+      sql: {
+        text: '',
+        result: null, // { columns, rows, rowCount, elapsedMs }
+        error: null,
+        running: false,
+      },
+      // builder pane
+      builder: {
+        table: null,
+        args: emptyBuilderArgs(),
+        result: null,
+        error: null,
+        running: false,
+        validation: {},
+      },
+      savedQueries: [],
+      sidebarFilter: '',
+      // save prompt context
+      savePrompt: {
+        kind: null, // 'sql' | 'builder'
+        sql: null,
+        args: null,
+      },
+    };
+
+    function emptyBuilderArgs() {
+      return {
+        combinator: 'AND',
+        where: [],
+        with: [], // [{ relation, args: {...} }]
+        orderBy: { column: null, dir: 'asc' },
+        limit: 10,
+        select: [],
+        omit: [],
+      };
+    }
+
+    // =====================================================================
+    // Storage (localStorage wrapper)
+    // =====================================================================
+    const Storage = {
+      PREFIX: 'turbine_studio_',
+      get(key, fallback) {
+        try {
+          const raw = localStorage.getItem(Storage.PREFIX + key);
+          if (raw == null) return fallback;
+          return JSON.parse(raw);
+        } catch {
+          return fallback;
+        }
+      },
+      set(key, val) {
+        try {
+          localStorage.setItem(Storage.PREFIX + key, JSON.stringify(val));
+        } catch {
+          /* ignore quota */
+        }
+      },
+      del(key) {
+        try {
+          localStorage.removeItem(Storage.PREFIX + key);
+        } catch {
+          /* ignore */
+        }
+      },
+    };
+
+    // =====================================================================
+    // API client
+    // =====================================================================
+    const Api = {
+      async _fetch(path, opts = {}) {
+        const res = await fetch(path, {
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          ...opts,
+        });
+        let body = null;
+        try {
+          body = await res.json();
+        } catch {
+          /* non-JSON response */
+        }
+        if (!res.ok) {
+          const err = new Error((body && body.error) || res.statusText || 'Request failed');
+          err.status = res.status;
+          throw err;
+        }
+        return body;
+      },
+      schema() {
+        return Api._fetch('/api/schema');
+      },
+      rows(table, params) {
+        const qs = new URLSearchParams();
+        if (params) {
+          for (const [k, v] of Object.entries(params)) {
+            if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+          }
+        }
+        const q = qs.toString();
+        return Api._fetch('/api/tables/' + encodeURIComponent(table) + (q ? '?' + q : ''));
+      },
+      runSql(sql) {
+        return Api._fetch('/api/query', {
+          method: 'POST',
+          body: JSON.stringify({ sql }),
+        });
+      },
+      runBuilder(table, args) {
+        return Api._fetch('/api/builder', {
+          method: 'POST',
+          body: JSON.stringify({ table, args }),
+        });
+      },
+      savedQueries(table) {
+        const qs = table ? '?table=' + encodeURIComponent(table) : '';
+        return Api._fetch('/api/saved-queries' + qs);
+      },
+      saveQuery(payload) {
+        return Api._fetch('/api/saved-queries', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+      },
+      deleteSaved(id) {
+        return Api._fetch('/api/saved-queries/' + encodeURIComponent(id), {
+          method: 'DELETE',
+        });
+      },
+    };
+
+    // =====================================================================
+    // Utilities
+    // =====================================================================
+    const $ = (sel, root) => (root || document).querySelector(sel);
+    const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+
+    function el(tag, attrs = {}, children = []) {
+      const node = document.createElement(tag);
+      for (const [k, v] of Object.entries(attrs)) {
+        if (k === 'class') node.className = v;
+        else if (k === 'text') node.textContent = v;
+        else if (k === 'html') node.innerHTML = v;
+        else if (k.startsWith('on') && typeof v === 'function') {
+          node.addEventListener(k.slice(2).toLowerCase(), v);
+        } else if (k === 'style' && typeof v === 'object') {
+          Object.assign(node.style, v);
+        } else if (v !== undefined && v !== null && v !== false) {
+          node.setAttribute(k, v === true ? '' : String(v));
+        }
+      }
+      const list = Array.isArray(children) ? children : [children];
+      for (const c of list) {
+        if (c == null || c === false) continue;
+        if (typeof c === 'string' || typeof c === 'number') {
+          node.appendChild(document.createTextNode(String(c)));
+        } else {
+          node.appendChild(c);
+        }
+      }
+      return node;
+    }
+
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function formatCount(n) {
+      if (n == null) return '—';
+      if (n < 1000) return String(n);
+      if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0).replace(/\.0$/, '') + 'k';
+      if (n < 1_000_000_000) return (n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0).replace(/\.0$/, '') + 'M';
+      return (n / 1_000_000_000).toFixed(1).replace(/\.0$/, '') + 'B';
+    }
+
+    function formatNumber(n) {
+      if (n == null) return '—';
+      return Number(n).toLocaleString();
+    }
+
+    function debounce(fn, ms) {
+      let t;
+      return (...args) => {
+        clearTimeout(t);
+        t = setTimeout(() => fn(...args), ms);
+      };
+    }
+
+    function isTypingInInput() {
+      const a = document.activeElement;
+      if (!a) return false;
+      const tag = a.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || a.isContentEditable;
+    }
+
+    function isMac() {
+      return navigator.platform.toLowerCase().includes('mac');
+    }
+
+    function toast(msg, kind) {
+      const t = el('div', { class: 'toast ' + (kind || ''), text: msg });
+      $('#toastWrap').appendChild(t);
+      setTimeout(() => {
+        t.style.transition = 'opacity 200ms';
+        t.style.opacity = '0';
+        setTimeout(() => t.remove(), 220);
+      }, 2400);
+    }
+
+    function isStringType(ts) {
+      return ts === 'string';
+    }
+    function isNumericType(ts) {
+      return ts === 'number' || ts === 'bigint';
+    }
+    function isBoolType(ts) {
+      return ts === 'boolean';
+    }
+    function isDateType(ts) {
+      return ts === 'Date';
+    }
+
+    function operatorsForType(ts) {
+      const base = ['equals', 'not', 'in', 'notIn'];
+      if (isStringType(ts)) return base.concat(['contains', 'startsWith', 'endsWith']);
+      if (isNumericType(ts) || isDateType(ts)) return base.concat(['lt', 'lte', 'gt', 'gte']);
+      return base;
+    }
+
+    // =====================================================================
+    // Sidebar
+    // =====================================================================
+    const Sidebar = {
+      render() {
+        const tablesList = $('#tablesList');
+        const enumsList = $('#enumsList');
+        tablesList.innerHTML = '';
+        enumsList.innerHTML = '';
+
+        const filter = State.sidebarFilter.toLowerCase();
+        const filtered = State.tables.filter((t) =>
+          !filter || t.name.toLowerCase().includes(filter)
+        );
+
+        if (!filtered.length) {
+          tablesList.appendChild(el('div', { class: 'sidebar-empty', text: 'No tables' }));
+        } else {
+          for (const t of filtered) {
+            const active = State.currentTable && State.currentTable.name === t.name;
+            const item = el(
+              'div',
+              {
+                class: 'sidebar-item' + (active ? ' active' : ''),
+                role: 'button',
+                tabindex: '0',
+                'aria-label': 'Table ' + t.name,
+                onclick: () => Router.selectTable(t.name),
+                onkeydown: (e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    Router.selectTable(t.name);
+                  }
+                },
+              },
+              [
+                el('span', { class: 'sidebar-item-name', text: t.name }),
+                el('span', { class: 'sidebar-item-count', text: formatCount(t.estimatedRows) }),
+              ]
+            );
+            tablesList.appendChild(item);
+          }
+        }
+
+        const enumEntries = Object.entries(State.enums || {});
+        if (!enumEntries.length) {
+          enumsList.appendChild(el('div', { class: 'sidebar-empty', text: 'No enums' }));
+        } else {
+          for (const [name, values] of enumEntries) {
+            enumsList.appendChild(
+              el(
+                'div',
+                {
+                  class: 'sidebar-item',
+                  title: (values || []).join(', '),
+                },
+                [
+                  el('span', { class: 'sidebar-item-name', text: name }),
+                  el('span', { class: 'sidebar-item-count', text: String((values || []).length) }),
+                ]
+              )
+            );
+          }
+        }
+
+        Sidebar.renderSaved();
+      },
+
+      renderSaved() {
+        const host = $('#savedList');
+        host.innerHTML = '';
+        if (!State.savedQueries.length) {
+          host.appendChild(el('div', { class: 'sidebar-empty', text: 'No saved queries' }));
+          return;
+        }
+        const byTable = new Map();
+        for (const q of State.savedQueries) {
+          if (!byTable.has(q.table)) byTable.set(q.table, []);
+          byTable.get(q.table).push(q);
+        }
+        const ordered = Array.from(byTable.keys()).sort();
+        for (const table of ordered) {
+          host.appendChild(el('div', { class: 'saved-table-header', text: table }));
+          for (const q of byTable.get(table)) {
+            const row = el('div', { class: 'saved-query', onclick: () => SavedQueries.load(q) }, [
+              el('span', { class: 'saved-query-name', text: q.name, title: q.name }),
+              el('span', { class: 'saved-kind', text: q.kind }),
+              el('button', {
+                class: 'saved-query-del icon-btn',
+                'aria-label': 'Delete saved query',
+                onclick: (e) => {
+                  e.stopPropagation();
+                  SavedQueries.remove(q.id);
+                },
+                text: '×',
+              }),
+            ]);
+            host.appendChild(row);
+          }
+        }
+      },
+
+      bind() {
+        $('#sidebarSearch').addEventListener('input', (e) => {
+          State.sidebarFilter = e.target.value;
+          Sidebar.render();
+        });
+        $$('.sidebar-group-header').forEach((h) => {
+          h.addEventListener('click', () => {
+            const g = document.getElementById(h.dataset.group);
+            if (g) g.classList.toggle('collapsed');
+          });
+        });
+
+        // Resizer
+        const resizer = $('#sidebarResizer');
+        const sidebar = $('#sidebar');
+        let startX = 0;
+        let startW = 0;
+        const onMove = (e) => {
+          const dx = e.clientX - startX;
+          const next = Math.min(480, Math.max(200, startW + dx));
+          document.documentElement.style.setProperty('--sidebar-w', next + 'px');
+        };
+        const onUp = () => {
+          resizer.classList.remove('dragging');
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+          document.body.style.userSelect = '';
+          const cur = getComputedStyle(document.documentElement).getPropertyValue('--sidebar-w');
+          Storage.set('sidebarW', cur.trim());
+        };
+        resizer.addEventListener('mousedown', (e) => {
+          startX = e.clientX;
+          startW = sidebar.getBoundingClientRect().width;
+          resizer.classList.add('dragging');
+          document.body.style.userSelect = 'none';
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+        });
+
+        $('#hamburger').addEventListener('click', () => {
+          sidebar.classList.toggle('open');
+        });
+      },
+    };
+
+    // =====================================================================
+    // Router / tabs
+    // =====================================================================
+    const Router = {
+      selectTab(tab) {
+        State.currentTab = tab;
+        Storage.set('tab', tab);
+        $$('.tab').forEach((b) =>
+          b.classList.toggle('active', b.dataset.tab === tab)
+        );
+        $$('.pane').forEach((p) =>
+          p.classList.toggle('active', p.id === 'pane-' + tab)
+        );
+        if (tab === 'schema') SchemaPane.render();
+        if (tab === 'data') DataPane.render();
+        if (tab === 'sql') SqlPane.focus();
+        if (tab === 'builder') BuilderPane.render();
+      },
+
+      selectTable(name) {
+        const t = State.tablesByName.get(name);
+        if (!t) return;
+        State.currentTable = t;
+        State.data.offset = 0;
+        State.data.orderBy = (t.primaryKey && t.primaryKey[0]) || (t.columns[0] && t.columns[0].name);
+        State.data.dir = 'asc';
+        State.data.search = '';
+        Storage.set('currentTable', name);
+        Sidebar.render();
+        if (State.currentTab === 'data') DataPane.loadAndRender();
+        if (State.currentTab === 'schema') SchemaPane.render();
+        if (State.currentTab === 'builder') {
+          BuilderPane.resetForTable(name);
+        }
+        // always close mobile sidebar after selecting
+        $('#sidebar').classList.remove('open');
+      },
+
+      bind() {
+        $$('.tab').forEach((btn) => {
+          btn.addEventListener('click', () => Router.selectTab(btn.dataset.tab));
+        });
+      },
+    };
+
+    // =====================================================================
+    // Data pane
+    // =====================================================================
+    const DataPane = {
+      render() {
+        const t = State.currentTable;
+        if (!t) {
+          $('#dataTitle').textContent = '—';
+          $('#dataTotal').textContent = '';
+          $('#dataScroll').innerHTML = '<div class="empty">Select a table to browse data.</div>';
+          $('#dataRange').textContent = '—';
+          $('#pageIndicator').textContent = '—';
+          return;
+        }
+        $('#dataTitle').textContent = t.name;
+        $('#dataTotal').textContent = State.data.loading ? 'loading…' : formatNumber(State.data.total) + ' rows';
+
+        const host = $('#dataScroll');
+
+        if (State.data.error) {
+          host.innerHTML = '';
+          host.appendChild(
+            el('div', { class: 'error-box' }, [
+              el('div', { class: 'error-box-title', text: 'Error loading data' }),
+              document.createTextNode(State.data.error),
+            ])
+          );
+          $('#dataRange').textContent = '—';
+          $('#pageIndicator').textContent = '—';
+          return;
+        }
+
+        if (State.data.loading) {
+          host.innerHTML = '';
+          const skel = el('div');
+          for (let i = 0; i < 12; i++) {
+            const row = el('div', { class: 'skeleton-row' });
+            for (let c = 0; c < 5; c++) {
+              row.appendChild(el('div', { class: 'skeleton-cell' }));
+            }
+            skel.appendChild(row);
+          }
+          host.appendChild(skel);
+          return;
+        }
+
+        if (!State.data.rows.length) {
+          host.innerHTML = '';
+          host.appendChild(
+            el('div', { class: 'empty' }, [
+              el(
+                'svg',
+                {
+                  class: 'empty-icon',
+                  viewBox: '0 0 24 24',
+                  fill: 'none',
+                  stroke: 'currentColor',
+                  'stroke-width': '2',
+                },
+                []
+              ),
+              document.createTextNode('No rows match your search.'),
+            ])
+          );
+          $('#dataRange').textContent = '0 of 0';
+          $('#pageIndicator').textContent = '—';
+          return;
+        }
+
+        host.innerHTML = '';
+        const cols = State.data.columns.length
+          ? State.data.columns.map((c) => c.name)
+          : Object.keys(State.data.rows[0] || {});
+        host.appendChild(Table.render(cols, State.data.rows, {
+          sortable: true,
+          orderBy: State.data.orderBy,
+          dir: State.data.dir,
+          onSort: (col) => {
+            if (State.data.orderBy === col) {
+              State.data.dir = State.data.dir === 'asc' ? 'desc' : 'asc';
+            } else {
+              State.data.orderBy = col;
+              State.data.dir = 'asc';
+            }
+            State.data.offset = 0;
+            DataPane.loadAndRender();
+          },
+        }));
+
+        const start = State.data.total ? State.data.offset + 1 : 0;
+        const end = Math.min(State.data.offset + State.data.limit, State.data.total);
+        $('#dataRange').textContent = start + '-' + end + ' of ' + formatNumber(State.data.total);
+        const page = Math.floor(State.data.offset / State.data.limit) + 1;
+        const pages = Math.max(1, Math.ceil(State.data.total / State.data.limit));
+        $('#pageIndicator').textContent = 'Page ' + page + ' / ' + pages;
+        $('#pagePrev').disabled = State.data.offset === 0;
+        $('#pageNext').disabled = State.data.offset + State.data.limit >= State.data.total;
+      },
+
+      async loadAndRender() {
+        const t = State.currentTable;
+        if (!t) return;
+        State.data.loading = true;
+        State.data.error = null;
+        DataPane.render();
+        try {
+          const params = {
+            limit: State.data.limit,
+            offset: State.data.offset,
+            orderBy: State.data.orderBy,
+            dir: State.data.dir,
+            search: State.data.search,
+          };
+          const res = await Api.rows(t.name, params);
+          State.data.rows = res.rows || [];
+          State.data.columns = res.columns || [];
+          State.data.total = res.total || 0;
+        } catch (err) {
+          State.data.error = err.message;
+          State.data.rows = [];
+          State.data.total = 0;
+        } finally {
+          State.data.loading = false;
+          DataPane.render();
+        }
+      },
+
+      bind() {
+        $('#dataSearch').addEventListener(
+          'input',
+          debounce((e) => {
+            State.data.search = e.target.value;
+            State.data.offset = 0;
+            DataPane.loadAndRender();
+          }, 240)
+        );
+        $('#dataRefresh').addEventListener('click', () => DataPane.loadAndRender());
+        $('#pagePrev').addEventListener('click', () => {
+          if (State.data.offset === 0) return;
+          State.data.offset = Math.max(0, State.data.offset - State.data.limit);
+          DataPane.loadAndRender();
+        });
+        $('#pageNext').addEventListener('click', () => {
+          if (State.data.offset + State.data.limit >= State.data.total) return;
+          State.data.offset += State.data.limit;
+          DataPane.loadAndRender();
+        });
+      },
+    };
+
+    // =====================================================================
+    // Shared data table renderer
+    // =====================================================================
+    const Table = {
+      render(cols, rows, opts = {}) {
+        const table = el('table', { class: 'data' });
+        const thead = el('thead');
+        const headRow = el('tr');
+        for (const c of cols) {
+          const attrs = {
+            class: opts.sortable ? 'sortable' : '',
+            scope: 'col',
+          };
+          if (opts.sortable) {
+            attrs.onclick = () => opts.onSort && opts.onSort(c);
+          }
+          const th = el('th', attrs);
+          th.appendChild(document.createTextNode(c));
+          if (opts.sortable && opts.orderBy === c) {
+            th.appendChild(el('span', { class: 'sort-ind', text: opts.dir === 'asc' ? '▲' : '▼' }));
+          }
+          headRow.appendChild(th);
+        }
+        thead.appendChild(headRow);
+        table.appendChild(thead);
+
+        const tbody = el('tbody');
+        for (const row of rows) {
+          const tr = el('tr');
+          for (const c of cols) {
+            const val = row[c];
+            tr.appendChild(Table.renderCell(val));
+          }
+          tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        return table;
+      },
+
+      renderCell(val) {
+        const td = el('td');
+        if (val === null || val === undefined) {
+          td.className = 'cell-null';
+          td.textContent = 'null';
+          td.title = 'null';
+          return td;
+        }
+        if (typeof val === 'number') {
+          td.className = 'cell-number';
+          td.textContent = String(val);
+          td.title = String(val);
+          return td;
+        }
+        if (typeof val === 'boolean') {
+          td.className = 'cell-bool';
+          td.textContent = String(val);
+          td.title = String(val);
+          return td;
+        }
+        if (val && typeof val === 'object') {
+          td.className = 'cell-json';
+          const str = JSON.stringify(val);
+          const preview = str.length > 48 ? str.slice(0, 45) + '…' : str;
+          td.textContent = preview;
+          td.title = 'JSON (click to expand)';
+          const btn = el('button', {
+            class: 'expand-btn',
+            text: 'expand',
+            onclick: (e) => {
+              e.stopPropagation();
+              JsonModal.open(val);
+            },
+          });
+          td.appendChild(btn);
+          return td;
+        }
+        const s = String(val);
+        td.textContent = s;
+        td.title = s;
+        return td;
+      },
+    };
+
+    // =====================================================================
+    // Schema pane
+    // =====================================================================
+    const SchemaPane = {
+      render() {
+        const t = State.currentTable;
+        const host = $('#schemaScroll');
+        if (!t) {
+          $('#schemaTitle').textContent = '—';
+          $('#schemaSub').textContent = '';
+          host.innerHTML = '<div class="empty">Select a table to inspect its schema.</div>';
+          return;
+        }
+        $('#schemaTitle').textContent = t.name;
+        $('#schemaSub').textContent =
+          (t.columns.length + ' columns · ' + (t.relations || []).length + ' relations');
+        host.innerHTML = '';
+
+        // Columns
+        const colsSection = el('section', { class: 'schema-section' });
+        colsSection.appendChild(el('h2', { text: 'Columns' }));
+        const colTable = el('table', { class: 'col-table' });
+        const colHead = el('thead');
+        colHead.appendChild(
+          el('tr', {}, ['Name', 'TS', 'PG', 'Attributes'].map((h) => el('th', { text: h })))
+        );
+        colTable.appendChild(colHead);
+        const colBody = el('tbody');
+        for (const c of t.columns) {
+          const tr = el('tr');
+          tr.appendChild(
+            el('td', {}, [
+              el('span', {
+                class: 'col-name' + (c.isPrimaryKey ? ' pk' : ''),
+                text: c.name,
+              }),
+            ])
+          );
+          tr.appendChild(el('td', {}, [el('span', { class: 'col-ts', text: c.tsType || '—' })]));
+          tr.appendChild(el('td', {}, [el('span', { class: 'col-pg', text: c.pgType || '—' })]));
+          const attrs = el('td');
+          if (c.isPrimaryKey) attrs.appendChild(el('span', { class: 'badge pk', text: 'PK' }));
+          if (!c.nullable) attrs.appendChild(el('span', { class: 'badge nn', text: 'NOT NULL' }));
+          else attrs.appendChild(el('span', { class: 'badge nullable', text: 'nullable' }));
+          if (c.hasDefault) attrs.appendChild(el('span', { class: 'badge def', text: 'default' }));
+          tr.appendChild(attrs);
+          colBody.appendChild(tr);
+        }
+        colTable.appendChild(colBody);
+        colsSection.appendChild(colTable);
+        host.appendChild(colsSection);
+
+        // Relations
+        const rels = t.relations || [];
+        if (rels.length) {
+          const relsSection = el('section', { class: 'schema-section' });
+          relsSection.appendChild(el('h2', { text: 'Relations' }));
+          const relTable = el('table', { class: 'col-table' });
+          const relHead = el('thead');
+          relHead.appendChild(
+            el('tr', {}, ['Name', 'Type', 'Target', 'Keys'].map((h) => el('th', { text: h })))
+          );
+          relTable.appendChild(relHead);
+          const relBody = el('tbody');
+          for (const r of rels) {
+            const tr = el('tr');
+            tr.appendChild(el('td', {}, [el('span', { class: 'col-rel-name', text: r.name })]));
+            tr.appendChild(el('td', {}, [el('span', { class: 'badge rel-type', text: r.type })]));
+            tr.appendChild(el('td', {}, [el('span', { class: 'col-name', text: r.to })]));
+            tr.appendChild(
+              el('td', {}, [
+                el('span', {
+                  class: 'col-pg',
+                  text: (r.foreignKey || '—') + ' → ' + (r.referenceKey || '—'),
+                }),
+              ])
+            );
+            relBody.appendChild(tr);
+          }
+          relTable.appendChild(relBody);
+          relsSection.appendChild(relTable);
+          host.appendChild(relsSection);
+        }
+
+        // CREATE TABLE
+        const details = el('details', { class: 'schema-details' });
+        details.appendChild(el('summary', { text: 'CREATE TABLE SQL' }));
+        const pre = el('pre');
+        pre.innerHTML = SchemaPane.renderCreateTable(t);
+        details.appendChild(pre);
+        host.appendChild(details);
+      },
+
+      renderCreateTable(t) {
+        const lines = [];
+        lines.push(
+          '<span class="sql-kw">CREATE TABLE</span> <span class="sql-ident">"' +
+            escapeHtml(t.name) +
+            '"</span> ('
+        );
+        const colLines = t.columns.map((c) => {
+          let line = '  <span class="sql-ident">"' + escapeHtml(c.name) + '"</span> ';
+          line += '<span class="sql-type">' + escapeHtml(c.pgType || 'text') + '</span>';
+          if (!c.nullable) line += ' <span class="sql-kw">NOT NULL</span>';
+          if (c.hasDefault) line += ' <span class="sql-kw">DEFAULT</span> <span class="sql-str">…</span>';
+          return line;
+        });
+        if (t.primaryKey && t.primaryKey.length) {
+          colLines.push(
+            '  <span class="sql-kw">PRIMARY KEY</span> (' +
+              t.primaryKey.map((k) => '<span class="sql-ident">"' + escapeHtml(k) + '"</span>').join(', ') +
+              ')'
+          );
+        }
+        lines.push(colLines.join(',\n'));
+        lines.push(');');
+        return lines.join('\n');
+      },
+    };
+
+    // =====================================================================
+    // SQL pane
+    // =====================================================================
+    const SqlPane = {
+      focus() {
+        const ed = $('#sqlEditor');
+        if (ed && !ed.value) {
+          ed.value = Storage.get('sqlDraft', '') || '';
+        }
+        setTimeout(() => ed.focus(), 30);
+      },
+
+      bind() {
+        const ed = $('#sqlEditor');
+        ed.addEventListener('input', () => {
+          State.sql.text = ed.value;
+          Storage.set('sqlDraft', ed.value);
+        });
+        ed.addEventListener('keydown', (e) => {
+          if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+            e.preventDefault();
+            SqlPane.run();
+          }
+          if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+            e.preventDefault();
+            SqlPane.openSave();
+          }
+          if (e.key === 'Tab') {
+            e.preventDefault();
+            const start = ed.selectionStart;
+            const end = ed.selectionEnd;
+            ed.value = ed.value.slice(0, start) + '  ' + ed.value.slice(end);
+            ed.selectionStart = ed.selectionEnd = start + 2;
+          }
+        });
+        $('#sqlRun').addEventListener('click', () => SqlPane.run());
+        $('#sqlFormat').addEventListener('click', () => {
+          ed.value = SqlPane.format(ed.value);
+          State.sql.text = ed.value;
+          Storage.set('sqlDraft', ed.value);
+        });
+        $('#sqlSave').addEventListener('click', () => SqlPane.openSave());
+      },
+
+      async run() {
+        const text = $('#sqlEditor').value.trim();
+        if (!text) return;
+        State.sql.running = true;
+        State.sql.error = null;
+        SqlPane.renderResults();
+        try {
+          const res = await Api.runSql(text);
+          State.sql.result = res;
+          State.sql.error = null;
+        } catch (err) {
+          State.sql.error = err.message;
+          State.sql.result = null;
+        } finally {
+          State.sql.running = false;
+          SqlPane.renderResults();
+        }
+      },
+
+      renderResults() {
+        const meta = $('#sqlMeta');
+        const host = $('#sqlResults');
+        if (State.sql.running) {
+          meta.style.display = 'none';
+          host.innerHTML = '';
+          const skel = el('div');
+          for (let i = 0; i < 8; i++) {
+            const row = el('div', { class: 'skeleton-row' });
+            for (let c = 0; c < 4; c++) row.appendChild(el('div', { class: 'skeleton-cell' }));
+            skel.appendChild(row);
+          }
+          host.appendChild(skel);
+          return;
+        }
+        if (State.sql.error) {
+          meta.style.display = 'none';
+          host.innerHTML = '';
+          host.appendChild(
+            el('div', { class: 'error-box' }, [
+              el('div', { class: 'error-box-title', text: 'Query error' }),
+              document.createTextNode(State.sql.error),
+            ])
+          );
+          return;
+        }
+        const r = State.sql.result;
+        if (!r) {
+          meta.style.display = 'none';
+          host.innerHTML = '<div class="empty">Run a query to see results.</div>';
+          return;
+        }
+        meta.style.display = '';
+        meta.innerHTML = '';
+        meta.appendChild(el('span', { class: 'ok', text: '●' }));
+        meta.appendChild(document.createTextNode(' ' + formatNumber(r.rowCount) + ' rows'));
+        meta.appendChild(el('span', { class: 'sep', text: '·' }));
+        meta.appendChild(document.createTextNode(r.elapsedMs + ' ms'));
+        meta.appendChild(el('span', { class: 'sep', text: '·' }));
+        meta.appendChild(document.createTextNode((r.columns || []).length + ' columns'));
+
+        host.innerHTML = '';
+        if (!r.rows || !r.rows.length) {
+          host.appendChild(el('div', { class: 'empty', text: 'Query returned no rows.' }));
+          return;
+        }
+        const cols = (r.columns || []).map((c) => c.name || c);
+        host.appendChild(Table.render(cols, r.rows));
+      },
+
+      format(sql) {
+        // Minimal client-side formatter: uppercase keywords + newlines before clauses
+        const kws = [
+          'SELECT',
+          'FROM',
+          'WHERE',
+          'ORDER BY',
+          'GROUP BY',
+          'HAVING',
+          'LIMIT',
+          'OFFSET',
+          'JOIN',
+          'LEFT JOIN',
+          'RIGHT JOIN',
+          'INNER JOIN',
+          'OUTER JOIN',
+          'ON',
+          'AND',
+          'OR',
+          'WITH',
+          'UNION',
+          'UNION ALL',
+          'INTERSECT',
+          'EXCEPT',
+          'AS',
+        ];
+        let out = sql.replace(/\s+/g, ' ').trim();
+        const patterns = kws
+          .slice()
+          .sort((a, b) => b.length - a.length)
+          .map((k) => ({
+            k,
+            re: new RegExp('\\b' + k.replace(/ /g, '\\s+') + '\\b', 'gi'),
+          }));
+        for (const { k, re } of patterns) {
+          out = out.replace(re, k);
+        }
+        const breakBefore = ['FROM', 'WHERE', 'ORDER BY', 'GROUP BY', 'HAVING', 'LIMIT', 'OFFSET'];
+        for (const k of breakBefore) {
+          out = out.replace(new RegExp('\\s*' + k + '\\s*', 'g'), '\n' + k + ' ');
+        }
+        out = out.replace(/\s*,\s*/g, ', ');
+        return out.trim();
+      },
+
+      openSave() {
+        const text = $('#sqlEditor').value.trim();
+        if (!text) return;
+        State.savePrompt = { kind: 'sql', sql: text, args: null };
+        Modal.open('savePromptBackdrop');
+        $('#savePromptName').value = '';
+        SavePrompt.fillTables();
+      },
+    };
+
+    // =====================================================================
+    // Builder pane
+    // =====================================================================
+    const BuilderPane = {
+      resetForTable(tableName) {
+        State.builder.table = tableName;
+        State.builder.args = emptyBuilderArgs();
+        State.builder.result = null;
+        State.builder.error = null;
+        State.builder.validation = {};
+        BuilderPane.render();
+      },
+
+      findTable(name) {
+        return State.tablesByName.get(name);
+      },
+
+      render() {
+        const host = $('#builderLeft');
+        host.innerHTML = '';
+        if (!State.tables.length) {
+          host.appendChild(el('div', { class: 'empty', text: 'Loading schema…' }));
+          BuilderPane.updatePreview();
+          return;
+        }
+        if (!State.builder.table) {
+          State.builder.table =
+            (State.currentTable && State.currentTable.name) ||
+            (State.tables[0] && State.tables[0].name);
+        }
+        $('#builderSub').textContent = 'Visual findMany composer';
+
+        // Table picker
+        const tablePick = el('div', { class: 'builder-section' }, [
+          el('div', { class: 'builder-section-title' }, [el('h3', { text: 'Table' })]),
+          (() => {
+            const sel = el('select', { class: 'builder-select', id: 'builderTable' });
+            for (const t of State.tables) {
+              sel.appendChild(el('option', { value: t.name, text: t.name }));
+            }
+            sel.value = State.builder.table;
+            sel.addEventListener('change', () => {
+              BuilderPane.resetForTable(sel.value);
+            });
+            return sel;
+          })(),
+        ]);
+        host.appendChild(tablePick);
+
+        const tableMeta = BuilderPane.findTable(State.builder.table);
+        if (!tableMeta) {
+          host.appendChild(el('div', { class: 'error-box', text: 'Unknown table.' }));
+          return;
+        }
+
+        // WHERE
+        host.appendChild(BuilderPane.renderWhere(State.builder.args, tableMeta, []));
+        // WITH
+        host.appendChild(BuilderPane.renderWith(State.builder.args, tableMeta, []));
+        // ORDER BY / LIMIT
+        host.appendChild(BuilderPane.renderOrderLimit(State.builder.args, tableMeta));
+        // SELECT / OMIT
+        host.appendChild(BuilderPane.renderSelectOmit(State.builder.args, tableMeta));
+
+        BuilderPane.updatePreview();
+        BuilderPane.updateRunButton();
+      },
+
+      renderWhere(args, tableMeta, path) {
+        const section = el('div', { class: 'builder-section' });
+        const header = el('div', { class: 'builder-section-title' }, [
+          el('h3', { text: 'where' }),
+          (() => {
+            const pick = el('div', { class: 'combinator-pick' });
+            for (const c of ['AND', 'OR', 'NOT']) {
+              pick.appendChild(
+                el('button', {
+                  class: args.combinator === c ? 'active' : '',
+                  text: c,
+                  onclick: () => {
+                    args.combinator = c;
+                    BuilderPane.render();
+                  },
+                })
+              );
+            }
+            return pick;
+          })(),
+        ]);
+        section.appendChild(header);
+
+        const wrap = el('div', { class: 'where-clauses' });
+        args.where.forEach((clause, idx) => {
+          wrap.appendChild(BuilderPane.renderClause(args, clause, idx, tableMeta));
+        });
+        section.appendChild(wrap);
+
+        const addRow = el('div', { class: 'clause-row', style: { marginTop: '8px' } }, [
+          el('button', {
+            class: 'btn btn-sm',
+            text: '+ Clause',
+            onclick: () => {
+              args.where.push({
+                column: (tableMeta.columns[0] || {}).name || '',
+                op: 'equals',
+                value: '',
+                insensitive: false,
+              });
+              BuilderPane.render();
+            },
+          }),
+        ]);
+        section.appendChild(addRow);
+
+        return section;
+      },
+
+      renderClause(args, clause, idx, tableMeta) {
+        const row = el('div', { class: 'where-clause' });
+        // column select
+        const colSel = el('select', { class: 'builder-select' });
+        for (const c of tableMeta.columns) {
+          const opt = el('option', { value: c.name, text: c.name });
+          if (c.name === clause.column) opt.selected = true;
+          colSel.appendChild(opt);
+        }
+        colSel.addEventListener('change', () => {
+          clause.column = colSel.value;
+          const col = tableMeta.columns.find((c) => c.name === clause.column);
+          const ops = col ? operatorsForType(col.tsType) : ['equals'];
+          if (!ops.includes(clause.op)) clause.op = ops[0];
+          BuilderPane.render();
+        });
+        row.appendChild(colSel);
+
+        // op select
+        const col = tableMeta.columns.find((c) => c.name === clause.column);
+        const ops = col ? operatorsForType(col.tsType) : ['equals'];
+        const opSel = el('select', { class: 'builder-select' });
+        for (const op of ops) {
+          const opt = el('option', { value: op, text: op });
+          if (op === clause.op) opt.selected = true;
+          opSel.appendChild(opt);
+        }
+        opSel.addEventListener('change', () => {
+          clause.op = opSel.value;
+          BuilderPane.render();
+        });
+        row.appendChild(opSel);
+
+        // value input
+        const valInput = el('input', {
+          class: 'builder-input',
+          type: col && isNumericType(col.tsType) ? 'number' : 'text',
+          placeholder: 'value',
+          value: clause.value != null ? String(clause.value) : '',
+        });
+        valInput.addEventListener('input', () => {
+          clause.value = valInput.value;
+          BuilderPane.updatePreview();
+          BuilderPane.updateRunButton();
+        });
+        row.appendChild(valInput);
+
+        // remove
+        const rm = el('button', {
+          class: 'btn-ghost icon-btn',
+          'aria-label': 'Remove clause',
+          text: '×',
+          onclick: () => {
+            args.where.splice(idx, 1);
+            BuilderPane.render();
+          },
+        });
+        row.appendChild(rm);
+
+        // insensitive toggle for string cols
+        if (col && isStringType(col.tsType) && ['contains', 'startsWith', 'endsWith', 'equals'].includes(clause.op)) {
+          const ci = el('div', { class: 'clause-row', style: { gridColumn: '1 / -1' } }, [
+            el(
+              'button',
+              {
+                class: 'chip' + (clause.insensitive ? ' active' : ''),
+                text: 'mode: insensitive',
+                onclick: () => {
+                  clause.insensitive = !clause.insensitive;
+                  BuilderPane.render();
+                },
+              },
+              []
+            ),
+          ]);
+          const both = el('div', { class: 'builder-field' });
+          both.appendChild(row);
+          both.appendChild(ci);
+          return both;
+        }
+        return row;
+      },
+
+      renderWith(args, tableMeta, path) {
+        const section = el('div', { class: 'builder-section' });
+        section.appendChild(
+          el('div', { class: 'builder-section-title' }, [el('h3', { text: 'with (relations)' })])
+        );
+        const rels = tableMeta.relations || [];
+        if (!rels.length) {
+          section.appendChild(
+            el('div', { class: 'field-hint', style: { color: 'var(--text-muted)' }, text: 'No relations.' })
+          );
+          return section;
+        }
+        const wrap = el('div', { class: 'with-rels' });
+        for (const rel of rels) {
+          const existing = args.with.find((w) => w.relation === rel.name);
+          const active = !!existing;
+          const relBox = el('div', { class: 'with-rel' + (existing && existing.expanded ? ' expanded' : '') });
+          const head = el('div', { class: 'with-rel-header' }, [
+            el('div', {}, [
+              el('span', { class: 'chev', text: '›' }),
+              el('span', { class: 'with-rel-name', text: ' ' + rel.name }),
+              el('span', { class: 'with-rel-meta', text: ' · ' + rel.type + ' → ' + rel.to }),
+            ]),
+            el(
+              'button',
+              {
+                class: 'chip' + (active ? ' active' : ''),
+                text: active ? 'included' : 'include',
+                onclick: (e) => {
+                  e.stopPropagation();
+                  if (active) {
+                    args.with = args.with.filter((w) => w.relation !== rel.name);
+                  } else {
+                    args.with.push({
+                      relation: rel.name,
+                      expanded: true,
+                      args: emptyBuilderArgs(),
+                    });
+                  }
+                  BuilderPane.render();
+                },
+              },
+              []
+            ),
+          ]);
+          head.addEventListener('click', () => {
+            if (existing) {
+              existing.expanded = !existing.expanded;
+              BuilderPane.render();
+            }
+          });
+          relBox.appendChild(head);
+
+          if (existing && existing.expanded) {
+            const targetMeta = BuilderPane.findTable(rel.to);
+            const body = el('div', { class: 'with-rel-body' });
+            if (!targetMeta) {
+              body.appendChild(el('div', { class: 'field-hint', text: 'Unknown target table ' + rel.to }));
+            } else {
+              body.appendChild(BuilderPane.renderWhere(existing.args, targetMeta, path.concat(rel.name)));
+              body.appendChild(BuilderPane.renderOrderLimit(existing.args, targetMeta));
+              body.appendChild(BuilderPane.renderWith(existing.args, targetMeta, path.concat(rel.name)));
+            }
+            relBox.appendChild(body);
+          }
+          wrap.appendChild(relBox);
+        }
+        section.appendChild(wrap);
+        return section;
+      },
+
+      renderOrderLimit(args, tableMeta) {
+        const section = el('div', { class: 'builder-section' });
+        section.appendChild(
+          el('div', { class: 'builder-section-title' }, [el('h3', { text: 'orderBy / limit' })])
+        );
+
+        const row = el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 120px 100px', gap: '8px' } });
+
+        const colSel = el('select', { class: 'builder-select' });
+        colSel.appendChild(el('option', { value: '', text: '— none —' }));
+        for (const c of tableMeta.columns) {
+          const opt = el('option', { value: c.name, text: c.name });
+          if (args.orderBy && args.orderBy.column === c.name) opt.selected = true;
+          colSel.appendChild(opt);
+        }
+        colSel.addEventListener('change', () => {
+          args.orderBy = args.orderBy || { column: null, dir: 'asc' };
+          args.orderBy.column = colSel.value || null;
+          BuilderPane.updatePreview();
+        });
+        row.appendChild(colSel);
+
+        const dirSel = el('select', { class: 'builder-select' });
+        for (const d of ['asc', 'desc']) {
+          const opt = el('option', { value: d, text: d });
+          if (args.orderBy && args.orderBy.dir === d) opt.selected = true;
+          dirSel.appendChild(opt);
+        }
+        dirSel.addEventListener('change', () => {
+          args.orderBy = args.orderBy || { column: null, dir: 'asc' };
+          args.orderBy.dir = dirSel.value;
+          BuilderPane.updatePreview();
+        });
+        row.appendChild(dirSel);
+
+        const limInput = el('input', {
+          class: 'builder-input',
+          type: 'number',
+          min: '1',
+          max: '10000',
+          value: args.limit != null ? String(args.limit) : '',
+          placeholder: 'limit',
+        });
+        limInput.addEventListener('input', () => {
+          const n = parseInt(limInput.value, 10);
+          args.limit = Number.isFinite(n) && n > 0 ? n : null;
+          BuilderPane.updatePreview();
+          BuilderPane.updateRunButton();
+        });
+        row.appendChild(limInput);
+        section.appendChild(row);
+        return section;
+      },
+
+      renderSelectOmit(args, tableMeta) {
+        const section = el('div', { class: 'builder-section' });
+        section.appendChild(
+          el('div', { class: 'builder-section-title' }, [el('h3', { text: 'select / omit' })])
+        );
+        const chipsSel = el('div', { class: 'chip-row' });
+        chipsSel.appendChild(
+          el(
+            'span',
+            { style: { fontFamily: 'var(--mono)', fontSize: '10px', color: 'var(--text-muted)', marginRight: '4px' } },
+            ['select:']
+          )
+        );
+        for (const c of tableMeta.columns) {
+          const active = args.select.includes(c.name);
+          chipsSel.appendChild(
+            el('button', {
+              class: 'chip' + (active ? ' active' : ''),
+              text: c.name,
+              onclick: () => {
+                if (active) args.select = args.select.filter((x) => x !== c.name);
+                else {
+                  args.select.push(c.name);
+                  args.omit = args.omit.filter((x) => x !== c.name);
+                }
+                BuilderPane.render();
+              },
+            })
+          );
+        }
+        section.appendChild(chipsSel);
+
+        const chipsOm = el('div', { class: 'chip-row', style: { marginTop: '8px' } });
+        chipsOm.appendChild(
+          el(
+            'span',
+            { style: { fontFamily: 'var(--mono)', fontSize: '10px', color: 'var(--text-muted)', marginRight: '4px' } },
+            ['omit:']
+          )
+        );
+        for (const c of tableMeta.columns) {
+          const active = args.omit.includes(c.name);
+          chipsOm.appendChild(
+            el('button', {
+              class: 'chip' + (active ? ' active' : ''),
+              text: c.name,
+              onclick: () => {
+                if (active) args.omit = args.omit.filter((x) => x !== c.name);
+                else {
+                  args.omit.push(c.name);
+                  args.select = args.select.filter((x) => x !== c.name);
+                }
+                BuilderPane.render();
+              },
+            })
+          );
+        }
+        section.appendChild(chipsOm);
+        return section;
+      },
+
+      // ---------- Spec assembly / validation ----------
+      buildFindManyArgs(localArgs, tableMeta) {
+        const out = {};
+        const whereObj = BuilderPane.assembleWhere(localArgs, tableMeta);
+        if (whereObj) out.where = whereObj;
+        if (localArgs.with && localArgs.with.length) {
+          out.with = {};
+          for (const w of localArgs.with) {
+            const rel = (tableMeta.relations || []).find((r) => r.name === w.relation);
+            if (!rel) continue;
+            const childMeta = BuilderPane.findTable(rel.to);
+            const childArgs = childMeta ? BuilderPane.buildFindManyArgs(w.args, childMeta) : null;
+            if (childArgs && Object.keys(childArgs).length) {
+              out.with[w.relation] = childArgs;
+            } else {
+              out.with[w.relation] = true;
+            }
+          }
+        }
+        if (localArgs.orderBy && localArgs.orderBy.column) {
+          out.orderBy = { [localArgs.orderBy.column]: localArgs.orderBy.dir };
+        }
+        if (localArgs.limit) out.limit = localArgs.limit;
+        if (localArgs.select && localArgs.select.length) {
+          out.select = Object.fromEntries(localArgs.select.map((c) => [c, true]));
+        }
+        if (localArgs.omit && localArgs.omit.length) {
+          out.omit = Object.fromEntries(localArgs.omit.map((c) => [c, true]));
+        }
+        return out;
+      },
+
+      assembleWhere(localArgs, tableMeta) {
+        if (!localArgs.where || !localArgs.where.length) return null;
+        const clauses = [];
+        for (const c of localArgs.where) {
+          const col = tableMeta.columns.find((cc) => cc.name === c.column);
+          if (!col) continue;
+          const parsed = BuilderPane.coerceValue(c.value, col.tsType, c.op);
+          if (parsed === undefined) continue;
+          const inner =
+            c.op === 'equals'
+              ? parsed
+              : c.insensitive
+              ? { [c.op]: parsed, mode: 'insensitive' }
+              : { [c.op]: parsed };
+          clauses.push({ [c.column]: inner });
+        }
+        if (!clauses.length) return null;
+        if (clauses.length === 1 && localArgs.combinator === 'AND') return clauses[0];
+        if (localArgs.combinator === 'AND') return Object.assign({}, ...clauses);
+        if (localArgs.combinator === 'OR') return { OR: clauses };
+        if (localArgs.combinator === 'NOT') return { NOT: clauses.length === 1 ? clauses[0] : { AND: clauses } };
+        return null;
+      },
+
+      coerceValue(val, tsType, op) {
+        if (val == null || val === '') return undefined;
+        if (op === 'in' || op === 'notIn') {
+          return String(val)
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .map((s) => (isNumericType(tsType) ? Number(s) : s));
+        }
+        if (isNumericType(tsType)) {
+          const n = Number(val);
+          return Number.isFinite(n) ? n : undefined;
+        }
+        if (isBoolType(tsType)) {
+          return val === 'true' || val === true;
+        }
+        return String(val);
+      },
+
+      validate() {
+        const errs = {};
+        if (!State.builder.table) errs.table = 'Pick a table';
+        if (State.builder.args.limit != null && State.builder.args.limit < 1) {
+          errs.limit = 'Limit must be ≥ 1';
+        }
+        for (const c of State.builder.args.where) {
+          if (!c.column) errs.where = 'Clause missing column';
+          if (c.value === '' || c.value == null) errs.where = 'Clause missing value';
+        }
+        State.builder.validation = errs;
+        return Object.keys(errs).length === 0;
+      },
+
+      updateRunButton() {
+        const ok = BuilderPane.validate();
+        $('#builderRun').disabled = !ok;
+      },
+
+      updatePreview() {
+        const tableMeta = BuilderPane.findTable(State.builder.table);
+        if (!tableMeta) {
+          $('#builderPreview').textContent = '';
+          return;
+        }
+        const args = BuilderPane.buildFindManyArgs(State.builder.args, tableMeta);
+        const code = BuilderPane.renderCode(State.builder.table, args);
+        $('#builderPreview').innerHTML = highlightTs(code);
+      },
+
+      renderCode(tableName, args) {
+        const ind = '  ';
+        let out = 'await client.' + tableName + '.findMany(';
+        const body = renderJsArgs(args, 1);
+        if (!body) {
+          out += ');';
+        } else {
+          out += '{\n' + body + '\n});';
+        }
+        return out;
+      },
+
+      async run() {
+        if (!BuilderPane.validate()) return;
+        const tableMeta = BuilderPane.findTable(State.builder.table);
+        const args = BuilderPane.buildFindManyArgs(State.builder.args, tableMeta);
+        State.builder.running = true;
+        State.builder.error = null;
+        BuilderPane.renderResults();
+        try {
+          const res = await Api.runBuilder(State.builder.table, args);
+          State.builder.result = res;
+          State.builder.error = null;
+        } catch (err) {
+          State.builder.error = err.message;
+          State.builder.result = null;
+        } finally {
+          State.builder.running = false;
+          BuilderPane.renderResults();
+        }
+      },
+
+      renderResults() {
+        const host = $('#builderResults');
+        const header = $('#builderResultsHeader');
+        if (State.builder.running) {
+          header.textContent = 'Results · running…';
+          host.innerHTML = '';
+          const skel = el('div');
+          for (let i = 0; i < 6; i++) {
+            const row = el('div', { class: 'skeleton-row' });
+            for (let c = 0; c < 4; c++) row.appendChild(el('div', { class: 'skeleton-cell' }));
+            skel.appendChild(row);
+          }
+          host.appendChild(skel);
+          return;
+        }
+        if (State.builder.error) {
+          header.textContent = 'Results · error';
+          host.innerHTML = '';
+          host.appendChild(
+            el('div', { class: 'error-box' }, [
+              el('div', { class: 'error-box-title', text: 'Builder error' }),
+              document.createTextNode(State.builder.error),
+            ])
+          );
+          return;
+        }
+        const r = State.builder.result;
+        if (!r) {
+          header.textContent = 'Results';
+          host.innerHTML = '<div class="empty">Run to see results.</div>';
+          return;
+        }
+        header.textContent = 'Results · ' + formatNumber(r.rowCount) + ' rows · ' + r.elapsedMs + 'ms';
+        host.innerHTML = '';
+        if (!r.rows || !r.rows.length) {
+          host.appendChild(el('div', { class: 'empty', text: 'No rows.' }));
+          return;
+        }
+        const cols = (r.columns || []).map((c) => c.name || c);
+        const rendered = cols.length ? cols : Object.keys(r.rows[0] || {});
+        host.appendChild(Table.render(rendered, r.rows));
+      },
+
+      openSave() {
+        if (!BuilderPane.validate()) return;
+        const tableMeta = BuilderPane.findTable(State.builder.table);
+        const args = BuilderPane.buildFindManyArgs(State.builder.args, tableMeta);
+        State.savePrompt = { kind: 'builder', sql: null, args, fixedTable: State.builder.table };
+        Modal.open('savePromptBackdrop');
+        $('#savePromptName').value = '';
+        SavePrompt.fillTables(State.builder.table);
+      },
+
+      bind() {
+        $('#builderRun').addEventListener('click', () => BuilderPane.run());
+        $('#builderSave').addEventListener('click', () => BuilderPane.openSave());
+        $('#builderReset').addEventListener('click', () => {
+          if (State.builder.table) BuilderPane.resetForTable(State.builder.table);
+        });
+      },
+    };
+
+    // ---------- JS args renderer (used by builder preview) ----------
+    function renderJsArgs(obj, depth) {
+      if (obj == null) return '';
+      const ind = '  '.repeat(depth);
+      const indIn = '  '.repeat(depth + 1);
+      const keys = Object.keys(obj);
+      if (!keys.length) return '';
+      const lines = [];
+      for (const k of keys) {
+        const v = obj[k];
+        lines.push(ind + k + ': ' + renderJsValue(v, depth) + ',');
+      }
+      return lines.join('\n');
+    }
+    function renderJsValue(v, depth) {
+      if (v === null) return 'null';
+      if (v === undefined) return 'undefined';
+      if (typeof v === 'boolean') return v ? 'true' : 'false';
+      if (typeof v === 'number') return String(v);
+      if (typeof v === 'string') return "'" + v.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+      if (Array.isArray(v)) {
+        if (!v.length) return '[]';
+        return '[' + v.map((x) => renderJsValue(x, depth)).join(', ') + ']';
+      }
+      if (typeof v === 'object') {
+        const keys = Object.keys(v);
+        if (!keys.length) return '{}';
+        const ind = '  '.repeat(depth + 1);
+        const close = '  '.repeat(depth);
+        const inner = keys.map((k) => ind + k + ': ' + renderJsValue(v[k], depth + 1)).join(',\n');
+        return '{\n' + inner + '\n' + close + '}';
+      }
+      return String(v);
+    }
+
+    // ---------- TS syntax highlighter (simple tokenizer) ----------
+    function highlightTs(src) {
+      const KWS = new Set([
+        'await',
+        'async',
+        'const',
+        'let',
+        'var',
+        'return',
+        'if',
+        'else',
+        'true',
+        'false',
+        'null',
+        'undefined',
+        'import',
+        'from',
+        'export',
+        'new',
+      ]);
+      const out = [];
+      let i = 0;
+      while (i < src.length) {
+        const ch = src[i];
+        // comment
+        if (ch === '/' && src[i + 1] === '/') {
+          let j = i;
+          while (j < src.length && src[j] !== '\n') j++;
+          out.push('<span class="tok-comment">' + escapeHtml(src.slice(i, j)) + '</span>');
+          i = j;
+          continue;
+        }
+        // string
+        if (ch === "'" || ch === '"' || ch === '`') {
+          const q = ch;
+          let j = i + 1;
+          while (j < src.length && src[j] !== q) {
+            if (src[j] === '\\') j += 2;
+            else j++;
+          }
+          j = Math.min(src.length, j + 1);
+          out.push('<span class="tok-str">' + escapeHtml(src.slice(i, j)) + '</span>');
+          i = j;
+          continue;
+        }
+        // number
+        if (/[0-9]/.test(ch)) {
+          let j = i;
+          while (j < src.length && /[0-9_.]/.test(src[j])) j++;
+          out.push('<span class="tok-num">' + escapeHtml(src.slice(i, j)) + '</span>');
+          i = j;
+          continue;
+        }
+        // identifier / keyword
+        if (/[A-Za-z_$]/.test(ch)) {
+          let j = i;
+          while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++;
+          const word = src.slice(i, j);
+          // key: identifier followed by colon
+          let k = j;
+          while (k < src.length && src[k] === ' ') k++;
+          if (src[k] === ':') {
+            out.push('<span class="tok-key">' + escapeHtml(word) + '</span>');
+          } else if (KWS.has(word)) {
+            out.push('<span class="tok-kw">' + escapeHtml(word) + '</span>');
+          } else if (src[j] === '(' || (src[j] === '.' && false)) {
+            out.push('<span class="tok-fn">' + escapeHtml(word) + '</span>');
+          } else {
+            out.push(escapeHtml(word));
+          }
+          i = j;
+          continue;
+        }
+        // punctuation
+        if (/[{}[\](),;:]/.test(ch)) {
+          out.push('<span class="tok-punc">' + escapeHtml(ch) + '</span>');
+          i++;
+          continue;
+        }
+        out.push(escapeHtml(ch));
+        i++;
+      }
+      return out.join('');
+    }
+
+    // =====================================================================
+    // Saved queries
+    // =====================================================================
+    const SavedQueries = {
+      async load(q) {
+        if (q.kind === 'sql') {
+          Router.selectTab('sql');
+          $('#sqlEditor').value = q.sql || '';
+          State.sql.text = q.sql || '';
+          Storage.set('sqlDraft', q.sql || '');
+          toast('Loaded saved SQL: ' + q.name, 'ok');
+        } else if (q.kind === 'builder') {
+          if (q.table) {
+            const t = State.tablesByName.get(q.table);
+            if (t) {
+              State.currentTable = t;
+              Storage.set('currentTable', t.name);
+            }
+          }
+          Router.selectTab('builder');
+          // Re-hydrating from a saved args object is tricky since our internal
+          // shape differs from the flat Turbine args object. For now we store
+          // the args alongside the builder table and render a hint.
+          State.builder.table = q.table;
+          State.builder.args = SavedQueries.hydrateBuilderArgs(q.args || {}, q.table);
+          BuilderPane.render();
+          toast('Loaded saved builder: ' + q.name, 'ok');
+        }
+      },
+
+      hydrateBuilderArgs(argsObj, tableName) {
+        // Best-effort inverse of buildFindManyArgs for a flat where obj
+        const tableMeta = State.tablesByName.get(tableName);
+        const out = emptyBuilderArgs();
+        if (!tableMeta) return out;
+        if (argsObj.limit) out.limit = argsObj.limit;
+        if (argsObj.orderBy) {
+          const k = Object.keys(argsObj.orderBy)[0];
+          if (k) out.orderBy = { column: k, dir: argsObj.orderBy[k] };
+        }
+        if (argsObj.where) {
+          const w = argsObj.where;
+          const collectInto = (obj, combinator) => {
+            for (const [col, val] of Object.entries(obj)) {
+              if (col === 'AND' || col === 'OR' || col === 'NOT') continue;
+              if (val && typeof val === 'object' && !Array.isArray(val)) {
+                const op = Object.keys(val).find((k) => k !== 'mode') || 'equals';
+                out.where.push({
+                  column: col,
+                  op,
+                  value: val[op],
+                  insensitive: val.mode === 'insensitive',
+                });
+              } else {
+                out.where.push({ column: col, op: 'equals', value: val, insensitive: false });
+              }
+            }
+          };
+          if (w.OR) {
+            out.combinator = 'OR';
+            for (const c of w.OR) collectInto(c, 'OR');
+          } else if (w.AND) {
+            for (const c of w.AND) collectInto(c, 'AND');
+          } else {
+            collectInto(w, 'AND');
+          }
+        }
+        if (argsObj.select) out.select = Object.keys(argsObj.select);
+        if (argsObj.omit) out.omit = Object.keys(argsObj.omit);
+        if (argsObj.with) {
+          for (const [relName, v] of Object.entries(argsObj.with)) {
+            const rel = (tableMeta.relations || []).find((r) => r.name === relName);
+            if (!rel) continue;
+            const childArgs = v === true ? emptyBuilderArgs() : SavedQueries.hydrateBuilderArgs(v, rel.to);
+            out.with.push({ relation: relName, expanded: true, args: childArgs });
+          }
+        }
+        return out;
+      },
+
+      async remove(id) {
+        try {
+          await Api.deleteSaved(id);
+          State.savedQueries = State.savedQueries.filter((q) => q.id !== id);
+          Sidebar.renderSaved();
+          toast('Deleted saved query', 'ok');
+        } catch (err) {
+          toast('Delete failed: ' + err.message, 'err');
+        }
+      },
+
+      async refresh() {
+        try {
+          const res = await Api.savedQueries();
+          State.savedQueries = res.queries || [];
+          Sidebar.renderSaved();
+        } catch {
+          // silent on refresh fail
+        }
+      },
+    };
+
+    // =====================================================================
+    // Modals
+    // =====================================================================
+    const Modal = {
+      open(id) {
+        const m = document.getElementById(id);
+        if (!m) return;
+        m.classList.add('open');
+        m.setAttribute('aria-hidden', 'false');
+        setTimeout(() => {
+          const inp = m.querySelector('input,textarea,select,button');
+          if (inp) inp.focus();
+        }, 20);
+      },
+      close(id) {
+        const m = document.getElementById(id);
+        if (!m) return;
+        m.classList.remove('open');
+        m.setAttribute('aria-hidden', 'true');
+      },
+      bind() {
+        $$('[data-close-modal]').forEach((b) => {
+          b.addEventListener('click', () => Modal.close(b.dataset.closeModal));
+        });
+        $$('.modal-backdrop').forEach((bd) => {
+          bd.addEventListener('click', (e) => {
+            if (e.target === bd) Modal.close(bd.id);
+          });
+        });
+      },
+    };
+
+    const JsonModal = {
+      open(val) {
+        const host = $('#jsonModalBody');
+        host.textContent = JSON.stringify(val, null, 2);
+        Modal.open('jsonModalBackdrop');
+      },
+    };
+
+    const SavePrompt = {
+      fillTables(preferred) {
+        const sel = $('#savePromptTable');
+        sel.innerHTML = '';
+        for (const t of State.tables) {
+          const opt = el('option', { value: t.name, text: t.name });
+          sel.appendChild(opt);
+        }
+        const target =
+          preferred ||
+          (State.currentTable && State.currentTable.name) ||
+          (State.tables[0] && State.tables[0].name);
+        if (target) sel.value = target;
+      },
+      bind() {
+        $('#savePromptConfirm').addEventListener('click', async () => {
+          const name = $('#savePromptName').value.trim();
+          const table = $('#savePromptTable').value;
+          if (!name || !table) {
+            toast('Name and table required', 'err');
+            return;
+          }
+          const payload = {
+            table,
+            name,
+            kind: State.savePrompt.kind,
+          };
+          if (State.savePrompt.kind === 'sql') payload.sql = State.savePrompt.sql;
+          if (State.savePrompt.kind === 'builder') payload.args = State.savePrompt.args;
+          try {
+            await Api.saveQuery(payload);
+            Modal.close('savePromptBackdrop');
+            toast('Query saved', 'ok');
+            SavedQueries.refresh();
+          } catch (err) {
+            toast('Save failed: ' + err.message, 'err');
+          }
+        });
+      },
+    };
+
+    // =====================================================================
+    // Command palette
+    // =====================================================================
+    const Palette = {
+      bind() {
+        $('#openPalette').addEventListener('click', () => Palette.open());
+        const input = $('#paletteInput');
+        input.addEventListener('input', () => Palette.render());
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') {
+            Modal.close('paletteBackdrop');
+            return;
+          }
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            const items = $$('.palette-item');
+            if (!items.length) return;
+            const cur = items.findIndex((n) => n.classList.contains('selected'));
+            const next =
+              e.key === 'ArrowDown'
+                ? Math.min(items.length - 1, cur + 1)
+                : Math.max(0, cur - 1);
+            items.forEach((n, idx) => n.classList.toggle('selected', idx === next));
+            items[next].scrollIntoView({ block: 'nearest' });
+          }
+          if (e.key === 'Enter') {
+            const sel = $('.palette-item.selected');
+            if (sel) sel.click();
+          }
+        });
+      },
+
+      open() {
+        Modal.open('paletteBackdrop');
+        $('#paletteInput').value = '';
+        Palette.render();
+      },
+
+      render() {
+        const q = $('#paletteInput').value.toLowerCase().trim();
+        const list = $('#paletteList');
+        list.innerHTML = '';
+
+        const items = [];
+
+        // Commands
+        const cmds = [
+          { name: 'Go to Data tab', kbd: ['G', 'D'], run: () => Router.selectTab('data') },
+          { name: 'Go to Schema tab', kbd: ['G', 'S'], run: () => Router.selectTab('schema') },
+          { name: 'Go to SQL tab', kbd: ['G', 'Q'], run: () => Router.selectTab('sql') },
+          { name: 'Go to Builder tab', kbd: ['G', 'B'], run: () => Router.selectTab('builder') },
+          { name: 'Run SQL query', kbd: [isMac() ? '⌘' : 'Ctrl', '↵'], run: () => { Router.selectTab('sql'); setTimeout(() => SqlPane.run(), 50); } },
+          { name: 'Save SQL query', kbd: [isMac() ? '⌘' : 'Ctrl', 'S'], run: () => { Router.selectTab('sql'); SqlPane.openSave(); } },
+          { name: 'Refresh data', kbd: ['R'], run: () => DataPane.loadAndRender() },
+          { name: 'Reload schema', kbd: ['Shift', 'R'], run: () => boot(true) },
+        ];
+        const filteredCmds = q
+          ? cmds.filter((c) => c.name.toLowerCase().includes(q))
+          : cmds;
+        if (filteredCmds.length) {
+          list.appendChild(el('div', { class: 'palette-section', text: 'Commands' }));
+          for (const c of filteredCmds) items.push(Palette.renderItem(c.name, c.kbd, c.run));
+        }
+
+        // Tables
+        const tables = State.tables.filter(
+          (t) => !q || t.name.toLowerCase().includes(q)
+        );
+        if (tables.length) {
+          list.appendChild(el('div', { class: 'palette-section', text: 'Tables' }));
+          for (const t of tables.slice(0, 50)) {
+            items.push(
+              Palette.renderItem(t.name, [formatCount(t.estimatedRows)], () => {
+                Router.selectTable(t.name);
+                Modal.close('paletteBackdrop');
+              })
+            );
+          }
+        }
+
+        if (!items.length) {
+          list.appendChild(el('div', { class: 'empty', style: { padding: '24px' }, text: 'No matches.' }));
+        }
+        for (const it of items) list.appendChild(it);
+        const first = list.querySelector('.palette-item');
+        if (first) first.classList.add('selected');
+      },
+
+      renderItem(name, kbd, run) {
+        const kbdEls = (kbd || []).map((k) => el('span', { class: 'kbd', text: k }));
+        const item = el('div', { class: 'palette-item' }, [
+          el('div', { class: 'pi-name' }, [
+            el(
+              'svg',
+              {
+                class: 'pi-icon',
+                viewBox: '0 0 24 24',
+                fill: 'none',
+                stroke: 'currentColor',
+                'stroke-width': '2',
+              },
+              []
+            ),
+            el('span', { text: name }),
+          ]),
+          el('div', { class: 'pi-kbd' }, kbdEls),
+        ]);
+        item.addEventListener('click', () => {
+          run();
+          Modal.close('paletteBackdrop');
+        });
+        return item;
+      },
+    };
+
+    // =====================================================================
+    // Keyboard shortcuts
+    // =====================================================================
+    function bindKeys() {
+      document.addEventListener('keydown', (e) => {
+        const cmd = e.metaKey || e.ctrlKey;
+        // Cmd+K opens palette
+        if (cmd && (e.key === 'k' || e.key === 'K')) {
+          e.preventDefault();
+          Palette.open();
+          return;
+        }
+        if (e.key === 'Escape') {
+          ['savePromptBackdrop', 'jsonModalBackdrop', 'paletteBackdrop'].forEach((id) =>
+            Modal.close(id)
+          );
+          return;
+        }
+        if (isTypingInInput()) return;
+        if (e.key === '/') {
+          e.preventDefault();
+          $('#sidebarSearch').focus();
+        }
+        if (e.key === '?') {
+          Palette.open();
+        }
+      });
+    }
+
+    // =====================================================================
+    // Init / boot
+    // =====================================================================
+    async function boot(reloadOnly) {
+      try {
+        const schema = await Api.schema();
+        State.schema = schema;
+        State.tables = schema.tables || [];
+        State.tablesByName = new Map(State.tables.map((t) => [t.name, t]));
+        State.enums = schema.enums || {};
+        State.connOk = true;
+        $('#connDot').classList.add('ok');
+        $('#connLabel').textContent = 'connected';
+        const meta =
+          (schema.schema || 'public') + ' · ' + State.tables.length + ' tables';
+        $('#headerMeta').textContent = meta;
+        $('#sidebarMeta').textContent = meta;
+
+        // Restore
+        const savedW = Storage.get('sidebarW');
+        if (savedW) document.documentElement.style.setProperty('--sidebar-w', savedW);
+        const savedTab = Storage.get('tab', 'data');
+        const savedTable = Storage.get('currentTable');
+        const initialTable = (savedTable && State.tablesByName.has(savedTable)
+          ? savedTable
+          : State.tables[0] && State.tables[0].name);
+        if (initialTable) {
+          State.currentTable = State.tablesByName.get(initialTable);
+        }
+
+        Sidebar.render();
+        Router.selectTab(savedTab || 'data');
+        if (State.currentTable) {
+          if (savedTab === 'data' || !savedTab) DataPane.loadAndRender();
+          if (savedTab === 'schema') SchemaPane.render();
+          if (savedTab === 'builder') BuilderPane.resetForTable(State.currentTable.name);
+        }
+
+        // SQL draft
+        const sqlDraft = Storage.get('sqlDraft', '');
+        if (sqlDraft) $('#sqlEditor').value = sqlDraft;
+
+        SavedQueries.refresh();
+      } catch (err) {
+        State.connOk = false;
+        $('#connDot').classList.remove('ok');
+        $('#connDot').classList.add('err');
+        $('#connLabel').textContent = 'offline';
+        $('#headerMeta').textContent = 'connection failed';
+        $('#sidebarMeta').textContent = '—';
+        const mainErr = el('div', { class: 'error-box' }, [
+          el('div', { class: 'error-box-title', text: 'Cannot reach /api/schema' }),
+          document.createTextNode(err.message),
+        ]);
+        $('#dataScroll').innerHTML = '';
+        $('#dataScroll').appendChild(mainErr);
+      }
+    }
+
+    function init() {
+      Sidebar.bind();
+      Router.bind();
+      DataPane.bind();
+      SqlPane.bind();
+      BuilderPane.bind();
+      Modal.bind();
+      SavePrompt.bind();
+      Palette.bind();
+      bindKeys();
+      boot();
+    }
+
+    document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>

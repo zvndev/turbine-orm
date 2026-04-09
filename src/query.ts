@@ -1831,7 +1831,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._sum)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`SUM(${quoteIdent(col)}) AS ${quoteIdent('_sum_' + col)}`);
+          selectExprs.push(`SUM(${quoteIdent(col)}) AS ${quoteIdent(`_sum_${col}`)}`);
         }
       }
     }
@@ -1841,7 +1841,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._avg)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`AVG(${quoteIdent(col)})::float AS ${quoteIdent('_avg_' + col)}`);
+          selectExprs.push(`AVG(${quoteIdent(col)})::float AS ${quoteIdent(`_avg_${col}`)}`);
         }
       }
     }
@@ -1851,7 +1851,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._min)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MIN(${quoteIdent(col)}) AS ${quoteIdent('_min_' + col)}`);
+          selectExprs.push(`MIN(${quoteIdent(col)}) AS ${quoteIdent(`_min_${col}`)}`);
         }
       }
     }
@@ -1861,7 +1861,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._max)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MAX(${quoteIdent(col)}) AS ${quoteIdent('_max_' + col)}`);
+          selectExprs.push(`MAX(${quoteIdent(col)}) AS ${quoteIdent(`_max_${col}`)}`);
         }
       }
     }
@@ -1983,7 +1983,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._count)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`COUNT(${quoteIdent(col)})::int AS ${quoteIdent('_count_' + col)}`);
+          selectExprs.push(`COUNT(${quoteIdent(col)})::int AS ${quoteIdent(`_count_${col}`)}`);
         }
       }
     }
@@ -1993,7 +1993,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._sum)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`SUM(${quoteIdent(col)}) AS ${quoteIdent('_sum_' + col)}`);
+          selectExprs.push(`SUM(${quoteIdent(col)}) AS ${quoteIdent(`_sum_${col}`)}`);
         }
       }
     }
@@ -2003,7 +2003,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._avg)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`AVG(${quoteIdent(col)})::float AS ${quoteIdent('_avg_' + col)}`);
+          selectExprs.push(`AVG(${quoteIdent(col)})::float AS ${quoteIdent(`_avg_${col}`)}`);
         }
       }
     }
@@ -2013,7 +2013,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._min)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MIN(${quoteIdent(col)}) AS ${quoteIdent('_min_' + col)}`);
+          selectExprs.push(`MIN(${quoteIdent(col)}) AS ${quoteIdent(`_min_${col}`)}`);
         }
       }
     }
@@ -2023,7 +2023,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._max)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MAX(${quoteIdent(col)}) AS ${quoteIdent('_max_' + col)}`);
+          selectExprs.push(`MAX(${quoteIdent(col)}) AS ${quoteIdent(`_max_${col}`)}`);
         }
       }
     }
@@ -2135,7 +2135,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private toColumn(field: string): string {
     const mapped = this.tableMeta.columnMap[field];
     if (mapped) return mapped;
-    return camelToSnake(field);
+    // Fall back to camelToSnake ONLY if that snake_cased name also exists as a
+    // real column on the table. This preserves the convenience of writing
+    // `userId` when the schema exposes `user_id` under an unusual field name,
+    // but rejects arbitrary strings — closing the defense-in-depth gap for
+    // SQL injection and catching typos like `where: { emial: 'x' }` with a
+    // clear error instead of a cryptic Postgres "column does not exist".
+    const snake = camelToSnake(field);
+    if (this.tableMeta.reverseColumnMap?.[snake]) {
+      return snake;
+    }
+    if (this.tableMeta.allColumns?.includes(snake)) {
+      return snake;
+    }
+    throw new ValidationError(
+      `[turbine] Unknown field "${field}" on table "${this.table}". ` +
+        `Known fields: ${Object.keys(this.tableMeta.columnMap).join(', ') || '(none)'}.`,
+    );
   }
 
   /** Convert camelCase field name to a double-quoted SQL identifier */
@@ -2314,7 +2330,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /**
    * Fingerprint a relation filter sub-where for some/every/none.
    */
-  private fingerprintRelFilter(targetTable: string, subWhere: Record<string, unknown>): string {
+  private fingerprintRelFilter(_targetTable: string, subWhere: Record<string, unknown>): string {
     const keys = Object.keys(subWhere)
       .filter((k) => subWhere[k] !== undefined)
       .sort();
@@ -2431,7 +2447,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = this.schema.tables[targetTable];
     if (!meta) return;
 
-    for (const [field, value] of Object.entries(subWhere)) {
+    for (const [_field, value] of Object.entries(subWhere)) {
       if (value === undefined) continue;
       if (value === null) continue;
       if (isWhereOperator(value)) {

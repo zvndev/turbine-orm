@@ -12,7 +12,7 @@
  *   turbine migrate status        — Show migration status
  *   turbine seed                  — Run seed file
  *   turbine status                — Show schema summary
- *   turbine studio                — Launch web UI (coming soon)
+ *   turbine studio                — Launch local read-only web UI
  *
  * Usage:
  *   DATABASE_URL=postgres://... npx turbine generate
@@ -21,7 +21,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { relative, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generate } from '../generate.js';
 import { introspect } from '../introspect.js';
@@ -31,6 +31,7 @@ import type { CliOverrides, ResolvedConfig } from './config.js';
 import { configTemplate, findConfigFile, loadConfig, resolveConfig } from './config.js';
 import { needsTsLoader, registerTsLoader } from './loader.js';
 import { createMigration, listMigrationFiles, migrateDown, migrateStatus, migrateUp } from './migrate.js';
+import { startStudio } from './studio.js';
 import {
   banner,
   blue,
@@ -78,6 +79,10 @@ interface CliArgs {
   help?: boolean;
   auto?: boolean;
   allowDrift?: boolean;
+  // studio flags
+  port?: number;
+  host?: string;
+  noOpen?: boolean;
 }
 
 function parseArgs(): CliArgs {
@@ -148,6 +153,17 @@ function parseArgs(): CliArgs {
       case '--help':
       case '-h':
         result.help = true;
+        break;
+      case '--port':
+        result.port = next ? Number.parseInt(next, 10) : undefined;
+        i++;
+        break;
+      case '--host':
+        result.host = next;
+        i++;
+        break;
+      case '--no-open':
+        result.noOpen = true;
         break;
       default:
         if (!arg.startsWith('-')) {
@@ -1085,26 +1101,85 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
-// Command: studio (scaffold)
+// Command: studio — local read-only web UI
 // ---------------------------------------------------------------------------
 
-async function cmdStudio(_args: CliArgs, _config: ResolvedConfig): Promise<void> {
+async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
+  const url = requireUrl(config);
 
+  const port = args.port ?? 4983;
+  const host = args.host ?? '127.0.0.1';
+  const openBrowser = !args.noOpen;
+
+  if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+    console.log(red(`✗ invalid port: ${args.port}`));
+    process.exit(1);
+  }
+
+  // Refuse to bind anything other than loopback unless explicitly overridden.
+  // This is deliberate: Studio has no real authentication beyond a random
+  // session token, so exposing it on a LAN interface is foot-gun territory.
+  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+    console.log(
+      warn(
+        `Studio is binding to ${yellow(host)} — this is NOT loopback. ` +
+          `Anyone on your network who can reach this port + guess the session token can read your database.`,
+      ),
+    );
+  }
+
+  const spinner = new Spinner('Introspecting database').start();
+  let studio: { dispose: () => Promise<void>; authToken: string; url: string };
+  try {
+    studio = await startStudio({
+      url,
+      schema: config.schema,
+      port,
+      host,
+      openBrowser,
+      include: config.include.length ? config.include : undefined,
+      exclude: config.exclude.length ? config.exclude : undefined,
+    });
+    spinner.succeed(`Studio is running`);
+  } catch (err) {
+    spinner.fail(`Failed to start Studio: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  newline();
   console.log(
     box(
       [
-        `${bold('Turbine Studio')} ${dim('— coming soon')}`,
+        `${bold('Turbine Studio')}  ${dim('— local read-only UI')}`,
         '',
-        'A local web UI for browsing your database,',
-        'exploring relations, and managing data.',
+        `  ${cyan('URL:')}    ${bold(studio.url)}`,
+        `  ${cyan('Schema:')} ${config.schema}`,
+        `  ${cyan('DB:')}     ${redactUrl(url)}`,
         '',
-        `Follow ${cyan('@turbineorm')} for updates.`,
+        dim('Open the URL above in your browser. It includes a one-time session'),
+        dim('token that gets set as an HttpOnly cookie on first load.'),
+        dim('Press Ctrl+C to stop.'),
       ].join('\n'),
-      { title: bold(cyan('Studio')), padding: 2 },
+      { title: bold(cyan('Studio')), padding: 1 },
     ),
   );
   newline();
+
+  // Wait forever until SIGINT/SIGTERM, then dispose cleanly.
+  await new Promise<void>((resolve) => {
+    const shutdown = async () => {
+      console.log(dim('\n  shutting down…'));
+      try {
+        await studio.dispose();
+      } catch {
+        /* ignore */
+      }
+      resolve();
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,7 +1342,7 @@ function showHelp(): void {
   console.log(`      ${dim('status')}           Show applied/pending migrations`);
   console.log(`    ${cyan('seed')}               Run seed file`);
   console.log(`    ${cyan('status')} ${dim('| info')}     Show schema summary`);
-  console.log(`    ${cyan('studio')}             Launch web UI (coming soon)`);
+  console.log(`    ${cyan('studio')}             Launch local read-only web UI`);
   newline();
 
   console.log(`  ${bold('Options:')}`);
@@ -1281,6 +1356,12 @@ function showHelp(): void {
   console.log(`    ${cyan('--dry-run')}            Show SQL without executing`);
   console.log(`    ${cyan('--verbose, -v')}        Show detailed output`);
   console.log(`    ${cyan('--force, -f')}          Overwrite existing files`);
+  newline();
+
+  console.log(`  ${bold('Studio options:')}`);
+  console.log(`    ${cyan('--port')} ${dim('<n>')}           HTTP port ${dim('(default: 4983)')}`);
+  console.log(`    ${cyan('--host')} ${dim('<addr>')}        Bind address ${dim('(default: 127.0.0.1)')}`);
+  console.log(`    ${cyan('--no-open')}            Don't auto-open the browser`);
   newline();
 
   console.log(`  ${bold('Config file:')}`);
@@ -1302,7 +1383,28 @@ function showHelp(): void {
 // ---------------------------------------------------------------------------
 
 function showVersion(): void {
-  console.log(`turbine-orm v0.5.0`);
+  // Walk up from the running script to find the turbine-orm package.json.
+  // Using process.argv[1] instead of import.meta.url so the same code compiles
+  // cleanly for both the ESM and CJS builds.
+  try {
+    let dir = dirname(process.argv[1] ?? '');
+    for (let i = 0; i < 6; i++) {
+      const candidate = resolve(dir, 'package.json');
+      if (existsSync(candidate)) {
+        const pkg = JSON.parse(readFileSync(candidate, 'utf8')) as { name?: string; version?: string };
+        if (pkg.name === 'turbine-orm') {
+          console.log(`turbine-orm v${pkg.version ?? '?'}`);
+          return;
+        }
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    console.log(`turbine-orm`);
+  } catch {
+    console.log(`turbine-orm`);
+  }
 }
 
 // ---------------------------------------------------------------------------
