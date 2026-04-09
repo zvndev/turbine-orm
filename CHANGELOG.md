@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.9.0 (2026-04-09)
+
+**Studio Premium.** Turbine now ships a premium, read-only Studio web UI — the
+only Postgres ORM with a Studio your DBA will approve. Loopback-bound by
+default, random per-process auth token, every query runs inside
+`BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`, and a strict
+SELECT/WITH parser blocks statement stacking. No mutations, no writes, no way
+around the transaction guard — the posture is unchanged from 0.8.0 and a
+product review (8.1/10) found zero CRITICAL or HIGH vulnerabilities.
+
+### Added
+- **Premium Studio UI** with Data / Schema / SQL / Builder tabs — a
+  single-file embedded HTML/CSS/JS bundle served by the CLI `turbine studio`
+  command, matching the turbineorm.dev dark theme.
+- **Cmd+K command palette** for fast navigation across tables, tabs, and
+  saved queries.
+- **Saved queries** — named SQL snippets persisted to
+  `.turbine/studio-queries.json` and surfaced in the SQL tab and command
+  palette.
+- **Visual query composer** (Builder tab) with live TypeScript preview —
+  pick a table, compose `where` / `orderBy` / `with` / `limit` visually, and
+  watch the matching `db.table.findMany(...)` code render in real time.
+- **Full-text search across table rows** — the Data tab now supports
+  substring search across every text column via a `search` query parameter.
+- **Sortable tables, JSON modal, toasts, keyboard shortcuts** — every data
+  table is column-sortable; JSON/JSONB cells open in a full-screen modal;
+  toast notifications confirm saves/errors; keyboard shortcuts for tab
+  switching, row navigation, and query execution.
+- **Four new backend endpoints:** `/api/builder` (preview SQL for a visual
+  composer payload), `/api/saved-queries` (GET/POST/DELETE), and a `search`
+  query parameter on `/api/tables/:name`.
+- **CLI flag smoke test** (`src/test/cli-flags.test.ts`) — locks in every
+  `turbine studio` flag (`--port`, `--host`, `--no-open`) against the
+  argument parser.
+
+### Changed
+- **Migration advisory lock ID is now derived from the database name via
+  FNV-1a** — fixes cluster-wide contention when two databases on the same
+  Postgres cluster both run `turbine migrate up` concurrently. The previous
+  implementation used a static lock ID, so a migration in database A would
+  block a migration in database B. Lock ID is now a stable per-database
+  64-bit FNV-1a hash of `current_database()`.
+- **README Studio section rewritten** to headline read-only as a design
+  feature, not a limitation. The old "Turbine Studio is planned but not yet
+  available" bullet under Limitations has been removed.
+
+### Fixed
+- Two `any` leaks in `src/schema-builder.ts` public signatures — the
+  column definition builder now exposes precise generic types end-to-end.
+- Search endpoint parameter-index bug in `/api/tables/:name` — the search
+  clause was using a stale `$N` index when combined with pagination params.
+- Biome template-literal lint errors in `src/query.ts` surfaced by the new
+  biome rules shipped in 2.4.10.
+
+### Security
+- **Studio posture unchanged from v0.8.0.** Loopback default (`127.0.0.1`,
+  loud warning on non-loopback binds), 24-byte random hex token generated
+  per process, `SameSite=Strict` `HttpOnly` auth cookies, every query
+  wrapped in `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`,
+  SELECT/WITH-only parser that strips comments and rejects non-trailing
+  semicolons (blocks statement stacking), and security headers
+  (`X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy:
+  no-referrer`). Product review scored the surface 8.1/10 and found
+  **zero CRITICAL or HIGH vulnerabilities**.
+
 ## 0.8.0 (2026-04-09)
 
 ### Added

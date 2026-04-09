@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. 1 dependency, ~110KB",
   "type": "module",
   "exports": {
@@ -36,6 +36,7 @@
   ],
   "sideEffects": false,
   "scripts": {
+    "prebuild": "node scripts/build-studio-ui.mjs",
     "build": "tsc && tsc --project tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit --project tsconfig.test.json",

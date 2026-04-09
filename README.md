@@ -381,6 +381,7 @@ Commands:
   migrate status               Show applied/pending migrations
   seed                         Run seed file
   status                       Show database schema summary
+  studio                       Launch local read-only Studio web UI
 
 Options:
   --url, -u <url>       Postgres connection string
@@ -435,6 +436,32 @@ npx turbine migrate down
 # Check migration status (applied vs pending)
 npx turbine migrate status
 ```
+
+## Studio
+
+The only Postgres ORM with a Studio your DBA will approve. `turbine studio` launches a local, read-only web UI for exploring your database — no mutations, no writes, no way around the transaction guard.
+
+```bash
+DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
+# With flags
+npx turbine studio --port 5173 --host 127.0.0.1 --no-open
+```
+
+**Features**
+
+- **Data / Schema / SQL / Builder tabs.** Browse rows, inspect tables and relations, run ad-hoc `SELECT`s, or compose queries visually with a live TypeScript preview.
+- **Saved queries.** Named SQL snippets persisted to `.turbine/studio-queries.json` — share them across runs without committing them.
+- **Cmd+K command palette.** Jump to any table, tab, or saved query in one keystroke.
+- **Full-text search across rows.** The Data tab supports substring search across every text column of the current table.
+- **Visual query composer.** The Builder tab lets you click together `where` / `orderBy` / `with` / `limit` clauses and renders the matching `db.table.findMany(...)` TypeScript in real time — copy it into your codebase.
+
+**Security posture (read-only by design)**
+
+- **Loopback by default** (`127.0.0.1`) with a loud warning if you bind to a non-loopback address.
+- **Per-process auth token** — 24 random bytes of hex, stored in a `SameSite=Strict` `HttpOnly` cookie.
+- **Every query runs inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`.** Writes are physically impossible at the transaction level.
+- **SELECT/WITH-only SQL parser** strips comments and rejects non-trailing semicolons, blocking statement-stacking attacks.
+- **Security headers on every response** — `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
 
 ## Serverless / Edge
 
@@ -573,7 +600,6 @@ Turbine is focused and opinionated. Here's what it doesn't do:
 - **PostgreSQL only.** No MySQL, SQLite, or MSSQL. By design — going deep on one database enables the performance advantage and the edge-runtime story.
 - **No full-text search operators.** TSVECTOR/TSQUERY are not exposed in the query builder. Use `db.raw` for full-text queries.
 - **Large nested result sets.** Nested results are materialized server-side in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause — or stream the parents with `findManyStream` and resolve children per-row.
-- **No admin UI.** Turbine Studio is planned but not yet available.
 
 ## Examples
 
