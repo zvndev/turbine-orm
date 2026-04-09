@@ -31,7 +31,8 @@
   "files": {
     "includes": [
       "src/**",
-      "!src/cli/studio-ui.generated.ts"
+      "!src/cli/studio-ui.generated.ts",
+      "!src/cli/studio-ui.html"
     ]
   }
 }
