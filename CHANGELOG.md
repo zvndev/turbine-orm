@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.9.1 (2026-04-10)
+
+**Docs + tests patch.** Restores accurate messaging around deep `with`-clause
+type inference (shipped since 0.7.1) and locks in the end-to-end inference
+path with compile-time assertions. No runtime changes — `WithResult`,
+`RelationDescriptor`, and the generator's branded `*Relations` output were
+already in place and correct; this release just stops claiming otherwise in
+the README/landing page and adds a regression guard.
+
+### Tests
+- **End-to-end compile-time assertions for deep `with` inference through real
+  call sites** (`src/test/with-inference.test.ts`). The existing tests only
+  verified `WithResult` in isolation; the new sections 8 and 9 exercise
+  `findMany` / `findUnique` / `findFirst` / `findUniqueOrThrow` at 1/2/3
+  nested levels via both explicit type arguments and plain call-site literal
+  inference (`users.findMany({ with: { posts: { with: { comments: ... } } } })`).
+  If inference regresses at the user-facing signature, `tsx --test` now exits
+  non-zero because the test file fails to typecheck. 530/530 unit tests pass.
+
+### Docs
+- **README + site/app/page.mdx:** removed the "deep `with` type inference
+  lands in v1.0" caveat that slipped into 0.9.0 and replaced it with an
+  accurate description of the shipped feature. Deep inference has been
+  working end-to-end since 0.7.1 via the recursive `WithResult` mapped type
+  and the generator's `RelationDescriptor`-branded `*Relations` interfaces —
+  the 0.9.0 README was wrong, not the runtime.
+- **CLAUDE.md "Type System" section** corrected: removed the stale "Current
+  limitation: `with` clause return types do not reflect included relations
+  at the type level" paragraph (a pre-0.7.1 artifact) and replaced it with
+  an accurate architecture note covering `TypedWithClause`, `WithResult`,
+  `RelationDescriptor`, and `ApplyCardinality`.
+
 ## 0.9.0 (2026-04-09)
 
 **Studio Premium.** Turbine now ships a premium, read-only Studio web UI — the

@@ -13,7 +13,7 @@
  */
 
 import { describe, it } from 'node:test';
-import type { RelationDescriptor, WithResult } from '../query.js';
+import type { QueryInterface, RelationDescriptor, WithResult } from '../query.js';
 
 // ---------------------------------------------------------------------------
 // Type-level assertion helpers
@@ -146,6 +146,103 @@ interface LegacyUserRelations {
 
 type LegacySingle = WithResult<User, LegacyUserRelations, { posts: true }>;
 assertTrue<Equals<LegacySingle['posts'], Post[]>>();
+
+// ---------------------------------------------------------------------------
+// 8. End-to-end: calling findMany / findUnique / findFirst on a typed
+//    QueryInterface returns the correctly-inferred nested shape.
+//
+//    These assertions are the real-world path — they exercise the exact
+//    signature users see when they write `db.users.findMany({ with: ... })`.
+//    If this block fails to typecheck, `with` inference is broken at the
+//    *call site*, not in WithResult itself.
+// ---------------------------------------------------------------------------
+
+// Helper: extract the element type of an awaited array return value.
+type AwaitedArrayOf<P> = P extends Promise<(infer Item)[]> ? Item : never;
+type AwaitedOf<P> = P extends Promise<infer V> ? V : never;
+
+// Mock a typed QueryInterface for User, mirroring what `generate.ts` emits
+// for a table with relations.
+declare const users: QueryInterface<User, UserRelations>;
+
+// --- Plain call: no with ---
+// Note: we pass `<{}>` explicitly here because `ReturnType<typeof fn>` on a
+// generic function substitutes the constraint (`TypedWithClause<R>`), not the
+// default (`{}`). In real user code, calling `users.findMany()` without type
+// args does infer `W = {}` correctly — that path is exercised in section 9.
+type PlainList = AwaitedArrayOf<ReturnType<typeof users.findMany<{}>>>;
+assertTrue<Equals<PlainList, User>>();
+
+// --- Single-level with: { posts: true } ---
+type SingleFm = AwaitedArrayOf<ReturnType<typeof users.findMany<{ posts: true }>>>;
+assertTrue<Equals<SingleFm['posts'], Post[]>>();
+assertTrue<Equals<SingleFm['email'], string>>();
+
+// --- Two-level with: posts → comments ---
+type TwoFm = AwaitedArrayOf<ReturnType<typeof users.findMany<{ posts: { with: { comments: true } } }>>>;
+type TwoFmPost = TwoFm['posts'][number];
+assertTrue<Equals<TwoFmPost['comments'], Comment[]>>();
+
+// --- Three-level with: posts → comments → author ---
+type ThreeFm = AwaitedArrayOf<
+  ReturnType<typeof users.findMany<{ posts: { with: { comments: { with: { author: true } } } } }>>
+>;
+type ThreeFmComment = ThreeFm['posts'][number]['comments'][number];
+assertTrue<Equals<ThreeFmComment['author'], Author | null>>();
+
+// --- findUnique (single nullable result) ---
+type UniqRes = AwaitedOf<ReturnType<typeof users.findUnique<{ posts: true }>>>;
+// findUnique returns `WithResult<...> | null` — narrow to the non-null branch.
+type UniqResNonNull = NonNullable<UniqRes>;
+assertTrue<Equals<UniqResNonNull['posts'], Post[]>>();
+
+// --- findFirst (single nullable result) ---
+type FirstRes = AwaitedOf<ReturnType<typeof users.findFirst<{ profile: true }>>>;
+type FirstResNonNull = NonNullable<FirstRes>;
+assertTrue<Equals<FirstResNonNull['profile'], Profile | null>>();
+
+// --- findUniqueOrThrow (non-null result) ---
+type UniqOrThrowRes = AwaitedOf<ReturnType<typeof users.findUniqueOrThrow<{ posts: true }>>>;
+assertTrue<Equals<UniqOrThrowRes['posts'], Post[]>>();
+
+// ---------------------------------------------------------------------------
+// 9. Call-site literal inference: passing a `with` literal directly to
+//    findMany (without explicit type arguments) should still produce a
+//    correctly-inferred return type. This is the shape users actually
+//    write — explicit generics would be a regression in ergonomics.
+// ---------------------------------------------------------------------------
+
+// We call the method and capture the inferred return type via `typeof`.
+// TypeScript evaluates this at compile time even though it's in a type
+// position — no runtime invocation happens because the expression is
+// guarded by `false`.
+async function callSiteInference() {
+  // Using `0 as 1` guard so the body is unreachable at runtime but TS still
+  // typechecks the calls for us.
+  if (false as boolean) {
+    // Plain call — no with. Should collapse to plain `User`.
+    const plain = await users.findMany();
+    type PlainItem = (typeof plain)[number];
+    assertTrue<Equals<PlainItem, User>>();
+
+    const singleLevel = await users.findMany({ with: { posts: true } });
+    type SingleLevelItem = (typeof singleLevel)[number];
+    assertTrue<Equals<SingleLevelItem['posts'], Post[]>>();
+
+    const twoLevel = await users.findMany({
+      with: { posts: { with: { comments: true } } },
+    });
+    type TwoLevelItem = (typeof twoLevel)[number];
+    assertTrue<Equals<TwoLevelItem['posts'][number]['comments'], Comment[]>>();
+
+    const threeLevel = await users.findMany({
+      with: { posts: { with: { comments: { with: { author: true } } } } },
+    });
+    type ThreeLevelItem = (typeof threeLevel)[number];
+    assertTrue<Equals<ThreeLevelItem['posts'][number]['comments'][number]['author'], Author | null>>();
+  }
+}
+void callSiteInference;
 
 // ---------------------------------------------------------------------------
 // node:test stub so the runner picks up the file
