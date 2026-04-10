@@ -32,7 +32,19 @@ const repoRoot = resolve(__dirname, '..');
 const inputPath = resolve(repoRoot, 'src/cli/studio-ui.html');
 const outputPath = resolve(repoRoot, 'src/cli/studio-ui.generated.ts');
 
-const html = readFileSync(inputPath, 'utf8');
+let html;
+try {
+  html = readFileSync(inputPath, 'utf8');
+} catch (err) {
+  if (err && err.code === 'ENOENT') {
+    console.error(`build-studio-ui: source file not found at ${inputPath}`);
+    console.error('The designer-authored Studio HTML must exist before the build step runs.');
+    console.error('If you are building from a published tarball, this script should not run —');
+    console.error('the generated file is shipped pre-built. Run from a git checkout instead.');
+    process.exit(1);
+  }
+  throw err;
+}
 
 const banner =
   '// AUTO-GENERATED from src/cli/studio-ui.html. Do not edit by hand.\n' +

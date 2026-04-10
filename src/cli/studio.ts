@@ -233,7 +233,7 @@ function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
   }
   const cookieHeader = req.headers.cookie ?? '';
   const match = /turbine_studio_token=([a-f0-9]+)/.exec(cookieHeader);
-  if (match && match[1] && constantTimeEqual(match[1], expectedToken)) {
+  if (match?.[1] && constantTimeEqual(match[1], expectedToken)) {
     return true;
   }
   return false;

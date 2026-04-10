@@ -8,7 +8,7 @@ npm install turbine-orm
 
 ## Why Turbine?
 
-Turbine is a PostgreSQL-native TypeScript ORM with features no other ORM offers together: **deep typed `with` inference** (`users[0].posts[0].comments[0].author` autocompletes after one `findMany`), **cursor-based streaming** through nested relations, **typed error classes** with PostgreSQL constraint mapping, **pipeline batching** (N queries, 1 round-trip), **middleware**, and a driver-agnostic core that plugs into any pg-compatible pool so it runs on Vercel Edge, Cloudflare Workers, Deno Deploy, and similar environments. 1 runtime dependency (`pg`), ~110KB on npm.
+Turbine is a PostgreSQL-native TypeScript ORM built around features no other ORM bundles together: a **read-only, DBA-approvable Studio web UI** (the only one in the TS ORM ecosystem — `BEGIN READ ONLY` + statement-stacking guard + loopback-only + 24-byte auth token), **cursor-based streaming** through nested relations, **typed error classes** with PostgreSQL constraint mapping, **pipeline batching** (N queries, 1 round-trip), **middleware**, and a driver-agnostic core that plugs into any pg-compatible pool so it runs on Vercel Edge, Cloudflare Workers, Deno Deploy, and similar environments. 1 runtime dependency (`pg`), ~110KB on npm.
 
 **One round-trip for nested relations.** `db.users.findMany({ with: { posts: { with: { comments: true } } } })` resolves the entire object graph in a single database round-trip, regardless of nesting depth. Prisma 7+ and Drizzle v2 also do single-query nested loads — Turbine's advantage is architectural simplicity: 1 dependency, no code generation DSL, no query plan compiler.
 
@@ -34,7 +34,7 @@ Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizz
 - **Streaming 50K rows.** Turbine's optimized streaming (speculative first fetch + batch size 1000) matches Prisma at ~3.1–3.2 s. Drizzle's keyset pagination is 1.49× slower at 4.6 s. Turbine's cursor still gives you correctness on any `orderBy` and clean early-`break` semantics.
 - **Pipeline batching** puts 5 independent queries through a single round-trip using the Postgres extended-query pipeline protocol — all three ORMs are tied here since each runs 5 queries sequentially in a transaction.
 
-Beyond the numbers, Turbine's real strengths are: **one runtime dependency** (`pg`, ~110 KB), a **single import swap** for edge runtimes (`turbine-orm/serverless`), **typed Postgres errors** with a `readonly isRetryable` const for retry loops, and **inferred `with` result types** — `users[0].posts[0].comments[0].author.name` autocompletes from a single `findMany` with no manual assertion.
+Beyond the numbers, Turbine's real strengths are: **one runtime dependency** (`pg`, ~110 KB), a **single import swap** for edge runtimes (`turbine-orm/serverless`), **typed Postgres errors** with a `readonly isRetryable` const for retry loops, and the **read-only Studio** web UI that ships in the CLI — the only one in the TS ORM ecosystem that physically cannot mutate your database. Deep type inference through `with` clauses is runtime-correct today (the relations are nested for you in a single round-trip) and lands at the type level in v1.0 — see the tracking issue for progress.
 
 > Full analysis with p50/p95/p99 and methodology notes: [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench.ts`
@@ -560,9 +560,9 @@ Priority order: CLI flags > environment variables (`DATABASE_URL`) > config file
 
 ## How It Works
 
-Turbine resolves the entire object graph in a single database round-trip, regardless of nesting depth. The `with` clause is fully type-inferred end-to-end — `users[0].posts[0].comments[0].author.name` autocompletes from a single `findMany` call, with no manual type assertions.
+Turbine resolves the entire object graph in a single database round-trip, regardless of nesting depth. The runtime nests relations for you via `json_agg` — one round-trip, no N+1, no client-side stitching. Deep `with` type inference at the TypeScript level (so `users[0].posts[0].comments[0].author.name` autocompletes without a manual assertion) is the last piece landing in v1.0; today, the generated `*With*` helper interfaces let you annotate the return type when you need the nested shape to narrow.
 
-Prisma 7+ and Drizzle v2 also do single-query nested loads. Turbine's advantage isn't query latency (see [Benchmarks](#benchmarks) — all three are within noise over a real pooled database); it's architectural simplicity. One runtime dependency (`pg`), no DSL compiler, no driver adapter shim for edge, and deep `with` type inference without verbose helper types.
+Prisma 7+ and Drizzle v2 also do single-query nested loads. Turbine's advantage isn't query latency (see [Benchmarks](#benchmarks) — all three are within noise over a real pooled database); it's architectural simplicity plus the read-only Studio. One runtime dependency (`pg`), no DSL compiler, no driver adapter shim for edge, and the only TS ORM Studio your DBA will approve.
 
 ## Type Mapping
 

@@ -1717,6 +1717,7 @@
                   Run <span class="kbd" style="margin-left:4px">⌘↵</span>
                 </button>
                 <button class="btn" id="sqlFormat">Format</button>
+                <button class="btn" id="sqlCopy" title="Copy SQL to clipboard">Copy</button>
                 <button class="btn" id="sqlSave">
                   Save <span class="kbd" style="margin-left:4px">⌘S</span>
                 </button>
@@ -1755,6 +1756,7 @@
                 Run
               </button>
               <button class="btn" id="builderSave">Save</button>
+              <button class="btn" id="builderCopy" title="Copy generated TypeScript to clipboard">Copy TS</button>
               <button class="btn btn-ghost btn-sm" id="builderReset">Reset</button>
             </div>
           </div>
@@ -2066,6 +2068,31 @@
       }, 2400);
     }
 
+    async function copyToClipboard(text, label) {
+      if (!text) {
+        toast('Nothing to copy', 'err');
+        return;
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          // Fallback for non-secure contexts / older browsers
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.left = '-9999px';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+        }
+        toast((label || 'Copied') + ' to clipboard', 'ok');
+      } catch (err) {
+        toast('Copy failed: ' + (err && err.message ? err.message : 'unknown'), 'err');
+      }
+    }
+
     function isStringType(ts) {
       return ts === 'string';
     }
@@ -2339,7 +2366,9 @@
                 },
                 []
               ),
-              document.createTextNode('No rows match your search.'),
+              document.createTextNode(
+                State.data.search ? 'No rows match your search.' : 'No rows.'
+              ),
             ])
           );
           $('#dataRange').textContent = '0 of 0';
@@ -2671,6 +2700,9 @@
           ed.value = SqlPane.format(ed.value);
           State.sql.text = ed.value;
           Storage.set('sqlDraft', ed.value);
+        });
+        $('#sqlCopy').addEventListener('click', () => {
+          copyToClipboard($('#sqlEditor').value, 'SQL copied');
         });
         $('#sqlSave').addEventListener('click', () => SqlPane.openSave());
       },
@@ -3280,14 +3312,17 @@
       },
 
       updatePreview() {
+        const host = $('#builderPreview');
         const tableMeta = BuilderPane.findTable(State.builder.table);
         if (!tableMeta) {
-          $('#builderPreview').textContent = '';
+          host.textContent = '';
+          host.dataset.rawCode = '';
           return;
         }
         const args = BuilderPane.buildFindManyArgs(State.builder.args, tableMeta);
         const code = BuilderPane.renderCode(State.builder.table, args);
-        $('#builderPreview').innerHTML = highlightTs(code);
+        host.dataset.rawCode = code;
+        host.innerHTML = highlightTs(code);
       },
 
       renderCode(tableName, args) {
@@ -3378,6 +3413,10 @@
       bind() {
         $('#builderRun').addEventListener('click', () => BuilderPane.run());
         $('#builderSave').addEventListener('click', () => BuilderPane.openSave());
+        $('#builderCopy').addEventListener('click', () => {
+          const code = $('#builderPreview').dataset.rawCode || '';
+          copyToClipboard(code, 'TypeScript copied');
+        });
         $('#builderReset').addEventListener('click', () => {
           if (State.builder.table) BuilderPane.resetForTable(State.builder.table);
         });

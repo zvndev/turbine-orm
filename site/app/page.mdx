@@ -13,12 +13,16 @@ Postgres-native TypeScript ORM. Single-query nested relations via `json_agg`. On
   <span style={{ color: '#fff' }}>npm install turbine-orm</span>
 </div>
 
-Turbine resolves an entire object graph in one database round-trip, no matter how deep the nesting. The `with` clause is fully type-inferred end-to-end — `users[0].posts[0].comments[0].author.name` autocompletes from a single `findMany` call with no manual assertions. One runtime dependency (`pg`), ~110 KB on npm, and a one-import swap for edge runtimes.
+Turbine resolves an entire object graph in one database round-trip, no matter how deep the nesting. It ships with **Studio** — a read-only, loopback-bound web UI that your DBA will approve on sight (`BEGIN READ ONLY` + statement-stacking guard + 24-byte auth token, zero mutation surface). One runtime dependency (`pg`), ~110 KB on npm, and a one-import swap for edge runtimes. Deep `with` type inference lands in v1.0 — the runtime already nests relations for you today.
 
 <div className="card-grid">
   <div className="card">
     <h4>Single-query nested reads</h4>
     <p>Deep `with` clauses compile to one SQL statement using `json_agg` and correlated subqueries. No N+1, no client-side stitching.</p>
+  </div>
+  <div className="card">
+    <h4>Read-only Studio UI</h4>
+    <p>`npx turbine studio` ships a loopback-bound web UI that physically cannot mutate your database — `BEGIN READ ONLY`, statement-stacking guard, 24-byte auth token. The only TS ORM Studio your DBA will approve.</p>
   </div>
   <div className="card">
     <h4>Streaming cursors</h4>
@@ -61,9 +65,10 @@ const users = await db.users.findMany({
 Prisma 7+ and Drizzle v2 also do single-query nested loads — the N+1 framing is dead. Turbine's value is architectural simplicity combined with measurable performance on the scenarios that matter.
 
 - **One runtime dependency** (`pg`). No Rust binary, no WASM blob, no separate query engine process. ~110 KB on npm.
-- **Deep `with` inference.** Types narrow through arbitrarily nested relations without manual assertions or generated include helpers.
+- **Read-only Studio.** The only TypeScript ORM Studio that physically cannot mutate your database — `BEGIN READ ONLY` + statement-stacking guard + loopback-only + 24-byte auth token. Your DBA will approve it on sight.
 - **Real pipeline protocol.** `db.pipeline([...])` uses Postgres extended-query parse/bind/execute/sync in a single TCP flush — verified 2.58× speedup over sequential on Neon.
 - **Edge-ready.** `turbine-orm/serverless` accepts any pg-compatible pool and runs on Vercel Edge, Cloudflare Workers, Deno Deploy.
+- **Runtime-correct nested relations today.** Deep `with` clauses already return the full nested shape at runtime in a single round-trip. Type-level inference through `with` lands in v1.0; today you can use the generated `*With*` helper interfaces to annotate the return type when you need narrowing.
 - **Honest benchmarks.** Tested against Prisma 7.6 and Drizzle 0.45 on a real pooled Neon database. Wins L2 nested reads by 1.59× over Drizzle, matches Prisma on streaming, beats Drizzle by 1.49×. See [Benchmarks](/benchmarks).
 
 ## Next steps

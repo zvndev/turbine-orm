@@ -41,7 +41,8 @@ product review (8.1/10) found zero CRITICAL or HIGH vulnerabilities.
   Postgres cluster both run `turbine migrate up` concurrently. The previous
   implementation used a static lock ID, so a migration in database A would
   block a migration in database B. Lock ID is now a stable per-database
-  64-bit FNV-1a hash of `current_database()`.
+  32-bit FNV-1a hash of `current_database()` (top bit cleared for positive
+  `int4`, matching Postgres advisory-lock semantics).
 - **README Studio section rewritten** to headline read-only as a design
   feature, not a limitation. The old "Turbine Studio is planned but not yet
   available" bullet under Limitations has been removed.
