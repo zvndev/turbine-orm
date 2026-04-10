@@ -10,26 +10,22 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        brand: {
-          DEFAULT: '#3b82f6',
-          50: '#eff6ff',
-          100: '#dbeafe',
-          200: '#bfdbfe',
-          300: '#93c5fd',
-          400: '#60a5fa',
-          500: '#3b82f6',
-          600: '#2563eb',
-          700: '#1d4ed8',
-          800: '#1e40af',
-          900: '#1e3a8a',
+        surface: {
+          0: '#09090B',
+          1: '#0C0C0E',
+          2: '#111114',
+          3: '#141417',
+          4: '#1A1A1F',
         },
       },
       fontFamily: {
+        display: ['var(--font-display)', 'system-ui', 'sans-serif'],
         sans: ['var(--font-sans)', 'system-ui', 'sans-serif'],
         mono: ['var(--font-mono)', 'ui-monospace', 'monospace'],
       },
       maxWidth: {
-        content: '780px',
+        content: '820px',
+        landing: '1200px',
       },
     },
   },
