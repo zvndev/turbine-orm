@@ -9,6 +9,11 @@ concurrency:
   group: publish-next-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  # Required for npm provenance attestation
+  id-token: write
+
 jobs:
   publish-next:
     runs-on: ubuntu-latest

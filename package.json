@@ -52,7 +52,7 @@
     "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit",
     "prepare": "husky",
     "size": "size-limit",
-    "size:check": "size-limit --limit",
+    "size:check": "size-limit",
     "test:watch": "tsx --watch --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts",
     "db:seed": "psql $DATABASE_URL -v ON_ERROR_STOP=1 -f src/test/fixtures/seed.sql",
     "db:reset": "psql $DATABASE_URL -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;' && npm run db:seed",

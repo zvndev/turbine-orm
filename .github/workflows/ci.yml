@@ -122,6 +122,8 @@ jobs:
             echo "::error::Package size $SIZE exceeds 150kB limit"
             exit 1
           fi
+      - name: Check bundle sizes
+        run: npx size-limit
 
   security:
     runs-on: ubuntu-latest

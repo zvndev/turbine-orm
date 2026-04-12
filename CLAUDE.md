@@ -18,15 +18,22 @@ npm run lint:fix      # Biome lint --apply
 
 The core insight: instead of N+1 queries for nested relations, Turbine generates a single SQL statement using PostgreSQL's `json_agg` + `json_build_object` with correlated subqueries.
 
-**Dependency graph:** `client.ts` wraps `query.ts` with connection pooling and transactions. `query.ts` is the heart — it builds all SQL and parses results. `pipeline.ts` batches multiple `DeferredQuery` objects from `query.ts` into a single round-trip. The CLI (`cli/`) imports `generate.ts`, `introspect.ts`, and `schema-sql.ts` but never imports `query.ts` or `client.ts` directly.
+**Dependency graph:** `client.ts` wraps `query/` with connection pooling and transactions. The `query/` module is the heart — it builds all SQL and parses results. `pipeline.ts` batches multiple `DeferredQuery` objects from `query/` into a single round-trip. The CLI (`cli/`) imports `generate.ts`, `introspect.ts`, and `schema-sql.ts` but never imports `query/` or `client.ts` directly.
 
 ```
 src/
-  query.ts          — The heart (~3.5K LOC). SQL generation for all operations (findMany,
-                      findUnique, create, update, delete, aggregate, count). Builds WHERE
-                      clauses with operators (gt, in, contains, etc.), json_agg nested
-                      relation subqueries, and parameterized queries. Contains LRUCache
-                      (1K entry cap), QueryInterface class, and all public arg types.
+  query/            — The heart, split into submodules:
+    types.ts        — All public query arg types (~430 LOC): WhereClause, WithClause,
+                      FindManyArgs, RelationDescriptor, WithResult, UpdateOperatorInput,
+                      AggregateArgs, JsonFilter, ArrayFilter, etc.
+    utils.ts        — Pure utility functions (~130 LOC): quoteIdent(), escapeLike(),
+                      LRUCache (1K entry cap), fnv1a64Hex(), sqlToPreparedName(),
+                      OPERATOR_KEYS constant.
+    builder.ts      — QueryInterface class (~3.1K LOC): SQL generation for all operations
+                      (findMany, findUnique, create, update, delete, aggregate, count).
+                      Builds WHERE clauses, json_agg nested relation subqueries, and
+                      parameterized queries. Includes dev-only NODE_ENV validation guards.
+    index.ts        — Barrel re-export (~65 LOC). All imports use `./query/index.js`.
 
   client.ts         — TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
@@ -83,7 +90,7 @@ This repo ships the library **and** its marketing/docs site. The site lives at `
 
 ## The json_agg Algorithm
 
-The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (query.ts ~line 2173). For each relation in a `with` clause, it generates a correlated subquery that PostgreSQL evaluates per parent row.
+The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (query/builder.ts). For each relation in a `with` clause, it generates a correlated subquery that PostgreSQL evaluates per parent row.
 
 1. **Alias generation.** A shared `aliasCounter: { n: number }` is passed through all nesting levels. Each call allocates `t0`, `t1`, `t2`, etc. This prevents alias collisions in arbitrarily deep trees.
 
@@ -101,18 +108,18 @@ The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (
 
 ## Type System
 
-**Query arg types** (query.ts lines 60-270): `WhereClause<T>` supports equality, null checks, operators (`gt`, `gte`, `lt`, `lte`, `not`, `in`, `notIn`, `contains`, `startsWith`, `endsWith`), `mode: 'insensitive'` for ILIKE, `OR`/`AND`/`NOT` combinators, and relation filters (`some`/`every`/`none`). `WithClause` maps relation names to `true | WithOptions`. `WithOptions` supports nested `with`, `where`, `orderBy`, `limit`, `select`, and `omit`.
+**Query arg types** (query/types.ts): `WhereClause<T>` supports equality, null checks, operators (`gt`, `gte`, `lt`, `lte`, `not`, `in`, `notIn`, `contains`, `startsWith`, `endsWith`), `mode: 'insensitive'` for ILIKE, `OR`/`AND`/`NOT` combinators, and relation filters (`some`/`every`/`none`). `WithClause` maps relation names to `true | WithOptions`. `WithOptions` supports nested `with`, `where`, `orderBy`, `limit`, `select`, and `omit`.
 
-**Atomic updates** (query.ts ~line 197): `UpdateOperatorInput<V>` supports `set`, `increment`, `decrement`, `multiply`, `divide` for numeric fields. These generate `col = col + $n` style SQL for concurrent safety.
+**Atomic updates** (query/types.ts): `UpdateOperatorInput<V>` supports `set`, `increment`, `decrement`, `multiply`, `divide` for numeric fields. These generate `col = col + $n` style SQL for concurrent safety.
 
 **Generated types** (generate.ts): The code generator emits three files:
 - `types.ts` — Entity interfaces (singularized PascalCase), `*Create` types (optional for PK/default/nullable fields), `*Update` types (all non-PK fields optional), and `*With*` interfaces for each relation.
 - `metadata.ts` — Runtime `SchemaMetadata` constant with column maps, relations, indexes.
 - `index.ts` — `TurbineClient` subclass with `declare readonly` typed table accessors and a `turbine()` factory function.
 
-**`with` clause inference (shipped since 0.7.1):** `findMany` / `findUnique` / `findFirst` / `findUniqueOrThrow` are generic over `W extends TypedWithClause<R>` and return `Promise<WithResult<T, R, W>[]>`. The recursive `WithResult` mapped type (query.ts ~line 278) walks the `with` literal at arbitrary depth by reading the `RelationDescriptor<Target, Cardinality, TargetRelations>` phantom brand that the code generator emits on `*Relations` interfaces (see `generate.ts` ~line 183). Cardinality (`'many'` vs `'one'`) is re-applied at each level via `ApplyCardinality`, so `users[0].posts[0].comments[0].author.name` autocompletes end-to-end with no manual assertion. Compile-time assertions for this path live in `src/test/with-inference.test.ts` — if inference regresses, `tsx --test` exits non-zero because the test file fails to typecheck. The generated `*With*` interfaces (for annotating variables by hand) still exist for back-compat but are no longer required.
+**`with` clause inference (shipped since 0.7.1):** `findMany` / `findUnique` / `findFirst` / `findUniqueOrThrow` are generic over `W extends TypedWithClause<R>` and return `Promise<WithResult<T, R, W>[]>`. The recursive `WithResult` mapped type (query/types.ts) walks the `with` literal at arbitrary depth by reading the `RelationDescriptor<Target, Cardinality, TargetRelations>` phantom brand that the code generator emits on `*Relations` interfaces (see `generate.ts` ~line 183). Cardinality (`'many'` vs `'one'`) is re-applied at each level via `ApplyCardinality`, so `users[0].posts[0].comments[0].author.name` autocompletes end-to-end with no manual assertion. Compile-time assertions for this path live in `src/test/with-inference.test.ts` — if inference regresses, `tsx --test` exits non-zero because the test file fails to typecheck. The generated `*With*` interfaces (for annotating variables by hand) still exist for back-compat but are no longer required.
 
-**DeferredQuery<T>** (query.ts line 436): Each `build*()` method returns `{ sql, params, transform, tag }` instead of executing. The `transform` function converts `pg.QueryResult` into the final typed value. Used by `pipeline()` for batching.
+**DeferredQuery<T>** (query/builder.ts): Each `build*()` method returns `{ sql, params, transform, tag }` instead of executing. The `transform` function converts `pg.QueryResult` into the final typed value. Used by `pipeline()` for batching.
 
 ## Error System
 
@@ -131,8 +138,11 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E009 | `ForeignKeyError` | pg 23503 — via `wrapPgError()` |
 | E010 | `NotNullViolationError` | pg 23502 — via `wrapPgError()` |
 | E011 | `CheckConstraintError` | pg 23514 — via `wrapPgError()` |
+| E012 | `DeadlockError` | pg 40P01 — `isRetryable = true as const` |
+| E013 | `SerializationFailureError` | pg 40001 — `isRetryable = true as const` |
+| E014 | `PipelineError` | One or more queries in a pipeline batch failed |
 
-`wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query.ts`.
+`wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 
 ## CLI Architecture
 
@@ -168,7 +178,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 ## Common Tasks
 
 **Adding a new query method:**
-1. Define the args interface in query.ts (e.g. `FooArgs<T>`) near the existing arg types (~line 150).
+1. Define the args interface in `query/types.ts` (e.g. `FooArgs<T>`) near the existing arg types.
 2. Add a `buildFoo()` method to `QueryInterface` that returns `DeferredQuery<T>`. Build SQL using parameterized queries, push values to `params[]`, reference columns via `this.tableMeta`.
 3. Add a `foo()` method that calls `buildFoo()`, executes via `this.execute()`, and applies the transform.
 4. Add unit tests in `src/test/` using `makeQuery()` from helpers to verify generated SQL without a database.
@@ -196,5 +206,5 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 - Don't use `eval`, `new Function`, or shell interpolation
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings — always use `$N` parameterization
-- Don't import `client.ts` from `query.ts` (would create circular dependency)
+- Don't import `client.ts` from `query/` (would create circular dependency)
 - Don't register type parsers outside the TurbineClient constructor
