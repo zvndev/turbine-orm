@@ -98,7 +98,7 @@ describe('SQL injection defense — quoted identifier escaping', () => {
     // We can't directly reach quoteIdent's code path through the public API
     // with a hostile column name (metadata validation rejects it first),
     // but we can verify quoteIdent's contract directly.
-    const { quoteIdent } = await import('../query.js');
+    const { quoteIdent } = await import('../query/index.js');
     assert.equal(quoteIdent('users'), '"users"');
     assert.equal(quoteIdent('id"; DROP TABLE users; --'), '"id""; DROP TABLE users; --"');
     // The doubled quote is the critical invariant: any `"` in the input

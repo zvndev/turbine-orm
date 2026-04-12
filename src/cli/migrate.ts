@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { join } from 'node:path';
 import pg from 'pg';
 import { MigrationError } from '../errors.js';
-import { quoteIdent } from '../query.js';
+import { quoteIdent } from '../query/index.js';
 
 // ---------------------------------------------------------------------------
 // Types

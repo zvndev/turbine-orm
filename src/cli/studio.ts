@@ -24,8 +24,8 @@ import { platform } from 'node:os';
 import { dirname, resolve as pathResolve } from 'node:path';
 import pg from 'pg';
 import { introspect } from '../introspect.js';
-import type { FindManyArgs } from '../query.js';
-import { QueryInterface, quoteIdent } from '../query.js';
+import type { FindManyArgs } from '../query/index.js';
+import { QueryInterface, quoteIdent } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { STUDIO_HTML } from './studio-ui.generated.js';
 

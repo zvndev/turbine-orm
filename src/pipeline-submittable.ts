@@ -22,7 +22,7 @@ import type pg from 'pg';
 import Result from 'pg/lib/result';
 import { prepareValue } from 'pg/lib/utils';
 import { wrapPgError } from './errors.js';
-import type { DeferredQuery } from './query.js';
+import type { DeferredQuery } from './query/index.js';
 
 // ---------------------------------------------------------------------------
 // Types for pg internals we interact with

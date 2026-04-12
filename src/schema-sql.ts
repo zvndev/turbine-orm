@@ -6,7 +6,7 @@
  */
 
 import pg from 'pg';
-import { quoteIdent } from './query.js';
+import { quoteIdent } from './query/index.js';
 import { camelToSnake } from './schema.js';
 import type { ColumnConfig, SchemaDef, TableDef } from './schema-builder.js';
 

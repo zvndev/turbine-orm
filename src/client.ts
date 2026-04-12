@@ -25,7 +25,7 @@
 import pg from 'pg';
 import { type ErrorMessageMode, setErrorMessageMode, TimeoutError, wrapPgError } from './errors.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
-import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from './query.js';
+import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from './query/index.js';
 import type { SchemaMetadata } from './schema.js';
 
 // ---------------------------------------------------------------------------
