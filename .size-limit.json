@@ -1,0 +1,14 @@
+[
+  {
+    "path": "dist/index.js",
+    "limit": "120 kB"
+  },
+  {
+    "path": "dist/cjs/index.js",
+    "limit": "120 kB"
+  },
+  {
+    "path": "dist/serverless.js",
+    "limit": "5 kB"
+  }
+]
