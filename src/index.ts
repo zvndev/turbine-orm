@@ -105,7 +105,7 @@ export {
   type WithClause,
   type WithOptions,
   type WithResult,
-} from './query.js';
+} from './query/index.js';
 // Schema metadata types
 export type {
   ColumnMetadata,

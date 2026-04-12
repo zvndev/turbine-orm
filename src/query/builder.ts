@@ -19,79 +19,47 @@ import {
   TimeoutError,
   ValidationError,
   wrapPgError,
-} from './errors.js';
-import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
-import { camelToSnake, snakeToCamel } from './schema.js';
+} from '../errors.js';
+import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
+import { camelToSnake, snakeToCamel } from '../schema.js';
+import type {
+  AggregateArgs,
+  AggregateResult,
+  ArrayFilter,
+  CountArgs,
+  CreateArgs,
+  CreateManyArgs,
+  DeleteArgs,
+  DeleteManyArgs,
+  FindManyArgs,
+  FindManyStreamArgs,
+  FindUniqueArgs,
+  GroupByArgs,
+  JsonFilter,
+  OrderDirection,
+  TypedWithClause,
+  UpdateArgs,
+  UpdateManyArgs,
+  UpsertArgs,
+  WhereClause,
+  WhereOperator,
+  WithClause,
+  WithOptions,
+  WithResult,
+} from './types.js';
+import {
+  escapeLike,
+  escSingleQuote,
+  LRUCache,
+  OPERATOR_KEYS,
+  quoteIdent,
+  type SqlCacheEntry,
+  sqlToPreparedName,
+} from './utils.js';
 
 // ---------------------------------------------------------------------------
-// Identifier quoting — prevents SQL injection via table/column names
+// Internal detection helpers — used by QueryInterface
 // ---------------------------------------------------------------------------
-
-/**
- * Quote a SQL identifier (table name, column name) using Postgres double-quote
- * rules: wrap in double quotes, escape internal double quotes by doubling them.
- *
- * @example
- *   quoteIdent('users')       → '"users"'
- *   quoteIdent('my"table')    → '"my""table"'
- *   quoteIdent('user name')   → '"user name"'
- */
-export function quoteIdent(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
-}
-
-/**
- * Escape single quotes for use as string keys in json_build_object().
- * Doubles single quotes per SQL quoting rules.
- */
-function escSingleQuote(s: string): string {
-  return s.replace(/'/g, "''");
-}
-
-/**
- * Escape LIKE pattern metacharacters: %, _, and \.
- * Must be used with `ESCAPE '\'` in the LIKE clause.
- */
-function escapeLike(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
-}
-
-// ---------------------------------------------------------------------------
-// Public query argument types
-// ---------------------------------------------------------------------------
-
-export type OrderDirection = 'asc' | 'desc';
-
-/** Operator object for advanced where filtering */
-export interface WhereOperator<V = unknown> {
-  gt?: V;
-  gte?: V;
-  lt?: V;
-  lte?: V;
-  not?: V | null;
-  in?: V[];
-  notIn?: V[];
-  contains?: string;
-  startsWith?: string;
-  endsWith?: string;
-  /** Set to 'insensitive' to use ILIKE instead of LIKE for string comparisons */
-  mode?: 'default' | 'insensitive';
-}
-
-/** Known operator keys — used to detect operator objects vs plain values */
-const OPERATOR_KEYS = new Set<string>([
-  'gt',
-  'gte',
-  'lt',
-  'lte',
-  'not',
-  'in',
-  'notIn',
-  'contains',
-  'startsWith',
-  'endsWith',
-  'mode',
-]);
 
 /** Check if a value is a where operator object (has at least one known operator key) */
 function isWhereOperator(value: unknown): value is WhereOperator {
@@ -108,397 +76,8 @@ function isWhereOperator(value: unknown): value is WhereOperator {
   return keys.length > 0 && keys.every((k) => OPERATOR_KEYS.has(k));
 }
 
-/**
- * A where value can be:
- * - A plain value (equality: column = $N)
- * - null (column IS NULL)
- * - An operator object ({ gt: 5, lte: 10 })
- * - A JSONB filter object ({ contains, equals, path, hasKey })
- * - An array filter object ({ has, hasEvery, hasSome, isEmpty })
- */
-export type WhereValue<V = unknown> = V | WhereOperator<V> | JsonFilter | ArrayFilter | null;
-
-/**
- * Where clause type: each field can be a plain value, null, or operator object.
- * Special keys: OR for disjunctive conditions.
- * Relation names can be used with some/every/none sub-filters.
- */
-export type WhereClause<T> = {
-  [K in keyof T]?: WhereValue<T[K]>;
-} & {
-  OR?: WhereClause<T>[];
-  AND?: WhereClause<T>[];
-  NOT?: WhereClause<T>;
-  /** Relation filters — keyed by relation name, value is { some, every, none } */
-  [relationName: string]: unknown;
-};
-
-/**
- * Unparameterized with clause — accepts any relation name.
- * Used internally by the query builder at runtime.
- */
-export interface WithClause {
-  [relation: string]: true | WithOptions;
-}
-
-/**
- * Relation-aware with clause. When R (the relations map) is provided,
- * only keys from R are autocompleted. Used in public method signatures
- * so the compiler can narrow the return type.
- *
- * For typed maps, each relation accepts either `true` (default include) or a
- * {@link WithOptions} object whose nested `with` is keyed against the relation
- * target's own relations interface — this is what enables deep
- * `WithResult` inference.
- */
-export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
-  ? WithClause
-  : {
-      [K in keyof R]?: true | WithOptions<RelationRelations<R[K]> & object>;
-    };
-
-/**
- * Options for an included relation.
- *
- * Generic over `NestedR` — the relations interface of the *target* entity —
- * so the nested `with` clause is autocompleted with the correct relation keys
- * and so {@link WithResult} can recursively infer the return type. Defaults to
- * `{}` (no relation suggestions) for callers that use the unparameterized
- * {@link WithClause}.
- */
-export interface WithOptions<NestedR extends object = {}> {
-  with?: TypedWithClause<NestedR>;
-  where?: Record<string, unknown>;
-  orderBy?: Record<string, OrderDirection>;
-  limit?: number;
-  /** Only include these fields from the relation */
-  select?: Record<string, boolean>;
-  /** Exclude these fields from the relation */
-  omit?: Record<string, boolean>;
-}
-
-// ---------------------------------------------------------------------------
-// WithResult — compute return type based on included relations (recursive)
-// ---------------------------------------------------------------------------
-
-/**
- * A relation descriptor used by generated `*Relations` interfaces to make deep
- * `with` clause inference work. It bundles three pieces of information that
- * `WithResult` needs to recurse through nested relations:
- *
- *  - `__target`     — the target entity type (e.g. `Post`)
- *  - `__cardinality`— `'many'` for hasMany, `'one'` for belongsTo / hasOne
- *  - `__relations`  — the target entity's relations interface (for further recursion)
- *
- * **Generator contract (Track 3):** the code generator emits `*Relations`
- * interfaces in the following shape so that `WithResult` can walk arbitrary
- * nesting depth:
- *
- * ```ts
- * export interface UserRelations {
- *   posts:   RelationDescriptor<Post,    'many', PostRelations>;
- *   profile: RelationDescriptor<Profile, 'one',  ProfileRelations>;
- * }
- * ```
- *
- * The brand fields are phantom — they exist only for type inference and have
- * no runtime representation. The runtime always sees the parsed entity values
- * (arrays for hasMany, single object or null for belongsTo / hasOne) — see the
- * cardinality projection inside {@link WithResult}.
- *
- * **Backward compatibility:** legacy generated code emitted bare types
- * (`posts: Post[]`, `profile: Profile | null`). `WithResult` still accepts that
- * shape via a fallback branch — it just cannot recurse into nested `with` for
- * those relations until the generator is updated.
- *
- * @typeParam Target      - The entity type the relation points at.
- * @typeParam Cardinality - `'many'` (array) or `'one'` (single object | null).
- * @typeParam Relations   - The target entity's own `*Relations` interface, or
- *                          `{}` if the target has no relations of its own.
- */
-export interface RelationDescriptor<Target, Cardinality extends 'one' | 'many', Relations extends object = {}> {
-  readonly __target?: Target;
-  readonly __cardinality?: Cardinality;
-  readonly __relations?: Relations;
-}
-
-/** Extract the target entity from a relation descriptor or bare relation type. */
-type RelationTarget<Rel> =
-  Rel extends RelationDescriptor<infer Target, infer _C, infer _R>
-    ? Target
-    : Rel extends Array<infer Item>
-      ? Item
-      : Rel extends infer One | null
-        ? One
-        : Rel;
-
-/** Extract the target's relations map from a relation descriptor (or `{}` for bare types). */
-type RelationRelations<Rel> = Rel extends RelationDescriptor<infer _T, infer _C, infer R> ? R : {};
-
-/** Project the target type into its runtime shape (array for many, single for one). */
-type ApplyCardinality<Rel, Resolved> =
-  Rel extends RelationDescriptor<infer _T, infer Cardinality, infer _R>
-    ? Cardinality extends 'many'
-      ? Resolved[]
-      : Resolved | null
-    : Rel extends Array<infer _Item>
-      ? Resolved[]
-      : Resolved | null;
-
-/**
- * Compute the result type when relations are included via `with`.
- *
- * Recursively walks the `with` clause, looking up each relation in `R` and:
- *
- *  1. If the relation is included with `true` (or no nested `with`), the
- *     relation's bare resolved type is grafted onto `T` (e.g. `posts: Post[]`).
- *  2. If the relation is included with a nested `with: {...}`, the recursion
- *     looks up the target entity's relations interface (via the
- *     {@link RelationDescriptor} brand fields the generator emits) and
- *     recursively applies `WithResult` to the nested target. Cardinality is
- *     re-applied at each level so a hasMany relation stays an array even after
- *     deep nesting.
- *
- * **When `R` is `{}` (the default):** the recursion short-circuits and the
- * function returns plain `T` — preserving the existing untyped escape hatch
- * for callers that have not generated typed clients.
- *
- * **When `R` does not contain the requested relations:** the unknown keys are
- * ignored (the runtime will throw a `RelationError`, but the type system stays
- * permissive so the legacy `WithClause` index signature still typechecks).
- *
- * @typeParam T - Base entity type (e.g. `User`).
- * @typeParam R - Relations map for `T` (e.g.
- *                `{ posts: RelationDescriptor<Post, 'many', PostRelations>; ... }`).
- *                Legacy bare shapes (`{ posts: Post[]; profile: Profile | null }`)
- *                are also accepted, but cannot recurse beyond one level.
- * @typeParam W - The `with` clause the user passed (e.g. `{ posts: true }` or
- *                `{ posts: { with: { comments: true } } }`).
- */
-export type WithResult<T, R extends object, W> = [keyof R] extends [never]
-  ? T
-  : W extends object
-    ? [keyof W & keyof R] extends [never]
-      ? T
-      : T & {
-          [K in keyof W & keyof R]: W[K] extends true
-            ? // Leaf inclusion — no further `with`. Project the relation's runtime shape.
-              ApplyCardinality<R[K], RelationTarget<R[K]>>
-            : W[K] extends { with?: infer NestedW }
-              ? NestedW extends object
-                ? // Recursive case — drill into the target's relations map.
-                  ApplyCardinality<R[K], WithResult<RelationTarget<R[K]>, RelationRelations<R[K]> & object, NestedW>>
-                : // `with` was passed but is not an object literal — treat as leaf.
-                  ApplyCardinality<R[K], RelationTarget<R[K]>>
-              : // `WithOptions` was passed without a nested `with` — treat as leaf.
-                ApplyCardinality<R[K], RelationTarget<R[K]>>;
-        }
-    : T;
-
-export interface FindUniqueArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>> {
-  where: WhereClause<T>;
-  select?: Record<string, boolean>;
-  omit?: Record<string, boolean>;
-  with?: W;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-}
-
-export interface FindManyArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>> {
-  where?: WhereClause<T>;
-  select?: Record<string, boolean>;
-  omit?: Record<string, boolean>;
-  orderBy?: Record<string, OrderDirection>;
-  limit?: number;
-  offset?: number;
-  with?: W;
-  /** Cursor-based pagination: start after this row */
-  cursor?: Partial<T>;
-  /** Number of records to take (used with cursor) */
-  take?: number;
-  /** De-duplicate results by specified fields */
-  distinct?: (keyof T & string)[];
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-}
-
-export interface FindManyStreamArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>>
-  extends FindManyArgs<T, R, W> {
-  /**
-   * Number of rows to fetch per internal FETCH batch (default: 1000).
-   *
-   * Trade-off: larger batches reduce network round-trips (important for
-   * high-latency connections like Neon) but increase per-batch memory.
-   * At 1000 rows x ~500 bytes/row the default is ~500 KB per batch.
-   *
-   * When the total result set fits within one batch, the stream avoids
-   * cursor overhead entirely (no BEGIN / DECLARE / CLOSE / COMMIT) by
-   * using a speculative `SELECT ... LIMIT batchSize+1` first.
-   */
-  batchSize?: number;
-}
-
-export interface CreateArgs<T> {
-  data: Partial<T>;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-}
-
-export interface CreateManyArgs<T> {
-  data: Partial<T>[];
-  /** When true, adds ON CONFLICT DO NOTHING to skip duplicate rows */
-  skipDuplicates?: boolean;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-}
-
-/**
- * Atomic update operators for a field.
- *
- * `set` works on any type; `increment`, `decrement`, `multiply`, and `divide`
- * are only valid on numeric fields. They generate SQL like
- * `col = col + $n` (and the corresponding `-`, `*`, `/` variants) instead of
- * plain absolute assignments, so they are safe against concurrent writers —
- * the database performs the math atomically.
- *
- * @example
- *   db.posts.update({ where: { id: 5 }, data: { viewCount: { increment: 1 } } });
- */
-export type UpdateOperatorInput<V> =
-  | { set: V }
-  | (V extends number ? { increment: number } : never)
-  | (V extends number ? { decrement: number } : never)
-  | (V extends number ? { multiply: number } : never)
-  | (V extends number ? { divide: number } : never);
-
-/**
- * Update data — each field can be a plain value or an atomic operator object.
- * Back-compatible with `Partial<T>`: plain values still typecheck unchanged.
- */
-export type UpdateInput<T> = {
-  [K in keyof T]?: T[K] | UpdateOperatorInput<T[K]>;
-};
-
 /** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
 const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
-
-export interface UpdateArgs<T> {
-  where: WhereClause<T>;
-  data: UpdateInput<T>;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-  /**
-   * Opt in to running this mutation when `where` resolves to an empty
-   * predicate (e.g. `{}` or `{ id: undefined }`). Default `false` — an
-   * empty predicate throws `ValidationError` to catch the common case of
-   * a filter value accidentally being `undefined`. Set this to `true` only
-   * when an unconditional mutation is the intended behaviour.
-   */
-  allowFullTableScan?: boolean;
-}
-
-export interface UpdateManyArgs<T> {
-  where: WhereClause<T>;
-  data: UpdateInput<T>;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-  /** See {@link UpdateArgs.allowFullTableScan}. */
-  allowFullTableScan?: boolean;
-}
-
-export interface DeleteArgs<T> {
-  where: WhereClause<T>;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-  /** See {@link UpdateArgs.allowFullTableScan}. */
-  allowFullTableScan?: boolean;
-}
-
-export interface DeleteManyArgs<T> {
-  where: WhereClause<T>;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-  /** See {@link UpdateArgs.allowFullTableScan}. */
-  allowFullTableScan?: boolean;
-}
-
-export interface UpsertArgs<T> {
-  where: WhereClause<T>;
-  create: Partial<T>;
-  update: Partial<T>;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-}
-
-export interface CountArgs<T> {
-  where?: WhereClause<T>;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-}
-
-export interface GroupByArgs<T> {
-  by: (keyof T & string)[];
-  where?: WhereClause<T>;
-  /** Include count of each group */
-  _count?: true;
-  /** Sum of numeric fields in each group */
-  _sum?: Partial<Record<keyof T & string, boolean>>;
-  /** Average of numeric fields in each group */
-  _avg?: Partial<Record<keyof T & string, boolean>>;
-  /** Minimum value of fields in each group */
-  _min?: Partial<Record<keyof T & string, boolean>>;
-  /** Maximum value of fields in each group */
-  _max?: Partial<Record<keyof T & string, boolean>>;
-  /** Order groups */
-  orderBy?: Record<string, OrderDirection>;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-}
-
-/** Arguments for the standalone aggregate method */
-export interface AggregateArgs<T> {
-  where?: WhereClause<T>;
-  /** Count all rows matching the filter */
-  _count?: true | Partial<Record<keyof T & string, boolean>>;
-  /** Sum of numeric fields */
-  _sum?: Partial<Record<keyof T & string, boolean>>;
-  /** Average of numeric fields */
-  _avg?: Partial<Record<keyof T & string, boolean>>;
-  /** Minimum value of fields */
-  _min?: Partial<Record<keyof T & string, boolean>>;
-  /** Maximum value of fields */
-  _max?: Partial<Record<keyof T & string, boolean>>;
-  /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
-}
-
-/** Result type for aggregate queries */
-export interface AggregateResult<T> {
-  _count?: number | Record<string, number>;
-  _sum?: Partial<Record<keyof T & string, number | null>>;
-  _avg?: Partial<Record<keyof T & string, number | null>>;
-  _min?: Partial<Record<keyof T & string, unknown>>;
-  _max?: Partial<Record<keyof T & string, unknown>>;
-}
-
-/** Relation filter operators for where clauses */
-export interface RelationFilter {
-  some?: Record<string, unknown>;
-  every?: Record<string, unknown>;
-  none?: Record<string, unknown>;
-}
-
-/** JSONB query operators for where clauses */
-export interface JsonFilter {
-  /** Access nested path via #>> operator */
-  path?: string[];
-  /** Exact match: column @> value::jsonb (containment) */
-  equals?: unknown;
-  /** Containment check: column @> value::jsonb */
-  contains?: unknown;
-  /** Key existence check: column ? key */
-  hasKey?: string;
-}
 
 /** Known JSONB operator keys */
 const JSONB_OPERATOR_KEYS = new Set<string>(['path', 'equals', 'contains', 'hasKey']);
@@ -536,18 +115,6 @@ function findJsonUniqueKey(value: object): string | null {
     if (JSONB_UNIQUE_KEYS.has(k)) return k;
   }
   return null;
-}
-
-/** Array query operators for where clauses */
-export interface ArrayFilter {
-  /** Check if array contains a single value: value = ANY(column) */
-  has?: unknown;
-  /** Check if array contains ALL values: column @> ARRAY[...] */
-  hasEvery?: unknown[];
-  /** Check if array has ANY of the values: column && ARRAY[...] */
-  hasSome?: unknown[];
-  /** Check if array is empty: array_length(column, 1) IS NULL */
-  isEmpty?: boolean;
 }
 
 /** Known Array operator keys */
@@ -589,85 +156,6 @@ function findArrayUniqueKey(value: object): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// LRU cache — bounded SQL template cache to prevent memory leaks
-// ---------------------------------------------------------------------------
-
-/**
- * Simple LRU (Least Recently Used) cache with a fixed maximum size.
- * When the cache exceeds maxSize, the oldest (least recently used) entry is evicted.
- * Uses Map insertion order for O(1) eviction.
- */
-class LRUCache<K, V> {
-  private cache = new Map<K, V>();
-  constructor(private maxSize: number) {}
-
-  get(key: K): V | undefined {
-    const value = this.cache.get(key);
-    if (value !== undefined) {
-      // Move to end (most recently used)
-      this.cache.delete(key);
-      this.cache.set(key, value);
-    }
-    return value;
-  }
-
-  set(key: K, value: V): void {
-    if (this.cache.has(key)) {
-      this.cache.delete(key);
-    } else if (this.cache.size >= this.maxSize) {
-      // Delete oldest (first) entry
-      const firstKey = this.cache.keys().next().value;
-      if (firstKey !== undefined) this.cache.delete(firstKey);
-    }
-    this.cache.set(key, value);
-  }
-
-  get size() {
-    return this.cache.size;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// SQL cache entry + prepared statement name derivation
-// ---------------------------------------------------------------------------
-
-/** Cached SQL template paired with its prepared-statement name. */
-export interface SqlCacheEntry {
-  sql: string;
-  name: string;
-}
-
-/**
- * FNV-1a 64-bit hash returning 16 lowercase hex chars.
- * Single-loop string iteration. Uses BigInt for 64-bit math.
- *
- * @internal Exported for testing only.
- */
-export function fnv1a64Hex(s: string): string {
-  // FNV-1a offset basis and prime for 64-bit
-  let hash = 0xcbf29ce484222325n;
-  const prime = 0x100000001b3n;
-  const mask = 0xffffffffffffffffn; // 64-bit mask
-
-  for (let i = 0; i < s.length; i++) {
-    hash ^= BigInt(s.charCodeAt(i));
-    hash = (hash * prime) & mask;
-  }
-
-  return hash.toString(16).padStart(16, '0');
-}
-
-/**
- * Derive a prepared-statement name from a SQL string.
- * Format: `t_<16hex>` — always 18 chars, well under NAMEDATALEN (63).
- *
- * @internal Exported for testing only.
- */
-export function sqlToPreparedName(sql: string): string {
-  return `t_${fnv1a64Hex(sql)}`;
-}
-
-// ---------------------------------------------------------------------------
 // Deferred query descriptor (for pipeline batching)
 // ---------------------------------------------------------------------------
 
@@ -689,7 +177,7 @@ export interface DeferredQuery<T> {
 // ---------------------------------------------------------------------------
 
 /** Middleware function type — imported from client to avoid circular deps */
-type MiddlewareFn = (
+export type MiddlewareFn = (
   params: { model: string; action: string; args: Record<string, unknown> },
   next: (params: { model: string; action: string; args: Record<string, unknown> }) => Promise<unknown>,
 ) => Promise<unknown>;
@@ -751,6 +239,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** Pre-computed column type lookups (avoids linear scans per query) */
   private readonly columnPgTypeMap: Map<string, string>;
   private readonly columnArrayTypeMap: Map<string, string>;
+
+  /** Tracks tables that have already triggered a deep-with warning (one-time) */
+  private readonly deepWithWarned = new Set<string>();
 
   constructor(
     private readonly pool: pg.Pool,
@@ -1032,6 +523,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async findMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): Promise<WithResult<T, R, W>[]> {
     this.maybeWarnUnlimited(args);
 
+    // Dev-only: warn on deeply nested with clauses
+    if (process.env.NODE_ENV !== 'production') {
+      if (args?.with) {
+        const depth = this.measureWithDepth(args.with as WithClause);
+        if (depth > 5 && !this.deepWithWarned.has(this.table)) {
+          this.deepWithWarned.add(this.table);
+          console.warn(
+            `[turbine] Deep with clause (depth ${depth}) on "${this.tableMeta.name}" — ` +
+              'consider splitting into separate queries for better performance.',
+          );
+        }
+      }
+    }
+
     return this.executeWithMiddleware('findMany', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
@@ -1060,6 +565,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
       `[turbine] warning: findMany on "${this.table}" has no limit — this will fetch every row. ` +
         'Pass `limit` or set `warnOnUnlimited: false` in config to silence.',
     );
+  }
+
+  /**
+   * Recursively measure the maximum depth of a `with` clause tree.
+   * Used by the dev-only deep-with warning guard.
+   */
+  private measureWithDepth(withClause: WithClause): number {
+    let maxDepth = 1;
+    for (const spec of Object.values(withClause)) {
+      if (spec && typeof spec === 'object' && 'with' in spec && spec.with) {
+        const nested = this.measureWithDepth(spec.with as WithClause);
+        maxDepth = Math.max(maxDepth, 1 + nested);
+      }
+    }
+    return maxDepth;
   }
 
   buildFindMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T[]> {
@@ -2999,6 +2519,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /** Build ORDER BY clause from an object */
   private buildOrderBy(orderBy: Record<string, OrderDirection>): string {
+    // Dev-only: validate that orderBy fields exist in the table schema
+    if (process.env.NODE_ENV !== 'production') {
+      for (const key of Object.keys(orderBy)) {
+        const snakeKey = camelToSnake(key);
+        if (!this.tableMeta.columns.some((c) => c.name === snakeKey) && !(key in this.tableMeta.columnMap)) {
+          console.warn(
+            `[turbine] Unknown orderBy field "${key}" for table "${this.tableMeta.name}". ` +
+              'This will cause a runtime error.',
+          );
+        }
+      }
+    }
+
     const meta = this.schema.tables[this.table];
     return Object.entries(orderBy)
       .map(([key, dir]) => {

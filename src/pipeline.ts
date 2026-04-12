@@ -22,7 +22,7 @@
 import type pg from 'pg';
 import { wrapPgError } from './errors.js';
 import { type PipelineRunOptions, runPipelined, supportsExtendedPipeline } from './pipeline-submittable.js';
-import type { DeferredQuery } from './query.js';
+import type { DeferredQuery } from './query/index.js';
 
 // ---------------------------------------------------------------------------
 // Pipeline options (public)

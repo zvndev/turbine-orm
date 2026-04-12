@@ -13,7 +13,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type pg from 'pg';
-import { QueryInterface } from '../query.js';
+import { QueryInterface } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
 

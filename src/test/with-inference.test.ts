@@ -13,7 +13,7 @@
  */
 
 import { describe, it } from 'node:test';
-import type { QueryInterface, RelationDescriptor, WithResult } from '../query.js';
+import type { QueryInterface, RelationDescriptor, WithResult } from '../query/index.js';
 
 // ---------------------------------------------------------------------------
 // Type-level assertion helpers

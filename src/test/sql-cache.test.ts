@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { fnv1a64Hex, QueryInterface, sqlToPreparedName } from '../query.js';
+import { fnv1a64Hex, QueryInterface, sqlToPreparedName } from '../query/index.js';
 import type { RelationDef, SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 

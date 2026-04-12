@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { describe, it } from 'node:test';
 import { type PgPoolClient, runPipelined, supportsExtendedPipeline } from '../pipeline-submittable.js';
-import type { DeferredQuery } from '../query.js';
+import type { DeferredQuery } from '../query/index.js';
 
 // ---------------------------------------------------------------------------
 // Fake Connection that simulates Postgres backend messages

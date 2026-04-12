@@ -5,7 +5,7 @@
  * the table layout it cares about.
  */
 
-import { QueryInterface } from '../query.js';
+import { QueryInterface } from '../query/index.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
 /** Build a minimal ColumnMetadata for testing */

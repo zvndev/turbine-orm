@@ -15,7 +15,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { executePipeline } from '../pipeline.js';
-import type { DeferredQuery } from '../query.js';
+import type { DeferredQuery } from '../query/index.js';
 
 // ---------------------------------------------------------------------------
 // Minimal mock pool
