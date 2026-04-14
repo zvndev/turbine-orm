@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.9.2 (2026-04-14)
+
+**Docs + positioning patch.** Sharpens the landing-page/README pitch around the
+real differentiators (one runtime dep, Studio, code-first + DB-first in one
+CLI, first-class edge runtimes) and demotes `json_agg` as a headline feature
+since Drizzle and Prisma 7 both use it. Ships four new site doc pages, a
+contributor seed script, and two new internal design docs (dialect roadmap +
+full DX reference).
+
+### Docs
+- **New site pages:** `/relations` (deep-dive on `with`, nested options,
+  relation filters, payload-size warnings with concrete numbers),
+  `/transactions` (`$transaction` callback form, isolation, timeouts, nested
+  SAVEPOINTs, retry loops for `DeadlockError` / `SerializationFailureError`,
+  `pipeline()` semantics), `/serverless` (Neon / Vercel Postgres / Cloudflare
+  Hyperdrive / Supabase walkthroughs, `PgCompatPool` contract, edge memory
+  budget table), `/migrate-from-prisma` (promoted from `docs/` with an 8-step
+  checklist and schema translation example).
+- **Landing hero + README** rewritten to lead with "one runtime dependency,"
+  built-in Studio, code-first + DB-first in the same CLI, and edge runtime
+  support. `json_agg` moved to the last feature rather than the first.
+- **Sidebar + sitemap** updated to include the four new pages.
+
+### Internal docs
+- **`docs/NEXT-INTEGRATIONS.md`** — post-v1.0 dialect roadmap. Tier 1:
+  CockroachDB (~1 engineer-week, PG-wire already compatible) and MySQL
+  (4–6 weeks as `turbine-orm/mysql` subpath). Tier 2: SQLite (3 weeks; also
+  wins internal CI speed). Tier 3 skip: SQL Server (engineering cost too high,
+  audience already captured by TypeORM), MongoDB (philosophical mismatch).
+  Tier 4 declined: PowDB (custom binary wire protocol, no SQL, no `json_agg`,
+  no `information_schema` — revisit when PG-wire compat layer ships).
+- **`docs/USING-TURBINE-ORM.md`** — 19-section full DX reference covering
+  schema / client / reads / where / with / writes / transactions / pipeline /
+  streaming / raw SQL / errors / CLI / migrations / Studio / testing /
+  deployment / intentional non-features. Each section includes port notes
+  for building a similar TypeScript client against another database.
+
+### Contributor DX
+- **`scripts/seed-test-db.sh` + `scripts/docker-compose.yml`** — one-command
+  Postgres seed for the integration-test database (throwaway Docker Compose
+  on port 54329, benchmark seeder on first run). `CONTRIBUTING.md` updated
+  with the new path.
+- **`.c8rc.json`** — scope comment added (why `cli/`, `generate.ts`,
+  `introspect.ts`, `serverless.ts`, `index.ts` are excluded) and thresholds
+  raised: lines 57→65, functions 64→70, statements 57→65, branches 80→82.
+
+No runtime changes. 530/530 unit tests pass.
+
 ## 0.9.1 (2026-04-10)
 
 **Docs + tests patch.** Restores accurate messaging around deep `with`-clause
