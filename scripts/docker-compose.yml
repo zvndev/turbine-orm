@@ -1,0 +1,17 @@
+services:
+  turbine-test-db:
+    image: postgres:17-alpine
+    container_name: turbine-test-db
+    environment:
+      POSTGRES_USER: turbine
+      POSTGRES_PASSWORD: turbine
+      POSTGRES_DB: turbine_test
+    ports:
+      - "54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U turbine -d turbine_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    tmpfs:
+      - /var/lib/postgresql/data

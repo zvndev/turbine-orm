@@ -1,0 +1,219 @@
+export const metadata = {
+  title: 'Migrating from Prisma',
+  description:
+    'Move from Prisma to Turbine ORM. API mapping, side-by-side examples, schema translation, atomic operators, typed errors, edge deployment.',
+};
+
+# Migrating from Prisma
+
+Turbine is a Postgres-native TypeScript ORM with a Prisma-inspired API. If you're on Prisma but want a smaller dependency footprint, edge/serverless without an extra adapter, and a code-first schema (no `.prisma` DSL), Turbine is a near drop-in. Most of your query code moves over by renaming `include` to `with` and re-pointing your imports.
+
+This is the full mapping. Skip to [Side-by-side](#side-by-side) if you want to see it working.
+
+## API mapping
+
+| Prisma | Turbine | Notes |
+|---|---|---|
+| `prisma.user.findMany` | `db.users.findMany` | Table accessor uses the snake_case table name (camelCased). |
+| `prisma.user.findUnique` | `db.users.findUnique` | Same shape. |
+| `prisma.user.findFirst` | `db.users.findFirst` | Same. |
+| `prisma.user.findFirstOrThrow` | `db.users.findFirstOrThrow` | Throws `NotFoundError` (`TURBINE_E001`). |
+| `prisma.user.findUniqueOrThrow` | `db.users.findUniqueOrThrow` | Same. |
+| `prisma.user.create` | `db.users.create` | Same `data` shape. |
+| `prisma.user.createMany` | `db.users.createMany` | Single `INSERT ... UNNEST` under the hood. |
+| `prisma.user.update` | `db.users.update` | Supports atomic operators: `{ count: { increment: 1 } }`. |
+| `prisma.user.updateMany` | `db.users.updateMany` | Empty `where` rejected unless `allowFullTableScan: true`. |
+| `prisma.user.delete` | `db.users.delete` | Same. |
+| `prisma.user.deleteMany` | `db.users.deleteMany` | Empty `where` rejected unless `allowFullTableScan: true`. |
+| `prisma.user.upsert` | `db.users.upsert` | Same `where` / `create` / `update` shape. |
+| `prisma.user.count` | `db.users.count` | Same. |
+| `prisma.user.aggregate` | `db.users.aggregate` | `_sum` / `_avg` / `_min` / `_max` / `_count`. |
+| `prisma.user.groupBy` | `db.users.groupBy` | `by`, `where`, `orderBy` supported. |
+| `prisma.$transaction` | `db.$transaction` | Callback form with nested SAVEPOINTs and isolation levels. |
+| `include: { posts: true }` | `with: { posts: true }` | The only renamed key. |
+| `select: { id: true, name: true }` | `select: { id: true, name: true }` | Same. |
+| `where: { name: { contains: 'a' } }` | `where: { name: { contains: 'a' } }` | All operators ported. |
+| `where: { posts: { some: ... } }` | `where: { posts: { some: ... } }` | Relation filters: `some` / `every` / `none`. |
+| `take: 10` | `limit: 10` | Renamed. |
+| `skip: 20` | `offset: 20` | Renamed. |
+
+## Schema translation
+
+Prisma's `.prisma` schema translates to Turbine's `defineSchema()` call.
+
+```prisma
+// schema.prisma
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  name      String
+  posts     Post[]
+  createdAt DateTime @default(now())
+}
+
+model Post {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+  title     String
+  published Boolean  @default(false)
+  viewCount Int      @default(0)
+  createdAt DateTime @default(now())
+}
+```
+
+```ts
+// schema.ts
+import { defineSchema } from 'turbine-orm';
+
+export default defineSchema({
+  users: {
+    id: { type: 'serial', primaryKey: true },
+    email: { type: 'text', unique: true, notNull: true },
+    name: { type: 'text', notNull: true },
+    createdAt: { type: 'timestamp', default: 'now()' },
+  },
+  posts: {
+    id: { type: 'serial', primaryKey: true },
+    userId: { type: 'bigint', notNull: true, references: 'users.id' },
+    title: { type: 'text', notNull: true },
+    published: { type: 'boolean', notNull: true, default: 'false' },
+    viewCount: { type: 'integer', notNull: true, default: '0' },
+    createdAt: { type: 'timestamp', default: 'now()' },
+  },
+});
+```
+
+Relations aren't declared in Turbine — they're *inferred* from foreign keys. `posts.userId references 'users.id'` automatically yields `user` on `Post` and `posts` on `User`.
+
+## Side-by-side
+
+### findMany with nested relations
+
+```ts
+// Prisma
+const users = await prisma.user.findMany({
+  where: { orgId: 1 },
+  include: { posts: { orderBy: { createdAt: 'desc' }, take: 5 } },
+  orderBy: { createdAt: 'desc' },
+  take: 10,
+});
+```
+
+```ts
+// Turbine
+const users = await db.users.findMany({
+  where: { orgId: 1 },
+  with: { posts: { orderBy: { createdAt: 'desc' }, limit: 5 } },
+  orderBy: { createdAt: 'desc' },
+  limit: 10,
+});
+```
+
+### Atomic update
+
+```ts
+// Prisma
+await prisma.post.update({
+  where: { id: 42 },
+  data: { viewCount: { increment: 1 } },
+});
+```
+
+```ts
+// Turbine — identical
+await db.posts.update({
+  where: { id: 42 },
+  data: { viewCount: { increment: 1 } },
+});
+```
+
+Both generate `view_count = view_count + $1`. No extra round-trip.
+
+### Transaction
+
+```ts
+// Prisma
+await prisma.$transaction(async (tx) => {
+  const user = await tx.user.create({ data: { email: 'a@b.c', name: 'A' } });
+  await tx.post.create({ data: { userId: user.id, title: 'Hi' } });
+});
+```
+
+```ts
+// Turbine
+await db.$transaction(async (tx) => {
+  const user = await tx.users.create({ data: { email: 'a@b.c', name: 'A' } });
+  await tx.posts.create({ data: { userId: user.id, title: 'Hi' } });
+});
+```
+
+### Upsert
+
+```ts
+// Prisma
+await prisma.user.upsert({
+  where: { email: 'a@b.c' },
+  create: { email: 'a@b.c', name: 'A' },
+  update: { name: 'A' },
+});
+```
+
+```ts
+// Turbine — identical
+await db.users.upsert({
+  where: { email: 'a@b.c' },
+  create: { email: 'a@b.c', name: 'A' },
+  update: { name: 'A' },
+});
+```
+
+### Relation filter
+
+```ts
+// Prisma
+const active = await prisma.user.findMany({
+  where: { posts: { some: { published: true } } },
+});
+```
+
+```ts
+// Turbine — identical
+const active = await db.users.findMany({
+  where: { posts: { some: { published: true } } },
+});
+```
+
+## Notable differences
+
+- **No `schema.prisma`.** Code-first `defineSchema()` in a TypeScript module. `npx turbine push` (fast path) or `migrate create --auto` (generates SQL). No DSL, no separate parser.
+- **`include` → `with`, `take` → `limit`, `skip` → `offset`.** That's the full lexical diff.
+- **Atomic update operators are first-class.** `set`, `increment`, `decrement`, `multiply`, `divide`. All compile to in-place SQL.
+- **Typed errors with codes.** `UniqueConstraintError` / `ForeignKeyError` / `NotNullViolationError` / `CheckConstraintError` all carry `code` (`TURBINE_E008`–`E011`) and `cause`. `findUniqueOrThrow` throws `NotFoundError` (`TURBINE_E001`) with the `where` attached. `DeadlockError` / `SerializationFailureError` have `readonly isRetryable = true as const`.
+- **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, schema)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.
+- **Single runtime dependency.** `pg` only. No engine binary, no WASM, no `@prisma/client`.
+- **Postgres only.** Intentional — depth over breadth enables the edge and Studio stories. See the [roadmap](/roadmap) for planned dialects.
+
+## Migration checklist
+
+1. `npm install turbine-orm && npm uninstall @prisma/client prisma`
+2. Write `schema.ts` mirroring your `.prisma` models (or run `npx turbine pull` to introspect your live DB).
+3. `npx turbine generate` — writes `./generated/turbine/{types,metadata,index}.ts`.
+4. Find/replace:
+   - `prisma.` → `db.`
+   - Singular model names → plural snake-camelCase table names (`prisma.user` → `db.users`)
+   - `include:` → `with:`
+   - `take:` → `limit:`
+   - `skip:` → `offset:`
+5. Replace `import { PrismaClient } from '@prisma/client'` with `import { turbine } from './generated/turbine'`.
+6. Port any raw SQL from `prisma.$queryRaw` to `db.raw\`SELECT ...\``.
+7. Update your error-handling to the typed classes (or keep catching by message during transition).
+8. Delete `schema.prisma` and the `prisma/` directory once the build passes.
+
+## See also
+
+- **[Schema & Migrations](/schema)** — `defineSchema`, DDL, introspection.
+- **[API Reference](/queries)** — every method, operator, option.
+- **[Relations](/relations)** — one-to-many, many-to-many, filters.
+- **[Typed Errors](/errors)** — full hierarchy with SQLSTATE mapping.
+- **[Serverless](/serverless)** — Neon, Vercel, Cloudflare Hyperdrive.

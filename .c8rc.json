@@ -1,4 +1,5 @@
 {
+  "//": "Coverage scope is the query/schema/error runtime. Excludes: tooling (cli/, generate.ts, introspect.ts), edge shim (serverless.ts — tested via pg-compat contract), package barrel (index.ts), and test helpers. CLI and codegen are covered by end-to-end tests in test/cli.test.ts and test/generate-relations.test.ts; raising line coverage on them would require mocking filesystem + child_process in unit tests without adding real signal.",
   "all": true,
   "include": ["src/**"],
   "exclude": [
@@ -11,8 +12,8 @@
   ],
   "reporter": ["text", "lcov"],
   "check-coverage": true,
-  "lines": 57,
-  "functions": 64,
-  "branches": 80,
-  "statements": 57
+  "lines": 65,
+  "functions": 70,
+  "branches": 82,
+  "statements": 65
 }

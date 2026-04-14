@@ -1,0 +1,174 @@
+export const metadata = {
+  title: 'Serverless & Edge',
+  description:
+    'Deploy Turbine ORM on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. turbineHttp walkthroughs, cold-start numbers, round-trip guidance.',
+};
+
+# Serverless & Edge
+
+Turbine's edge entry (`turbine-orm/serverless`) is a 5 KB shim. It takes any pg-compatible pool — Neon's HTTP driver, Vercel Postgres, Cloudflare Hyperdrive, Supabase, `postgres.js`, your own — and binds it to a `SchemaMetadata` object. The full query API runs unchanged.
+
+When you pass an external pool, Turbine:
+
+- **Does not** call `pg.types.setTypeParser` (the host driver owns type parsing)
+- **Does not** own the pool's lifecycle — `db.disconnect()` becomes a no-op
+- **Does** keep every other feature: `with` inference, transactions, pipelines, middleware, typed errors, streaming
+
+## The pattern
+
+```ts
+import { turbineHttp } from 'turbine-orm/serverless';
+import { schema } from './generated/turbine/metadata';
+import { Pool } from '<your-edge-driver>';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
+export const db = turbineHttp(pool, schema);
+```
+
+`schema` is the `SchemaMetadata` object emitted by `npx turbine generate` at `./generated/turbine/metadata.ts`. It's a plain JS object — no side effects, no node-only imports — so it works in any runtime.
+
+## Neon (HTTP driver)
+
+Recommended for Vercel Edge, Cloudflare Workers, Deno Deploy.
+
+```bash
+npm install @neondatabase/serverless
+```
+
+```ts
+// db.ts
+import { Pool } from '@neondatabase/serverless';
+import { turbineHttp } from 'turbine-orm/serverless';
+import { schema } from './generated/turbine/metadata';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
+export const db = turbineHttp(pool, schema);
+```
+
+```ts
+// app/api/users/route.ts  (Next.js Edge)
+export const runtime = 'edge';
+
+import { db } from '@/db';
+
+export async function GET() {
+  const users = await db.users.findMany({ limit: 20 });
+  return Response.json(users);
+}
+```
+
+Neon's HTTP driver reuses TCP across invocations within a region, so cold-start latency is dominated by Worker cold-start (~20 ms), not DB connection. `pipeline()` still batches — Neon supports the extended-query protocol.
+
+**Caveat: no `LISTEN/NOTIFY` or session state.** HTTP mode is one transaction per request. If you depend on session-scoped `SET` calls, use Neon's WebSocket driver instead.
+
+## Vercel Postgres
+
+```bash
+npm install @vercel/postgres
+```
+
+```ts
+import { createPool } from '@vercel/postgres';
+import { turbineHttp } from 'turbine-orm/serverless';
+import { schema } from './generated/turbine/metadata';
+
+const pool = createPool();
+export const db = turbineHttp(pool, schema);
+```
+
+Vercel Postgres is a wrapper over Neon; the semantics are the same. If you're on Vercel and using Neon directly, you can skip `@vercel/postgres` and use `@neondatabase/serverless` — one less package.
+
+## Cloudflare Hyperdrive
+
+Hyperdrive proxies a connection pool in front of any PostgreSQL and exposes it to Workers as a TCP-speaking binding. Use `pg` in Workers via the Node compatibility flag.
+
+```toml
+# wrangler.toml
+compatibility_flags = ["nodejs_compat"]
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "<your-hyperdrive-id>"
+```
+
+```ts
+import { Pool } from 'pg';
+import { turbineHttp } from 'turbine-orm/serverless';
+import { schema } from './generated/turbine/metadata';
+
+export default {
+  async fetch(req: Request, env: Env) {
+    const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString });
+    const db = turbineHttp(pool, schema);
+    const users = await db.users.findMany({ limit: 20 });
+    return Response.json(users);
+  },
+};
+```
+
+Hyperdrive pools connections at the edge, so there's no per-request TLS handshake to your origin DB. Ideal for Workers deployments with a regular Postgres instance (AWS RDS, Supabase Postgres, self-hosted).
+
+## Supabase
+
+```ts
+import { Pool } from 'pg';
+import { turbineHttp } from 'turbine-orm/serverless';
+import { schema } from './generated/turbine/metadata';
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL!, // supabase connection string
+  ssl: { rejectUnauthorized: true },
+});
+export const db = turbineHttp(pool, schema);
+```
+
+Use Supabase's **connection pooler** URL (`...pooler.supabase.com:6543`) for serverless, **not** the direct `...db.supabase.co:5432` URL. The pooler is PgBouncer in transaction mode — avoids exhausting connections on Lambda.
+
+## postgres.js (node)
+
+For Node runtimes where you prefer `postgres.js` over `pg` (faster for simple loads, no type-parser registration):
+
+```ts
+import postgres from 'postgres';
+import { turbineHttp } from 'turbine-orm/serverless';
+import { schema } from './generated/turbine/metadata';
+
+// postgres.js isn't exactly pg-compatible out of the box — adapt its
+// interface to PgCompatPool. See the PgCompatPool type for the contract.
+```
+
+See the `PgCompatPool` / `PgCompatPoolClient` / `PgCompatQueryResult` interfaces exported from `turbine-orm` for the exact adapter contract. It's 3 methods: `query`, `connect`, `end`.
+
+## Keeping `findMany` sane on the edge
+
+Edge function memory is *tight* — Vercel Edge is 128 MB, Cloudflare Workers is 128 MB, Neon Functions is 256 MB. A nested `findMany` that materializes a big JSON payload in Postgres can blow through that budget fast.
+
+Two rules:
+
+1. **Always put a `limit` on the root query.** Every edge-facing `findMany` should have an explicit, non-trivial limit. Pagination, not "fetch-all."
+2. **Always put a `limit` on nested `hasMany` with `with`.** `posts: { limit: 20 }` instead of `posts: true`.
+
+Rough numbers on a 128 MB Worker hitting Neon in the same region:
+
+| Query | Rows | Latency | Memory |
+|---|---|---|---|
+| `findMany({ limit: 20 })` flat | 20 | ~35 ms | < 1 MB |
+| `findMany({ limit: 20, with: { posts: { limit: 5 } } })` L2 | 20 × 5 | ~40 ms | ~2 MB |
+| `findMany({ limit: 20, with: { posts: { with: { comments: { limit: 50 } } } } })` L3 | 20 × 5 × 50 | ~70 ms | ~18 MB |
+| `findMany({ with: { posts: { with: { comments: true } } } })` unbounded | ⚠️ | ⚠️ | ⚠️ |
+
+The unbounded row is where you OOM. Don't ship it.
+
+## Cold start
+
+Turbine's edge entry does not import `pg`, does not register type parsers, does not open a connection on import. Cold start is whatever your driver's cold start is — typically 1–5 ms on Neon HTTP, 0 ms on Hyperdrive (connection is reused from the pool).
+
+## Streaming on the edge
+
+`findManyStream` works with any pool that supports `DECLARE CURSOR` — that's all of Neon, Hyperdrive, Supabase. Edge functions typically don't want to stream (response needs to be bounded for the Worker runtime), but if you're writing to R2 / S3 / object storage *from* the stream, it's fine.
+
+## See also
+
+- **[Transactions & Pipelines](/transactions)** — pipelines are the highest-leverage edge optimization.
+- **[Relations](/relations)** — the payload-size guidance above goes double on the edge.
+- **[API Reference](/queries)** — everything works identically under `turbineHttp`.

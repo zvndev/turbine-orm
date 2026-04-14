@@ -1,0 +1,253 @@
+export const metadata = {
+  title: 'Relations',
+  description:
+    'One-to-many, one-to-one, many-to-many, and self-referential relations in Turbine ORM. Nested with clauses, payload-size guidance, when to stream instead.',
+};
+
+# Relations
+
+Relations are inferred from foreign keys. `npx turbine pull` reads `information_schema` + `pg_catalog` and generates a `*Relations` interface for each table — with the target table, cardinality (`'one'` vs `'many'`), and the join keys baked into a phantom-branded `RelationDescriptor`. That brand is what powers deep `with` type inference.
+
+You rarely declare a relation by hand. Define your foreign keys in `defineSchema()` (or let introspection read them) and the relation falls out.
+
+## One-to-many (hasMany)
+
+The canonical case. A user has many posts because `posts.user_id` references `users.id`.
+
+```ts
+// schema.ts
+export default defineSchema({
+  users: {
+    id: { type: 'serial', primaryKey: true },
+    email: { type: 'text', unique: true, notNull: true },
+  },
+  posts: {
+    id: { type: 'serial', primaryKey: true },
+    userId: { type: 'bigint', notNull: true, references: 'users.id' },
+    title: { type: 'text', notNull: true },
+  },
+});
+```
+
+```ts
+// query.ts
+const users = await db.users.findMany({
+  with: { posts: true },
+});
+// users[0].posts is Post[] — never null, empty array if no rows
+```
+
+`posts` arrives as `Post[]` on each user, `COALESCE`-d to `[]` so you never have to null-check a collection.
+
+## One-to-one (belongsTo + hasOne)
+
+Same foreign-key setup, different cardinality. The *owning* side (with the FK) gets `belongsTo`; the *referenced* side gets `hasOne` if the FK is `UNIQUE`.
+
+```ts
+users: {
+  id: { type: 'serial', primaryKey: true },
+  profileId: { type: 'bigint', unique: true, references: 'profiles.id' },
+},
+profiles: {
+  id: { type: 'serial', primaryKey: true },
+  bio: { type: 'text' },
+},
+```
+
+```ts
+const user = await db.users.findUnique({
+  where: { id: 1 },
+  with: { profile: true },
+});
+// user.profile is Profile | null
+```
+
+Without the `unique: true` on `profileId`, Turbine would infer `hasMany` on the reverse side.
+
+## Many-to-many (join table)
+
+Turbine doesn't use a magic `@relation(through: ...)` — you model the join table as a real entity, because it is one. You almost always want timestamps or roles on it anyway.
+
+```ts
+users: {
+  id: { type: 'serial', primaryKey: true },
+  name: { type: 'text', notNull: true },
+},
+organizations: {
+  id: { type: 'serial', primaryKey: true },
+  name: { type: 'text', notNull: true },
+},
+memberships: {
+  userId: { type: 'bigint', notNull: true, references: 'users.id' },
+  orgId: { type: 'bigint', notNull: true, references: 'organizations.id' },
+  role: { type: 'text', notNull: true, default: "'member'" },
+  primaryKey: ['userId', 'orgId'],
+},
+```
+
+Query through the join table:
+
+```ts
+const user = await db.users.findUnique({
+  where: { id: 1 },
+  with: {
+    memberships: {
+      with: { organization: true },
+    },
+  },
+});
+// user.memberships[0].organization.name
+```
+
+If you want the flat list without the join-table rows, flatten it in code:
+
+```ts
+const orgs = user.memberships.map((m) => m.organization);
+```
+
+## Self-referential
+
+Comments with a `parentId` pointing at another comment. Turbine generates both sides of the relation (`parent` belongsTo, `children` hasMany):
+
+```ts
+comments: {
+  id: { type: 'serial', primaryKey: true },
+  parentId: { type: 'bigint', references: 'comments.id' },
+  body: { type: 'text', notNull: true },
+},
+```
+
+```ts
+const thread = await db.comments.findMany({
+  where: { parentId: null }, // top-level comments
+  with: {
+    children: {
+      with: {
+        children: true, // 2 levels deep
+      },
+    },
+  },
+});
+```
+
+Back-references like `posts -> user -> posts` are allowed — Turbine detects cycles by tracking the recursion path, not by refusing to revisit a table. The depth cap (10) is the guardrail.
+
+## Nested with — what's available at every level
+
+At any level inside a `with` clause you can pass the same options `findMany` accepts (except pagination semantics differ — see below):
+
+```ts
+await db.users.findMany({
+  with: {
+    posts: {
+      where: { published: true },
+      orderBy: { createdAt: 'desc' },
+      limit: 5,
+      select: { id: true, title: true, createdAt: true },
+      with: {
+        comments: {
+          where: { flagged: false },
+          orderBy: { createdAt: 'asc' },
+          limit: 20,
+        },
+      },
+    },
+  },
+});
+```
+
+- **`where`** — applies to the relation rows, not the parents.
+- **`orderBy` + `limit`** — applied *per parent* via an inner subquery wrapping. `LIMIT 5` means "5 posts per user," not "5 posts total."
+- **`select` / `omit`** — either one, not both. Picks/drops columns at this level.
+- **Further `with`** — recurses. Depth cap is 10; beyond that Turbine throws `CircularRelationError` (TURBINE_E007) with the full path trail.
+
+## Relation filters on the parent
+
+Filter parents *by* their relations without loading them. `some` / `every` / `none`:
+
+```ts
+// Users who have at least one published post
+await db.users.findMany({
+  where: { posts: { some: { published: true } } },
+});
+
+// Users where every post is published
+await db.users.findMany({
+  where: { posts: { every: { published: true } } },
+});
+
+// Users with no posts at all
+await db.users.findMany({
+  where: { posts: { none: {} } },
+});
+```
+
+These compile to `EXISTS` / `NOT EXISTS` subqueries — no relation data is returned, the join is pure filter.
+
+## Payload size — when to prefer streaming
+
+The `json_agg` strategy materializes the full object graph in Postgres memory *before* serializing it over the wire. That's fine for bounded queries. It's not fine for unbounded ones.
+
+**Rule of thumb:** if the root `limit` is absent or > ~10k rows, or if a nested `with` has no `limit` on a `hasMany`, stop and reach for `findManyStream` instead.
+
+```ts
+// Bad — materializes the whole users table + all their posts + all their comments in Postgres RAM
+const all = await db.users.findMany({
+  with: { posts: { with: { comments: true } } },
+});
+
+// Good — streams parents, loads relations per batch
+for await (const user of db.users.findManyStream({ batchSize: 500 })) {
+  const posts = await db.posts.findMany({
+    where: { userId: user.id },
+    with: { comments: true },
+  });
+  // ...process
+}
+```
+
+Concrete numbers on a seeded dataset (5K users, 46K posts, 432K comments): the unbounded nested `findMany` above builds a ~180 MB JSON payload server-side before sending a byte. Postgres happily does it. Your Lambda's 512 MB budget does not.
+
+Nested `with` on the streaming API works too — Turbine opens a `DECLARE CURSOR` for the parent query and runs the nested subqueries per-batch:
+
+```ts
+for await (const user of db.users.findManyStream({
+  with: { posts: { limit: 5 } },
+  batchSize: 500,
+})) {
+  console.log(user.posts[0]?.title);
+}
+```
+
+## belongsTo loading without extra JOINs
+
+Turbine emits a single correlated subquery per relation, not a `JOIN`. This means a `belongsTo` with 1,000 parents doesn't cartesian-explode against the child table:
+
+```ts
+// 1,000 posts, each with its 1 author — one SQL statement, one pass over posts, one lookup per row
+await db.posts.findMany({
+  limit: 1000,
+  with: { user: true },
+});
+```
+
+The generated SQL for `with: { user: true }` looks like:
+
+```sql
+SELECT "posts".*,
+  (SELECT json_build_object('id', t0."id", 'email', t0."email")
+     FROM "users" t0
+     WHERE t0."id" = "posts"."user_id"
+     LIMIT 1) AS "user"
+FROM "posts"
+LIMIT 1000
+```
+
+If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop to `db.raw` — Turbine's opinion on relation loading is correlated subqueries; reporting queries have different shape.
+
+## See also
+
+- **[API Reference](/queries)** — every operator and option in `where`, `with`, `select`.
+- **[Transactions & Pipelines](/transactions)** — batching and atomic groups.
+- **[Serverless](/serverless)** — why `with` depth matters more on the edge.
+- **[Typed Errors](/errors)** — `RelationError` (E005) and `CircularRelationError` (E007).

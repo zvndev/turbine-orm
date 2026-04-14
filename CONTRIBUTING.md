@@ -13,14 +13,21 @@ npm install
 ## Running Tests
 
 ```bash
-# Unit tests (no database needed)
+# Unit tests — no database needed
 npm run test:unit
 
-# All tests (requires DATABASE_URL)
-DATABASE_URL=postgres://... npm test
+# Integration tests — spin up a throwaway Postgres + seed it, then run everything
+./scripts/seed-test-db.sh
+DATABASE_URL=postgres://turbine:turbine@localhost:54329/turbine_test npm test
 ```
 
-Unit tests cover schema building, migration parsing, and DDL generation. Integration tests require a live Postgres database with seeded data.
+Unit tests cover schema building, migration parsing, DDL generation, SQL builder output, error mapping, and Studio guards. Integration tests require a seeded Postgres (5K users / 46K posts / 432K comments) — the `seed-test-db.sh` script starts `scripts/docker-compose.yml` and runs the benchmark seeder so outside contributors don't need their own database.
+
+Stop the DB when you're done:
+
+```bash
+docker compose -f scripts/docker-compose.yml down
+```
 
 ## Building
 

@@ -12,13 +12,17 @@ const sections: NavSection[] = [
     title: 'Getting Started',
     items: [
       { href: '/quickstart', label: 'Quick Start' },
+      { href: '/migrate-from-prisma', label: 'Migrate from Prisma' },
     ],
   },
   {
     title: 'Guide',
     items: [
       { href: '/queries', label: 'API Reference' },
+      { href: '/relations', label: 'Relations' },
+      { href: '/transactions', label: 'Transactions & Pipelines' },
       { href: '/schema', label: 'Schema & Migrations' },
+      { href: '/serverless', label: 'Serverless & Edge' },
       { href: '/cli', label: 'CLI' },
       { href: '/errors', label: 'Typed Errors' },
     ],

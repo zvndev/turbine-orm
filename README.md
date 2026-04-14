@@ -1,6 +1,6 @@
 # turbine-orm
 
-Postgres-native TypeScript ORM — runs on **Neon, Vercel Postgres, Cloudflare, Supabase**, and any pg-compatible driver. Streaming cursors, typed errors, single-query nested relations. 1 dependency, ~110KB.
+Postgres ORM built for the edge. One runtime dependency. Built-in read-only Studio. Code-first and DB-first schema workflows in the same CLI. Runs on **Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase**, and any pg-compatible driver.
 
 ```
 npm install turbine-orm
@@ -8,9 +8,14 @@ npm install turbine-orm
 
 ## Why Turbine?
 
-Turbine is a PostgreSQL-native TypeScript ORM built around features no other ORM bundles together: a **read-only, DBA-approvable Studio web UI** (the only one in the TS ORM ecosystem — `BEGIN READ ONLY` + statement-stacking guard + loopback-only + 24-byte auth token), **cursor-based streaming** through nested relations, **typed error classes** with PostgreSQL constraint mapping, **pipeline batching** (N queries, 1 round-trip), **middleware**, and a driver-agnostic core that plugs into any pg-compatible pool so it runs on Vercel Edge, Cloudflare Workers, Deno Deploy, and similar environments. 1 runtime dependency (`pg`), ~110KB on npm.
+The elevator pitch: **a Prisma-like DX without Prisma's engine, a Drizzle-class runtime footprint, and the only built-in read-only Studio in the TS ORM ecosystem.** Four things bundled together that no other ORM bundles:
 
-**One round-trip for nested relations.** `db.users.findMany({ with: { posts: { with: { comments: true } } } })` resolves the entire object graph in a single database round-trip, regardless of nesting depth. Prisma 7+ and Drizzle v2 also do single-query nested loads — Turbine's advantage is architectural simplicity: 1 dependency, no code generation DSL, no query plan compiler.
+1. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no code-generation DSL. ~110 KB on npm. 5 KB on the edge entry.
+2. **First-class edge support.** `turbineHttp(pool, schema)` — one import swap — and the full API runs on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No extra adapter package, no WASM bundle.
+3. **Built-in read-only Studio.** `npx turbine studio` spins up a loopback-bound, token-authed web UI with `BEGIN READ ONLY` + statement-stacking guard. DBA-approvable. No separate install.
+4. **Code-first and DB-first in the same CLI.** `defineSchema()` in TypeScript *or* `npx turbine pull` against a live database — same generated client, same migrations runner. Prisma forces the DSL; Drizzle is code-only.
+
+Plus the architectural bits you'd expect: pipeline batching (N queries in one round-trip via the pg extended-query protocol), `json_agg`-based nested relation loading (same technique Drizzle and Prisma 7 use — no N+1), deep `with` type inference, streaming cursors, typed error hierarchy with `isRetryable` discriminants, middleware.
 
 ## Benchmarks
 

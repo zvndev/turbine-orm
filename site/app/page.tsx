@@ -4,9 +4,9 @@ import { codeToHtml } from 'shiki';
 import { CopyButton } from '../components/CopyButton';
 
 export const metadata: Metadata = {
-  title: 'Turbine ORM — Postgres-native TypeScript ORM',
+  title: 'Turbine ORM — Postgres ORM built for the edge',
   description:
-    'Postgres-native TypeScript ORM. Single-query nested relations via json_agg. One runtime dependency. Deep type inference. Edge-ready.',
+    'Postgres ORM built for the edge. One runtime dependency, built-in read-only Studio, code-first and DB-first schema workflows. Prisma-like DX, no engine binary.',
 };
 
 const heroCode = `const users = await db.users.findMany({
@@ -43,40 +43,40 @@ WHERE "users"."org_id" = $1`;
 
 const features = [
   {
-    icon: '⚡',
-    title: 'Single-query nested reads',
+    icon: '📦',
+    title: 'One runtime dependency',
     description:
-      'Deep with clauses compile to one SQL statement using json_agg and correlated subqueries. No N+1, no client-side stitching.',
-  },
-  {
-    icon: '🔬',
-    title: 'Deep with type inference',
-    description:
-      'Recursive WithResult walks your with literal at arbitrary depth. Write the query, get the exact nested shape in autocomplete.',
-  },
-  {
-    icon: '🛡️',
-    title: 'Read-only Studio',
-    description:
-      'npx turbine studio ships a loopback-bound web UI — BEGIN READ ONLY, statement-stacking guard, 24-byte auth token. Zero mutation surface.',
-  },
-  {
-    icon: '🌊',
-    title: 'Streaming cursors',
-    description:
-      'findManyStream uses DECLARE CURSOR with a speculative first fetch for small results. Nested with works inside the stream.',
+      'Just pg. No engine binary, no WASM, no adapter packages to keep in lockstep. ~110 KB on npm, 5 KB on the edge.',
   },
   {
     icon: '🌐',
-    title: 'Edge runtime support',
+    title: 'First-class edge runtime',
     description:
-      'One import swap — turbineHttp(pool, schema) — and the same API runs on Neon, Vercel Postgres, Cloudflare, Supabase.',
+      'One import swap — turbineHttp(pool, schema) — and the same API runs on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase.',
+  },
+  {
+    icon: '🛡️',
+    title: 'Built-in read-only Studio',
+    description:
+      'npx turbine studio ships a loopback-bound web UI — BEGIN READ ONLY, statement-stacking guard, 24-byte auth token. DBA-approvable.',
+  },
+  {
+    icon: '🔀',
+    title: 'Code-first and DB-first',
+    description:
+      'defineSchema() in TypeScript or npx turbine pull against a live database. Same CLI, same generated client, same migrations runner.',
   },
   {
     icon: '🎯',
     title: 'Typed Postgres errors',
     description:
-      'UniqueConstraintError, ForeignKeyError, SerializationFailureError with readonly isRetryable — so your retry loop type-checks.',
+      'UniqueConstraintError, ForeignKeyError, DeadlockError with readonly isRetryable — your retry loop type-checks.',
+  },
+  {
+    icon: '⚡',
+    title: 'Single-query nested reads',
+    description:
+      'Deep with clauses compile to one SQL statement using json_agg. Pipeline batching puts N queries in one round-trip via the pg extended-query protocol.',
   },
 ];
 
@@ -95,7 +95,7 @@ export default async function Home() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            v0.9 — Studio Premium + deep type inference
+            v0.9 — one dependency, built-in Studio, edge-ready
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
@@ -104,8 +104,9 @@ export default async function Home() {
           </h1>
 
           <p className="hero-subtitle animate-fade-in-up delay-2">
-            Postgres-native TypeScript ORM. Single-query nested relations,
-            deep type inference, one runtime dependency.
+            Postgres ORM built for the edge. One runtime dependency,
+            built-in read-only Studio, code-first and DB-first workflows
+            in the same CLI.
           </p>
 
           <div className="animate-fade-in-up delay-3">
