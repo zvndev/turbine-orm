@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.13.0 (2026-05-10)
+
+**DDL and migration dialect hooks for future MySQL/SQLite packages.**
+
+### Added
+- Extended the `Dialect` contract with schema DDL builders for column types, column definitions, table creation, primary keys, and indexes.
+- Added migration tracking SQL builders so dialect packages can own `_turbine_migrations` DDL and applied-migration record queries.
+- `schemaToSQL()` / `schemaToSQLString()` now accept an optional dialect for build-time DDL generation while preserving PostgreSQL as the default.
+- Added MySQL-style build-only regression coverage for backtick DDL, `BIGINT AUTO_INCREMENT`, `DATETIME`, `JSON`, FK indexes, and MySQL-shaped migration tracking SQL.
+
+### Changed
+- The root `turbine-orm` package remains PostgreSQL-only at runtime. This release removes another dialect-package blocker; it does not ship MySQL/SQLite drivers, introspection, or migration execution.
+- Exported schema DDL dialect input types and `SchemaSqlOptions` for future dialect packages.
+
+### Tests
+- 681 unit tests, 0 failures.
+- Lint, typecheck, and build clean.
+
+---
 ## 0.12.0 (2026-05-10)
 
 **DML dialect hooks for future MySQL/SQLite packages.**

@@ -1,7 +1,7 @@
 # Remaining Work — Post v0.10.0
 
 **Last updated:** 2026-05-09
-**Current version:** 0.10.0 (published)
+**Current version:** 0.13.0 (published)
 
 ---
 
@@ -29,8 +29,8 @@
 ### Phase 1: Extract Core (prerequisite for all dialects)
 - Extract shared types into `@turbine-orm/core` or internal module boundary
 - Define `Dialect` interface (see `docs/MULTI_DB_PLAN.md` section 3)
-- Refactor PostgreSQL path to implement the Dialect interface
-- No user-facing changes — just internal restructuring
+- Refactor PostgreSQL query, DML, schema DDL, and migration tracking SQL paths to implement the Dialect interface
+- No MySQL/SQLite runtime support yet — foundation work only
 
 ### Phase 2: MySQL/MariaDB (`@turbine-orm/mysql`)
 - New query builder using `JSON_ARRAYAGG` + `JSON_OBJECT`

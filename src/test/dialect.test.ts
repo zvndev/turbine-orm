@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { type Dialect, postgresDialect, QueryInterface } from '../index.js';
 import type { RelationDef, SchemaMetadata } from '../schema.js';
+import { column, defineSchema, table } from '../schema-builder.js';
+import { schemaToSQL } from '../schema-sql.js';
 import { mockTable } from './helpers.js';
 
 const mysqlishDialect: Dialect = {
@@ -44,6 +46,23 @@ const mysqlishDialect: Dialect = {
     return leftCols
       .map((col, i) => `${leftRef}.${this.quoteIdentifier(col)} = ${rightRef}.${this.quoteIdentifier(rightCols[i]!)}`)
       .join(' AND ');
+  },
+  buildColumnType(input) {
+    if (input.type === 'BIGSERIAL') return 'BIGINT AUTO_INCREMENT';
+    if (input.type === 'TIMESTAMPTZ') return 'DATETIME';
+    if (input.type === 'JSONB') return 'JSON';
+    return postgresDialect.buildColumnType(input);
+  },
+  buildMigrationTrackingTable(tableName) {
+    return `CREATE TABLE IF NOT EXISTS ${tableName} (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    checksum TEXT NOT NULL,
+    applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );`;
+  },
+  buildMigrationInsertApplied(tableName) {
+    return `INSERT INTO ${tableName} (name, checksum) VALUES (?, ?) ON DUPLICATE KEY UPDATE name = name`;
   },
 };
 
@@ -151,5 +170,41 @@ describe('Dialect contract', () => {
     assert.deepEqual(upsert.params, [1, 'Ada', 'Ada Lovelace']);
 
     assert.doesNotMatch(`${created.sql} ${bulk.sql} ${upsert.sql}`, /RETURNING|UNNEST|ON CONFLICT|\$1/);
+  });
+
+  it('schema DDL generation routes identifiers and type names through the active dialect', () => {
+    const schema = defineSchema({
+      organizations: table({
+        id: column.serial().primaryKey(),
+        createdAt: column.timestamp().notNull().default('now()'),
+      }),
+      users: table({
+        id: column.serial().primaryKey(),
+        orgId: column.bigint().notNull().references('organizations.id'),
+        profile: column.json().nullable(),
+      }),
+    });
+
+    const sql = schemaToSQL(schema, { dialect: mysqlishDialect }).join('\n');
+
+    assert.match(sql, /CREATE TABLE `organizations`/);
+    assert.match(sql, /`id` BIGINT AUTO_INCREMENT PRIMARY KEY/);
+    assert.match(sql, /`created_at` DATETIME NOT NULL DEFAULT NOW\(\)/);
+    assert.match(sql, /`profile` JSON/);
+    assert.match(sql, /REFERENCES `organizations`\(`id`\)/);
+    assert.match(sql, /CREATE INDEX `idx_users_org_id` ON `users`\(`org_id`\);/);
+    assert.doesNotMatch(sql, /"organizations"|BIGSERIAL|TIMESTAMPTZ|JSONB/);
+  });
+
+  it('migration tracking SQL is dialect-owned', () => {
+    assert.equal(
+      mysqlishDialect.buildMigrationInsertApplied('`_turbine_migrations`'),
+      'INSERT INTO `_turbine_migrations` (name, checksum) VALUES (?, ?) ON DUPLICATE KEY UPDATE name = name',
+    );
+    assert.match(
+      mysqlishDialect.buildMigrationTrackingTable('`_turbine_migrations`'),
+      /id BIGINT AUTO_INCREMENT PRIMARY KEY/,
+    );
+    assert.doesNotMatch(mysqlishDialect.buildMigrationTrackingTable('`_turbine_migrations`'), /SERIAL|TIMESTAMPTZ/);
   });
 });

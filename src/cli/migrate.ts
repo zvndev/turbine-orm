@@ -18,8 +18,8 @@ import { join } from 'node:path';
 import pg from 'pg';
 import type { DatabaseAdapter } from '../adapters/index.js';
 import { postgresql } from '../adapters/index.js';
+import { type Dialect, postgresDialect } from '../dialect.js';
 import { MigrationError } from '../errors.js';
-import { quoteIdent } from '../query/index.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,25 +56,22 @@ export interface MigrationStatus {
 // ---------------------------------------------------------------------------
 
 const TRACKING_TABLE = '_turbine_migrations';
-const QUOTED_TRACKING_TABLE = quoteIdent(TRACKING_TABLE);
 
-const CREATE_TRACKING_TABLE = `
-  CREATE TABLE IF NOT EXISTS ${QUOTED_TRACKING_TABLE} (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    checksum TEXT NOT NULL,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );
-`;
-
-async function ensureTrackingTable(client: pg.Client): Promise<void> {
-  await client.query(CREATE_TRACKING_TABLE);
+function quotedTrackingTable(dialect: Dialect): string {
+  return dialect.quoteIdentifier(TRACKING_TABLE);
 }
 
-async function getAppliedMigrations(client: pg.Client): Promise<AppliedMigration[]> {
-  await ensureTrackingTable(client);
+async function ensureTrackingTable(client: pg.Client, dialect: Dialect = postgresDialect): Promise<void> {
+  await client.query(dialect.buildMigrationTrackingTable(quotedTrackingTable(dialect)));
+}
+
+async function getAppliedMigrations(
+  client: pg.Client,
+  dialect: Dialect = postgresDialect,
+): Promise<AppliedMigration[]> {
+  await ensureTrackingTable(client, dialect);
   const result = await client.query<AppliedMigration>(
-    `SELECT id, name, applied_at, checksum FROM ${QUOTED_TRACKING_TABLE} ORDER BY id ASC`,
+    dialect.buildMigrationSelectApplied(quotedTrackingTable(dialect)),
   );
   return result.rows;
 }
@@ -327,8 +324,12 @@ interface ChecksumMismatch {
  * Validate that applied migration files have not been modified or deleted since they were run.
  * Returns an array of mismatched migrations (empty if all are clean).
  */
-async function validateChecksums(client: pg.Client, migrationsDir: string): Promise<ChecksumMismatch[]> {
-  const applied = await getAppliedMigrations(client);
+async function validateChecksums(
+  client: pg.Client,
+  migrationsDir: string,
+  dialect: Dialect = postgresDialect,
+): Promise<ChecksumMismatch[]> {
+  const applied = await getAppliedMigrations(client, dialect);
   const allFiles = listMigrationFiles(migrationsDir);
   const fileMap = new Map(allFiles.map((f) => [f.name, f]));
   const mismatches: ChecksumMismatch[] = [];
@@ -349,7 +350,7 @@ async function validateChecksums(client: pg.Client, migrationsDir: string): Prom
     if (currentHash !== migration.checksum) {
       // Auto-upgrade legacy djb2 checksums to SHA-256 without flagging as modified
       if (isLegacyChecksum(migration.checksum)) {
-        await client.query(`UPDATE ${QUOTED_TRACKING_TABLE} SET checksum = $1 WHERE name = $2`, [
+        await client.query(dialect.buildMigrationUpdateChecksum(quotedTrackingTable(dialect)), [
           currentHash,
           migration.name,
         ]);
@@ -389,6 +390,7 @@ export async function migrateUp(
     allowDrift?: boolean /** @deprecated use allowDrift */;
     force?: boolean;
     adapter?: DatabaseAdapter;
+    dialect?: Dialect;
   },
 ): Promise<{ applied: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
   const client = new pg.Client({ connectionString });
@@ -396,6 +398,7 @@ export async function migrateUp(
 
   // Treat `force` as an alias for `allowDrift` for backwards compatibility.
   const allowDrift = options?.allowDrift === true || options?.force === true;
+  const dialect = options?.dialect ?? postgresDialect;
 
   try {
     // Derive an advisory lock ID per-database so concurrent migrations in
@@ -412,7 +415,7 @@ export async function migrateUp(
     }
 
     try {
-      await ensureTrackingTable(client);
+      await ensureTrackingTable(client, dialect);
 
       // Validate checksums of already-applied migrations.
       // Drift = an APPLIED migration's on-disk file has changed (or been deleted)
@@ -421,7 +424,7 @@ export async function migrateUp(
       // Users can pass `allowDrift: true` (CLI: `--allow-drift`) to force past
       // the block when they are intentionally rewriting history.
       if (!allowDrift) {
-        const mismatches = await validateChecksums(client, migrationsDir);
+        const mismatches = await validateChecksums(client, migrationsDir, dialect);
         if (mismatches.length > 0) {
           const modified = mismatches.filter((m) => m.type === 'modified');
           const missing = mismatches.filter((m) => m.type === 'missing');
@@ -448,7 +451,7 @@ export async function migrateUp(
         }
       }
 
-      const applied = await getAppliedMigrations(client);
+      const applied = await getAppliedMigrations(client, dialect);
       const appliedNames = new Set(applied.map((m) => m.name));
 
       const allFiles = listMigrationFiles(migrationsDir);
@@ -474,10 +477,7 @@ export async function migrateUp(
         try {
           await client.query('BEGIN');
           await client.query(up);
-          await client.query(
-            `INSERT INTO ${QUOTED_TRACKING_TABLE} (name, checksum) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`,
-            [file.name, hash],
-          );
+          await client.query(dialect.buildMigrationInsertApplied(quotedTrackingTable(dialect)), [file.name, hash]);
           await client.query('COMMIT');
           results.push(file);
         } catch (err) {
@@ -509,10 +509,11 @@ export async function migrateUp(
 export async function migrateDown(
   connectionString: string,
   migrationsDir: string,
-  options?: { step?: number; adapter?: DatabaseAdapter },
+  options?: { step?: number; adapter?: DatabaseAdapter; dialect?: Dialect },
 ): Promise<{ rolledBack: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
   const client = new pg.Client({ connectionString });
   await client.connect();
+  const dialect = options?.dialect ?? postgresDialect;
 
   try {
     // Derive a per-database advisory lock ID so concurrent migrations in
@@ -527,8 +528,8 @@ export async function migrateDown(
     }
 
     try {
-      await ensureTrackingTable(client);
-      const applied = await getAppliedMigrations(client);
+      await ensureTrackingTable(client, dialect);
+      const applied = await getAppliedMigrations(client, dialect);
 
       if (applied.length === 0) {
         return { rolledBack: [], errors: [] };
@@ -562,7 +563,7 @@ export async function migrateDown(
         try {
           await client.query('BEGIN');
           await client.query(down);
-          await client.query(`DELETE FROM ${QUOTED_TRACKING_TABLE} WHERE name = $1`, [migration.name]);
+          await client.query(dialect.buildMigrationDeleteApplied(quotedTrackingTable(dialect)), [migration.name]);
           await client.query('COMMIT');
           results.push(file);
         } catch (err) {
@@ -586,13 +587,18 @@ export async function migrateDown(
  * Get the status of all migrations (applied vs pending).
  * Includes checksum validation for applied migrations.
  */
-export async function migrateStatus(connectionString: string, migrationsDir: string): Promise<MigrationStatus[]> {
+export async function migrateStatus(
+  connectionString: string,
+  migrationsDir: string,
+  options?: { dialect?: Dialect },
+): Promise<MigrationStatus[]> {
   const client = new pg.Client({ connectionString });
   await client.connect();
+  const dialect = options?.dialect ?? postgresDialect;
 
   try {
-    await ensureTrackingTable(client);
-    const applied = await getAppliedMigrations(client);
+    await ensureTrackingTable(client, dialect);
+    const applied = await getAppliedMigrations(client, dialect);
     const appliedMap = new Map(applied.map((m) => [m.name, m]));
 
     const allFiles = listMigrationFiles(migrationsDir);

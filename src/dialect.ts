@@ -56,6 +56,44 @@ export interface UpsertStatementInput {
   returning?: string;
 }
 
+export interface ColumnTypeInput {
+  /** Schema-builder column type name (PostgreSQL-native in the root package). */
+  type: string;
+  /** Optional VARCHAR length. */
+  maxLength?: number | null;
+}
+
+export interface ColumnDefinitionInput extends ColumnTypeInput {
+  /** SQL-ready quoted column name. */
+  name: string;
+  /** Whether this column is a single-column primary key. */
+  primaryKey?: boolean;
+  /** Whether this column is unique. Ignored when primaryKey is true. */
+  unique?: boolean;
+  /** Whether this column is NOT NULL. */
+  notNull?: boolean;
+  /** SQL-ready default expression. */
+  defaultValue?: string;
+  /** SQL-ready REFERENCES clause without the leading REFERENCES keyword. */
+  references?: { table: string; column: string };
+}
+
+export interface CreateTableStatementInput {
+  /** SQL-ready quoted table name. */
+  table: string;
+  /** SQL-ready column and table constraints. */
+  definitions: string[];
+}
+
+export interface CreateIndexStatementInput {
+  /** SQL-ready quoted index name. */
+  name: string;
+  /** SQL-ready quoted table name. */
+  table: string;
+  /** SQL-ready quoted index columns. */
+  columns: string[];
+}
+
 export interface Dialect {
   /** Dialect identifier. */
   readonly name: DialectName;
@@ -124,6 +162,36 @@ export interface Dialect {
 
   /** Optional array-cast hook for bulk insert implementations. */
   arrayType?(baseType: string): string;
+
+  /** Map a schema-builder column type to dialect DDL. */
+  buildColumnType(input: ColumnTypeInput): string;
+
+  /** Build a column definition line for CREATE/ALTER TABLE. */
+  buildColumnDefinition(input: ColumnDefinitionInput): string;
+
+  /** Build a table-level PRIMARY KEY constraint. */
+  buildPrimaryKeyConstraint(columns: string[]): string;
+
+  /** Build a CREATE TABLE statement from SQL-ready definitions. */
+  buildCreateTableStatement(input: CreateTableStatementInput): string;
+
+  /** Build a CREATE INDEX statement. */
+  buildCreateIndexStatement(input: CreateIndexStatementInput): string;
+
+  /** Build the migration tracking table DDL. */
+  buildMigrationTrackingTable(table: string): string;
+
+  /** Build the query that reads applied migrations. */
+  buildMigrationSelectApplied(table: string): string;
+
+  /** Build the query that updates an applied migration checksum. */
+  buildMigrationUpdateChecksum(table: string): string;
+
+  /** Build the query that records an applied migration. */
+  buildMigrationInsertApplied(table: string): string;
+
+  /** Build the query that deletes a rolled-back migration record. */
+  buildMigrationDeleteApplied(table: string): string;
 }
 
 export interface DialectIntrospector {
@@ -226,5 +294,62 @@ export const postgresDialect: Dialect = {
     // Existing PostgreSQL type mapping remains in schema.ts/generate.ts for now.
     // This hook is the package boundary MySQL/SQLite implementations will fill.
     return 'unknown';
+  },
+
+  buildColumnType(input: ColumnTypeInput): string {
+    if (input.type === 'VARCHAR' && input.maxLength != null) {
+      return `VARCHAR(${input.maxLength})`;
+    }
+    return input.type;
+  },
+
+  buildColumnDefinition(input: ColumnDefinitionInput): string {
+    const parts = [input.name, this.buildColumnType(input)];
+    if (input.primaryKey) parts.push('PRIMARY KEY');
+    if (input.unique && !input.primaryKey) parts.push('UNIQUE');
+    if (input.notNull) parts.push('NOT NULL');
+    if (input.defaultValue != null) parts.push(`DEFAULT ${input.defaultValue}`);
+    if (input.references) parts.push(`REFERENCES ${input.references.table}(${input.references.column})`);
+    return parts.join(' ');
+  },
+
+  buildPrimaryKeyConstraint(columns: string[]): string {
+    return `PRIMARY KEY (${columns.join(', ')})`;
+  },
+
+  buildCreateTableStatement(input: CreateTableStatementInput): string {
+    const body = input.definitions.map((d) => `    ${d}`).join(',\n');
+    return `CREATE TABLE ${input.table} (\n${body}\n);`;
+  },
+
+  buildCreateIndexStatement(input: CreateIndexStatementInput): string {
+    return `CREATE INDEX ${input.name} ON ${input.table}(${input.columns.join(', ')});`;
+  },
+
+  buildMigrationTrackingTable(table: string): string {
+    return `
+  CREATE TABLE IF NOT EXISTS ${table} (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    checksum TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+`;
+  },
+
+  buildMigrationSelectApplied(table: string): string {
+    return `SELECT id, name, applied_at, checksum FROM ${table} ORDER BY id ASC`;
+  },
+
+  buildMigrationUpdateChecksum(table: string): string {
+    return `UPDATE ${table} SET checksum = ${this.paramPlaceholder(1)} WHERE name = ${this.paramPlaceholder(2)}`;
+  },
+
+  buildMigrationInsertApplied(table: string): string {
+    return `INSERT INTO ${table} (name, checksum) VALUES (${this.paramPlaceholder(1)}, ${this.paramPlaceholder(2)}) ON CONFLICT (name) DO NOTHING`;
+  },
+
+  buildMigrationDeleteApplied(table: string): string {
+    return `DELETE FROM ${table} WHERE name = ${this.paramPlaceholder(1)}`;
   },
 };

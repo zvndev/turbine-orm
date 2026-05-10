@@ -6,9 +6,14 @@
  */
 
 import pg from 'pg';
-import { quoteIdent } from './query/index.js';
+import { type Dialect, postgresDialect } from './dialect.js';
 import { camelToSnake } from './schema.js';
 import type { ColumnConfig, SchemaDef, TableDef } from './schema-builder.js';
+
+export interface SchemaSqlOptions {
+  /** SQL dialect used for DDL generation. Defaults to PostgreSQL. */
+  dialect?: Dialect;
+}
 
 // ---------------------------------------------------------------------------
 // SQL Generation — SchemaDef → CREATE TABLE statements
@@ -20,7 +25,8 @@ import type { ColumnConfig, SchemaDef, TableDef } from './schema-builder.js';
  * Returns CREATE TABLE statements (in dependency order based on references)
  * followed by CREATE INDEX statements for foreign key columns.
  */
-export function schemaToSQL(schema: SchemaDef): string[] {
+export function schemaToSQL(schema: SchemaDef, options?: SchemaSqlOptions): string[] {
+  const dialect = options?.dialect ?? postgresDialect;
   const statements: string[] = [];
 
   // Topologically sort tables by their foreign key references
@@ -30,13 +36,13 @@ export function schemaToSQL(schema: SchemaDef): string[] {
   // Generate CREATE TABLE statements
   for (const tableName of sorted) {
     const table = schema.tables[tableName]!;
-    statements.push(generateCreateTable(table, resolveRef));
+    statements.push(generateCreateTable(table, resolveRef, dialect));
   }
 
   // Generate CREATE INDEX for foreign key columns
   for (const tableName of sorted) {
     const table = schema.tables[tableName]!;
-    const indexes = generateForeignKeyIndexes(table);
+    const indexes = generateForeignKeyIndexes(table, dialect);
     statements.push(...indexes);
   }
 
@@ -138,48 +144,41 @@ function topologicalSort(schema: SchemaDef): string[] {
  * to their snake_case DDL form, so users can write either camelCase JS
  * accessor names or snake_case DDL names.
  */
-function generateCreateTable(table: TableDef, resolveRef?: (raw: string) => string): string {
+function generateCreateTable(
+  table: TableDef,
+  resolveRef?: (raw: string) => string,
+  dialect: Dialect = postgresDialect,
+): string {
   const tableName = table.name;
   const columnDefs: string[] = [];
   const compositePk = table.primaryKey && table.primaryKey.length > 0 ? table.primaryKey : null;
 
   for (const [fieldName, config] of Object.entries(table.columns)) {
-    columnDefs.push(generateColumnDef(fieldName, config, resolveRef));
+    columnDefs.push(generateColumnDef(fieldName, config, resolveRef, dialect));
   }
 
   // Append a table-level PRIMARY KEY constraint when a composite PK is set.
   if (compositePk) {
-    const cols = compositePk.map((c) => quoteIdent(camelToSnake(c))).join(', ');
-    columnDefs.push(`PRIMARY KEY (${cols})`);
+    const cols = compositePk.map((c) => dialect.quoteIdentifier(camelToSnake(c)));
+    columnDefs.push(dialect.buildPrimaryKeyConstraint(cols));
   }
 
-  const body = columnDefs.map((d) => `    ${d}`).join(',\n');
-  return `CREATE TABLE ${quoteIdent(tableName)} (\n${body}\n);`;
+  return dialect.buildCreateTableStatement({
+    table: dialect.quoteIdentifier(tableName),
+    definitions: columnDefs,
+  });
 }
 
 /**
  * Generate a single column definition line (e.g. "id BIGSERIAL PRIMARY KEY").
  */
-function generateColumnDef(fieldName: string, config: ColumnConfig, resolveRef?: (raw: string) => string): string {
+function generateColumnDef(
+  fieldName: string,
+  config: ColumnConfig,
+  resolveRef?: (raw: string) => string,
+  dialect: Dialect = postgresDialect,
+): string {
   const snakeName = camelToSnake(fieldName);
-  const parts: string[] = [quoteIdent(snakeName)];
-
-  // Type
-  if (config.type === 'VARCHAR' && config.maxLength != null) {
-    parts.push(`VARCHAR(${config.maxLength})`);
-  } else {
-    parts.push(config.type);
-  }
-
-  // PRIMARY KEY
-  if (config.isPrimaryKey) {
-    parts.push('PRIMARY KEY');
-  }
-
-  // UNIQUE (only if not primary key — PK is implicitly unique)
-  if (config.isUnique && !config.isPrimaryKey) {
-    parts.push('UNIQUE');
-  }
 
   // NOT NULL — serial types are implicitly NOT NULL, but explicit is fine.
   // A column is NOT NULL if:
@@ -189,28 +188,39 @@ function generateColumnDef(fieldName: string, config: ColumnConfig, resolveRef?:
   // A column is left nullable if .nullable() was called.
   const isSerial = config.type === 'BIGSERIAL';
   const implicitNotNull = isSerial || config.isPrimaryKey;
-  if (config.isNotNull && !implicitNotNull) {
-    parts.push('NOT NULL');
-  }
+  const notNull = config.isNotNull && !implicitNotNull;
 
   // DEFAULT
+  let defaultValue: string | undefined;
   if (config.defaultValue != null) {
-    const sqlDefault = normalizeDefault(config.defaultValue);
-    parts.push(`DEFAULT ${sqlDefault}`);
+    defaultValue = normalizeDefault(config.defaultValue);
   }
 
   // REFERENCES — resolve the raw table name through the optional resolver so
   // both camelCase accessor names and snake_case DDL names work.
+  let references: { table: string; column: string } | undefined;
   if (config.referencesTarget) {
     const refParts = config.referencesTarget.split('.');
     if (refParts.length === 2) {
       const rawTable = refParts[0]!;
       const refTable = resolveRef ? resolveRef(rawTable) : rawTable;
-      parts.push(`REFERENCES ${quoteIdent(refTable)}(${quoteIdent(refParts[1]!)})`);
+      references = {
+        table: dialect.quoteIdentifier(refTable),
+        column: dialect.quoteIdentifier(refParts[1]!),
+      };
     }
   }
 
-  return parts.join(' ');
+  return dialect.buildColumnDefinition({
+    name: dialect.quoteIdentifier(snakeName),
+    type: config.type,
+    maxLength: config.maxLength,
+    primaryKey: config.isPrimaryKey,
+    unique: config.isUnique,
+    notNull,
+    defaultValue,
+    references,
+  });
 }
 
 /**
@@ -257,14 +267,20 @@ function normalizeDefault(val: string): string {
  * Generate CREATE INDEX statements for foreign key columns.
  * Only generates indexes for columns that have a REFERENCES clause.
  */
-function generateForeignKeyIndexes(table: TableDef): string[] {
+function generateForeignKeyIndexes(table: TableDef, dialect: Dialect = postgresDialect): string[] {
   const indexes: string[] = [];
 
   for (const [fieldName, config] of Object.entries(table.columns)) {
     if (config.referencesTarget) {
       const snakeName = camelToSnake(fieldName);
       const indexName = `idx_${table.name}_${snakeName}`;
-      indexes.push(`CREATE INDEX ${quoteIdent(indexName)} ON ${quoteIdent(table.name)}(${quoteIdent(snakeName)});`);
+      indexes.push(
+        dialect.buildCreateIndexStatement({
+          name: dialect.quoteIdentifier(indexName),
+          table: dialect.quoteIdentifier(table.name),
+          columns: [dialect.quoteIdentifier(snakeName)],
+        }),
+      );
     }
   }
 
@@ -322,6 +338,7 @@ export interface DiffResult {
  * DDL is needed to make the database match the schema definition.
  */
 export async function schemaDiff(schema: SchemaDef, connectionString: string): Promise<DiffResult> {
+  const dialect = postgresDialect;
   const client = new pg.Client({ connectionString });
   await client.connect();
 
@@ -416,11 +433,11 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       const ddlName = tableDef.name;
       if (!existingTables.has(ddlName)) {
         result.create.push(tableDef);
-        result.statements.push(generateCreateTable(tableDef, resolveRef));
-        const fkIndexes = generateForeignKeyIndexes(tableDef);
+        result.statements.push(generateCreateTable(tableDef, resolveRef, dialect));
+        const fkIndexes = generateForeignKeyIndexes(tableDef, dialect);
         result.statements.push(...fkIndexes);
         // Reverse: DROP TABLE (with indexes — they drop automatically)
-        result.reverseStatements.unshift(`DROP TABLE IF EXISTS ${quoteIdent(ddlName)} CASCADE;`);
+        result.reverseStatements.unshift(`DROP TABLE IF EXISTS ${dialect.quoteIdentifier(ddlName)} CASCADE;`);
       }
     }
 
@@ -448,9 +465,9 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
 
         if (!dbCol) {
           // Column exists in schema but not in DB — ADD COLUMN
-          const colDef = generateColumnDef(fieldName, config, resolveRef);
-          const sql = `ALTER TABLE ${quoteIdent(tableName)} ADD COLUMN ${colDef};`;
-          const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} DROP COLUMN ${quoteIdent(snakeName)};`;
+          const colDef = generateColumnDef(fieldName, config, resolveRef, dialect);
+          const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ADD COLUMN ${colDef};`;
+          const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP COLUMN ${dialect.quoteIdentifier(snakeName)};`;
           alterDef.columns.push({ column: snakeName, action: 'add', sql, reverseSql });
           result.statements.push(sql);
           result.reverseStatements.unshift(reverseSql);
@@ -462,8 +479,8 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         if (expectedUdt && dbCol.udtName !== expectedUdt) {
           const sqlType = config.type === 'VARCHAR' && config.maxLength ? `VARCHAR(${config.maxLength})` : config.type;
           const oldSqlType = udtToSqlType(dbCol.udtName, dbCol.maxLength);
-          const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} TYPE ${sqlType} USING ${quoteIdent(snakeName)}::${sqlType};`;
-          const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} TYPE ${oldSqlType} USING ${quoteIdent(snakeName)}::${oldSqlType};`;
+          const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${sqlType} USING ${dialect.quoteIdentifier(snakeName)}::${sqlType};`;
+          const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${oldSqlType} USING ${dialect.quoteIdentifier(snakeName)}::${oldSqlType};`;
           alterDef.columns.push({ column: snakeName, action: 'alter_type', sql, reverseSql });
           result.statements.push(sql);
           result.reverseStatements.unshift(reverseSql);
@@ -473,14 +490,14 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         const shouldBeNotNull = config.isNotNull || config.isPrimaryKey || config.type === 'BIGSERIAL';
         const isCurrentlyNullable = dbCol.isNullable;
         if (shouldBeNotNull && isCurrentlyNullable && !config.isNullable) {
-          const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET NOT NULL;`;
-          const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} DROP NOT NULL;`;
+          const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} SET NOT NULL;`;
+          const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} DROP NOT NULL;`;
           alterDef.columns.push({ column: snakeName, action: 'set_not_null', sql, reverseSql });
           result.statements.push(sql);
           result.reverseStatements.unshift(reverseSql);
         } else if (!shouldBeNotNull && !isCurrentlyNullable && config.isNullable) {
-          const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} DROP NOT NULL;`;
-          const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET NOT NULL;`;
+          const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} DROP NOT NULL;`;
+          const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} SET NOT NULL;`;
           alterDef.columns.push({ column: snakeName, action: 'drop_not_null', sql, reverseSql });
           result.statements.push(sql);
           result.reverseStatements.unshift(reverseSql);
@@ -494,15 +511,15 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
 
           if (schemaDefault && !dbDefault) {
             // Schema has default, DB doesn't
-            const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET DEFAULT ${schemaDefault};`;
-            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} DROP DEFAULT;`;
+            const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} SET DEFAULT ${schemaDefault};`;
+            const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} DROP DEFAULT;`;
             alterDef.columns.push({ column: snakeName, action: 'set_default', sql, reverseSql });
             result.statements.push(sql);
             result.reverseStatements.unshift(reverseSql);
           } else if (!schemaDefault && dbDefault && !isSequenceDefault(dbDefault)) {
             // DB has a non-sequence default, schema doesn't
-            const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} DROP DEFAULT;`;
-            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET DEFAULT ${dbDefault};`;
+            const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} DROP DEFAULT;`;
+            const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} SET DEFAULT ${dbDefault};`;
             alterDef.columns.push({ column: snakeName, action: 'drop_default', sql, reverseSql });
             result.statements.push(sql);
             result.reverseStatements.unshift(reverseSql);
@@ -513,8 +530,8 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
             !defaultsMatch(schemaDefault, dbDefault)
           ) {
             // Both have defaults but they differ
-            const sql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET DEFAULT ${schemaDefault};`;
-            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ALTER COLUMN ${quoteIdent(snakeName)} SET DEFAULT ${dbDefault};`;
+            const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} SET DEFAULT ${schemaDefault};`;
+            const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} SET DEFAULT ${dbDefault};`;
             alterDef.columns.push({ column: snakeName, action: 'set_default', sql, reverseSql });
             result.statements.push(sql);
             result.reverseStatements.unshift(reverseSql);
@@ -528,15 +545,15 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
 
           if (wantsUnique && !hasDbUnique) {
             const constraintName = `${tableName}_${snakeName}_key`;
-            const sql = `ALTER TABLE ${quoteIdent(tableName)} ADD CONSTRAINT ${quoteIdent(constraintName)} UNIQUE (${quoteIdent(snakeName)});`;
-            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} DROP CONSTRAINT ${quoteIdent(constraintName)};`;
+            const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ADD CONSTRAINT ${dialect.quoteIdentifier(constraintName)} UNIQUE (${dialect.quoteIdentifier(snakeName)});`;
+            const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP CONSTRAINT ${dialect.quoteIdentifier(constraintName)};`;
             alterDef.columns.push({ column: snakeName, action: 'add_unique', sql, reverseSql });
             result.statements.push(sql);
             result.reverseStatements.unshift(reverseSql);
           } else if (!wantsUnique && hasDbUnique) {
             const constraintName = tableUniques[snakeName]!;
-            const sql = `ALTER TABLE ${quoteIdent(tableName)} DROP CONSTRAINT ${quoteIdent(constraintName)};`;
-            const reverseSql = `ALTER TABLE ${quoteIdent(tableName)} ADD CONSTRAINT ${quoteIdent(constraintName)} UNIQUE (${quoteIdent(snakeName)});`;
+            const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP CONSTRAINT ${dialect.quoteIdentifier(constraintName)};`;
+            const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ADD CONSTRAINT ${dialect.quoteIdentifier(constraintName)} UNIQUE (${dialect.quoteIdentifier(snakeName)});`;
             alterDef.columns.push({ column: snakeName, action: 'drop_unique', sql, reverseSql });
             result.statements.push(sql);
             result.reverseStatements.unshift(reverseSql);
@@ -548,7 +565,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       for (const dbColName of Object.keys(dbCols)) {
         const hasField = Object.entries(tableDef.columns).some(([fieldName]) => camelToSnake(fieldName) === dbColName);
         if (!hasField) {
-          const sql = `ALTER TABLE ${quoteIdent(tableName)} DROP COLUMN ${quoteIdent(dbColName)};`;
+          const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP COLUMN ${dialect.quoteIdentifier(dbColName)};`;
           const reverseSql = `-- Cannot auto-reverse DROP COLUMN for "${dbColName}" — add it back manually`;
           alterDef.columns.push({ column: dbColName, action: 'drop', sql, reverseSql });
           // Don't auto-add drops to statements for safety — user must opt in
@@ -712,7 +729,7 @@ export async function schemaPush(
  * Generate the full DDL as a single formatted string.
  * Useful for printing or saving to a .sql file.
  */
-export function schemaToSQLString(schema: SchemaDef): string {
-  const statements = schemaToSQL(schema);
+export function schemaToSQLString(schema: SchemaDef, options?: SchemaSqlOptions): string {
+  const statements = schemaToSQL(schema, options);
   return `${statements.join('\n\n')}\n`;
 }

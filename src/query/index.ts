@@ -50,6 +50,10 @@ export type {
 export type {
   BuiltStatement,
   BulkInsertStatementInput,
+  ColumnDefinitionInput,
+  ColumnTypeInput,
+  CreateIndexStatementInput,
+  CreateTableStatementInput,
   Dialect,
   InsertStatementInput,
   UpsertStatementInput,

@@ -53,6 +53,10 @@ export {
 export type {
   BuiltStatement,
   BulkInsertStatementInput,
+  ColumnDefinitionInput,
+  ColumnTypeInput,
+  CreateIndexStatementInput,
+  CreateTableStatementInput,
   Dialect,
   DialectIntrospector,
   DialectMigrator,
@@ -161,6 +165,7 @@ export {
   type AlterDef,
   type DiffResult,
   type PushResult,
+  type SchemaSqlOptions,
   schemaDiff,
   schemaPush,
   schemaToSQL,
