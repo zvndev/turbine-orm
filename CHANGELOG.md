@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.13.2 (2026-05-10)
+
+**Integration-suite stabilization for the v0.13 patch recovery.**
+
+### Fixed
+- Prevented unknown `with` relations from sharing the no-relation SQL cache key before relation validation runs.
+- Updated legacy integration expectations for safe not-found messages and seeded fixture sizes.
+
+### Tests
+- GitHub CI run `25619387838` passed build, typecheck, lint, coverage, unit, error-code, and security jobs; this patch targets the remaining integration-only failures.
+
+---
+
 ## 0.13.1 (2026-05-10)
 
 **CI hardening patch for the v0.13 dialect-hook release.**

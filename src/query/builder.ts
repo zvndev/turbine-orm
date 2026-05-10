@@ -2067,7 +2067,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const spec = withClause[relName];
       if (!spec) continue;
       const relDef = meta.relations[relName];
-      if (!relDef) continue;
+      if (!relDef) {
+        parts.push(`unknown:${relName}`);
+        continue;
+      }
 
       if (spec === true) {
         parts.push(relName);

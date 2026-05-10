@@ -241,6 +241,11 @@ describe('withFingerprint', () => {
   it('undefined/empty with returns empty string', () => {
     assert.equal(qi.withFingerprint(undefined), '');
   });
+
+  it('unknown relations do not share the no-with cache key', () => {
+    const fp = qi.withFingerprint({ nonexistent: true });
+    assert.equal(fp, 'unknown:nonexistent');
+  });
 });
 
 // ---------------------------------------------------------------------------
