@@ -48,6 +48,7 @@ import type {
   WithResult,
 } from './types.js';
 import {
+  buildCorrelation,
   escapeLike,
   escSingleQuote,
   LRUCache,
@@ -213,6 +214,7 @@ export interface QueryInterfaceOptions {
   sqlCache?: boolean;
 }
 
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional for untyped table access
 export class QueryInterface<T extends object, R extends object = {}> {
   private readonly tableMeta: TableMetadata;
   /** SQL template cache: cacheKey → SqlCacheEntry (sql + prepared statement name) */
@@ -401,6 +403,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findUnique
   // -------------------------------------------------------------------------
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findUnique<W extends TypedWithClause<R> = {}>(
     args: FindUniqueArgs<T, R, W>,
   ): Promise<WithResult<T, R, W> | null> {
@@ -411,6 +414,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<WithResult<T, R, W> | null>;
   }
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   buildFindUnique<W extends TypedWithClause<R> = {}>(args: FindUniqueArgs<T, R, W>): DeferredQuery<T | null> {
     const columnsList = this.resolveColumns(args.select, args.omit);
     const whereObj = args.where as Record<string, unknown>;
@@ -520,6 +524,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findMany
   // -------------------------------------------------------------------------
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): Promise<WithResult<T, R, W>[]> {
     this.maybeWarnUnlimited(args);
 
@@ -582,6 +587,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return maxDepth;
   }
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   buildFindMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T[]> {
     const columnsList = this.resolveColumns(args?.select, args?.omit);
     const colKey = columnsList ? columnsList.join(',') : '*';
@@ -741,6 +747,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * }
    * ```
    */
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async *findManyStream<W extends TypedWithClause<R> = {}>(
     args?: FindManyStreamArgs<T, R, W>,
   ): AsyncGenerator<WithResult<T, R, W>, void, undefined> {
@@ -818,6 +825,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findFirst — like findMany but returns a single row or null
   // -------------------------------------------------------------------------
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findFirst<W extends TypedWithClause<R> = {}>(
     args?: FindManyArgs<T, R, W>,
   ): Promise<WithResult<T, R, W> | null> {
@@ -828,6 +836,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<WithResult<T, R, W> | null>;
   }
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   buildFindFirst<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T | null> {
     // Reuse findMany's SQL builder but force LIMIT 1
     const findManyArgs: FindManyArgs<T, R, W> = { ...args, limit: 1 };
@@ -848,6 +857,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findFirstOrThrow — like findFirst but throws if no record found
   // -------------------------------------------------------------------------
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findFirstOrThrow<W extends TypedWithClause<R> = {}>(
     args?: FindManyArgs<T, R, W>,
   ): Promise<WithResult<T, R, W>> {
@@ -858,6 +868,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<WithResult<T, R, W>>;
   }
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   buildFindFirstOrThrow<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T> {
     const inner = this.buildFindFirst(args);
 
@@ -883,6 +894,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findUniqueOrThrow — like findUnique but throws if no record found
   // -------------------------------------------------------------------------
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findUniqueOrThrow<W extends TypedWithClause<R> = {}>(
     args: FindUniqueArgs<T, R, W>,
   ): Promise<WithResult<T, R, W>> {
@@ -893,6 +905,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<WithResult<T, R, W>>;
   }
 
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   buildFindUniqueOrThrow<W extends TypedWithClause<R> = {}>(args: FindUniqueArgs<T, R, W>): DeferredQuery<T> {
     const inner = this.buildFindUnique(args);
 
@@ -2380,14 +2393,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const qSelf = quoteIdent(this.table);
     const clauses: string[] = [];
 
-    // Correlation: link child table to parent table
+    // Correlation: link child table to parent table (supports composite FKs)
     let correlation: string;
     if (relDef.type === 'hasMany' || relDef.type === 'hasOne') {
       // parent.pk = child.fk
-      correlation = `${qt}.${quoteIdent(relDef.foreignKey)} = ${qSelf}.${quoteIdent(relDef.referenceKey)}`;
+      correlation = buildCorrelation(qt, relDef.foreignKey, qSelf, relDef.referenceKey);
     } else {
       // belongsTo: parent.fk = child.pk
-      correlation = `${qt}.${quoteIdent(relDef.referenceKey)} = ${qSelf}.${quoteIdent(relDef.foreignKey)}`;
+      correlation = buildCorrelation(qt, relDef.referenceKey, qSelf, relDef.foreignKey);
     }
 
     // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter)
@@ -2439,6 +2452,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (value === undefined) continue;
 
       const col = meta.columnMap[field] ?? camelToSnake(field);
+      if (!meta.allColumns.includes(col)) {
+        throw new ValidationError(
+          `[turbine] Unknown field "${field}" in relation filter for table "${targetTable}". ` +
+            `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
+        );
+      }
       const qCol = `${qt}.${quoteIdent(col)}`;
 
       if (value === null) {
@@ -2909,11 +2928,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Build WHERE — correlate to parent via parentRef (alias or table name).
     // For hasMany: target has FK, so alias.fk = parentRef.pk
     // For belongsTo: source has FK, so alias.pk = parentRef.fk (reversed)
+    // Supports composite foreign keys (string[]) via buildCorrelation.
     let whereClause: string;
     if (relDef.type === 'belongsTo' || relDef.type === 'hasOne') {
-      whereClause = `${alias}.${quoteIdent(relDef.referenceKey)} = ${qParent}.${quoteIdent(relDef.foreignKey)}`;
+      whereClause = buildCorrelation(alias, relDef.referenceKey, qParent, relDef.foreignKey);
     } else {
-      whereClause = `${alias}.${quoteIdent(relDef.foreignKey)} = ${qParent}.${quoteIdent(relDef.referenceKey)}`;
+      whereClause = buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
     }
 
     // Additional filters — properly parameterized

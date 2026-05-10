@@ -69,6 +69,7 @@ export interface WithClause {
  * target's own relations interface — this is what enables deep
  * `WithResult` inference.
  */
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional unconstrained default for generic inference
 export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
   ? WithClause
   : {
@@ -84,6 +85,7 @@ export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
  * `{}` (no relation suggestions) for callers that use the unparameterized
  * {@link WithClause}.
  */
+// biome-ignore lint/complexity/noBannedTypes: {} means "no nested relations" — using object would break WithResult inference
 export interface WithOptions<NestedR extends object = {}> {
   with?: TypedWithClause<NestedR>;
   where?: Record<string, unknown>;
@@ -134,6 +136,7 @@ export interface WithOptions<NestedR extends object = {}> {
  * @typeParam Relations   - The target entity's own `*Relations` interface, or
  *                          `{}` if the target has no relations of its own.
  */
+// biome-ignore lint/complexity/noBannedTypes: {} means target has no relations — intentional for code generator output
 export interface RelationDescriptor<Target, Cardinality extends 'one' | 'many', Relations extends object = {}> {
   readonly __target?: Target;
   readonly __cardinality?: Cardinality;
@@ -151,6 +154,7 @@ type RelationTarget<Rel> =
         : Rel;
 
 /** Extract the target's relations map from a relation descriptor (or `{}` for bare types). */
+// biome-ignore lint/complexity/noBannedTypes: {} fallback for bare types without RelationDescriptor wrapping
 type RelationRelations<Rel> = Rel extends RelationDescriptor<infer _T, infer _C, infer R> ? R : {};
 
 /** Project the target type into its runtime shape (array for many, single for one). */
@@ -213,6 +217,7 @@ export type WithResult<T, R extends object, W> = [keyof R] extends [never]
         }
     : T;
 
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
 export interface FindUniqueArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>> {
   where: WhereClause<T>;
   select?: Record<string, boolean>;
@@ -222,6 +227,7 @@ export interface FindUniqueArgs<T, R extends object = {}, W extends TypedWithCla
   timeout?: number;
 }
 
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
 export interface FindManyArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>> {
   where?: WhereClause<T>;
   select?: Record<string, boolean>;
@@ -240,6 +246,7 @@ export interface FindManyArgs<T, R extends object = {}, W extends TypedWithClaus
   timeout?: number;
 }
 
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
 export interface FindManyStreamArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>>
   extends FindManyArgs<T, R, W> {
   /**

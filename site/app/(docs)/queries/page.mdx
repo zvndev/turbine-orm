@@ -2,6 +2,7 @@ export const metadata = {
   title: 'API Reference',
   description:
     'Every Turbine query method, WHERE operator, nested with option, transaction and pipeline API.',
+  alternates: { canonical: '/queries' },
 };
 
 # API Reference
@@ -166,6 +167,31 @@ await db.users.deleteMany({
 
 Empty `where` (or `where: {}`) throws `ValidationError` — Turbine blocks accidental mass deletes. Pass `{ allowFullTableScan: true }` if you really mean it.
 
+## upsert
+
+Insert a row or update it if a row matching the `where` clause already exists. Uses PostgreSQL's `INSERT ... ON CONFLICT ... DO UPDATE` under the hood — atomic, no race conditions.
+
+The `where` keys determine the conflict target (must be unique or primary key columns). If no matching row exists, `create` is inserted. If a row matches, `update` is applied.
+
+```ts
+const user = await db.users.upsert({
+  where: { email: 'alice@example.com' },
+  create: { email: 'alice@example.com', name: 'Alice', orgId: 1 },
+  update: { name: 'Alice Updated' },
+});
+```
+
+Returns the full row (via `RETURNING *`) whether it was inserted or updated.
+
+```ts
+// Upsert with a composite key
+const membership = await db.memberships.upsert({
+  where: { userId: 1, orgId: 2 },
+  create: { userId: 1, orgId: 2, role: 'member' },
+  update: { role: 'admin' },
+});
+```
+
 ## count
 
 ```ts
@@ -184,6 +210,47 @@ const stats = await db.posts.aggregate({
   _count: true,
 });
 ```
+
+## groupBy
+
+Group rows by one or more columns and compute aggregations per group. Similar to SQL `GROUP BY` with aggregate functions.
+
+```ts
+const postsByUser = await db.posts.groupBy({
+  by: ['userId'],
+  _count: true,
+  _sum: { viewCount: true },
+  _avg: { score: true },
+});
+// [{ userId: 1, _count: 12, _sum: { viewCount: 4800 }, _avg: { score: 4.2 } }, ...]
+```
+
+### Filtering groups
+
+Pass a `where` clause to filter rows before grouping:
+
+```ts
+const activePostsByOrg = await db.posts.groupBy({
+  by: ['orgId'],
+  where: { published: true },
+  _count: true,
+  _max: { createdAt: true },
+  orderBy: { _count: 'desc' },
+});
+```
+
+### Multiple group-by columns
+
+```ts
+const breakdown = await db.posts.groupBy({
+  by: ['orgId', 'published'],
+  _count: true,
+  _min: { createdAt: true },
+  _max: { createdAt: true },
+});
+```
+
+Supported aggregate functions: `_count`, `_sum`, `_avg`, `_min`, `_max`. When `_count` is `true` (or omitted), each group includes a `_count` field with the number of rows in that group.
 
 ## findManyStream
 
@@ -355,7 +422,7 @@ try {
 }
 ```
 
-HTTP / serverless pools that don't support the pipeline protocol fall back to sequential execution automatically. Probe at runtime with `pipelineSupported(pool)`.
+HTTP / serverless pools that don't support the pipeline protocol fall back to sequential execution automatically. Probe at runtime with `db.pipelineSupported()`.
 
 ## Middleware
 

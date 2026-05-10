@@ -30,6 +30,17 @@ export interface TurbineCliConfig {
   seedFile?: string;
   /** Schema builder file path (for push command) */
   schemaFile?: string;
+  /**
+   * Database adapter for PostgreSQL-compatible databases that need
+   * dialect-specific behavior (e.g. CockroachDB, YugabyteDB).
+   *
+   * @example
+   * ```ts
+   * import { cockroachdb } from 'turbine-orm/adapters';
+   * export default { url: process.env.DATABASE_URL, adapter: cockroachdb };
+   * ```
+   */
+  adapter?: import('../adapters/index.js').DatabaseAdapter;
 }
 
 // ---------------------------------------------------------------------------

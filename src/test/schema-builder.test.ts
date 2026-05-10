@@ -499,6 +499,7 @@ describe('defineSchema runtime type validation', () => {
       defineSchema({
         test: {
           id: { type: 'serial', primaryKey: true },
+          // biome-ignore lint/suspicious/noExplicitAny: intentionally passing invalid type to test runtime validation
           bad: { type: 'invalidtype' as any },
         },
       });
@@ -509,6 +510,7 @@ describe('defineSchema runtime type validation', () => {
     assert.throws(() => {
       defineSchema({
         test: {
+          // biome-ignore lint/suspicious/noExplicitAny: intentionally passing invalid type to test runtime validation
           id: { type: '' as any },
         },
       });
@@ -519,6 +521,7 @@ describe('defineSchema runtime type validation', () => {
     assert.throws(() => {
       defineSchema({
         test: {
+          // biome-ignore lint/suspicious/noExplicitAny: intentionally passing invalid type to test runtime validation
           id: { type: 'BIGSERIAL' as any, primaryKey: true },
         },
       });

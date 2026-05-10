@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.10.0 (2026-05-09)
+
+**Database adapters, composite FK support, marketing rewrite, full hardening pass.**
+
+### Added
+- **Database adapter system** (`src/adapters/`): pluggable `DatabaseAdapter`
+  interface for PG-compatible databases. Ships `cockroachdb` (table-based
+  locking, introspection overrides, transaction_timeout syntax), `yugabytedb`
+  (distributed table locks), and no-op `alloydb`/`timescale` adapters.
+  New `./adapters` subpath export.
+- **Composite foreign key support**: `introspect.ts` now groups FK rows by
+  constraint name. `RelationDef.foreignKey`/`referenceKey` accept
+  `string | string[]`. New `buildCorrelation()` utility generates AND-joined
+  equality clauses. Code generation emits array literals for composite FKs.
+- **Compatibility docs page** (`/compatibility`): CockroachDB, YugabyteDB,
+  AlloyDB, Timescale connection guides and feature matrices.
+- **Multi-DB architecture plan** (`docs/MULTI_DB_PLAN.md`): design doc for
+  future MySQL/SQLite/SQL Server as separate `@turbine-orm/*` packages.
+- **Dynamic OG + Twitter images**: Next.js `ImageResponse` routes for social
+  sharing previews.
+- **JSON-LD structured data** on landing page (SoftwareApplication schema).
+- **Per-page canonical URLs** and Twitter card metadata across all docs.
+- **`upsert` and `groupBy` documentation** in API reference.
+- **56 new tests** for database adapters (CockroachDB, YugabyteDB, pg-compat).
+- **64 new tests** for coverage gaps: `client-coverage.test.ts` (middleware,
+  timeouts, external pools, SAVEPOINTs) and `schema-diff.test.ts` (all
+  schemaDiff patterns).
+- **10 new tests** for relation filter field validation.
+- **14 new tests** for composite FK correlation and introspection.
+
+### Fixed
+- **Validation gap in `buildSubWhereForRelation`** (medium-severity security
+  finding): now validates column existence against target table metadata,
+  throws `ValidationError` with field name and available columns.
+- **Multi-column FK introspection bug**: composite FKs no longer split into
+  separate single-column relations.
+- **Dead `/roadmap` link** in Prisma migration page removed.
+- **Pipeline API inconsistency** across docs unified to `db.pipeline(...)`.
+- **Sidebar accessibility**: Escape key closes mobile menu, aria-expanded +
+  aria-labels added.
+- Removed 7 unused imports caught during lint cleanup.
+
+### Changed
+- **Landing page messaging** rewritten: leads with "110 KB. One dep." and
+  actual differentiators (Studio, PII-safe errors, migrations). Feature
+  section titled "What Prisma and Drizzle don't ship."
+- **README top section** reframed around real moat; json_agg moved to
+  "How it works" supporting section.
+- **Comparison tables** expanded (9 rows, install size + Studio first).
+- `migrate.ts` and `studio.ts` now accept optional `DatabaseAdapter` for
+  pluggable locking and timeout strategies. Fully backwards-compatible.
+- Hero badge changed from `v0.9` to `pre-1.0`.
+- Cleaned 6 vestigial empty route directories from `site/app/`.
+
+### Tests
+- 674 unit tests, 0 failures (up from 530 in v0.9.2).
+- Lint: 0 warnings, 0 errors (72 warnings suppressed with targeted
+  `biome-ignore` comments including justification).
+- TypeScript: strict check clean.
+
+---
+
 ## 0.9.2 (2026-04-14)
 
 **Docs + positioning patch.** Sharpens the landing-page/README pitch around the

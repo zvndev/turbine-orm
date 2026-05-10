@@ -1,0 +1,225 @@
+export const metadata = {
+  title: 'Database Compatibility',
+  description:
+    'Turbine ORM works with PostgreSQL and PG-compatible databases: AlloyDB, TimescaleDB, YugabyteDB, CockroachDB, Neon, Supabase, and more.',
+  alternates: { canonical: '/compatibility' },
+};
+
+# Database Compatibility
+
+Turbine is built for PostgreSQL. Because it generates standard SQL (parameterized queries, `json_agg`, correlated subqueries), it also works with databases that speak the PostgreSQL wire protocol.
+
+## Compatibility Matrix
+
+| Database | Adapter | Status | Notes |
+|---|---|---|---|
+| **PostgreSQL** 13+ | None (default) | Full | Native target |
+| **AlloyDB** | `alloydb` (no-op) | Full | Google's PG storage engine |
+| **TimescaleDB** | `timescale` (no-op) | Full | PG extension — hypertables introspect fine |
+| **Neon** | None | Full | Use `turbine-orm/serverless` for HTTP driver |
+| **Supabase** | None | Full | Standard Postgres, connect directly |
+| **YugabyteDB** | `yugabytedb` | Full | Distributed lock adapter for migrations |
+| **CockroachDB** | `cockroachdb` | Full | Table-based locks, introspection overrides |
+
+## AlloyDB
+
+[AlloyDB](https://cloud.google.com/alloydb) is Google Cloud's PostgreSQL-compatible database service. Under the hood it **is** PostgreSQL with a custom columnar storage engine — wire protocol, system catalogs, and SQL dialect are identical.
+
+**No adapter is needed.** Every Turbine feature works out of the box:
+
+- `json_agg` / nested `with` relations
+- Advisory locks for migrations
+- Standard `information_schema` introspection
+- Transactions, pipelines, streaming
+
+### Connection
+
+```ts
+import { TurbineClient } from 'turbine-orm';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+// AlloyDB uses standard PG connection strings
+const db = new TurbineClient({
+  connectionString: process.env.ALLOYDB_URL,
+  // AlloyDB requires SSL in production
+  ssl: { rejectUnauthorized: true },
+}, SCHEMA);
+```
+
+If you want to be explicit about the target database:
+
+```ts
+import { alloydb } from 'turbine-orm/adapters';
+
+// turbine.config.ts
+export default {
+  url: process.env.ALLOYDB_URL,
+  adapter: alloydb, // purely documentation — no behavior changes
+};
+```
+
+## TimescaleDB
+
+[TimescaleDB](https://www.timescale.com/) is a PostgreSQL extension that adds hypertables (time-series-optimized tables), continuous aggregates, and compression policies. Because it's an extension (not a fork), the underlying database is standard PostgreSQL.
+
+**No adapter is needed.** Hypertables introspect as regular tables via `information_schema`. All Turbine features work identically.
+
+### Connection
+
+```ts
+import { TurbineClient } from 'turbine-orm';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+// Timescale Cloud uses standard PG connection strings
+const db = new TurbineClient({
+  connectionString: process.env.TIMESCALE_URL,
+  ssl: { rejectUnauthorized: true },
+}, SCHEMA);
+```
+
+### Hypertable considerations
+
+- `npx turbine generate` introspects hypertables the same as regular tables
+- `findMany` with `orderBy: { time: 'desc' }` benefits from Timescale's chunk exclusion
+- Continuous aggregates are **not** introspected (they're materialized views, not tables)
+- If you need to query a continuous aggregate, use `db.$queryRaw`
+
+## YugabyteDB
+
+[YugabyteDB](https://www.yugabyte.com/) is a distributed SQL database that reuses the PostgreSQL query layer. It supports `json_agg`, subqueries, transactions, and most of `pg_catalog`.
+
+**All query features work identically to PostgreSQL.** The only difference is in migration locking: advisory locks (`pg_try_advisory_lock`) are scoped per-tserver node, not cluster-wide. In a multi-node deployment, two concurrent `turbine migrate` commands routed to different nodes could both acquire the "same" lock.
+
+### Use the adapter for safe distributed migrations
+
+```ts
+import { yugabytedb } from 'turbine-orm/adapters';
+
+// turbine.config.ts
+export default {
+  url: process.env.YUGABYTE_URL,
+  adapter: yugabytedb,
+};
+```
+
+The YugabyteDB adapter replaces advisory locks with a `_turbine_lock` table using `SELECT ... FOR UPDATE NOWAIT`. Because YugabyteDB's row locks are distributed (backed by Raft consensus), this provides a true cluster-wide mutex.
+
+### Connection
+
+```ts
+import { TurbineClient } from 'turbine-orm';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+// YugabyteDB uses standard PG connection strings
+const db = new TurbineClient({
+  connectionString: 'postgresql://yugabyte:yugabyte@localhost:5433/mydb',
+}, SCHEMA);
+```
+
+### What works identically
+
+- `json_agg` + `json_build_object` nested relations
+- Correlated subqueries
+- Parameterized queries and pipeline batching
+- Transactions with `SAVEPOINT` (nested transactions)
+- `information_schema` for introspection
+- `pg_indexes`, `pg_type`, `pg_enum`
+- `FOR UPDATE` / `FOR SHARE` row-level locking
+- All WHERE operators (LIKE, ILIKE, IN, arrays, JSON)
+
+### Known differences
+
+| Area | Difference | Impact |
+|---|---|---|
+| Advisory locks | Per-node, not cluster-wide | Use `yugabytedb` adapter for migrations |
+| Sequences | May have gaps under concurrent inserts | Cosmetic only — IDs are still unique |
+| `pg_class.reltuples` | May be stale or zero on new tables | Studio row counts may lag |
+| Index types | Hash indexes not supported | GIN, GiST, B-tree all work |
+
+## CockroachDB
+
+[CockroachDB](https://www.cockroachlabs.com/) is a distributed SQL database that speaks the PostgreSQL wire protocol. Turbine's core query features (json_agg, correlated subqueries, parameterized queries) work correctly. However, CockroachDB has several differences that require the `cockroachdb` adapter.
+
+### Use the adapter
+
+```ts
+import { cockroachdb } from 'turbine-orm/adapters';
+
+// turbine.config.ts
+export default {
+  url: process.env.COCKROACH_URL,
+  adapter: cockroachdb,
+};
+```
+
+### What the adapter does
+
+| Area | PostgreSQL | CockroachDB (with adapter) |
+|---|---|---|
+| Migration locks | `pg_try_advisory_lock()` | `_turbine_lock` table + `SELECT FOR UPDATE NOWAIT` |
+| Statement timeout | `SET LOCAL statement_timeout` | `SET transaction_timeout` (v23.1+) |
+| Index introspection | `pg_indexes` view | Same view (compatible since v22.1) |
+| Row estimates | `pg_class.reltuples` | `crdb_internal.table_row_statistics` |
+
+### Connection
+
+```ts
+import { TurbineClient } from 'turbine-orm';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+const db = new TurbineClient({
+  connectionString: process.env.COCKROACH_URL,
+  ssl: { rejectUnauthorized: true }, // CockroachDB Cloud requires SSL
+}, SCHEMA);
+```
+
+### What works identically
+
+- `json_agg` + `json_build_object` nested relations
+- Correlated subqueries (the core of Turbine's single-query strategy)
+- Parameterized queries and pipeline batching (extended query protocol)
+- `information_schema` for table, column, constraint introspection
+- `pg_enum` / `pg_type` for enum introspection
+- `WITH` (CTEs), `COALESCE`, `LIMIT`, `OFFSET`, `ORDER BY`
+- All WHERE operators (LIKE, ILIKE, IN, NOT IN, arrays)
+- Transactions (note: CockroachDB uses serializable by default)
+
+### Known limitations
+
+| Area | Difference | Impact |
+|---|---|---|
+| Advisory locks | Not supported | Adapter provides table-based alternative |
+| `SERIAL` columns | Uses `unique_rowid()` not sequences | IDs are unique but not sequential |
+| NULL ordering in `json_agg` | May differ from PostgreSQL | Cosmetic for most use cases |
+| `SET LOCAL statement_timeout` | Not supported | Adapter uses `SET transaction_timeout` |
+| Default isolation | Serializable (vs. Read Committed) | More retryable errors under contention |
+| `pg_class.reltuples` | Not reliable | Studio uses `crdb_internal` for estimates |
+
+### Serverless with CockroachDB
+
+CockroachDB Serverless exposes a standard PostgreSQL connection string. Use it directly with `turbineHttp`:
+
+```ts
+import { turbineHttp } from 'turbine-orm/serverless';
+import { Pool } from 'pg';
+import { schema } from './generated/turbine/metadata';
+
+const pool = new Pool({
+  connectionString: process.env.COCKROACH_URL,
+  ssl: { rejectUnauthorized: true },
+});
+export const db = turbineHttp(pool, schema);
+```
+
+## Other PG-Compatible Databases
+
+If your database speaks the PostgreSQL wire protocol and supports:
+
+1. `json_agg` and `json_build_object`
+2. Correlated subqueries
+3. `$1, $2, ...` parameterized queries
+4. `information_schema.tables` and `information_schema.columns`
+
+Then Turbine will likely work out of the box. Connect using the standard `pg` driver and run `npx turbine generate` to verify introspection works.
+
+If you encounter issues with a specific PG-compatible database, [open an issue](https://github.com/zvndev/turbine-orm/issues) — adapters are straightforward to add.

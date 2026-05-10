@@ -170,6 +170,7 @@ declare const users: QueryInterface<User, UserRelations>;
 // generic function substitutes the constraint (`TypedWithClause<R>`), not the
 // default (`{}`). In real user code, calling `users.findMany()` without type
 // args does infer `W = {}` correctly — that path is exercised in section 9.
+// biome-ignore lint/complexity/noBannedTypes: testing exact {} generic default inference behavior
 type PlainList = AwaitedArrayOf<ReturnType<typeof users.findMany<{}>>>;
 assertTrue<Equals<PlainList, User>>();
 

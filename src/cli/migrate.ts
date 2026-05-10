@@ -16,6 +16,8 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import pg from 'pg';
+import type { DatabaseAdapter } from '../adapters/index.js';
+import { postgresql } from '../adapters/index.js';
 import { MigrationError } from '../errors.js';
 import { quoteIdent } from '../query/index.js';
 
@@ -298,13 +300,15 @@ async function getCurrentDatabaseName(client: pg.Client): Promise<string> {
   return result.rows[0]?.current_database ?? '';
 }
 
-async function acquireLock(client: pg.Client, lockId: number): Promise<boolean> {
-  const result = await client.query<{ locked: boolean }>(`SELECT pg_try_advisory_lock($1) AS locked`, [lockId]);
-  return result.rows[0]?.locked ?? false;
+async function acquireLock(client: pg.Client, lockId: number, adapter?: DatabaseAdapter): Promise<boolean> {
+  const a = adapter ?? postgresql;
+  // pg.Client satisfies PgCompatPoolClient (query + release)
+  return a.acquireLock(client as unknown as import('../client.js').PgCompatPoolClient, lockId);
 }
 
-async function releaseLock(client: pg.Client, lockId: number): Promise<void> {
-  await client.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
+async function releaseLock(client: pg.Client, lockId: number, adapter?: DatabaseAdapter): Promise<void> {
+  const a = adapter ?? postgresql;
+  await a.releaseLock(client as unknown as import('../client.js').PgCompatPoolClient, lockId);
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +384,12 @@ async function validateChecksums(client: pg.Client, migrationsDir: string): Prom
 export async function migrateUp(
   connectionString: string,
   migrationsDir: string,
-  options?: { step?: number; allowDrift?: boolean /** @deprecated use allowDrift */; force?: boolean },
+  options?: {
+    step?: number;
+    allowDrift?: boolean /** @deprecated use allowDrift */;
+    force?: boolean;
+    adapter?: DatabaseAdapter;
+  },
 ): Promise<{ applied: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
   const client = new pg.Client({ connectionString });
   await client.connect();
@@ -394,8 +403,10 @@ export async function migrateUp(
     const dbName = await getCurrentDatabaseName(client);
     const lockId = deriveLockId(dbName);
 
-    // Acquire advisory lock to prevent concurrent migrations
-    const gotLock = await acquireLock(client, lockId);
+    // Acquire lock to prevent concurrent migrations.
+    // The adapter determines the strategy (advisory lock vs table lock).
+    const adapter = options?.adapter;
+    const gotLock = await acquireLock(client, lockId, adapter);
     if (!gotLock) {
       throw new MigrationError('[turbine] Could not acquire migration lock — another migration is already running');
     }
@@ -480,7 +491,7 @@ export async function migrateUp(
 
       return { applied: results, errors };
     } finally {
-      await releaseLock(client, lockId);
+      await releaseLock(client, lockId, adapter);
     }
   } finally {
     await client.end();
@@ -498,7 +509,7 @@ export async function migrateUp(
 export async function migrateDown(
   connectionString: string,
   migrationsDir: string,
-  options?: { step?: number },
+  options?: { step?: number; adapter?: DatabaseAdapter },
 ): Promise<{ rolledBack: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
   const client = new pg.Client({ connectionString });
   await client.connect();
@@ -509,7 +520,8 @@ export async function migrateDown(
     const dbName = await getCurrentDatabaseName(client);
     const lockId = deriveLockId(dbName);
 
-    const gotLock = await acquireLock(client, lockId);
+    const adapter = options?.adapter;
+    const gotLock = await acquireLock(client, lockId, adapter);
     if (!gotLock) {
       throw new MigrationError('[turbine] Could not acquire migration lock — another migration is already running');
     }
@@ -563,7 +575,7 @@ export async function migrateDown(
 
       return { rolledBack: results, errors };
     } finally {
-      await releaseLock(client, lockId);
+      await releaseLock(client, lockId, adapter);
     }
   } finally {
     await client.end();

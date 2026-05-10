@@ -1082,8 +1082,9 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
         const isLast = i === rels.length - 1;
         const prefix = isLast ? symbols.teeEnd : symbols.tee;
         const relColor = rel.type === 'hasMany' ? blue : yellow;
+        const fkDisplay = Array.isArray(rel.foreignKey) ? rel.foreignKey.join(', ') : rel.foreignKey;
         console.log(
-          `    ${dim(prefix)} ${relColor(relName)} ${dim(symbols.arrow)} ${rel.to} ${dim(`(${rel.type}, FK: ${rel.foreignKey})`)}`,
+          `    ${dim(prefix)} ${relColor(relName)} ${dim(symbols.arrow)} ${rel.to} ${dim(`(${rel.type}, FK: ${fkDisplay})`)}`,
         );
       }
     }

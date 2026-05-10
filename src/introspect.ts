@@ -84,13 +84,16 @@ const SQL_FOREIGN_KEYS = `
 const SQL_UNIQUE_CONSTRAINTS = `
   SELECT
     tc.table_name,
-    kcu.column_name
+    tc.constraint_name,
+    kcu.column_name,
+    kcu.ordinal_position
   FROM information_schema.table_constraints tc
   JOIN information_schema.key_column_usage kcu
     ON tc.constraint_name = kcu.constraint_name
     AND tc.table_schema = kcu.table_schema
   WHERE tc.constraint_type = 'UNIQUE'
     AND tc.table_schema = $1
+  ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position
 `;
 
 const SQL_INDEXES = `
@@ -195,12 +198,20 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
     }
 
     // ----- Group unique constraints by table -----
+    // Group rows by (table_name, constraint_name) to correctly handle multi-column unique constraints
     const uniqueByTable = new Map<string, string[][]>();
+    const uniqueConstraintGroups = new Map<string, { table: string; columns: string[] }>();
     for (const row of uniqueResult.rows) {
       if (!tableSet.has(row.table_name)) continue;
-      if (!uniqueByTable.has(row.table_name)) uniqueByTable.set(row.table_name, []);
-      // Each unique constraint may be multi-column; for simplicity, treat as single-col here
-      uniqueByTable.get(row.table_name)!.push([row.column_name]);
+      const key = `${row.table_name}::${row.constraint_name}`;
+      if (!uniqueConstraintGroups.has(key)) {
+        uniqueConstraintGroups.set(key, { table: row.table_name, columns: [] });
+      }
+      uniqueConstraintGroups.get(key)!.columns.push(row.column_name);
+    }
+    for (const { table, columns } of uniqueConstraintGroups.values()) {
+      if (!uniqueByTable.has(table)) uniqueByTable.set(table, []);
+      uniqueByTable.get(table)!.push(columns);
     }
 
     // ----- Group indexes by table -----
@@ -230,22 +241,33 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
     }
 
     // ----- Build foreign key map -----
+    // Group FK rows by constraint_name to correctly handle multi-column composite FKs.
+    // Each constraint becomes one FKEntry with arrays of columns.
     interface FKEntry {
       sourceTable: string;
-      sourceColumn: string;
+      sourceColumns: string[];
       targetTable: string;
-      targetColumn: string;
+      targetColumns: string[];
+      constraintName: string;
     }
-    const foreignKeys: FKEntry[] = [];
+    const fkGroups = new Map<string, FKEntry>();
     for (const row of fkResult.rows) {
       if (!tableSet.has(row.source_table) || !tableSet.has(row.target_table)) continue;
-      foreignKeys.push({
-        sourceTable: row.source_table,
-        sourceColumn: row.source_column,
-        targetTable: row.target_table,
-        targetColumn: row.target_column,
-      });
+      const key = row.constraint_name as string;
+      if (!fkGroups.has(key)) {
+        fkGroups.set(key, {
+          sourceTable: row.source_table,
+          sourceColumns: [],
+          targetTable: row.target_table,
+          targetColumns: [],
+          constraintName: key,
+        });
+      }
+      const entry = fkGroups.get(key)!;
+      entry.sourceColumns.push(row.source_column);
+      entry.targetColumns.push(row.target_column);
     }
+    const foreignKeys = Array.from(fkGroups.values());
 
     // ----- Build relations from foreign keys -----
     // Count FKs per (source, target) pair for disambiguation
@@ -261,10 +283,18 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
       const pairKey = `${fk.sourceTable}→${fk.targetTable}`;
       const needsDisambiguation = (fkCounts.get(pairKey) ?? 0) > 1;
 
+      // For single-column FKs, keep string form for backwards compatibility.
+      // For multi-column (composite) FKs, use array form.
+      const foreignKey = fk.sourceColumns.length === 1 ? fk.sourceColumns[0]! : fk.sourceColumns;
+      const referenceKey = fk.targetColumns.length === 1 ? fk.targetColumns[0]! : fk.targetColumns;
+
       // --- belongsTo on the source (child) table ---
       // e.g. posts.user_id → users.id creates posts.user (belongsTo)
+      // For composite FKs with disambiguation, use the constraint name
       const belongsToName = needsDisambiguation
-        ? snakeToCamel(fk.sourceColumn.replace(/_id$/, ''))
+        ? fk.sourceColumns.length === 1
+          ? snakeToCamel(fk.sourceColumns[0]!.replace(/_id$/, ''))
+          : snakeToCamel(fk.constraintName.replace(/^fk_/, '').replace(/_fkey$/, ''))
         : singularize(snakeToCamel(fk.targetTable));
 
       if (!relationsByTable.has(fk.sourceTable)) relationsByTable.set(fk.sourceTable, {});
@@ -273,14 +303,16 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
         name: belongsToName,
         from: fk.sourceTable,
         to: fk.targetTable,
-        foreignKey: fk.sourceColumn,
-        referenceKey: fk.targetColumn,
+        foreignKey,
+        referenceKey,
       };
 
       // --- hasMany on the target (parent) table ---
       // e.g. posts.user_id → users.id creates users.posts (hasMany)
       const hasManyName = needsDisambiguation
-        ? snakeToCamel(`${fk.sourceTable}_by_${fk.sourceColumn.replace(/_id$/, '')}`)
+        ? fk.sourceColumns.length === 1
+          ? snakeToCamel(`${fk.sourceTable}_by_${fk.sourceColumns[0]!.replace(/_id$/, '')}`)
+          : snakeToCamel(`${fk.sourceTable}_by_${fk.constraintName.replace(/^fk_/, '').replace(/_fkey$/, '')}`)
         : snakeToCamel(fk.sourceTable);
 
       if (!relationsByTable.has(fk.targetTable)) relationsByTable.set(fk.targetTable, {});
@@ -289,8 +321,8 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
         name: hasManyName,
         from: fk.targetTable,
         to: fk.sourceTable,
-        foreignKey: fk.sourceColumn,
-        referenceKey: fk.targetColumn,
+        foreignKey,
+        referenceKey,
       };
     }
 

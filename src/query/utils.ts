@@ -130,3 +130,28 @@ export const OPERATOR_KEYS = new Set<string>([
   'endsWith',
   'mode',
 ]);
+
+// ---------------------------------------------------------------------------
+// Composite key correlation helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a correlation clause joining columns between two table references.
+ * Handles both single-column (string) and multi-column (string[]) foreign keys.
+ *
+ * For single-column: `"alias"."col" = "parent"."col"`
+ * For multi-column:  `"alias"."col_a" = "parent"."ref_a" AND "alias"."col_b" = "parent"."ref_b"`
+ */
+export function buildCorrelation(
+  leftRef: string,
+  leftColumns: string | string[],
+  rightRef: string,
+  rightColumns: string | string[],
+): string {
+  const leftCols = Array.isArray(leftColumns) ? leftColumns : [leftColumns];
+  const rightCols = Array.isArray(rightColumns) ? rightColumns : [rightColumns];
+
+  return leftCols
+    .map((col, i) => `${leftRef}.${quoteIdent(col)} = ${rightRef}.${quoteIdent(rightCols[i]!)}`)
+    .join(' AND ');
+}

@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 type NavItem = { href: string; label: string };
 type NavSection = { title: string; items: NavItem[] };
@@ -23,6 +23,7 @@ const sections: NavSection[] = [
       { href: '/transactions', label: 'Transactions & Pipelines' },
       { href: '/schema', label: 'Schema & Migrations' },
       { href: '/serverless', label: 'Serverless & Edge' },
+      { href: '/compatibility', label: 'Database Compatibility' },
       { href: '/cli', label: 'CLI' },
       { href: '/errors', label: 'Typed Errors' },
     ],
@@ -53,6 +54,18 @@ export function Sidebar() {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
 
+  const closeSidebar = useCallback(() => setOpen(false), []);
+
+  // Close sidebar on Escape key
+  useEffect(() => {
+    if (!open) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeSidebar();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [open, closeSidebar]);
+
   const isActive = (href: string) => {
     if (href === '/') return pathname === '/';
     return pathname === href || pathname?.startsWith(`${href}/`);
@@ -64,7 +77,8 @@ export function Sidebar() {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        aria-label="Toggle navigation"
+        aria-label={open ? 'Close navigation' : 'Open navigation'}
+        aria-expanded={open}
         className="fixed top-4 left-4 z-50 md:hidden p-2 rounded-lg"
         style={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)' }}
       >
@@ -86,13 +100,13 @@ export function Sidebar() {
         <div
           className="fixed inset-0 z-30 md:hidden"
           style={{ background: 'rgba(0, 0, 0, 0.6)', backdropFilter: 'blur(4px)' }}
-          onClick={() => setOpen(false)}
-          onKeyDown={() => {}}
+          onClick={closeSidebar}
           role="presentation"
         />
       )}
 
       <nav
+        aria-label="Documentation"
         className={`fixed top-0 left-0 h-screen flex flex-col overflow-y-auto z-40 transition-transform duration-200 ease-in-out ${
           open ? 'translate-x-0' : '-translate-x-full'
         } md:translate-x-0`}
@@ -137,7 +151,7 @@ export function Sidebar() {
                     fontWeight: 600,
                   }}
                 >
-                  v0.9.1
+                  v0.10.0
                 </span>
               </div>
             </div>

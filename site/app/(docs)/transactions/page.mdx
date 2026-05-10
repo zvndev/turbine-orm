@@ -2,6 +2,7 @@ export const metadata = {
   title: 'Transactions & Pipelines',
   description:
     'Callback-style transactions with nested SAVEPOINTs, isolation levels, timeouts, retryable errors, and pipeline batching in Turbine ORM.',
+  alternates: { canonical: '/transactions' },
 };
 
 # Transactions & Pipelines
@@ -138,9 +139,7 @@ The `as const` on `isRetryable` means `err.isRetryable` is the literal type `tru
 A pipeline bundles independent queries and sends them together using the Postgres extended-query pipeline protocol. Each query gets its own parsed SQL, own params, own typed result. **No transactional semantics** — if query 3 fails, queries 1, 2, 4, 5 still ran.
 
 ```ts
-import { pipeline } from 'turbine-orm';
-
-const [user, posts, commentCount, orgs, latestLogin] = await pipeline(db, [
+const [user, posts, commentCount, orgs, latestLogin] = await db.pipeline([
   db.users.buildFindUnique({ where: { id: 1 } }),
   db.posts.buildFindMany({ where: { userId: 1 }, limit: 10 }),
   db.comments.buildCount({ where: { userId: 1 } }),
@@ -171,7 +170,7 @@ Rarely useful but possible: run a pipeline through `tx` for batched reads inside
 
 ```ts
 await db.$transaction(async (tx) => {
-  const [user, posts] = await pipeline(tx, [
+  const [user, posts] = await tx.pipeline([
     tx.users.buildFindUnique({ where: { id: 1 } }),
     tx.posts.buildFindMany({ where: { userId: 1 } }),
   ]);

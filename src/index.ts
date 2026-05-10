@@ -33,6 +33,9 @@
  * ```
  */
 
+// Database adapters
+export type { DatabaseAdapter, IntrospectionOverrides } from './adapters/index.js';
+export { alloydb, cockroachdb, postgresql, timescale, yugabytedb } from './adapters/index.js';
 // Client
 export {
   type Middleware,
@@ -118,6 +121,7 @@ export type {
 export {
   camelToSnake,
   isDateType,
+  normalizeKeyColumns,
   pgArrayType,
   pgTypeToTs,
   singularize,

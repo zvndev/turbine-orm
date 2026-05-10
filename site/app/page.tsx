@@ -4,9 +4,9 @@ import { codeToHtml } from 'shiki';
 import { CopyButton } from '../components/CopyButton';
 
 export const metadata: Metadata = {
-  title: 'Turbine ORM — Postgres ORM built for the edge',
+  title: 'Turbine ORM — 110 KB Postgres ORM. One dependency. Read-only Studio.',
   description:
-    'Postgres ORM built for the edge. One runtime dependency, built-in read-only Studio, code-first and DB-first schema workflows. Prisma-like DX, no engine binary.',
+    'The Postgres ORM that ships 110 KB total. One runtime dependency (pg), built-in read-only Studio, PII-safe errors, SQL-first migrations with drift detection. No WASM engine, no adapter shims.',
 };
 
 const heroCode = `const users = await db.users.findMany({
@@ -43,40 +43,46 @@ WHERE "users"."org_id" = $1`;
 
 const features = [
   {
-    icon: '📦',
-    title: 'One runtime dependency',
+    title: 'One dependency. 110 KB.',
     description:
-      'Just pg. No engine binary, no WASM, no adapter packages to keep in lockstep. ~110 KB on npm, 5 KB on the edge.',
+      'Turbine ships pg and nothing else. No WASM engine (Prisma: 1.6 MB), no adapter chain, no lockstep package upgrades. 110 KB on npm, 5 KB on the edge entry.',
+    stat: '1',
+    statLabel: 'runtime dep',
   },
   {
-    icon: '🌐',
-    title: 'First-class edge runtime',
+    title: 'Read-only Studio your DBA will approve',
     description:
-      'One import swap — turbineHttp(pool, schema) — and the same API runs on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase.',
+      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, statement-stacking guard, X-Frame-Options: DENY. No other TS ORM ships this.',
+    stat: '0',
+    statLabel: 'write paths',
   },
   {
-    icon: '🛡️',
-    title: 'Built-in read-only Studio',
+    title: 'PII-safe error messages',
     description:
-      'npx turbine studio ships a loopback-bound web UI — BEGIN READ ONLY, statement-stacking guard, 24-byte auth token. DBA-approvable.',
+      'Turbine errors show WHERE keys, not values. A UniqueConstraintError says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.',
+    stat: 'keys',
+    statLabel: 'not values',
   },
   {
-    icon: '🔀',
-    title: 'Code-first and DB-first',
+    title: 'SQL-first migrations with drift detection',
     description:
-      'defineSchema() in TypeScript or npx turbine pull against a live database. Same CLI, same generated client, same migrations runner.',
+      'Write real SQL. SHA-256 checksums catch modified migrations. pg_try_advisory_lock() prevents concurrent runs. Each migration in its own transaction. No magic DSL between you and your database.',
+    stat: 'SHA-256',
+    statLabel: 'checksums',
   },
   {
-    icon: '🎯',
-    title: 'Typed Postgres errors',
+    title: 'Edge-native. One import swap.',
     description:
-      'UniqueConstraintError, ForeignKeyError, DeadlockError with readonly isRetryable — your retry loop type-checks.',
+      'turbineHttp(pool, schema) — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step.',
+    stat: '5 KB',
+    statLabel: 'edge entry',
   },
   {
-    icon: '⚡',
-    title: 'Single-query nested reads',
+    title: 'Pipeline batching via wire protocol',
     description:
-      'Deep with clauses compile to one SQL statement using json_agg. Pipeline batching puts N queries in one round-trip via the pg extended-query protocol.',
+      'Real Parse/Bind/Execute pipeline — not queries wrapped in a transaction. N independent queries in one round-trip. Deep with clauses compile to one SQL statement using json_agg.',
+    stat: '1',
+    statLabel: 'round-trip',
   },
 ];
 
@@ -86,8 +92,33 @@ export default async function Home() {
     codeToHtml(sqlCode, { lang: 'sql', theme: 'github-dark-dimmed' }),
   ]);
 
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareApplication',
+    name: 'Turbine ORM',
+    description:
+      '110 KB Postgres ORM with one runtime dependency, built-in read-only Studio, PII-safe errors, and SQL-first migrations with drift detection.',
+    applicationCategory: 'DeveloperApplication',
+    operatingSystem: 'Any',
+    url: 'https://turbineorm.dev',
+    offers: {
+      '@type': 'Offer',
+      price: '0',
+      priceCurrency: 'USD',
+    },
+    author: {
+      '@type': 'Organization',
+      name: 'ZVN',
+      url: 'https://github.com/zvndev',
+    },
+  };
+
   return (
     <div>
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+      />
       {/* ========== HERO ========== */}
       <section className="landing-hero">
         <div className="relative z-10 flex flex-col items-center w-full max-w-landing mx-auto">
@@ -95,18 +126,19 @@ export default async function Home() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            v0.9 — one dependency, built-in Studio, edge-ready
+            pre-1.0 — 110 KB total, read-only Studio, PII-safe errors
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
-            <span className="text-white">Turbine </span>
-            <span className="amber">ORM</span>
+            <span className="text-white">110 KB. One dep.</span>
+            <br />
+            <span className="amber">Production Postgres.</span>
           </h1>
 
           <p className="hero-subtitle animate-fade-in-up delay-2">
-            Postgres ORM built for the edge. One runtime dependency,
-            built-in read-only Studio, code-first and DB-first workflows
-            in the same CLI.
+            The Postgres ORM that ships light and locks tight. One runtime
+            dependency, a read-only Studio no other ORM has, and error messages
+            that never leak PII. Prisma-like DX without the 1.6 MB engine.
           </p>
 
           <div className="animate-fade-in-up delay-3">
@@ -135,9 +167,9 @@ export default async function Home() {
       {/* ========== FEATURES ========== */}
       <section className="features-section">
         <div className="animate-fade-in-up">
-          <p className="section-label">Capabilities</p>
+          <p className="section-label">What Prisma and Drizzle don&apos;t ship</p>
           <h2 className="section-title">
-            Everything you need. Nothing you don&apos;t.
+            Six things. Zero overlap.
           </h2>
         </div>
 
@@ -147,7 +179,10 @@ export default async function Home() {
               key={f.title}
               className={`feature-card animate-fade-in-up delay-${i + 1}`}
             >
-              <div className="feature-card-icon">{f.icon}</div>
+              <div className="feature-card-stat">
+                <span className="feature-stat-value">{f.stat}</span>
+                <span className="feature-stat-label">{f.statLabel}</span>
+              </div>
               <h3>{f.title}</h3>
               <p>{f.description}</p>
             </div>
@@ -158,7 +193,7 @@ export default async function Home() {
       {/* ========== CODE SHOWCASE ========== */}
       <section className="showcase-section">
         <div className="showcase-inner">
-          <p className="section-label">Under the hood</p>
+          <p className="section-label">How it works</p>
           <h2 className="section-title" style={{ marginBottom: '2rem' }}>
             One query. Any depth.
           </h2>
@@ -167,16 +202,17 @@ export default async function Home() {
             <div className="showcase-text">
               <h3>Your code writes one call. Turbine writes one query.</h3>
               <p>
-                For each relation in a <code>with</code> clause, Turbine generates
-                a correlated subquery using <code>json_agg</code> and{' '}
-                <code>json_build_object</code>. PostgreSQL evaluates the entire
-                object graph in a single round-trip.
+                Every ORM claims single-query nested loads now. Turbine uses
+                the same <code>json_agg</code> approach as Prisma 7 and
+                Drizzle v2. The difference isn&apos;t the query strategy &mdash; it&apos;s
+                everything around it: the 110 KB footprint, the read-only
+                Studio, and the error messages that never expose user data.
               </p>
 
               <ul className="showcase-list">
                 <li>
                   <span className="check">&#10003;</span>
-                  <span>Alias counter prevents collisions at any nesting depth</span>
+                  <span>Correlated subqueries with json_agg + json_build_object</span>
                 </li>
                 <li>
                   <span className="check">&#10003;</span>
@@ -188,7 +224,7 @@ export default async function Home() {
                 </li>
                 <li>
                   <span className="check">&#10003;</span>
-                  <span>Depth cap at 10 with CircularRelationError</span>
+                  <span>Pipeline batching via real Parse/Bind/Execute protocol</span>
                 </li>
                 <li>
                   <span className="check">&#10003;</span>
@@ -205,10 +241,10 @@ export default async function Home() {
         </div>
       </section>
 
-      {/* ========== WHY TURBINE ========== */}
+      {/* ========== COMPARISON ========== */}
       <section className="features-section">
         <p className="section-label">Comparison</p>
-        <h2 className="section-title">Why Turbine</h2>
+        <h2 className="section-title">Turbine vs. Prisma vs. Drizzle</h2>
 
         <div className="overflow-x-auto" style={{ margin: '0 -1.5rem', padding: '0 1.5rem' }}>
           <table
@@ -276,12 +312,15 @@ export default async function Home() {
             </thead>
             <tbody>
               {[
-                ['Nested relations', '1 query, deep inference', '1 query, shallow', 'relations() re-declaration'],
+                ['Install size', '~110 KB (pg only)', '~1.6 MB (WASM engine)', '~0 KB (no runtime)'],
                 ['Runtime deps', '1 (pg)', '@prisma/client + adapter', '0'],
-                ['Schema', 'TypeScript', 'Custom DSL (.prisma)', 'TypeScript'],
-                ['Edge support', 'One import swap', 'WASM adapter', 'Native'],
-                ['Studio', 'Read-only, built-in', 'Full CRUD', 'Drizzle Studio'],
-                ['Typed errors', 'isRetryable const', 'Error codes', 'None'],
+                ['Studio', 'Read-only, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (paid tier)'],
+                ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
+                ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
+                ['Edge runtime', 'One import swap, 5 KB', '1.6 MB WASM adapter', 'Native'],
+                ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
+                ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
+                ['Nested relations', '1 query, deep type inference', '1 query, shallow inference', 'relations() re-declaration'],
               ].map(([label, turbine, prisma, drizzle]) => (
                 <tr key={label} style={{ borderBottom: '1px solid var(--border)' }}>
                   <td
@@ -291,6 +330,7 @@ export default async function Home() {
                       color: '#fff',
                       fontWeight: 600,
                       fontSize: '0.8rem',
+                      whiteSpace: 'nowrap',
                     }}
                   >
                     {label}
@@ -364,7 +404,7 @@ export default async function Home() {
       {/* ========== FOOTER ========== */}
       <footer className="landing-footer">
         <p>
-          One dependency. Zero compromises. Built by{' '}
+          110 KB. One dependency. Zero compromises. Built by{' '}
           <a href="https://github.com/zvndev" target="_blank" rel="noopener noreferrer">
             ZVN
           </a>

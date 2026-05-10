@@ -70,10 +70,19 @@ export interface RelationDef {
   from: string;
   /** Target table */
   to: string;
-  /** FK column on the "many" / "child" side (snake_case) */
-  foreignKey: string;
-  /** Referenced column on the "one" / "parent" side (snake_case) */
-  referenceKey: string;
+  /** FK column(s) on the "many" / "child" side (snake_case). Array for composite FKs. */
+  foreignKey: string | string[];
+  /** Referenced column(s) on the "one" / "parent" side (snake_case). Array for composite FKs. */
+  referenceKey: string | string[];
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for composite key handling
+// ---------------------------------------------------------------------------
+
+/** Normalize foreignKey/referenceKey to always be an array for uniform processing */
+export function normalizeKeyColumns(key: string | string[]): string[] {
+  return Array.isArray(key) ? key : [key];
 }
 
 export interface IndexMetadata {

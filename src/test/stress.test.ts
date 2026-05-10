@@ -189,6 +189,7 @@ describe('stress: deep nesting (up to depth 9)', () => {
     const q = makeQuery('t0', schema);
 
     // Build nesting 9 levels deep: t0 -> t1 -> t2 -> ... -> t9
+    // biome-ignore lint/suspicious/noExplicitAny: dynamically building nested with clause for depth testing
     let withClause: any = true;
     for (let i = 8; i >= 0; i--) {
       withClause = { child: withClause === true ? true : { with: withClause } };
@@ -305,6 +306,7 @@ describe('stress: depth limit (10)', () => {
     const q = makeQuery('t0', schema);
 
     // Build 11 levels of nesting: t0 -> t1 -> ... -> t11
+    // biome-ignore lint/suspicious/noExplicitAny: dynamically building nested with clause for depth testing
     let withClause: any = true;
     for (let i = 10; i >= 0; i--) {
       withClause = { child: withClause === true ? true : { with: withClause } };
@@ -357,6 +359,7 @@ describe('stress: depth limit (10)', () => {
     const q = makeQuery('t0', schema);
 
     // 10 with levels (t0 -> t1 -> ... -> t10): max depth=9, should succeed
+    // biome-ignore lint/suspicious/noExplicitAny: dynamically building nested with clause for depth testing
     let withClause9: any = true;
     for (let i = 9; i >= 0; i--) {
       withClause9 = { child: withClause9 === true ? true : { with: withClause9 } };
@@ -365,6 +368,7 @@ describe('stress: depth limit (10)', () => {
     assert.ok(deferred.sql.length > 0, 'depth 9 (10 with levels) should succeed');
 
     // 11 with levels (t0 -> t1 -> ... -> t11): max depth=10, should fail
+    // biome-ignore lint/suspicious/noExplicitAny: dynamically building nested with clause for depth testing
     let withClause10: any = true;
     for (let i = 10; i >= 0; i--) {
       withClause10 = { child: withClause10 === true ? true : { with: withClause10 } };
@@ -403,6 +407,7 @@ describe('stress: large WHERE clause', () => {
       where[`col${i}`] = i * 10;
     }
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime where shapes that bypass type constraints
     const deferred = q.buildFindMany({ where: where as any });
 
     assert.ok(deferred.sql.length > 0, 'should produce non-empty SQL');
@@ -432,6 +437,7 @@ describe('stress: large WHERE clause', () => {
     }
 
     const deferred = q.buildFindMany({
+      // biome-ignore lint/suspicious/noExplicitAny: testing runtime where shapes that bypass type constraints
       where: { OR: orConditions } as any,
     });
 
@@ -451,6 +457,7 @@ describe('stress: repeated query builds (LRU cache)', () => {
     const q = makeQuery('users', schema);
 
     const args = {
+      // biome-ignore lint/suspicious/noExplicitAny: testing runtime where shapes that bypass type constraints
       where: { id: 42 } as any,
     };
 
@@ -500,7 +507,9 @@ describe('stress: repeated query builds (LRU cache)', () => {
 
     // Build multiple distinct queries and verify each is internally consistent
     for (let val = 0; val < 20; val++) {
+      // biome-ignore lint/suspicious/noExplicitAny: testing runtime where shapes that bypass type constraints
       const a = q.buildFindMany({ where: { id: val } as any });
+      // biome-ignore lint/suspicious/noExplicitAny: testing runtime where shapes that bypass type constraints
       const b = q.buildFindMany({ where: { id: val } as any });
       assert.equal(a.sql, b.sql, `query for id=${val} should be deterministic`);
       assert.deepEqual(a.params, b.params, `params for id=${val} should be deterministic`);
@@ -614,6 +623,7 @@ describe('stress: orderBy / groupBy column validation', () => {
     assert.throws(
       () => {
         q.buildFindMany({
+          // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation of invalid orderBy columns
           orderBy: { nonexistentColumn: 'asc' } as any,
         });
       },
@@ -633,6 +643,7 @@ describe('stress: orderBy / groupBy column validation', () => {
     assert.throws(
       () => {
         q.buildGroupBy({
+          // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation of invalid groupBy columns
           by: ['nonexistentField' as any],
         });
       },
@@ -650,6 +661,7 @@ describe('stress: orderBy / groupBy column validation', () => {
 
     // 'id' and 'name' are valid columns on the users table
     const deferred = q.buildFindMany({
+      // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation of invalid orderBy columns
       orderBy: { id: 'asc', name: 'desc' } as any,
     });
 
@@ -665,6 +677,7 @@ describe('stress: orderBy / groupBy column validation', () => {
 
     // 'orgId' maps to 'org_id' which is a valid column
     const deferred = q.buildGroupBy({
+      // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation of invalid groupBy columns
       by: ['orgId' as any],
     });
 
@@ -682,6 +695,7 @@ describe('stress: orderBy / groupBy column validation', () => {
         q.buildFindMany({
           with: {
             posts: {
+              // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation of invalid orderBy columns
               orderBy: { fakeColumn: 'asc' } as any,
             },
           },
@@ -703,6 +717,7 @@ describe('stress: orderBy / groupBy column validation', () => {
     assert.throws(
       () => {
         q.buildFindMany({
+          // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation of invalid orderBy columns
           orderBy: { badCol1: 'asc', badCol2: 'desc' } as any,
         });
       },
@@ -720,6 +735,7 @@ describe('stress: orderBy / groupBy column validation', () => {
     assert.throws(
       () => {
         q.buildFindMany({
+          // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation of invalid orderBy columns
           orderBy: { 'id; DROP TABLE users': 'asc' } as any,
         });
       },

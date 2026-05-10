@@ -278,8 +278,15 @@ function generateMetadata(schema: SchemaMetadata): string {
     // relations
     lines.push('      relations: {');
     for (const [relName, rel] of Object.entries(table.relations)) {
+      // Emit foreignKey/referenceKey as string for single-column, array for composite
+      const fkLiteral = Array.isArray(rel.foreignKey)
+        ? `[${rel.foreignKey.map((c) => `'${escSQ(c)}'`).join(', ')}]`
+        : `'${escSQ(rel.foreignKey)}'`;
+      const refLiteral = Array.isArray(rel.referenceKey)
+        ? `[${rel.referenceKey.map((c) => `'${escSQ(c)}'`).join(', ')}]`
+        : `'${escSQ(rel.referenceKey)}'`;
       lines.push(
-        `        ${relName}: { type: '${escSQ(rel.type)}', name: '${escSQ(rel.name)}', from: '${escSQ(rel.from)}', to: '${escSQ(rel.to)}', foreignKey: '${escSQ(rel.foreignKey)}', referenceKey: '${escSQ(rel.referenceKey)}' },`,
+        `        ${relName}: { type: '${escSQ(rel.type)}', name: '${escSQ(rel.name)}', from: '${escSQ(rel.from)}', to: '${escSQ(rel.to)}', foreignKey: ${fkLiteral}, referenceKey: ${refLiteral} },`,
       );
     }
     lines.push('      },');

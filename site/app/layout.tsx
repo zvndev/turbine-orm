@@ -37,9 +37,19 @@ export const metadata: Metadata = {
       'Postgres-native TypeScript ORM with single-query nested relations, streaming cursors, typed errors, and deep with-clause type inference.',
     url: 'https://turbineorm.dev',
     siteName: 'Turbine ORM',
+    type: 'website',
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: 'Turbine ORM',
+    description:
+      'Postgres-native TypeScript ORM. Single-query nested relations via json_agg. One dependency. Edge-ready.',
   },
   icons: {
     icon: '/favicon.svg',
+  },
+  alternates: {
+    canonical: 'https://turbineorm.dev',
   },
 };
 

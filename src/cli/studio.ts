@@ -43,6 +43,8 @@ export interface StudioOptions {
   exclude?: string[];
   /** Directory where studio-queries.json is persisted. Defaults to `.turbine/` in cwd. */
   stateDir?: string;
+  /** Database adapter for dialect-specific behavior (e.g. statement timeout syntax). */
+  adapter?: import('../adapters/index.js').DatabaseAdapter;
 }
 
 export interface StudioHandle {
@@ -60,6 +62,8 @@ export interface StudioContext {
   options: StudioOptions;
   authToken: string;
   stateDir: string;
+  /** Resolved statement timeout SQL string (adapter-aware). */
+  statementTimeoutSQL: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +103,8 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
 
   const authToken = randomBytes(24).toString('hex');
   const stateDir = pathResolve(options.stateDir ?? '.turbine');
-  const ctx: StudioContext = { pool, metadata, options, authToken, stateDir };
+  const statementTimeoutSQL = options.adapter?.statementTimeout?.(30) ?? `SET LOCAL statement_timeout = '30s'`;
+  const ctx: StudioContext = { pool, metadata, options, authToken, stateDir, statementTimeoutSQL };
 
   const server = createServer((req, res) => {
     handleRequest(req, res, ctx).catch((err) => {
@@ -361,7 +366,7 @@ export async function apiTableRows(
   const client = await ctx.pool.connect();
   try {
     await client.query('BEGIN READ ONLY');
-    await client.query(`SET LOCAL statement_timeout = '30s'`);
+    await client.query(ctx.statementTimeoutSQL);
     const result = await client.query(sql, mainValues);
     const countResult = await client.query<{ count: string }>(countSql, countValues);
     await client.query('COMMIT');
@@ -434,7 +439,7 @@ async function apiQuery(req: IncomingMessage, res: ServerResponse, ctx: StudioCo
   const client = await ctx.pool.connect();
   try {
     await client.query('BEGIN READ ONLY');
-    await client.query(`SET LOCAL statement_timeout = '30s'`);
+    await client.query(ctx.statementTimeoutSQL);
     const started = Date.now();
     const result = await client.query(rawSql);
     const elapsedMs = Date.now() - started;
@@ -488,7 +493,7 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
   const client = await ctx.pool.connect();
   try {
     await client.query('BEGIN READ ONLY');
-    await client.query(`SET LOCAL statement_timeout = '30s'`);
+    await client.query(ctx.statementTimeoutSQL);
     const started = Date.now();
     const result = await client.query(deferred.sql, deferred.params);
     const elapsedMs = Date.now() - started;

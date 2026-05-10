@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { QueryInterface } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
-import { mockColumn, mockTable } from './helpers.js';
+import { mockTable } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Schema helpers
@@ -206,6 +206,7 @@ describe('findManyStream: speculative fast-path', () => {
     const rows: Record<string, unknown>[] = [];
 
     for await (const row of q.findManyStream({ batchSize: 10 })) {
+      // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
       rows.push(row as any);
     }
 
@@ -398,7 +399,9 @@ describe('findManyStream: speculative fast-path', () => {
     const q = makeStreamQuery(harness.pool, schema);
     const rows: Record<string, unknown>[] = [];
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     for await (const row of q.findManyStream({ with: { posts: true }, batchSize: 10 } as any)) {
+      // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
       rows.push(row as any);
     }
 
@@ -407,6 +410,7 @@ describe('findManyStream: speculative fast-path', () => {
     const posts0 = rows[0]!.posts as unknown[];
     assert.ok(Array.isArray(posts0));
     assert.equal(posts0.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on parsed relation result
     assert.equal((posts0[0] as any).title, 'Hello');
 
     // Second user has empty posts
@@ -477,6 +481,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
       schema,
     );
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     const deferred = q.buildFindMany({ with: { posts: true } as any });
     const result = deferred.transform({
       rows: [{ id: 1, name: 'Alice', email: 'a@test.com', posts: '[]' }],
@@ -487,6 +492,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
     assert.ok(Array.isArray(row.posts), 'posts should be an array');
     assert.equal((row.posts as unknown[]).length, 0, 'posts should be empty');
@@ -501,6 +507,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
       schema,
     );
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     const deferred = q.buildFindMany({ with: { organization: true } as any });
     const result = deferred.transform({
       rows: [{ id: 1, name: 'Alice', email: 'a@test.com', organization: 'null' }],
@@ -511,6 +518,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
     assert.equal(row.organization, null, 'organization should be null');
   });
@@ -524,6 +532,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
       schema,
     );
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     const deferred = q.buildFindMany({ with: { organization: true } as any });
     const result = deferred.transform({
       rows: [{ id: 1, name: 'Alice', email: 'a@test.com', organization: null }],
@@ -534,6 +543,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
     assert.equal(row.organization, null, 'organization should be null');
   });
@@ -547,6 +557,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
       schema,
     );
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     const deferred = q.buildFindMany({ with: { posts: true } as any });
     const result = deferred.transform({
       rows: [{ id: 1, name: 'Alice', email: 'a@test.com', posts: [] }],
@@ -557,6 +568,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
     assert.ok(Array.isArray(row.posts));
     assert.equal((row.posts as unknown[]).length, 0);
@@ -571,6 +583,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
       schema,
     );
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     const deferred = q.buildFindMany({ with: { posts: true } as any });
     const result = deferred.transform({
       rows: [
@@ -588,7 +601,9 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped array properties on mock query result
     const posts = row.posts as any[];
     assert.ok(Array.isArray(posts));
     assert.equal(posts.length, 1);
@@ -606,6 +621,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
       schema,
     );
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     const deferred = q.buildFindMany({ with: { posts: true } as any });
     const result = deferred.transform({
       rows: [
@@ -623,7 +639,9 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped array properties on mock query result
     const posts = row.posts as any[];
     assert.ok(Array.isArray(posts));
     assert.equal(posts.length, 1);
@@ -640,6 +658,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
       schema,
     );
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     const deferred = q.buildFindMany({ with: { organization: true } as any });
     const result = deferred.transform({
       rows: [
@@ -657,7 +676,9 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const org = row.organization as any;
     assert.ok(org !== null && typeof org === 'object');
     assert.equal(org.id, 42);
@@ -674,6 +695,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     );
 
     const deferred = q.buildFindMany({
+      // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
       with: { posts: true, comments: true } as any,
     });
     const result = deferred.transform({
@@ -693,6 +715,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
 
     // posts should be empty array (short-circuited)
@@ -700,6 +723,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     assert.equal((row.posts as unknown[]).length, 0);
 
     // comments should be parsed
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped array properties on mock query result
     const comments = row.comments as any[];
     assert.ok(Array.isArray(comments));
     assert.equal(comments.length, 1);
@@ -724,6 +748,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     };
 
     try {
+      // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
       const deferred = q.buildFindMany({ with: { posts: true } as any });
       const result = deferred.transform({
         rows: [{ id: 1, name: 'Alice', email: 'a@test.com', posts: 'not valid json' }],
@@ -734,6 +759,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
       });
 
       assert.equal(result.length, 1);
+      // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
       const row = result[0] as any;
       // Malformed JSON should be preserved as raw string
       assert.equal(row.posts, 'not valid json');
@@ -755,6 +781,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     );
 
     // Row without any relation columns
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     const deferred = q.buildFindMany({ with: { posts: true } as any });
     const result = deferred.transform({
       rows: [{ id: 1, name: 'Alice', email: 'a@test.com' }],
@@ -765,6 +792,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
     // 'posts' key should not be present since the row didn't have that column
     assert.equal('posts' in row, false, 'posts key should not exist when column is absent');
@@ -779,6 +807,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
       schema,
     );
 
+    // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
     const deferred = q.buildFindMany({ with: { organization: true } as any });
     const result = deferred.transform({
       rows: [
@@ -796,7 +825,9 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     });
 
     assert.equal(result.length, 1);
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const row = result[0] as any;
+    // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
     const org = row.organization as any;
     assert.equal(org.id, 42);
     assert.equal(org.name, 'Acme Corp');

@@ -2,6 +2,7 @@ export const metadata = {
   title: 'Migrating from Prisma',
   description:
     'Move from Prisma to Turbine ORM. API mapping, side-by-side examples, schema translation, atomic operators, typed errors, edge deployment.',
+  alternates: { canonical: '/migrate-from-prisma' },
 };
 
 # Migrating from Prisma
@@ -192,7 +193,7 @@ const active = await db.users.findMany({
 - **Typed errors with codes.** `UniqueConstraintError` / `ForeignKeyError` / `NotNullViolationError` / `CheckConstraintError` all carry `code` (`TURBINE_E008`–`E011`) and `cause`. `findUniqueOrThrow` throws `NotFoundError` (`TURBINE_E001`) with the `where` attached. `DeadlockError` / `SerializationFailureError` have `readonly isRetryable = true as const`.
 - **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, schema)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.
 - **Single runtime dependency.** `pg` only. No engine binary, no WASM, no `@prisma/client`.
-- **Postgres only.** Intentional — depth over breadth enables the edge and Studio stories. See the [roadmap](/roadmap) for planned dialects.
+- **Postgres only.** Intentional — depth over breadth enables the edge and Studio stories.
 
 ## Migration checklist
 

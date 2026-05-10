@@ -47,6 +47,7 @@ export type {
 
 export type { SqlCacheEntry } from './utils.js';
 export {
+  buildCorrelation,
   escapeLike,
   escSingleQuote,
   fnv1a64Hex,
