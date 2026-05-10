@@ -10,6 +10,52 @@ import type { SchemaMetadata } from './schema.js';
 
 export type DialectName = 'postgresql' | 'mysql' | 'sqlite' | (string & {});
 
+export interface InsertStatementInput {
+  /** SQL-ready quoted table name. */
+  table: string;
+  /** SQL-ready quoted insert columns. */
+  columns: string[];
+  /** SQL-ready parameter placeholders/expressions for VALUES. */
+  valuePlaceholders: string[];
+  /** Optional SQL-ready RETURNING selection. */
+  returning?: string;
+}
+
+export interface BulkInsertStatementInput {
+  /** SQL-ready quoted table name. */
+  table: string;
+  /** SQL-ready quoted insert columns. */
+  columns: string[];
+  /** Row-major values, one inner array per inserted row. */
+  rowValues: unknown[][];
+  /** Optional SQL-ready array casts for dialects that batch by column arrays (PostgreSQL UNNEST). */
+  columnArrayTypes?: string[];
+  /** Skip duplicate rows when supported by the dialect. */
+  skipDuplicates?: boolean;
+  /** Optional SQL-ready RETURNING selection. */
+  returning?: string;
+}
+
+export interface BuiltStatement {
+  sql: string;
+  params: unknown[];
+}
+
+export interface UpsertStatementInput {
+  /** SQL-ready quoted table name. */
+  table: string;
+  /** SQL-ready quoted insert columns. */
+  insertColumns: string[];
+  /** SQL-ready parameter placeholders/expressions for VALUES. */
+  valuePlaceholders: string[];
+  /** SQL-ready quoted conflict/unique columns. */
+  conflictColumns: string[];
+  /** SQL-ready update SET clauses. */
+  updateSetClauses: string[];
+  /** Optional SQL-ready RETURNING selection. */
+  returning?: string;
+}
+
 export interface Dialect {
   /** Dialect identifier. */
   readonly name: DialectName;
@@ -37,6 +83,18 @@ export interface Dialect {
 
   /** Whether INSERT/UPDATE/DELETE support RETURNING rows. */
   readonly supportsReturning: boolean;
+
+  /** Build a dialect-specific RETURNING clause. Return an empty string when unsupported. */
+  buildReturningClause(selection?: string): string;
+
+  /** Build a single-row INSERT statement. Inputs are SQL-ready quoted fragments. */
+  buildInsertStatement(input: InsertStatementInput): string;
+
+  /** Build a multi-row bulk INSERT statement and its dialect-shaped params. */
+  buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement;
+
+  /** Build an upsert statement. Inputs are SQL-ready quoted fragments. */
+  buildUpsertStatement(input: UpsertStatementInput): string;
 
   /** Whether native ILIKE is supported. */
   readonly supportsILike: boolean;
@@ -113,6 +171,34 @@ export const postgresDialect: Dialect = {
   buildJsonArrayAgg(jsonObjectExpr: string, orderBy?: string): string {
     const suffix = orderBy ? ` ${orderBy}` : '';
     return `COALESCE(json_agg(${jsonObjectExpr}${suffix}), ${this.emptyJsonArrayLiteral})`;
+  },
+
+  buildReturningClause(selection = '*'): string {
+    return ` RETURNING ${selection}`;
+  },
+
+  buildInsertStatement(input: InsertStatementInput): string {
+    return `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES (${input.valuePlaceholders.join(', ')})${this.buildReturningClause(input.returning)}`;
+  },
+
+  buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement {
+    if (!input.columnArrayTypes || input.columnArrayTypes.length !== input.columns.length) {
+      throw new Error('PostgreSQL bulk insert requires one array type per column');
+    }
+
+    const columnArrays = input.columns.map((_, columnIndex) => input.rowValues.map((row) => row[columnIndex]));
+    const unnestArgs = input.columns.map((_, i) => `${this.paramPlaceholder(i + 1)}::${input.columnArrayTypes![i]}`);
+    let sql = `INSERT INTO ${input.table} (${input.columns.join(', ')}) SELECT * FROM UNNEST(${unnestArgs.join(', ')})`;
+    if (input.skipDuplicates) sql += ' ON CONFLICT DO NOTHING';
+    return { sql: `${sql}${this.buildReturningClause(input.returning)}`, params: columnArrays };
+  },
+
+  buildUpsertStatement(input: UpsertStatementInput): string {
+    return (
+      `INSERT INTO ${input.table} (${input.insertColumns.join(', ')}) VALUES (${input.valuePlaceholders.join(', ')})` +
+      ` ON CONFLICT (${input.conflictColumns.join(', ')}) DO UPDATE SET ${input.updateSetClauses.join(', ')}` +
+      this.buildReturningClause(input.returning)
+    );
   },
 
   buildInsensitiveLike(column: string, paramRef: string): string {

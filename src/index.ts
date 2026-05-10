@@ -51,11 +51,15 @@ export {
 } from './client.js';
 // Dialect contract
 export type {
+  BuiltStatement,
+  BulkInsertStatementInput,
   Dialect,
   DialectIntrospector,
   DialectMigrator,
   DialectName,
+  InsertStatementInput,
   IntrospectOptions as DialectIntrospectOptions,
+  UpsertStatementInput,
 } from './dialect.js';
 export { postgresDialect } from './dialect.js';
 // Error types

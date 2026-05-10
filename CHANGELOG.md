@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.0 (2026-05-10)
+
+**DML dialect hooks for future MySQL/SQLite packages.**
+
+### Added
+- Extended the `Dialect` contract with DML SQL builders for `INSERT`, bulk insert, upsert, and `RETURNING` clauses.
+- PostgreSQL's default dialect now owns the existing `RETURNING *`, `UNNEST(...)`, and `ON CONFLICT` generation instead of hardcoding those primitives in `QueryInterface`.
+- Bulk insert dialect builders now return both SQL and params so non-Postgres dialects can use row-major `VALUES` params while PostgreSQL keeps column-array `UNNEST` params.
+- Added MySQL-style build-only regression coverage for DML output: backtick identifiers, `?` placeholders, `VALUES (?, ?), (?, ?)`, `ON DUPLICATE KEY UPDATE`, and no Postgres-only `RETURNING` / `UNNEST` / `ON CONFLICT`.
+
+### Changed
+- No public Postgres import or runtime behavior changes. This is still foundation work for dialect packages, not MySQL/SQLite GA support.
+- Exported DML dialect input/result types for future dialect packages.
+
+### Tests
+- 679 unit tests, 0 failures.
+- Lint, typecheck, and build clean.
+
+---
+
 ## 0.11.0 (2026-05-10)
 
 **Dialect interface foundation for MySQL/SQLite expansion.**

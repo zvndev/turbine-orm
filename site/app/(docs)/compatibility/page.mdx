@@ -9,7 +9,7 @@ export const metadata = {
 
 Turbine is built for PostgreSQL. Because it generates standard SQL (parameterized queries, `json_agg`, correlated subqueries), it also works with databases that speak the PostgreSQL wire protocol.
 
-Turbine v0.11 also includes the first internal `Dialect` interface seam. PostgreSQL remains the only GA target in the `turbine-orm` package, but the query builder now routes SQL primitives like quoting, placeholders, JSON aggregation, insensitive search, and JSON filters through a dialect contract so future `@turbine-orm/mysql` and `@turbine-orm/sqlite` packages can implement native SQL without compromising the Postgres path.
+Turbine v0.12 extends the internal `Dialect` interface seam across DML generation. PostgreSQL remains the only GA target in the `turbine-orm` package, but the query builder now routes SQL primitives like quoting, placeholders, JSON aggregation, insensitive search, JSON filters, and DML generation (`RETURNING`, `UNNEST`, `ON CONFLICT`) through a dialect contract so future `@turbine-orm/mysql` and `@turbine-orm/sqlite` packages can implement native SQL without compromising the Postgres path.
 
 ## Compatibility Matrix
 

@@ -47,7 +47,13 @@ export type {
 
 // ---------------------------------------------------------------------------
 // Dialect contract
-export type { Dialect } from '../dialect.js';
+export type {
+  BuiltStatement,
+  BulkInsertStatementInput,
+  Dialect,
+  InsertStatementInput,
+  UpsertStatementInput,
+} from '../dialect.js';
 export { postgresDialect } from '../dialect.js';
 export type { SqlCacheEntry } from './utils.js';
 export {

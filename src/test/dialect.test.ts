@@ -14,6 +14,23 @@ const mysqlishDialect: Dialect = {
   jsonPathSupport: 'function',
   paramPlaceholder: () => '?',
   quoteIdentifier: (name) => `\`${name.replace(/`/g, '``')}\``,
+  buildReturningClause: () => '',
+  buildInsertStatement: (input) =>
+    `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES (${input.valuePlaceholders.join(', ')})`,
+  buildBulkInsertStatement(input) {
+    const placeholders = input.rowValues
+      .map((row) => `(${row.map((_, i) => this.paramPlaceholder(i + 1)).join(', ')})`)
+      .join(', ');
+    const params = input.rowValues.flat();
+    const firstColumn = input.columns[0] ?? 'id';
+    const duplicateClause = input.skipDuplicates ? ` ON DUPLICATE KEY UPDATE ${firstColumn} = ${firstColumn}` : '';
+    return {
+      sql: `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${placeholders}${duplicateClause}`,
+      params,
+    };
+  },
+  buildUpsertStatement: (input) =>
+    `INSERT INTO ${input.table} (${input.insertColumns.join(', ')}) VALUES (${input.valuePlaceholders.join(', ')}) ON DUPLICATE KEY UPDATE ${input.updateSetClauses.join(', ')}`,
   buildJsonObject: (pairs) =>
     `JSON_OBJECT(${pairs.map(([key, expr]) => `'${key.replace(/'/g, "''")}', ${expr}`).join(', ')})`,
   buildJsonArrayAgg: (jsonObjectExpr, orderBy) =>
@@ -103,5 +120,36 @@ describe('Dialect contract', () => {
 
     assert.match(d.sql, /JSON_CONTAINS\(`metadata`, \?\)/);
     assert.deepEqual(d.params, ['{"role":"admin"}']);
+  });
+
+  it('QueryInterface routes DML RETURNING, bulk insert, and upsert through the active dialect', () => {
+    const q = queryWithDialect(mysqlishDialect);
+
+    const created = q.buildCreate({ data: { id: 1, name: 'Ada' } });
+    assert.equal(created.sql, 'INSERT INTO `users` (`id`, `name`) VALUES (?, ?)');
+    assert.deepEqual(created.params, [1, 'Ada']);
+
+    const bulk = q.buildCreateMany({
+      data: [
+        { id: 1, name: 'Ada' },
+        { id: 2, name: 'Grace' },
+      ],
+      skipDuplicates: true,
+    });
+    assert.equal(
+      bulk.sql,
+      'INSERT INTO `users` (`id`, `name`) VALUES (?, ?), (?, ?) ON DUPLICATE KEY UPDATE `id` = `id`',
+    );
+    assert.deepEqual(bulk.params, [1, 'Ada', 2, 'Grace']);
+
+    const upsert = q.buildUpsert({
+      where: { id: 1 },
+      create: { id: 1, name: 'Ada' },
+      update: { name: 'Ada Lovelace' },
+    });
+    assert.equal(upsert.sql, 'INSERT INTO `users` (`id`, `name`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `name` = ?');
+    assert.deepEqual(upsert.params, [1, 'Ada', 'Ada Lovelace']);
+
+    assert.doesNotMatch(`${created.sql} ${bulk.sql} ${upsert.sql}`, /RETURNING|UNNEST|ON CONFLICT|\$1/);
   });
 });

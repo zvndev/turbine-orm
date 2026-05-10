@@ -952,7 +952,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const params = entries.map(([, v]) => v);
     const placeholders = entries.map((_, i) => `${this.p(i + 1)}`);
 
-    const sql = `INSERT INTO ${this.q(this.table)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`;
+    const sql = this.dialect.buildInsertStatement({
+      table: this.q(this.table),
+      columns,
+      valuePlaceholders: placeholders,
+      returning: '*',
+    });
 
     return {
       sql,
@@ -998,32 +1003,27 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const keys = Object.keys(args.data[0]!).filter((k) => (args.data[0] as Record<string, unknown>)[k] !== undefined);
     const columns = keys.map((k) => this.toColumn(k));
 
-    // Build column arrays for UNNEST
-    const columnArrays: unknown[][] = keys.map(() => []);
-    for (const row of args.data) {
+    const rowValues = args.data.map((row) => {
       const record = row as Record<string, unknown>;
-      keys.forEach((key, i) => {
-        columnArrays[i]!.push(record[key]);
-      });
-    }
+      return keys.map((key) => record[key]);
+    });
 
-    // Use actual Postgres types for array casts
+    // Use actual Postgres types for array casts in the default PostgreSQL dialect.
     const typeCasts = columns.map((col) => this.getColumnArrayType(col));
-    const unnestArgs = columnArrays.map((_, i) => `${this.p(i + 1)}::${typeCasts[i]}`);
     const quotedColumns = columns.map((c) => this.q(c));
 
-    let sql = `INSERT INTO ${qt} (${quotedColumns.join(', ')}) SELECT * FROM UNNEST(${unnestArgs.join(', ')})`;
-
-    // skipDuplicates: add ON CONFLICT DO NOTHING
-    if (args.skipDuplicates) {
-      sql += ` ON CONFLICT DO NOTHING`;
-    }
-
-    sql += ` RETURNING *`;
+    const built = this.dialect.buildBulkInsertStatement({
+      table: qt,
+      columns: quotedColumns,
+      rowValues,
+      columnArrayTypes: typeCasts,
+      skipDuplicates: args.skipDuplicates,
+      returning: '*',
+    });
 
     return {
-      sql,
-      params: columnArrays,
+      sql: built.sql,
+      params: built.params,
       transform: (result) => result.rows.map((row) => this.parseRow(row, this.table) as T),
       tag: `${this.table}.createMany`,
     };
@@ -1057,7 +1057,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const whereClause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
       this.assertMutationHasPredicate('update', whereSql, args.allowFullTableScan);
-      return `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql} RETURNING *`;
+      return `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}${this.dialect.buildReturningClause('*')}`;
     });
 
     // On cache hit, validate predicate
@@ -1114,7 +1114,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
       this.assertMutationHasPredicate('delete', whereSql, args.allowFullTableScan);
-      return `DELETE FROM ${this.q(this.table)}${whereSql} RETURNING *`;
+      return `DELETE FROM ${this.q(this.table)}${whereSql}${this.dialect.buildReturningClause('*')}`;
     });
 
     // On cache hit, still validate the predicate
@@ -1180,10 +1180,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params = [...createParams, ...updateParams];
 
-    const sql =
-      `INSERT INTO ${this.q(this.table)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})` +
-      ` ON CONFLICT (${conflictColumns.join(', ')}) DO UPDATE SET ${setClauses.join(', ')}` +
-      ` RETURNING *`;
+    const sql = this.dialect.buildUpsertStatement({
+      table: this.q(this.table),
+      insertColumns: columns,
+      valuePlaceholders: placeholders,
+      conflictColumns,
+      updateSetClauses: setClauses,
+      returning: '*',
+    });
 
     return {
       sql,
