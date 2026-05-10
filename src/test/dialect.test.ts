@@ -40,6 +40,17 @@ const mysqlishDialect: Dialect = {
   buildInsensitiveLike: (column, paramRef) => `LOWER(${column}) LIKE LOWER(${paramRef})`,
   buildJsonContains: (column, paramRef) => `JSON_CONTAINS(${column}, ${paramRef})`,
   buildJsonPathExtract: (column, pathParamRef) => `JSON_UNQUOTE(JSON_EXTRACT(${column}, ${pathParamRef}))`,
+  typeToTypeScript(dialectType, nullable) {
+    const base =
+      {
+        bigint: 'number',
+        int: 'number',
+        varchar: 'string',
+        datetime: 'Date',
+        json: 'unknown',
+      }[dialectType.toLowerCase()] ?? 'unknown';
+    return nullable ? `${base} | null` : base;
+  },
   buildCorrelation(leftRef, leftColumns, rightRef, rightColumns) {
     const leftCols = Array.isArray(leftColumns) ? leftColumns : [leftColumns];
     const rightCols = Array.isArray(rightColumns) ? rightColumns : [rightColumns];
@@ -93,6 +104,9 @@ const postsTable = mockTable('posts', [
 
 const schema: SchemaMetadata = { tables: { users: usersTable, posts: postsTable }, enums: {} };
 
+const { typeToTypeScript: _typeToTypeScript, ...legacyCompatibleDialect }: Dialect = mysqlishDialect;
+void _typeToTypeScript;
+
 function queryWithDialect(dialect: Dialect): QueryInterface<Record<string, unknown>> {
   // biome-ignore lint/suspicious/noExplicitAny: build-only test; pool is never used.
   return new QueryInterface<Record<string, unknown>>(null as any, 'users', schema, [], { dialect });
@@ -110,6 +124,21 @@ describe('Dialect contract', () => {
       postgresDialect.buildJsonArrayAgg('json_build_object(\'id\', t0."id")'),
       "COALESCE(json_agg(json_build_object('id', t0.\"id\")), '[]'::json)",
     );
+    assert.equal(postgresDialect.typeToTypeScript?.('int8', false), 'number');
+    assert.equal(postgresDialect.typeToTypeScript?.('_text', true), 'string[] | null');
+    assert.equal(postgresDialect.arrayType?.('int8'), 'bigint[]');
+  });
+
+  it('type mapping is owned by the active dialect contract when implemented', () => {
+    assert.equal(mysqlishDialect.typeToTypeScript?.('varchar', false), 'string');
+    assert.equal(mysqlishDialect.typeToTypeScript?.('datetime', true), 'Date | null');
+    assert.equal(mysqlishDialect.typeToTypeScript?.('json', false), 'unknown');
+  });
+
+  it('keeps v0.13-style query dialect implementations source-compatible', () => {
+    assert.equal(legacyCompatibleDialect.name, 'mysql');
+    assert.equal('typeToTypeScript' in legacyCompatibleDialect, false);
+    assert.equal(queryWithDialect(legacyCompatibleDialect).buildFindUnique({ where: { id: 1 } }).params[0], 1);
   });
 
   it('QueryInterface routes identifiers, placeholders, and LIKE through the active dialect', () => {

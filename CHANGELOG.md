@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.0 (2026-05-10)
+
+**Dialect-owned type metadata for future database packages.**
+
+### Added
+- Added optional `Dialect.typeToTypeScript()` and a PostgreSQL-backed implementation so PostgreSQL introspection can route generated TypeScript types through the dialect contract without source-breaking query-only dialect implementers.
+- Added optional `Dialect.arrayType()` and wired PostgreSQL introspection/query fallback bulk-insert casts through the dialect contract.
+- Added dialect-neutral `dialectType`, `arrayType`, and `dialectTypes` schema metadata aliases while preserving the existing `pgType`, `pgArrayType`, and `pgTypes` fields for compatibility.
+
+### Tests
+- Added dialect contract coverage for type mapping and metadata serialization.
+
+---
+
 ## 0.13.3 (2026-05-10)
 
 **Final integration fixture-size assertion patch.**

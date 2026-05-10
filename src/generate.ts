@@ -257,7 +257,13 @@ function generateMetadata(schema: SchemaMetadata): string {
     const dateCols = [...table.dateColumns];
     lines.push(`      dateColumns: new Set([${dateCols.map((c) => `'${escSQ(c)}'`).join(', ')}]),`);
 
-    // pgTypes
+    // dialectTypes + pgTypes (pgTypes is kept for backwards compatibility)
+    const dialectTypes = table.dialectTypes ?? table.pgTypes;
+    lines.push('      dialectTypes: {');
+    for (const [col, dialectType] of Object.entries(dialectTypes)) {
+      lines.push(`        ${quoteIfNeeded(col)}: '${escSQ(dialectType)}',`);
+    }
+    lines.push('      },');
     lines.push('      pgTypes: {');
     for (const [col, pgType] of Object.entries(table.pgTypes)) {
       lines.push(`        ${quoteIfNeeded(col)}: '${escSQ(pgType)}',`);
@@ -457,11 +463,13 @@ function serializeColumn(col: ColumnMetadata): string {
   const parts = [
     `name: '${escSQ(col.name)}'`,
     `field: '${escSQ(col.field)}'`,
+    `dialectType: '${escSQ(col.dialectType ?? col.pgType)}'`,
     `pgType: '${escSQ(col.pgType)}'`,
     `tsType: '${escSQ(col.tsType)}'`,
     `nullable: ${col.nullable}`,
     `hasDefault: ${col.hasDefault}`,
     `isArray: ${col.isArray}`,
+    `arrayType: '${escSQ(col.arrayType ?? col.pgArrayType)}'`,
     `pgArrayType: '${escSQ(col.pgArrayType)}'`,
   ];
   if (col.maxLength !== undefined) parts.push(`maxLength: ${col.maxLength}`);

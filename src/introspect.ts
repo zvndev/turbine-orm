@@ -9,11 +9,11 @@
  */
 
 import pg from 'pg';
+import { postgresDialect } from './dialect.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
   isDateType,
-  pgArrayType,
   pgTypeToTs,
   type RelationDef,
   type SchemaMetadata,
@@ -132,6 +132,7 @@ export interface IntrospectOptions {
 
 export async function introspect(options: IntrospectOptions): Promise<SchemaMetadata> {
   const schema = options.schema ?? 'public';
+  const dialect = postgresDialect;
   const pool = new pg.Pool({
     connectionString: options.connectionString,
     max: 1,
@@ -173,15 +174,21 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
       const isArray = row.data_type === 'ARRAY';
       const baseType: string = isArray ? row.udt_name.slice(1) : row.udt_name;
 
+      const dialectType = row.udt_name;
+      const arrayType = dialect.arrayType?.(baseType) ?? 'text[]';
       const col: ColumnMetadata = {
         name: row.column_name,
         field: snakeToCamel(row.column_name),
-        pgType: row.udt_name,
-        tsType: pgTypeToTs(isArray ? row.udt_name : baseType, isNullable),
+        dialectType,
+        pgType: dialectType,
+        tsType:
+          dialect.typeToTypeScript?.(isArray ? dialectType : baseType, isNullable) ??
+          pgTypeToTs(isArray ? dialectType : baseType, isNullable),
         nullable: isNullable,
         hasDefault: row.column_default !== null,
         isArray,
-        pgArrayType: pgArrayType(baseType),
+        arrayType,
+        pgArrayType: arrayType,
         maxLength: row.character_maximum_length ?? undefined,
       };
 
@@ -334,6 +341,7 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
       const columnMap: Record<string, string> = {};
       const reverseColumnMap: Record<string, string> = {};
       const dateColumns = new Set<string>();
+      const dialectTypes: Record<string, string> = {};
       const pgTypes: Record<string, string> = {};
       const allColumns: string[] = [];
 
@@ -341,9 +349,10 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
         columnMap[col.field] = col.name;
         reverseColumnMap[col.name] = col.field;
         allColumns.push(col.name);
+        dialectTypes[col.name] = col.dialectType ?? col.pgType;
         pgTypes[col.name] = col.pgType;
 
-        const baseType = col.isArray ? col.pgType.slice(1) : col.pgType;
+        const baseType = col.isArray ? (col.dialectType ?? col.pgType).slice(1) : (col.dialectType ?? col.pgType);
         if (isDateType(baseType)) {
           dateColumns.add(col.name);
         }
@@ -355,6 +364,7 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
         columnMap,
         reverseColumnMap,
         dateColumns,
+        dialectTypes,
         pgTypes,
         allColumns,
         primaryKey: pkByTable.get(tableName) ?? [],

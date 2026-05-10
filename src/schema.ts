@@ -27,7 +27,9 @@ export interface TableMetadata {
   reverseColumnMap: Record<string, string>;
   /** snake_case columns that are timestamp/date types (need Date parsing) */
   dateColumns: Set<string>;
-  /** snake_case column → Postgres type for UNNEST casts */
+  /** snake_case column → dialect-native database type. */
+  dialectTypes?: Record<string, string>;
+  /** snake_case column → Postgres type for UNNEST casts. Back-compat alias for dialectTypes. */
   pgTypes: Record<string, string>;
   /** All snake_case column names in ordinal order */
   allColumns: string[];
@@ -46,7 +48,9 @@ export interface ColumnMetadata {
   name: string;
   /** camelCase field name for TypeScript */
   field: string;
-  /** Postgres base type (e.g. 'int8', 'text', 'timestamptz') */
+  /** Dialect-native database type (e.g. PostgreSQL 'int8', MySQL 'bigint', SQLite 'INTEGER'). */
+  dialectType?: string;
+  /** Postgres base type (e.g. 'int8', 'text', 'timestamptz'). Back-compat alias for dialectType. */
   pgType: string;
   /** TypeScript type string (e.g. 'number', 'string', 'Date') */
   tsType: string;
@@ -56,7 +60,9 @@ export interface ColumnMetadata {
   hasDefault: boolean;
   /** Whether this is an array column */
   isArray: boolean;
-  /** Postgres array type for UNNEST (e.g. 'bigint[]') */
+  /** Dialect-specific array/bulk-insert type token when needed. */
+  arrayType?: string;
+  /** Postgres array type for UNNEST (e.g. 'bigint[]'). Back-compat alias for arrayType. */
   pgArrayType: string;
   /** Max character length (for varchar) */
   maxLength?: number;

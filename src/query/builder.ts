@@ -269,8 +269,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.columnPgTypeMap = new Map();
     this.columnArrayTypeMap = new Map();
     for (const col of this.tableMeta.columns) {
-      this.columnPgTypeMap.set(col.name, col.pgType);
-      this.columnArrayTypeMap.set(col.name, col.pgArrayType);
+      this.columnPgTypeMap.set(col.name, col.dialectType ?? col.pgType);
+      this.columnArrayTypeMap.set(col.name, col.arrayType ?? col.pgArrayType);
     }
   }
 
@@ -3138,9 +3138,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const arrayType = this.columnArrayTypeMap.get(column);
     if (arrayType) return arrayType;
 
-    // Fallback heuristic for unknown columns
-    if (column === 'id' || column.endsWith('_id')) return 'bigint[]';
-    if (column.endsWith('_at')) return 'timestamptz[]';
-    return 'text[]';
+    // Fallback heuristic for unknown columns, routed through the active dialect
+    // so non-Postgres packages can supply their own bulk-insert cast shape.
+    if (column === 'id' || column.endsWith('_id')) return this.dialect.arrayType?.('int8') ?? 'text[]';
+    if (column.endsWith('_at')) return this.dialect.arrayType?.('timestamptz') ?? 'text[]';
+    return this.dialect.arrayType?.('text') ?? 'text[]';
   }
 }

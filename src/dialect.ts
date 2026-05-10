@@ -7,7 +7,7 @@
  */
 
 import { ValidationError } from './errors.js';
-import type { SchemaMetadata } from './schema.js';
+import { pgArrayType, pgTypeToTs, type SchemaMetadata } from './schema.js';
 
 export type DialectName = 'postgresql' | 'mysql' | 'sqlite' | (string & {});
 
@@ -158,8 +158,8 @@ export interface Dialect {
     rightColumns: string | string[],
   ): string;
 
-  /** Type mapping hook for code generation. */
-  typeToTypeScript(dialectType: string, nullable: boolean): string;
+  /** Optional type mapping hook for code generation/introspection. */
+  typeToTypeScript?(dialectType: string, nullable: boolean): string;
 
   /** Optional array-cast hook for bulk insert implementations. */
   arrayType?(baseType: string): string;
@@ -291,10 +291,12 @@ export const postgresDialect: Dialect = {
       .join(' AND ');
   },
 
-  typeToTypeScript(_dialectType: string, _nullable: boolean): string {
-    // Existing PostgreSQL type mapping remains in schema.ts/generate.ts for now.
-    // This hook is the package boundary MySQL/SQLite implementations will fill.
-    return 'unknown';
+  typeToTypeScript(dialectType: string, nullable: boolean): string {
+    return pgTypeToTs(dialectType, nullable);
+  },
+
+  arrayType(baseType: string): string {
+    return pgArrayType(baseType);
   },
 
   buildColumnType(input: ColumnTypeInput): string {

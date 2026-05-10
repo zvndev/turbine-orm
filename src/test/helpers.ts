@@ -45,6 +45,7 @@ export function mockTable(
     columnMap,
     reverseColumnMap,
     dateColumns: new Set(),
+    dialectTypes: Object.fromEntries(cols.map((c) => [c.name, c.dialectType ?? c.pgType])),
     pgTypes: Object.fromEntries(cols.map((c) => [c.name, c.pgType])),
     allColumns,
     primaryKey: ['id'],

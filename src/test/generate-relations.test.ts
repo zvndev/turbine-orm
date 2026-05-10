@@ -13,8 +13,10 @@
  */
 
 import assert from 'node:assert/strict';
+import { readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { generateTypes } from '../generate.js';
+import { generate, generateTypes } from '../generate.js';
 import type { SchemaMetadata } from '../schema.js';
 
 // Minimal mock schema: users → posts → comments, plus a one-to-one profile.
@@ -275,6 +277,22 @@ describe('generator: *Relations interface output', () => {
 
     const postRelations = extractInterfaceBody(out, 'PostRelations');
     assert.doesNotMatch(postRelations, /author: User \| null;/);
+  });
+
+  it('serializes dialect-neutral metadata alongside PostgreSQL compatibility aliases', () => {
+    const outDir = `.tmp-generate-metadata-${process.pid}`;
+    try {
+      generate({ schema: SCHEMA, outDir });
+      const metadata = readFileSync(join(outDir, 'metadata.ts'), 'utf-8');
+      assert.match(metadata, /dialectTypes: \{/);
+      assert.match(metadata, /dialectType: 'int8'/);
+      assert.match(metadata, /arrayType: 'bigint\[\]'/);
+      assert.match(metadata, /pgTypes: \{/);
+      assert.match(metadata, /pgType: 'int8'/);
+      assert.match(metadata, /pgArrayType: 'bigint\[\]'/);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
   });
 
   it('still emits the legacy *With<Relation> compat interfaces (one level deep)', () => {
