@@ -1859,8 +1859,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // Array filter
       if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value as ArrayFilter)) {
-        const aKeys = Object.keys(value as object).sort();
-        parts.push(`${key}:arr(${aKeys.join(',')})`);
+        parts.push(`${key}:arr(${this.fingerprintArrayFilter(value as ArrayFilter)})`);
         continue;
       }
 
@@ -1869,6 +1868,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     return parts.join('&');
+  }
+
+  /**
+   * Produce a value-invariant fingerprint for array filters while preserving
+   * parameterless boolean operators that change SQL shape.
+   */
+  private fingerprintArrayFilter(filter: ArrayFilter): string {
+    const keys = Object.keys(filter).sort();
+    const suffix = filter.isEmpty === undefined ? '' : `:empty=${filter.isEmpty ? 'true' : 'false'}`;
+    return `${keys.join(',')}${suffix}`;
   }
 
   /**
@@ -3108,11 +3117,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     if (filter.isEmpty === true) {
-      // array_length(column, 1) IS NULL
-      clauses.push(`array_length(${column}, 1) IS NULL`);
+      // Treat NULL and empty arrays as empty for Prisma-compatible ergonomics.
+      clauses.push(`COALESCE(cardinality(${column}), 0) = 0`);
     } else if (filter.isEmpty === false) {
-      // array_length(column, 1) IS NOT NULL
-      clauses.push(`array_length(${column}, 1) IS NOT NULL`);
+      // Require at least one element; excludes both NULL and ARRAY[] values.
+      clauses.push(`cardinality(${column}) > 0`);
     }
 
     return clauses;

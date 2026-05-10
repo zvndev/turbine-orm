@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.13.1 (2026-05-10)
+
+**CI hardening patch for the v0.13 dialect-hook release.**
+
+### Fixed
+- Generated the Studio UI fixture before typecheck and test scripts so clean CI checkouts can resolve `studio-ui.generated.js`.
+- Changed an internal Postgres bulk-insert dialect guard to throw `ValidationError`, preserving Turbine error-code enforcement.
+- Corrected integration cursor pagination expectations for the seeded 8-user fixture.
+- Fixed the query cache fingerprint for `isEmpty: true` vs `isEmpty: false` array filters and now emits `cardinality(...)` checks that exclude empty arrays from non-empty queries.
+- Updated the CI package-size gate to parse npm output robustly and match the current published tarball size budget.
+
+### Tests
+- CI failure triage covered typecheck, build, unit, coverage, error-code, and integration logs from GitHub Actions run `25619209599`.
+
+---
+
 ## 0.13.0 (2026-05-10)
 
 **DDL and migration dialect hooks for future MySQL/SQLite packages.**

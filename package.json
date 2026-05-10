@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. 1 dependency, ~110KB",
   "type": "module",
   "exports": {
@@ -41,7 +41,7 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "prebuild": "node scripts/build-studio-ui.mjs",
+    "prebuild": "npm run gen:studio",
     "build": "tsc && tsc --project tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit --project tsconfig.test.json",
@@ -63,7 +63,12 @@
     "db:reset": "psql $DATABASE_URL -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;' && npm run db:seed",
     "site:dev": "cd site && npm run dev",
     "site:build": "cd site && npm run build",
-    "site:deploy": "cd site && vercel --prod"
+    "site:deploy": "cd site && vercel --prod",
+    "gen:studio": "node scripts/build-studio-ui.mjs",
+    "pretypecheck": "npm run gen:studio",
+    "pretest": "npm run gen:studio",
+    "pretest:unit": "npm run gen:studio",
+    "pretest:coverage": "npm run gen:studio"
   },
   "engines": {
     "node": ">=18.0.0"

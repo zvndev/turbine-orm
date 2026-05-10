@@ -6,6 +6,7 @@
  * contract for the SQL primitives that vary across MySQL and SQLite.
  */
 
+import { ValidationError } from './errors.js';
 import type { SchemaMetadata } from './schema.js';
 
 export type DialectName = 'postgresql' | 'mysql' | 'sqlite' | (string & {});
@@ -251,7 +252,7 @@ export const postgresDialect: Dialect = {
 
   buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement {
     if (!input.columnArrayTypes || input.columnArrayTypes.length !== input.columns.length) {
-      throw new Error('PostgreSQL bulk insert requires one array type per column');
+      throw new ValidationError('PostgreSQL bulk insert requires one array type per column');
     }
 
     const columnArrays = input.columns.map((_, columnIndex) => input.rowValues.map((row) => row[columnIndex]));

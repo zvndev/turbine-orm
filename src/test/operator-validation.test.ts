@@ -145,5 +145,19 @@ describe('strict operator validation', () => {
       assert.doesNotThrow(() => q.buildFindMany({ where: { tags: { hasEvery: ['a', 'b'] } } as never }));
       assert.doesNotThrow(() => q.buildFindMany({ where: { tags: { isEmpty: true } } as never }));
     });
+
+    it('builds precise SQL for `isEmpty` true and false', () => {
+      const q = makeQuery('posts', buildSchema());
+
+      const empty = q.buildFindMany({ where: { tags: { isEmpty: true } } as never });
+      assert.match(empty.sql, /COALESCE\(cardinality\("tags"\), 0\) = 0/);
+      assert.deepEqual(empty.params, []);
+
+      // Same QueryInterface instance intentionally exercises the SQL cache; the
+      // parameterless boolean must be part of the fingerprint because it changes SQL.
+      const nonEmpty = q.buildFindMany({ where: { tags: { isEmpty: false } } as never });
+      assert.match(nonEmpty.sql, /cardinality\("tags"\) > 0/);
+      assert.deepEqual(nonEmpty.params, []);
+    });
   });
 });
