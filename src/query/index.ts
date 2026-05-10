@@ -45,6 +45,10 @@ export type {
 // Utilities (runtime values + types)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Dialect contract
+export type { Dialect } from '../dialect.js';
+export { postgresDialect } from '../dialect.js';
 export type { SqlCacheEntry } from './utils.js';
 export {
   buildCorrelation,
@@ -57,7 +61,6 @@ export {
   sqlToPreparedName,
 } from './utils.js';
 
-// ---------------------------------------------------------------------------
 // Builder (runtime values + types)
 // ---------------------------------------------------------------------------
 

@@ -12,6 +12,8 @@
  */
 
 import type pg from 'pg';
+import type { Dialect } from '../dialect.js';
+import { postgresDialect } from '../dialect.js';
 import {
   CircularRelationError,
   NotFoundError,
@@ -47,16 +49,7 @@ import type {
   WithOptions,
   WithResult,
 } from './types.js';
-import {
-  buildCorrelation,
-  escapeLike,
-  escSingleQuote,
-  LRUCache,
-  OPERATOR_KEYS,
-  quoteIdent,
-  type SqlCacheEntry,
-  sqlToPreparedName,
-} from './utils.js';
+import { escapeLike, LRUCache, OPERATOR_KEYS, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
 
 // ---------------------------------------------------------------------------
 // Internal detection helpers — used by QueryInterface
@@ -212,6 +205,8 @@ export interface QueryInterfaceOptions {
    * Default: `true`. Set to `false` as a nuclear kill switch.
    */
   sqlCache?: boolean;
+  /** SQL dialect implementation. Defaults to PostgreSQL. */
+  dialect?: Dialect;
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional for untyped table access
@@ -224,6 +219,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly warnOnUnlimited: boolean;
   private readonly preparedStatementsEnabled: boolean;
   private readonly sqlCacheEnabled: boolean;
+  private readonly dialect: Dialect;
   /**
    * Tracks tables that have already triggered an unlimited-query warning so
    * the user is not spammed once per row. Per-instance state — each
@@ -267,6 +263,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.warnOnUnlimited = options?.warnOnUnlimited !== false;
     this.preparedStatementsEnabled = options?.preparedStatements ?? true;
     this.sqlCacheEnabled = options?.sqlCache !== false;
+    this.dialect = options?.dialect ?? postgresDialect;
 
     // Pre-compute column type lookup maps (TASK-26)
     this.columnPgTypeMap = new Map();
@@ -275,6 +272,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       this.columnPgTypeMap.set(col.name, col.pgType);
       this.columnArrayTypeMap.set(col.name, col.pgArrayType);
     }
+  }
+
+  /** Quote an identifier through the active SQL dialect. */
+  private q(name: string): string {
+    return this.dialect.quoteIdentifier(name);
+  }
+
+  /** Return the active dialect's placeholder for a 1-indexed parameter position. */
+  private p(index: number): string {
+    return this.dialect.paramPlaceholder(index);
   }
 
   /**
@@ -439,11 +446,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Simple path: plain equality, no operators/null/OR
     if (!args.with && isSimpleWhere) {
       const entry = this.acquireSql(ck, () => {
-        const qt = quoteIdent(this.table);
+        const qt = this.q(this.table);
         const tempParams: unknown[] = whereKeys.map((k) => whereObj[k]);
-        const whereClauses = whereKeys.map((k, i) => `${this.toSqlColumn(k)} = $${i + 1}`);
+        const whereClauses = whereKeys.map((k, i) => `${this.toSqlColumn(k)} = ${this.p(i + 1)}`);
         const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
-        const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ') : `${qt}.*`;
+        const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
         void tempParams; // params are positional, SQL is value-invariant
         return `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
       });
@@ -471,8 +478,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const freshParams: unknown[] = [];
         const clause = this.buildWhereClause(whereObj, freshParams);
         const whereSql = clause ? ` WHERE ${clause}` : '';
-        const qt = quoteIdent(this.table);
-        const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ') : `${qt}.*`;
+        const qt = this.q(this.table);
+        const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
         return `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
       });
 
@@ -501,7 +508,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
       const selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, freshParams, columnsList);
-      return `SELECT ${selectClause} FROM ${quoteIdent(this.table)}${whereSql} LIMIT 1`;
+      return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql} LIMIT 1`;
     });
 
     // Collect params in exact build order: where first, then with-clause relations
@@ -626,7 +633,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           })()
         : { sql: '' };
 
-      const qt = quoteIdent(this.table);
+      const qt = this.q(this.table);
 
       let distinctPrefix = '';
       if (args?.distinct && args.distinct.length > 0) {
@@ -638,7 +645,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (args?.with) {
         selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, freshParams, columnsList);
       } else if (columnsList) {
-        selectClause = columnsList.map((c) => `${qt}.${quoteIdent(c)}`).join(', ');
+        selectClause = columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ');
       } else {
         selectClause = `${qt}.*`;
       }
@@ -653,7 +660,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             const dir = args.orderBy?.[k] ?? 'asc';
             const op = dir === 'desc' ? '<' : '>';
             freshParams.push(v);
-            return `${qt}.${col} ${op} $${freshParams.length}`;
+            return `${qt}.${col} ${op} ${this.p(freshParams.length)}`;
           });
           if (freshWhereSql) {
             sql += ` AND ${cursorConditions.join(' AND ')}`;
@@ -669,11 +676,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       if (effectiveLimit !== undefined) {
         freshParams.push(Number(effectiveLimit));
-        sql += ` LIMIT $${freshParams.length}`;
+        sql += ` LIMIT ${this.p(freshParams.length)}`;
       }
       if (args?.offset !== undefined) {
         freshParams.push(Number(args.offset));
-        sql += ` OFFSET $${freshParams.length}`;
+        sql += ` OFFSET ${this.p(freshParams.length)}`;
       }
 
       return sql;
@@ -784,7 +791,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Acquire a dedicated connection — cursors require a single connection in a transaction
     const client = await this.pool.connect();
     const cursorName = `turbine_cursor_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const quotedCursor = quoteIdent(cursorName);
+    const quotedCursor = this.q(cursorName);
 
     try {
       await client.query('BEGIN');
@@ -943,9 +950,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const entries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = entries.map(([k]) => this.toSqlColumn(k));
     const params = entries.map(([, v]) => v);
-    const placeholders = entries.map((_, i) => `$${i + 1}`);
+    const placeholders = entries.map((_, i) => `${this.p(i + 1)}`);
 
-    const sql = `INSERT INTO ${quoteIdent(this.table)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`;
+    const sql = `INSERT INTO ${this.q(this.table)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`;
 
     return {
       sql,
@@ -978,7 +985,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildCreateMany(args: CreateManyArgs<T>): DeferredQuery<T[]> {
-    const qt = quoteIdent(this.table);
+    const qt = this.q(this.table);
     if (args.data.length === 0) {
       return {
         sql: `SELECT * FROM ${qt} WHERE false`,
@@ -1002,8 +1009,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Use actual Postgres types for array casts
     const typeCasts = columns.map((col) => this.getColumnArrayType(col));
-    const unnestArgs = columnArrays.map((_, i) => `$${i + 1}::${typeCasts[i]}`);
-    const quotedColumns = columns.map((c) => quoteIdent(c));
+    const unnestArgs = columnArrays.map((_, i) => `${this.p(i + 1)}::${typeCasts[i]}`);
+    const quotedColumns = columns.map((c) => this.q(c));
 
     let sql = `INSERT INTO ${qt} (${quotedColumns.join(', ')}) SELECT * FROM UNNEST(${unnestArgs.join(', ')})`;
 
@@ -1050,7 +1057,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const whereClause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
       this.assertMutationHasPredicate('update', whereSql, args.allowFullTableScan);
-      return `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql} RETURNING *`;
+      return `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql} RETURNING *`;
     });
 
     // On cache hit, validate predicate
@@ -1107,7 +1114,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
       this.assertMutationHasPredicate('delete', whereSql, args.allowFullTableScan);
-      return `DELETE FROM ${quoteIdent(this.table)}${whereSql} RETURNING *`;
+      return `DELETE FROM ${this.q(this.table)}${whereSql} RETURNING *`;
     });
 
     // On cache hit, still validate the predicate
@@ -1153,7 +1160,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const createEntries = Object.entries(args.create as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = createEntries.map(([k]) => this.toSqlColumn(k));
     const createParams = createEntries.map(([, v]) => v);
-    const placeholders = createEntries.map((_, i) => `$${i + 1}`);
+    const placeholders = createEntries.map((_, i) => `${this.p(i + 1)}`);
 
     // The conflict target comes from `where` keys — must be unique/PK columns
     const conflictKeys = Object.keys(args.where as Record<string, unknown>).filter(
@@ -1165,7 +1172,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const updateEntries = Object.entries(args.update as Record<string, unknown>).filter(([, v]) => v !== undefined);
     let paramIdx = createParams.length + 1;
     const setClauses = updateEntries.map(([k]) => {
-      const clause = `${this.toSqlColumn(k)} = $${paramIdx}`;
+      const clause = `${this.toSqlColumn(k)} = ${this.p(paramIdx)}`;
       paramIdx++;
       return clause;
     });
@@ -1174,7 +1181,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const params = [...createParams, ...updateParams];
 
     const sql =
-      `INSERT INTO ${quoteIdent(this.table)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})` +
+      `INSERT INTO ${this.q(this.table)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})` +
       ` ON CONFLICT (${conflictColumns.join(', ')}) DO UPDATE SET ${setClauses.join(', ')}` +
       ` RETURNING *`;
 
@@ -1225,7 +1232,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const whereClause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
       this.assertMutationHasPredicate('updateMany', whereSql, args.allowFullTableScan);
-      return `UPDATE ${quoteIdent(this.table)} SET ${setClauses.join(', ')}${whereSql}`;
+      return `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}`;
     });
 
     if (whereFp === '') {
@@ -1268,7 +1275,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
       this.assertMutationHasPredicate('deleteMany', whereSql, args.allowFullTableScan);
-      return `DELETE FROM ${quoteIdent(this.table)}${whereSql}`;
+      return `DELETE FROM ${this.q(this.table)}${whereSql}`;
     });
 
     if (whereFp === '') {
@@ -1309,7 +1316,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const freshParams: unknown[] = [];
       const clause = args?.where ? this.buildWhereClause(whereObj, freshParams) : null;
       const whereSql = clause ? ` WHERE ${clause}` : '';
-      return `SELECT COUNT(*)::int AS count FROM ${quoteIdent(this.table)}${whereSql}`;
+      return `SELECT COUNT(*)::int AS count FROM ${this.q(this.table)}${whereSql}`;
     });
 
     if (args?.where) {
@@ -1347,7 +1354,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
     const groupColsRaw = args.by.map((k) => this.toColumn(k as string));
-    const groupCols = groupColsRaw.map((c) => quoteIdent(c));
+    const groupCols = groupColsRaw.map((c) => this.q(c));
     const { sql: whereSql, params } = args.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
 
     // Build SELECT expressions: group-by columns + aggregate functions
@@ -1364,7 +1371,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._sum)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`SUM(${quoteIdent(col)}) AS ${quoteIdent(`_sum_${col}`)}`);
+          selectExprs.push(`SUM(${this.q(col)}) AS ${this.q(`_sum_${col}`)}`);
         }
       }
     }
@@ -1374,7 +1381,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._avg)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`AVG(${quoteIdent(col)})::float AS ${quoteIdent(`_avg_${col}`)}`);
+          selectExprs.push(`AVG(${this.q(col)})::float AS ${this.q(`_avg_${col}`)}`);
         }
       }
     }
@@ -1384,7 +1391,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._min)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MIN(${quoteIdent(col)}) AS ${quoteIdent(`_min_${col}`)}`);
+          selectExprs.push(`MIN(${this.q(col)}) AS ${this.q(`_min_${col}`)}`);
         }
       }
     }
@@ -1394,12 +1401,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._max)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MAX(${quoteIdent(col)}) AS ${quoteIdent(`_max_${col}`)}`);
+          selectExprs.push(`MAX(${this.q(col)}) AS ${this.q(`_max_${col}`)}`);
         }
       }
     }
 
-    let sql = `SELECT ${selectExprs.join(', ')} FROM ${quoteIdent(this.table)}${whereSql} GROUP BY ${groupCols.join(', ')}`;
+    let sql = `SELECT ${selectExprs.join(', ')} FROM ${this.q(this.table)}${whereSql} GROUP BY ${groupCols.join(', ')}`;
 
     // ORDER BY
     if (args.orderBy) {
@@ -1516,7 +1523,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._count)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`COUNT(${quoteIdent(col)})::int AS ${quoteIdent(`_count_${col}`)}`);
+          selectExprs.push(`COUNT(${this.q(col)})::int AS ${this.q(`_count_${col}`)}`);
         }
       }
     }
@@ -1526,7 +1533,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._sum)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`SUM(${quoteIdent(col)}) AS ${quoteIdent(`_sum_${col}`)}`);
+          selectExprs.push(`SUM(${this.q(col)}) AS ${this.q(`_sum_${col}`)}`);
         }
       }
     }
@@ -1536,7 +1543,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._avg)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`AVG(${quoteIdent(col)})::float AS ${quoteIdent(`_avg_${col}`)}`);
+          selectExprs.push(`AVG(${this.q(col)})::float AS ${this.q(`_avg_${col}`)}`);
         }
       }
     }
@@ -1546,7 +1553,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._min)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MIN(${quoteIdent(col)}) AS ${quoteIdent(`_min_${col}`)}`);
+          selectExprs.push(`MIN(${this.q(col)}) AS ${this.q(`_min_${col}`)}`);
         }
       }
     }
@@ -1556,7 +1563,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._max)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`MAX(${quoteIdent(col)}) AS ${quoteIdent(`_max_${col}`)}`);
+          selectExprs.push(`MAX(${this.q(col)}) AS ${this.q(`_max_${col}`)}`);
         }
       }
     }
@@ -1565,7 +1572,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       selectExprs.push('COUNT(*)::int AS _count');
     }
 
-    const sql = `SELECT ${selectExprs.join(', ')} FROM ${quoteIdent(this.table)}${whereSql}`;
+    const sql = `SELECT ${selectExprs.join(', ')} FROM ${this.q(this.table)}${whereSql}`;
 
     return {
       sql,
@@ -1689,7 +1696,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /** Convert camelCase field name to a double-quoted SQL identifier */
   private toSqlColumn(field: string): string {
-    return quoteIdent(this.toColumn(field));
+    return this.q(this.toColumn(field));
   }
 
   /**
@@ -1727,7 +1734,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
         if (op === 'set') {
           params.push(opValue);
-          return `${col} = $${params.length}`;
+          return `${col} = ${this.p(params.length)}`;
         }
 
         // Arithmetic operators: must be finite numbers
@@ -1739,19 +1746,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
         if (op === 'increment') {
           params.push(opValue);
-          return `${col} = ${col} + $${params.length}`;
+          return `${col} = ${col} + ${this.p(params.length)}`;
         }
         if (op === 'decrement') {
           params.push(opValue);
-          return `${col} = ${col} - $${params.length}`;
+          return `${col} = ${col} - ${this.p(params.length)}`;
         }
         if (op === 'multiply') {
           params.push(opValue);
-          return `${col} = ${col} * $${params.length}`;
+          return `${col} = ${col} * ${this.p(params.length)}`;
         }
         if (op === 'divide') {
           params.push(opValue);
-          return `${col} = ${col} / $${params.length}`;
+          return `${col} = ${col} / ${this.p(params.length)}`;
         }
       }
       // Fall through: multi-key objects or non-operator single-key objects
@@ -1760,7 +1767,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Plain value (including null, Date, Buffer, arrays, JSON objects)
     params.push(value);
-    return `${col} = $${params.length}`;
+    return `${col} = ${this.p(params.length)}`;
   }
 
   // =========================================================================
@@ -2309,7 +2316,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       const rawColumn = this.toColumn(key);
-      const column = quoteIdent(rawColumn);
+      const column = this.q(rawColumn);
 
       // Handle null → IS NULL
       if (value === null) {
@@ -2368,7 +2375,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // Plain equality
       params.push(value);
-      andClauses.push(`${column} = $${params.length}`);
+      andClauses.push(`${column} = ${this.p(params.length)}`);
     }
 
     if (andClauses.length === 0) return null;
@@ -2389,18 +2396,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const targetMeta = this.schema.tables[targetTable];
     if (!targetMeta) return null;
 
-    const qt = quoteIdent(targetTable);
-    const qSelf = quoteIdent(this.table);
+    const qt = this.q(targetTable);
+    const qSelf = this.q(this.table);
     const clauses: string[] = [];
 
     // Correlation: link child table to parent table (supports composite FKs)
     let correlation: string;
     if (relDef.type === 'hasMany' || relDef.type === 'hasOne') {
       // parent.pk = child.fk
-      correlation = buildCorrelation(qt, relDef.foreignKey, qSelf, relDef.referenceKey);
+      correlation = this.dialect.buildCorrelation(qt, relDef.foreignKey, qSelf, relDef.referenceKey);
     } else {
       // belongsTo: parent.fk = child.pk
-      correlation = buildCorrelation(qt, relDef.referenceKey, qSelf, relDef.foreignKey);
+      correlation = this.dialect.buildCorrelation(qt, relDef.referenceKey, qSelf, relDef.foreignKey);
     }
 
     // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter)
@@ -2445,7 +2452,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = this.schema.tables[targetTable];
     if (!meta) return null;
 
-    const qt = quoteIdent(targetTable);
+    const qt = this.q(targetTable);
     const conditions: string[] = [];
 
     for (const [field, value] of Object.entries(subWhere)) {
@@ -2458,7 +2465,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
         );
       }
-      const qCol = `${qt}.${quoteIdent(col)}`;
+      const qCol = `${qt}.${this.q(col)}`;
 
       if (value === null) {
         conditions.push(`${qCol} IS NULL`);
@@ -2472,7 +2479,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       params.push(value);
-      conditions.push(`${qCol} = $${params.length}`);
+      conditions.push(`${qCol} = ${this.p(params.length)}`);
     }
 
     return conditions.length > 0 ? conditions.join(' AND ') : null;
@@ -2487,50 +2494,50 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     if (op.gt !== undefined) {
       params.push(op.gt);
-      clauses.push(`${column} > $${params.length}`);
+      clauses.push(`${column} > ${this.p(params.length)}`);
     }
     if (op.gte !== undefined) {
       params.push(op.gte);
-      clauses.push(`${column} >= $${params.length}`);
+      clauses.push(`${column} >= ${this.p(params.length)}`);
     }
     if (op.lt !== undefined) {
       params.push(op.lt);
-      clauses.push(`${column} < $${params.length}`);
+      clauses.push(`${column} < ${this.p(params.length)}`);
     }
     if (op.lte !== undefined) {
       params.push(op.lte);
-      clauses.push(`${column} <= $${params.length}`);
+      clauses.push(`${column} <= ${this.p(params.length)}`);
     }
     if (op.not !== undefined) {
       if (op.not === null) {
         clauses.push(`${column} IS NOT NULL`);
       } else {
         params.push(op.not);
-        clauses.push(`${column} != $${params.length}`);
+        clauses.push(`${column} != ${this.p(params.length)}`);
       }
     }
     if (op.in !== undefined) {
       params.push(op.in);
-      clauses.push(`${column} = ANY($${params.length})`);
+      clauses.push(`${column} = ANY(${this.p(params.length)})`);
     }
     if (op.notIn !== undefined) {
       params.push(op.notIn);
-      clauses.push(`${column} != ALL($${params.length})`);
+      clauses.push(`${column} != ALL(${this.p(params.length)})`);
     }
-    // Use ILIKE for case-insensitive mode, LIKE otherwise
-    const likeOp = op.mode === 'insensitive' ? 'ILIKE' : 'LIKE';
+    const buildLikeClause = (paramRef: string) =>
+      op.mode === 'insensitive' ? this.dialect.buildInsensitiveLike(column, paramRef) : `${column} LIKE ${paramRef}`;
 
     if (op.contains !== undefined) {
       params.push(`%${escapeLike(op.contains)}%`);
-      clauses.push(`${column} ${likeOp} $${params.length} ESCAPE '\\'`);
+      clauses.push(`${buildLikeClause(this.p(params.length))} ESCAPE '\\'`);
     }
     if (op.startsWith !== undefined) {
       params.push(`${escapeLike(op.startsWith)}%`);
-      clauses.push(`${column} ${likeOp} $${params.length} ESCAPE '\\'`);
+      clauses.push(`${buildLikeClause(this.p(params.length))} ESCAPE '\\'`);
     }
     if (op.endsWith !== undefined) {
       params.push(`%${escapeLike(op.endsWith)}`);
-      clauses.push(`${column} ${likeOp} $${params.length} ESCAPE '\\'`);
+      clauses.push(`${buildLikeClause(this.p(params.length))} ESCAPE '\\'`);
     }
 
     return clauses;
@@ -2707,8 +2714,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (!meta) throw new ValidationError(`[turbine] Unknown table "${table}"`);
 
     const cols = columnsList ?? meta.allColumns;
-    const qtbl = quoteIdent(table);
-    const baseCols = cols.map((col) => `${qtbl}.${quoteIdent(col)}`).join(', ');
+    const qtbl = this.q(table);
+    const baseCols = cols.map((col) => `${qtbl}.${this.q(col)}`).join(', ');
 
     const relationSelects: string[] = [];
     const aliasCounter = { n: 0 };
@@ -2724,7 +2731,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // The main table is not aliased, so pass table name as parentRef
       const subquery = this.buildRelationSubquery(relDef, relSpec, params, table, aliasCounter, depth, path);
-      relationSelects.push(`(${subquery}) AS ${quoteIdent(relName)}`);
+      relationSelects.push(`(${subquery}) AS ${this.q(relName)}`);
     }
 
     return [baseCols, ...relationSelects].join(', ');
@@ -2788,7 +2795,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * 8. **Parameter threading:** All user-supplied values (where filters, limit) are
    *    pushed to the shared `params` array with `$N` placeholders. No string
    *    interpolation of user data ever occurs -- all identifiers go through
-   *    `quoteIdent()` and all values are parameterized.
+   *    `this.q()` and all values are parameterized.
    *
    * ### Example output (hasMany with nested relation)
    * ```sql
@@ -2865,11 +2872,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       targetColumns = targetMeta.allColumns.filter((col) => !omittedFields.has(col));
     }
 
-    // Build json_build_object pairs for resolved columns
-    const jsonPairs = targetColumns.map(
-      (col) =>
-        `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${alias}.${quoteIdent(col)}`,
-    );
+    // Build JSON object pairs for resolved columns
+    const jsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
+      targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
+      `${alias}.${this.q(col)}`,
+    ]);
 
     // Determine if this hasMany will take the wrapped subquery path (LIMIT or ORDER BY).
     // When wrapping, nested relations are built in the wrapped path referencing innerAlias,
@@ -2898,16 +2905,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
           [...currentPath, relDef.name],
         );
         // Use '[]'::json for hasMany (empty array), NULL for belongsTo/hasOne (no object)
-        const fallback = nestedRelDef.type === 'hasMany' ? "'[]'::json" : 'NULL';
-        jsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSubquery}), ${fallback})`);
+        const fallback =
+          nestedRelDef.type === 'hasMany' ? this.dialect.emptyJsonArrayLiteral : this.dialect.nullJsonLiteral;
+        jsonPairs.push([nestedRelName, `COALESCE((${nestedSubquery}), ${fallback})`]);
       }
     }
 
-    const jsonObj = `json_build_object(${jsonPairs.join(', ')})`;
+    const jsonObj = this.dialect.buildJsonObject(jsonPairs);
 
     // Quote parent ref — can be a table name or auto-generated alias
-    const qParent = quoteIdent(parentRef);
-    const qTarget = quoteIdent(targetTable);
+    const qParent = this.q(parentRef);
+    const qTarget = this.q(targetTable);
 
     // Build ORDER BY for json_agg
     let orderClause = '';
@@ -2919,7 +2927,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
           }
           const safeDir = dir.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-          return `${alias}.${quoteIdent(col)} ${safeDir}`;
+          return `${alias}.${this.q(col)} ${safeDir}`;
         })
         .join(', ');
       orderClause = ` ORDER BY ${orders}`;
@@ -2931,9 +2939,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Supports composite foreign keys (string[]) via buildCorrelation.
     let whereClause: string;
     if (relDef.type === 'belongsTo' || relDef.type === 'hasOne') {
-      whereClause = buildCorrelation(alias, relDef.referenceKey, qParent, relDef.foreignKey);
+      whereClause = this.dialect.buildCorrelation(alias, relDef.referenceKey, qParent, relDef.foreignKey);
     } else {
-      whereClause = buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
+      whereClause = this.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
     }
 
     // Additional filters — properly parameterized
@@ -2944,7 +2952,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           throw new ValidationError(`[turbine] Unknown column "${k}" in where for table "${targetTable}"`);
         }
         params.push(v);
-        whereClause += ` AND ${alias}.${quoteIdent(col)} = $${params.length}`;
+        whereClause += ` AND ${alias}.${this.q(col)} = ${this.p(params.length)}`;
       }
     }
 
@@ -2952,7 +2960,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     let limitClause = '';
     if (spec !== true && spec.limit) {
       params.push(Number(spec.limit));
-      limitClause = ` LIMIT $${params.length}`;
+      limitClause = ` LIMIT ${this.p(params.length)}`;
     }
 
     if (relDef.type === 'hasMany') {
@@ -2962,12 +2970,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const innerAlias = `${alias}i`;
         // Rewrite: SELECT json_agg(json_build_object(...)) FROM (SELECT * FROM table WHERE ... ORDER BY ... LIMIT N) AS alias
         // Inner SELECT always needs all columns for WHERE/ORDER to work; json_build_object filters later
-        const innerSql = `SELECT ${targetMeta.allColumns.map((c) => `${alias}.${quoteIdent(c)}`).join(', ')} FROM ${qTarget} ${alias} WHERE ${whereClause}${orderClause}${limitClause}`;
+        const innerSql = `SELECT ${targetMeta.allColumns.map((c) => `${alias}.${this.q(c)}`).join(', ')} FROM ${qTarget} ${alias} WHERE ${whereClause}${orderClause}${limitClause}`;
         // For the json_build_object, reference the inner alias — only include resolved columns
-        const innerJsonPairs = targetColumns.map(
-          (col) =>
-            `'${escSingleQuote(targetMeta.reverseColumnMap[col] ?? snakeToCamel(col))}', ${innerAlias}.${quoteIdent(col)}`,
-        );
+        const innerJsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
+          targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
+          `${innerAlias}.${this.q(col)}`,
+        ]);
         // Build nested relation subqueries referencing innerAlias
         if (spec !== true && spec.with) {
           for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
@@ -2987,14 +2995,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
               currentDepth + 1,
               [...currentPath, relDef.name],
             );
-            const fallback = nestedRelDef.type === 'hasMany' ? "'[]'::json" : 'NULL';
-            innerJsonPairs.push(`'${escSingleQuote(nestedRelName)}', COALESCE((${nestedSub}), ${fallback})`);
+            const fallback =
+              nestedRelDef.type === 'hasMany' ? this.dialect.emptyJsonArrayLiteral : this.dialect.nullJsonLiteral;
+            innerJsonPairs.push([nestedRelName, `COALESCE((${nestedSub}), ${fallback})`]);
           }
         }
-        const innerJsonObj = `json_build_object(${innerJsonPairs.join(', ')})`;
-        return `SELECT COALESCE(json_agg(${innerJsonObj}), '[]'::json) FROM (${innerSql}) ${innerAlias}`;
+        const innerJsonObj = this.dialect.buildJsonObject(innerJsonPairs);
+        return `SELECT ${this.dialect.buildJsonArrayAgg(innerJsonObj)} FROM (${innerSql}) ${innerAlias}`;
       }
-      return `SELECT COALESCE(json_agg(${jsonObj}${orderClause}), '[]'::json) FROM ${qTarget} ${alias} WHERE ${whereClause}`;
+      return `SELECT ${this.dialect.buildJsonArrayAgg(jsonObj, orderClause.trim() || undefined)} FROM ${qTarget} ${alias} WHERE ${whereClause}`;
     }
 
     // belongsTo / hasOne — return single object
@@ -3046,23 +3055,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
       params.push(filter.path);
       const pathParam = params.length;
       params.push(String(filter.equals));
-      clauses.push(`${column} #>> $${pathParam}::text[] = $${params.length}`);
+      clauses.push(`${this.dialect.buildJsonPathExtract(column, this.p(pathParam))} = ${this.p(params.length)}`);
     } else if (filter.equals !== undefined) {
       // Containment equality: column @> $N::jsonb
       params.push(JSON.stringify(filter.equals));
-      clauses.push(`${column} @> $${params.length}::jsonb`);
+      clauses.push(this.dialect.buildJsonContains(column, this.p(params.length)));
     }
 
     if (filter.contains !== undefined) {
       // Containment: column @> $N::jsonb
       params.push(JSON.stringify(filter.contains));
-      clauses.push(`${column} @> $${params.length}::jsonb`);
+      clauses.push(this.dialect.buildJsonContains(column, this.p(params.length)));
     }
 
     if (filter.hasKey !== undefined) {
       // Key existence: column ? $N
       params.push(filter.hasKey);
-      clauses.push(`${column} ? $${params.length}`);
+      clauses.push(`${column} ? ${this.p(params.length)}`);
     }
 
     return clauses;
@@ -3079,19 +3088,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (filter.has !== undefined) {
       // value = ANY(column)
       params.push(filter.has);
-      clauses.push(`$${params.length} = ANY(${column})`);
+      clauses.push(`${this.p(params.length)} = ANY(${column})`);
     }
 
     if (filter.hasEvery !== undefined) {
       // column @> ARRAY[...]::type[]
       params.push(filter.hasEvery);
-      clauses.push(`${column} @> $${params.length}::${elementType}[]`);
+      clauses.push(`${column} @> ${this.p(params.length)}::${elementType}[]`);
     }
 
     if (filter.hasSome !== undefined) {
       // column && ARRAY[...]::type[]
       params.push(filter.hasSome);
-      clauses.push(`${column} && $${params.length}::${elementType}[]`);
+      clauses.push(`${column} && ${this.p(params.length)}::${elementType}[]`);
     }
 
     if (filter.isEmpty === true) {

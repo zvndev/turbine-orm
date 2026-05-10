@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.11.0 (2026-05-10)
+
+**Dialect interface foundation for MySQL/SQLite expansion.**
+
+### Added
+- **Dialect contract** (`src/dialect.ts`) with PostgreSQL implementation and public exports for future `@turbine-orm/mysql` / `@turbine-orm/sqlite` packages.
+- **Query builder dialect seam**: identifiers, placeholders, nested relation JSON aggregation, case-insensitive LIKE, JSON contains/path operations, and relation correlation now route through the active dialect while preserving PostgreSQL output by default.
+- **Internal `TurbineConfig.dialect` option** so dialect packages can inject their SQL primitive implementation without forking the public client shape.
+- **Dialect regression tests** proving a MySQL-style dialect can emit backtick identifiers, `?` placeholders, `JSON_OBJECT`, `JSON_ARRAYAGG`, `JSON_CONTAINS`, and non-`ILIKE` insensitive search.
+
+### Changed
+- PostgreSQL remains the default and `turbine-orm` imports are unchanged. This release is a compatibility-preserving foundation step, not a MySQL/SQLite GA release.
+- Test scripts now include the dialect contract suite.
+
+### Tests
+- 678 unit tests, 0 failures.
+- Lint, typecheck, and build clean.
+
+---
+
 ## 0.10.0 (2026-05-09)
 
 **Database adapters, composite FK support, marketing rewrite, full hardening pass.**

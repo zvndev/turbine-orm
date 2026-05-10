@@ -49,6 +49,15 @@ export {
   TurbineClient,
   type TurbineConfig,
 } from './client.js';
+// Dialect contract
+export type {
+  Dialect,
+  DialectIntrospector,
+  DialectMigrator,
+  DialectName,
+  IntrospectOptions as DialectIntrospectOptions,
+} from './dialect.js';
+export { postgresDialect } from './dialect.js';
 // Error types
 export {
   CheckConstraintError,

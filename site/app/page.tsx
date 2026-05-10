@@ -126,7 +126,7 @@ export default async function Home() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            pre-1.0 — 110 KB total, read-only Studio, PII-safe errors
+            v0.11 — dialect seam live, MySQL/SQLite groundwork started
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
@@ -138,7 +138,8 @@ export default async function Home() {
           <p className="hero-subtitle animate-fade-in-up delay-2">
             The Postgres ORM that ships light and locks tight. One runtime
             dependency, a read-only Studio no other ORM has, and error messages
-            that never leak PII. Prisma-like DX without the 1.6 MB engine.
+            that never leak PII. v0.11 adds the internal dialect seam for
+            MySQL and SQLite packages without changing Postgres imports.
           </p>
 
           <div className="animate-fade-in-up delay-3">

@@ -1,0 +1,107 @@
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+import { type Dialect, postgresDialect, QueryInterface } from '../index.js';
+import type { RelationDef, SchemaMetadata } from '../schema.js';
+import { mockTable } from './helpers.js';
+
+const mysqlishDialect: Dialect = {
+  ...postgresDialect,
+  name: 'mysql',
+  emptyJsonArrayLiteral: 'JSON_ARRAY()',
+  nullJsonLiteral: 'NULL',
+  supportsReturning: false,
+  supportsILike: false,
+  jsonPathSupport: 'function',
+  paramPlaceholder: () => '?',
+  quoteIdentifier: (name) => `\`${name.replace(/`/g, '``')}\``,
+  buildJsonObject: (pairs) =>
+    `JSON_OBJECT(${pairs.map(([key, expr]) => `'${key.replace(/'/g, "''")}', ${expr}`).join(', ')})`,
+  buildJsonArrayAgg: (jsonObjectExpr, orderBy) =>
+    `COALESCE(JSON_ARRAYAGG(${jsonObjectExpr}${orderBy ? ` ${orderBy}` : ''}), JSON_ARRAY())`,
+  buildInsensitiveLike: (column, paramRef) => `LOWER(${column}) LIKE LOWER(${paramRef})`,
+  buildJsonContains: (column, paramRef) => `JSON_CONTAINS(${column}, ${paramRef})`,
+  buildJsonPathExtract: (column, pathParamRef) => `JSON_UNQUOTE(JSON_EXTRACT(${column}, ${pathParamRef}))`,
+  buildCorrelation(leftRef, leftColumns, rightRef, rightColumns) {
+    const leftCols = Array.isArray(leftColumns) ? leftColumns : [leftColumns];
+    const rightCols = Array.isArray(rightColumns) ? rightColumns : [rightColumns];
+    return leftCols
+      .map((col, i) => `${leftRef}.${this.quoteIdentifier(col)} = ${rightRef}.${this.quoteIdentifier(rightCols[i]!)}`)
+      .join(' AND ');
+  },
+};
+
+const usersTable = mockTable(
+  'users',
+  [
+    { name: 'id', field: 'id', pgType: 'int8' },
+    { name: 'name', field: 'name', pgType: 'text' },
+    { name: 'metadata', field: 'metadata', pgType: 'jsonb' },
+  ],
+  {
+    posts: {
+      name: 'posts',
+      type: 'hasMany',
+      from: 'users',
+      to: 'posts',
+      foreignKey: 'user_id',
+      referenceKey: 'id',
+    } as RelationDef,
+  },
+);
+
+const postsTable = mockTable('posts', [
+  { name: 'id', field: 'id', pgType: 'int8' },
+  { name: 'user_id', field: 'userId', pgType: 'int8' },
+  { name: 'title', field: 'title', pgType: 'text' },
+]);
+
+const schema: SchemaMetadata = { tables: { users: usersTable, posts: postsTable }, enums: {} };
+
+function queryWithDialect(dialect: Dialect): QueryInterface<Record<string, unknown>> {
+  // biome-ignore lint/suspicious/noExplicitAny: build-only test; pool is never used.
+  return new QueryInterface<Record<string, unknown>>(null as any, 'users', schema, [], { dialect });
+}
+
+describe('Dialect contract', () => {
+  it('postgresDialect preserves current PostgreSQL primitives', () => {
+    assert.equal(postgresDialect.paramPlaceholder(2), '$2');
+    assert.equal(postgresDialect.quoteIdentifier('a"b'), '"a""b"');
+    assert.equal(
+      postgresDialect.buildJsonObject([['createdAt', 't0."created_at"']]),
+      'json_build_object(\'createdAt\', t0."created_at")',
+    );
+    assert.equal(
+      postgresDialect.buildJsonArrayAgg('json_build_object(\'id\', t0."id")'),
+      "COALESCE(json_agg(json_build_object('id', t0.\"id\")), '[]'::json)",
+    );
+  });
+
+  it('QueryInterface routes identifiers, placeholders, and LIKE through the active dialect', () => {
+    const q = queryWithDialect(mysqlishDialect);
+    const d = q.buildFindMany({ where: { name: { contains: 'Ada', mode: 'insensitive' } }, limit: 10 });
+
+    assert.match(d.sql, /FROM `users`/);
+    assert.match(d.sql, /LOWER\(`name`\) LIKE LOWER\(\?\) ESCAPE/);
+    assert.match(d.sql, /LIMIT \?/);
+    assert.doesNotMatch(d.sql, /\$1|ILIKE|"users"/);
+    assert.deepEqual(d.params, ['%Ada%', 10]);
+  });
+
+  it('QueryInterface routes relation JSON generation through the active dialect', () => {
+    const q = queryWithDialect(mysqlishDialect);
+    const d = q.buildFindMany({ with: { posts: true }, limit: 1 });
+
+    assert.match(d.sql, /JSON_ARRAYAGG/);
+    assert.match(d.sql, /JSON_OBJECT\('id', t0\.`id`/);
+    assert.match(d.sql, /COALESCE\(JSON_ARRAYAGG/);
+    assert.doesNotMatch(d.sql, /json_agg|json_build_object|'\[\]'::json/);
+  });
+
+  it('QueryInterface routes JSON filter operators through the active dialect', () => {
+    const q = queryWithDialect(mysqlishDialect);
+    const d = q.buildFindMany({ where: { metadata: { contains: { role: 'admin' } } } });
+
+    assert.match(d.sql, /JSON_CONTAINS\(`metadata`, \?\)/);
+    assert.deepEqual(d.params, ['{"role":"admin"}']);
+  });
+});

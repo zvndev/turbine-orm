@@ -23,6 +23,7 @@
  */
 
 import pg from 'pg';
+import type { Dialect } from './dialect.js';
 import { type ErrorMessageMode, setErrorMessageMode, TimeoutError, wrapPgError } from './errors.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from './query/index.js';
@@ -143,6 +144,8 @@ export interface TurbineConfig {
    * Default: `true`. Set to `false` as a nuclear kill switch.
    */
   sqlCache?: boolean;
+  /** SQL dialect implementation. Defaults to PostgreSQL. Internal Phase-1 seam for dialect packages. */
+  dialect?: Dialect;
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +362,7 @@ export class TurbineClient {
       warnOnUnlimited: config.warnOnUnlimited,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
       sqlCache: config.sqlCache ?? true,
+      dialect: config.dialect,
     };
 
     // Apply NotFoundError message redaction mode (default: safe — values are
