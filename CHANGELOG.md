@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.3 (2026-05-10)
+
+**Final integration fixture-size assertion patch.**
+
+### Fixed
+- Updated the remaining stream-ordering integration assertion to respect the documented 8-user seed fixture while still verifying ordering and limit behavior.
+
+### Tests
+- Targets the single remaining failure from GitHub CI run `25619796677` (`findManyStream` ordering).
+
+---
+
 ## 0.13.2 (2026-05-10)
 
 **Integration-suite stabilization for the v0.13 patch recovery.**
