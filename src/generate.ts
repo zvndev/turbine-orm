@@ -212,6 +212,104 @@ export function generateTypes(schema: SchemaMetadata): string {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Nested write types (WhereUnique, NestedCreateInput, NestedUpdateInput,
+  // ConnectOrCreate, CreateInput, UpdateInput)
+  // ---------------------------------------------------------------------------
+
+  for (const table of Object.values(schema.tables)) {
+    const typeName = entityName(table.name);
+    const hasRels = Object.keys(table.relations).length > 0;
+
+    // WhereUnique — union of unique constraint shapes, deduplicating PK
+    const seen = new Set<string>();
+    const uniqueSets: string[][] = [];
+
+    // Always include the primary key first
+    const pkKey = table.primaryKey.join(',');
+    seen.add(pkKey);
+    uniqueSets.push(table.primaryKey);
+
+    // Add unique indexes that aren't duplicates of the PK
+    for (const uc of table.uniqueColumns) {
+      const ucKey = uc.join(',');
+      if (!seen.has(ucKey)) {
+        seen.add(ucKey);
+        uniqueSets.push(uc);
+      }
+    }
+
+    if (uniqueSets.length > 0) {
+      const branches = uniqueSets.map((cols) => {
+        const fields = cols.map((colName) => {
+          const col = table.columns.find((c) => c.name === colName);
+          const field = col?.field ?? colName;
+          const tsType = col?.tsType ?? 'unknown';
+          return `${field}: ${tsType}`;
+        });
+        return `{ ${fields.join('; ')} }`;
+      });
+      lines.push(`export type ${typeName}WhereUnique = ${branches.join(' | ')};`);
+      lines.push('');
+    }
+
+    // CreateInput / UpdateInput — extends base type with optional relation fields
+    if (hasRels) {
+      lines.push(`export type ${typeName}CreateInput = ${typeName}Create & {`);
+      for (const [relName, rel] of Object.entries(table.relations)) {
+        const targetType = entityName(rel.to);
+        lines.push(`  ${relName}?: ${targetType}NestedCreateInput;`);
+      }
+      lines.push('};');
+      lines.push('');
+
+      lines.push(`export type ${typeName}UpdateInput = ${typeName}Update & {`);
+      for (const [relName, rel] of Object.entries(table.relations)) {
+        const targetType = entityName(rel.to);
+        if (rel.type === 'hasMany') {
+          lines.push(`  ${relName}?: ${targetType}NestedUpdateInput;`);
+        } else {
+          lines.push(`  ${relName}?: ${targetType}NestedCreateInput;`);
+        }
+      }
+      lines.push('};');
+      lines.push('');
+    }
+  }
+
+  // Emit NestedCreateInput, NestedUpdateInput, ConnectOrCreate for every table
+  for (const table of Object.values(schema.tables)) {
+    const typeName = entityName(table.name);
+    const hasRels = Object.keys(table.relations).length > 0;
+
+    // NestedCreateInput uses *CreateInput (which includes relation fields) when
+    // the table has relations, otherwise falls back to the plain *Create type.
+    const createRefType = hasRels ? `${typeName}CreateInput` : `${typeName}Create`;
+
+    lines.push(`export interface ${typeName}NestedCreateInput {`);
+    lines.push(`  create?: ${createRefType} | ${createRefType}[];`);
+    lines.push(`  connect?: ${typeName}WhereUnique | ${typeName}WhereUnique[];`);
+    lines.push(`  connectOrCreate?: ${typeName}ConnectOrCreate | ${typeName}ConnectOrCreate[];`);
+    lines.push('}');
+    lines.push('');
+
+    lines.push(`export interface ${typeName}NestedUpdateInput {`);
+    lines.push(`  create?: ${createRefType} | ${createRefType}[];`);
+    lines.push(`  connect?: ${typeName}WhereUnique | ${typeName}WhereUnique[];`);
+    lines.push(`  connectOrCreate?: ${typeName}ConnectOrCreate | ${typeName}ConnectOrCreate[];`);
+    lines.push(`  disconnect?: ${typeName}WhereUnique | ${typeName}WhereUnique[];`);
+    lines.push(`  set?: ${typeName}WhereUnique[];`);
+    lines.push(`  delete?: ${typeName}WhereUnique | ${typeName}WhereUnique[];`);
+    lines.push('}');
+    lines.push('');
+
+    lines.push(`export interface ${typeName}ConnectOrCreate {`);
+    lines.push(`  where: ${typeName}WhereUnique;`);
+    lines.push(`  create: ${createRefType};`);
+    lines.push('}');
+    lines.push('');
+  }
+
   return lines.join('\n');
 }
 
