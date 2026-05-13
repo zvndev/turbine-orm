@@ -125,6 +125,9 @@ export {
   type WithClause,
   type WithOptions,
   type WithResult,
+  type ConnectOrCreateOp,
+  type NestedCreateOp,
+  type NestedUpdateOp,
 } from './query/index.js';
 // Schema metadata types
 export type {

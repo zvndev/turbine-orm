@@ -352,6 +352,30 @@ export interface UpsertArgs<T> {
   timeout?: number;
 }
 
+// ---------------------------------------------------------------------------
+// Nested write operation types
+// ---------------------------------------------------------------------------
+
+export interface ConnectOrCreateOp<T> {
+  where: Partial<T>;
+  create: Partial<T>;
+}
+
+export interface NestedCreateOp<T> {
+  create?: Partial<T> | Partial<T>[];
+  connect?: Partial<T> | Partial<T>[];
+  connectOrCreate?: ConnectOrCreateOp<T> | ConnectOrCreateOp<T>[];
+}
+
+export interface NestedUpdateOp<T> {
+  create?: Partial<T> | Partial<T>[];
+  connect?: Partial<T> | Partial<T>[];
+  connectOrCreate?: ConnectOrCreateOp<T> | ConnectOrCreateOp<T>[];
+  disconnect?: Partial<T> | Partial<T>[];
+  set?: Partial<T>[];
+  delete?: Partial<T> | Partial<T>[];
+}
+
 export interface CountArgs<T> {
   where?: WhereClause<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */

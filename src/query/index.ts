@@ -39,6 +39,9 @@ export type {
   WithClause,
   WithOptions,
   WithResult,
+  ConnectOrCreateOp,
+  NestedCreateOp,
+  NestedUpdateOp,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
