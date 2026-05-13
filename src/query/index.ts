@@ -14,6 +14,7 @@ export type {
   AggregateArgs,
   AggregateResult,
   ArrayFilter,
+  ConnectOrCreateOp,
   CountArgs,
   CreateArgs,
   CreateManyArgs,
@@ -24,6 +25,8 @@ export type {
   FindUniqueArgs,
   GroupByArgs,
   JsonFilter,
+  NestedCreateOp,
+  NestedUpdateOp,
   OrderDirection,
   RelationDescriptor,
   RelationFilter,
@@ -39,9 +42,6 @@ export type {
   WithClause,
   WithOptions,
   WithResult,
-  ConnectOrCreateOp,
-  NestedCreateOp,
-  NestedUpdateOp,
 } from './types.js';
 
 // ---------------------------------------------------------------------------

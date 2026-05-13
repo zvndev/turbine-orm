@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { mockColumn, mockTable } from './helpers.js';
+import { CircularRelationError, ValidationError } from '../errors.js';
 import {
+  executeNestedCreate,
+  executeNestedUpdate,
   extractRelationFields,
   hasRelationFields,
   injectForeignKey,
-  executeNestedCreate,
-  executeNestedUpdate,
   type NestedWriteContext,
 } from '../nested-write.js';
-import { ValidationError, RelationError, CircularRelationError } from '../errors.js';
 import type { SchemaMetadata } from '../schema.js';
+import { mockTable } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Mock schema
@@ -341,27 +341,29 @@ describe('nested-write: executeNestedCreate', () => {
   it('throws RelationError for unknown relation name', async () => {
     const { ctx } = makeMockCtx(schema);
 
-    await assert.rejects(
-      () =>
-        executeNestedCreate(ctx, 'users', {
-          email: 'x',
-          bogus: { create: [{}] },
-        }),
-      // "bogus" won't be detected as a relation — it'll go into scalars
-      // because it's not in tableMeta.relations. So it gets passed to
-      // create() as scalar data without error.
-      // Actually wait — extractRelationFields checks key in tableMeta.relations,
-      // so { create: [{}] } for key "bogus" would be a plain object but
-      // "bogus" is NOT in relations. So it goes to scalars. No error.
-      // Let's test that it's handled gracefully.
-    ).catch(() => {
-      // This is expected to NOT throw from the nested write engine —
-      // "bogus" goes to scalars. The DB would reject it instead.
-    });
+    await assert
+      .rejects(
+        () =>
+          executeNestedCreate(ctx, 'users', {
+            email: 'x',
+            bogus: { create: [{}] },
+          }),
+        // "bogus" won't be detected as a relation — it'll go into scalars
+        // because it's not in tableMeta.relations. So it gets passed to
+        // create() as scalar data without error.
+        // Actually wait — extractRelationFields checks key in tableMeta.relations,
+        // so { create: [{}] } for key "bogus" would be a plain object but
+        // "bogus" is NOT in relations. So it goes to scalars. No error.
+        // Let's test that it's handled gracefully.
+      )
+      .catch(() => {
+        // This is expected to NOT throw from the nested write engine —
+        // "bogus" goes to scalars. The DB would reject it instead.
+      });
 
     // Actually verify it doesn't throw from nested-write
     const { ctx: ctx2, log: log2 } = makeMockCtx(schema);
-    const result = await executeNestedCreate(ctx2, 'users', {
+    await executeNestedCreate(ctx2, 'users', {
       email: 'x',
       bogus: { create: [{}] },
     });
@@ -423,10 +425,15 @@ describe('nested-write: executeNestedUpdate', () => {
   it('updates parent and creates new children', async () => {
     const { ctx, log } = makeMockCtx(schema);
 
-    await executeNestedUpdate(ctx, 'users', { id: 1 }, {
-      name: 'Updated Alice',
-      posts: { create: [{ title: 'New Post' }] },
-    });
+    await executeNestedUpdate(
+      ctx,
+      'users',
+      { id: 1 },
+      {
+        name: 'Updated Alice',
+        posts: { create: [{ title: 'New Post' }] },
+      },
+    );
 
     // Should update parent with scalar data
     const updateOp = log.find((l) => l.op === 'update' && l.table === 'users');
@@ -443,9 +450,14 @@ describe('nested-write: executeNestedUpdate', () => {
   it('handles relation-only update (no scalar changes)', async () => {
     const { ctx, log } = makeMockCtx(schema);
 
-    await executeNestedUpdate(ctx, 'users', { id: 1 }, {
-      posts: { create: [{ title: 'New Post' }] },
-    });
+    await executeNestedUpdate(
+      ctx,
+      'users',
+      { id: 1 },
+      {
+        posts: { create: [{ title: 'New Post' }] },
+      },
+    );
 
     // Should NOT call update (no scalar data), but should call findUnique
     const updateOp = log.find((l) => l.op === 'update' && l.table === 'users');
@@ -459,9 +471,14 @@ describe('nested-write: executeNestedUpdate', () => {
   it('supports delete operation', async () => {
     const { ctx, log } = makeMockCtx(schema);
 
-    await executeNestedUpdate(ctx, 'users', { id: 1 }, {
-      posts: { delete: [{ id: 5 }] },
-    });
+    await executeNestedUpdate(
+      ctx,
+      'users',
+      { id: 1 },
+      {
+        posts: { delete: [{ id: 5 }] },
+      },
+    );
 
     const deleteOp = log.find((l) => l.op === 'delete' && l.table === 'posts');
     assert.ok(deleteOp);
@@ -471,9 +488,14 @@ describe('nested-write: executeNestedUpdate', () => {
   it('supports set operation — disconnects all then connects new', async () => {
     const { ctx, log } = makeMockCtx(schema);
 
-    await executeNestedUpdate(ctx, 'users', { id: 1 }, {
-      posts: { set: [{ id: 10 }, { id: 20 }] },
-    });
+    await executeNestedUpdate(
+      ctx,
+      'users',
+      { id: 1 },
+      {
+        posts: { set: [{ id: 10 }, { id: 20 }] },
+      },
+    );
 
     // Should call updateMany to null out existing children
     const updateManyOp = log.find((l) => l.op === 'updateMany' && l.table === 'posts');

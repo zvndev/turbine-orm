@@ -37,7 +37,9 @@ export interface ExtractedFields {
 export interface NestedWriteContext {
   schema: SchemaMetadata;
   tx: {
-    table<T extends object>(name: string): {
+    table<T extends object>(
+      name: string,
+    ): {
       create(args: { data: Partial<T> }): Promise<T>;
       createMany(args: { data: Partial<T>[] }): Promise<T[]>;
       update(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<T>;
@@ -67,10 +69,7 @@ export interface NestedWriteContext {
  *
  * Everything else goes into `scalars`.
  */
-export function extractRelationFields(
-  data: Record<string, unknown>,
-  tableMeta: TableMetadata,
-): ExtractedFields {
+export function extractRelationFields(data: Record<string, unknown>, tableMeta: TableMetadata): ExtractedFields {
   const scalars: Record<string, unknown> = {};
   const relations: Record<string, Record<string, unknown>> = {};
 
@@ -377,8 +376,7 @@ async function processHasManyCreate(
       // Check if any items have nested relations (need per-row recursion)
       const childTable = ctx.schema.tables[rel.to];
       const hasNested =
-        childTable &&
-        items.some((item) => Object.keys(item).some((k) => k in (childTable.relations ?? {})));
+        childTable && items.some((item) => Object.keys(item).some((k) => k in (childTable.relations ?? {})));
 
       if (hasNested) {
         // Per-row recursive create for items with nested relations
@@ -433,10 +431,10 @@ async function processBelongsToCreate(
   if (ops.create !== undefined) {
     const items = toArray(ops.create as Record<string, unknown> | Record<string, unknown>[]);
     if (items.length > 0) {
-      const relatedRow = (await executeNestedCreate(ctx, rel.to, items[0]!, depth + 1, [
-        ...path,
-        relName,
-      ])) as Record<string, unknown>;
+      const relatedRow = (await executeNestedCreate(ctx, rel.to, items[0]!, depth + 1, [...path, relName])) as Record<
+        string,
+        unknown
+      >;
       const updateData: Record<string, unknown> = {};
       const relatedTable = ctx.schema.tables[rel.to];
       for (let i = 0; i < fks.length; i++) {

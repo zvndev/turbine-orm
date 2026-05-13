@@ -228,7 +228,8 @@ export class TransactionClient {
       // Create a QueryInterface that uses the transaction client as its "pool"
       // We use a proxy pool that routes queries through the transaction client
       const txPool = this.createTxPool();
-      qi = new QueryInterface<object>(txPool, name, this.schema, this.middlewares, this.queryOptions);
+      const txOpts = { ...this.queryOptions, _txScoped: true };
+      qi = new QueryInterface<object>(txPool, name, this.schema, this.middlewares, txOpts);
       this.tableCache.set(name, qi);
     }
     return qi as QueryInterface<T>;

@@ -94,6 +94,13 @@ export {
 export { type GenerateOptions, generate } from './generate.js';
 // Introspection
 export { type IntrospectOptions, introspect } from './introspect.js';
+// Nested writes
+export {
+  executeNestedCreate,
+  executeNestedUpdate,
+  hasRelationFields,
+  type NestedWriteContext,
+} from './nested-write.js';
 // Pipeline
 export { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 // Query builder
@@ -101,6 +108,7 @@ export {
   type AggregateArgs,
   type AggregateResult,
   type ArrayFilter,
+  type ConnectOrCreateOp,
   type CountArgs,
   type CreateArgs,
   type CreateManyArgs,
@@ -112,6 +120,8 @@ export {
   type FindUniqueArgs,
   type GroupByArgs,
   type JsonFilter,
+  type NestedCreateOp,
+  type NestedUpdateOp,
   type OrderDirection,
   QueryInterface,
   type RelationDescriptor,
@@ -125,9 +135,6 @@ export {
   type WithClause,
   type WithOptions,
   type WithResult,
-  type ConnectOrCreateOp,
-  type NestedCreateOp,
-  type NestedUpdateOp,
 } from './query/index.js';
 // Schema metadata types
 export type {

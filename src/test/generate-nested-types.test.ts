@@ -8,8 +8,26 @@ const schema: SchemaMetadata = {
     users: {
       name: 'users',
       columns: [
-        { name: 'id', field: 'id', pgType: 'int8', tsType: 'number', nullable: false, hasDefault: true, isArray: false, pgArrayType: 'bigint[]' },
-        { name: 'email', field: 'email', pgType: 'text', tsType: 'string', nullable: false, hasDefault: false, isArray: false, pgArrayType: 'text[]' },
+        {
+          name: 'id',
+          field: 'id',
+          pgType: 'int8',
+          tsType: 'number',
+          nullable: false,
+          hasDefault: true,
+          isArray: false,
+          pgArrayType: 'bigint[]',
+        },
+        {
+          name: 'email',
+          field: 'email',
+          pgType: 'text',
+          tsType: 'string',
+          nullable: false,
+          hasDefault: false,
+          isArray: false,
+          pgArrayType: 'text[]',
+        },
       ],
       columnMap: { id: 'id', email: 'email' },
       reverseColumnMap: { id: 'id', email: 'email' },
@@ -33,10 +51,46 @@ const schema: SchemaMetadata = {
     posts: {
       name: 'posts',
       columns: [
-        { name: 'id', field: 'id', pgType: 'int8', tsType: 'number', nullable: false, hasDefault: true, isArray: false, pgArrayType: 'bigint[]' },
-        { name: 'title', field: 'title', pgType: 'text', tsType: 'string', nullable: false, hasDefault: false, isArray: false, pgArrayType: 'text[]' },
-        { name: 'slug', field: 'slug', pgType: 'text', tsType: 'string', nullable: true, hasDefault: false, isArray: false, pgArrayType: 'text[]' },
-        { name: 'user_id', field: 'userId', pgType: 'int8', tsType: 'number', nullable: false, hasDefault: false, isArray: false, pgArrayType: 'bigint[]' },
+        {
+          name: 'id',
+          field: 'id',
+          pgType: 'int8',
+          tsType: 'number',
+          nullable: false,
+          hasDefault: true,
+          isArray: false,
+          pgArrayType: 'bigint[]',
+        },
+        {
+          name: 'title',
+          field: 'title',
+          pgType: 'text',
+          tsType: 'string',
+          nullable: false,
+          hasDefault: false,
+          isArray: false,
+          pgArrayType: 'text[]',
+        },
+        {
+          name: 'slug',
+          field: 'slug',
+          pgType: 'text',
+          tsType: 'string',
+          nullable: true,
+          hasDefault: false,
+          isArray: false,
+          pgArrayType: 'text[]',
+        },
+        {
+          name: 'user_id',
+          field: 'userId',
+          pgType: 'int8',
+          tsType: 'number',
+          nullable: false,
+          hasDefault: false,
+          isArray: false,
+          pgArrayType: 'bigint[]',
+        },
       ],
       columnMap: { id: 'id', title: 'title', slug: 'slug', userId: 'user_id' },
       reverseColumnMap: { id: 'id', title: 'title', slug: 'slug', user_id: 'userId' },
@@ -77,7 +131,7 @@ describe('generate nested input types', () => {
     // { id: number } | { id: number } | { email: string }.
     assert.ok(output.includes('export type UserWhereUnique ='));
     // Count occurrences of '{ id: number }' in the UserWhereUnique line
-    const line = output.split('\n').find(l => l.includes('export type UserWhereUnique'));
+    const line = output.split('\n').find((l) => l.includes('export type UserWhereUnique'));
     assert.ok(line);
     const idCount = (line.match(/\{ id: number \}/g) || []).length;
     assert.equal(idCount, 1, 'Should not duplicate PK in WhereUnique');
@@ -123,7 +177,7 @@ describe('generate nested input types', () => {
     const output = generateTypes(schema);
     // User has hasMany posts, so UpdateInput should use PostNestedUpdateInput
     const lines = output.split('\n');
-    const updateInputStart = lines.findIndex(l => l.includes('export type UserUpdateInput'));
+    const updateInputStart = lines.findIndex((l) => l.includes('export type UserUpdateInput'));
     assert.ok(updateInputStart >= 0);
     // Find the posts field within the next few lines
     const slice = lines.slice(updateInputStart, updateInputStart + 5).join('\n');
@@ -135,7 +189,7 @@ describe('generate nested input types', () => {
     // Post has belongsTo author, so CreateInput should use UserNestedCreateInput
     assert.ok(output.includes('export type PostCreateInput ='));
     const lines = output.split('\n');
-    const createInputStart = lines.findIndex(l => l.includes('export type PostCreateInput'));
+    const createInputStart = lines.findIndex((l) => l.includes('export type PostCreateInput'));
     assert.ok(createInputStart >= 0);
     const slice = lines.slice(createInputStart, createInputStart + 5).join('\n');
     assert.ok(slice.includes('UserNestedCreateInput'));
@@ -149,8 +203,26 @@ describe('generate nested input types', () => {
         tags: {
           name: 'tags',
           columns: [
-            { name: 'id', field: 'id', pgType: 'int8', tsType: 'number', nullable: false, hasDefault: true, isArray: false, pgArrayType: 'bigint[]' },
-            { name: 'label', field: 'label', pgType: 'text', tsType: 'string', nullable: false, hasDefault: false, isArray: false, pgArrayType: 'text[]' },
+            {
+              name: 'id',
+              field: 'id',
+              pgType: 'int8',
+              tsType: 'number',
+              nullable: false,
+              hasDefault: true,
+              isArray: false,
+              pgArrayType: 'bigint[]',
+            },
+            {
+              name: 'label',
+              field: 'label',
+              pgType: 'text',
+              tsType: 'string',
+              nullable: false,
+              hasDefault: false,
+              isArray: false,
+              pgArrayType: 'text[]',
+            },
           ],
           columnMap: { id: 'id', label: 'label' },
           reverseColumnMap: { id: 'id', label: 'label' },

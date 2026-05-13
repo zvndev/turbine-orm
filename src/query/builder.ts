@@ -22,6 +22,12 @@ import {
   ValidationError,
   wrapPgError,
 } from '../errors.js';
+import {
+  executeNestedCreate,
+  executeNestedUpdate,
+  hasRelationFields,
+  type NestedWriteContext,
+} from '../nested-write.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { camelToSnake, snakeToCamel } from '../schema.js';
 import type {
@@ -207,6 +213,8 @@ export interface QueryInterfaceOptions {
   sqlCache?: boolean;
   /** SQL dialect implementation. Defaults to PostgreSQL. */
   dialect?: Dialect;
+  /** @internal Set by TransactionClient — signals that this QI runs inside an active transaction. */
+  _txScoped?: boolean;
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional for untyped table access
@@ -241,6 +249,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** Tracks tables that have already triggered a deep-with warning (one-time) */
   private readonly deepWithWarned = new Set<string>();
 
+  /** True when this QI runs inside an active transaction (set via _txScoped option). */
+  private readonly txScoped: boolean;
+
+  /** Original options reference — forwarded to child QIs in nested writes. */
+  private readonly options?: QueryInterfaceOptions;
+
   constructor(
     private readonly pool: pg.Pool,
     private readonly table: string,
@@ -264,6 +278,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.preparedStatementsEnabled = options?.preparedStatements ?? true;
     this.sqlCacheEnabled = options?.sqlCache !== false;
     this.dialect = options?.dialect ?? postgresDialect;
+    this.txScoped = options?._txScoped ?? false;
+    this.options = options;
 
     // Pre-compute column type lookup maps (TASK-26)
     this.columnPgTypeMap = new Map();
@@ -940,6 +956,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   async create(args: CreateArgs<T>): Promise<T> {
     return this.executeWithMiddleware('create', args as unknown as Record<string, unknown>, async () => {
+      if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
+        return this.nestedCreate(args);
+      }
       const deferred = this.buildCreate(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
@@ -1035,6 +1054,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   async update(args: UpdateArgs<T>): Promise<T> {
     return this.executeWithMiddleware('update', args as unknown as Record<string, unknown>, async () => {
+      if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
+        return this.nestedUpdate(args);
+      }
       const deferred = this.buildUpdate(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
@@ -1085,6 +1107,81 @@ export class QueryInterface<T extends object, R extends object = {}> {
       },
       tag: `${this.table}.update`,
       preparedName: entry.name,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Nested write helpers (shared by create + update)
+  // -------------------------------------------------------------------------
+
+  private async nestedCreate(args: CreateArgs<T>): Promise<T> {
+    const data = args.data as Record<string, unknown>;
+
+    if (this.txScoped) {
+      const ctx = this.buildNestedCtx();
+      return executeNestedCreate(ctx, this.table, data) as Promise<T>;
+    }
+
+    return this.runInImplicitTx(async (ctx) => {
+      const result = await executeNestedCreate(ctx, this.table, data);
+      return result as T;
+    });
+  }
+
+  private async nestedUpdate(args: UpdateArgs<T>): Promise<T> {
+    const data = args.data as Record<string, unknown>;
+    const where = args.where as Record<string, unknown>;
+
+    if (this.txScoped) {
+      const ctx = this.buildNestedCtx();
+      return executeNestedUpdate(ctx, this.table, where, data) as Promise<T>;
+    }
+
+    return this.runInImplicitTx(async (ctx) => {
+      const result = await executeNestedUpdate(ctx, this.table, where, data);
+      return result as T;
+    });
+  }
+
+  private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>): Promise<R> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { TransactionClient } = await import('../client.js');
+      // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
+      const tx = new TransactionClient(client as any, this.schema, this.middlewares as any, this.options);
+      // biome-ignore lint/suspicious/noExplicitAny: TransactionClient satisfies NestedWriteContext['tx'] at runtime
+      const ctx: NestedWriteContext = { schema: this.schema, tx: tx as any };
+      const result = await fn(ctx);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // Best-effort rollback — connection may have died.
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  private buildNestedCtx(): NestedWriteContext {
+    const pool = this.pool;
+    const schema = this.schema;
+    const middlewares = this.middlewares;
+    const opts: QueryInterfaceOptions = { ...this.options, _txScoped: true };
+    return {
+      schema,
+      tx: this.makeTxProxy(pool, schema, middlewares, opts),
+    };
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: bridges MiddlewareFn[] ↔ Middleware[] and QI ↔ NestedWriteContext type gap
+  private makeTxProxy(pool: any, schema: SchemaMetadata, middlewares: any, opts: QueryInterfaceOptions): any {
+    return {
+      table: <U extends object>(name: string) => new QueryInterface<U>(pool, name, schema, middlewares, opts),
     };
   }
 
