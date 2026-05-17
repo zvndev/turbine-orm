@@ -30,6 +30,42 @@ import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from '
 import type { SchemaMetadata } from './schema.js';
 
 // ---------------------------------------------------------------------------
+// Retry utility
+// ---------------------------------------------------------------------------
+
+export interface RetryOptions {
+  maxAttempts?: number;
+  baseDelay?: number;
+  maxDelay?: number;
+  onRetry?: (error: unknown, attempt: number) => void;
+}
+
+export async function withRetry<T>(fn: () => Promise<T>, options?: RetryOptions): Promise<T> {
+  const maxAttempts = options?.maxAttempts ?? 3;
+  const baseDelay = options?.baseDelay ?? 50;
+  const maxDelay = options?.maxDelay ?? 5000;
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const isRetryable =
+        err &&
+        typeof err === 'object' &&
+        'isRetryable' in err &&
+        (err as { isRetryable: unknown }).isRetryable === true;
+      if (!isRetryable || attempt === maxAttempts - 1) throw err;
+      options?.onRetry?.(err, attempt + 1);
+      const delay = Math.min(baseDelay * 2 ** attempt + Math.random() * baseDelay, maxDelay);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -731,6 +767,29 @@ export class TurbineClient {
     } finally {
       releaseOnce();
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Retry — automatic retry for retryable errors (deadlock, serialization)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Execute an async function with automatic retry on retryable errors.
+   *
+   * Only errors with `isRetryable === true` (DeadlockError, SerializationFailureError)
+   * are retried. Uses exponential backoff with jitter.
+   *
+   * @example
+   * ```ts
+   * const result = await db.$retry(() =>
+   *   db.$transaction(async (tx) => {
+   *     // ... serializable transaction logic
+   *   }, { isolationLevel: 'Serializable' })
+   * );
+   * ```
+   */
+  async $retry<T>(fn: () => Promise<T>, options?: RetryOptions): Promise<T> {
+    return withRetry(fn, options);
   }
 
   // -------------------------------------------------------------------------

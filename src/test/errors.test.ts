@@ -13,6 +13,7 @@ import {
   CircularRelationError,
   ConnectionError,
   DeadlockError,
+  ExclusionConstraintError,
   ForeignKeyError,
   getErrorMessageMode,
   MigrationError,
@@ -369,8 +370,8 @@ describe('TurbineErrorCode', () => {
     assert.equal(TurbineErrorCode.PIPELINE, 'TURBINE_E014');
   });
 
-  it('has exactly 14 error codes', () => {
-    assert.equal(Object.keys(TurbineErrorCode).length, 14);
+  it('has exactly 16 error codes', () => {
+    assert.equal(Object.keys(TurbineErrorCode).length, 16);
   });
 });
 
@@ -644,6 +645,22 @@ describe('wrapPgError', () => {
     if (wrapped instanceof CheckConstraintError) {
       assert.equal(wrapped.constraint, 'price_positive');
       assert.equal(wrapped.table, 'products');
+      assert.equal(wrapped.cause, err);
+    }
+  });
+
+  it('wraps 23P01 into ExclusionConstraintError', () => {
+    const err = Object.assign(new Error('exclusion'), {
+      code: '23P01',
+      constraint: 'no_overlap',
+      table: 'reservations',
+    });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof ExclusionConstraintError);
+    if (wrapped instanceof ExclusionConstraintError) {
+      assert.equal(wrapped.constraint, 'no_overlap');
+      assert.equal(wrapped.table, 'reservations');
+      assert.equal(wrapped.code, 'TURBINE_E016');
       assert.equal(wrapped.cause, err);
     }
   });

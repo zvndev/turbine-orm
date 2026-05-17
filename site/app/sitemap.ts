@@ -6,6 +6,7 @@ const ROUTES = [
   '',
   '/quickstart',
   '/migrate-from-prisma',
+  '/migrate-from-drizzle',
   '/queries',
   '/relations',
   '/transactions',

@@ -33,8 +33,9 @@ export interface WhereOperator<V = unknown> {
  * - An operator object ({ gt: 5, lte: 10 })
  * - A JSONB filter object ({ contains, equals, path, hasKey })
  * - An array filter object ({ has, hasEvery, hasSome, isEmpty })
+ * - A text search filter object ({ search, config? })
  */
-export type WhereValue<V = unknown> = V | WhereOperator<V> | JsonFilter | ArrayFilter | null;
+export type WhereValue<V = unknown> = V | WhereOperator<V> | JsonFilter | ArrayFilter | TextSearchFilter | null;
 
 /**
  * Where clause type: each field can be a plain value, null, or operator object.
@@ -217,21 +218,84 @@ export type WithResult<T, R extends object, W> = [keyof R] extends [never]
         }
     : T;
 
+// ---------------------------------------------------------------------------
+// Select / Omit compile-time type narrowing
+// ---------------------------------------------------------------------------
+
+/** Extract keys from a boolean record where the value is `true`. */
+type TrueKeys<S extends Record<string, boolean>> = {
+  [K in keyof S]: S[K] extends true ? K : never;
+}[keyof S];
+
+/** Pick only the fields from T that are selected (value = true) in S. */
+export type SelectResult<T, S extends Record<string, boolean> | undefined> =
+  S extends Record<string, boolean> ? Pick<T, Extract<keyof T, TrueKeys<S>>> : T;
+
+/** Omit the fields from T that are marked (value = true) in O. */
+export type OmitResult<T, O extends Record<string, boolean> | undefined> =
+  O extends Record<string, boolean> ? Omit<T, Extract<keyof T, TrueKeys<O>>> : T;
+
+/**
+ * Apply select or omit field narrowing to a base type. Select takes priority —
+ * when both are provided, only select is applied (matching runtime behavior).
+ */
+export type FieldResult<
+  T,
+  S extends Record<string, boolean> | undefined,
+  O extends Record<string, boolean> | undefined,
+> = S extends Record<string, boolean> ? SelectResult<T, S> : OmitResult<T, O>;
+
+/**
+ * Compute the full query result type: apply field narrowing to the base entity,
+ * then add relation additions from the `with` clause. Relations are unaffected
+ * by select/omit (they are separate JSON subqueries at the SQL level).
+ *
+ * Short-circuits to plain WithResult when neither select nor omit is provided,
+ * preserving exact type equality with the pre-narrowing era.
+ */
+export type QueryResult<
+  T,
+  R extends object,
+  W,
+  S extends Record<string, boolean> | undefined,
+  O extends Record<string, boolean> | undefined,
+> = S extends undefined
+  ? O extends undefined
+    ? WithResult<T, R, W>
+    : O extends Record<string, boolean>
+      ? Omit<WithResult<T, R, W>, Extract<keyof T, TrueKeys<O>>>
+      : WithResult<T, R, W>
+  : S extends Record<string, boolean>
+    ? Pick<WithResult<T, R, W>, Extract<keyof T, TrueKeys<S>> | Exclude<keyof WithResult<T, R, W>, keyof T>>
+    : WithResult<T, R, W>;
+
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
-export interface FindUniqueArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>> {
+export interface FindUniqueArgs<
+  T,
+  R extends object = {},
+  W extends TypedWithClause<R> = TypedWithClause<R>,
+  S extends Record<string, boolean> | undefined = undefined,
+  O extends Record<string, boolean> | undefined = undefined,
+> {
   where: WhereClause<T>;
-  select?: Record<string, boolean>;
-  omit?: Record<string, boolean>;
+  select?: S;
+  omit?: O;
   with?: W;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
-export interface FindManyArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>> {
+export interface FindManyArgs<
+  T,
+  R extends object = {},
+  W extends TypedWithClause<R> = TypedWithClause<R>,
+  S extends Record<string, boolean> | undefined = undefined,
+  O extends Record<string, boolean> | undefined = undefined,
+> {
   where?: WhereClause<T>;
-  select?: Record<string, boolean>;
-  omit?: Record<string, boolean>;
+  select?: S;
+  omit?: O;
   orderBy?: Record<string, OrderDirection>;
   limit?: number;
   offset?: number;
@@ -247,8 +311,13 @@ export interface FindManyArgs<T, R extends object = {}, W extends TypedWithClaus
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
-export interface FindManyStreamArgs<T, R extends object = {}, W extends TypedWithClause<R> = TypedWithClause<R>>
-  extends FindManyArgs<T, R, W> {
+export interface FindManyStreamArgs<
+  T,
+  R extends object = {},
+  W extends TypedWithClause<R> = TypedWithClause<R>,
+  S extends Record<string, boolean> | undefined = undefined,
+  O extends Record<string, boolean> | undefined = undefined,
+> extends FindManyArgs<T, R, W, S, O> {
   /**
    * Number of rows to fetch per internal FETCH batch (default: 1000).
    *
@@ -317,6 +386,24 @@ export interface UpdateArgs<T> {
    * when an unconditional mutation is the intended behaviour.
    */
   allowFullTableScan?: boolean;
+  /**
+   * Optimistic locking — prevents lost updates in concurrent scenarios.
+   * Specify the version field and its expected value. The update adds a
+   * WHERE check on the version and auto-increments it. If the row was
+   * modified by another transaction, throws `OptimisticLockError`.
+   *
+   * @example
+   * ```ts
+   * await db.posts.update({
+   *   where: { id: 1 },
+   *   data: { title: 'new title' },
+   *   optimisticLock: { field: 'version', expected: 3 },
+   * });
+   * // Generates: UPDATE posts SET title=$1, version=version+1
+   * //            WHERE id=$2 AND version=$3 RETURNING *
+   * ```
+   */
+  optimisticLock?: { field: keyof T & string; expected: number };
 }
 
 export interface UpdateManyArgs<T> {
@@ -456,4 +543,12 @@ export interface ArrayFilter {
   hasSome?: unknown[];
   /** Check if array is empty: array_length(column, 1) IS NULL */
   isEmpty?: boolean;
+}
+
+/** Full-text search filter using PostgreSQL to_tsvector / to_tsquery */
+export interface TextSearchFilter {
+  /** The search query string passed to to_tsquery */
+  search: string;
+  /** PostgreSQL text search configuration name (defaults to 'english') */
+  config?: string;
 }

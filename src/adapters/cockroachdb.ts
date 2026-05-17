@@ -181,8 +181,8 @@ export const cockroachdb: DatabaseAdapter = {
     rowEstimates: SQL_ROW_ESTIMATES_CRDB,
   } satisfies Partial<IntrospectionOverrides>,
 
-  statementTimeout(seconds: number): string {
+  statementTimeout(seconds: number): { sql: string; params: unknown[] } {
     // CockroachDB v23.1+ supports transaction_timeout
-    return `SET transaction_timeout = '${seconds}s'`;
+    return { sql: `SET transaction_timeout = $1`, params: [`${seconds}s`] };
   },
 };

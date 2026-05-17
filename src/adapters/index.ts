@@ -70,13 +70,13 @@ export interface DatabaseAdapter {
 
   /**
    * Generate the SQL to set a statement timeout within a transaction.
-   * PostgreSQL uses `SET LOCAL statement_timeout = '<n>s'`.
-   * CockroachDB uses `SET transaction_timeout = '<n>s'` (v23.1+).
+   * PostgreSQL uses `SET LOCAL statement_timeout = $1`.
+   * CockroachDB uses `SET transaction_timeout = $1` (v23.1+).
    *
    * @param seconds — timeout in seconds
-   * @returns the SQL string to execute
+   * @returns an object with the parameterized SQL and its bound values
    */
-  statementTimeout?(seconds: number): string;
+  statementTimeout?(seconds: number): { sql: string; params: unknown[] };
 
   /**
    * SQL to create the lock table used by table-based locking adapters.
@@ -106,7 +106,7 @@ export const postgresql: DatabaseAdapter = {
   },
 
   statementTimeout(seconds) {
-    return `SET LOCAL statement_timeout = '${seconds}s'`;
+    return { sql: `SET LOCAL statement_timeout = $1`, params: [`${seconds}s`] };
   },
 };
 

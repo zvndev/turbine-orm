@@ -293,7 +293,8 @@ function makeCtx(pool: pg.Pool, stateDir: string): StudioContext {
     options,
     authToken: 'test-token',
     stateDir,
-    statementTimeoutSQL: `SET LOCAL statement_timeout = '30s'`,
+    statementTimeout: { sql: `SET LOCAL statement_timeout = $1`, params: ['30s'] },
+    rateLimiter: new Map(),
   };
 }
 

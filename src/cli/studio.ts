@@ -62,8 +62,10 @@ export interface StudioContext {
   options: StudioOptions;
   authToken: string;
   stateDir: string;
-  /** Resolved statement timeout SQL string (adapter-aware). */
-  statementTimeoutSQL: string;
+  /** Resolved statement timeout (adapter-aware) — parameterized SQL + values. */
+  statementTimeout: { sql: string; params: unknown[] };
+  /** Rate limiter state — tracks requests per authenticated session. */
+  rateLimiter: Map<string, { count: number; resetAt: number }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,8 +105,12 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
 
   const authToken = randomBytes(24).toString('hex');
   const stateDir = pathResolve(options.stateDir ?? '.turbine');
-  const statementTimeoutSQL = options.adapter?.statementTimeout?.(30) ?? `SET LOCAL statement_timeout = '30s'`;
-  const ctx: StudioContext = { pool, metadata, options, authToken, stateDir, statementTimeoutSQL };
+  const statementTimeout = options.adapter?.statementTimeout?.(30) ?? {
+    sql: `SET LOCAL statement_timeout = $1`,
+    params: ['30s'],
+  };
+  const rateLimiter = new Map<string, { count: number; resetAt: number }>();
+  const ctx: StudioContext = { pool, metadata, options, authToken, stateDir, statementTimeout, rateLimiter };
 
   const server = createServer((req, res) => {
     handleRequest(req, res, ctx).catch((err) => {
@@ -194,6 +200,15 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Stu
     return;
   }
 
+  // Rate limiting — 100 requests per 60 seconds per authenticated session.
+  const rateLimitResult = checkRateLimit(ctx.rateLimiter, ctx.authToken);
+  if (!rateLimitResult.allowed) {
+    const retryAfter = Math.ceil((rateLimitResult.resetAt - Date.now()) / 1000);
+    res.setHeader('Retry-After', String(retryAfter));
+    sendJson(res, 429, { error: 'Rate limit exceeded', retryAfter });
+    return;
+  }
+
   if (pathname === '/api/schema' && req.method === 'GET') {
     return apiSchema(res, ctx);
   }
@@ -242,6 +257,37 @@ function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
     return true;
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+const RATE_LIMIT_WINDOW_MS = 60_000; // 60 seconds
+const RATE_LIMIT_MAX_REQUESTS = 100;
+
+interface RateLimitResult {
+  allowed: boolean;
+  resetAt: number;
+}
+
+function checkRateLimit(limiter: Map<string, { count: number; resetAt: number }>, token: string): RateLimitResult {
+  const now = Date.now();
+  const entry = limiter.get(token);
+
+  if (!entry || now >= entry.resetAt) {
+    // Start a new window
+    const resetAt = now + RATE_LIMIT_WINDOW_MS;
+    limiter.set(token, { count: 1, resetAt });
+    return { allowed: true, resetAt };
+  }
+
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX_REQUESTS) {
+    return { allowed: false, resetAt: entry.resetAt };
+  }
+
+  return { allowed: true, resetAt: entry.resetAt };
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -346,7 +392,7 @@ export async function apiTableRows(
   let mainWhere = '';
   if (hasSearch && pattern !== null) {
     mainValues.push(pattern);
-    const conds = textColumns.map((c) => `${quoteIdent(c)} ILIKE $3`);
+    const conds = textColumns.map((c) => `${quoteIdent(c)} ILIKE $3 ESCAPE '\\'`);
     mainWhere = `WHERE (${conds.join(' OR ')})`;
   }
 
@@ -355,7 +401,7 @@ export async function apiTableRows(
   let countWhere = '';
   if (hasSearch && pattern !== null) {
     countValues.push(pattern);
-    const conds = textColumns.map((c) => `${quoteIdent(c)} ILIKE $1`);
+    const conds = textColumns.map((c) => `${quoteIdent(c)} ILIKE $1 ESCAPE '\\'`);
     countWhere = `WHERE (${conds.join(' OR ')})`;
   }
 
@@ -366,7 +412,7 @@ export async function apiTableRows(
   const client = await ctx.pool.connect();
   try {
     await client.query('BEGIN READ ONLY');
-    await client.query(ctx.statementTimeoutSQL);
+    await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
     const result = await client.query(sql, mainValues);
     const countResult = await client.query<{ count: string }>(countSql, countValues);
     await client.query('COMMIT');
@@ -429,6 +475,11 @@ async function apiQuery(req: IncomingMessage, res: ServerResponse, ctx: StudioCo
     return;
   }
 
+  if (rawSql.length > 10_000) {
+    sendJson(res, 400, { error: 'query too long — maximum 10,000 characters allowed' });
+    return;
+  }
+
   if (!isReadOnlyStatement(rawSql)) {
     sendJson(res, 400, {
       error: 'only SELECT / WITH statements are allowed in Studio — use the CLI for writes',
@@ -439,7 +490,7 @@ async function apiQuery(req: IncomingMessage, res: ServerResponse, ctx: StudioCo
   const client = await ctx.pool.connect();
   try {
     await client.query('BEGIN READ ONLY');
-    await client.query(ctx.statementTimeoutSQL);
+    await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
     const started = Date.now();
     const result = await client.query(rawSql);
     const elapsedMs = Date.now() - started;
@@ -493,7 +544,7 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
   const client = await ctx.pool.connect();
   try {
     await client.query('BEGIN READ ONLY');
-    await client.query(ctx.statementTimeoutSQL);
+    await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
     const started = Date.now();
     const result = await client.query(deferred.sql, deferred.params);
     const elapsedMs = Date.now() - started;
@@ -712,6 +763,8 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy':
+      "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'",
   });
   res.end(payload);
 }
@@ -732,6 +785,8 @@ function sendHtml(res: ServerResponse, status: number, body: string): void {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy':
+      "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'",
   });
   res.end(body);
 }

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.15.0 (2026-05-17)
+
+**Feature release: select/omit type narrowing, optimistic locking, full-text search, retry utility, security hardening.**
+
+### Added
+- **Select/omit compile-time type narrowing** — `findMany`, `findUnique`, `findFirst` accept `select` and `omit` args that narrow the return type at compile time via `QueryResult<T, R, W, S, O>`. Preserves `with` relation additions while narrowing base entity fields.
+- **Optimistic locking** — `update({ optimisticLock: { field: 'version', expected: 3 } })` auto-increments the version field and throws `OptimisticLockError` (E015) on concurrent modification.
+- **Full-text search** — `TextSearchFilter` type with `search`, `config`, and `language` options. Generates `to_tsvector @@ plainto_tsquery` SQL with injection protection.
+- **Retry utility** — `withRetry(fn, opts)` and `db.$retry(fn, opts)` with exponential backoff + jitter. Only retries errors marked `isRetryable` (deadlocks, serialization failures).
+- **`ExclusionConstraintError`** (E016) — maps pg error code 23P01 via `wrapPgError()`.
+- **SQL safety property tests** — 22 injection payloads verified against WHERE, UPDATE SET, and CREATE SQL generation.
+- **Migrate from Drizzle** documentation page at `/migrate-from-drizzle`.
+
+### Security
+- Studio: Added `Content-Security-Policy` header, rate limiting (100 req/60s per token), ESCAPE clause on ILIKE queries, 10KB query length limit.
+- Adapters: `statementTimeout()` now returns parameterized `{ sql, params }` instead of interpolated strings.
+
+### Changed
+- Release workflow supports `workflow_dispatch` with dry-run mode and auto-tag creation.
+- Git tags synced through v0.10.0.
+
+### Tests
+- 711 unit tests (up from 686), all passing.
+- Added test suites: `optimistic-lock`, `retry`, `text-search`, `sql-safety-property`.
+
+---
+
 ## 0.14.0 (2026-05-10)
 
 **Dialect-owned type metadata for future database packages.**

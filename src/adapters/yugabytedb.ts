@@ -163,8 +163,8 @@ export const yugabytedb: DatabaseAdapter = {
     rowEstimates: SQL_ROW_ESTIMATES_YBDB,
   } satisfies Partial<IntrospectionOverrides>,
 
-  statementTimeout(seconds: number): string {
+  statementTimeout(seconds: number): { sql: string; params: unknown[] } {
     // YugabyteDB supports standard PostgreSQL statement_timeout
-    return `SET LOCAL statement_timeout = '${seconds}s'`;
+    return { sql: `SET LOCAL statement_timeout = $1`, params: [`${seconds}s`] };
   },
 };

@@ -136,13 +136,14 @@ describe('CockroachDB adapter', () => {
 
   describe('statementTimeout', () => {
     it('generates CockroachDB-specific timeout syntax', () => {
-      const sql = cockroachdb.statementTimeout!(30);
-      assert.equal(sql, "SET transaction_timeout = '30s'");
+      const result = cockroachdb.statementTimeout!(30);
+      assert.equal(result.sql, 'SET transaction_timeout = $1');
+      assert.deepEqual(result.params, ['30s']);
     });
 
     it('handles different timeout values', () => {
-      assert.equal(cockroachdb.statementTimeout!(5), "SET transaction_timeout = '5s'");
-      assert.equal(cockroachdb.statementTimeout!(60), "SET transaction_timeout = '60s'");
+      assert.deepEqual(cockroachdb.statementTimeout!(5), { sql: 'SET transaction_timeout = $1', params: ['5s'] });
+      assert.deepEqual(cockroachdb.statementTimeout!(60), { sql: 'SET transaction_timeout = $1', params: ['60s'] });
     });
   });
 
@@ -193,8 +194,9 @@ describe('PostgreSQL adapter (default)', () => {
   });
 
   it('generates standard statement_timeout', () => {
-    const sql = postgresql.statementTimeout!(30);
-    assert.equal(sql, "SET LOCAL statement_timeout = '30s'");
+    const result = postgresql.statementTimeout!(30);
+    assert.equal(result.sql, 'SET LOCAL statement_timeout = $1');
+    assert.deepEqual(result.params, ['30s']);
   });
 });
 
@@ -217,8 +219,9 @@ describe('YugabyteDB adapter', () => {
   });
 
   it('generates standard PostgreSQL statement_timeout', () => {
-    const sql = yugabytedb.statementTimeout!(15);
-    assert.equal(sql, "SET LOCAL statement_timeout = '15s'");
+    const result = yugabytedb.statementTimeout!(15);
+    assert.equal(result.sql, 'SET LOCAL statement_timeout = $1');
+    assert.deepEqual(result.params, ['15s']);
   });
 
   it('provides row estimates override', () => {
@@ -247,9 +250,10 @@ describe('Adapter interface compliance', () => {
       assert.equal(typeof adapter.releaseLock, 'function');
       if (adapter.statementTimeout) {
         assert.equal(typeof adapter.statementTimeout, 'function');
-        const sql = adapter.statementTimeout(10);
-        assert.equal(typeof sql, 'string');
-        assert.ok(sql.length > 0);
+        const result = adapter.statementTimeout(10);
+        assert.equal(typeof result.sql, 'string');
+        assert.ok(result.sql.length > 0);
+        assert.ok(Array.isArray(result.params));
       }
     });
   }

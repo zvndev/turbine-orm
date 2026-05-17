@@ -21,6 +21,8 @@ export const TurbineErrorCode = {
   DEADLOCK_DETECTED: 'TURBINE_E012',
   SERIALIZATION_FAILURE: 'TURBINE_E013',
   PIPELINE: 'TURBINE_E014',
+  OPTIMISTIC_LOCK: 'TURBINE_E015',
+  EXCLUSION_VIOLATION: 'TURBINE_E016',
 } as const;
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
@@ -423,6 +425,33 @@ export class CheckConstraintError extends TurbineError {
   }
 }
 
+export class ExclusionConstraintError extends TurbineError {
+  readonly constraint?: string;
+  readonly table?: string;
+
+  constructor(
+    opts: {
+      constraint?: string;
+      table?: string;
+      message?: string;
+      cause?: unknown;
+    } = {},
+  ) {
+    const { constraint, table, cause } = opts;
+    let message = opts.message;
+    if (!message) {
+      const constraintPart = constraint ? ` on ${constraint}` : '';
+      message = `[turbine] Exclusion constraint violation${constraintPart}`;
+      const detail = detailFromCause(cause);
+      if (detail) message += `: ${detail}`;
+    }
+    super(TurbineErrorCode.EXCLUSION_VIOLATION, message, { cause });
+    this.name = 'ExclusionConstraintError';
+    this.constraint = constraint;
+    this.table = table;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline error
 // ---------------------------------------------------------------------------
@@ -481,6 +510,24 @@ export class PipelineError extends TurbineError {
   }
 }
 
+export class OptimisticLockError extends TurbineError {
+  readonly table: string;
+  readonly versionField: string;
+  readonly expectedVersion: unknown;
+
+  constructor(opts: { table: string; versionField: string; expectedVersion: unknown }) {
+    super(
+      TurbineErrorCode.OPTIMISTIC_LOCK,
+      `[turbine] Optimistic lock failed on "${opts.table}" — ` +
+        `expected ${opts.versionField} = ${opts.expectedVersion} but row was modified by another transaction`,
+    );
+    this.name = 'OptimisticLockError';
+    this.table = opts.table;
+    this.versionField = opts.versionField;
+    this.expectedVersion = opts.expectedVersion;
+  }
+}
+
 /**
  * Parse column names out of a pg `detail` string like:
  *   "Key (email)=(foo@bar) already exists."
@@ -501,6 +548,7 @@ function parseColumnsFromDetail(detail: string): string[] | undefined {
  *   23503 (foreign_key_violation) -> ForeignKeyError
  *   23502 (not_null_violation)    -> NotNullViolationError
  *   23514 (check_violation)       -> CheckConstraintError
+ *   23P01 (exclusion_violation)   -> ExclusionConstraintError
  *   40P01 (deadlock_detected)     -> DeadlockError       (retryable)
  *   40001 (serialization_failure) -> SerializationFailureError (retryable)
  *
@@ -542,6 +590,12 @@ export function wrapPgError(err: unknown): unknown {
       });
     case '23514':
       return new CheckConstraintError({
+        constraint: e.constraint,
+        table: e.table,
+        cause: err,
+      });
+    case '23P01':
+      return new ExclusionConstraintError({
         constraint: e.constraint,
         table: e.table,
         cause: err,

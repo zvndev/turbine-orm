@@ -141,6 +141,8 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E012 | `DeadlockError` | pg 40P01 — `isRetryable = true as const` |
 | E013 | `SerializationFailureError` | pg 40001 — `isRetryable = true as const` |
 | E014 | `PipelineError` | One or more queries in a pipeline batch failed |
+| E015 | `OptimisticLockError` | Version mismatch on `optimisticLock` update |
+| E016 | `ExclusionConstraintError` | pg 23P01 — via `wrapPgError()` |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 

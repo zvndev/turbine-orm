@@ -246,6 +246,70 @@ async function callSiteInference() {
 void callSiteInference;
 
 // ---------------------------------------------------------------------------
+// 10. Select/omit compile-time type narrowing
+//
+//     When `select` is provided, the return type is narrowed to only the
+//     selected fields. When `omit` is provided, those fields are removed.
+//     Relations from `with` are unaffected by select/omit.
+// ---------------------------------------------------------------------------
+
+import type { QueryResult } from '../query/index.js';
+
+// --- Select narrows to only selected fields ---
+type SelectId = QueryResult<User, UserRelations, {}, { id: true }, undefined>;
+assertTrue<Equals<SelectId, Pick<User, 'id'>>>();
+
+// --- Select with multiple fields ---
+type SelectBoth = QueryResult<User, UserRelations, {}, { id: true; email: true }, undefined>;
+assertTrue<Equals<SelectBoth, User>>();
+
+// --- Omit removes specified fields ---
+type OmitEmail = QueryResult<User, UserRelations, {}, undefined, { email: true }>;
+assertTrue<Equals<OmitEmail, Omit<User, 'email'>>>();
+
+// --- Select + with: relations are preserved alongside narrowed base ---
+type SelectWithRelations = QueryResult<User, UserRelations, { posts: true }, { id: true }, undefined>;
+assertTrue<Equals<SelectWithRelations['id'], number>>();
+assertTrue<Equals<SelectWithRelations['posts'], Post[]>>();
+type SelectWithRelationsHasEmail = 'email' extends keyof SelectWithRelations ? true : false;
+assertTrue<Equals<SelectWithRelationsHasEmail, false>>();
+
+// --- Omit + with: relations preserved, omitted fields gone ---
+type OmitWithRelations = QueryResult<User, UserRelations, { posts: true }, undefined, { email: true }>;
+assertTrue<Equals<OmitWithRelations['id'], number>>();
+assertTrue<Equals<OmitWithRelations['posts'], Post[]>>();
+type OmitWithRelationsHasEmail = 'email' extends keyof OmitWithRelations ? true : false;
+assertTrue<Equals<OmitWithRelationsHasEmail, false>>();
+
+// --- No select/omit: passthrough to WithResult (backward compat) ---
+type NoNarrow = QueryResult<User, UserRelations, { posts: true }, undefined, undefined>;
+assertTrue<Equals<NoNarrow['id'], number>>();
+assertTrue<Equals<NoNarrow['email'], string>>();
+assertTrue<Equals<NoNarrow['posts'], Post[]>>();
+
+// --- Call-site inference with select/omit ---
+async function selectOmitCallSite() {
+  if (false as boolean) {
+    const selected = await users.findMany({ select: { id: true } });
+    type SelectedItem = (typeof selected)[number];
+    assertTrue<Equals<SelectedItem, Pick<User, 'id'>>>();
+
+    const omitted = await users.findMany({ omit: { email: true } });
+    type OmittedItem = (typeof omitted)[number];
+    assertTrue<Equals<OmittedItem, Omit<User, 'email'>>>();
+
+    const selectWithRelation = await users.findMany({
+      select: { id: true },
+      with: { posts: true },
+    });
+    type SelectRelItem = (typeof selectWithRelation)[number];
+    assertTrue<Equals<SelectRelItem['id'], number>>();
+    assertTrue<Equals<SelectRelItem['posts'], Post[]>>();
+  }
+}
+void selectOmitCallSite;
+
+// ---------------------------------------------------------------------------
 // node:test stub so the runner picks up the file
 // ---------------------------------------------------------------------------
 

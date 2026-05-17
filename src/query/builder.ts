@@ -17,6 +17,7 @@ import { postgresDialect } from '../dialect.js';
 import {
   CircularRelationError,
   NotFoundError,
+  OptimisticLockError,
   RelationError,
   TimeoutError,
   ValidationError,
@@ -45,6 +46,8 @@ import type {
   GroupByArgs,
   JsonFilter,
   OrderDirection,
+  QueryResult,
+  TextSearchFilter,
   TypedWithClause,
   UpdateArgs,
   UpdateManyArgs,
@@ -53,7 +56,6 @@ import type {
   WhereOperator,
   WithClause,
   WithOptions,
-  WithResult,
 } from './types.js';
 import { escapeLike, LRUCache, OPERATOR_KEYS, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
 
@@ -153,6 +155,33 @@ function findArrayUniqueKey(value: object): string | null {
     if (ARRAY_UNIQUE_KEYS.has(k)) return k;
   }
   return null;
+}
+
+/** Known text search operator keys */
+const TEXT_SEARCH_KEYS = new Set<string>(['search', 'config']);
+
+/** Check if a value is a TextSearchFilter object */
+function isTextSearchFilter(value: unknown): value is TextSearchFilter {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    value instanceof Date
+  ) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  // Must have 'search' key and only known text search keys
+  return keys.includes('search') && keys.every((k) => TEXT_SEARCH_KEYS.has(k));
+}
+
+/**
+ * Validate a text search config name. Only alphanumeric characters and
+ * underscores are allowed to prevent SQL injection via the config parameter.
+ */
+function validateTextSearchConfig(config: string): boolean {
+  return /^[a-zA-Z0-9_]+$/.test(config);
 }
 
 // ---------------------------------------------------------------------------
@@ -427,18 +456,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  async findUnique<W extends TypedWithClause<R> = {}>(
-    args: FindUniqueArgs<T, R, W>,
-  ): Promise<WithResult<T, R, W> | null> {
+  async findUnique<
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUnique(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
-    }) as Promise<WithResult<T, R, W> | null>;
+    }) as Promise<QueryResult<T, R, W, S, O> | null>;
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindUnique<W extends TypedWithClause<R> = {}>(args: FindUniqueArgs<T, R, W>): DeferredQuery<T | null> {
+  buildFindUnique<W extends TypedWithClause<R> = {}>(
+    args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
+  ): DeferredQuery<T | null> {
     const columnsList = this.resolveColumns(args.select, args.omit);
     const whereObj = args.where as Record<string, unknown>;
     const colKey = columnsList ? columnsList.join(',') : '*';
@@ -548,7 +581,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  async findMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): Promise<WithResult<T, R, W>[]> {
+  async findMany<
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>[]> {
     this.maybeWarnUnlimited(args);
 
     // Dev-only: warn on deeply nested with clauses
@@ -569,7 +606,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const deferred = this.buildFindMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
-    }) as Promise<WithResult<T, R, W>[]>;
+    }) as Promise<QueryResult<T, R, W, S, O>[]>;
   }
 
   /**
@@ -611,7 +648,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindMany<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T[]> {
+  buildFindMany<W extends TypedWithClause<R> = {}>(
+    args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
+  ): DeferredQuery<T[]> {
     const columnsList = this.resolveColumns(args?.select, args?.omit);
     const colKey = columnsList ? columnsList.join(',') : '*';
     const whereObj = (args?.where ?? {}) as Record<string, unknown>;
@@ -771,9 +810,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * ```
    */
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  async *findManyStream<W extends TypedWithClause<R> = {}>(
-    args?: FindManyStreamArgs<T, R, W>,
-  ): AsyncGenerator<WithResult<T, R, W>, void, undefined> {
+  async *findManyStream<
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>, void, undefined> {
     const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
     const hasRelations = !!args?.with;
 
@@ -781,7 +822,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const speculativeDeferred = this.buildFindMany({
       ...args,
       limit: batchSize + 1,
-    } as FindManyArgs<T, R, TypedWithClause<R>>);
+    } as FindManyArgs<
+      T,
+      R,
+      TypedWithClause<R>,
+      Record<string, boolean> | undefined,
+      Record<string, boolean> | undefined
+    >);
 
     const speculativeResult = await this.queryWithTimeout(
       speculativeDeferred.sql,
@@ -792,10 +839,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (speculativeResult.rows.length <= batchSize) {
       // Small drain — yield all rows and return, no cursor needed
       for (const row of speculativeResult.rows) {
-        yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as WithResult<
+        yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as QueryResult<
           T,
           R,
-          W
+          W,
+          S,
+          O
         >;
       }
       return;
@@ -818,10 +867,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         if (batch.rows.length === 0) break;
 
         for (const row of batch.rows) {
-          yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as WithResult<
+          yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as QueryResult<
             T,
             R,
-            W
+            W,
+            S,
+            O
           >;
         }
 
@@ -849,20 +900,30 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  async findFirst<W extends TypedWithClause<R> = {}>(
-    args?: FindManyArgs<T, R, W>,
-  ): Promise<WithResult<T, R, W> | null> {
+  async findFirst<
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirst(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
-    }) as Promise<WithResult<T, R, W> | null>;
+    }) as Promise<QueryResult<T, R, W, S, O> | null>;
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindFirst<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T | null> {
+  buildFindFirst<W extends TypedWithClause<R> = {}>(
+    args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
+  ): DeferredQuery<T | null> {
     // Reuse findMany's SQL builder but force LIMIT 1
-    const findManyArgs: FindManyArgs<T, R, W> = { ...args, limit: 1 };
+    const findManyArgs = { ...args, limit: 1 } as FindManyArgs<
+      T,
+      R,
+      W,
+      Record<string, boolean> | undefined,
+      Record<string, boolean> | undefined
+    >;
     const deferred = this.buildFindMany(findManyArgs);
 
     return {
@@ -881,18 +942,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  async findFirstOrThrow<W extends TypedWithClause<R> = {}>(
-    args?: FindManyArgs<T, R, W>,
-  ): Promise<WithResult<T, R, W>> {
+  async findFirstOrThrow<
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
     return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirstOrThrow(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
-    }) as Promise<WithResult<T, R, W>>;
+    }) as Promise<QueryResult<T, R, W, S, O>>;
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindFirstOrThrow<W extends TypedWithClause<R> = {}>(args?: FindManyArgs<T, R, W>): DeferredQuery<T> {
+  buildFindFirstOrThrow<W extends TypedWithClause<R> = {}>(
+    args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
+  ): DeferredQuery<T> {
     const inner = this.buildFindFirst(args);
 
     return {
@@ -918,18 +983,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  async findUniqueOrThrow<W extends TypedWithClause<R> = {}>(
-    args: FindUniqueArgs<T, R, W>,
-  ): Promise<WithResult<T, R, W>> {
+  async findUniqueOrThrow<
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
     return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUniqueOrThrow(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
-    }) as Promise<WithResult<T, R, W>>;
+    }) as Promise<QueryResult<T, R, W, S, O>>;
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindUniqueOrThrow<W extends TypedWithClause<R> = {}>(args: FindUniqueArgs<T, R, W>): DeferredQuery<T> {
+  buildFindUniqueOrThrow<W extends TypedWithClause<R> = {}>(
+    args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
+  ): DeferredQuery<T> {
     const inner = this.buildFindUnique(args);
 
     return {
@@ -1066,37 +1135,71 @@ export class QueryInterface<T extends object, R extends object = {}> {
   buildUpdate(args: UpdateArgs<T>): DeferredQuery<T> {
     const dataObj = args.data as Record<string, unknown>;
     const whereObj = args.where as Record<string, unknown>;
+    const lock = args.optimisticLock;
     const setFp = this.fingerprintSet(dataObj);
     const whereFp = this.fingerprintWhere(whereObj);
-    const ck = `u:${setFp}|${whereFp}`;
+    const ck = lock ? null : `u:${setFp}|${whereFp}`;
 
     const params: unknown[] = [];
 
-    const entry = this.acquireSql(ck, () => {
+    const buildSql = () => {
       const freshParams: unknown[] = [];
       const setEntries = Object.entries(dataObj).filter(([, v]) => v !== undefined);
       const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, freshParams));
+
+      if (lock) {
+        const versionCol = this.toSqlColumn(lock.field);
+        setClauses.push(`${versionCol} = ${versionCol} + 1`);
+      }
+
       const whereClause = this.buildWhereClause(whereObj, freshParams);
-      const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
+      let whereSql = whereClause ? ` WHERE ${whereClause}` : '';
+
+      if (lock) {
+        const versionCol = this.toSqlColumn(lock.field);
+        freshParams.push(lock.expected);
+        const versionCheck = `${versionCol} = ${this.p(freshParams.length)}`;
+        whereSql = whereSql ? `${whereSql} AND ${versionCheck}` : ` WHERE ${versionCheck}`;
+      }
+
       this.assertMutationHasPredicate('update', whereSql, args.allowFullTableScan);
       return `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}${this.dialect.buildReturningClause('*')}`;
-    });
+    };
 
-    // On cache hit, validate predicate
-    if (whereFp === '') {
-      this.assertMutationHasPredicate('update', '', args.allowFullTableScan);
+    let sql: string;
+    let preparedName: string | undefined;
+
+    if (ck) {
+      const entry = this.acquireSql(ck, buildSql);
+      sql = entry.sql;
+      preparedName = entry.name;
+      if (whereFp === '') {
+        this.assertMutationHasPredicate('update', '', args.allowFullTableScan);
+      }
+    } else {
+      sql = buildSql();
     }
 
-    // Collect params: SET first, then WHERE (same order as fresh build)
+    // Collect params: SET first, then WHERE, then version check (same order as fresh build)
     this.collectSetParams(dataObj, params);
     this.collectWhereParams(whereObj, params);
+    if (lock) {
+      params.push(lock.expected);
+    }
 
     return {
-      sql: entry.sql,
+      sql,
       params,
       transform: (result) => {
         const row = result.rows[0];
         if (!row) {
+          if (lock) {
+            throw new OptimisticLockError({
+              table: this.table,
+              versionField: lock.field,
+              expectedVersion: lock.expected,
+            });
+          }
           throw new NotFoundError({
             table: this.table,
             where: args.where,
@@ -1106,7 +1209,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.update`,
-      preparedName: entry.name,
+      preparedName,
     };
   }
 
@@ -1960,6 +2063,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      // Text search filter
+      if (typeof value === 'object' && !Array.isArray(value) && isTextSearchFilter(value as TextSearchFilter)) {
+        const cfg = (value as TextSearchFilter).config ?? 'english';
+        parts.push(`${key}:fts(${cfg})`);
+        continue;
+      }
+
       // Plain equality
       parts.push(`${key}:eq`);
     }
@@ -2079,6 +2189,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
           this.collectArrayFilterParams(value, params);
           continue;
         }
+      }
+
+      // Text search filter
+      if (typeof value === 'object' && !Array.isArray(value) && isTextSearchFilter(value)) {
+        params.push(value.search);
+        continue;
       }
 
       // Operator objects
@@ -2477,6 +2593,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
               `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
           );
         }
+      }
+
+      // Handle full-text search filter
+      if (typeof value === 'object' && !Array.isArray(value) && isTextSearchFilter(value)) {
+        const tsClause = this.buildTextSearchClause(column, value, params);
+        andClauses.push(tsClause);
+        continue;
       }
 
       // Handle operator objects
@@ -3225,6 +3348,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     return clauses;
+  }
+
+  /**
+   * Build SQL clause for full-text search using to_tsvector @@ to_tsquery.
+   * The config name is validated to prevent injection (only alphanumeric + underscore).
+   */
+  private buildTextSearchClause(column: string, filter: TextSearchFilter, params: unknown[]): string {
+    const config = filter.config ?? 'english';
+    if (!validateTextSearchConfig(config)) {
+      throw new ValidationError(
+        `[turbine] Invalid text search config "${config}": only alphanumeric characters and underscores are allowed.`,
+      );
+    }
+    params.push(filter.search);
+    return `to_tsvector('${config}', ${column}) @@ to_tsquery('${config}', ${this.p(params.length)})`;
   }
 
   /**
