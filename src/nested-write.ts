@@ -3,8 +3,8 @@
  *
  * Tree-walking create/update that resolves relation fields in `data` into
  * batched SQL operations within a transaction. Supports create, connect,
- * connectOrCreate, disconnect, set, and delete on related records at
- * arbitrary depth (capped at 10).
+ * connectOrCreate, disconnect, set, delete, update, and upsert on related
+ * records at arbitrary depth (capped at 10).
  *
  * This module is imported by `query/builder.ts` when the `data` argument
  * of `create()` or `update()` contains relation fields. It never imports
@@ -19,7 +19,7 @@ import { normalizeKeyColumns } from './schema.js';
 const MAX_DEPTH = 10;
 
 const CREATE_ONLY_OPS = new Set(['create', 'connect', 'connectOrCreate']);
-const UPDATE_ONLY_OPS = new Set(['disconnect', 'set', 'delete']);
+const UPDATE_ONLY_OPS = new Set(['disconnect', 'set', 'delete', 'update', 'upsert']);
 
 // ---------------------------------------------------------------------------
 // Public helper types
@@ -150,7 +150,7 @@ function validateOps(relationName: string, ops: Record<string, unknown>, isUpdat
     if (!CREATE_ONLY_OPS.has(opName) && !UPDATE_ONLY_OPS.has(opName)) {
       throw new ValidationError(
         `[turbine] Unknown nested write operation "${opName}" on relation "${relationName}". ` +
-          `Valid operations: create, connect, connectOrCreate${isUpdate ? ', disconnect, set, delete' : ''}.`,
+          `Valid operations: create, connect, connectOrCreate${isUpdate ? ', disconnect, set, delete, update, upsert' : ''}.`,
       );
     }
     if (!isUpdate && UPDATE_ONLY_OPS.has(opName)) {
@@ -314,8 +314,28 @@ export async function executeNestedUpdate(
       if (ops.delete !== undefined) {
         await processDelete(ctx, rel, ops.delete);
       }
+
+      // update
+      if (ops.update !== undefined) {
+        await processNestedUpdate(ctx, rel, ops.update);
+      }
+
+      // upsert
+      if (ops.upsert !== undefined) {
+        await processNestedUpsert(ctx, rel, ops.upsert, parentRow);
+      }
     } else if (rel.type === 'belongsTo') {
       await processBelongsToCreate(ctx, rel, ops, parentRow, tableName, depth, path, relName);
+
+      // update (belongsTo — derive where from parent FK)
+      if (ops.update !== undefined) {
+        await processBelongsToUpdate(ctx, rel, ops.update, parentRow, tableName);
+      }
+
+      // upsert (belongsTo)
+      if (ops.upsert !== undefined) {
+        await processBelongsToUpsert(ctx, rel, ops.upsert, parentRow, tableName);
+      }
 
       if (ops.disconnect !== undefined) {
         // For belongsTo disconnect, null out the FK on the parent
@@ -618,6 +638,122 @@ async function processSet(
   }
   for (const target of setItems) {
     await ctx.tx.table(rel.to).update({ where: target, data: updateData });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// update / upsert operations (update-context only)
+// ---------------------------------------------------------------------------
+
+async function processNestedUpdate(ctx: NestedWriteContext, rel: RelationDef, updateArg: unknown): Promise<void> {
+  const items = toArray(
+    updateArg as
+      | { where: Record<string, unknown>; data: Record<string, unknown> }
+      | { where: Record<string, unknown>; data: Record<string, unknown> }[],
+  );
+  for (const item of items) {
+    if (!item.where || !item.data) {
+      throw new ValidationError(`[turbine] Nested update on "${rel.name}" requires both "where" and "data" fields.`);
+    }
+    await ctx.tx.table(rel.to).update({ where: item.where, data: item.data });
+  }
+}
+
+async function processNestedUpsert(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  upsertArg: unknown,
+  parentRow: Record<string, unknown>,
+): Promise<void> {
+  const items = toArray(
+    upsertArg as
+      | { where: Record<string, unknown>; create: Record<string, unknown>; update: Record<string, unknown> }
+      | { where: Record<string, unknown>; create: Record<string, unknown>; update: Record<string, unknown> }[],
+  );
+  for (const item of items) {
+    if (!item.where || !item.create || !item.update) {
+      throw new ValidationError(
+        `[turbine] Nested upsert on "${rel.name}" requires "where", "create", and "update" fields.`,
+      );
+    }
+    const existing = await ctx.tx.table(rel.to).findUnique({ where: item.where });
+    if (existing) {
+      await ctx.tx.table(rel.to).update({ where: item.where, data: item.update });
+    } else {
+      const injected = injectForeignKey(item.create, rel, parentRow, ctx.schema);
+      await ctx.tx.table(rel.to).create({ data: injected });
+    }
+  }
+}
+
+async function processBelongsToUpdate(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  updateArg: unknown,
+  parentRow: Record<string, unknown>,
+  parentTable: string,
+): Promise<void> {
+  const item = updateArg as { data: Record<string, unknown> };
+  if (!item.data) {
+    throw new ValidationError(`[turbine] Nested update on belongsTo "${rel.name}" requires a "data" field.`);
+  }
+
+  // Derive where from parent's FK values
+  const fks = normalizeKeyColumns(rel.foreignKey);
+  const refs = normalizeKeyColumns(rel.referenceKey);
+  const parentMeta = ctx.schema.tables[parentTable];
+  const relatedTable = ctx.schema.tables[rel.to];
+
+  const where: Record<string, unknown> = {};
+  for (let i = 0; i < fks.length; i++) {
+    const fkField = parentMeta?.reverseColumnMap[fks[i]!] ?? fks[i]!;
+    const refField = relatedTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
+    where[refField] = parentRow[fkField];
+  }
+
+  await ctx.tx.table(rel.to).update({ where, data: item.data });
+}
+
+async function processBelongsToUpsert(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  upsertArg: unknown,
+  parentRow: Record<string, unknown>,
+  parentTable: string,
+): Promise<void> {
+  const item = upsertArg as {
+    where: Record<string, unknown>;
+    create: Record<string, unknown>;
+    update: Record<string, unknown>;
+  };
+  if (!item.where || !item.create || !item.update) {
+    throw new ValidationError(
+      `[turbine] Nested upsert on belongsTo "${rel.name}" requires "where", "create", and "update" fields.`,
+    );
+  }
+
+  const existing = await ctx.tx.table(rel.to).findUnique({ where: item.where });
+  if (existing) {
+    await ctx.tx.table(rel.to).update({ where: item.where, data: item.update });
+  } else {
+    // Create the related row, then update parent's FK to point at it
+    const createdRow = (await ctx.tx.table(rel.to).create({ data: item.create })) as Record<string, unknown>;
+
+    const fks = normalizeKeyColumns(rel.foreignKey);
+    const refs = normalizeKeyColumns(rel.referenceKey);
+    const parentMeta = ctx.schema.tables[parentTable]!;
+    const relatedTable = ctx.schema.tables[rel.to];
+
+    const updateData: Record<string, unknown> = {};
+    for (let i = 0; i < fks.length; i++) {
+      const fkField = parentMeta.reverseColumnMap[fks[i]!] ?? fks[i]!;
+      const refField = relatedTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
+      updateData[fkField] = createdRow[refField];
+    }
+    await ctx.tx.table(parentTable).update({
+      where: pkWhere(parentMeta, parentRow),
+      data: updateData,
+    });
   }
 }
 

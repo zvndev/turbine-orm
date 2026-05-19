@@ -105,6 +105,8 @@ export {
   hasRelationFields,
   type NestedWriteContext,
 } from './nested-write.js';
+// Observability
+export type { ObserveConfig, ObserveHandle } from './observe.js';
 // Pipeline
 export { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 // Query builder
@@ -129,6 +131,8 @@ export {
   type NestedUpdateOp,
   type OmitResult,
   type OrderDirection,
+  type QueryEvent,
+  type QueryEventListener,
   QueryInterface,
   type QueryResult,
   type RelationDescriptor,

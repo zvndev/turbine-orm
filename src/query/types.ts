@@ -269,9 +269,9 @@ export type QueryResult<
     ? Pick<WithResult<T, R, W>, Extract<keyof T, TrueKeys<S>> | Exclude<keyof WithResult<T, R, W>, keyof T>>
     : WithResult<T, R, W>;
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
 export interface FindUniqueArgs<
   T,
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
   R extends object = {},
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,
@@ -285,9 +285,9 @@ export interface FindUniqueArgs<
   timeout?: number;
 }
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
 export interface FindManyArgs<
   T,
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
   R extends object = {},
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,
@@ -310,9 +310,9 @@ export interface FindManyArgs<
   timeout?: number;
 }
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
 export interface FindManyStreamArgs<
   T,
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
   R extends object = {},
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,

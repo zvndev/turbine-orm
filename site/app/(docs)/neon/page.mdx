@@ -1,0 +1,89 @@
+export const metadata = {
+  title: 'Turbine + Neon in 60 Seconds',
+  description:
+    'Get Turbine ORM running on Neon in under a minute. Node.js, serverless, edge — one API, zero bloat.',
+  alternates: { canonical: '/neon' },
+};
+
+# Turbine + Neon
+
+From zero to typed queries on Neon — Node.js or edge, same API.
+
+## 1. Install
+
+```bash
+npm install turbine-orm @neondatabase/serverless
+```
+
+## 2. Generate your client
+
+Point Turbine at your Neon database and generate a fully-typed client:
+
+```bash
+DATABASE_URL="postgresql://..." npx turbine generate
+```
+
+This introspects your schema and writes typed accessors to `./generated/turbine/`.
+
+## 3. Connect (Node.js / long-running server)
+
+For traditional Node.js servers, Express, Fastify, or any long-running process:
+
+```ts
+import { turbine } from './generated/turbine';
+
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+});
+
+const users = await db.users.findMany({
+  with: { posts: true },
+});
+```
+
+## 4. Connect (Serverless / Edge)
+
+For Vercel Edge, Cloudflare Workers, Deno Deploy, or any serverless runtime:
+
+```ts
+import { Pool } from '@neondatabase/serverless';
+import { turbineHttp } from 'turbine-orm/serverless';
+import { SCHEMA } from './generated/turbine/metadata';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const db = turbineHttp(pool, SCHEMA);
+
+// Same API — works on Vercel Edge, Cloudflare Workers, etc.
+const users = await db.users.findMany({
+  with: { posts: true },
+});
+```
+
+## 5. Migrations
+
+SQL-first migrations with no shadow database and no proprietary schema DSL:
+
+```bash
+# Create a migration
+npx turbine migrate create add_users_table
+
+# Apply migrations
+DATABASE_URL="..." npx turbine migrate up
+
+# Check status
+npx turbine migrate status
+```
+
+## Why Turbine on Neon?
+
+- **110 KB** — fits in Cloudflare Workers' 1 MB limit (Prisma: 1.6 MB)
+- **Single-query nested reads** — one SQL statement via `json_agg`, not N+1
+- **Pipeline batching** — N queries in 1 round-trip (critical for high-latency serverless)
+- **No adapter layer** — `turbineHttp(pool, schema)` with any pg-compatible driver
+- **SQL-first migrations** — no shadow database, no proprietary schema DSL
+
+## Next steps
+
+- **[Serverless & Edge](/serverless)** — full guide for Neon, Vercel Postgres, Cloudflare, Supabase
+- **[Transactions & Pipelines](/transactions)** — pipelines are the highest-leverage edge optimization
+- **[Quick Start](/quickstart)** — the complete getting-started walkthrough

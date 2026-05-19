@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.16.0 (2026-05-18)
+
+**Feature release: observability, nested write update/upsert, is/isNot relation filters, cursor pagination tests, Neon guide.**
+
+### Added
+- **Event emitter** — `db.$on('query', fn)` and `db.$off('query', fn)` fire after every query with SQL text, params, duration, model, action, and row count. Param redaction in safe mode. Listener errors never crash queries.
+- **Observability module** — `db.$observe({ connectionString })` buffers per-minute aggregated metrics (count, avg, p50, p95, p99, errors) and flushes to a dedicated `_turbine_metrics` table in a separate database. Non-blocking (fire-and-forget), 1-connection pool, configurable retention. Auto-starts from `TURBINE_OBSERVE_URL` env var.
+- **`turbine observe` CLI** — local read-only dashboard for viewing query metrics. Same security model as Studio (loopback binding, 192-bit token, HttpOnly cookies, CSP, X-Frame-Options: DENY). Dark-theme SVG charts, top models table, error rates, time range selector.
+- **Nested write `update`** — `{ posts: { update: { where: { id: 1 }, data: { title: 'new' } } } }` in `update()` context. Array form supported. BelongsTo derives where from parent FK automatically.
+- **Nested write `upsert`** — `{ posts: { upsert: { where: { id: 1 }, create: {...}, update: {...} } } }`. Checks existence, creates with FK injection or updates.
+- **`is`/`isNot` relation filters** — for to-one relations (belongsTo/hasOne): `where: { author: { is: { name: 'Alice' } } }`. Generates EXISTS/NOT EXISTS subqueries.
+- **Neon guide** — `/neon` page on turbineorm.dev: "Turbine + Neon in 60 Seconds" covering install, generate, Node.js + serverless connections, migrations, and why Turbine on Neon.
+
+### Fixed
+- All Biome lint violations resolved — `npm run lint` now exits clean.
+
+### Tests
+- 812 unit tests (up from 711), all passing.
+- Added test suites: `event-emitter` (10), `observe` (12), `nested-write-update-upsert` (15), `is-isNot-filter` (6), `cursor-pagination` (7), `client-branches` (17).
+
+---
+
 ## 0.15.0 (2026-05-17)
 
 **Feature release: select/omit type narrowing, optimistic locking, full-text search, retry utility, security hardening.**

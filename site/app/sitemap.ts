@@ -5,6 +5,7 @@ const SITE = 'https://turbineorm.dev';
 const ROUTES = [
   '',
   '/quickstart',
+  '/neon',
   '/migrate-from-prisma',
   '/migrate-from-drizzle',
   '/queries',

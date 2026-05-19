@@ -25,8 +25,15 @@
 import pg from 'pg';
 import type { Dialect } from './dialect.js';
 import { type ErrorMessageMode, setErrorMessageMode, TimeoutError, wrapPgError } from './errors.js';
+import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
-import { type DeferredQuery, QueryInterface, type QueryInterfaceOptions } from './query/index.js';
+import {
+  type DeferredQuery,
+  type QueryEvent,
+  type QueryEventListener,
+  QueryInterface,
+  type QueryInterfaceOptions,
+} from './query/index.js';
 import type { SchemaMetadata } from './schema.js';
 
 // ---------------------------------------------------------------------------
@@ -357,7 +364,9 @@ export class TurbineClient {
   private readonly logging: boolean;
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private readonly middlewares: Middleware[] = [];
-  private readonly queryOptions: QueryInterfaceOptions;
+  private readonly queryListeners = new Set<QueryEventListener>();
+  private queryOptions: QueryInterfaceOptions;
+  private readonly errorMessagesSafe: boolean;
   /** True when Turbine created the pool and is responsible for tearing it down */
   private readonly ownsPool: boolean = true;
 
@@ -394,12 +403,25 @@ export class TurbineClient {
     // Respect env var kill switch
     const envDisablePrepared = typeof process !== 'undefined' && process.env?.TURBINE_DISABLE_PREPARED === '1';
 
+    this.errorMessagesSafe = (config.errorMessages ?? 'safe') === 'safe';
+
     this.queryOptions = {
       defaultLimit: config.defaultLimit,
       warnOnUnlimited: config.warnOnUnlimited,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
       sqlCache: config.sqlCache ?? true,
       dialect: config.dialect,
+      _onQuery: (event: QueryEvent) => {
+        if (this.queryListeners.size === 0) return;
+        const emitted = this.errorMessagesSafe ? { ...event, params: event.params.map(() => '[REDACTED]') } : event;
+        for (const listener of this.queryListeners) {
+          try {
+            listener(emitted);
+          } catch (e) {
+            if (this.logging) console.error('[turbine] Query listener error:', e);
+          }
+        }
+      },
     };
 
     // Apply NotFoundError message redaction mode (default: safe — values are
@@ -460,6 +482,12 @@ export class TurbineClient {
         });
       }
     }
+
+    // Auto-start observability from env var
+    const observeUrl = typeof process !== 'undefined' ? process.env?.TURBINE_OBSERVE_URL : undefined;
+    if (observeUrl) {
+      this.$observe({ connectionString: observeUrl }).catch(() => {});
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -501,6 +529,42 @@ export class TurbineClient {
     this.middlewares.push(middleware);
     // Clear table cache so new QueryInterfaces pick up the middleware
     this.tableCache.clear();
+  }
+
+  // -------------------------------------------------------------------------
+  // Event emitter — subscribe to query lifecycle events
+  // -------------------------------------------------------------------------
+
+  $on(_event: 'query', listener: QueryEventListener): void {
+    this.queryListeners.add(listener);
+  }
+
+  $off(_event: 'query', listener: QueryEventListener): void {
+    this.queryListeners.delete(listener);
+  }
+
+  // -------------------------------------------------------------------------
+  // Observability — automatic metrics collection
+  // -------------------------------------------------------------------------
+
+  private observeEngine?: ObserveEngine;
+
+  async $observe(config: ObserveConfig): Promise<ObserveHandle> {
+    if (this.observeEngine) {
+      await this.observeEngine.stop();
+      this.$off('query', this.observeEngine.getListener());
+    }
+    const engine = new ObserveEngine(config);
+    this.observeEngine = engine;
+    await engine.init();
+    this.$on('query', engine.getListener());
+    return {
+      stop: async () => {
+        this.$off('query', engine.getListener());
+        await engine.stop();
+        if (this.observeEngine === engine) this.observeEngine = undefined;
+      },
+    };
   }
 
   // -------------------------------------------------------------------------

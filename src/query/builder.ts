@@ -211,6 +211,20 @@ export type MiddlewareFn = (
   next: (params: { model: string; action: string; args: Record<string, unknown> }) => Promise<unknown>,
 ) => Promise<unknown>;
 
+/** Emitted after every query execution (success or failure). */
+export interface QueryEvent {
+  sql: string;
+  params: unknown[];
+  duration: number;
+  model: string;
+  action: string;
+  rows: number;
+  timestamp: Date;
+  error?: Error;
+}
+
+export type QueryEventListener = (event: QueryEvent) => void;
+
 /** Options passed from TurbineClient to QueryInterface */
 export interface QueryInterfaceOptions {
   /** Default LIMIT applied to findMany() when no limit is specified */
@@ -244,6 +258,8 @@ export interface QueryInterfaceOptions {
   dialect?: Dialect;
   /** @internal Set by TransactionClient — signals that this QI runs inside an active transaction. */
   _txScoped?: boolean;
+  /** @internal Callback from TurbineClient for query event emission. */
+  _onQuery?: (event: QueryEvent) => void;
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional for untyped table access
@@ -283,6 +299,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /** Original options reference — forwarded to child QIs in nested writes. */
   private readonly options?: QueryInterfaceOptions;
+
+  /** Set by executeWithMiddleware so queryWithTimeout can include it in events. */
+  private currentAction = 'raw';
 
   constructor(
     private readonly pool: pg.Pool,
@@ -379,6 +398,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.warnedTables.clear();
   }
 
+  private emitQueryEvent(
+    sql: string,
+    params: unknown[],
+    duration: number,
+    action: string,
+    rows: number,
+    error?: Error,
+  ): void {
+    const onQuery = this.options?._onQuery;
+    if (!onQuery) return;
+    try {
+      onQuery({ sql, params, duration, model: this.table, action, rows, timestamp: new Date(), error });
+    } catch {
+      // Listener errors must never crash a query
+    }
+  }
+
   /**
    * Execute a pool.query with an optional timeout.
    * If timeout is set, races the query against a timer and rejects on expiry.
@@ -390,6 +426,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     timeout?: number,
     preparedName?: string,
   ): Promise<pg.QueryResult> {
+    const start = performance.now();
+    const action = this.currentAction;
     // Build the query argument — use object form with `name` for prepared
     // statements, or the plain (text, values) form otherwise.
     const usePrepared = preparedName && this.preparedStatementsEnabled;
@@ -399,9 +437,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     if (!timeout) {
       try {
-        return await exec;
+        const result = await exec;
+        this.emitQueryEvent(sql, params, performance.now() - start, action, result.rowCount ?? 0);
+        return result;
       } catch (err) {
-        throw wrapPgError(err);
+        const wrapped = wrapPgError(err);
+        this.emitQueryEvent(
+          sql,
+          params,
+          performance.now() - start,
+          action,
+          0,
+          wrapped instanceof Error ? wrapped : undefined,
+        );
+        throw wrapped;
       }
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -409,9 +458,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
       timer = setTimeout(() => reject(new TimeoutError(timeout)), timeout);
     });
     try {
-      return await Promise.race([exec, timeoutPromise]);
+      const result = await Promise.race([exec, timeoutPromise]);
+      this.emitQueryEvent(sql, params, performance.now() - start, action, result.rowCount ?? 0);
+      return result;
     } catch (err) {
-      throw wrapPgError(err);
+      const wrapped = wrapPgError(err);
+      this.emitQueryEvent(
+        sql,
+        params,
+        performance.now() - start,
+        action,
+        0,
+        wrapped instanceof Error ? wrapped : undefined,
+      );
+      throw wrapped;
     } finally {
       clearTimeout(timer);
     }
@@ -431,6 +491,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     args: Record<string, unknown>,
     executor: () => Promise<R>,
   ): Promise<R> {
+    this.currentAction = action;
     if (this.middlewares.length === 0) {
       return executor();
     }
@@ -455,8 +516,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findUnique
   // -------------------------------------------------------------------------
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findUnique<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -580,8 +641,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findMany
   // -------------------------------------------------------------------------
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findMany<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -809,8 +870,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * }
    * ```
    */
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async *findManyStream<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -830,6 +891,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       Record<string, boolean> | undefined
     >);
 
+    this.currentAction = 'findManyStream';
     const speculativeResult = await this.queryWithTimeout(
       speculativeDeferred.sql,
       speculativeDeferred.params,
@@ -899,8 +961,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findFirst — like findMany but returns a single row or null
   // -------------------------------------------------------------------------
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findFirst<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -941,8 +1003,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findFirstOrThrow — like findFirst but throws if no record found
   // -------------------------------------------------------------------------
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findFirstOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -982,8 +1044,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // findUniqueOrThrow — like findUnique but throws if no record found
   // -------------------------------------------------------------------------
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
   async findUniqueOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -2020,7 +2082,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const relDef = this.tableMeta.relations[key];
       if (relDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
         const filterObj = value as Record<string, unknown>;
-        if ('some' in filterObj || 'every' in filterObj || 'none' in filterObj) {
+        if (
+          'some' in filterObj ||
+          'every' in filterObj ||
+          'none' in filterObj ||
+          'is' in filterObj ||
+          'isNot' in filterObj
+        ) {
           const relParts: string[] = [];
           if (filterObj.some !== undefined)
             relParts.push(`some(${this.fingerprintRelFilter(relDef.to, filterObj.some as Record<string, unknown>)})`);
@@ -2028,6 +2096,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
             relParts.push(`every(${this.fingerprintRelFilter(relDef.to, filterObj.every as Record<string, unknown>)})`);
           if (filterObj.none !== undefined)
             relParts.push(`none(${this.fingerprintRelFilter(relDef.to, filterObj.none as Record<string, unknown>)})`);
+          if (filterObj.is !== undefined)
+            relParts.push(`is(${this.fingerprintRelFilter(relDef.to, filterObj.is as Record<string, unknown>)})`);
+          if (filterObj.isNot !== undefined)
+            relParts.push(`isNot(${this.fingerprintRelFilter(relDef.to, filterObj.isNot as Record<string, unknown>)})`);
           parts.push(`${key}:{${relParts.join(',')}}`);
           continue;
         }
@@ -2157,13 +2229,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const relationDef = this.tableMeta.relations[key];
       if (relationDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
         const filterObj = value as Record<string, unknown>;
-        if ('some' in filterObj || 'every' in filterObj || 'none' in filterObj) {
+        if (
+          'some' in filterObj ||
+          'every' in filterObj ||
+          'none' in filterObj ||
+          'is' in filterObj ||
+          'isNot' in filterObj
+        ) {
           if (filterObj.some !== undefined)
             this.collectRelFilterParams(relationDef.to, filterObj.some as Record<string, unknown>, params);
           if (filterObj.none !== undefined)
             this.collectRelFilterParams(relationDef.to, filterObj.none as Record<string, unknown>, params);
           if (filterObj.every !== undefined)
             this.collectRelFilterParams(relationDef.to, filterObj.every as Record<string, unknown>, params);
+          if (filterObj.is !== undefined)
+            this.collectRelFilterParams(relationDef.to, filterObj.is as Record<string, unknown>, params);
+          if (filterObj.isNot !== undefined)
+            this.collectRelFilterParams(relationDef.to, filterObj.isNot as Record<string, unknown>, params);
           continue;
         }
       }
@@ -2537,7 +2619,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (relationDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
         const filterObj = value as Record<string, unknown>;
         // Check if this is a relation filter (has some/every/none keys)
-        if ('some' in filterObj || 'every' in filterObj || 'none' in filterObj) {
+        if (
+          'some' in filterObj ||
+          'every' in filterObj ||
+          'none' in filterObj ||
+          'is' in filterObj ||
+          'isNot' in filterObj
+        ) {
           const relClause = this.buildRelationFilter(key, relationDef, filterObj, params);
           if (relClause) andClauses.push(relClause);
           continue;
@@ -2671,6 +2759,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
       } else {
         // "every" with empty filter = true (all match trivially)
       }
+    }
+
+    // "is": EXISTS — for to-one relations (same SQL as "some")
+    if (filterObj.is !== undefined) {
+      const subWhere = filterObj.is as Record<string, unknown>;
+      const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
+      const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
+      clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+    }
+
+    // "isNot": NOT EXISTS — for to-one relations (same SQL as "none")
+    if (filterObj.isNot !== undefined) {
+      const subWhere = filterObj.isNot as Record<string, unknown>;
+      const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
+      const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
+      clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
     }
 
     return clauses.length > 0 ? clauses.join(' AND ') : null;

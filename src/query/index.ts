@@ -82,5 +82,5 @@ export {
 // Builder (runtime values + types)
 // ---------------------------------------------------------------------------
 
-export type { DeferredQuery, MiddlewareFn, QueryInterfaceOptions } from './builder.js';
+export type { DeferredQuery, MiddlewareFn, QueryEvent, QueryEventListener, QueryInterfaceOptions } from './builder.js';
 export { QueryInterface } from './builder.js';

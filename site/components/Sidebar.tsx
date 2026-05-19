@@ -12,6 +12,7 @@ const sections: NavSection[] = [
     title: 'Getting Started',
     items: [
       { href: '/quickstart', label: 'Quick Start' },
+      { href: '/neon', label: 'Turbine + Neon' },
       { href: '/migrate-from-prisma', label: 'Migrate from Prisma' },
       { href: '/migrate-from-drizzle', label: 'Migrate from Drizzle' },
     ],

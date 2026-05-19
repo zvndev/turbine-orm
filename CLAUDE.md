@@ -67,6 +67,11 @@ src/
                       metadata.ts (runtime SchemaMetadata object), and
                       index.ts (typed TurbineClient subclass with table accessors).
 
+  observe.ts        — Observability module. Buffers per-minute query metrics in memory,
+                      flushes aggregates (count, avg, p50, p95, p99, errors) to a
+                      _turbine_metrics table in a separate database. Non-blocking via
+                      fire-and-forget INSERT with ON CONFLICT additive merge.
+
   pipeline.ts       — Batch query execution. Takes DeferredQuery[] and runs all SQL
                       in a single pg round-trip, then applies each query's transform.
 

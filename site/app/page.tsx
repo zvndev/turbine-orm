@@ -126,7 +126,7 @@ export default async function Home() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            v0.15 — optimistic locking, select/omit narrowing, full-text search
+            v0.16 — observability, nested write update/upsert, is/isNot filters
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
@@ -138,8 +138,8 @@ export default async function Home() {
           <p className="hero-subtitle animate-fade-in-up delay-2">
             The Postgres ORM that ships light and locks tight. One runtime
             dependency, a read-only Studio no other ORM has, and error messages
-            that never leak PII. v0.15 adds compile-time select/omit type narrowing,
-            optimistic locking, full-text search, and automatic retry with backoff.
+            that never leak PII. v0.16 adds built-in observability with a self-hosted
+            dashboard, nested write update/upsert, and is/isNot relation filters.
           </p>
 
           <div className="animate-fade-in-up delay-3">

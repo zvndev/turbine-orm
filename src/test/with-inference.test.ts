@@ -256,14 +256,17 @@ void callSiteInference;
 import type { QueryResult } from '../query/index.js';
 
 // --- Select narrows to only selected fields ---
+// biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — testing select/omit narrowing with empty relations
 type SelectId = QueryResult<User, UserRelations, {}, { id: true }, undefined>;
 assertTrue<Equals<SelectId, Pick<User, 'id'>>>();
 
 // --- Select with multiple fields ---
+// biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — testing select/omit narrowing with empty relations
 type SelectBoth = QueryResult<User, UserRelations, {}, { id: true; email: true }, undefined>;
 assertTrue<Equals<SelectBoth, User>>();
 
 // --- Omit removes specified fields ---
+// biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — testing select/omit narrowing with empty relations
 type OmitEmail = QueryResult<User, UserRelations, {}, undefined, { email: true }>;
 assertTrue<Equals<OmitEmail, Omit<User, 'email'>>>();
 

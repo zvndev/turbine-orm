@@ -31,6 +31,7 @@ const INJECTION_PAYLOADS = [
   '$$malicious$$',
   "E'\\x41'",
   'chr(65)||chr(66)',
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional template-like string to test SQL injection resistance
   '${process.env.SECRET}',
   '{{7*7}}',
   '`id`',

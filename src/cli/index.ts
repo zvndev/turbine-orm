@@ -13,6 +13,7 @@
  *   turbine seed                  — Run seed file
  *   turbine status                — Show schema summary
  *   turbine studio                — Launch local read-only web UI
+ *   turbine observe               — Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
  *
  * Usage:
  *   DATABASE_URL=postgres://... npx turbine generate
@@ -31,6 +32,7 @@ import type { CliOverrides, ResolvedConfig } from './config.js';
 import { configTemplate, findConfigFile, loadConfig, resolveConfig } from './config.js';
 import { needsTsLoader, registerTsLoader } from './loader.js';
 import { createMigration, listMigrationFiles, migrateDown, migrateStatus, migrateUp } from './migrate.js';
+import { startObserve } from './observe.js';
 import { startStudio } from './studio.js';
 import {
   banner,
@@ -1184,6 +1186,81 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Command: observe
+// ---------------------------------------------------------------------------
+
+async function cmdObserve(args: CliArgs): Promise<void> {
+  banner();
+
+  const url = process.env.TURBINE_OBSERVE_URL;
+  if (!url) {
+    error('TURBINE_OBSERVE_URL environment variable is required for the observe command.');
+    newline();
+    console.log(`  ${dim('Set it to the Postgres connection string where metrics are stored.')}`);
+    console.log(`  ${dim('Example:')} ${cyan('TURBINE_OBSERVE_URL=postgres://... npx turbine observe')}`);
+    newline();
+    process.exit(1);
+  }
+
+  const port = args.port ?? 4984;
+  const host = args.host ?? '127.0.0.1';
+  const openBrowser = !args.noOpen;
+
+  if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+    console.log(red(`✗ invalid port: ${args.port}`));
+    process.exit(1);
+  }
+
+  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+    console.log(
+      warn(
+        `Observe is binding to ${yellow(host)} — this is NOT loopback. ` +
+          `Anyone on your network who can reach this port + guess the session token can read your metrics.`,
+      ),
+    );
+  }
+
+  const spinner = new Spinner('Connecting to metrics database').start();
+  let handle: { dispose: () => Promise<void>; url: string };
+  try {
+    handle = await startObserve({ url, port, host, openBrowser });
+    spinner.succeed('Observe dashboard is running');
+  } catch (err) {
+    spinner.fail(`Failed to start Observe: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  newline();
+  console.log(
+    box(
+      [
+        `${bold('Turbine Observe')}  ${dim('— query metrics dashboard')}`,
+        '',
+        `  ${cyan('URL:')}  ${bold(handle.url)}`,
+        '',
+        dim('Open the URL above in your browser. Press Ctrl+C to stop.'),
+      ].join('\n'),
+      { title: bold(cyan('Observe')), padding: 1 },
+    ),
+  );
+  newline();
+
+  await new Promise<void>((resolve) => {
+    const shutdown = async () => {
+      console.log(dim('\n  shutting down…'));
+      try {
+        await handle.dispose();
+      } catch {
+        /* ignore */
+      }
+      resolve();
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Subcommand help
 // ---------------------------------------------------------------------------
 
@@ -1497,6 +1574,10 @@ async function main() {
 
       case 'studio':
         await cmdStudio(args, config);
+        break;
+
+      case 'observe':
+        await cmdObserve(args);
         break;
 
       default:

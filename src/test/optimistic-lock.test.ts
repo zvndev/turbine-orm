@@ -63,10 +63,10 @@ describe('optimistic locking', () => {
       optimisticLock: { field: 'version', expected: 2 },
     });
 
-    // biome-ignore lint/suspicious/noExplicitAny: mock pg result
     const result = deferred.transform({
       rows: [{ id: 1, title: 'updated', version: 3 }],
       rowCount: 1,
+      // biome-ignore lint/suspicious/noExplicitAny: mock pg result
     } as any);
     assert.deepEqual(result, { id: 1, title: 'updated', version: 3 });
   });
