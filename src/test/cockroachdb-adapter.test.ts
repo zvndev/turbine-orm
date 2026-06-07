@@ -135,15 +135,21 @@ describe('CockroachDB adapter', () => {
   });
 
   describe('statementTimeout', () => {
-    it('generates CockroachDB-specific timeout syntax', () => {
+    it('generates CockroachDB-specific timeout syntax via set_config', () => {
       const result = cockroachdb.statementTimeout!(30);
-      assert.equal(result.sql, 'SET transaction_timeout = $1');
+      assert.equal(result.sql, "SELECT set_config('transaction_timeout', $1, true)");
       assert.deepEqual(result.params, ['30s']);
     });
 
     it('handles different timeout values', () => {
-      assert.deepEqual(cockroachdb.statementTimeout!(5), { sql: 'SET transaction_timeout = $1', params: ['5s'] });
-      assert.deepEqual(cockroachdb.statementTimeout!(60), { sql: 'SET transaction_timeout = $1', params: ['60s'] });
+      assert.deepEqual(cockroachdb.statementTimeout!(5), {
+        sql: "SELECT set_config('transaction_timeout', $1, true)",
+        params: ['5s'],
+      });
+      assert.deepEqual(cockroachdb.statementTimeout!(60), {
+        sql: "SELECT set_config('transaction_timeout', $1, true)",
+        params: ['60s'],
+      });
     });
   });
 
@@ -193,9 +199,9 @@ describe('PostgreSQL adapter (default)', () => {
     assert.deepEqual(unlock!.values, [99]);
   });
 
-  it('generates standard statement_timeout', () => {
+  it('generates standard statement_timeout via set_config', () => {
     const result = postgresql.statementTimeout!(30);
-    assert.equal(result.sql, 'SET LOCAL statement_timeout = $1');
+    assert.equal(result.sql, "SELECT set_config('statement_timeout', $1, true)");
     assert.deepEqual(result.params, ['30s']);
   });
 });
@@ -218,9 +224,9 @@ describe('YugabyteDB adapter', () => {
     assert.ok(forUpdate, 'should use FOR UPDATE NOWAIT');
   });
 
-  it('generates standard PostgreSQL statement_timeout', () => {
+  it('generates standard PostgreSQL statement_timeout via set_config', () => {
     const result = yugabytedb.statementTimeout!(15);
-    assert.equal(result.sql, 'SET LOCAL statement_timeout = $1');
+    assert.equal(result.sql, "SELECT set_config('statement_timeout', $1, true)");
     assert.deepEqual(result.params, ['15s']);
   });
 

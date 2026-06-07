@@ -19,6 +19,7 @@
 - **Data:** 5 orgs, 1,000 users, 10,000 posts, 50,000 comments — deterministic, identical for every ORM
 - **Runs:** 100 iterations + 20 warmup per scenario (streaming scenario: 3 runs + 1 warmup because each run is ~3–5 seconds)
 - **Versions:** turbine-orm 0.7.1 · @prisma/client 7.6.0 (with `@prisma/adapter-pg`, `relationJoins` preview on) · drizzle-orm 0.45.0 (node-postgres relational API)
+- **Measured:** April 2026 on turbine-orm 0.7.1. The core read path (`findMany`/`findUnique` + `json_agg` nesting + SQL template cache) is unchanged through 0.17.0; later releases added write-side features (nested writes, optimistic locking, FTS, observability) that don't touch these scenarios. Re-validate before quoting as current — reproduce with `cd benchmarks && DATABASE_URL=… npx tsx bench.ts`.
 - **Pool:** plain `pg.Pool` size 10, same for Prisma adapter-pg and Drizzle; Turbine uses its internal pool at default size
 - **Network:** every query round-trips US-east → Neon pooler → US-east over TLS, ~33–40 ms floor
 

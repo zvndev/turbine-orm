@@ -1,28 +1,28 @@
 {
   "name": "turbine-orm",
-  "version": "0.16.0",
-  "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. 1 dependency, ~110KB",
+  "version": "0.17.0",
+  "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/cjs/index.js",
-      "types": "./dist/index.d.ts"
+      "require": "./dist/cjs/index.js"
     },
     "./serverless": {
+      "types": "./dist/serverless.d.ts",
       "import": "./dist/serverless.js",
-      "require": "./dist/cjs/serverless.js",
-      "types": "./dist/serverless.d.ts"
+      "require": "./dist/cjs/serverless.js"
     },
     "./cli": {
+      "types": "./dist/cli/config.d.ts",
       "import": "./dist/cli/config.js",
-      "require": "./dist/cjs/cli/config.js",
-      "types": "./dist/cli/config.d.ts"
+      "require": "./dist/cjs/cli/config.js"
     },
     "./adapters": {
+      "types": "./dist/adapters/index.d.ts",
       "import": "./dist/adapters/index.js",
-      "require": "./dist/cjs/adapters/index.js",
-      "types": "./dist/adapters/index.d.ts"
+      "require": "./dist/cjs/adapters/index.js"
     }
   },
   "main": "./dist/cjs/index.js",
@@ -50,7 +50,7 @@
     "examples": "tsx examples/examples.ts",
     "test": "tsx --test src/test/*.test.ts",
     "test:unit": "tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts src/test/pipeline-submittable.test.ts src/test/with-inference.test.ts src/test/operator-validation.test.ts src/test/unlimited-warning.test.ts src/test/generate-relations.test.ts src/test/stream-and-parse.test.ts src/test/sql-cache.test.ts src/test/dialect.test.ts src/test/studio.test.ts src/test/sql-injection.test.ts src/test/cli-flags.test.ts src/test/cockroachdb-adapter.test.ts src/test/yugabytedb-adapter.test.ts src/test/pg-compat.test.ts src/test/relation-filter-validation.test.ts src/test/client-coverage.test.ts src/test/schema-diff.test.ts src/test/composite-fk.test.ts src/test/retry.test.ts src/test/text-search.test.ts src/test/optimistic-lock.test.ts src/test/sql-safety-property.test.ts src/test/nested-write.test.ts src/test/nested-write-update-upsert.test.ts src/test/cursor-pagination.test.ts src/test/client-branches.test.ts src/test/is-isNot-filter.test.ts src/test/event-emitter.test.ts src/test/observe.test.ts",
-    "test:coverage": "c8 tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts src/test/pipeline-submittable.test.ts src/test/with-inference.test.ts src/test/operator-validation.test.ts src/test/unlimited-warning.test.ts src/test/generate-relations.test.ts src/test/stream-and-parse.test.ts src/test/sql-cache.test.ts src/test/dialect.test.ts src/test/studio.test.ts src/test/sql-injection.test.ts src/test/cli-flags.test.ts",
+    "test:coverage": "c8 tsx --test src/test/*.test.ts",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
@@ -74,17 +74,18 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@types/pg": "^8.11.11",
     "pg": "^8.13.1"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.10",
-    "@size-limit/file": "^12.0.1",
+    "@size-limit/esbuild": "^12.1.0",
+    "@size-limit/file": "^12.1.0",
     "@types/node": "^22.10.0",
-    "@types/pg": "^8.11.11",
     "c8": "^11.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
-    "size-limit": "^12.0.1",
+    "size-limit": "^12.1.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },

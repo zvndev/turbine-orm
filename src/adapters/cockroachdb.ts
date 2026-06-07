@@ -182,7 +182,9 @@ export const cockroachdb: DatabaseAdapter = {
   } satisfies Partial<IntrospectionOverrides>,
 
   statementTimeout(seconds: number): { sql: string; params: unknown[] } {
-    // CockroachDB v23.1+ supports transaction_timeout
-    return { sql: `SET transaction_timeout = $1`, params: [`${seconds}s`] };
+    // CockroachDB v23.1+ supports transaction_timeout. `SET ... = $1` cannot
+    // take a bind parameter, so use the parameterizable set_config() form
+    // (is_local=true scopes it to the current transaction).
+    return { sql: `SELECT set_config('transaction_timeout', $1, true)`, params: [`${seconds}s`] };
   },
 };

@@ -106,7 +106,10 @@ export const postgresql: DatabaseAdapter = {
   },
 
   statementTimeout(seconds) {
-    return { sql: `SET LOCAL statement_timeout = $1`, params: [`${seconds}s`] };
+    // `SET LOCAL ... = $1` is a Postgres syntax error — SET does not accept
+    // bind parameters. `set_config(name, value, is_local=true)` is the
+    // parameterizable, transaction-local equivalent.
+    return { sql: `SELECT set_config('statement_timeout', $1, true)`, params: [`${seconds}s`] };
   },
 };
 

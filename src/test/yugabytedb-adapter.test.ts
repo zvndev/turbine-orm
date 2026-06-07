@@ -187,16 +187,19 @@ describe('yugabytedb adapter', () => {
   });
 
   describe('statementTimeout', () => {
-    it('uses standard PostgreSQL SET LOCAL statement_timeout', () => {
+    it('uses set_config(statement_timeout, …, is_local) — SET LOCAL cannot take a bind param', () => {
       const result = yugabytedb.statementTimeout!(30);
-      assert.equal(result.sql, 'SET LOCAL statement_timeout = $1');
+      assert.equal(result.sql, "SELECT set_config('statement_timeout', $1, true)");
       assert.deepEqual(result.params, ['30s']);
     });
 
     it('handles different timeout values', () => {
-      assert.deepEqual(yugabytedb.statementTimeout!(5), { sql: 'SET LOCAL statement_timeout = $1', params: ['5s'] });
+      assert.deepEqual(yugabytedb.statementTimeout!(5), {
+        sql: "SELECT set_config('statement_timeout', $1, true)",
+        params: ['5s'],
+      });
       assert.deepEqual(yugabytedb.statementTimeout!(120), {
-        sql: 'SET LOCAL statement_timeout = $1',
+        sql: "SELECT set_config('statement_timeout', $1, true)",
         params: ['120s'],
       });
     });

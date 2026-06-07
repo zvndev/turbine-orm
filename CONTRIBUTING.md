@@ -21,7 +21,7 @@ npm run test:unit
 DATABASE_URL=postgres://turbine:turbine@localhost:54329/turbine_test npm test
 ```
 
-Unit tests cover schema building, migration parsing, DDL generation, SQL builder output, error mapping, and Studio guards. Integration tests require a seeded Postgres (5K users / 46K posts / 432K comments) — the `seed-test-db.sh` script starts `scripts/docker-compose.yml` and runs the benchmark seeder so outside contributors don't need their own database.
+Unit tests cover schema building, migration parsing, DDL generation, SQL builder output, error mapping, and Studio guards. Integration tests require a seeded Postgres. The small correctness fixture (`src/test/fixtures/seed.sql`, 5 users / 10 posts / 20 comments) is enough for the suite; the `benchmarks/seed-neon.ts` seeder (defaults to 1K users / 10K posts / 50K comments) is used for performance runs.
 
 Stop the DB when you're done:
 
@@ -56,18 +56,25 @@ npm run typecheck  # Type checking only
 ```
 src/
   client.ts         — Connection pool, transactions, middleware
-  query.ts          — SQL generation, WHERE clauses, json_agg nesting
+  query/             — SQL generation, split into submodules:
+    types.ts          — Public query arg types
+    utils.ts          — quoteIdent, escapeLike, LRUCache
+    builder.ts        — QueryInterface: WHERE clauses, json_agg nesting
+    index.ts          — Barrel re-export
+  nested-write.ts   — Tree-walking nested create/update engine
   schema.ts         — Type definitions, PG-to-TS mapping
   schema-builder.ts — defineSchema() API
   schema-sql.ts     — DDL generation, diff, push
   introspect.ts     — Database schema introspection
   generate.ts       — TypeScript code generation
   pipeline.ts       — Batch query execution
-  serverless.ts     — HTTP driver (in development)
-  cli/              — CLI commands (init, generate, migrate, etc.)
+  observe.ts        — Observability / query metrics
+  serverless.ts     — Edge/serverless driver binding (turbineHttp)
+  adapters/         — Dialect adapters (CockroachDB, YugabyteDB, …)
+  cli/              — CLI commands (init, generate, migrate, studio, etc.)
 ```
 
-The query builder (`query.ts`) is the core — it generates `json_agg` + `json_build_object` subqueries for nested relations, resolving entire object graphs in a single SQL statement.
+The query builder (`query/builder.ts`) is the core — it generates `json_agg` + `json_build_object` subqueries for nested relations, resolving entire object graphs in a single SQL statement.
 
 ## Reporting Bugs
 

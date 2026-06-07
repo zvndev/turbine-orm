@@ -167,9 +167,9 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 **Unit tests** run without a database. They use mock schemas from `src/test/helpers.ts` which provides `mockColumn()`, `mockTable()`, and `makeQuery()` (creates a QueryInterface with a null pool for build-only SQL tests).
 
-**Integration tests** need a PostgreSQL instance with seeded data. Set `DATABASE_URL` env var. The seed schema lives in `benchmarks/` and creates 5K users, 46K posts, and 432K comments. Tests that require a database use a `describe.skip` wrapper when `DATABASE_URL` is absent — they show as skipped, not failed.
+**Integration tests** need a PostgreSQL instance with seeded data. Set `DATABASE_URL` env var. The small correctness fixture is `src/test/fixtures/seed.sql` (5 users / 10 posts / 20 comments / 8 orgs). The larger benchmark seed lives in `benchmarks/seed-neon.ts` and defaults to 1K users / 10K posts / 50K comments (override via `USERS`/`POSTS_PER_USER`/`COMMENTS_PER_POST`). Tests that require a database use a `describe.skip` wrapper when `DATABASE_URL` is absent — they show as skipped, not failed.
 
-**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, and `src/index.ts`. Thresholds: 55% lines/functions/statements, 75% branches.
+**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, and `src/index.ts`. Thresholds: 65% lines, 70% functions, 82% branches, 65% statements.
 
 ## Key Patterns
 

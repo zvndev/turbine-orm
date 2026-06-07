@@ -250,7 +250,13 @@ export class UniqueConstraintError extends TurbineError {
       const constraintPart = constraint ? ` on ${constraint}` : '';
       const columnsPart = columns && columns.length > 0 ? ` (${columns.join(', ')})` : '';
       message = `[turbine] Unique constraint violation${constraintPart}${columnsPart}`;
-      const detail = detailFromCause(cause);
+      // PII-safe by default: the raw pg `detail` string contains the
+      // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
+      // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
+      // message carries keys/constraint/column names only — the structured
+      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
+      // the full detail for programmatic use.
+      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.UNIQUE_VIOLATION, message, { cause });
@@ -279,7 +285,13 @@ export class ForeignKeyError extends TurbineError {
     if (!message) {
       const constraintPart = constraint ? ` on ${constraint}` : '';
       message = `[turbine] Foreign key constraint violation${constraintPart}`;
-      const detail = detailFromCause(cause);
+      // PII-safe by default: the raw pg `detail` string contains the
+      // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
+      // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
+      // message carries keys/constraint/column names only — the structured
+      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
+      // the full detail for programmatic use.
+      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.FOREIGN_KEY_VIOLATION, message, { cause });
@@ -307,7 +319,13 @@ export class NotNullViolationError extends TurbineError {
     if (!message) {
       const columnPart = column ? ` on column "${column}"` : '';
       message = `[turbine] NOT NULL constraint violation${columnPart}`;
-      const detail = detailFromCause(cause);
+      // PII-safe by default: the raw pg `detail` string contains the
+      // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
+      // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
+      // message carries keys/constraint/column names only — the structured
+      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
+      // the full detail for programmatic use.
+      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.NOT_NULL_VIOLATION, message, { cause });
@@ -415,7 +433,13 @@ export class CheckConstraintError extends TurbineError {
     if (!message) {
       const constraintPart = constraint ? ` on ${constraint}` : '';
       message = `[turbine] Check constraint violation${constraintPart}`;
-      const detail = detailFromCause(cause);
+      // PII-safe by default: the raw pg `detail` string contains the
+      // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
+      // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
+      // message carries keys/constraint/column names only — the structured
+      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
+      // the full detail for programmatic use.
+      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.CHECK_VIOLATION, message, { cause });
@@ -442,7 +466,13 @@ export class ExclusionConstraintError extends TurbineError {
     if (!message) {
       const constraintPart = constraint ? ` on ${constraint}` : '';
       message = `[turbine] Exclusion constraint violation${constraintPart}`;
-      const detail = detailFromCause(cause);
+      // PII-safe by default: the raw pg `detail` string contains the
+      // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
+      // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
+      // message carries keys/constraint/column names only — the structured
+      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
+      // the full detail for programmatic use.
+      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.EXCLUSION_VIOLATION, message, { cause });

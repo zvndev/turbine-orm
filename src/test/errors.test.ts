@@ -423,10 +423,28 @@ describe('UniqueConstraintError', () => {
     assert.equal(err.cause, cause);
   });
 
-  it('appends pg detail to default message when cause has detail', () => {
-    const cause = { detail: 'Key (email)=(foo@bar) already exists.' };
-    const err = new UniqueConstraintError({ cause });
-    assert.ok(err.message.includes('Key (email)=(foo@bar) already exists.'));
+  it('does NOT append pg detail (which carries values) in safe mode — the default', () => {
+    const prev = getErrorMessageMode();
+    setErrorMessageMode('safe');
+    try {
+      const cause = { detail: 'Key (email)=(foo@bar) already exists.' };
+      const err = new UniqueConstraintError({ cause });
+      assert.ok(!err.message.includes('foo@bar'), 'the conflicting value must not leak into the message');
+    } finally {
+      setErrorMessageMode(prev);
+    }
+  });
+
+  it('appends pg detail to the message in verbose mode (opt-in)', () => {
+    const prev = getErrorMessageMode();
+    setErrorMessageMode('verbose');
+    try {
+      const cause = { detail: 'Key (email)=(foo@bar) already exists.' };
+      const err = new UniqueConstraintError({ cause });
+      assert.ok(err.message.includes('Key (email)=(foo@bar) already exists.'));
+    } finally {
+      setErrorMessageMode(prev);
+    }
   });
 
   it('honors explicit message override', () => {
@@ -901,5 +919,71 @@ describe('NotFoundError redaction modes', () => {
     } finally {
       restore();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PII-safe constraint error messages
+// ---------------------------------------------------------------------------
+
+describe('constraint errors are PII-safe by default', () => {
+  const withMode = (mode: 'safe' | 'verbose', fn: () => void) => {
+    const prev = getErrorMessageMode();
+    setErrorMessageMode(mode);
+    try {
+      fn();
+    } finally {
+      setErrorMessageMode(prev);
+    }
+  };
+
+  // A realistic pg 23505 error: the `detail` field carries the conflicting VALUE.
+  const pgUnique = {
+    code: '23505',
+    constraint: 'users_email_key',
+    table: 'users',
+    detail: 'Key (email)=(alice@secret.com) already exists.',
+    message: 'duplicate key value violates unique constraint "users_email_key"',
+  };
+  const pgNotNull = {
+    code: '23502',
+    column: 'email',
+    table: 'users',
+    detail: 'Failing row contains (14, 1, null, NoEmail, member).',
+    message: 'null value in column "email" violates not-null constraint',
+  };
+
+  it('safe mode: unique violation message contains the column key but NOT the value', () => {
+    withMode('safe', () => {
+      const err = wrapPgError(pgUnique) as UniqueConstraintError;
+      assert.ok(err instanceof UniqueConstraintError);
+      assert.ok(err.message.includes('email'), 'column name should be present');
+      assert.ok(!err.message.includes('alice@secret.com'), 'the conflicting VALUE must not leak into the message');
+      // Structured access still exposes the columns for programmatic use.
+      assert.deepEqual(err.columns, ['email']);
+    });
+  });
+
+  it('safe mode: not-null violation message does NOT dump the failing row', () => {
+    withMode('safe', () => {
+      const err = wrapPgError(pgNotNull) as NotNullViolationError;
+      assert.ok(err instanceof NotNullViolationError);
+      assert.ok(err.message.includes('email'));
+      assert.ok(!/Failing row contains|NoEmail/.test(err.message), 'the failing row must not leak into the message');
+    });
+  });
+
+  it('verbose mode (opt-in): the raw pg detail IS included', () => {
+    withMode('verbose', () => {
+      const err = wrapPgError(pgUnique) as UniqueConstraintError;
+      assert.ok(err.message.includes('alice@secret.com'), 'verbose mode intentionally surfaces the value');
+    });
+  });
+
+  it('the original pg error is preserved on .cause regardless of mode', () => {
+    withMode('safe', () => {
+      const err = wrapPgError(pgUnique) as UniqueConstraintError;
+      assert.equal((err.cause as { code?: string }).code, '23505');
+    });
   });
 });

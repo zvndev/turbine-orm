@@ -18,11 +18,13 @@ You will receive a response within 48 hours. We will work with you to understand
 
 ## Supported Versions
 
+Turbine is pre-1.0; security fixes land on the latest minor release.
+
 | Version | Supported |
 |---------|-----------|
-| 0.6.x   | Yes       |
-| 0.5.x   | Yes       |
-| < 0.5   | No        |
+| 0.17.x  | Yes       |
+| 0.16.x  | Yes       |
+| < 0.16  | No        |
 
 ## Security Measures
 
