@@ -4,9 +4,9 @@ import { codeToHtml } from 'shiki';
 import { CopyButton } from '../components/CopyButton';
 
 export const metadata: Metadata = {
-  title: 'Turbine ORM — 110 KB Postgres ORM. One dependency. Read-only Studio.',
+  title: 'Turbine ORM — Postgres ORM. One dependency, no WASM engine. Read-only Studio.',
   description:
-    'The Postgres ORM that ships 110 KB total. One runtime dependency (pg), built-in read-only Studio, PII-safe errors, SQL-first migrations with drift detection. No WASM engine, no adapter shims.',
+    'The Postgres ORM that ships one dependency (pg) and no engine binary. Built-in read-only Studio, PII-safe errors, SQL-first migrations with drift detection. No WASM engine, no adapter shims.',
 };
 
 const heroCode = `const users = await db.users.findMany({
@@ -43,9 +43,9 @@ WHERE "users"."org_id" = $1`;
 
 const features = [
   {
-    title: 'One dependency. 110 KB.',
+    title: 'One dependency. No WASM engine.',
     description:
-      'Turbine ships pg and nothing else. No WASM engine (Prisma: 1.6 MB), no adapter chain, no lockstep package upgrades. 110 KB on npm, 5 KB on the edge entry.',
+      'Turbine ships pg and nothing else. No WASM engine (Prisma: 1.6 MB), no adapter chain, no lockstep package upgrades. The main entry bundles to ~27 KB brotli, ~19 KB on the edge.',
     stat: '1',
     statLabel: 'runtime dep',
   },
@@ -74,8 +74,8 @@ const features = [
     title: 'Edge-native. One import swap.',
     description:
       'turbineHttp(pool, schema) — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step.',
-    stat: '5 KB',
-    statLabel: 'edge entry',
+    stat: '~19 KB',
+    statLabel: 'edge bundle (gzip)',
   },
   {
     title: 'Pipeline batching via wire protocol',
@@ -97,7 +97,7 @@ export default async function Home() {
     '@type': 'SoftwareApplication',
     name: 'Turbine ORM',
     description:
-      '110 KB Postgres ORM with one runtime dependency, built-in read-only Studio, PII-safe errors, and SQL-first migrations with drift detection.',
+      'Postgres ORM with one runtime dependency and no WASM engine, built-in read-only Studio, PII-safe errors, and SQL-first migrations with drift detection.',
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Any',
     url: 'https://turbineorm.dev',
@@ -130,16 +130,17 @@ export default async function Home() {
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
-            <span className="text-white">110 KB. One dep.</span>
+            <span className="text-white">One dep. No WASM.</span>
             <br />
             <span className="amber">Production Postgres.</span>
           </h1>
 
           <p className="hero-subtitle animate-fade-in-up delay-2">
             The Postgres ORM that ships light and locks tight. One runtime
-            dependency, a read-only Studio no other ORM has, and error messages
-            that never leak PII. v0.16 adds built-in observability with a self-hosted
-            dashboard, nested write update/upsert, and is/isNot relation filters.
+            dependency, no WASM engine, a read-only Studio no other ORM has, and
+            error messages that never leak PII. v0.17 makes the PII-safe error
+            guarantee airtight and fixes belongsTo nested writes and Studio on
+            plain Postgres.
           </p>
 
           <div className="animate-fade-in-up delay-3">
@@ -206,8 +207,8 @@ export default async function Home() {
                 Every ORM claims single-query nested loads now. Turbine uses
                 the same <code>json_agg</code> approach as Prisma 7 and
                 Drizzle v2. The difference isn&apos;t the query strategy &mdash; it&apos;s
-                everything around it: the 110 KB footprint, the read-only
-                Studio, and the error messages that never expose user data.
+                everything around it: the one-dependency, no-WASM footprint, the
+                read-only Studio, and the error messages that never expose user data.
               </p>
 
               <ul className="showcase-list">
@@ -313,12 +314,13 @@ export default async function Home() {
             </thead>
             <tbody>
               {[
-                ['Install size', '~110 KB (pg only)', '~1.6 MB (WASM engine)', '~0 KB (no runtime)'],
+                ['Engine / runtime', 'No engine binary (pg only)', 'Client + 1.6 MB WASM engine', 'No engine'],
                 ['Runtime deps', '1 (pg)', '@prisma/client + adapter', '0'],
+                ['Main bundle (gzip)', '~30 KB', 'dominated by 1.6 MB WASM', '~7 KB core'],
                 ['Studio', 'Read-only, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (paid tier)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, 5 KB', '1.6 MB WASM adapter', 'Native'],
+                ['Edge runtime', 'One import swap, ~19 KB gzip', '1.6 MB WASM adapter', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 ['Nested relations', '1 query, deep type inference', '1 query, shallow inference', 'relations() re-declaration'],
@@ -405,7 +407,7 @@ export default async function Home() {
       {/* ========== FOOTER ========== */}
       <footer className="landing-footer">
         <p>
-          110 KB. One dependency. Zero compromises. Built by{' '}
+          One dependency. No WASM engine. Zero compromises. Built by{' '}
           <a href="https://github.com/zvndev" target="_blank" rel="noopener noreferrer">
             ZVN
           </a>
