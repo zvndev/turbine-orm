@@ -469,6 +469,63 @@ export interface CountArgs<T> {
   timeout?: number;
 }
 
+/**
+ * Numeric comparison operators usable inside a `having` filter. A bare number
+ * is shorthand for equality (`COUNT(*) = $n`); the operator object supports
+ * range and inequality comparisons. Mirrors the numeric subset of
+ * {@link WhereOperator} so the same SQL machinery can be reused.
+ */
+export interface HavingNumericOperator {
+  equals?: number;
+  not?: number;
+  gt?: number;
+  gte?: number;
+  lt?: number;
+  lte?: number;
+  in?: number[];
+  notIn?: number[];
+}
+
+/** A single having predicate value: a bare number (equality) or an operator object. */
+export type HavingFilter = number | HavingNumericOperator;
+
+/**
+ * Per-field aggregate filters inside a {@link HavingClause}. Each aggregate
+ * function maps to a {@link HavingFilter} comparison on that field.
+ *
+ * @example
+ *   viewCount: { _sum: { gt: 100 }, _avg: { lte: 50 } }
+ */
+export interface HavingAggregateFilter {
+  _sum?: HavingFilter;
+  _avg?: HavingFilter;
+  _min?: HavingFilter;
+  _max?: HavingFilter;
+  _count?: HavingFilter;
+}
+
+/**
+ * HAVING clause for `groupBy` — filters whole groups by their aggregate values
+ * (the SQL `HAVING` clause). Follows Prisma's shape: each aggregable field maps
+ * to a {@link HavingAggregateFilter} (`field → aggregate → operator → value`),
+ * and the special top-level `_count` key (no field) filters on `COUNT(*)`.
+ *
+ * Implemented as a mapped type so the special `_count` key can carry a
+ * {@link HavingFilter} while every entity field carries a
+ * {@link HavingAggregateFilter} — without the index-signature conflict an
+ * intersection type would produce when `T` is a broad `Record<string, unknown>`.
+ *
+ * @example
+ *   // groups with more than 5 rows whose summed viewCount is at least 100
+ *   having: { _count: { gt: 5 }, viewCount: { _sum: { gte: 100 } } }
+ */
+export type HavingClause<T> = {
+  /** Filter on `COUNT(*)` for the whole group. */
+  _count?: HavingFilter;
+} & {
+  [K in keyof T & string]?: HavingAggregateFilter;
+};
+
 export interface GroupByArgs<T> {
   by: (keyof T & string)[];
   where?: WhereClause<T>;
@@ -482,6 +539,8 @@ export interface GroupByArgs<T> {
   _min?: Partial<Record<keyof T & string, boolean>>;
   /** Maximum value of fields in each group */
   _max?: Partial<Record<keyof T & string, boolean>>;
+  /** Filter whole groups by their aggregate values (SQL HAVING). */
+  having?: HavingClause<T>;
   /** Order groups */
   orderBy?: Record<string, OrderDirection>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */

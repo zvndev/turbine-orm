@@ -196,3 +196,5 @@ export {
 } from './schema-sql.js';
 // Serverless / edge factory
 export { type TurbineHttpOptions, turbineHttp } from './serverless.js';
+// Typed raw SQL — Turbine's TypedSQL escape hatch
+export { buildTypedSql, TypedSqlQuery } from './typed-sql.js';

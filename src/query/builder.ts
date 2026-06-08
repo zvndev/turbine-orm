@@ -44,6 +44,9 @@ import type {
   FindManyStreamArgs,
   FindUniqueArgs,
   GroupByArgs,
+  HavingClause,
+  HavingFilter,
+  HavingNumericOperator,
   JsonFilter,
   OrderDirection,
   QueryResult,
@@ -1683,6 +1686,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     let sql = `SELECT ${selectExprs.join(', ')} FROM ${this.q(this.table)}${whereSql} GROUP BY ${groupCols.join(', ')}`;
 
+    // HAVING — filter whole groups by their aggregate values.
+    // Appends to the same `params` array, so placeholders continue from the
+    // WHERE clause's parameter positions (this.p(params.length) below).
+    if (args.having) {
+      const havingClauses = this.buildHavingClauses(args.having, params);
+      if (havingClauses.length > 0) {
+        sql += ` HAVING ${havingClauses.join(' AND ')}`;
+      }
+    }
+
     // ORDER BY
     if (args.orderBy) {
       sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
@@ -1752,6 +1765,135 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }),
       tag: `${this.table}.groupBy`,
     };
+  }
+
+  /**
+   * Build the SQL fragments for a {@link HavingClause}.
+   *
+   * Each aggregate expression (`COUNT(*)`, `SUM("col")`, etc.) is constructed
+   * from a **schema-validated, quoted** column identifier — `this.toColumn()`
+   * throws {@link ValidationError} for unknown fields and `this.q()` quotes via
+   * the dialect, so no unvalidated identifier ever reaches the SQL string. Every
+   * comparison value is pushed onto the shared `params` array and referenced by
+   * a `$N` placeholder via {@link buildHavingNumericClauses} — there is no string
+   * interpolation of user values.
+   */
+  private buildHavingClauses(having: HavingClause<T>, params: unknown[]): string[] {
+    const clauses: string[] = [];
+
+    // Maps the per-field aggregate key to its SQL function name. The set of
+    // allowed keys is fixed here — any other key on a field's filter object is
+    // rejected by ValidationError below (never interpolated).
+    const aggFnByKey: Record<string, string> = {
+      _sum: 'SUM',
+      _avg: 'AVG',
+      _min: 'MIN',
+      _max: 'MAX',
+      _count: 'COUNT',
+    };
+
+    for (const [key, value] of Object.entries(having)) {
+      if (value === undefined) continue;
+
+      // Top-level `_count` (no field) → COUNT(*) for the whole group.
+      if (key === '_count') {
+        clauses.push(...this.buildHavingNumericClauses('COUNT(*)', value as HavingFilter, params));
+        continue;
+      }
+
+      // Otherwise `key` is a field name mapping to a per-aggregate filter object.
+      if (typeof value !== 'object' || value === null) {
+        throw new ValidationError(
+          `[turbine] Invalid having filter for field "${key}" on table "${this.table}": ` +
+            `expected an aggregate object like { _sum: { gt: 100 } }.`,
+        );
+      }
+
+      // toColumn validates the field against schema metadata (throws
+      // ValidationError on unknown columns) and q() quotes the identifier — no
+      // unvalidated identifier ever reaches the SQL string.
+      const quotedCol = this.q(this.toColumn(key));
+
+      for (const [aggKey, filter] of Object.entries(value as Record<string, HavingFilter>)) {
+        if (filter === undefined) continue;
+        const fn = aggFnByKey[aggKey];
+        if (!fn) {
+          throw new ValidationError(
+            `[turbine] Unknown aggregate "${aggKey}" in having for field "${key}" on table "${this.table}". ` +
+              `Supported: ${Object.keys(aggFnByKey).join(', ')}.`,
+          );
+        }
+        const expr = `${fn}(${quotedCol})`;
+        clauses.push(...this.buildHavingNumericClauses(expr, filter, params));
+      }
+    }
+
+    return clauses;
+  }
+
+  /**
+   * Convert a single having filter into one or more parameterized SQL
+   * comparisons against the given aggregate expression. A bare number is
+   * shorthand for equality. Unknown operator keys throw {@link ValidationError}.
+   */
+  private buildHavingNumericClauses(expr: string, filter: HavingFilter, params: unknown[]): string[] {
+    // Bare number → equality.
+    if (typeof filter === 'number') {
+      params.push(filter);
+      return [`${expr} = ${this.p(params.length)}`];
+    }
+
+    if (typeof filter !== 'object' || filter === null) {
+      throw new ValidationError(
+        `[turbine] Invalid having filter on "${expr}" for table "${this.table}": expected a number or operator object.`,
+      );
+    }
+
+    const op = filter as HavingNumericOperator;
+    const allowedKeys = new Set(['equals', 'not', 'gt', 'gte', 'lt', 'lte', 'in', 'notIn']);
+    for (const k of Object.keys(op)) {
+      if (!allowedKeys.has(k)) {
+        throw new ValidationError(
+          `[turbine] Unknown having operator "${k}" on "${expr}" for table "${this.table}". ` +
+            `Supported: ${[...allowedKeys].join(', ')}.`,
+        );
+      }
+    }
+
+    const clauses: string[] = [];
+    if (op.equals !== undefined) {
+      params.push(op.equals);
+      clauses.push(`${expr} = ${this.p(params.length)}`);
+    }
+    if (op.not !== undefined) {
+      params.push(op.not);
+      clauses.push(`${expr} != ${this.p(params.length)}`);
+    }
+    if (op.gt !== undefined) {
+      params.push(op.gt);
+      clauses.push(`${expr} > ${this.p(params.length)}`);
+    }
+    if (op.gte !== undefined) {
+      params.push(op.gte);
+      clauses.push(`${expr} >= ${this.p(params.length)}`);
+    }
+    if (op.lt !== undefined) {
+      params.push(op.lt);
+      clauses.push(`${expr} < ${this.p(params.length)}`);
+    }
+    if (op.lte !== undefined) {
+      params.push(op.lte);
+      clauses.push(`${expr} <= ${this.p(params.length)}`);
+    }
+    if (op.in !== undefined) {
+      params.push(op.in);
+      clauses.push(`${expr} = ANY(${this.p(params.length)})`);
+    }
+    if (op.notIn !== undefined) {
+      params.push(op.notIn);
+      clauses.push(`${expr} != ALL(${this.p(params.length)})`);
+    }
+    return clauses;
   }
 
   // -------------------------------------------------------------------------

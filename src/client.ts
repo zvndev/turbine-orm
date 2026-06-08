@@ -35,6 +35,7 @@ import {
   type QueryInterfaceOptions,
 } from './query/index.js';
 import type { SchemaMetadata } from './schema.js';
+import { buildTypedSql, TypedSqlQuery } from './typed-sql.js';
 
 // ---------------------------------------------------------------------------
 // Retry utility
@@ -674,6 +675,44 @@ export class TurbineClient {
     } catch (err) {
       throw wrapPgError(err);
     }
+  }
+
+  /**
+   * Execute a **typed** raw SQL query — Turbine's answer to Prisma's TypedSQL.
+   *
+   * Like {@link raw}, every interpolated `${value}` becomes a `$N` parameter
+   * (never string-concatenated), so it is injection-safe by construction. The
+   * difference is the caller-supplied row type and the chainable result: the
+   * returned {@link TypedSqlQuery} can be `await`ed directly for `T[]`, or
+   * refined with `.one()` (→ `T | null`) or `.scalar<V>()` (→ `V | null`).
+   *
+   * Rows are returned as-is — no snake→camel mapping (matching `raw()`). Alias
+   * columns in SQL if you want camelCase keys.
+   *
+   * @example
+   * ```ts
+   * // rows
+   * const rows = await db.sql<{ id: number; name: string }>`
+   *   SELECT id, name FROM users WHERE org_id = ${orgId}
+   * `;
+   *
+   * // single row or null
+   * const user = await db.sql<{ id: number; name: string }>`
+   *   SELECT id, name FROM users WHERE id = ${userId}
+   * `.one();
+   *
+   * // scalar
+   * const total = await db.sql<{ count: number }>`
+   *   SELECT COUNT(*)::int AS count FROM users
+   * `.scalar();
+   * ```
+   */
+  sql<T extends Record<string, unknown> = Record<string, unknown>>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): TypedSqlQuery<T> {
+    const { sql, params } = buildTypedSql(strings, values);
+    return new TypedSqlQuery<T>(this.pool, sql, params, this.logging);
   }
 
   // -------------------------------------------------------------------------
