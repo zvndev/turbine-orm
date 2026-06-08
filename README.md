@@ -118,6 +118,62 @@ const user = await db.users.findUnique({
 // user.posts is Post[] -- resolved in the same query
 ```
 
+### Many-to-many relations
+
+Turbine auto-detects pure junction tables during `generate` — a table whose primary key is exactly two single-column foreign keys and which carries no other columns (e.g. `posts_tags(post_id, tag_id)`). Both endpoints gain a many-to-many relation you can load like any other:
+
+```typescript
+const posts = await db.posts.findMany({
+  with: { tags: true }, // each post comes back with its tags array
+});
+
+// Nested where / orderBy / limit work on the m2m target too
+const post = await db.posts.findFirst({
+  where: { id: 1 },
+  with: { tags: { where: { name: 'sql' }, orderBy: { name: 'asc' }, limit: 5 } },
+});
+```
+
+A junction table that carries extra columns (a "payload") is treated as a first-class entity, so it stays an ordinary `hasMany` — that's by design. For those, or for any junction you want to wire up by hand, declare the relation explicitly in your code-first schema:
+
+```typescript
+import { defineSchema } from 'turbine-orm';
+
+export default defineSchema({
+  posts: {
+    id:    { type: 'serial', primaryKey: true },
+    title: { type: 'text', notNull: true },
+    manyToMany: [
+      { name: 'tags', target: 'tags', through: 'postsTags',
+        sourceKey: 'postId', targetKey: 'tagId' },
+    ],
+  },
+  // ...tags and postsTags table definitions
+});
+```
+
+`sourceKey`/`targetKey` are the junction columns referencing each side's primary key; add `references` if the source side is keyed on something other than `id`.
+
+### Self-relations
+
+A self-referencing foreign key (e.g. `categories.parent_id → categories.id`) introspects to a `belongsTo` *and* a `hasMany` on the same table, so parent and child queries just work — including nested trees:
+
+```typescript
+// A category with its parent and its children
+const category = await db.categories.findFirst({
+  where: { id: 2 },
+  with: { parent: true, children: true },
+});
+
+// Walk a level deeper
+const tree = await db.categories.findFirst({
+  where: { id: 1 },
+  with: { children: { with: { children: true } } },
+});
+```
+
+When a table has a single self-referencing FK, Turbine auto-names the relations after the table: the `belongsTo` is named for the singular (`category`) and the `hasMany` for the table (`categories`). Rename them in your code-first schema if you prefer `parent`/`children`.
+
 ### create
 
 ```typescript
@@ -216,6 +272,29 @@ const stats = await db.raw<{ day: Date; count: number }>`
 `;
 ```
 
+### Typed raw SQL (`db.sql<T>`)
+
+`db.sql<T>` is the typed escape hatch: you supply the row shape and get a thenable query with `.one()` and `.scalar()` helpers. Every `${value}` is bound as a `$N` parameter — never interpolated — so injection isn't possible even with hostile input.
+
+```typescript
+// Awaiting the query returns T[]
+const users = await db.sql<{ id: number; name: string }>`
+  SELECT id, name FROM users WHERE org_id = ${orgId}
+`;
+
+// .one() returns T | null
+const user = await db.sql<{ id: number; name: string }>`
+  SELECT id, name FROM users WHERE id = ${42}
+`.one();
+
+// .scalar() returns the first column of the first row, or null
+const total = await db.sql<{ count: number }>`
+  SELECT COUNT(*)::int AS count FROM users
+`.scalar();
+```
+
+Reach for `db.sql<T>` when you want a hand-written query with a known return type; use `db.raw` when you don't need the typing or the helpers.
+
 ### Case-insensitive search
 
 ```typescript
@@ -308,6 +387,91 @@ try {
 Error codes: `TURBINE_E001` (NotFound), `TURBINE_E002` (Timeout), `TURBINE_E003` (Validation), `TURBINE_E004` (Connection), `TURBINE_E005` (Relation), `TURBINE_E006` (Migration), `TURBINE_E007` (CircularRelation), `TURBINE_E008` (UniqueConstraint), `TURBINE_E009` (ForeignKey), `TURBINE_E010` (NotNullViolation), `TURBINE_E011` (CheckConstraint), `TURBINE_E012` (Deadlock), `TURBINE_E013` (SerializationFailure), `TURBINE_E014` (Pipeline), `TURBINE_E015` (OptimisticLock), `TURBINE_E016` (ExclusionConstraint).
 
 Full reference with `wrapPgError()` translation, retry patterns for `DeadlockError` / `SerializationFailureError`, and safe vs verbose message modes: **[turbineorm.dev/errors](https://turbineorm.dev/errors)**.
+
+### groupBy with HAVING
+
+`groupBy` aggregates rows by one or more columns. Add a `having` clause to filter the resulting groups by their aggregates. Every comparison value is parameterized.
+
+```typescript
+// Users with more than one post
+const prolific = await db.posts.groupBy({
+  by: ['userId'],
+  _count: true,
+  having: { _count: { gt: 1 } },
+});
+
+// Groups whose summed view count clears a threshold
+const popular = await db.posts.groupBy({
+  by: ['published'],
+  _sum: { viewCount: true },
+  having: { viewCount: { _sum: { gte: 100 } } },
+});
+```
+
+Filter on the group count with `_count`, or on a column aggregate with `{ column: { _sum | _avg | _min | _max: { ... } } }`. Operators are `gt`, `gte`, `lt`, `lte`, `in`, and `notIn` (a bare number is shorthand for equality). `having` predicates combine with `AND`, and `where` filters rows *before* grouping while `having` filters groups *after*.
+
+### Multi-tenant queries with RLS session context
+
+Set transaction-local Postgres settings (GUCs) so PostgreSQL Row-Level Security policies that call `current_setting()` filter rows for you. Pass `sessionContext` to `$transaction`, or use the `$withSession` shorthand.
+
+```typescript
+// Postgres policy: USING (tenant_id = current_setting('app.current_tenant')::int)
+const rows = await db.$transaction(
+  async (tx) => tx.documents.findMany(),
+  { sessionContext: { 'app.current_tenant': tenantId } },
+);
+
+// Shorthand for a single-purpose session
+const rows2 = await db.$withSession(
+  { 'app.current_tenant': tenantId },
+  async (tx) => tx.documents.findMany(),
+);
+```
+
+Each entry is applied as `SELECT set_config(name, value, true)` right after `BEGIN`, so the setting is scoped to the transaction and resets automatically on commit. Values may be strings, numbers, or booleans (coerced to strings). Invalid setting names throw `ValidationError` and roll the transaction back before any query runs.
+
+### Realtime with LISTEN/NOTIFY
+
+Subscribe to a Postgres channel with `$listen` and publish to it with `$notify`. The handler receives the notification payload as a string.
+
+```typescript
+const sub = await db.$listen('order_created', (payload) => {
+  console.log('new order:', payload);
+});
+
+await db.$notify('order_created', JSON.stringify({ id: 1 }));
+
+// Later, when you're done
+await sub.unsubscribe();
+```
+
+`$listen` holds a dedicated connection open for the lifetime of the subscription, so it requires a real persistent pool — it is not available over serverless HTTP drivers. `$notify` is a single round-trip and works everywhere. Channel names are validated as plain identifiers; the payload is always bound as a parameter.
+
+## Vector search (pgvector)
+
+Query a `vector` column for nearest neighbors. Requires the [pgvector](https://github.com/pgvector/pgvector) extension and a `vector` column on your table.
+
+**KNN ranking** — order by distance to a query vector and take the closest rows:
+
+```typescript
+const similar = await db.items.findMany({
+  orderBy: { embedding: { distance: { to: queryVector, metric: 'cosine' } } },
+  limit: 5,
+});
+// queryVector is a number[]; nearest-first by default (direction: 'desc' to invert)
+```
+
+**Distance filter** — keep only rows within a distance threshold:
+
+```typescript
+const close = await db.items.findMany({
+  where: { embedding: { distance: { to: queryVector, metric: 'l2', lt: 0.3 } } },
+});
+```
+
+`metric` selects the pgvector operator: `'l2'` → `<->` (Euclidean), `'cosine'` → `<=>` (cosine distance), `'ip'` → `<#>` (negative inner product). Distance filters accept `lt`, `lte`, `gt`, and `gte`. The query vector is always bound as `$n::vector` — never interpolated.
+
+> **Note:** pg has no built-in parser for the `vector` type, so a fetched `vector` column comes back as a string literal like `'[1,2,3]'` unless you register a parser (e.g. via pgvector's own client helpers). Querying by distance works regardless.
 
 ## WHERE Operator Reference
 
@@ -605,6 +769,9 @@ Turbine maps Postgres types to TypeScript:
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query, shallow inference | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |
+| **Many-to-many** | Auto-detected from junctions | Implicit/explicit | Explicit `relations()` | Manual joins |
+| **Vector search** | Built-in `distance` / KNN | Preview / raw | Extension API | Manual |
+| **LISTEN/NOTIFY** | `$listen` / `$notify` | None | None | None |
 | **Multi-DB** | PostgreSQL only | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
 
 All three ORMs now do single-query nested loads — that's table stakes. Turbine's real differentiators: no engine binary or WASM — just one dependency (`pg`), vs Prisma's 1.6 MB WASM query engine; the only read-only Studio in the ecosystem; error messages that never leak PII; and SQL-first migrations with SHA-256 drift detection. See [Benchmarks](#benchmarks) for performance numbers — most scenarios are within noise over a real pooled database.

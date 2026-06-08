@@ -25,20 +25,28 @@ src/
   query/            — The heart, split into submodules:
     types.ts        — All public query arg types (~430 LOC): WhereClause, WithClause,
                       FindManyArgs, RelationDescriptor, WithResult, UpdateOperatorInput,
-                      AggregateArgs, JsonFilter, ArrayFilter, etc.
+                      AggregateArgs, JsonFilter, ArrayFilter, HavingClause (groupBy
+                      aggregate filtering), VectorFilter/VectorOrderBy (pgvector distance
+                      ops), etc.
     utils.ts        — Pure utility functions (~130 LOC): quoteIdent(), escapeLike(),
                       LRUCache (1K entry cap), fnv1a64Hex(), sqlToPreparedName(),
                       OPERATOR_KEYS constant.
     builder.ts      — QueryInterface class (~3.1K LOC): SQL generation for all operations
-                      (findMany, findUnique, create, update, delete, aggregate, count).
-                      Builds WHERE clauses, json_agg nested relation subqueries, and
-                      parameterized queries. Includes dev-only NODE_ENV validation guards.
+                      (findMany, findUnique, create, update, delete, aggregate, count,
+                      groupBy + HAVING). Builds WHERE clauses, json_agg nested relation
+                      subqueries (hasMany/belongsTo/hasOne + manyToMany through junction
+                      tables + self-relations), pgvector distance ops, and parameterized
+                      queries. Includes dev-only NODE_ENV validation guards.
     index.ts        — Barrel re-export (~65 LOC). All imports use `./query/index.js`.
 
   client.ts         — TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
-                      ($transaction with SAVEPOINTs for nesting, isolation levels, timeouts),
-                      raw SQL tagged templates, and pipeline batching. Registers int8 parser
+                      ($transaction with SAVEPOINTs for nesting, isolation levels, timeouts,
+                      and a sessionContext option that set_config()s txn-local GUCs for
+                      Postgres RLS — plus the $withSession shorthand), typed raw SQL
+                      (client.sql<T> -> typed-sql.ts), realtime ($listen/$notify ->
+                      realtime.ts), raw SQL tagged templates, and pipeline batching.
+                      Registers int8 parser
                       once (static flag) so bigint comes back as number. Also exports
                       PgCompatPool / PgCompatPoolClient / PgCompatQueryResult interfaces
                       and accepts an external pool via TurbineConfig.pool for serverless
@@ -81,6 +89,20 @@ src/
                       Hyperdrive, etc.). Pure TypeScript shim — no extra runtime deps.
                       Published as the `turbine-orm/serverless` subpath export.
 
+  typed-sql.ts      — Typed raw SQL escape hatch (Turbine's TypedSQL). buildTypedSql()
+                      turns a tagged template into a parameterized (sql, params) pair —
+                      every ${value} becomes $N, impossible to string-concat a value in.
+                      TypedSqlQuery<T> is a thenable (await -> T[]) with .one() -> T|null
+                      and .scalar<V>() -> V|null. Exposed as client.sql<T>`...`.
+
+  realtime.ts       — LISTEN/NOTIFY pub/sub. createSubscription() checks out a dedicated
+                      pooled connection, runs LISTEN "chan" (channel is the one
+                      interpolated identifier — strict regex + quoteIdent), and wires the
+                      pg 'notification' event to the handler. Exposed as client.$listen()
+                      / client.$notify() (pg_notify($1,$2)). Subscriptions are tracked and
+                      force-released on disconnect(); serverless HTTP pools (no persistent
+                      connection) throw a clear error instead of hanging.
+
   cli/              — CLI entry point and commands (see CLI Architecture below).
 ```
 
@@ -103,7 +125,7 @@ The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (
 
 3. **json_agg + COALESCE (hasMany).** For one-to-many, the json_build_object is wrapped in `json_agg(...)`, then `COALESCE(..., '[]'::json)` ensures the result is never NULL (empty array fallback). For belongsTo/hasOne, no aggregation is used, just `LIMIT 1`.
 
-4. **Correlation WHERE.** Links the subquery to its parent: hasMany uses `alias.foreignKey = parentRef.referenceKey` (child FK points to parent PK); belongsTo reverses this (`alias.referenceKey = parentRef.foreignKey`).
+4. **Correlation WHERE.** Links the subquery to its parent: hasMany uses `alias.foreignKey = parentRef.referenceKey` (child FK points to parent PK); belongsTo reverses this (`alias.referenceKey = parentRef.foreignKey`). manyToMany (`buildManyToManySubquery`) instead JOINs the target through the junction table (`RelationDef.through`) and correlates `junction.sourceKey = parentRef.referenceKey`. Self-relations are just hasMany/belongsTo where `from === to` — the per-call alias counter keeps them collision-free.
 
 5. **Inner subquery wrapping for LIMIT/ORDER.** When a hasMany relation has `limit` or `orderBy`, the query restructures into two levels: an inner SELECT with WHERE/ORDER/LIMIT on raw rows, wrapped by an outer SELECT that applies json_agg to the inner alias (`t0i`). Without this, LIMIT on aggregated results is meaningless.
 
