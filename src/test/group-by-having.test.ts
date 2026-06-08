@@ -11,7 +11,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { before, describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
+import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
@@ -205,17 +206,54 @@ const testFn = SKIP ? describe.skip : describe;
 
 testFn('groupBy having — integration', () => {
   let db: TurbineClient;
+  // Own isolated table so concurrent test files mutating the shared `posts`
+  // fixture can't race the exact-count/sum assertions below. Mirrors the
+  // fixture's 10 posts deterministically (user_id, published, view_count).
+  const TABLE = '_having_posts';
 
   before(async () => {
+    const setup = new pg.Client({ connectionString: DATABASE_URL! });
+    await setup.connect();
+    try {
+      await setup.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await setup.query(
+        `CREATE TABLE ${TABLE} (
+           id serial PRIMARY KEY,
+           user_id int NOT NULL,
+           published boolean NOT NULL,
+           view_count int NOT NULL
+         )`,
+      );
+      await setup.query(
+        `INSERT INTO ${TABLE} (user_id, published, view_count) VALUES
+           (1, TRUE, 100), (1, TRUE, 75), (1, FALSE, 0),
+           (2, TRUE, 42),  (2, FALSE, 10),
+           (3, TRUE, 30),  (5, TRUE, 60), (6, TRUE, 20),
+           (7, TRUE, 55),  (7, FALSE, 5)`,
+      );
+    } finally {
+      await setup.end();
+    }
     const schema = await introspect({ connectionString: DATABASE_URL! });
     db = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 3 }, schema);
     await db.connect();
   });
 
+  after(async () => {
+    if (db) await db.disconnect();
+    const teardown = new pg.Client({ connectionString: DATABASE_URL! });
+    await teardown.connect();
+    try {
+      await teardown.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    } finally {
+      await teardown.end();
+    }
+  });
+
   it('filters groups by COUNT(*) > N', async () => {
-    // Seed: posts grouped by user_id. user 1 has 3 posts, user 2 has 2,
-    // user 7 has 2, users 3/5/6 have 1 each. HAVING COUNT(*) > 1 → users 1,2,7.
-    const results = (await db.table<Post>('posts').groupBy({
+    // user 1 has 3 posts, user 2 has 2, user 7 has 2, users 3/5/6 have 1 each.
+    // HAVING COUNT(*) > 1 → users 1,2,7.
+    const results = (await db.table<Post>(TABLE).groupBy({
       by: ['userId'],
       _count: true,
       having: { _count: { gt: 1 } },
@@ -232,7 +270,7 @@ testFn('groupBy having — integration', () => {
     // published=true total views = 100+75+42+30+60+20+55 = 382
     // published=false total views = 0+10+5 = 15
     // HAVING SUM(view_count) >= 100 → only the published=true group survives.
-    const results = (await db.table<Post>('posts').groupBy({
+    const results = (await db.table<Post>(TABLE).groupBy({
       by: ['published'],
       _sum: { viewCount: true },
       having: { viewCount: { _sum: { gte: 100 } } },
@@ -248,7 +286,7 @@ testFn('groupBy having — integration', () => {
     // Restrict to published posts, then keep user groups summing > 60 views.
     // Published per user: u1=175, u2=42, u3=30, u5=60, u6=20, u7=55.
     // HAVING SUM > 60 → only user 1.
-    const results = (await db.table<Post>('posts').groupBy({
+    const results = (await db.table<Post>(TABLE).groupBy({
       by: ['userId'],
       where: { published: true },
       _sum: { viewCount: true },
@@ -259,7 +297,7 @@ testFn('groupBy having — integration', () => {
   });
 
   it('returns an empty array when no group satisfies HAVING', async () => {
-    const results = (await db.table<Post>('posts').groupBy({
+    const results = (await db.table<Post>(TABLE).groupBy({
       by: ['published'],
       _count: true,
       having: { _count: { gt: 100000 } },
