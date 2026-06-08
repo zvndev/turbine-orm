@@ -186,7 +186,8 @@ export function generateTypes(schema: SchemaMetadata): string {
       lines.push(`export interface ${typeName}Relations {`);
       for (const [relName, rel] of Object.entries(table.relations)) {
         const targetType = entityName(rel.to);
-        const cardinality = rel.type === 'hasMany' ? "'many'" : "'one'";
+        // manyToMany is a collection too → 'many' cardinality (same as hasMany).
+        const cardinality = rel.type === 'hasMany' || rel.type === 'manyToMany' ? "'many'" : "'one'";
         const targetRelations = tablesWithRelations.has(rel.to) ? `${targetType}Relations` : '{}';
         lines.push(`  ${relName}: RelationDescriptor<${targetType}, ${cardinality}, ${targetRelations}>;`);
       }
@@ -196,7 +197,7 @@ export function generateTypes(schema: SchemaMetadata): string {
       // --- Legacy per-relation interfaces (kept for backward compatibility) ---
       for (const [relName, rel] of Object.entries(table.relations)) {
         const targetType = entityName(rel.to);
-        if (rel.type === 'hasMany') {
+        if (rel.type === 'hasMany' || rel.type === 'manyToMany') {
           lines.push(`/** ${typeName} with \`${relName}\` relation loaded (${rel.type}: ${rel.to}) */`);
           lines.push(`export interface ${typeName}With${snakeToPascal(relName)} extends ${typeName} {`);
           lines.push(`  ${relName}: ${targetType}[];`);
@@ -389,8 +390,19 @@ function generateMetadata(schema: SchemaMetadata): string {
       const refLiteral = Array.isArray(rel.referenceKey)
         ? `[${rel.referenceKey.map((c) => `'${escSQ(c)}'`).join(', ')}]`
         : `'${escSQ(rel.referenceKey)}'`;
+      // manyToMany relations carry a `through` junction descriptor — emit it so
+      // the runtime query builder can JOIN through the junction table.
+      let throughLiteral = '';
+      if (rel.through) {
+        const keyLiteral = (k: string | string[]) =>
+          Array.isArray(k) ? `[${k.map((c) => `'${escSQ(c)}'`).join(', ')}]` : `'${escSQ(k)}'`;
+        throughLiteral =
+          `, through: { table: '${escSQ(rel.through.table)}', ` +
+          `sourceKey: ${keyLiteral(rel.through.sourceKey)}, ` +
+          `targetKey: ${keyLiteral(rel.through.targetKey)} }`;
+      }
       lines.push(
-        `        ${relName}: { type: '${escSQ(rel.type)}', name: '${escSQ(rel.name)}', from: '${escSQ(rel.from)}', to: '${escSQ(rel.to)}', foreignKey: ${fkLiteral}, referenceKey: ${refLiteral} },`,
+        `        ${relName}: { type: '${escSQ(rel.type)}', name: '${escSQ(rel.name)}', from: '${escSQ(rel.from)}', to: '${escSQ(rel.to)}', foreignKey: ${fkLiteral}, referenceKey: ${refLiteral}${throughLiteral} },`,
       );
     }
     lines.push('      },');

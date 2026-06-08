@@ -170,6 +170,7 @@ export {
 } from './schema.js';
 // Schema builder — define schemas in TypeScript
 export {
+  applyManyToManyRelations,
   ColumnBuilder,
   type ColumnConfig,
   type ColumnDef,
@@ -177,6 +178,7 @@ export {
   type ColumnTypeName,
   column,
   defineSchema,
+  type ManyToManyDef,
   type SchemaDef,
   type TableDef,
   // Legacy compat (deprecated — use object format with defineSchema)

@@ -69,7 +69,7 @@ export interface ColumnMetadata {
 }
 
 export interface RelationDef {
-  type: 'hasMany' | 'hasOne' | 'belongsTo';
+  type: 'hasMany' | 'hasOne' | 'belongsTo' | 'manyToMany';
   /** Relation name (camelCase, used as the field name) */
   name: string;
   /** Source table */
@@ -80,6 +80,23 @@ export interface RelationDef {
   foreignKey: string | string[];
   /** Referenced column(s) on the "one" / "parent" side (snake_case). Array for composite FKs. */
   referenceKey: string | string[];
+  /**
+   * For `manyToMany` relations only: the junction (join) table that links the
+   * source and target tables. The subquery JOINs the target through this table.
+   *
+   *   - `table`     — junction table name (snake_case).
+   *   - `sourceKey` — junction column(s) referencing the SOURCE table's
+   *                   {@link referenceKey} (typically the source PK).
+   *   - `targetKey` — junction column(s) referencing the TARGET table's PK.
+   *
+   * Array forms support composite keys (paired positionally with the
+   * referenced columns). Omitted for non-m2m relations.
+   */
+  through?: {
+    table: string;
+    sourceKey: string | string[];
+    targetKey: string | string[];
+  };
 }
 
 // ---------------------------------------------------------------------------

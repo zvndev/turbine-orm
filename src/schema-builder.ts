@@ -23,6 +23,11 @@
  * ```
  */
 
+// Type-only import — erased at runtime, so it cannot introduce a circular
+// runtime dependency (the local `camelToSnakeLocal` copy avoids that for the
+// value-level helper).
+import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
+
 // ---------------------------------------------------------------------------
 // Column types — lowercase shorthand mapped to Postgres types
 // ---------------------------------------------------------------------------
@@ -142,6 +147,37 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
 // Table & Schema definitions
 // ---------------------------------------------------------------------------
 
+/**
+ * Explicit many-to-many relation declaration for the code-first schema.
+ *
+ * Auto-detecting m2m from a junction table is intentionally conservative (a
+ * junction with payload columns is treated as a first-class entity, not a join
+ * table — see `introspect.ts`). This declaration lets users opt in to an m2m
+ * relation explicitly, mirroring how Prisma/Drizzle require an explicit
+ * `@relation` / `relation()` for join tables.
+ *
+ * All names are the JS-facing accessor / camelCase field names you wrote in
+ * `defineSchema({ ... })`; they are normalized to snake_case when merged into
+ * the introspected {@link SchemaMetadata} via {@link applyManyToManyRelations}.
+ */
+export interface ManyToManyDef {
+  /** Relation field name on the source table (e.g. `tags`). */
+  name: string;
+  /** Target table accessor (e.g. `tags`). */
+  target: string;
+  /** Junction (join) table accessor (e.g. `postsTags`). */
+  through: string;
+  /** Junction column(s) referencing the SOURCE table's PK. */
+  sourceKey: string | readonly string[];
+  /** Junction column(s) referencing the TARGET table's PK. */
+  targetKey: string | readonly string[];
+  /**
+   * Optional: the SOURCE table's referenced column(s) that `sourceKey` points
+   * at. Defaults to `id`. Use for sources keyed on a non-`id` / composite PK.
+   */
+  references?: string | readonly string[];
+}
+
 export interface TableDef {
   /**
    * DDL-facing table name (snake_case). This is the name used when generating
@@ -166,6 +202,13 @@ export interface TableDef {
    * when emitted as a `PRIMARY KEY (...)` table constraint.
    */
   primaryKey?: readonly string[];
+  /**
+   * Explicit many-to-many relations declared on this table. These never affect
+   * DDL emission (junction tables are still ordinary `CREATE TABLE`s); they are
+   * consumed by {@link applyManyToManyRelations} to enrich an introspected
+   * {@link SchemaMetadata} with `manyToMany` {@link RelationDef}s.
+   */
+  manyToMany?: readonly ManyToManyDef[];
 }
 
 /**
@@ -175,8 +218,10 @@ export interface TableDef {
 export interface TableInput {
   /** Optional composite primary key (camelCase field names) */
   primaryKey?: readonly string[];
+  /** Optional explicit many-to-many relations on this table */
+  manyToMany?: readonly ManyToManyDef[];
   /** Column definitions keyed by camelCase field name */
-  [columnName: string]: ColumnDef | readonly string[] | undefined;
+  [columnName: string]: ColumnDef | readonly string[] | readonly ManyToManyDef[] | undefined;
 }
 
 export interface SchemaDef {
@@ -234,8 +279,18 @@ export function defineSchema(input: SchemaInput): SchemaDef {
       const raw = value as TableInput;
       const columns: Record<string, ColumnConfig> = {};
       let pk: readonly string[] | undefined;
+      let m2m: readonly ManyToManyDef[] | undefined;
 
       for (const [fieldName, def] of Object.entries(raw)) {
+        if (fieldName === 'manyToMany') {
+          if (def !== undefined) {
+            if (!Array.isArray(def)) {
+              throw new Error(`Table "${accessor}": "manyToMany" must be an array of relation declarations`);
+            }
+            m2m = def as readonly ManyToManyDef[];
+          }
+          continue;
+        }
         if (fieldName === 'primaryKey') {
           // Top-level composite primary key declaration
           if (def !== undefined) {
@@ -281,6 +336,7 @@ export function defineSchema(input: SchemaInput): SchemaDef {
         accessor,
         columns,
         ...(pk && pk.length > 0 ? { primaryKey: pk } : {}),
+        ...(m2m && m2m.length > 0 ? { manyToMany: m2m } : {}),
       };
     }
   }
@@ -473,6 +529,82 @@ export function table(columns: Record<string, ColumnBuilder>): TableDef {
     built[fieldName] = builder.build();
   }
   return { name: '', accessor: '', columns: built };
+}
+
+// ---------------------------------------------------------------------------
+// Explicit many-to-many: merge declared relations into introspected metadata
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge the explicit `manyToMany` declarations from a code-first {@link SchemaDef}
+ * into an introspected {@link SchemaMetadata}, returning a new metadata object
+ * with the `manyToMany` {@link RelationDef}s added.
+ *
+ * This is the runtime bridge for the code-first m2m API: `defineSchema` only
+ * produces DDL, so after `introspect()`ing the live database you call this to
+ * attach the m2m relations you declared. It is PURELY ADDITIVE — existing
+ * belongsTo/hasMany/hasOne relations are preserved, and a declared relation is
+ * skipped (not overwritten) if its name already exists on the source table.
+ *
+ * @example
+ * ```ts
+ * const def = defineSchema({
+ *   posts: { id: { type: 'serial', primaryKey: true },
+ *            manyToMany: [{ name: 'tags', target: 'tags', through: 'postsTags',
+ *                           sourceKey: 'postId', targetKey: 'tagId' }] },
+ *   tags:  { id: { type: 'serial', primaryKey: true } },
+ *   postsTags: { postId: { type: 'integer', references: 'posts.id' },
+ *                tagId:  { type: 'integer', references: 'tags.id' },
+ *                primaryKey: ['postId', 'tagId'] },
+ * });
+ * let meta = await introspect({ connectionString });
+ * meta = applyManyToManyRelations(meta, def);
+ * ```
+ */
+export function applyManyToManyRelations(meta: SchemaMetadata, def: SchemaDef): SchemaMetadata {
+  // Map accessor (camelCase key) → DDL snake_case table name.
+  const accessorToTable = new Map<string, string>();
+  for (const [accessor, t] of Object.entries(def.tables)) {
+    accessorToTable.set(accessor, t.name);
+  }
+  const resolveTable = (accessor: string): string => accessorToTable.get(accessor) ?? camelToSnakeLocal(accessor);
+  const resolveCols = (k: string | readonly string[]): string | string[] => {
+    if (Array.isArray(k)) return (k as readonly string[]).map(camelToSnakeLocal);
+    return camelToSnakeLocal(k as string);
+  };
+
+  // Deep-ish clone of the tables we touch so the input metadata is not mutated.
+  const tables: Record<string, TableMetadata> = { ...meta.tables };
+
+  for (const tableDef of Object.values(def.tables)) {
+    if (!tableDef.manyToMany || tableDef.manyToMany.length === 0) continue;
+    const sourceTable = tableDef.name;
+    const sourceMeta = tables[sourceTable];
+    if (!sourceMeta) continue; // table not present in introspected metadata — skip
+
+    const relations: Record<string, RelationDef> = { ...sourceMeta.relations };
+    for (const m of tableDef.manyToMany) {
+      // Additive-only: never clobber an existing relation name.
+      if (relations[m.name]) continue;
+      const ref = m.references ?? 'id';
+      relations[m.name] = {
+        type: 'manyToMany',
+        name: m.name,
+        from: sourceTable,
+        to: resolveTable(m.target),
+        referenceKey: resolveCols(ref),
+        foreignKey: resolveCols(ref),
+        through: {
+          table: resolveTable(m.through),
+          sourceKey: resolveCols(m.sourceKey),
+          targetKey: resolveCols(m.targetKey),
+        },
+      };
+    }
+    tables[sourceTable] = { ...sourceMeta, relations };
+  }
+
+  return { ...meta, tables };
 }
 
 // ---------------------------------------------------------------------------

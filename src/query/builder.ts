@@ -30,7 +30,7 @@ import {
   type NestedWriteContext,
 } from '../nested-write.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
-import { camelToSnake, snakeToCamel } from '../schema.js';
+import { camelToSnake, normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import type {
   AggregateArgs,
   AggregateResult,
@@ -2604,6 +2604,27 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const targetMeta = this.schema.tables[targetTable];
     if (!targetMeta) return;
 
+    // manyToMany param order mirrors buildManyToManySubquery:
+    //   where params → limit param → nested-with params (always, both paths).
+    if (relDef.type === 'manyToMany') {
+      if (spec.where) {
+        for (const [, v] of Object.entries(spec.where)) {
+          params.push(v);
+        }
+      }
+      if (spec.limit) {
+        params.push(Number(spec.limit));
+      }
+      if (spec.with) {
+        for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+          const nestedRelDef = targetMeta.relations[nestedRelName];
+          if (!nestedRelDef) continue;
+          this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'alias', depth + 1);
+        }
+      }
+      return;
+    }
+
     const willWrap = relDef.type === 'hasMany' && (spec.limit !== undefined || spec.orderBy !== undefined);
 
     // Non-wrapped path: nested relations BEFORE where/limit
@@ -3400,6 +3421,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const willWrap =
       relDef.type === 'hasMany' && spec !== true && (spec.limit !== undefined || spec.orderBy !== undefined);
 
+    // manyToMany takes a dedicated JOIN-through-junction path. Nested relations,
+    // where, orderBy, and select/omit are handled there (the target alias is the
+    // row source, exactly like hasMany), so short-circuit before the hasMany logic.
+    if (relDef.type === 'manyToMany') {
+      return this.buildManyToManySubquery(
+        relDef,
+        spec,
+        params,
+        parentRef,
+        aliasCounter,
+        currentDepth,
+        currentPath,
+        alias,
+        targetMeta,
+        targetColumns,
+      );
+    }
+
     // Nested relations — only in the non-wrapped path (wrapped path builds them separately)
     if (!willWrap && spec !== true && spec.with) {
       for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
@@ -3524,6 +3563,198 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // belongsTo / hasOne — return single object
     return `SELECT ${jsonObj} FROM ${qTarget} ${alias} WHERE ${whereClause} LIMIT 1`;
+  }
+
+  /**
+   * Build the json_agg subquery for a `manyToMany` relation, JOINing the target
+   * table through a junction (join) table.
+   *
+   * Shape (no LIMIT/ORDER):
+   * ```sql
+   * SELECT COALESCE(json_agg(json_build_object(...)), '[]'::json)
+   * FROM <target> <talias>
+   * JOIN <junction> <jalias> ON <jalias>.<targetKey> = <talias>.<targetPK>
+   * WHERE <jalias>.<sourceKey> = <parentRef>.<referenceKey>
+   * ```
+   *
+   * With LIMIT/ORDER, the rows are wrapped in an inner subquery so the LIMIT
+   * applies BEFORE aggregation (identical strategy to hasMany).
+   *
+   * Cardinality is always 'many' → empty-array fallback, never NULL.
+   *
+   * IMPORTANT: every `params.push` here MUST be mirrored, in the same order, in
+   * {@link collectRelationSubqueryParams} or pipeline batching will desync.
+   */
+  private buildManyToManySubquery(
+    relDef: RelationDef,
+    spec: true | WithOptions,
+    params: unknown[],
+    parentRef: string,
+    aliasCounter: { n: number },
+    currentDepth: number,
+    currentPath: string[],
+    talias: string,
+    targetMeta: TableMetadata,
+    targetColumns: string[],
+  ): string {
+    if (!relDef.through) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`,
+      );
+    }
+
+    const targetTable = relDef.to;
+    const qTarget = this.q(targetTable);
+    const qJunction = this.q(relDef.through.table);
+    const qParent = this.q(parentRef);
+    const jalias = `${talias}j`; // junction alias, distinct from the target alias
+
+    // JOIN: junction.targetKey = target.<targetPK>. Composite keys pair positionally.
+    const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
+    // The target PK is the column(s) the junction's targetKey references. An empty
+    // introspected PK means we cannot know what to JOIN on — fail loudly rather than
+    // silently guessing `id` and generating a wrong JOIN.
+    if (targetMeta.primaryKey.length === 0) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}" targets table "${targetTable}" which has no primary key; ` +
+          `cannot determine the join column. Define a primary key or use an explicit through descriptor.`,
+      );
+    }
+    const targetPk = targetMeta.primaryKey;
+    if (targetKeys.length !== targetPk.length) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}": through.targetKey has ${targetKeys.length} column(s) ` +
+          `but target "${targetTable}" primary key has ${targetPk.length}. Composite keys must pair positionally.`,
+      );
+    }
+    const joinOn = targetKeys
+      .map((jcol, i) => `${jalias}.${this.q(jcol)} = ${talias}.${this.q(targetPk[i]!)}`)
+      .join(' AND ');
+
+    // Correlation: junction.sourceKey = parent.<referenceKey>.
+    const sourceKeys = normalizeKeyColumns(relDef.through.sourceKey);
+    const refKeys = normalizeKeyColumns(relDef.referenceKey);
+    if (sourceKeys.length !== refKeys.length) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}": through.sourceKey has ${sourceKeys.length} column(s) ` +
+          `but referenceKey has ${refKeys.length}. Composite keys must pair positionally.`,
+      );
+    }
+    let whereClause = sourceKeys
+      .map((jcol, i) => `${jalias}.${this.q(jcol)} = ${qParent}.${this.q(refKeys[i]!)}`)
+      .join(' AND ');
+
+    // ORDER BY on the target rows
+    let orderClause = '';
+    if (spec !== true && spec.orderBy) {
+      const orders = Object.entries(spec.orderBy)
+        .map(([k, dir]) => {
+          const col = camelToSnake(k);
+          if (!targetMeta.allColumns.includes(col)) {
+            throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
+          }
+          const safeDir = dir.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+          return `${talias}.${this.q(col)} ${safeDir}`;
+        })
+        .join(', ');
+      orderClause = ` ORDER BY ${orders}`;
+    }
+
+    // Additional WHERE filters on the target — properly parameterized.
+    if (spec !== true && spec.where) {
+      for (const [k, v] of Object.entries(spec.where)) {
+        const col = camelToSnake(k);
+        if (!targetMeta.allColumns.includes(col)) {
+          throw new ValidationError(`[turbine] Unknown column "${k}" in where for table "${targetTable}"`);
+        }
+        params.push(v);
+        whereClause += ` AND ${talias}.${this.q(col)} = ${this.p(params.length)}`;
+      }
+    }
+
+    // LIMIT
+    let limitClause = '';
+    if (spec !== true && spec.limit) {
+      params.push(Number(spec.limit));
+      limitClause = ` LIMIT ${this.p(params.length)}`;
+    }
+
+    const fromJoin = `FROM ${qTarget} ${talias} JOIN ${qJunction} ${jalias} ON ${joinOn}`;
+
+    // When LIMIT or ORDER BY is present, wrap the joined rows in an inner subquery
+    // so the LIMIT applies to rows BEFORE aggregation (same approach as hasMany).
+    if (limitClause || orderClause) {
+      const innerAlias = `${talias}i`;
+      const innerSql =
+        `SELECT ${targetMeta.allColumns.map((c) => `${talias}.${this.q(c)}`).join(', ')} ` +
+        `${fromJoin} WHERE ${whereClause}${orderClause}${limitClause}`;
+      const innerJsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
+        targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
+        `${innerAlias}.${this.q(col)}`,
+      ]);
+      // Nested relations reference the inner alias.
+      if (spec !== true && spec.with) {
+        for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+          const nestedRelDef = targetMeta.relations[nestedRelName];
+          if (!nestedRelDef) {
+            throw new RelationError(
+              `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+                `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
+            );
+          }
+          const nestedSub = this.buildRelationSubquery(
+            nestedRelDef,
+            nestedSpec,
+            params,
+            innerAlias,
+            aliasCounter,
+            currentDepth + 1,
+            [...currentPath, relDef.name],
+          );
+          const fallback =
+            nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'
+              ? this.dialect.nullJsonLiteral
+              : this.dialect.emptyJsonArrayLiteral;
+          innerJsonPairs.push([nestedRelName, `COALESCE((${nestedSub}), ${fallback})`]);
+        }
+      }
+      const innerJsonObj = this.dialect.buildJsonObject(innerJsonPairs);
+      return `SELECT ${this.dialect.buildJsonArrayAgg(innerJsonObj)} FROM (${innerSql}) ${innerAlias}`;
+    }
+
+    // Simple path: build the json object pairs directly off the target alias,
+    // including any nested relations (correlated to the target alias).
+    const jsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
+      targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
+      `${talias}.${this.q(col)}`,
+    ]);
+    if (spec !== true && spec.with) {
+      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+        const nestedRelDef = targetMeta.relations[nestedRelName];
+        if (!nestedRelDef) {
+          throw new RelationError(
+            `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+              `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
+          );
+        }
+        const nestedSub = this.buildRelationSubquery(
+          nestedRelDef,
+          nestedSpec,
+          params,
+          talias,
+          aliasCounter,
+          currentDepth + 1,
+          [...currentPath, relDef.name],
+        );
+        const fallback =
+          nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'
+            ? this.dialect.nullJsonLiteral
+            : this.dialect.emptyJsonArrayLiteral;
+        jsonPairs.push([nestedRelName, `COALESCE((${nestedSub}), ${fallback})`]);
+      }
+    }
+    const jsonObj = this.dialect.buildJsonObject(jsonPairs);
+    return `SELECT ${this.dialect.buildJsonArrayAgg(jsonObj)} ${fromJoin} WHERE ${whereClause}`;
   }
 
   /**
