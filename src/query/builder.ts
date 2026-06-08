@@ -294,6 +294,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** Tracks tables that have already triggered a deep-with warning (one-time) */
   private readonly deepWithWarned = new Set<string>();
 
+  /**
+   * Per-table memo of date columns keyed by their camelCase FIELD name.
+   * `meta.dateColumns` is keyed by raw snake_case column name, which matches
+   * top-level rows from pg. Nested relation rows arrive from json_build_object
+   * with camelCase keys, so they need this camelCase-keyed set to be coerced
+   * to Date as well (otherwise nested dates leak through as strings).
+   */
+  private readonly camelDateFieldCache = new Map<string, Set<string>>();
+
   /** True when this QI runs inside an active transaction (set via _txScoped option). */
   private readonly txScoped: boolean;
 
@@ -2911,6 +2920,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /** Parse a flat row: convert snake_case to camelCase + Date coercion */
+  /**
+   * Returns the set of camelCase field names for a table's date columns,
+   * derived once from `meta.dateColumns` (snake_case) via reverseColumnMap and
+   * memoized per table. Used so nested relation rows (camelCase keys) coerce
+   * dates the same way top-level rows do.
+   */
+  private getCamelDateFields(table: string, meta: TableMetadata): Set<string> {
+    let camel = this.camelDateFieldCache.get(table);
+    if (!camel) {
+      camel = new Set<string>();
+      for (const col of meta.dateColumns) {
+        camel.add(meta.reverseColumnMap[col] ?? col);
+      }
+      this.camelDateFieldCache.set(table, camel);
+    }
+    return camel;
+  }
+
   private parseRow(row: Record<string, unknown>, table: string): Record<string, unknown> {
     const parsed: Record<string, unknown> = {};
     const meta = this.schema.tables[table];
@@ -2919,13 +2946,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Fast path: use pre-computed maps (avoids regex per column per row)
       const reverseMap = meta.reverseColumnMap;
       const dateCols = meta.dateColumns;
+      // camelCase-keyed date fields, so nested json_build_object rows (whose
+      // keys are already camelCase) get the same Date coercion as top-level rows.
+      const camelDateFields = this.getCamelDateFields(table, meta);
 
       const keys = Object.keys(row);
       for (let i = 0; i < keys.length; i++) {
         const col = keys[i]!;
         const value = row[col];
         const field = reverseMap[col] ?? col; // fall back to raw col name, not regex
-        if (dateCols.has(col) && value !== null && !(value instanceof Date)) {
+        // Top-level rows are snake_case (dateCols); nested rows are camelCase (camelDateFields).
+        if ((dateCols.has(col) || camelDateFields.has(field)) && value !== null && !(value instanceof Date)) {
           parsed[field] = new Date(value as string);
         } else {
           parsed[field] = value;
@@ -2969,15 +3000,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (typeof rawValue === 'string') {
         try {
           const jsonVal = JSON.parse(rawValue);
-          // After parsing, apply parseRow to each item for snake→camel + date coercion
+          // After parsing, recurse via parseNestedRow so each item gets date
+          // coercion AND its own sub-relations parsed at arbitrary depth.
           if (Array.isArray(jsonVal)) {
             parsed[relName] = jsonVal.map((item: unknown) =>
               typeof item === 'object' && item !== null
-                ? this.parseRow(item as Record<string, unknown>, relDef.to)
+                ? this.parseNestedRow(item as Record<string, unknown>, relDef.to)
                 : item,
             );
           } else if (typeof jsonVal === 'object' && jsonVal !== null) {
-            parsed[relName] = this.parseRow(jsonVal as Record<string, unknown>, relDef.to);
+            parsed[relName] = this.parseNestedRow(jsonVal as Record<string, unknown>, relDef.to);
           } else {
             parsed[relName] = jsonVal;
           }
@@ -2989,10 +3021,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       } else if (Array.isArray(rawValue)) {
         parsed[relName] = rawValue.map((item) =>
-          typeof item === 'object' && item !== null ? this.parseRow(item as Record<string, unknown>, relDef.to) : item,
+          typeof item === 'object' && item !== null
+            ? this.parseNestedRow(item as Record<string, unknown>, relDef.to)
+            : item,
         );
       } else if (typeof rawValue === 'object' && rawValue !== null) {
-        parsed[relName] = this.parseRow(rawValue as Record<string, unknown>, relDef.to);
+        parsed[relName] = this.parseNestedRow(rawValue as Record<string, unknown>, relDef.to);
       } else {
         parsed[relName] = rawValue;
       }

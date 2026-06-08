@@ -63,14 +63,12 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Verify package size
-        run: |
-          SIZE_KB=$(npm pack --dry-run 2>&1 | grep 'package size' | awk '{print $(NF-1)}')
-          echo "Package size: ${SIZE_KB} kB"
-          if [ "$(echo "$SIZE_KB > 150" | bc)" -eq 1 ]; then
-            echo "::error::Package size ${SIZE_KB}kB exceeds 150kB limit"
-            exit 1
-          fi
+      # Bundle size gate — size-limit is the single source of truth (same check
+      # CI runs). Measures the bundled import graph against .size-limit.js limits
+      # (~27 kB main / ~19 kB edge, under 35/25 ceilings). Replaces the previous
+      # stale hard-coded 150 kB tarball check that never matched reality.
+      - name: Verify bundle sizes
+        run: npx size-limit
 
   publish:
     needs: [test]
