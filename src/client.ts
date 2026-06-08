@@ -24,7 +24,7 @@
 
 import pg from 'pg';
 import type { Dialect } from './dialect.js';
-import { type ErrorMessageMode, setErrorMessageMode, TimeoutError, wrapPgError } from './errors.js';
+import { type ErrorMessageMode, setErrorMessageMode, TimeoutError, ValidationError, wrapPgError } from './errors.js';
 import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 import {
@@ -34,6 +34,14 @@ import {
   QueryInterface,
   type QueryInterfaceOptions,
 } from './query/index.js';
+import { quoteIdent } from './query/utils.js';
+import {
+  type ActiveSubscription,
+  createSubscription,
+  type NotificationHandler,
+  type Subscription,
+  validateChannel,
+} from './realtime.js';
 import type { SchemaMetadata } from './schema.js';
 import { buildTypedSql, TypedSqlQuery } from './typed-sql.js';
 
@@ -221,6 +229,30 @@ export interface TransactionOptions {
   timeout?: number;
   /** Isolation level for the transaction */
   isolationLevel?: 'ReadUncommitted' | 'ReadCommitted' | 'RepeatableRead' | 'Serializable';
+  /**
+   * Transaction-local session GUCs to set after BEGIN. The canonical use case
+   * is multi-tenant Postgres row-level security (RLS): your policies filter on
+   * `current_setting('app.current_tenant')`, and you set that value here so
+   * every query inside the transaction sees it.
+   *
+   * Each entry is applied via `SELECT set_config($1, $2, true)` — `is_local=true`
+   * scopes the value to this transaction, so it auto-resets on COMMIT/ROLLBACK
+   * and never leaks onto the pooled connection. Both the name and value are
+   * bound parameters (never interpolated); the GUC name is additionally
+   * validated against a strict identifier regex.
+   *
+   * @example
+   * ```ts
+   * await db.$transaction(
+   *   async (tx) => {
+   *     // every query here sees current_setting('app.current_tenant') = '42'
+   *     return tx.invoices.findMany();
+   *   },
+   *   { sessionContext: { 'app.current_tenant': '42', 'app.current_user': userId } },
+   * );
+   * ```
+   */
+  sessionContext?: Record<string, string | number | boolean>;
 }
 
 /** Maps isolation level names to SQL */
@@ -230,6 +262,14 @@ const ISOLATION_LEVELS: Record<string, string> = {
   RepeatableRead: 'REPEATABLE READ',
   Serializable: 'SERIALIZABLE',
 };
+
+/**
+ * Strict GUC (session variable) name: an optionally namespaced identifier such
+ * as `app.current_tenant` or `search_path`. Even though the name is passed as a
+ * bound parameter to `set_config`, a malformed name is a programmer error worth
+ * rejecting loudly before it reaches the database.
+ */
+const GUC_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
 
 // ---------------------------------------------------------------------------
 // TransactionClient — provides typed table accessors within a transaction
@@ -370,6 +410,8 @@ export class TurbineClient {
   private readonly errorMessagesSafe: boolean;
   /** True when Turbine created the pool and is responsible for tearing it down */
   private readonly ownsPool: boolean = true;
+  /** Active LISTEN subscriptions — torn down on disconnect() so it never hangs */
+  private readonly activeSubscriptions = new Set<ActiveSubscription>();
 
   constructor(config: TurbineConfig = {}, schema: SchemaMetadata) {
     /**
@@ -799,6 +841,24 @@ export class TurbineClient {
       }
       await client.query(beginSQL);
 
+      // Apply transaction-local session context (RLS / multi-tenant GUCs).
+      // Order matters: BEGIN -> isolation level (above) -> set_config loop ->
+      // user fn. Any error here propagates to the catch below and rolls back
+      // like any other transaction failure. We use set_config(name, value,
+      // is_local=true) — the parameterizable, transaction-scoped equivalent of
+      // SET LOCAL — so both name and value are BOUND params, never interpolated.
+      if (options?.sessionContext) {
+        for (const [name, value] of Object.entries(options.sessionContext)) {
+          if (!GUC_NAME_REGEX.test(name)) {
+            throw new ValidationError(
+              `[turbine] Invalid session-context GUC name "${name}" — must match ` +
+                '/^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$/ (optionally namespaced, e.g. "app.current_tenant")',
+            );
+          }
+          await client.query('SELECT set_config($1, $2, true)', [name, String(value)]);
+        }
+      }
+
       // Create the transaction client with typed table accessors
       const tx = new TransactionClient(client, this.schema, this.middlewares, this.queryOptions);
 
@@ -872,6 +932,102 @@ export class TurbineClient {
     }
   }
 
+  /**
+   * Convenience wrapper around `$transaction` for the multi-tenant / RLS case:
+   * runs `fn` inside a transaction with the given session GUCs applied via
+   * `set_config(..., is_local=true)`. Equivalent to
+   * `$transaction(fn, { sessionContext: context })`.
+   *
+   * @example
+   * ```ts
+   * const invoices = await db.$withSession(
+   *   { 'app.current_tenant': tenantId },
+   *   (tx) => tx.invoices.findMany(),
+   * );
+   * ```
+   */
+  async $withSession<R>(
+    context: Record<string, string | number | boolean>,
+    fn: (tx: TransactionClient) => Promise<R>,
+  ): Promise<R> {
+    return this.$transaction(fn, { sessionContext: context });
+  }
+
+  // -------------------------------------------------------------------------
+  // LISTEN / NOTIFY — Postgres realtime pub/sub
+  // -------------------------------------------------------------------------
+
+  /**
+   * Subscribe to a Postgres NOTIFY channel. The handler fires with each
+   * notification's payload string (the empty string when a payload-less
+   * NOTIFY is sent) for as long as the subscription is active.
+   *
+   * Each `$listen` checks out its OWN dedicated long-lived connection from the
+   * pool and runs `LISTEN "channel"` on it; `subscription.unsubscribe()`
+   * UNLISTENs, detaches the handler, and releases that connection. Active
+   * subscriptions are tracked and force-released on `disconnect()` so shutdown
+   * never hangs.
+   *
+   * The channel name CANNOT be a bound parameter (`LISTEN $1` is a syntax
+   * error), so it is validated against a strict identifier regex AND quoted via
+   * `quoteIdent` before interpolation — it is the only identifier this method
+   * places into SQL text.
+   *
+   * **Serverless caveat:** LISTEN needs a persistent connection that can push
+   * async notifications. Stateless HTTP drivers (Neon HTTP, Vercel Postgres)
+   * cannot do this — `$listen` throws a `ConnectionError` rather than hang.
+   * `$notify` works on every driver.
+   *
+   * @example
+   * ```ts
+   * const sub = await db.$listen('order_created', (payload) => {
+   *   const order = JSON.parse(payload);
+   *   console.log('new order', order.id);
+   * });
+   * // ...later
+   * await sub.unsubscribe();
+   * ```
+   */
+  async $listen(channel: string, handler: NotificationHandler): Promise<Subscription> {
+    validateChannel(channel);
+    const quoted = quoteIdent(channel);
+
+    if (this.logging) {
+      console.log(`[turbine] LISTEN ${quoted}`);
+    }
+
+    const sub = await createSubscription(this.pool as unknown as PgCompatPool, channel, quoted, handler, (closed) => {
+      this.activeSubscriptions.delete(closed);
+    });
+    this.activeSubscriptions.add(sub);
+    return sub;
+  }
+
+  /**
+   * Send a Postgres NOTIFY on `channel` with an optional payload string.
+   *
+   * Issued as `SELECT pg_notify($1, $2)` — both the channel and payload are
+   * BOUND parameters (no quoting/injection concern). The channel is still
+   * validated against the identifier regex for parity with `$listen` and to
+   * catch typos loudly. Works on every driver, including serverless HTTP pools.
+   *
+   * @example
+   * ```ts
+   * await db.$notify('order_created', JSON.stringify({ id: 7 }));
+   * ```
+   */
+  async $notify(channel: string, payload?: string): Promise<void> {
+    validateChannel(channel);
+    if (this.logging) {
+      console.log(`[turbine] NOTIFY ${channel}`);
+    }
+    try {
+      await this.pool.query('SELECT pg_notify($1, $2)', [channel, payload ?? '']);
+    } catch (err) {
+      throw wrapPgError(err);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Retry — automatic retry for retryable errors (deadlock, serialization)
   // -------------------------------------------------------------------------
@@ -922,6 +1078,22 @@ export class TurbineClient {
    * method is a no-op — the caller is responsible for the pool's lifecycle.
    */
   async disconnect(): Promise<void> {
+    // Tear down any live LISTEN subscriptions first. Each holds a dedicated
+    // pooled connection checked out; if we ended the pool (or returned for an
+    // external pool) without releasing them, pool.end() would wait forever for
+    // those connections to return. _forceRelease() detaches the handler and
+    // releases the client WITHOUT issuing UNLISTEN (pointless if we're ending
+    // the pool / the connection is going away anyway). This runs for both
+    // owned and external pools so subscriptions never leak.
+    if (this.activeSubscriptions.size > 0) {
+      // _forceRelease mutates activeSubscriptions via the onClosed callback,
+      // so iterate a snapshot.
+      for (const sub of [...this.activeSubscriptions]) {
+        sub._forceRelease();
+      }
+      this.activeSubscriptions.clear();
+    }
+
     if (!this.ownsPool) {
       if (this.logging) {
         console.log('[turbine] disconnect() skipped — external pool is not owned by Turbine');

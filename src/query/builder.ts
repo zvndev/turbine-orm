@@ -48,6 +48,7 @@ import type {
   HavingFilter,
   HavingNumericOperator,
   JsonFilter,
+  OrderByClause,
   OrderDirection,
   QueryResult,
   TextSearchFilter,
@@ -55,6 +56,8 @@ import type {
   UpdateArgs,
   UpdateManyArgs,
   UpsertArgs,
+  VectorFilter,
+  VectorOrderBy,
   WhereClause,
   WhereOperator,
   WithClause,
@@ -185,6 +188,49 @@ function isTextSearchFilter(value: unknown): value is TextSearchFilter {
  */
 function validateTextSearchConfig(config: string): boolean {
   return /^[a-zA-Z0-9_]+$/.test(config);
+}
+
+/**
+ * pgvector distance metric → operator allow-list. This is the ONLY mapping
+ * from a user-supplied metric token to a SQL operator; any token not present
+ * here is rejected, so a user value can never become an arbitrary operator.
+ *
+ *  - `l2`     → `<->` (Euclidean / L2 distance)
+ *  - `cosine` → `<=>` (cosine distance)
+ *  - `ip`     → `<#>` (negative inner product)
+ */
+const VECTOR_METRIC_OPERATORS: Record<string, string> = {
+  l2: '<->',
+  cosine: '<=>',
+  ip: '<#>',
+};
+
+/** Comparison keys allowed on a {@link VectorDistanceFilter}. */
+const VECTOR_DISTANCE_COMPARATORS: Record<string, string> = {
+  lt: '<',
+  lte: '<=',
+  gt: '>',
+  gte: '>=',
+};
+
+/** Check if a value is a vector distance WHERE filter: `{ distance: { to, metric } }` */
+function isVectorFilter(value: unknown): value is VectorFilter {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || value instanceof Date) {
+    return false;
+  }
+  const dist = (value as { distance?: unknown }).distance;
+  return (
+    typeof dist === 'object' &&
+    dist !== null &&
+    !Array.isArray(dist) &&
+    'to' in (dist as object) &&
+    'metric' in (dist as object)
+  );
+}
+
+/** Check if an orderBy value is a vector KNN ordering: `{ distance: { to, metric } }` */
+function isVectorOrderBy(value: unknown): value is VectorOrderBy {
+  return isVectorFilter(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -733,7 +779,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
     const orderFp = args?.orderBy
       ? Object.entries(args.orderBy)
-          .map(([k, d]) => `${k}:${d}`)
+          .map(([k, d]) => {
+            // Vector KNN ordering changes the emitted SQL operator by metric and
+            // adds a `::vector` param, so the metric + direction must be part of
+            // the cache key — otherwise two KNN queries differing only in metric
+            // would collide on a single cached SQL string.
+            if (isVectorOrderBy(d)) {
+              return `${k}:vec(${d.distance.metric},${d.distance.direction ?? 'asc'})`;
+            }
+            return `${k}:${d}`;
+          })
           .join(',')
       : '';
     const cursorFp = args?.cursor
@@ -799,7 +854,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       if (args?.orderBy) {
-        sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
+        // Pass freshParams so vector KNN ordering binds its `$n::vector` query
+        // vector at the correct position (after cursor params, before LIMIT).
+        sql += ` ORDER BY ${this.buildOrderBy(args.orderBy, freshParams)}`;
       }
 
       if (effectiveLimit !== undefined) {
@@ -830,11 +887,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
         params.push(v);
       }
     }
-    // 4. LIMIT param
+    // 4. ORDER BY params (vector KNN ordering binds a `$n::vector` query vector).
+    //    Mirrors buildOrderBy's push order — between cursor and LIMIT.
+    if (args?.orderBy) {
+      this.collectOrderByParams(args.orderBy, params);
+    }
+    // 5. LIMIT param
     if (effectiveLimit !== undefined) {
       params.push(Number(effectiveLimit));
     }
-    // 5. OFFSET param
+    // 6. OFFSET param
     if (args?.offset !== undefined) {
       params.push(Number(args.offset));
     }
@@ -2273,6 +2335,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      // Vector distance filter — metric (operator) and present comparators
+      // change the SQL shape, so both go in the fingerprint.
+      if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
+        const dist = (value as VectorFilter).distance;
+        const cmps = Object.keys(VECTOR_DISTANCE_COMPARATORS)
+          .filter((c) => (dist as unknown as Record<string, unknown>)[c] !== undefined)
+          .sort()
+          .join('|');
+        parts.push(`${key}:vec(${dist.metric},${cmps})`);
+        continue;
+      }
+
       // JSON filter
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
         const jKeys = Object.keys(value as object).sort();
@@ -2406,6 +2480,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       const rawColumn = this.toColumn(key);
 
+      // Vector distance filter — mirrors buildVectorFilterClauses push order.
+      if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
+        // Validate the same way the build path does so the collect path never
+        // diverges (it would throw before any param was pushed).
+        this.vectorOperator(key, rawColumn, value.distance.metric);
+        this.collectVectorFilterParams(key, rawColumn, value, params);
+        continue;
+      }
+
       // JSONB filter
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.getColumnPgType(rawColumn);
@@ -2493,6 +2576,38 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (filter.hasEvery !== undefined) params.push(filter.hasEvery);
     if (filter.hasSome !== undefined) params.push(filter.hasSome);
     // isEmpty has no params (IS NULL / IS NOT NULL)
+  }
+
+  /**
+   * Collect params for an orderBy clause. Only vector KNN ordering pushes a
+   * param (the `$n::vector` query vector); plain direction ordering is
+   * parameterless. Mirrors buildOrderBy's push order exactly so the cached-SQL
+   * param re-collection stays in lockstep.
+   */
+  private collectOrderByParams(orderBy: OrderByClause, params: unknown[]): void {
+    for (const [key, dir] of Object.entries(orderBy)) {
+      if (isVectorOrderBy(dir)) {
+        const rawColumn = this.toColumn(key);
+        // Re-run the same validation as buildOrderBy so the collect path can
+        // never push a param that the build path rejected (or vice versa).
+        this.vectorOperator(key, rawColumn, dir.distance.metric);
+        this.pushVectorParam(key, rawColumn, dir.distance.to, params);
+      }
+    }
+  }
+
+  /**
+   * Collect params for a vector distance WHERE filter. Mirrors
+   * {@link buildVectorFilterClauses}: the `$n::vector` query vector first, then
+   * the comparison threshold(s).
+   */
+  private collectVectorFilterParams(field: string, rawColumn: string, filter: VectorFilter, params: unknown[]): void {
+    const dist = filter.distance;
+    this.pushVectorParam(field, rawColumn, dist.to, params);
+    for (const cmp of Object.keys(VECTOR_DISTANCE_COMPARATORS)) {
+      const threshold = (dist as unknown as Record<string, unknown>)[cmp];
+      if (threshold !== undefined) params.push(threshold);
+    }
   }
 
   /**
@@ -2813,6 +2928,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      // Handle vector distance filter (pgvector): `{ distance: { to, metric, lt } }`
+      if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
+        const vecClauses = this.buildVectorFilterClauses(key, rawColumn, value, params);
+        andClauses.push(...vecClauses);
+        continue;
+      }
+
       // Handle JSONB filter operators (for json/jsonb columns)
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.getColumnPgType(rawColumn);
@@ -3055,8 +3177,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return clauses;
   }
 
-  /** Build ORDER BY clause from an object */
-  private buildOrderBy(orderBy: Record<string, OrderDirection>): string {
+  /**
+   * Build ORDER BY clause from an object.
+   *
+   * Each value is either a plain direction (`'asc'`/`'desc'`) or — for pgvector
+   * columns — a `{ distance: { to, metric, direction? } }` KNN ordering object.
+   * Vector ordering binds the query vector as a `$n::vector` param, so a `params`
+   * array MUST be supplied when a vector ordering may be present (top-level
+   * findMany path). When `params` is omitted (groupBy / relation path) a vector
+   * ordering throws — KNN ordering is only supported at the top level.
+   */
+  private buildOrderBy(orderBy: OrderByClause, params?: unknown[]): string {
     // Dev-only: validate that orderBy fields exist in the table schema
     if (process.env.NODE_ENV !== 'production') {
       for (const key of Object.keys(orderBy)) {
@@ -3076,10 +3207,81 @@ export class QueryInterface<T extends object, R extends object = {}> {
         if (meta && !(key in meta.columnMap)) {
           throw new ValidationError(`Unknown column "${key}" in orderBy for table "${this.table}"`);
         }
-        const safeDir = dir.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
+        // Vector KNN ordering: { distance: { to, metric, direction? } }
+        if (isVectorOrderBy(dir)) {
+          if (!params) {
+            throw new ValidationError(
+              `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
+            );
+          }
+          const rawColumn = this.toColumn(key);
+          const operator = this.vectorOperator(key, rawColumn, dir.distance.metric);
+          const placeholder = this.pushVectorParam(key, rawColumn, dir.distance.to, params);
+          const safeDir = dir.distance.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+          return `${this.q(rawColumn)} ${operator} ${placeholder} ${safeDir}`;
+        }
+
+        const safeDir = (dir as OrderDirection).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
         return `${this.toSqlColumn(key)} ${safeDir}`;
       })
       .join(', ');
+  }
+
+  // -------------------------------------------------------------------------
+  // pgvector helpers (similarity search)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve a {@link VectorMetric} to its pgvector distance operator from a
+   * fixed allow-list, validating the target column is actually a `vector`
+   * column. Throws {@link ValidationError} for an unknown metric or a
+   * non-vector column — a user-supplied string can never become a SQL operator.
+   */
+  private vectorOperator(field: string, rawColumn: string, metric: string): string {
+    const colType = this.getColumnPgType(rawColumn);
+    if (colType !== 'vector') {
+      throw new ValidationError(
+        `[turbine] Column "${field}" on table "${this.table}" is not a vector column ` +
+          `(actual type: ${colType}); cannot apply a vector distance operation.`,
+      );
+    }
+    const op = VECTOR_METRIC_OPERATORS[metric];
+    if (!op) {
+      throw new ValidationError(
+        `[turbine] Unknown vector metric "${metric}" for column "${field}". ` +
+          `Valid metrics: ${Object.keys(VECTOR_METRIC_OPERATORS).join(', ')}.`,
+      );
+    }
+    return op;
+  }
+
+  /**
+   * Validate and bind a query vector as a single `$n::vector` parameter.
+   * Every element must be a finite number (no NaN / Infinity / strings) so a
+   * malformed array can never produce a broken `::vector` literal, and the array
+   * is NEVER string-interpolated into the SQL text. Returns the `$n::vector`
+   * placeholder string.
+   */
+  private pushVectorParam(field: string, _rawColumn: string, to: unknown, params: unknown[]): string {
+    if (!Array.isArray(to) || to.length === 0) {
+      throw new ValidationError(
+        `[turbine] Vector distance on "${field}" requires a non-empty array of numbers for "to".`,
+      );
+    }
+    for (const el of to) {
+      if (typeof el !== 'number' || !Number.isFinite(el)) {
+        throw new ValidationError(
+          `[turbine] Vector "to" for column "${field}" must contain only finite numbers; ` +
+            `got ${JSON.stringify(el)}.`,
+        );
+      }
+    }
+    // Bind as a pgvector text literal '[1,2,3]'. Elements are already validated
+    // as finite numbers, so the joined string is safe; it is still passed as a
+    // bound param (never interpolated) and cast with ::vector.
+    params.push(`[${(to as number[]).join(',')}]`);
+    return `${this.p(params.length)}::vector`;
   }
 
   /** Parse a flat row: convert snake_case to camelCase + Date coercion */
@@ -3858,6 +4060,50 @@ export class QueryInterface<T extends object, R extends object = {}> {
       clauses.push(`cardinality(${column}) > 0`);
     }
 
+    return clauses;
+  }
+
+  /**
+   * Build SQL clauses for a pgvector distance WHERE filter:
+   *
+   *   `"embedding" <-> $1::vector < $2`
+   *
+   * The query vector is bound as a `$n::vector` param (never interpolated), the
+   * metric maps to an operator via a fixed allow-list, and each comparison
+   * threshold (`lt`/`lte`/`gt`/`gte`) is its own bound param. Emits one clause
+   * per supplied comparator (all ANDed). Param push order matches
+   * {@link collectVectorFilterParams}.
+   */
+  private buildVectorFilterClauses(
+    field: string,
+    rawColumn: string,
+    filter: VectorFilter,
+    params: unknown[],
+  ): string[] {
+    const dist = filter.distance;
+    const operator = this.vectorOperator(field, rawColumn, dist.metric);
+    const placeholder = this.pushVectorParam(field, rawColumn, dist.to, params);
+    const distanceExpr = `${this.q(rawColumn)} ${operator} ${placeholder}`;
+
+    const clauses: string[] = [];
+    for (const [cmp, sqlOp] of Object.entries(VECTOR_DISTANCE_COMPARATORS)) {
+      const threshold = (dist as unknown as Record<string, unknown>)[cmp];
+      if (threshold === undefined) continue;
+      if (typeof threshold !== 'number' || !Number.isFinite(threshold)) {
+        throw new ValidationError(
+          `[turbine] Vector distance threshold "${cmp}" on "${field}" must be a finite number; ` +
+            `got ${JSON.stringify(threshold)}.`,
+        );
+      }
+      params.push(threshold);
+      clauses.push(`${distanceExpr} ${sqlOp} ${this.p(params.length)}`);
+    }
+
+    if (clauses.length === 0) {
+      throw new ValidationError(
+        `[turbine] Vector distance filter on "${field}" requires at least one comparison (lt / lte / gt / gte).`,
+      );
+    }
     return clauses;
   }
 

@@ -171,6 +171,16 @@ const PG_TO_TS: Record<string, string> = {
   // TSVector
   tsvector: 'string',
   tsquery: 'string',
+  // pgvector — embeddings. Mapped to `number[]` for DX (the natural shape an app
+  // passes when inserting / comparing embeddings). NOTE: like `numeric` above,
+  // there is a runtime caveat — pg has no built-in parser for the `vector` type,
+  // so over the wire a fetched vector arrives as a string literal like
+  // '[1,2,3]' unless the app registers its own parser (e.g. via pgvector's
+  // `registerType`). Turbine never auto-registers one (no side-effecting type
+  // parsers outside the client constructor). The query-side helpers (KNN
+  // orderBy, distance WHERE) always bind the query vector as a `$n::vector`
+  // param, so writing/comparing is unaffected by the read-side caveat.
+  vector: 'number[]',
 };
 
 const DATE_TYPES = new Set(['timestamptz', 'timestamp', 'date']);
