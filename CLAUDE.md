@@ -6,7 +6,7 @@ TypeScript ORM for PostgreSQL. Single-query nested relations via `json_agg`.
 
 ```bash
 npm install           # Install deps
-npm run build         # ESM + CJS output (dist/ and dist-cjs/)
+npm run build         # ESM + CJS output (dist/ and dist/cjs/)
 npm run typecheck     # tsc --noEmit
 npm run test:unit     # Schema builder + migration tests (no DB needed)
 npm test              # All tests (needs DATABASE_URL)
