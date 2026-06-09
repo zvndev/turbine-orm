@@ -2133,12 +2133,28 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private resolveColumns(select?: Record<string, boolean>, omit?: Record<string, boolean>): string[] | null {
     if (select) {
+      // An array here means a caller wrote `select: ['id', 'name']` (Drizzle/SQL
+      // style) instead of the object shape. Object.entries() would iterate the
+      // numeric indices and throw a cryptic `Unknown field "0"` — catch it early
+      // with an actionable message.
+      if (Array.isArray(select)) {
+        throw new ValidationError(
+          `[turbine] "select" must be an object mapping field names to true ` +
+            `(e.g. { id: true, name: true }), not an array.`,
+        );
+      }
       // Only include columns where value is true
       return Object.entries(select)
         .filter(([, v]) => v)
         .map(([k]) => this.toColumn(k));
     }
     if (omit) {
+      if (Array.isArray(omit)) {
+        throw new ValidationError(
+          `[turbine] "omit" must be an object mapping field names to true ` +
+            `(e.g. { createdAt: true }), not an array.`,
+        );
+      }
       // Include all columns except those where value is true
       const omitCols = new Set(
         Object.entries(omit)
@@ -2991,6 +3007,28 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      // Strict validation: a plain (non-array, non-Date) object on a non-JSON
+      // column matched no known filter shape — almost always a misspelled
+      // operator (`startWith` for `startsWith`) or a stray nested object.
+      // Silently treating it as `col = $1` returns wrong rows with no error, so
+      // throw with the offending keys and the supported operator list. JSON/JSONB
+      // columns legitimately accept object values for equality, so they fall
+      // through unchanged.
+      if (typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date)) {
+        const colType = this.getColumnPgType(rawColumn);
+        if (colType !== 'json' && colType !== 'jsonb') {
+          const badKeys = Object.keys(value as Record<string, unknown>);
+          throw new ValidationError(
+            badKeys.length === 0
+              ? `[turbine] Empty filter object on "${rawColumn}" for table "${this.table}". ` +
+                  `Provide a value or an operator like { gt: 1 }.`
+              : `[turbine] Unknown operator${badKeys.length > 1 ? 's' : ''} ` +
+                  `${badKeys.map((k) => `"${k}"`).join(', ')} on "${rawColumn}" for table "${this.table}". ` +
+                  `Supported operators: ${[...OPERATOR_KEYS].join(', ')}.`,
+          );
+        }
+      }
+
       // Plain equality
       params.push(value);
       andClauses.push(`${column} = ${this.p(params.length)}`);
@@ -3205,7 +3243,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return Object.entries(orderBy)
       .map(([key, dir]) => {
         if (meta && !(key in meta.columnMap)) {
-          throw new ValidationError(`Unknown column "${key}" in orderBy for table "${this.table}"`);
+          throw new ValidationError(
+            `[turbine] Unknown field "${key}" in orderBy on table "${this.table}". ` +
+              `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
+          );
         }
 
         // Vector KNN ordering: { distance: { to, metric, direction? } }
