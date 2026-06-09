@@ -175,14 +175,15 @@ DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
 npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 ```
 
-Studio ships four tabs:
+Studio ships three tabs:
 
+- **Query** — the default. Compose a `findMany` visually: pick fields (`select` / `omit`), filter (`where` with AND/OR/NOT and the full operator set), order and `limit`, and drill into relations (`with`) — recursively, to any depth, picking fields and filters at every level. A live TypeScript preview shows the exact `db.table.findMany(...)` call to copy into your codebase. There is no raw-SQL surface: every query is expressed in Turbine ORM, so what you build is what you ship.
 - **Data** — browse rows, sort columns, open JSON/JSONB cells in a modal, and full-text search across every text column.
 - **Schema** — inspect tables, columns, indexes, and relations.
-- **SQL** — run ad-hoc `SELECT` statements. Everything executes inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`, so writes are impossible at the transaction level.
-- **Builder** — compose `where` / `orderBy` / `with` / `limit` visually, with a live TypeScript preview of the matching `db.table.findMany(...)` call to copy into your codebase.
 
-**Saved queries** persist to `.turbine/studio-queries.json` and surface in the SQL tab and the **Cmd+K command palette**, which also jumps to any table or tab in a single keystroke.
+Everything still executes inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`, so writes are impossible at the transaction level.
+
+**Saved queries** persist to `.turbine/studio-queries.json` and surface in the sidebar and the **Cmd+K command palette**, which also jumps to any table or tab in a single keystroke.
 
 **Security posture (read-only by design)**
 
