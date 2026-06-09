@@ -23,6 +23,8 @@ const sections: NavSection[] = [
       { href: '/queries', label: 'API Reference' },
       { href: '/relations', label: 'Relations' },
       { href: '/transactions', label: 'Transactions & Pipelines' },
+      { href: '/vector', label: 'Vector Search' },
+      { href: '/realtime', label: 'Realtime (LISTEN/NOTIFY)' },
       { href: '/schema', label: 'Schema & Migrations' },
       { href: '/serverless', label: 'Serverless & Edge' },
       { href: '/compatibility', label: 'Database Compatibility' },
@@ -153,7 +155,7 @@ export function Sidebar() {
                     fontWeight: 600,
                   }}
                 >
-                  v0.10.0
+                  v0.18.0
                 </span>
               </div>
             </div>

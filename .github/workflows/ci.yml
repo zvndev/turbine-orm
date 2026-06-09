@@ -58,17 +58,25 @@ jobs:
       - run: npm ci
       - run: npm run test:coverage
 
-  # Integration tests run against a real Postgres service container. The
-  # service is seeded from src/test/fixtures/seed.sql before the test run,
-  # which provides the schema + a small fixture dataset (5 orgs / 8 users /
-  # 10 posts / 20 comments) — enough to exercise nested relations, cursor
-  # pagination, JSONB / array operators, and the streaming cursor API.
+  # Integration tests run against a real Postgres service container, exercised
+  # across a version matrix (PG 14/15/16/17). The service is seeded from
+  # src/test/fixtures/seed.sql before the test run, which provides the schema +
+  # a small fixture dataset (7 orgs / 8 users / 10 posts / 20 comments) — enough
+  # to exercise nested relations, cursor pagination, JSONB / array operators,
+  # and the streaming cursor API. Running the full suite on every supported
+  # major version catches version-specific SQL/behavior regressions (e.g. the
+  # default statement_timeout path that was previously never integration-tested).
   # Failures gate PRs.
   integration-tests:
+    name: integration-tests (postgres ${{ matrix.postgres-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres-version: [14, 15, 16, 17]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres-version }}
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -98,6 +106,136 @@ jobs:
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
 
+  # Real CockroachDB job. The CRDB/Yugabyte adapters were only ever unit-tested
+  # with mocked clients, so a bug in the adapter's statementTimeout set_config()
+  # SQL (and the Studio read-only timeout path) shipped green. This job spins a
+  # real single-node CockroachDB and runs the DB-gated timeout/adapter
+  # integration tests against it, proving the SQL the adapter emits is actually
+  # accepted by a real CockroachDB server. CRDB listens on 26257 and (in
+  # --insecure mode) authenticates the built-in `root` user with no password.
+  # This job GATES PRs — a CRDB-rejected statement is exactly the regression we
+  # want to catch.
+  # Real CockroachDB job: proves the cockroachdb adapter's set_config()
+  # `transaction_timeout` SQL is accepted by a real CRDB server (not just a
+  # mock). It runs studio-timeout-integration.test.ts with
+  # TURBINE_TEST_ENGINE=cockroachdb so the CRDB-specific adapter SQL is the SQL
+  # actually sent over the wire. Marked continue-on-error until it has run green
+  # in CI a few times — it exercises a real engine but the container topology
+  # hasn't been proven on GitHub runners yet; promote to a hard gate once it has.
+  cockroachdb-integration:
+    name: cockroachdb-integration
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      cockroachdb:
+        # Pinned to the v24.1 major (rolling within the major) so an upstream
+        # CRDB release can't silently change behavior under CI.
+        image: cockroachdb/cockroach:latest-v24.1
+        # The image's ENTRYPOINT is `cockroach`, so the service `command:` only
+        # needs to supply the subcommand + flags. `start-single-node --insecure`
+        # brings up a one-node cluster with auth disabled, suitable for CI. SQL
+        # is served on 26257; the HTTP health endpoint on 8080.
+        command: start-single-node --insecure
+        # Health-probe with the cockroach binary itself (guaranteed present in
+        # the image) rather than curl/pg_isready, which aren't. `node status`
+        # exits 0 once the single node is live and serving SQL.
+        options: >-
+          --health-cmd "/cockroach/cockroach node status --insecure --host=localhost:26257"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 15
+          --health-start-period 30s
+        ports:
+          - 26257:26257
+          - 8080:8080
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Wait until SQL accepts connections, then create the test database.
+      - name: Wait for CockroachDB SQL + create database
+        run: |
+          for i in $(seq 1 30); do
+            if node -e "const pg=require('pg');const c=new pg.Client({connectionString:process.env.ROOT_URL});c.connect().then(()=>c.query('SELECT 1')).then(()=>c.end()).then(()=>process.exit(0)).catch(()=>process.exit(1))"; then
+              echo "CockroachDB is accepting SQL connections"
+              break
+            fi
+            echo "Waiting for CockroachDB SQL... ($i)"
+            sleep 3
+          done
+          node -e "const pg=require('pg');const c=new pg.Client({connectionString:process.env.ROOT_URL});c.connect().then(()=>c.query('CREATE DATABASE IF NOT EXISTS turbine_test')).then(()=>c.end()).then(()=>process.exit(0)).catch(e=>{console.error(e);process.exit(1)})"
+        env:
+          ROOT_URL: postgres://root@localhost:26257/defaultdb?sslmode=disable
+      - name: Run engine-aware studio-timeout integration test against CockroachDB
+        # TURBINE_TEST_ENGINE=cockroachdb makes the test send the cockroachdb
+        # adapter's own `transaction_timeout` set_config() SQL over the live
+        # connection — the engine-specific path the mocked unit tests can't cover.
+        run: npx tsx --test src/test/studio-timeout-integration.test.ts
+        env:
+          DATABASE_URL: postgres://root@localhost:26257/turbine_test?sslmode=disable
+          TURBINE_TEST_ENGINE: cockroachdb
+
+  # Real YugabyteDB job. Same motivation as the CockroachDB job: prove the
+  # yugabytedb adapter's set_config() timeout SQL is accepted by a real YSQL
+  # server rather than only by a mock, via TURBINE_TEST_ENGINE=yugabytedb.
+  # Yugabyte's container is heavy and slow to become ready in CI (the yugabyted
+  # bootstrap + YSQL init can take a couple of minutes and is occasionally flaky
+  # on shared runners), so this job is continue-on-error: true — a failure here
+  # is surfaced but does NOT block the PR. (The CockroachDB job is likewise
+  # continue-on-error until its container topology is proven green in CI.) YSQL
+  # is Postgres-wire-compatible on port 5433, default user `yugabyte` with no
+  # password in the single-node image.
+  yugabytedb-integration:
+    name: yugabytedb-integration
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      yugabytedb:
+        # NOTE: left on :latest deliberately — pin to a specific known-good
+        # YugabyteDB tag once one is verified to pull + boot on GitHub runners.
+        # The job is continue-on-error, so :latest drift can't break PRs here.
+        image: yugabytedb/yugabyte:latest
+        # `bin/yugabyted start --background=false` runs the all-in-one node in
+        # the foreground. YSQL is exposed on 5433.
+        command: bin/yugabyted start --background=false
+        options: >-
+          --health-cmd "postgres/bin/pg_isready -h 127.0.0.1 -p 5433 -U yugabyte"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+        ports:
+          - 5433:5433
+          - 15433:15433
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Wait for YSQL + create database
+        run: |
+          for i in $(seq 1 40); do
+            if node -e "const pg=require('pg');const c=new pg.Client({connectionString:process.env.ROOT_URL});c.connect().then(()=>c.query('SELECT 1')).then(()=>c.end()).then(()=>process.exit(0)).catch(()=>process.exit(1))"; then
+              echo "YSQL is accepting connections"
+              break
+            fi
+            echo "Waiting for YSQL... ($i)"
+            sleep 5
+          done
+          node -e "const pg=require('pg');const c=new pg.Client({connectionString:process.env.ROOT_URL});c.connect().then(()=>c.query('CREATE DATABASE turbine_test').catch(e=>{if(!/already exists/i.test(String(e.message)))throw e;})).then(()=>c.end()).then(()=>process.exit(0)).catch(e=>{console.error(e);process.exit(1)})"
+        env:
+          ROOT_URL: postgres://yugabyte@localhost:5433/yugabyte?sslmode=disable
+      - name: Run engine-aware studio-timeout integration test against YugabyteDB
+        run: npx tsx --test src/test/studio-timeout-integration.test.ts
+        env:
+          DATABASE_URL: postgres://yugabyte@localhost:5433/turbine_test?sslmode=disable
+          TURBINE_TEST_ENGINE: yugabytedb
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -112,12 +250,12 @@ jobs:
         run: test -f dist/cjs/index.js && head -1 dist/cjs/index.js | grep -q '"use strict"'
       - name: Verify ESM output
         run: test -f dist/index.js
-      - name: Check package size
-        run: |
-          PACK_OUTPUT=$(npm pack --dry-run 2>&1)
-          SIZE_KB=$(printf '%s\n' "$PACK_OUTPUT" | node -e "const input = require('fs').readFileSync(0, 'utf8'); const match = input.match(/package size:\s*([0-9.]+)\s*(B|kB|MB)/i); if (!match) process.exit(1); let value = Number(match[1]); const unit = match[2].toLowerCase(); if (unit === 'b') value /= 1024; if (unit === 'mb') value *= 1024; console.log(value.toFixed(1));")
-          echo "Package size: ${SIZE_KB}kB"
-          node -e "const size = Number(process.argv[1]); const limit = 350; if (!Number.isFinite(size)) { console.error('::error::Could not parse package size'); process.exit(1); } if (size > limit) { console.error('::error::Package size ' + size + 'kB exceeds ' + limit + 'kB limit'); process.exit(1); }" "$SIZE_KB"
+      # Bundle size is gated by size-limit alone — it measures the REAL bundled
+      # import graph (esbuild) of each public entry against the limits declared
+      # in .size-limit.js (~27 kB main / ~19 kB edge, under 35/25 limits). This
+      # replaces the previous hard-coded `npm pack` KB ceiling (which was stale
+      # at 350 kB and measured tarball size, not the runtime closure). One
+      # source of truth, shared with `npm run size`.
       - name: Check bundle sizes
         run: npx size-limit
 

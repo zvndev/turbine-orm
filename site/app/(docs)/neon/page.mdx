@@ -76,7 +76,7 @@ npx turbine migrate status
 
 ## Why Turbine on Neon?
 
-- **110 KB** — fits in Cloudflare Workers' 1 MB limit (Prisma: 1.6 MB)
+- **No WASM engine** — ~19 KB gzipped on the edge, fits Cloudflare Workers' 1 MB limit (Prisma: 1.6 MB WASM)
 - **Single-query nested reads** — one SQL statement via `json_agg`, not N+1
 - **Pipeline batching** — N queries in 1 round-trip (critical for high-latency serverless)
 - **No adapter layer** — `turbineHttp(pool, schema)` with any pg-compatible driver

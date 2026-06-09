@@ -333,6 +333,85 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
       };
     }
 
+    // ----- Conservative many-to-many auto-detection (PURELY ADDITIVE) -----
+    //
+    // Auto-detecting m2m is a footgun: any table with two FKs *looks* like a
+    // junction, but a `enrollments(student_id, course_id, grade, enrolled_at)`
+    // table is a first-class entity, not a join table. Prisma and Drizzle both
+    // require explicit m2m declaration for exactly this reason.
+    //
+    // We only treat a table J as a PURE junction when ALL of these hold:
+    //   1. J's primary key is exactly two columns.
+    //   2. J has exactly two FKs, each single-column.
+    //   3. Each FK's source column is one of J's two PK columns (the PK *is* the
+    //      two FK columns — no surrogate PK, no extra identity).
+    //   4. The two FKs target two DISTINCT tables (A and B).
+    //   5. J has no columns beyond those two FK/PK columns (no payload columns
+    //      like `grade` or `created_at`).
+    //
+    // For such a J linking A and B we ADD a `manyToMany` relation on A → B and
+    // symmetrically on B → A, both routed `through` J. The existing belongsTo /
+    // hasMany relations derived from J's FKs are left untouched — this block
+    // never removes or renames anything. If the chosen relation name already
+    // exists on the source table (e.g. another relation grabbed it), we SKIP to
+    // stay additive.
+    for (const tableName of tableNames) {
+      const pk = pkByTable.get(tableName) ?? [];
+      if (pk.length !== 2) continue;
+
+      // FKs whose source is this table.
+      const tableFks = foreignKeys.filter((fk) => fk.sourceTable === tableName);
+      if (tableFks.length !== 2) continue;
+      // Both FKs must be single-column.
+      if (tableFks.some((fk) => fk.sourceColumns.length !== 1)) continue;
+
+      const fkCols = tableFks.map((fk) => fk.sourceColumns[0]!);
+      const pkSet = new Set(pk);
+      // Both FK columns must be the PK columns (and vice-versa).
+      if (!fkCols.every((c) => pkSet.has(c))) continue;
+      if (new Set(fkCols).size !== 2) continue;
+
+      // Two DISTINCT target tables.
+      const [fkA, fkB] = tableFks as [FKEntry, FKEntry];
+      if (fkA.targetTable === fkB.targetTable) continue;
+
+      // No payload columns: J's columns are exactly the two FK/PK columns.
+      const jCols = (columnsByTable.get(tableName) ?? []).map((c) => c.name);
+      if (jCols.length !== 2) continue;
+
+      // For each direction, the m2m `referenceKey` is the *targeted* table's
+      // referenced column(s); the junction's sourceKey is the FK column pointing
+      // to that table; the targetKey is the FK column pointing to the OTHER table.
+      const addM2M = (self: FKEntry, other: FKEntry) => {
+        const sourceTbl = self.targetTable; // A
+        const targetTbl = other.targetTable; // B
+        const relName = snakeToCamel(targetTbl); // plural table name → e.g. "tags"
+        if (!relationsByTable.has(sourceTbl)) relationsByTable.set(sourceTbl, {});
+        const existing = relationsByTable.get(sourceTbl)!;
+        // Additive-only: never clobber an existing relation name.
+        if (existing[relName]) return;
+        existing[relName] = {
+          type: 'manyToMany',
+          name: relName,
+          from: sourceTbl,
+          to: targetTbl,
+          // referenceKey = A's referenced column(s) that J's sourceKey points at.
+          referenceKey: self.targetColumns.length === 1 ? self.targetColumns[0]! : self.targetColumns,
+          // foreignKey is unused for m2m correlation but kept for shape parity
+          // (mirrors the source-side reference for back-compat consumers).
+          foreignKey: self.targetColumns.length === 1 ? self.targetColumns[0]! : self.targetColumns,
+          through: {
+            table: tableName,
+            sourceKey: self.sourceColumns[0]!, // J col → A
+            targetKey: other.sourceColumns[0]!, // J col → B
+          },
+        };
+      };
+
+      addM2M(fkA, fkB); // A → B
+      addM2M(fkB, fkA); // B → A
+    }
+
     // ----- Assemble TableMetadata for each table -----
     const tables: Record<string, TableMetadata> = {};
 

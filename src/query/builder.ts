@@ -30,7 +30,7 @@ import {
   type NestedWriteContext,
 } from '../nested-write.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
-import { camelToSnake, snakeToCamel } from '../schema.js';
+import { camelToSnake, normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import type {
   AggregateArgs,
   AggregateResult,
@@ -44,7 +44,11 @@ import type {
   FindManyStreamArgs,
   FindUniqueArgs,
   GroupByArgs,
+  HavingClause,
+  HavingFilter,
+  HavingNumericOperator,
   JsonFilter,
+  OrderByClause,
   OrderDirection,
   QueryResult,
   TextSearchFilter,
@@ -52,6 +56,8 @@ import type {
   UpdateArgs,
   UpdateManyArgs,
   UpsertArgs,
+  VectorFilter,
+  VectorOrderBy,
   WhereClause,
   WhereOperator,
   WithClause,
@@ -184,6 +190,49 @@ function validateTextSearchConfig(config: string): boolean {
   return /^[a-zA-Z0-9_]+$/.test(config);
 }
 
+/**
+ * pgvector distance metric → operator allow-list. This is the ONLY mapping
+ * from a user-supplied metric token to a SQL operator; any token not present
+ * here is rejected, so a user value can never become an arbitrary operator.
+ *
+ *  - `l2`     → `<->` (Euclidean / L2 distance)
+ *  - `cosine` → `<=>` (cosine distance)
+ *  - `ip`     → `<#>` (negative inner product)
+ */
+const VECTOR_METRIC_OPERATORS: Record<string, string> = {
+  l2: '<->',
+  cosine: '<=>',
+  ip: '<#>',
+};
+
+/** Comparison keys allowed on a {@link VectorDistanceFilter}. */
+const VECTOR_DISTANCE_COMPARATORS: Record<string, string> = {
+  lt: '<',
+  lte: '<=',
+  gt: '>',
+  gte: '>=',
+};
+
+/** Check if a value is a vector distance WHERE filter: `{ distance: { to, metric } }` */
+function isVectorFilter(value: unknown): value is VectorFilter {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || value instanceof Date) {
+    return false;
+  }
+  const dist = (value as { distance?: unknown }).distance;
+  return (
+    typeof dist === 'object' &&
+    dist !== null &&
+    !Array.isArray(dist) &&
+    'to' in (dist as object) &&
+    'metric' in (dist as object)
+  );
+}
+
+/** Check if an orderBy value is a vector KNN ordering: `{ distance: { to, metric } }` */
+function isVectorOrderBy(value: unknown): value is VectorOrderBy {
+  return isVectorFilter(value);
+}
+
 // ---------------------------------------------------------------------------
 // Deferred query descriptor (for pipeline batching)
 // ---------------------------------------------------------------------------
@@ -293,6 +342,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /** Tracks tables that have already triggered a deep-with warning (one-time) */
   private readonly deepWithWarned = new Set<string>();
+
+  /**
+   * Per-table memo of date columns keyed by their camelCase FIELD name.
+   * `meta.dateColumns` is keyed by raw snake_case column name, which matches
+   * top-level rows from pg. Nested relation rows arrive from json_build_object
+   * with camelCase keys, so they need this camelCase-keyed set to be coerced
+   * to Date as well (otherwise nested dates leak through as strings).
+   */
+  private readonly camelDateFieldCache = new Map<string, Set<string>>();
 
   /** True when this QI runs inside an active transaction (set via _txScoped option). */
   private readonly txScoped: boolean;
@@ -721,7 +779,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
     const orderFp = args?.orderBy
       ? Object.entries(args.orderBy)
-          .map(([k, d]) => `${k}:${d}`)
+          .map(([k, d]) => {
+            // Vector KNN ordering changes the emitted SQL operator by metric and
+            // adds a `::vector` param, so the metric + direction must be part of
+            // the cache key — otherwise two KNN queries differing only in metric
+            // would collide on a single cached SQL string.
+            if (isVectorOrderBy(d)) {
+              return `${k}:vec(${d.distance.metric},${d.distance.direction ?? 'asc'})`;
+            }
+            return `${k}:${d}`;
+          })
           .join(',')
       : '';
     const cursorFp = args?.cursor
@@ -787,7 +854,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       if (args?.orderBy) {
-        sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
+        // Pass freshParams so vector KNN ordering binds its `$n::vector` query
+        // vector at the correct position (after cursor params, before LIMIT).
+        sql += ` ORDER BY ${this.buildOrderBy(args.orderBy, freshParams)}`;
       }
 
       if (effectiveLimit !== undefined) {
@@ -818,11 +887,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
         params.push(v);
       }
     }
-    // 4. LIMIT param
+    // 4. ORDER BY params (vector KNN ordering binds a `$n::vector` query vector).
+    //    Mirrors buildOrderBy's push order — between cursor and LIMIT.
+    if (args?.orderBy) {
+      this.collectOrderByParams(args.orderBy, params);
+    }
+    // 5. LIMIT param
     if (effectiveLimit !== undefined) {
       params.push(Number(effectiveLimit));
     }
-    // 5. OFFSET param
+    // 6. OFFSET param
     if (args?.offset !== undefined) {
       params.push(Number(args.offset));
     }
@@ -1674,6 +1748,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     let sql = `SELECT ${selectExprs.join(', ')} FROM ${this.q(this.table)}${whereSql} GROUP BY ${groupCols.join(', ')}`;
 
+    // HAVING — filter whole groups by their aggregate values.
+    // Appends to the same `params` array, so placeholders continue from the
+    // WHERE clause's parameter positions (this.p(params.length) below).
+    if (args.having) {
+      const havingClauses = this.buildHavingClauses(args.having, params);
+      if (havingClauses.length > 0) {
+        sql += ` HAVING ${havingClauses.join(' AND ')}`;
+      }
+    }
+
     // ORDER BY
     if (args.orderBy) {
       sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
@@ -1743,6 +1827,135 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }),
       tag: `${this.table}.groupBy`,
     };
+  }
+
+  /**
+   * Build the SQL fragments for a {@link HavingClause}.
+   *
+   * Each aggregate expression (`COUNT(*)`, `SUM("col")`, etc.) is constructed
+   * from a **schema-validated, quoted** column identifier — `this.toColumn()`
+   * throws {@link ValidationError} for unknown fields and `this.q()` quotes via
+   * the dialect, so no unvalidated identifier ever reaches the SQL string. Every
+   * comparison value is pushed onto the shared `params` array and referenced by
+   * a `$N` placeholder via {@link buildHavingNumericClauses} — there is no string
+   * interpolation of user values.
+   */
+  private buildHavingClauses(having: HavingClause<T>, params: unknown[]): string[] {
+    const clauses: string[] = [];
+
+    // Maps the per-field aggregate key to its SQL function name. The set of
+    // allowed keys is fixed here — any other key on a field's filter object is
+    // rejected by ValidationError below (never interpolated).
+    const aggFnByKey: Record<string, string> = {
+      _sum: 'SUM',
+      _avg: 'AVG',
+      _min: 'MIN',
+      _max: 'MAX',
+      _count: 'COUNT',
+    };
+
+    for (const [key, value] of Object.entries(having)) {
+      if (value === undefined) continue;
+
+      // Top-level `_count` (no field) → COUNT(*) for the whole group.
+      if (key === '_count') {
+        clauses.push(...this.buildHavingNumericClauses('COUNT(*)', value as HavingFilter, params));
+        continue;
+      }
+
+      // Otherwise `key` is a field name mapping to a per-aggregate filter object.
+      if (typeof value !== 'object' || value === null) {
+        throw new ValidationError(
+          `[turbine] Invalid having filter for field "${key}" on table "${this.table}": ` +
+            `expected an aggregate object like { _sum: { gt: 100 } }.`,
+        );
+      }
+
+      // toColumn validates the field against schema metadata (throws
+      // ValidationError on unknown columns) and q() quotes the identifier — no
+      // unvalidated identifier ever reaches the SQL string.
+      const quotedCol = this.q(this.toColumn(key));
+
+      for (const [aggKey, filter] of Object.entries(value as Record<string, HavingFilter>)) {
+        if (filter === undefined) continue;
+        const fn = aggFnByKey[aggKey];
+        if (!fn) {
+          throw new ValidationError(
+            `[turbine] Unknown aggregate "${aggKey}" in having for field "${key}" on table "${this.table}". ` +
+              `Supported: ${Object.keys(aggFnByKey).join(', ')}.`,
+          );
+        }
+        const expr = `${fn}(${quotedCol})`;
+        clauses.push(...this.buildHavingNumericClauses(expr, filter, params));
+      }
+    }
+
+    return clauses;
+  }
+
+  /**
+   * Convert a single having filter into one or more parameterized SQL
+   * comparisons against the given aggregate expression. A bare number is
+   * shorthand for equality. Unknown operator keys throw {@link ValidationError}.
+   */
+  private buildHavingNumericClauses(expr: string, filter: HavingFilter, params: unknown[]): string[] {
+    // Bare number → equality.
+    if (typeof filter === 'number') {
+      params.push(filter);
+      return [`${expr} = ${this.p(params.length)}`];
+    }
+
+    if (typeof filter !== 'object' || filter === null) {
+      throw new ValidationError(
+        `[turbine] Invalid having filter on "${expr}" for table "${this.table}": expected a number or operator object.`,
+      );
+    }
+
+    const op = filter as HavingNumericOperator;
+    const allowedKeys = new Set(['equals', 'not', 'gt', 'gte', 'lt', 'lte', 'in', 'notIn']);
+    for (const k of Object.keys(op)) {
+      if (!allowedKeys.has(k)) {
+        throw new ValidationError(
+          `[turbine] Unknown having operator "${k}" on "${expr}" for table "${this.table}". ` +
+            `Supported: ${[...allowedKeys].join(', ')}.`,
+        );
+      }
+    }
+
+    const clauses: string[] = [];
+    if (op.equals !== undefined) {
+      params.push(op.equals);
+      clauses.push(`${expr} = ${this.p(params.length)}`);
+    }
+    if (op.not !== undefined) {
+      params.push(op.not);
+      clauses.push(`${expr} != ${this.p(params.length)}`);
+    }
+    if (op.gt !== undefined) {
+      params.push(op.gt);
+      clauses.push(`${expr} > ${this.p(params.length)}`);
+    }
+    if (op.gte !== undefined) {
+      params.push(op.gte);
+      clauses.push(`${expr} >= ${this.p(params.length)}`);
+    }
+    if (op.lt !== undefined) {
+      params.push(op.lt);
+      clauses.push(`${expr} < ${this.p(params.length)}`);
+    }
+    if (op.lte !== undefined) {
+      params.push(op.lte);
+      clauses.push(`${expr} <= ${this.p(params.length)}`);
+    }
+    if (op.in !== undefined) {
+      params.push(op.in);
+      clauses.push(`${expr} = ANY(${this.p(params.length)})`);
+    }
+    if (op.notIn !== undefined) {
+      params.push(op.notIn);
+      clauses.push(`${expr} != ALL(${this.p(params.length)})`);
+    }
+    return clauses;
   }
 
   // -------------------------------------------------------------------------
@@ -2122,6 +2335,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      // Vector distance filter — metric (operator) and present comparators
+      // change the SQL shape, so both go in the fingerprint.
+      if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
+        const dist = (value as VectorFilter).distance;
+        const cmps = Object.keys(VECTOR_DISTANCE_COMPARATORS)
+          .filter((c) => (dist as unknown as Record<string, unknown>)[c] !== undefined)
+          .sort()
+          .join('|');
+        parts.push(`${key}:vec(${dist.metric},${cmps})`);
+        continue;
+      }
+
       // JSON filter
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
         const jKeys = Object.keys(value as object).sort();
@@ -2255,6 +2480,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       const rawColumn = this.toColumn(key);
 
+      // Vector distance filter — mirrors buildVectorFilterClauses push order.
+      if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
+        // Validate the same way the build path does so the collect path never
+        // diverges (it would throw before any param was pushed).
+        this.vectorOperator(key, rawColumn, value.distance.metric);
+        this.collectVectorFilterParams(key, rawColumn, value, params);
+        continue;
+      }
+
       // JSONB filter
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.getColumnPgType(rawColumn);
@@ -2342,6 +2576,38 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (filter.hasEvery !== undefined) params.push(filter.hasEvery);
     if (filter.hasSome !== undefined) params.push(filter.hasSome);
     // isEmpty has no params (IS NULL / IS NOT NULL)
+  }
+
+  /**
+   * Collect params for an orderBy clause. Only vector KNN ordering pushes a
+   * param (the `$n::vector` query vector); plain direction ordering is
+   * parameterless. Mirrors buildOrderBy's push order exactly so the cached-SQL
+   * param re-collection stays in lockstep.
+   */
+  private collectOrderByParams(orderBy: OrderByClause, params: unknown[]): void {
+    for (const [key, dir] of Object.entries(orderBy)) {
+      if (isVectorOrderBy(dir)) {
+        const rawColumn = this.toColumn(key);
+        // Re-run the same validation as buildOrderBy so the collect path can
+        // never push a param that the build path rejected (or vice versa).
+        this.vectorOperator(key, rawColumn, dir.distance.metric);
+        this.pushVectorParam(key, rawColumn, dir.distance.to, params);
+      }
+    }
+  }
+
+  /**
+   * Collect params for a vector distance WHERE filter. Mirrors
+   * {@link buildVectorFilterClauses}: the `$n::vector` query vector first, then
+   * the comparison threshold(s).
+   */
+  private collectVectorFilterParams(field: string, rawColumn: string, filter: VectorFilter, params: unknown[]): void {
+    const dist = filter.distance;
+    this.pushVectorParam(field, rawColumn, dist.to, params);
+    for (const cmp of Object.keys(VECTOR_DISTANCE_COMPARATORS)) {
+      const threshold = (dist as unknown as Record<string, unknown>)[cmp];
+      if (threshold !== undefined) params.push(threshold);
+    }
   }
 
   /**
@@ -2452,6 +2718,27 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const targetTable = relDef.to;
     const targetMeta = this.schema.tables[targetTable];
     if (!targetMeta) return;
+
+    // manyToMany param order mirrors buildManyToManySubquery:
+    //   where params → limit param → nested-with params (always, both paths).
+    if (relDef.type === 'manyToMany') {
+      if (spec.where) {
+        for (const [, v] of Object.entries(spec.where)) {
+          params.push(v);
+        }
+      }
+      if (spec.limit) {
+        params.push(Number(spec.limit));
+      }
+      if (spec.with) {
+        for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+          const nestedRelDef = targetMeta.relations[nestedRelName];
+          if (!nestedRelDef) continue;
+          this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'alias', depth + 1);
+        }
+      }
+      return;
+    }
 
     const willWrap = relDef.type === 'hasMany' && (spec.limit !== undefined || spec.orderBy !== undefined);
 
@@ -2638,6 +2925,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Handle null → IS NULL
       if (value === null) {
         andClauses.push(`${column} IS NULL`);
+        continue;
+      }
+
+      // Handle vector distance filter (pgvector): `{ distance: { to, metric, lt } }`
+      if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
+        const vecClauses = this.buildVectorFilterClauses(key, rawColumn, value, params);
+        andClauses.push(...vecClauses);
         continue;
       }
 
@@ -2883,8 +3177,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return clauses;
   }
 
-  /** Build ORDER BY clause from an object */
-  private buildOrderBy(orderBy: Record<string, OrderDirection>): string {
+  /**
+   * Build ORDER BY clause from an object.
+   *
+   * Each value is either a plain direction (`'asc'`/`'desc'`) or — for pgvector
+   * columns — a `{ distance: { to, metric, direction? } }` KNN ordering object.
+   * Vector ordering binds the query vector as a `$n::vector` param, so a `params`
+   * array MUST be supplied when a vector ordering may be present (top-level
+   * findMany path). When `params` is omitted (groupBy / relation path) a vector
+   * ordering throws — KNN ordering is only supported at the top level.
+   */
+  private buildOrderBy(orderBy: OrderByClause, params?: unknown[]): string {
     // Dev-only: validate that orderBy fields exist in the table schema
     if (process.env.NODE_ENV !== 'production') {
       for (const key of Object.keys(orderBy)) {
@@ -2904,13 +3207,102 @@ export class QueryInterface<T extends object, R extends object = {}> {
         if (meta && !(key in meta.columnMap)) {
           throw new ValidationError(`Unknown column "${key}" in orderBy for table "${this.table}"`);
         }
-        const safeDir = dir.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
+        // Vector KNN ordering: { distance: { to, metric, direction? } }
+        if (isVectorOrderBy(dir)) {
+          if (!params) {
+            throw new ValidationError(
+              `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
+            );
+          }
+          const rawColumn = this.toColumn(key);
+          const operator = this.vectorOperator(key, rawColumn, dir.distance.metric);
+          const placeholder = this.pushVectorParam(key, rawColumn, dir.distance.to, params);
+          const safeDir = dir.distance.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+          return `${this.q(rawColumn)} ${operator} ${placeholder} ${safeDir}`;
+        }
+
+        const safeDir = (dir as OrderDirection).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
         return `${this.toSqlColumn(key)} ${safeDir}`;
       })
       .join(', ');
   }
 
+  // -------------------------------------------------------------------------
+  // pgvector helpers (similarity search)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve a {@link VectorMetric} to its pgvector distance operator from a
+   * fixed allow-list, validating the target column is actually a `vector`
+   * column. Throws {@link ValidationError} for an unknown metric or a
+   * non-vector column — a user-supplied string can never become a SQL operator.
+   */
+  private vectorOperator(field: string, rawColumn: string, metric: string): string {
+    const colType = this.getColumnPgType(rawColumn);
+    if (colType !== 'vector') {
+      throw new ValidationError(
+        `[turbine] Column "${field}" on table "${this.table}" is not a vector column ` +
+          `(actual type: ${colType}); cannot apply a vector distance operation.`,
+      );
+    }
+    const op = VECTOR_METRIC_OPERATORS[metric];
+    if (!op) {
+      throw new ValidationError(
+        `[turbine] Unknown vector metric "${metric}" for column "${field}". ` +
+          `Valid metrics: ${Object.keys(VECTOR_METRIC_OPERATORS).join(', ')}.`,
+      );
+    }
+    return op;
+  }
+
+  /**
+   * Validate and bind a query vector as a single `$n::vector` parameter.
+   * Every element must be a finite number (no NaN / Infinity / strings) so a
+   * malformed array can never produce a broken `::vector` literal, and the array
+   * is NEVER string-interpolated into the SQL text. Returns the `$n::vector`
+   * placeholder string.
+   */
+  private pushVectorParam(field: string, _rawColumn: string, to: unknown, params: unknown[]): string {
+    if (!Array.isArray(to) || to.length === 0) {
+      throw new ValidationError(
+        `[turbine] Vector distance on "${field}" requires a non-empty array of numbers for "to".`,
+      );
+    }
+    for (const el of to) {
+      if (typeof el !== 'number' || !Number.isFinite(el)) {
+        throw new ValidationError(
+          `[turbine] Vector "to" for column "${field}" must contain only finite numbers; ` +
+            `got ${JSON.stringify(el)}.`,
+        );
+      }
+    }
+    // Bind as a pgvector text literal '[1,2,3]'. Elements are already validated
+    // as finite numbers, so the joined string is safe; it is still passed as a
+    // bound param (never interpolated) and cast with ::vector.
+    params.push(`[${(to as number[]).join(',')}]`);
+    return `${this.p(params.length)}::vector`;
+  }
+
   /** Parse a flat row: convert snake_case to camelCase + Date coercion */
+  /**
+   * Returns the set of camelCase field names for a table's date columns,
+   * derived once from `meta.dateColumns` (snake_case) via reverseColumnMap and
+   * memoized per table. Used so nested relation rows (camelCase keys) coerce
+   * dates the same way top-level rows do.
+   */
+  private getCamelDateFields(table: string, meta: TableMetadata): Set<string> {
+    let camel = this.camelDateFieldCache.get(table);
+    if (!camel) {
+      camel = new Set<string>();
+      for (const col of meta.dateColumns) {
+        camel.add(meta.reverseColumnMap[col] ?? col);
+      }
+      this.camelDateFieldCache.set(table, camel);
+    }
+    return camel;
+  }
+
   private parseRow(row: Record<string, unknown>, table: string): Record<string, unknown> {
     const parsed: Record<string, unknown> = {};
     const meta = this.schema.tables[table];
@@ -2919,13 +3311,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Fast path: use pre-computed maps (avoids regex per column per row)
       const reverseMap = meta.reverseColumnMap;
       const dateCols = meta.dateColumns;
+      // camelCase-keyed date fields, so nested json_build_object rows (whose
+      // keys are already camelCase) get the same Date coercion as top-level rows.
+      const camelDateFields = this.getCamelDateFields(table, meta);
 
       const keys = Object.keys(row);
       for (let i = 0; i < keys.length; i++) {
         const col = keys[i]!;
         const value = row[col];
         const field = reverseMap[col] ?? col; // fall back to raw col name, not regex
-        if (dateCols.has(col) && value !== null && !(value instanceof Date)) {
+        // Top-level rows are snake_case (dateCols); nested rows are camelCase (camelDateFields).
+        if ((dateCols.has(col) || camelDateFields.has(field)) && value !== null && !(value instanceof Date)) {
           parsed[field] = new Date(value as string);
         } else {
           parsed[field] = value;
@@ -2969,15 +3365,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (typeof rawValue === 'string') {
         try {
           const jsonVal = JSON.parse(rawValue);
-          // After parsing, apply parseRow to each item for snake→camel + date coercion
+          // After parsing, recurse via parseNestedRow so each item gets date
+          // coercion AND its own sub-relations parsed at arbitrary depth.
           if (Array.isArray(jsonVal)) {
             parsed[relName] = jsonVal.map((item: unknown) =>
               typeof item === 'object' && item !== null
-                ? this.parseRow(item as Record<string, unknown>, relDef.to)
+                ? this.parseNestedRow(item as Record<string, unknown>, relDef.to)
                 : item,
             );
           } else if (typeof jsonVal === 'object' && jsonVal !== null) {
-            parsed[relName] = this.parseRow(jsonVal as Record<string, unknown>, relDef.to);
+            parsed[relName] = this.parseNestedRow(jsonVal as Record<string, unknown>, relDef.to);
           } else {
             parsed[relName] = jsonVal;
           }
@@ -2989,10 +3386,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       } else if (Array.isArray(rawValue)) {
         parsed[relName] = rawValue.map((item) =>
-          typeof item === 'object' && item !== null ? this.parseRow(item as Record<string, unknown>, relDef.to) : item,
+          typeof item === 'object' && item !== null
+            ? this.parseNestedRow(item as Record<string, unknown>, relDef.to)
+            : item,
         );
       } else if (typeof rawValue === 'object' && rawValue !== null) {
-        parsed[relName] = this.parseRow(rawValue as Record<string, unknown>, relDef.to);
+        parsed[relName] = this.parseNestedRow(rawValue as Record<string, unknown>, relDef.to);
       } else {
         parsed[relName] = rawValue;
       }
@@ -3224,6 +3623,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const willWrap =
       relDef.type === 'hasMany' && spec !== true && (spec.limit !== undefined || spec.orderBy !== undefined);
 
+    // manyToMany takes a dedicated JOIN-through-junction path. Nested relations,
+    // where, orderBy, and select/omit are handled there (the target alias is the
+    // row source, exactly like hasMany), so short-circuit before the hasMany logic.
+    if (relDef.type === 'manyToMany') {
+      return this.buildManyToManySubquery(
+        relDef,
+        spec,
+        params,
+        parentRef,
+        aliasCounter,
+        currentDepth,
+        currentPath,
+        alias,
+        targetMeta,
+        targetColumns,
+      );
+    }
+
     // Nested relations — only in the non-wrapped path (wrapped path builds them separately)
     if (!willWrap && spec !== true && spec.with) {
       for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
@@ -3351,6 +3768,198 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Build the json_agg subquery for a `manyToMany` relation, JOINing the target
+   * table through a junction (join) table.
+   *
+   * Shape (no LIMIT/ORDER):
+   * ```sql
+   * SELECT COALESCE(json_agg(json_build_object(...)), '[]'::json)
+   * FROM <target> <talias>
+   * JOIN <junction> <jalias> ON <jalias>.<targetKey> = <talias>.<targetPK>
+   * WHERE <jalias>.<sourceKey> = <parentRef>.<referenceKey>
+   * ```
+   *
+   * With LIMIT/ORDER, the rows are wrapped in an inner subquery so the LIMIT
+   * applies BEFORE aggregation (identical strategy to hasMany).
+   *
+   * Cardinality is always 'many' → empty-array fallback, never NULL.
+   *
+   * IMPORTANT: every `params.push` here MUST be mirrored, in the same order, in
+   * {@link collectRelationSubqueryParams} or pipeline batching will desync.
+   */
+  private buildManyToManySubquery(
+    relDef: RelationDef,
+    spec: true | WithOptions,
+    params: unknown[],
+    parentRef: string,
+    aliasCounter: { n: number },
+    currentDepth: number,
+    currentPath: string[],
+    talias: string,
+    targetMeta: TableMetadata,
+    targetColumns: string[],
+  ): string {
+    if (!relDef.through) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`,
+      );
+    }
+
+    const targetTable = relDef.to;
+    const qTarget = this.q(targetTable);
+    const qJunction = this.q(relDef.through.table);
+    const qParent = this.q(parentRef);
+    const jalias = `${talias}j`; // junction alias, distinct from the target alias
+
+    // JOIN: junction.targetKey = target.<targetPK>. Composite keys pair positionally.
+    const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
+    // The target PK is the column(s) the junction's targetKey references. An empty
+    // introspected PK means we cannot know what to JOIN on — fail loudly rather than
+    // silently guessing `id` and generating a wrong JOIN.
+    if (targetMeta.primaryKey.length === 0) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}" targets table "${targetTable}" which has no primary key; ` +
+          `cannot determine the join column. Define a primary key or use an explicit through descriptor.`,
+      );
+    }
+    const targetPk = targetMeta.primaryKey;
+    if (targetKeys.length !== targetPk.length) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}": through.targetKey has ${targetKeys.length} column(s) ` +
+          `but target "${targetTable}" primary key has ${targetPk.length}. Composite keys must pair positionally.`,
+      );
+    }
+    const joinOn = targetKeys
+      .map((jcol, i) => `${jalias}.${this.q(jcol)} = ${talias}.${this.q(targetPk[i]!)}`)
+      .join(' AND ');
+
+    // Correlation: junction.sourceKey = parent.<referenceKey>.
+    const sourceKeys = normalizeKeyColumns(relDef.through.sourceKey);
+    const refKeys = normalizeKeyColumns(relDef.referenceKey);
+    if (sourceKeys.length !== refKeys.length) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}": through.sourceKey has ${sourceKeys.length} column(s) ` +
+          `but referenceKey has ${refKeys.length}. Composite keys must pair positionally.`,
+      );
+    }
+    let whereClause = sourceKeys
+      .map((jcol, i) => `${jalias}.${this.q(jcol)} = ${qParent}.${this.q(refKeys[i]!)}`)
+      .join(' AND ');
+
+    // ORDER BY on the target rows
+    let orderClause = '';
+    if (spec !== true && spec.orderBy) {
+      const orders = Object.entries(spec.orderBy)
+        .map(([k, dir]) => {
+          const col = camelToSnake(k);
+          if (!targetMeta.allColumns.includes(col)) {
+            throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
+          }
+          const safeDir = dir.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+          return `${talias}.${this.q(col)} ${safeDir}`;
+        })
+        .join(', ');
+      orderClause = ` ORDER BY ${orders}`;
+    }
+
+    // Additional WHERE filters on the target — properly parameterized.
+    if (spec !== true && spec.where) {
+      for (const [k, v] of Object.entries(spec.where)) {
+        const col = camelToSnake(k);
+        if (!targetMeta.allColumns.includes(col)) {
+          throw new ValidationError(`[turbine] Unknown column "${k}" in where for table "${targetTable}"`);
+        }
+        params.push(v);
+        whereClause += ` AND ${talias}.${this.q(col)} = ${this.p(params.length)}`;
+      }
+    }
+
+    // LIMIT
+    let limitClause = '';
+    if (spec !== true && spec.limit) {
+      params.push(Number(spec.limit));
+      limitClause = ` LIMIT ${this.p(params.length)}`;
+    }
+
+    const fromJoin = `FROM ${qTarget} ${talias} JOIN ${qJunction} ${jalias} ON ${joinOn}`;
+
+    // When LIMIT or ORDER BY is present, wrap the joined rows in an inner subquery
+    // so the LIMIT applies to rows BEFORE aggregation (same approach as hasMany).
+    if (limitClause || orderClause) {
+      const innerAlias = `${talias}i`;
+      const innerSql =
+        `SELECT ${targetMeta.allColumns.map((c) => `${talias}.${this.q(c)}`).join(', ')} ` +
+        `${fromJoin} WHERE ${whereClause}${orderClause}${limitClause}`;
+      const innerJsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
+        targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
+        `${innerAlias}.${this.q(col)}`,
+      ]);
+      // Nested relations reference the inner alias.
+      if (spec !== true && spec.with) {
+        for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+          const nestedRelDef = targetMeta.relations[nestedRelName];
+          if (!nestedRelDef) {
+            throw new RelationError(
+              `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+                `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
+            );
+          }
+          const nestedSub = this.buildRelationSubquery(
+            nestedRelDef,
+            nestedSpec,
+            params,
+            innerAlias,
+            aliasCounter,
+            currentDepth + 1,
+            [...currentPath, relDef.name],
+          );
+          const fallback =
+            nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'
+              ? this.dialect.nullJsonLiteral
+              : this.dialect.emptyJsonArrayLiteral;
+          innerJsonPairs.push([nestedRelName, `COALESCE((${nestedSub}), ${fallback})`]);
+        }
+      }
+      const innerJsonObj = this.dialect.buildJsonObject(innerJsonPairs);
+      return `SELECT ${this.dialect.buildJsonArrayAgg(innerJsonObj)} FROM (${innerSql}) ${innerAlias}`;
+    }
+
+    // Simple path: build the json object pairs directly off the target alias,
+    // including any nested relations (correlated to the target alias).
+    const jsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
+      targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
+      `${talias}.${this.q(col)}`,
+    ]);
+    if (spec !== true && spec.with) {
+      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+        const nestedRelDef = targetMeta.relations[nestedRelName];
+        if (!nestedRelDef) {
+          throw new RelationError(
+            `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+              `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
+          );
+        }
+        const nestedSub = this.buildRelationSubquery(
+          nestedRelDef,
+          nestedSpec,
+          params,
+          talias,
+          aliasCounter,
+          currentDepth + 1,
+          [...currentPath, relDef.name],
+        );
+        const fallback =
+          nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'
+            ? this.dialect.nullJsonLiteral
+            : this.dialect.emptyJsonArrayLiteral;
+        jsonPairs.push([nestedRelName, `COALESCE((${nestedSub}), ${fallback})`]);
+      }
+    }
+    const jsonObj = this.dialect.buildJsonObject(jsonPairs);
+    return `SELECT ${this.dialect.buildJsonArrayAgg(jsonObj)} ${fromJoin} WHERE ${whereClause}`;
+  }
+
+  /**
    * Get the Postgres type for a column (e.g. 'jsonb', 'text', '_int4').
    * Used to detect JSONB/array columns for specialized operators.
    * Uses pre-computed Map for O(1) lookup instead of linear scan.
@@ -3451,6 +4060,50 @@ export class QueryInterface<T extends object, R extends object = {}> {
       clauses.push(`cardinality(${column}) > 0`);
     }
 
+    return clauses;
+  }
+
+  /**
+   * Build SQL clauses for a pgvector distance WHERE filter:
+   *
+   *   `"embedding" <-> $1::vector < $2`
+   *
+   * The query vector is bound as a `$n::vector` param (never interpolated), the
+   * metric maps to an operator via a fixed allow-list, and each comparison
+   * threshold (`lt`/`lte`/`gt`/`gte`) is its own bound param. Emits one clause
+   * per supplied comparator (all ANDed). Param push order matches
+   * {@link collectVectorFilterParams}.
+   */
+  private buildVectorFilterClauses(
+    field: string,
+    rawColumn: string,
+    filter: VectorFilter,
+    params: unknown[],
+  ): string[] {
+    const dist = filter.distance;
+    const operator = this.vectorOperator(field, rawColumn, dist.metric);
+    const placeholder = this.pushVectorParam(field, rawColumn, dist.to, params);
+    const distanceExpr = `${this.q(rawColumn)} ${operator} ${placeholder}`;
+
+    const clauses: string[] = [];
+    for (const [cmp, sqlOp] of Object.entries(VECTOR_DISTANCE_COMPARATORS)) {
+      const threshold = (dist as unknown as Record<string, unknown>)[cmp];
+      if (threshold === undefined) continue;
+      if (typeof threshold !== 'number' || !Number.isFinite(threshold)) {
+        throw new ValidationError(
+          `[turbine] Vector distance threshold "${cmp}" on "${field}" must be a finite number; ` +
+            `got ${JSON.stringify(threshold)}.`,
+        );
+      }
+      params.push(threshold);
+      clauses.push(`${distanceExpr} ${sqlOp} ${this.p(params.length)}`);
+    }
+
+    if (clauses.length === 0) {
+      throw new ValidationError(
+        `[turbine] Vector distance filter on "${field}" requires at least one comparison (lt / lte / gt / gte).`,
+      );
+    }
     return clauses;
   }
 

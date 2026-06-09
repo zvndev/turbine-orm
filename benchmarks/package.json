@@ -5,7 +5,8 @@
   "scripts": {
     "setup": "prisma generate",
     "bench": "tsx bench.ts",
-    "bench:quick": "ITERATIONS=50 WARMUP=10 tsx bench.ts"
+    "bench:quick": "ITERATIONS=50 WARMUP=10 tsx bench.ts",
+    "parity": "tsx parity/seed.ts && tsx parity/run.ts"
   },
   "dependencies": {
     "turbine-orm": "file:..",

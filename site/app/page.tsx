@@ -4,9 +4,9 @@ import { codeToHtml } from 'shiki';
 import { CopyButton } from '../components/CopyButton';
 
 export const metadata: Metadata = {
-  title: 'Turbine ORM — 110 KB Postgres ORM. One dependency. Read-only Studio.',
+  title: 'Turbine ORM — Postgres ORM. One dependency, no WASM engine. Read-only Studio.',
   description:
-    'The Postgres ORM that ships 110 KB total. One runtime dependency (pg), built-in read-only Studio, PII-safe errors, SQL-first migrations with drift detection. No WASM engine, no adapter shims.',
+    'The Postgres ORM that ships one dependency (pg) and no engine binary. Built-in read-only Studio, PII-safe errors, SQL-first migrations with drift detection. No WASM engine, no adapter shims.',
 };
 
 const heroCode = `const users = await db.users.findMany({
@@ -43,9 +43,9 @@ WHERE "users"."org_id" = $1`;
 
 const features = [
   {
-    title: 'One dependency. 110 KB.',
+    title: 'One dependency. No WASM engine.',
     description:
-      'Turbine ships pg and nothing else. No WASM engine (Prisma: 1.6 MB), no adapter chain, no lockstep package upgrades. 110 KB on npm, 5 KB on the edge entry.',
+      'Turbine ships pg and nothing else. No WASM engine (Prisma: 1.6 MB), no adapter chain, no lockstep package upgrades. The main entry bundles to ~27 KB brotli, ~19 KB on the edge.',
     stat: '1',
     statLabel: 'runtime dep',
   },
@@ -74,8 +74,8 @@ const features = [
     title: 'Edge-native. One import swap.',
     description:
       'turbineHttp(pool, schema) — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step.',
-    stat: '5 KB',
-    statLabel: 'edge entry',
+    stat: '~19 KB',
+    statLabel: 'edge bundle (gzip)',
   },
   {
     title: 'Pipeline batching via wire protocol',
@@ -83,6 +83,37 @@ const features = [
       'Real Parse/Bind/Execute pipeline — not queries wrapped in a transaction. N independent queries in one round-trip. Deep with clauses compile to one SQL statement using json_agg.',
     stat: '1',
     statLabel: 'round-trip',
+  },
+];
+
+const postgresFeatures = [
+  {
+    title: 'Vector search (pgvector)',
+    description:
+      'KNN ranking and distance filters over vector columns — orderBy: { embedding: { distance: { to, metric: "cosine" } } }. l2 / cosine / inner-product, every value bound as a parameter.',
+    href: '/vector',
+    cta: 'Vector docs',
+  },
+  {
+    title: 'Realtime (LISTEN / NOTIFY)',
+    description:
+      'Postgres pub/sub with db.$listen(channel, handler) and db.$notify(channel, payload). No broker, no extra service — your database is the message bus.',
+    href: '/realtime',
+    cta: 'Realtime docs',
+  },
+  {
+    title: 'RLS session context',
+    description:
+      'Multi-tenant isolation the database enforces. $transaction(fn, { sessionContext }) sets transaction-local GUCs so Row-Level Security policies filter rows for you.',
+    href: '/transactions',
+    cta: 'Transactions docs',
+  },
+  {
+    title: 'Many-to-many, auto-detected',
+    description:
+      'Pure junction tables are detected at generate time — db.posts.findMany({ with: { tags: true } }) just works. Self-relations too: a self-referencing FK gives you parent + children.',
+    href: '/relations',
+    cta: 'Relations docs',
   },
 ];
 
@@ -97,7 +128,7 @@ export default async function Home() {
     '@type': 'SoftwareApplication',
     name: 'Turbine ORM',
     description:
-      '110 KB Postgres ORM with one runtime dependency, built-in read-only Studio, PII-safe errors, and SQL-first migrations with drift detection.',
+      'Postgres ORM with one runtime dependency and no WASM engine, built-in read-only Studio, PII-safe errors, and SQL-first migrations with drift detection.',
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Any',
     url: 'https://turbineorm.dev',
@@ -126,20 +157,22 @@ export default async function Home() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            v0.16 — observability, nested write update/upsert, is/isNot filters
+            v0.18 — pgvector search, RLS, LISTEN/NOTIFY, many-to-many, HAVING, typed SQL
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
-            <span className="text-white">110 KB. One dep.</span>
+            <span className="text-white">One dep. No WASM.</span>
             <br />
             <span className="amber">Production Postgres.</span>
           </h1>
 
           <p className="hero-subtitle animate-fade-in-up delay-2">
             The Postgres ORM that ships light and locks tight. One runtime
-            dependency, a read-only Studio no other ORM has, and error messages
-            that never leak PII. v0.16 adds built-in observability with a self-hosted
-            dashboard, nested write update/upsert, and is/isNot relation filters.
+            dependency, no WASM engine, a read-only Studio no other ORM has, and
+            error messages that never leak PII. v0.18 goes Postgres-native:
+            pgvector similarity search, row-level-security session context,
+            LISTEN/NOTIFY realtime, many-to-many + self-relations, GROUP BY
+            HAVING, and a typed raw-SQL escape hatch.
           </p>
 
           <div className="animate-fade-in-up delay-3">
@@ -206,8 +239,8 @@ export default async function Home() {
                 Every ORM claims single-query nested loads now. Turbine uses
                 the same <code>json_agg</code> approach as Prisma 7 and
                 Drizzle v2. The difference isn&apos;t the query strategy &mdash; it&apos;s
-                everything around it: the 110 KB footprint, the read-only
-                Studio, and the error messages that never expose user data.
+                everything around it: the one-dependency, no-WASM footprint, the
+                read-only Studio, and the error messages that never expose user data.
               </p>
 
               <ul className="showcase-list">
@@ -239,6 +272,36 @@ export default async function Home() {
               <div dangerouslySetInnerHTML={{ __html: sqlHtml }} />
             </div>
           </div>
+        </div>
+      </section>
+
+      {/* ========== POSTGRES-NATIVE ========== */}
+      <section className="features-section">
+        <div className="animate-fade-in-up">
+          <p className="section-label">Postgres-native</p>
+          <h2 className="section-title">
+            Use the database you actually have.
+          </h2>
+        </div>
+
+        <div className="feature-grid">
+          {postgresFeatures.map((f, i) => (
+            <Link
+              key={f.title}
+              href={f.href}
+              className={`feature-card animate-fade-in-up delay-${i + 1}`}
+              style={{ textDecoration: 'none', display: 'block' }}
+            >
+              <h3>{f.title}</h3>
+              <p>{f.description}</p>
+              <span
+                className="font-mono"
+                style={{ color: 'var(--accent)', fontSize: '0.8rem' }}
+              >
+                {f.cta} &rarr;
+              </span>
+            </Link>
+          ))}
         </div>
       </section>
 
@@ -313,15 +376,19 @@ export default async function Home() {
             </thead>
             <tbody>
               {[
-                ['Install size', '~110 KB (pg only)', '~1.6 MB (WASM engine)', '~0 KB (no runtime)'],
+                ['Engine / runtime', 'No engine binary (pg only)', 'Client + 1.6 MB WASM engine', 'No engine'],
                 ['Runtime deps', '1 (pg)', '@prisma/client + adapter', '0'],
+                ['Main bundle (gzip)', '~30 KB', 'dominated by 1.6 MB WASM', '~7 KB core'],
                 ['Studio', 'Read-only, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (paid tier)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, 5 KB', '1.6 MB WASM adapter', 'Native'],
+                ['Edge runtime', 'One import swap, ~19 KB gzip', '1.6 MB WASM adapter', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 ['Nested relations', '1 query, deep type inference', '1 query, shallow inference', 'relations() re-declaration'],
+                ['Many-to-many', 'Auto-detected from junctions', 'Implicit/explicit', 'Explicit relations()'],
+                ['Vector search', 'Built-in distance / KNN', 'Preview / raw', 'Extension API'],
+                ['LISTEN/NOTIFY', '$listen / $notify', 'None', 'None'],
               ].map(([label, turbine, prisma, drizzle]) => (
                 <tr key={label} style={{ borderBottom: '1px solid var(--border)' }}>
                   <td
@@ -405,7 +472,7 @@ export default async function Home() {
       {/* ========== FOOTER ========== */}
       <footer className="landing-footer">
         <p>
-          110 KB. One dependency. Zero compromises. Built by{' '}
+          One dependency. No WASM engine. Zero compromises. Built by{' '}
           <a href="https://github.com/zvndev" target="_blank" rel="noopener noreferrer">
             ZVN
           </a>

@@ -69,7 +69,7 @@ export interface ColumnMetadata {
 }
 
 export interface RelationDef {
-  type: 'hasMany' | 'hasOne' | 'belongsTo';
+  type: 'hasMany' | 'hasOne' | 'belongsTo' | 'manyToMany';
   /** Relation name (camelCase, used as the field name) */
   name: string;
   /** Source table */
@@ -80,6 +80,23 @@ export interface RelationDef {
   foreignKey: string | string[];
   /** Referenced column(s) on the "one" / "parent" side (snake_case). Array for composite FKs. */
   referenceKey: string | string[];
+  /**
+   * For `manyToMany` relations only: the junction (join) table that links the
+   * source and target tables. The subquery JOINs the target through this table.
+   *
+   *   - `table`     — junction table name (snake_case).
+   *   - `sourceKey` — junction column(s) referencing the SOURCE table's
+   *                   {@link referenceKey} (typically the source PK).
+   *   - `targetKey` — junction column(s) referencing the TARGET table's PK.
+   *
+   * Array forms support composite keys (paired positionally with the
+   * referenced columns). Omitted for non-m2m relations.
+   */
+  through?: {
+    table: string;
+    sourceKey: string | string[];
+    targetKey: string | string[];
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +171,16 @@ const PG_TO_TS: Record<string, string> = {
   // TSVector
   tsvector: 'string',
   tsquery: 'string',
+  // pgvector — embeddings. Mapped to `number[]` for DX (the natural shape an app
+  // passes when inserting / comparing embeddings). NOTE: like `numeric` above,
+  // there is a runtime caveat — pg has no built-in parser for the `vector` type,
+  // so over the wire a fetched vector arrives as a string literal like
+  // '[1,2,3]' unless the app registers its own parser (e.g. via pgvector's
+  // `registerType`). Turbine never auto-registers one (no side-effecting type
+  // parsers outside the client constructor). The query-side helpers (KNN
+  // orderBy, distance WHERE) always bind the query vector as a `$n::vector`
+  // param, so writing/comparing is unaffected by the read-side caveat.
+  vector: 'number[]',
 };
 
 const DATE_TYPES = new Set(['timestamptz', 'timestamp', 'date']);

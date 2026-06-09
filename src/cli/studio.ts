@@ -106,7 +106,11 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
   const authToken = randomBytes(24).toString('hex');
   const stateDir = pathResolve(options.stateDir ?? '.turbine');
   const statementTimeout = options.adapter?.statementTimeout?.(30) ?? {
-    sql: `SET LOCAL statement_timeout = $1`,
+    // Postgres rejects parameters in `SET LOCAL` (`SET LOCAL ... = $1` is a
+    // syntax error). `set_config(name, value, is_local=true)` is the
+    // parameterizable, transaction-local equivalent and works on every
+    // Postgres-compatible engine.
+    sql: `SELECT set_config('statement_timeout', $1, true)`,
     params: ['30s'],
   };
   const rateLimiter = new Map<string, { count: number; resetAt: number }>();

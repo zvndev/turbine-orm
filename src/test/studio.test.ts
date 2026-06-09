@@ -293,14 +293,15 @@ function makeCtx(pool: pg.Pool, stateDir: string): StudioContext {
     options,
     authToken: 'test-token',
     stateDir,
-    statementTimeout: { sql: `SET LOCAL statement_timeout = $1`, params: ['30s'] },
+    statementTimeout: { sql: `SELECT set_config('statement_timeout', $1, true)`, params: ['30s'] },
     rateLimiter: new Map(),
   };
 }
 
-// Find the first real SQL (not BEGIN/COMMIT/SET) in the recorded call log.
+// Find the first real SQL (not BEGIN/COMMIT/SET or the statement-timeout
+// set_config call) in the recorded call log.
 function firstDataQuery(calls: QueryCall[]): QueryCall {
-  const ignore = /^(BEGIN|COMMIT|ROLLBACK|SET\b)/i;
+  const ignore = /^(BEGIN|COMMIT|ROLLBACK|SET\b|SELECT set_config\()/i;
   for (const c of calls) {
     if (!ignore.test(c.text.trim())) return c;
   }

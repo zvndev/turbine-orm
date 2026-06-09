@@ -34,8 +34,16 @@ export interface WhereOperator<V = unknown> {
  * - A JSONB filter object ({ contains, equals, path, hasKey })
  * - An array filter object ({ has, hasEvery, hasSome, isEmpty })
  * - A text search filter object ({ search, config? })
+ * - A vector distance filter object ({ distance: { to, metric, lt } }) for pgvector columns
  */
-export type WhereValue<V = unknown> = V | WhereOperator<V> | JsonFilter | ArrayFilter | TextSearchFilter | null;
+export type WhereValue<V = unknown> =
+  | V
+  | WhereOperator<V>
+  | JsonFilter
+  | ArrayFilter
+  | TextSearchFilter
+  | VectorFilter
+  | null;
 
 /**
  * Where clause type: each field can be a plain value, null, or operator object.
@@ -296,7 +304,7 @@ export interface FindManyArgs<
   where?: WhereClause<T>;
   select?: S;
   omit?: O;
-  orderBy?: Record<string, OrderDirection>;
+  orderBy?: OrderByClause;
   limit?: number;
   offset?: number;
   with?: W;
@@ -469,6 +477,63 @@ export interface CountArgs<T> {
   timeout?: number;
 }
 
+/**
+ * Numeric comparison operators usable inside a `having` filter. A bare number
+ * is shorthand for equality (`COUNT(*) = $n`); the operator object supports
+ * range and inequality comparisons. Mirrors the numeric subset of
+ * {@link WhereOperator} so the same SQL machinery can be reused.
+ */
+export interface HavingNumericOperator {
+  equals?: number;
+  not?: number;
+  gt?: number;
+  gte?: number;
+  lt?: number;
+  lte?: number;
+  in?: number[];
+  notIn?: number[];
+}
+
+/** A single having predicate value: a bare number (equality) or an operator object. */
+export type HavingFilter = number | HavingNumericOperator;
+
+/**
+ * Per-field aggregate filters inside a {@link HavingClause}. Each aggregate
+ * function maps to a {@link HavingFilter} comparison on that field.
+ *
+ * @example
+ *   viewCount: { _sum: { gt: 100 }, _avg: { lte: 50 } }
+ */
+export interface HavingAggregateFilter {
+  _sum?: HavingFilter;
+  _avg?: HavingFilter;
+  _min?: HavingFilter;
+  _max?: HavingFilter;
+  _count?: HavingFilter;
+}
+
+/**
+ * HAVING clause for `groupBy` — filters whole groups by their aggregate values
+ * (the SQL `HAVING` clause). Follows Prisma's shape: each aggregable field maps
+ * to a {@link HavingAggregateFilter} (`field → aggregate → operator → value`),
+ * and the special top-level `_count` key (no field) filters on `COUNT(*)`.
+ *
+ * Implemented as a mapped type so the special `_count` key can carry a
+ * {@link HavingFilter} while every entity field carries a
+ * {@link HavingAggregateFilter} — without the index-signature conflict an
+ * intersection type would produce when `T` is a broad `Record<string, unknown>`.
+ *
+ * @example
+ *   // groups with more than 5 rows whose summed viewCount is at least 100
+ *   having: { _count: { gt: 5 }, viewCount: { _sum: { gte: 100 } } }
+ */
+export type HavingClause<T> = {
+  /** Filter on `COUNT(*)` for the whole group. */
+  _count?: HavingFilter;
+} & {
+  [K in keyof T & string]?: HavingAggregateFilter;
+};
+
 export interface GroupByArgs<T> {
   by: (keyof T & string)[];
   where?: WhereClause<T>;
@@ -482,6 +547,8 @@ export interface GroupByArgs<T> {
   _min?: Partial<Record<keyof T & string, boolean>>;
   /** Maximum value of fields in each group */
   _max?: Partial<Record<keyof T & string, boolean>>;
+  /** Filter whole groups by their aggregate values (SQL HAVING). */
+  having?: HavingClause<T>;
   /** Order groups */
   orderBy?: Record<string, OrderDirection>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
@@ -552,3 +619,81 @@ export interface TextSearchFilter {
   /** PostgreSQL text search configuration name (defaults to 'english') */
   config?: string;
 }
+
+// ---------------------------------------------------------------------------
+// pgvector — similarity search
+// ---------------------------------------------------------------------------
+
+/**
+ * Vector distance metric. Maps to a pgvector distance operator:
+ *
+ *  - `'l2'`     → `<->` (Euclidean / L2 distance)
+ *  - `'cosine'` → `<=>` (cosine distance)
+ *  - `'ip'`     → `<#>` (negative inner product)
+ *
+ * This is a fixed allow-list — a value outside it is rejected with a
+ * `ValidationError` so a user-supplied string can never become a SQL operator.
+ */
+export type VectorMetric = 'l2' | 'cosine' | 'ip';
+
+/**
+ * Distance threshold filter for a pgvector column inside a `where` clause:
+ *
+ * ```ts
+ * where: { embedding: { distance: { to: [0.1, 0.2, 0.3], metric: 'l2', lt: 0.3 } } }
+ * // → WHERE "embedding" <-> $1::vector < $2
+ * ```
+ *
+ * `to` is always bound as a single `$n::vector` param (never interpolated) and
+ * each element must be a finite number. Exactly one comparison
+ * (`lt` / `lte` / `gt` / `gte`) is applied; the threshold is also a bound param.
+ */
+export interface VectorDistanceFilter {
+  /** The query vector to measure distance against. */
+  to: number[];
+  /** Distance metric → operator. */
+  metric: VectorMetric;
+  /** distance < threshold */
+  lt?: number;
+  /** distance <= threshold */
+  lte?: number;
+  /** distance > threshold */
+  gt?: number;
+  /** distance >= threshold */
+  gte?: number;
+}
+
+/** Vector query operators for where clauses (pgvector). */
+export interface VectorFilter {
+  /** Filter rows by distance from a query vector. */
+  distance: VectorDistanceFilter;
+}
+
+/**
+ * KNN ordering spec for a pgvector column inside an `orderBy` clause:
+ *
+ * ```ts
+ * orderBy: { embedding: { distance: { to: [...], metric: 'cosine' } } }
+ * // → ORDER BY "embedding" <=> $1::vector ASC
+ * ```
+ *
+ * `distance` ASC ranks nearest-first (the default). Pass `direction: 'desc'`
+ * to invert. The query vector `to` is bound as a `$n::vector` param.
+ */
+export interface VectorOrderByDistance {
+  to: number[];
+  metric: VectorMetric;
+  /** Sort direction for the computed distance. Defaults to `'asc'` (nearest first). */
+  direction?: OrderDirection;
+}
+
+/** Per-column orderBy value: a plain direction or a vector-distance ordering. */
+export interface VectorOrderBy {
+  distance: VectorOrderByDistance;
+}
+
+/**
+ * An orderBy clause maps each column to either a plain direction (`'asc'` /
+ * `'desc'`) or, for pgvector columns, a KNN distance ordering object.
+ */
+export type OrderByClause = Record<string, OrderDirection | VectorOrderBy>;

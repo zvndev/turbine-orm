@@ -164,7 +164,9 @@ export const yugabytedb: DatabaseAdapter = {
   } satisfies Partial<IntrospectionOverrides>,
 
   statementTimeout(seconds: number): { sql: string; params: unknown[] } {
-    // YugabyteDB supports standard PostgreSQL statement_timeout
-    return { sql: `SET LOCAL statement_timeout = $1`, params: [`${seconds}s`] };
+    // YugabyteDB supports standard PostgreSQL statement_timeout. `SET LOCAL`
+    // cannot take a bind parameter, so use the parameterizable, transaction-
+    // local set_config() form.
+    return { sql: `SELECT set_config('statement_timeout', $1, true)`, params: [`${seconds}s`] };
   },
 };

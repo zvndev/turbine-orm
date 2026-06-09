@@ -360,4 +360,64 @@ testFn('nested write integration tests', () => {
       assert.ok(!('posts' in user), 'should not have posts key without with clause');
     });
   });
+
+  // Regression: belongsTo nested writes put the FK on the PARENT row, so the
+  // FK must be resolved BEFORE the parent INSERT. Earlier the parent was
+  // inserted first and the FK set via a follow-up UPDATE, which failed the
+  // NOT NULL `user_id` constraint on the initial INSERT. These exercise the
+  // FK-on-parent direction (the prior tests only covered hasMany / FK-on-child).
+  describe('create with belongsTo (FK on parent, NOT NULL)', () => {
+    it('connect: sets the parent FK from an existing related row', async () => {
+      const post = row(
+        await db.table('posts').create({
+          data: {
+            title: 'belongsTo connect',
+            content: 'x',
+            orgId: 1,
+            user: { connect: { id: 1 } },
+          },
+        }),
+      );
+      assert.ok(post.id);
+      assert.equal(String(post.userId), '1', 'parent user_id should be set from the connected user');
+      assert.ok(post.user && (post.user as Record<string, unknown>).id, 'nested user should be returned');
+    });
+
+    it('create: creates the related row and sets the parent FK to its PK', async () => {
+      const email = `belongsto-create-${Date.now()}@example.com`;
+      const post = row(
+        await db.table('posts').create({
+          data: {
+            title: 'belongsTo create',
+            content: 'y',
+            orgId: 1,
+            user: { create: { email, name: 'BelongsTo Created', orgId: 1 } },
+          },
+        }),
+      );
+      assert.ok(post.userId, 'parent user_id should be set to the created user PK');
+      const nested = post.user as Record<string, unknown>;
+      assert.equal(nested.email, email, 'nested created user should round-trip');
+      assert.equal(String(post.userId), String(nested.id));
+    });
+
+    it('connectOrCreate: connects an existing related row', async () => {
+      const post = row(
+        await db.table('posts').create({
+          data: {
+            title: 'belongsTo connectOrCreate',
+            content: 'z',
+            orgId: 1,
+            user: {
+              connectOrCreate: {
+                where: { id: 1 },
+                create: { email: `cor-${Date.now()}@example.com`, name: 'nope', orgId: 1 },
+              },
+            },
+          },
+        }),
+      );
+      assert.equal(String(post.userId), '1', 'should connect to existing user, not create');
+    });
+  });
 });

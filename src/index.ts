@@ -130,6 +130,7 @@ export {
   type NestedCreateOp,
   type NestedUpdateOp,
   type OmitResult,
+  type OrderByClause,
   type OrderDirection,
   type QueryEvent,
   type QueryEventListener,
@@ -145,10 +146,17 @@ export {
   type UpdateManyArgs,
   type UpdateOperatorInput,
   type UpsertArgs,
+  type VectorDistanceFilter,
+  type VectorFilter,
+  type VectorMetric,
+  type VectorOrderBy,
+  type VectorOrderByDistance,
   type WithClause,
   type WithOptions,
   type WithResult,
 } from './query/index.js';
+// Realtime — LISTEN/NOTIFY pub/sub
+export { type ActiveSubscription, type NotificationHandler, type Subscription, validateChannel } from './realtime.js';
 // Schema metadata types
 export type {
   ColumnMetadata,
@@ -170,6 +178,7 @@ export {
 } from './schema.js';
 // Schema builder — define schemas in TypeScript
 export {
+  applyManyToManyRelations,
   ColumnBuilder,
   type ColumnConfig,
   type ColumnDef,
@@ -177,6 +186,7 @@ export {
   type ColumnTypeName,
   column,
   defineSchema,
+  type ManyToManyDef,
   type SchemaDef,
   type TableDef,
   // Legacy compat (deprecated — use object format with defineSchema)
@@ -196,3 +206,5 @@ export {
 } from './schema-sql.js';
 // Serverless / edge factory
 export { type TurbineHttpOptions, turbineHttp } from './serverless.js';
+// Typed raw SQL — Turbine's TypedSQL escape hatch
+export { buildTypedSql, TypedSqlQuery } from './typed-sql.js';

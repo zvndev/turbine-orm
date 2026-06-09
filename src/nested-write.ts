@@ -212,17 +212,30 @@ export async function executeNestedCreate(
     validateOps(relName, ops, false);
   }
 
-  // Insert the parent row
-  const parentRow = (await ctx.tx.table(tableName).create({ data: scalars })) as Record<string, unknown>;
-
-  // Process each relation
+  // belongsTo relations put the foreign key on the PARENT row, so they must be
+  // resolved BEFORE the parent is inserted — otherwise a NOT NULL FK column
+  // fails on the initial INSERT. We resolve each belongsTo op (create/connect/
+  // connectOrCreate) to its referenced row and fold the FK values into the
+  // parent's own INSERT.
+  const belongsToFks: Record<string, unknown> = {};
   for (const [relName, ops] of Object.entries(relations)) {
     const rel = tableMeta.relations[relName]!;
+    if (rel.type === 'belongsTo') {
+      Object.assign(belongsToFks, await resolveBelongsToForCreate(ctx, rel, ops, tableName, depth, path, relName));
+    }
+  }
 
+  // Insert the parent row (scalars + resolved belongsTo foreign keys)
+  const parentRow = (await ctx.tx.table(tableName).create({
+    data: { ...scalars, ...belongsToFks },
+  })) as Record<string, unknown>;
+
+  // Process hasMany / hasOne relations — their FK lives on the CHILD, so they
+  // need the parent row to exist first.
+  for (const [relName, ops] of Object.entries(relations)) {
+    const rel = tableMeta.relations[relName]!;
     if (rel.type === 'hasMany' || rel.type === 'hasOne') {
       await processHasManyCreate(ctx, rel, ops, parentRow, depth, path, relName);
-    } else if (rel.type === 'belongsTo') {
-      await processBelongsToCreate(ctx, rel, ops, parentRow, tableName, depth, path, relName);
     }
   }
 
@@ -433,6 +446,73 @@ async function processHasManyCreate(
 // ---------------------------------------------------------------------------
 // belongsTo create operations
 // ---------------------------------------------------------------------------
+
+/**
+ * Resolve a belongsTo relation's create/connect/connectOrCreate op to the
+ * foreign-key value(s) that belong on the PARENT row, returning them keyed by
+ * the parent's own field names so they can be merged into the parent INSERT.
+ *
+ * Used by the create path only. (The update path uses processBelongsToCreate,
+ * which UPDATEs the FK after the parent already exists.)
+ */
+async function resolveBelongsToForCreate(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  ops: Record<string, unknown>,
+  parentTable: string,
+  depth: number,
+  path: string[],
+  relName: string,
+): Promise<Record<string, unknown>> {
+  const fks = normalizeKeyColumns(rel.foreignKey);
+  const refs = normalizeKeyColumns(rel.referenceKey);
+  const parentMeta = ctx.schema.tables[parentTable]!;
+  const relatedTable = ctx.schema.tables[rel.to];
+
+  let relatedRow: Record<string, unknown> | null = null;
+
+  if (ops.create !== undefined) {
+    const items = toArray(ops.create as Record<string, unknown> | Record<string, unknown>[]);
+    if (items.length > 0) {
+      relatedRow = (await executeNestedCreate(ctx, rel.to, items[0]!, depth + 1, [...path, relName])) as Record<
+        string,
+        unknown
+      >;
+    }
+  } else if (ops.connect !== undefined) {
+    const items = toArray(ops.connect as Record<string, unknown> | Record<string, unknown>[]);
+    if (items.length > 0) {
+      const target = items[0]!;
+      relatedRow = (await ctx.tx.table(rel.to).findUnique({ where: target })) as Record<string, unknown> | null;
+      if (!relatedRow) {
+        throw new ValidationError(
+          `[turbine] connect on "${relName}": no ${rel.to} row found matching ${JSON.stringify(target)}.`,
+        );
+      }
+    }
+  } else if (ops.connectOrCreate !== undefined) {
+    const items = toArray(ops.connectOrCreate as Record<string, unknown> | Record<string, unknown>[]);
+    if (items.length > 0) {
+      const op = items[0] as { where: Record<string, unknown>; create: Record<string, unknown> };
+      relatedRow = (await ctx.tx.table(rel.to).findUnique({ where: op.where })) as Record<string, unknown> | null;
+      if (!relatedRow) {
+        // For belongsTo the FK lives on the parent, so the related row is
+        // created plainly (no FK injection) and we read its reference key.
+        relatedRow = (await ctx.tx.table(rel.to).create({ data: op.create })) as Record<string, unknown>;
+      }
+    }
+  }
+
+  const fkScalars: Record<string, unknown> = {};
+  if (relatedRow) {
+    for (let i = 0; i < fks.length; i++) {
+      const fkField = parentMeta.reverseColumnMap[fks[i]!] ?? fks[i]!;
+      const refField = relatedTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
+      fkScalars[fkField] = relatedRow[refField];
+    }
+  }
+  return fkScalars;
+}
 
 async function processBelongsToCreate(
   ctx: NestedWriteContext,

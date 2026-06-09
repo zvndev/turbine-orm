@@ -525,12 +525,22 @@ testFn('high-priority gap tests', () => {
     });
 
     it('runs 10 concurrent counts and gets matching numbers', async () => {
-      const promises = Array.from({ length: 10 }, () => db.table('users').count());
-      const counts = await Promise.all(promises);
-      const first = counts[0];
-      for (const c of counts) {
-        assert.equal(c, first);
-      }
+      // Snapshot all 10 counts inside one RepeatableRead transaction so concurrent
+      // test files creating/deleting users (constraint tests, comprehensive tests)
+      // can't race the "all equal" assertion. The point of this test is that
+      // concurrent count() calls return a consistent number — not isolation
+      // against external writers — so a stable snapshot is the right guarantee.
+      await db.$transaction(
+        async (tx) => {
+          const promises = Array.from({ length: 10 }, () => tx.table('users').count());
+          const counts = await Promise.all(promises);
+          const first = counts[0];
+          for (const c of counts) {
+            assert.equal(c, first);
+          }
+        },
+        { isolationLevel: 'RepeatableRead' },
+      );
     });
   });
 
