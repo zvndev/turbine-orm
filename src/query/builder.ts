@@ -2774,8 +2774,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
 
-    // limit param
-    if (spec.limit) {
+    // limit param — only hasMany parameterizes its limit (mirrors
+    // buildRelationSubquery). belongsTo/hasOne ignore limit (always LIMIT 1), so
+    // pushing one here would orphan a param and desync the collect path.
+    if (relDef.type === 'hasMany' && spec.limit) {
       params.push(Number(spec.limit));
     }
 
@@ -3754,9 +3756,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
 
-    // LIMIT
+    // LIMIT — only meaningful for hasMany. A belongsTo / hasOne subquery returns
+    // a single row (literal `LIMIT 1` below), so a `spec.limit` here must NOT push
+    // a parameter: doing so orphans an untyped `$N` that the SQL never references,
+    // which Postgres rejects with "could not determine data type of parameter $N"
+    // (and shifts every later placeholder by one). To-one relations ignore limit.
     let limitClause = '';
-    if (spec !== true && spec.limit) {
+    if (relDef.type === 'hasMany' && spec !== true && spec.limit) {
       params.push(Number(spec.limit));
       limitClause = ` LIMIT ${this.p(params.length)}`;
     }

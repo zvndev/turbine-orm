@@ -2865,9 +2865,12 @@
               // Same controls as the top level, applied to this relation's args —
               // this is the recursive drill-down: pick its fields, filter it, order
               // it, and expand its own relations to arbitrary depth.
+              // orderBy/limit only apply to to-many relations; a belongsTo/hasOne
+              // always resolves to a single row, so we hide those controls for it.
+              const toMany = rel.type === 'hasMany' || rel.type === 'manyToMany';
               body.appendChild(BuilderPane.renderSelectOmit(existing.args, targetMeta));
               body.appendChild(BuilderPane.renderWhere(existing.args, targetMeta, path.concat(rel.name)));
-              body.appendChild(BuilderPane.renderOrderLimit(existing.args, targetMeta));
+              if (toMany) body.appendChild(BuilderPane.renderOrderLimit(existing.args, targetMeta));
               body.appendChild(BuilderPane.renderWith(existing.args, targetMeta, path.concat(rel.name)));
             }
             relBox.appendChild(body);
