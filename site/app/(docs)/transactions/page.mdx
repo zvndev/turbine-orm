@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'Transactions & Pipelines',
   description:
-    'Callback-style transactions with nested SAVEPOINTs, isolation levels, timeouts, retryable errors, and pipeline batching in Turbine ORM.',
+    'Callback-style transactions with nested SAVEPOINTs, isolation levels, timeouts, RLS session context for multi-tenancy, retryable errors, and pipeline batching in Turbine ORM.',
   alternates: { canonical: '/transactions' },
 };
 
@@ -48,13 +48,13 @@ await db.$transaction(
       data: { stock: { decrement: 1 } },
     });
   },
-  { isolationLevel: 'serializable' },
+  { isolationLevel: 'Serializable' },
 );
 ```
 
-Supported: `'read committed'` (Postgres default), `'repeatable read'`, `'serializable'`.
+Supported: `'ReadUncommitted'`, `'ReadCommitted'` (Postgres default), `'RepeatableRead'`, `'Serializable'`.
 
-When `serializable` detects a conflict, it throws `SerializationFailureError` (TURBINE_E013) with `isRetryable: true as const`. See the retry section below.
+When `Serializable` detects a conflict, it throws `SerializationFailureError` (TURBINE_E013) with `isRetryable: true as const`. See the retry section below.
 
 ## Timeouts
 
@@ -95,6 +95,36 @@ await db.$transaction(async (tx) => {
 
 SAVEPOINT names are auto-generated with a counter so nesting is safe.
 
+## Multi-tenant queries with RLS session context
+
+Set transaction-local Postgres settings (GUCs) so PostgreSQL Row-Level Security policies that call `current_setting()` filter rows for you. This is the clean way to do multi-tenant isolation: the database enforces the tenant boundary, not your application code.
+
+Pass `sessionContext` to `$transaction`:
+
+```ts
+// Postgres policy: USING (tenant_id = current_setting('app.current_tenant')::int)
+const rows = await db.$transaction(
+  async (tx) => tx.documents.findMany(),
+  { sessionContext: { 'app.current_tenant': tenantId } },
+);
+// Only this tenant's documents come back — the policy did the filtering
+```
+
+Each entry is applied as `SELECT set_config(name, value, true)` right after `BEGIN`, so the setting is scoped to the transaction and resets automatically on commit or rollback. Values may be strings, numbers, or booleans (numbers and booleans are coerced to strings, since GUCs are text). An invalid setting name throws `ValidationError` and rolls the transaction back *before* any query runs.
+
+### $withSession shorthand
+
+For a single-purpose session, `$withSession` skips the options object — pass the context first, then the callback:
+
+```ts
+const rows = await db.$withSession(
+  { 'app.current_tenant': tenantId },
+  async (tx) => tx.documents.findMany(),
+);
+```
+
+`$withSession(ctx, fn)` is exactly `$transaction(fn, { sessionContext: ctx })`. Use it when the only reason you're opening a transaction is to scope the RLS context.
+
 ## Retryable errors
 
 Two error classes carry `readonly isRetryable = true as const` — so TypeScript narrows them and you don't need a runtime field check.
@@ -127,7 +157,7 @@ await withRetry(() =>
     async (tx) => {
       /* ... */
     },
-    { isolationLevel: 'serializable' },
+    { isolationLevel: 'Serializable' },
   ),
 );
 ```

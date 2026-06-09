@@ -86,6 +86,37 @@ const features = [
   },
 ];
 
+const postgresFeatures = [
+  {
+    title: 'Vector search (pgvector)',
+    description:
+      'KNN ranking and distance filters over vector columns — orderBy: { embedding: { distance: { to, metric: "cosine" } } }. l2 / cosine / inner-product, every value bound as a parameter.',
+    href: '/vector',
+    cta: 'Vector docs',
+  },
+  {
+    title: 'Realtime (LISTEN / NOTIFY)',
+    description:
+      'Postgres pub/sub with db.$listen(channel, handler) and db.$notify(channel, payload). No broker, no extra service — your database is the message bus.',
+    href: '/realtime',
+    cta: 'Realtime docs',
+  },
+  {
+    title: 'RLS session context',
+    description:
+      'Multi-tenant isolation the database enforces. $transaction(fn, { sessionContext }) sets transaction-local GUCs so Row-Level Security policies filter rows for you.',
+    href: '/transactions',
+    cta: 'Transactions docs',
+  },
+  {
+    title: 'Many-to-many, auto-detected',
+    description:
+      'Pure junction tables are detected at generate time — db.posts.findMany({ with: { tags: true } }) just works. Self-relations too: a self-referencing FK gives you parent + children.',
+    href: '/relations',
+    cta: 'Relations docs',
+  },
+];
+
 export default async function Home() {
   const [heroHtml, sqlHtml] = await Promise.all([
     codeToHtml(heroCode, { lang: 'typescript', theme: 'github-dark-dimmed' }),
@@ -126,7 +157,7 @@ export default async function Home() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            v0.16 — observability, nested write update/upsert, is/isNot filters
+            v0.18 — pgvector search, RLS, LISTEN/NOTIFY, many-to-many, HAVING, typed SQL
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
@@ -138,9 +169,10 @@ export default async function Home() {
           <p className="hero-subtitle animate-fade-in-up delay-2">
             The Postgres ORM that ships light and locks tight. One runtime
             dependency, no WASM engine, a read-only Studio no other ORM has, and
-            error messages that never leak PII. v0.17 makes the PII-safe error
-            guarantee airtight and fixes belongsTo nested writes and Studio on
-            plain Postgres.
+            error messages that never leak PII. v0.18 goes Postgres-native:
+            pgvector similarity search, row-level-security session context,
+            LISTEN/NOTIFY realtime, many-to-many + self-relations, GROUP BY
+            HAVING, and a typed raw-SQL escape hatch.
           </p>
 
           <div className="animate-fade-in-up delay-3">
@@ -243,6 +275,36 @@ export default async function Home() {
         </div>
       </section>
 
+      {/* ========== POSTGRES-NATIVE ========== */}
+      <section className="features-section">
+        <div className="animate-fade-in-up">
+          <p className="section-label">Postgres-native</p>
+          <h2 className="section-title">
+            Use the database you actually have.
+          </h2>
+        </div>
+
+        <div className="feature-grid">
+          {postgresFeatures.map((f, i) => (
+            <Link
+              key={f.title}
+              href={f.href}
+              className={`feature-card animate-fade-in-up delay-${i + 1}`}
+              style={{ textDecoration: 'none', display: 'block' }}
+            >
+              <h3>{f.title}</h3>
+              <p>{f.description}</p>
+              <span
+                className="font-mono"
+                style={{ color: 'var(--accent)', fontSize: '0.8rem' }}
+              >
+                {f.cta} &rarr;
+              </span>
+            </Link>
+          ))}
+        </div>
+      </section>
+
       {/* ========== COMPARISON ========== */}
       <section className="features-section">
         <p className="section-label">Comparison</p>
@@ -324,6 +386,9 @@ export default async function Home() {
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 ['Nested relations', '1 query, deep type inference', '1 query, shallow inference', 'relations() re-declaration'],
+                ['Many-to-many', 'Auto-detected from junctions', 'Implicit/explicit', 'Explicit relations()'],
+                ['Vector search', 'Built-in distance / KNN', 'Preview / raw', 'Extension API'],
+                ['LISTEN/NOTIFY', '$listen / $notify', 'None', 'None'],
               ].map(([label, turbine, prisma, drizzle]) => (
                 <tr key={label} style={{ borderBottom: '1px solid var(--border)' }}>
                   <td

@@ -65,19 +65,52 @@ const user = await db.users.findUnique({
 
 Without the `unique: true` on `profileId`, Turbine would infer `hasMany` on the reverse side.
 
-## Many-to-many (join table)
+## Many-to-many (auto-detected pure junctions)
 
-Turbine doesn't use a magic `@relation(through: ...)` — you model the join table as a real entity, because it is one. You almost always want timestamps or roles on it anyway.
+Turbine auto-detects **pure junction tables** during `generate` and gives both endpoints a flat many-to-many relation. A pure junction is a table whose primary key is exactly two single-column foreign keys and which carries no other columns — for example `posts_tags(post_id, tag_id)`.
 
 ```ts
-users: {
+// schema.ts
+posts: {
+  id: { type: 'serial', primaryKey: true },
+  title: { type: 'text', notNull: true },
+},
+tags: {
   id: { type: 'serial', primaryKey: true },
   name: { type: 'text', notNull: true },
 },
-organizations: {
-  id: { type: 'serial', primaryKey: true },
-  name: { type: 'text', notNull: true },
+postsTags: {
+  postId: { type: 'bigint', notNull: true, references: 'posts.id' },
+  tagId: { type: 'bigint', notNull: true, references: 'tags.id' },
+  primaryKey: ['postId', 'tagId'],
 },
+```
+
+Load the related rows directly — no join-table hop:
+
+```ts
+const posts = await db.posts.findMany({
+  with: { tags: true }, // each post comes back with its tags array
+});
+// posts[0].tags is Tag[]
+```
+
+Nested `where` / `orderBy` / `limit` work on the m2m target too:
+
+```ts
+const post = await db.posts.findFirst({
+  where: { id: 1 },
+  with: { tags: { where: { name: 'sql' }, orderBy: { name: 'asc' }, limit: 5 } },
+});
+```
+
+Under the hood Turbine JOINs the target through the junction table and correlates `junction.sourceKey = parent.referenceKey` — still one SQL statement, still `json_agg`.
+
+### Junctions with a payload, or non-pure junctions
+
+A junction table that carries extra columns (a role, a timestamp, an "added by") is a first-class entity, so Turbine keeps it as an ordinary `hasMany` — that's by design. You query it the same way you'd query any relation: through the junction, with the join-table row available.
+
+```ts
 memberships: {
   userId: { type: 'bigint', notNull: true, references: 'users.id' },
   orgId: { type: 'bigint', notNull: true, references: 'organizations.id' },
@@ -85,8 +118,6 @@ memberships: {
   primaryKey: ['userId', 'orgId'],
 },
 ```
-
-Query through the join table:
 
 ```ts
 const user = await db.users.findUnique({
@@ -97,41 +128,66 @@ const user = await db.users.findUnique({
     },
   },
 });
+// user.memberships[0].role  — the payload is right there
 // user.memberships[0].organization.name
-```
 
-If you want the flat list without the join-table rows, flatten it in code:
-
-```ts
+// Want the flat list without the join-table rows? Flatten in code:
 const orgs = user.memberships.map((m) => m.organization);
 ```
 
-## Self-referential
+### Declaring a many-to-many by hand
 
-Comments with a `parentId` pointing at another comment. Turbine generates both sides of the relation (`parent` belongsTo, `children` hasMany):
+To get the flat m2m relation on a junction that *isn't* pure — or to wire one up explicitly — declare it in your code-first schema with `manyToMany`:
 
 ```ts
-comments: {
+import { defineSchema } from 'turbine-orm';
+
+export default defineSchema({
+  posts: {
+    id: { type: 'serial', primaryKey: true },
+    title: { type: 'text', notNull: true },
+    manyToMany: [
+      { name: 'tags', target: 'tags', through: 'postsTags',
+        sourceKey: 'postId', targetKey: 'tagId' },
+    ],
+  },
+  // ...tags and postsTags table definitions
+});
+```
+
+`sourceKey` / `targetKey` are the junction columns referencing each side's primary key. Add `references` if the source side is keyed on something other than `id`.
+
+## Self-referential
+
+A self-referencing foreign key (a column on a table that references that same table's primary key) introspects to **both** a `belongsTo` and a `hasMany` on the table. Categories with a `parentId` pointing at another category, comments threaded under a parent comment, an org chart — they all work the same way, including nested trees.
+
+```ts
+categories: {
   id: { type: 'serial', primaryKey: true },
-  parentId: { type: 'bigint', references: 'comments.id' },
-  body: { type: 'text', notNull: true },
+  parentId: { type: 'bigint', references: 'categories.id' },
+  name: { type: 'text', notNull: true },
 },
 ```
 
 ```ts
-const thread = await db.comments.findMany({
-  where: { parentId: null }, // top-level comments
-  with: {
-    children: {
-      with: {
-        children: true, // 2 levels deep
-      },
-    },
-  },
+// A category with its parent and its direct children
+const category = await db.categories.findFirst({
+  where: { id: 2 },
+  with: { parent: true, children: true },
+});
+// category.parent is Category | null
+// category.children is Category[]
+
+// Walk a level deeper
+const tree = await db.categories.findFirst({
+  where: { id: 1 },
+  with: { children: { with: { children: true } } },
 });
 ```
 
-Back-references like `posts -> user -> posts` are allowed — Turbine detects cycles by tracking the recursion path, not by refusing to revisit a table. The depth cap (10) is the guardrail.
+When a table has a single self-referencing FK, Turbine auto-names the two relations after the table: the `belongsTo` takes the singular (`category`) and the `hasMany` takes the table name (`categories`). Rename them to `parent` / `children` in your code-first schema if you prefer — the examples above assume you have.
+
+Back-references like `posts -> user -> posts` are allowed too — Turbine detects cycles by tracking the recursion path, not by refusing to revisit a table. The depth cap (10) is the guardrail.
 
 ## Nested with — what's available at every level
 

@@ -1,0 +1,86 @@
+export const metadata = {
+  title: 'Vector Search (pgvector)',
+  description:
+    'KNN nearest-neighbor ranking and distance WHERE filters over pgvector columns in Turbine ORM. l2 / cosine / inner-product metrics, fully parameterized.',
+  alternates: { canonical: '/vector' },
+};
+
+# Vector Search (pgvector)
+
+Rank rows by similarity to a query vector — for semantic search, recommendations, or RAG retrieval — without dropping to raw SQL. Turbine queries [pgvector](https://github.com/pgvector/pgvector) columns through the same `findMany` you already use, with `orderBy` for nearest-neighbor ranking and `where` for distance thresholds.
+
+You need the `pgvector` extension installed and a `vector` column on your table. Everything else is ordinary Turbine.
+
+## KNN — order by distance
+
+Pass a `distance` object on a `vector` column in `orderBy` to sort rows by their distance to a query vector. Add `limit` to take the closest *k* rows.
+
+```ts
+const similar = await db.items.findMany({
+  orderBy: { embedding: { distance: { to: queryVector, metric: 'cosine' } } },
+  limit: 5,
+});
+// queryVector is a number[]; the 5 nearest rows, nearest-first
+```
+
+`to` is a `number[]`. The default sort direction is `'asc'` — smallest distance first, i.e. nearest-first. To invert it, pass `direction: 'desc'`:
+
+```ts
+const farthest = await db.items.findMany({
+  orderBy: { embedding: { distance: { to: queryVector, metric: 'cosine', direction: 'desc' } } },
+  limit: 5,
+});
+```
+
+This compiles to `ORDER BY "embedding" <=> $1::vector ASC` with the vector bound as a parameter — never interpolated.
+
+## Distance filter — keep rows within a threshold
+
+Put the same `distance` object in `where` with a comparator to keep only rows inside (or outside) a distance threshold.
+
+```ts
+const close = await db.items.findMany({
+  where: { embedding: { distance: { to: queryVector, metric: 'l2', lt: 0.3 } } },
+});
+// Generates: WHERE "embedding" <-> $1::vector < $2
+```
+
+Distance filters accept `lt`, `lte`, `gt`, and `gte`. Both the vector and the threshold are bound as parameters (`$1::vector < $2`). A distance filter with no comparator throws `ValidationError`.
+
+Combine a filter with KNN ordering to retrieve the closest matches above a quality bar:
+
+```ts
+const results = await db.items.findMany({
+  where: { embedding: { distance: { to: queryVector, metric: 'cosine', lt: 0.4 } } },
+  orderBy: { embedding: { distance: { to: queryVector, metric: 'cosine' } } },
+  limit: 10,
+});
+```
+
+## Metrics
+
+`metric` selects the pgvector distance operator:
+
+| `metric` | Operator | Distance |
+|---|---|---|
+| `'l2'` | `<->` | Euclidean (L2) distance |
+| `'cosine'` | `<=>` | Cosine distance |
+| `'ip'` | `<#>` | Negative inner product |
+
+An unknown metric throws `ValidationError`. A `distance` op on a non-`vector` column also throws `ValidationError`.
+
+> **Note:** pg has no built-in parser for the `vector` type, so a fetched `vector` column comes back as a string literal like `'[1,2,3]'` unless you register a parser (for example via pgvector's own client helpers). Querying *by* distance works regardless — this only affects how the column value reads when you select it.
+
+## Validation and safety
+
+Every value in a vector query is bound as a parameter, so hostile input can't escape the query:
+
+- The query vector is always bound as `$n::vector`.
+- The distance threshold is always bound as `$n`.
+- A non-number element in `to` (including `NaN` or `Infinity`) throws `ValidationError` before any query runs.
+
+## See also
+
+- **[API Reference](/queries)** — `findMany`, `where`, `orderBy`, and the full operator table.
+- **[Realtime](/realtime)** — `LISTEN` / `NOTIFY` pub/sub.
+- **[Relations](/relations)** — combine vector ranking with nested `with` loads.

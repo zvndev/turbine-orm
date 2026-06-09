@@ -1,0 +1,76 @@
+export const metadata = {
+  title: 'Realtime (LISTEN / NOTIFY)',
+  description:
+    'Postgres pub/sub in Turbine ORM with $listen and $notify. Subscribe to a channel on a dedicated connection, publish payloads, and unsubscribe cleanly.',
+  alternates: { canonical: '/realtime' },
+};
+
+# Realtime (LISTEN / NOTIFY)
+
+Push events between processes through Postgres itself — no message broker, no extra service. Turbine wraps Postgres `LISTEN` / `NOTIFY` in two methods: `$listen` subscribes to a channel and `$notify` publishes to it.
+
+This is ideal for cache invalidation, live dashboards, and worker fan-out where you already have a Postgres connection and don't want to stand up Redis or a queue.
+
+## Subscribe with $listen
+
+Pass a channel name and a handler. The handler receives the notification payload as a string. `$listen` resolves once the subscription is live.
+
+```ts
+const sub = await db.$listen('order_created', (payload) => {
+  console.log('new order:', payload);
+});
+```
+
+`$listen` checks out a dedicated pooled connection and runs `LISTEN "order_created"` on it, holding that connection open for the lifetime of the subscription. The returned subscription exposes the resolved `channel` and an `unsubscribe()` method.
+
+## Publish with $notify
+
+```ts
+await db.$notify('order_created', JSON.stringify({ id: 1 }));
+```
+
+`$notify` is a single round-trip — it runs `SELECT pg_notify($1, $2)` with the channel and payload both bound as parameters. The payload is optional and defaults to an empty string:
+
+```ts
+await db.$notify('cache_invalidated'); // payload defaults to ''
+```
+
+Because the payload is a single string, serialize structured data yourself (`JSON.stringify`) on the way out and parse it in the handler.
+
+## Unsubscribe
+
+When you're done, call `unsubscribe()`. It runs `UNLISTEN` and releases the dedicated connection back to the pool.
+
+```ts
+const sub = await db.$listen('order_created', (payload) => {
+  console.log('new order:', payload);
+});
+
+// ...later
+await sub.unsubscribe();
+// subsequent $notify calls no longer fire the handler
+```
+
+All live subscriptions are also force-released when you call `db.disconnect()`, so you won't leak connections on shutdown.
+
+## Channel names
+
+Channel names are validated as plain identifiers and quoted before use — they're the one interpolated token in the generated SQL, so the validation is strict. Names with spaces, leading digits, dots, or other special characters throw `ValidationError` *before* any connection is touched.
+
+```ts
+await db.$notify('order created');  // throws ValidationError — space
+await db.$listen('1bad', () => {}); // throws ValidationError — leading digit
+await db.$notify('app.events');     // throws ValidationError — no dotted namespacing
+```
+
+## Not available on serverless HTTP drivers
+
+`$listen` needs a persistent connection to hold the subscription open, which HTTP / serverless drivers (Neon HTTP, Vercel Postgres, Cloudflare Hyperdrive) don't provide. On those pools it throws a clear error rather than hanging. `$notify` is a single round-trip and works everywhere.
+
+If you need realtime on the edge, run `$listen` from a long-lived process (a worker, a server) on a real `pg` pool, and `$notify` from anywhere.
+
+## See also
+
+- **[Serverless & Edge](/serverless)** — which APIs work on HTTP drivers.
+- **[Transactions & Pipelines](/transactions)** — connection lifecycle and pooling.
+- **[Typed Errors](/errors)** — `ValidationError` (E003) and the full code table.

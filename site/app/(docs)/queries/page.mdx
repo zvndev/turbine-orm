@@ -252,6 +252,40 @@ const breakdown = await db.posts.groupBy({
 
 Supported aggregate functions: `_count`, `_sum`, `_avg`, `_min`, `_max`. When `_count` is `true` (or omitted), each group includes a `_count` field with the number of rows in that group.
 
+### Filtering groups with HAVING
+
+A `where` clause filters rows *before* grouping. A `having` clause filters the resulting groups *after* — by their aggregates. Every comparison value is parameterized.
+
+```ts
+// Users with more than one post
+const prolific = await db.posts.groupBy({
+  by: ['userId'],
+  _count: true,
+  having: { _count: { gt: 1 } },
+});
+
+// Groups whose summed view count clears a threshold
+const popular = await db.posts.groupBy({
+  by: ['published'],
+  _sum: { viewCount: true },
+  having: { viewCount: { _sum: { gte: 100 } } },
+});
+```
+
+Filter on the group row count with `_count`, or on a column aggregate with `{ column: { _sum | _avg | _min | _max: { ... } } }`. The available operators are `gt`, `gte`, `lt`, `lte`, `in`, and `notIn` — a bare number is shorthand for equality. Multiple `having` predicates combine with `AND`:
+
+```ts
+// Groups with > 1 row AND a summed view count <= 500
+const niche = await db.posts.groupBy({
+  by: ['userId'],
+  _count: true,
+  _sum: { viewCount: true },
+  having: { _count: { gt: 1 }, viewCount: { _sum: { lte: 500 } } },
+});
+```
+
+`HAVING` is emitted after `GROUP BY` and before `ORDER BY`, and its parameters continue the same numbering as any `where` params.
+
 ## findManyStream
 
 Stream rows using a PostgreSQL server-side cursor. Constant memory, works on any number of rows, and supports nested `with` clauses inside the stream.
@@ -459,6 +493,41 @@ const stats = await db.raw<{ day: Date; count: number }>`
 ```
 
 Parameters from `${}` interpolations become `$1, $2, ...` — never string-interpolated into the SQL text.
+
+## Typed raw SQL — `db.sql<T>`
+
+`db.sql<T>` is the typed escape hatch: you supply the row shape and get a thenable query with `.one()` and `.scalar()` helpers. Like `db.raw`, every `${value}` is bound as a `$N` parameter — injection is impossible even with hostile input. Unlike `db.raw`, you choose the result shape and get the convenience helpers.
+
+```ts
+// Awaiting the query returns T[]
+const users = await db.sql<{ id: number; name: string }>`
+  SELECT id, name FROM users WHERE org_id = ${orgId}
+`;
+```
+
+`.one()` returns the first row or `null`:
+
+```ts
+const user = await db.sql<{ id: number; name: string }>`
+  SELECT id, name FROM users WHERE id = ${42}
+`.one();
+// user is { id: number; name: string } | null
+```
+
+`.scalar()` returns the first column of the first row, or `null`. Pass a type argument to override the inferred value type:
+
+```ts
+const total = await db.sql<{ count: number }>`
+  SELECT COUNT(*)::int AS count FROM users
+`.scalar();
+// total is number | null
+
+const name = await db.sql<{ name: string }>`
+  SELECT name FROM users LIMIT 1
+`.scalar<string>();
+```
+
+Reach for `db.sql<T>` when you want a hand-written query with a known return type and the `.one()` / `.scalar()` helpers; use `db.raw` when you don't need either.
 
 ## See also
 
