@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.19.0 (2026-06-09)
+
+**Studio goes ORM-native, plus two correctness fixes to the query builder.** Studio no longer has a raw-SQL surface — every query is composed visually in Turbine ORM and previewed as the exact `findMany` call you'd write. Two query-builder bugs are fixed, one of which silently returned wrong data.
+
+### Changed
+- **Studio is now ORM-native** (`src/cli/studio.ts`, `src/cli/studio-ui.html`). The raw-SQL tab, its `/api/query` endpoint, and SQL-kind saved queries are gone. The default (and only) authoring surface is the visual **Query** composer — a `findMany` builder that drills into relations (`with`) recursively to any depth, picking fields (`select`/`omit`), filters (`where`), and `orderBy`/`limit` at every level, with a live TypeScript preview to copy into your code. Tabs are now **Query / Data / Schema**. `orderBy`/`limit` controls are hidden for to-one relations (they always resolve to a single row). Saved queries are builder-only; legacy raw-SQL entries are dropped on load. Polish: system font stack (no external font fetch / CSP violation), `204` favicon, `reltuples` row estimates clamped to ≥ 0.
+
+### Fixed
+- **Unknown `where` operators now throw instead of silently returning wrong rows.** A misspelled operator (e.g. `startWith` for `startsWith`, or any unrecognized key) previously fell through to plain equality — `col = $1` with the operator object as the value — quietly returning zero/wrong rows with no error. The WHERE builder now throws `ValidationError` for any plain object on a non-JSON column that matches no known filter shape, naming the offending key(s) and listing supported operators. JSON/JSONB column equality is unaffected. `orderBy` on an unknown field and `select`/`omit` passed as an array (instead of the `{ field: true }` object) now produce the same `[turbine]` + "Known fields" error format.
+- **`limit` on a to-one relation no longer crashes the query.** A `with` clause on a `belongsTo`/`hasOne` relation that carried a `limit` (e.g. `with: { author: { limit: 10 } }`) pushed the limit value as a parameter but rendered a literal `LIMIT 1`, leaving an orphaned, untyped `$N` that Postgres rejected with `could not determine data type of parameter $1` (and shifting every later placeholder). To-one relations now ignore `limit` entirely on both the SQL-build and param-collect paths; `hasMany`/`manyToMany` are unchanged.
+
+### Tests
+- New suites: `relation-limit-param` (parameter/placeholder alignment, including the to-one-limit regression) and expanded `operator-validation` (misspelled/unknown operators, empty filter objects, orderBy + select/omit shape). Full suite: 1223 passing, 1 skipped, 0 failures (incl. live-DB integration).
+
 ## 0.18.0 (2026-06-08)
 
 **Feature release: aggregate filtering, a typed raw-SQL escape hatch, many-to-many + self-relations, pgvector similarity search, RLS session context, and LISTEN/NOTIFY realtime.** This is also the first npm release to carry the 0.17.0 release-readiness fixes below (0.17.0 was tagged in the changelog but never published).

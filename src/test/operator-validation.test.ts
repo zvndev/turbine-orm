@@ -160,4 +160,114 @@ describe('strict operator validation', () => {
       assert.deepEqual(nonEmpty.params, []);
     });
   });
+
+  describe('Unknown where operators', () => {
+    it('throws on a misspelled operator instead of silently returning wrong rows', () => {
+      const q = makeQuery('posts', buildSchema());
+      // `startWith` is a typo for `startsWith`. The old behaviour fell through to
+      // `title = $1` with the operator object as the value — silently zero rows.
+      assert.throws(
+        () => q.buildFindMany({ where: { title: { startWith: 'x' } } as never }),
+        (err: unknown) => {
+          assert.ok(err instanceof ValidationError, 'should be ValidationError');
+          assert.match((err as Error).message, /\[turbine\]/);
+          assert.match((err as Error).message, /title/);
+          assert.match((err as Error).message, /startWith/);
+          // Lists the supported operators so the typo is obvious.
+          assert.match((err as Error).message, /startsWith/);
+          return true;
+        },
+      );
+    });
+
+    it('throws on a completely unknown operator key', () => {
+      const q = makeQuery('posts', buildSchema());
+      assert.throws(
+        () => q.buildFindMany({ where: { title: { weird: 'x' } } as never }),
+        (err: unknown) => {
+          assert.ok(err instanceof ValidationError);
+          assert.match((err as Error).message, /weird/);
+          return true;
+        },
+      );
+    });
+
+    it('throws on an empty filter object', () => {
+      const q = makeQuery('posts', buildSchema());
+      assert.throws(
+        () => q.buildFindMany({ where: { title: {} } as never }),
+        (err: unknown) => {
+          assert.ok(err instanceof ValidationError);
+          assert.match((err as Error).message, /title/);
+          return true;
+        },
+      );
+    });
+
+    it('does NOT throw for valid operators or mode', () => {
+      const q = makeQuery('posts', buildSchema());
+      assert.doesNotThrow(() => q.buildFindMany({ where: { title: { startsWith: 'x' } } }));
+      assert.doesNotThrow(() => q.buildFindMany({ where: { title: { gt: 'a', lt: 'z' } } }));
+      assert.doesNotThrow(() => q.buildFindMany({ where: { title: { contains: 'x', mode: 'insensitive' } } }));
+    });
+
+    it('does NOT throw for plain equality, bare arrays, or JSON-column object equality', () => {
+      const q = makeQuery('posts', buildSchema());
+      assert.doesNotThrow(() => q.buildFindMany({ where: { title: 'exact' } }));
+      // Bare array on an array column → equality, not an operator object.
+      assert.doesNotThrow(() => q.buildFindMany({ where: { tags: ['a', 'b'] } as never }));
+      // Arbitrary object on a jsonb column is a legitimate equality value.
+      assert.doesNotThrow(() => q.buildFindMany({ where: { metadata: { foo: 'bar' } } as never }));
+    });
+  });
+
+  describe('orderBy field validation', () => {
+    it('throws a consistent [turbine] error listing known fields', () => {
+      const q = makeQuery('posts', buildSchema());
+      assert.throws(
+        () => q.buildFindMany({ orderBy: { bogus: 'asc' } as never }),
+        (err: unknown) => {
+          assert.ok(err instanceof ValidationError);
+          assert.match((err as Error).message, /\[turbine\]/);
+          assert.match((err as Error).message, /orderBy/);
+          assert.match((err as Error).message, /bogus/);
+          assert.match((err as Error).message, /Known fields/);
+          return true;
+        },
+      );
+    });
+  });
+
+  describe('select / omit shape validation', () => {
+    it('throws a clear error when select is an array instead of an object', () => {
+      const q = makeQuery('posts', buildSchema());
+      assert.throws(
+        () => q.buildFindMany({ select: ['id', 'title'] as never }),
+        (err: unknown) => {
+          assert.ok(err instanceof ValidationError);
+          assert.match((err as Error).message, /select/);
+          assert.match((err as Error).message, /object/);
+          return true;
+        },
+      );
+    });
+
+    it('throws a clear error when omit is an array instead of an object', () => {
+      const q = makeQuery('posts', buildSchema());
+      assert.throws(
+        () => q.buildFindMany({ omit: ['id'] as never }),
+        (err: unknown) => {
+          assert.ok(err instanceof ValidationError);
+          assert.match((err as Error).message, /omit/);
+          return true;
+        },
+      );
+    });
+
+    it('does NOT throw for the correct object shape', () => {
+      const q = makeQuery('posts', buildSchema());
+      assert.doesNotThrow(() => q.buildFindMany({ select: { id: true, title: true } }));
+      assert.doesNotThrow(() => q.buildFindMany({ omit: { metadata: true } } as never));
+    });
+  });
 });

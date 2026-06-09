@@ -5,12 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark" />
   <title>Turbine Studio</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap"
-    rel="stylesheet"
-  />
+  <!-- No external font fetch: Studio is loopback-only with a strict CSP
+       (font-src 'self'), so we rely on the system font stack defined in
+       --sans / --mono below. Keeps Studio fully offline + CSP-clean. -->
   <style>
     /* =====================================================================
        Design tokens
@@ -1621,7 +1618,13 @@
       <!-- Main -->
       <main class="main">
         <nav class="tabs" role="tablist">
-          <button class="tab active" data-tab="data" role="tab" aria-selected="true">
+          <button class="tab active" data-tab="builder" role="tab" aria-selected="true">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" />
+            </svg>
+            Query
+          </button>
+          <button class="tab" data-tab="data" role="tab">
             <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="3" y="3" width="18" height="18" rx="2" />
               <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
@@ -1636,23 +1639,10 @@
             </svg>
             Schema
           </button>
-          <button class="tab" data-tab="sql" role="tab">
-            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="16 18 22 12 16 6" />
-              <polyline points="8 6 2 12 8 18" />
-            </svg>
-            SQL
-          </button>
-          <button class="tab" data-tab="builder" role="tab">
-            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" />
-            </svg>
-            Builder
-          </button>
         </nav>
 
         <!-- Data pane -->
-        <section class="pane active" id="pane-data" role="tabpanel">
+        <section class="pane" id="pane-data" role="tabpanel">
           <div class="pane-header">
             <div class="pane-title">
               <h1 id="dataTitle">—</h1>
@@ -1700,53 +1690,12 @@
         </section>
 
         <!-- SQL pane -->
-        <section class="pane sql-pane" id="pane-sql" role="tabpanel">
+        <!-- Query (visual findMany builder) pane -->
+        <section class="pane active" id="pane-builder" role="tabpanel">
           <div class="pane-header">
             <div class="pane-title">
-              <h1>SQL</h1>
-              <span class="muted">Read-only SELECT / WITH queries</span>
-            </div>
-          </div>
-          <div class="sql-editor-wrap">
-            <div class="sql-toolbar">
-              <div class="sql-toolbar-left">
-                <button class="btn btn-primary" id="sqlRun">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M8 5v14l11-7z" />
-                  </svg>
-                  Run <span class="kbd" style="margin-left:4px">⌘↵</span>
-                </button>
-                <button class="btn" id="sqlFormat">Format</button>
-                <button class="btn" id="sqlCopy" title="Copy SQL to clipboard">Copy</button>
-                <button class="btn" id="sqlSave">
-                  Save <span class="kbd" style="margin-left:4px">⌘S</span>
-                </button>
-              </div>
-              <div class="sql-toolbar-left">
-                <span style="font-size:10.5px;color:var(--text-muted);font-family:var(--mono);text-transform:uppercase;letter-spacing:0.04em">
-                  select / with only
-                </span>
-              </div>
-            </div>
-            <textarea
-              class="sql-editor"
-              id="sqlEditor"
-              spellcheck="false"
-              placeholder="SELECT id, email FROM users ORDER BY created_at DESC LIMIT 10;"
-            ></textarea>
-          </div>
-          <div class="sql-meta" id="sqlMeta" style="display:none"></div>
-          <div class="data-wrap">
-            <div class="data-scroll" id="sqlResults"></div>
-          </div>
-        </section>
-
-        <!-- Builder pane -->
-        <section class="pane" id="pane-builder" role="tabpanel">
-          <div class="pane-header">
-            <div class="pane-title">
-              <h1>Builder</h1>
-              <span class="muted" id="builderSub">Visual findMany composer</span>
+              <h1>Query</h1>
+              <span class="muted" id="builderSub">Visual findMany composer — no SQL required</span>
             </div>
             <div class="toolbar">
               <button class="btn btn-primary" id="builderRun">
@@ -1851,14 +1800,7 @@
         loading: false,
         error: null,
       },
-      // sql pane
-      sql: {
-        text: '',
-        result: null, // { columns, rows, rowCount, elapsedMs }
-        error: null,
-        running: false,
-      },
-      // builder pane
+      // builder (Query) pane
       builder: {
         table: null,
         args: emptyBuilderArgs(),
@@ -1869,10 +1811,9 @@
       },
       savedQueries: [],
       sidebarFilter: '',
-      // save prompt context
+      // save prompt context (builder queries only)
       savePrompt: {
-        kind: null, // 'sql' | 'builder'
-        sql: null,
+        kind: 'builder',
         args: null,
       },
     };
@@ -1954,12 +1895,6 @@
         }
         const q = qs.toString();
         return Api._fetch('/api/tables/' + encodeURIComponent(table) + (q ? '?' + q : ''));
-      },
-      runSql(sql) {
-        return Api._fetch('/api/query', {
-          method: 'POST',
-          body: JSON.stringify({ sql }),
-        });
       },
       runBuilder(table, args) {
         return Api._fetch('/api/builder', {
@@ -2275,7 +2210,6 @@
         );
         if (tab === 'schema') SchemaPane.render();
         if (tab === 'data') DataPane.render();
-        if (tab === 'sql') SqlPane.focus();
         if (tab === 'builder') BuilderPane.render();
       },
 
@@ -2661,177 +2595,6 @@
     };
 
     // =====================================================================
-    // SQL pane
-    // =====================================================================
-    const SqlPane = {
-      focus() {
-        const ed = $('#sqlEditor');
-        if (ed && !ed.value) {
-          ed.value = Storage.get('sqlDraft', '') || '';
-        }
-        setTimeout(() => ed.focus(), 30);
-      },
-
-      bind() {
-        const ed = $('#sqlEditor');
-        ed.addEventListener('input', () => {
-          State.sql.text = ed.value;
-          Storage.set('sqlDraft', ed.value);
-        });
-        ed.addEventListener('keydown', (e) => {
-          if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-            e.preventDefault();
-            SqlPane.run();
-          }
-          if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
-            e.preventDefault();
-            SqlPane.openSave();
-          }
-          if (e.key === 'Tab') {
-            e.preventDefault();
-            const start = ed.selectionStart;
-            const end = ed.selectionEnd;
-            ed.value = ed.value.slice(0, start) + '  ' + ed.value.slice(end);
-            ed.selectionStart = ed.selectionEnd = start + 2;
-          }
-        });
-        $('#sqlRun').addEventListener('click', () => SqlPane.run());
-        $('#sqlFormat').addEventListener('click', () => {
-          ed.value = SqlPane.format(ed.value);
-          State.sql.text = ed.value;
-          Storage.set('sqlDraft', ed.value);
-        });
-        $('#sqlCopy').addEventListener('click', () => {
-          copyToClipboard($('#sqlEditor').value, 'SQL copied');
-        });
-        $('#sqlSave').addEventListener('click', () => SqlPane.openSave());
-      },
-
-      async run() {
-        const text = $('#sqlEditor').value.trim();
-        if (!text) return;
-        State.sql.running = true;
-        State.sql.error = null;
-        SqlPane.renderResults();
-        try {
-          const res = await Api.runSql(text);
-          State.sql.result = res;
-          State.sql.error = null;
-        } catch (err) {
-          State.sql.error = err.message;
-          State.sql.result = null;
-        } finally {
-          State.sql.running = false;
-          SqlPane.renderResults();
-        }
-      },
-
-      renderResults() {
-        const meta = $('#sqlMeta');
-        const host = $('#sqlResults');
-        if (State.sql.running) {
-          meta.style.display = 'none';
-          host.innerHTML = '';
-          const skel = el('div');
-          for (let i = 0; i < 8; i++) {
-            const row = el('div', { class: 'skeleton-row' });
-            for (let c = 0; c < 4; c++) row.appendChild(el('div', { class: 'skeleton-cell' }));
-            skel.appendChild(row);
-          }
-          host.appendChild(skel);
-          return;
-        }
-        if (State.sql.error) {
-          meta.style.display = 'none';
-          host.innerHTML = '';
-          host.appendChild(
-            el('div', { class: 'error-box' }, [
-              el('div', { class: 'error-box-title', text: 'Query error' }),
-              document.createTextNode(State.sql.error),
-            ])
-          );
-          return;
-        }
-        const r = State.sql.result;
-        if (!r) {
-          meta.style.display = 'none';
-          host.innerHTML = '<div class="empty">Run a query to see results.</div>';
-          return;
-        }
-        meta.style.display = '';
-        meta.innerHTML = '';
-        meta.appendChild(el('span', { class: 'ok', text: '●' }));
-        meta.appendChild(document.createTextNode(' ' + formatNumber(r.rowCount) + ' rows'));
-        meta.appendChild(el('span', { class: 'sep', text: '·' }));
-        meta.appendChild(document.createTextNode(r.elapsedMs + ' ms'));
-        meta.appendChild(el('span', { class: 'sep', text: '·' }));
-        meta.appendChild(document.createTextNode((r.columns || []).length + ' columns'));
-
-        host.innerHTML = '';
-        if (!r.rows || !r.rows.length) {
-          host.appendChild(el('div', { class: 'empty', text: 'Query returned no rows.' }));
-          return;
-        }
-        const cols = (r.columns || []).map((c) => c.name || c);
-        host.appendChild(Table.render(cols, r.rows));
-      },
-
-      format(sql) {
-        // Minimal client-side formatter: uppercase keywords + newlines before clauses
-        const kws = [
-          'SELECT',
-          'FROM',
-          'WHERE',
-          'ORDER BY',
-          'GROUP BY',
-          'HAVING',
-          'LIMIT',
-          'OFFSET',
-          'JOIN',
-          'LEFT JOIN',
-          'RIGHT JOIN',
-          'INNER JOIN',
-          'OUTER JOIN',
-          'ON',
-          'AND',
-          'OR',
-          'WITH',
-          'UNION',
-          'UNION ALL',
-          'INTERSECT',
-          'EXCEPT',
-          'AS',
-        ];
-        let out = sql.replace(/\s+/g, ' ').trim();
-        const patterns = kws
-          .slice()
-          .sort((a, b) => b.length - a.length)
-          .map((k) => ({
-            k,
-            re: new RegExp('\\b' + k.replace(/ /g, '\\s+') + '\\b', 'gi'),
-          }));
-        for (const { k, re } of patterns) {
-          out = out.replace(re, k);
-        }
-        const breakBefore = ['FROM', 'WHERE', 'ORDER BY', 'GROUP BY', 'HAVING', 'LIMIT', 'OFFSET'];
-        for (const k of breakBefore) {
-          out = out.replace(new RegExp('\\s*' + k + '\\s*', 'g'), '\n' + k + ' ');
-        }
-        out = out.replace(/\s*,\s*/g, ', ');
-        return out.trim();
-      },
-
-      openSave() {
-        const text = $('#sqlEditor').value.trim();
-        if (!text) return;
-        State.savePrompt = { kind: 'sql', sql: text, args: null };
-        Modal.open('savePromptBackdrop');
-        $('#savePromptName').value = '';
-        SavePrompt.fillTables();
-      },
-    };
-
-    // =====================================================================
     // Builder pane
     // =====================================================================
     const BuilderPane = {
@@ -3037,6 +2800,15 @@
           el('div', { class: 'builder-section-title' }, [el('h3', { text: 'with (relations)' })])
         );
         const rels = tableMeta.relations || [];
+        // Depth guard — the engine caps `with` nesting at depth 10
+        // (CircularRelationError). Stop offering deeper expansion before then so
+        // the UI can never compose a query the engine will reject.
+        if (path.length >= 8) {
+          section.appendChild(
+            el('div', { class: 'field-hint', style: { color: 'var(--text-muted)' }, text: 'Max relation depth reached.' })
+          );
+          return section;
+        }
         if (!rels.length) {
           section.appendChild(
             el('div', { class: 'field-hint', style: { color: 'var(--text-muted)' }, text: 'No relations.' })
@@ -3090,8 +2862,15 @@
             if (!targetMeta) {
               body.appendChild(el('div', { class: 'field-hint', text: 'Unknown target table ' + rel.to }));
             } else {
+              // Same controls as the top level, applied to this relation's args —
+              // this is the recursive drill-down: pick its fields, filter it, order
+              // it, and expand its own relations to arbitrary depth.
+              // orderBy/limit only apply to to-many relations; a belongsTo/hasOne
+              // always resolves to a single row, so we hide those controls for it.
+              const toMany = rel.type === 'hasMany' || rel.type === 'manyToMany';
+              body.appendChild(BuilderPane.renderSelectOmit(existing.args, targetMeta));
               body.appendChild(BuilderPane.renderWhere(existing.args, targetMeta, path.concat(rel.name)));
-              body.appendChild(BuilderPane.renderOrderLimit(existing.args, targetMeta));
+              if (toMany) body.appendChild(BuilderPane.renderOrderLimit(existing.args, targetMeta));
               body.appendChild(BuilderPane.renderWith(existing.args, targetMeta, path.concat(rel.name)));
             }
             relBox.appendChild(body);
@@ -3404,7 +3183,7 @@
         if (!BuilderPane.validate()) return;
         const tableMeta = BuilderPane.findTable(State.builder.table);
         const args = BuilderPane.buildFindManyArgs(State.builder.args, tableMeta);
-        State.savePrompt = { kind: 'builder', sql: null, args, fixedTable: State.builder.table };
+        State.savePrompt = { kind: 'builder', args, fixedTable: State.builder.table };
         Modal.open('savePromptBackdrop');
         $('#savePromptName').value = '';
         SavePrompt.fillTables(State.builder.table);
@@ -3548,13 +3327,7 @@
     // =====================================================================
     const SavedQueries = {
       async load(q) {
-        if (q.kind === 'sql') {
-          Router.selectTab('sql');
-          $('#sqlEditor').value = q.sql || '';
-          State.sql.text = q.sql || '';
-          Storage.set('sqlDraft', q.sql || '');
-          toast('Loaded saved SQL: ' + q.name, 'ok');
-        } else if (q.kind === 'builder') {
+        if (q.kind === 'builder') {
           if (q.table) {
             const t = State.tablesByName.get(q.table);
             if (t) {
@@ -3710,10 +3483,9 @@
           const payload = {
             table,
             name,
-            kind: State.savePrompt.kind,
+            kind: 'builder',
+            args: State.savePrompt.args,
           };
-          if (State.savePrompt.kind === 'sql') payload.sql = State.savePrompt.sql;
-          if (State.savePrompt.kind === 'builder') payload.args = State.savePrompt.args;
           try {
             await Api.saveQuery(payload);
             Modal.close('savePromptBackdrop');
@@ -3773,12 +3545,11 @@
 
         // Commands
         const cmds = [
+          { name: 'Go to Query tab', kbd: ['G', 'Q'], run: () => Router.selectTab('builder') },
           { name: 'Go to Data tab', kbd: ['G', 'D'], run: () => Router.selectTab('data') },
           { name: 'Go to Schema tab', kbd: ['G', 'S'], run: () => Router.selectTab('schema') },
-          { name: 'Go to SQL tab', kbd: ['G', 'Q'], run: () => Router.selectTab('sql') },
-          { name: 'Go to Builder tab', kbd: ['G', 'B'], run: () => Router.selectTab('builder') },
-          { name: 'Run SQL query', kbd: [isMac() ? '⌘' : 'Ctrl', '↵'], run: () => { Router.selectTab('sql'); setTimeout(() => SqlPane.run(), 50); } },
-          { name: 'Save SQL query', kbd: [isMac() ? '⌘' : 'Ctrl', 'S'], run: () => { Router.selectTab('sql'); SqlPane.openSave(); } },
+          { name: 'Run query', kbd: [isMac() ? '⌘' : 'Ctrl', '↵'], run: () => { Router.selectTab('builder'); setTimeout(() => BuilderPane.run(), 50); } },
+          { name: 'Save query', kbd: [isMac() ? '⌘' : 'Ctrl', 'S'], run: () => { Router.selectTab('builder'); BuilderPane.openSave(); } },
           { name: 'Refresh data', kbd: ['R'], run: () => DataPane.loadAndRender() },
           { name: 'Reload schema', kbd: ['Shift', 'R'], run: () => boot(true) },
         ];
@@ -3891,7 +3662,7 @@
         // Restore
         const savedW = Storage.get('sidebarW');
         if (savedW) document.documentElement.style.setProperty('--sidebar-w', savedW);
-        const savedTab = Storage.get('tab', 'data');
+        const savedTab = Storage.get('tab', 'builder');
         const savedTable = Storage.get('currentTable');
         const initialTable = (savedTable && State.tablesByName.has(savedTable)
           ? savedTable
@@ -3901,16 +3672,12 @@
         }
 
         Sidebar.render();
-        Router.selectTab(savedTab || 'data');
+        Router.selectTab(savedTab || 'builder');
         if (State.currentTable) {
-          if (savedTab === 'data' || !savedTab) DataPane.loadAndRender();
+          if (savedTab === 'data') DataPane.loadAndRender();
           if (savedTab === 'schema') SchemaPane.render();
-          if (savedTab === 'builder') BuilderPane.resetForTable(State.currentTable.name);
+          if (savedTab === 'builder' || !savedTab) BuilderPane.resetForTable(State.currentTable.name);
         }
-
-        // SQL draft
-        const sqlDraft = Storage.get('sqlDraft', '');
-        if (sqlDraft) $('#sqlEditor').value = sqlDraft;
 
         SavedQueries.refresh();
       } catch (err) {
@@ -3933,7 +3700,6 @@
       Sidebar.bind();
       Router.bind();
       DataPane.bind();
-      SqlPane.bind();
       BuilderPane.bind();
       Modal.bind();
       SavePrompt.bind();

@@ -14,7 +14,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -457,14 +457,14 @@ describe('Studio — saved queries round-trip', () => {
         assert.deepEqual(data.queries, []);
       }
 
-      // Create a SQL-kind saved query.
+      // Create a builder-kind saved query (the only kind Studio persists).
       let createdId = '';
       {
         const req = makeReq({
           table: 'users',
           name: 'active users',
-          kind: 'sql',
-          sql: 'SELECT id FROM users',
+          kind: 'builder',
+          args: { where: { role: 'admin' }, limit: 10 },
         });
         const { res, done } = makeRes();
         await apiCreateSavedQuery(req, res, ctx);
@@ -472,7 +472,7 @@ describe('Studio — saved queries round-trip', () => {
         assert.equal(response.status, 200);
         const data = response.json as { query: { id: string; name: string; kind: string } };
         assert.equal(data.query.name, 'active users');
-        assert.equal(data.query.kind, 'sql');
+        assert.equal(data.query.kind, 'builder');
         assert.ok(data.query.id);
         createdId = data.query.id;
       }
@@ -491,10 +491,11 @@ describe('Studio — saved queries round-trip', () => {
       const file = join(tmp, 'studio-queries.json');
       assert.ok(existsSync(file));
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
-        queries: Array<{ id: string; sql?: string }>;
+        queries: Array<{ id: string; kind: string; args?: { limit?: number } }>;
       };
       assert.equal(parsed.queries.length, 1);
-      assert.equal(parsed.queries[0]?.sql, 'SELECT id FROM users');
+      assert.equal(parsed.queries[0]?.kind, 'builder');
+      assert.equal(parsed.queries[0]?.args?.limit, 10);
 
       // Delete.
       {
@@ -517,7 +518,7 @@ describe('Studio — saved queries round-trip', () => {
     }
   });
 
-  it('rejects creating a saved SQL query that is not SELECT/WITH', async () => {
+  it('rejects creating a non-builder saved query (Studio is builder-only)', async () => {
     const tmp = mkdtempSync(join(tmpdir(), 'turbine-studio-'));
     try {
       const { pool } = makePool();
@@ -525,16 +526,44 @@ describe('Studio — saved queries round-trip', () => {
 
       const req = makeReq({
         table: 'users',
-        name: 'bad',
+        name: 'legacy sql',
         kind: 'sql',
-        sql: 'DELETE FROM users',
+        sql: 'SELECT id FROM users',
       });
       const { res, done } = makeRes();
       await apiCreateSavedQuery(req, res, ctx);
       const response = await done;
       assert.equal(response.status, 400);
       const data = response.json as { error: string };
-      assert.match(data.error, /SELECT\/WITH/);
+      assert.match(data.error, /builder/);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('drops legacy raw-SQL saved queries when listing (builder-only)', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'turbine-studio-'));
+    try {
+      const { pool } = makePool();
+      const ctx = makeCtx(pool, tmp);
+      // Simulate an older studio-queries.json that still has a 'sql' entry.
+      writeFileSync(
+        join(tmp, 'studio-queries.json'),
+        JSON.stringify({
+          version: 1,
+          queries: [
+            { id: 'a', table: 'users', name: 'old sql', kind: 'sql', sql: 'SELECT 1', createdAt: 'x' },
+            { id: 'b', table: 'users', name: 'keep', kind: 'builder', args: { limit: 5 }, createdAt: 'y' },
+          ],
+        }),
+      );
+      const { res, done } = makeRes();
+      apiListSavedQueries(res, ctx, new URLSearchParams());
+      const response = await done;
+      const data = response.json as { queries: Array<{ id: string; kind: string }> };
+      assert.equal(data.queries.length, 1);
+      assert.equal(data.queries[0]?.id, 'b');
+      assert.equal(data.queries[0]?.kind, 'builder');
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
