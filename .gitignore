@@ -10,3 +10,8 @@ turbine.config.ts
 *.tgz
 .vercel
 src/cli/studio-ui.generated.ts
+
+# Local Studio E2E / agent artifacts
+.playwright-mcp/
+screenshots/
+studio-*.png

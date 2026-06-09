@@ -198,6 +198,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Stu
     return;
   }
 
+  // Favicon — answered before the auth gate so the browser's automatic request
+  // doesn't 401/404 on every load. No icon body needed (204).
+  if (pathname === '/favicon.ico') {
+    res.writeHead(204, { 'Content-Length': '0' });
+    res.end();
+    return;
+  }
+
   // API routes — all require auth.
   if (!isAuthorized(req, ctx.authToken)) {
     sendJson(res, 401, { error: 'unauthorized — use the URL printed in the terminal' });
@@ -220,10 +228,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Stu
   if (pathname.startsWith('/api/tables/') && req.method === 'GET') {
     const rawName = decodeURIComponent(pathname.slice('/api/tables/'.length));
     return apiTableRows(res, ctx, rawName, url.searchParams);
-  }
-
-  if (pathname === '/api/query' && req.method === 'POST') {
-    return apiQuery(req, res, ctx);
   }
 
   if (pathname === '/api/builder' && req.method === 'POST') {
@@ -303,6 +307,16 @@ function constantTimeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
+/**
+ * Build a helpful "unknown table" error that lists the available tables so the
+ * caller can spot a typo or schema mismatch immediately.
+ */
+function unknownTableMessage(name: string, ctx: StudioContext): string {
+  const available = Object.keys(ctx.metadata.tables);
+  const list = available.length ? available.join(', ') : '(none)';
+  return `[turbine] Unknown table "${name}" in schema "${ctx.options.schema}". Available: ${list}`;
+}
+
 // ---------------------------------------------------------------------------
 // API: /api/schema
 // ---------------------------------------------------------------------------
@@ -340,7 +354,9 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
   );
   const counts = new Map<string, number>();
   for (const row of countsResult.rows) {
-    counts.set(row.relname, Number(row.reltuples));
+    // pg_class.reltuples is -1 on PG14+ until a table is ANALYZEd; clamp so the
+    // sidebar never shows a negative estimate.
+    counts.set(row.relname, Math.max(0, Number(row.reltuples)));
   }
 
   sendJson(res, 200, {
@@ -362,7 +378,7 @@ export async function apiTableRows(
 ): Promise<void> {
   const table = ctx.metadata.tables[rawTableName];
   if (!table) {
-    sendJson(res, 404, { error: `unknown table: ${rawTableName}` });
+    sendJson(res, 404, { error: unknownTableMessage(rawTableName, ctx) });
     return;
   }
 
@@ -467,58 +483,6 @@ export function escapeLikePattern(s: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// API: /api/query — read-only SELECT/WITH runner
-// ---------------------------------------------------------------------------
-
-async function apiQuery(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
-  const body = await readJsonBody(req);
-  const rawSql = typeof body?.sql === 'string' ? body.sql.trim() : '';
-
-  if (!rawSql) {
-    sendJson(res, 400, { error: 'missing sql' });
-    return;
-  }
-
-  if (rawSql.length > 10_000) {
-    sendJson(res, 400, { error: 'query too long — maximum 10,000 characters allowed' });
-    return;
-  }
-
-  if (!isReadOnlyStatement(rawSql)) {
-    sendJson(res, 400, {
-      error: 'only SELECT / WITH statements are allowed in Studio — use the CLI for writes',
-    });
-    return;
-  }
-
-  const client = await ctx.pool.connect();
-  try {
-    await client.query('BEGIN READ ONLY');
-    await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
-    const started = Date.now();
-    const result = await client.query(rawSql);
-    const elapsedMs = Date.now() - started;
-    await client.query('COMMIT');
-
-    sendJson(res, 200, {
-      columns: result.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID })),
-      rows: result.rows.map((r) => serializeRow(r as Record<string, unknown>)),
-      rowCount: result.rowCount ?? result.rows.length,
-      elapsedMs,
-    });
-  } catch (err) {
-    try {
-      await client.query('ROLLBACK');
-    } catch {
-      /* ignore */
-    }
-    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
-  } finally {
-    client.release();
-  }
-}
-
-// ---------------------------------------------------------------------------
 // API: /api/builder — Turbine ORM findMany spec runner
 // ---------------------------------------------------------------------------
 
@@ -528,7 +492,7 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
   const args = (body?.args ?? {}) as FindManyArgs<Record<string, unknown>>;
 
   if (!tableName || !ctx.metadata.tables[tableName]) {
-    sendJson(res, 400, { error: `unknown table: ${tableName}` });
+    sendJson(res, 400, { error: unknownTableMessage(tableName, ctx) });
     return;
   }
 
@@ -581,8 +545,8 @@ interface SavedQuery {
   id: string;
   table: string;
   name: string;
-  kind: 'sql' | 'builder';
-  sql?: string;
+  /** Studio only saves visual-builder queries — there is no raw-SQL surface. */
+  kind: 'builder';
   args?: unknown;
   createdAt: string;
 }
@@ -603,7 +567,9 @@ function loadSavedQueries(ctx: StudioContext): SavedQueriesFile {
     const raw = readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw) as SavedQueriesFile;
     if (!parsed.queries || !Array.isArray(parsed.queries)) return { version: 1, queries: [] };
-    return { version: 1, queries: parsed.queries };
+    // Drop any legacy raw-SQL entries — Studio is builder-only now.
+    const queries = parsed.queries.filter((q) => q && q.kind === 'builder');
+    return { version: 1, queries };
   } catch {
     return { version: 1, queries: [] };
   }
@@ -631,29 +597,18 @@ export async function apiCreateSavedQuery(
   const body = await readJsonBody(req);
   const table = typeof body?.table === 'string' ? body.table : '';
   const name = typeof body?.name === 'string' ? body.name.trim() : '';
-  const kind = body?.kind === 'builder' ? 'builder' : body?.kind === 'sql' ? 'sql' : null;
 
   if (!table || !ctx.metadata.tables[table]) {
-    sendJson(res, 400, { error: `unknown table: ${table}` });
+    sendJson(res, 400, { error: unknownTableMessage(table, ctx) });
     return;
   }
   if (!name) {
     sendJson(res, 400, { error: 'name is required' });
     return;
   }
-  if (!kind) {
-    sendJson(res, 400, { error: 'kind must be "sql" or "builder"' });
-    return;
-  }
-
-  const sql = kind === 'sql' && typeof body?.sql === 'string' ? body.sql : undefined;
-  const args = kind === 'builder' ? body?.args : undefined;
-  if (kind === 'sql' && !sql) {
-    sendJson(res, 400, { error: 'sql is required for kind=sql' });
-    return;
-  }
-  if (kind === 'sql' && sql && !isReadOnlyStatement(sql)) {
-    sendJson(res, 400, { error: 'saved sql must be SELECT/WITH only' });
+  // Studio only persists visual-builder queries (no raw SQL surface).
+  if (body?.kind !== 'builder') {
+    sendJson(res, 400, { error: 'kind must be "builder"' });
     return;
   }
 
@@ -662,9 +617,8 @@ export async function apiCreateSavedQuery(
     id: randomUUID(),
     table,
     name,
-    kind,
-    sql,
-    args,
+    kind: 'builder',
+    args: body?.args,
     createdAt: new Date().toISOString(),
   };
   data.queries.push(entry);
