@@ -131,6 +131,24 @@ function assertBindableEqualsOperand(value: unknown, column: string): void {
   );
 }
 
+/**
+ * Object keys in sorted order, mirroring the canonical order used by every
+ * cache fingerprint. The SQL-build and cache-hit param-collect paths MUST
+ * enumerate object keys in this exact order: fingerprints sort keys, so two
+ * where clauses with the same fields in different insertion order share one
+ * cache entry — if build/collect iterated insertion order, the cached SQL's
+ * `$N` placeholders would bind the wrong values (cross-tenant-leak class).
+ * Array order (OR/AND members) is positional and is never sorted.
+ */
+function sortedKeys(obj: Record<string, unknown>): string[] {
+  return Object.keys(obj).sort();
+}
+
+/** {@link sortedKeys}, but yielding `[key, value]` pairs. */
+function sortedEntries<V>(obj: Record<string, V>): [string, V][] {
+  return Object.entries(obj).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
 /** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
 const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
 
@@ -588,10 +606,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Execute a query through the middleware chain.
    * If no middlewares are registered, executes directly.
    *
-   * Middleware can inspect and log query parameters, modify results after execution,
-   * and measure timing. Note: query SQL is generated before middleware runs, so
-   * modifying params.args in middleware will NOT affect the executed SQL.
-   * To intercept queries before SQL generation, use the raw() method instead.
+   * Middleware can inspect and log query parameters, measure timing, and
+   * transform the result returned by `next()`. Note: query SQL is generated
+   * BEFORE middleware runs — `params.args` is a read-only snapshot, and
+   * mutating it does NOT change the executed SQL. Cross-cutting filters
+   * (e.g. soft deletes) belong in the query itself: pass an explicit
+   * `where: { deletedAt: null }` or wrap the table accessor in a small helper.
    */
   private async executeWithMiddleware<R>(
     action: string,
@@ -885,7 +905,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       let sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${freshWhereSql}`;
 
       if (args?.cursor) {
-        const cursorEntries = Object.entries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
+        // Sorted (canonical) order — MUST match cursorFp and the cache-hit collect below.
+        const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
         if (cursorEntries.length > 0) {
           const cursorConditions = cursorEntries.map(([k, v]) => {
             const col = this.toSqlColumn(k);
@@ -929,9 +950,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.with) {
       this.collectWithParams(args.with as WithClause, params);
     }
-    // 3. Cursor params
+    // 3. Cursor params — sorted (canonical) order, matching cursorFp and the build path.
     if (args?.cursor) {
-      const cursorEntries = Object.entries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
+      const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
       for (const [, v] of cursorEntries) {
         params.push(v);
       }
@@ -2494,7 +2515,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * @internal Exposed as package-private for testing.
    */
   collectWhereParams(where: Record<string, unknown>, params: unknown[]): void {
-    const keys = Object.keys(where);
+    // Sorted (canonical) order — MUST match fingerprintWhere and buildWhereClause.
+    const keys = sortedKeys(where);
 
     for (const key of keys) {
       const value = where[key];
@@ -2589,7 +2611,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // Operator objects
       if (isWhereOperator(value)) {
-        this.collectOperatorParams(value, params);
+        this.collectOperatorParams(rawColumn, value, params);
         continue;
       }
 
@@ -2605,23 +2627,25 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = this.schema.tables[targetTable];
     if (!meta) return;
 
-    for (const [field, value] of Object.entries(subWhere)) {
+    // Sorted (canonical) order — MUST match fingerprintRelFilter and buildSubWhereForRelation.
+    for (const field of sortedKeys(subWhere)) {
+      const value = subWhere[field];
       if (value === undefined) continue;
       if (value === null) continue;
+      const col = meta.columnMap[field] ?? camelToSnake(field);
       if (isWhereOperator(value)) {
-        this.collectOperatorParams(value, params);
+        this.collectOperatorParams(col, value, params);
         continue;
       }
-      const col = meta.columnMap[field] ?? camelToSnake(field);
       this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(meta, col), targetTable);
       params.push(value);
     }
   }
 
   /** Collect params from operator clauses. Mirrors buildOperatorClauses. */
-  private collectOperatorParams(op: WhereOperator, params: unknown[]): void {
+  private collectOperatorParams(column: string, op: WhereOperator, params: unknown[]): void {
     if (op.equals !== undefined && op.equals !== null) {
-      assertBindableEqualsOperand(op.equals, 'column');
+      assertBindableEqualsOperand(op.equals, `"${column}"`);
       params.push(op.equals);
     }
     if (op.gt !== undefined) params.push(op.gt);
@@ -2777,7 +2801,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = this.schema.tables[table ?? this.table];
     if (!meta) return;
 
-    for (const [relName, relSpec] of Object.entries(withClause)) {
+    for (const [relName, relSpec] of sortedEntries(withClause)) {
       const relDef = meta.relations[relName];
       if (!relDef) continue;
       this.collectRelationSubqueryParams(relDef, relSpec, params, table ?? this.table);
@@ -2809,7 +2833,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         params.push(Number(spec.limit));
       }
       if (spec.with) {
-        for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+        for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
           const nestedRelDef = targetMeta.relations[nestedRelName];
           if (!nestedRelDef) continue;
           this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'alias', depth + 1);
@@ -2824,7 +2848,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Non-wrapped path: nested relations BEFORE where/limit
     if (!willWrap && spec.with) {
-      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) continue;
         this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'alias', depth + 1);
@@ -2846,7 +2870,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Wrapped path: nested relations AFTER where/limit (inside inner subquery)
     if (willWrap && spec.with) {
-      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) continue;
         this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'innerAlias', depth + 1);
@@ -2939,7 +2963,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Supports: equality, operators, NULL, OR, AND, NOT, relation filters (some/every/none).
    */
   private buildWhereClause(where: Record<string, unknown>, params: unknown[]): string | null {
-    const keys = Object.keys(where);
+    // Sorted (canonical) order — MUST match fingerprintWhere and collectWhereParams.
+    const keys = sortedKeys(where);
     if (keys.length === 0) return null;
 
     const andClauses: string[] = [];
@@ -3176,7 +3201,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const qt = this.q(targetTable);
     const conditions: string[] = [];
 
-    for (const [field, value] of Object.entries(subWhere)) {
+    // Sorted (canonical) order — MUST match fingerprintRelFilter and collectRelFilterParams.
+    for (const field of sortedKeys(subWhere)) {
+      const value = subWhere[field];
       if (value === undefined) continue;
 
       const col = meta.columnMap[field] ?? camelToSnake(field);
@@ -3257,7 +3284,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): string | null {
     const clauses: string[] = [];
 
-    for (const [key, value] of Object.entries(where)) {
+    // Sorted (canonical) order — MUST match fingerprintAliasWhere and collectAliasWhereParams.
+    for (const key of sortedKeys(where)) {
+      const value = where[key];
       if (value === undefined) continue;
 
       if (key === 'OR' || key === 'AND') {
@@ -3308,7 +3337,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     where: Record<string, unknown>,
     params: unknown[],
   ): void {
-    for (const [key, value] of Object.entries(where)) {
+    // Sorted (canonical) order — MUST match fingerprintAliasWhere and buildAliasWhere.
+    for (const key of sortedKeys(where)) {
+      const value = where[key];
       if (value === undefined) continue;
 
       if (key === 'OR' || key === 'AND') {
@@ -3327,12 +3358,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       if (value === null) continue;
 
+      const col = targetMeta.columnMap[key] ?? camelToSnake(key);
+
       if (isWhereOperator(value)) {
-        this.collectOperatorParams(value, params);
+        this.collectOperatorParams(col, value, params);
         continue;
       }
 
-      const col = targetMeta.columnMap[key] ?? camelToSnake(key);
       this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(targetMeta, col), targetTable);
       params.push(value);
     }
@@ -3737,7 +3769,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const relationSelects: string[] = [];
     const aliasCounter = { n: 0 };
 
-    for (const [relName, relSpec] of Object.entries(withClause)) {
+    for (const [relName, relSpec] of sortedEntries(withClause)) {
       const relDef = meta.relations[relName];
       if (!relDef) {
         throw new RelationError(
@@ -3926,7 +3958,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Nested relations — only in the non-wrapped path (wrapped path builds them separately)
     if (!willWrap && spec !== true && spec.with) {
-      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) {
           throw new RelationError(
@@ -4018,7 +4050,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         ]);
         // Build nested relation subqueries referencing innerAlias
         if (spec !== true && spec.with) {
-          for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+          for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
             const nestedRelDef = targetMeta.relations[nestedRelName];
             if (!nestedRelDef) {
               throw new RelationError(
@@ -4183,7 +4215,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       ]);
       // Nested relations reference the inner alias.
       if (spec !== true && spec.with) {
-        for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+        for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
           const nestedRelDef = targetMeta.relations[nestedRelName];
           if (!nestedRelDef) {
             throw new RelationError(
@@ -4218,7 +4250,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       `${talias}.${this.q(col)}`,
     ]);
     if (spec !== true && spec.with) {
-      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) {
           throw new RelationError(

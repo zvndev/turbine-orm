@@ -125,9 +125,10 @@ describe('is / isNot relation filters', () => {
     const deferred = q.buildFindMany({
       where: { status: 'active', author: { is: { verified: true } } } as never,
     });
-    assert.match(deferred.sql, /"status" = \$1/);
+    // Where keys bind in canonical (sorted) order: "author" sorts before "status".
+    assert.match(deferred.sql, /"status" = \$2/);
     assert.match(deferred.sql, /EXISTS \(SELECT 1 FROM "users" WHERE/);
-    assert.deepStrictEqual(deferred.params, ['active', true]);
+    assert.deepStrictEqual(deferred.params, [true, 'active']);
   });
 
   it('isNot combined with some on different relations', () => {

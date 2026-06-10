@@ -98,9 +98,10 @@ describe('TextSearchFilter', () => {
         published: true,
       },
     });
-    assert.match(sql, /to_tsvector\('english', "title"\) @@ to_tsquery\('english', \$1\)/);
-    assert.match(sql, /"published" = \$2/);
-    assert.deepEqual(params, ['typescript', true]);
+    // Where keys bind in canonical (sorted) order: "published" sorts before "title".
+    assert.match(sql, /"published" = \$1/);
+    assert.match(sql, /to_tsvector\('english', "title"\) @@ to_tsquery\('english', \$2\)/);
+    assert.deepEqual(params, [true, 'typescript']);
   });
 
   it('works with multiple text search filters on different columns', () => {
@@ -111,8 +112,9 @@ describe('TextSearchFilter', () => {
         body: { search: 'world' },
       },
     });
-    assert.match(sql, /to_tsvector\('english', "title"\) @@ to_tsquery\('english', \$1\)/);
-    assert.match(sql, /to_tsvector\('english', "body"\) @@ to_tsquery\('english', \$2\)/);
-    assert.deepEqual(params, ['hello', 'world']);
+    // Where keys bind in canonical (sorted) order: "body" sorts before "title".
+    assert.match(sql, /to_tsvector\('english', "body"\) @@ to_tsquery\('english', \$1\)/);
+    assert.match(sql, /to_tsvector\('english', "title"\) @@ to_tsquery\('english', \$2\)/);
+    assert.deepEqual(params, ['world', 'hello']);
   });
 });
