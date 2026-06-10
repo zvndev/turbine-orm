@@ -79,6 +79,53 @@ Every value in a vector query is bound as a parameter, so hostile input can't es
 - The distance threshold is always bound as `$n`.
 - A non-number element in `to` (including `NaN` or `Infinity`) throws `ValidationError` before any query runs.
 
+## The same query, three ways
+
+The task: the 10 nearest rows by cosine distance, filtered to a quality threshold, fully parameterized.
+
+**Turbine** — `distance` is a first-class `where` / `orderBy` operator on `vector` columns:
+
+```ts
+const results = await db.items.findMany({
+  where: { embedding: { distance: { to: queryVector, metric: 'cosine', lt: 0.4 } } },
+  orderBy: { embedding: { distance: { to: queryVector, metric: 'cosine' } } },
+  limit: 10,
+});
+```
+
+**Prisma** — pgvector columns are `Unsupported("vector")` in the schema, so querying by distance means `$queryRaw` with the vector serialized to a string and cast by hand:
+
+```ts
+const embedding = `[${queryVector.join(',')}]`;
+
+const results = await prisma.$queryRaw<
+  { id: number; title: string; distance: number }[]
+>`
+  SELECT id, title, embedding <=> ${embedding}::vector AS distance
+  FROM items
+  WHERE embedding <=> ${embedding}::vector < 0.4
+  ORDER BY distance
+  LIMIT 10
+`;
+```
+
+**Drizzle** — a native `vector` column type plus SQL expression helpers; the distance expression is built with `cosineDistance` and threaded through `where` / `orderBy`:
+
+```ts
+import { asc, cosineDistance, lt } from 'drizzle-orm';
+
+const distance = cosineDistance(items.embedding, queryVector);
+
+const results = await db
+  .select({ id: items.id, title: items.title, distance })
+  .from(items)
+  .where(lt(distance, 0.4))
+  .orderBy(asc(distance))
+  .limit(10);
+```
+
+All three run the same SQL. The difference is where the vector semantics live: in Turbine they're part of the typed query object; in Prisma they're raw SQL you maintain; in Drizzle they're SQL expression helpers you compose yourself.
+
 ## See also
 
 - **[API Reference](/queries)** — `findMany`, `where`, `orderBy`, and the full operator table.

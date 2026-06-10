@@ -512,7 +512,7 @@ HTTP / serverless pools that don't support the pipeline protocol fall back to se
 
 ## Middleware
 
-`db.$use(fn)` registers a middleware that runs around every query. It can log, time, mutate arguments, or transform results — but it cannot rewrite the SQL.
+`db.$use(fn)` registers a middleware that wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()` — but it cannot change the query itself.
 
 ```ts
 // Query timing
@@ -523,13 +523,31 @@ db.$use(async (params, next) => {
   return result;
 });
 
-// Soft-delete filter
+// Result transformation — redact a field on the way out
 db.$use(async (params, next) => {
-  if (params.action === 'findMany' || params.action === 'findUnique') {
-    params.args.where = { ...params.args.where, deletedAt: null };
+  const result = await next(params);
+  if (params.model === 'users' && Array.isArray(result)) {
+    for (const row of result as { email?: string }[]) row.email = '[redacted]';
   }
-  return next(params);
+  return result;
 });
+```
+
+> **Warning:** `params.args` is a read-only snapshot — mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
+
+Because middleware can't rewrite queries, cross-cutting filters like **soft deletes** belong in the query itself — either explicitly or via a small scoped helper:
+
+```ts
+import type { WhereClause } from 'turbine-orm';
+
+// Explicit filter
+const users = await db.users.findMany({ where: { deletedAt: null } });
+
+// Scoped helper that always applies the filter
+const activeUsers = (where: WhereClause<User> = {}) =>
+  db.users.findMany({ where: { ...where, deletedAt: null } });
+
+const rows = await activeUsers({ orgId: 1 });
 ```
 
 ## Raw SQL
