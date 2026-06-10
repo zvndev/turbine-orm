@@ -672,35 +672,6 @@ function clampInt(value: string | null, fallback: number, min: number, max: numb
   return Math.min(Math.max(n, min), max);
 }
 
-/**
- * Accept only SELECT or WITH (CTE) statements. Reject any statement that
- * contains a semicolon followed by non-whitespace (prevents statement
- * stacking), and require the first non-comment keyword to be SELECT or WITH.
- *
- * This is a first-line filter — the transaction's READ ONLY mode is the
- * second line of defense. Both must fail before a destructive statement
- * could run.
- */
-export function isReadOnlyStatement(sql: string): boolean {
-  const stripped = stripSqlComments(sql).trim();
-  if (!stripped) return false;
-
-  // Disallow statement stacking. A single trailing `;` is fine.
-  const withoutTrailingSemi = stripped.replace(/;+\s*$/, '');
-  if (withoutTrailingSemi.includes(';')) return false;
-
-  const firstWord = withoutTrailingSemi.slice(0, 6).toUpperCase();
-  if (firstWord.startsWith('SELECT')) return true;
-  if (firstWord.startsWith('WITH')) return true;
-  return false;
-}
-
-function stripSqlComments(sql: string): string {
-  // Strip -- line comments and /* block comments */. Not a full SQL parser,
-  // but sufficient to catch the common bypass attempts.
-  return sql.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
-}
-
 function serializeRow(row: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(row)) {
