@@ -18,11 +18,12 @@
  */
 
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { describe } from 'node:test';
 import pg from 'pg';
 import { cockroachdb } from '../adapters/cockroachdb.js';
 import { postgresql } from '../adapters/index.js';
 import { yugabytedb } from '../adapters/yugabytedb.js';
+import { skipGate } from './helpers.js';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const SKIP = !DATABASE_URL;
@@ -42,7 +43,10 @@ const ADAPTER_BY_ENGINE = {
 } as const;
 const adapter = ADAPTER_BY_ENGINE[ENGINE as keyof typeof ADAPTER_BY_ENGINE] ?? postgresql;
 
-const testFn = SKIP ? describe.skip : describe;
+// Without DATABASE_URL every test below registers as skipped (visible in the
+// reporter summary).
+const { it } = skipGate(SKIP, 'DATABASE_URL not set');
+const testFn = describe;
 
 testFn(`statement-timeout SQL executes on a real engine (${ENGINE})`, () => {
   it(`the ${adapter.name} adapter timeout SQL runs in a transaction without a syntax error`, async () => {

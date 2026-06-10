@@ -35,7 +35,9 @@ This is the full mapping. Skip to [Side-by-side](#side-by-side) if you want to s
 | `select: { id: true, name: true }` | `select: { id: true, name: true }` | Same. |
 | `where: { name: { contains: 'a' } }` | `where: { name: { contains: 'a' } }` | All operators ported. |
 | `where: { posts: { some: ... } }` | `where: { posts: { some: ... } }` | Relation filters: `some` / `every` / `none`. |
-| `take: 10` | `limit: 10` | Renamed. |
+| `take: 10` | `take: 10` | Works as-is — `take` is an alias for `limit`. |
+| `cursor: { id: 99 }` | `cursor: { id: 99 }` | Keyset pagination, same shape (Turbine's cursor is exclusive — no `skip: 1` needed). |
+| `distinct: ['userId']` | `distinct: ['userId']` | Same — compiles to `DISTINCT ON`. |
 | `skip: 20` | `offset: 20` | Renamed. |
 
 ## Schema translation
@@ -102,12 +104,12 @@ const users = await prisma.user.findMany({
 ```
 
 ```ts
-// Turbine
+// Turbine — top-level take works as-is; the nested take becomes limit
 const users = await db.users.findMany({
   where: { orgId: 1 },
   with: { posts: { orderBy: { createdAt: 'desc' }, limit: 5 } },
   orderBy: { createdAt: 'desc' },
-  limit: 10,
+  take: 10,
 });
 ```
 
@@ -188,7 +190,7 @@ const active = await db.users.findMany({
 ## Notable differences
 
 - **No `schema.prisma`.** Code-first `defineSchema()` in a TypeScript module. `npx turbine push` (fast path) or `migrate create --auto` (generates SQL). No DSL, no separate parser.
-- **`include` → `with`, `take` → `limit`, `skip` → `offset`.** That's the full lexical diff.
+- **`include` → `with`, `skip` → `offset`.** That's the full lexical diff. `take`, `cursor`, and `distinct` work as-is at the top level (`take` is an alias for `limit`); inside a nested `with`, the per-relation limit is spelled `limit`.
 - **Atomic update operators are first-class.** `set`, `increment`, `decrement`, `multiply`, `divide`. All compile to in-place SQL.
 - **Typed errors with codes.** `UniqueConstraintError` / `ForeignKeyError` / `NotNullViolationError` / `CheckConstraintError` all carry `code` (`TURBINE_E008`–`E011`) and `cause`. `findUniqueOrThrow` throws `NotFoundError` (`TURBINE_E001`) with the `where` attached. `DeadlockError` / `SerializationFailureError` have `readonly isRetryable = true as const`.
 - **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, schema)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.
@@ -204,8 +206,8 @@ const active = await db.users.findMany({
    - `prisma.` → `db.`
    - Singular model names → plural snake-camelCase table names (`prisma.user` → `db.users`)
    - `include:` → `with:`
-   - `take:` → `limit:`
    - `skip:` → `offset:`
+   - `take:` stays as-is at the top level; inside a `with` block, rename it to `limit:`
 5. Replace `import { PrismaClient } from '@prisma/client'` with `import { turbine } from './generated/turbine'`.
 6. Port any raw SQL from `prisma.$queryRaw` to `db.raw\`SELECT ...\``.
 7. Update your error-handling to the typed classes (or keep catching by message during transition).

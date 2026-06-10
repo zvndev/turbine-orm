@@ -21,6 +21,8 @@ Three-way head-to-head against **Prisma 7.6** (`@prisma/adapter-pg`, `relationJo
 - **Pool.** Plain `pg.Pool` size 10 for Prisma adapter-pg and Drizzle. Turbine uses its internal pool at default size.
 - **Network.** Every query round-trips US-East client → Neon pooler → US-East database over TLS. ~33–40 ms floor.
 
+> **Measurement vintage.** These numbers were measured **April 9, 2026** on Turbine **0.8.x** against the Prisma and Drizzle versions current at the time. Turbine's query-generation strategy (json_agg subqueries, template cache, prepared statements) is unchanged through 0.19.x, so we haven't re-run the suite for every release — but Prisma and Drizzle have shipped releases since (Prisma 7's engine-less client and JOIN-based relation loading have moved from preview toward default), so the relative numbers may have shifted. We'll re-measure and update this page; until then, treat the table as an April-2026 snapshot, not a current scoreboard.
+
 ## Raw results — April 9, 2026 (post-optimization)
 
 Average wall-clock ms per operation (lower is better). Bold = fastest.
@@ -105,6 +107,7 @@ What's actually different about Turbine here isn't speed — it's the **typed re
 
 ## Caveats
 
+- **The numbers are from April 2026.** Measured on Turbine 0.8.x; the query-generation strategy is unchanged through 0.19.x, but Prisma 7.6 and Drizzle 0.45 were the competitor versions at measurement time and both have moved since. We will re-measure rather than extrapolate.
 - **All measurements are wall-clock from the client.** They include network + Neon query + response serialization. Per-query CPU profiling would tell a different (and probably more favorable) story for Turbine on raw CPU.
 - **Single region.** Client and database both in US-East. A cross-region run would drown any per-query difference in a higher latency floor.
 - **Prisma 7's `relationJoins` is a preview feature.** Without it, Prisma falls back to N+1 and Turbine would win by 3–5× on the L3 scenario.

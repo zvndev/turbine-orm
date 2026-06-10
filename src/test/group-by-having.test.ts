@@ -11,13 +11,13 @@
  */
 
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { describe, it } from 'node:test';
 import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
-import { makeQuery, mockTable } from './helpers.js';
+import { makeQuery, mockTable, skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Build-only schema
@@ -202,9 +202,12 @@ if (SKIP) {
   console.log('⚠ Skipping groupBy having integration tests: DATABASE_URL not set');
 }
 
-const testFn = SKIP ? describe.skip : describe;
+const testFn = describe;
 
 testFn('groupBy having — integration', () => {
+  // Without DATABASE_URL these tests register as skipped (visible in the
+  // reporter summary) and the before/after hooks become no-ops.
+  const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
   let db: TurbineClient;
   // Own isolated table so concurrent test files mutating the shared `posts`
   // fixture can't race the exact-count/sum assertions below. Mirrors the

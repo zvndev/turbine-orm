@@ -18,12 +18,12 @@
  */
 
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { describe, it } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
-import { makeQuery, mockTable } from './helpers.js';
+import { makeQuery, mockTable, skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Build-only test harness (no DB needed)
@@ -236,9 +236,12 @@ if (SKIP) {
 let db: TurbineClient;
 let schema: SchemaMetadata;
 
-const testFn = SKIP ? describe.skip : describe;
+const testFn = describe;
 
 testFn('update operators: integration', () => {
+  // Without DATABASE_URL these tests register as skipped (visible in the
+  // reporter summary) and the before/after hooks become no-ops.
+  const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
   // A post we create in `before` and mutate across tests.
   let postId: number;
   // A user ID we borrow for FK purposes

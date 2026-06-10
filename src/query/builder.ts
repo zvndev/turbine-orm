@@ -97,6 +97,58 @@ function isUnmatchedPlainObject(value: unknown): boolean {
   return proto === Object.prototype || proto === null;
 }
 
+/**
+ * Fingerprint the SHAPE of a where-operator object. Null-valued `equals` /
+ * `not` compile to parameterless `IS NULL` / `IS NOT NULL` (different SQL, no
+ * param pushed), so null-ness is part of the shape — without it a cache entry
+ * warmed by `{ not: 5 }` would serve `{ not: null }` with a desynced param list.
+ */
+function fingerprintOperatorShape(value: WhereOperator): string {
+  const obj = value as Record<string, unknown>;
+  const opKeys = Object.keys(obj)
+    .filter((k) => k !== 'mode')
+    .map((k) => ((k === 'equals' || k === 'not') && obj[k] === null ? `${k}:null` : k))
+    .sort();
+  const modeStr = value.mode === 'insensitive' ? ':i' : '';
+  return `op(${opKeys.join(',')}${modeStr})`;
+}
+
+/**
+ * Guard for the value of an `equals` operator reaching the plain-equality
+ * operator path. A plain object literal can only legitimately be an equality
+ * value on a json/jsonb column — and those route to the JSONB filter branch
+ * BEFORE the operator branch, so any plain object that reaches here is a
+ * mistake (e.g. `{ equals: { foo: 1 } }` on a text column). Shared by the
+ * SQL-build path and the cache-hit param-collect path so a warmed cache can
+ * never skip the check.
+ */
+function assertBindableEqualsOperand(value: unknown, column: string): void {
+  if (!isUnmatchedPlainObject(value)) return;
+  throw new ValidationError(
+    `[turbine] Plain-object value for operator 'equals' on ${column}: ` +
+      `objects are only valid 'equals' values on JSON (json/jsonb) columns, ` +
+      `where 'equals' is the JSONB containment filter.`,
+  );
+}
+
+/**
+ * Object keys in sorted order, mirroring the canonical order used by every
+ * cache fingerprint. The SQL-build and cache-hit param-collect paths MUST
+ * enumerate object keys in this exact order: fingerprints sort keys, so two
+ * where clauses with the same fields in different insertion order share one
+ * cache entry — if build/collect iterated insertion order, the cached SQL's
+ * `$N` placeholders would bind the wrong values (cross-tenant-leak class).
+ * Array order (OR/AND members) is positional and is never sorted.
+ */
+function sortedKeys(obj: Record<string, unknown>): string[] {
+  return Object.keys(obj).sort();
+}
+
+/** {@link sortedKeys}, but yielding `[key, value]` pairs. */
+function sortedEntries<V>(obj: Record<string, V>): [string, V][] {
+  return Object.entries(obj).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
 /** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
 const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
 
@@ -108,9 +160,11 @@ const JSONB_OPERATOR_KEYS = new Set<string>(['path', 'equals', 'contains', 'hasK
  * appear in any other where-filter shape, so the presence of one of these is
  * an unambiguous signal that the user meant a JSON filter. Used by the
  * strict-validation path so that `{ contains: 'foo' }` (which is also a valid
- * `WhereOperator` for LIKE) is not misclassified.
+ * `WhereOperator` for LIKE) is not misclassified. Note `equals` is NOT in this
+ * set: on non-JSON columns it is a plain equality operator (`WhereOperator`),
+ * so it must fall through instead of throwing.
  */
-const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'equals', 'hasKey']);
+const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'hasKey']);
 
 /** Check if a value is a JSONB filter object */
 function isJsonFilter(value: unknown): value is JsonFilter {
@@ -552,10 +606,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Execute a query through the middleware chain.
    * If no middlewares are registered, executes directly.
    *
-   * Middleware can inspect and log query parameters, modify results after execution,
-   * and measure timing. Note: query SQL is generated before middleware runs, so
-   * modifying params.args in middleware will NOT affect the executed SQL.
-   * To intercept queries before SQL generation, use the raw() method instead.
+   * Middleware can inspect and log query parameters, measure timing, and
+   * transform the result returned by `next()`. Note: query SQL is generated
+   * BEFORE middleware runs — `params.args` is a read-only snapshot, and
+   * mutating it does NOT change the executed SQL. Cross-cutting filters
+   * (e.g. soft deletes) belong in the query itself: pass an explicit
+   * `where: { deletedAt: null }` or wrap the table accessor in a small helper.
    */
   private async executeWithMiddleware<R>(
     action: string,
@@ -613,8 +669,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params: unknown[] = [];
 
-    // Check if all where values are simple (plain equality, no operators/null/OR)
-    const whereKeys = Object.keys(whereObj).filter((k) => whereObj[k] !== undefined);
+    // Check if all where values are simple (plain equality, no operators/null/OR).
+    // Keys are sorted to match fingerprintWhere — insertion order here would let
+    // permuted where literals share a cache entry with misaligned params.
+    const whereKeys = Object.keys(whereObj)
+      .filter((k) => whereObj[k] !== undefined)
+      .sort();
     const isSimpleWhere =
       !whereObj.OR &&
       !whereObj.AND &&
@@ -849,7 +909,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       let sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${freshWhereSql}`;
 
       if (args?.cursor) {
-        const cursorEntries = Object.entries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
+        // Sorted (canonical) order — MUST match cursorFp and the cache-hit collect below.
+        const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
         if (cursorEntries.length > 0) {
           const cursorConditions = cursorEntries.map(([k, v]) => {
             const col = this.toSqlColumn(k);
@@ -893,9 +954,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.with) {
       this.collectWithParams(args.with as WithClause, params);
     }
-    // 3. Cursor params
+    // 3. Cursor params — sorted (canonical) order, matching cursorFp and the build path.
     if (args?.cursor) {
-      const cursorEntries = Object.entries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
+      const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
       for (const [, v] of cursorEntries) {
         params.push(v);
       }
@@ -1172,7 +1233,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // create
   // -------------------------------------------------------------------------
 
-  async create(args: CreateArgs<T>): Promise<T> {
+  async create(args: CreateArgs<T, R>): Promise<T> {
     return this.executeWithMiddleware('create', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
         return this.nestedCreate(args);
@@ -1270,7 +1331,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // update
   // -------------------------------------------------------------------------
 
-  async update(args: UpdateArgs<T>): Promise<T> {
+  async update(args: UpdateArgs<T, R>): Promise<T> {
     return this.executeWithMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
         return this.nestedUpdate(args);
@@ -1366,7 +1427,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // Nested write helpers (shared by create + update)
   // -------------------------------------------------------------------------
 
-  private async nestedCreate(args: CreateArgs<T>): Promise<T> {
+  private async nestedCreate(args: CreateArgs<T, R>): Promise<T> {
     const data = args.data as Record<string, unknown>;
 
     if (this.txScoped) {
@@ -1380,7 +1441,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     });
   }
 
-  private async nestedUpdate(args: UpdateArgs<T>): Promise<T> {
+  private async nestedUpdate(args: UpdateArgs<T, R>): Promise<T> {
     const data = args.data as Record<string, unknown>;
     const where = args.where as Record<string, unknown>;
 
@@ -2355,12 +2416,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // Operator objects
       if (isWhereOperator(value)) {
-        const opKeys = Object.keys(value as object)
-          .filter((k) => k !== 'mode')
-          .sort();
-        const mode = (value as WhereOperator).mode;
-        const modeStr = mode === 'insensitive' ? ':i' : '';
-        parts.push(`${key}:op(${opKeys.join(',')}${modeStr})`);
+        parts.push(`${key}:${fingerprintOperatorShape(value)}`);
         continue;
       }
 
@@ -2441,12 +2497,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (value === null) {
         parts.push(`${key}:null`);
       } else if (isWhereOperator(value)) {
-        const opKeys = Object.keys(value as object)
-          .filter((k) => k !== 'mode')
-          .sort();
-        const mode = (value as WhereOperator).mode;
-        const modeStr = mode === 'insensitive' ? ':i' : '';
-        parts.push(`${key}:op(${opKeys.join(',')}${modeStr})`);
+        parts.push(`${key}:${fingerprintOperatorShape(value)}`);
       } else if (isUnmatchedPlainObject(value)) {
         parts.push(
           `${key}:obj(${Object.keys(value as object)
@@ -2468,7 +2519,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * @internal Exposed as package-private for testing.
    */
   collectWhereParams(where: Record<string, unknown>, params: unknown[]): void {
-    const keys = Object.keys(where);
+    // Sorted (canonical) order — MUST match fingerprintWhere and buildWhereClause.
+    const keys = sortedKeys(where);
 
     for (const key of keys) {
       const value = where[key];
@@ -2563,7 +2615,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // Operator objects
       if (isWhereOperator(value)) {
-        this.collectOperatorParams(value, params);
+        this.collectOperatorParams(rawColumn, value, params);
         continue;
       }
 
@@ -2579,21 +2631,27 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = this.schema.tables[targetTable];
     if (!meta) return;
 
-    for (const [field, value] of Object.entries(subWhere)) {
+    // Sorted (canonical) order — MUST match fingerprintRelFilter and buildSubWhereForRelation.
+    for (const field of sortedKeys(subWhere)) {
+      const value = subWhere[field];
       if (value === undefined) continue;
       if (value === null) continue;
+      const col = meta.columnMap[field] ?? camelToSnake(field);
       if (isWhereOperator(value)) {
-        this.collectOperatorParams(value, params);
+        this.collectOperatorParams(col, value, params);
         continue;
       }
-      const col = meta.columnMap[field] ?? camelToSnake(field);
       this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(meta, col), targetTable);
       params.push(value);
     }
   }
 
   /** Collect params from operator clauses. Mirrors buildOperatorClauses. */
-  private collectOperatorParams(op: WhereOperator, params: unknown[]): void {
+  private collectOperatorParams(column: string, op: WhereOperator, params: unknown[]): void {
+    if (op.equals !== undefined && op.equals !== null) {
+      assertBindableEqualsOperand(op.equals, `"${column}"`);
+      params.push(op.equals);
+    }
     if (op.gt !== undefined) params.push(op.gt);
     if (op.gte !== undefined) params.push(op.gte);
     if (op.lt !== undefined) params.push(op.lt);
@@ -2747,7 +2805,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = this.schema.tables[table ?? this.table];
     if (!meta) return;
 
-    for (const [relName, relSpec] of Object.entries(withClause)) {
+    for (const [relName, relSpec] of sortedEntries(withClause)) {
       const relDef = meta.relations[relName];
       if (!relDef) continue;
       this.collectRelationSubqueryParams(relDef, relSpec, params, table ?? this.table);
@@ -2779,7 +2837,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         params.push(Number(spec.limit));
       }
       if (spec.with) {
-        for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+        for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
           const nestedRelDef = targetMeta.relations[nestedRelName];
           if (!nestedRelDef) continue;
           this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'alias', depth + 1);
@@ -2794,7 +2852,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Non-wrapped path: nested relations BEFORE where/limit
     if (!willWrap && spec.with) {
-      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) continue;
         this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'alias', depth + 1);
@@ -2816,7 +2874,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Wrapped path: nested relations AFTER where/limit (inside inner subquery)
     if (willWrap && spec.with) {
-      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) continue;
         this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'innerAlias', depth + 1);
@@ -2909,7 +2967,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Supports: equality, operators, NULL, OR, AND, NOT, relation filters (some/every/none).
    */
   private buildWhereClause(where: Record<string, unknown>, params: unknown[]): string | null {
-    const keys = Object.keys(where);
+    // Sorted (canonical) order — MUST match fingerprintWhere and collectWhereParams.
+    const keys = sortedKeys(where);
     if (keys.length === 0) return null;
 
     const andClauses: string[] = [];
@@ -3146,7 +3205,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const qt = this.q(targetTable);
     const conditions: string[] = [];
 
-    for (const [field, value] of Object.entries(subWhere)) {
+    // Sorted (canonical) order — MUST match fingerprintRelFilter and collectRelFilterParams.
+    for (const field of sortedKeys(subWhere)) {
+      const value = subWhere[field];
       if (value === undefined) continue;
 
       const col = meta.columnMap[field] ?? camelToSnake(field);
@@ -3227,7 +3288,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): string | null {
     const clauses: string[] = [];
 
-    for (const [key, value] of Object.entries(where)) {
+    // Sorted (canonical) order — MUST match fingerprintAliasWhere and collectAliasWhereParams.
+    for (const key of sortedKeys(where)) {
+      const value = where[key];
       if (value === undefined) continue;
 
       if (key === 'OR' || key === 'AND') {
@@ -3278,7 +3341,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     where: Record<string, unknown>,
     params: unknown[],
   ): void {
-    for (const [key, value] of Object.entries(where)) {
+    // Sorted (canonical) order — MUST match fingerprintAliasWhere and buildAliasWhere.
+    for (const key of sortedKeys(where)) {
+      const value = where[key];
       if (value === undefined) continue;
 
       if (key === 'OR' || key === 'AND') {
@@ -3297,12 +3362,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       if (value === null) continue;
 
+      const col = targetMeta.columnMap[key] ?? camelToSnake(key);
+
       if (isWhereOperator(value)) {
-        this.collectOperatorParams(value, params);
+        this.collectOperatorParams(col, value, params);
         continue;
       }
 
-      const col = targetMeta.columnMap[key] ?? camelToSnake(key);
       this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(targetMeta, col), targetTable);
       params.push(value);
     }
@@ -3338,11 +3404,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
       if (isWhereOperator(value)) {
-        const opKeys = Object.keys(value as object)
-          .filter((k) => k !== 'mode')
-          .sort();
-        const mode = (value as WhereOperator).mode;
-        parts.push(`${key}:op(${opKeys.join(',')}${mode === 'insensitive' ? ':i' : ''})`);
+        parts.push(`${key}:${fingerprintOperatorShape(value)}`);
         continue;
       }
       if (isUnmatchedPlainObject(value)) {
@@ -3366,6 +3428,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private buildOperatorClauses(column: string, op: WhereOperator, params: unknown[]): string[] {
     const clauses: string[] = [];
 
+    if (op.equals !== undefined) {
+      if (op.equals === null) {
+        clauses.push(`${column} IS NULL`);
+      } else {
+        assertBindableEqualsOperand(op.equals, column);
+        params.push(op.equals);
+        clauses.push(`${column} = ${this.p(params.length)}`);
+      }
+    }
     if (op.gt !== undefined) {
       params.push(op.gt);
       clauses.push(`${column} > ${this.p(params.length)}`);
@@ -3702,7 +3773,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const relationSelects: string[] = [];
     const aliasCounter = { n: 0 };
 
-    for (const [relName, relSpec] of Object.entries(withClause)) {
+    for (const [relName, relSpec] of sortedEntries(withClause)) {
       const relDef = meta.relations[relName];
       if (!relDef) {
         throw new RelationError(
@@ -3891,7 +3962,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Nested relations — only in the non-wrapped path (wrapped path builds them separately)
     if (!willWrap && spec !== true && spec.with) {
-      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) {
           throw new RelationError(
@@ -3983,7 +4054,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         ]);
         // Build nested relation subqueries referencing innerAlias
         if (spec !== true && spec.with) {
-          for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+          for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
             const nestedRelDef = targetMeta.relations[nestedRelName];
             if (!nestedRelDef) {
               throw new RelationError(
@@ -4148,7 +4219,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       ]);
       // Nested relations reference the inner alias.
       if (spec !== true && spec.with) {
-        for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+        for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
           const nestedRelDef = targetMeta.relations[nestedRelName];
           if (!nestedRelDef) {
             throw new RelationError(
@@ -4183,7 +4254,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       `${talias}.${this.q(col)}`,
     ]);
     if (spec !== true && spec.with) {
-      for (const [nestedRelName, nestedSpec] of Object.entries(spec.with)) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) {
           throw new RelationError(

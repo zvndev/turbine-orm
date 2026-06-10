@@ -1,48 +1,58 @@
-# Sprint Plan — Turbine ORM Gold Standard Improvements
+# Sprint Plan — Turbine ORM v0.19.1 → v0.19.2
 
-Generated: 2026-04-12
-Based on: Gold Standard Audit (40/50) — conversation findings
+Generated: 2026-06-09
+Based on: /product-review findings (5-agent audit: codebase, security, competitive, engineering, UX). Security audit: zero CRITICAL/HIGH/MEDIUM findings — this sprint is contract fixes + docs + hygiene.
 
 ## Sprint Goal
 
-Ship P0, P2, and P3 improvements from the Gold Standard audit: fix release traceability, add bundle tracking and DX scripts, refactor the monolithic query module, add dev-only validation guards, and enforce error code hygiene via CI.
+Eliminate every documented-but-broken behavior and every undocumented flagship feature, so a new user's first hour contains zero contract violations.
 
 ## Success Criteria
 
-- [x] All 5 version tags exist and match npm releases (v0.7.0, v0.7.1, v0.8.0, v0.9.0, v0.9.1)
-- [ ] `size-limit` tracks bundle size with PR-level reporting
-- [ ] `test:watch`, `db:seed`, `db:reset` scripts work
-- [ ] `query.ts` split into submodules (types, utils, builder)
-- [ ] Dev-only validation guards behind `process.env.NODE_ENV`
-- [ ] `next` release channel publishes on every main merge
-- [ ] Error code enforcement script runs in CI
-- [ ] All unit tests pass, typecheck clean, build clean
+- [ ] `where: { field: { equals: value } }` works on non-JSON columns (P0)
+- [ ] Soft-delete middleware example no longer documents a silently-broken pattern (P0)
+- [ ] Nested-write op types either wired into input typing or un-exported (P0)
+- [ ] `/studio` docs page exists and is in the site sidebar (P1)
+- [ ] `turbine observe` appears in `--help`, README, and site docs (P1)
+- [ ] `cursor`/`take`/`distinct` documented; migrate-from-prisma corrected re: `take` (P1)
+- [ ] DB-gated tests report as `skipped`, not silent pass (P2)
+- [ ] Dead code removed: `isReadOnlyStatement`, orphaned `.sql-editor` CSS (P2)
+- [ ] Doc drift fixed: CLAUDE.md builder.ts LOC, release.yml "308 tests" comment (P2)
+- [ ] All tests pass, typecheck/lint/build clean, site builds
 
-## Dev Tracks
+## Intentionally skipped (and why)
 
-### Track 1: Package & Config — DX Infrastructure
-**Owner:** Dev Agent 1
-**Files touched:** `package.json`, `.size-limit.json` (new)
-**Tasks:**
-- [x] TASK-01: Tag missing git releases (v0.8.0, v0.9.0, v0.9.1) — DONE pre-sprint
-- [ ] TASK-02 (P0): Add `@size-limit/file` devDep + `.size-limit.json` config + `size-limit` npm script
-- [ ] TASK-03 (P0): Add `test:watch` script to package.json
-- [ ] TASK-05 (P2): Add `db:seed` and `db:reset` npm scripts
+- builder.ts split into modules — high-risk refactor, no user-facing value this sprint
+- Closing `WhereClause` index signature / typing `WithOptions.where` — breaking-change territory, needs design
+- Benchmark re-run vs Prisma 7 / LATERAL comparison — needs live Neon infra; caveat text updated instead
+- Release-path consolidation — process decision for Kirby
 
-### Track 2: Query Module Refactor + Dev Guards
-**Owner:** Dev Agent 2
-**Files touched:** `src/query.ts` -> `src/query/`, `src/client.ts`, `src/index.ts`, `src/pipeline.ts`, `src/pipeline-submittable.ts`, `src/schema-sql.ts`, `src/cli/studio.ts`, `src/cli/migrate.ts`, `src/test/*.ts`
-**Tasks:**
-- [ ] TASK-06 (P2): Split `query.ts` (3,568 LOC) into `src/query/types.ts`, `src/query/utils.ts`, `src/query/builder.ts`, `src/query/index.ts`
-- [ ] TASK-07 (P3): Add `process.env.NODE_ENV !== 'production'` validation guards in query builder
+## Dev Tracks (isolated worktrees, zero file overlap)
 
-### Track 3: CI Workflows & Error Code Enforcement
-**Owner:** Dev Agent 3
-**Files touched:** `.github/workflows/ci.yml`, `.github/workflows/nightly.yml` (new), `scripts/check-error-codes.ts` (new)
-**Tasks:**
-- [ ] TASK-04 (P2): Add `next` release channel via nightly CI workflow
-- [ ] TASK-08 (P3): Add error code enforcement script + CI job
+### Track 1: Core query engine — `equals` operator + nested-write typing
+**Files:** `src/query/utils.ts`, `src/query/builder.ts`, `src/query/types.ts`, `src/index.ts` (exports), unit-test files in `src/test/`
+- [ ] TASK-01 (P0): Support `equals` as plain equality operator on non-JSON columns
+- [ ] TASK-02 (P0): Wire `NestedCreateOp`/`NestedUpdateOp`/`ConnectOrCreateOp` into create/update input typing, or un-export if it breaks inference
 
-## File Conflict Matrix
+### Track 2: Repo docs — middleware example, README observe, drift
+**Files:** `README.md`, `src/client.ts` (JSDoc only), `CLAUDE.md`, `.github/workflows/release.yml` (comment only)
+- [ ] TASK-03 (P0): Replace broken soft-delete middleware example in README + `$use` JSDoc
+- [ ] TASK-04 (P1): Document `turbine observe` + `$observe` in README
+- [ ] TASK-05 (P2): Fix CLAUDE.md builder.ts LOC drift; fix stale "308 tests" comment in release.yml
 
-Zero file conflicts between tracks. Each track owns distinct files.
+### Track 3: Site — studio page, observe docs, queries gaps, hero repositioning
+**Files:** `site/**` only
+- [ ] TASK-06 (P1): Create `/studio` docs page; add to sidebar
+- [ ] TASK-07 (P1): Create/extend observability docs
+- [ ] TASK-08 (P1): Document `cursor`, `take`, `distinct` in /queries; fix migrate-from-prisma `take` note
+- [ ] TASK-09 (P1): Update stale benchmark caveat (0.17.0 → current); note Prisma 7 landscape honestly
+- [ ] TASK-10 (P2): Reposition homepage hero toward "Postgres-maximalist" framing
+
+### Track 4: CLI surfaces — help text + dead code
+**Files:** `src/cli/index.ts`, `src/cli/studio.ts`, `src/cli/studio-ui.html` (+ regenerated `studio-ui.generated.ts`), studio test files (only isReadOnlyStatement tests)
+- [ ] TASK-11 (P1): Add `observe` to help; add `--auto`, `--allow-drift`, `--step` flags to help text
+- [ ] TASK-12 (P2): Delete `isReadOnlyStatement()` + its tests; remove orphaned `.sql-editor` CSS; run `npm run gen:studio`
+
+### Track 5: Test hygiene — proper skip reporting
+**Files:** DB-gated integration test files in `src/test/` only
+- [ ] TASK-13 (P2): Convert silent `const SKIP = !DATABASE_URL` no-op guards to node:test `skip` so reporters show skipped counts

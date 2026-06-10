@@ -12,11 +12,12 @@
  */
 
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { describe } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { NotFoundError, ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
+import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -31,7 +32,10 @@ if (SKIP) {
 let db: TurbineClient;
 let schema: SchemaMetadata;
 
-const testFn = SKIP ? describe.skip : describe;
+// Without DATABASE_URL every test below registers as skipped (visible in
+// the reporter summary) and the before/after hooks become no-ops.
+const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
+const testFn = describe;
 
 testFn('comprehensive integration tests', () => {
   before(async () => {

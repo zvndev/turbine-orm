@@ -11,14 +11,14 @@ Every query method, operator, and API surface Turbine exposes. Generated clients
 
 ## findMany
 
-Returns an array of rows matching the query. Supports `where`, `with`, `orderBy`, `take` / `limit`, `skip`, `select`, and `omit`.
+Returns an array of rows matching the query. Supports `where`, `with`, `orderBy`, `limit` / `take`, `offset`, `cursor`, `distinct`, `select`, and `omit`.
 
 ```ts
 const users = await db.users.findMany({
   where: { role: 'admin', orgId: 1 },
   orderBy: { createdAt: 'desc' },
-  take: 20,
-  skip: 0,
+  limit: 20,
+  offset: 0,
 });
 ```
 
@@ -55,6 +55,49 @@ const users = await db.users.findMany({
   omit: { passwordHash: true },
 });
 ```
+
+### Pagination — `limit` / `take`, `offset`, `cursor`
+
+Offset pagination uses `limit` + `offset`. `take` is a Prisma-compatible alias for `limit` — when both are passed, `take` wins (`take ?? limit`):
+
+```ts
+const page2 = await db.posts.findMany({
+  orderBy: { id: 'asc' },
+  limit: 20,   // or take: 20 — same thing
+  offset: 20,
+});
+```
+
+For deep pagination, `cursor` is the keyset alternative: pass the column values of the last row you saw, and Turbine adds a comparison per cursor field — `column > value` for ascending order, `column < value` for descending (taken from `orderBy`; defaults to ascending). The cursor row itself is **excluded**, so the next page starts immediately after it:
+
+```ts
+const firstPage = await db.posts.findMany({
+  orderBy: { id: 'asc' },
+  take: 20,
+});
+
+const nextPage = await db.posts.findMany({
+  orderBy: { id: 'asc' },
+  cursor: { id: firstPage.at(-1)!.id }, // rows with id > this value
+  take: 20,
+});
+```
+
+Multiple cursor fields combine with `AND`. Use a unique (or unique-in-combination) column in `cursor` + `orderBy` so the ordering is total — that's what makes keyset pagination skip-free and index-friendly at any depth, where `OFFSET 100000` still scans the skipped rows.
+
+### distinct
+
+`distinct` de-duplicates rows by the listed fields using PostgreSQL's `DISTINCT ON`:
+
+```ts
+// One post per author
+const sample = await db.posts.findMany({
+  distinct: ['userId'],
+  orderBy: { userId: 'asc' },
+});
+```
+
+Per `DISTINCT ON` semantics, which row survives per group is governed by `orderBy` — sort by the distinct fields first, then by whatever should decide the winner within each group.
 
 ## findUnique / findUniqueOrThrow
 
@@ -350,6 +393,15 @@ LIKE wildcards in user input (`%`, `_`, `\`) are escaped automatically.
 | `hasEvery` | Array contains every element | `where: { tags: { hasEvery: ['sql', 'pg'] } }` |
 | `hasSome` | Array contains at least one element | `where: { tags: { hasSome: ['sql', 'mysql'] } }` |
 
+### Full-text search
+
+| Operator | Description | Example |
+|---|---|---|
+| `search` | `to_tsvector(col) @@ to_tsquery(query)` | `where: { body: { search: 'postgres & orm' } }` |
+| `config` | Text search configuration (default `'english'`) | `where: { body: { search: 'orm', config: 'simple' } }` |
+
+The query string is bound as a parameter and uses `to_tsquery` syntax (`&`, `|`, `!`, `<->`). The `config` name is validated (alphanumeric + underscore only) before it reaches the SQL.
+
 ### Relation filters
 
 Filter parent rows by predicates on their child rows.
@@ -460,7 +512,7 @@ HTTP / serverless pools that don't support the pipeline protocol fall back to se
 
 ## Middleware
 
-`db.$use(fn)` registers a middleware that runs around every query. It can log, time, mutate arguments, or transform results — but it cannot rewrite the SQL.
+`db.$use(fn)` registers a middleware that wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()` — but it cannot change the query itself.
 
 ```ts
 // Query timing
@@ -471,18 +523,36 @@ db.$use(async (params, next) => {
   return result;
 });
 
-// Soft-delete filter
+// Result transformation — redact a field on the way out
 db.$use(async (params, next) => {
-  if (params.action === 'findMany' || params.action === 'findUnique') {
-    params.args.where = { ...params.args.where, deletedAt: null };
+  const result = await next(params);
+  if (params.model === 'users' && Array.isArray(result)) {
+    for (const row of result as { email?: string }[]) row.email = '[redacted]';
   }
-  return next(params);
+  return result;
 });
+```
+
+> **Warning:** `params.args` is a read-only snapshot — mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
+
+Because middleware can't rewrite queries, cross-cutting filters like **soft deletes** belong in the query itself — either explicitly or via a small scoped helper:
+
+```ts
+import type { WhereClause } from 'turbine-orm';
+
+// Explicit filter
+const users = await db.users.findMany({ where: { deletedAt: null } });
+
+// Scoped helper that always applies the filter
+const activeUsers = (where: WhereClause<User> = {}) =>
+  db.users.findMany({ where: { ...where, deletedAt: null } });
+
+const rows = await activeUsers({ orgId: 1 });
 ```
 
 ## Raw SQL
 
-When you need something the query builder doesn't expose (full-text search, window functions, `WITH RECURSIVE`, etc.):
+When you need something the query builder doesn't expose (window functions, `WITH RECURSIVE`, lateral joins, etc.):
 
 ```ts
 const stats = await db.raw<{ day: Date; count: number }>`

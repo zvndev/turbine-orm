@@ -26,6 +26,7 @@ Commands:
   seed                           Run the seed file
   status                         Show connection info + schema summary
   studio                         Launch local read-only Studio web UI
+  observe                        Launch local metrics dashboard
 ```
 
 ## Global options
@@ -172,26 +173,22 @@ Launch a local, read-only web UI for exploring your database. The only Postgres 
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
-npx turbine studio --port 5173 --host 127.0.0.1 --no-open
+npx turbine studio --port 5173 --no-open
 ```
 
-Studio ships three tabs:
+Three tabs: a visual `findMany` **Query** builder with a live Copy-TS preview (no raw-SQL surface at all), **Data** browsing, and **Schema** inspection — all inside `BEGIN READ ONLY` with loopback binding and per-process token auth.
 
-- **Query** — the default. Compose a `findMany` visually: pick fields (`select` / `omit`), filter (`where` with AND/OR/NOT and the full operator set), order and `limit`, and drill into relations (`with`) — recursively, to any depth, picking fields and filters at every level. A live TypeScript preview shows the exact `db.table.findMany(...)` call to copy into your codebase. There is no raw-SQL surface: every query is expressed in Turbine ORM, so what you build is what you ship.
-- **Data** — browse rows, sort columns, open JSON/JSONB cells in a modal, and full-text search across every text column.
-- **Schema** — inspect tables, columns, indexes, and relations.
+Studio has its own page covering the builder, saved queries, every flag, and the full security model: **[Studio](/studio)**.
 
-Everything still executes inside `BEGIN READ ONLY` with a 30s transaction-local statement timeout (parameterized `set_config`), so writes are impossible at the transaction level.
+## `turbine observe`
 
-**Saved queries** persist to `.turbine/studio-queries.json` and surface in the sidebar and the **Cmd+K command palette**, which also jumps to any table or tab in a single keystroke.
+Launch the local metrics dashboard over the `_turbine_metrics` table written by `db.$observe()`.
 
-**Security posture (read-only by design)**
+```bash
+TURBINE_OBSERVE_URL=postgres://... npx turbine observe
+```
 
-- Loopback by default (`127.0.0.1`), with a loud warning on non-loopback binds.
-- Per-process 24-byte random hex auth token, stored in a `SameSite=Strict` `HttpOnly` cookie.
-- Every query runs inside `BEGIN READ ONLY` with a 30s transaction-local statement timeout (parameterized `set_config`).
-- No SQL input surface at all — builder requests are validated identifier-by-identifier against the introspected schema, and every value is bound as a `$N` parameter.
-- Security headers on every response (CSP, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`), per-session rate limiting, cross-origin refusal.
+See **[Observability](/observability)** for the event API, the metrics engine, and the dashboard.
 
 ## Config resolution
 

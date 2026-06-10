@@ -12,7 +12,7 @@ npm install turbine-orm
 
 Prisma ships a 1.6 MB WASM query engine. Drizzle ships zero runtime but no Studio, no typed errors, no migration checksums. Turbine ships **one dependency (`pg`) and no engine binary**, and bundles six things no other TS ORM has together:
 
-1. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~30 KB gzipped (~109 KB minified); the edge entry to ~21 KB gzipped. Prisma's WASM query engine alone is 1.6 MB.
+1. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~31 kB brotli (~109 KB minified); the edge entry to ~22 kB brotli. Prisma's WASM query engine alone is 1.6 MB.
 2. **Built-in read-only Studio.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and — since v0.19 — no raw-SQL surface at all: queries are composed in the ORM's own validated builder. The only TS ORM Studio that physically cannot mutate your database. DBA-approvable.
 3. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
@@ -343,6 +343,8 @@ const db = turbine({
 
 ### Middleware
 
+Middleware wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()` — but it cannot change the query itself.
+
 ```typescript
 // Query timing
 db.$use(async (params, next) => {
@@ -352,13 +354,31 @@ db.$use(async (params, next) => {
   return result;
 });
 
-// Soft-delete filter
+// Result transformation — redact a field on the way out
 db.$use(async (params, next) => {
-  if (params.action === 'findMany' || params.action === 'findUnique') {
-    params.args.where = { ...params.args.where, deletedAt: null };
+  const result = await next(params);
+  if (params.model === 'users' && Array.isArray(result)) {
+    for (const row of result as { email?: string }[]) row.email = '[redacted]';
   }
-  return next(params);
+  return result;
 });
+```
+
+> **Warning:** `params.args` is a read-only snapshot — mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
+
+Because middleware can't rewrite queries, cross-cutting filters like **soft deletes** belong in the query itself — either explicitly or via a small scoped helper:
+
+```typescript
+import type { WhereClause } from 'turbine-orm';
+
+// Explicit filter
+const users = await db.users.findMany({ where: { deletedAt: null } });
+
+// Scoped helper that always applies the filter
+const activeUsers = (where: WhereClause<User> = {}) =>
+  db.users.findMany({ where: { ...where, deletedAt: null } });
+
+const rows = await activeUsers({ orgId: 1 });
 ```
 
 ### Error handling
@@ -557,6 +577,7 @@ Commands:
   seed                         Run seed file
   status                       Show database schema summary
   studio                       Launch local read-only Studio web UI
+  observe                      Launch local metrics dashboard (requires TURBINE_OBSERVE_URL)
 
 Options:
   --url, -u <url>       Postgres connection string
@@ -637,6 +658,42 @@ npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 - **Per-process auth token** — 24 random bytes of hex, stored in a `SameSite=Strict` `HttpOnly` cookie.
 - **Every query runs inside `BEGIN READ ONLY`** with a 30s transaction-local statement timeout (parameterized `set_config`). Writes are physically impossible at the transaction level.
 - **Security headers on every response** — CSP, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` — plus per-session rate limiting and cross-origin refusal.
+
+## Observability
+
+Built-in query metrics with zero new dependencies. `$observe` buffers per-query timings in memory and flushes **per-minute aggregates** — count, avg, p50, p95, p99, and error count per `model:action` — to a `_turbine_metrics` table in a **separate database**, over its own 1-connection pool so metrics writes never contend with your application pool.
+
+```typescript
+const handle = await db.$observe({
+  connectionString: process.env.TURBINE_OBSERVE_URL!, // metrics DB (not your app DB)
+  flushIntervalMs: 60_000, // default: 60s
+  retentionDays: 30,       // default: 30 — older buckets are pruned on flush
+});
+
+// Later, to flush remaining metrics and close the metrics pool
+await handle.stop();
+```
+
+`$observe` creates the `_turbine_metrics` table if it doesn't exist. Flushes are fire-and-forget (`INSERT ... ON CONFLICT` additive merge) and never throw into your application. If the `TURBINE_OBSERVE_URL` environment variable is set, the client starts observing automatically on construction — no code needed.
+
+For your own instrumentation, subscribe to query events with `$on('query')` — each event carries `sql`, `params`, `duration` (ms), `model`, `action`, `rows`, `timestamp`, and `error` (if the query failed):
+
+```typescript
+db.$on('query', (e) => {
+  if (e.duration > 200) {
+    console.warn(`slow query: ${e.model}.${e.action} (${e.duration.toFixed(1)}ms, ${e.rows} rows)`);
+  }
+});
+```
+
+View the collected metrics in a local dashboard:
+
+```bash
+TURBINE_OBSERVE_URL=postgres://... npx turbine observe
+# Flags: --port (default 4984), --host (default 127.0.0.1), --no-open
+```
+
+Same security model as Studio: loopback binding by default, per-process random auth token in an `HttpOnly` cookie, CSP headers, and read-only access to the metrics table.
 
 ## Serverless / Edge
 
@@ -761,11 +818,11 @@ Turbine maps Postgres types to TypeScript:
 |---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + 1.6 MB WASM engine | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + adapter | 0 | 0 |
-| **Main bundle (gzip)** | ~30 KB | dominated by 1.6 MB WASM | ~7 KB core | small |
+| **Main bundle (brotli)** | ~31 kB | dominated by 1.6 MB WASM | ~7 KB core | small |
 | **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Paid tier | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, ~21 KB gzip | 1.6 MB WASM adapter | Native | Native |
+| **Edge runtime** | One import swap, ~22 kB brotli | 1.6 MB WASM adapter | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query, shallow inference | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |
@@ -817,6 +874,17 @@ Turbine is focused and opinionated. Here's what it doesn't do:
 - Node.js >= 18.0.0
 - PostgreSQL >= 14
 - Works with both ESM (`import`) and CommonJS (`require`)
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the test strategy, and the PR checklist. The unit suite runs without a database:
+
+```bash
+npm install
+npm run test:unit
+```
+
+Integration tests need a PostgreSQL instance via `DATABASE_URL` (see CONTRIBUTING.md for a one-command seeded setup).
 
 ## License
 

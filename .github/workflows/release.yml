@@ -18,8 +18,8 @@ name: Release
 #
 # Note: integration tests are intentionally NOT run here. They require a
 # seeded Postgres database and are covered separately by ci.yml on push.
-# The unit tests gate alone is 308 tests covering all SQL generation,
-# schema/migration logic, error handling, and the edge-driver adapter.
+# The unit test gate alone covers all SQL generation, schema/migration
+# logic, error handling, and the edge-driver adapter.
 
 on:
   push:
@@ -65,7 +65,7 @@ jobs:
 
       # Bundle size gate — size-limit is the single source of truth (same check
       # CI runs). Measures the bundled import graph against .size-limit.js limits
-      # (~27 kB main / ~19 kB edge, under 35/25 ceilings). Replaces the previous
+      # (~31 kB main / ~22 kB edge, under 35/25 ceilings). Replaces the previous
       # stale hard-coded 150 kB tarball check that never matched reality.
       - name: Verify bundle sizes
         run: npx size-limit
@@ -107,11 +107,59 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Backfilled/old tags must not re-attempt a publish: npm rejects
+      # republishing an existing version, which would just paint the run red.
+      - name: Check version not already published
+        id: published
+        run: |
+          PKG_VERSION=$(jq -r .version package.json)
+          if npm view "turbine-orm@$PKG_VERSION" version >/dev/null 2>&1; then
+            echo "already=true >> note: turbine-orm@$PKG_VERSION already on npm — skipping publish"
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to npm
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && steps.published.outputs.already != 'true' }}
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Install the just-published version from the public registry in a clean
+      # temp project and verify the package surface (ESM import, CJS require,
+      # CLI bin, serverless subpath). Registry propagation can lag the publish,
+      # so retry the install for up to ~2 minutes before failing.
+      - name: Post-publish smoke test
+        if: ${{ github.event.inputs.dry_run != 'true' && steps.published.outputs.already != 'true' }}
+        env:
+          # setup-node's .npmrc references NODE_AUTH_TOKEN; npm errors on any
+          # command if it's undefined, so keep it set for this step too.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG_VERSION=$(jq -r .version package.json)
+          SMOKE_DIR=$(mktemp -d)
+          cd "$SMOKE_DIR"
+          npm init -y > /dev/null
+          INSTALLED=0
+          for i in $(seq 1 12); do
+            if npm install "turbine-orm@$PKG_VERSION" --no-audit --no-fund; then
+              INSTALLED=1
+              break
+            fi
+            echo "turbine-orm@$PKG_VERSION not installable yet, retrying in 10s ($i/12)..."
+            sleep 10
+          done
+          if [ "$INSTALLED" != "1" ]; then
+            echo "::error::turbine-orm@$PKG_VERSION never became installable from the registry"
+            exit 1
+          fi
+          node --input-type=module -e "const m = await import('turbine-orm'); if (!m.TurbineClient) { console.error('ESM import missing TurbineClient'); process.exit(1); } console.log('ESM import OK');"
+          node -e "const m = require('turbine-orm'); if (!m.TurbineClient) { console.error('CJS require missing TurbineClient'); process.exit(1); } console.log('CJS require OK');"
+          node --input-type=module -e "const m = await import('turbine-orm/serverless'); if (typeof m.turbineHttp !== 'function') { console.error('serverless subpath missing turbineHttp'); process.exit(1); } console.log('serverless subpath OK');"
+          npx turbine --version
+          npx turbine --version | grep -F "$PKG_VERSION"
+          echo "Post-publish smoke test passed for turbine-orm@$PKG_VERSION"
 
       - name: Dry run — verify package
         if: ${{ github.event.inputs.dry_run == 'true' }}

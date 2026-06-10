@@ -12,6 +12,13 @@ export type OrderDirection = 'asc' | 'desc';
 
 /** Operator object for advanced where filtering */
 export interface WhereOperator<V = unknown> {
+  /**
+   * Explicit equality: `{ equals: value }` → `column = $n`.
+   * `{ equals: null }` → `column IS NULL`.
+   * On json/jsonb columns `equals` routes to the JSONB containment filter
+   * ({@link JsonFilter}) instead.
+   */
+  equals?: V | null;
   gt?: V;
   gte?: V;
   lt?: V;
@@ -340,8 +347,16 @@ export interface FindManyStreamArgs<
   batchSize?: number;
 }
 
-export interface CreateArgs<T> {
-  data: Partial<T>;
+export interface CreateArgs<
+  T,
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+  R extends object = {},
+> {
+  /**
+   * Row data. On typed clients, relation names additionally accept nested
+   * write ops ({@link NestedCreateOp}): `create` / `connect` / `connectOrCreate`.
+   */
+  data: CreateDataInput<T, R>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
 }
@@ -381,9 +396,18 @@ export type UpdateInput<T> = {
   [K in keyof T]?: T[K] | UpdateOperatorInput<T[K]>;
 };
 
-export interface UpdateArgs<T> {
+export interface UpdateArgs<
+  T,
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+  R extends object = {},
+> {
   where: WhereClause<T>;
-  data: UpdateInput<T>;
+  /**
+   * Update data. On typed clients, relation names additionally accept nested
+   * write ops ({@link NestedUpdateOp}): `create` / `connect` / `connectOrCreate`
+   * / `disconnect` / `set` / `delete` / `update` / `upsert`.
+   */
+  data: UpdateDataInput<T, R>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /**
@@ -449,27 +473,89 @@ export interface UpsertArgs<T> {
 
 // ---------------------------------------------------------------------------
 // Nested write operation types
+//
+// These mirror exactly what the runtime nested-write engine
+// (src/nested-write.ts) supports: create / connect / connectOrCreate in a
+// create() context, plus disconnect / set / delete / update / upsert in an
+// update() context. They are wired into `CreateArgs.data` / `UpdateArgs.data`
+// via {@link CreateDataInput} / {@link UpdateDataInput}, keyed by the
+// generated `*Relations` map (the same `RelationDescriptor` phantom brand
+// that powers deep `with`-clause inference), so typed clients get full IDE
+// discovery of nested writes at arbitrary depth.
+//
+// `TR` is the relation target's own relations map, enabling recursion
+// (`posts: { create: { comments: { create: ... } } }`). It defaults to `{}`
+// so the legacy single-generic usage (`NestedCreateOp<Post>`) still works.
 // ---------------------------------------------------------------------------
 
-export interface ConnectOrCreateOp<T> {
+/** `connectOrCreate` op: connect to the row matching `where`, or create it. */
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+export interface ConnectOrCreateOp<T, TR extends object = {}> {
   where: Partial<T>;
-  create: Partial<T>;
+  create: CreateDataInput<T, TR>;
 }
 
-export interface NestedCreateOp<T> {
-  create?: Partial<T> | Partial<T>[];
+/** Nested write ops valid inside `create()` data for a relation field. */
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+export interface NestedCreateOp<T, TR extends object = {}> {
+  create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[];
   connect?: Partial<T> | Partial<T>[];
-  connectOrCreate?: ConnectOrCreateOp<T> | ConnectOrCreateOp<T>[];
+  connectOrCreate?: ConnectOrCreateOp<T, TR> | ConnectOrCreateOp<T, TR>[];
 }
 
-export interface NestedUpdateOp<T> {
-  create?: Partial<T> | Partial<T>[];
+/** A nested `update` op item: update the related row(s) matching `where`. `where` is optional for belongsTo relations (derived from the parent's FK). */
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+export interface NestedUpdateOpItem<T, TR extends object = {}> {
+  where?: Partial<T>;
+  data: UpdateDataInput<T, TR>;
+}
+
+/** A nested `upsert` op item: update the row matching `where` or create it. */
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+export interface NestedUpsertOpItem<T, TR extends object = {}> {
+  where: Partial<T>;
+  create: CreateDataInput<T, TR>;
+  update: UpdateDataInput<T, TR>;
+}
+
+/** Nested write ops valid inside `update()` data for a relation field. */
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+export interface NestedUpdateOp<T, TR extends object = {}> {
+  create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[];
   connect?: Partial<T> | Partial<T>[];
-  connectOrCreate?: ConnectOrCreateOp<T> | ConnectOrCreateOp<T>[];
+  connectOrCreate?: ConnectOrCreateOp<T, TR> | ConnectOrCreateOp<T, TR>[];
   disconnect?: Partial<T> | Partial<T>[];
   set?: Partial<T>[];
   delete?: Partial<T> | Partial<T>[];
+  update?: NestedUpdateOpItem<T, TR> | NestedUpdateOpItem<T, TR>[];
+  upsert?: NestedUpsertOpItem<T, TR> | NestedUpsertOpItem<T, TR>[];
 }
+
+/**
+ * `create()` data input. When the relations map `R` is known (typed clients),
+ * each relation name additionally accepts a {@link NestedCreateOp} for the
+ * relation's target entity — recursively, via the target's own relations map.
+ * When `R` is `{}` (untyped escape hatch) this collapses to plain `Partial<T>`.
+ */
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+export type CreateDataInput<T, R extends object = {}> = [keyof R] extends [never]
+  ? Partial<T>
+  : Partial<T> & {
+      [K in keyof R]?: NestedCreateOp<RelationTarget<R[K]> & object, RelationRelations<R[K]> & object>;
+    };
+
+/**
+ * `update()` data input. Like {@link CreateDataInput} but relation fields
+ * accept the full {@link NestedUpdateOp} surface (disconnect / set / delete /
+ * update / upsert in addition to the create-context ops), and scalar fields
+ * accept atomic {@link UpdateOperatorInput} objects.
+ */
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+export type UpdateDataInput<T, R extends object = {}> = [keyof R] extends [never]
+  ? UpdateInput<T>
+  : UpdateInput<T> & {
+      [K in keyof R]?: NestedUpdateOp<RelationTarget<R[K]> & object, RelationRelations<R[K]> & object>;
+    };
 
 export interface CountArgs<T> {
   where?: WhereClause<T>;

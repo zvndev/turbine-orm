@@ -1,0 +1,101 @@
+export const metadata = {
+  title: 'Observability',
+  description:
+    'Query lifecycle events with db.$on, automatic metrics aggregation with db.$observe, and the npx turbine observe dashboard.',
+  alternates: { canonical: '/observability' },
+};
+
+# Observability
+
+Three layers, each opt-in: raw query events (`$on`), aggregated metrics persisted to Postgres (`$observe`), and a local dashboard over those metrics (`npx turbine observe`). All of it ships in the box — no agent, no SaaS, no extra dependency.
+
+## Query events — `db.$on('query')`
+
+Every query emits an event after execution — success or failure. Subscribe with `$on`, unsubscribe with `$off`:
+
+```ts
+db.$on('query', (event) => {
+  if (event.duration > 200) {
+    console.warn(`slow: ${event.model}.${event.action} took ${event.duration.toFixed(1)}ms`);
+  }
+});
+```
+
+The event shape:
+
+```ts
+interface QueryEvent {
+  sql: string;        // the generated SQL text
+  params: unknown[];  // bound parameter values (redacted by default — see below)
+  duration: number;   // wall-clock ms (performance.now)
+  model: string;      // table name, e.g. 'users'
+  action: string;     // operation, e.g. 'findMany'
+  rows: number;       // rows returned / affected
+  timestamp: Date;
+  error?: Error;      // present when the query failed
+}
+```
+
+**Params are PII-safe by default.** With the default `errorMessages: 'safe'` client config, every entry in `event.params` is replaced with `'[REDACTED]'` before listeners see it — you get the SQL shape and timing without user data flowing into your logs. Set `errorMessages: 'verbose'` to receive raw values. A listener that throws never breaks the query; the error is swallowed (logged when `logging: true`).
+
+`$on` differs from [middleware](/queries#middleware): middleware wraps the call — it can observe args and transform results (it cannot change the query); `$on` is a passive tap that fires after execution with the final SQL, timing, and outcome.
+
+## Metrics — `db.$observe()`
+
+`$observe` turns the event stream into per-minute aggregates persisted to a `_turbine_metrics` table — typically in a *separate* database so metrics writes never touch your application data:
+
+```ts
+const handle = await db.$observe({
+  connectionString: process.env.TURBINE_OBSERVE_URL!, // metrics DB
+  flushIntervalMs: 60_000, // default: 60s
+  retentionDays: 30,       // default: 30
+});
+
+// on shutdown
+await handle.stop(); // final flush, then closes the metrics pool
+```
+
+What it does, exactly:
+
+- Buffers events in memory, keyed by `model:action` per minute bucket.
+- On each flush, computes **count, avg, p50, p95, p99, and error count** per key and upserts a row into `_turbine_metrics` (`ON CONFLICT` merges additively, so multiple app instances can flush into the same bucket).
+- Uses its own **1-connection pool** against the metrics database — metric writes never contend with your application pool.
+- **Fire-and-forget**: flush errors are swallowed, the flush timer is `unref()`ed so it never keeps the process alive, and a failing metrics database cannot fail a query.
+- Creates the table on init (`CREATE TABLE IF NOT EXISTS _turbine_metrics`) and prunes rows older than `retentionDays` on each flush.
+
+The table schema, if you want to query it yourself:
+
+```sql
+CREATE TABLE IF NOT EXISTS _turbine_metrics (
+  id          BIGSERIAL PRIMARY KEY,
+  bucket      TIMESTAMPTZ NOT NULL,  -- minute bucket
+  model       TEXT NOT NULL,
+  action      TEXT NOT NULL,
+  count       INTEGER NOT NULL DEFAULT 0,
+  avg_ms      REAL NOT NULL DEFAULT 0,
+  p50_ms      REAL NOT NULL DEFAULT 0,
+  p95_ms      REAL NOT NULL DEFAULT 0,
+  p99_ms      REAL NOT NULL DEFAULT 0,
+  error_count INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(bucket, model, action)
+);
+```
+
+Calling `$observe` again replaces the previous engine (the old one is stopped and unsubscribed first).
+
+## Dashboard — `npx turbine observe`
+
+A local, read-only dashboard over `_turbine_metrics` — latency over time and a per-`model.action` breakdown:
+
+```bash
+TURBINE_OBSERVE_URL=postgres://... npx turbine observe
+npx turbine observe --port 5000 --no-open
+```
+
+It binds `127.0.0.1:4984` by default and shares [Studio's security model](/studio#security-model): loopback binding with a loud warning on non-loopback hosts, a random per-process session token, and security headers on every response. It reads metrics only — it never connects to your application database.
+
+## See also
+
+- **[Studio](/studio)** — the read-only database UI with the same local security posture.
+- **[API Reference](/queries#middleware)** — middleware, the active counterpart to `$on`.
+- **[Typed Errors](/errors)** — what lands in `event.error`.
