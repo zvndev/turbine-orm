@@ -15,20 +15,20 @@
  *         different cached SQL (no cache collision).
  *
  *  2. **Integration (DATABASE_URL-gated AND extension-gated).** pgvector may not
- *     be installed; we probe `CREATE EXTENSION` in `before` and `describe.skip`
- *     the live block when unavailable, so it shows skipped (not failed).
+ *     be installed; without DATABASE_URL the tests register as skipped via
+ *     skipGate(), and `t.skip()` covers a missing extension — never failed.
  *
  * Run: npx tsx --test src/test/pgvector.test.ts
  */
 
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { describe, it } from 'node:test';
 import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
-import { makeQuery, mockTable } from './helpers.js';
+import { makeQuery, mockTable, skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Build-only (no DB) — PRIMARY gate
@@ -245,18 +245,20 @@ let HAS_VECTOR = false;
 
 // Probe the extension synchronously-ish before declaring the suite. node:test
 // evaluates the module top-to-bottom, so we resolve the probe in `before` and
-// rely on it being installed; if the probe fails we skip via describe.skip.
+// rely on it being installed; if the probe fails each test calls `t.skip()`.
 const SKIP_DB = !DATABASE_URL;
 if (SKIP_DB) {
   console.log('⚠ Skipping pgvector integration tests: DATABASE_URL not set');
 }
 
-// We cannot await before choosing describe vs describe.skip, so we always
-// declare the suite (when DATABASE_URL is set) and skip individual probes
-// inside `before`/`it` when the extension is unavailable.
-const dbDescribe = SKIP_DB ? describe.skip : describe;
+// We cannot await the probe before declaring the suite, so we always declare
+// it and skip individual probes inside `it` when the extension is unavailable.
+const dbDescribe = describe;
 
 dbDescribe('pgvector — integration', () => {
+  // Without DATABASE_URL these tests register as skipped (visible in the
+  // reporter summary) and the before/after hooks become no-ops.
+  const { it, before, after } = skipGate(SKIP_DB, 'DATABASE_URL not set');
   let client: TurbineClient | undefined;
   let schema: SchemaMetadata | undefined;
 

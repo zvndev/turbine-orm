@@ -21,11 +21,12 @@
  */
 
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { describe, it } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
 import { buildTypedSql, TypedSqlQuery } from '../typed-sql.js';
+import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Compile-time type assertions
@@ -140,9 +141,12 @@ const SKIP = !DATABASE_URL;
 if (SKIP) {
   console.log('⚠ Skipping typed-sql integration tests: DATABASE_URL not set');
 }
-const testFn = SKIP ? describe.skip : describe;
+const testFn = describe;
 
 testFn('typed-sql integration', () => {
+  // Without DATABASE_URL these tests register as skipped (visible in the
+  // reporter summary) and the before/after hooks become no-ops.
+  const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
   let client: TurbineClient;
   let schema: SchemaMetadata;
 

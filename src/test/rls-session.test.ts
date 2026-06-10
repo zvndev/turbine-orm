@@ -23,11 +23,12 @@
  */
 
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { describe, it } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
+import { skipGate } from './helpers.js';
 
 // Minimal schema with a single table so TurbineClient constructs.
 const MOCK_SCHEMA: SchemaMetadata = {
@@ -163,9 +164,12 @@ const SKIP = !DATABASE_URL;
 if (SKIP) {
   console.log('⚠ Skipping rls-session integration tests: DATABASE_URL not set');
 }
-const testFn = SKIP ? describe.skip : describe;
+const testFn = describe;
 
 testFn('rls session-context integration', () => {
+  // Without DATABASE_URL these tests register as skipped (visible in the
+  // reporter summary) and the before/after hooks become no-ops.
+  const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
   let client: TurbineClient;
   let schema: SchemaMetadata;
   // Constant identifier — baked literally into SQL strings below. Never user input.
