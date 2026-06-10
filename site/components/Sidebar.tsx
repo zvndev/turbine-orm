@@ -30,6 +30,8 @@ const sections: NavSection[] = [
       { href: '/serverless', label: 'Serverless & Edge' },
       { href: '/compatibility', label: 'Database Compatibility' },
       { href: '/cli', label: 'CLI' },
+      { href: '/studio', label: 'Studio' },
+      { href: '/observability', label: 'Observability' },
       { href: '/errors', label: 'Typed Errors' },
     ],
   },
