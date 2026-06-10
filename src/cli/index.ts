@@ -1369,13 +1369,15 @@ function showMigrateHelp(): void {
   newline();
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
+  console.log(`    ${cyan('--auto')}            Auto-generate UP/DOWN SQL from schema diff ${dim('(create only)')}`);
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
-  console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
-  console.log(`    ${cyan('--allow-drift')}      Bypass checksum validation ${dim('(migrate up only — advanced)')}`);
-  console.log(`    ${cyan('--verbose, -v')}      Show detailed output`);
+  console.log(`    ${cyan('--dry-run')}         Show SQL without executing`);
+  console.log(`    ${cyan('--allow-drift')}     Bypass checksum validation ${dim('(migrate up only — advanced)')}`);
+  console.log(`    ${cyan('--verbose, -v')}     Show detailed output`);
   newline();
   console.log(`  ${bold('Examples:')}`);
   console.log(`    ${dim('$')} npx turbine migrate create add_users_table`);
+  console.log(`    ${dim('$')} npx turbine migrate create add_email_index --auto`);
   console.log(`    ${dim('$')} npx turbine migrate up`);
   console.log(`    ${dim('$')} npx turbine migrate down --step 2`);
   console.log(`    ${dim('$')} npx turbine migrate status`);
@@ -1426,16 +1428,17 @@ function showHelp(): void {
 
   console.log(`  ${bold('Commands:')}`);
   console.log(`    ${cyan('init')}               Initialize a Turbine project`);
-  console.log(`    ${cyan('generate')} ${dim('| pull')}   Introspect database ${symbols.arrow} generate types`);
+  console.log(`    ${cyan('generate')} ${dim('| pull')}    Introspect database ${symbols.arrow} generate types`);
   console.log(`    ${cyan('push')}               Apply schema definitions to database`);
-  console.log(`    ${cyan('migrate')} ${dim('<sub>')}     SQL migration management`);
-  console.log(`      ${dim('create <name>')}     Create a new migration file`);
+  console.log(`    ${cyan('migrate')} ${dim('<sub>')}      SQL migration management`);
+  console.log(`      ${dim('create <name>')}    Create a new migration file`);
   console.log(`      ${dim('up')}               Apply pending migrations`);
   console.log(`      ${dim('down')}             Rollback last migration`);
   console.log(`      ${dim('status')}           Show applied/pending migrations`);
   console.log(`    ${cyan('seed')}               Run seed file`);
-  console.log(`    ${cyan('status')} ${dim('| info')}     Show schema summary`);
+  console.log(`    ${cyan('status')} ${dim('| info')}      Show schema summary`);
   console.log(`    ${cyan('studio')}             Launch local read-only web UI`);
+  console.log(`    ${cyan('observe')}            Launch metrics dashboard ${dim('(requires TURBINE_OBSERVE_URL)')}`);
   newline();
 
   console.log(`  ${bold('Options:')}`);
@@ -1449,6 +1452,14 @@ function showHelp(): void {
   console.log(`    ${cyan('--dry-run')}            Show SQL without executing`);
   console.log(`    ${cyan('--verbose, -v')}        Show detailed output`);
   console.log(`    ${cyan('--force, -f')}          Overwrite existing files`);
+  newline();
+
+  console.log(`  ${bold('Migrate options:')}`);
+  console.log(`    ${cyan('--auto')}               Auto-generate UP/DOWN SQL from schema diff ${dim('(create)')}`);
+  console.log(`    ${cyan('--step, -n')} ${dim('<N>')}       Number of migrations to apply/rollback`);
+  console.log(
+    `    ${cyan('--allow-drift')}        Bypass checksum validation on ${cyan('migrate up')} ${dim('(advanced)')}`,
+  );
   newline();
 
   console.log(`  ${bold('Studio options:')}`);
