@@ -27,6 +27,8 @@ const KNOWN_ERRORS = new Set([
   'DeadlockError',
   'SerializationFailureError',
   'PipelineError',
+  'OptimisticLockError',
+  'ExclusionConstraintError',
 ]);
 
 // Also allow standard Error in test files and CLI UI code

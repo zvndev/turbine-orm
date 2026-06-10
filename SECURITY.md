@@ -22,9 +22,9 @@ Turbine is pre-1.0; security fixes land on the latest minor release.
 
 | Version | Supported |
 |---------|-----------|
-| 0.17.x  | Yes       |
-| 0.16.x  | Yes       |
-| < 0.16  | No        |
+| 0.19.x  | Yes       |
+| 0.18.x  | Yes       |
+| < 0.18  | No        |
 
 ## Security Measures
 
