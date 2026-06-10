@@ -313,6 +313,33 @@ describe('where-key-order: cache fingerprint vs build/collect canonical order', 
     assert.equal(boundValue(cnt.sql, cnt.params, /"score" = \$(\d+)/), 60);
   });
 
+  it('findUnique simple path: permuted composite-key order binds each column its own value', () => {
+    const q = makeQuery('users', buildSchema());
+
+    // Warm the simple (plain-equality) path…
+    const first = q.buildFindUnique({ where: { tenantId: 1, name: 'a@x.com' } } as never);
+    assertParamsAligned(first.sql, first.params);
+
+    // …then hit it with the keys swapped.
+    const second = q.buildFindUnique({ where: { name: 'b@y.com', tenantId: 2 } } as never);
+    assert.equal(second.sql, first.sql, 'same shape must hit the same cache entry');
+    assertParamsAligned(second.sql, second.params);
+
+    assert.equal(boundValue(second.sql, second.params, /"tenant_id" = \$(\d+)/), 2, 'tenant_id must bind 2');
+    assert.equal(boundValue(second.sql, second.params, /"name" = \$(\d+)/), 'b@y.com', 'name must bind b@y.com');
+  });
+
+  it('findUnique general path (operator present): permuted key order stays aligned', () => {
+    const q = makeQuery('users', buildSchema());
+
+    q.buildFindUnique({ where: { tenantId: 7, age: { gt: 1 } } } as never);
+    const second = q.buildFindUnique({ where: { age: { gt: 100 }, tenantId: 42 } } as never);
+    assertParamsAligned(second.sql, second.params);
+
+    assert.equal(boundValue(second.sql, second.params, /"tenant_id" = \$(\d+)/), 42);
+    assert.equal(boundValue(second.sql, second.params, /"age" > \$(\d+)/), 100);
+  });
+
   it('SQL generation is deterministic regardless of literal key order (no cache involved)', () => {
     // Two fresh QueryInterfaces (separate caches) must emit identical SQL for
     // permuted literals — canonical order, not first-writer-wins.

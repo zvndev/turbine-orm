@@ -669,8 +669,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params: unknown[] = [];
 
-    // Check if all where values are simple (plain equality, no operators/null/OR)
-    const whereKeys = Object.keys(whereObj).filter((k) => whereObj[k] !== undefined);
+    // Check if all where values are simple (plain equality, no operators/null/OR).
+    // Keys are sorted to match fingerprintWhere — insertion order here would let
+    // permuted where literals share a cache entry with misaligned params.
+    const whereKeys = Object.keys(whereObj)
+      .filter((k) => whereObj[k] !== undefined)
+      .sort();
     const isSimpleWhere =
       !whereObj.OR &&
       !whereObj.AND &&
