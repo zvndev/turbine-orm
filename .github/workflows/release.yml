@@ -113,6 +113,41 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # Install the just-published version from the public registry in a clean
+      # temp project and verify the package surface (ESM import, CJS require,
+      # CLI bin, serverless subpath). Registry propagation can lag the publish,
+      # so retry the install for up to ~2 minutes before failing.
+      - name: Post-publish smoke test
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          # setup-node's .npmrc references NODE_AUTH_TOKEN; npm errors on any
+          # command if it's undefined, so keep it set for this step too.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG_VERSION=$(jq -r .version package.json)
+          SMOKE_DIR=$(mktemp -d)
+          cd "$SMOKE_DIR"
+          npm init -y > /dev/null
+          INSTALLED=0
+          for i in $(seq 1 12); do
+            if npm install "turbine-orm@$PKG_VERSION" --no-audit --no-fund; then
+              INSTALLED=1
+              break
+            fi
+            echo "turbine-orm@$PKG_VERSION not installable yet, retrying in 10s ($i/12)..."
+            sleep 10
+          done
+          if [ "$INSTALLED" != "1" ]; then
+            echo "::error::turbine-orm@$PKG_VERSION never became installable from the registry"
+            exit 1
+          fi
+          node --input-type=module -e "const m = await import('turbine-orm'); if (!m.TurbineClient) { console.error('ESM import missing TurbineClient'); process.exit(1); } console.log('ESM import OK');"
+          node -e "const m = require('turbine-orm'); if (!m.TurbineClient) { console.error('CJS require missing TurbineClient'); process.exit(1); } console.log('CJS require OK');"
+          node --input-type=module -e "const m = await import('turbine-orm/serverless'); if (typeof m.turbineHttp !== 'function') { console.error('serverless subpath missing turbineHttp'); process.exit(1); } console.log('serverless subpath OK');"
+          npx turbine --version
+          npx turbine --version | grep -F "$PKG_VERSION"
+          echo "Post-publish smoke test passed for turbine-orm@$PKG_VERSION"
+
       - name: Dry run — verify package
         if: ${{ github.event.inputs.dry_run == 'true' }}
         run: npm pack --dry-run

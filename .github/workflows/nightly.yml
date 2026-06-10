@@ -1,12 +1,17 @@
-name: Publish @next
+name: Publish @next & nightly engine tests
 
 on:
   push:
     branches: [main]
+  # Nightly run for the heavy/flaky engine-integration jobs that were parked
+  # out of per-PR CI (see yugabytedb-integration below). 09:17 UTC daily.
+  schedule:
+    - cron: '17 9 * * *'
 
-# Only one publish at a time per branch
+# Only one publish at a time per branch (scheduled runs get their own group so
+# a nightly engine test can't cancel an in-flight publish).
 concurrency:
-  group: publish-next-${{ github.ref }}
+  group: publish-next-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -17,8 +22,9 @@ permissions:
 jobs:
   publish-next:
     runs-on: ubuntu-latest
-    # Don't publish on tag pushes (release.yml handles those)
-    if: "!startsWith(github.ref, 'refs/tags/')"
+    # Only publish on branch pushes — not on the nightly schedule, and not on
+    # tag pushes (release.yml handles those).
+    if: "github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')"
     steps:
       - uses: actions/checkout@v5
 
@@ -56,3 +62,64 @@ jobs:
         run: npm publish --tag next --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Real YugabyteDB job, moved here from ci.yml. Same motivation as ci.yml's
+  # CockroachDB job: prove the yugabytedb adapter's set_config() timeout SQL is
+  # accepted by a real YSQL server rather than only by a mock, via
+  # TURBINE_TEST_ENGINE=yugabytedb. Yugabyte's container is heavy and slow to
+  # become ready in CI (the yugabyted bootstrap + YSQL init can take a couple
+  # of minutes and is occasionally flaky on shared runners) and it never
+  # initialized successfully on per-PR runs — so it now runs nightly only, and
+  # stays continue-on-error: true so a failure is surfaced but blocks nothing.
+  # YSQL is Postgres-wire-compatible on port 5433, default user `yugabyte` with
+  # no password in the single-node image.
+  yugabytedb-integration:
+    name: yugabytedb-integration
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    continue-on-error: true
+    services:
+      yugabytedb:
+        # Pinned (was :latest, which never booted on GitHub runners). This is
+        # the v2.25 preview build tag from YugabyteDB's own Docker quickstart
+        # docs. If it still fails to initialize, try a recent stable tag from
+        # https://hub.docker.com/r/yugabytedb/yugabyte/tags — the job is
+        # continue-on-error and nightly-only, so a bad tag can't block PRs.
+        image: yugabytedb/yugabyte:2.25.0.0-b489
+        # `bin/yugabyted start --background=false` runs the all-in-one node in
+        # the foreground. YSQL is exposed on 5433.
+        command: bin/yugabyted start --background=false
+        options: >-
+          --health-cmd "postgres/bin/pg_isready -h 127.0.0.1 -p 5433 -U yugabyte"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+        ports:
+          - 5433:5433
+          - 15433:15433
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Wait for YSQL + create database
+        run: |
+          for i in $(seq 1 40); do
+            if node -e "const pg=require('pg');const c=new pg.Client({connectionString:process.env.ROOT_URL});c.connect().then(()=>c.query('SELECT 1')).then(()=>c.end()).then(()=>process.exit(0)).catch(()=>process.exit(1))"; then
+              echo "YSQL is accepting connections"
+              break
+            fi
+            echo "Waiting for YSQL... ($i)"
+            sleep 5
+          done
+          node -e "const pg=require('pg');const c=new pg.Client({connectionString:process.env.ROOT_URL});c.connect().then(()=>c.query('CREATE DATABASE turbine_test').catch(e=>{if(!/already exists/i.test(String(e.message)))throw e;})).then(()=>c.end()).then(()=>process.exit(0)).catch(e=>{console.error(e);process.exit(1)})"
+        env:
+          ROOT_URL: postgres://yugabyte@localhost:5433/yugabyte?sslmode=disable
+      - name: Run engine-aware studio-timeout integration test against YugabyteDB
+        run: npx tsx --test src/test/studio-timeout-integration.test.ts
+        env:
+          DATABASE_URL: postgres://yugabyte@localhost:5433/turbine_test?sslmode=disable
+          TURBINE_TEST_ENGINE: yugabytedb
