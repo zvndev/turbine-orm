@@ -16,9 +16,10 @@
  */
 
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { describe, it } from 'node:test';
 import { defineSchema } from '../schema-builder.js';
 import { schemaDiff, schemaToSQL, schemaToSQLString } from '../schema-sql.js';
+import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Unit tests: schemaToSQL patterns for CREATE TABLE (UP) and DROP TABLE (DOWN)
@@ -279,9 +280,12 @@ describe('schemaDiff patterns — add/remove FK indexes', () => {
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
-const integrationDescribe = DATABASE_URL ? describe : describe.skip;
+const integrationDescribe = describe;
 
 integrationDescribe('schemaDiff() integration — live database', () => {
+  // Without DATABASE_URL these tests register as skipped (visible in the
+  // reporter summary) and the before/after hooks become no-ops.
+  const { it, before, after } = skipGate(!DATABASE_URL, 'DATABASE_URL not set');
   let testSchema: string;
 
   before(async () => {

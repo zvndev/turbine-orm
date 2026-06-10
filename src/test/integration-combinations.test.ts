@@ -13,15 +13,16 @@
  *
  *   DATABASE_URL=postgres://... npx tsx --test src/test/integration-combinations.test.ts
  *
- * The whole suite is gated by DATABASE_URL — when it's absent the file shows
- * up as `skip`, never `fail`, so unit-only test runs stay green.
+ * The whole suite is gated by DATABASE_URL — when it's absent every test is
+ * reported as skipped, never failed, so unit-only test runs stay green.
  */
 
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { describe } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
+import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Setup — same gating pattern as turbine.test.ts / comprehensive.test.ts
@@ -36,7 +37,10 @@ if (SKIP) {
 let db: TurbineClient;
 let schema: SchemaMetadata;
 
-const testFn = SKIP ? describe.skip : describe;
+// Without DATABASE_URL every test below registers as skipped (visible in
+// the reporter summary) and the before/after hooks become no-ops.
+const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
+const testFn = describe;
 
 // Local cast helper — keeps type assertions short and readable
 const row = (r: unknown): Record<string, unknown> => r as Record<string, unknown>;
