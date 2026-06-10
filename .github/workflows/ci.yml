@@ -178,63 +178,11 @@ jobs:
           DATABASE_URL: postgres://root@localhost:26257/turbine_test?sslmode=disable
           TURBINE_TEST_ENGINE: cockroachdb
 
-  # Real YugabyteDB job. Same motivation as the CockroachDB job: prove the
-  # yugabytedb adapter's set_config() timeout SQL is accepted by a real YSQL
-  # server rather than only by a mock, via TURBINE_TEST_ENGINE=yugabytedb.
-  # Yugabyte's container is heavy and slow to become ready in CI (the yugabyted
-  # bootstrap + YSQL init can take a couple of minutes and is occasionally flaky
-  # on shared runners), so this job is continue-on-error: true — a failure here
-  # is surfaced but does NOT block the PR. (The CockroachDB job is likewise
-  # continue-on-error until its container topology is proven green in CI.) YSQL
-  # is Postgres-wire-compatible on port 5433, default user `yugabyte` with no
-  # password in the single-node image.
-  yugabytedb-integration:
-    name: yugabytedb-integration
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    services:
-      yugabytedb:
-        # NOTE: left on :latest deliberately — pin to a specific known-good
-        # YugabyteDB tag once one is verified to pull + boot on GitHub runners.
-        # The job is continue-on-error, so :latest drift can't break PRs here.
-        image: yugabytedb/yugabyte:latest
-        # `bin/yugabyted start --background=false` runs the all-in-one node in
-        # the foreground. YSQL is exposed on 5433.
-        command: bin/yugabyted start --background=false
-        options: >-
-          --health-cmd "postgres/bin/pg_isready -h 127.0.0.1 -p 5433 -U yugabyte"
-          --health-interval 15s
-          --health-timeout 10s
-          --health-retries 20
-          --health-start-period 60s
-        ports:
-          - 5433:5433
-          - 15433:15433
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Wait for YSQL + create database
-        run: |
-          for i in $(seq 1 40); do
-            if node -e "const pg=require('pg');const c=new pg.Client({connectionString:process.env.ROOT_URL});c.connect().then(()=>c.query('SELECT 1')).then(()=>c.end()).then(()=>process.exit(0)).catch(()=>process.exit(1))"; then
-              echo "YSQL is accepting connections"
-              break
-            fi
-            echo "Waiting for YSQL... ($i)"
-            sleep 5
-          done
-          node -e "const pg=require('pg');const c=new pg.Client({connectionString:process.env.ROOT_URL});c.connect().then(()=>c.query('CREATE DATABASE turbine_test').catch(e=>{if(!/already exists/i.test(String(e.message)))throw e;})).then(()=>c.end()).then(()=>process.exit(0)).catch(e=>{console.error(e);process.exit(1)})"
-        env:
-          ROOT_URL: postgres://yugabyte@localhost:5433/yugabyte?sslmode=disable
-      - name: Run engine-aware studio-timeout integration test against YugabyteDB
-        run: npx tsx --test src/test/studio-timeout-integration.test.ts
-        env:
-          DATABASE_URL: postgres://yugabyte@localhost:5433/turbine_test?sslmode=disable
-          TURBINE_TEST_ENGINE: yugabytedb
+  # NOTE: the YugabyteDB integration job used to live here, but its container
+  # never initialized successfully on GitHub runners and burned ~6 minutes of
+  # guaranteed red X on every PR/push. It now runs on a nightly schedule in
+  # nightly.yml (job: yugabytedb-integration) — same test, same
+  # continue-on-error — so per-PR CI stays green and fast.
 
   build:
     runs-on: ubuntu-latest
@@ -259,9 +207,13 @@ jobs:
       - name: Check bundle sizes
         run: npx size-limit
 
-  security:
+  # Installs the real npm tarball (npm pack) into a clean temp project and
+  # verifies the published package surface end-to-end: ESM import, CJS require,
+  # the `turbine` CLI bin, and the /serverless subpath export. Catches
+  # packaging regressions (missing dist files, broken exports map, bad bin
+  # path) that `npm run build` alone can't.
+  pack-smoke:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -269,7 +221,55 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm audit --audit-level=high
+      - run: npm run build
+      - name: Pack tarball
+        run: |
+          TARBALL=$(npm pack --silent | tail -1)
+          echo "TARBALL=$GITHUB_WORKSPACE/$TARBALL" >> "$GITHUB_ENV"
+          echo "EXPECTED_VERSION=$(jq -r .version package.json)" >> "$GITHUB_ENV"
+      - name: Install tarball in temp project
+        run: |
+          SMOKE_DIR=$(mktemp -d)
+          echo "SMOKE_DIR=$SMOKE_DIR" >> "$GITHUB_ENV"
+          cd "$SMOKE_DIR"
+          npm init -y > /dev/null
+          npm install "$TARBALL" --no-audit --no-fund
+      - name: Verify ESM import
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm'); if (!m.TurbineClient) { console.error('ESM import missing TurbineClient'); process.exit(1); } console.log('ESM import OK');"
+      - name: Verify CJS require
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node -e "const m = require('turbine-orm'); if (!m.TurbineClient) { console.error('CJS require missing TurbineClient'); process.exit(1); } console.log('CJS require OK');"
+      - name: Verify CLI bin prints version
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          npx turbine --version
+          npx turbine --version | grep -F "$EXPECTED_VERSION"
+      - name: Verify serverless subpath import
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/serverless'); if (typeof m.turbineHttp !== 'function') { console.error('serverless subpath missing turbineHttp'); process.exit(1); } console.log('serverless subpath OK');"
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Hard gate: any HIGH or CRITICAL vulnerability in the PRODUCTION
+      # dependency tree fails CI. (The prod tree is just `pg` + `@types/pg`,
+      # currently 0 vulns, so this passes — and stays meaningful.)
+      - name: Audit production dependencies (blocking)
+        run: npm audit --omit=dev --audit-level=high
+      # Full-tree audit (dev deps included) for visibility only — never blocks.
+      - name: Audit full tree including dev deps (non-blocking)
+        run: npm audit --audit-level=high
+        continue-on-error: true
 
   error-codes:
     runs-on: ubuntu-latest
