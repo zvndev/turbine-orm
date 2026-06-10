@@ -548,12 +548,14 @@ export class TurbineClient {
   // -------------------------------------------------------------------------
 
   /**
-   * Register a middleware function that runs before/after every query.
+   * Register a middleware function that runs around every query.
    *
-   * Middleware can inspect and log query parameters, modify results after execution,
-   * and measure timing. Note: query SQL is generated before middleware runs, so
-   * modifying params.args in middleware will NOT affect the executed SQL.
-   * To intercept queries before SQL generation, use the raw() method instead.
+   * Middleware can inspect and log query parameters, measure timing, and
+   * transform the result returned by `next()`. Note: query SQL is generated
+   * BEFORE middleware runs — `params.args` is a read-only snapshot, and
+   * mutating it does NOT change the executed SQL. Cross-cutting filters
+   * (e.g. soft deletes) belong in the query itself: pass an explicit
+   * `where: { deletedAt: null }` or wrap the table accessor in a small helper.
    *
    * @example
    * ```ts
@@ -565,16 +567,13 @@ export class TurbineClient {
    *   return result;
    * });
    *
-   * // Soft-delete middleware
+   * // Result transformation middleware — redact a field on the way out
    * db.$use(async (params, next) => {
-   *   if (params.action === 'findMany' || params.action === 'findUnique') {
-   *     params.args.where = { ...params.args.where, deletedAt: null };
+   *   const result = await next(params);
+   *   if (params.model === 'users' && Array.isArray(result)) {
+   *     for (const row of result as { email?: string }[]) row.email = '[redacted]';
    *   }
-   *   if (params.action === 'delete') {
-   *     params.action = 'update';
-   *     params.args = { where: params.args.where, data: { deletedAt: new Date() } };
-   *   }
-   *   return next(params);
+   *   return result;
    * });
    * ```
    */
