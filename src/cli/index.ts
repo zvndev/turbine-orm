@@ -1462,8 +1462,10 @@ function showHelp(): void {
   );
   newline();
 
-  console.log(`  ${bold('Studio options:')}`);
-  console.log(`    ${cyan('--port')} ${dim('<n>')}           HTTP port ${dim('(default: 4983)')}`);
+  console.log(`  ${bold('Studio / observe options:')}`);
+  console.log(
+    `    ${cyan('--port')} ${dim('<n>')}           HTTP port ${dim('(default: 4983 studio, 4984 observe)')}`,
+  );
   console.log(`    ${cyan('--host')} ${dim('<addr>')}        Bind address ${dim('(default: 127.0.0.1)')}`);
   console.log(`    ${cyan('--no-open')}            Don't auto-open the browser`);
   newline();
