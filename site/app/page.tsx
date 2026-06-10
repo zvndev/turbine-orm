@@ -6,7 +6,7 @@ import { CopyButton } from '../components/CopyButton';
 export const metadata: Metadata = {
   title: 'Turbine ORM — The Postgres-maximalist ORM. Vectors, RLS, realtime, typed.',
   description:
-    'Everything Postgres can do — pgvector search, RLS sessions, LISTEN/NOTIFY, full-text — as typed, first-class API. One dependency (pg), ~27 KB, no WASM engine, no paid tier, and the only read-only hardened Studio.',
+    'Everything Postgres can do — pgvector search, RLS sessions, LISTEN/NOTIFY, full-text — as typed, first-class API. One dependency (pg), ~31 KB, no WASM engine, no paid tier, and the only read-only hardened Studio.',
 };
 
 const heroCode = `const docs = await db.documents.findMany({
@@ -44,7 +44,7 @@ const features = [
   {
     title: 'One dependency. No WASM engine.',
     description:
-      'Turbine ships pg and nothing else. No WASM engine (Prisma: 1.6 MB), no adapter chain, no lockstep package upgrades. The main entry bundles to ~27 KB brotli, ~19 KB on the edge.',
+      'Turbine ships pg and nothing else. No WASM engine (Prisma: 1.6 MB), no adapter chain, no lockstep package upgrades. The main entry bundles to ~31 KB brotli, ~22 KB on the edge.',
     stat: '1',
     statLabel: 'runtime dep',
   },
@@ -184,7 +184,7 @@ export default async function Home() {
             treats it as the platform: pgvector similarity search, Row-Level
             Security session context, LISTEN/NOTIFY, full-text search, and
             atomic updates — all typed, first-class API, no raw-SQL detours.
-            One runtime dependency (pg), ~27 KB brotli, no WASM engine, no
+            One runtime dependency (pg), ~31 KB brotli, no WASM engine, no
             paid tier. And the only read-only hardened Studio: every query
             inside BEGIN READ ONLY, with no raw-SQL surface at all.
           </p>
