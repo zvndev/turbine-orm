@@ -31,7 +31,7 @@ src/
     utils.ts        — Pure utility functions (~130 LOC): quoteIdent(), escapeLike(),
                       LRUCache (1K entry cap), fnv1a64Hex(), sqlToPreparedName(),
                       OPERATOR_KEYS constant.
-    builder.ts      — QueryInterface class (~3.1K LOC): SQL generation for all operations
+    builder.ts      — QueryInterface class (~4.4K LOC): SQL generation for all operations
                       (findMany, findUnique, create, update, delete, aggregate, count,
                       groupBy + HAVING). Builds WHERE clauses, json_agg nested relation
                       subqueries (hasMany/belongsTo/hasOne + manyToMany through junction

@@ -18,8 +18,8 @@ name: Release
 #
 # Note: integration tests are intentionally NOT run here. They require a
 # seeded Postgres database and are covered separately by ci.yml on push.
-# The unit tests gate alone is 308 tests covering all SQL generation,
-# schema/migration logic, error handling, and the edge-driver adapter.
+# The unit test gate alone covers all SQL generation, schema/migration
+# logic, error handling, and the edge-driver adapter.
 
 on:
   push:
