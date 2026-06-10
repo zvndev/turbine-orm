@@ -176,13 +176,11 @@ void updateOps;
 // ---------------------------------------------------------------------------
 
 type UserUpdateData = UpdateDataInput<User, UserRelations>;
-declare const updateData: UserUpdateData;
 // Scalar field accepts plain value or atomic operator object:
 const _email: UserUpdateData['email'] = 'plain';
 const _id: UserUpdateData['id'] = { increment: 1 };
 void _email;
 void _id;
-void updateData;
 
 // ---------------------------------------------------------------------------
 // node:test stub so the runner picks up the file
