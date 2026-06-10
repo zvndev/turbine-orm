@@ -44,7 +44,10 @@ describe('strict operator validation', () => {
       );
     });
 
-    it('throws when `equals` (JSON) is used on a non-JSON column', () => {
+    it('throws when `equals` is given a plain-object value on a non-JSON column', () => {
+      // `equals` is a plain equality operator on non-JSON columns since the
+      // README documented it that way; an OBJECT value there is still always a
+      // mistake (object equality only makes sense on json/jsonb columns).
       const q = makeQuery('posts', buildSchema());
       assert.throws(
         () => q.buildFindMany({ where: { title: { equals: { foo: 1 } } as never } }),
@@ -55,6 +58,13 @@ describe('strict operator validation', () => {
           return true;
         },
       );
+    });
+
+    it('allows `equals` with a scalar value on a non-JSON column (plain equality)', () => {
+      const q = makeQuery('posts', buildSchema());
+      const deferred = q.buildFindMany({ where: { title: { equals: 'hello' } } });
+      assert.match(deferred.sql, /"title" = \$1/);
+      assert.deepEqual(deferred.params, ['hello']);
     });
 
     it('throws when `hasKey` is used on a non-JSON column', () => {

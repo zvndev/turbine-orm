@@ -118,6 +118,7 @@ export function sqlToPreparedName(sql: string): string {
 
 /** Known operator keys — used to detect operator objects vs plain values */
 export const OPERATOR_KEYS = new Set<string>([
+  'equals',
   'gt',
   'gte',
   'lt',
