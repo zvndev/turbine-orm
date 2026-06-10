@@ -17,6 +17,8 @@ const ROUTES = [
   '/serverless',
   '/compatibility',
   '/cli',
+  '/studio',
+  '/observability',
   '/errors',
   '/benchmarks',
 ] as const;
