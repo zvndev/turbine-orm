@@ -420,9 +420,12 @@ describe('stress: large WHERE clause', () => {
     assert.ok(deferred.sql.includes('$1'), 'should include $1 placeholder');
     assert.ok(deferred.sql.includes('$60'), 'should include $60 placeholder');
 
-    // Verify values are correct
+    // Verify values are correct — keys bind in canonical (sorted) order,
+    // matching the cache fingerprint, so derive the expected value per slot.
+    const sortedFields = Object.keys(where).sort();
     for (let i = 0; i < 120; i++) {
-      assert.equal(deferred.params[i], (i + 1) * 10, `param ${i} should be ${(i + 1) * 10}`);
+      const expected = Number(sortedFields[i]!.slice(3)) * 10;
+      assert.equal(deferred.params[i], expected, `param ${i} should be ${expected}`);
     }
   });
 

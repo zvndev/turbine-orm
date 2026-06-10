@@ -76,9 +76,10 @@ describe('cursor pagination: SQL build (no DB)', () => {
       cursor: { id: 10, createdAt: '2026-01-01' },
       orderBy: { id: 'asc', createdAt: 'desc' },
     });
-    assert.match(deferred.sql, /"posts"\."id" > \$1/);
-    assert.match(deferred.sql, /"posts"\."created_at" < \$2/);
-    assert.deepEqual(deferred.params, [10, '2026-01-01']);
+    // Cursor keys bind in canonical (sorted) order, matching the cache fingerprint.
+    assert.match(deferred.sql, /"posts"\."created_at" < \$1/);
+    assert.match(deferred.sql, /"posts"\."id" > \$2/);
+    assert.deepEqual(deferred.params, ['2026-01-01', 10]);
   });
 
   // 5. take maps to LIMIT

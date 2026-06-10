@@ -268,9 +268,10 @@ describe('nested relation where supports the full scalar surface (H3)', () => {
       },
     } as never);
     assertParamsAligned(sql, params);
-    assert.match(sql, /\(\(t0\."title" LIKE \$1 ESCAPE '\\'\) OR \(t0\."view_count" > \$2\)\)/);
-    assert.match(sql, /NOT \(t0\."title" = \$3\)/);
-    assert.deepEqual(params, ['a%', 5, 'spam']);
+    // Combinator keys bind in canonical (sorted) order: 'NOT' sorts before 'OR'.
+    assert.match(sql, /NOT \(t0\."title" = \$1\)/);
+    assert.match(sql, /\(\(t0\."title" LIKE \$2 ESCAPE '\\'\) OR \(t0\."view_count" > \$3\)\)/);
+    assert.deepEqual(params, ['spam', 'a%', 5]);
   });
 
   it('supports null (IS NULL) inside a relation where', () => {
