@@ -97,6 +97,40 @@ function isUnmatchedPlainObject(value: unknown): boolean {
   return proto === Object.prototype || proto === null;
 }
 
+/**
+ * Fingerprint the SHAPE of a where-operator object. Null-valued `equals` /
+ * `not` compile to parameterless `IS NULL` / `IS NOT NULL` (different SQL, no
+ * param pushed), so null-ness is part of the shape — without it a cache entry
+ * warmed by `{ not: 5 }` would serve `{ not: null }` with a desynced param list.
+ */
+function fingerprintOperatorShape(value: WhereOperator): string {
+  const obj = value as Record<string, unknown>;
+  const opKeys = Object.keys(obj)
+    .filter((k) => k !== 'mode')
+    .map((k) => ((k === 'equals' || k === 'not') && obj[k] === null ? `${k}:null` : k))
+    .sort();
+  const modeStr = value.mode === 'insensitive' ? ':i' : '';
+  return `op(${opKeys.join(',')}${modeStr})`;
+}
+
+/**
+ * Guard for the value of an `equals` operator reaching the plain-equality
+ * operator path. A plain object literal can only legitimately be an equality
+ * value on a json/jsonb column — and those route to the JSONB filter branch
+ * BEFORE the operator branch, so any plain object that reaches here is a
+ * mistake (e.g. `{ equals: { foo: 1 } }` on a text column). Shared by the
+ * SQL-build path and the cache-hit param-collect path so a warmed cache can
+ * never skip the check.
+ */
+function assertBindableEqualsOperand(value: unknown, column: string): void {
+  if (!isUnmatchedPlainObject(value)) return;
+  throw new ValidationError(
+    `[turbine] Plain-object value for operator 'equals' on ${column}: ` +
+      `objects are only valid 'equals' values on JSON (json/jsonb) columns, ` +
+      `where 'equals' is the JSONB containment filter.`,
+  );
+}
+
 /** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
 const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
 
@@ -108,9 +142,11 @@ const JSONB_OPERATOR_KEYS = new Set<string>(['path', 'equals', 'contains', 'hasK
  * appear in any other where-filter shape, so the presence of one of these is
  * an unambiguous signal that the user meant a JSON filter. Used by the
  * strict-validation path so that `{ contains: 'foo' }` (which is also a valid
- * `WhereOperator` for LIKE) is not misclassified.
+ * `WhereOperator` for LIKE) is not misclassified. Note `equals` is NOT in this
+ * set: on non-JSON columns it is a plain equality operator (`WhereOperator`),
+ * so it must fall through instead of throwing.
  */
-const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'equals', 'hasKey']);
+const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'hasKey']);
 
 /** Check if a value is a JSONB filter object */
 function isJsonFilter(value: unknown): value is JsonFilter {
@@ -1172,7 +1208,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // create
   // -------------------------------------------------------------------------
 
-  async create(args: CreateArgs<T>): Promise<T> {
+  async create(args: CreateArgs<T, R>): Promise<T> {
     return this.executeWithMiddleware('create', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
         return this.nestedCreate(args);
@@ -1270,7 +1306,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // update
   // -------------------------------------------------------------------------
 
-  async update(args: UpdateArgs<T>): Promise<T> {
+  async update(args: UpdateArgs<T, R>): Promise<T> {
     return this.executeWithMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
         return this.nestedUpdate(args);
@@ -1366,7 +1402,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // Nested write helpers (shared by create + update)
   // -------------------------------------------------------------------------
 
-  private async nestedCreate(args: CreateArgs<T>): Promise<T> {
+  private async nestedCreate(args: CreateArgs<T, R>): Promise<T> {
     const data = args.data as Record<string, unknown>;
 
     if (this.txScoped) {
@@ -1380,7 +1416,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     });
   }
 
-  private async nestedUpdate(args: UpdateArgs<T>): Promise<T> {
+  private async nestedUpdate(args: UpdateArgs<T, R>): Promise<T> {
     const data = args.data as Record<string, unknown>;
     const where = args.where as Record<string, unknown>;
 
@@ -2355,12 +2391,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // Operator objects
       if (isWhereOperator(value)) {
-        const opKeys = Object.keys(value as object)
-          .filter((k) => k !== 'mode')
-          .sort();
-        const mode = (value as WhereOperator).mode;
-        const modeStr = mode === 'insensitive' ? ':i' : '';
-        parts.push(`${key}:op(${opKeys.join(',')}${modeStr})`);
+        parts.push(`${key}:${fingerprintOperatorShape(value)}`);
         continue;
       }
 
@@ -2441,12 +2472,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (value === null) {
         parts.push(`${key}:null`);
       } else if (isWhereOperator(value)) {
-        const opKeys = Object.keys(value as object)
-          .filter((k) => k !== 'mode')
-          .sort();
-        const mode = (value as WhereOperator).mode;
-        const modeStr = mode === 'insensitive' ? ':i' : '';
-        parts.push(`${key}:op(${opKeys.join(',')}${modeStr})`);
+        parts.push(`${key}:${fingerprintOperatorShape(value)}`);
       } else if (isUnmatchedPlainObject(value)) {
         parts.push(
           `${key}:obj(${Object.keys(value as object)
@@ -2594,6 +2620,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /** Collect params from operator clauses. Mirrors buildOperatorClauses. */
   private collectOperatorParams(op: WhereOperator, params: unknown[]): void {
+    if (op.equals !== undefined && op.equals !== null) {
+      assertBindableEqualsOperand(op.equals, 'column');
+      params.push(op.equals);
+    }
     if (op.gt !== undefined) params.push(op.gt);
     if (op.gte !== undefined) params.push(op.gte);
     if (op.lt !== undefined) params.push(op.lt);
@@ -3338,11 +3368,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
       if (isWhereOperator(value)) {
-        const opKeys = Object.keys(value as object)
-          .filter((k) => k !== 'mode')
-          .sort();
-        const mode = (value as WhereOperator).mode;
-        parts.push(`${key}:op(${opKeys.join(',')}${mode === 'insensitive' ? ':i' : ''})`);
+        parts.push(`${key}:${fingerprintOperatorShape(value)}`);
         continue;
       }
       if (isUnmatchedPlainObject(value)) {
@@ -3366,6 +3392,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private buildOperatorClauses(column: string, op: WhereOperator, params: unknown[]): string[] {
     const clauses: string[] = [];
 
+    if (op.equals !== undefined) {
+      if (op.equals === null) {
+        clauses.push(`${column} IS NULL`);
+      } else {
+        assertBindableEqualsOperand(op.equals, column);
+        params.push(op.equals);
+        clauses.push(`${column} = ${this.p(params.length)}`);
+      }
+    }
     if (op.gt !== undefined) {
       params.push(op.gt);
       clauses.push(`${column} > ${this.p(params.length)}`);
