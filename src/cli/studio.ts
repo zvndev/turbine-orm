@@ -2,15 +2,20 @@
  * turbine-orm CLI — Studio
  *
  * A local, read-only web UI for browsing databases, exploring relations,
- * and running SELECT queries. Pure Node (built-in `http` module), no
- * runtime dependencies beyond `pg`, bound to 127.0.0.1 only.
+ * and composing queries visually. ORM-native since v0.19: there is no
+ * raw-SQL input surface — the Query tab builds `findMany` args that are
+ * validated against introspected metadata and compiled by QueryInterface
+ * (`/api/builder`). Pure Node (built-in `http` module), no runtime
+ * dependencies beyond `pg`, bound to 127.0.0.1 only.
  *
  * Security model:
  *   • Bind 127.0.0.1 only (never 0.0.0.0 — no LAN exposure)
  *   • Random auth token generated per process, required in Cookie header
- *   • SELECT/WITH-only guard on the query endpoint
+ *   • No SQL input surface at all — every identifier in a builder request is
+ *     validated against the introspected schema; all values are $N params
  *   • Every query runs in a READ ONLY transaction (belt-and-suspenders)
- *   • 30s statement timeout
+ *   • 30s statement timeout via parameterized set_config()
+ *   • Per-session rate limiting, CSP + security headers, cross-origin refusal
  *
  * Not implemented (deliberately): row editing, DDL, destructive operations.
  * Studio is for inspection. Use the CLI, migrate, or raw SQL for writes.
@@ -513,6 +518,11 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
   try {
     await client.query('BEGIN READ ONLY');
     await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
+    // QueryInterface emits unqualified table identifiers, which resolve via
+    // the connection's search_path. Pin it to the configured --schema so the
+    // Query tab reads the same schema as the Data tab (set_config is
+    // transaction-local and fully parameterized).
+    await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
     const started = Date.now();
     const result = await client.query(deferred.sql, deferred.params);
     const elapsedMs = Date.now() - started;
@@ -560,6 +570,9 @@ function savedQueriesPath(ctx: StudioContext): string {
   return pathResolve(ctx.stateDir, 'studio-queries.json');
 }
 
+/** One-shot flag so the legacy saved-query notice isn't logged on every request. */
+let legacyDropNoticeShown = false;
+
 function loadSavedQueries(ctx: StudioContext): SavedQueriesFile {
   const file = savedQueriesPath(ctx);
   if (!existsSync(file)) return { version: 1, queries: [] };
@@ -567,8 +580,18 @@ function loadSavedQueries(ctx: StudioContext): SavedQueriesFile {
     const raw = readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw) as SavedQueriesFile;
     if (!parsed.queries || !Array.isArray(parsed.queries)) return { version: 1, queries: [] };
-    // Drop any legacy raw-SQL entries — Studio is builder-only now.
+    // Drop any legacy raw-SQL entries — Studio is builder-only now. Tell the
+    // user instead of silently discarding their saved work (the file on disk
+    // is only rewritten when a new query is saved, so this is recoverable).
     const queries = parsed.queries.filter((q) => q && q.kind === 'builder');
+    const dropped = parsed.queries.length - queries.length;
+    if (dropped > 0 && !legacyDropNoticeShown) {
+      legacyDropNoticeShown = true;
+      console.warn(
+        `[turbine studio] Ignoring ${dropped} legacy raw-SQL saved quer${dropped === 1 ? 'y' : 'ies'} in ${file} — ` +
+          'Studio is builder-only since v0.19. The entries remain in the file until a new query is saved.',
+      );
+    }
     return { version: 1, queries };
   } catch {
     return { version: 1, queries: [] };

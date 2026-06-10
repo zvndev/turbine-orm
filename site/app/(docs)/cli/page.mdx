@@ -181,7 +181,7 @@ Studio ships three tabs:
 - **Data** — browse rows, sort columns, open JSON/JSONB cells in a modal, and full-text search across every text column.
 - **Schema** — inspect tables, columns, indexes, and relations.
 
-Everything still executes inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`, so writes are impossible at the transaction level.
+Everything still executes inside `BEGIN READ ONLY` with a 30s transaction-local statement timeout (parameterized `set_config`), so writes are impossible at the transaction level.
 
 **Saved queries** persist to `.turbine/studio-queries.json` and surface in the sidebar and the **Cmd+K command palette**, which also jumps to any table or tab in a single keystroke.
 
@@ -189,9 +189,9 @@ Everything still executes inside `BEGIN READ ONLY` + `SET LOCAL statement_timeou
 
 - Loopback by default (`127.0.0.1`), with a loud warning on non-loopback binds.
 - Per-process 24-byte random hex auth token, stored in a `SameSite=Strict` `HttpOnly` cookie.
-- Every query runs inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`.
-- SELECT/WITH-only SQL parser strips comments and rejects non-trailing semicolons — blocks statement-stacking.
-- Security headers on every response (`X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`).
+- Every query runs inside `BEGIN READ ONLY` with a 30s transaction-local statement timeout (parameterized `set_config`).
+- No SQL input surface at all — builder requests are validated identifier-by-identifier against the introspected schema, and every value is bound as a `$N` parameter.
+- Security headers on every response (CSP, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`), per-session rate limiting, cross-origin refusal.
 
 ## Config resolution
 

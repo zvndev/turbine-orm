@@ -25,6 +25,7 @@ export type {
   FindManyStreamArgs,
   FindUniqueArgs,
   GroupByArgs,
+  HavingClause,
   JsonFilter,
   NestedCreateOp,
   NestedUpdateOp,

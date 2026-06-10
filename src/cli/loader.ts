@@ -8,9 +8,18 @@
  *
  * Strategy:
  *   1. If the file we're about to import ends in `.ts` / `.mts` / `.cts`,
- *      probe whether `tsx/esm` is resolvable from the user's CWD.
- *   2. If yes, call `module.register('tsx/esm', ...)` ONCE per process.
- *   3. If no, surface an actionable error telling the user to install `tsx`.
+ *      probe whether `tsx` is resolvable from the user's CWD.
+ *   2. Prefer tsx's supported programmatic API, `tsx/esm/api`'s `register()`.
+ *      Calling Node's `module.register('tsx/esm', ...)` directly throws
+ *      "tsx must be loaded with --import instead of --loader" on every Node
+ *      version that has `module.register()` (>= 20.6) — tsx's hook file
+ *      guards against being loaded that way. The `tsx/esm/api` entry point
+ *      is the documented path and works everywhere `module.register()` does.
+ *   3. Fall back to `module.register('tsx/esm', ...)` only for very old tsx
+ *      versions (< 4.0) that predate `tsx/esm/api`.
+ *   4. If tsx isn't installed, or registration genuinely fails, surface an
+ *      actionable error — including the REAL underlying error message, never
+ *      a misdiagnosed "tsx is not installed".
  *
  * `tsx` is intentionally NOT a runtime dependency — many projects already
  * have it, and adding a heavy dev tool to a 1-dependency ORM would be silly.
@@ -51,9 +60,18 @@ export function canResolveTsx(resolver?: (id: string) => string): boolean {
   }
 }
 
-export type TsLoaderStatus = 'registered' | 'already' | 'unsupported' | 'missing';
+export type TsLoaderStatus = 'registered' | 'already' | 'unsupported' | 'missing' | 'failed';
 
 let tsLoaderState: TsLoaderStatus | null = null;
+let tsLoaderError: string | null = null;
+
+/**
+ * The underlying error message from the last failed registration attempt,
+ * or null. Lets the CLI report the REAL cause instead of guessing.
+ */
+export function getTsLoaderError(): string | null {
+  return tsLoaderError;
+}
 
 /**
  * Register the tsx ESM loader so subsequent dynamic imports of `.ts` files
@@ -62,17 +80,54 @@ let tsLoaderState: TsLoaderStatus | null = null;
  * Returns:
  *   - 'registered'  loader was successfully registered this call
  *   - 'already'     a loader was previously registered (idempotent)
- *   - 'unsupported' Node lacks `module.register()` (Node < 20.6)
+ *   - 'unsupported' Node lacks `module.register()` (Node < 20.6) and tsx has
+ *                   no programmatic API to fall back to
  *   - 'missing'     `tsx` is not installed in the user's project
+ *   - 'failed'      tsx IS installed but registration threw — see
+ *                   {@link getTsLoaderError} for the underlying message
  */
 export async function registerTsLoader(): Promise<TsLoaderStatus> {
   if (tsLoaderState === 'registered' || tsLoaderState === 'already') {
     return 'already';
   }
+
+  const userRequire = createRequire(`${process.cwd()}/`);
+
+  // Preferred: tsx's supported programmatic API (tsx >= 4.0).
+  let apiPath: string | null = null;
+  try {
+    apiPath = userRequire.resolve('tsx/esm/api');
+  } catch {
+    apiPath = null;
+  }
+
+  if (apiPath) {
+    try {
+      const api = (await import(pathToFileURL(apiPath).href)) as { register?: () => unknown };
+      if (typeof api.register !== 'function') {
+        throw new Error(`tsx/esm/api resolved at ${apiPath} but exports no register() function`);
+      }
+      api.register();
+      tsLoaderState = 'registered';
+      tsLoaderError = null;
+      return 'registered';
+    } catch (err) {
+      tsLoaderState = 'failed';
+      tsLoaderError = err instanceof Error ? err.message : String(err);
+      return 'failed';
+    }
+  }
+
+  // tsx/esm/api not resolvable — is tsx installed at all?
   if (!canResolveTsx()) {
     tsLoaderState = 'missing';
     return 'missing';
   }
+
+  // Legacy fallback for tsx < 4.0 (no tsx/esm/api): Node's module.register.
+  // On tsx >= 4.19 this path throws ("tsx must be loaded with --import
+  // instead of --loader") — but those versions all ship tsx/esm/api, so we
+  // only land here for genuinely old installs.
   try {
     const mod = await import('node:module');
     const register = (mod as { register?: (specifier: string, parentURL: URL) => void }).register;
@@ -82,14 +137,17 @@ export async function registerTsLoader(): Promise<TsLoaderStatus> {
     }
     register('tsx/esm', pathToFileURL(`${process.cwd()}/`));
     tsLoaderState = 'registered';
+    tsLoaderError = null;
     return 'registered';
-  } catch {
-    tsLoaderState = 'missing';
-    return 'missing';
+  } catch (err) {
+    tsLoaderState = 'failed';
+    tsLoaderError = err instanceof Error ? err.message : String(err);
+    return 'failed';
   }
 }
 
 /** Reset the loader state — used by unit tests only. */
 export function _resetTsLoaderStateForTests(): void {
   tsLoaderState = null;
+  tsLoaderError = null;
 }

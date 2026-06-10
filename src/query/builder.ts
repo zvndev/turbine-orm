@@ -84,6 +84,19 @@ function isWhereOperator(value: unknown): value is WhereOperator {
   return keys.length > 0 && keys.every((k) => OPERATOR_KEYS.has(k));
 }
 
+/**
+ * True for a *plain object literal* that reached an equality fallthrough
+ * without matching any known filter shape — the misspelled-operator case.
+ * Class instances (Buffer for bytea, Decimal wrappers, ...) are legitimate
+ * bind values and return false, as do arrays and Dates.
+ */
+function isUnmatchedPlainObject(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || value instanceof Date) return false;
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
 /** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
 const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
 
@@ -2383,6 +2396,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      // Plain object literal that matched no filter shape — give it a
+      // fingerprint distinct from real equality. The build path throws for
+      // these on non-JSON columns; sharing `key:eq` would let a cache entry
+      // warmed by genuine equality serve the bad filter silently.
+      if (isUnmatchedPlainObject(value)) {
+        parts.push(
+          `${key}:obj(${Object.keys(value as object)
+            .sort()
+            .join(',')})`,
+        );
+        continue;
+      }
+
       // Plain equality
       parts.push(`${key}:eq`);
     }
@@ -2421,6 +2447,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const mode = (value as WhereOperator).mode;
         const modeStr = mode === 'insensitive' ? ':i' : '';
         parts.push(`${key}:op(${opKeys.join(',')}${modeStr})`);
+      } else if (isUnmatchedPlainObject(value)) {
+        parts.push(
+          `${key}:obj(${Object.keys(value as object)
+            .sort()
+            .join(',')})`,
+        );
       } else {
         parts.push(`${key}:eq`);
       }
@@ -2535,7 +2567,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
-      // Plain equality
+      // Plain equality — same strict validation as the build path, so a
+      // cache hit can never silently bind a misspelled-operator object.
+      this.assertBindableEqualityValue(rawColumn, value, this.getColumnPgType(rawColumn), this.table);
       params.push(value);
     }
   }
@@ -2545,13 +2579,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = this.schema.tables[targetTable];
     if (!meta) return;
 
-    for (const [_field, value] of Object.entries(subWhere)) {
+    for (const [field, value] of Object.entries(subWhere)) {
       if (value === undefined) continue;
       if (value === null) continue;
       if (isWhereOperator(value)) {
         this.collectOperatorParams(value, params);
         continue;
       }
+      const col = meta.columnMap[field] ?? camelToSnake(field);
+      this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(meta, col), targetTable);
       params.push(value);
     }
   }
@@ -2673,13 +2709,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
         subParts.push(`om=${omKeys.join(',')}`);
       }
 
-      // where shape (value-invariant)
+      // where shape (value-invariant, operator-shape-aware: `{title: 'x'}` and
+      // `{title: {contains: 'x'}}` emit different SQL so they must not share
+      // a fingerprint)
       if (opts.where) {
-        // Use a target-table QI if possible, or a simplified fingerprint
-        const wKeys = Object.keys(opts.where)
-          .filter((k) => opts.where![k] !== undefined)
-          .sort();
-        subParts.push(`w=${wKeys.join(',')}`);
+        subParts.push(`w=${this.fingerprintAliasWhere(opts.where as Record<string, unknown>)}`);
       }
 
       // orderBy shape
@@ -2739,11 +2773,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     //   where params → limit param → nested-with params (always, both paths).
     if (relDef.type === 'manyToMany') {
       if (spec.where) {
-        for (const [, v] of Object.entries(spec.where)) {
-          params.push(v);
-        }
+        this.collectAliasWhereParams(targetTable, targetMeta, spec.where as Record<string, unknown>, params);
       }
-      if (spec.limit) {
+      if (spec.limit !== undefined) {
         params.push(Number(spec.limit));
       }
       if (spec.with) {
@@ -2756,7 +2788,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       return;
     }
 
-    const willWrap = relDef.type === 'hasMany' && (spec.limit !== undefined || spec.orderBy !== undefined);
+    // Mirrors buildRelationSubquery's willWrap: `orderBy: {}` is treated as absent.
+    const hasOrder = spec.orderBy ? Object.values(spec.orderBy).some((dir) => dir !== undefined) : false;
+    const willWrap = relDef.type === 'hasMany' && (spec.limit !== undefined || hasOrder);
 
     // Non-wrapped path: nested relations BEFORE where/limit
     if (!willWrap && spec.with) {
@@ -2767,17 +2801,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
 
-    // where params
+    // where params — mirrors buildAliasWhere push order
     if (spec.where) {
-      for (const [, v] of Object.entries(spec.where)) {
-        params.push(v);
-      }
+      this.collectAliasWhereParams(targetTable, targetMeta, spec.where as Record<string, unknown>, params);
     }
 
     // limit param — only hasMany parameterizes its limit (mirrors
     // buildRelationSubquery). belongsTo/hasOne ignore limit (always LIMIT 1), so
     // pushing one here would orphan a param and desync the collect path.
-    if (relDef.type === 'hasMany' && spec.limit) {
+    // `limit: 0` pushes (LIMIT 0 is honored), so check !== undefined.
+    if (relDef.type === 'hasMany' && spec.limit !== undefined) {
       params.push(Number(spec.limit));
     }
 
@@ -3009,27 +3042,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
-      // Strict validation: a plain (non-array, non-Date) object on a non-JSON
-      // column matched no known filter shape — almost always a misspelled
-      // operator (`startWith` for `startsWith`) or a stray nested object.
-      // Silently treating it as `col = $1` returns wrong rows with no error, so
-      // throw with the offending keys and the supported operator list. JSON/JSONB
-      // columns legitimately accept object values for equality, so they fall
-      // through unchanged.
-      if (typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date)) {
-        const colType = this.getColumnPgType(rawColumn);
-        if (colType !== 'json' && colType !== 'jsonb') {
-          const badKeys = Object.keys(value as Record<string, unknown>);
-          throw new ValidationError(
-            badKeys.length === 0
-              ? `[turbine] Empty filter object on "${rawColumn}" for table "${this.table}". ` +
-                  `Provide a value or an operator like { gt: 1 }.`
-              : `[turbine] Unknown operator${badKeys.length > 1 ? 's' : ''} ` +
-                  `${badKeys.map((k) => `"${k}"`).join(', ')} on "${rawColumn}" for table "${this.table}". ` +
-                  `Supported operators: ${[...OPERATOR_KEYS].join(', ')}.`,
-          );
-        }
-      }
+      // Strict validation: a plain object literal that matched no known filter
+      // shape is almost always a misspelled operator (`startWith` for
+      // `startsWith`). The guard also runs on the cache-hit param-collect path
+      // (collectWhereParams) so a warmed SQL cache can never skip it.
+      this.assertBindableEqualityValue(rawColumn, value, this.getColumnPgType(rawColumn), this.table);
 
       // Plain equality
       params.push(value);
@@ -3152,11 +3169,194 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(meta, col), targetTable);
       params.push(value);
       conditions.push(`${qCol} = ${this.p(params.length)}`);
     }
 
     return conditions.length > 0 ? conditions.join(' AND ') : null;
+  }
+
+  /**
+   * Resolve a column's Postgres type from an arbitrary table's metadata
+   * (relation targets, not just `this.table`).
+   */
+  private pgTypeForColumn(meta: TableMetadata, column: string): string {
+    return meta.dialectTypes?.[column] ?? meta.pgTypes?.[column] ?? 'text';
+  }
+
+  /**
+   * Equality-fallthrough guard shared by every SQL-build path AND every
+   * cache-hit param-collect path. A plain object literal that matched no known
+   * filter shape on a non-JSON column is almost always a misspelled operator
+   * (`startWith` for `startsWith`); binding it as `col = $1` silently returns
+   * wrong rows. Class instances (Buffer for bytea, Decimal wrappers, ...) are
+   * legitimate bind values and pass through, as do objects on json/jsonb
+   * columns (object equality).
+   */
+  private assertBindableEqualityValue(rawColumn: string, value: unknown, columnPgType: string, table: string): void {
+    if (!isUnmatchedPlainObject(value)) return;
+    if (columnPgType === 'json' || columnPgType === 'jsonb') return;
+    const badKeys = Object.keys(value as Record<string, unknown>);
+    throw new ValidationError(
+      badKeys.length === 0
+        ? `[turbine] Empty filter object on "${rawColumn}" for table "${table}". ` +
+            `Provide a value or an operator like { gt: 1 }.`
+        : `[turbine] Unknown operator${badKeys.length > 1 ? 's' : ''} ` +
+            `${badKeys.map((k) => `"${k}"`).join(', ')} on "${rawColumn}" for table "${table}". ` +
+            `Supported operators: ${[...OPERATOR_KEYS].join(', ')}.`,
+    );
+  }
+
+  /**
+   * Build the user-supplied `where` filter of a relation `with` clause against
+   * the relation's table alias. Supports the same scalar surface as the
+   * top-level WHERE builder — equality, IS NULL, operator objects (incl.
+   * `mode: 'insensitive'`), and OR/AND/NOT combinators. Unknown operator
+   * objects throw via {@link assertBindableEqualityValue}.
+   *
+   * Param push order MUST mirror {@link collectAliasWhereParams} exactly, or
+   * cache hits and pipeline batching will desync.
+   */
+  private buildAliasWhere(
+    targetTable: string,
+    targetMeta: TableMetadata,
+    alias: string,
+    where: Record<string, unknown>,
+    params: unknown[],
+  ): string | null {
+    const clauses: string[] = [];
+
+    for (const [key, value] of Object.entries(where)) {
+      if (value === undefined) continue;
+
+      if (key === 'OR' || key === 'AND') {
+        const arr = value as Record<string, unknown>[];
+        if (!Array.isArray(arr) || arr.length === 0) continue;
+        const subs = arr
+          .map((cond) => this.buildAliasWhere(targetTable, targetMeta, alias, cond, params))
+          .filter((s): s is string => s !== null)
+          .map((s) => `(${s})`);
+        if (subs.length > 0) clauses.push(`(${subs.join(key === 'OR' ? ' OR ' : ' AND ')})`);
+        continue;
+      }
+
+      if (key === 'NOT') {
+        const sub = this.buildAliasWhere(targetTable, targetMeta, alias, value as Record<string, unknown>, params);
+        if (sub) clauses.push(`NOT (${sub})`);
+        continue;
+      }
+
+      const col = targetMeta.columnMap[key] ?? camelToSnake(key);
+      if (!targetMeta.allColumns.includes(col)) {
+        throw new ValidationError(`[turbine] Unknown column "${key}" in where for table "${targetTable}"`);
+      }
+      const qCol = `${alias}.${this.q(col)}`;
+
+      if (value === null) {
+        clauses.push(`${qCol} IS NULL`);
+        continue;
+      }
+
+      if (isWhereOperator(value)) {
+        clauses.push(...this.buildOperatorClauses(qCol, value, params));
+        continue;
+      }
+
+      this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(targetMeta, col), targetTable);
+      params.push(value);
+      clauses.push(`${qCol} = ${this.p(params.length)}`);
+    }
+
+    return clauses.length > 0 ? clauses.join(' AND ') : null;
+  }
+
+  /** Mirrors {@link buildAliasWhere} param-push order for the cache-hit collect path. */
+  private collectAliasWhereParams(
+    targetTable: string,
+    targetMeta: TableMetadata,
+    where: Record<string, unknown>,
+    params: unknown[],
+  ): void {
+    for (const [key, value] of Object.entries(where)) {
+      if (value === undefined) continue;
+
+      if (key === 'OR' || key === 'AND') {
+        const arr = value as Record<string, unknown>[];
+        if (!Array.isArray(arr) || arr.length === 0) continue;
+        for (const cond of arr) {
+          this.collectAliasWhereParams(targetTable, targetMeta, cond, params);
+        }
+        continue;
+      }
+
+      if (key === 'NOT') {
+        this.collectAliasWhereParams(targetTable, targetMeta, value as Record<string, unknown>, params);
+        continue;
+      }
+
+      if (value === null) continue;
+
+      if (isWhereOperator(value)) {
+        this.collectOperatorParams(value, params);
+        continue;
+      }
+
+      const col = targetMeta.columnMap[key] ?? camelToSnake(key);
+      this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(targetMeta, col), targetTable);
+      params.push(value);
+    }
+  }
+
+  /**
+   * Value-invariant, shape-aware fingerprint for a relation `with` clause's
+   * `where` filter. Must distinguish every SQL shape {@link buildAliasWhere}
+   * can emit — equality vs null vs operator sets vs combinators — or two
+   * differently-shaped wheres would share one cached SQL string.
+   */
+  private fingerprintAliasWhere(where: Record<string, unknown>): string {
+    const keys = Object.keys(where)
+      .filter((k) => where[k] !== undefined)
+      .sort();
+    const parts: string[] = [];
+
+    for (const key of keys) {
+      const value = where[key];
+
+      if (key === 'OR' || key === 'AND') {
+        const arr = value as Record<string, unknown>[];
+        if (!Array.isArray(arr) || arr.length === 0) continue;
+        parts.push(`${key}[${arr.map((c) => this.fingerprintAliasWhere(c)).join(',')}]`);
+        continue;
+      }
+      if (key === 'NOT') {
+        parts.push(`NOT(${this.fingerprintAliasWhere(value as Record<string, unknown>)})`);
+        continue;
+      }
+      if (value === null) {
+        parts.push(`${key}:null`);
+        continue;
+      }
+      if (isWhereOperator(value)) {
+        const opKeys = Object.keys(value as object)
+          .filter((k) => k !== 'mode')
+          .sort();
+        const mode = (value as WhereOperator).mode;
+        parts.push(`${key}:op(${opKeys.join(',')}${mode === 'insensitive' ? ':i' : ''})`);
+        continue;
+      }
+      if (isUnmatchedPlainObject(value)) {
+        parts.push(
+          `${key}:obj(${Object.keys(value as object)
+            .sort()
+            .join(',')})`,
+        );
+        continue;
+      }
+      parts.push(`${key}:eq`);
+    }
+
+    return parts.join('&');
   }
 
   /**
@@ -3663,8 +3863,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Determine if this hasMany will take the wrapped subquery path (LIMIT or ORDER BY).
     // When wrapping, nested relations are built in the wrapped path referencing innerAlias,
     // so we must NOT build them here (they would push orphaned params).
+    // An orderBy with no defined entries (`orderBy: {}`) is treated as absent —
+    // it must neither trigger the wrap (dropping nested relations) nor render a
+    // dangling `ORDER BY `. `limit: 0` is meaningful (LIMIT 0) and DOES wrap.
+    const relOrderEntries =
+      spec !== true && spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
     const willWrap =
-      relDef.type === 'hasMany' && spec !== true && (spec.limit !== undefined || spec.orderBy !== undefined);
+      relDef.type === 'hasMany' && spec !== true && (spec.limit !== undefined || relOrderEntries.length > 0);
 
     // manyToMany takes a dedicated JOIN-through-junction path. Nested relations,
     // where, orderBy, and select/omit are handled there (the target alias is the
@@ -3719,14 +3924,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Build ORDER BY for json_agg
     let orderClause = '';
-    if (spec !== true && spec.orderBy) {
-      const orders = Object.entries(spec.orderBy)
+    if (relOrderEntries.length > 0) {
+      const orders = relOrderEntries
         .map(([k, dir]) => {
           const col = camelToSnake(k);
           if (!targetMeta.allColumns.includes(col)) {
             throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
           }
-          const safeDir = dir.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+          const safeDir = String(dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
           return `${alias}.${this.q(col)} ${safeDir}`;
         })
         .join(', ');
@@ -3744,16 +3949,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       whereClause = this.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
     }
 
-    // Additional filters — properly parameterized
+    // Additional filters — full scalar where surface (equality, null, operator
+    // objects, OR/AND/NOT), properly parameterized against this alias.
     if (spec !== true && spec.where) {
-      for (const [k, v] of Object.entries(spec.where)) {
-        const col = camelToSnake(k);
-        if (!targetMeta.allColumns.includes(col)) {
-          throw new ValidationError(`[turbine] Unknown column "${k}" in where for table "${targetTable}"`);
-        }
-        params.push(v);
-        whereClause += ` AND ${alias}.${this.q(col)} = ${this.p(params.length)}`;
-      }
+      const extra = this.buildAliasWhere(targetTable, targetMeta, alias, spec.where as Record<string, unknown>, params);
+      if (extra) whereClause += ` AND ${extra}`;
     }
 
     // LIMIT — only meaningful for hasMany. A belongsTo / hasOne subquery returns
@@ -3761,8 +3961,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // a parameter: doing so orphans an untyped `$N` that the SQL never references,
     // which Postgres rejects with "could not determine data type of parameter $N"
     // (and shifts every later placeholder by one). To-one relations ignore limit.
+    // `limit: 0` is honored (LIMIT 0 → empty array), so check !== undefined.
     let limitClause = '';
-    if (relDef.type === 'hasMany' && spec !== true && spec.limit) {
+    if (relDef.type === 'hasMany' && spec !== true && spec.limit !== undefined) {
       params.push(Number(spec.limit));
       limitClause = ` LIMIT ${this.p(params.length)}`;
     }
@@ -3893,37 +4094,41 @@ export class QueryInterface<T extends object, R extends object = {}> {
       .map((jcol, i) => `${jalias}.${this.q(jcol)} = ${qParent}.${this.q(refKeys[i]!)}`)
       .join(' AND ');
 
-    // ORDER BY on the target rows
+    // ORDER BY on the target rows. `orderBy: {}` (no defined entries) is
+    // treated as absent — it must not render a dangling `ORDER BY `.
+    const relOrderEntries =
+      spec !== true && spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
     let orderClause = '';
-    if (spec !== true && spec.orderBy) {
-      const orders = Object.entries(spec.orderBy)
+    if (relOrderEntries.length > 0) {
+      const orders = relOrderEntries
         .map(([k, dir]) => {
           const col = camelToSnake(k);
           if (!targetMeta.allColumns.includes(col)) {
             throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
           }
-          const safeDir = dir.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+          const safeDir = String(dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
           return `${talias}.${this.q(col)} ${safeDir}`;
         })
         .join(', ');
       orderClause = ` ORDER BY ${orders}`;
     }
 
-    // Additional WHERE filters on the target — properly parameterized.
+    // Additional WHERE filters on the target — full scalar where surface,
+    // properly parameterized against the target alias.
     if (spec !== true && spec.where) {
-      for (const [k, v] of Object.entries(spec.where)) {
-        const col = camelToSnake(k);
-        if (!targetMeta.allColumns.includes(col)) {
-          throw new ValidationError(`[turbine] Unknown column "${k}" in where for table "${targetTable}"`);
-        }
-        params.push(v);
-        whereClause += ` AND ${talias}.${this.q(col)} = ${this.p(params.length)}`;
-      }
+      const extra = this.buildAliasWhere(
+        targetTable,
+        targetMeta,
+        talias,
+        spec.where as Record<string, unknown>,
+        params,
+      );
+      if (extra) whereClause += ` AND ${extra}`;
     }
 
-    // LIMIT
+    // LIMIT — `limit: 0` is honored (LIMIT 0 → empty array)
     let limitClause = '';
-    if (spec !== true && spec.limit) {
+    if (spec !== true && spec.limit !== undefined) {
       params.push(Number(spec.limit));
       limitClause = ` LIMIT ${this.p(params.length)}`;
     }

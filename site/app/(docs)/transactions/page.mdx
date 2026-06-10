@@ -58,7 +58,7 @@ When `Serializable` detects a conflict, it throws `SerializationFailureError` (T
 
 ## Timeouts
 
-Per-transaction statement timeout, applied as `SET LOCAL statement_timeout = '<ms>ms'` inside the transaction:
+Per-transaction timeout, enforced client-side: if the callback exceeds `timeoutMs`, Turbine destroys the connection (aborting any in-flight statement server-side) and rolls back:
 
 ```ts
 await db.$transaction(

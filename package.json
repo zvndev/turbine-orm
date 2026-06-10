@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.19.0",
+  "version": "0.19.1",
   "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "exports": {
@@ -42,7 +42,7 @@
   "sideEffects": false,
   "scripts": {
     "prebuild": "npm run gen:studio",
-    "build": "tsc && tsc --project tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
+    "build": "rm -rf dist && tsc && tsc --project tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit --project tsconfig.test.json",
     "generate": "tsx src/cli/index.ts generate",
@@ -50,7 +50,7 @@
     "examples": "tsx examples/examples.ts",
     "dogfood": "tsx examples/dogfood.ts",
     "test": "tsx --test --test-concurrency=1 src/test/*.test.ts",
-    "test:unit": "tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts src/test/pipeline-submittable.test.ts src/test/with-inference.test.ts src/test/operator-validation.test.ts src/test/unlimited-warning.test.ts src/test/generate-relations.test.ts src/test/stream-and-parse.test.ts src/test/sql-cache.test.ts src/test/dialect.test.ts src/test/studio.test.ts src/test/sql-injection.test.ts src/test/cli-flags.test.ts src/test/cockroachdb-adapter.test.ts src/test/yugabytedb-adapter.test.ts src/test/pg-compat.test.ts src/test/relation-filter-validation.test.ts src/test/client-coverage.test.ts src/test/schema-diff.test.ts src/test/composite-fk.test.ts src/test/retry.test.ts src/test/text-search.test.ts src/test/optimistic-lock.test.ts src/test/sql-safety-property.test.ts src/test/nested-write.test.ts src/test/nested-write-update-upsert.test.ts src/test/cursor-pagination.test.ts src/test/client-branches.test.ts src/test/is-isNot-filter.test.ts src/test/event-emitter.test.ts src/test/observe.test.ts",
+    "test:unit": "tsx --test src/test/schema-builder.test.ts src/test/errors.test.ts src/test/stress.test.ts src/test/migrate.test.ts src/test/update-operators.test.ts src/test/empty-where-guard.test.ts src/test/cli.test.ts src/test/serverless.test.ts src/test/pipeline.test.ts src/test/pipeline-submittable.test.ts src/test/with-inference.test.ts src/test/operator-validation.test.ts src/test/unlimited-warning.test.ts src/test/generate-relations.test.ts src/test/stream-and-parse.test.ts src/test/sql-cache.test.ts src/test/dialect.test.ts src/test/studio.test.ts src/test/sql-injection.test.ts src/test/cli-flags.test.ts src/test/cockroachdb-adapter.test.ts src/test/yugabytedb-adapter.test.ts src/test/pg-compat.test.ts src/test/relation-filter-validation.test.ts src/test/client-coverage.test.ts src/test/schema-diff.test.ts src/test/composite-fk.test.ts src/test/retry.test.ts src/test/text-search.test.ts src/test/optimistic-lock.test.ts src/test/sql-safety-property.test.ts src/test/nested-write.test.ts src/test/nested-write-update-upsert.test.ts src/test/cursor-pagination.test.ts src/test/client-branches.test.ts src/test/is-isNot-filter.test.ts src/test/event-emitter.test.ts src/test/observe.test.ts src/test/relation-limit-param.test.ts src/test/where-guard-cache-and-relation-where.test.ts",
     "test:coverage": "c8 tsx --test --test-concurrency=1 src/test/*.test.ts",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",

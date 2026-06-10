@@ -4,23 +4,25 @@ This repo ships a TypeScript Postgres ORM **and** its own marketing/docs site. E
 
 ## The two things in this repo
 
-- **Library** — `src/`, `dist/`, `dist-cjs/`, published as `turbine-orm` on npm.
+- **Library** — `src/`, `dist/` (ESM) + `dist/cjs/` (CJS), published as `turbine-orm` on npm.
 - **Site** — `site/` (Next.js 15 App Router), deployed to `turbineorm.dev` via Vercel project `zvn-dev/turbine-docs`.
 
 ## The release flow — do not skip steps
 
 1. Do library work in `src/`, then run `npm run typecheck && npm run lint && npm run test:unit`.
 2. Update `site/` content for anything user-facing that changed — new benchmarks, new API, new error codes, new CLI flags, changed defaults.
-3. Update `CHANGELOG.md` with the new version section.
-4. Bump version in root `package.json` (minor for features, patch for fixes).
-5. Commit everything in a single commit: library + site + changelog + version bump.
-6. Push to `origin/main`.
-7. Publish to npm: `npm publish` (see npm auth note below).
-8. Deploy the site: `cd site && vercel --prod` (or `npm run site:deploy` from the root).
-9. Verify both:
-   - `npm view turbine-orm version` should show the new version.
-   - `curl -I https://turbineorm.dev` should return a fresh `Age` header (< 60s).
-   - The homepage HTML should contain any new content you added.
+3. **Drift check** — grep README.md, CLAUDE.md, and `site/` for claims the release invalidates (feature descriptions, version strings, security-posture bullets). Three separate stale-docs findings in the v0.19.0 audit traced to skipping this.
+4. Update `CHANGELOG.md` with the new version section.
+5. Bump version in root `package.json` (minor for features, patch for fixes).
+6. Commit everything in a single commit: library + site + changelog + version bump.
+7. Push to `origin/main`.
+8. Publish to npm: `npm publish` (see npm auth note below).
+9. Deploy the site: `cd site && vercel --prod` (or `npm run site:deploy` from the root).
+10. Tag the release: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+11. Verify both:
+    - `npm view turbine-orm version` should show the new version.
+    - `curl -I https://turbineorm.dev` should return a fresh `Age` header (< 60s).
+    - The homepage HTML should contain any new content you added.
 
 **The rule is: no release is complete until both npm and turbineorm.dev reflect the new state.**
 
@@ -67,7 +69,10 @@ npm publish --ignore-scripts   # requires .npmrc with bypass-2fa token
 # 4. Deploy the site
 cd site && vercel --prod
 
-# 5. Verify
+# 5. Tag
+git tag vX.Y.Z && git push origin vX.Y.Z
+
+# 6. Verify
 npm view turbine-orm version
 curl -sI https://turbineorm.dev | grep -i age
 ```

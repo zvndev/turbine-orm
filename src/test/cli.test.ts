@@ -531,7 +531,11 @@ describe('CLI TypeScript loader', () => {
       _resetTsLoaderStateForTests();
       const status = await registerTsLoader();
       assert.ok(
-        status === 'registered' || status === 'already' || status === 'unsupported' || status === 'missing',
+        status === 'registered' ||
+          status === 'already' ||
+          status === 'unsupported' ||
+          status === 'missing' ||
+          status === 'failed',
         `unexpected status: ${status}`,
       );
     });

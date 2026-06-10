@@ -70,8 +70,9 @@ export interface DatabaseAdapter {
 
   /**
    * Generate the SQL to set a statement timeout within a transaction.
-   * PostgreSQL uses `SET LOCAL statement_timeout = $1`.
-   * CockroachDB uses `SET transaction_timeout = $1` (v23.1+).
+   * PostgreSQL uses `SELECT set_config('statement_timeout', $1, true)`.
+   * CockroachDB uses `SELECT set_config('transaction_timeout', $1, true)` (v23.1+).
+   * (`SET LOCAL ... = $1` is a syntax error — SET takes no bind params.)
    *
    * @param seconds — timeout in seconds
    * @returns an object with the parameterized SQL and its bound values

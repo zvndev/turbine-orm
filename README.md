@@ -13,7 +13,7 @@ npm install turbine-orm
 Prisma ships a 1.6 MB WASM query engine. Drizzle ships zero runtime but no Studio, no typed errors, no migration checksums. Turbine ships **one dependency (`pg`) and no engine binary**, and bundles six things no other TS ORM has together:
 
 1. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~30 KB gzipped (~109 KB minified); the edge entry to ~21 KB gzipped. Prisma's WASM query engine alone is 1.6 MB.
-2. **Built-in read-only Studio.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and a statement-stacking guard. The only TS ORM Studio that physically cannot mutate your database. DBA-approvable.
+2. **Built-in read-only Studio.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and — since v0.19 — no raw-SQL surface at all: queries are composed in the ORM's own validated builder. The only TS ORM Studio that physically cannot mutate your database. DBA-approvable.
 3. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
 5. **Edge-native — one import swap.** `turbineHttp(pool, schema)` — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle, no adapter package, no separate serverless build.
@@ -614,7 +614,7 @@ npx turbine migrate status
 
 ## Studio
 
-The only Postgres ORM with a Studio your DBA will approve. `turbine studio` launches a local, read-only web UI for exploring your database — no mutations, no writes, no way around the transaction guard.
+The only Postgres ORM with a Studio your DBA will approve. `turbine studio` launches a local, read-only web UI for exploring your database — no mutations, no writes, and since v0.19 **no raw-SQL surface at all**: every query is composed visually in the ORM and compiled by the same validated query builder your application uses.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
@@ -624,19 +624,19 @@ npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 
 **Features**
 
-- **Data / Schema / SQL / Builder tabs.** Browse rows, inspect tables and relations, run ad-hoc `SELECT`s, or compose queries visually with a live TypeScript preview.
-- **Saved queries.** Named SQL snippets persisted to `.turbine/studio-queries.json` — share them across runs without committing them.
+- **Query / Data / Schema tabs.** Compose queries visually, browse rows, and inspect tables and relations.
+- **ORM-native query composer.** The Query tab builds a real `findMany` — drill into relations (`with`) to any depth, pick fields (`select`/`omit`), add filters (`where`), `orderBy`, and `limit` at every level — with a live TypeScript preview of the exact call to copy into your codebase.
+- **Saved queries.** Named builder queries persisted to `.turbine/studio-queries.json` — share them across runs without committing them.
 - **Cmd+K command palette.** Jump to any table, tab, or saved query in one keystroke.
 - **Full-text search across rows.** The Data tab supports substring search across every text column of the current table.
-- **Visual query composer.** The Builder tab lets you click together `where` / `orderBy` / `with` / `limit` clauses and renders the matching `db.table.findMany(...)` TypeScript in real time — copy it into your codebase.
 
 **Security posture (read-only by design)**
 
+- **No SQL input surface.** There is nothing to inject into — builder requests are validated identifier-by-identifier against the introspected schema, and every value is bound as a `$N` parameter.
 - **Loopback by default** (`127.0.0.1`) with a loud warning if you bind to a non-loopback address.
 - **Per-process auth token** — 24 random bytes of hex, stored in a `SameSite=Strict` `HttpOnly` cookie.
-- **Every query runs inside `BEGIN READ ONLY` + `SET LOCAL statement_timeout = '30s'`.** Writes are physically impossible at the transaction level.
-- **SELECT/WITH-only SQL parser** strips comments and rejects non-trailing semicolons, blocking statement-stacking attacks.
-- **Security headers on every response** — `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
+- **Every query runs inside `BEGIN READ ONLY`** with a 30s transaction-local statement timeout (parameterized `set_config`). Writes are physically impossible at the transaction level.
+- **Security headers on every response** — CSP, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` — plus per-session rate limiting and cross-origin refusal.
 
 ## Serverless / Edge
 

@@ -159,7 +159,7 @@ export default {
 | Area | PostgreSQL | CockroachDB (with adapter) |
 |---|---|---|
 | Migration locks | `pg_try_advisory_lock()` | `_turbine_lock` table + `SELECT FOR UPDATE NOWAIT` |
-| Statement timeout | `SET LOCAL statement_timeout` | `SET transaction_timeout` (v23.1+) |
+| Statement timeout | `set_config('statement_timeout', …, true)` | `set_config('transaction_timeout', …, true)` (v23.1+) |
 | Index introspection | `pg_indexes` view | Same view (compatible since v22.1) |
 | Row estimates | `pg_class.reltuples` | `crdb_internal.table_row_statistics` |
 
@@ -193,7 +193,7 @@ const db = new TurbineClient({
 | Advisory locks | Not supported | Adapter provides table-based alternative |
 | `SERIAL` columns | Uses `unique_rowid()` not sequences | IDs are unique but not sequential |
 | NULL ordering in `json_agg` | May differ from PostgreSQL | Cosmetic for most use cases |
-| `SET LOCAL statement_timeout` | Not supported | Adapter uses `SET transaction_timeout` |
+| `statement_timeout` | Not supported | Adapter uses `set_config('transaction_timeout', …)` |
 | Default isolation | Serializable (vs. Read Committed) | More retryable errors under contention |
 | `pg_class.reltuples` | Not reliable | Studio uses `crdb_internal` for estimates |
 

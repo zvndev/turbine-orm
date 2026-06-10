@@ -414,6 +414,16 @@ export class TurbineClient {
   private readonly activeSubscriptions = new Set<ActiveSubscription>();
 
   constructor(config: TurbineConfig = {}, schema: SchemaMetadata) {
+    // Constructing without schema metadata previously crashed deep in the
+    // constructor with an opaque "Cannot read properties of undefined
+    // (reading 'tables')". Fail fast with an actionable message instead.
+    if (!schema || typeof schema !== 'object' || !schema.tables) {
+      throw new ValidationError(
+        '[turbine] TurbineClient requires schema metadata as its second argument. ' +
+          'Run `npx turbine generate` and use the generated client (`turbine()` from your output dir), ' +
+          'or pass the generated `schemaMetadata` object: new TurbineClient(config, schemaMetadata).',
+      );
+    }
     /**
      * Parse int8 (bigint, OID 20) as JavaScript number instead of string.
      * Safe for values up to Number.MAX_SAFE_INTEGER (9,007,199,254,740,991).

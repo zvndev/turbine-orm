@@ -52,7 +52,7 @@ const features = [
   {
     title: 'Read-only Studio your DBA will approve',
     description:
-      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, statement-stacking guard, X-Frame-Options: DENY. No other TS ORM ships this.',
+      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, no raw-SQL surface at all, X-Frame-Options: DENY. No other TS ORM ships this.',
     stat: '0',
     statLabel: 'write paths',
   },
@@ -157,7 +157,7 @@ export default async function Home() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            v0.18 — pgvector search, RLS, LISTEN/NOTIFY, many-to-many, HAVING, typed SQL
+            v0.19 — ORM-native Studio: compose queries visually, zero raw SQL
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
@@ -169,10 +169,12 @@ export default async function Home() {
           <p className="hero-subtitle animate-fade-in-up delay-2">
             The Postgres ORM that ships light and locks tight. One runtime
             dependency, no WASM engine, a read-only Studio no other ORM has, and
-            error messages that never leak PII. v0.18 goes Postgres-native:
-            pgvector similarity search, row-level-security session context,
-            LISTEN/NOTIFY realtime, many-to-many + self-relations, GROUP BY
-            HAVING, and a typed raw-SQL escape hatch.
+            error messages that never leak PII. v0.19 makes Studio ORM-native:
+            compose real findMany queries visually — relations, filters, and
+            field picks at every depth — with a live TypeScript preview, and no
+            raw-SQL surface at all. Plus the v0.18 Postgres-native line:
+            pgvector search, RLS session context, LISTEN/NOTIFY realtime,
+            many-to-many, HAVING, and typed SQL.
           </p>
 
           <div className="animate-fade-in-up delay-3">

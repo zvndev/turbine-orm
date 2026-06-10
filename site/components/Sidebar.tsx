@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
+import { TURBINE_VERSION } from '../lib/version';
 
 type NavItem = { href: string; label: string };
 type NavSection = { title: string; items: NavItem[] };
@@ -155,7 +156,7 @@ export function Sidebar() {
                     fontWeight: 600,
                   }}
                 >
-                  v0.18.0
+                  v{TURBINE_VERSION}
                 </span>
               </div>
             </div>

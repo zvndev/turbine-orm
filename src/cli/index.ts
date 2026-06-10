@@ -21,7 +21,7 @@
  *   npx turbine migrate create add_users_table
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generate } from '../generate.js';
@@ -30,7 +30,7 @@ import type { SchemaDef } from '../schema-builder.js';
 import { schemaDiff, schemaPush } from '../schema-sql.js';
 import type { CliOverrides, ResolvedConfig } from './config.js';
 import { configTemplate, findConfigFile, loadConfig, resolveConfig } from './config.js';
-import { needsTsLoader, registerTsLoader } from './loader.js';
+import { canResolveTsx, getTsLoaderError, needsTsLoader, registerTsLoader } from './loader.js';
 import { createMigration, listMigrationFiles, migrateDown, migrateStatus, migrateUp } from './migrate.js';
 import { startObserve } from './observe.js';
 import { startStudio } from './studio.js';
@@ -186,7 +186,7 @@ function parseArgs(): CliArgs {
  * Print a friendly error explaining how to install tsx, then exit.
  * Called when we know we need to load a `.ts` file but the loader isn't available.
  */
-function failMissingTsLoader(filePath: string, reason: 'missing' | 'unsupported'): never {
+function failMissingTsLoader(filePath: string, reason: 'missing' | 'unsupported' | 'failed'): never {
   newline();
   error(`Cannot load TypeScript file: ${filePath}`);
   newline();
@@ -194,6 +194,16 @@ function failMissingTsLoader(filePath: string, reason: 'missing' | 'unsupported'
     console.log(`  ${dim('Your Node.js version does not support')} ${cyan('module.register()')}.`);
     console.log(
       `  ${dim('Upgrade to Node.js')} ${cyan('20.6+')} ${dim('or use a')} ${cyan('.js')} ${dim('/')} ${cyan('.mjs')} ${dim('config file.')}`,
+    );
+  } else if (reason === 'failed') {
+    // tsx IS installed but registering its loader threw. Report the real
+    // cause — telling the user to install tsx here would be a misdiagnosis.
+    console.log(`  ${dim('tsx is installed, but registering its TypeScript loader failed:')}`);
+    newline();
+    console.log(`    ${getTsLoaderError() ?? '(unknown error)'}`);
+    newline();
+    console.log(
+      `  ${dim('Try upgrading tsx:')} ${cyan('npm install --save-dev tsx@latest')}${dim(', or rename your file to')} ${cyan('.mjs')}.`,
     );
   } else {
     console.log(`  ${dim('Loading .ts config / schema files requires')} ${cyan('tsx')} ${dim('to be installed.')}`);
@@ -242,7 +252,7 @@ async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
   // ERR_UNKNOWN_FILE_EXTENSION for `.ts`.
   if (needsTsLoader(absPath)) {
     const status = await registerTsLoader();
-    if (status === 'missing' || status === 'unsupported') {
+    if (status === 'missing' || status === 'unsupported' || status === 'failed') {
       failMissingTsLoader(schemaFile, status);
     }
   }
@@ -390,7 +400,7 @@ export default defineSchema({
   //   id: { type: 'serial', primaryKey: true },
   //   email: { type: 'text', notNull: true, unique: true },
   //   name: { type: 'text', notNull: true },
-  //   created_at: { type: 'timestamptz', default: 'NOW()' },
+  //   created_at: { type: 'timestamp', default: 'NOW()' },
   // },
 });
 `,
@@ -463,6 +473,11 @@ export default defineSchema({
       );
     }
     console.log(`  ${dim('2.')} Run ${cyan('npx turbine generate')} to introspect your DB`);
+    if (!canResolveTsx()) {
+      console.log(
+        `     ${dim('Note: the TypeScript config requires')} ${cyan('tsx')} ${dim('—')} ${cyan('npm install --save-dev tsx')}`,
+      );
+    }
   } else {
     console.log(`  ${dim('1.')} Import the generated client:`);
     console.log(`     ${cyan(`import { turbine } from './${config.out.replace('./', '')}';`)}`);
@@ -1465,7 +1480,16 @@ function showVersion(): void {
   // Using process.argv[1] instead of import.meta.url so the same code compiles
   // cleanly for both the ESM and CJS builds.
   try {
-    let dir = dirname(process.argv[1] ?? '');
+    // Resolve symlinks first: `npx turbine` runs via node_modules/.bin/turbine,
+    // a symlink whose dirname would walk the CONSUMER's tree and never find
+    // turbine-orm's package.json (printing no version number at all).
+    let entry = process.argv[1] ?? '';
+    try {
+      entry = realpathSync(entry);
+    } catch {
+      // keep the raw path if realpath fails (e.g. deleted cwd)
+    }
+    let dir = dirname(entry);
     for (let i = 0; i < 6; i++) {
       const candidate = resolve(dir, 'package.json');
       if (existsSync(candidate)) {
@@ -1514,7 +1538,7 @@ async function main() {
   const configPath = findConfigFile();
   if (needsTsLoader(configPath)) {
     const status = await registerTsLoader();
-    if (status === 'missing' || status === 'unsupported') {
+    if (status === 'missing' || status === 'unsupported' || status === 'failed') {
       failMissingTsLoader(configPath ?? 'turbine.config.ts', status);
     }
   }

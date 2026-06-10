@@ -316,7 +316,8 @@ describe('Studio — apiBuilder', () => {
   it('builds and runs a findMany-shaped query through the pool', async () => {
     const { pool, calls } = makePool([
       { rows: [] }, // BEGIN
-      { rows: [] }, // SET LOCAL statement_timeout
+      { rows: [] }, // set_config statement_timeout
+      { rows: [] }, // set_config search_path (pins the configured --schema)
       {
         rows: [{ id: 1, name: 'Alice', email: 'a@b.com' }],
         fields: [{ name: 'id' }, { name: 'name' }, { name: 'email' }],
