@@ -23,7 +23,7 @@ The core insight: instead of N+1 queries for nested relations, Turbine generates
 ```
 src/
   query/            — The heart, split into submodules:
-    types.ts        — All public query arg types (~430 LOC): WhereClause, WithClause,
+    types.ts        — All public query arg types (~785 LOC): WhereClause, WithClause,
                       FindManyArgs, RelationDescriptor, WithResult, UpdateOperatorInput,
                       AggregateArgs, JsonFilter, ArrayFilter, HavingClause (groupBy
                       aggregate filtering), VectorFilter/VectorOrderBy (pgvector distance
@@ -54,9 +54,26 @@ src/
                       is supplied, Turbine does NOT call pg.types.setTypeParser and
                       disconnect() becomes a no-op (caller owns lifecycle).
 
+  adapters/         — Database adapter layer (~530 LOC) for Postgres-compatible engines.
+                      cockroachdb.ts + yugabytedb.ts override the operations with
+                      compatibility gaps (migration locking, introspection SQL); alloydb
+                      and timescale are pass-through adapters defined in index.ts.
+                      Everything else falls through to standard PostgreSQL. Published as
+                      the `turbine-orm/adapters` subpath export.
+
+  dialect.ts        — Phase-1 SQL dialect seam. Query generation depends on this contract
+                      for the SQL primitives that vary across MySQL/SQLite; the package
+                      stays PostgreSQL-native by default via postgresDialect.
+
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code
-                      (TURBINE_E001-E011). wrapPgError() translates pg driver constraint
-                      errors (23505, 23503, 23502, 23514) into typed Turbine errors.
+                      (TURBINE_E001-E016). wrapPgError() translates pg driver errors
+                      (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
+                      Turbine errors.
+
+  nested-write.ts   — Nested-write engine. Tree-walking create/update that resolves
+                      relation fields in `data` (create, connect, connectOrCreate,
+                      disconnect, set, delete, update, upsert) into batched SQL inside a
+                      transaction, depth-capped at 10. Imported by query/builder.ts.
 
   schema.ts         — Postgres-to-TypeScript type mapping, SchemaMetadata/TableMetadata
                       interfaces, camelToSnake/snakeToCamel utilities, singularize helper.
@@ -82,6 +99,11 @@ src/
 
   pipeline.ts       — Batch query execution. Takes DeferredQuery[] and runs all SQL
                       in a single pg round-trip, then applies each query's transform.
+
+  pipeline-submittable.ts — Real pg extended-query pipeline protocol. Uses
+                      parse/bind/execute/sync wire messages on pg's Connection
+                      (listener-swap pattern, same as pg-cursor) to send all pipeline
+                      queries in one TCP flush — true 1-RTT execution.
 
   serverless.ts     — Edge / serverless driver binding. Exports turbineHttp(pool, schema)
                       which constructs a TurbineClient bound to an external pg-compatible
@@ -189,7 +211,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 **Unit tests** run without a database. They use mock schemas from `src/test/helpers.ts` which provides `mockColumn()`, `mockTable()`, and `makeQuery()` (creates a QueryInterface with a null pool for build-only SQL tests).
 
-**Integration tests** need a PostgreSQL instance with seeded data. Set `DATABASE_URL` env var. The small correctness fixture is `src/test/fixtures/seed.sql` (5 users / 10 posts / 20 comments / 8 orgs). The larger benchmark seed lives in `benchmarks/seed-neon.ts` and defaults to 1K users / 10K posts / 50K comments (override via `USERS`/`POSTS_PER_USER`/`COMMENTS_PER_POST`). Tests that require a database are gated via the `skipGate()` helper in `src/test/helpers.ts` when `DATABASE_URL` is absent — each test registers with `{ skip }` so the reporter shows real skipped counts, not silent passes.
+**Integration tests** need a PostgreSQL instance with seeded data. Set `DATABASE_URL` env var. The small correctness fixture is `src/test/fixtures/seed.sql` (8 users / 10 posts / 20 comments / 5 orgs). The larger benchmark seed lives in `benchmarks/seed-neon.ts` and defaults to 1K users / 10K posts / 50K comments (override via `USERS`/`POSTS_PER_USER`/`COMMENTS_PER_POST`). Tests that require a database are gated via the `skipGate()` helper in `src/test/helpers.ts` when `DATABASE_URL` is absent — each test registers with `{ skip }` so the reporter shows real skipped counts, not silent passes.
 
 **Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, and `src/index.ts`. Thresholds: 65% lines, 70% functions, 82% branches, 65% statements.
 

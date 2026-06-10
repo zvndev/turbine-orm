@@ -27,6 +27,8 @@ Turbine throws typed errors you can catch with `instanceof`. Every error extends
 | `TURBINE_E012` | `DeadlockError` | pg 40P01 — **retryable**, exposes `isRetryable: true` |
 | `TURBINE_E013` | `SerializationFailureError` | pg 40001 — **retryable**, exposes `isRetryable: true` |
 | `TURBINE_E014` | `PipelineError` | Non-transactional pipeline has partial failures |
+| `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update — the row was modified by another transaction |
+| `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01 — translated via `wrapPgError()` |
 
 ## Catching typed errors
 
@@ -71,6 +73,7 @@ Every query execution runs its pg error through `wrapPgError()`. The original dr
 | `23503` | foreign_key_violation | `ForeignKeyError` |
 | `23502` | not_null_violation | `NotNullViolationError` |
 | `23514` | check_violation | `CheckConstraintError` |
+| `23P01` | exclusion_violation | `ExclusionConstraintError` |
 | `40P01` | deadlock_detected | `DeadlockError` (retryable) |
 | `40001` | serialization_failure | `SerializationFailureError` (retryable) |
 

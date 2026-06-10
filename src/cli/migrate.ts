@@ -387,8 +387,8 @@ export async function migrateUp(
   migrationsDir: string,
   options?: {
     step?: number;
-    allowDrift?: boolean /** @deprecated use allowDrift */;
-    force?: boolean;
+    allowDrift?: boolean;
+    force?: boolean /** @deprecated use allowDrift */;
     adapter?: DatabaseAdapter;
     dialect?: Dialect;
   },

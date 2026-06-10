@@ -875,6 +875,17 @@ Turbine is focused and opinionated. Here's what it doesn't do:
 - PostgreSQL >= 14
 - Works with both ESM (`import`) and CommonJS (`require`)
 
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the test strategy, and the PR checklist. The unit suite runs without a database:
+
+```bash
+npm install
+npm run test:unit
+```
+
+Integration tests need a PostgreSQL instance via `DATABASE_URL` (see CONTRIBUTING.md for a one-command seeded setup).
+
 ## License
 
 MIT

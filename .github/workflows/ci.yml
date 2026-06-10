@@ -200,7 +200,7 @@ jobs:
         run: test -f dist/index.js
       # Bundle size is gated by size-limit alone — it measures the REAL bundled
       # import graph (esbuild) of each public entry against the limits declared
-      # in .size-limit.js (~27 kB main / ~19 kB edge, under 35/25 limits). This
+      # in .size-limit.js (~31 kB main / ~22 kB edge, under 35/25 limits). This
       # replaces the previous hard-coded `npm pack` KB ceiling (which was stale
       # at 350 kB and measured tarball size, not the runtime closure). One
       # source of truth, shared with `npm run size`.

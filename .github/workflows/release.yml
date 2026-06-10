@@ -65,7 +65,7 @@ jobs:
 
       # Bundle size gate — size-limit is the single source of truth (same check
       # CI runs). Measures the bundled import graph against .size-limit.js limits
-      # (~27 kB main / ~19 kB edge, under 35/25 ceilings). Replaces the previous
+      # (~31 kB main / ~22 kB edge, under 35/25 ceilings). Replaces the previous
       # stale hard-coded 150 kB tarball check that never matched reality.
       - name: Verify bundle sizes
         run: npx size-limit
@@ -107,8 +107,21 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Backfilled/old tags must not re-attempt a publish: npm rejects
+      # republishing an existing version, which would just paint the run red.
+      - name: Check version not already published
+        id: published
+        run: |
+          PKG_VERSION=$(jq -r .version package.json)
+          if npm view "turbine-orm@$PKG_VERSION" version >/dev/null 2>&1; then
+            echo "already=true >> note: turbine-orm@$PKG_VERSION already on npm — skipping publish"
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to npm
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && steps.published.outputs.already != 'true' }}
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -118,7 +131,7 @@ jobs:
       # CLI bin, serverless subpath). Registry propagation can lag the publish,
       # so retry the install for up to ~2 minutes before failing.
       - name: Post-publish smoke test
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && steps.published.outputs.already != 'true' }}
         env:
           # setup-node's .npmrc references NODE_AUTH_TOKEN; npm errors on any
           # command if it's undefined, so keep it set for this step too.
