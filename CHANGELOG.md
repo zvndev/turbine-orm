@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.19.2 (2026-06-10)
+
+**Patch release from a full product review + gold-standard audit** — closes a HIGH silent-wrong-rows hole in the SQL cache, makes two documented-but-broken behaviors actually work, and brings the docs/site in line with what the library does.
+
+### Fixed
+- **`where`-key order can no longer cross-bind parameters on a warm SQL cache (HIGH).** The cache fingerprint sorted `where` keys, but the SQL-build and cache-hit param-collect paths iterated object-insertion order — so two queries with the same fields in different key order shared one cached SQL string but pushed parameters in different positions. `findMany({ where: { tenantId, id } })` followed by `findMany({ where: { id, tenantId } })` could execute the cached SQL with the values swapped, silently returning the wrong row (a cross-tenant-leak class when the permuted fields are same-typed). Key enumeration is now canonicalized (sorted) across every fingerprint/build/collect triple — top-level `where`, relation-filter sub-wheres (`some`/`every`/`none`), alias wheres, nested `with` relation order, cursor, and the `findUnique` simple (plain-equality) path. 14 regression tests warm the cache then assert each column binds its own value. Array members (`OR`/`AND`/`NOT`) remain positional.
+- **`{ equals: value }` works as plain equality on any column.** `where: { email: { equals: 'a@b.com' } }` — documented in the README and the most common operator a migrating Prisma user reaches for — previously threw `ValidationError` because `equals` was treated only as a JSONB filter key. It now compiles to `"col" = $n` (and `{ equals: null }` to `IS NULL`), parameterized, on the build path, the cache-hit path, and relation filters, while JSON/JSONB columns keep their existing containment behavior.
+- **Nested-write input types are now real.** The exported `NestedCreateOp` / `NestedUpdateOp` / `ConnectOrCreateOp` types were referenced by zero code — `create({ data })` was typed as `Partial<T>` so the `create`/`connect`/`connectOrCreate`/`update`/`upsert`/`disconnect`/`delete` relation ops the runtime already supported were invisible to TypeScript. `CreateArgs`/`UpdateArgs` are now generic over the target's relations and surface the full nested-write op palette (matching `nested-write.ts` exactly), recursively, via the same `RelationDescriptor` brand that powers `with` inference. Untyped clients collapse to the old `Partial<T>`, so nothing breaks; generated clients get typed nested writes with no generator changes.
+
+### Changed
+- **Middleware docs no longer teach a silently-broken soft-delete pattern.** The README, the `$use` JSDoc, and the site `/queries` + `/observability` pages showed middleware mutating `params.args.where` to inject `deletedAt: null` — which does nothing, because SQL is generated before middleware runs. Replaced with working patterns (query timing, result transformation) plus an explicit "`params.args` is a read-only snapshot" warning, and the soft-delete recipe is now an explicit `where` filter / scoped helper.
+- **New docs: `/studio` and `/observability` pages.** Studio (the flagship read-only-Studio differentiator) and the `$observe()` / `$on('query')` / `npx turbine observe` observability surface were undocumented on the site; both now have full pages, in the sidebar and sitemap, with the security model spelled out.
+- **`/queries` documents `cursor`, `take`, and `distinct`; benchmarks page carries a measurement-vintage caveat; homepage repositioned** around Postgres-native depth (pgvector, RLS, LISTEN/NOTIFY, full-text) with a side-by-side pgvector comparison, since single-query nested relations are now table stakes across ORMs. Bundle-size claims corrected to the measured ~31 kB (main) / ~22 kB (edge) brotli.
+- **CLI help completed.** `turbine observe` and the `migrate create --auto` / `--allow-drift` / `--step` flags are now in `--help`; column alignment fixed.
+
+### Errors
+- Site `/errors` page now documents **E015 `OptimisticLockError`** and **E016 `ExclusionConstraintError`** (they shipped in 0.15.0 / 0.18.0 but were never added to the page), and the `check-error-codes` CI gate — which had silently failed since 0.15.0 because its known-classes list was missing both — passes again.
+
+### Tooling / CI
+- DB-gated integration tests now report as **skipped** (via a `skipGate()` helper) instead of silently passing 0 tests when `DATABASE_URL` is unset.
+- `test:unit` is now a glob instead of a hand-maintained file list (new test files can no longer be silently dropped from the release gate); `test:watch` watches the full suite.
+- `npm audit` is a hard gate on production deps (`--audit-level=high`); the YugabyteDB integration job moved from per-PR to a nightly cron (pinned image) to stop burning ~6 min of red CI per push; new `pack-smoke` job installs the built tarball and verifies ESM/CJS/CLI/serverless; `release.yml` gained a post-publish smoke test and skips publishing a version that already exists on npm.
+- Added `SECURITY.md` supported-versions refresh, `.github/dependabot.yml`, dead-code removal (`isReadOnlyStatement`, orphaned Studio CSS), and a CLAUDE.md architecture/LOC sync. Backfilled git tags for v0.11.0–v0.14.0 and v0.16.0 (published to npm without tags).
+
 ## 0.19.1 (2026-06-09)
 
 **Patch release fixing everything found by the v0.19.0 post-release audit** — most importantly a broken new-user CLI happy path and two remaining silent-wrong-rows holes in the query builder.
