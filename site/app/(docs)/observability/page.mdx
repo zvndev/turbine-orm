@@ -38,7 +38,7 @@ interface QueryEvent {
 
 **Params are PII-safe by default.** With the default `errorMessages: 'safe'` client config, every entry in `event.params` is replaced with `'[REDACTED]'` before listeners see it — you get the SQL shape and timing without user data flowing into your logs. Set `errorMessages: 'verbose'` to receive raw values. A listener that throws never breaks the query; the error is swallowed (logged when `logging: true`).
 
-`$on` differs from [middleware](/queries#middleware): middleware wraps the call and can mutate args and results; `$on` is a passive tap that fires after execution with the final SQL, timing, and outcome.
+`$on` differs from [middleware](/queries#middleware): middleware wraps the call — it can observe args and transform results (it cannot change the query); `$on` is a passive tap that fires after execution with the final SQL, timing, and outcome.
 
 ## Metrics — `db.$observe()`
 

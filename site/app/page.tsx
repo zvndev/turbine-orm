@@ -73,8 +73,8 @@ const features = [
     title: 'Edge-native. One import swap.',
     description:
       'turbineHttp(pool, schema) — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step.',
-    stat: '~19 KB',
-    statLabel: 'edge bundle (gzip)',
+    stat: '~22 KB',
+    statLabel: 'edge bundle (brotli)',
   },
   {
     title: 'Pipeline batching via wire protocol',
@@ -180,13 +180,10 @@ export default async function Home() {
           </h1>
 
           <p className="hero-subtitle animate-fade-in-up delay-2">
-            Most ORMs treat Postgres as a lowest common denominator. Turbine
-            treats it as the platform: pgvector similarity search, Row-Level
-            Security session context, LISTEN/NOTIFY, full-text search, and
-            atomic updates — all typed, first-class API, no raw-SQL detours.
-            One runtime dependency (pg), ~31 KB brotli, no WASM engine, no
-            paid tier. And the only read-only hardened Studio: every query
-            inside BEGIN READ ONLY, with no raw-SQL surface at all.
+            Most ORMs treat Postgres as a lowest common denominator — Turbine
+            treats it as the platform. Typed pgvector search, Row-Level
+            Security session context, and a read-only Studio that physically
+            cannot write. The rest is below.
           </p>
 
           <div className="animate-fade-in-up delay-3">
@@ -247,7 +244,7 @@ export default async function Home() {
         <div className="animate-fade-in-up">
           <p className="section-label">What Prisma and Drizzle don&apos;t ship</p>
           <h2 className="section-title">
-            Six things. Zero overlap.
+            Built in, not bolted on.
           </h2>
         </div>
 
@@ -392,11 +389,11 @@ export default async function Home() {
               {[
                 ['Engine / runtime', 'No engine binary (pg only)', 'Client + 1.6 MB WASM engine', 'No engine'],
                 ['Runtime deps', '1 (pg)', '@prisma/client + adapter', '0'],
-                ['Main bundle (gzip)', '~30 KB', 'dominated by 1.6 MB WASM', '~7 KB core'],
+                ['Main bundle (brotli)', '~31 KB', 'dominated by 1.6 MB WASM', '~7 KB core'],
                 ['Studio', 'Read-only, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (paid tier)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, ~19 KB gzip', '1.6 MB WASM adapter', 'Native'],
+                ['Edge runtime', 'One import swap, ~22 KB brotli', '1.6 MB WASM adapter', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 ['Nested relations', '1 query, deep type inference', '1 query, shallow inference', 'relations() re-declaration'],

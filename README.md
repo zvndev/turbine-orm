@@ -12,7 +12,7 @@ npm install turbine-orm
 
 Prisma ships a 1.6 MB WASM query engine. Drizzle ships zero runtime but no Studio, no typed errors, no migration checksums. Turbine ships **one dependency (`pg`) and no engine binary**, and bundles six things no other TS ORM has together:
 
-1. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~30 KB gzipped (~109 KB minified); the edge entry to ~21 KB gzipped. Prisma's WASM query engine alone is 1.6 MB.
+1. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~31 kB brotli (~109 KB minified); the edge entry to ~22 kB brotli. Prisma's WASM query engine alone is 1.6 MB.
 2. **Built-in read-only Studio.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and — since v0.19 — no raw-SQL surface at all: queries are composed in the ORM's own validated builder. The only TS ORM Studio that physically cannot mutate your database. DBA-approvable.
 3. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
@@ -818,11 +818,11 @@ Turbine maps Postgres types to TypeScript:
 |---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + 1.6 MB WASM engine | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + adapter | 0 | 0 |
-| **Main bundle (gzip)** | ~30 KB | dominated by 1.6 MB WASM | ~7 KB core | small |
+| **Main bundle (brotli)** | ~31 kB | dominated by 1.6 MB WASM | ~7 KB core | small |
 | **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Paid tier | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, ~21 KB gzip | 1.6 MB WASM adapter | Native | Native |
+| **Edge runtime** | One import swap, ~22 kB brotli | 1.6 MB WASM adapter | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query, shallow inference | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |
