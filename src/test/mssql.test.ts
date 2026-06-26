@@ -821,13 +821,18 @@ describe('turbine-orm/mssql — integration (real SQL Server)', () => {
   });
 
   gate.it('upsert via MERGE inserts then updates on conflict', async () => {
-    // `create` omits the IDENTITY `id`: SQL Server rejects explicit IDENTITY
-    // values in a MERGE INSERT clause (no IDENTITY_INSERT). The seeded id=1 row
-    // matches, so this exercises the WHEN MATCHED → UPDATE path.
+    // Upsert targets the UNIQUE `name` column, not the IDENTITY `id`: SQL Server
+    // rejects explicit IDENTITY values in a MERGE source, and the MERGE ON clause
+    // matches T.<conflict> = S.<conflict>, so the conflict column must be in the
+    // create data. First call → WHEN NOT MATCHED → INSERT; second → MATCHED → UPDATE.
+    const inserted = await client
+      .table('tags')
+      .upsert({ where: { name: 'merge-tag' }, create: { name: 'merge-tag' }, update: { name: 'merge-tag-v2' } });
+    assert.equal(inserted.name, 'merge-tag');
     const updated = await client
       .table('tags')
-      .upsert({ where: { id: 1 }, create: { name: 'tech' }, update: { name: 'technology' } });
-    assert.equal(updated.name, 'technology');
+      .upsert({ where: { name: 'merge-tag' }, create: { name: 'merge-tag' }, update: { name: 'merge-tag-v2' } });
+    assert.equal(updated.name, 'merge-tag-v2');
   });
 
   gate.it('update returns the updated row (BIT round-trips as boolean)', async () => {
