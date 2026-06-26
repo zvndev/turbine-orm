@@ -14,7 +14,7 @@
 
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
-import { QueryInterface } from '../index.js';
+import { OptimisticLockError, QueryInterface } from '../index.js';
 import {
   introspectMysqlWith,
   MysqlPool,
@@ -239,7 +239,9 @@ interface MockCall {
 }
 
 /** A fake mysql2 pool/connection that records calls and returns canned rows/headers. */
-function fakeMysql2(opts: { rowsFor?: (sql: string) => Record<string, unknown>[]; insertId?: number } = {}) {
+function fakeMysql2(
+  opts: { rowsFor?: (sql: string) => Record<string, unknown>[]; insertId?: number; affectedRows?: number } = {},
+) {
   const calls: MockCall[] = [];
   const isSelect = (sql: string) => /^\s*(?:select|show|with)/i.test(sql);
   const run =
@@ -248,7 +250,7 @@ function fakeMysql2(opts: { rowsFor?: (sql: string) => Record<string, unknown>[]
       calls.push({ sql, binding, method });
       if (isSelect(sql)) return [opts.rowsFor?.(sql) ?? [], []];
       // write → ResultSetHeader
-      return [{ affectedRows: 1, insertId: opts.insertId ?? 0 }, []];
+      return [{ affectedRows: opts.affectedRows ?? 1, insertId: opts.insertId ?? 0 }, []];
     };
   const conn = { query: run('query'), execute: run('execute'), release: () => {} };
   const pool = {
@@ -349,6 +351,41 @@ describe('turbine-orm/mysql — reselect result strategy (mock driver)', () => {
     assert.equal(calls.length, 2);
     assert.equal(calls[0]!.sql, 'SELECT * FROM `users` WHERE `id` = :p1', 'pre-SELECT before DELETE');
     assert.match(calls[1]!.sql, /^DELETE FROM `users`/);
+  });
+
+  it('optimistic-lock conflict (0 rows updated) throws OptimisticLockError, not the stale row', async () => {
+    // reselect engines re-fetch by `where` WITHOUT the version predicate, so a
+    // version conflict must be detected from affected-rows — regression guard.
+    const versioned: SchemaMetadata = {
+      tables: {
+        users: mockTable(
+          'users',
+          [
+            { name: 'id', field: 'id', pgType: 'bigint' },
+            { name: 'name', field: 'name', pgType: 'text' },
+            { name: 'version', field: 'version', pgType: 'integer' },
+          ],
+          {},
+        ),
+      },
+      enums: {},
+    };
+    const { pool, calls } = fakeMysql2({ affectedRows: 0, rowsFor: () => [{ id: 1, name: 'stale', version: 8 }] });
+    const qi = new QueryInterface<Record<string, unknown>>(
+      // biome-ignore lint/suspicious/noExplicitAny: MysqlPool stands in for pg.Pool
+      new MysqlPool(pool) as any,
+      'users',
+      versioned,
+      [],
+      { dialect: mysqlDialect, preparedStatements: false, sqlCache: false },
+    );
+    await assert.rejects(
+      qi.update({ where: { id: 1 }, data: { name: 'next' }, optimisticLock: { field: 'version', expected: 7 } }),
+      (e: unknown) => e instanceof OptimisticLockError && e.versionField === 'version' && e.expectedVersion === 7,
+    );
+    // Only the version-checked UPDATE ran; the stale re-SELECT must NOT be issued.
+    assert.equal(calls.length, 1, 'no re-SELECT after a detected conflict');
+    assert.match(calls[0]!.sql, /^UPDATE `users` SET/);
   });
 });
 

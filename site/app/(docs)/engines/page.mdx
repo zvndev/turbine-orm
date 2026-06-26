@@ -31,7 +31,7 @@ Every cell reflects the actual behavior of the engine's dialect. `✗ E017` mean
 | Atomic update operators (`increment`, …) | ✓ | ✓ | ✓ | ✓ |
 | Transactions + nested savepoints | ✓ | ✓ ¹ | ✓ | ✓ |
 | Cursor / streaming (`findManyStream`) | ✓ | ✓ ⁵ | ✓ ⁵ | ✓ ⁵ |
-| Optimistic locking | ✓ | ✓ | ⚠ ⁴ | ✓ |
+| Optimistic locking | ✓ | ✓ | ✓ ⁴ | ✓ |
 | Schema introspection | ✓ | ✓ ² | ✓ ² | ✓ ² |
 | Migrations (`turbine migrate` CLI) | ✓ | CLI ³ | CLI ³ | CLI ³ |
 | pgvector distance / KNN | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
@@ -44,7 +44,7 @@ Every cell reflects the actual behavior of the engine's dialect. `✗ E017` mean
 
 ³ The `turbine migrate` runner is currently Postgres-only. Each dialect already emits its own migration-tracking SQL, and MySQL / SQL Server expose advisory-lock primitives (`GET_LOCK`, `sp_getapplock`) for a future adapter; SQLite serializes migrations naturally as a single writer.
 
-⁴ Optimistic locking throws `OptimisticLockError` on PostgreSQL, SQLite, and SQL Server. On MySQL (the `reselect` strategy) the write's row is re-fetched by `where` only, so a version conflict returns the current row instead of raising — depend on optimistic-lock failures throwing only on an engine with `RETURNING` / `OUTPUT`.
+⁴ Optimistic locking throws `OptimisticLockError` on all four engines. On `RETURNING` / `OUTPUT` engines (PostgreSQL, SQLite, SQL Server) the conflict is a missing returned row; on MySQL (the `reselect` strategy) the conflict is detected from the version-checked UPDATE's affected-row count, so it raises identically.
 
 ⁵ `findManyStream` works on every engine — it yields rows in `batchSize` batches and you can `break` early. Only PostgreSQL streams with a true server-side cursor (`DECLARE CURSOR`, constant memory regardless of result size); SQLite, MySQL, and SQL Server currently materialize the full result first, then yield it in batches. For very large exports, stream on Postgres or paginate with `limit` on the other engines.
 

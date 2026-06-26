@@ -1568,7 +1568,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
       reselect:
         this.dialect.resultStrategy === 'reselect'
           ? async (exec) => {
-              await exec(sql, params, preparedName);
+              const writeResult = await exec(sql, params, preparedName);
+              // Optimistic-lock conflict: the version-checked UPDATE matched no
+              // row. The re-fetch below uses `where` WITHOUT the version
+              // predicate, so it would return the stale row and silently mask
+              // the conflict — detect it from affected-rows here instead, to
+              // match the OptimisticLockError thrown on RETURNING/OUTPUT engines.
+              if (lock && (writeResult.rowCount ?? 0) === 0) {
+                throw new OptimisticLockError({
+                  table: this.table,
+                  versionField: lock.field,
+                  expectedVersion: lock.expected,
+                });
+              }
               const sel = this.buildReselectByWhere(whereObj);
               return exec(sel.sql, sel.params);
             }
