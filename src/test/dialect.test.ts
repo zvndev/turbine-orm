@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { type Dialect, postgresDialect, QueryInterface, UnsupportedFeatureError } from '../index.js';
+import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
 import type { RelationDef, SchemaMetadata } from '../schema.js';
 import { column, defineSchema, table } from '../schema-builder.js';
@@ -356,6 +357,12 @@ interface ConformanceFixture {
   placeholder: RegExp;
   /** This engine's own identifier-quote form that SHOULD appear. */
   quote: RegExp;
+  /**
+   * The engine's nested-relation empty/null wrap marker. Defaults to `/COALESCE/`
+   * (PG/MySQL/SQLite all coalesce). SQL Server's FOR JSON override uses ISNULL +
+   * JSON_QUERY instead, so it sets its own marker.
+   */
+  nestedWrap?: RegExp;
 }
 
 const fixtures: ConformanceFixture[] = [
@@ -394,6 +401,20 @@ const fixtures: ConformanceFixture[] = [
     forbidden: /json_agg|json_build_object|::json|ILIKE|\$\d|"users"|"posts"|RETURNING|ON CONFLICT|UNNEST|= ANY|!= ALL/,
     placeholder: /:p\d/,
     quote: /`users`/,
+  },
+  {
+    // The REAL shipped mssqlDialect (turbine-orm/mssql) — proves the production
+    // engine emits no Postgres leakage. Uses `[…]` + named `@pN` placeholders, no
+    // LIMIT (OFFSET/FETCH), no RETURNING (OUTPUT/MERGE), no json_agg (FOR JSON PATH).
+    label: 'mssql (real)',
+    dialect: mssqlDialect,
+    forbidden:
+      /json_agg|json_build_object|::json|ILIKE|\$\d|"users"|"posts"|`users`|`posts`|RETURNING|ON CONFLICT|UNNEST|= ANY|!= ALL|\bLIMIT\b/,
+    placeholder: /@p\d/,
+    quote: /\[users\]/,
+    // SQL Server wraps to-many in ISNULL((… FOR JSON PATH), '[]') and nests via
+    // JSON_QUERY — it does NOT route through wrapJsonSubresult/COALESCE.
+    nestedWrap: /ISNULL\(\(SELECT|JSON_QUERY/,
   },
 ];
 
@@ -445,13 +466,14 @@ describe('Dialect conformance matrix (no Postgres leakage)', () => {
         assert.match(sql, fx.quote);
       });
 
-      it('routes nested-relation JSON wrapping through wrapJsonSubresult', () => {
-        // posts → author exercises the nested-subresult wrap hook (the to-one
-        // `author` subquery embedded inside the `posts` json_object).
+      it('routes nested-relation JSON wrapping through the engine wrap marker', () => {
+        // posts → author exercises the nested-subresult wrap (the to-one `author`
+        // subquery embedded inside the `posts` JSON object).
         const sql = convQuery(fx.dialect).buildFindMany({ with: { posts: { with: { author: true } } } }).sql;
         assert.doesNotMatch(sql, fx.forbidden);
-        // The hook output is present in some engine-specific form (COALESCE here).
-        assert.match(sql, /COALESCE/);
+        // The wrap output is present in some engine-specific form (COALESCE for
+        // PG/MySQL/SQLite; ISNULL + JSON_QUERY for SQL Server's FOR JSON override).
+        assert.match(sql, fx.nestedWrap ?? /COALESCE/);
       });
     });
   }

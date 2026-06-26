@@ -501,6 +501,37 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Build the trailing pagination clause for an OUTER SELECT. PostgreSQL/MySQL/
+   * SQLite use ` LIMIT <ph>` and/or ` OFFSET <ph>`. SQL Server has no `LIMIT`, so
+   * its dialect implements {@link Dialect.buildLimitOffset} to emit
+   * `[ORDER BY (SELECT NULL)] OFFSET <off> ROWS [FETCH NEXT <lim> ROWS ONLY]`.
+   * Param-push order (limit before offset) is owned by the caller and unchanged —
+   * this only varies the SQL text, so PG output stays byte-identical.
+   */
+  private buildPagination(limitPh: string | undefined, offsetPh: string | undefined, hasOrderBy: boolean): string {
+    if (this.dialect.buildLimitOffset) {
+      return this.dialect.buildLimitOffset({ limitPlaceholder: limitPh, offsetPlaceholder: offsetPh, hasOrderBy });
+    }
+    let s = '';
+    if (limitPh !== undefined) s += ` LIMIT ${limitPh}`;
+    if (offsetPh !== undefined) s += ` OFFSET ${offsetPh}`;
+    return s;
+  }
+
+  /**
+   * The single-row limit appended to findUnique / findFirst-style lookups. ` LIMIT 1`
+   * for PG/MySQL/SQLite; SQL Server routes through {@link Dialect.buildLimitOffset}
+   * (literal `1`, no params) → ` ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 1
+   * ROWS ONLY`. No params are pushed, so the collect path is unaffected.
+   */
+  private limitOneClause(): string {
+    if (this.dialect.buildLimitOffset) {
+      return this.dialect.buildLimitOffset({ limitPlaceholder: '1', offsetPlaceholder: undefined, hasOrderBy: false });
+    }
+    return ' LIMIT 1';
+  }
+
+  /**
    * Build an `IN` / `NOT IN` predicate through the active dialect. PostgreSQL
    * keeps the array-param form (`expr = ANY($n)` / `expr != ALL($n)`); other
    * engines (SQLite) use a length-independent single-placeholder form. Paired
@@ -783,7 +814,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
         const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
         void tempParams; // params are positional, SQL is value-invariant
-        return `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
+        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}`;
       });
 
       // Collect params (same order as build)
@@ -811,7 +842,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const whereSql = clause ? ` WHERE ${clause}` : '';
         const qt = this.q(this.table);
         const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
-        return `SELECT ${selectExpr} FROM ${qt}${whereSql} LIMIT 1`;
+        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}`;
       });
 
       // Collect params
@@ -839,7 +870,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
       const selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, freshParams, columnsList);
-      return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql} LIMIT 1`;
+      return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql}${this.limitOneClause()}`;
     });
 
     // Collect params in exact build order: where first, then with-clause relations
@@ -1023,14 +1054,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
         sql += ` ORDER BY ${this.buildOrderBy(args.orderBy, freshParams)}`;
       }
 
+      // Pagination — push params in the same order the collect path mirrors
+      // (limit before offset); the SQL TEXT shape is dialect-owned via
+      // buildPagination (PG: ` LIMIT $n`/` OFFSET $n`; SQL Server: OFFSET/FETCH).
+      let limitPh: string | undefined;
+      let offsetPh: string | undefined;
       if (effectiveLimit !== undefined) {
         freshParams.push(Number(effectiveLimit));
-        sql += ` LIMIT ${this.p(freshParams.length)}`;
+        limitPh = this.p(freshParams.length);
       }
       if (args?.offset !== undefined) {
         freshParams.push(Number(args.offset));
-        sql += ` OFFSET ${this.p(freshParams.length)}`;
+        offsetPh = this.p(freshParams.length);
       }
+      sql += this.buildPagination(limitPh, offsetPh, !!args?.orderBy);
 
       return sql;
     });
@@ -1475,7 +1512,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       this.assertMutationHasPredicate('update', whereSql, args.allowFullTableScan);
-      return `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}${this.dialect.buildReturningClause('*')}`;
+      // Engines that inject their returning shape MID-statement (SQL Server
+      // `OUTPUT INSERTED.*` between SET and WHERE) override buildUpdateStatement;
+      // absent → the trailing-clause PG/SQLite/MySQL form (byte-identical).
+      return this.dialect.buildUpdateStatement
+        ? this.dialect.buildUpdateStatement({ table: this.q(this.table), setClauses, whereSql, returning: '*' })
+        : `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}${this.dialect.buildReturningClause('*')}`;
     };
 
     let sql: string;
@@ -1634,7 +1676,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
       this.assertMutationHasPredicate('delete', whereSql, args.allowFullTableScan);
-      return `DELETE FROM ${this.q(this.table)}${whereSql}${this.dialect.buildReturningClause('*')}`;
+      // SQL Server injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and WHERE;
+      // absent override → the trailing-clause PG/SQLite/MySQL form (byte-identical).
+      return this.dialect.buildDeleteStatement
+        ? this.dialect.buildDeleteStatement({ table: this.q(this.table), whereSql, returning: '*' })
+        : `DELETE FROM ${this.q(this.table)}${whereSql}${this.dialect.buildReturningClause('*')}`;
     });
 
     // On cache hit, still validate the predicate
@@ -4066,6 +4112,35 @@ export class QueryInterface<T extends object, R extends object = {}> {
           .map(([k]) => targetMeta.columnMap[k] ?? camelToSnake(k)),
       );
       targetColumns = targetMeta.allColumns.filter((col) => !omittedFields.has(col));
+    }
+
+    // Engine override seam (additive): a dialect whose JSON-aggregation shape does
+    // not map onto buildJsonObject/buildJsonArrayAgg (SQL Server FOR JSON PATH) owns
+    // the WHOLE subquery. Absent for PG/MySQL/SQLite → the native path below runs
+    // unchanged (byte-identical output, all their tests stay green). The override
+    // pushes params per the documented RelationSubqueryContext ordering contract,
+    // which mirrors collectRelationSubqueryParams so the SQL cache / pipeline stay
+    // in sync.
+    if (this.dialect.buildRelationSubquery) {
+      return this.dialect.buildRelationSubquery({
+        relDef,
+        spec,
+        params,
+        parentRef,
+        alias,
+        targetTable,
+        targetMeta,
+        targetColumns,
+        depth: currentDepth,
+        path: currentPath,
+        quote: (name) => this.q(name),
+        buildWhere: (whereAlias) =>
+          (spec !== true && spec.where
+            ? this.buildAliasWhere(targetTable, targetMeta, whereAlias, spec.where as Record<string, unknown>, params)
+            : '') ?? '',
+        recurse: (nRelDef, nSpec, nParent, nDepth, nPath) =>
+          this.buildRelationSubquery(nRelDef, nSpec, params, nParent, aliasCounter, nDepth, nPath),
+      });
     }
 
     // Build JSON object pairs for resolved columns
