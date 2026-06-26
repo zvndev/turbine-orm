@@ -9,7 +9,7 @@
  */
 
 import pg from 'pg';
-import { postgresDialect } from './dialect.js';
+import { type Dialect, postgresDialect } from './dialect.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -124,13 +124,39 @@ export interface IntrospectOptions {
   include?: string[];
   /** Tables to exclude (default: none). Applied after include. */
   exclude?: string[];
+  /**
+   * Dialect whose {@link Dialect.introspector} drives the catalog reads.
+   * Defaults to {@link postgresDialect}. Engines plug their own introspector
+   * here so `introspect()` works across databases.
+   */
+  dialect?: Dialect;
 }
 
 // ---------------------------------------------------------------------------
 // Main introspection function
 // ---------------------------------------------------------------------------
 
+/**
+ * Introspect a database into {@link SchemaMetadata}, routing through the active
+ * dialect's {@link Dialect.introspector} so each engine can override the catalog
+ * SQL. PostgreSQL is driven by {@link introspectPostgresCatalog}.
+ */
 export async function introspect(options: IntrospectOptions): Promise<SchemaMetadata> {
+  const dialect = options.dialect ?? postgresDialect;
+  const introspector = dialect.introspector;
+  if (introspector) {
+    return introspector.introspect(options);
+  }
+  // Dialects without an introspector fall back to the Postgres catalog reader.
+  return introspectPostgresCatalog(options);
+}
+
+/**
+ * PostgreSQL catalog introspector: reads information_schema + pg_catalog and
+ * produces {@link SchemaMetadata}. This is the implementation wrapped by
+ * `postgresDialect.introspector`; call {@link introspect} for dialect routing.
+ */
+export async function introspectPostgresCatalog(options: IntrospectOptions): Promise<SchemaMetadata> {
   const schema = options.schema ?? 'public';
   const dialect = postgresDialect;
   const pool = new pg.Pool({

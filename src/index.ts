@@ -49,6 +49,7 @@ export {
   type TransactionOptions,
   TurbineClient,
   type TurbineConfig,
+  type TurbineDriver,
   withRetry,
 } from './client.js';
 // Dialect contract
@@ -65,6 +66,8 @@ export type {
   DialectName,
   InsertStatementInput,
   IntrospectOptions as DialectIntrospectOptions,
+  ResultStrategy,
+  StreamableConnection,
   UpsertStatementInput,
 } from './dialect.js';
 export { postgresDialect } from './dialect.js';
@@ -91,6 +94,7 @@ export {
   TurbineError,
   TurbineErrorCode,
   UniqueConstraintError,
+  UnsupportedFeatureError,
   ValidationError,
   wrapPgError,
 } from './errors.js';
