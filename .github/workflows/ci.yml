@@ -258,11 +258,25 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Create the test database with the same `mssql` driver the tests use
+      # (already installed by `npm ci`) rather than a separate sqlcmd tools
+      # image — `mcr.microsoft.com/mssql-tools18:latest` has no published tag.
       - name: Create the test database
         run: |
-          docker run --rm --network host mcr.microsoft.com/mssql-tools18 \
-            /opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1 -U sa -P 'Turbine_Passw0rd!' \
-            -Q "IF DB_ID('turbine_test') IS NULL CREATE DATABASE turbine_test" || true
+          cat > /tmp/create-mssql-db.cjs <<'EOF'
+          const sql = require('mssql');
+          (async () => {
+            const pool = await sql.connect({
+              server: '127.0.0.1', port: 1433, user: 'sa',
+              password: 'Turbine_Passw0rd!', database: 'master',
+              options: { encrypt: false, trustServerCertificate: true },
+            });
+            await pool.request().query("IF DB_ID('turbine_test') IS NULL CREATE DATABASE turbine_test");
+            await pool.close();
+            console.log('turbine_test database ready');
+          })().catch((err) => { console.error(err); process.exit(1); });
+          EOF
+          node /tmp/create-mssql-db.cjs
       - name: Run turbine-orm/mssql integration tests against SQL Server 2022
         run: npx tsx --test src/test/mssql.test.ts
         env:

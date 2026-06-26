@@ -1176,8 +1176,14 @@ export async function turbineMysql(
     // MySQL — by default MySQL would parse `'\'` as an escaped quote (syntax
     // error). This also makes string-literal semantics match Postgres. Turbine
     // parameterizes every value, so no behavior depends on backslash escaping.
-    mysql2Pool.on?.('connection', (conn: Mysql2Connection) => {
-      conn.query("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')").catch(() => {});
+    //
+    // NOTE: even on a `mysql2/promise` pool, the 'connection' event yields the
+    // *raw* (callback-style) connection — its `.query()` returns a non-thenable
+    // `Query`, so `.catch()`/`await` on it throws "result of query that is not a
+    // promise". Use the callback form here (fire-and-forget): if the SET fails we
+    // fall back to MySQL's default escaping, harmless since every value is a param.
+    mysql2Pool.on?.('connection', (rawConn: { query: (sql: string, cb: () => void) => void }) => {
+      rawConn.query("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')", () => {});
     });
     pool = new MysqlPool(mysql2Pool);
     owns = true;

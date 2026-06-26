@@ -46,7 +46,8 @@
  * ```
  */
 
-import { DatabaseSync } from 'node:sqlite';
+import { createRequire } from 'node:module';
+import type { DatabaseSync } from 'node:sqlite';
 import { type PgCompatPool, type PgCompatPoolClient, TurbineClient, type TurbineConfig } from './client.js';
 import {
   type BulkInsertStatementInput,
@@ -73,6 +74,47 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+
+// ---------------------------------------------------------------------------
+// Driver constructor — lazily loaded
+// ---------------------------------------------------------------------------
+
+/** The shape of `node:sqlite`'s `DatabaseSync` constructor. */
+type DatabaseSyncCtor = new (path: string, options?: unknown) => DatabaseSync;
+
+let cachedDatabaseSync: DatabaseSyncCtor | undefined;
+
+/**
+ * Lazily load `node:sqlite`'s `DatabaseSync` constructor.
+ *
+ * `node:sqlite` is a built-in only on Node >= 22.5, so importing it at module
+ * top-level would make `import 'turbine-orm/sqlite'` — and any module that
+ * merely re-exports `sqliteDialect` (e.g. the dialect test suite) — throw
+ * `ERR_UNKNOWN_BUILTIN_MODULE` on Node 20. Deferring the require to the moment a
+ * connection is actually opened keeps the dialect (pure SQL generation) usable
+ * everywhere and scopes the Node-version requirement to `turbineSqlite()`.
+ *
+ * `createRequire` is anchored on `process.cwd()` so this works identically in
+ * the ESM and CJS builds (no `import.meta` / `__filename`, which differ between
+ * them); built-in module resolution ignores the anchor entirely.
+ */
+function loadDatabaseSync(): DatabaseSyncCtor {
+  if (cachedDatabaseSync) return cachedDatabaseSync;
+  try {
+    const req = createRequire(process.cwd());
+    const mod = req('node:sqlite') as { DatabaseSync?: DatabaseSyncCtor };
+    if (typeof mod.DatabaseSync !== 'function') {
+      throw new Error("'node:sqlite' did not export a DatabaseSync constructor");
+    }
+    cachedDatabaseSync = mod.DatabaseSync;
+    return cachedDatabaseSync;
+  } catch (err) {
+    throw new ConnectionError(
+      "[turbine] turbine-orm/sqlite requires Node's built-in 'node:sqlite' module (Node >= 22.5). " +
+        `Upgrade Node to >= 22.5, or pass an already-open better-sqlite3-compatible handle. (${(err as Error).message})`,
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Value coercion (params in, rows out)
@@ -858,6 +900,7 @@ export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: 
  * are per-handle), so codegen should target a real file.
  */
 export async function introspectSqlite(options: IntrospectOptions): Promise<SchemaMetadata> {
+  const DatabaseSync = loadDatabaseSync();
   let db: DatabaseSync;
   try {
     db = new DatabaseSync(options.connectionString);
@@ -891,6 +934,7 @@ export interface TurbineSqliteOptions extends Pick<TurbineConfig, 'logging' | 'd
 }
 
 function openSqliteDatabase(target: string, options: TurbineSqliteOptions): DatabaseSync {
+  const DatabaseSync = loadDatabaseSync();
   let db: DatabaseSync;
   try {
     db = new DatabaseSync(target);
