@@ -4,9 +4,9 @@ import { codeToHtml } from 'shiki';
 import { CopyButton } from '../components/CopyButton';
 
 export const metadata: Metadata = {
-  title: 'Turbine ORM — The Postgres-maximalist ORM. Vectors, RLS, realtime, typed.',
+  title: 'Turbine ORM — the Postgres ORM your DBA will sign off on.',
   description:
-    'Everything Postgres can do — pgvector search, RLS sessions, LISTEN/NOTIFY, full-text — as typed, first-class API. One dependency (pg), ~31 KB, no WASM engine, no paid tier, and the only read-only hardened Studio.',
+    'A read-only Studio that physically cannot mutate prod, errors that never leak PII, one dependency (pg, no WASM engine), and SQL-first migrations with SHA-256 drift detection. Postgres-maximalist underneath: typed pgvector, RLS sessions, LISTEN/NOTIFY, full-text.',
 };
 
 const heroCode = `const docs = await db.documents.findMany({
@@ -72,7 +72,7 @@ const features = [
   {
     title: 'Edge-native. One import swap.',
     description:
-      'turbineHttp(pool, schema) — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step.',
+      'turbineHttp(pool, SCHEMA) — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step.',
     stat: '~22 KB',
     statLabel: 'edge bundle (brotli)',
   },
@@ -141,7 +141,7 @@ export default async function Home() {
     '@type': 'SoftwareApplication',
     name: 'Turbine ORM',
     description:
-      'The Postgres-maximalist ORM: pgvector search, RLS session context, LISTEN/NOTIFY, and full-text search as typed first-class API — one runtime dependency, no WASM engine, built-in read-only Studio, PII-safe errors.',
+      'The Postgres ORM your DBA will sign off on: a read-only Studio that physically cannot mutate prod, PII-safe error messages, one runtime dependency with no WASM engine, and SQL-first migrations with SHA-256 drift detection. Postgres-maximalist underneath — pgvector search, RLS session context, LISTEN/NOTIFY, and full-text as typed first-class API.',
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Any',
     url: 'https://turbineorm.dev',
@@ -174,16 +174,17 @@ export default async function Home() {
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
-            <span className="text-white">The Postgres-maximalist ORM.</span>
+            <span className="text-white">The Postgres ORM your DBA will sign off on.</span>
             <br />
-            <span className="amber">Vectors. RLS. Realtime. Typed.</span>
+            <span className="amber">Read-only Studio. PII-safe errors. One dependency.</span>
           </h1>
 
           <p className="hero-subtitle animate-fade-in-up delay-2">
-            Most ORMs treat Postgres as a lowest common denominator — Turbine
-            treats it as the platform. Typed pgvector search, Row-Level
-            Security session context, and a read-only Studio that physically
-            cannot write. The rest is below.
+            A Studio that physically cannot mutate prod, error messages that
+            never leak PII, one dependency (<code>pg</code>, no WASM engine),
+            and SQL-first migrations with checksum drift detection. Underneath
+            it&apos;s Postgres-maximalist — typed pgvector, RLS sessions, and
+            realtime are all first-class. The rest is below.
           </p>
 
           <div className="animate-fade-in-up delay-3">

@@ -1,6 +1,6 @@
 # turbine-orm
 
-One dependency. No WASM engine. The Postgres ORM that ships light and locks tight.
+The Postgres ORM your DBA will sign off on. A read-only Studio that can't touch prod, errors that never leak PII, one dependency, and checksummed migrations.
 
 ```
 npm install turbine-orm
@@ -10,16 +10,16 @@ npm install turbine-orm
 
 ## Why Turbine?
 
-Prisma ships a 1.6 MB WASM query engine. Drizzle ships zero runtime but no Studio, no typed errors, no migration checksums. Turbine ships **one dependency (`pg`) and no engine binary**, and bundles six things no other TS ORM has together:
+Every TS ORM now resolves nested relations in a single `json_agg` query — Prisma 7 and Drizzle v2 both ship it, and so does Turbine. That part is table stakes. The reason to reach for Turbine is the **safety bundle**: the boxes a DBA ticks before a query layer goes anywhere near production. It's the only TypeScript ORM that ships all six of these together:
 
-1. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~31 kB brotli (~109 KB minified); the edge entry to ~22 kB brotli. Prisma's WASM query engine alone is 1.6 MB.
-2. **Built-in read-only Studio.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and — since v0.19 — no raw-SQL surface at all: queries are composed in the ORM's own validated builder. The only TS ORM Studio that physically cannot mutate your database. DBA-approvable.
-3. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
+1. **Read-only Studio your DBA will approve.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and — since v0.19 — no raw-SQL surface at all: queries are composed in the ORM's own validated builder. The only TS ORM Studio that physically cannot mutate your database.
+2. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
+3. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~31 kB brotli (~109 KB minified); the edge entry to ~22 kB brotli. Prisma's WASM query engine alone is 1.6 MB.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
-5. **Edge-native — one import swap.** `turbineHttp(pool, schema)` — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle, no adapter package, no separate serverless build.
+5. **Edge-native — one import swap.** `turbineHttp(pool, SCHEMA)` — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle, no adapter package, no separate serverless build.
 6. **Pipeline batching via wire protocol.** Real Parse/Bind/Execute pipeline — not queries wrapped in a transaction. N independent queries in one round-trip.
 
-Every ORM claims single-query nested loads now (Prisma 7 and Drizzle v2 both use json_agg). Turbine does too — see [How It Works](#how-it-works). The differentiator isn't the query strategy; it's the one-dependency, no-WASM footprint, the read-only Studio, and the error messages that never leak user data.
+See [How It Works](#how-it-works) for the `json_agg` query strategy itself — but the query strategy isn't why you'd pick Turbine. The safety bundle above is: a Studio that can't mutate prod, errors that never leak PII, one dependency, and checksummed migrations.
 
 ## Benchmarks
 
@@ -705,12 +705,12 @@ Turbine's core is driver-agnostic: pass any pg-compatible pool to `TurbineConfig
 // app/api/users/route.ts
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from '@/generated/turbine/metadata';
+import { SCHEMA } from '@/generated/turbine/metadata';
 
 export const runtime = 'edge';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const db = turbineHttp(pool, schema);
+const db = turbineHttp(pool, SCHEMA);
 
 export async function GET() {
   const users = await db.table('users').findMany({
@@ -726,22 +726,22 @@ export async function GET() {
 ```ts
 import { createPool } from '@vercel/postgres';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata.js';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = createPool({ connectionString: process.env.POSTGRES_URL });
-const db = turbineHttp(pool, schema);
+const db = turbineHttp(pool, SCHEMA);
 ```
 
 ### Supabase (direct Postgres — no HTTP proxy needed)
 
 ```ts
 import { TurbineClient } from 'turbine-orm';
-import { schema } from './generated/turbine/metadata.js';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const db = new TurbineClient({
   connectionString: process.env.SUPABASE_DB_URL,
   ssl: { rejectUnauthorized: false },
-}, schema);
+}, SCHEMA);
 ```
 
 ### Cloudflare Workers
@@ -749,12 +749,12 @@ const db = new TurbineClient({
 ```ts
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata';
 
 export default {
   async fetch(req: Request, env: Env) {
     const pool = new Pool({ connectionString: env.DATABASE_URL });
-    const db = turbineHttp(pool, schema);
+    const db = turbineHttp(pool, SCHEMA);
     const users = await db.table('users').findMany({ limit: 10 });
     return Response.json(users);
   },
