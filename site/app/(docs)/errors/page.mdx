@@ -29,6 +29,7 @@ Turbine throws typed errors you can catch with `instanceof`. Every error extends
 | `TURBINE_E014` | `PipelineError` | Non-transactional pipeline has partial failures |
 | `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update — the row was modified by another transaction |
 | `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01 — translated via `wrapPgError()` |
+| `TURBINE_E017` | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on a non-Postgres engine — exposes `feature` and `dialect` |
 
 ## Catching typed errors
 
@@ -173,6 +174,29 @@ try {
 
 Transactional pipelines (the default) either fully succeed or roll back — a failure surfaces as whichever typed error the failing query raised.
 
+## Unsupported features on other engines
+
+`UnsupportedFeatureError` (`TURBINE_E017`) is thrown when you invoke a **Postgres-only** feature on one of Turbine's other [database engines](/engines) — SQLite, MySQL, or SQL Server. It is *not* a `wrapPgError()` translation; Turbine raises it directly (from a capability flag on the active dialect) instead of generating broken SQL. The Postgres-only features are pgvector distance ops, LISTEN/NOTIFY realtime (`$listen` / `$notify`), and RLS `sessionContext` (`$withSession`).
+
+```ts
+import { UnsupportedFeatureError } from 'turbine-orm';
+import { turbineMysql } from 'turbine-orm/mysql';
+
+const db = await turbineMysql(process.env.MYSQL_URL!, SCHEMA);
+
+try {
+  await db.$listen('orders', (payload) => console.log(payload));
+} catch (err) {
+  if (err instanceof UnsupportedFeatureError) {
+    // err.code    === 'TURBINE_E017'
+    // err.feature === 'LISTEN/NOTIFY'
+    // err.dialect === 'mysql'
+  }
+}
+```
+
+On PostgreSQL these features never throw — `TURBINE_E017` only appears on the non-Postgres engines. See [Database Engines](/engines) for the full capability matrix.
+
 ## Safe error messages
 
 By default, `NotFoundError` messages include only the **keys** of the `where` clause — values are redacted so PII doesn't leak into logs (Sentry, Datadog, and friends).
@@ -194,3 +218,4 @@ const db = turbine({
 
 - **[API Reference](/queries)** — transactions, pipelines, and the queries that raise these errors.
 - **[Schema & Migrations](/schema)** — `MigrationError` fires here.
+- **[Database Engines](/engines)** — where `UnsupportedFeatureError` comes from and the per-engine capability matrix.

@@ -30,6 +30,7 @@ const sections: NavSection[] = [
       { href: '/realtime', label: 'Realtime (LISTEN/NOTIFY)' },
       { href: '/schema', label: 'Schema & Migrations' },
       { href: '/serverless', label: 'Serverless & Edge' },
+      { href: '/engines', label: 'Database Engines' },
       { href: '/compatibility', label: 'Database Compatibility' },
       { href: '/cli', label: 'CLI' },
       { href: '/studio', label: 'Studio' },
