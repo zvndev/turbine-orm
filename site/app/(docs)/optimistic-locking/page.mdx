@@ -1,0 +1,135 @@
+export const metadata = {
+  title: 'Optimistic Locking',
+  description:
+    'Prevent lost updates in Turbine ORM with optimistic concurrency control: a version column, the optimisticLock update option, and the OptimisticLockError (E015) thrown when a row changed under you.',
+  alternates: { canonical: '/optimistic-locking' },
+};
+
+# Optimistic Locking
+
+Optimistic locking lets concurrent writers detect a *lost update* without holding a row lock. You read a row (capturing its version), then write back asserting the version is unchanged. If someone else committed in between, your update matches zero rows and Turbine throws `OptimisticLockError`.
+
+It's "optimistic" because nothing is locked — you bet that conflicts are rare and pay only when one actually happens. That's the opposite of pessimistic `SELECT ... FOR UPDATE`, which serializes writers up front.
+
+## The version column
+
+Add an integer column that increments on every update. The convention is `version`, defaulting to `0`.
+
+```ts
+// schema.ts
+export default defineSchema({
+  posts: {
+    id: { type: 'serial', primaryKey: true },
+    title: { type: 'text', notNull: true },
+    version: { type: 'integer', notNull: true, default: 0 },
+  },
+});
+```
+
+Or as a migration against an existing table:
+
+```sql
+ALTER TABLE posts ADD COLUMN version integer NOT NULL DEFAULT 0;
+```
+
+## The `optimisticLock` option
+
+Pass `optimisticLock: { field, expected }` to `update`. `field` is the version column name; `expected` is the version you read.
+
+```ts
+const post = await db.posts.findUniqueOrThrow({ where: { id: 1 } });
+
+await db.posts.update({
+  where: { id: post.id },
+  data: { title: 'Updated title' },
+  optimisticLock: { field: 'version', expected: post.version },
+});
+```
+
+Turbine adds the version check to the `WHERE` clause and auto-increments the column in the same statement:
+
+```sql
+UPDATE posts SET title = $1, version = version + 1
+WHERE id = $2 AND version = $3
+RETURNING *
+```
+
+If another writer bumped `version` after you read it, the `version = $3` predicate fails, no row is updated, and Turbine raises `OptimisticLockError` instead of silently doing nothing.
+
+## Handling a conflict
+
+`OptimisticLockError` is `TURBINE_E015`. It carries the `table`, the `versionField`, and the `expectedVersion` you supplied.
+
+```ts
+import { OptimisticLockError } from 'turbine-orm';
+
+try {
+  await db.posts.update({
+    where: { id: post.id },
+    data: { title: input.title },
+    optimisticLock: { field: 'version', expected: post.version },
+  });
+} catch (err) {
+  if (err instanceof OptimisticLockError) {
+    // err.table          -> 'posts'
+    // err.versionField   -> 'version'
+    // err.expectedVersion-> the stale version you sent
+    // The row changed under you. Re-read and reapply, or surface a 409 conflict.
+  }
+  throw err;
+}
+```
+
+### Not auto-retryable
+
+Unlike `DeadlockError` and `SerializationFailureError`, `OptimisticLockError` does **not** carry an `isRetryable` flag. That's deliberate: resolving a version conflict means the underlying data changed, so you can't blindly replay the same statement — you have to re-read the current row and decide whether your change still makes sense.
+
+A re-read-then-retry helper makes that explicit:
+
+```ts
+import { OptimisticLockError } from 'turbine-orm';
+
+async function patchPost(id: number, patch: { title?: string }, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const current = await db.posts.findUniqueOrThrow({ where: { id } });
+    try {
+      return await db.posts.update({
+        where: { id },
+        data: patch,
+        optimisticLock: { field: 'version', expected: current.version },
+      });
+    } catch (err) {
+      if (err instanceof OptimisticLockError && attempt < maxAttempts) continue;
+      throw err;
+    }
+  }
+}
+```
+
+For a user-facing edit form, prefer surfacing the conflict (HTTP `409`) so the human can re-review the latest data, rather than silently overwriting it.
+
+## Optimistic locking vs atomic operators
+
+These solve different problems:
+
+- **Atomic update operators** (`{ increment: 1 }`, `{ decrement: 1 }`, …) compute the new value from the current column inside the `UPDATE`, so concurrent `+1`s never lose each other. Use them for counters and balances where you don't care what the previous value *was*.
+- **Optimistic locking** guards a *read-modify-write* where the new value depends on what the user saw. Use it for edit forms and any update computed in application code from a value you read earlier.
+
+```ts
+// Atomic — no lock needed, both increments land:
+await db.posts.update({ where: { id: 1 }, data: { viewCount: { increment: 1 } } });
+
+// Read-modify-write — guard with optimisticLock:
+const p = await db.posts.findUniqueOrThrow({ where: { id: 1 } });
+await db.posts.update({
+  where: { id: 1 },
+  data: { title: rewrite(p.title) },
+  optimisticLock: { field: 'version', expected: p.version },
+});
+```
+
+## See also
+
+- **[Transactions & Pipelines](/transactions)** — `SerializationFailureError` and `DeadlockError`, the *retryable* concurrency errors.
+- **[Typed Errors](/errors)** — the full error table, including `OptimisticLockError` (E015).
+- **[API Reference](/queries)** — `update`, atomic operators, and the rest of the write surface.

@@ -23,7 +23,9 @@ const sections: NavSection[] = [
     items: [
       { href: '/queries', label: 'API Reference' },
       { href: '/relations', label: 'Relations' },
+      { href: '/nested-writes', label: 'Nested Writes' },
       { href: '/transactions', label: 'Transactions & Pipelines' },
+      { href: '/optimistic-locking', label: 'Optimistic Locking' },
       { href: '/vector', label: 'Vector Search' },
       { href: '/realtime', label: 'Realtime (LISTEN/NOTIFY)' },
       { href: '/schema', label: 'Schema & Migrations' },
@@ -34,6 +36,10 @@ const sections: NavSection[] = [
       { href: '/observability', label: 'Observability' },
       { href: '/errors', label: 'Typed Errors' },
     ],
+  },
+  {
+    title: 'Recipes',
+    items: [{ href: '/recipes', label: 'Framework Integration' }],
   },
   {
     title: 'Reference',
