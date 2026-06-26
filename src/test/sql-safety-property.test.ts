@@ -1,3 +1,20 @@
+/**
+ * SQL safety — adversarial injection corpus (table-driven).
+ *
+ * NOTE: despite the file name, this is NOT a property/fuzz test — there is no
+ * random input generation. It is a fixed, hand-curated corpus of known
+ * SQL-injection payloads iterated in a loop (a table-driven / parameterized
+ * test). Each payload is fed through the query builder and we assert the
+ * builder never string-interpolates it: the raw payload must not appear in the
+ * generated SQL, and the value must instead show up in the `$N` params array.
+ *
+ * To strengthen coverage, add more real-world payloads to INJECTION_PAYLOADS —
+ * keep it a deterministic, fixed list (do not add random generation, which
+ * would make failures non-reproducible). Avoid payloads that are legitimate
+ * substrings of the emitted SQL (e.g. a bare `$1` or `"users"`), since the
+ * "payload must not appear in SQL" assertion would then false-positive.
+ */
+
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { SchemaMetadata } from '../schema.js';
@@ -39,10 +56,27 @@ const INJECTION_PAYLOADS = [
   '\0',
   '\n; DROP TABLE users;',
   "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT version()))) --",
+  // Postgres-specific time-based / stacked-query probes
+  "'; SELECT pg_sleep(5); --",
+  "' OR pg_sleep(5)='",
+  "'); SELECT pg_sleep(5)--",
+  // Comment-obfuscated boolean bypass
+  "'/**/OR/**/1=1--",
+  "' OR 'a'='a' /*",
+  // Nested-parenthesis bypass
+  '1)) OR ((1=1',
+  // Backslash-escaped quote attempt
+  "\\'; DROP TABLE users; --",
+  // URL-encoded ' OR 1=1
+  '%27%20OR%201=1',
+  // UNION column-count probe
+  "' UNION SELECT NULL,NULL,NULL--",
+  // Boolean blind injection
+  "' AND 1=CAST((SELECT current_user) AS int)--",
   Array(10000).fill('A').join(''),
 ];
 
-describe('SQL safety property tests', () => {
+describe('SQL safety — adversarial injection corpus (table-driven)', () => {
   it('user values never appear unparameterized in WHERE SQL', () => {
     const q = makeQuery('users', schema);
 
