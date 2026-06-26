@@ -22,4 +22,11 @@ export default [
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
+  {
+    name: 'sqlite entry — turbine-orm/sqlite (node:sqlite + client graph)',
+    path: 'dist/sqlite.js',
+    limit: '30 kB',
+    ignore: ['pg', 'node:sqlite'],
+    modifyEsbuildConfig: nodePlatform,
+  },
 ];

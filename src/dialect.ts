@@ -226,6 +226,35 @@ export interface Dialect {
   /** Optional type mapping hook for code generation/introspection. */
   typeToTypeScript?(dialectType: string, nullable: boolean): string;
 
+  /**
+   * Cast an aggregate result expression to an integer or float SQL type.
+   * PostgreSQL uses the postfix casts `expr::int` / `expr::float`; portable
+   * engines (e.g. SQLite, which has no `::` cast operator) emit
+   * `CAST(expr AS INTEGER/REAL)`. Optional: when a dialect omits it, the query
+   * builder falls back to the PostgreSQL postfix cast, so dialects that predate
+   * this hook keep emitting byte-identical SQL.
+   */
+  castAggregate?(expr: string, target: 'int' | 'float'): string;
+
+  /**
+   * Build a membership (`IN` / `NOT IN`) predicate from a column/expression and
+   * a single bound parameter reference. PostgreSQL binds the whole list as one
+   * array param (`expr = ANY($n)` / `expr != ALL($n)`), so the placeholder count
+   * stays independent of the list length and the SQL cache remains valid.
+   * Engines without array parameters (SQLite) override this together with
+   * {@link inClauseParam} to use a length-independent single-placeholder form
+   * (e.g. `expr IN (SELECT value FROM json_each(?))`). Optional: the query
+   * builder falls back to the PostgreSQL `ANY`/`ALL` form when absent.
+   */
+  buildInClause?(expr: string, paramRef: string, negated: boolean): string;
+
+  /**
+   * The single bound value for an `IN` list (paired with {@link buildInClause}).
+   * PostgreSQL passes the array through unchanged; SQLite serializes it to a
+   * JSON string consumed by `json_each`. Optional: defaults to the array itself.
+   */
+  inClauseParam?(values: unknown[]): unknown;
+
   /** Optional array-cast hook for bulk insert implementations. */
   arrayType?(baseType: string): string;
 
@@ -425,6 +454,18 @@ export const postgresDialect: Dialect = {
 
   typeToTypeScript(dialectType: string, nullable: boolean): string {
     return pgTypeToTs(dialectType, nullable);
+  },
+
+  castAggregate(expr: string, target: 'int' | 'float'): string {
+    return `${expr}::${target}`;
+  },
+
+  buildInClause(expr: string, paramRef: string, negated: boolean): string {
+    return negated ? `${expr} != ALL(${paramRef})` : `${expr} = ANY(${paramRef})`;
+  },
+
+  inClauseParam(values: unknown[]): unknown {
+    return values;
   },
 
   arrayType(baseType: string): string {

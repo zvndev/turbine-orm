@@ -4,6 +4,7 @@ import { type Dialect, postgresDialect, QueryInterface, UnsupportedFeatureError 
 import type { RelationDef, SchemaMetadata } from '../schema.js';
 import { column, defineSchema, table } from '../schema-builder.js';
 import { schemaToSQL } from '../schema-sql.js';
+import { sqliteDialect } from '../sqlite.js';
 import { mockTable } from './helpers.js';
 
 const mysqlishDialect: Dialect = {
@@ -372,6 +373,15 @@ const fixtures: ConformanceFixture[] = [
     // json_agg / UNNEST / ILIKE / `$N` / MySQL backtick identifiers.
     forbidden: /json_agg|json_build_object|::json|ILIKE|\$\d|`users`|`posts`|UNNEST/,
     placeholder: /\?/,
+    quote: /"users"/,
+  },
+  {
+    // The REAL shipped sqliteDialect (turbine-orm/sqlite) — proves the production
+    // engine emits no Postgres leakage. Uses "…" + named `:pN` placeholders.
+    label: 'sqlite (real)',
+    dialect: sqliteDialect,
+    forbidden: /json_agg|json_build_object|::json|ILIKE|\$\d|`users`|`posts`|UNNEST|= ANY|!= ALL/,
+    placeholder: /:p\d/,
     quote: /"users"/,
   },
 ];
