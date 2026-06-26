@@ -7,7 +7,8 @@
  */
 
 import { ValidationError } from './errors.js';
-import { pgArrayType, pgTypeToTs, type SchemaMetadata } from './schema.js';
+import type { WithOptions } from './query/types.js';
+import { pgArrayType, pgTypeToTs, type RelationDef, type SchemaMetadata, type TableMetadata } from './schema.js';
 
 export type DialectName = 'postgresql' | 'mysql' | 'sqlite' | (string & {});
 
@@ -121,6 +122,103 @@ export type ResultStrategy = 'returning' | 'output' | 'reselect';
  */
 export interface StreamableConnection {
   query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
+}
+
+/**
+ * Inputs for {@link Dialect.buildUpdateStatement} — full UPDATE assembly. Used by
+ * engines whose returning shape is injected MID-statement rather than as a trailing
+ * clause (SQL Server `OUTPUT INSERTED.*` lands between `SET …` and `WHERE …`).
+ */
+export interface UpdateStatementInput {
+  /** SQL-ready quoted table name. */
+  table: string;
+  /** SQL-ready `col = expr` assignments. */
+  setClauses: string[];
+  /** SQL-ready WHERE fragment INCLUDING the leading ` WHERE ` (or '' for none). */
+  whereSql: string;
+  /** SQL-ready returning selection (default `*`). */
+  returning?: string;
+}
+
+/**
+ * Inputs for {@link Dialect.buildDeleteStatement} — full DELETE assembly. SQL Server
+ * injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and `WHERE …`.
+ */
+export interface DeleteStatementInput {
+  /** SQL-ready quoted table name. */
+  table: string;
+  /** SQL-ready WHERE fragment INCLUDING the leading ` WHERE ` (or '' for none). */
+  whereSql: string;
+  /** SQL-ready returning selection (default `*`). */
+  returning?: string;
+}
+
+/**
+ * Inputs for {@link Dialect.buildLimitOffset} — the trailing pagination clause of an
+ * outer SELECT. PostgreSQL/MySQL/SQLite use `LIMIT x [OFFSET y]`; SQL Server has no
+ * `LIMIT` and uses `[ORDER BY …] OFFSET y ROWS [FETCH NEXT x ROWS ONLY]` (which
+ * requires an ORDER BY — a stable default is injected when {@link hasOrderBy} is false).
+ */
+export interface LimitOffsetInput {
+  /** SQL-ready placeholder/literal for the row LIMIT, or undefined for no limit. */
+  limitPlaceholder?: string;
+  /** SQL-ready placeholder/literal for the OFFSET, or undefined for no offset. */
+  offsetPlaceholder?: string;
+  /** Whether the outer SELECT already carries an ORDER BY (so none must be injected). */
+  hasOrderBy: boolean;
+}
+
+/**
+ * Everything an engine needs to OVERRIDE nested-relation subquery generation, for
+ * dialects whose JSON-aggregation shape is fundamentally different from PostgreSQL's
+ * `json_agg(json_build_object(...))` (SQL Server's `FOR JSON PATH` expresses the
+ * object shape through the child SELECT's column ALIASES rather than an explicit
+ * `JSON_OBJECT`, so it cannot be assembled from {@link Dialect.buildJsonObject} /
+ * {@link Dialect.buildJsonArrayAgg} primitives — see {@link Dialect.buildRelationSubquery}).
+ *
+ * The query builder pre-resolves the parts that are engine-independent (alias,
+ * select/omit-resolved columns, recursion + param threading) and hands them to the
+ * dialect. **Param-push ordering contract:** the override MUST push values to
+ * {@link params} in the same order the builder's collect path expects so the SQL
+ * cache and pipeline batching stay in sync —
+ *   - to-many with `limit`/`orderBy` (the "wrap" path) and manyToMany:
+ *     `buildWhere(...)` → push `limit` → `recurse(...)` for each nested relation;
+ *   - everything else (to-one, unordered/unlimited to-many): `recurse(...)` for each
+ *     nested relation → `buildWhere(...)` (no limit param).
+ */
+export interface RelationSubqueryContext {
+  /** The relation being expanded (its `type`, `to`, `foreignKey`/`referenceKey`, `through`). */
+  relDef: RelationDef;
+  /** The `with` spec for this relation: `true`, or a {@link WithOptions} object. */
+  spec: true | WithOptions;
+  /** Shared parameter array — push BOUND values here in the order described above. */
+  params: unknown[];
+  /** Parent alias or table name (RAW identifier, not quoted) to correlate against. */
+  parentRef: string;
+  /** Pre-allocated unique alias for this relation's target rows (e.g. `t0`). */
+  alias: string;
+  /** Target table name (snake_case). */
+  targetTable: string;
+  /** Target table metadata. */
+  targetMeta: TableMetadata;
+  /** Resolved target columns (snake_case) honoring `select` / `omit`. */
+  targetColumns: string[];
+  /** Current recursion depth (for nested {@link recurse} calls, pass `depth + 1`). */
+  depth: number;
+  /** Breadcrumb path of relation/table names for circular-relation errors. */
+  path: string[];
+  /** Quote a RAW identifier through the active dialect. */
+  quote(name: string): string;
+  /**
+   * Build a WHERE fragment for `spec.where` against `whereAlias`, PUSHING its params
+   * to {@link params}. Returns '' when the spec has no `where`. Call exactly once.
+   */
+  buildWhere(whereAlias: string): string;
+  /**
+   * Recurse to build a nested relation's subquery (PUSHING its params to
+   * {@link params}). Uses the shared alias counter, so nested aliases never collide.
+   */
+  recurse(relDef: RelationDef, spec: true | WithOptions, parentRef: string, depth: number, path: string[]): string;
 }
 
 export interface Dialect {
@@ -337,6 +435,44 @@ export interface Dialect {
    * information_schema / pg_catalog reader in `introspect.ts`.
    */
   readonly introspector?: DialectIntrospector;
+
+  // ---- Optional engine-specific overrides (PG/MySQL/SQLite omit them) -------
+
+  /**
+   * Build the trailing pagination clause for an OUTER SELECT. Optional: when a
+   * dialect omits it, the query builder emits the PostgreSQL form
+   * (` LIMIT <ph>` and/or ` OFFSET <ph>`), so PG/MySQL/SQLite stay byte-identical.
+   * SQL Server has no `LIMIT`, so it implements this to emit
+   * `[ORDER BY (SELECT NULL)] OFFSET <off> ROWS [FETCH NEXT <lim> ROWS ONLY]`.
+   */
+  buildLimitOffset?(input: LimitOffsetInput): string;
+
+  /**
+   * Assemble a full UPDATE statement. Optional: omitted by engines whose returning
+   * shape is a trailing clause (PG/SQLite `RETURNING`, MySQL none) — the builder
+   * falls back to `UPDATE <t> SET <set> <where><returningClause>`. SQL Server
+   * implements this to inject `OUTPUT INSERTED.*` between `SET …` and `WHERE …`.
+   */
+  buildUpdateStatement?(input: UpdateStatementInput): string;
+
+  /**
+   * Assemble a full DELETE statement. Optional: see {@link buildUpdateStatement}.
+   * SQL Server injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and `WHERE …`.
+   */
+  buildDeleteStatement?(input: DeleteStatementInput): string;
+
+  /**
+   * OVERRIDE nested-relation subquery generation entirely. Optional: when a dialect
+   * omits it, the builder uses its native `json_agg(json_build_object(...))` path
+   * (PG) routed through {@link buildJsonObject} / {@link buildJsonArrayAgg} /
+   * {@link wrapJsonSubresult} — so MySQL and SQLite, which only swap those
+   * primitives, produce identical output and never define this hook. SQL Server
+   * defines it to emit `FOR JSON PATH` correlated subqueries (its JSON aggregate
+   * is expressed through the child SELECT's column aliases, which does not map onto
+   * the primitive hooks). See {@link RelationSubqueryContext} for the
+   * param-push-ordering contract the override must honor.
+   */
+  buildRelationSubquery?(ctx: RelationSubqueryContext): string;
 }
 
 export interface DialectIntrospector {
