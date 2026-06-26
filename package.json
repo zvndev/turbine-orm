@@ -19,6 +19,11 @@
       "import": "./dist/sqlite.js",
       "require": "./dist/cjs/sqlite.js"
     },
+    "./mysql": {
+      "types": "./dist/mysql.d.ts",
+      "import": "./dist/mysql.js",
+      "require": "./dist/cjs/mysql.js"
+    },
     "./cli": {
       "types": "./dist/cli/config.d.ts",
       "import": "./dist/cli/config.js",
@@ -91,9 +96,18 @@
     "c8": "^11.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
+    "mysql2": "^3.22.5",
     "size-limit": "^12.1.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "mysql2": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "mysql2": {
+      "optional": true
+    }
   },
   "keywords": [
     "orm",

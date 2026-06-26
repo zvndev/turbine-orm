@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { type Dialect, postgresDialect, QueryInterface, UnsupportedFeatureError } from '../index.js';
+import { mysqlDialect } from '../mysql.js';
 import type { RelationDef, SchemaMetadata } from '../schema.js';
 import { column, defineSchema, table } from '../schema-builder.js';
 import { schemaToSQL } from '../schema-sql.js';
@@ -383,6 +384,16 @@ const fixtures: ConformanceFixture[] = [
     forbidden: /json_agg|json_build_object|::json|ILIKE|\$\d|`users`|`posts`|UNNEST|= ANY|!= ALL/,
     placeholder: /:p\d/,
     quote: /"users"/,
+  },
+  {
+    // The REAL shipped mysqlDialect (turbine-orm/mysql) — proves the production
+    // engine emits no Postgres leakage. Uses backticks + named `:pN` placeholders,
+    // no RETURNING / ON CONFLICT / UNNEST / ILIKE / array-IN.
+    label: 'mysql (real)',
+    dialect: mysqlDialect,
+    forbidden: /json_agg|json_build_object|::json|ILIKE|\$\d|"users"|"posts"|RETURNING|ON CONFLICT|UNNEST|= ANY|!= ALL/,
+    placeholder: /:p\d/,
+    quote: /`users`/,
   },
 ];
 
