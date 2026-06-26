@@ -193,7 +193,7 @@ const active = await db.users.findMany({
 - **`include` → `with`, `skip` → `offset`.** That's the full lexical diff. `take`, `cursor`, and `distinct` work as-is at the top level (`take` is an alias for `limit`); inside a nested `with`, the per-relation limit is spelled `limit`.
 - **Atomic update operators are first-class.** `set`, `increment`, `decrement`, `multiply`, `divide`. All compile to in-place SQL.
 - **Typed errors with codes.** `UniqueConstraintError` / `ForeignKeyError` / `NotNullViolationError` / `CheckConstraintError` all carry `code` (`TURBINE_E008`–`E011`) and `cause`. `findUniqueOrThrow` throws `NotFoundError` (`TURBINE_E001`) with the `where` attached. `DeadlockError` / `SerializationFailureError` have `readonly isRetryable = true as const`.
-- **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, schema)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.
+- **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, SCHEMA)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.
 - **Single runtime dependency.** `pg` only. No engine binary, no WASM, no `@prisma/client`.
 - **Postgres only.** Intentional — depth over breadth enables the edge and Studio stories.
 

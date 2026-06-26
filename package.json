@@ -75,6 +75,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@types/pg": "^8.11.11",
     "pg": "^8.13.1"
   },
   "devDependencies": {
@@ -82,7 +83,6 @@
     "@size-limit/esbuild": "^12.1.0",
     "@size-limit/file": "^12.1.0",
     "@types/node": "^22.10.0",
-    "@types/pg": "^8.11.11",
     "c8": "^11.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
