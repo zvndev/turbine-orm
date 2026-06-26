@@ -7,9 +7,11 @@ export const metadata = {
 
 # Database Compatibility
 
-Turbine is built for PostgreSQL. Because it generates standard SQL (parameterized queries, `json_agg`, correlated subqueries), it also works with databases that speak the PostgreSQL wire protocol.
+Turbine is built for PostgreSQL. Because it generates standard SQL (parameterized queries, `json_agg`, correlated subqueries), it also works with databases that speak the PostgreSQL wire protocol — and **this page is about those databases**, the ones that run on Turbine's default Postgres path (CockroachDB, YugabyteDB, AlloyDB, TimescaleDB, Neon, Supabase, and friends).
 
-Turbine v0.15 extends the internal `Dialect` interface seam across query generation, DML generation, schema DDL, migration tracking SQL, PostgreSQL-generated TypeScript type mapping, and bulk-insert array type mapping. PostgreSQL remains the only GA target in the `turbine-orm` package, but SQL primitives like quoting, placeholders, JSON aggregation, DML (`RETURNING`, `UNNEST`, `ON CONFLICT`), column types, `CREATE TABLE`, indexes, `_turbine_migrations` statements, and schema metadata type names now route through a dialect contract so future `@turbine-orm/mysql` and `@turbine-orm/sqlite` packages can implement native SQL without compromising the Postgres path.
+> Looking for **SQLite, MySQL, or SQL Server**? Those are first-class non-Postgres engines with their own SQL dialects, not wire-compatible Postgres — see **[Database Engines](/engines)** for setup and the per-engine capability matrix.
+
+Turbine's internal `Dialect` seam routes query generation, DML, schema DDL, migration-tracking SQL, transactions, streaming, introspection, and TypeScript type mapping through a single contract — quoting, placeholders, JSON aggregation, DML (`RETURNING`, `UNNEST`, `ON CONFLICT`), column types, `CREATE TABLE`, indexes, and `_turbine_migrations` statements all flow through it. That seam is what makes the dedicated SQLite / MySQL / SQL Server engines possible without compromising the Postgres path. The PG-wire-compatible databases below need none of that machinery — they reuse the Postgres dialect directly, with at most a thin [adapter](/cli) for migration locking or catalog quirks.
 
 ## Compatibility Matrix
 
