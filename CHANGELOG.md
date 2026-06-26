@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.21.0 (2026-06-26)
+
+**Multi-dialect: SQLite, MySQL, and SQL Server engines.** Turbine is still Postgres-first, but the query/result core is now engine-agnostic behind a dialect/driver seam, and three new engines ship as additive subpath exports. Drivers are optional peer dependencies — `npm i turbine-orm` still installs only `pg`.
+
+### Added
+- **`turbine-orm/sqlite`** — `turbineSqlite(path | ':memory:', schema)`. **Zero new dependency** via Node's built-in `node:sqlite` (Node ≥ 22.5; `better-sqlite3` is a documented fallback for older Node). Single-query nested `with` via `json_group_array`/`json_object` (with a `json()` subresult wrap so nested trees aren't double-encoded), `RETURNING` writes (SQLite ≥ 3.35), `PRAGMA`-based introspection, and savepoint-nested transactions. Runs **in-process** — its full integration suite executes against `:memory:` in the normal unit lane.
+- **`turbine-orm/mysql`** — `turbineMysql(config | pool, schema)`. Optional peer `mysql2`; MySQL **8.0+** (enforced on connect). Nested `with` via `JSON_ARRAYAGG`/`JSON_OBJECT`. MySQL has no `RETURNING`, so writes use the new `reselect` strategy (execute, then re-fetch the row); `INSERT … ON DUPLICATE KEY UPDATE` upserts; `information_schema` introspection; `GET_LOCK` migration locking. `createMany` returns `[]` (rows are inserted; re-query if you need them).
+- **`turbine-orm/mssql`** — `turbineMssql(config | pool, schema)`. Optional peer `mssql`. Nested `with` via a dedicated `FOR JSON PATH` generator; writes return rows via `OUTPUT` / `MERGE`; `OFFSET … FETCH` paging; `INFORMATION_SCHEMA` + `sys.*` introspection; `sp_getapplock` locking.
+- **`/engines` docs page** with a per-engine capability matrix, plus a "Database engines" section in the README and CLAUDE.md.
+- **E017 `UnsupportedFeatureError`** — thrown when a Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) is invoked on an engine whose capability flag reports it unsupported, rather than failing with a confusing driver error.
+
+### Changed
+- **The `Dialect` contract became a real multi-engine seam** — `resultStrategy` (`returning` / `reselect` / `output`), a `TurbineDriver` driver abstraction (every `BEGIN`/`COMMIT`/`SAVEPOINT`/isolation/`set_config` literal now routes through the dialect), `DialectIntrospector`, and additive SQL hooks (`wrapJsonSubresult`, `aggSupportsInlineOrderBy`, `castAggregate`, `buildInClause`, `buildRelationSubquery`, `buildLimitOffset`, `buildUpdate`/`buildDeleteStatement`). **PostgreSQL output is byte-identical and unchanged** — engines that don't define a hook fall back to the exact prior SQL.
+- Engine drivers (`mysql2`, `mssql`) are devDependencies + **optional** peerDependencies; the root runtime dependency set remains exactly `pg`. A CI `pack-smoke` check verifies each engine subpath imports with its driver absent, and new `mysql:8` / SQL Server 2022 CI service-container jobs run the real integration suites.
+
+### Fixed
+- **MySQL optimistic-lock conflicts now throw `OptimisticLockError`.** On the `reselect` path the version-checked UPDATE was followed by a re-fetch on `where` only (no version predicate), so a conflict silently returned the stale row. The conflict is now detected from the UPDATE's affected-row count — identical behavior to the `RETURNING`/`OUTPUT` engines.
+
+### Also in this release (product-review sprint)
+- **Repositioning + onboarding fixes:** README and landing now lead with the "safety bundle" (read-only Studio, PII-safe errors, one dependency, checksummed migrations). Fixed copy-paste-breaking docs: serverless `SCHEMA` casing (the generator now also emits a lowercase `schema` alias), the non-existent `db.$queryRaw` (→ `db.sql`/`db.raw`), `timeoutMs` → `timeout`, and the `withRetry()` "built-in" claim.
+- **Security:** closed a LOW stored-XSS gap in the Observe dashboard (`row.model`/`row.action` now escaped); hardened the Studio/Observe token check to SHA-256 + `crypto.timingSafeEqual`.
+- **Docs + tests:** new nested-writes, optimistic-locking, and framework-recipes pages; Studio security-perimeter tests (401/403/429/READ-ONLY).
+
 ## 0.19.2 (2026-06-10)
 
 **Patch release from a full product review + gold-standard audit** — closes a HIGH silent-wrong-rows hole in the SQL cache, makes two documented-but-broken behaviors actually work, and brings the docs/site in line with what the library does.
