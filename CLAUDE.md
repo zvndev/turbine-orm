@@ -18,7 +18,7 @@ npm run lint:fix      # Biome lint --apply
 
 The core insight: instead of N+1 queries for nested relations, Turbine generates a single SQL statement using PostgreSQL's `json_agg` + `json_build_object` with correlated subqueries.
 
-**Dependency graph:** `client.ts` wraps `query/` with connection pooling and transactions. The `query/` module is the heart — it builds all SQL and parses results. `pipeline.ts` batches multiple `DeferredQuery` objects from `query/` into a single round-trip. The CLI (`cli/`) imports `generate.ts`, `introspect.ts`, and `schema-sql.ts` but never imports `query/` or `client.ts` directly.
+**Dependency graph:** `client.ts` wraps `query/` with connection pooling and transactions. The `query/` module is the heart — it builds all SQL and parses results. `pipeline.ts` batches multiple `DeferredQuery` objects from `query/` into a single round-trip. The CLI (`cli/`) imports `generate.ts`, `introspect.ts`, and `schema-sql.ts`, and since v0.19 the ORM-native Studio (`cli/studio.ts`) also imports `QueryInterface`/`quoteIdent` from `query/`. The CLI still never imports `client.ts` directly — that's the real circular-dependency rule.
 
 ```
 src/

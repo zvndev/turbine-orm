@@ -290,6 +290,9 @@ describe('generator: *Relations interface output', () => {
       assert.match(metadata, /pgTypes: \{/);
       assert.match(metadata, /pgType: 'int8'/);
       assert.match(metadata, /pgArrayType: 'bigint\[\]'/);
+      // Canonical SCHEMA export plus the lowercase back-compat alias.
+      assert.match(metadata, /export const SCHEMA: SchemaMetadata = \{/);
+      assert.match(metadata, /export const schema = SCHEMA;/);
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }

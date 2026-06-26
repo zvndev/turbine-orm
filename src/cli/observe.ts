@@ -6,7 +6,7 @@
  * random token, HttpOnly cookie, CSP headers, read-only transactions.
  */
 
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import pg from 'pg';
 import { OBSERVE_HTML } from './observe-ui.js';
@@ -154,12 +154,12 @@ function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let result = 0;
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return result === 0;
+  // Hash both inputs to fixed-length 32-byte SHA-256 digests before comparing.
+  // This makes the comparison constant-length (timingSafeEqual never throws on a
+  // length mismatch) and leaks neither length nor content via timing.
+  const ah = createHash('sha256').update(a).digest();
+  const bh = createHash('sha256').update(b).digest();
+  return timingSafeEqual(ah, bh);
 }
 
 // ---------------------------------------------------------------------------

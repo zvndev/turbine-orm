@@ -22,7 +22,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { platform } from 'node:os';
@@ -304,12 +304,12 @@ function checkRateLimit(limiter: Map<string, { count: number; resetAt: number }>
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let result = 0;
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return result === 0;
+  // Hash both inputs to fixed-length 32-byte SHA-256 digests before comparing.
+  // This makes the comparison constant-length (timingSafeEqual never throws on a
+  // length mismatch) and leaks neither length nor content via timing.
+  const ah = createHash('sha256').update(a).digest();
+  const bh = createHash('sha256').update(b).digest();
+  return timingSafeEqual(ah, bh);
 }
 
 /**
