@@ -532,6 +532,36 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Validate a LIMIT/OFFSET value as a non-negative integer and return it as an
+   * inline SQL literal. Used only on `dialect.inlineLimitOffset` engines (MySQL).
+   * The input is always a Turbine-controlled pagination value, never a raw user
+   * string — and this guard guarantees the output is `String` of a validated
+   * integer, so inlining cannot inject SQL.
+   */
+  private limitOffsetLiteral(value: unknown): string {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new ValidationError(`LIMIT/OFFSET must be a non-negative integer, received: ${String(value)}`);
+    }
+    return String(n);
+  }
+
+  /**
+   * Resolve a LIMIT/OFFSET value to either an inline literal (no param pushed, on
+   * `dialect.inlineLimitOffset` engines) or a bound placeholder (the value is
+   * pushed to `params`). Build and collect paths both gate on the same flag so
+   * the param order stays mirrored; PG/SQLite/SQL Server keep parameterizing and
+   * stay byte-identical.
+   */
+  private paginationRef(value: unknown, params: unknown[]): string {
+    if (this.dialect.inlineLimitOffset) {
+      return this.limitOffsetLiteral(value);
+    }
+    params.push(Number(value));
+    return this.p(params.length);
+  }
+
+  /**
    * Build an `IN` / `NOT IN` predicate through the active dialect. PostgreSQL
    * keeps the array-param form (`expr = ANY($n)` / `expr != ALL($n)`); other
    * engines (SQLite) use a length-independent single-placeholder form. Paired
@@ -1060,12 +1090,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
       let limitPh: string | undefined;
       let offsetPh: string | undefined;
       if (effectiveLimit !== undefined) {
-        freshParams.push(Number(effectiveLimit));
-        limitPh = this.p(freshParams.length);
+        limitPh = this.paginationRef(effectiveLimit, freshParams);
       }
       if (args?.offset !== undefined) {
-        freshParams.push(Number(args.offset));
-        offsetPh = this.p(freshParams.length);
+        offsetPh = this.paginationRef(args.offset, freshParams);
       }
       sql += this.buildPagination(limitPh, offsetPh, !!args?.orderBy);
 
@@ -1093,12 +1121,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.orderBy) {
       this.collectOrderByParams(args.orderBy, params);
     }
-    // 5. LIMIT param
-    if (effectiveLimit !== undefined) {
+    // 5. LIMIT param — skipped when the dialect inlines pagination (build path
+    //    mirrors via paginationRef → no placeholder, no param).
+    if (effectiveLimit !== undefined && !this.dialect.inlineLimitOffset) {
       params.push(Number(effectiveLimit));
     }
-    // 6. OFFSET param
-    if (args?.offset !== undefined) {
+    // 6. OFFSET param — same inline gate as LIMIT above.
+    if (args?.offset !== undefined && !this.dialect.inlineLimitOffset) {
       params.push(Number(args.offset));
     }
 
@@ -3020,7 +3049,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (spec.where) {
         this.collectAliasWhereParams(targetTable, targetMeta, spec.where as Record<string, unknown>, params);
       }
-      if (spec.limit !== undefined) {
+      if (spec.limit !== undefined && !this.dialect.inlineLimitOffset) {
         params.push(Number(spec.limit));
       }
       if (spec.with) {
@@ -3055,7 +3084,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // buildRelationSubquery). belongsTo/hasOne ignore limit (always LIMIT 1), so
     // pushing one here would orphan a param and desync the collect path.
     // `limit: 0` pushes (LIMIT 0 is honored), so check !== undefined.
-    if (relDef.type === 'hasMany' && spec.limit !== undefined) {
+    if (relDef.type === 'hasMany' && spec.limit !== undefined && !this.dialect.inlineLimitOffset) {
       params.push(Number(spec.limit));
     }
 
@@ -4265,8 +4294,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `limit: 0` is honored (LIMIT 0 → empty array), so check !== undefined.
     let limitClause = '';
     if (relDef.type === 'hasMany' && spec !== true && spec.limit !== undefined) {
-      params.push(Number(spec.limit));
-      limitClause = ` LIMIT ${this.p(params.length)}`;
+      limitClause = ` LIMIT ${this.paginationRef(spec.limit, params)}`;
     }
 
     if (relDef.type === 'hasMany') {
@@ -4434,8 +4462,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // LIMIT — `limit: 0` is honored (LIMIT 0 → empty array)
     let limitClause = '';
     if (spec !== true && spec.limit !== undefined) {
-      params.push(Number(spec.limit));
-      limitClause = ` LIMIT ${this.p(params.length)}`;
+      limitClause = ` LIMIT ${this.paginationRef(spec.limit, params)}`;
     }
 
     const fromJoin = `FROM ${qTarget} ${talias} JOIN ${qJunction} ${jalias} ON ${joinOn}`;

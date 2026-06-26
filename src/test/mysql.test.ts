@@ -91,9 +91,13 @@ describe('turbine-orm/mysql — dialect conformance (no Postgres leakage)', () =
   it('case-insensitive contains → LOWER() LIKE LOWER(), backticks, :pN, no ILIKE', () => {
     const d = q().buildFindMany({ where: { name: { contains: 'Ada', mode: 'insensitive' } }, limit: 5 });
     assert.match(d.sql, /LOWER\(`name`\) LIKE LOWER\(:p\d\) ESCAPE/);
-    assert.match(d.sql, /LIMIT :p\d/);
+    // LIMIT is an inline integer literal on MySQL (mysql2's binary protocol sends
+    // numbers as DOUBLE, which LIMIT rejects), NOT a :pN param — so it must not
+    // appear in params.
+    assert.match(d.sql, /LIMIT 5$/);
+    assert.doesNotMatch(d.sql, /LIMIT :p\d/);
     assert.doesNotMatch(d.sql, FORBIDDEN);
-    assert.deepEqual(d.params, ['%Ada%', 5]);
+    assert.deepEqual(d.params, ['%Ada%']);
   });
 
   it('nested with → JSON_OBJECT / JSON_ARRAYAGG / CAST(... AS JSON) wrap, no json_agg', () => {
@@ -108,8 +112,9 @@ describe('turbine-orm/mysql — dialect conformance (no Postgres leakage)', () =
 
   it('ordered+limited to-many uses the inner-subquery rewrite (aggSupportsInlineOrderBy=false)', () => {
     const sql = q().buildFindMany({ with: { posts: { orderBy: { title: 'asc' }, limit: 3 } } }).sql;
-    // inner subquery alias t0i with ORDER BY / LIMIT before JSON_ARRAYAGG
-    assert.match(sql, /FROM \(SELECT .* ORDER BY t0\.`title` ASC LIMIT :p\d\) t0i/);
+    // inner subquery alias t0i with ORDER BY / LIMIT before JSON_ARRAYAGG; LIMIT
+    // is an inline integer literal on MySQL (not a :pN param).
+    assert.match(sql, /FROM \(SELECT .* ORDER BY t0\.`title` ASC LIMIT 3\) t0i/);
     assert.match(sql, /JSON_ARRAYAGG/);
     assert.doesNotMatch(sql, FORBIDDEN);
   });

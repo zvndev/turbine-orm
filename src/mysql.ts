@@ -435,6 +435,10 @@ export const mysqlDialect: Dialect = {
   // JSON_ARRAYAGG has no inline ORDER BY argument → force the inner-subquery
   // rewrite for every ordered to-many relation.
   aggSupportsInlineOrderBy: false,
+  // mysql2's binary (prepared) protocol sends JS numbers as DOUBLE, which MySQL's
+  // LIMIT/OFFSET reject ("Incorrect arguments to mysqld_stmt_execute"). Render
+  // pagination as inline integer literals (Turbine-validated, injection-safe).
+  inlineLimitOffset: true,
   jsonPathSupport: 'function',
   emptyJsonArrayLiteral: 'JSON_ARRAY()',
   nullJsonLiteral: 'NULL',

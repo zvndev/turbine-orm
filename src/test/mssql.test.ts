@@ -586,7 +586,7 @@ const DDL = [
     id BIGINT IDENTITY(1,1) PRIMARY KEY,
     name NVARCHAR(255) NOT NULL,
     slug NVARCHAR(255) NOT NULL UNIQUE,
-    plan NVARCHAR(50) NOT NULL DEFAULT 'free',
+    [plan] NVARCHAR(50) NOT NULL DEFAULT 'free',
     metadata NVARCHAR(MAX),
     created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
   )`,
@@ -639,7 +639,7 @@ const DDL = [
 
 const SEED = [
   `SET IDENTITY_INSERT organizations ON;
-   INSERT INTO organizations (id, name, slug, plan, metadata) VALUES
+   INSERT INTO organizations (id, name, slug, [plan], metadata) VALUES
     (1, 'Acme Inc', 'acme', 'enterprise', '{"tier":"enterprise"}'),
     (2, 'Beta LLC', 'beta', 'pro', '{"tier":"pro"}');
    SET IDENTITY_INSERT organizations OFF;`,

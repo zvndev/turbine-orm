@@ -263,6 +263,17 @@ export interface Dialect {
   readonly aggSupportsInlineOrderBy: boolean;
 
   /**
+   * Render `LIMIT` / `OFFSET` as inline integer literals instead of bound
+   * parameters. MySQL sets this `true`: mysql2's binary (prepared) protocol sends
+   * JS numbers as `DOUBLE`, which MySQL's `LIMIT`/`OFFSET` reject ("Incorrect
+   * arguments to mysqld_stmt_execute"). The values are Turbine-validated
+   * non-negative integers (never user strings), so inlining is injection-safe.
+   * PostgreSQL / SQLite / SQL Server leave this falsy and keep pagination
+   * parameterized, so their generated SQL stays byte-identical.
+   */
+  readonly inlineLimitOffset?: boolean;
+
+  /**
    * Wrap a correlated nested-relation subquery (and its empty/null fallback) for
    * embedding as a JSON value in a parent `json_build_object`. PostgreSQL emits
    * `COALESCE((subquery), fallback)`. SQLite must additionally `json(...)`-wrap
