@@ -491,6 +491,32 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Cast an aggregate expression to an integer/float result type through the
+   * active dialect. PostgreSQL keeps the historical postfix cast (`expr::int` /
+   * `expr::float`); SQLite (no `::` operator) maps to `CAST(expr AS INTEGER/REAL)`.
+   * Falls back to the Postgres postfix cast for dialects without the hook.
+   */
+  private castAgg(expr: string, target: 'int' | 'float'): string {
+    return this.dialect.castAggregate?.(expr, target) ?? `${expr}::${target}`;
+  }
+
+  /**
+   * Build an `IN` / `NOT IN` predicate through the active dialect. PostgreSQL
+   * keeps the array-param form (`expr = ANY($n)` / `expr != ALL($n)`); other
+   * engines (SQLite) use a length-independent single-placeholder form. Paired
+   * with {@link inParam}, which supplies the single bound value.
+   */
+  private inClause(expr: string, paramRef: string, negated: boolean): string {
+    if (this.dialect.buildInClause) return this.dialect.buildInClause(expr, paramRef, negated);
+    return negated ? `${expr} != ALL(${paramRef})` : `${expr} = ANY(${paramRef})`;
+  }
+
+  /** The single bound parameter for an `IN` list (PG: the array; SQLite: a JSON string). */
+  private inParam(values: unknown): unknown {
+    return this.dialect.inClauseParam ? this.dialect.inClauseParam(values as unknown[]) : values;
+  }
+
+  /**
    * Return cache hit/miss statistics for this QueryInterface instance.
    * Useful for monitoring and benchmarking.
    */
@@ -1833,7 +1859,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const freshParams: unknown[] = [];
       const clause = args?.where ? this.buildWhereClause(whereObj, freshParams) : null;
       const whereSql = clause ? ` WHERE ${clause}` : '';
-      return `SELECT COUNT(*)::int AS count FROM ${this.q(this.table)}${whereSql}`;
+      return `SELECT ${this.castAgg('COUNT(*)', 'int')} AS count FROM ${this.q(this.table)}${whereSql}`;
     });
 
     if (args?.where) {
@@ -1880,7 +1906,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // _count
     if (args._count === true || args._count === undefined) {
       // default: always include count
-      selectExprs.push('COUNT(*)::int AS _count');
+      selectExprs.push(`${this.castAgg('COUNT(*)', 'int')} AS _count`);
     }
 
     // _sum
@@ -1898,7 +1924,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._avg)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`AVG(${this.q(col)})::float AS ${this.q(`_avg_${col}`)}`);
+          selectExprs.push(`${this.castAgg(`AVG(${this.q(col)})`, 'float')} AS ${this.q(`_avg_${col}`)}`);
         }
       }
     }
@@ -2125,12 +2151,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       clauses.push(`${expr} <= ${this.p(params.length)}`);
     }
     if (op.in !== undefined) {
-      params.push(op.in);
-      clauses.push(`${expr} = ANY(${this.p(params.length)})`);
+      params.push(this.inParam(op.in));
+      clauses.push(this.inClause(expr, this.p(params.length), false));
     }
     if (op.notIn !== undefined) {
-      params.push(op.notIn);
-      clauses.push(`${expr} != ALL(${this.p(params.length)})`);
+      params.push(this.inParam(op.notIn));
+      clauses.push(this.inClause(expr, this.p(params.length), true));
     }
     return clauses;
   }
@@ -2174,12 +2200,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // _count
     if (args._count === true) {
-      selectExprs.push('COUNT(*)::int AS _count');
+      selectExprs.push(`${this.castAgg('COUNT(*)', 'int')} AS _count`);
     } else if (args._count && typeof args._count === 'object') {
       for (const [field, enabled] of Object.entries(args._count)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`COUNT(${this.q(col)})::int AS ${this.q(`_count_${col}`)}`);
+          selectExprs.push(`${this.castAgg(`COUNT(${this.q(col)})`, 'int')} AS ${this.q(`_count_${col}`)}`);
         }
       }
     }
@@ -2199,7 +2225,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [field, enabled] of Object.entries(args._avg)) {
         if (enabled) {
           const col = this.toColumn(field);
-          selectExprs.push(`AVG(${this.q(col)})::float AS ${this.q(`_avg_${col}`)}`);
+          selectExprs.push(`${this.castAgg(`AVG(${this.q(col)})`, 'float')} AS ${this.q(`_avg_${col}`)}`);
         }
       }
     }
@@ -2225,7 +2251,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     if (selectExprs.length === 0) {
-      selectExprs.push('COUNT(*)::int AS _count');
+      selectExprs.push(`${this.castAgg('COUNT(*)', 'int')} AS _count`);
     }
 
     const sql = `SELECT ${selectExprs.join(', ')} FROM ${this.q(this.table)}${whereSql}`;
@@ -2760,8 +2786,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (op.lt !== undefined) params.push(op.lt);
     if (op.lte !== undefined) params.push(op.lte);
     if (op.not !== undefined && op.not !== null) params.push(op.not);
-    if (op.in !== undefined) params.push(op.in);
-    if (op.notIn !== undefined) params.push(op.notIn);
+    if (op.in !== undefined) params.push(this.inParam(op.in));
+    if (op.notIn !== undefined) params.push(this.inParam(op.notIn));
     if (op.contains !== undefined) params.push(`%${escapeLike(op.contains)}%`);
     if (op.startsWith !== undefined) params.push(`${escapeLike(op.startsWith)}%`);
     if (op.endsWith !== undefined) params.push(`%${escapeLike(op.endsWith)}`);
@@ -3565,12 +3591,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
     if (op.in !== undefined) {
-      params.push(op.in);
-      clauses.push(`${column} = ANY(${this.p(params.length)})`);
+      params.push(this.inParam(op.in));
+      clauses.push(this.inClause(column, this.p(params.length), false));
     }
     if (op.notIn !== undefined) {
-      params.push(op.notIn);
-      clauses.push(`${column} != ALL(${this.p(params.length)})`);
+      params.push(this.inParam(op.notIn));
+      clauses.push(this.inClause(column, this.p(params.length), true));
     }
     const buildLikeClause = (paramRef: string) =>
       op.mode === 'insensitive' ? this.dialect.buildInsensitiveLike(column, paramRef) : `${column} LIKE ${paramRef}`;
