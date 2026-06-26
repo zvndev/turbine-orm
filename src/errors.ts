@@ -23,6 +23,7 @@ export const TurbineErrorCode = {
   PIPELINE: 'TURBINE_E014',
   OPTIMISTIC_LOCK: 'TURBINE_E015',
   EXCLUSION_VIOLATION: 'TURBINE_E016',
+  UNSUPPORTED_FEATURE: 'TURBINE_E017',
 } as const;
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
@@ -555,6 +556,27 @@ export class OptimisticLockError extends TurbineError {
     this.table = opts.table;
     this.versionField = opts.versionField;
     this.expectedVersion = opts.expectedVersion;
+  }
+}
+
+/**
+ * Thrown when a Postgres-only feature (pgvector distance ops, LISTEN/NOTIFY
+ * realtime, RLS session GUCs, advisory-lock migration locking, ...) is invoked
+ * on a dialect/engine whose capability flag reports it unsupported. Surfaces a
+ * clear `unsupported on <engine>` message instead of generating broken SQL.
+ */
+export class UnsupportedFeatureError extends TurbineError {
+  readonly feature: string;
+  readonly dialect: string;
+
+  constructor(feature: string, dialect: string, hint?: string) {
+    super(
+      TurbineErrorCode.UNSUPPORTED_FEATURE,
+      `[turbine] ${feature} is unsupported on "${dialect}".${hint ? ` ${hint}` : ''}`,
+    );
+    this.name = 'UnsupportedFeatureError';
+    this.feature = feature;
+    this.dialect = dialect;
   }
 }
 

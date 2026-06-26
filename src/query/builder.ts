@@ -20,6 +20,7 @@ import {
   OptimisticLockError,
   RelationError,
   TimeoutError,
+  UnsupportedFeatureError,
   ValidationError,
   wrapPgError,
 } from '../errors.js';
@@ -304,6 +305,13 @@ function isVectorOrderBy(value: unknown): value is VectorOrderBy {
 // Deferred query descriptor (for pipeline batching)
 // ---------------------------------------------------------------------------
 
+/**
+ * Runs a SQL statement and resolves its raw result. Passed to a
+ * {@link DeferredQuery.reselect} plan so it can run the write and the follow-up
+ * SELECT through the same timeout/instrumentation path as the primary query.
+ */
+export type ReselectExecutor = (sql: string, params: unknown[], preparedName?: string) => Promise<pg.QueryResult>;
+
 export interface DeferredQuery<T> {
   /** SQL text with $1, $2 placeholders */
   sql: string;
@@ -315,6 +323,15 @@ export interface DeferredQuery<T> {
   tag: string;
   /** Prepared statement name (t_<16hex>). Set when SQL cache is enabled. */
   preparedName?: string;
+  /**
+   * Execution plan for dialects whose {@link Dialect.resultStrategy} is
+   * `'reselect'` (no RETURNING — e.g. MySQL). Owns the statement ordering: it
+   * runs the write and the follow-up row-fetching SELECT(s) via `exec`, and
+   * resolves the result whose rows {@link DeferredQuery.transform} consumes.
+   * Absent for `'returning'`/`'output'` dialects (the statement returns its own
+   * rows), so the PostgreSQL path never allocates or consults it.
+   */
+  reselect?: (exec: ReselectExecutor) => Promise<pg.QueryResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +617,53 @@ export class QueryInterface<T extends object, R extends object = {}> {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * Execute a write `DeferredQuery` (create/update/delete/upsert) according to
+   * the active dialect's {@link Dialect.resultStrategy}, then apply its
+   * transform.
+   *
+   *   - `'returning'` / `'output'`: the statement returns its own affected rows
+   *     (`RETURNING *` / `OUTPUT INSERTED.*`). Byte-identical to the historical
+   *     single `queryWithTimeout` + `transform(result)` path — the PostgreSQL
+   *     route is unchanged.
+   *   - `'reselect'`: the engine cannot return rows from a write, so the build
+   *     method attached a {@link DeferredQuery.reselect} plan that runs the
+   *     write and a follow-up SELECT; the SELECT's rows feed the transform.
+   */
+  private async executeMutation<V>(deferred: DeferredQuery<V>, timeout?: number): Promise<V> {
+    if (this.dialect.resultStrategy === 'reselect' && deferred.reselect) {
+      const exec: ReselectExecutor = (sql, params, preparedName) =>
+        this.queryWithTimeout(sql, params, timeout, preparedName);
+      const result = await deferred.reselect(exec);
+      return deferred.transform(result);
+    }
+    const result = await this.queryWithTimeout(deferred.sql, deferred.params, timeout, deferred.preparedName);
+    return deferred.transform(result);
+  }
+
+  /**
+   * Build a `SELECT * ... WHERE <predicate>` that re-fetches the row(s) matched
+   * by a write's `where` clause. Used by the `'reselect'` result strategy to
+   * return rows from non-RETURNING engines. Reuses the same parameterized WHERE
+   * builder as reads, so no user value is interpolated.
+   */
+  private buildReselectByWhere(whereObj: Record<string, unknown>): { sql: string; params: unknown[] } {
+    const params: unknown[] = [];
+    const clause = this.buildWhereClause(whereObj, params);
+    const where = clause ? ` WHERE ${clause}` : '';
+    return { sql: `SELECT * FROM ${this.q(this.table)}${where}`, params };
+  }
+
+  /**
+   * Best-effort extraction of an auto-generated primary key from a write
+   * result for `'reselect'` engines (e.g. mysql2's `insertId`). Returns
+   * `undefined` when the driver exposes no such field.
+   */
+  private mutationInsertId(result: pg.QueryResult): unknown {
+    const r = result as unknown as { insertId?: unknown; lastID?: unknown };
+    return r.insertId ?? r.lastID;
   }
 
   /**
@@ -1063,20 +1127,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // --- Overflow: fall back to cursor path from scratch ---
     const deferred = this.buildFindMany(args);
 
-    // Acquire a dedicated connection — cursors require a single connection in a transaction
+    // Acquire a dedicated connection — cursors require a single connection in a
+    // transaction. The dialect owns the streaming SQL (Postgres: BEGIN → DECLARE
+    // … NO SCROLL CURSOR FOR → FETCH n → CLOSE → COMMIT, ROLLBACK on error); we
+    // just parse + yield the row batches it produces.
     const client = await this.pool.connect();
-    const cursorName = `turbine_cursor_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const quotedCursor = this.q(cursorName);
-
     try {
-      await client.query('BEGIN');
-      await client.query(`DECLARE ${quotedCursor} NO SCROLL CURSOR FOR ${deferred.sql}`, deferred.params);
-
-      while (true) {
-        const batch = await client.query(`FETCH ${batchSize} FROM ${quotedCursor}`);
-        if (batch.rows.length === 0) break;
-
-        for (const row of batch.rows) {
+      for await (const batch of this.dialect.openStream(client, deferred.sql, deferred.params, batchSize)) {
+        for (const row of batch) {
           yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as QueryResult<
             T,
             R,
@@ -1085,19 +1143,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
             O
           >;
         }
-
-        if (batch.rows.length < batchSize) break;
       }
-
-      await client.query(`CLOSE ${quotedCursor}`);
-      await client.query('COMMIT');
     } catch (err) {
-      // Rollback on error (also closes cursor implicitly)
-      try {
-        await client.query('ROLLBACK');
-      } catch {
-        // Connection may already be broken — ignore rollback error
-      }
       // Wrap pg constraint errors so streaming surfaces typed errors like the rest of the API
       throw wrapPgError(err);
     } finally {
@@ -1239,8 +1286,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return this.nestedCreate(args);
       }
       const deferred = this.buildCreate(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
-      return deferred.transform(result);
+      return this.executeMutation(deferred, args.timeout);
     });
   }
 
@@ -1272,6 +1318,37 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.create`,
+      // Non-RETURNING engines: INSERT, then re-fetch the new row by primary key
+      // (provided value, else the driver's generated insert id).
+      reselect: this.makeCreateReselect(sql, params, args.data as Record<string, unknown>),
+    };
+  }
+
+  /**
+   * Build the `'reselect'` plan for {@link buildCreate}: run the INSERT, then
+   * `SELECT * WHERE pk = ?`. Returns `undefined` (skipped) unless the active
+   * dialect's result strategy is `'reselect'`, so the PostgreSQL/RETURNING path
+   * pays nothing. Not yet wired to a real non-RETURNING engine.
+   */
+  private makeCreateReselect(
+    insertSql: string,
+    insertParams: unknown[],
+    data: Record<string, unknown>,
+  ): DeferredQuery<T>['reselect'] {
+    if (this.dialect.resultStrategy !== 'reselect') return undefined;
+    return async (exec) => {
+      const writeResult = await exec(insertSql, insertParams);
+      const insertId = this.mutationInsertId(writeResult);
+      const conds: string[] = [];
+      const selParams: unknown[] = [];
+      let idx = 1;
+      for (const pk of this.tableMeta.primaryKey) {
+        const field = this.tableMeta.reverseColumnMap[pk] ?? snakeToCamel(pk);
+        selParams.push(data[field] ?? data[pk] ?? insertId);
+        conds.push(`${this.q(pk)} = ${this.p(idx++)}`);
+      }
+      const where = conds.length > 0 ? ` WHERE ${conds.join(' AND ')}` : '';
+      return exec(`SELECT * FROM ${this.q(this.table)}${where}`, selParams);
     };
   }
 
@@ -1337,8 +1414,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return this.nestedUpdate(args);
       }
       const deferred = this.buildUpdate(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
-      return deferred.transform(result);
+      return this.executeMutation(deferred, args.timeout);
     });
   }
 
@@ -1420,6 +1496,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
       },
       tag: `${this.table}.update`,
       preparedName,
+      // Non-RETURNING engines: UPDATE, then re-fetch the row by the same where.
+      reselect:
+        this.dialect.resultStrategy === 'reselect'
+          ? async (exec) => {
+              await exec(sql, params, preparedName);
+              const sel = this.buildReselectByWhere(whereObj);
+              return exec(sel.sql, sel.params);
+            }
+          : undefined,
     };
   }
 
@@ -1459,18 +1544,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>): Promise<R> {
     const client = await this.pool.connect();
     try {
-      await client.query('BEGIN');
+      await client.query(this.dialect.beginStatement());
       const { TransactionClient } = await import('../client.js');
       // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
       const tx = new TransactionClient(client as any, this.schema, this.middlewares as any, this.options);
       // biome-ignore lint/suspicious/noExplicitAny: TransactionClient satisfies NestedWriteContext['tx'] at runtime
       const ctx: NestedWriteContext = { schema: this.schema, tx: tx as any };
       const result = await fn(ctx);
-      await client.query('COMMIT');
+      await client.query(this.dialect.commitStatement());
       return result;
     } catch (err) {
       try {
-        await client.query('ROLLBACK');
+        await client.query(this.dialect.rollbackStatement());
       } catch {
         // Best-effort rollback — connection may have died.
       }
@@ -1505,8 +1590,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async delete(args: DeleteArgs<T>): Promise<T> {
     return this.executeWithMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDelete(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
-      return deferred.transform(result);
+      return this.executeMutation(deferred, args.timeout);
     });
   }
 
@@ -1550,6 +1634,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
       },
       tag: `${this.table}.delete`,
       preparedName: entry.name,
+      // Non-RETURNING engines: the row is gone after DELETE, so pre-SELECT it
+      // by the same where, then run the DELETE, returning the captured row.
+      reselect:
+        this.dialect.resultStrategy === 'reselect'
+          ? async (exec) => {
+              const sel = this.buildReselectByWhere(whereObj);
+              const pre = await exec(sel.sql, sel.params);
+              await exec(entry.sql, params, entry.name);
+              return pre;
+            }
+          : undefined,
     };
   }
 
@@ -1560,8 +1655,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async upsert(args: UpsertArgs<T>): Promise<T> {
     return this.executeWithMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpsert(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
-      return deferred.transform(result);
+      return this.executeMutation(deferred, args.timeout);
     });
   }
 
@@ -1615,6 +1709,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return this.parseRow(row, this.table) as T;
       },
       tag: `${this.table}.upsert`,
+      // Non-RETURNING engines: run the upsert, then re-fetch by the where keys.
+      reselect:
+        this.dialect.resultStrategy === 'reselect'
+          ? async (exec) => {
+              await exec(sql, params);
+              const sel = this.buildReselectByWhere(args.where as Record<string, unknown>);
+              return exec(sel.sql, sel.params);
+            }
+          : undefined,
     };
   }
 
@@ -3553,6 +3656,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * non-vector column — a user-supplied string can never become a SQL operator.
    */
   private vectorOperator(field: string, rawColumn: string, metric: string): string {
+    if (!this.dialect.supportsVector) {
+      throw new UnsupportedFeatureError(
+        'pgvector distance operations',
+        this.dialect.name,
+        'Vector search requires PostgreSQL with the pgvector extension.',
+      );
+    }
     const colType = this.getColumnPgType(rawColumn);
     if (colType !== 'vector') {
       throw new ValidationError(
@@ -3578,6 +3688,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * placeholder string.
    */
   private pushVectorParam(field: string, _rawColumn: string, to: unknown, params: unknown[]): string {
+    if (!this.dialect.supportsVector) {
+      throw new UnsupportedFeatureError(
+        'pgvector distance operations',
+        this.dialect.name,
+        'Vector search requires PostgreSQL with the pgvector extension.',
+      );
+    }
     if (!Array.isArray(to) || to.length === 0) {
       throw new ValidationError(
         `[turbine] Vector distance on "${field}" requires a non-empty array of numbers for "to".`,
@@ -3983,7 +4100,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // Use '[]'::json for hasMany (empty array), NULL for belongsTo/hasOne (no object)
         const fallback =
           nestedRelDef.type === 'hasMany' ? this.dialect.emptyJsonArrayLiteral : this.dialect.nullJsonLiteral;
-        jsonPairs.push([nestedRelName, `COALESCE((${nestedSubquery}), ${fallback})`]);
+        jsonPairs.push([nestedRelName, this.dialect.wrapJsonSubresult(nestedSubquery, fallback)]);
       }
     }
 
@@ -4073,13 +4190,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
             );
             const fallback =
               nestedRelDef.type === 'hasMany' ? this.dialect.emptyJsonArrayLiteral : this.dialect.nullJsonLiteral;
-            innerJsonPairs.push([nestedRelName, `COALESCE((${nestedSub}), ${fallback})`]);
+            innerJsonPairs.push([nestedRelName, this.dialect.wrapJsonSubresult(nestedSub, fallback)]);
           }
         }
         const innerJsonObj = this.dialect.buildJsonObject(innerJsonPairs);
         return `SELECT ${this.dialect.buildJsonArrayAgg(innerJsonObj)} FROM (${innerSql}) ${innerAlias}`;
       }
-      return `SELECT ${this.dialect.buildJsonArrayAgg(jsonObj, orderClause.trim() || undefined)} FROM ${qTarget} ${alias} WHERE ${whereClause}`;
+      // Inline ORDER BY only when the dialect's array-agg supports it (PG). For
+      // hasMany this path is reached only when there is no orderClause, so the
+      // argument is `undefined` either way — keeping PG output byte-identical.
+      const inlineOrder = this.dialect.aggSupportsInlineOrderBy ? orderClause.trim() || undefined : undefined;
+      return `SELECT ${this.dialect.buildJsonArrayAgg(jsonObj, inlineOrder)} FROM ${qTarget} ${alias} WHERE ${whereClause}`;
     }
 
     // belongsTo / hasOne — return single object
@@ -4240,7 +4361,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'
               ? this.dialect.nullJsonLiteral
               : this.dialect.emptyJsonArrayLiteral;
-          innerJsonPairs.push([nestedRelName, `COALESCE((${nestedSub}), ${fallback})`]);
+          innerJsonPairs.push([nestedRelName, this.dialect.wrapJsonSubresult(nestedSub, fallback)]);
         }
       }
       const innerJsonObj = this.dialect.buildJsonObject(innerJsonPairs);
@@ -4275,7 +4396,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'
             ? this.dialect.nullJsonLiteral
             : this.dialect.emptyJsonArrayLiteral;
-        jsonPairs.push([nestedRelName, `COALESCE((${nestedSub}), ${fallback})`]);
+        jsonPairs.push([nestedRelName, this.dialect.wrapJsonSubresult(nestedSub, fallback)]);
       }
     }
     const jsonObj = this.dialect.buildJsonObject(jsonPairs);

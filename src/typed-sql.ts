@@ -49,25 +49,28 @@
  */
 
 import type { PgCompatPool } from './client.js';
+import { type Dialect, postgresDialect } from './dialect.js';
 import { ValidationError, wrapPgError } from './errors.js';
 
 /**
  * Build a `(sql, params)` pair from a tagged-template invocation.
  *
- * Each interpolated value is replaced by a positional `$N` placeholder and
- * pushed to the params array in order. The static string segments are the only
- * thing concatenated into the SQL text. This is the single point that
- * guarantees parameterization for the entire typed-SQL surface.
+ * Each interpolated value is replaced by a positional placeholder (the active
+ * dialect's `paramPlaceholder`, `$N` for PostgreSQL) and pushed to the params
+ * array in order. The static string segments are the only thing concatenated
+ * into the SQL text. This is the single point that guarantees parameterization
+ * for the entire typed-SQL surface.
  *
  * Exported for unit testing the parameterization invariant without a database.
  */
 export function buildTypedSql(
   strings: TemplateStringsArray,
   values: readonly unknown[],
+  dialect: Pick<Dialect, 'paramPlaceholder'> = postgresDialect,
 ): { sql: string; params: unknown[] } {
   // The tagged-template API guarantees `strings.length === values.length + 1`.
   // Guard the directly-callable (exported) surface so a mismatched call can't
-  // silently desync `$N` placeholders from params (pg would reject it, but fail
+  // silently desync placeholders from params (pg would reject it, but fail
   // loudly here instead).
   if (strings.length !== values.length + 1) {
     throw new ValidationError(
@@ -78,7 +81,7 @@ export function buildTypedSql(
   for (let i = 0; i < strings.length; i++) {
     sql += strings[i];
     if (i < values.length) {
-      sql += `$${i + 1}`;
+      sql += dialect.paramPlaceholder(i + 1);
     }
   }
   return { sql, params: values.slice() };

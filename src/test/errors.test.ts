@@ -370,8 +370,12 @@ describe('TurbineErrorCode', () => {
     assert.equal(TurbineErrorCode.PIPELINE, 'TURBINE_E014');
   });
 
-  it('has exactly 16 error codes', () => {
-    assert.equal(Object.keys(TurbineErrorCode).length, 16);
+  it('has UNSUPPORTED_FEATURE = TURBINE_E017', () => {
+    assert.equal(TurbineErrorCode.UNSUPPORTED_FEATURE, 'TURBINE_E017');
+  });
+
+  it('has exactly 17 error codes', () => {
+    assert.equal(Object.keys(TurbineErrorCode).length, 17);
   });
 });
 

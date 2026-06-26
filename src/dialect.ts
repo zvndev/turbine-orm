@@ -95,9 +95,44 @@ export interface CreateIndexStatementInput {
   columns: string[];
 }
 
+/**
+ * How a dialect surfaces the row(s) produced by an INSERT/UPDATE/DELETE/upsert.
+ *
+ *  - `'returning'` — a trailing `RETURNING *` clause returns the affected rows
+ *    in the same statement (PostgreSQL, SQLite ≥ 3.35). The executor reads them
+ *    directly from the statement result.
+ *  - `'output'` — the statement itself emits the rows in a non-RETURNING shape
+ *    (SQL Server `OUTPUT INSERTED.*`). Executed exactly like `'returning'`: the
+ *    rows come back on the statement result.
+ *  - `'reselect'` — the engine cannot return rows from a write (MySQL). The
+ *    executor runs the write, then issues a follow-up `SELECT` (by primary
+ *    key / unique / where predicate) to fetch the affected row(s). The build
+ *    method supplies the {@link DeferredQuery} `reselect` plan that owns the
+ *    statement ordering (write-then-select for create/update/upsert;
+ *    select-then-write for delete, whose row is gone after the statement runs).
+ */
+export type ResultStrategy = 'returning' | 'output' | 'reselect';
+
+/**
+ * Minimal connection surface needed to drive a server-side stream (cursor /
+ * driver iterator). `pg.PoolClient` and `PgCompatPoolClient` both satisfy it.
+ * Declared locally so {@link Dialect.openStream} stays free of an import cycle
+ * back into `client.ts`.
+ */
+export interface StreamableConnection {
+  query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
+}
+
 export interface Dialect {
   /** Dialect identifier. */
   readonly name: DialectName;
+
+  /**
+   * How write statements surface their affected rows. PostgreSQL uses
+   * `'returning'`; the executor branches on this so non-RETURNING engines
+   * (MySQL `'reselect'`, SQL Server `'output'`) can still return rows.
+   */
+  readonly resultStrategy: ResultStrategy;
 
   /** Parameter placeholder for the Nth value, using a 1-indexed public count. */
   paramPlaceholder(index: number): string;
@@ -120,8 +155,38 @@ export interface Dialect {
   /** Build a JSON array aggregation expression with a dialect-specific empty-array fallback. */
   buildJsonArrayAgg(jsonObjectExpr: string, orderBy?: string): string;
 
+  /**
+   * Whether the array-aggregate (`buildJsonArrayAgg`) can take an inline
+   * `ORDER BY` argument. PostgreSQL's `json_agg(... ORDER BY ...)` can, so this
+   * is `true`. Engines whose array aggregate has no ORDER BY argument
+   * (MySQL `JSON_ARRAYAGG`, SQLite `json_group_array`) set this `false` to force
+   * the inner-subquery rewrite for every ordered to-many relation.
+   */
+  readonly aggSupportsInlineOrderBy: boolean;
+
+  /**
+   * Wrap a correlated nested-relation subquery (and its empty/null fallback) for
+   * embedding as a JSON value in a parent `json_build_object`. PostgreSQL emits
+   * `COALESCE((subquery), fallback)`. SQLite must additionally `json(...)`-wrap
+   * the subquery (its `json_group_array` double-encodes nested objects);
+   * SQL Server uses `ISNULL((... FOR JSON PATH), '[]')`.
+   */
+  wrapJsonSubresult(subquery: string, fallback: string): string;
+
   /** Whether INSERT/UPDATE/DELETE support RETURNING rows. */
   readonly supportsReturning: boolean;
+
+  /** Whether this dialect/engine supports pgvector distance ops (KNN / distance WHERE). */
+  readonly supportsVector: boolean;
+
+  /** Whether this dialect/engine supports LISTEN/NOTIFY realtime pub/sub. */
+  readonly supportsListenNotify: boolean;
+
+  /** Whether this dialect/engine supports row-level-security session GUCs (set_config). */
+  readonly supportsRLS: boolean;
+
+  /** Whether this dialect/engine supports advisory-lock-style migration locking. */
+  readonly supportsAdvisoryLock: boolean;
 
   /** Build a dialect-specific RETURNING clause. Return an empty string when unsupported. */
   buildReturningClause(selection?: string): string;
@@ -193,6 +258,56 @@ export interface Dialect {
 
   /** Build the query that deletes a rolled-back migration record. */
   buildMigrationDeleteApplied(table: string): string;
+
+  // ---- Transaction control (keywords vary across engines) -----------------
+
+  /** `BEGIN`, optionally with a SQL-ready isolation-level suffix. */
+  beginStatement(isolationLevel?: string): string;
+
+  /** Commit the current transaction. */
+  commitStatement(): string;
+
+  /** Roll back the current transaction. */
+  rollbackStatement(): string;
+
+  /** Establish a savepoint with the given (SQL-ready) name. */
+  savepointStatement(name: string): string;
+
+  /** Release the named savepoint. */
+  releaseSavepointStatement(name: string): string;
+
+  /** Roll back to the named savepoint. */
+  rollbackToSavepointStatement(name: string): string;
+
+  /**
+   * Build a transaction-local session-config (GUC) assignment for RLS /
+   * multi-tenant context. Both name and value are bound parameters.
+   */
+  buildSetSessionConfig(name: string, value: string): BuiltStatement;
+
+  // ---- Streaming ----------------------------------------------------------
+
+  /**
+   * Drive a server-side stream of result rows on a single connection, yielding
+   * row batches of up to `batchSize`. PostgreSQL uses a `DECLARE CURSOR` /
+   * `FETCH` / `CLOSE` loop inside a transaction; other engines use their
+   * driver's native streaming iterator.
+   */
+  openStream(
+    connection: StreamableConnection,
+    sql: string,
+    params: unknown[],
+    batchSize: number,
+  ): AsyncGenerator<Record<string, unknown>[], void, undefined>;
+
+  // ---- Introspection ------------------------------------------------------
+
+  /**
+   * Schema introspector for this engine. `introspect()` routes through it so
+   * engines can override the catalog SQL. PostgreSQL wraps the
+   * information_schema / pg_catalog reader in `introspect.ts`.
+   */
+  readonly introspector?: DialectIntrospector;
 }
 
 export interface DialectIntrospector {
@@ -206,6 +321,13 @@ export interface IntrospectOptions {
   exclude?: string[];
 }
 
+/**
+ * @deprecated Migration locking is owned by the {@link DatabaseAdapter} seam
+ * (`src/adapters/index.ts` — `acquireLock`/`releaseLock`/`statementTimeout`),
+ * which is the single canonical locking seam. This interface was never
+ * implemented or wired and is retained only for type back-compat; new engines
+ * MUST provide a `DatabaseAdapter` instead. Will be removed in a future major.
+ */
 export interface DialectMigrator {
   acquireLock(lockId: number): Promise<boolean>;
   releaseLock(lockId: number): Promise<void>;
@@ -214,11 +336,17 @@ export interface DialectMigrator {
 /** PostgreSQL implementation of the dialect contract. */
 export const postgresDialect: Dialect = {
   name: 'postgresql',
+  resultStrategy: 'returning',
   supportsReturning: true,
   supportsILike: true,
   jsonPathSupport: 'native',
   emptyJsonArrayLiteral: "'[]'::json",
   nullJsonLiteral: 'NULL',
+  aggSupportsInlineOrderBy: true,
+  supportsVector: true,
+  supportsListenNotify: true,
+  supportsRLS: true,
+  supportsAdvisoryLock: true,
 
   paramPlaceholder(index: number): string {
     return `$${index}`;
@@ -240,6 +368,10 @@ export const postgresDialect: Dialect = {
   buildJsonArrayAgg(jsonObjectExpr: string, orderBy?: string): string {
     const suffix = orderBy ? ` ${orderBy}` : '';
     return `COALESCE(json_agg(${jsonObjectExpr}${suffix}), ${this.emptyJsonArrayLiteral})`;
+  },
+
+  wrapJsonSubresult(subquery: string, fallback: string): string {
+    return `COALESCE((${subquery}), ${fallback})`;
   },
 
   buildReturningClause(selection = '*'): string {
@@ -354,5 +486,80 @@ export const postgresDialect: Dialect = {
 
   buildMigrationDeleteApplied(table: string): string {
     return `DELETE FROM ${table} WHERE name = ${this.paramPlaceholder(1)}`;
+  },
+
+  beginStatement(isolationLevel?: string): string {
+    return isolationLevel ? `BEGIN ISOLATION LEVEL ${isolationLevel}` : 'BEGIN';
+  },
+
+  commitStatement(): string {
+    return 'COMMIT';
+  },
+
+  rollbackStatement(): string {
+    return 'ROLLBACK';
+  },
+
+  savepointStatement(name: string): string {
+    return `SAVEPOINT ${name}`;
+  },
+
+  releaseSavepointStatement(name: string): string {
+    return `RELEASE SAVEPOINT ${name}`;
+  },
+
+  rollbackToSavepointStatement(name: string): string {
+    return `ROLLBACK TO SAVEPOINT ${name}`;
+  },
+
+  buildSetSessionConfig(name: string, value: string): BuiltStatement {
+    // set_config(name, value, is_local=true) — the parameterizable,
+    // transaction-local equivalent of `SET LOCAL` (which rejects bind params).
+    return {
+      sql: `SELECT set_config(${this.paramPlaceholder(1)}, ${this.paramPlaceholder(2)}, true)`,
+      params: [name, value],
+    };
+  },
+
+  async *openStream(
+    connection: StreamableConnection,
+    sql: string,
+    params: unknown[],
+    batchSize: number,
+  ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
+    // Cursors require a single connection inside a transaction. Identical SQL
+    // sequence to the historical inline implementation: BEGIN → DECLARE … NO
+    // SCROLL CURSOR FOR → FETCH n (loop) → CLOSE → COMMIT; ROLLBACK on error.
+    const cursorName = `turbine_cursor_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const quotedCursor = this.quoteIdentifier(cursorName);
+    await connection.query(this.beginStatement());
+    try {
+      await connection.query(`DECLARE ${quotedCursor} NO SCROLL CURSOR FOR ${sql}`, params);
+      while (true) {
+        const batch = await connection.query(`FETCH ${batchSize} FROM ${quotedCursor}`);
+        if (batch.rows.length === 0) break;
+        yield batch.rows;
+        if (batch.rows.length < batchSize) break;
+      }
+      await connection.query(`CLOSE ${quotedCursor}`);
+      await connection.query(this.commitStatement());
+    } catch (err) {
+      try {
+        await connection.query(this.rollbackStatement());
+      } catch {
+        // Connection may already be broken — ignore rollback error.
+      }
+      throw err;
+    }
+  },
+
+  // Postgres introspection wraps the information_schema / pg_catalog reader in
+  // introspect.ts. A dynamic import keeps the static graph acyclic (introspect.ts
+  // imports postgresDialect) and calls the raw catalog reader (never the router).
+  introspector: {
+    async introspect(options) {
+      const { introspectPostgresCatalog } = await import('./introspect.js');
+      return introspectPostgresCatalog(options);
+    },
   },
 };
