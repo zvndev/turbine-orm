@@ -19,14 +19,14 @@ When you pass an external pool, Turbine:
 
 ```ts
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata';
 import { Pool } from '<your-edge-driver>';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
-export const db = turbineHttp(pool, schema);
+export const db = turbineHttp(pool, SCHEMA);
 ```
 
-`schema` is the `SchemaMetadata` object emitted by `npx turbine generate` at `./generated/turbine/metadata.ts`. It's a plain JS object — no side effects, no node-only imports — so it works in any runtime.
+`SCHEMA` is the `SchemaMetadata` object emitted by `npx turbine generate` at `./generated/turbine/metadata.ts`. It's a plain JS object — no side effects, no node-only imports — so it works in any runtime.
 
 ## Neon (HTTP driver)
 
@@ -40,10 +40,10 @@ npm install @neondatabase/serverless
 // db.ts
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
-export const db = turbineHttp(pool, schema);
+export const db = turbineHttp(pool, SCHEMA);
 ```
 
 ```ts
@@ -71,10 +71,10 @@ npm install @vercel/postgres
 ```ts
 import { createPool } from '@vercel/postgres';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata';
 
 const pool = createPool();
-export const db = turbineHttp(pool, schema);
+export const db = turbineHttp(pool, SCHEMA);
 ```
 
 Vercel Postgres is a wrapper over Neon; the semantics are the same. If you're on Vercel and using Neon directly, you can skip `@vercel/postgres` and use `@neondatabase/serverless` — one less package.
@@ -95,12 +95,12 @@ id = "<your-hyperdrive-id>"
 ```ts
 import { Pool } from 'pg';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata';
 
 export default {
   async fetch(req: Request, env: Env) {
     const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString });
-    const db = turbineHttp(pool, schema);
+    const db = turbineHttp(pool, SCHEMA);
     const users = await db.users.findMany({ limit: 20 });
     return Response.json(users);
   },
@@ -114,13 +114,13 @@ Hyperdrive pools connections at the edge, so there's no per-request TLS handshak
 ```ts
 import { Pool } from 'pg';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL!, // supabase connection string
   ssl: { rejectUnauthorized: true },
 });
-export const db = turbineHttp(pool, schema);
+export const db = turbineHttp(pool, SCHEMA);
 ```
 
 Use Supabase's **connection pooler** URL (`...pooler.supabase.com:6543`) for serverless, **not** the direct `...db.supabase.co:5432` URL. The pooler is PgBouncer in transaction mode — avoids exhausting connections on Lambda.
@@ -132,7 +132,7 @@ For Node runtimes where you prefer `postgres.js` over `pg` (faster for simple lo
 ```ts
 import postgres from 'postgres';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata';
 
 // postgres.js isn't exactly pg-compatible out of the box — adapt its
 // interface to PgCompatPool. See the PgCompatPool type for the contract.

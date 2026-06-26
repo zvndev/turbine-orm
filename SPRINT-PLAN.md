@@ -1,58 +1,66 @@
-# Sprint Plan — Turbine ORM v0.19.1 → v0.19.2
-
-Generated: 2026-06-09
-Based on: /product-review findings (5-agent audit: codebase, security, competitive, engineering, UX). Security audit: zero CRITICAL/HIGH/MEDIUM findings — this sprint is contract fixes + docs + hygiene.
+# Sprint Plan — Turbine ORM
+Generated: 2026-06-25
+Based on: AUDIT-REPORT.md (5-agent product review, v0.19.2)
 
 ## Sprint Goal
-
-Eliminate every documented-but-broken behavior and every undocumented flagship feature, so a new user's first hour contains zero contract violations.
+Eliminate every onboarding-breaking doc bug and the one security gap, document the
+two undocumented competitive features (nested writes, optimistic locking), reposition
+the top-line messaging around the real moat (the safety bundle), and put automated
+tests around the Studio security perimeter — without touching injection-critical code.
 
 ## Success Criteria
+- [ ] All P0/P1 broken/misleading items resolved (casing, `$queryRaw`, `timeoutMs`, Observe XSS, `withRetry` claim, quickstart `.author`)
+- [ ] Studio security perimeter has automated tests (token 401 / rate-limit 429 / cross-origin 403 / read-only write rejection)
+- [ ] Nested writes + optimistic locking documented
+- [ ] README + landing hero lead with the safety bundle
+- [ ] Build, typecheck, lint, and unit tests all green after merge
+- [ ] No file edited by two tracks (zero merge conflicts)
 
-- [ ] `where: { field: { equals: value } }` works on non-JSON columns (P0)
-- [ ] Soft-delete middleware example no longer documents a silently-broken pattern (P0)
-- [ ] Nested-write op types either wired into input typing or un-exported (P0)
-- [ ] `/studio` docs page exists and is in the site sidebar (P1)
-- [ ] `turbine observe` appears in `--help`, README, and site docs (P1)
-- [ ] `cursor`/`take`/`distinct` documented; migrate-from-prisma corrected re: `take` (P1)
-- [ ] DB-gated tests report as `skipped`, not silent pass (P2)
-- [ ] Dead code removed: `isReadOnlyStatement`, orphaned `.sql-editor` CSS (P2)
-- [ ] Doc drift fixed: CLAUDE.md builder.ts LOC, release.yml "308 tests" comment (P2)
-- [ ] All tests pass, typecheck/lint/build clean, site builds
+## Dev Tracks (4) — zero file overlap
 
-## Intentionally skipped (and why)
+### Track 1: Code & Security Hardening — backend/security specialist
+**Files owned:** `src/cli/observe-ui.ts`, `src/cli/observe.ts`, `src/cli/studio.ts`, `src/cli/index.ts`, `src/generate.ts`, `src/adapters/cockroachdb.ts`, `src/test/generate*.test.ts` (snapshot fixups only), `generated/turbine/metadata.ts` (if tracked), `package.json`, `CLAUDE.md`
+**Tasks:**
+- [ ] T1-1 (LOW-sec): Escape `row.model`/`row.action` via the existing `escapeHtml` pattern in `observe-ui.ts:138,155`
+- [ ] T1-2 (P3): Harden Studio/Observe token check to `crypto.timingSafeEqual` over SHA-256 digests (constant length, no throw, no length leak)
+- [ ] T1-3 (P2): Make the "Refuse to bind" comments at `cli/index.ts:~1138,~1229` accurate (warn-and-proceed on explicit `--host`)
+- [ ] T1-4 (P1): Export a lowercase `schema` alias alongside `SCHEMA` in `generate.ts` generateMetadata; update tracked fixture + any generate snapshot test
+- [ ] T1-5 (P2): Fix stale `cockroachdb.ts:77` comment (`SHOW INDEXES` → `pg_indexes`)
+- [ ] T1-6 (P3): Move `@types/pg` `dependencies` → `devDependencies`
+- [ ] T1-7 (P2): Fix stale CLAUDE.md invariant ("cli/ never imports query/")
 
-- builder.ts split into modules — high-risk refactor, no user-facing value this sprint
-- Closing `WhereClause` index signature / typing `WithOptions.where` — breaking-change territory, needs design
-- Benchmark re-run vs Prisma 7 / LATERAL comparison — needs live Neon infra; caveat text updated instead
-- Release-path consolidation — process decision for Kirby
+### Track 2: README + Landing Positioning — product/copy specialist
+**Files owned:** `README.md`, `site/app/page.tsx`
+**Tasks:**
+- [ ] T2-1 (P2-strategy): Reposition README hero around the safety bundle (DBA-approvable read-only Studio, PII-safe errors, one dependency, checksummed migrations) — re-order the lead, keep all technical content
+- [ ] T2-2 (P1): Fix `schema` → `SCHEMA` in README serverless examples (~lines 708–757)
+- [ ] T2-3 (P1): Correct the `withRetry()` "built-in" claim in the README comparison table
+- [ ] T2-4 (P2-strategy): Align the landing hero (`site/app/page.tsx`) with the same safety-bundle lead; fix `withRetry` in the landing comparison table if present
 
-## Dev Tracks (isolated worktrees, zero file overlap)
+### Track 3: Docs Pages (MDX) — docs specialist
+**Files owned:** `site/app/(docs)/**` (MDX + docs nav/layout only)
+**Tasks:**
+- [ ] T3-1 (P1): Fix `schema` → `SCHEMA` in `serverless/page.mdx` (all blocks)
+- [ ] T3-2 (P1): Fix `db.$queryRaw` → `db.raw` / `db.sql` in `compatibility/page.mdx`
+- [ ] T3-3 (P1): Fix `timeoutMs` → `timeout` in `transactions/page.mdx`
+- [ ] T3-4 (P1): Fix quickstart `.author` example (`quickstart/page.mdx:106`) — load `author` via nested `with` or remove the access
+- [ ] T3-5 (P2): NEW page — nested writes (verify against `src/nested-write.ts`)
+- [ ] T3-6 (P2): NEW page — optimistic locking (verify against `builder.ts` optimisticLock)
+- [ ] T3-7 (P3): NEW recipe — Next.js/Express route handler + end-to-end RLS example with policy DDL
+- [ ] T3-8: Update docs nav to include new pages
 
-### Track 1: Core query engine — `equals` operator + nested-write typing
-**Files:** `src/query/utils.ts`, `src/query/builder.ts`, `src/query/types.ts`, `src/index.ts` (exports), unit-test files in `src/test/`
-- [ ] TASK-01 (P0): Support `equals` as plain equality operator on non-JSON columns
-- [ ] TASK-02 (P0): Wire `NestedCreateOp`/`NestedUpdateOp`/`ConnectOrCreateOp` into create/update input typing, or un-export if it breaks inference
+### Track 4: Test Coverage — test specialist
+**Files owned:** `src/test/**` EXCEPT `src/test/generate*.test.ts` (Track 1 owns those)
+**Tasks:**
+- [ ] T4-1 (P1): Studio security-perimeter tests through the HTTP dispatch layer — invalid token → 401, rate limit → 429, cross-origin → 403, write under `BEGIN READ ONLY` → rejected. Test behavior, not implementation.
+- [ ] T4-2 (P2): Fix `with-inference.test.ts` docstring (real guard is the typecheck job, not `tsx --test`)
+- [ ] T4-3 (P3): Relabel `sql-safety-property.test.ts` to reflect it is a fixed adversarial corpus (no new deps); optionally expand the corpus
 
-### Track 2: Repo docs — middleware example, README observe, drift
-**Files:** `README.md`, `src/client.ts` (JSDoc only), `CLAUDE.md`, `.github/workflows/release.yml` (comment only)
-- [ ] TASK-03 (P0): Replace broken soft-delete middleware example in README + `$use` JSDoc
-- [ ] TASK-04 (P1): Document `turbine observe` + `$observe` in README
-- [ ] TASK-05 (P2): Fix CLAUDE.md builder.ts LOC drift; fix stale "308 tests" comment in release.yml
+## Intentionally skipped (with reason)
+- Refresh benchmarks — needs a live DB at 1M+ rows; manual follow-up.
+- Configure `NPM_TOKEN` — user must add the CI secret (manual).
+- Split `builder.ts` — injection-critical; too risky to bundle here.
 
-### Track 3: Site — studio page, observe docs, queries gaps, hero repositioning
-**Files:** `site/**` only
-- [ ] TASK-06 (P1): Create `/studio` docs page; add to sidebar
-- [ ] TASK-07 (P1): Create/extend observability docs
-- [ ] TASK-08 (P1): Document `cursor`, `take`, `distinct` in /queries; fix migrate-from-prisma `take` note
-- [ ] TASK-09 (P1): Update stale benchmark caveat (0.17.0 → current); note Prisma 7 landscape honestly
-- [ ] TASK-10 (P2): Reposition homepage hero toward "Postgres-maximalist" framing
-
-### Track 4: CLI surfaces — help text + dead code
-**Files:** `src/cli/index.ts`, `src/cli/studio.ts`, `src/cli/studio-ui.html` (+ regenerated `studio-ui.generated.ts`), studio test files (only isReadOnlyStatement tests)
-- [ ] TASK-11 (P1): Add `observe` to help; add `--auto`, `--allow-drift`, `--step` flags to help text
-- [ ] TASK-12 (P2): Delete `isReadOnlyStatement()` + its tests; remove orphaned `.sql-editor` CSS; run `npm run gen:studio`
-
-### Track 5: Test hygiene — proper skip reporting
-**Files:** DB-gated integration test files in `src/test/` only
-- [ ] TASK-13 (P2): Convert silent `const SKIP = !DATABASE_URL` no-op guards to node:test `skip` so reporters show skipped counts
+## Manual actions for the user
+- Add the `NPM_TOKEN` repo secret to re-enable automated publishing.
+- Run a fresh large-dataset benchmark (correlated-subquery vs LATERAL) before 1.0.

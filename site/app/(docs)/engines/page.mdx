@@ -1,0 +1,146 @@
+export const metadata = {
+  title: 'Database Engines',
+  description:
+    'Turbine ORM is Postgres-first, with optional SQLite, MySQL 8, and SQL Server engines behind subpath exports. Same typed API, honest capability matrix, one root dependency.',
+  alternates: { canonical: '/engines' },
+};
+
+# Database Engines
+
+Turbine is **Postgres-first**. `import { TurbineClient } from 'turbine-orm'` targets PostgreSQL, and the whole safety bundle — the read-only Studio, PII-safe errors, SQL-first migrations, pgvector, LISTEN/NOTIFY, RLS — is built around it. When you need a different database, the same typed API runs on **SQLite**, **MySQL 8**, and **SQL Server** through dedicated subpath exports.
+
+Multi-engine support is *additive*, not a pivot. You write the same `findMany` / `with` / `where` / `create` API; Turbine's dialect seam swaps the SQL primitives underneath. The one promise that never changes: `npm install turbine-orm` pulls exactly one runtime dependency (`pg`). Each engine's driver is its own concern — SQLite needs nothing extra, MySQL and SQL Server use **optional peer dependencies** you install only if you use them.
+
+## Honest by design
+
+Several of Turbine's flagship Postgres features have no portable equivalent. Rather than silently degrade, the non-Postgres engines throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) the moment you reach for one:
+
+- **pgvector** distance ops / KNN ordering
+- **LISTEN/NOTIFY** realtime (`$listen` / `$notify`)
+- **RLS `sessionContext`** (the transaction-local GUCs `$withSession` sets)
+
+If those are core to your app, stay on Postgres. If you need a second database for tests, edge demos, or an existing MySQL/SQL Server deployment, the engines below give you Turbine's nested-relation query model and typed errors without compromising the Postgres path.
+
+## Capability matrix
+
+Every cell reflects the actual behavior of the engine's dialect. `✗ E017` means calling the feature throws `UnsupportedFeatureError`.
+
+| Feature | PostgreSQL | SQLite | MySQL 8 | SQL Server |
+|---|:---:|:---:|:---:|:---:|
+| Single-query nested relations (`with`) | ✓ `json_agg` | ✓ `json_group_array` | ✓ `JSON_ARRAYAGG` | ✓ `FOR JSON PATH` |
+| Atomic update operators (`increment`, …) | ✓ | ✓ | ✓ | ✓ |
+| Transactions + nested savepoints | ✓ | ✓ ¹ | ✓ | ✓ |
+| Cursor / streaming (`findManyStream`) | ✓ | ✓ ⁵ | ✓ ⁵ | ✓ ⁵ |
+| Optimistic locking | ✓ | ✓ | ✓ ⁴ | ✓ |
+| Schema introspection | ✓ | ✓ ² | ✓ ² | ✓ ² |
+| Migrations (`turbine migrate` CLI) | ✓ | CLI ³ | CLI ³ | CLI ³ |
+| pgvector distance / KNN | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
+| LISTEN/NOTIFY realtime | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
+| RLS `sessionContext` | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
+
+¹ SQLite is single-writer — one write transaction at a time; concurrent writers get `SQLITE_BUSY` (treated as retryable). WAL mode is enabled for file databases so readers do not block.
+
+² Each engine ships a `DialectIntrospector`, so `introspect({ dialect })` reads the engine's own catalog (`PRAGMA` for SQLite, `information_schema` / `sys.*` for MySQL and SQL Server). The `turbine generate` CLI command itself is currently Postgres-only — point an engine factory at a programmatically introspected or hand-written `SCHEMA`.
+
+³ The `turbine migrate` runner is currently Postgres-only. Each dialect already emits its own migration-tracking SQL, and MySQL / SQL Server expose advisory-lock primitives (`GET_LOCK`, `sp_getapplock`) for a future adapter; SQLite serializes migrations naturally as a single writer.
+
+⁴ Optimistic locking throws `OptimisticLockError` on all four engines. On `RETURNING` / `OUTPUT` engines (PostgreSQL, SQLite, SQL Server) the conflict is a missing returned row; on MySQL (the `reselect` strategy) the conflict is detected from the version-checked UPDATE's affected-row count, so it raises identically.
+
+⁵ `findManyStream` works on every engine — it yields rows in `batchSize` batches and you can `break` early. Only PostgreSQL streams with a true server-side cursor (`DECLARE CURSOR`, constant memory regardless of result size); SQLite, MySQL, and SQL Server currently materialize the full result first, then yield it in batches. For very large exports, stream on Postgres or paginate with `limit` on the other engines.
+
+## How writes return rows
+
+The biggest difference between engines is how a write surfaces the row it affected — Turbine's `resultStrategy` seam handles it so `create` / `update` / `delete` / `upsert` keep returning the full row everywhere:
+
+| Engine | `resultStrategy` | Mechanism |
+|---|---|---|
+| PostgreSQL | `returning` | trailing `RETURNING *` |
+| SQLite ≥ 3.35 | `returning` | trailing `RETURNING *` |
+| MySQL 8 | `reselect` | run the write, then `SELECT` the affected row by primary key / `where` |
+| SQL Server | `output` | `OUTPUT INSERTED.*` / `MERGE` in the same statement |
+
+The one user-visible consequence: on MySQL, **`createMany` returns an empty array** (`[]`). The rows are inserted — MySQL just cannot return them safely in bulk, so re-query if you need them back.
+
+## SQLite
+
+The in-process engine for tests, edge demos, and a "try it in ten seconds" onboarding. It uses Node's built-in `node:sqlite` driver, so it adds **zero new dependencies**.
+
+```bash
+npm install turbine-orm   # nothing else — node:sqlite is built in (Node >= 22.5)
+```
+
+```ts
+import { turbineSqlite } from 'turbine-orm/sqlite';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+// File path, ':memory:', or an already-open DatabaseSync handle
+const db = turbineSqlite(':memory:', SCHEMA);
+
+const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
+await db.disconnect();
+```
+
+`turbineSqlite(target, schema, options?)` is **synchronous** and returns a `TurbineClient`. Pass a file path, `':memory:'`, or an open `DatabaseSync` (so you can seed and introspect it first, then reuse the same connection). Options:
+
+- `wal` — enable WAL journal mode for file databases (default `true`; ignored for `':memory:'`).
+- `busyTimeoutMs` — how long a writer waits on `SQLITE_BUSY` (default `5000`).
+- `foreignKeys` — enable `PRAGMA foreign_keys` enforcement (default `true`).
+- plus `logging`, `defaultLimit`, `warnOnUnlimited`.
+
+**Driver:** `node:sqlite` `DatabaseSync` is the primary driver (Node ≥ 22.5; it emits a harmless `ExperimentalWarning`). For older Node, wrap a `better-sqlite3` handle in the same pool shape — it is a documented fallback, not bundled.
+
+**Caveats:** SQLite has no native `BOOLEAN` (0/1 integers) or `DATE` (text/integer) — Turbine binds booleans as 1/0 and `Date` values as ISO-8601 text, and coerces `TIMESTAMP` / `DATETIME` / `DATE` columns back to `Date`. Integers wider than `Number.MAX_SAFE_INTEGER` come back as strings, mirroring the Postgres `int8` policy. Case-insensitive matching uses `COLLATE NOCASE`, which is ASCII-only (no Unicode case folding).
+
+## MySQL 8
+
+MySQL 8.0+ via the `mysql2` driver — the largest market after Postgres. `mysql2` is an **optional peer dependency**: install it only if you use this subpath.
+
+```bash
+npm install turbine-orm mysql2
+```
+
+```ts
+import { turbineMysql } from 'turbine-orm/mysql';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+const db = await turbineMysql('mysql://user:pass@localhost:3306/app', SCHEMA);
+
+const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
+await db.disconnect();
+```
+
+`turbineMysql(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` may be a connection string, a `mysql2` config object, or an existing `mysql2` pool (injection — you own its lifecycle and `disconnect()` becomes a no-op). When Turbine builds the pool it pins the correct `mysql2` flags (named placeholders, safe bignum, UTC dates, JSON-as-string), probes `SELECT VERSION()` to reject MariaDB and any MySQL older than 8.0, and `disconnect()` closes the pool it created. The only option is `connectionLimit` (default `10`), plus `logging` / `defaultLimit` / `warnOnUnlimited`.
+
+**Caveats:** MySQL has no `RETURNING`, so writes use the `reselect` strategy and **`createMany` returns `[]`** (re-query if you need the rows). Nested relations use `JSON_OBJECT` / `JSON_ARRAYAGG`; since `JSON_ARRAYAGG` has no inline `ORDER BY`, every ordered to-many relation goes through the inner-subquery rewrite. Case-insensitive matching uses `LOWER(col) LIKE LOWER(ref)`, which can defeat an index unless a functional/generated index exists. MySQL 8.0+ is required (5.7 lacks `JSON_ARRAYAGG`); MariaDB is unsupported.
+
+## SQL Server
+
+Microsoft SQL Server 2016+ via the `mssql` driver (which wraps `tedious`). `mssql` is an **optional peer dependency**.
+
+```bash
+npm install turbine-orm mssql
+```
+
+```ts
+import { turbineMssql } from 'turbine-orm/mssql';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+const db = await turbineMssql('mssql://sa:Passw0rd!@localhost:1433/app', SCHEMA);
+
+const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
+await db.disconnect();
+```
+
+`turbineMssql(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` may be a connection string, an `mssql` config object, or an existing pool (injection — `disconnect()` is a no-op). When Turbine builds the pool it probes `SERVERPROPERTY('ProductMajorVersion')` to reject any SQL Server older than 2016. The `schema` option sets the introspection / DDL schema (default `dbo`), plus `logging` / `defaultLimit` / `warnOnUnlimited`.
+
+**Caveats:** SQL Server has no `RETURNING` or `json_agg`. Writes return rows via `OUTPUT INSERTED.*` (and upserts via `MERGE … OUTPUT`); nested relations use a dedicated `FOR JSON PATH` correlated-subquery generator, wrapping to-many results in `ISNULL(…, '[]')` and embedding nested objects with `JSON_QUERY`. Paging is `ORDER BY … OFFSET … FETCH NEXT` (a stable order is injected when a query has none). `createMany` is capped at 1000 rows / 2100 parameters per statement (exceeding either throws a `ValidationError` — chunk it yourself). `MERGE` is not a substitute for a unique constraint, so keep the upsert conflict target backed by a real `UNIQUE` / `PK` index; the loser of a race surfaces as a typed `UniqueConstraintError`. `DISTINCT ON` is Postgres-only and is not translated.
+
+## Postgres-compatible databases
+
+Distributed and managed databases that speak the **PostgreSQL wire protocol** — AlloyDB, TimescaleDB, Neon, Supabase, YugabyteDB, CockroachDB — are not separate engines. They run on the default Postgres path (some with a thin adapter for migration locking or introspection quirks). See [Database Compatibility](/compatibility) for that matrix; this page covers the first-class non-Postgres engines.
+
+## See also
+
+- **[Database Compatibility](/compatibility)** — PG-wire-compatible databases (CockroachDB, YugabyteDB, AlloyDB, …) and their adapters.
+- **[Typed Errors](/errors)** — `UnsupportedFeatureError` (`TURBINE_E017`) and the full error code reference.
+- **[Serverless & Edge](/serverless)** — driver injection for Neon, Vercel Postgres, and Cloudflare on the Postgres path.

@@ -58,14 +58,14 @@ When `Serializable` detects a conflict, it throws `SerializationFailureError` (T
 
 ## Timeouts
 
-Per-transaction timeout, enforced client-side: if the callback exceeds `timeoutMs`, Turbine destroys the connection (aborting any in-flight statement server-side) and rolls back:
+Per-transaction timeout in milliseconds, enforced client-side: if the callback exceeds `timeout`, Turbine destroys the connection (aborting any in-flight statement server-side) and rolls back:
 
 ```ts
 await db.$transaction(
   async (tx) => {
     await tx.reports.create({ data: { /* ... */ } });
   },
-  { timeoutMs: 5_000 },
+  { timeout: 5_000 },
 );
 ```
 

@@ -3,13 +3,20 @@
  *
  * These tests verify that {@link WithResult} correctly threads relation types
  * through arbitrarily nested `with` clauses. They are pure compile-time checks
- * — the assertions are TypeScript type equalities, not runtime values. The
- * file is included in the `test:unit` script so any regression in inference
- * fails the test runner (the test file fails to typecheck and `tsx --test`
- * exits non-zero).
+ * — the assertions are TypeScript type equalities, not runtime values.
+ *
+ * IMPORTANT — what actually guards this file: `tsx`/esbuild strips types
+ * WITHOUT typechecking, so `tsx --test` (and therefore `npm run test:unit`)
+ * runs this file fine even if `with` inference has regressed — a broken type
+ * assertion would pass silently in the test runner. The REAL guard is the
+ * separate `npm run typecheck` job, which runs
+ * `tsc --noEmit --project tsconfig.test.json`. That config re-includes
+ * `src/test` (the base `tsconfig.json` excludes it from the build), so any
+ * regression in inference makes `tsc` fail with a non-zero exit. Keep this
+ * file in CI's typecheck step, not just the test step.
  *
  * The runtime portion just runs an empty `it()` so node:test recognises the
- * file. The real verification happens at compile time.
+ * file. The real verification happens at compile time, via `tsc`.
  */
 
 import { describe, it } from 'node:test';

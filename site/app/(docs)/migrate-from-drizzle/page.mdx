@@ -182,7 +182,7 @@ await db.$transaction(async (tx) => {
 | Optimistic locking | Manual | Built-in `optimisticLock: { field, expected }` |
 | Retry with backoff | Manual | `withRetry()` + `isRetryable` errors |
 | Full-text search | Raw SQL | `{ search: 'query' }` operator |
-| Edge/serverless | Separate driver packages | `turbineHttp(pool, schema)` — any pg-compatible pool |
+| Edge/serverless | Separate driver packages | `turbineHttp(pool, SCHEMA)` — any pg-compatible pool |
 | Relation filters | Manual subquery | `where: { posts: { some: { published: true } } }` |
 | Pipeline batching | N/A | Multiple queries in one round-trip |
 | Schema introspection | External tools | `npx turbine pull` → full metadata |

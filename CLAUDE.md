@@ -1,6 +1,6 @@
 # Turbine ORM
 
-TypeScript ORM for PostgreSQL. Single-query nested relations via `json_agg`.
+Postgres-first TypeScript ORM, with optional SQLite/MySQL/SQL Server engines behind subpath exports. Single-query nested relations via `json_agg`. Postgres remains the default and primary target; the other engines share the same typed API but several flagship features stay Postgres-only (see the capability notes in `dialect.ts` below).
 
 ## Quick Reference
 
@@ -18,7 +18,7 @@ npm run lint:fix      # Biome lint --apply
 
 The core insight: instead of N+1 queries for nested relations, Turbine generates a single SQL statement using PostgreSQL's `json_agg` + `json_build_object` with correlated subqueries.
 
-**Dependency graph:** `client.ts` wraps `query/` with connection pooling and transactions. The `query/` module is the heart — it builds all SQL and parses results. `pipeline.ts` batches multiple `DeferredQuery` objects from `query/` into a single round-trip. The CLI (`cli/`) imports `generate.ts`, `introspect.ts`, and `schema-sql.ts` but never imports `query/` or `client.ts` directly.
+**Dependency graph:** `client.ts` wraps `query/` with connection pooling and transactions. The `query/` module is the heart — it builds all SQL and parses results. `pipeline.ts` batches multiple `DeferredQuery` objects from `query/` into a single round-trip. The CLI (`cli/`) imports `generate.ts`, `introspect.ts`, and `schema-sql.ts`, and since v0.19 the ORM-native Studio (`cli/studio.ts`) also imports `QueryInterface`/`quoteIdent` from `query/`. The CLI still never imports `client.ts` directly — that's the real circular-dependency rule.
 
 ```
 src/
@@ -61,14 +61,63 @@ src/
                       Everything else falls through to standard PostgreSQL. Published as
                       the `turbine-orm/adapters` subpath export.
 
-  dialect.ts        — Phase-1 SQL dialect seam. Query generation depends on this contract
-                      for the SQL primitives that vary across MySQL/SQLite; the package
-                      stays PostgreSQL-native by default via postgresDialect.
+  dialect.ts        — The real multi-engine SQL seam (Phase-0 complete). Query generation,
+                      DML, DDL, migration-tracking SQL, transactions, streaming, and
+                      introspection all route through the `Dialect` contract; the package
+                      stays PostgreSQL-native by default via `postgresDialect`. Key parts:
+                      • `resultStrategy: 'returning' | 'reselect' | 'output'` — how a write
+                        surfaces its affected rows. `returning` = trailing `RETURNING *`
+                        (Postgres, SQLite ≥ 3.35); `reselect` = run the write then a
+                        follow-up SELECT by PK/where (MySQL — no RETURNING); `output` =
+                        rows come back from the same statement via `OUTPUT INSERTED.*` /
+                        `MERGE` (SQL Server). The executor branches on this.
+                      • Driver abstraction — engines bind via the external-pool seam
+                        (`PgCompatPool` / `TurbineConfig.pool`); each engine ships a thin
+                        pool shim (`SqlitePool`/`MysqlPool`/`MssqlPool`) plus
+                        `paramPlaceholder`, `quoteIdentifier`, and tx-keyword hooks
+                        (`begin/commit/rollback/savepoint/buildSetSessionConfig`).
+                      • Capability flags — `supportsReturning`, `supportsVector`,
+                        `supportsListenNotify`, `supportsRLS`, `supportsAdvisoryLock`,
+                        `supportsILike`, `aggSupportsInlineOrderBy`, `jsonPathSupport`.
+                        Builders/client throw `UnsupportedFeatureError` (E017) when a flag
+                        is false instead of emitting broken SQL.
+                      • Additive hooks — `wrapJsonSubresult` (SQLite `json(...)`, MSSQL
+                        `ISNULL(…, '[]')`), `aggSupportsInlineOrderBy` (forces the
+                        inner-subquery rewrite for ordered to-many on MySQL/SQLite),
+                        `castAggregate`, `buildInClause`/`inClauseParam`, `buildLimitOffset`
+                        (SQL Server `OFFSET/FETCH`), `buildUpdateStatement`/
+                        `buildDeleteStatement` (mid-statement `OUTPUT`), and
+                        `buildRelationSubquery` (SQL Server's `FOR JSON PATH` override).
+                        `openStream()` and the `DialectIntrospector` round out the seam.
+
+  sqlite.ts         — `turbine-orm/sqlite` engine. `turbineSqlite(path | ':memory:' |
+                      DatabaseSync, schema, options?)` — synchronous, zero new dependency
+                      via Node's built-in `node:sqlite` (Node ≥ 22.5; `better-sqlite3`
+                      documented fallback). `sqliteDialect` uses `resultStrategy:
+                      'returning'`, `json_group_array(json(...))` nested relations, and
+                      `COLLATE NOCASE` (ASCII-only) for insensitive matching. The
+                      in-process test / edge / "try it in 10 seconds" engine.
+
+  mysql.ts          — `turbine-orm/mysql` engine. `await turbineMysql(url | config |
+                      mysql2-pool, schema, options?)` — MySQL 8.0+ via the optional peer
+                      `mysql2` (loaded by dynamic import; never a root dep). `mysqlDialect`
+                      uses `resultStrategy: 'reselect'` (no RETURNING — write then re-SELECT
+                      by PK/where), `JSON_ARRAYAGG`/`JSON_OBJECT` nested relations, and
+                      named `:pN` placeholders. `createMany` returns `[]` (count-not-rows).
+
+  mssql.ts          — `turbine-orm/mssql` engine. `await turbineMssql(url | config |
+                      mssql-pool, schema, options?)` — SQL Server 2016+ via the optional
+                      peer `mssql` (dynamic import). `mssqlDialect` uses `resultStrategy:
+                      'output'` (`OUTPUT INSERTED.*` / `MERGE`), `FOR JSON PATH` nested
+                      relations (`buildRelationSubquery` override), `OFFSET/FETCH` paging,
+                      and named `@pN` placeholders.
 
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code
-                      (TURBINE_E001-E016). wrapPgError() translates pg driver errors
+                      (TURBINE_E001-E017). wrapPgError() translates pg driver errors
                       (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
-                      Turbine errors.
+                      Turbine errors. UnsupportedFeatureError (E017) is thrown directly
+                      (not via wrapPgError) when a non-Postgres engine hits a Postgres-only
+                      feature.
 
   nested-write.ts   — Nested-write engine. Tree-walking create/update that resolves
                       relation fields in `data` (create, connect, connectOrCreate,
@@ -192,6 +241,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E014 | `PipelineError` | One or more queries in a pipeline batch failed |
 | E015 | `OptimisticLockError` | Version mismatch on `optimisticLock` update |
 | E016 | `ExclusionConstraintError` | pg 23P01 — via `wrapPgError()` |
+| E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on an engine whose capability flag reports it unsupported — thrown directly, not via `wrapPgError()` |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 
@@ -253,7 +303,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 ## Don't
 
-- Don't add runtime dependencies beyond `pg`
+- Don't add runtime dependencies beyond `pg`. Root `dependencies` stays exactly `{ pg, @types/pg }`. The only sanctioned exception is the engine drivers: `mysql2` and `mssql` are **devDependencies + optional `peerDependencies`** (`peerDependenciesMeta.*.optional = true`), loaded lazily via dynamic `import()` from the `mysql`/`mssql` subpaths and never required for Postgres users; SQLite needs nothing at all (it uses the `node:sqlite` builtin). `npm i turbine-orm` must keep pulling only `pg`.
 - Don't use `eval`, `new Function`, or shell interpolation
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings — always use `$N` parameterization

@@ -130,12 +130,22 @@ export const OBSERVE_HTML = `<!doctype html>
         + '</svg>';
     }
 
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     function renderModels(data) {
       const el = document.getElementById('models-table');
       if (!data || data.length === 0) { el.innerHTML = '<p class="empty">No data yet</p>'; return; }
       let html = '<table><thead><tr><th>Model</th><th>Action</th><th class="num">Count</th><th class="num">Avg (ms)</th><th class="num">P95 (ms)</th><th class="num">P99 (ms)</th></tr></thead><tbody>';
       for (const row of data) {
-        html += '<tr><td>' + row.model + '</td><td>' + row.action + '</td>'
+        html += '<tr><td>' + escapeHtml(row.model) + '</td><td>' + escapeHtml(row.action) + '</td>'
           + '<td class="num">' + row.count + '</td>'
           + '<td class="num">' + row.avg_ms.toFixed(1) + '</td>'
           + '<td class="num">' + row.p95_ms.toFixed(1) + '</td>'
@@ -152,7 +162,7 @@ export const OBSERVE_HTML = `<!doctype html>
       for (const row of data) {
         const rate = row.count > 0 ? (row.error_count / row.count * 100).toFixed(1) : '0.0';
         const cls = parseFloat(rate) > 5 ? 'error-rate' : 'low-error';
-        html += '<tr><td>' + row.model + '</td><td>' + row.action + '</td>'
+        html += '<tr><td>' + escapeHtml(row.model) + '</td><td>' + escapeHtml(row.action) + '</td>'
           + '<td class="num">' + row.count + '</td>'
           + '<td class="num">' + row.error_count + '</td>'
           + '<td class="num ' + cls + '">' + rate + '%</td></tr>';

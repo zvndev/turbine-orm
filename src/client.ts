@@ -23,8 +23,15 @@
  */
 
 import pg from 'pg';
-import type { Dialect } from './dialect.js';
-import { type ErrorMessageMode, setErrorMessageMode, TimeoutError, ValidationError, wrapPgError } from './errors.js';
+import { type Dialect, postgresDialect } from './dialect.js';
+import {
+  type ErrorMessageMode,
+  setErrorMessageMode,
+  TimeoutError,
+  UnsupportedFeatureError,
+  ValidationError,
+  wrapPgError,
+} from './errors.js';
 import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 import {
@@ -129,6 +136,25 @@ export interface PgCompatPool {
   readonly waitingCount?: number;
   /** Optional — pg.Pool supports 'error' event; HTTP drivers typically do not */
   on?(event: 'error', listener: (err: Error) => void): this;
+}
+
+/**
+ * Driver-neutral seam. Bundles a pg-compatible connection pool with the SQL
+ * {@link Dialect} that owns every piece of SQL text varying across engines —
+ * parameter placeholders, transaction-control keywords (BEGIN/COMMIT/ROLLBACK/
+ * SAVEPOINT/isolation/set_config), streaming, and capability flags.
+ *
+ * This is the structural boundary that keeps hard-coded Postgres SQL out of
+ * `client.ts`: the pool provides connect/query/transaction/close, the dialect
+ * provides every literal keyword and the placeholder syntax. A future MySQL /
+ * SQLite engine ships a `{ pool, dialect }` pair instead of a raw `pg.Pool`,
+ * exactly as `turbineHttp` ships a serverless pool today.
+ */
+export interface TurbineDriver {
+  /** The underlying pg-compatible connection pool (connect/query/transaction/close). */
+  readonly pool: PgCompatPool;
+  /** SQL dialect: placeholders, transaction keywords, session-config, capability flags. */
+  readonly dialect: Dialect;
 }
 
 export interface TurbineConfig {
@@ -283,6 +309,8 @@ const GUC_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
 export class TransactionClient {
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private savepointCounter = 0;
+  /** Active SQL dialect — owns savepoint keywords and raw-SQL placeholders. */
+  private readonly dialect: Dialect;
 
   constructor(
     private readonly client: pg.PoolClient,
@@ -290,6 +318,7 @@ export class TransactionClient {
     private readonly middlewares: Middleware[],
     private readonly queryOptions?: QueryInterfaceOptions,
   ) {
+    this.dialect = queryOptions?.dialect ?? postgresDialect;
     // Auto-create typed table accessors for all tables in the schema
     for (const tableName of Object.keys(schema.tables)) {
       const camelName = tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -325,13 +354,13 @@ export class TransactionClient {
    */
   async $transaction<R>(fn: (tx: TransactionClient) => Promise<R>): Promise<R> {
     const savepointName = `sp_${++this.savepointCounter}`;
-    await this.client.query(`SAVEPOINT ${savepointName}`);
+    await this.client.query(this.dialect.savepointStatement(savepointName));
     try {
       const result = await fn(this);
-      await this.client.query(`RELEASE SAVEPOINT ${savepointName}`);
+      await this.client.query(this.dialect.releaseSavepointStatement(savepointName));
       return result;
     } catch (err) {
-      await this.client.query(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+      await this.client.query(this.dialect.rollbackToSavepointStatement(savepointName));
       throw err;
     }
   }
@@ -347,7 +376,7 @@ export class TransactionClient {
     strings.forEach((str, i) => {
       sql += str;
       if (i < values.length) {
-        sql += `$${i + 1}`;
+        sql += this.dialect.paramPlaceholder(i + 1);
       }
     });
     try {
@@ -403,6 +432,8 @@ export class TurbineClient {
 
   private static int8ParserRegistered = false;
   private readonly logging: boolean;
+  /** Active SQL dialect — owns transaction keywords, set_config, raw-SQL placeholders, capability flags. */
+  private readonly dialect: Dialect;
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private readonly middlewares: Middleware[] = [];
   private readonly queryListeners = new Set<QueryEventListener>();
@@ -452,6 +483,7 @@ export class TurbineClient {
     }
 
     this.logging = config.logging ?? false;
+    this.dialect = config.dialect ?? postgresDialect;
     this.schema = schema;
     // Respect env var kill switch
     const envDisablePrepared = typeof process !== 'undefined' && process.env?.TURBINE_DISABLE_PREPARED === '1';
@@ -712,7 +744,7 @@ export class TurbineClient {
     strings.forEach((str, i) => {
       sql += str;
       if (i < values.length) {
-        sql += `$${i + 1}`;
+        sql += this.dialect.paramPlaceholder(i + 1);
       }
     });
 
@@ -762,7 +794,7 @@ export class TurbineClient {
     strings: TemplateStringsArray,
     ...values: unknown[]
   ): TypedSqlQuery<T> {
-    const { sql, params } = buildTypedSql(strings, values);
+    const { sql, params } = buildTypedSql(strings, values, this.dialect);
     return new TypedSqlQuery<T>(this.pool, sql, params, this.logging);
   }
 
@@ -784,12 +816,12 @@ export class TurbineClient {
   async transaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {
-      await client.query('BEGIN');
+      await client.query(this.dialect.beginStatement());
       const result = await fn(client);
-      await client.query('COMMIT');
+      await client.query(this.dialect.commitStatement());
       return result;
     } catch (err) {
-      await client.query('ROLLBACK');
+      await client.query(this.dialect.rollbackStatement());
       throw err;
     } finally {
       client.release();
@@ -842,13 +874,10 @@ export class TurbineClient {
     let timedOut = false;
 
     try {
-      // BEGIN with optional isolation level
-      let beginSQL = 'BEGIN';
-      if (options?.isolationLevel) {
-        const level = ISOLATION_LEVELS[options.isolationLevel];
-        if (level) beginSQL += ` ISOLATION LEVEL ${level}`;
-      }
-      await client.query(beginSQL);
+      // BEGIN with optional isolation level — the dialect owns the keyword and
+      // BEGIN+isolation composition (Postgres appends ` ISOLATION LEVEL …`).
+      const isolationSql = options?.isolationLevel ? ISOLATION_LEVELS[options.isolationLevel] : undefined;
+      await client.query(this.dialect.beginStatement(isolationSql));
 
       // Apply transaction-local session context (RLS / multi-tenant GUCs).
       // Order matters: BEGIN -> isolation level (above) -> set_config loop ->
@@ -857,6 +886,13 @@ export class TurbineClient {
       // is_local=true) — the parameterizable, transaction-scoped equivalent of
       // SET LOCAL — so both name and value are BOUND params, never interpolated.
       if (options?.sessionContext) {
+        if (!this.dialect.supportsRLS) {
+          throw new UnsupportedFeatureError(
+            'sessionContext (RLS session GUCs)',
+            this.dialect.name,
+            'set_config-based row-level-security context requires PostgreSQL.',
+          );
+        }
         for (const [name, value] of Object.entries(options.sessionContext)) {
           if (!GUC_NAME_REGEX.test(name)) {
             throw new ValidationError(
@@ -864,7 +900,8 @@ export class TurbineClient {
                 '/^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$/ (optionally namespaced, e.g. "app.current_tenant")',
             );
           }
-          await client.query('SELECT set_config($1, $2, true)', [name, String(value)]);
+          const cfg = this.dialect.buildSetSessionConfig(name, String(value));
+          await client.query(cfg.sql, cfg.params);
         }
       }
 
@@ -913,7 +950,7 @@ export class TurbineClient {
         result = await fn(tx);
       }
 
-      await client.query('COMMIT');
+      await client.query(this.dialect.commitStatement());
 
       if (this.logging) {
         console.log('[turbine] Transaction committed');
@@ -927,7 +964,7 @@ export class TurbineClient {
       // when its socket was closed).
       if (!timedOut && !released) {
         try {
-          await client.query('ROLLBACK');
+          await client.query(this.dialect.rollbackStatement());
         } catch {
           // Best-effort rollback — the connection may have died mid-query.
         }
@@ -998,6 +1035,13 @@ export class TurbineClient {
    * ```
    */
   async $listen(channel: string, handler: NotificationHandler): Promise<Subscription> {
+    if (!this.dialect.supportsListenNotify) {
+      throw new UnsupportedFeatureError(
+        '$listen (LISTEN/NOTIFY realtime)',
+        this.dialect.name,
+        'Realtime pub/sub requires PostgreSQL.',
+      );
+    }
     validateChannel(channel);
     const quoted = quoteIdent(channel);
 
@@ -1026,6 +1070,13 @@ export class TurbineClient {
    * ```
    */
   async $notify(channel: string, payload?: string): Promise<void> {
+    if (!this.dialect.supportsListenNotify) {
+      throw new UnsupportedFeatureError(
+        '$notify (LISTEN/NOTIFY realtime)',
+        this.dialect.name,
+        'Realtime pub/sub requires PostgreSQL.',
+      );
+    }
     validateChannel(channel);
     if (this.logging) {
       console.log(`[turbine] NOTIFY ${channel}`);

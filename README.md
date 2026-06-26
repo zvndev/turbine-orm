@@ -1,6 +1,6 @@
 # turbine-orm
 
-One dependency. No WASM engine. The Postgres ORM that ships light and locks tight.
+The Postgres ORM your DBA will sign off on. A read-only Studio that can't touch prod, errors that never leak PII, one dependency, and checksummed migrations.
 
 ```
 npm install turbine-orm
@@ -10,16 +10,16 @@ npm install turbine-orm
 
 ## Why Turbine?
 
-Prisma ships a 1.6 MB WASM query engine. Drizzle ships zero runtime but no Studio, no typed errors, no migration checksums. Turbine ships **one dependency (`pg`) and no engine binary**, and bundles six things no other TS ORM has together:
+Every TS ORM now resolves nested relations in a single `json_agg` query — Prisma 7 and Drizzle v2 both ship it, and so does Turbine. That part is table stakes. The reason to reach for Turbine is the **safety bundle**: the boxes a DBA ticks before a query layer goes anywhere near production. It's the only TypeScript ORM that ships all six of these together:
 
-1. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~31 kB brotli (~109 KB minified); the edge entry to ~22 kB brotli. Prisma's WASM query engine alone is 1.6 MB.
-2. **Built-in read-only Studio.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and — since v0.19 — no raw-SQL surface at all: queries are composed in the ORM's own validated builder. The only TS ORM Studio that physically cannot mutate your database. DBA-approvable.
-3. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
+1. **Read-only Studio your DBA will approve.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and — since v0.19 — no raw-SQL surface at all: queries are composed in the ORM's own validated builder. The only TS ORM Studio that physically cannot mutate your database.
+2. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
+3. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~31 kB brotli (~109 KB minified); the edge entry to ~22 kB brotli. Prisma's WASM query engine alone is 1.6 MB.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
-5. **Edge-native — one import swap.** `turbineHttp(pool, schema)` — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle, no adapter package, no separate serverless build.
+5. **Edge-native — one import swap.** `turbineHttp(pool, SCHEMA)` — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle, no adapter package, no separate serverless build.
 6. **Pipeline batching via wire protocol.** Real Parse/Bind/Execute pipeline — not queries wrapped in a transaction. N independent queries in one round-trip.
 
-Every ORM claims single-query nested loads now (Prisma 7 and Drizzle v2 both use json_agg). Turbine does too — see [How It Works](#how-it-works). The differentiator isn't the query strategy; it's the one-dependency, no-WASM footprint, the read-only Studio, and the error messages that never leak user data.
+See [How It Works](#how-it-works) for the `json_agg` query strategy itself — but the query strategy isn't why you'd pick Turbine. The safety bundle above is: a Studio that can't mutate prod, errors that never leak PII, one dependency, and checksummed migrations.
 
 ## Benchmarks
 
@@ -404,7 +404,7 @@ try {
 }
 ```
 
-Error codes: `TURBINE_E001` (NotFound), `TURBINE_E002` (Timeout), `TURBINE_E003` (Validation), `TURBINE_E004` (Connection), `TURBINE_E005` (Relation), `TURBINE_E006` (Migration), `TURBINE_E007` (CircularRelation), `TURBINE_E008` (UniqueConstraint), `TURBINE_E009` (ForeignKey), `TURBINE_E010` (NotNullViolation), `TURBINE_E011` (CheckConstraint), `TURBINE_E012` (Deadlock), `TURBINE_E013` (SerializationFailure), `TURBINE_E014` (Pipeline), `TURBINE_E015` (OptimisticLock), `TURBINE_E016` (ExclusionConstraint).
+Error codes: `TURBINE_E001` (NotFound), `TURBINE_E002` (Timeout), `TURBINE_E003` (Validation), `TURBINE_E004` (Connection), `TURBINE_E005` (Relation), `TURBINE_E006` (Migration), `TURBINE_E007` (CircularRelation), `TURBINE_E008` (UniqueConstraint), `TURBINE_E009` (ForeignKey), `TURBINE_E010` (NotNullViolation), `TURBINE_E011` (CheckConstraint), `TURBINE_E012` (Deadlock), `TURBINE_E013` (SerializationFailure), `TURBINE_E014` (Pipeline), `TURBINE_E015` (OptimisticLock), `TURBINE_E016` (ExclusionConstraint), `TURBINE_E017` (UnsupportedFeature — a Postgres-only feature invoked on another engine).
 
 Full reference with `wrapPgError()` translation, retry patterns for `DeadlockError` / `SerializationFailureError`, and safe vs verbose message modes: **[turbineorm.dev/errors](https://turbineorm.dev/errors)**.
 
@@ -705,12 +705,12 @@ Turbine's core is driver-agnostic: pass any pg-compatible pool to `TurbineConfig
 // app/api/users/route.ts
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from '@/generated/turbine/metadata';
+import { SCHEMA } from '@/generated/turbine/metadata';
 
 export const runtime = 'edge';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const db = turbineHttp(pool, schema);
+const db = turbineHttp(pool, SCHEMA);
 
 export async function GET() {
   const users = await db.table('users').findMany({
@@ -726,22 +726,22 @@ export async function GET() {
 ```ts
 import { createPool } from '@vercel/postgres';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata.js';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = createPool({ connectionString: process.env.POSTGRES_URL });
-const db = turbineHttp(pool, schema);
+const db = turbineHttp(pool, SCHEMA);
 ```
 
 ### Supabase (direct Postgres — no HTTP proxy needed)
 
 ```ts
 import { TurbineClient } from 'turbine-orm';
-import { schema } from './generated/turbine/metadata.js';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const db = new TurbineClient({
   connectionString: process.env.SUPABASE_DB_URL,
   ssl: { rejectUnauthorized: false },
-}, schema);
+}, SCHEMA);
 ```
 
 ### Cloudflare Workers
@@ -749,12 +749,12 @@ const db = new TurbineClient({
 ```ts
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { schema } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata';
 
 export default {
   async fetch(req: Request, env: Env) {
     const pool = new Pool({ connectionString: env.DATABASE_URL });
-    const db = turbineHttp(pool, schema);
+    const db = turbineHttp(pool, SCHEMA);
     const users = await db.table('users').findMany({ limit: 10 });
     return Response.json(users);
   },
@@ -768,6 +768,70 @@ export default {
 - Transactions work but hold an HTTP connection for their duration — keep them short.
 
 When Turbine receives an external pool, `db.disconnect()` is a no-op: the caller owns the pool's lifecycle.
+
+## Database engines
+
+Turbine is **Postgres-first** — `import { TurbineClient } from 'turbine-orm'` targets PostgreSQL, and the safety bundle above is built around it. When you need another database, the same typed API runs on **SQLite**, **MySQL 8**, and **SQL Server** through subpath exports. Multi-engine is *additive*, not a pivot: pick the engine that fits, keep the same `findMany` / `with` / `where` API.
+
+The root install stays one dependency (`pg`). Each engine's driver is its own concern: SQLite needs nothing (Node's built-in `node:sqlite`), MySQL and SQL Server use **optional peer dependencies** you install only if you use them.
+
+```bash
+# SQLite — zero extra deps (Node >= 22.5, built-in node:sqlite)
+npm install turbine-orm
+
+# MySQL 8 — optional peer
+npm install turbine-orm mysql2
+
+# SQL Server 2016+ — optional peer
+npm install turbine-orm mssql
+```
+
+Each engine ships a factory that returns the same `TurbineClient`:
+
+```ts
+// SQLite — synchronous; pass a file path, ':memory:', or an open DatabaseSync
+import { turbineSqlite } from 'turbine-orm/sqlite';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+const db = turbineSqlite(':memory:', SCHEMA);
+const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
+```
+
+```ts
+// MySQL 8 — async; connection string, mysql2 config, or an existing mysql2 pool
+import { turbineMysql } from 'turbine-orm/mysql';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+const db = await turbineMysql('mysql://user:pass@localhost:3306/app', SCHEMA);
+```
+
+```ts
+// SQL Server 2016+ — async; connection string, mssql config, or an existing pool
+import { turbineMssql } from 'turbine-orm/mssql';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+const db = await turbineMssql('mssql://sa:Passw0rd!@localhost:1433/app', SCHEMA);
+```
+
+### Capability matrix
+
+Everything is honest about what ports and what doesn't. Features marked **PG-only** throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) on other engines rather than silently degrading.
+
+| Feature | PostgreSQL | SQLite | MySQL 8 | SQL Server |
+|---|:---:|:---:|:---:|:---:|
+| Single-query nested `with` | ✓ `json_agg` | ✓ `json_group_array` | ✓ `JSON_ARRAYAGG` | ✓ `FOR JSON PATH` |
+| Transactions + savepoints | ✓ | ✓ (single-writer) | ✓ | ✓ |
+| Streaming (`findManyStream`) | ✓ | ✓ | ✓ | ✓ |
+| Migrations (`turbine migrate` CLI) | ✓ | PG-only (CLI) | PG-only (CLI) | PG-only (CLI) |
+| pgvector distance / KNN | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
+| LISTEN/NOTIFY realtime | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
+| RLS `sessionContext` | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
+
+✗ E017 = throws `UnsupportedFeatureError`. The full matrix (atomic updates, introspection, optimistic locking, per-cell mechanics) is on [turbineorm.dev/engines](https://turbineorm.dev/engines).
+
+**Engine notes:** SQLite uses `RETURNING` (≥ 3.35) just like Postgres. MySQL has no `RETURNING`, so writes re-`SELECT` the affected row and **`createMany` returns `[]`** (the rows ARE inserted — re-query if you need them). SQL Server returns rows via `OUTPUT`/`MERGE`; `DISTINCT ON` is Postgres-only. Only Postgres streams via a true cursor (constant memory); the other engines' `findManyStream` materializes the result then yields it in batches. Optimistic locking throws `OptimisticLockError` on all engines (on MySQL the conflict is detected from the version-checked UPDATE's affected-row count). The `turbine` CLI (`generate`, `migrate`) is currently PostgreSQL-only — point the engine factories at a hand-written or programmatically introspected `SCHEMA`.
+
+Full setup, signatures, and the complete support matrix: **[turbineorm.dev/engines](https://turbineorm.dev/engines)**.
 
 ## Configuration
 
@@ -829,7 +893,7 @@ Turbine maps Postgres types to TypeScript:
 | **Many-to-many** | Auto-detected from junctions | Implicit/explicit | Explicit `relations()` | Manual joins |
 | **Vector search** | Built-in `distance` / KNN | Preview / raw | Extension API | Manual |
 | **LISTEN/NOTIFY** | `$listen` / `$notify` | None | None | None |
-| **Multi-DB** | PostgreSQL only | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
+| **Multi-DB** | Postgres-first (+ SQLite/MySQL/MSSQL engines) | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
 
 All three ORMs now do single-query nested loads — that's table stakes. Turbine's real differentiators: no engine binary or WASM — just one dependency (`pg`), vs Prisma's 1.6 MB WASM query engine; the only read-only Studio in the ecosystem; error messages that never leak PII; and SQL-first migrations with SHA-256 drift detection. See [Benchmarks](#benchmarks) for performance numbers — most scenarios are within noise over a real pooled database.
 
@@ -837,7 +901,7 @@ All three ORMs now do single-query nested loads — that's table stakes. Turbine
 
 Turbine is focused and opinionated. Here's what it doesn't do:
 
-- **PostgreSQL only.** No MySQL, SQLite, or MSSQL. By design — going deep on one database enables the performance advantage and the edge-runtime story.
+- **Postgres-first.** PostgreSQL is the default and primary target — going deep on one database is what enables the safety bundle and the edge-runtime story. SQLite, MySQL 8, and SQL Server engines are available as additive subpath exports (see [Database engines](#database-engines)), but several flagship features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) are Postgres-only and throw `UnsupportedFeatureError` elsewhere.
 - **Full-text search** is available via a `search` filter — `where: { title: { search: 'hello & world', config: 'english' } }` compiles to a parameterized `to_tsvector(...) @@ to_tsquery(...)`. For advanced ranking (`ts_rank`, weighted vectors) use `db.raw`.
 - **Large nested result sets.** Nested results are materialized server-side in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause — or stream the parents with `findManyStream` and resolve children per-row.
 

@@ -178,6 +178,114 @@ jobs:
           DATABASE_URL: postgres://root@localhost:26257/turbine_test?sslmode=disable
           TURBINE_TEST_ENGINE: cockroachdb
 
+  # Real MySQL 8 job for the turbine-orm/mysql engine (Phase 2 — multi-dialect).
+  # The mysql2 named-param driver + the `reselect` result strategy (no RETURNING)
+  # and the information_schema introspector are only proven against a real server,
+  # so this job spins a mysql:8 service container, sets MYSQL_URL, and runs
+  # src/test/mysql.test.ts — whose integration suite creates its own schema, seeds
+  # the fixture, dogfoods the introspector, and exercises findMany / nested-with /
+  # create(reselect) / upsert / update / delete / transactions / typed errors.
+  # Without MYSQL_URL (locally + the unit-tests job) those tests skip cleanly while
+  # the build-only + mock-driver tests still run. mysql2 is a devDep, so `npm ci`
+  # installs it. Marked continue-on-error until the container topology has run green
+  # on GitHub runners a few times (same posture as cockroachdb-integration); promote
+  # to a hard gate once proven.
+  mysql-integration:
+    name: mysql-integration
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: turbine_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run turbine-orm/mysql integration tests against MySQL 8
+        run: npx tsx --test src/test/mysql.test.ts
+        env:
+          MYSQL_URL: mysql://root:root@127.0.0.1:3306/turbine_test
+
+  # Real SQL Server 2022 job for the turbine-orm/mssql engine (Phase 3 — multi-dialect).
+  # The FOR JSON PATH nested-relation generator, the OUTPUT/MERGE result strategy, the
+  # @pN named-param driver, and the INFORMATION_SCHEMA/sys introspector are only proven
+  # against a real server, so this job spins an mssql/server:2022-latest service container,
+  # sets MSSQL_URL, and runs src/test/mssql.test.ts — whose integration suite creates its
+  # own schema, seeds the fixture, dogfoods the introspector, and exercises findMany /
+  # nested-with / create(output) / upsert(MERGE) / update / delete / transactions / typed
+  # errors. Without MSSQL_URL (locally + the unit-tests job) those tests skip cleanly while
+  # the build-only + mock-driver tests still run. mssql is a devDep, so `npm ci` installs
+  # it. Marked continue-on-error until the container topology has run green on GitHub
+  # runners a few times (same posture as mysql/cockroachdb); promote to a hard gate once
+  # proven.
+  mssql-integration:
+    name: mssql-integration
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Turbine_Passw0rd!"
+          SA_PASSWORD: "Turbine_Passw0rd!"
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Turbine_Passw0rd!' -Q 'SELECT 1' || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'Turbine_Passw0rd!' -Q 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 15
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Create the test database with the same `mssql` driver the tests use
+      # (already installed by `npm ci`) rather than a separate sqlcmd tools
+      # image — `mcr.microsoft.com/mssql-tools18:latest` has no published tag.
+      - name: Create the test database
+        # Write the script into the repo root (the step's cwd) so `require('mssql')`
+        # resolves the package `npm ci` just installed — a /tmp script can't see
+        # the workspace node_modules.
+        run: |
+          cat > create-mssql-db.cjs <<'EOF'
+          const sql = require('mssql');
+          (async () => {
+            const pool = await sql.connect({
+              server: '127.0.0.1', port: 1433, user: 'sa',
+              password: 'Turbine_Passw0rd!', database: 'master',
+              options: { encrypt: false, trustServerCertificate: true },
+            });
+            await pool.request().query("IF DB_ID('turbine_test') IS NULL CREATE DATABASE turbine_test");
+            await pool.close();
+            console.log('turbine_test database ready');
+          })().catch((err) => { console.error(err); process.exit(1); });
+          EOF
+          node create-mssql-db.cjs
+          rm -f create-mssql-db.cjs
+      - name: Run turbine-orm/mssql integration tests against SQL Server 2022
+        run: npx tsx --test src/test/mssql.test.ts
+        env:
+          MSSQL_URL: mssql://sa:Turbine_Passw0rd!@127.0.0.1:1433/turbine_test
+
   # NOTE: the YugabyteDB integration job used to live here, but its container
   # never initialized successfully on GitHub runners and burned ~6 minutes of
   # guaranteed red X on every PR/push. It now runs on a nightly schedule in
@@ -251,6 +359,20 @@ jobs:
         working-directory: ${{ env.SMOKE_DIR }}
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/serverless'); if (typeof m.turbineHttp !== 'function') { console.error('serverless subpath missing turbineHttp'); process.exit(1); } console.log('serverless subpath OK');"
+      - name: Verify mysql subpath import (mysql2 NOT installed — must not crash)
+        working-directory: ${{ env.SMOKE_DIR }}
+        # mysql2 is an OPTIONAL peer; this temp project never installs it. Importing
+        # turbine-orm/mysql and using mysqlDialect must work with mysql2 absent
+        # (it is only loaded by the dynamic import inside turbineMysql()).
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/mysql'); if (m.mysqlDialect?.name !== 'mysql' || typeof m.turbineMysql !== 'function') { console.error('mysql subpath broken'); process.exit(1); } console.log('mysql subpath OK (no mysql2 needed to import)');"
+      - name: Verify mssql subpath import (mssql NOT installed — must not crash)
+        working-directory: ${{ env.SMOKE_DIR }}
+        # mssql is an OPTIONAL peer; this temp project never installs it. Importing
+        # turbine-orm/mssql and using mssqlDialect must work with mssql absent
+        # (it is only loaded by the dynamic import inside turbineMssql()).
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/mssql'); if (m.mssqlDialect?.name !== 'mssql' || typeof m.turbineMssql !== 'function') { console.error('mssql subpath broken'); process.exit(1); } console.log('mssql subpath OK (no mssql needed to import)');"
 
   security:
     runs-on: ubuntu-latest

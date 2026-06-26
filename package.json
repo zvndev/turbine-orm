@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.19.2",
+  "version": "0.21.0",
   "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "exports": {
@@ -13,6 +13,21 @@
       "types": "./dist/serverless.d.ts",
       "import": "./dist/serverless.js",
       "require": "./dist/cjs/serverless.js"
+    },
+    "./sqlite": {
+      "types": "./dist/sqlite.d.ts",
+      "import": "./dist/sqlite.js",
+      "require": "./dist/cjs/sqlite.js"
+    },
+    "./mysql": {
+      "types": "./dist/mysql.d.ts",
+      "import": "./dist/mysql.js",
+      "require": "./dist/cjs/mysql.js"
+    },
+    "./mssql": {
+      "types": "./dist/mssql.d.ts",
+      "import": "./dist/mssql.js",
+      "require": "./dist/cjs/mssql.js"
     },
     "./cli": {
       "types": "./dist/cli/config.d.ts",
@@ -86,9 +101,23 @@
     "c8": "^11.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
+    "mssql": "^11.0.1",
+    "mysql2": "^3.22.5",
     "size-limit": "^12.1.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "mssql": "^10.0.0 || ^11.0.0",
+    "mysql2": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "mssql": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    }
   },
   "keywords": [
     "orm",
