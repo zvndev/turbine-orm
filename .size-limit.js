@@ -29,4 +29,13 @@ export default [
     ignore: ['pg', 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
+  {
+    name: 'mysql entry — turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
+    path: 'dist/mysql.js',
+    limit: '30 kB',
+    // mysql2 is an optional peer loaded via a dynamic import in the factory, so
+    // it is never in the static graph — exclude it (and pg) from the footprint.
+    ignore: ['pg', 'mysql2', 'mysql2/promise'],
+    modifyEsbuildConfig: nodePlatform,
+  },
 ];

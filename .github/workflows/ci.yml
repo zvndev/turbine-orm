@@ -178,6 +178,48 @@ jobs:
           DATABASE_URL: postgres://root@localhost:26257/turbine_test?sslmode=disable
           TURBINE_TEST_ENGINE: cockroachdb
 
+  # Real MySQL 8 job for the turbine-orm/mysql engine (Phase 2 — multi-dialect).
+  # The mysql2 named-param driver + the `reselect` result strategy (no RETURNING)
+  # and the information_schema introspector are only proven against a real server,
+  # so this job spins a mysql:8 service container, sets MYSQL_URL, and runs
+  # src/test/mysql.test.ts — whose integration suite creates its own schema, seeds
+  # the fixture, dogfoods the introspector, and exercises findMany / nested-with /
+  # create(reselect) / upsert / update / delete / transactions / typed errors.
+  # Without MYSQL_URL (locally + the unit-tests job) those tests skip cleanly while
+  # the build-only + mock-driver tests still run. mysql2 is a devDep, so `npm ci`
+  # installs it. Marked continue-on-error until the container topology has run green
+  # on GitHub runners a few times (same posture as cockroachdb-integration); promote
+  # to a hard gate once proven.
+  mysql-integration:
+    name: mysql-integration
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: turbine_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run turbine-orm/mysql integration tests against MySQL 8
+        run: npx tsx --test src/test/mysql.test.ts
+        env:
+          MYSQL_URL: mysql://root:root@127.0.0.1:3306/turbine_test
+
   # NOTE: the YugabyteDB integration job used to live here, but its container
   # never initialized successfully on GitHub runners and burned ~6 minutes of
   # guaranteed red X on every PR/push. It now runs on a nightly schedule in
@@ -251,6 +293,13 @@ jobs:
         working-directory: ${{ env.SMOKE_DIR }}
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/serverless'); if (typeof m.turbineHttp !== 'function') { console.error('serverless subpath missing turbineHttp'); process.exit(1); } console.log('serverless subpath OK');"
+      - name: Verify mysql subpath import (mysql2 NOT installed — must not crash)
+        working-directory: ${{ env.SMOKE_DIR }}
+        # mysql2 is an OPTIONAL peer; this temp project never installs it. Importing
+        # turbine-orm/mysql and using mysqlDialect must work with mysql2 absent
+        # (it is only loaded by the dynamic import inside turbineMysql()).
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/mysql'); if (m.mysqlDialect?.name !== 'mysql' || typeof m.turbineMysql !== 'function') { console.error('mysql subpath broken'); process.exit(1); } console.log('mysql subpath OK (no mysql2 needed to import)');"
 
   security:
     runs-on: ubuntu-latest
