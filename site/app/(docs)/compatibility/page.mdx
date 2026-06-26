@@ -84,7 +84,19 @@ const db = new TurbineClient({
 - `npx turbine generate` introspects hypertables the same as regular tables
 - `findMany` with `orderBy: { time: 'desc' }` benefits from Timescale's chunk exclusion
 - Continuous aggregates are **not** introspected (they're materialized views, not tables)
-- If you need to query a continuous aggregate, use `db.$queryRaw`
+- If you need to query a continuous aggregate, drop to raw SQL with the typed `` db.sql`...` `` escape hatch (or untyped `` db.raw`...` ``):
+
+```ts
+type DailyViews = { day: Date; views: number };
+
+const rows = await db.sql<DailyViews>`
+  SELECT day, views FROM daily_page_views
+  WHERE site_id = ${siteId}
+  ORDER BY day DESC
+  LIMIT 30
+`;
+//    ^? DailyViews[]  — every ${value} becomes a $N param
+```
 
 ## YugabyteDB
 
@@ -204,13 +216,13 @@ CockroachDB Serverless exposes a standard PostgreSQL connection string. Use it d
 ```ts
 import { turbineHttp } from 'turbine-orm/serverless';
 import { Pool } from 'pg';
-import { schema } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata';
 
 const pool = new Pool({
   connectionString: process.env.COCKROACH_URL,
   ssl: { rejectUnauthorized: true },
 });
-export const db = turbineHttp(pool, schema);
+export const db = turbineHttp(pool, SCHEMA);
 ```
 
 ## Other PG-Compatible Databases
