@@ -62,15 +62,10 @@ const CREATE_LOCK_TABLE_SQL = `
 // ---------------------------------------------------------------------------
 
 /**
- * CockroachDB index introspection via SHOW INDEXES.
- * This returns a different shape than pg_indexes, so the consumer
- * needs to handle the transformation. However, since we're providing this
- * as a drop-in SQL string for the existing introspection flow, we use
- * CockroachDB's pg_indexes compatibility view but with a fallback query
- * that produces the same columns.
- *
- * CockroachDB's pg_indexes is compatible since v22.1 — we keep this
- * override for older versions or when indexdef is incomplete.
+ * CockroachDB index introspection via the pg_indexes compatibility view.
+ * CockroachDB exposes pg_indexes (compatible since v22.1) with the same
+ * tablename/indexname/indexdef columns as PostgreSQL, so the standard
+ * introspection flow consumes this drop-in SQL string unchanged.
  */
 const SQL_INDEXES_CRDB = `
   SELECT

@@ -431,6 +431,11 @@ function generateMetadata(schema: SchemaMetadata): string {
   lines.push('};');
   lines.push('');
 
+  // Back-compat lowercase alias. `SCHEMA` is the canonical export, but docs and
+  // users frequently import `schema`; emit both so either name resolves.
+  lines.push('export const schema = SCHEMA;');
+  lines.push('');
+
   return lines.join('\n');
 }
 

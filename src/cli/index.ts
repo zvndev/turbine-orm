@@ -1135,9 +1135,10 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
     process.exit(1);
   }
 
-  // Refuse to bind anything other than loopback unless explicitly overridden.
-  // This is deliberate: Studio has no real authentication beyond a random
-  // session token, so exposing it on a LAN interface is foot-gun territory.
+  // Warn loudly when an explicit non-loopback --host is used — the user is
+  // opting in, so we proceed rather than refuse. Studio has no real
+  // authentication beyond a random session token, so exposing it on a LAN
+  // interface is foot-gun territory.
   if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
     console.log(
       warn(
@@ -1226,6 +1227,8 @@ async function cmdObserve(args: CliArgs): Promise<void> {
     process.exit(1);
   }
 
+  // Warn loudly when an explicit non-loopback --host is used — the user is
+  // opting in, so we proceed rather than refuse.
   if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
     console.log(
       warn(
