@@ -100,20 +100,23 @@ let cachedDatabaseSync: DatabaseSyncCtor | undefined;
  */
 function loadDatabaseSync(): DatabaseSyncCtor {
   if (cachedDatabaseSync) return cachedDatabaseSync;
+  let ctor: DatabaseSyncCtor | undefined;
   try {
     const req = createRequire(process.cwd());
-    const mod = req('node:sqlite') as { DatabaseSync?: DatabaseSyncCtor };
-    if (typeof mod.DatabaseSync !== 'function') {
-      throw new Error("'node:sqlite' did not export a DatabaseSync constructor");
-    }
-    cachedDatabaseSync = mod.DatabaseSync;
-    return cachedDatabaseSync;
+    ctor = (req('node:sqlite') as { DatabaseSync?: DatabaseSyncCtor }).DatabaseSync;
   } catch (err) {
     throw new ConnectionError(
       "[turbine] turbine-orm/sqlite requires Node's built-in 'node:sqlite' module (Node >= 22.5). " +
         `Upgrade Node to >= 22.5, or pass an already-open better-sqlite3-compatible handle. (${(err as Error).message})`,
     );
   }
+  if (typeof ctor !== 'function') {
+    throw new ConnectionError(
+      "[turbine] 'node:sqlite' loaded but did not export a DatabaseSync constructor — this Node build may lack SQLite support.",
+    );
+  }
+  cachedDatabaseSync = ctor;
+  return cachedDatabaseSync;
 }
 
 // ---------------------------------------------------------------------------

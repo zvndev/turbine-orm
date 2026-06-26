@@ -155,8 +155,14 @@ interface MssqlRequest {
   batch<R = Record<string, unknown>>(text: string): Promise<MssqlQueryResult<R>>;
 }
 
+/** Per-column metadata `mssql` attaches to a recordset (`recordset.columns`). */
+interface MssqlColumnMeta {
+  [name: string]: { type?: { name?: string; declaration?: string } } | undefined;
+}
+
 interface MssqlQueryResult<R = Record<string, unknown>> {
-  recordset?: R[];
+  // `mssql` attaches column metadata to the recordset array itself.
+  recordset?: R[] & { columns?: MssqlColumnMeta };
   recordsets?: R[][];
   rowsAffected?: number[];
 }
@@ -222,8 +228,38 @@ function toMssqlParam(value: unknown): MssqlParam {
 /** Shape an `mssql` result into a `pg.QueryResult`-like object. */
 function shapeResult(result: MssqlQueryResult): { rows: Record<string, unknown>[]; rowCount: number } {
   const rows = result.recordset ?? [];
+  coerceBigIntColumns(rows, result.recordset?.columns);
   const affected = result.rowsAffected?.[0];
   return { rows, rowCount: typeof affected === 'number' ? affected : rows.length };
+}
+
+/**
+ * Coerce top-level `BIGINT` columns from strings to numbers, mirroring the
+ * Postgres `int8` policy (the TurbineClient registers a pg type parser that
+ * returns bigint as number within the JS safe-integer range). The `mssql`/tedious
+ * driver returns BIGINT as a string to avoid precision loss, so a BIGINT IDENTITY
+ * `id` would otherwise surface as `'1'` instead of `1`. Values outside the safe
+ * range are left as strings (same as the Postgres path). Nested relations are
+ * unaffected — `FOR JSON PATH` already renders BIGINT as a JSON number.
+ */
+function coerceBigIntColumns(rows: Record<string, unknown>[], columns: MssqlColumnMeta | undefined): void {
+  if (!columns || rows.length === 0) return;
+  const bigIntCols: string[] = [];
+  for (const [name, col] of Object.entries(columns)) {
+    const t = col?.type;
+    const decl = String(t?.declaration ?? t?.name ?? '').toLowerCase();
+    if (decl === 'bigint') bigIntCols.push(name);
+  }
+  if (bigIntCols.length === 0) return;
+  for (const row of rows) {
+    for (const c of bigIntCols) {
+      const v = row[c];
+      if (typeof v === 'string' && /^-?\d+$/.test(v)) {
+        const n = Number(v);
+        if (Number.isSafeInteger(n)) row[c] = n;
+      }
+    }
+  }
 }
 
 const EMPTY_RESULT = { rows: [] as Record<string, unknown>[], rowCount: 0 };
