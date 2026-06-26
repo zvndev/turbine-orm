@@ -7,12 +7,34 @@
  */
 
 import assert from 'node:assert/strict';
-import { DatabaseSync } from 'node:sqlite';
-import { afterEach, beforeEach, describe, it } from 'node:test';
+import { createRequire } from 'node:module';
+import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import { afterEach, beforeEach, describe, it as nodeIt } from 'node:test';
 import type { TurbineClient } from '../client.js';
 import { UnsupportedFeatureError } from '../errors.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
+
+// `node:sqlite` is a builtin only on Node >= 22.5. Probe for it WITHOUT a static
+// import so this file *loads* on Node 20 (the unit matrix's lowest version) and
+// skips cleanly, rather than crashing the whole lane with
+// ERR_UNKNOWN_BUILTIN_MODULE. createRequire is anchored on cwd so it resolves
+// the builtin identically in any module system.
+const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() => {
+  try {
+    return createRequire(process.cwd())('node:sqlite').DatabaseSync;
+  } catch {
+    return undefined;
+  }
+})();
+
+// When node:sqlite is absent (Node < 22.5), register each test as skipped: the
+// Postgres/dialect paths still get full coverage on Node 20, and the SQLite
+// engine is explicitly documented as Node >= 22.5.
+const it: typeof nodeIt = DatabaseSync
+  ? nodeIt
+  : (((name: string) =>
+      nodeIt(name, { skip: 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)' }, () => {})) as typeof nodeIt);
 
 // ---------------------------------------------------------------------------
 // SQLite port of src/test/fixtures/seed.sql (+ a tags/post_tags m2m junction).
@@ -138,11 +160,12 @@ interface TagRow {
 
 // ---------------------------------------------------------------------------
 
-let db: DatabaseSync;
+let db: DatabaseSyncType;
 let schema: SchemaMetadata;
 let client: TurbineClient;
 
 beforeEach(() => {
+  if (!DatabaseSync) return; // Node < 22.5 — every test in this file is skipped.
   db = new DatabaseSync(':memory:');
   db.exec('PRAGMA foreign_keys = ON');
   db.exec(SCHEMA_SQL);
@@ -153,6 +176,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  if (!DatabaseSync) return; // Node < 22.5 — no client was created.
   await client.disconnect();
 });
 

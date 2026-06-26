@@ -262,8 +262,11 @@ jobs:
       # (already installed by `npm ci`) rather than a separate sqlcmd tools
       # image — `mcr.microsoft.com/mssql-tools18:latest` has no published tag.
       - name: Create the test database
+        # Write the script into the repo root (the step's cwd) so `require('mssql')`
+        # resolves the package `npm ci` just installed — a /tmp script can't see
+        # the workspace node_modules.
         run: |
-          cat > /tmp/create-mssql-db.cjs <<'EOF'
+          cat > create-mssql-db.cjs <<'EOF'
           const sql = require('mssql');
           (async () => {
             const pool = await sql.connect({
@@ -276,7 +279,8 @@ jobs:
             console.log('turbine_test database ready');
           })().catch((err) => { console.error(err); process.exit(1); });
           EOF
-          node /tmp/create-mssql-db.cjs
+          node create-mssql-db.cjs
+          rm -f create-mssql-db.cjs
       - name: Run turbine-orm/mssql integration tests against SQL Server 2022
         run: npx tsx --test src/test/mssql.test.ts
         env:

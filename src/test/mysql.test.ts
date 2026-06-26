@@ -636,8 +636,12 @@ describe('turbine-orm/mysql — integration (real MySQL 8)', () => {
       // biome-ignore lint/suspicious/noExplicitAny: mysql2 typeCast field shape
       typeCast: (field: any, next: () => unknown) => (field.type === 'JSON' ? field.string() : next()),
     });
-    rawPool.on('connection', (conn: { query: (s: string) => Promise<unknown> }) => {
-      conn.query("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')").catch(() => {});
+    // The 'connection' event yields the raw (callback) connection even on a
+    // mysql2/promise pool, so `.catch()` on its non-thenable query() would throw
+    // "result of query that is not a promise" — use the callback form (mirrors
+    // the same fix in src/mysql.ts).
+    rawPool.on('connection', (conn: { query: (s: string, cb: () => void) => void }) => {
+      conn.query("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')", () => {});
     });
     pool = new MysqlPool(rawPool);
     // Build the schema once via the introspector (dogfood) after creating tables.
