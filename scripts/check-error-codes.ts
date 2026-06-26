@@ -29,6 +29,7 @@ const KNOWN_ERRORS = new Set([
   'PipelineError',
   'OptimisticLockError',
   'ExclusionConstraintError',
+  'UnsupportedFeatureError',
 ]);
 
 // Also allow standard Error in test files and CLI UI code
