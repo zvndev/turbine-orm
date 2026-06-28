@@ -11,18 +11,22 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   ConnectionError,
+  NotNullViolationError,
   TimeoutError,
   UniqueConstraintError,
   UnsupportedFeatureError,
   ValidationError,
 } from '../errors.js';
 import {
+  assertSupportedPowdbVersion,
   coerceValue,
   encodePowqlLiteral,
   materializePowql,
   PowdbEmbeddedPool,
   PowdbFloatParam,
   type PowdbPool,
+  parsePowdbUrl,
+  powdbDialect,
   powqlColumnType,
   powqlSchemaDDL,
   rowToEntity,
@@ -210,13 +214,56 @@ describe('powdb: coercion (wire string → JS)', () => {
 // ---------------------------------------------------------------------------
 
 describe('powdb: wrapPowdbError', () => {
-  it('maps PowDB error codes to typed Turbine errors', () => {
+  it('maps networked PowDB error codes to typed Turbine errors', () => {
     assert.ok(
       wrapPowdbError({ message: 'unique constraint violation on app_user.id' }) instanceof UniqueConstraintError,
     );
     assert.ok(wrapPowdbError({ code: 'connect_failed', message: 'x' }) instanceof ConnectionError);
     assert.ok(wrapPowdbError({ code: 'timeout', message: 'x' }) instanceof TimeoutError);
     assert.ok(wrapPowdbError({ code: 'query_failed', message: 'x' }) instanceof ValidationError);
+  });
+
+  it('maps EMBEDDED napi errors (code:GenericFailure) by message shape', () => {
+    // The embedded addon tags EVERY error code:'GenericFailure' — the class can
+    // only be recovered from the message. These are real engine message shapes.
+    const notNull = wrapPowdbError({
+      code: 'GenericFailure',
+      message: `query failed: Execution("column 'email' is required but no value was provided")`,
+    });
+    assert.ok(notNull instanceof NotNullViolationError);
+    assert.equal((notNull as NotNullViolationError).column, 'email');
+
+    const typeMismatch = wrapPowdbError({
+      code: 'GenericFailure',
+      message: `query failed: Execution("type mismatch for column 'id': expected Int, got str")`,
+    });
+    assert.ok(typeMismatch instanceof ValidationError);
+
+    const parse = wrapPowdbError({ code: 'GenericFailure', message: `query failed: Parse("unexpected token")` });
+    assert.ok(parse instanceof ValidationError);
+
+    const storage = wrapPowdbError({
+      code: 'GenericFailure',
+      message: `query failed: StorageError("row too large: 5000 exceeds max 4070 bytes")`,
+    });
+    assert.ok(storage instanceof ValidationError);
+
+    const unique = wrapPowdbError({
+      code: 'GenericFailure',
+      message: 'unique constraint violation on app_user.id',
+    });
+    assert.ok(unique instanceof UniqueConstraintError);
+  });
+
+  it('maps a not-null message on the NETWORKED path too (no longer collapses to E003)', () => {
+    const e = wrapPowdbError({ code: 'query_failed', message: "column 'name' is required, no value" });
+    assert.ok(e instanceof NotNullViolationError);
+  });
+
+  it('preserves the original error as .cause', () => {
+    const raw = { code: 'GenericFailure', message: `Execution("column 'x' is required")` };
+    const wrapped = wrapPowdbError(raw) as NotNullViolationError;
+    assert.equal((wrapped as { cause?: unknown }).cause, raw);
   });
 });
 
@@ -361,6 +408,53 @@ describe('powdb: write generation', () => {
     const m = mockPool();
     await assert.rejects(() => qi(m).updateMany({ where: {}, data: { age: 0 } }), ValidationError);
     await assert.rejects(() => qi(m).deleteMany({ where: {} }), ValidationError);
+  });
+
+  it('FIX 1: guard gates on the COMPILED filter — combinators that compile empty are refused', async () => {
+    // These pass the old shape-based check (they HAVE keys) but compile to an
+    // empty PowQL filter — so they must be rejected and emit no write.
+    const cases: Record<string, unknown>[] = [
+      { OR: [] },
+      { AND: [] },
+      { NOT: {} },
+      { id: undefined },
+      { OR: [{ name: undefined }] },
+    ];
+    for (const where of cases) {
+      const m = mockPool();
+      await assert.rejects(
+        () => qi(m).updateMany({ where: where as never, data: { age: 0 } }),
+        ValidationError,
+        `updateMany should reject ${JSON.stringify(where)}`,
+      );
+      await assert.rejects(
+        () => qi(m).update({ where: where as never, data: { age: 0 } }),
+        ValidationError,
+        `update should reject ${JSON.stringify(where)}`,
+      );
+      await assert.rejects(
+        () => qi(m).deleteMany({ where: where as never }),
+        ValidationError,
+        `deleteMany should reject ${JSON.stringify(where)}`,
+      );
+      await assert.rejects(
+        () => qi(m).delete({ where: where as never }),
+        ValidationError,
+        `delete should reject ${JSON.stringify(where)}`,
+      );
+      // No write PowQL was ever emitted.
+      assert.equal(m.calls.length, 0, `no query should run for ${JSON.stringify(where)}`);
+    }
+  });
+
+  it('FIX 1: a real predicate still compiles + runs; allowFullTableScan opts in', async () => {
+    const m = mockPool();
+    await qi(m).updateMany({ where: { age: { gte: 18 } }, data: { age: 0 } });
+    assert.match(m.last().powql, /^app_user filter \.age >= \$1 update \{ age := \$2 \}$/);
+
+    const m2 = mockPool();
+    await qi(m2).updateMany({ where: {}, allowFullTableScan: true, data: { age: 0 } });
+    assert.match(m2.last().powql, /^app_user update \{ age := \$1 \}$/);
   });
 });
 
@@ -533,5 +627,93 @@ describe('powdb: PowdbEmbeddedPool param materialization', () => {
     await client.query('commit');
     client.release();
     assert.deepEqual(seen, ['begin', 'insert app_user { id := "x" }', 'commit']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX 2 — single-writer transaction model
+// ---------------------------------------------------------------------------
+
+describe('powdb: transaction model (single-writer)', () => {
+  it('powdbDialect savepoint keywords throw E017 (no nested tx)', () => {
+    assert.throws(() => powdbDialect.savepointStatement('sp_1'), UnsupportedFeatureError);
+    assert.throws(() => powdbDialect.releaseSavepointStatement('sp_1'), UnsupportedFeatureError);
+    assert.throws(() => powdbDialect.rollbackToSavepointStatement('sp_1'), UnsupportedFeatureError);
+    // begin/commit/rollback are the real lowercase PowQL keywords (single-level tx works).
+    assert.equal(powdbDialect.beginStatement(), 'begin');
+    assert.equal(powdbDialect.commitStatement(), 'commit');
+    assert.equal(powdbDialect.rollbackStatement(), 'rollback');
+  });
+
+  it('PowdbEmbeddedPool rejects a re-entrant begin (begin while a tx is open)', async () => {
+    const { pool } = fakeEmbeddedDb();
+    await pool.query('begin');
+    // A SECOND begin while the first is open → typed error, not a raw engine reject.
+    await assert.rejects(() => pool.query('begin'), UnsupportedFeatureError);
+    // After commit, a fresh begin is allowed again.
+    await pool.query('commit');
+    await assert.doesNotReject(() => pool.query('begin'));
+  });
+
+  it('PowdbEmbeddedPool clears the flag on connect().release() (timeout safety net)', async () => {
+    const { pool } = fakeEmbeddedDb();
+    const client = await pool.connect();
+    await client.query('begin');
+    // Releasing without an explicit commit/rollback must not wedge the pool.
+    client.release();
+    await assert.doesNotReject(() => pool.query('begin'));
+  });
+
+  it('recognizes the SQL-spelling transaction keywords case-insensitively', async () => {
+    const { pool } = fakeEmbeddedDb();
+    await pool.query('BEGIN TRANSACTION');
+    await assert.rejects(() => pool.query('start transaction'), UnsupportedFeatureError);
+    await pool.query('ROLLBACK');
+    await assert.doesNotReject(() => pool.query('begin'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX 6 — connection-string parsing + version guard
+// ---------------------------------------------------------------------------
+
+describe('powdb: parsePowdbUrl', () => {
+  it('parses powdb://host:port with defaults', () => {
+    assert.deepEqual(parsePowdbUrl('powdb://127.0.0.1:5463'), { host: '127.0.0.1', port: 5463 });
+    assert.deepEqual(parsePowdbUrl('powdb://localhost'), { host: 'localhost', port: 5433 });
+  });
+
+  it('parses user / password / db name', () => {
+    const opts = parsePowdbUrl('powdb://alice:s%40cret@db.host:6000/appdb');
+    assert.equal(opts.host, 'db.host');
+    assert.equal(opts.port, 6000);
+    assert.equal(opts.user, 'alice');
+    assert.equal(opts.password, 's@cret'); // URL-decoded
+    assert.equal(opts.dbName, 'appdb');
+  });
+
+  it('rejects a non-powdb scheme and a malformed URL', () => {
+    assert.throws(() => parsePowdbUrl('postgres://x:5432'), ConnectionError);
+    assert.throws(() => parsePowdbUrl('not a url'), ConnectionError);
+  });
+});
+
+describe('powdb: assertSupportedPowdbVersion', () => {
+  it('accepts >= 0.7.0', () => {
+    assert.doesNotThrow(() => assertSupportedPowdbVersion('0.7.0'));
+    assert.doesNotThrow(() => assertSupportedPowdbVersion('0.8.2'));
+    assert.doesNotThrow(() => assertSupportedPowdbVersion('1.0.0'));
+    assert.doesNotThrow(() => assertSupportedPowdbVersion('0.7.0-rc1'));
+  });
+
+  it('rejects < 0.7.0 with a ConnectionError', () => {
+    assert.throws(() => assertSupportedPowdbVersion('0.6.2'), ConnectionError);
+    assert.throws(() => assertSupportedPowdbVersion('0.1.0'), ConnectionError);
+  });
+
+  it('tolerates an unknown / non-semver version (cannot prove too old)', () => {
+    assert.doesNotThrow(() => assertSupportedPowdbVersion(undefined));
+    assert.doesNotThrow(() => assertSupportedPowdbVersion(''));
+    assert.doesNotThrow(() => assertSupportedPowdbVersion('dev'));
   });
 });

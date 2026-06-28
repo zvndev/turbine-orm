@@ -1,8 +1,11 @@
 # Turbine ↔ PowDB Feature Parity Matrix
 
 **Grounded firsthand** against a live `powdb-server` **v0.7.0** (built from source 2026-06-28) via
-`@zvndev/powdb-client` **and** the in-process `@zvndev/powdb-embedded` addon. Every row below was
-verified by running the actual PowQL against a real engine — not inferred from docs.
+`@zvndev/powdb-client` **and** the in-process `@zvndev/powdb-embedded` addon. The rows below were
+established by running the actual PowQL against a real engine — not inferred from docs. The embedded
+transport additionally has automated regression coverage in CI (`src/test/powdb.integration.test.ts`,
+the `powdb-integration` job); the networked transport has no CI service container (exercised by the
+embedded suite + by hand).
 
 **v0.7.0 update (2026-06-28):** PowDB now supports a trailing `returning` keyword (`RETURNING *`) and
 has fixed int→float coercion on every write path. Turbine's two ≤0.6.2 workarounds are retired:
@@ -94,7 +97,6 @@ PK is declared `required unique <pk>: str` and gets a client-generated UUID defa
 | relation filter `some` | `Outer filter .pk in (Rel filter <e> { .fk })` | ✅ (IN-subquery, not `exists`) |
 | relation filter `none` | `Outer filter .pk not in (Rel filter <e> { .fk })` | ✅ |
 | relation filter `every` | `.pk not in (Rel filter not(<e>) { .fk })` | ⚠ derived form (Phase B) |
-| `between` (range) | `.c between $1 and $2` | ✅ (native PowQL only) |
 
 ---
 
@@ -106,7 +108,9 @@ impossible. **Fallback: batched N+1 per-level loaders** (verified the core mecha
 
 - Root select returns base rows; collect parent keys; one `in (…)` query **per relation level**
   (breadth-first, N+1-by-level not by-row); stitch into the exact `parseNestedRow` shape (hasMany→array,
-  belongsTo/hasOne→object|null); m2m hops through the junction. Chunk large key sets (`MAX_PARAMS`=4096).
+  belongsTo/hasOne→object|null); m2m hops through the junction. Large key sets are chunked into batches
+  of `MAX_RELATION_KEYS = 1000` (one loader query per chunk, merged before grouping) so a single `in (…)`
+  never exceeds PowDB's per-statement param / row limits.
 - The typed `WithResult` inference is compile-time only → **no type changes**;
   `users[0].posts[0].comments[0].author.name` resolves identically.
 - **Documented caveat:** D round-trips for depth D, not one. The single-query guarantee is Postgres-only.
@@ -119,9 +123,10 @@ impossible. **Fallback: batched N+1 per-level loaders** (verified the core mecha
 | Feature | Why | Behavior |
 |---|---|---|
 | pgvector (KNN / distance) | no vector type | **throw** |
-| `$listen` / `$notify` (LISTEN/NOTIFY) | only client-side polling `watch()` | **throw**; offer documented `$watch(powql,{intervalMs})` polling shim |
+| `$listen` / `$notify` (LISTEN/NOTIFY) | no server push | **throw** |
 | RLS `sessionContext` / `$withSession` | no GUCs, no per-row policy | **throw** |
-| nested `$transaction` (savepoints) | engine errors on nested `begin` | **throw** |
+| nested `tx.$transaction` (savepoints) | no savepoints | **throw** E017 (`powdbDialect` savepoint keywords throw) |
+| re-entrant / concurrent `db.$transaction` | single global write lock | **throw** E017 (pool begin-while-active guard — prevents the networked hang) |
 | isolation levels | single `RwLock`, no SQL levels | **ignore-with-warn** |
 | JSON filters / path ops | no `json` type | **throw** (+ reject in `defineSchema`) |
 | array operators (`hasSome`/`has`/…) | no array type | **throw** (+ reject) |
@@ -135,25 +140,48 @@ impossible. **Fallback: batched N+1 per-level loaders** (verified the core mecha
 
 ## 5. Transactions / concurrency
 
-- `$transaction(fn)` → pin a pooled client, `begin`/`commit`/`rollback`. **Verified.**
-- **Global write stall:** an open `begin` on one connection blocks all other writers (single global
-  permit) — keep transactions short; documented prominently.
-- Nested tx, isolation levels, optimistic locking, MVCC → throw / ignore-with-warn (no engine support).
+PowDB has **one global write lock** and supports neither concurrent nor nested transactions. Turbine
+enforces that single-writer model at the client layer so a second transaction fails fast with a typed
+error instead of hanging or leaking raw engine text:
+
+- `$transaction(fn)` → pin a pooled client, `begin`/`commit`/`rollback`. **Verified live (both transports).**
+- **Nested `tx.$transaction`** → `UnsupportedFeatureError` (E017). PowDB has no savepoints, so
+  `powdbDialect.savepointStatement`/`releaseSavepointStatement`/`rollbackToSavepointStatement` throw. The
+  override runs synchronously (before any query), so the nested call fails fast with no partial DB state.
+- **Re-entrant / concurrent `db.$transaction`** (a fresh top-level transaction opened while another is
+  open) → `UnsupportedFeatureError` (E017). Both `PowdbPool` and `PowdbEmbeddedPool` track a pool-level
+  `activeTransaction` flag and reject a `begin` while a transaction is already open. On the **networked**
+  transport this is critical: without the guard the second `begin` checks out a second pooled connection
+  and blocks **forever** on the write lock the open transaction holds — the `await` never resolves. The
+  guard converts that hang into a prompt typed error (verified live: returns in ~20 ms, no hang). The flag
+  is also cleared on connection release so a tx torn down by a timeout never wedges the pool.
+- **Embedded transactions:** one handle = one connection. No query may overlap an open transaction
+  (single handle); nested/concurrent transactions throw (as above).
+- Isolation levels, optimistic locking, MVCC → ignore-with-warn / no engine support.
 - Write timeout: client `AbortSignal` frees the *client*; server query keeps running (no cancellation yet).
 
 ---
 
 ## 6. Error mapping (`wrapPowdbError`)
 
-PowDB errors carry a string `.code`, not a SQLSTATE. Map:
+The two transports surface errors differently and `wrapPowdbError` handles both:
 
-| PowDB | Turbine | 
+- **Networked** (`@zvndev/powdb-client`) carries a *semantic* string `.code` (not a SQLSTATE).
+- **Embedded** (`@zvndev/powdb-embedded` napi addon) tags **every** error `code:'GenericFailure'`, so the
+  class can only be recovered from the message text. `wrapPowdbError` therefore runs message-shape checks
+  first (they fire on both transports), then falls through to the networked `.code` switch.
+
+| PowDB signal | Turbine |
 |---|---|
-| `connect_failed` / `closed` | `ConnectionError` (E004) |
-| `timeout` | `TimeoutError` (E002) |
+| `connect_failed` / `closed` (code) | `ConnectionError` (E004) |
+| `timeout` / `aborted` (code) | `TimeoutError` (E002) |
 | message `unique constraint violation on …` | `UniqueConstraintError` (E008) |
-| `query_failed` / `type_coercion_failed` | `ValidationError` (E003) |
+| message `required` / `not null` / `no value` (`column 'x' is required …`) | `NotNullViolationError` (E010) |
+| message `type mismatch` / `Parse(…)` / `Execution(…)` / `StorageError(…)` / `row too large` | `ValidationError` (E003) |
+| `query_failed` / `type_coercion_failed` (code) | `ValidationError` (E003) |
 | (no FK/CHECK/deadlock surface) | E009/E011/E012/E013 never fire |
+
+The original error is preserved as `.cause` on every wrapped class.
 
 ---
 
@@ -190,11 +218,23 @@ is still N+1 until the engine ships JSON-agg / link navigation. No "faster than 
   each positional `$N` into a PowQL literal via the `encodePowqlLiteral`/`materializePowql` pair —
   string escaping matches the engine lexer exactly (`\"` `\\` `\n` `\t`; everything else raw), so it is
   injection-safe (verified: quotes, backslashes, `$N`, `"); drop … --`, raw CR, emoji round-trip as data).
-- **Durability:** Full only, checkpoint-bound (no explicit close — `disconnect()` drops the handle;
-  hold the process open for the final WAL flush in short scripts).
+- **Durability:** Full only, **checkpoint-bound**. `disconnect()` is checkpoint-bound — there is no
+  explicit close, so a process that writes then exits *immediately* may lose the last write; hold the
+  process open long enough for the final WAL flush, or rely on WAL replay when the dir is reopened.
+- **Per-row size cap:** the embedded engine caps a single row at ~4070 bytes (a write past it surfaces as
+  `StorageError("row too large …")` → `ValidationError` E003).
 - **Platform:** prebuilt binaries for macOS arm64/x64 and Linux glibc x64/arm64. Intel-mac/musl/Windows
   build from source (`npm run build` in the addon) — a clear `ConnectionError` explains the gap on a
-  failed load.
+  failed load. The embedded peer is pinned `^0.7.0` at install; there is no embedded version method, so
+  the **≥ 0.7.0 requirement is enforced at install time** (the networked transport additionally probes
+  `serverVersion` at connect and throws a clear `ConnectionError` below 0.7.0).
+
+### Other documented caveats
+
+- **`divide: 0`** in an atomic update sets the column to **null** (PowDB's behavior — no divide-by-zero
+  error is raised).
+- **`int8` columns surface as JS `number`** and lose precision past 2⁵³. For keys/ids larger than 2⁵³,
+  declare the column `bigint` (read back via `BigInt`) rather than `number`.
 
 ---
 
@@ -207,14 +247,24 @@ Wired through the `queryInterfaceFactory` option on `QueryInterfaceOptions` (`bu
 `./powdb` subpath export + optional peer deps (`@zvndev/powdb-client` **and** `@zvndev/powdb-embedded`,
 both `^0.7.0`) added; root deps stay `{ pg, @types/pg }`.
 
-**Verified live against `powdb-server` v0.7.0 AND `@zvndev/powdb-embedded` v0.7.0 — full CRUD passes on
-both transports:** create (client-UUID + type coercion + `returning`), createMany (multi-row `returning`
-→ real rows), update (atomic increment + `returning`), upsert (insert+update branches, reselect-by-PK),
-delete (`returning` deleted row); plus a **float column round-trips a plain INTEGER value (7, 99) with
-no workaround** (int→float coercion fixed on every write path) and an **adversarial string `a"b\c`
-round-trips as data** through the embedded literal encoder. 36 build-only unit tests
-(`src/test/powdb.test.ts`) lock PowQL generation, the literal encoder (adversarial cases), and embedded
-param-materialization in CI (no server needed).
+**Automated coverage:** the embedded transport now has a live integration suite,
+`src/test/powdb.integration.test.ts`, that runs the **real** `@zvndev/powdb-embedded` addon in-process
+(gated to skip cleanly where no prebuilt binary loads). It is wired into CI as the `powdb-integration`
+job (in-process, **no service container**) and covers RETURNING column-order round-trip, error-class
+mapping (unique / not-null / type-mismatch / parse → typed), the empty-where guard, transactions
+(commit/rollback + nested/re-entrant throw), chunked relation loads, and the E017 guards. The build-only
+unit suite (`src/test/powdb.test.ts`) locks PowQL generation, the literal encoder (adversarial cases),
+embedded param-materialization, the single-writer transaction guard, error mapping, and the
+connection-string / version guard with no engine needed. (The **networked** transport has no CI service
+container — it is exercised by the embedded suite and by hand against a local `powdb-server`.)
+
+**Manually verified against `powdb-server` v0.7.0 AND `@zvndev/powdb-embedded` v0.7.0 — full CRUD passes
+on both transports:** create (client-UUID + type coercion + `returning`), createMany (multi-row
+`returning` → real rows), update (atomic increment + `returning`), upsert (insert+update branches,
+reselect-by-PK), delete (`returning` deleted row); plus a **float column round-trips a plain INTEGER
+value with no workaround**, an **adversarial string `a"b\c` round-trips as data**, the **networked
+re-entrant transaction throws in ~20 ms (no hang)**, and a **> 1000-parent relation loads fully across
+chunked `in (…)` queries**.
 
 **v0.7.0 engine facts adopted (both retired Turbine's ≤0.6.2 workarounds):**
 1. **`returning` keyword** (`RETURNING *`, all columns, schema order; `returning .col` is a parse error;

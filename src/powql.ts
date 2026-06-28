@@ -55,6 +55,14 @@ import {
   type TableMetadata,
 } from './schema.js';
 
+/**
+ * Max parent keys per relation-loader `in (…)` query. A `with` over a large
+ * parent set is split into batches of this size so a single query never exceeds
+ * PowDB's per-statement param / row limits; the batches' children are merged
+ * before grouping. Mirrors the chunking the parity matrix documents.
+ */
+const MAX_RELATION_KEYS = 1000;
+
 /** Operator keys recognised inside a `WhereOperator` object. */
 const OPERATOR_KEYS = new Set([
   'equals',
@@ -577,10 +585,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         ...new Set(parents.map((p) => (p as Record<string, unknown>)[parentKeyField]).filter((k) => k != null)),
       ];
       const childByKey = new Map<unknown, T[]>();
-      if (keys.length) {
+      // Chunk the key set so a single `in (…)` never exceeds PowDB's
+      // per-statement param / row limits; merge each chunk's children.
+      for (let i = 0; i < keys.length; i += MAX_RELATION_KEYS) {
+        const chunk = keys.slice(i, i + MAX_RELATION_KEYS);
         const childWhere = {
           ...(options.where as Record<string, unknown> | undefined),
-          [childKeyField]: { in: keys },
+          [childKeyField]: { in: chunk },
         } as WhereClause<object>;
         const children = (await targetQi.findMany({
           ...options,
@@ -665,9 +676,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async update(args: UpdateArgs<T>): Promise<T> {
     return this.withMiddleware('update', args as unknown as Record<string, unknown>, async () => {
-      this.assertNonEmptyWhere(args.where, false, 'update');
       const params: unknown[] = [];
       const where = this.buildWhere(args.where, params);
+      this.assertCompiledWhere(where, false, 'update');
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       // `returning` hands back the post-update row(s); take the first (single-row contract).
       const { rows } = await this.exec(
@@ -683,9 +694,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async updateMany(args: UpdateManyArgs<T>): Promise<{ count: number }> {
     return this.withMiddleware('updateMany', args as unknown as Record<string, unknown>, async () => {
-      this.assertNonEmptyWhere(args.where, args.allowFullTableScan, 'updateMany');
       const params: unknown[] = [];
       const where = this.buildWhere(args.where, params);
+      this.assertCompiledWhere(where, args.allowFullTableScan, 'updateMany');
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       const filter = where ? ` filter ${where}` : '';
       const { rowCount } = await this.exec(`${this.table}${filter} update { ${setClause} }`, params, args.timeout);
@@ -725,9 +736,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async delete(args: DeleteArgs<T>): Promise<T> {
     return this.withMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
-      this.assertNonEmptyWhere(args.where, false, 'delete');
       const params: unknown[] = [];
       const where = this.buildWhere(args.where, params);
+      this.assertCompiledWhere(where, false, 'delete');
       // `returning` hands back the deleted row(s) — no separate pre-image reselect needed.
       const { rows } = await this.exec(`${this.table} filter ${where} delete returning`, params, args.timeout);
       const row = rows.length ? this.shape(rows)[0]! : null;
@@ -738,9 +749,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async deleteMany(args: DeleteManyArgs<T>): Promise<{ count: number }> {
     return this.withMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
-      this.assertNonEmptyWhere(args.where, args.allowFullTableScan, 'deleteMany');
       const params: unknown[] = [];
       const where = this.buildWhere(args.where, params);
+      this.assertCompiledWhere(where, args.allowFullTableScan, 'deleteMany');
       const filter = where ? ` filter ${where}` : '';
       const { rowCount } = await this.exec(`${this.table}${filter} delete`, params, args.timeout);
       return { count: rowCount };
@@ -932,18 +943,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return rows.length ? this.shape(rows)[0]! : null;
   }
 
-  /** Empty-where guard — blocks accidental whole-table writes. */
-  private assertNonEmptyWhere(where: WhereClause<T> | undefined, allow: boolean | undefined, action: string): void {
-    if (allow) return;
-    const hasCondition =
-      where &&
-      Object.entries(where).some(([k, v]) => v !== undefined && (k === 'OR' || k === 'AND' || k === 'NOT' || true));
-    if (!hasCondition) {
-      throw new ValidationError(
-        `[turbine] ${action} with an empty where would affect every row in "${this.table}". ` +
-          `Pass allowFullTableScan: true if this is intentional.`,
-      );
-    }
+  /**
+   * Empty-where guard — blocks accidental whole-table writes. Mirrors the SQL
+   * path's `assertMutationHasPredicate` (query/builder.ts): it gates on the
+   * *compiled* PowQL filter fragment, NOT the shape of the `where` object. A
+   * `where` whose conditions all evaporate during compilation — `{}`,
+   * `{ id: undefined }`, `{ OR: [] }`, `{ AND: [] }`, `{ NOT: {} }`,
+   * `{ OR: [{ f: undefined }] }` — compiles to the empty string and is refused,
+   * because emitting a filter-less write would hit every row.
+   */
+  private assertCompiledWhere(compiledWhere: string, allow: boolean | undefined, action: string): void {
+    if (allow === true) return;
+    if (compiledWhere.length > 0) return;
+    throw new ValidationError(
+      `[turbine] ${action} on "${this.table}" refused: the \`where\` clause is empty. ` +
+        `Pass \`allowFullTableScan: true\` to opt in, or check that your filter values are defined.`,
+    );
   }
 }
 

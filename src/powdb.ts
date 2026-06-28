@@ -50,7 +50,14 @@ import {
   type TurbineConfig,
 } from './client.js';
 import { type Dialect, postgresDialect } from './dialect.js';
-import { ConnectionError, TimeoutError, UniqueConstraintError, ValidationError } from './errors.js';
+import {
+  ConnectionError,
+  NotNullViolationError,
+  TimeoutError,
+  UniqueConstraintError,
+  UnsupportedFeatureError,
+  ValidationError,
+} from './errors.js';
 import type { QueryInterface, QueryInterfaceOptions } from './query/index.js';
 import type { ColumnMetadata, SchemaMetadata, TableMetadata } from './schema.js';
 
@@ -64,7 +71,15 @@ import type { ColumnMetadata, SchemaMetadata, TableMetadata } from './schema.js'
  *     instead of emitting SQL that PowDB cannot parse.
  *   - `begin`/`commit`/`rollback` are lowercase PowQL keywords (verified on the
  *     wire) so a single-level `$transaction` works.
- * Nested transactions (savepoints) and isolation levels remain Phase B.
+ *   - PowDB has a single global write lock and supports neither savepoints nor
+ *     nested/concurrent transactions. The `savepoint*` keywords therefore throw
+ *     {@link UnsupportedFeatureError} (E017): a nested `tx.$transaction` emits a
+ *     savepoint synchronously (before any DB call) and so fails fast with a
+ *     clear typed error instead of leaking PowDB's cryptic `Parse(... 'sp_1')`.
+ *     The pool-level begin-while-active guard (see {@link PowdbPool}) catches the
+ *     other re-entrant shape — a fresh top-level `db.$transaction` opened inside
+ *     an already-open one — before it can deadlock on the write lock.
+ * Isolation levels remain Phase B.
  */
 export const powdbDialect: Dialect = {
   ...postgresDialect,
@@ -82,7 +97,24 @@ export const powdbDialect: Dialect = {
   beginStatement: () => 'begin',
   commitStatement: () => 'commit',
   rollbackStatement: () => 'rollback',
+  // PowDB has no savepoints — a nested `tx.$transaction` would emit one and PowDB
+  // rejects it with a cryptic parse error. Throw a clear typed error instead.
+  // These run synchronously in TransactionClient.$transaction before any query,
+  // so the nested call fails fast with no partial DB state.
+  savepointStatement: throwNoNestedTransaction,
+  releaseSavepointStatement: throwNoNestedTransaction,
+  rollbackToSavepointStatement: throwNoNestedTransaction,
 };
+
+/** Reject any savepoint (nested-transaction) operation — PowDB is single-writer. */
+function throwNoNestedTransaction(): never {
+  throw new UnsupportedFeatureError(
+    'nested transactions',
+    'powdb',
+    'PowDB is single-writer — it has one global write lock and no savepoints. ' +
+      'Complete the open transaction before starting another; do not nest `$transaction` calls.',
+  );
+}
 
 // ---------------------------------------------------------------------------
 // PowDB client surface (the subset we bind — see @zvndev/powdb-client)
@@ -138,6 +170,57 @@ export interface PowdbConnOptions {
   password?: string | null;
   connectTimeoutMs?: number;
   tls?: boolean;
+}
+
+/** Minimum PowDB server version the networked transport requires. */
+export const MIN_POWDB_VERSION = '0.7.0';
+
+/**
+ * Parse a `powdb://[user[:pass]@]host[:port][/db]` connection string into
+ * {@link PowdbConnOptions} (consistency with `turbineMysql`/`turbineMssql`,
+ * which accept a URL). Defaults: host `127.0.0.1`, port `5433`.
+ */
+export function parsePowdbUrl(connectionString: string): PowdbConnOptions {
+  let u: URL;
+  try {
+    u = new URL(connectionString);
+  } catch {
+    throw new ConnectionError(`[turbine] Invalid PowDB connection string: "${connectionString}"`);
+  }
+  if (u.protocol !== 'powdb:') {
+    throw new ConnectionError(
+      `[turbine] PowDB connection string must use the powdb:// scheme (got "${u.protocol}//…").`,
+    );
+  }
+  const opts: PowdbConnOptions = {
+    host: u.hostname || '127.0.0.1',
+    port: u.port ? Number(u.port) : 5433,
+  };
+  if (u.username) opts.user = decodeURIComponent(u.username);
+  if (u.password) opts.password = decodeURIComponent(u.password);
+  const db = u.pathname.replace(/^\//, '');
+  if (db) opts.dbName = decodeURIComponent(db);
+  return opts;
+}
+
+/**
+ * Fail fast if a networked PowDB server is older than {@link MIN_POWDB_VERSION}.
+ * Turbine's write path relies on the trailing `returning` keyword and the
+ * int→float coercion fix, both of which landed in 0.7.0. Embedded exposes no
+ * version method, so this is networked-only (the embedded peer is pinned ^0.7.0
+ * at install time). A non-semver / empty version string is tolerated (we cannot
+ * prove it is too old).
+ */
+export function assertSupportedPowdbVersion(version: string | undefined): void {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? '').trim());
+  if (!m) return; // unknown / non-semver — don't block
+  const [major, minor] = [Number(m[1]), Number(m[2])];
+  // 0.7.0 is the floor; >= 0.7 (or any 1.x+) passes.
+  if (major > 0 || (major === 0 && minor >= 7)) return;
+  throw new ConnectionError(
+    `[turbine] turbine-orm/powdb requires PowDB >= ${MIN_POWDB_VERSION}; the server reports "${version}". ` +
+      'Upgrade the PowDB server (0.7.0 added the `returning` keyword and the int->float coercion fix Turbine relies on).',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -283,15 +366,43 @@ export function rowToEntity(raw: Record<string, unknown>, meta: TableMetadata): 
 // Error translation
 // ---------------------------------------------------------------------------
 
-/** Translate a `@zvndev/powdb-client` error into a typed Turbine error. */
+/**
+ * Translate a PowDB error into a typed Turbine error. Handles BOTH transports,
+ * whose error shapes differ:
+ *   - **networked** (`@zvndev/powdb-client`) tags errors with a *semantic*
+ *     `.code` (`connect_failed`, `timeout`, `query_failed`, …);
+ *   - **embedded** (`@zvndev/powdb-embedded` napi addon) tags EVERY error
+ *     `code:'GenericFailure'`, so the class can only be recovered from the
+ *     message text (`Execution("column 'email' is required …")`,
+ *     `Execution("type mismatch …")`, `Parse(…)`, `StorageError(…)`).
+ *
+ * So we always run the unique-constraint and message-shape checks first (they
+ * fire for both transports), then fall through to the networked `.code` switch.
+ */
 export function wrapPowdbError(err: unknown): Error {
   if (!err || typeof err !== 'object') return new ConnectionError(`[turbine] PowDB error: ${String(err)}`);
   const e = err as { code?: string; message?: string };
   const msg = e.message ?? 'unknown PowDB error';
+
+  // Unique-constraint — message-based on both transports.
   if (/unique constraint violation/i.test(msg)) {
     const m = /on\s+\S+\.(\w+)/i.exec(msg);
     return new UniqueConstraintError({ constraint: m?.[1], cause: err as Error });
   }
+  // NOT NULL — "column 'x' is required but no value was provided". Map on BOTH
+  // transports (the networked path used to collapse this into E003).
+  if (/required|not[- ]?null|no value/i.test(msg)) {
+    const m = /column ['"]?(\w+)['"]?/i.exec(msg);
+    return new NotNullViolationError({ column: m?.[1], cause: err as Error });
+  }
+  // Type mismatch / parse / execution / storage / unexpected → validation
+  // (E003). On the embedded transport these are the only signal we get
+  // (code is always 'GenericFailure'); on the networked path they are a
+  // safety net before the .code switch.
+  if (/type mismatch|\bParse\b|\bExecution\b|StorageError|unexpected|row too large/i.test(msg)) {
+    return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
+  }
+
   switch (e.code) {
     case 'connect_failed':
     case 'closed':
@@ -318,6 +429,36 @@ type QueryArg = string | { name?: string; text: string; values?: unknown[] };
 function normalizeQueryArgs(arg: QueryArg, values?: unknown[]): { text: string; params: unknown[] } {
   if (typeof arg === 'string') return { text: arg, params: values ?? [] };
   return { text: arg.text, params: arg.values ?? values ?? [] };
+}
+
+/**
+ * Classify a transaction-control statement so the single-writer guard can track
+ * whether a transaction is open. Matches the lowercase keywords
+ * {@link powdbDialect} emits (`begin`/`commit`/`rollback`) plus the common SQL
+ * spellings, case-insensitively. Returns `null` for ordinary queries.
+ */
+function txControl(powql: string): 'begin' | 'commit' | 'rollback' | null {
+  const head = powql.trim().toLowerCase();
+  if (head === 'begin' || head === 'begin transaction' || head === 'start transaction') return 'begin';
+  if (head === 'commit' || head === 'commit transaction' || head === 'end') return 'commit';
+  if (head === 'rollback' || head === 'rollback transaction') return 'rollback';
+  return null;
+}
+
+/**
+ * The error a pool throws when a `begin` arrives while a transaction is already
+ * open. PowDB has ONE global write lock and supports neither concurrent nor
+ * nested transactions: on the networked transport a second `begin` checks out a
+ * fresh pooled connection and blocks forever on the lock the open transaction
+ * holds. This guard converts that hang into a fast, typed error.
+ */
+function reentrantTransactionError(): UnsupportedFeatureError {
+  return new UnsupportedFeatureError(
+    'concurrent or nested transactions',
+    'powdb',
+    'PowDB is single-writer — it has one global write lock. A second transaction would block on it forever; ' +
+      'complete the open transaction first.',
+  );
 }
 
 /** Adapt a PowDB result into the pg-compat `{ rows, rowCount, fields }` shape. */
@@ -350,15 +491,40 @@ function adaptResult(r: PowdbResult): PgCompatQueryResult {
  */
 export class PowdbPool implements PgCompatPool {
   private closed = false;
+  /**
+   * Pool-level single-writer guard. PowDB holds one global write lock, so at
+   * most one transaction may be open across the whole pool. A `begin` issued
+   * while this is `true` is rejected (it would otherwise check out a second
+   * connection and block on the lock forever — the networked re-entrant hang).
+   */
+  private activeTransaction = false;
 
   constructor(
     readonly pool: PowdbClientPool,
     private readonly toParam: (v: unknown, i: number) => PowdbParam = (v) => toPowdbParam(v),
   ) {}
 
+  /**
+   * Enforce the single-writer model on a transaction-control statement. Throws
+   * (before any query runs) if a `begin` arrives while a transaction is open;
+   * otherwise flips the pool-level flag. Returns the control kind so the caller
+   * can decide whether it even needs to hit the engine.
+   */
+  private guardTxControl(powql: string): 'begin' | 'commit' | 'rollback' | null {
+    const ctl = txControl(powql);
+    if (ctl === 'begin') {
+      if (this.activeTransaction) throw reentrantTransactionError();
+      this.activeTransaction = true;
+    } else if (ctl === 'commit' || ctl === 'rollback') {
+      this.activeTransaction = false;
+    }
+    return ctl;
+  }
+
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
     const { text: powql, params } = normalizeQueryArgs(text, values);
+    this.guardTxControl(powql);
     try {
       const result = await this.pool.withClient((c) => c.query(powql, params.map(this.toParam)));
       return adaptResult(result);
@@ -374,6 +540,9 @@ export class PowdbPool implements PgCompatPool {
       // biome-ignore lint/suspicious/noExplicitAny: see query() above.
       query: async (text: QueryArg, values?: unknown[]): Promise<any> => {
         const { text: powql, params } = normalizeQueryArgs(text, values);
+        // Guard BEFORE acquiring the engine — a re-entrant begin throws fast
+        // instead of blocking on the global write lock the open tx holds.
+        this.guardTxControl(powql);
         try {
           return adaptResult(await client.query(powql, params.map(this.toParam)));
         } catch (err) {
@@ -381,7 +550,14 @@ export class PowdbPool implements PgCompatPool {
           throw wrapPowdbError(err);
         }
       },
-      release: () => (broken ? this.pool.destroy(client) : this.pool.release(client)),
+      release: () => {
+        // Releasing this connection ends its transaction scope. Clear the flag
+        // as a safety net so a tx torn down without an explicit commit/rollback
+        // (e.g. a timeout that destroys the connection) never leaves the pool
+        // permanently believing a transaction is still open.
+        this.activeTransaction = false;
+        return broken ? this.pool.destroy(client) : this.pool.release(client);
+      },
     };
   }
 
@@ -509,10 +685,31 @@ export function materializePowql(powql: string, params: unknown[]): string {
  */
 export class PowdbEmbeddedPool implements PgCompatPool {
   private closed = false;
+  /**
+   * Single-writer guard. The embedded engine is one handle with one global
+   * write lock — only one transaction may be open at a time. A re-entrant
+   * `begin` (a fresh top-level `db.$transaction` opened inside an open one)
+   * would otherwise hit PowDB's raw "already in a transaction" parse error;
+   * this surfaces a typed error instead. (Nested `tx.$transaction` is caught
+   * earlier still, by the savepoint override in {@link powdbDialect}.)
+   */
+  private activeTransaction = false;
 
   constructor(private readonly db: EmbeddedDatabase) {}
 
+  /** Enforce the single-writer model on a transaction-control statement. */
+  private guardTxControl(powql: string): void {
+    const ctl = txControl(powql);
+    if (ctl === 'begin') {
+      if (this.activeTransaction) throw reentrantTransactionError();
+      this.activeTransaction = true;
+    } else if (ctl === 'commit' || ctl === 'rollback') {
+      this.activeTransaction = false;
+    }
+  }
+
   private run(powql: string, params: unknown[]): PgCompatQueryResult {
+    this.guardTxControl(powql);
     try {
       const materialized = materializePowql(powql, params);
       return adaptResult(normalizeEmbeddedResult(this.db.query(materialized)));
@@ -536,7 +733,11 @@ export class PowdbEmbeddedPool implements PgCompatPool {
         const { text: powql, params } = normalizeQueryArgs(text, values);
         return this.run(powql, params);
       },
-      release: () => {},
+      release: () => {
+        // End-of-scope safety net (see PowdbPool.connect()): a tx torn down
+        // without an explicit commit/rollback must not wedge the handle.
+        this.activeTransaction = false;
+      },
     };
   }
 
@@ -635,24 +836,37 @@ async function openEmbeddedPool(dir: string): Promise<PowdbEmbeddedPool> {
 
 /**
  * Bind Turbine to PowDB. `target` is one of:
+ *   - a `powdb://[user[:pass]@]host[:port][/db]` connection string → a
+ *     **networked** `@zvndev/powdb-client` pool (consistency with
+ *     `turbineMysql`/`turbineMssql`);
  *   - a host/port options object → a **networked** `@zvndev/powdb-client` pool;
  *   - an `{ embedded: <data-dir> }` object → an in-process
  *     `@zvndev/powdb-embedded` database (no server);
  *   - an already-constructed `@zvndev/powdb-client` `Pool` or {@link PowdbPool}
  *     (injection — you own its lifecycle and `disconnect()` is a no-op).
  *
+ * On the networked transport the server version is probed and a clear
+ * {@link ConnectionError} is thrown if it is older than {@link MIN_POWDB_VERSION}
+ * (the `returning` keyword / int->float coercion fix Turbine relies on).
+ *
  * Resolves to a `TurbineClient` whose `table()` accessors generate **PowQL** via
  * {@link PowqlInterface}. The SQL `Dialect` is not involved.
  */
 export async function turbinePowDB(
-  target: PowdbConnOptions | PowdbClientPool | PowdbPool | TurbinePowdbEmbeddedTarget,
+  target: string | PowdbConnOptions | PowdbClientPool | PowdbPool | TurbinePowdbEmbeddedTarget,
   schema: SchemaMetadata,
   options: TurbinePowdbOptions = {},
 ): Promise<TurbineClient> {
   let pool: PgCompatPool;
   let owns = false;
 
-  if (target instanceof PowdbPool) {
+  if (typeof target === 'string') {
+    const mod = await loadPowdb();
+    const clientPool = new mod.Pool({ ...parsePowdbUrl(target), max: options.connectionLimit ?? 10 });
+    await assertNetworkedVersion(clientPool);
+    pool = new PowdbPool(clientPool);
+    owns = true;
+  } else if (target instanceof PowdbPool) {
     pool = target;
   } else if (isEmbeddedTarget(target)) {
     pool = await openEmbeddedPool(target.embedded);
@@ -661,7 +875,9 @@ export async function turbinePowDB(
     pool = new PowdbPool(target);
   } else {
     const mod = await loadPowdb();
-    pool = new PowdbPool(new mod.Pool({ ...(target as PowdbConnOptions), max: options.connectionLimit ?? 10 }));
+    const clientPool = new mod.Pool({ ...(target as PowdbConnOptions), max: options.connectionLimit ?? 10 });
+    await assertNetworkedVersion(clientPool);
+    pool = new PowdbPool(clientPool);
     owns = true;
   }
 
@@ -694,6 +910,18 @@ export async function turbinePowDB(
     (client as { disconnect: () => Promise<void> }).disconnect = async () => {};
   }
   return client;
+}
+
+/**
+ * Probe a networked pool's `serverVersion` (declared on {@link PowdbClient}) and
+ * fail fast if the server is older than {@link MIN_POWDB_VERSION}. Best-effort:
+ * a driver that does not surface a version is left untouched (we cannot prove it
+ * too old). Errors from the probe itself surface as the normal connect failure.
+ */
+async function assertNetworkedVersion(clientPool: PowdbClientPool): Promise<void> {
+  await clientPool.withClient(async (c) => {
+    assertSupportedPowdbVersion(c.serverVersion);
+  });
 }
 
 function isPowdbClientPool(x: unknown): x is PowdbClientPool {
