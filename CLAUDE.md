@@ -112,6 +112,35 @@ src/
                       relations (`buildRelationSubquery` override), `OFFSET/FETCH` paging,
                       and named `@pN` placeholders.
 
+  powdb.ts +        — `turbine-orm/powdb` engine (PowDB **≥ 0.7.0**).
+  powql.ts            `await turbinePowDB(connOpts | pool | { embedded: dir }, schema, options?)`
+                      — PowDB, a single-node DB with its OWN query language **PowQL** (not SQL).
+                      Two transports: **networked** via the optional peer `@zvndev/powdb-client`
+                      (binary TCP), and **embedded** (preview) via the optional peer
+                      `@zvndev/powdb-embedded` (in-process napi addon, no server). Both dynamic
+                      `import()` — `npm i turbine-orm` still pulls only `pg`. PowQL shares no
+                      surface with `SELECT…FROM…WHERE`, so this is NOT a `Dialect`: powql.ts ships
+                      a parallel `PowqlInterface` (PowQL generator with the same public method
+                      surface as `QueryInterface`) wired in via the `queryInterfaceFactory`
+                      option on `QueryInterfaceOptions` — `TurbineClient.table()` calls that
+                      factory when present, else `new QueryInterface` (SQL engines untouched).
+                      powdb.ts holds the driver shims (`PowdbPool` over the client `Pool`;
+                      `PowdbEmbeddedPool` over a single `Database` handle), type mapping
+                      (Turbine→PowQL `str/int/float/bool`; never emits `uuid/datetime/bytes`;
+                      `Date`→int micros), `powqlSchemaDDL`, `wrapPowdbError`, and `powdbDialect`
+                      (`supportsReturning: true`; the Postgres-only flags stay false →
+                      `$listen`/`$notify`/RLS/pgvector throw E017). PowDB realities shaping it:
+                      writes use the trailing **`returning`** keyword (create/createMany/update/
+                      delete) — `upsert` reselects by PK (its statement rejects `returning`); no
+                      generated IDs (→client UUID); no JSON-agg/link-nav (→N+1 `with` loaders);
+                      no wire introspection (→`defineSchema` only); single RwLock. **Embedded
+                      takes no params array**, so `PowdbEmbeddedPool` materializes each `$N` into
+                      a PowQL literal via `encodePowqlLiteral`/`materializePowql` — string
+                      escaping matches the engine lexer exactly (`\"` `\\` `\n` `\t`; else raw),
+                      injection-safe. Embedded is Full-durability only and macOS-arm64/x64 +
+                      Linux-glibc only. (The ≤0.6.2 reselect + float-literal-inlining workarounds
+                      were retired in 0.7.0.) See `docs/strategy/powdb-parity-matrix.md`.
+
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code
                       (TURBINE_E001-E017). wrapPgError() translates pg driver errors
                       (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
@@ -303,7 +332,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 ## Don't
 
-- Don't add runtime dependencies beyond `pg`. Root `dependencies` stays exactly `{ pg, @types/pg }`. The only sanctioned exception is the engine drivers: `mysql2` and `mssql` are **devDependencies + optional `peerDependencies`** (`peerDependenciesMeta.*.optional = true`), loaded lazily via dynamic `import()` from the `mysql`/`mssql` subpaths and never required for Postgres users; SQLite needs nothing at all (it uses the `node:sqlite` builtin). `npm i turbine-orm` must keep pulling only `pg`.
+- Don't add runtime dependencies beyond `pg`. Root `dependencies` stays exactly `{ pg, @types/pg }`. The only sanctioned exception is the engine drivers: `mysql2`, `mssql`, `@zvndev/powdb-client`, and `@zvndev/powdb-embedded` are **devDependencies + optional `peerDependencies`** (`peerDependenciesMeta.*.optional = true`), loaded lazily via dynamic `import()` from the `mysql`/`mssql`/`powdb` subpaths and never required for Postgres users; SQLite needs nothing at all (it uses the `node:sqlite` builtin). `npm i turbine-orm` must keep pulling only `pg`.
 - Don't use `eval`, `new Function`, or shell interpolation
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings — always use `$N` parameterization
