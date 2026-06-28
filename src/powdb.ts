@@ -805,12 +805,9 @@ async function loadPowdb(): Promise<PowdbModule> {
  * from-source `npm run build` fallback.
  */
 async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
+  let mod: EmbeddedModule;
   try {
-    const mod = (await import('@zvndev/powdb-embedded')) as unknown as EmbeddedModule;
-    if (!mod || typeof mod.Database?.open !== 'function') {
-      throw new Error('module did not export Database.open');
-    }
-    return mod;
+    mod = (await import('@zvndev/powdb-embedded')) as unknown as EmbeddedModule;
   } catch (err) {
     throw new ConnectionError(
       "[turbine] turbine-orm/powdb embedded mode requires the optional peer '@zvndev/powdb-embedded'. " +
@@ -820,6 +817,13 @@ async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
         `(${(err as Error).message})`,
     );
   }
+  if (!mod || typeof mod.Database?.open !== 'function') {
+    throw new ConnectionError(
+      "[turbine] '@zvndev/powdb-embedded' loaded but did not export Database.open — the installed version is " +
+        'likely incompatible (turbine-orm/powdb embedded requires @zvndev/powdb-embedded ^0.7.0).',
+    );
+  }
+  return mod;
 }
 
 /** Open an embedded database handle, wrapping engine open failures (corrupt dir, etc.). */
