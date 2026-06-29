@@ -587,6 +587,9 @@ function serializeColumn(col: ColumnMetadata): string {
     `arrayType: '${escSQ(col.arrayType ?? col.pgArrayType)}'`,
     `pgArrayType: '${escSQ(col.pgArrayType)}'`,
   ];
+  // Emit isGenerated only when set (server-generated serial/identity), so the
+  // output stays byte-identical for the common client-default columns.
+  if (col.isGenerated) parts.push(`isGenerated: true`);
   if (col.maxLength !== undefined) parts.push(`maxLength: ${col.maxLength}`);
   return `{ ${parts.join(', ')} }`;
 }

@@ -180,6 +180,32 @@ describe('powdb: type mapping', () => {
     assert.match(userType, /score: float/);
     assert.match(userType, /created_at: int/); // Date → int micros
   });
+
+  it('emits the `auto` modifier for a server-generated int PK', () => {
+    const s: SchemaMetadata = {
+      enums: {},
+      tables: {
+        widget: table('widget', [
+          col('id', 'id', 'number', 'int8', { isGenerated: true, hasDefault: true }),
+          col('label', 'label', 'string', 'text'),
+        ]),
+      },
+    };
+    const ddl = powqlSchemaDDL(s);
+    assert.match(ddl[0]!, /required unique auto id: int/);
+  });
+
+  it('does NOT mark composite-PK columns individually unique (PowDB has no composite unique)', () => {
+    const junction: TableMetadata = {
+      ...table('user_tags', [col('user_id', 'userId', 'number', 'int8'), col('tag_id', 'tagId', 'number', 'int8')]),
+      primaryKey: ['user_id', 'tag_id'],
+      uniqueColumns: [],
+    };
+    const ddl = powqlSchemaDDL({ enums: {}, tables: { user_tags: junction } } as SchemaMetadata);
+    assert.match(ddl[0]!, /required user_id: int/);
+    assert.match(ddl[0]!, /required tag_id: int/);
+    assert.ok(!/unique/.test(ddl[0]!), 'composite-PK columns must not be marked unique');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -305,10 +331,26 @@ describe('powdb: findMany generation', () => {
     assert.match(m.last().powql, /\(\.name = \$1 or \.name = \$2\)/);
   });
 
-  it('relation filter `some` uses the IN-subquery form (not exists)', async () => {
+  it('relation filter `some` resolves client-side to a literal in-list (never an IN-subquery)', async () => {
+    // PowDB caches a subquery's result by plan shape, ignoring the literal, so a
+    // second IN-subquery of the same shape returns stale rows. Turbine therefore
+    // resolves the inner predicate to keys first, then filters with `in (list)`.
     const m = mockPool();
+    m.setRows([
+      { id: 'p1', author_id: 'u7' },
+      { id: 'p2', author_id: 'u9' },
+    ]);
     await qi(m).findMany({ where: { posts: { some: { views: { gte: 80 } } } } });
-    assert.match(m.last().powql, /\.id in \(post filter \.views >= \$1 \{ \.author_id \}\)/);
+    // 1) a resolution query selects the child FK on the target table
+    assert.ok(
+      m.calls.some((c) => /^post filter \.views >= \$1 \{/.test(c.powql.trimStart())),
+      'expected a resolution query on the post table',
+    );
+    // 2) the main query filters by a literal in-list of the resolved keys — no subquery
+    const main = m.last();
+    assert.match(main.powql, /\.id in \(\$\d/);
+    assert.ok(!/in \(post filter/.test(main.powql), 'must NOT emit an IN-subquery');
+    assert.deepEqual(main.params, ['u7', 'u9']);
   });
 
   it('count emits count(T filter …) scalar', async () => {
@@ -474,11 +516,14 @@ describe('powdb: capability guards throw E017', () => {
       UnsupportedFeatureError,
     );
   });
-  it('manyToMany nested reads and nested writes are Phase B', async () => {
+  it('createMany/upsert reject nested-write relation data (only create/update support it)', async () => {
     const m = mockPool();
-    // nested write (relation key in data)
     await assert.rejects(
-      () => qi(m).create({ data: { name: 'x', posts: { create: [] } } as never }),
+      () => qi(m).createMany({ data: [{ name: 'x', posts: { create: [] } }] as never }),
+      UnsupportedFeatureError,
+    );
+    await assert.rejects(
+      () => qi(m).upsert({ where: { id: 'x' }, create: { name: 'x', posts: { create: [] } }, update: {} } as never),
       UnsupportedFeatureError,
     );
   });

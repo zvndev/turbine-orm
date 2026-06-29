@@ -15,10 +15,20 @@
  *   - `create`/`createMany`/`update`/`delete` use PowDB 0.7.0's trailing
  *     `returning` keyword (`RETURNING *`, all columns) to surface affected rows
  *     in one round-trip. `upsert` is the lone exception — its statement does not
- *     accept `returning`, so it reselects the row by PK.
- *   - The PK is generated client-side (UUID) when the column has a default.
- *   - `with` (nested relations) degrades to **batched N+1 loaders** — D
- *     round-trips for depth D, not one query. manyToMany is Phase B.
+ *     accept `returning`, so it reselects the row by PK (a composite-PK upsert
+ *     reselects-or-writes inside one flat transaction).
+ *   - The PK is server-assigned when the column is `isGenerated` (PowDB's `auto`
+ *     int — read back via `returning`); otherwise a defaulted **string** PK is
+ *     generated client-side (UUID).
+ *   - `with` (nested relations) uses **batched N+1 loaders** — D round-trips for
+ *     depth D, not one query — including manyToMany (junction → targets).
+ *   - **Relation filters** (`some`/`none`/`every`, all cardinalities incl. m2m)
+ *     are resolved client-side to a literal `in (…)` list, never an IN-subquery:
+ *     PowDB's executor caches a subquery's result by plan shape and would return
+ *     a stale prior result for a later subquery of the same shape.
+ *   - **Nested writes** (relation ops in `create`/`update` data) run through the
+ *     shared nested-write engine as one flat top-level transaction (PowDB is
+ *     single-writer, no savepoints).
  *   - pgvector / JSON / array filters and cursor streaming throw
  *     {@link UnsupportedFeatureError} (E017) — they have no PowDB equivalent.
  *
@@ -27,6 +37,12 @@
 
 import { randomUUID } from 'node:crypto';
 import { NotFoundError, TimeoutError, UnsupportedFeatureError, ValidationError } from './errors.js';
+import {
+  executeNestedCreate,
+  executeNestedUpdate,
+  hasRelationFields,
+  type NestedWriteContext,
+} from './nested-write.js';
 import { PowdbFloatParam, type PowdbPool, powqlColumnType, rowToEntity } from './powdb.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
 import type {
@@ -218,7 +234,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         const sub = this.buildWhere(value as WhereClause<T>, params);
         if (sub) parts.push(`not (${sub})`);
       } else if (this.meta.relations[key]) {
-        parts.push(this.buildRelationFilter(this.meta.relations[key]!, value as Record<string, unknown>, params));
+        // Relation filters are pre-resolved to scalar in/notIn by
+        // resolveRelationFilters() before buildWhere runs — reaching here means
+        // a caller skipped that step (an internal bug, not user error).
+        throw new ValidationError(
+          `[turbine] internal: relation filter "${key}" reached buildWhere unresolved (missing resolveRelationFilters()).`,
+        );
       } else {
         parts.push(this.buildFieldCondition(key, value, params));
       }
@@ -314,17 +335,60 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * Relation filter (`some`/`none`/`every`) via the verified IN-subquery form
-   * `Outer filter .localKey in (Target filter <e> { .targetKey })`. `exists`
-   * correlation is unreliable on PowDB, so it is never used.
+   * Pre-resolve every relation filter (`some`/`none`/`every`) in a where clause
+   * into a plain scalar `in`/`notIn` condition on the **local key**, by running
+   * the inner predicate as its own query and materializing the matching keys as
+   * a literal list. The compiled where is then relation-free and `buildWhere`
+   * emits only `in (<literal list>)`.
+   *
+   * Why not an IN-subquery (`.k in (Target filter <e> { .fk })`)? PowDB's
+   * executor caches a subquery's result by **plan shape, ignoring the literal**,
+   * so a second subquery of the same shape with a different value returns the
+   * first one's stale rows (reproduced live on the embedded engine; the
+   * single-statement literal `in (list)` form is always correct). Resolving
+   * client-side trades extra round-trips for correctness, and recurses — nested
+   * relation filters in the inner predicate resolve when the target query runs.
    */
-  private buildRelationFilter(rel: RelationDef, filter: Record<string, unknown>, params: unknown[]): string {
+  private async resolveRelationFilters(
+    where: WhereClause<T> | undefined,
+    timeout?: number,
+  ): Promise<WhereClause<T> | undefined> {
+    if (!where) return where;
+    const scalar: Record<string, unknown> = {};
+    const relConds: Record<string, unknown>[] = [];
+    for (const [key, value] of Object.entries(where)) {
+      if (value === undefined) continue;
+      if (key === 'AND' || key === 'OR') {
+        scalar[key] = await Promise.all(
+          (value as WhereClause<T>[]).map((w) => this.resolveRelationFilters(w, timeout)),
+        );
+      } else if (key === 'NOT') {
+        scalar[key] = await this.resolveRelationFilters(value as WhereClause<T>, timeout);
+      } else if (this.meta.relations[key]) {
+        relConds.push(
+          await this.resolveRelationCondition(this.meta.relations[key]!, value as Record<string, unknown>, timeout),
+        );
+      } else {
+        scalar[key] = value;
+      }
+    }
+    if (!relConds.length) return scalar as WhereClause<T>;
+    const hasScalar = Object.keys(scalar).length > 0;
+    return { AND: [...(hasScalar ? [scalar] : []), ...relConds] } as WhereClause<T>;
+  }
+
+  /** Resolve one hasMany/hasOne/belongsTo filter to `{ localField: { in|notIn: [...] } }`. */
+  private async resolveRelationCondition(
+    rel: RelationDef,
+    filter: Record<string, unknown>,
+    timeout?: number,
+  ): Promise<Record<string, unknown>> {
+    const mode = filter.some ? 'some' : filter.none ? 'none' : filter.every ? 'every' : null;
+    if (!mode) return {};
+    const innerWhere = filter[mode] as Record<string, unknown> | undefined;
+    const innerEmpty = !innerWhere || Object.keys(innerWhere).length === 0;
     if (rel.type === 'manyToMany') {
-      throw new UnsupportedFeatureError(
-        'manyToMany relation filters',
-        'PowDB',
-        `relation "${rel.name}" — junction-table relation filters are Phase B`,
-      );
+      return this.resolveManyToManyCondition(rel, mode, innerWhere, innerEmpty, timeout);
     }
     const fk = normalizeKeyColumns(rel.foreignKey);
     const rk = normalizeKeyColumns(rel.referenceKey);
@@ -332,28 +396,102 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       throw new UnsupportedFeatureError(
         'composite-key relation filters',
         'PowDB',
-        `relation "${rel.name}" uses a composite key`,
+        `relation "${rel.name}" uses a composite key — PowQL has no tuple-\`in\` to express it`,
       );
     }
-    // hasMany/hasOne: outer.referenceKey ∈ target.foreignKey.
-    // belongsTo:      outer.foreignKey  ∈ target.referenceKey.
-    const localKey = rel.type === 'belongsTo' ? fk[0]! : rk[0]!;
-    const targetKey = rel.type === 'belongsTo' ? rk[0]! : fk[0]!;
     const targetMeta = this.schema.tables[rel.to];
     if (!targetMeta) throw new ValidationError(`[turbine] Relation "${rel.name}" targets unknown table "${rel.to}".`);
-    const sub = (whereObj: Record<string, unknown> | undefined, negateInner: boolean) => {
-      const innerQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.options);
-      const inner = innerQi.buildWhere(whereObj as WhereClause<object> | undefined, params);
-      const filterClause = inner ? ` filter ${negateInner ? `not (${inner})` : inner}` : '';
-      return `${rel.to}${filterClause} { .${targetKey} }`;
+    // hasMany/hasOne: localKey = our referenceKey, collect the child's foreignKey.
+    // belongsTo:      localKey = our foreignKey,   collect the target's referenceKey.
+    const localCol = rel.type === 'belongsTo' ? fk[0]! : rk[0]!;
+    const childCol = rel.type === 'belongsTo' ? rk[0]! : fk[0]!;
+    const localField = this.meta.reverseColumnMap[localCol] ?? localCol;
+    const childField = targetMeta.reverseColumnMap[childCol] ?? childCol;
+    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.options);
+    const collect = async (w: Record<string, unknown> | undefined): Promise<unknown[]> => {
+      const rows = await targetQi.findMany({
+        where: w as WhereClause<object> | undefined,
+        select: { [childField]: true },
+        timeout,
+      } as unknown as FindManyArgs<object>);
+      return [...new Set(rows.map((r) => (r as Record<string, unknown>)[childField]).filter((v) => v != null))];
     };
-    if (filter.some) return `.${localKey} in (${sub(filter.some as Record<string, unknown>, false)})`;
-    if (filter.none) return `.${localKey} not in (${sub(filter.none as Record<string, unknown>, false)})`;
-    if (filter.every) {
-      // Parents with no child failing the predicate.
-      return `.${localKey} not in (${sub(filter.every as Record<string, unknown>, true)})`;
+    if (mode === 'some') return { [localField]: { in: await collect(innerWhere) } };
+    if (mode === 'none') return { [localField]: { notIn: await collect(innerWhere) } };
+    // every: a parent qualifies unless it has a child FAILING the predicate.
+    if (innerEmpty) return {}; // every:{} ⇒ trivially true for all parents
+    return { [localField]: { notIn: await collect({ NOT: innerWhere }) } };
+  }
+
+  /** Resolve a manyToMany filter through the junction to `{ sourceRefField: { in|notIn: [...] } }`. */
+  private async resolveManyToManyCondition(
+    rel: RelationDef,
+    mode: 'some' | 'none' | 'every',
+    innerWhere: Record<string, unknown> | undefined,
+    innerEmpty: boolean,
+    timeout?: number,
+  ): Promise<Record<string, unknown>> {
+    const through = rel.through;
+    if (!through)
+      throw new ValidationError(`[turbine] manyToMany relation "${rel.name}" is missing its junction (\`through\`).`);
+    const sourceJ = normalizeKeyColumns(through.sourceKey);
+    const targetJ = normalizeKeyColumns(through.targetKey);
+    const sourceRef = normalizeKeyColumns(rel.referenceKey);
+    const targetMeta = this.schema.tables[rel.to];
+    if (!targetMeta) throw new ValidationError(`[turbine] Relation "${rel.name}" targets unknown table "${rel.to}".`);
+    if (sourceJ.length > 1 || targetJ.length > 1 || sourceRef.length > 1 || targetMeta.primaryKey.length > 1) {
+      throw new UnsupportedFeatureError(
+        'composite-key manyToMany filters',
+        'PowDB',
+        `relation "${rel.name}" — PowQL has no tuple-\`in\` for composite junction/target keys`,
+      );
     }
-    return this.alwaysFalse();
+    const sourceJCol = sourceJ[0]!;
+    const targetJCol = targetJ[0]!;
+    const sourceRefCol = sourceRef[0]!;
+    const targetPkCol = targetMeta.primaryKey[0]!;
+    const sourceRefField = this.meta.reverseColumnMap[sourceRefCol] ?? sourceRefCol;
+    const sourceRefColMeta = this.meta.columns.find((c) => c.name === sourceRefCol);
+    const targetPkField = targetMeta.reverseColumnMap[targetPkCol] ?? targetPkCol;
+    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.options);
+    const collectTargetPks = async (w: Record<string, unknown> | undefined): Promise<unknown[]> => {
+      const rows = await targetQi.findMany({
+        where: w as WhereClause<object> | undefined,
+        select: { [targetPkField]: true },
+        timeout,
+      } as unknown as FindManyArgs<object>);
+      return [...new Set(rows.map((r) => (r as Record<string, unknown>)[targetPkField]).filter((v) => v != null))];
+    };
+    // Junction source keys linking any of `targetPks` (literal IN-list — never a subquery).
+    const sourcesForTargets = async (targetPks: unknown[]): Promise<unknown[]> => {
+      if (!targetPks.length) return [];
+      const out = new Set<unknown>();
+      for (let i = 0; i < targetPks.length; i += MAX_RELATION_KEYS) {
+        const chunk = targetPks.slice(i, i + MAX_RELATION_KEYS);
+        const params: unknown[] = [];
+        const ph = chunk.map((v) => this.param(v, params)).join(', ');
+        const { rows } = await this.exec(
+          `${through.table} filter .${targetJCol} in (${ph}) { .${sourceJCol} }`,
+          params,
+          timeout,
+        );
+        for (const r of rows) {
+          const v = r[sourceJCol];
+          if (v != null) out.add(sourceRefColMeta ? coerceScalar(String(v), sourceRefColMeta.tsType) : v);
+        }
+      }
+      return [...out];
+    };
+    if (mode === 'some') {
+      return { [sourceRefField]: { in: await sourcesForTargets(await collectTargetPks(innerWhere)) } };
+    }
+    if (mode === 'none') {
+      return { [sourceRefField]: { notIn: await sourcesForTargets(await collectTargetPks(innerWhere)) } };
+    }
+    // every: exclude parents that link a target FAILING the predicate.
+    if (innerEmpty) return {}; // every:{} ⇒ trivially true
+    const failing = await sourcesForTargets(await collectTargetPks({ NOT: innerWhere }));
+    return { [sourceRefField]: { notIn: failing } };
   }
 
   // -------------------------------------------------------------------------
@@ -488,7 +626,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       throw new UnsupportedFeatureError('cursor pagination', 'PowDB', 'use limit/offset instead');
     }
     const params: unknown[] = [];
-    const where = this.buildWhere(args.where, params);
+    const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+    const where = this.buildWhere(resolvedWhere, params);
     const cols = this.projectedColumns(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
@@ -560,11 +699,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const rel = this.meta.relations[relName];
       if (!rel) throw new ValidationError(`[turbine] Unknown relation "${relName}" on "${this.table}".`);
       if (rel.type === 'manyToMany') {
-        throw new UnsupportedFeatureError(
-          'manyToMany nested reads',
-          'PowDB',
-          `relation "${relName}" — junction loading is Phase B`,
-        );
+        await this.loadManyToMany(parents, rel, relName, opt, timeout);
+        continue;
       }
       const fk = normalizeKeyColumns(rel.foreignKey);
       const rk = normalizeKeyColumns(rel.referenceKey);
@@ -615,6 +751,106 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
   }
 
+  /**
+   * manyToMany nested read — a three-hop batched loader (no `json_agg`/join
+   * pushdown): (1) read the junction rows for all parents in `sourceKey in (…)`
+   * chunks, (2) read the target rows for the collected `targetKey`s, (3) stitch
+   * each parent → its junction rows → its targets in memory. Mirrors the
+   * single-key N+1 loaders; the junction's source/target columns must be single
+   * (composite junction keys would need PowQL tuple-`in`, which it lacks).
+   */
+  private async loadManyToMany(
+    parents: T[],
+    rel: RelationDef,
+    relName: string,
+    opt: unknown,
+    timeout?: number,
+  ): Promise<void> {
+    const through = rel.through;
+    if (!through)
+      throw new ValidationError(`[turbine] manyToMany relation "${relName}" is missing its junction (\`through\`).`);
+    const sourceJ = normalizeKeyColumns(through.sourceKey);
+    const targetJ = normalizeKeyColumns(through.targetKey);
+    const sourceRef = normalizeKeyColumns(rel.referenceKey);
+    const targetMeta = this.schema.tables[rel.to];
+    if (!targetMeta) throw new ValidationError(`[turbine] Relation "${relName}" targets unknown table "${rel.to}".`);
+    if (sourceJ.length > 1 || targetJ.length > 1 || sourceRef.length > 1 || targetMeta.primaryKey.length > 1) {
+      throw new UnsupportedFeatureError(
+        'composite-key manyToMany',
+        'PowDB',
+        `relation "${relName}" — PowQL has no tuple-\`in\`, so composite junction/target keys can't be loaded`,
+      );
+    }
+    const sourceJCol = sourceJ[0]!;
+    const targetJCol = targetJ[0]!;
+    const sourceRefCol = sourceRef[0]!;
+    const targetPkCol = targetMeta.primaryKey[0]!;
+    const parentRefField = this.meta.reverseColumnMap[sourceRefCol] ?? sourceRefCol;
+    const targetPkField = targetMeta.reverseColumnMap[targetPkCol] ?? targetPkCol;
+    const targetPkColMeta = targetMeta.columns.find((c) => c.name === targetPkCol);
+
+    const parentKeys = [
+      ...new Set(parents.map((p) => (p as Record<string, unknown>)[parentRefField]).filter((k) => k != null)),
+    ];
+    if (!parentKeys.length) {
+      for (const parent of parents) (parent as Record<string, unknown>)[relName] = [];
+      return;
+    }
+
+    // (1) Junction rows: sourceKeyVal(String) → [targetKeyVal(String)].
+    const targetsBySource = new Map<string, string[]>();
+    const allTargetVals = new Set<string>();
+    for (let i = 0; i < parentKeys.length; i += MAX_RELATION_KEYS) {
+      const chunk = parentKeys.slice(i, i + MAX_RELATION_KEYS);
+      const params: unknown[] = [];
+      const placeholders = chunk.map((v) => this.param(v, params)).join(', ');
+      const powql = `${through.table} filter .${sourceJCol} in (${placeholders}) { .${sourceJCol}, .${targetJCol} }`;
+      const { rows } = await this.exec(powql, params, timeout);
+      for (const row of rows) {
+        const sv = String(row[sourceJCol]);
+        const tv = String(row[targetJCol]);
+        const bucket = targetsBySource.get(sv);
+        if (bucket) bucket.push(tv);
+        else targetsBySource.set(sv, [tv]);
+        allTargetVals.add(tv);
+      }
+    }
+
+    // (2) Target rows by PK, honouring the relation's own where/with/select/…
+    const options = (opt === true ? {} : opt) as FindManyArgs<object> & { with?: Record<string, unknown> };
+    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.options);
+    const targetByPk = new Map<string, T>();
+    const targetValList = [...allTargetVals].map((v) =>
+      targetPkColMeta ? coerceScalar(v, targetPkColMeta.tsType) : v,
+    );
+    for (let i = 0; i < targetValList.length; i += MAX_RELATION_KEYS) {
+      const chunk = targetValList.slice(i, i + MAX_RELATION_KEYS);
+      const where = {
+        ...(options.where as Record<string, unknown> | undefined),
+        [targetPkField]: { in: chunk },
+      } as WhereClause<object>;
+      const targets = (await targetQi.findMany({
+        ...options,
+        where,
+        with: options.with,
+        timeout: options.timeout ?? timeout,
+      } as FindManyArgs<object>)) as T[];
+      for (const t of targets) targetByPk.set(String((t as Record<string, unknown>)[targetPkField]), t);
+    }
+
+    // (3) Stitch: each parent → its junction targets (m2m is always a list).
+    for (const parent of parents) {
+      const sv = String((parent as Record<string, unknown>)[parentRefField]);
+      const tvs = targetsBySource.get(sv) ?? [];
+      const children: T[] = [];
+      for (const tv of tvs) {
+        const child = targetByPk.get(tv);
+        if (child) children.push(child);
+      }
+      (parent as Record<string, unknown>)[relName] = children;
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Writes (reselect — PowDB has no RETURNING)
   // -------------------------------------------------------------------------
@@ -625,20 +861,34 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (const [field, value] of Object.entries(data)) {
       if (value === undefined) continue;
       if (this.meta.relations[field]) {
-        throw new UnsupportedFeatureError('nested writes', 'PowDB', `relation "${field}" in write data — Phase B`);
+        throw new UnsupportedFeatureError(
+          'nested writes',
+          'PowDB',
+          `relation "${field}" — nested writes need create()/update(), not createMany()/upsert()`,
+        );
       }
       out.push({ col: this.column(field), value });
     }
     return out;
   }
 
-  /** Fill in a client-generated UUID for a defaulted PK that wasn't supplied. */
+  /**
+   * Fill in a client-generated UUID for a defaulted **string** PK that wasn't
+   * supplied. A server-generated PK ({@link ColumnMetadata.isGenerated}, e.g. an
+   * `int` column with PowDB's `auto` modifier) is left untouched — PowDB assigns
+   * it and the trailing `returning` reads it back — as is any non-string PK.
+   */
   private applyPkDefault(data: Record<string, unknown>): Record<string, unknown> {
     const out = { ...data };
     for (const pk of this.meta.primaryKey) {
       const field = this.meta.reverseColumnMap[pk] ?? pk;
       const col = this.meta.columns.find((c) => c.name === pk);
-      if (out[field] == null && col?.hasDefault && col.tsType.replace(/\s*\|\s*null$/, '').trim() === 'string') {
+      if (
+        out[field] == null &&
+        col?.hasDefault &&
+        !col.isGenerated &&
+        col.tsType.replace(/\s*\|\s*null$/, '').trim() === 'string'
+      ) {
         out[field] = randomUUID();
       }
     }
@@ -647,6 +897,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async create(args: CreateArgs<T>): Promise<T> {
     return this.withMiddleware('create', args as unknown as Record<string, unknown>, async () => {
+      if (hasRelationFields(args.data as Record<string, unknown>, this.meta)) {
+        return this.nestedCreate(args);
+      }
       const data = this.applyPkDefault(args.data as Record<string, unknown>);
       const assigns = this.scalarData(data);
       const params: unknown[] = [];
@@ -676,8 +929,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async update(args: UpdateArgs<T>): Promise<T> {
     return this.withMiddleware('update', args as unknown as Record<string, unknown>, async () => {
+      if (hasRelationFields(args.data as Record<string, unknown>, this.meta)) {
+        return this.nestedUpdate(args);
+      }
       const params: unknown[] = [];
-      const where = this.buildWhere(args.where, params);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, false, 'update');
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       // `returning` hands back the post-update row(s); take the first (single-row contract).
@@ -695,7 +952,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   async updateMany(args: UpdateManyArgs<T>): Promise<{ count: number }> {
     return this.withMiddleware('updateMany', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
-      const where = this.buildWhere(args.where, params);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, args.allowFullTableScan, 'updateMany');
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       const filter = where ? ` filter ${where}` : '';
@@ -710,7 +968,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (const [field, value] of Object.entries(data)) {
       if (value === undefined) continue;
       if (this.meta.relations[field]) {
-        throw new UnsupportedFeatureError('nested writes', 'PowDB', `relation "${field}" — Phase B`);
+        throw new UnsupportedFeatureError(
+          'nested writes',
+          'PowDB',
+          `relation "${field}" — nested writes need create()/update(), not updateMany()/upsert()`,
+        );
       }
       const colMeta = this.column(field);
       const ref = this.ref(field);
@@ -734,10 +996,84 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return parts.join(', ');
   }
 
+  // -------------------------------------------------------------------------
+  // Nested writes — create/update whose `data` carries relation ops (create,
+  // connect, connectOrCreate, disconnect, set, delete, update, upsert). Reuses
+  // the engine-agnostic nested-write engine (it only needs ctx.schema + the
+  // table accessors PowqlInterface already provides). Runs as ONE flat top-level
+  // PowDB transaction — single global write lock, no savepoints, so the whole
+  // tree commits or rolls back together (mirrors the SQL path's coverage:
+  // hasMany / hasOne / belongsTo; manyToMany nested writes are not handled by
+  // the shared engine on any backend).
+  // -------------------------------------------------------------------------
+
+  private isTxScoped(): boolean {
+    return (this.options as { _txScoped?: boolean })._txScoped === true;
+  }
+
+  private async nestedCreate(args: CreateArgs<T>): Promise<T> {
+    const data = args.data as Record<string, unknown>;
+    if (this.isTxScoped()) {
+      return executeNestedCreate(this.buildNestedCtx(), this.table, data) as Promise<T>;
+    }
+    return this.runInImplicitTx((ctx) => executeNestedCreate(ctx, this.table, data)) as Promise<T>;
+  }
+
+  private async nestedUpdate(args: UpdateArgs<T>): Promise<T> {
+    const data = args.data as Record<string, unknown>;
+    const where = args.where as Record<string, unknown>;
+    if (this.isTxScoped()) {
+      return executeNestedUpdate(this.buildNestedCtx(), this.table, where, data) as Promise<T>;
+    }
+    return this.runInImplicitTx((ctx) => executeNestedUpdate(ctx, this.table, where, data)) as Promise<T>;
+  }
+
+  /** Open a flat PowDB transaction on a pinned connection and run `fn` inside it. */
+  private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>): Promise<R> {
+    // Route tx keywords through the dialect (like the SQL path) so this never
+    // drifts from `powdbDialect`; falls back to the literal lowercase keywords.
+    const d = this.options.dialect;
+    const client = await this.pool.connect();
+    try {
+      await client.query(d?.beginStatement?.() ?? 'begin');
+      const { TransactionClient } = await import('./client.js');
+      const tx = new TransactionClient(
+        client as unknown as never,
+        this.schema,
+        this.middlewares as unknown as never,
+        this.options,
+      );
+      const ctx: NestedWriteContext = { schema: this.schema, tx: tx as unknown as NestedWriteContext['tx'] };
+      const result = await fn(ctx);
+      await client.query(d?.commitStatement?.() ?? 'commit');
+      return result;
+    } catch (err) {
+      try {
+        await client.query(d?.rollbackStatement?.() ?? 'rollback');
+      } catch {
+        /* best-effort — the connection may be gone */
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Already inside a transaction: build a context whose table accessors reuse the pinned pool. */
+  private buildNestedCtx(): NestedWriteContext {
+    const opts = { ...this.options, _txScoped: true } as QueryInterfaceOptions;
+    const tx = {
+      table: <U extends object>(name: string) =>
+        new PowqlInterface<U>(this.pool, name, this.schema, this.middlewares, opts),
+    };
+    return { schema: this.schema, tx: tx as unknown as NestedWriteContext['tx'] };
+  }
+
   async delete(args: DeleteArgs<T>): Promise<T> {
     return this.withMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
-      const where = this.buildWhere(args.where, params);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, false, 'delete');
       // `returning` hands back the deleted row(s) — no separate pre-image reselect needed.
       const { rows } = await this.exec(`${this.table} filter ${where} delete returning`, params, args.timeout);
@@ -750,7 +1086,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   async deleteMany(args: DeleteManyArgs<T>): Promise<{ count: number }> {
     return this.withMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
-      const where = this.buildWhere(args.where, params);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, args.allowFullTableScan, 'deleteMany');
       const filter = where ? ` filter ${where}` : '';
       const { rowCount } = await this.exec(`${this.table}${filter} delete`, params, args.timeout);
@@ -762,8 +1099,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return this.withMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
       const createData = this.applyPkDefault(args.create as Record<string, unknown>);
       const pkCol = this.meta.primaryKey[0];
-      if (!pkCol || this.meta.primaryKey.length !== 1) {
-        throw new UnsupportedFeatureError('composite-key upsert', 'PowDB', `table "${this.table}"`);
+      if (this.meta.primaryKey.length !== 1 || !pkCol) {
+        // PowQL's native `upsert … on .col` takes a single conflict column, so a
+        // composite PK falls back to an atomic reselect-or-write transaction.
+        return this.upsertComposite(createData, args.update as Record<string, unknown>);
       }
       const params: unknown[] = [];
       const createBody = this.scalarData(createData)
@@ -786,6 +1125,37 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
   }
 
+  /**
+   * Composite-key upsert: PowQL's `upsert … on .col` only takes one conflict
+   * column, so reselect by the full composite PK and update-or-create inside one
+   * flat transaction (PowDB single-writer makes the read-then-write safe from
+   * concurrent writers; the transaction makes it atomic with the write).
+   */
+  private async upsertComposite(createData: Record<string, unknown>, updateData: Record<string, unknown>): Promise<T> {
+    // Accept either the camelCase field or the snake_case column in `create`
+    // (create() resolves both), and key the where by field name.
+    const pkPairs = this.meta.primaryKey.map((pk) => {
+      const field = this.meta.reverseColumnMap[pk] ?? pk;
+      return { field, value: createData[field] ?? createData[pk] };
+    });
+    if (pkPairs.some((p) => p.value == null)) {
+      throw new ValidationError(
+        `[turbine] upsert on "${this.table}" needs every composite-PK field in \`create\` (${pkPairs
+          .map((p) => p.field)
+          .join(', ')}).`,
+      );
+    }
+    const pkWhere = Object.fromEntries(pkPairs.map((p) => [p.field, p.value]));
+    const run = async (ctx: NestedWriteContext): Promise<T> => {
+      const tbl = ctx.tx.table<T>(this.table);
+      const existing = await tbl.findUnique({ where: pkWhere });
+      return existing
+        ? ((await tbl.update({ where: pkWhere, data: updateData })) as T)
+        : ((await tbl.create({ data: createData as Partial<T> })) as T);
+    };
+    return this.isTxScoped() ? run(this.buildNestedCtx()) : this.runInImplicitTx(run);
+  }
+
   // -------------------------------------------------------------------------
   // Aggregates
   // -------------------------------------------------------------------------
@@ -793,7 +1163,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   async count(args: CountArgs<T> = {}): Promise<number> {
     return this.withMiddleware('count', (args ?? {}) as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
-      const where = this.buildWhere(args.where, params);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const where = this.buildWhere(resolvedWhere, params);
       const filter = where ? ` filter ${where}` : '';
       const { rows } = await this.exec(`count(${this.table}${filter})`, params, args.timeout);
       return Number((rows[0]?.value ?? rows[0]?.count ?? 0) as string | number);
@@ -805,7 +1176,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // One scalar query per aggregate — PowDB's bare-projection aggregate is broken.
       const result: AggregateResult<T> = {};
       const filterParams: unknown[] = [];
-      const where = this.buildWhere(args.where, filterParams);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const where = this.buildWhere(resolvedWhere, filterParams);
       const filter = where ? ` filter ${where}` : '';
       const scalar = async (expr: string): Promise<number | null> => {
         const params = [...filterParams];
@@ -841,7 +1213,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
     return this.withMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
-      const where = this.buildWhere(args.where, params);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const where = this.buildWhere(resolvedWhere, params);
       const filter = where ? ` filter ${where}` : '';
       const groupKeys = args.by.map((f) => this.ref(f));
       // Safe aliases — PowQL rejects reserved-word aliases (e.g. `count:`).

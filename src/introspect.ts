@@ -42,6 +42,7 @@ const SQL_COLUMNS = `
     data_type,
     is_nullable,
     column_default,
+    is_identity,
     ordinal_position,
     character_maximum_length
   FROM information_schema.columns
@@ -212,6 +213,12 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
           pgTypeToTs(isArray ? dialectType : baseType, isNullable),
         nullable: isNullable,
         hasDefault: row.column_default !== null,
+        // Server-generated = a sequence default (serial/BIGSERIAL → nextval(…))
+        // or an IDENTITY column. Distinct from a client-side default expression
+        // (gen_random_uuid(), now()), which Turbine must still synthesize.
+        isGenerated:
+          (typeof row.column_default === 'string' && row.column_default.includes('nextval(')) ||
+          row.is_identity === 'YES',
         isArray,
         arrayType,
         pgArrayType: arrayType,

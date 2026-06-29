@@ -133,11 +133,25 @@ src/
                       (`supportsReturning: true`; the Postgres-only flags stay false →
                       `$listen`/`$notify`/RLS/pgvector throw E017). PowDB realities shaping it:
                       writes use the trailing **`returning`** keyword (create/createMany/update/
-                      delete) — `upsert` reselects by PK (its statement rejects `returning`); no
-                      generated IDs (→client UUID); no JSON-agg/link-nav (→N+1 `with` loaders,
-                      keys chunked at `MAX_RELATION_KEYS=1000`); no wire introspection (→`defineSchema`
-                      only). **Single global write lock — single-writer transactions:** a nested
-                      `tx.$transaction` throws E017 (`powdbDialect` savepoint keywords throw), and a
+                      delete) — `upsert` reselects by PK (its statement rejects `returning`; a
+                      **composite-PK upsert** reselects-or-writes in one flat txn via `upsertComposite`).
+                      **PKs: server-assigned `auto` int OR client UUID** — `isGenerated` columns emit
+                      PowDB's `auto` modifier (`powqlSchemaDDL`) and let the engine assign the id;
+                      otherwise a defaulted string PK gets a client UUID (`applyPkDefault`). No
+                      JSON-agg/link-nav (→N+1 `with` loaders incl. **m2m via the junction**
+                      `loadManyToMany`, keys chunked at `MAX_RELATION_KEYS=1000`); no wire introspection
+                      (→`defineSchema` only). **Relation filters (`some`/`none`/`every`, all
+                      cardinalities incl. m2m) resolve CLIENT-SIDE** (`resolveRelationFilters` →
+                      literal `in (list)`), NEVER an IN-subquery: PowDB's executor caches a subquery
+                      result by plan shape ignoring the literal → a repeated `in (<subquery>)` returns
+                      stale rows (a real engine bug, reproduced on the raw addon; it had silently
+                      broken the 0.22.0 hasMany/belongsTo filters). **Nested writes** (relation ops in
+                      create/update data) route to the shared `executeNestedCreate/Update` engine via
+                      `runInImplicitTx` (one flat top-level txn; same hasMany/hasOne/belongsTo coverage
+                      as SQL; m2m nested writes unhandled on every backend). Composite-PK columns are
+                      `required` only — PowDB has no composite-unique, so per-column `unique` is emitted
+                      ONLY for a single-column PK. **Single global write lock — single-writer transactions:**
+                      a nested `tx.$transaction` throws E017 (`powdbDialect` savepoint keywords throw), and a
                       re-entrant/concurrent `db.$transaction` throws E017 via a pool-level
                       `activeTransaction` guard (this prevents the networked second-`begin` HANG on the
                       held lock). The empty-where guard gates on the COMPILED PowQL filter (like the SQL

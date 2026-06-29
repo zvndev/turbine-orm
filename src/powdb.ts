@@ -279,16 +279,29 @@ function isDateColumn(col: ColumnMetadata): boolean {
  * Generate PowQL DDL (`type T { … }`) for every table in a schema. Used to
  * provision a PowDB database from a code-first `defineSchema`/`SchemaMetadata`
  * (PowDB has no migration runner yet). The primary key column is declared
- * `required unique`; non-nullable columns are `required`.
+ * `required unique`; non-nullable columns are `required`. A server-generated
+ * column ({@link ColumnMetadata.isGenerated}) that maps to PowQL `int` gets the
+ * `auto` modifier, so PowDB assigns a monotonic id on insert and Turbine stops
+ * synthesizing a client-side value for it.
  */
 export function powqlSchemaDDL(schema: SchemaMetadata): string[] {
   const stmts: string[] = [];
   for (const meta of Object.values(schema.tables)) {
     const pkSet = new Set(meta.primaryKey);
+    // PowDB's `unique` is single-column only — there is no composite-unique
+    // constraint (`add unique` takes one `.column`). So the per-field `unique`
+    // modifier is emitted only for a single-column PK; a composite PK (e.g. a
+    // m2m junction's `(source_id, target_id)`) marks its columns `required` but
+    // cannot enforce the tuple's uniqueness at the engine level.
+    const pkIsSingle = meta.primaryKey.length === 1;
     const fields = meta.columns.map((col) => {
       const mods: string[] = [];
       if (!col.nullable || pkSet.has(col.name)) mods.push('required');
-      if (pkSet.has(col.name)) mods.push('unique');
+      if (pkSet.has(col.name) && pkIsSingle) mods.push('unique');
+      // `auto` = server-generated monotonic int. PowDB requires it be `int` and
+      // rejects it alongside a `default`; non-int generated columns fall back to
+      // a plain typed column (Turbine assigns the value client-side instead).
+      if (col.isGenerated && powqlColumnType(col) === 'int') mods.push('auto');
       return `  ${mods.join(' ')}${mods.length ? ' ' : ''}${col.name}: ${powqlColumnType(col)}`;
     });
     stmts.push(`type ${meta.name} {\n${fields.join(',\n')}\n}`);
