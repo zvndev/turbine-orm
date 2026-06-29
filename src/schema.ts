@@ -58,6 +58,16 @@ export interface ColumnMetadata {
   nullable: boolean;
   /** Whether the column has a DEFAULT, is serial, or is generated */
   hasDefault: boolean;
+  /**
+   * Whether the **database server** generates this column's value on insert —
+   * a `serial`/`BIGSERIAL` sequence, an `IDENTITY` column, or PowDB's `auto`
+   * modifier. This is a strict subset of {@link hasDefault} (a server-generated
+   * column always reports `hasDefault: true`), but unlike a client-side default
+   * expression (`gen_random_uuid()`, `now()`) the value is assigned by the
+   * engine, so Turbine must NOT synthesize one client-side and the PowDB DDL
+   * emits the `auto` modifier. Optional / defaults to `false` for back-compat.
+   */
+  isGenerated?: boolean;
   /** Whether this is an array column */
   isArray: boolean;
   /** Dialect-specific array/bulk-insert type token when needed. */

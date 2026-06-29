@@ -1,5 +1,18 @@
 # Turbine ↔ PowDB Feature Parity Matrix
 
+**v0.23.0 update (2026-06-29) — Phase B landed + a relation-filter correctness fix.** Now shipped:
+server-generated **`auto` int PKs** (`isGenerated`), **many-to-many** nested reads + relation filters
+(client-side resolution through the junction), **nested writes** (create/update relation ops, one flat
+transaction), and **composite-key upsert** (reselect-or-write). **Correctness fix:** relation filters
+(all cardinalities) NO LONGER use the IN-subquery form below — PowDB's executor caches a subquery's
+result by plan shape, ignoring the literal, so a repeated `in (<subquery>)` of the same shape returned
+the prior query's stale rows (reproduced on the raw embedded addon; it had silently broken the 0.22.0
+hasMany/belongsTo filters). Turbine now resolves every relation filter to a literal `in (<keys>)` list
+client-side (`resolveRelationFilters`). The IN-subquery rows below (lines ~52, 104–106) are **retired** —
+read them as "what we tried, then replaced." Still E017: composite-key relation filters / composite-junction
+m2m (PowQL has no tuple-`in`), nested writes in `createMany`/`upsert`, cursor streaming, and the
+Postgres-only set. *(The subquery-cache defect was reported upstream to PowDB.)*
+
 **Grounded firsthand** against a live `powdb-server` **v0.7.0** (built from source 2026-06-28) via
 `@zvndev/powdb-client` **and** the in-process `@zvndev/powdb-embedded` addon. The rows below were
 established by running the actual PowQL against a real engine — not inferred from docs. The embedded

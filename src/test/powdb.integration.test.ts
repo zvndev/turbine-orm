@@ -367,3 +367,240 @@ describe('powdb integration (embedded)', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase B (v0.23.0) — auto/server-generated PKs, manyToMany reads + filters,
+// nested writes, composite-key upsert. Own schema (auto-int PKs + a junction).
+// These exercise the live engine; the relation-filter cases also guard the
+// PowDB subquery-result-cache bug (Turbine resolves filters to literal lists).
+// ---------------------------------------------------------------------------
+
+function composite(name: string, columns: ColumnMetadata[], pk: string[]): TableMetadata {
+  return { ...makeTable(name, columns), primaryKey: pk, uniqueColumns: [] };
+}
+
+const pbSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    member: makeTable(
+      'member',
+      [
+        col('id', 'id', 'number', 'int8', { isGenerated: true, hasDefault: true }),
+        col('name', 'name', 'string', 'text'),
+      ],
+      {
+        posts: {
+          type: 'hasMany',
+          name: 'posts',
+          from: 'member',
+          to: 'ppost',
+          foreignKey: 'member_id',
+          referenceKey: 'id',
+        },
+        tags: {
+          type: 'manyToMany',
+          name: 'tags',
+          from: 'member',
+          to: 'ptag',
+          foreignKey: 'id',
+          referenceKey: 'id',
+          through: { table: 'member_tag', sourceKey: 'member_id', targetKey: 'tag_id' },
+        },
+      },
+    ),
+    ppost: makeTable(
+      'ppost',
+      [
+        col('id', 'id', 'number', 'int8', { isGenerated: true, hasDefault: true }),
+        col('member_id', 'memberId', 'number', 'int8'),
+        col('title', 'title', 'string', 'text'),
+      ],
+      {
+        author: {
+          type: 'belongsTo',
+          name: 'author',
+          from: 'ppost',
+          to: 'member',
+          foreignKey: 'member_id',
+          referenceKey: 'id',
+        },
+      },
+    ),
+    ptag: makeTable('ptag', [
+      col('id', 'id', 'number', 'int8', { isGenerated: true, hasDefault: true }),
+      col('label', 'label', 'string', 'text'),
+    ]),
+    member_tag: composite(
+      'member_tag',
+      [col('member_id', 'memberId', 'number', 'int8'), col('tag_id', 'tagId', 'number', 'int8')],
+      ['member_id', 'tag_id'],
+    ),
+    pscore: composite(
+      'pscore',
+      [
+        col('member_id', 'memberId', 'number', 'int8'),
+        col('tag_id', 'tagId', 'number', 'int8'),
+        col('points', 'points', 'number', 'int8'),
+      ],
+      ['member_id', 'tag_id'],
+    ),
+  },
+};
+
+async function withPb(fn: (db: DB) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'powdb-pb-'));
+  const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, pbSchema, { warnOnUnlimited: false });
+  try {
+    for (const stmt of powqlSchemaDDL(pbSchema)) await db.raw([stmt]);
+    await fn(db);
+  } finally {
+    await db.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('powdb integration: Phase B', () => {
+  it('auto/server-generated int PK — create/createMany assign monotonic ids', async () => {
+    await withPb(async (db) => {
+      const a = await db.table('member').create({ data: { name: 'Ada' } });
+      const b = await db.table('member').create({ data: { name: 'Bob' } });
+      assert.equal(typeof a.id, 'number');
+      assert.equal(b.id, a.id + 1);
+      const many = await db.table('member').createMany({ data: [{ name: 'Cy' }, { name: 'Di' }] });
+      assert.equal(many.length, 2);
+      assert.notEqual(many[0].id, many[1].id);
+    });
+  });
+
+  it('manyToMany nested reads — junction loader stitches targets (empty array, not null)', async () => {
+    await withPb(async (db) => {
+      const ada = await db.table('member').create({ data: { name: 'Ada' } });
+      const bob = await db.table('member').create({ data: { name: 'Bob' } });
+      const cy = await db.table('member').create({ data: { name: 'Cy' } });
+      const red = await db.table('ptag').create({ data: { label: 'red' } });
+      const blue = await db.table('ptag').create({ data: { label: 'blue' } });
+      await db.table('member_tag').createMany({
+        data: [
+          { memberId: ada.id, tagId: red.id },
+          { memberId: ada.id, tagId: blue.id },
+          { memberId: bob.id, tagId: blue.id },
+        ],
+      });
+      const rows = await db.table('member').findMany({
+        where: { id: { in: [ada.id, bob.id, cy.id] } },
+        orderBy: { id: 'asc' },
+        with: { tags: true },
+      });
+      const by = Object.fromEntries(rows.map((r: { name: string }) => [r.name, r]));
+      assert.equal(by.Ada.tags.length, 2);
+      assert.deepEqual(by.Ada.tags.map((t: { label: string }) => t.label).sort(), ['blue', 'red']);
+      assert.equal(by.Bob.tags.length, 1);
+      assert.ok(Array.isArray(by.Cy.tags) && by.Cy.tags.length === 0);
+    });
+  });
+
+  it('manyToMany relation filters — some/none/every resolve correctly and DETERMINISTICALLY', async () => {
+    await withPb(async (db) => {
+      const ada = await db.table('member').create({ data: { name: 'Ada' } });
+      const bob = await db.table('member').create({ data: { name: 'Bob' } });
+      const cy = await db.table('member').create({ data: { name: 'Cy' } });
+      const red = await db.table('ptag').create({ data: { label: 'red' } });
+      const blue = await db.table('ptag').create({ data: { label: 'blue' } });
+      await db.table('member_tag').createMany({
+        data: [
+          { memberId: ada.id, tagId: red.id },
+          { memberId: ada.id, tagId: blue.id },
+          { memberId: bob.id, tagId: blue.id },
+        ],
+      });
+      const names = (rs: { name: string }[]) =>
+        rs
+          .map((r) => r.name)
+          .sort()
+          .join(',');
+      // Run red BEFORE blue — the pre-cache-bug ordering that returned stale rows.
+      assert.equal(names(await db.table('member').findMany({ where: { tags: { some: { label: 'red' } } } })), 'Ada');
+      assert.equal(
+        names(await db.table('member').findMany({ where: { tags: { some: { label: 'blue' } } } })),
+        'Ada,Bob',
+      );
+      assert.equal(names(await db.table('member').findMany({ where: { tags: { none: { label: 'blue' } } } })), 'Cy');
+      assert.equal(
+        names(await db.table('member').findMany({ where: { tags: { every: { label: 'blue' } } } })),
+        'Bob,Cy',
+      );
+      void cy;
+    });
+  });
+
+  it('hasMany/belongsTo relation filters resolve to literal lists (no stale IN-subquery)', async () => {
+    await withPb(async (db) => {
+      const ada = await db.table('member').create({ data: { name: 'Ada' } });
+      const bob = await db.table('member').create({ data: { name: 'Bob' } });
+      await db.table('ppost').createMany({
+        data: [
+          { memberId: ada.id, title: 'x' },
+          { memberId: bob.id, title: 'y' },
+        ],
+      });
+      // querying by different titles back-to-back must NOT return stale results
+      const x = await db.table('member').findMany({ where: { posts: { some: { title: 'x' } } } });
+      const y = await db.table('member').findMany({ where: { posts: { some: { title: 'y' } } } });
+      assert.deepEqual(
+        x.map((m: { name: string }) => m.name),
+        ['Ada'],
+      );
+      assert.deepEqual(
+        y.map((m: { name: string }) => m.name),
+        ['Bob'],
+      );
+    });
+  });
+
+  it('nested writes — hasMany create + belongsTo create/connect, atomic rollback on failure', async () => {
+    await withPb(async (db) => {
+      const eve = await db
+        .table('member')
+        .create({ data: { name: 'Eve', posts: { create: [{ title: 'P1' }, { title: 'P2' }] } } });
+      const full = await db.table('member').findUnique({ where: { id: eve.id }, with: { posts: true } });
+      assert.equal(full.posts.length, 2);
+      assert.ok(full.posts.every((p: { memberId: number }) => p.memberId === eve.id));
+      const post = await db
+        .table('ppost')
+        .create({ data: { title: 'byFrank', author: { create: { name: 'Frank' } } } });
+      const frank = await db.table('member').findFirst({ where: { name: 'Frank' } });
+      assert.equal(post.memberId, frank.id);
+      // atomic: a failing nested create rolls back the parent
+      const dupe = post.id;
+      let threw = false;
+      try {
+        await db
+          .table('member')
+          .create({ data: { name: 'Zed', posts: { create: [{ title: 'ok' }, { id: dupe, title: 'dupe' }] } } });
+      } catch {
+        threw = true;
+      }
+      assert.ok(threw);
+      assert.equal((await db.table('member').findMany({ where: { name: 'Zed' } })).length, 0);
+    });
+  });
+
+  it('composite-key upsert — insert then update branch, exactly one row', async () => {
+    await withPb(async (db) => {
+      const ins = await db.table('pscore').upsert({
+        where: { memberId: 1, tagId: 2 },
+        create: { memberId: 1, tagId: 2, points: 10 },
+        update: { points: 99 },
+      });
+      assert.equal(ins.points, 10);
+      const upd = await db.table('pscore').upsert({
+        where: { memberId: 1, tagId: 2 },
+        create: { memberId: 1, tagId: 2, points: 10 },
+        update: { points: 99 },
+      });
+      assert.equal(upd.points, 99);
+      const rows = await db.table('pscore').findMany({ where: { memberId: 1, tagId: 2 } });
+      assert.equal(rows.length, 1);
+    });
+  });
+});

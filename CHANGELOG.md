@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.23.0 (2026-06-29)
+
+**PowDB Phase B — server-generated PKs, many-to-many, nested writes, composite-key upsert — plus a correctness fix for relation filters.** All PowDB-only; the four SQL engines are untouched and `npm i turbine-orm` still installs only `pg`.
+
+### Fixed
+- **Relation filters (`some`/`none`/`every`) no longer return stale results on PowDB (correctness, affects 0.22.0).** PowDB's executor caches an `in (<subquery>)` result by **plan shape, ignoring the literal**, so a second relation filter of the same shape with a different value returned the first query's rows (reproduced against the raw embedded addon, no Turbine). Turbine no longer emits an IN-subquery for relation filters: it **resolves the inner predicate to a literal key list** (`resolveRelationFilters`) and filters with `in (<list>)`, which is always correct. This covers hasMany / hasOne / belongsTo (the 0.22.0 shapes) and the new manyToMany filters, at every nesting level, on `findMany`/`findUnique`/`update`/`delete`/`count`/`aggregate`/`groupBy`. Trades one extra round-trip per relation filter for correctness. *(Reported upstream to PowDB; the SQL engines were never affected — they use real `EXISTS`/`json_agg`.)*
+
+### Added
+- **Server-generated / auto-increment primary keys.** New `ColumnMetadata.isGenerated` flag distinguishes a DB-assigned PK (serial / `IDENTITY` / PowDB `auto`) from a client-side default. On PowDB, `powqlSchemaDDL` now emits the **`auto`** modifier (`unique auto id: int`) for a generated int PK and `create`/`createMany` let the engine assign the id (read back via `returning`) instead of synthesizing a client UUID. Introspection sets the flag from `nextval(` / `is_identity`; the code generator emits it. **No change to the SQL engines** — the flag is additive and they already omit undefined PKs and rely on `RETURNING`.
+- **many-to-many nested reads** — `with: { tags: true }` on a junction relation now loads through the junction (batched, chunked at 1,000 keys), with correct empty-array semantics and nested `where`/`with`.
+- **many-to-many relation filters** — `where: { tags: { some/none/every } }` through a junction table.
+- **Nested writes on PowDB** — relation ops in `create`/`update` data (`create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert` for hasMany/hasOne/belongsTo) now run through the shared nested-write engine as **one flat top-level transaction** (PowDB is single-writer / no savepoints, so the whole tree commits or rolls back together). Same coverage as the SQL engines.
+- **Composite-key upsert on PowDB** — PowQL's native `upsert … on .col` takes a single conflict column, so a composite PK now falls back to an atomic reselect-or-write transaction.
+- Live `powdb-integration` coverage for every item above (6 new tests against the real embedded addon), plus build-only DDL tests for the `auto` modifier and the composite-PK fix.
+
+### Changed
+- **`powqlSchemaDDL` no longer marks each column of a composite PK individually `unique`.** PowDB has no composite-unique constraint (its `unique` is single-column), and per-column `unique` wrongly forbade, e.g., a member having two tags. Composite-PK columns are now `required` only; a single-column PK still gets `unique`.
+
+### Still unsupported on PowDB (throws `UnsupportedFeatureError` / E017)
+- Composite-key **relation filters** and **composite-key m2m** (PowQL has no tuple-`in` `(a,b) in (…)`), nested writes inside `createMany`/`upsert` (use `create`/`update`), and the unchanged Postgres-only set: pgvector, LISTEN/NOTIFY, RLS `sessionContext`, cursor streaming.
+
 ## 0.22.0 (2026-06-28)
 
 **New engine: PowDB.** Turbine now runs on [PowDB](https://github.com/zvndev/powdb), a single-node embedded database with its own query language (PowQL — not SQL), behind the same `findMany` / `with` / `where` / `create` API. PowDB is the only engine that runs **both** in-process (embedded) **and** over a network client against the same data. Postgres remains the default and primary target; PowDB is an additive optional-peer subpath export — `npm i turbine-orm` still installs only `pg`.

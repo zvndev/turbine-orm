@@ -212,22 +212,23 @@ Embedded keeps a real storage engine (indexes, WAL) *and* has a networked siblin
 
 PowDB is a younger, intentionally smaller engine, so Turbine's PowQL backend differs from the SQL path in a few honest ways:
 
-- **Nested `with` uses N+1 loaders, not a single query.** PowDB has no `json_agg`/link-navigation, so each relation level is a separate batched lookup (keys chunked at 1,000). Correctness is identical; depth-D nesting costs D round-trips, not one.
-- **Primary keys are client-assigned.** PowDB does not generate IDs, so Turbine writes a UUID string PK on `create`. Plan your schema around string PKs (or supply your own).
-- **Single-writer transactions, no nesting.** `db.$transaction` works, but PowDB has one global write lock — a nested or concurrent `$transaction` throws `UnsupportedFeatureError` (no savepoints) rather than deadlocking.
+- **Nested `with` uses N+1 loaders, not a single query.** PowDB has no `json_agg`/link-navigation, so each relation level — including **many-to-many through a junction table** — is a separate batched lookup (keys chunked at 1,000). Correctness is identical; depth-D nesting costs D round-trips, not one.
+- **Primary keys can be server-assigned _or_ client-assigned.** Declare an `auto` int PK (`isGenerated`) and PowDB assigns a monotonic id on `create` (read back automatically); otherwise a defaulted string PK gets a client-generated UUID.
+- **Relation filters resolve to a literal list, not a subquery.** `where: { tags: { some } }` runs the inner predicate first and filters with `in (<keys>)` — one extra round-trip, but it sidesteps a PowDB engine quirk where a repeated `in (<subquery>)` of the same shape can return a stale cached result. Correct on every cardinality and nesting level.
+- **Nested writes run as one flat transaction.** `create`/`update` with relation ops (`create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert` on hasMany/hasOne/belongsTo) commit or roll back together. PowDB is single-writer with one global write lock — a nested or concurrent `$transaction` throws `UnsupportedFeatureError` (no savepoints) rather than deadlocking.
 - **Schema is code-only.** No wire introspection → define schemas with `defineSchema`; `turbine generate` / `turbine migrate` are Postgres-only.
 - **Type mapping is narrowed.** PowDB stores `str` / `int` / `float` / `bool`; Turbine never emits `uuid` / `datetime` / `bytes` on the wire, and maps `Date` to integer microseconds.
 
 ### Unsupported features → `TURBINE_E017`
 
-Beyond the Postgres-only trio every non-Postgres engine throws on (pgvector, LISTEN/NOTIFY, RLS `sessionContext`), PowDB also throws `UnsupportedFeatureError` for capabilities that are not yet built (several are slated for a later phase):
+Beyond the Postgres-only trio every non-Postgres engine throws on (pgvector, LISTEN/NOTIFY, RLS `sessionContext`), PowDB throws `UnsupportedFeatureError` for the capabilities PowQL genuinely can't express:
 
 - **Filters:** JSON path/key, array, full-text, and pgvector-distance filters; vector / distance ordering.
-- **Relations:** many-to-many relation filters *and* nested reads (junction tables — Phase B); composite-key relation filters and composite-key nested reads.
-- **Writes:** nested writes inside `create` / `update` data (Phase B); composite-key `upsert`.
+- **Composite keys via subqueries:** composite-key relation filters, composite-key nested reads, and composite-junction many-to-many — PowQL has no tuple-`in` (`(a, b) in (…)`). (A single-row `findUnique`/`upsert` on a composite PK works — it's plain `AND`-of-equalities.)
+- **Writes:** nested writes inside `createMany` / `upsert` (use `create` / `update`).
 - **Reads:** cursor pagination and `findManyStream` (no server-side cursor — page with `findMany({ limit, offset })`).
 
-Everything else — `findMany` / `findUnique` / `findFirst`, `create` / `createMany` / `update` / `updateMany` / `delete` / `deleteMany` / `upsert`, atomic update operators, `count` / `aggregate` / `groupBy`, `where` operators, `orderBy` / `select` / `omit`, and single-key `with` for hasMany / belongsTo / hasOne (including `some` / `none` relation filters) — works.
+Everything else works — `findMany` / `findUnique` / `findFirst`, `create` / `createMany` / `update` / `updateMany` / `delete` / `deleteMany` / `upsert` (composite PK included), atomic update operators, `count` / `aggregate` / `groupBy`, `where` operators, `orderBy` / `select` / `omit`, `with` for hasMany / belongsTo / hasOne **and many-to-many**, relation filters (`some` / `none` / `every`) on every cardinality, and nested writes in `create` / `update`.
 
 ### Platform binaries (embedded)
 
