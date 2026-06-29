@@ -588,10 +588,16 @@ interface EmbeddedDatabase {
   querySql(sql: string): EmbeddedQueryResult;
   queryReadonly(powql: string): EmbeddedQueryResult;
   isPoisoned(): boolean;
+  /** WAL durability selector — `@zvndev/powdb-embedded` ≥ 0.7.1. */
+  setSyncMode?(mode: string): void;
 }
 
 interface EmbeddedModule {
-  Database: { open(dir: string): EmbeddedDatabase };
+  Database: {
+    open(dir: string): EmbeddedDatabase;
+    /** Open with a per-query memory budget — `@zvndev/powdb-embedded` ≥ 0.7.1. */
+    openWithMemoryLimit?(dir: string, limitBytes: number): EmbeddedDatabase;
+  };
 }
 
 /** Normalize the embedded addon's loosely-typed result into a {@link PowdbResult}. */
@@ -776,10 +782,20 @@ export interface TurbinePowdbOptions extends Pick<TurbineConfig, 'logging' | 'de
  * @example
  * ```ts
  * const db = await turbinePowDB({ embedded: '/var/data/app.powdb' }, SCHEMA);
+ * // Faster writes (fsync off the commit path, bounded-loss) — requires addon >= 0.7.1:
+ * const fast = await turbinePowDB({ embedded: '/var/data/app.powdb', syncMode: 'normal' }, SCHEMA);
  * ```
  */
 export interface TurbinePowdbEmbeddedTarget {
   embedded: string;
+  /**
+   * WAL durability for the embedded engine (requires `@zvndev/powdb-embedded` ≥ 0.7.1):
+   * `'full'` (default — fsync per commit), `'normal'` (fsync off the commit path,
+   * ~15–40× faster writes, bounded loss on OS crash/power loss), `'off'` (bench-only).
+   */
+  syncMode?: 'full' | 'normal' | 'off';
+  /** Per-query memory budget in bytes (requires `@zvndev/powdb-embedded` ≥ 0.7.1). */
+  memoryLimit?: number;
 }
 
 /**
@@ -827,13 +843,30 @@ async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
 }
 
 /** Open an embedded database handle, wrapping engine open failures (corrupt dir, etc.). */
-async function openEmbeddedPool(dir: string): Promise<PowdbEmbeddedPool> {
+async function openEmbeddedPool(target: TurbinePowdbEmbeddedTarget): Promise<PowdbEmbeddedPool> {
   const mod = await loadPowdbEmbedded();
+  const { embedded: dir, syncMode, memoryLimit } = target;
   let db: EmbeddedDatabase;
   try {
-    db = mod.Database.open(dir);
+    if (memoryLimit !== undefined) {
+      if (typeof mod.Database.openWithMemoryLimit !== 'function') {
+        throw new ConnectionError('[turbine] embedded `memoryLimit` requires @zvndev/powdb-embedded ≥ 0.7.1.');
+      }
+      db = mod.Database.openWithMemoryLimit(dir, memoryLimit);
+    } else {
+      db = mod.Database.open(dir);
+    }
   } catch (err) {
+    if (err instanceof ConnectionError) throw err;
     throw new ConnectionError(`[turbine] PowDB embedded could not open data dir "${dir}": ${(err as Error).message}`);
+  }
+  if (syncMode !== undefined) {
+    if (typeof db.setSyncMode !== 'function') {
+      throw new ConnectionError(
+        '[turbine] embedded `syncMode` requires @zvndev/powdb-embedded ≥ 0.7.1 (the installed addon has no setSyncMode).',
+      );
+    }
+    db.setSyncMode(syncMode);
   }
   return new PowdbEmbeddedPool(db);
 }
@@ -873,7 +906,7 @@ export async function turbinePowDB(
   } else if (target instanceof PowdbPool) {
     pool = target;
   } else if (isEmbeddedTarget(target)) {
-    pool = await openEmbeddedPool(target.embedded);
+    pool = await openEmbeddedPool(target);
     owns = true;
   } else if (isPowdbClientPool(target)) {
     pool = new PowdbPool(target);

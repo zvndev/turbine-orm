@@ -1,4 +1,4 @@
-# Turbine ORM — Cross-Engine Benchmark (PowDB v0.7.0)
+# Turbine ORM — Cross-Engine Benchmark (PowDB v0.7.1)
 
 Same ORM-realistic operation mix run through **Turbine's API** against each engine, to show
 where each is strong/weak *as seen through the ORM* (not a raw-driver or cross-ORM shootout).
@@ -10,95 +10,83 @@ where each is strong/weak *as seen through the ORM* (not a raw-driver or cross-O
 - **Method:** one connection per engine; per-op warmup (30) then 200 measured iterations
   (80 nested, 150 writes, 40 bulk); report p50/p95/p99 + ops/sec.
 - **Run on:** Apple-Silicon mac, local loopback. PG 16, SQLite (node:sqlite), MySQL 9,
-  **PowDB 0.7.0**. Two PowDB configs are measured:
-  - **PowDB (net)** — networked `@zvndev/powdb-client` over a **Unix domain socket**, server
-    started with **`POWDB_SYNC_MODE=normal`** (bounded-loss WAL durability).
-  - **PowDB (embed)** — in-process `@zvndev/powdb-embedded` napi addon, **no server/socket**.
-    Durability is **Full** (the addon exposes no sync-mode selector from JS — see "remaining gap").
+  **PowDB 0.7.1**. Two PowDB configs:
+  - **PowDB (net)** — networked `@zvndev/powdb-client` over a Unix domain socket, server
+    started with `POWDB_SYNC_MODE=normal`.
+  - **PowDB (embed·norm)** — in-process `@zvndev/powdb-embedded` addon, **no server/socket**,
+    opened with **`turbinePowDB({ embedded, syncMode: 'normal' })`** — the 0.7.1 knob that
+    moves fsync off the commit path. (0.7.0 embedded had no such selector and was Full-only.)
 
-> ⚠️ Per-op latency on a warm cache, small dataset, single connection — not concurrent throughput
-> or large-data scaling. **SQLite and PowDB-embed are in-process** (no network hop); their absolute
-> numbers aren't directly comparable to the networked engines — different deployment model.
-> Turbine on PowDB v0.7.0 uses **`RETURNING`** (no more reselect round-trip) and **plain `$N`
-> parameters** (the int→float literal workaround is gone — coercion is fixed engine-side).
+> ⚠️ Per-op latency on a warm cache, small dataset, single connection — not concurrent
+> throughput or large-data scaling. **SQLite and PowDB-embed are in-process** (no network hop);
+> their absolute numbers aren't comparable to the networked engines. Absolute numbers carry
+> run-to-run noise (the networked engines' figures here ran a touch higher than a prior idle
+> run); the **relative** embed-vs-SQLite story below is the robust signal.
 
 ## p50 latency (ms, lower is better)
 
-| operation | Postgres | SQLite | MySQL | PowDB (net) | PowDB (embed) |
+| operation | Postgres | SQLite | MySQL | PowDB (net) | PowDB (embed·norm) |
 |---|--:|--:|--:|--:|--:|
-| findUnique by PK | 0.088 | **0.006** | 0.104 | 0.041 | **0.006** |
-| findMany filter+order+limit | 0.146 | **0.091** | 0.395 | 0.190 | 0.156 |
-| nested `with` (posts→comments) | 0.407 | 0.368 | 0.861 | 0.401 | **0.314** |
-| create (single insert) | 0.122 | **0.015** | 0.290 | 0.042 | 3.989 |
-| createMany (100 rows) | **0.438** | 1.048 | 0.789 | 0.466 | 15.058 |
-| update (atomic increment) | 0.073 | **0.011** | 0.223 | 0.068 | 3.977 |
+| findUnique by PK | 0.092 | **0.006** | 0.115 | 0.060 | **0.006** |
+| findMany filter+order+limit | 0.280 | **0.095** | 0.588 | 0.280 | 0.158 |
+| nested `with` (posts→comments) | 0.685 | 0.409 | 1.251 | 0.758 | **0.355** |
+| create (single insert) | 0.391 | 0.016 | 0.361 | 0.061 | **0.009** |
+| createMany (100 rows) | 1.800 | 1.197 | 1.228 | 0.698 | **0.278** |
+| update (atomic increment) | 0.211 | 0.012 | 0.260 | 0.065 | **0.008** |
 
-## throughput (ops/sec, from mean, higher is better)
+## The headline: embedded `syncMode:'normal'` (0.7.1) closes the write gap — embedded now beats SQLite
 
-| operation | Postgres | SQLite | MySQL | PowDB (net) | PowDB (embed) |
-|---|--:|--:|--:|--:|--:|
-| findUnique by PK | 10,270 | **154,575** | 9,117 | 20,947 | 126,934 |
-| findMany filter+order+limit | 5,736 | **10,349** | 2,410 | 5,079 | 6,320 |
-| nested `with` | 2,364 | 2,598 | 1,111 | 2,415 | **3,112** |
-| create (single insert) | 7,373 | **58,484** | 3,293 | 21,773 | 255 |
-| createMany (100 rows) | 2,100 | 933 | 1,188 | 1,761 | 64 |
-| update (atomic increment) | 12,334 | **90,898** | 4,020 | 8,327 | 261 |
+PowDB's stated goal was to beat SQLite. On **v0.7.0** embedded reads already matched SQLite, but
+embedded *writes* were Full-fsync-bound (~4 ms) because the addon couldn't select durability from
+JS. **v0.7.1 added `setSyncMode`**, which Turbine now exposes as `turbinePowDB({ embedded, syncMode })`.
+With `'normal'`, embedded writes drop ~440× and pass SQLite:
 
-Seed (6,105 rows via createMany): PG 56ms · SQLite 147ms · MySQL 108ms · **PowDB net 49ms** · PowDB embed 887ms.
+| op (p50) | SQLite | embed 0.7.0 (Full) | **embed 0.7.1 (normal)** | vs SQLite |
+|---|--:|--:|--:|:--|
+| create | 0.016 | 3.989 | **0.009** | **1.8× faster** ✅ |
+| update | 0.012 | 3.977 | **0.008** | **1.5× faster** ✅ |
+| createMany 100 | 1.197 | 15.06 | **0.278** | **4.3× faster** ✅ |
+| findUnique | 0.006 | 0.006 | **0.006** | tie |
+| nested `with` | 0.409 | 0.314 | **0.355** | **faster** ✅ |
+| findMany | 0.095 | 0.156 | 0.158 | SQLite wins |
 
-## What changed vs PowDB 0.6.2 (the previous run)
+Embedded PowDB 0.7.1 now **wins or ties SQLite on every op except filtered-list**, while keeping a
+real storage engine, indexes, WAL, and (unlike SQLite) a networked transport for the same data.
+Seed time: 6,105 rows in **31 ms** (was 887 ms on 0.7.0-Full).
 
-The v0.7.0 adoption (RETURNING + Normal durability + Unix socket, workarounds removed) transformed
-PowDB's **write** profile and **read** latency:
+> Caveat — tail variance: embedded writes have a heavier p99 than SQLite (e.g. create p99 ~0.28 ms),
+> so *mean*-based ops/sec is closer than the p50s suggest (create: SQLite 56k vs embed 28k ops/s by
+> mean; createMany embed 2,410 vs SQLite 819). The p50/median — the standard latency measure — is the
+> headline; the mean reflects occasional fsync-batch hitches under Normal mode.
 
-| op (p50) | 0.6.2 net | **0.7.0 net** (sock+Normal) | **0.7.0 embed** |
-|---|--:|--:|--:|
-| findUnique | 0.086 | 0.041 (**2.1× faster** — socket) | **0.006** (14× faster — no wire; = SQLite) |
-| create | 4.041 | 0.042 (**96× faster**) | 3.989 (Full fsync — see gap) |
-| createMany 100 | 18.105 | 0.466 (**39× faster**) | 15.058 (Full fsync) |
-| update | 4.049 | 0.068 (**60× faster**) | 3.977 (Full fsync) |
-| seed 6,105 | 965ms | 49ms (**20× faster**) | 887ms (Full fsync) |
+## Networked PowDB (net+sock+Normal) — Postgres-class
 
-## Headlines
+create 0.061 ms, update 0.065 ms, createMany 0.698 ms, findUnique 0.060 ms — at or ahead of
+Postgres on writes, with reads paying the (socket-halved) wire floor. The reselect→RETURNING +
+Normal-durability work from 0.7.0 holds.
 
-1. **The "beat SQLite" goal is met — in embedded mode, on reads.** PowDB-embed findUnique is
-   **0.006 ms = SQLite's 0.006 ms** (was 14× slower networked), and nested `with` is **0.314 ms —
-   faster than both SQLite (0.368) and Postgres (0.407)**, even though PowDB does N+1 loaders, because
-   in-process they're nearly free. Killing the wire deleted the ~0.04 ms transport floor exactly as
-   the latency spec predicted.
+## What's verified, what's a known gap
 
-2. **Networked PowDB writes went from worst to best-in-class.** Normal durability + RETURNING (no
-   reselect) + socket put create at **0.042 ms (3× faster than Postgres, ~96× faster than 0.6.2)**,
-   update at 0.068 ms (beats PG), and createMany at 0.466 ms (≈ PG, beats SQLite + MySQL). PowDB is
-   now a genuinely fast networked write path.
-
-3. **The one remaining gap: embedded WRITES are fsync-bound (~4 ms).** PowDB-embed create/update sit
-   at ~4 ms and createMany at 15 ms — ~95× slower than the *same engine* networked-Normal. The cause
-   is **100% durability mode**: the napi addon ships no `setSyncMode`, so embedded is locked to
-   **Full** (one fsync per commit ≈ SSD fsync latency). The reads prove the engine + literal
-   materialization overhead is negligible (0.006 ms). **Fix is upstream:** expose `setSyncMode`
-   (and ideally `openWithMemoryLimit`) on the `@zvndev/powdb-embedded` `Database` class. With Normal,
-   embedded writes should drop to in-process-Normal territory (~0.01–0.02 ms) and beat SQLite's
-   0.015 ms create outright.
+- **`count(*)` bug (PowDB's heads-up): does not affect Turbine.** Turbine's PowQL generator emits
+  PowDB's *native* `count(<Table>)` aggregate, never the SQL-frontend `SELECT count(*)` that was
+  wrong before 0.7.1. Re-checked live on 0.7.1: `count`, filtered `count`, and `_count/_sum/_avg/_min/_max`
+  all return correct scalars.
+- **Upstream items closed in 0.7.1:** embedded `setSyncMode`/`openWithMemoryLimit`; `open()` no
+  longer aborts the host on a corrupt dir (`Error::OpenPanicked`); PID-based data-dir lock (rejects a
+  second live-process open); bindings version drift fixed.
+- **Still open (upstream, 0.7.2):** musl/Alpine + a reliable Intel-mac prebuilt. 0.7.1 ships
+  darwin-arm64 + linux-glibc (x64/arm64) only — other platforms build the addon from source.
+- **Embedded durability note:** `'normal'` trades a bounded loss window (≤ one fsync interval) on
+  OS crash / power loss for the write speed; `'full'` (default) keeps per-commit fsync. Process
+  crash (not OS) loses nothing in either mode (WAL replay).
 
 ## Where each engine lands (through Turbine)
 
-- **SQLite (in-process):** still the single-row latency king (point reads 154k ops/s, writes 58–90k).
-  Relative weak spot: bulk `createMany` (933 ops/s, row-by-row). Best for tests / edge / single-process.
-- **Postgres:** best networked all-rounder and the bulk-insert leader (UNNEST). The sensible default.
-- **MySQL:** ~2–4× behind PG locally; reselect tax on single create; weakest at nested reads.
-- **PowDB (net) v0.7.0:** Postgres-class-or-better across the board now — fast reads (socket) and
-  **fast writes** (Normal). The networked story is no longer "great reads, terrible writes."
-- **PowDB (embed) v0.7.0:** **SQLite-class reads** (often faster on nested), but **writes are
-  Full-fsync-bound** until the addon exposes Normal durability. Best today for **read-heavy local-first**
-  apps; batch writes, or use the networked-Normal path when write latency matters — until embedded
-  Normal lands.
-
-## Caveats / honesty
-
-- PowDB-embed prebuilt binaries ship for macOS-arm64/x64 + Linux-glibc x64/arm64 only (no Intel-mac
-  in the published 0.7.0 tarball, no musl/Alpine, no Windows) — those platforms must build from source.
-- Embedded durability is Full; do not read embedded write numbers as PowDB's best — they're the
-  durability-locked floor, not an engine limit.
-- Single-connection latency only. Concurrent-write throughput (where a server should beat SQLite's
-  single-writer lock) is not measured here.
+- **SQLite (in-process):** still elite on single-row latency and the simplest deploy; loses to
+  embedded PowDB on bulk writes and nested reads. Best for tests / edge / single-process.
+- **Postgres:** best networked all-rounder; the bulk-insert leader (UNNEST). The sensible default.
+- **MySQL:** ~2–4× behind PG locally; weakest at nested reads.
+- **PowDB (net):** Postgres-class across the board now — fast reads (socket) and fast writes (Normal).
+- **PowDB (embed·norm):** **SQLite-class-or-better on reads AND writes** as of 0.7.1 — the
+  local-first / SQLite-replacement story, with a networked sibling for the same data. Mind the
+  platform-binary gap (no musl/Windows/Intel-mac prebuilt yet) and the Normal-mode loss window.

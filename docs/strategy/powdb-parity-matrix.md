@@ -12,7 +12,14 @@ has fixed int→float coercion on every write path. Turbine's two ≤0.6.2 worka
 `create`/`createMany`/`update`/`delete` now use `returning` instead of a follow-up reselect, and the
 float-literal inlining hack in `writeRef` is gone (float columns are plain `$N` params again). `upsert`
 is the lone write that still reselects — its statement rejects `returning`. A new **embedded** transport
-(`turbinePowDB({ embedded: <dir> })`) runs the engine in-process; min supported version is **^0.7.0**.
+(`turbinePowDB({ embedded: <dir> })`) runs the engine in-process; min supported version is **^0.7.1**.
+
+**v0.7.1 update (2026-06-29):** the embedded addon now exposes durability + memory selection from JS, so
+`turbinePowDB({ embedded, syncMode: 'normal' })` moves fsync off the commit path — embedded writes drop
+from ~4 ms (Full) to ~0.008 ms and **beat SQLite** (see `benchmarks/CROSS-ENGINE-RESULTS.md`). Also picks
+up upstream fixes: `open()` no longer aborts the host on a corrupt dir, a PID-based data-dir lock, and the
+SQL-frontend `count(*)` fix (Turbine was unaffected — it emits PowDB's native `count(<Table>)`, not SQL
+`count(*)`).
 
 This matrix supersedes the capability assumptions in `powdb-support-plan.md` where firsthand testing
 contradicted them (noted inline). It is the implementation spec for `turbine-orm/powdb`.
@@ -218,16 +225,21 @@ is still N+1 until the engine ships JSON-agg / link navigation. No "faster than 
   each positional `$N` into a PowQL literal via the `encodePowqlLiteral`/`materializePowql` pair —
   string escaping matches the engine lexer exactly (`\"` `\\` `\n` `\t`; everything else raw), so it is
   injection-safe (verified: quotes, backslashes, `$N`, `"); drop … --`, raw CR, emoji round-trip as data).
-- **Durability:** Full only, **checkpoint-bound**. `disconnect()` is checkpoint-bound — there is no
-  explicit close, so a process that writes then exits *immediately* may lose the last write; hold the
-  process open long enough for the final WAL flush, or rely on WAL replay when the dir is reopened.
+- **Durability:** selectable via `turbinePowDB({ embedded, syncMode })` (addon ≥ 0.7.1): `'full'`
+  (default, fsync per commit), `'normal'` (fsync off the commit path — ~15–40× faster writes, bounded
+  loss ≤ one fsync interval on OS-crash/power-loss; a *process* crash still loses nothing via WAL replay),
+  `'off'` (bench-only). Also `memoryLimit` (bytes). Used against an addon < 0.7.1 these throw a clear
+  `ConnectionError`. `disconnect()` is still checkpoint-bound (no explicit close) — a process that writes
+  then exits *immediately* may lose the last unsynced write; hold the process open for the final flush or
+  rely on WAL replay on reopen.
 - **Per-row size cap:** the embedded engine caps a single row at ~4070 bytes (a write past it surfaces as
   `StorageError("row too large …")` → `ValidationError` E003).
 - **Platform:** prebuilt binaries for macOS arm64/x64 and Linux glibc x64/arm64. Intel-mac/musl/Windows
   build from source (`npm run build` in the addon) — a clear `ConnectionError` explains the gap on a
-  failed load. The embedded peer is pinned `^0.7.0` at install; there is no embedded version method, so
-  the **≥ 0.7.0 requirement is enforced at install time** (the networked transport additionally probes
-  `serverVersion` at connect and throws a clear `ConnectionError` below 0.7.0).
+  failed load. The embedded peer is pinned `^0.7.1` at install; there is no embedded version method, so
+  the **≥ 0.7.1 requirement is enforced at install time** (the networked transport additionally probes
+  `serverVersion` at connect and throws a clear `ConnectionError` below 0.7.0). musl/Alpine + a reliable
+  Intel-mac prebuilt are slated for PowDB 0.7.2 (upstream).
 
 ### Other documented caveats
 

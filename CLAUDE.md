@@ -112,8 +112,8 @@ src/
                       relations (`buildRelationSubquery` override), `OFFSET/FETCH` paging,
                       and named `@pN` placeholders.
 
-  powdb.ts +        — `turbine-orm/powdb` engine (PowDB **≥ 0.7.0**).
-  powql.ts            `await turbinePowDB(url | connOpts | pool | { embedded: dir }, schema, options?)`
+  powdb.ts +        — `turbine-orm/powdb` engine (PowDB **≥ 0.7.1**).
+  powql.ts            `await turbinePowDB(url | connOpts | pool | { embedded: dir, syncMode?, memoryLimit? }, schema, options?)`
                       (`url` = `powdb://host:port`; networked path probes `serverVersion` and throws
                       `ConnectionError` below 0.7.0)
                       — PowDB, a single-node DB with its OWN query language **PowQL** (not SQL).
@@ -148,11 +148,14 @@ src/
                       takes no params array**, so `PowdbEmbeddedPool` materializes each `$N` into
                       a PowQL literal via `encodePowqlLiteral`/`materializePowql` — string
                       escaping matches the engine lexer exactly (`\"` `\\` `\n` `\t`; else raw),
-                      injection-safe. Embedded is Full-durability only (checkpoint-bound), ~4070-byte
+                      injection-safe. Embedded durability is selectable (`syncMode` 'full'|'normal'|'off'
+                      + `memoryLimit`, addon ≥0.7.1; `'normal'` moves fsync off the commit path → embedded
+                      writes beat SQLite, see benchmarks); checkpoint-bound `disconnect()`, ~4070-byte
                       per-row cap, macOS-arm64/x64 + Linux-glibc only; live regression coverage in
                       `src/test/powdb.integration.test.ts` (CI `powdb-integration` job, in-process, no
-                      container). (The ≤0.6.2 reselect + float-literal-inlining workarounds were retired
-                      in 0.7.0.) See `docs/strategy/powdb-parity-matrix.md`.
+                      container). (≤0.6.2 reselect + float-literal workarounds retired in 0.7.0; embedded
+                      `syncMode`/`memoryLimit` + `count(*)`-fix picked up in 0.7.1.) See
+                      `docs/strategy/powdb-parity-matrix.md`.
 
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code
                       (TURBINE_E001-E017). wrapPgError() translates pg driver errors

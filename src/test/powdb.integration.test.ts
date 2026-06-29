@@ -166,6 +166,21 @@ async function withDb(fn: (db: DB) => Promise<void>): Promise<void> {
 // ---------------------------------------------------------------------------
 
 describe('powdb integration (embedded)', () => {
+  it('syncMode:"normal" (addon ≥0.7.1) opens and round-trips a write', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-it-sync-'));
+    const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, schema, { warnOnUnlimited: false });
+    try {
+      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      const u = await db.table('app_user').create({ data: { name: 'Norm', email: 'norm@x', age: 1, score: 1.5 } });
+      assert.equal(u.email, 'norm@x');
+      const found = await db.table('app_user').findUnique({ where: { email: 'norm@x' } });
+      assert.equal(found.name, 'Norm');
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('create/findUnique round-trips columns by NAME despite arg order ≠ schema order', async () => {
     await withDb(async (db) => {
       const created = await db.table('app_user').create({

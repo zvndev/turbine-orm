@@ -406,7 +406,7 @@ const engines: Record<string, Engine> = {
   powdb: {
     // Networked v0.7.0. Start the server with POWDB_SYNC_MODE=normal (and
     // optionally -s <sock>) to measure the Normal-durability + Unix-socket path.
-    name: POWDB_SOCKET ? 'PowDB 0.7.0 (net+sock)' : 'PowDB 0.7.0 (net)',
+    name: POWDB_SOCKET ? 'PowDB 0.7.1 (net+sock)' : 'PowDB 0.7.1 (net)',
     async setup() {
       const conn = POWDB_SOCKET ? { path: POWDB_SOCKET } : { host: POWDB_HOST, port: POWDB_PORT };
       const { Client } = await import('@zvndev/powdb-client');
@@ -422,15 +422,16 @@ const engines: Record<string, Engine> = {
     },
   },
   powdb_emb: {
-    // In-process embedded v0.7.0 (@zvndev/powdb-embedded). No server, no wire —
+    // In-process embedded v0.7.1 (@zvndev/powdb-embedded). No server, no wire —
     // the SQLite-shaped path. Single handle: DDL runs through db.raw() (NOT a
     // second Database.open on the same dir, which has no lock and would corrupt).
-    // Durability is Full only (the addon exposes no sync-mode selector from JS).
-    name: 'PowDB 0.7.0 (embed)',
+    // syncMode:'normal' (0.7.1) moves fsync off the commit path — the knob that
+    // closes the embedded-write gap.
+    name: 'PowDB 0.7.1 (embed·norm)',
     async setup() {
       const dir = POWDB_EMB_DIR ?? mkdtempSync(join(tmpdir(), 'powdb-emb-bench-'));
       powdbEmbDir = dir;
-      const db = await turbinePowDB({ embedded: dir }, schema, { warnOnUnlimited: false });
+      const db = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, schema, { warnOnUnlimited: false });
       // DDL on the single embedded handle (no params → raw PowQL passthrough).
       for (const t of Object.keys(schema.tables)) {
         await (db.raw as unknown as (s: string[]) => Promise<unknown>)([`drop ${t}`]).catch(() => {});
