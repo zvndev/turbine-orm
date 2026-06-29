@@ -771,9 +771,9 @@ When Turbine receives an external pool, `db.disconnect()` is a no-op: the caller
 
 ## Database engines
 
-Turbine is **Postgres-first** — `import { TurbineClient } from 'turbine-orm'` targets PostgreSQL, and the safety bundle above is built around it. When you need another database, the same typed API runs on **SQLite**, **MySQL 8**, and **SQL Server** through subpath exports. Multi-engine is *additive*, not a pivot: pick the engine that fits, keep the same `findMany` / `with` / `where` API.
+Turbine is **Postgres-first** — `import { TurbineClient } from 'turbine-orm'` targets PostgreSQL, and the safety bundle above is built around it. When you need another database, the same typed API runs on **SQLite**, **MySQL 8**, and **SQL Server** through subpath exports — plus **PowDB**, a single-node embedded database with its own query language (PowQL). Multi-engine is *additive*, not a pivot: pick the engine that fits, keep the same `findMany` / `with` / `where` API.
 
-The root install stays one dependency (`pg`). Each engine's driver is its own concern: SQLite needs nothing (Node's built-in `node:sqlite`), MySQL and SQL Server use **optional peer dependencies** you install only if you use them.
+Two engines run **in-process** (no server): **SQLite** (always — there is no SQLite wire protocol) and **PowDB**, which uniquely runs *both* in-process (embedded) *and* over a network client against the same data. The root install stays one dependency (`pg`). Each engine's driver is its own concern: SQLite needs nothing (Node's built-in `node:sqlite`), while MySQL, SQL Server, and PowDB use **optional peer dependencies** you install only if you use them.
 
 ```bash
 # SQLite — zero extra deps (Node >= 22.5, built-in node:sqlite)
@@ -784,6 +784,10 @@ npm install turbine-orm mysql2
 
 # SQL Server 2016+ — optional peer
 npm install turbine-orm mssql
+
+# PowDB — optional peer; embedded (in-process) or networked transport
+npm install turbine-orm @zvndev/powdb-embedded   # in-process
+npm install turbine-orm @zvndev/powdb-client     # networked
 ```
 
 Each engine ships a factory that returns the same `TurbineClient`:
@@ -813,6 +817,17 @@ import { SCHEMA } from './generated/turbine/metadata.js';
 const db = await turbineMssql('mssql://sa:Passw0rd!@localhost:1433/app', SCHEMA);
 ```
 
+```ts
+// PowDB — async; embedded (in-process) or networked. Schema is code-defined (no introspection).
+import { turbinePowDB } from 'turbine-orm/powdb';
+import { schema } from './schema.js'; // defineSchema({...})
+
+// Embedded, in-process — syncMode 'normal' makes writes beat SQLite:
+const db = await turbinePowDB({ embedded: './data', syncMode: 'normal' }, schema);
+// …or networked against a running powdb-server:
+// const db = await turbinePowDB('powdb://127.0.0.1:7070', schema);
+```
+
 ### Capability matrix
 
 Everything is honest about what ports and what doesn't. Features marked **PG-only** throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) on other engines rather than silently degrading.
@@ -830,6 +845,8 @@ Everything is honest about what ports and what doesn't. Features marked **PG-onl
 ✗ E017 = throws `UnsupportedFeatureError`. The full matrix (atomic updates, introspection, optimistic locking, per-cell mechanics) is on [turbineorm.dev/engines](https://turbineorm.dev/engines).
 
 **Engine notes:** SQLite uses `RETURNING` (≥ 3.35) just like Postgres. MySQL has no `RETURNING`, so writes re-`SELECT` the affected row and **`createMany` returns `[]`** (the rows ARE inserted — re-query if you need them). SQL Server returns rows via `OUTPUT`/`MERGE`; `DISTINCT ON` is Postgres-only. Only Postgres streams via a true cursor (constant memory); the other engines' `findManyStream` materializes the result then yields it in batches. Optimistic locking throws `OptimisticLockError` on all engines (on MySQL the conflict is detected from the version-checked UPDATE's affected-row count). The `turbine` CLI (`generate`, `migrate`) is currently PostgreSQL-only — point the engine factories at a hand-written or programmatically introspected `SCHEMA`.
+
+**PowDB** speaks its own non-SQL query language (PowQL), so it sits outside the SQL matrix above. It uses `reselect` writes with client-assigned UUID PKs, N+1 relation loaders (no `json_agg`), single-writer transactions (no nesting), and `defineSchema` (no introspection). Embedded `syncMode: 'normal'` writes beat SQLite; the networked transport runs the same data over a socket. many-to-many, nested writes, composite keys, cursor streaming, and the Postgres-only trio throw `UnsupportedFeatureError`. Full details: **[turbineorm.dev/engines#powdb](https://turbineorm.dev/engines#powdb)**.
 
 Full setup, signatures, and the complete support matrix: **[turbineorm.dev/engines](https://turbineorm.dev/engines)**.
 
