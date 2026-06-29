@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.22.0 (2026-06-28)
+
+**New engine: PowDB.** Turbine now runs on [PowDB](https://github.com/zvndev/powdb), a single-node embedded database with its own query language (PowQL — not SQL), behind the same `findMany` / `with` / `where` / `create` API. PowDB is the only engine that runs **both** in-process (embedded) **and** over a network client against the same data. Postgres remains the default and primary target; PowDB is an additive optional-peer subpath export — `npm i turbine-orm` still installs only `pg`.
+
+### Added
+- **`turbine-orm/powdb`** — `await turbinePowDB(target, schema, options?)`. Because PowQL shares no surface with SQL, this is **not** a `Dialect`: a parallel `PowqlInterface` (PowQL generator with the same public method surface as `QueryInterface`) is wired in via the new `queryInterfaceFactory` seam, leaving the four SQL engines byte-identical.
+  - **Two transports.** Embedded (in-process) via the native addon `@zvndev/powdb-embedded`, and networked via `@zvndev/powdb-client` against a `powdb-server`. Both are optional peer dependencies (`^0.7.1`), loaded by dynamic `import()` — neither is pulled by a default install.
+  - **Embedded durability control.** `turbinePowDB({ embedded, syncMode: 'full' | 'normal' | 'off', memoryLimit })` exposes PowDB 0.7.1's `setSyncMode` / `openWithMemoryLimit`. With `syncMode: 'normal'`, embedded writes drop ~440× (fsync off the commit path) and **beat SQLite** on `create` (0.009 vs 0.016 ms p50), `update` (0.008 vs 0.012), `createMany` (0.278 vs 1.197), and nested `with` — while keeping a real storage engine, indexes, and WAL. `syncMode` / `memoryLimit` are feature-detected; using them on a pre-0.7.1 addon raises a clear `ConnectionError`.
+  - **Honest capability surface.** PowDB writes use the `reselect` strategy with client-assigned UUID PKs (PowDB generates no IDs), N+1 relation loaders (no `json_agg` — keys chunked at 1,000), single-writer transactions (no nesting), and code-defined schemas via `defineSchema` (no wire introspection). Not-yet-built capabilities throw `UnsupportedFeatureError` (`E017`): many-to-many relation filters/nested reads, composite-key relations/reads/upsert, nested writes, cursor pagination / `findManyStream`, JSON/array/full-text/pgvector filters and vector ordering — plus the Postgres-only trio (pgvector, LISTEN/NOTIFY, RLS `sessionContext`).
+- **`/engines#powdb` docs** — a full PowDB section (both transports, `syncMode`, the embedded-beats-SQLite benchmark, the E017 list, and the platform-binary caveat), plus PowDB coverage in the README "Database engines" section and `benchmarks/CROSS-ENGINE-RESULTS.md`.
+- **`src/test/powdb.integration.test.ts`** — 10 tests exercising the real embedded addon (gated via `skipGate` so the unit lane stays green without it) and wired to a new in-process `powdb-integration` CI job (live addon on Linux, no container).
+
+### Fixed
+- **Empty-`where` guard now gates on the compiled PowQL filter**, mirroring the SQL path — `{ OR: [] }` / `{ AND: [] }` / `{ NOT: {} }` / `{ OR: [{ field: undefined }] }` can no longer bypass the mass-mutation guard on `updateMany` / `deleteMany`.
+- **Single-writer transaction model hardened.** A re-entrant or concurrent `db.$transaction` on the networked transport used to hang forever on PowDB's global write lock; a pool-level `activeTransaction` guard (both transports) now throws `E017` immediately. Nested `tx.$transaction` likewise throws (no savepoints).
+- **Embedded driver errors are now typed.** Embedded addon failures (every one tagged `GenericFailure`) are mapped by message shape to the right Turbine error (`E010` not-null, `E003` type/parse, `E008` unique), and addon load/shape failures raise a typed `ConnectionError`.
+
+### Notes
+- **Platform binaries (embedded).** `@zvndev/powdb-embedded` 0.7.1 ships prebuilt binaries for darwin-arm64 and linux-glibc (x64/arm64); other platforms (musl/Alpine, Windows, Intel macOS) build from source at install. The networked transport has no such constraint. musl/Intel-mac prebuilts are tracked upstream for PowDB 0.7.2.
+
 ## 0.21.0 (2026-06-26)
 
 **Multi-dialect: SQLite, MySQL, and SQL Server engines.** Turbine is still Postgres-first, but the query/result core is now engine-agnostic behind a dialect/driver seam, and three new engines ship as additive subpath exports. Drivers are optional peer dependencies — `npm i turbine-orm` still installs only `pg`.

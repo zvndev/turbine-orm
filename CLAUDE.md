@@ -112,6 +112,51 @@ src/
                       relations (`buildRelationSubquery` override), `OFFSET/FETCH` paging,
                       and named `@pN` placeholders.
 
+  powdb.ts +        — `turbine-orm/powdb` engine (PowDB **≥ 0.7.1**).
+  powql.ts            `await turbinePowDB(url | connOpts | pool | { embedded: dir, syncMode?, memoryLimit? }, schema, options?)`
+                      (`url` = `powdb://host:port`; networked path probes `serverVersion` and throws
+                      `ConnectionError` below 0.7.0)
+                      — PowDB, a single-node DB with its OWN query language **PowQL** (not SQL).
+                      Two transports: **networked** via the optional peer `@zvndev/powdb-client`
+                      (binary TCP), and **embedded** (preview) via the optional peer
+                      `@zvndev/powdb-embedded` (in-process napi addon, no server). Both dynamic
+                      `import()` — `npm i turbine-orm` still pulls only `pg`. PowQL shares no
+                      surface with `SELECT…FROM…WHERE`, so this is NOT a `Dialect`: powql.ts ships
+                      a parallel `PowqlInterface` (PowQL generator with the same public method
+                      surface as `QueryInterface`) wired in via the `queryInterfaceFactory`
+                      option on `QueryInterfaceOptions` — `TurbineClient.table()` calls that
+                      factory when present, else `new QueryInterface` (SQL engines untouched).
+                      powdb.ts holds the driver shims (`PowdbPool` over the client `Pool`;
+                      `PowdbEmbeddedPool` over a single `Database` handle), type mapping
+                      (Turbine→PowQL `str/int/float/bool`; never emits `uuid/datetime/bytes`;
+                      `Date`→int micros), `powqlSchemaDDL`, `wrapPowdbError`, and `powdbDialect`
+                      (`supportsReturning: true`; the Postgres-only flags stay false →
+                      `$listen`/`$notify`/RLS/pgvector throw E017). PowDB realities shaping it:
+                      writes use the trailing **`returning`** keyword (create/createMany/update/
+                      delete) — `upsert` reselects by PK (its statement rejects `returning`); no
+                      generated IDs (→client UUID); no JSON-agg/link-nav (→N+1 `with` loaders,
+                      keys chunked at `MAX_RELATION_KEYS=1000`); no wire introspection (→`defineSchema`
+                      only). **Single global write lock — single-writer transactions:** a nested
+                      `tx.$transaction` throws E017 (`powdbDialect` savepoint keywords throw), and a
+                      re-entrant/concurrent `db.$transaction` throws E017 via a pool-level
+                      `activeTransaction` guard (this prevents the networked second-`begin` HANG on the
+                      held lock). The empty-where guard gates on the COMPILED PowQL filter (like the SQL
+                      path), so `{OR:[]}`/`{AND:[]}`/`{NOT:{}}` are refused. `wrapPowdbError` maps BOTH
+                      transports: the embedded napi addon tags every error `code:'GenericFailure'`, so
+                      it maps by message shape (required/no-value→E010, type-mismatch/Parse/Execution/
+                      StorageError→E003, unique→E008) before the networked `.code` switch. **Embedded
+                      takes no params array**, so `PowdbEmbeddedPool` materializes each `$N` into
+                      a PowQL literal via `encodePowqlLiteral`/`materializePowql` — string
+                      escaping matches the engine lexer exactly (`\"` `\\` `\n` `\t`; else raw),
+                      injection-safe. Embedded durability is selectable (`syncMode` 'full'|'normal'|'off'
+                      + `memoryLimit`, addon ≥0.7.1; `'normal'` moves fsync off the commit path → embedded
+                      writes beat SQLite, see benchmarks); checkpoint-bound `disconnect()`, ~4070-byte
+                      per-row cap, macOS-arm64/x64 + Linux-glibc only; live regression coverage in
+                      `src/test/powdb.integration.test.ts` (CI `powdb-integration` job, in-process, no
+                      container). (≤0.6.2 reselect + float-literal workarounds retired in 0.7.0; embedded
+                      `syncMode`/`memoryLimit` + `count(*)`-fix picked up in 0.7.1.) See
+                      `docs/strategy/powdb-parity-matrix.md`.
+
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code
                       (TURBINE_E001-E017). wrapPgError() translates pg driver errors
                       (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
@@ -303,7 +348,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 ## Don't
 
-- Don't add runtime dependencies beyond `pg`. Root `dependencies` stays exactly `{ pg, @types/pg }`. The only sanctioned exception is the engine drivers: `mysql2` and `mssql` are **devDependencies + optional `peerDependencies`** (`peerDependenciesMeta.*.optional = true`), loaded lazily via dynamic `import()` from the `mysql`/`mssql` subpaths and never required for Postgres users; SQLite needs nothing at all (it uses the `node:sqlite` builtin). `npm i turbine-orm` must keep pulling only `pg`.
+- Don't add runtime dependencies beyond `pg`. Root `dependencies` stays exactly `{ pg, @types/pg }`. The only sanctioned exception is the engine drivers: `mysql2`, `mssql`, `@zvndev/powdb-client`, and `@zvndev/powdb-embedded` are **devDependencies + optional `peerDependencies`** (`peerDependenciesMeta.*.optional = true`), loaded lazily via dynamic `import()` from the `mysql`/`mssql`/`powdb` subpaths and never required for Postgres users; SQLite needs nothing at all (it uses the `node:sqlite` builtin). `npm i turbine-orm` must keep pulling only `pg`.
 - Don't use `eval`, `new Function`, or shell interpolation
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings — always use `$N` parameterization

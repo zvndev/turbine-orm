@@ -286,6 +286,32 @@ jobs:
         env:
           MSSQL_URL: mssql://sa:Turbine_Passw0rd!@127.0.0.1:1433/turbine_test
 
+  # Real PowDB job for the turbine-orm/powdb engine — runs the embedded napi
+  # addon (@zvndev/powdb-embedded) IN-PROCESS, so there is NO service container
+  # (unlike mysql/mssql/cockroachdb). The addon is a published npm package with a
+  # Linux-glibc-x64 prebuilt binary, installed as a devDependency by `npm ci`, so
+  # the runner loads the real engine and src/test/powdb.integration.test.ts
+  # exercises RETURNING column-order, typed error mapping, the empty-where guard,
+  # transactions (commit/rollback + nested/re-entrant throw), chunked relation
+  # loads, and the E017 guards against a real database. On a platform without a
+  # prebuilt binary the suite's skipGate fires and every test skips cleanly, so
+  # `npm run test:unit` stays green without the addon. continue-on-error until the
+  # job has run green on GitHub runners a few times (same posture as the other
+  # engine jobs); promote to a hard gate once proven.
+  powdb-integration:
+    name: powdb-integration
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run turbine-orm/powdb integration tests against the embedded engine
+        run: npx tsx --test src/test/powdb.integration.test.ts
+
   # NOTE: the YugabyteDB integration job used to live here, but its container
   # never initialized successfully on GitHub runners and burned ~6 minutes of
   # guaranteed red X on every PR/push. It now runs on a nightly schedule in

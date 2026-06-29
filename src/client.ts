@@ -342,7 +342,9 @@ export class TransactionClient {
       // We use a proxy pool that routes queries through the transaction client
       const txPool = this.createTxPool();
       const txOpts = { ...this.queryOptions, _txScoped: true };
-      qi = new QueryInterface<object>(txPool, name, this.schema, this.middlewares, txOpts);
+      qi = txOpts.queryInterfaceFactory
+        ? txOpts.queryInterfaceFactory(txPool, name, this.schema, this.middlewares, txOpts)
+        : new QueryInterface<object>(txPool, name, this.schema, this.middlewares, txOpts);
       this.tableCache.set(name, qi);
     }
     return qi as QueryInterface<T>;
@@ -496,6 +498,11 @@ export class TurbineClient {
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
       sqlCache: config.sqlCache ?? true,
       dialect: config.dialect,
+      // Non-SQL backends (PowDB) inject a factory that builds their own query
+      // interface (PowqlInterface) instead of the SQL QueryInterface. SQL engines
+      // never set this, so `table()` keeps constructing `new QueryInterface`.
+      queryInterfaceFactory: (config as { queryInterfaceFactory?: QueryInterfaceOptions['queryInterfaceFactory'] })
+        .queryInterfaceFactory,
       _onQuery: (event: QueryEvent) => {
         if (this.queryListeners.size === 0) return;
         const emitted = this.errorMessagesSafe ? { ...event, params: event.params.map(() => '[REDACTED]') } : event;
@@ -662,7 +669,9 @@ export class TurbineClient {
   table<T extends object = Record<string, unknown>>(name: string): QueryInterface<T> {
     let qi = this.tableCache.get(name);
     if (!qi) {
-      qi = new QueryInterface<object>(this.pool, name, this.schema, this.middlewares, this.queryOptions);
+      qi = this.queryOptions?.queryInterfaceFactory
+        ? this.queryOptions.queryInterfaceFactory(this.pool, name, this.schema, this.middlewares, this.queryOptions)
+        : new QueryInterface<object>(this.pool, name, this.schema, this.middlewares, this.queryOptions);
       this.tableCache.set(name, qi);
     }
     return qi as QueryInterface<T>;

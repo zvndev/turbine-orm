@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "exports": {
@@ -28,6 +28,11 @@
       "types": "./dist/mssql.d.ts",
       "import": "./dist/mssql.js",
       "require": "./dist/cjs/mssql.js"
+    },
+    "./powdb": {
+      "types": "./dist/powdb.d.ts",
+      "import": "./dist/powdb.js",
+      "require": "./dist/cjs/powdb.js"
     },
     "./cli": {
       "types": "./dist/cli/config.d.ts",
@@ -101,6 +106,8 @@
     "c8": "^11.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
+    "@zvndev/powdb-client": "^0.7.1",
+    "@zvndev/powdb-embedded": "^0.7.1",
     "mssql": "^11.0.1",
     "mysql2": "^3.22.5",
     "size-limit": "^12.1.0",
@@ -108,10 +115,18 @@
     "typescript": "^5.7.0"
   },
   "peerDependencies": {
+    "@zvndev/powdb-client": "^0.7.1",
+    "@zvndev/powdb-embedded": "^0.7.1",
     "mssql": "^10.0.0 || ^11.0.0",
     "mysql2": "^3.0.0"
   },
   "peerDependenciesMeta": {
+    "@zvndev/powdb-client": {
+      "optional": true
+    },
+    "@zvndev/powdb-embedded": {
+      "optional": true
+    },
     "mssql": {
       "optional": true
     },

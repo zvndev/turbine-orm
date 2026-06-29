@@ -393,6 +393,20 @@ export interface QueryInterfaceOptions {
   _txScoped?: boolean;
   /** @internal Callback from TurbineClient for query event emission. */
   _onQuery?: (event: QueryEvent) => void;
+  /**
+   * @internal Factory that builds the per-table query interface. Defaults to
+   * `new QueryInterface` (the SQL path). Non-SQL backends (PowDB) supply a
+   * factory returning a structurally-compatible interface that generates their
+   * own query language instead of SQL. The SQL dialects never set this, so their
+   * `table()` behavior is byte-identical.
+   */
+  queryInterfaceFactory?: (
+    pool: pg.Pool,
+    table: string,
+    schema: SchemaMetadata,
+    middlewares: MiddlewareFn[],
+    options: QueryInterfaceOptions,
+  ) => QueryInterface<object>;
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional for untyped table access
