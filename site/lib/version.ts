@@ -1,12 +1,13 @@
 /**
- * Single source of truth for the version shown on the site (hero badge,
- * docs sidebar). Bump this together with the root package.json on every
- * release — it's part of the AGENTS.md release-flow drift check.
+ * GENERATED FILE — do not edit by hand.
  *
- * (The site deploys standalone from `site/`, so it cannot import the root
- * package.json at build time on Vercel.)
+ * Derived from the root package.json version at build time by
+ * site/scripts/gen-version.mjs (runs as predev/prebuild). This is the single
+ * source of truth for the version shown on the site (hero badge, docs
+ * sidebar); it can never drift from the published package because every build
+ * regenerates it. To change it, bump the root package.json and rebuild.
  */
-export const TURBINE_VERSION = '0.19.2';
+export const TURBINE_VERSION = '0.23.1';
 
-/** Marketing minor line, e.g. "v0.19" for the hero badge. */
+/** Marketing minor line, e.g. "v0.23" for the hero badge. */
 export const TURBINE_MINOR = `v${TURBINE_VERSION.split('.').slice(0, 2).join('.')}`;
