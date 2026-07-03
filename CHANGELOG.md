@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+_A `0.23.1` will be cut when PowDB `0.8.0` publishes._
+
+### Fixed
+- **CJS build now compiles under TypeScript 6.0.** `tsconfig.cjs.json` sets `ignoreDeprecations: "6.0"` for its `module: CommonJS` / `moduleResolution: node10` pairing, which TS 6.0 otherwise rejects as a hard error (`TS5107`). The `typescript` devDependency floor moves to `^6.0.3` so the option is recognized. Emitted `dist/` output is byte-identical to the previous toolchain (verified by a full `dist` diff); no runtime or API change.
+
 ## 0.23.0 (2026-06-29)
 
 **PowDB Phase B — server-generated PKs, many-to-many, nested writes, composite-key upsert — plus a correctness fix for relation filters.** All PowDB-only; the four SQL engines are untouched and `npm i turbine-orm` still installs only `pg`.
