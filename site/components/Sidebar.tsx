@@ -14,6 +14,7 @@ const sections: NavSection[] = [
     items: [
       { href: '/quickstart', label: 'Quick Start' },
       { href: '/neon', label: 'Turbine + Neon' },
+      { href: '/batadb', label: 'Turbine + BataDB' },
       { href: '/migrate-from-prisma', label: 'Migrate from Prisma' },
       { href: '/migrate-from-drizzle', label: 'Migrate from Drizzle' },
     ],

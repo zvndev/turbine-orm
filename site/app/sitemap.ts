@@ -6,6 +6,7 @@ const ROUTES = [
   '',
   '/quickstart',
   '/neon',
+  '/batadb',
   '/migrate-from-prisma',
   '/migrate-from-drizzle',
   '/queries',
