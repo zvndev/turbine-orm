@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.23.1 (2026-07-03)
 
-_A `0.23.1` will be cut when PowDB `0.8.0` publishes._
+**Coordinated release with PowDB `0.8.0`** — the PowDB engine's optional peers now accept the newly published `@zvndev/powdb-client@0.8.0` / `@zvndev/powdb-embedded@0.8.0`, and the full test suite runs green against those exact published artifacts (1113 passing / 0 failing).
 
 ### Changed
 - **Widened the PowDB optional-peer range to `^0.7.1 || ^0.8.0`** for both `@zvndev/powdb-client` and `@zvndev/powdb-embedded`, ahead of the coordinated PowDB `0.8.0` release. The engine surface Turbine uses (`query` / `write` / `tx` / `returning`) is unchanged in `0.8.0` — Turbine does not call `applyRetainedUnits` — so the widening is safe and additive. Both remain optional peers (`peerDependenciesMeta` unchanged); a default `npm i turbine-orm` still installs only `pg`.
