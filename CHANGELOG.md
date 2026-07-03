@@ -4,6 +4,9 @@
 
 _A `0.23.1` will be cut when PowDB `0.8.0` publishes._
 
+### Changed
+- **Widened the PowDB optional-peer range to `^0.7.1 || ^0.8.0`** for both `@zvndev/powdb-client` and `@zvndev/powdb-embedded`, ahead of the coordinated PowDB `0.8.0` release. The engine surface Turbine uses (`query` / `write` / `tx` / `returning`) is unchanged in `0.8.0` — Turbine does not call `applyRetainedUnits` — so the widening is safe and additive. Both remain optional peers (`peerDependenciesMeta` unchanged); a default `npm i turbine-orm` still installs only `pg`.
+
 ### Fixed
 - **CJS build now compiles under TypeScript 6.0.** `tsconfig.cjs.json` sets `ignoreDeprecations: "6.0"` for its `module: CommonJS` / `moduleResolution: node10` pairing, which TS 6.0 otherwise rejects as a hard error (`TS5107`). The `typescript` devDependency floor moves to `^6.0.3` so the option is recognized. Emitted `dist/` output is byte-identical to the previous toolchain (verified by a full `dist` diff); no runtime or API change.
 
