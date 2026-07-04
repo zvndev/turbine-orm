@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.23.2 (2026-07-03)
+
+### Fixed
+- **Published files no longer reference missing source maps.** `sourceMap`/`declarationMap` emitted `//# sourceMappingURL=…` comments in every published `dist/*.js` / `*.d.ts`, but the `files` allowlist excludes the `.map` files themselves — Node ignores the dangling reference, but Next.js/turbopack's stricter loader logged a failed-to-map warning on every stack trace through Turbine. Maps are now emitted only for local builds and never referenced from published output. (#25, #26)
+
+### Changed
+- `pg` dependency bumped 8.20.0 → 8.22.0 (upstream fixes; no API change). (#13)
+- CI: actions/checkout 5 → 7, actions/setup-node 5 → 6; dev-dependency refresh. Docs site upgraded to Next 16 + Tailwind 4 with a real site-build CI gate, and the site's displayed version is now derived from the root `package.json` at build time (can't drift from the published package). (#4, #12, #23, #27)
+- New docs page: **Turbine + BataDB guide** (`turbineorm.dev/batadb`) — typed Turbine over BataDB's edge HTTP driver or direct TCP, with the dual-transport pattern. (#24)
+
 ## 0.23.1 (2026-07-03)
 
 **Coordinated release with PowDB `0.8.0`** — the PowDB engine's optional peers now accept the newly published `@zvndev/powdb-client@0.8.0` / `@zvndev/powdb-embedded@0.8.0`, and the full test suite runs green against those exact published artifacts (1113 passing / 0 failing).
