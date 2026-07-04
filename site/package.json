@@ -4,7 +4,9 @@
   "private": true,
   "description": "Documentation site for turbine-orm (turbineorm.dev)",
   "scripts": {
+    "predev": "node scripts/gen-version.mjs",
     "dev": "next dev",
+    "prebuild": "node scripts/gen-version.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"
@@ -12,9 +14,9 @@
   "dependencies": {
     "@mdx-js/loader": "^3.0.1",
     "@mdx-js/react": "^3.0.1",
-    "@next/mdx": "^15.5.15",
+    "@next/mdx": "^16.2.10",
     "@types/mdx": "^2.0.14",
-    "next": "^15.5.15",
+    "next": "^16.2.10",
     "react": "^19.0.0",
     "react-dom": "^19.2.7",
     "rehype-pretty-code": "^0.14.0",
@@ -23,12 +25,12 @@
     "shiki": "^1.22.2"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.2",
     "@types/node": "^22.9.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "autoprefixer": "^10.5.0",
     "postcss": "^8.4.49",
-    "tailwindcss": "^3.4.15",
+    "tailwindcss": "^4.3.2",
     "typescript": "^5.6.3"
   }
 }

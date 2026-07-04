@@ -1,6 +1,8 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+/* Keep the existing JS theme config (surface colors, display/sans/mono font
+   families, content/landing max-widths) under Tailwind v4's CSS-first model. */
+@config '../tailwind.config.ts';
 
 /* ==========================================================================
    Turbine ORM — "Precision Engine" Design System

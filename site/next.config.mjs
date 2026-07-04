@@ -1,9 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import createMDX from '@next/mdx';
-import rehypePrettyCode from 'rehype-pretty-code';
-import rehypeSlug from 'rehype-slug';
-import remarkGfm from 'remark-gfm';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -22,11 +19,17 @@ const nextConfig = {
   outputFileTracingRoot: __dirname,
 };
 
+// Next 16 builds with Turbopack by default, which requires MDX loader options
+// to be serializable. Pass remark/rehype plugins as [name, options] string
+// tuples (not imported function references) so Turbopack can resolve them.
 const withMDX = createMDX({
   extension: /\.mdx?$/,
   options: {
-    remarkPlugins: [remarkGfm],
-    rehypePlugins: [rehypeSlug, [rehypePrettyCode, prettyCodeOptions]],
+    remarkPlugins: [['remark-gfm', {}]],
+    rehypePlugins: [
+      ['rehype-slug', {}],
+      ['rehype-pretty-code', prettyCodeOptions],
+    ],
   },
 });
 
