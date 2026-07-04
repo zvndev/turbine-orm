@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { codeToHtml } from 'shiki';
 import { CopyButton } from '../components/CopyButton';
+import { TURBINE_MINOR } from '../lib/version';
 
 export const metadata: Metadata = {
   title: 'Turbine ORM — the Postgres ORM your DBA will sign off on.',
@@ -170,7 +171,7 @@ export default async function Home() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            v0.19 — read-only Studio with an ORM-native query builder
+            {TURBINE_MINOR} — PowDB engine support &amp; the BataDB guide
           </div>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
