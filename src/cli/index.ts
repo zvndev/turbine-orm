@@ -29,7 +29,7 @@ import { introspect } from '../introspect.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { schemaDiff, schemaPush } from '../schema-sql.js';
 import type { CliOverrides, ResolvedConfig } from './config.js';
-import { configTemplate, findConfigFile, loadConfig, resolveConfig } from './config.js';
+import { configTemplate, findConfigFile, loadConfig, looksLikeSchemaFilePath, resolveConfig } from './config.js';
 import { canResolveTsx, getTsLoaderError, needsTsLoader, registerTsLoader } from './loader.js';
 import { createMigration, listMigrationFiles, migrateDown, migrateStatus, migrateUp } from './migrate.js';
 import { startObserve } from './observe.js';
@@ -81,6 +81,7 @@ interface CliArgs {
   help?: boolean;
   auto?: boolean;
   allowDrift?: boolean;
+  allowEmpty?: boolean;
   // studio flags
   port?: number;
   host?: string;
@@ -143,6 +144,9 @@ function parseArgs(): CliArgs {
         break;
       case '--allow-drift':
         result.allowDrift = true;
+        break;
+      case '--allow-empty':
+        result.allowEmpty = true;
         break;
       case '--force':
       case '-f':
@@ -277,8 +281,33 @@ async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
           `  ${dim('Hint: install')} ${cyan('tsx')} ${dim('to load .ts files:')} ${cyan('npm install --save-dev tsx')}`,
         );
       }
+      printCjsHintIfApplicable(err);
     }
     process.exit(1);
+  }
+}
+
+/**
+ * When a config/schema import blows up with the CommonJS-vs-ESM interop error
+ * (`Cannot require() ES Module` / `ERR_REQUIRE_ESM`), the root cause is almost
+ * always a project whose `package.json` lacks `"type": "module"`: tsx transpiles
+ * the `.ts` file to CJS and then can't `require()` Turbine's ESM build. Point the
+ * user at the one-line fix instead of leaving them with a raw Node stack trace.
+ */
+function printCjsHintIfApplicable(err: Error): void {
+  const msg = err.message;
+  if (
+    msg.includes('ERR_REQUIRE_ESM') ||
+    msg.includes('require() of ES Module') ||
+    msg.includes('Cannot require() ES Module')
+  ) {
+    newline();
+    console.log(
+      `  ${dim('Hint: add')} ${cyan('"type": "module"')} ${dim('to your')} ${cyan('package.json')}${dim('.')}`,
+    );
+    console.log(
+      `  ${dim('Turbine is an ESM package; without it, Node/tsx tries to')} ${cyan('require()')} ${dim('it and fails.')}`,
+    );
   }
 }
 
@@ -503,6 +532,33 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   const url = requireUrl(config);
   const startTime = performance.now();
 
+  // Guard: `schema` is the Postgres NAMESPACE to introspect (default `public`),
+  // NOT the path to your schema-builder file — that goes in `schemaFile`. If the
+  // configured `schema` looks like a file path, introspection would silently
+  // match zero tables and emit an empty client. Fail loudly instead.
+  if (!args.allowEmpty && looksLikeSchemaFilePath(config.schema)) {
+    error(`The "schema" option looks like a file path: ${cyan(config.schema)}`);
+    newline();
+    console.log(
+      `  ${dim('"schema" is the Postgres schema NAME to introspect')} ${dim('(default:')} ${cyan('public')}${dim(').')}`,
+    );
+    console.log(`  ${dim('The path to your defineSchema() file belongs in')} ${cyan('schemaFile')}${dim('.')}`);
+    newline();
+    console.log(`  ${dim('Fix your')} ${cyan('turbine.config.ts')}${dim(':')}`);
+    console.log(
+      `    ${green('schema:')} ${cyan("'public'")}${dim(",       // or omit — introspects the 'public' schema")}`,
+    );
+    console.log(
+      `    ${green('schemaFile:')} ${cyan(`'${config.schema}'`)}${dim(', // your defineSchema() file (used by `turbine push`)')}`,
+    );
+    newline();
+    console.log(
+      `  ${dim('Re-run with')} ${cyan('--allow-empty')} ${dim('to introspect this literal schema name anyway.')}`,
+    );
+    newline();
+    process.exit(1);
+  }
+
   label('Database', redactUrl(url));
   label('Schema', config.schema);
   label('Output', config.out);
@@ -525,6 +581,33 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   spinner.succeed(
     `Found ${bold(String(tableNames.length))} tables, ${bold(String(totalColumns))} columns, ${bold(String(totalRelations))} relations`,
   );
+
+  // Guard: zero tables means the generated client would be empty. That is almost
+  // always a misconfiguration (wrong `schema`, an include/exclude that filtered
+  // everything, or a database with no tables yet) rather than intent. Fail loudly
+  // instead of silently emitting an empty typed client.
+  if (tableNames.length === 0 && !args.allowEmpty) {
+    newline();
+    error(`Introspection matched 0 tables in schema ${cyan(config.schema)} — refusing to generate an empty client.`);
+    newline();
+    console.log(`  ${dim('Common causes:')}`);
+    console.log(
+      `    ${dim('•')} ${cyan('schema')} ${dim('points at the wrong Postgres namespace')} ${dim('(it is the schema NAME, default')} ${cyan('public')}${dim(').')}`,
+    );
+    console.log(
+      `    ${dim('•')} ${dim('You meant to set')} ${cyan('schemaFile')} ${dim('(your defineSchema() file), not')} ${cyan('schema')}${dim('.')}`,
+    );
+    console.log(`    ${dim('•')} ${cyan('include')}/${cyan('exclude')} ${dim('filtered out every table.')}`);
+    console.log(
+      `    ${dim('•')} ${dim('The database has no tables yet — run')} ${cyan('turbine push')} ${dim('or a migration first.')}`,
+    );
+    newline();
+    console.log(
+      `  ${dim('If an empty client is genuinely what you want, re-run with')} ${cyan('--allow-empty')}${dim('.')}`,
+    );
+    newline();
+    process.exit(1);
+  }
 
   // Print table summary
   if (args.verbose) {
@@ -1337,6 +1420,7 @@ function showGenerateHelp(): void {
   console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}   Postgres schema ${dim('(default: public)')}`);
   console.log(`    ${cyan('--include')} ${dim('<tables>')}    Comma-separated tables to include`);
   console.log(`    ${cyan('--exclude')} ${dim('<tables>')}    Comma-separated tables to exclude`);
+  console.log(`    ${cyan('--allow-empty')}         Generate even when introspection matches 0 tables`);
   newline();
 }
 
@@ -1564,6 +1648,7 @@ async function main() {
   } catch (err) {
     if (args.command !== 'init') {
       warn(`Could not load config: ${err instanceof Error ? err.message : String(err)}`);
+      if (err instanceof Error) printCjsHintIfApplicable(err);
     }
   }
 

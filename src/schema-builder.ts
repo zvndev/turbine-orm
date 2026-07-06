@@ -34,16 +34,19 @@ import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 
 /** Shorthand type names that map to Postgres column types */
 export type ColumnTypeName =
-  | 'serial' // BIGSERIAL
+  | 'serial' // SERIAL (int4) — auto-increment PK that stays a JS `number`
+  | 'bigserial' // BIGSERIAL (int8) — 64-bit auto-increment; large values read back as string
   | 'bigint' // BIGINT
   | 'integer' // INTEGER
   | 'smallint' // SMALLINT
   | 'text' // TEXT
   | 'varchar' // VARCHAR(n)
   | 'boolean' // BOOLEAN
-  | 'timestamp' // TIMESTAMPTZ
+  | 'timestamp' // TIMESTAMPTZ (timezone-aware; alias kept for back-compat)
+  | 'timestamptz' // TIMESTAMPTZ
   | 'date' // DATE
-  | 'json' // JSONB
+  | 'json' // JSONB (alias kept for back-compat)
+  | 'jsonb' // JSONB
   | 'uuid' // UUID
   | 'real' // REAL
   | 'double' // DOUBLE PRECISION
@@ -52,16 +55,28 @@ export type ColumnTypeName =
 
 /** Maps shorthand names to actual Postgres type strings */
 const TYPE_MAP: Record<ColumnTypeName, string> = {
-  serial: 'BIGSERIAL',
+  // `serial` maps to SERIAL (int4). Its values fit in a JS `number` and pg
+  // returns them as numbers — so the generated `number` type is accurate.
+  // For 64-bit auto-increment keys use `bigserial` (int8), noting that values
+  // above Number.MAX_SAFE_INTEGER read back as string. (Changed in 0.24.0;
+  // `serial` previously emitted BIGSERIAL.)
+  serial: 'SERIAL',
+  bigserial: 'BIGSERIAL',
   bigint: 'BIGINT',
   integer: 'INTEGER',
   smallint: 'SMALLINT',
   text: 'TEXT',
   varchar: 'VARCHAR',
   boolean: 'BOOLEAN',
+  // `timestamp` is an honest alias for TIMESTAMPTZ (timezone-aware) — Turbine
+  // has always emitted TIMESTAMPTZ for it. `timestamptz` is the explicit spelling.
   timestamp: 'TIMESTAMPTZ',
+  timestamptz: 'TIMESTAMPTZ',
   date: 'DATE',
+  // `json` is an alias for JSONB (Turbine has always emitted JSONB). `jsonb`
+  // is the explicit spelling.
   json: 'JSONB',
+  jsonb: 'JSONB',
   uuid: 'UUID',
   real: 'REAL',
   double: 'DOUBLE PRECISION',
@@ -99,6 +114,7 @@ export interface ColumnDef {
 
 /** Postgres-level column type (uppercase, as used in DDL) */
 export type ColumnType =
+  | 'SERIAL'
   | 'BIGSERIAL'
   | 'BIGINT'
   | 'INTEGER'
@@ -373,6 +389,11 @@ export class ColumnBuilder {
   }
 
   serial(): this {
+    // See TYPE_MAP: `serial` is SERIAL (int4) as of 0.24.0. Use bigserial() for 64-bit.
+    this._config.type = 'SERIAL';
+    return this;
+  }
+  bigserial(): this {
     this._config.type = 'BIGSERIAL';
     return this;
   }
@@ -405,11 +426,19 @@ export class ColumnBuilder {
     this._config.type = 'TIMESTAMPTZ';
     return this;
   }
+  timestamptz(): this {
+    this._config.type = 'TIMESTAMPTZ';
+    return this;
+  }
   date(): this {
     this._config.type = 'DATE';
     return this;
   }
   json(): this {
+    this._config.type = 'JSONB';
+    return this;
+  }
+  jsonb(): this {
     this._config.type = 'JSONB';
     return this;
   }
@@ -468,14 +497,17 @@ export class ColumnBuilder {
 type ColumnProxy = {
   [K in
     | 'serial'
+    | 'bigserial'
     | 'bigint'
     | 'integer'
     | 'smallint'
     | 'text'
     | 'boolean'
     | 'timestamp'
+    | 'timestamptz'
     | 'date'
     | 'json'
+    | 'jsonb'
     | 'uuid'
     | 'real'
     | 'doublePrecision'
@@ -490,14 +522,17 @@ type NullaryColumnType = Exclude<keyof ColumnProxy, 'varchar'>;
 function isNullaryColumnType(prop: string): prop is NullaryColumnType {
   return (
     prop === 'serial' ||
+    prop === 'bigserial' ||
     prop === 'bigint' ||
     prop === 'integer' ||
     prop === 'smallint' ||
     prop === 'text' ||
     prop === 'boolean' ||
     prop === 'timestamp' ||
+    prop === 'timestamptz' ||
     prop === 'date' ||
     prop === 'json' ||
+    prop === 'jsonb' ||
     prop === 'uuid' ||
     prop === 'real' ||
     prop === 'doublePrecision' ||

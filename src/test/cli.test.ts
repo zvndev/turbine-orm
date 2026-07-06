@@ -8,11 +8,20 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
-import { configTemplate, findConfigFile, loadConfig, resolveConfig } from '../cli/config.js';
+import {
+  configTemplate,
+  findConfigFile,
+  loadConfig,
+  looksLikeSchemaFilePath,
+  resolveConfig,
+  type TurbineCliConfig,
+  type TurbineConfig,
+} from '../cli/config.js';
 import { _resetTsLoaderStateForTests, canResolveTsx, needsTsLoader, registerTsLoader } from '../cli/loader.js';
 import { parseMigrationContent } from '../cli/migrate.js';
 import { box, redactUrl, stripAnsi, table } from '../cli/ui.js';
@@ -215,6 +224,48 @@ describe('CLI config', () => {
       assert.deepEqual(result.include, ['posts', 'comments']);
       // exclude was not overridden, so file config is used
       assert.deepEqual(result.exclude, ['sessions']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // looksLikeSchemaFilePath() — the `schema` vs `schemaFile` collision guard.
+  // Regression for #28 item 1: a user who puts the schema FILE path in the
+  // `schema` field (a Postgres namespace name) would silently generate an empty
+  // client. `turbine generate` uses this to fail loudly instead.
+  // -------------------------------------------------------------------------
+  describe('looksLikeSchemaFilePath()', () => {
+    it('flags values that are clearly file paths', () => {
+      for (const v of [
+        './turbine/schema.ts',
+        'turbine/schema.ts',
+        './schema.js',
+        'src/db/schema.mts',
+        'schema.cjs',
+        'C:\\project\\schema.ts',
+        'schema.json',
+      ]) {
+        assert.equal(looksLikeSchemaFilePath(v), true, `${v} should look like a file path`);
+      }
+    });
+
+    it('does not flag real Postgres schema names', () => {
+      for (const v of ['public', 'analytics', 'my_schema', 'tenant1', '']) {
+        assert.equal(looksLikeSchemaFilePath(v), false, `${v} should be treated as a schema name`);
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // TurbineConfig alias (#28 item 3). Compile-time check: the doc's
+  // `import type { TurbineConfig }` must resolve to the same shape as
+  // TurbineCliConfig. If the alias were removed, typecheck would fail here.
+  // -------------------------------------------------------------------------
+  describe('TurbineConfig alias export', () => {
+    it('is assignable to TurbineCliConfig', () => {
+      const cfg: TurbineConfig = { url: 'postgres://x', schema: 'public', schemaFile: './turbine/schema.ts' };
+      const asCli: TurbineCliConfig = cfg;
+      assert.equal(asCli.schema, 'public');
+      assert.equal(asCli.schemaFile, './turbine/schema.ts');
     });
   });
 });
@@ -577,5 +628,72 @@ describe('CLI TypeScript loader', () => {
         _resetTsLoaderStateForTests();
       }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `turbine generate` — silent-empty-client guard (#28 item 1), end-to-end.
+//
+// Runs the real CLI via tsx in a temp dir (no DB needed — the guard fires
+// before any connection). Asserts a non-zero exit and an actionable message.
+// ---------------------------------------------------------------------------
+
+describe('turbine generate — empty-client guard (#28)', () => {
+  const repoRoot = process.cwd();
+  const tsxBin = resolve(repoRoot, 'node_modules/.bin/tsx');
+  const cliEntry = resolve(repoRoot, 'src/cli/index.ts');
+  const haveTsx = existsSync(tsxBin);
+
+  /** Run the CLI; returns { code, output } without throwing on non-zero exit. */
+  function runGenerate(cwd: string, extraArgs: string[]): { code: number; output: string } {
+    try {
+      const stdout = execFileSync(tsxBin, [cliEntry, 'generate', ...extraArgs], {
+        cwd,
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, DATABASE_URL: '', FORCE_COLOR: '0' },
+      });
+      return { code: 0, output: stdout };
+    } catch (err) {
+      const e = err as { status?: number; stdout?: Buffer | string; stderr?: Buffer | string };
+      const out = `${e.stdout?.toString() ?? ''}${e.stderr?.toString() ?? ''}`;
+      return { code: e.status ?? 1, output: out };
+    }
+  }
+
+  it('errors (exit 1) when `schema` is set to a schema FILE path', { skip: !haveTsx }, () => {
+    const dir = join(tmpdir(), `turbine-gen-guard-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+    try {
+      const { code, output } = runGenerate(dir, [
+        '--url',
+        'postgres://u:p@localhost:5432/db',
+        '--schema',
+        './turbine/schema.ts',
+      ]);
+      assert.equal(code, 1, `expected non-zero exit; output:\n${output}`);
+      assert.match(output, /looks like a file path/);
+      assert.match(output, /schemaFile/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--allow-empty bypasses the file-path guard (then fails on connection, not the guard)', { skip: !haveTsx }, () => {
+    const dir = join(tmpdir(), `turbine-gen-allow-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+    try {
+      const { output } = runGenerate(dir, [
+        '--url',
+        'postgres://u:p@127.0.0.1:1/db',
+        '--schema',
+        './turbine/schema.ts',
+        '--allow-empty',
+      ]);
+      // The path guard must NOT fire when --allow-empty is passed.
+      assert.doesNotMatch(output, /looks like a file path/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

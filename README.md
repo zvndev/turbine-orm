@@ -51,8 +51,9 @@ Performance is at parity with Prisma and Drizzle — the real reasons to choose 
 ## Quick Start
 
 ```bash
-# 1. Install
+# 1. Install (the CLI also needs tsx to load .ts config/schema files)
 npm install turbine-orm
+npm install --save-dev tsx
 
 # 2. Initialize project
 npx turbine init --url postgres://user:pass@localhost:5432/mydb
@@ -60,6 +61,8 @@ npx turbine init --url postgres://user:pass@localhost:5432/mydb
 # 3. Generate typed client from your database
 npx turbine generate
 ```
+
+> **CLI prerequisites.** The `turbine` CLI loads your `turbine.config.ts` / `turbine/schema.ts` directly, so a fresh project needs (1) `tsx` installed — otherwise `.ts` config loading fails with *"Loading .ts config / schema files requires tsx to be installed"* — and (2) `"type": "module"` in `package.json`, since Turbine is ESM. Without it you'll hit `Error [ERR_REQUIRE_ESM]: Cannot require() ES Module`. `create-next-app` sets neither by default. See [USING-TURBINE-ORM.md §0](docs/USING-TURBINE-ORM.md) for details.
 
 Works with both ESM and CommonJS:
 

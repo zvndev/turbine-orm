@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.24.0 (2026-07-06)
+
+**Dogfood fixes from building a fresh Next.js app on 0.23.2 (#28).** Five papercuts that made the first-run experience worse than it should be — a silent empty `generate`, two rejected column types, doc drift, undocumented prereqs, and an inaccurate `serial` type. All fixed; the only behavior change is the `serial` mapping (below), which is safe for existing databases.
+
+### Changed
+- **`serial` now emits `SERIAL` (int4), not `BIGSERIAL` (int8) — behavior change for NEW pushes.** A `serial` primary key was typed `number` but, being int8, read back over the wire as a **string** for large values — the generated type lied. `serial` now maps to `SERIAL` (int4), whose values fit in a JS `number` and are returned as numbers, so the type is accurate end-to-end. A new **`bigserial`** column type covers 64-bit auto-increment keys (int8; large values still read back as string, now documented). **Existing databases are unaffected:** `turbine push` / `migrate --auto` never auto-narrow a live column's integer width, so a `serial` column created as `BIGSERIAL` before 0.24.0 is left exactly as-is. Only brand-new `CREATE TABLE`s get `SERIAL`. (#28)
+
+### Added
+- **`bigserial`, `timestamptz`, and `jsonb` are now first-class `defineSchema` column types.** The docs' type table listed `timestamptz` and `jsonb`, but `defineSchema` rejected them; they now work. `timestamptz` is an explicit spelling of the timezone-aware timestamp Turbine already emitted for `timestamp`; `jsonb` is an explicit spelling of what `json` already emitted. Both aliases (`timestamp`, `json`) still work unchanged. (#28)
+- **`TurbineConfig` is now exported as an alias of `TurbineCliConfig`** from `turbine-orm/cli`, matching what the docs import. (#28)
+- **`turbine generate --allow-empty`** escape hatch for the two new guards below.
+
+### Fixed
+- **`turbine generate` no longer silently emits an empty client.** The `schema` config field is the Postgres schema *name* (default `public`), but the docs told users to put their schema *file path* there — so `generate` introspected `WHERE table_schema = './turbine/schema.ts'`, matched zero tables, and wrote an empty typed client with no error. `generate` now **errors (exit 1)** when `schema` looks like a file path (with a hint pointing at `schemaFile`) and when introspection matches **0 tables**. Pass `--allow-empty` to override. (#28)
+- **Clearer CLI error for the CommonJS case.** When a project's `package.json` lacks `"type": "module"`, loading a `.ts` config/schema fails with Node's raw `ERR_REQUIRE_ESM`; the CLI now appends a hint to add `"type": "module"`. (#28)
+
+### Docs
+- **`USING-TURBINE-ORM.md` §0 corrected:** the config example used `schema: './turbine/schema.ts'` (should be `schema: 'public'` + `schemaFile:`) and `migrations:` (should be `migrationsDir:`). Added a **CLI prerequisites** section documenting that the CLI needs `tsx` installed and `"type": "module"` in `package.json`, with the exact error messages — neither is set by `create-next-app`. README quickstart updated to match. (#28)
+
 ## 0.23.2 (2026-07-03)
 
 ### Fixed

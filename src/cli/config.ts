@@ -43,6 +43,25 @@ export interface TurbineCliConfig {
   adapter?: import('../adapters/index.js').DatabaseAdapter;
 }
 
+/**
+ * Alias for {@link TurbineCliConfig}. Some docs and examples import the config
+ * type as `TurbineConfig`; both names refer to the same shape.
+ */
+export type TurbineConfig = TurbineCliConfig;
+
+/**
+ * Heuristic: does a configured `schema` value actually look like a schema FILE
+ * path rather than a Postgres schema name? `schema` is the Postgres namespace
+ * to introspect (default `public`); the schema-builder file goes in `schemaFile`.
+ * A value containing a path separator or a JS/TS extension is almost certainly a
+ * mis-set `schemaFile` — introspecting `WHERE table_schema = './turbine/schema.ts'`
+ * silently matches zero tables. Used by `turbine generate` to fail loudly.
+ */
+export function looksLikeSchemaFilePath(schema: string): boolean {
+  if (!schema) return false;
+  return schema.includes('/') || schema.includes('\\') || /\.(ts|mts|cts|js|mjs|cjs|json)$/i.test(schema);
+}
+
 // ---------------------------------------------------------------------------
 // Config file names, in priority order
 // ---------------------------------------------------------------------------

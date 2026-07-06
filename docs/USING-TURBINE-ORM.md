@@ -16,6 +16,31 @@ npm install turbine-orm
 
 One runtime dependency: `pg`. Ships both ESM (`dist/`) and CJS (`dist-cjs/`). Serverless/edge entry at `turbine-orm/serverless`.
 
+### CLI prerequisites
+
+The `turbine` CLI loads your `turbine.config.ts` and `turbine/schema.ts` files directly, so a fresh project (e.g. straight out of `create-next-app`) needs two things before the first `turbine` command:
+
+1. **`tsx` installed** — Turbine keeps it out of its own dependencies (it's a heavy dev tool many projects already have). Without it, loading a `.ts` config/schema fails:
+
+   ```
+   ✖ Cannot load TypeScript file: turbine.config.ts
+     Loading .ts config / schema files requires tsx to be installed.
+   ```
+
+   ```bash
+   npm install --save-dev tsx
+   ```
+
+   (Or rename your config/schema files to `.mjs` and skip `tsx` entirely.)
+
+2. **`"type": "module"` in `package.json`** — Turbine is an ESM package. In a CommonJS project, `tsx` transpiles your `.ts` files to CJS and then can't `require()` Turbine's ESM build:
+
+   ```
+   Error [ERR_REQUIRE_ESM]: Cannot require() ES Module .../turbine-orm/dist/index.js
+   ```
+
+   Add `"type": "module"` to your `package.json` to fix it. (`create-next-app` does not set this by default.)
+
 ### Recommended project layout
 
 ```
@@ -42,10 +67,18 @@ import type { TurbineConfig } from 'turbine-orm/cli';
 export default {
   url: process.env.DATABASE_URL,
   out: './generated/turbine',
-  schema: './turbine/schema.ts',
-  migrations: './migrations',
+  // `schema` is the Postgres schema NAME to introspect. Omit it to use `public`.
+  // It is NOT the path to your schema file — that goes in `schemaFile` below.
+  schema: 'public',
+  // Your defineSchema() file — consumed by `turbine push` and `migrate --auto`.
+  schemaFile: './turbine/schema.ts',
+  migrationsDir: './migrations',
 } satisfies TurbineConfig;
 ```
+
+> `TurbineConfig` is an alias for `TurbineCliConfig`; either import name works.
+>
+> **`schema` vs `schemaFile` — the #1 config mistake.** `schema` is the Postgres namespace name (`public` by default). The path to your `defineSchema()` file is `schemaFile`. If you put the file path in `schema`, `turbine generate` introspects a schema that doesn't exist, matches zero tables, and (as of 0.24.0) **errors** instead of silently emitting an empty client. Field is `migrationsDir`, not `migrations`.
 
 **Port note for PowDB TS client:** mirror the `turbine.config.ts` concept — one config file that points at the DB, schema source, output dir, migrations dir. Users expect this shape.
 
@@ -97,7 +130,7 @@ export default defineSchema({
 
 | Option | Meaning |
 |---|---|
-| `type` | Postgres type. `serial`, `bigserial`, `text`, `varchar`, `integer`, `bigint`, `boolean`, `timestamp`, `timestamptz`, `date`, `uuid`, `jsonb`, `bytea`, etc. |
+| `type` | Postgres type. `serial`, `bigserial`, `text`, `varchar`, `integer`, `bigint`, `boolean`, `timestamp`, `timestamptz`, `date`, `uuid`, `json`, `jsonb`, `real`, `double`, `numeric`, `bytea`. `timestamp` and `timestamptz` both emit `TIMESTAMPTZ` (timezone-aware); `json` and `jsonb` both emit `JSONB`. |
 | `primaryKey: true` | Column-level PK. |
 | `primaryKey: [...]` | Table-level composite PK. |
 | `unique: true` | UNIQUE constraint. |
@@ -106,6 +139,8 @@ export default defineSchema({
 | `references: 'table.column'` | Foreign key. Infers the relation direction. |
 | `check: '...'` | CHECK constraint expression. |
 | `index: true \| { using: 'gin' \| 'gist' }` | Index. |
+
+> **Auto-increment keys — `serial` vs `bigserial` (changed in 0.24.0).** `serial` now emits `SERIAL` (int4). Its values fit in a JS `number` and pg returns them as numbers, so the generated `number` type is accurate end-to-end. For 64-bit keys use `bigserial` (int8) — but note that int8 values above `Number.MAX_SAFE_INTEGER` (2^53−1) come back over the wire as **strings** to avoid precision loss, even though the generated type says `number`. Reach for `bigserial` only when you actually expect to exceed ~9 quadrillion rows. Existing databases whose `serial` columns were created as `BIGSERIAL` before 0.24.0 are left alone — `turbine push` never auto-narrows a live column's integer width.
 
 ### DB-first: introspect
 
