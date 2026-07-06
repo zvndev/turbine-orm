@@ -12,6 +12,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { type PgCompatPool, TurbineClient } from '../client.js';
+import type { QueryInterface } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { turbineHttp } from '../serverless.js';
 import { mockTable } from './helpers.js';
@@ -188,6 +189,80 @@ describe('turbineHttp / external pool integration', () => {
     assert.strictEqual(db.users, db.table('users'));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Typed overload: turbineHttp<TClient>(pool, schema) returns the generated
+// client type so `db.users` etc. are visible to TS with no cast at the call
+// site — matching the TCP-path `turbine()` factory. See src/serverless.ts.
+// ---------------------------------------------------------------------------
+
+describe('turbineHttp / typed overload (generated accessors)', () => {
+  it('returns a working client whose generated accessors are usable without a cast', async () => {
+    // `GeneratedClient` mirrors exactly what generate.ts emits: a subclass of
+    // the base client that only declares typed accessors over each table.
+    interface UserRow {
+      id: number;
+      name: string;
+      email: string;
+    }
+    class GeneratedClient extends TurbineClient {
+      declare readonly users: QueryInterface<UserRow>;
+    }
+
+    const { pool, calls } = createMockPool([{ rows: [{ id: 1, name: 'Alice', email: 'a@b.com' }] }]);
+    // No `as` cast at the call site — the type argument threads the accessors.
+    const db = turbineHttp<GeneratedClient>(pool, buildSchema());
+
+    // Static: `db.users` is the typed QueryInterface, not `unknown`/missing.
+    const rows = await db.users.findMany({ limit: 1 });
+
+    // Runtime: the accessor genuinely exists (base ctor materializes it) and
+    // routes through the external pool.
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.name, 'Alice');
+    assert.equal(calls.length, 1);
+    assert.equal(at(calls, 0).via, 'pool');
+    assert.strictEqual(db.users, db.table('users'));
+  });
+});
+
+// --- Compile-time type assertions (never executed; fail `tsc` on regression) -
+
+/** Compile-time exact-equality assertion. `true` only when A and B are mutually assignable. */
+type Equals<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+
+/** Force a compile error if `T` is not the literal `true` type. */
+function assertTrue<_T extends true>(): void {
+  /* type-level only */
+}
+
+interface TypeTestUser {
+  id: number;
+  email: string;
+}
+class TypeTestClient extends TurbineClient {
+  declare readonly users: QueryInterface<TypeTestUser>;
+}
+
+// Referencing `declare const` values must stay inside a never-run function —
+// `declare const` emits no runtime binding.
+declare const _pool: PgCompatPool;
+declare const _schema: SchemaMetadata;
+
+function _turbineHttpTypeChecks(): void {
+  // 1. Typed: the type argument flows to the return type.
+  const typed = turbineHttp<TypeTestClient>(_pool, _schema);
+  assertTrue<Equals<typeof typed, TypeTestClient>>();
+  assertTrue<Equals<typeof typed.users, QueryInterface<TypeTestUser>>>();
+
+  // 2. Back-compat: the default (no type arg) is still the base TurbineClient.
+  const untyped = turbineHttp(_pool, _schema);
+  assertTrue<Equals<typeof untyped, TurbineClient>>();
+
+  // 3. The base client does NOT expose generated accessors as typed members.
+  // @ts-expect-error — `users` is not declared on the base TurbineClient.
+  untyped.users;
+}
 
 describe('turbineHttp / error surfaces', () => {
   it('propagates pool.query errors to the caller', async () => {

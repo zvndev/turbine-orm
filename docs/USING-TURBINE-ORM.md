@@ -185,14 +185,20 @@ export const db = turbine({
 
 ```ts
 import { turbineHttp } from 'turbine-orm/serverless';
+import type { TurbineClient } from '../generated/turbine';
 import { schema } from '../generated/turbine/metadata';
 import { Pool } from '@neondatabase/serverless';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
-export const db = turbineHttp(pool, schema);
+
+// Pass the generated client type to get the same typed accessors the TCP
+// `turbine()` factory gives you — `db.users`, `db.posts`, … — with no cast.
+export const db = turbineHttp<TurbineClient>(pool, schema);
+
+const users = await db.users.findMany({ limit: 10 }); // fully typed
 ```
 
-Same surface, same types. On external pools, `db.disconnect()` is a no-op — the caller owns lifecycle.
+Same surface, same types: `db.users.findMany()` is identical code across transports. If you omit the `<TurbineClient>` type argument, `turbineHttp` returns the base client and you reach tables via `db.table('users')` — the untyped escape hatch stays backward-compatible. On external pools, `db.disconnect()` is a no-op — the caller owns lifecycle.
 
 ### Middleware
 
