@@ -38,7 +38,7 @@ describe('schemaDiff patterns — add table (CREATE TABLE UP, DROP TABLE DOWN)',
     const statements = schemaToSQL(schema);
     const createStmt = statements.find((s) => s.includes('CREATE TABLE "accounts"'));
     assert.ok(createStmt, 'should produce CREATE TABLE');
-    assert.ok(createStmt.includes('"id" BIGSERIAL PRIMARY KEY'));
+    assert.ok(createStmt.includes('"id" SERIAL PRIMARY KEY'));
     assert.ok(createStmt.includes('"email" TEXT UNIQUE NOT NULL'));
     assert.ok(createStmt.includes('"name" TEXT NOT NULL'));
     assert.ok(createStmt.includes('"created_at" TIMESTAMPTZ NOT NULL DEFAULT NOW()'));
@@ -490,12 +490,16 @@ describe('schemaToSQL — diff-relevant DDL patterns', () => {
         m: { type: 'double' },
         n: { type: 'numeric' },
         o: { type: 'bytea' },
+        p: { type: 'bigserial' },
+        q: { type: 'timestamptz' },
+        r: { type: 'jsonb' },
       },
     });
     const stmts = schemaToSQL(schema);
     const ddl = stmts[0]!;
 
-    assert.ok(ddl.includes('"a" BIGSERIAL PRIMARY KEY'));
+    // `serial` emits SERIAL (int4) as of 0.24.0; `bigserial` covers 64-bit keys.
+    assert.ok(ddl.includes('"a" SERIAL PRIMARY KEY'));
     assert.ok(ddl.includes('"b" BIGINT'));
     assert.ok(ddl.includes('"c" INTEGER'));
     assert.ok(ddl.includes('"d" SMALLINT'));
@@ -510,6 +514,9 @@ describe('schemaToSQL — diff-relevant DDL patterns', () => {
     assert.ok(ddl.includes('"m" DOUBLE PRECISION'));
     assert.ok(ddl.includes('"n" NUMERIC'));
     assert.ok(ddl.includes('"o" BYTEA'));
+    assert.ok(ddl.includes('"p" BIGSERIAL'));
+    assert.ok(ddl.includes('"q" TIMESTAMPTZ'));
+    assert.ok(ddl.includes('"r" JSONB'));
   });
 
   it('FK references use correct quoting', () => {

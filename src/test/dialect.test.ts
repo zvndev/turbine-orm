@@ -62,6 +62,7 @@ const mysqlishDialect: Dialect = {
       .join(' AND ');
   },
   buildColumnType(input) {
+    if (input.type === 'SERIAL') return 'INT AUTO_INCREMENT';
     if (input.type === 'BIGSERIAL') return 'BIGINT AUTO_INCREMENT';
     if (input.type === 'TIMESTAMPTZ') return 'DATETIME';
     if (input.type === 'JSONB') return 'JSON';
@@ -220,12 +221,14 @@ describe('Dialect contract', () => {
     const sql = schemaToSQL(schema, { dialect: mysqlishDialect }).join('\n');
 
     assert.match(sql, /CREATE TABLE `organizations`/);
-    assert.match(sql, /`id` BIGINT AUTO_INCREMENT PRIMARY KEY/);
+    // `serial` now emits SERIAL (int4); the dialect translates it to INT AUTO_INCREMENT.
+    assert.match(sql, /`id` INT AUTO_INCREMENT PRIMARY KEY/);
     assert.match(sql, /`created_at` DATETIME NOT NULL DEFAULT NOW\(\)/);
     assert.match(sql, /`profile` JSON/);
     assert.match(sql, /REFERENCES `organizations`\(`id`\)/);
     assert.match(sql, /CREATE INDEX `idx_users_org_id` ON `users`\(`org_id`\);/);
-    assert.doesNotMatch(sql, /"organizations"|BIGSERIAL|TIMESTAMPTZ|JSONB/);
+    // No raw Postgres pseudo-types (SERIAL/BIGSERIAL/TIMESTAMPTZ/JSONB) leak through.
+    assert.doesNotMatch(sql, /"organizations"|SERIAL|TIMESTAMPTZ|JSONB/);
   });
 
   it('migration tracking SQL is dialect-owned', () => {

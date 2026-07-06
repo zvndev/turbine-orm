@@ -15,6 +15,16 @@ export interface SchemaSqlOptions {
   dialect?: Dialect;
 }
 
+/**
+ * Whether a resolved column type is an auto-increment pseudo-type (SERIAL /
+ * BIGSERIAL). These carry an implicit sequence default and NOT NULL, and their
+ * underlying integer width (int4 vs int8) is never auto-migrated by diff — a
+ * width change on a live PK is destructive and must be done by hand.
+ */
+function isSerialType(type: string): boolean {
+  return type === 'SERIAL' || type === 'BIGSERIAL';
+}
+
 // ---------------------------------------------------------------------------
 // SQL Generation — SchemaDef → CREATE TABLE statements
 // ---------------------------------------------------------------------------
@@ -186,7 +196,7 @@ function generateColumnDef(
   //   2. Is a serial (BIGSERIAL implies NOT NULL), OR
   //   3. Has a primary key (PKs are NOT NULL)
   // A column is left nullable if .nullable() was called.
-  const isSerial = config.type === 'BIGSERIAL';
+  const isSerial = isSerialType(config.type);
   const implicitNotNull = isSerial || config.isPrimaryKey;
   const notNull = config.isNotNull && !implicitNotNull;
 
@@ -474,9 +484,13 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
           continue;
         }
 
-        // Check type mismatch
+        // Check type mismatch. Serial/bigserial columns are exempt: their
+        // underlying int4/int8 width must never be auto-altered on a live table
+        // (a downcast on a PK loses data / breaks the sequence). This also
+        // preserves back-compat for DBs whose `serial` columns were created as
+        // BIGSERIAL (int8) before 0.24.0 — `push` won't try to shrink them.
         const expectedUdt = schemaTypeToUdt(config);
-        if (expectedUdt && dbCol.udtName !== expectedUdt) {
+        if (expectedUdt && !isSerialType(config.type) && dbCol.udtName !== expectedUdt) {
           const sqlType = config.type === 'VARCHAR' && config.maxLength ? `VARCHAR(${config.maxLength})` : config.type;
           const oldSqlType = udtToSqlType(dbCol.udtName, dbCol.maxLength);
           const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${sqlType} USING ${dialect.quoteIdentifier(snakeName)}::${sqlType};`;
@@ -487,7 +501,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         }
 
         // Check NOT NULL mismatch
-        const shouldBeNotNull = config.isNotNull || config.isPrimaryKey || config.type === 'BIGSERIAL';
+        const shouldBeNotNull = config.isNotNull || config.isPrimaryKey || isSerialType(config.type);
         const isCurrentlyNullable = dbCol.isNullable;
         if (shouldBeNotNull && isCurrentlyNullable && !config.isNullable) {
           const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} SET NOT NULL;`;
@@ -504,7 +518,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         }
 
         // Check DEFAULT value mismatch
-        const isSerial = config.type === 'BIGSERIAL';
+        const isSerial = isSerialType(config.type);
         if (!isSerial) {
           const schemaDefault = config.defaultValue ? normalizeDefault(config.defaultValue) : null;
           const dbDefault = dbCol.columnDefault;
@@ -588,6 +602,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
  */
 function schemaTypeToUdt(config: ColumnConfig): string | null {
   const map: Record<string, string> = {
+    SERIAL: 'int4',
     BIGSERIAL: 'int8',
     BIGINT: 'int8',
     INTEGER: 'int4',

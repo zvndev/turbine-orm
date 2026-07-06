@@ -66,8 +66,14 @@ const benchmarkSchema = defineSchema({
 describe('ColumnBuilder', () => {
   it('creates a serial primary key', () => {
     const config = column.serial().primaryKey().build();
-    assert.equal(config.type, 'BIGSERIAL');
+    // `serial` emits SERIAL (int4) as of 0.24.0; use bigserial() for 64-bit keys.
+    assert.equal(config.type, 'SERIAL');
     assert.equal(config.isPrimaryKey, true);
+  });
+
+  it('bigserial() maps to BIGSERIAL (int8)', () => {
+    assert.equal(column.bigserial().build().type, 'BIGSERIAL');
+    assert.equal(column.bigserial().primaryKey().build().isPrimaryKey, true);
   });
 
   it('creates a text column with NOT NULL and UNIQUE', () => {
@@ -115,14 +121,17 @@ describe('ColumnBuilder', () => {
   });
 
   it('supports all column types', () => {
-    assert.equal(column.serial().build().type, 'BIGSERIAL');
+    assert.equal(column.serial().build().type, 'SERIAL');
+    assert.equal(column.bigserial().build().type, 'BIGSERIAL');
     assert.equal(column.bigint().build().type, 'BIGINT');
     assert.equal(column.integer().build().type, 'INTEGER');
     assert.equal(column.smallint().build().type, 'SMALLINT');
     assert.equal(column.text().build().type, 'TEXT');
     assert.equal(column.boolean().build().type, 'BOOLEAN');
     assert.equal(column.timestamp().build().type, 'TIMESTAMPTZ');
+    assert.equal(column.timestamptz().build().type, 'TIMESTAMPTZ');
     assert.equal(column.json().build().type, 'JSONB');
+    assert.equal(column.jsonb().build().type, 'JSONB');
     assert.equal(column.uuid().build().type, 'UUID');
     assert.equal(column.real().build().type, 'REAL');
     assert.equal(column.doublePrecision().build().type, 'DOUBLE PRECISION');
@@ -218,7 +227,7 @@ describe('schemaToSQL', () => {
   it('generates correct organizations table', () => {
     const orgSQL = statements.find((s) => s.includes('"organizations"'));
     assert.ok(orgSQL, 'should have organizations CREATE TABLE');
-    assert.ok(orgSQL.includes('"id" BIGSERIAL PRIMARY KEY'), 'should have id BIGSERIAL PRIMARY KEY');
+    assert.ok(orgSQL.includes('"id" SERIAL PRIMARY KEY'), 'should have id SERIAL PRIMARY KEY');
     assert.ok(orgSQL.includes('"name" TEXT NOT NULL'), 'should have name TEXT NOT NULL');
     assert.ok(orgSQL.includes('"slug" TEXT UNIQUE NOT NULL'), 'should have slug TEXT UNIQUE NOT NULL');
     assert.ok(orgSQL.includes('"plan" TEXT NOT NULL DEFAULT \'free\''), "should have plan with default 'free'");
@@ -231,7 +240,7 @@ describe('schemaToSQL', () => {
   it('generates correct users table', () => {
     const usersSQL = statements.find((s) => s.includes('"users"'));
     assert.ok(usersSQL, 'should have users CREATE TABLE');
-    assert.ok(usersSQL.includes('"id" BIGSERIAL PRIMARY KEY'), 'should have id column');
+    assert.ok(usersSQL.includes('"id" SERIAL PRIMARY KEY'), 'should have id column');
     assert.ok(usersSQL.includes('"org_id" BIGINT NOT NULL'), 'should convert orgId to org_id');
     assert.ok(usersSQL.includes('REFERENCES "organizations"("id")'), 'should have FK reference');
     assert.ok(usersSQL.includes('"email" TEXT UNIQUE NOT NULL'), 'should have email');
@@ -311,7 +320,7 @@ describe('schema.sql compatibility', () => {
     const fullSQL = schemaToSQLString(benchmarkSchema);
 
     // organizations columns
-    assert.ok(fullSQL.includes('"id" BIGSERIAL PRIMARY KEY'), 'org.id');
+    assert.ok(fullSQL.includes('"id" SERIAL PRIMARY KEY'), 'org.id');
     assert.ok(fullSQL.includes('"name" TEXT NOT NULL'), 'org.name');
     assert.ok(fullSQL.includes('"slug" TEXT UNIQUE NOT NULL'), 'org.slug');
 
@@ -401,7 +410,7 @@ describe('defineSchema (object format)', () => {
 
   it('resolves column types correctly', () => {
     const orgCols = benchmarkSchemaObjects.tables.organizations!.columns;
-    assert.equal(orgCols.id!.type, 'BIGSERIAL');
+    assert.equal(orgCols.id!.type, 'SERIAL');
     assert.equal(orgCols.id!.isPrimaryKey, true);
     assert.equal(orgCols.name!.type, 'TEXT');
     assert.equal(orgCols.name!.isNotNull, true);
@@ -446,10 +455,13 @@ describe('defineSchema (object format)', () => {
         m: { type: 'double' },
         n: { type: 'numeric' },
         o: { type: 'bytea' },
+        p: { type: 'bigserial' },
+        q: { type: 'timestamptz' },
+        r: { type: 'jsonb' },
       },
     });
     const cols = schema.tables.allTypes!.columns;
-    assert.equal(cols.a!.type, 'BIGSERIAL');
+    assert.equal(cols.a!.type, 'SERIAL');
     assert.equal(cols.b!.type, 'BIGINT');
     assert.equal(cols.c!.type, 'INTEGER');
     assert.equal(cols.d!.type, 'SMALLINT');
@@ -465,6 +477,10 @@ describe('defineSchema (object format)', () => {
     assert.equal(cols.m!.type, 'DOUBLE PRECISION');
     assert.equal(cols.n!.type, 'NUMERIC');
     assert.equal(cols.o!.type, 'BYTEA');
+    // New first-class types (0.24.0): bigserial + explicit timestamptz/jsonb spellings.
+    assert.equal(cols.p!.type, 'BIGSERIAL');
+    assert.equal(cols.q!.type, 'TIMESTAMPTZ');
+    assert.equal(cols.r!.type, 'JSONB');
   });
 
   it('defaults omitted flags to false/null', () => {
@@ -531,6 +547,7 @@ describe('defineSchema runtime type validation', () => {
   it('should accept all valid column types without throwing', () => {
     const validTypes = [
       'serial',
+      'bigserial',
       'bigint',
       'integer',
       'smallint',
@@ -538,8 +555,10 @@ describe('defineSchema runtime type validation', () => {
       'varchar',
       'boolean',
       'timestamp',
+      'timestamptz',
       'date',
       'json',
+      'jsonb',
       'uuid',
       'real',
       'double',
