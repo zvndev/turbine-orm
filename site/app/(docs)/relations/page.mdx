@@ -302,6 +302,50 @@ LIMIT 1000
 
 If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop to `db.raw` — Turbine's opinion on relation loading is correlated subqueries; reporting queries have different shape.
 
+## Load strategy: `join` vs `batched`
+
+The correlated-subquery default (`relationLoadStrategy: 'join'`) resolves an entire `with` tree in **one** SQL statement. It's the right default: a single round-trip, and an index seek per parent when the child FK is indexed. Two situations favor the alternative:
+
+- **A child FK column is unindexed.** A correlated probe per parent becomes N-parents × full-table-scan. Run [`npx turbine doctor`](/cli#turbine-doctor) to find these — but if you can't add the index yet, batched loading pays that missing index only once.
+- **Huge result sets.** Nested JSON (`json_build_object` per row, re-serialized inside `json_agg`) is heavier to encode and decode than flat rows.
+
+Opt in per query, or set a client-wide default:
+
+```ts
+// Per query
+const users = await db.users.findMany({
+  with: { posts: true },
+  relationLoadStrategy: 'batched',
+});
+
+// Or as the default for every findMany/findFirst/findUnique
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  relationLoadStrategy: 'batched',
+});
+```
+
+`'batched'` runs the base query without `json_agg` subqueries, then issues **one flat follow-up query per relation** (`WHERE fk = ANY($1)`, chunked at 1,000 keys) and stitches the children onto the parents in memory. D relation levels cost D extra round-trips instead of one, but each is a single indexed key-set lookup and the rows come back flat.
+
+The result is **deep-equal** to the join strategy — same shape, same camelCase keys, same `Date` coercion — so you can flip the flag without touching the rest of your code. It honors per-relation `where` / `select` / `omit` / `orderBy` and nested `with`. The per-relation `limit` is applied **client-side per parent** (a `LIMIT` on a batched `= ANY($1)` would cap total children, not children-per-parent). And it's **transaction-safe**: the follow-up queries run on the same pinned connection, so batched loads inside `$transaction` see the transaction's own writes.
+
+> **Note.** Composite-key relations aren't supported by `'batched'` — use the default `'join'` strategy for those.
+
+## Lean JSON encoding
+
+With the join strategy, each nested row is a `json_build_object('id', …, 'title', …)` — every key name repeats in every row of every relation. For wide relations over large result sets that repetition dominates the wire payload. `jsonEncoding: 'positional'` (Postgres-only) drops the keys:
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  jsonEncoding: 'positional',
+});
+```
+
+Relation subqueries then emit `json_agg(json_build_array(…))` — a key-less array per row. Turbine knows the column order at build time, so it maps positions back to keys when parsing. The parsed output is **byte-identical** to the default `'object'` encoding; only the wire format changes.
+
+Measured on a 14-column `hasMany` relation: **39% fewer wire bytes** and ~13% faster end-to-end `findMany`. The win grows with column count and result size. It composes with everything — `select` / `omit`, ordered and limited relations, `hasOne` / `belongsTo`, many-to-many, nested trees. (`relationLoadStrategy: 'batched'` bypasses it entirely — there's no JSON aggregation on that path.) Default is `'object'`, byte-unchanged.
+
 ## See also
 
 - **[API Reference](/queries)** — every operator and option in `where`, `with`, `select`.

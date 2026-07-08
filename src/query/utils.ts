@@ -156,3 +156,39 @@ export function buildCorrelation(
     .map((col, i) => `${leftRef}.${quoteIdent(col)} = ${rightRef}.${quoteIdent(rightCols[i]!)}`)
     .join(' AND ');
 }
+
+/**
+ * Matches an explicit timezone suffix on a date-time string: a trailing `Z`
+ * or a `±HH`, `±HHMM`, `±HH:MM` offset.
+ */
+const TZ_SUFFIX_RE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
+
+/**
+ * Parse a database date-time string deterministically.
+ *
+ * Postgres `timestamp` (without time zone) values arrive with no offset —
+ * both from the driver and from `json_agg`/`json_build_object` subquery JSON
+ * (`2026-07-07T17:15:41.896`). JavaScript's `new Date()` interprets such
+ * strings in the SERVER'S LOCAL TIME ZONE, so the same row parses to a
+ * different instant depending on where the code runs. The universal ORM
+ * convention (Prisma, Rails, Django) is to treat offset-less timestamps as
+ * UTC — that is also the only interpretation that round-trips: Postgres
+ * stores exactly the wall-clock fields you sent.
+ *
+ * Strings that carry an explicit offset (`timestamptz` output) are parsed
+ * as-is.
+ */
+export function parseDbDate(value: string): Date {
+  // Date-only values (`2026-07-07`, from `date` columns in json_agg output)
+  // have no time to zone-pin — and their `-07` tail must not be read as an
+  // offset. JS parses bare ISO dates as UTC midnight already.
+  if (!value.includes(':')) return new Date(value);
+  if (TZ_SUFFIX_RE.test(value)) {
+    // JS Date can't parse colon-less (`-0430`) or bare-hour (`+02`) offsets —
+    // normalize both to `±HH:MM`. Postgres emits the bare-hour form for
+    // whole-hour zones in some text outputs.
+    return new Date(value.replace(/([+-]\d{2})(\d{2})$/, '$1:$2').replace(/([+-]\d{2})$/, '$1:00'));
+  }
+  // normalize `YYYY-MM-DD HH:MM:SS` (driver form) to ISO before pinning UTC
+  return new Date(`${value.replace(' ', 'T')}Z`);
+}

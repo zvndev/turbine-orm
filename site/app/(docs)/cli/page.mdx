@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'CLI',
   description:
-    'Every Turbine ORM CLI command — init, pull, push, migrate, seed, status — with flags and examples.',
+    'Every Turbine ORM CLI command — init, pull, push, migrate, seed, status, doctor — with flags and examples.',
   alternates: { canonical: '/cli' },
 };
 
@@ -25,6 +25,8 @@ Commands:
   migrate status                 Show applied vs pending migrations
   seed                           Run the seed file
   status                         Show connection info + schema summary
+  doctor                         Check relations for missing FK indexes
+  doctor --fix                   Write a migration that adds the missing indexes
   studio                         Launch local read-only Studio web UI
   observe                        Launch local metrics dashboard
 ```
@@ -166,6 +168,51 @@ npx turbine status
 ```
 
 Outputs the detected database name, host, Postgres version, table count, and the path to the generated client — handy for verifying CI environments.
+
+## `turbine doctor`
+
+Check every relation for a missing foreign-key index.
+
+```bash
+npx turbine doctor
+npx turbine doctor --fix
+```
+
+Turbine loads `with` relations as **correlated subqueries** — the child table is probed once per parent row (`child.fk = parent.pk`). When the probed column is indexed, that's an index seek per parent. When it isn't, it's a full table scan *per parent*, which multiplies by the parent row count and can turn a fast query into a many-second one. Batched-loader ORMs pay a missing FK index only once (a single `WHERE fk IN (…)` scan), so schemas migrated from them routinely lack the FK indexes Turbine's strategy needs. `doctor` finds them before they hit production.
+
+It introspects the database, derives every column set relations will probe (hasMany/hasOne child FKs, belongsTo reference keys, many-to-many junction keys), and reports the unindexed ones sorted by table row count — the biggest tables first, since a missing index on a 300-row table is noise and on a 300K-row table is the whole page load.
+
+Example report:
+
+```
+⚠ Found 2 unindexed relation probe(s)
+
+  Turbine loads relations as correlated subqueries — the child table is probed
+  once per parent row, so an unindexed FK costs a full table scan PER PARENT.
+
+  ⚠ comments (post_id)  ~357,000 rows
+    ├ probed by posts.comments (hasMany)
+    └ CREATE INDEX IF NOT EXISTS "idx_comments_post_id" ON "comments" ("post_id");
+
+  ⚠ posts (user_id)  ~46,000 rows
+    ├ probed by users.posts (hasMany)
+    └ CREATE INDEX IF NOT EXISTS "idx_posts_user_id" ON "posts" ("user_id");
+
+  Generate a fix migration with: npx turbine doctor --fix
+```
+
+`--fix` writes a ready-to-apply migration whose `-- UP` section is the `CREATE INDEX IF NOT EXISTS` statements and whose `-- DOWN` section drops them. Review it, then apply with `npx turbine migrate up`:
+
+```bash
+npx turbine doctor --fix
+# Created migration: 20260708143022_add_relation_fk_indexes.sql
+```
+
+For large, hot tables, prefer running the statements manually with `CREATE INDEX CONCURRENTLY` — it doesn't hold a write lock, but it can't run inside a transaction, so `doctor` never emits it in the migration.
+
+### Dev-mode warning
+
+You don't have to remember to run `doctor`. In non-production (`NODE_ENV !== 'production'`), the first query that builds a relation subquery over an unindexed FK logs a one-time warning naming the relation, the table and columns, and the exact `CREATE INDEX` statement. The warning only fires when the schema metadata actually carries index information (introspected or generated clients), so `defineSchema`-only setups see no false positives.
 
 ## `turbine studio`
 

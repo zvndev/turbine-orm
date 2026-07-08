@@ -24,6 +24,7 @@ import {
   ValidationError,
   wrapPgError,
 } from '../errors.js';
+import { missingIndexForRelation } from '../index-advisor.js';
 import {
   executeNestedCreate,
   executeNestedUpdate,
@@ -32,6 +33,14 @@ import {
 } from '../nested-write.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { camelToSnake, normalizeKeyColumns, snakeToCamel } from '../schema.js';
+import {
+  type BatchedChildReader,
+  includeKeysForBatching,
+  loadRelationsBatched,
+  neededParentKeyFields,
+  type RelationLoadContext,
+  stripFields,
+} from './batched-loader.js';
 import type {
   AggregateArgs,
   AggregateResult,
@@ -52,6 +61,7 @@ import type {
   OrderByClause,
   OrderDirection,
   QueryResult,
+  RelationLoadStrategy,
   TextSearchFilter,
   TypedWithClause,
   UpdateArgs,
@@ -64,7 +74,7 @@ import type {
   WithClause,
   WithOptions,
 } from './types.js';
-import { escapeLike, LRUCache, OPERATOR_KEYS, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
+import { escapeLike, LRUCache, OPERATOR_KEYS, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
 
 // ---------------------------------------------------------------------------
 // Internal detection helpers — used by QueryInterface
@@ -151,6 +161,9 @@ function sortedEntries<V>(obj: Record<string, V>): [string, V][] {
 }
 
 /** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
+/** Relations already warned about missing FK indexes (once per process, dev only). */
+const unindexedRelationWarned = new Set<string>();
+
 const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
 
 /** Known JSONB operator keys */
@@ -389,6 +402,26 @@ export interface QueryInterfaceOptions {
   sqlCache?: boolean;
   /** SQL dialect implementation. Defaults to PostgreSQL. */
   dialect?: Dialect;
+  /**
+   * Interpret offset-less timestamp strings (Postgres `timestamp` without
+   * time zone, and the JSON emitted by nested-relation subqueries) as UTC.
+   * This is the Prisma/Rails/Django convention and makes results independent
+   * of the server's local time zone. Default: `true`. Set `false` to restore
+   * the pre-0.26 behavior (JS local-time interpretation).
+   */
+  utcTimestamps?: boolean;
+  /**
+   * Client-level default relation-loading strategy for `with` clauses. Per-query
+   * `relationLoadStrategy` args override this; both default to `'join'`.
+   */
+  relationLoadStrategy?: RelationLoadStrategy;
+  /**
+   * How nested-relation subqueries encode each row's JSON: `'object'` (default,
+   * `json_build_object`) or `'positional'` (`json_build_array`, key-less — see
+   * {@link Dialect.buildJsonArray}). Positional is Postgres-only in v1; a
+   * `with` clause on any other dialect throws `UnsupportedFeatureError` (E017).
+   */
+  jsonEncoding?: 'object' | 'positional';
   /** @internal Set by TransactionClient — signals that this QI runs inside an active transaction. */
   _txScoped?: boolean;
   /** @internal Callback from TurbineClient for query event emission. */
@@ -409,6 +442,24 @@ export interface QueryInterfaceOptions {
   ) => QueryInterface<object>;
 }
 
+/**
+ * Decode descriptor for `jsonEncoding: 'positional'`. Built during SQL
+ * generation (see {@link QueryInterface.buildRelationShape}) and consumed by the
+ * transform to map key-less positional arrays back to keyed objects.
+ *
+ * - `keys` — camelCase field names in emitted array position, INCLUDING nested
+ *   relation slots (a nested relation occupies one more position after the
+ *   scalar columns, in `sortedEntries(with)` order).
+ * - `nested` — sub-shape for each key in `keys` that is itself a relation slot.
+ * - `cardinality` — `'one'` (belongsTo/hasOne, a single positional array or
+ *   null) vs `'many'` (an array of positional arrays).
+ */
+interface RelationShape {
+  keys: string[];
+  nested: Record<string, RelationShape>;
+  cardinality: 'many' | 'one';
+}
+
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional for untyped table access
 export class QueryInterface<T extends object, R extends object = {}> {
   private readonly tableMeta: TableMetadata;
@@ -417,9 +468,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly middlewares: MiddlewareFn[];
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
+  private readonly utcTimestamps: boolean;
   private readonly preparedStatementsEnabled: boolean;
   private readonly sqlCacheEnabled: boolean;
   private readonly dialect: Dialect;
+  /** Client-level default relation-loading strategy ('join' unless configured). */
+  private readonly relationLoadStrategy: RelationLoadStrategy;
+  /** Nested-relation JSON encoding: 'object' (default) or 'positional'. */
+  private readonly jsonEncoding: 'object' | 'positional';
   /**
    * Tracks tables that have already triggered an unlimited-query warning so
    * the user is not spammed once per row. Per-instance state — each
@@ -479,9 +535,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // than the (small) risk of noisy logs. Callers explicitly opt out with
     // `warnOnUnlimited: false`.
     this.warnOnUnlimited = options?.warnOnUnlimited !== false;
+    this.utcTimestamps = options?.utcTimestamps !== false;
     this.preparedStatementsEnabled = options?.preparedStatements ?? true;
     this.sqlCacheEnabled = options?.sqlCache !== false;
     this.dialect = options?.dialect ?? postgresDialect;
+    this.relationLoadStrategy = options?.relationLoadStrategy ?? 'join';
+    this.jsonEncoding = options?.jsonEncoding ?? 'object';
     this.txScoped = options?._txScoped ?? false;
     this.options = options;
 
@@ -589,6 +648,90 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** The single bound parameter for an `IN` list (PG: the array; SQLite: a JSON string). */
   private inParam(values: unknown): unknown {
     return this.dialect.inClauseParam ? this.dialect.inClauseParam(values as unknown[]) : values;
+  }
+
+  // -------------------------------------------------------------------------
+  // Batched relation loading (relationLoadStrategy: 'batched')
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve the effective relation-loading strategy for a query: the per-query
+   * arg wins, then the client-level default, then `'join'`. Only meaningful when
+   * a `with` clause is present; the callers gate on that.
+   */
+  private resolveLoadStrategy(argStrategy: RelationLoadStrategy | undefined): RelationLoadStrategy {
+    return argStrategy ?? this.relationLoadStrategy;
+  }
+
+  /**
+   * Build the {@link RelationLoadContext} the batched loader needs, closing over
+   * this interface's pool/dialect/executor. Child readers are constructed on the
+   * SAME pool (so they join an active transaction) with `defaultLimit` cleared
+   * and unlimited-warnings silenced — a relation load must fetch every matching
+   * child, and the per-relation `limit` is applied client-side by the loader.
+   */
+  private batchedContext(timeout: number | undefined): RelationLoadContext {
+    const childOptions: QueryInterfaceOptions = {
+      ...this.options,
+      defaultLimit: undefined,
+      warnOnUnlimited: false,
+    };
+    return {
+      parentMeta: this.tableMeta,
+      schema: this.schema,
+      makeChild: (table: string): BatchedChildReader =>
+        new QueryInterface<object>(this.pool, table, this.schema, [], childOptions) as unknown as BatchedChildReader,
+      exec: (sql, params, preparedName) => this.queryWithTimeout(sql, params, timeout, preparedName),
+      quote: (name) => this.q(name),
+      buildInClause: (expr, paramRef, negated) => this.inClause(expr, paramRef, negated),
+      inClauseParam: (values) => this.inParam(values),
+      paramPlaceholder: (index) => this.p(index),
+    };
+  }
+
+  /**
+   * Run a findMany with the batched strategy: execute the base query WITHOUT
+   * relation subqueries (all other clauses intact), then load each relation via
+   * one flat follow-up query and stitch client-side. Parent stitch keys the
+   * caller's `select`/`omit` excluded are added for the base query and stripped
+   * from the returned rows, so the shape matches the join strategy exactly.
+   */
+  private async runFindManyBatched(args: FindManyArgs<T>): Promise<T[]> {
+    const withClause = args.with as WithClause;
+    const { baseArgs, strip } = this.prepareBatchedBase(args, withClause);
+    // baseArgs.with is always undefined here; the cast just bridges the R generic.
+    const deferred = this.buildFindMany(baseArgs as Parameters<QueryInterface<T, R>['buildFindMany']>[0]);
+    const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+    const entities = deferred.transform(result) as Record<string, unknown>[];
+    if (entities.length > 0) {
+      await loadRelationsBatched(this.batchedContext(args.timeout), entities, withClause, args.timeout);
+    }
+    stripFields(entities, strip);
+    return entities as T[];
+  }
+
+  /**
+   * Build the base findMany args for a batched run: drop `with`, and ensure every
+   * parent correlation key needed for stitching is projected (returning the list
+   * of keys that must be stripped from the output afterwards).
+   */
+  private prepareBatchedBase(
+    args: FindManyArgs<T>,
+    withClause: WithClause,
+  ): { baseArgs: FindManyArgs<T>; strip: string[] } {
+    const needed = neededParentKeyFields(this.tableMeta, withClause);
+    const proj = includeKeysForBatching(
+      args.select as Record<string, boolean> | undefined,
+      args.omit as Record<string, boolean> | undefined,
+      needed,
+    );
+    const baseArgs = {
+      ...args,
+      with: undefined,
+      select: proj.select,
+      omit: proj.omit,
+    } as unknown as FindManyArgs<T>;
+    return { baseArgs, strip: proj.strip };
   }
 
   /**
@@ -815,10 +958,37 @@ export class QueryInterface<T extends object, R extends object = {}> {
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
+      if (args.with && this.resolveLoadStrategy(args.relationLoadStrategy) === 'batched') {
+        return this.runFindUniqueBatched(args as unknown as FindUniqueArgs<T>);
+      }
       const deferred = this.buildFindUnique(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
       return deferred.transform(result);
     }) as Promise<QueryResult<T, R, W, S, O> | null>;
+  }
+
+  /**
+   * Batched-strategy findUnique: fetch the single base row without relation
+   * subqueries (adding any parent stitch keys the projection excluded), then load
+   * its relations via one follow-up query each and stitch. Mirrors the join
+   * strategy's shape for the one row.
+   */
+  private async runFindUniqueBatched(args: FindUniqueArgs<T>): Promise<T | null> {
+    const withClause = args.with as WithClause;
+    const needed = neededParentKeyFields(this.tableMeta, withClause);
+    const proj = includeKeysForBatching(
+      args.select as Record<string, boolean> | undefined,
+      args.omit as Record<string, boolean> | undefined,
+      needed,
+    );
+    const baseArgs = { ...args, with: undefined, select: proj.select, omit: proj.omit } as unknown as FindUniqueArgs<T>;
+    const deferred = this.buildFindUnique(baseArgs as Parameters<QueryInterface<T, R>['buildFindUnique']>[0]);
+    const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+    const entity = deferred.transform(result) as Record<string, unknown> | null;
+    if (!entity) return null;
+    await loadRelationsBatched(this.batchedContext(args.timeout), [entity], withClause, args.timeout);
+    stripFields([entity], proj.strip);
+    return entity as T;
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
@@ -921,12 +1091,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.collectWhereParams(whereObj, params);
     this.collectWithParams(args.with as WithClause, params);
 
+    const parseWith = this.makeNestedParser(args.with as WithClause);
+
     return {
       sql: entry.sql,
       params,
       transform: (result) => {
         const row = result.rows[0];
-        return row ? (this.parseNestedRow(row, this.table) as T) : null;
+        return row ? (parseWith(row) as T) : null;
       },
       tag: `${this.table}.findUnique`,
       preparedName: entry.name,
@@ -960,6 +1132,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     return this.executeWithMiddleware('findMany', (args ?? {}) as Record<string, unknown>, async () => {
+      if (args?.with && this.resolveLoadStrategy(args.relationLoadStrategy) === 'batched') {
+        return this.runFindManyBatched(args as unknown as FindManyArgs<T>);
+      }
       const deferred = this.buildFindMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
@@ -1057,8 +1232,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const qt = this.q(this.table);
 
       let distinctPrefix = '';
+      let distinctCols: string[] = [];
       if (args?.distinct && args.distinct.length > 0) {
-        const distinctCols = args.distinct.map((k) => this.toSqlColumn(k as string));
+        distinctCols = args.distinct.map((k) => this.toSqlColumn(k as string));
         distinctPrefix = `DISTINCT ON (${distinctCols.join(', ')}) `;
       }
 
@@ -1093,9 +1269,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       if (args?.orderBy) {
-        // Pass freshParams so vector KNN ordering binds its `$n::vector` query
-        // vector at the correct position (after cursor params, before LIMIT).
-        sql += ` ORDER BY ${this.buildOrderBy(args.orderBy, freshParams)}`;
+        if (distinctPrefix) {
+          // Postgres requires DISTINCT ON expressions to lead the ORDER BY.
+          // Prisma semantics ("first row per combination, result in the user's
+          // order") need two levels: inner DISTINCT ON ordered by the distinct
+          // columns then the user's order (picks the right representative row),
+          // outer re-ordered by the user's order alone.
+          if (Object.values(args.orderBy).some((d) => isVectorOrderBy(d))) {
+            throw new ValidationError('[turbine] `distinct` cannot be combined with vector distance ordering.');
+          }
+          const userOrder = this.buildOrderBy(args.orderBy, freshParams);
+          sql += ` ORDER BY ${distinctCols.map((c) => `${c} ASC`).join(', ')}, ${userOrder}`;
+          sql = `SELECT * FROM (${sql}) AS ${this.q(`${this.table}_distinct`)} ORDER BY ${userOrder}`;
+        } else {
+          // Pass freshParams so vector KNN ordering binds its `$n::vector` query
+          // vector at the correct position (after cursor params, before LIMIT).
+          sql += ` ORDER BY ${this.buildOrderBy(args.orderBy, freshParams)}`;
+        }
       }
 
       // Pagination — push params in the same order the collect path mirrors
@@ -1145,13 +1335,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
       params.push(Number(args.offset));
     }
 
+    // Build the row parser once (positional shapes are computed here, not per row).
+    const parseWith = args?.with ? this.makeNestedParser(args.with as WithClause) : null;
+
     return {
       sql: entry.sql,
       params,
       transform: (result) =>
-        result.rows.map((row) =>
-          args?.with ? (this.parseNestedRow(row, this.table) as T) : (this.parseRow(row, this.table) as T),
-        ),
+        result.rows.map((row) => (parseWith ? (parseWith(row) as T) : (this.parseRow(row, this.table) as T))),
       tag: `${this.table}.findMany`,
       preparedName: entry.name,
     };
@@ -1196,6 +1387,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>, void, undefined> {
     const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
     const hasRelations = !!args?.with;
+    // Build the positional-aware relation parser once for the whole stream.
+    const parseWith = hasRelations ? this.makeNestedParser(args!.with as WithClause) : null;
 
     // --- Speculative first fetch: try to satisfy the entire drain in one RTT ---
     const speculativeDeferred = this.buildFindMany({
@@ -1219,13 +1412,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (speculativeResult.rows.length <= batchSize) {
       // Small drain — yield all rows and return, no cursor needed
       for (const row of speculativeResult.rows) {
-        yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as QueryResult<
-          T,
-          R,
-          W,
-          S,
-          O
-        >;
+        yield (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as QueryResult<T, R, W, S, O>;
       }
       return;
     }
@@ -1241,13 +1428,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     try {
       for await (const batch of this.dialect.openStream(client, deferred.sql, deferred.params, batchSize)) {
         for (const row of batch) {
-          yield (hasRelations ? this.parseNestedRow(row, this.table) : this.parseRow(row, this.table)) as QueryResult<
-            T,
-            R,
-            W,
-            S,
-            O
-          >;
+          yield (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as QueryResult<T, R, W, S, O>;
         }
       }
     } catch (err) {
@@ -1269,6 +1450,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
+      if (args?.with && this.resolveLoadStrategy(args.relationLoadStrategy) === 'batched') {
+        // findFirst is findMany + LIMIT 1: batch the single base row, then load.
+        const rows = await this.runFindManyBatched({ ...args, limit: 1 } as unknown as FindManyArgs<T>);
+        return (rows[0] ?? null) as QueryResult<T, R, W, S, O> | null;
+      }
       const deferred = this.buildFindFirst(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
@@ -2614,7 +2800,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Relation filters: { posts: { some: { published: true } } }
       const relDef = this.tableMeta.relations[key];
       if (relDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        const filterObj = value as Record<string, unknown>;
+        const filterObj = this.normalizeRelationFilter(relDef, value as Record<string, unknown>);
         if (
           'some' in filterObj ||
           'every' in filterObj ||
@@ -2624,15 +2810,35 @@ export class QueryInterface<T extends object, R extends object = {}> {
         ) {
           const relParts: string[] = [];
           if (filterObj.some !== undefined)
-            relParts.push(`some(${this.fingerprintRelFilter(relDef.to, filterObj.some as Record<string, unknown>)})`);
+            relParts.push(
+              filterObj.some === null
+                ? 'some(null)'
+                : `some(${this.fingerprintRelFilter(relDef.to, filterObj.some as Record<string, unknown>)})`,
+            );
           if (filterObj.every !== undefined)
-            relParts.push(`every(${this.fingerprintRelFilter(relDef.to, filterObj.every as Record<string, unknown>)})`);
+            relParts.push(
+              filterObj.every === null
+                ? 'every(null)'
+                : `every(${this.fingerprintRelFilter(relDef.to, filterObj.every as Record<string, unknown>)})`,
+            );
           if (filterObj.none !== undefined)
-            relParts.push(`none(${this.fingerprintRelFilter(relDef.to, filterObj.none as Record<string, unknown>)})`);
+            relParts.push(
+              filterObj.none === null
+                ? 'none(null)'
+                : `none(${this.fingerprintRelFilter(relDef.to, filterObj.none as Record<string, unknown>)})`,
+            );
           if (filterObj.is !== undefined)
-            relParts.push(`is(${this.fingerprintRelFilter(relDef.to, filterObj.is as Record<string, unknown>)})`);
+            relParts.push(
+              filterObj.is === null
+                ? 'is(null)'
+                : `is(${this.fingerprintRelFilter(relDef.to, filterObj.is as Record<string, unknown>)})`,
+            );
           if (filterObj.isNot !== undefined)
-            relParts.push(`isNot(${this.fingerprintRelFilter(relDef.to, filterObj.isNot as Record<string, unknown>)})`);
+            relParts.push(
+              filterObj.isNot === null
+                ? 'isNot(null)'
+                : `isNot(${this.fingerprintRelFilter(relDef.to, filterObj.isNot as Record<string, unknown>)})`,
+            );
           parts.push(`${key}:{${relParts.join(',')}}`);
           continue;
         }
@@ -2715,7 +2921,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /**
    * Fingerprint a relation filter sub-where for some/every/none.
    */
-  private fingerprintRelFilter(_targetTable: string, subWhere: Record<string, unknown>): string {
+  private fingerprintRelFilter(targetTable: string, subWhere: Record<string, unknown>): string {
+    const meta = this.schema.tables[targetTable];
     const keys = Object.keys(subWhere)
       .filter((k) => subWhere[k] !== undefined)
       .sort();
@@ -2724,6 +2931,34 @@ export class QueryInterface<T extends object, R extends object = {}> {
     for (const key of keys) {
       const value = subWhere[key];
       if (value === undefined) continue;
+      if (key === 'OR' || key === 'AND') {
+        const arr = Array.isArray(value) ? (value as Record<string, unknown>[]) : [];
+        parts.push(`${key}[${arr.map((b) => `(${this.fingerprintRelFilter(targetTable, b)})`).join(',')}]`);
+        continue;
+      }
+      if (key === 'NOT') {
+        parts.push(`NOT(${this.fingerprintRelFilter(targetTable, value as Record<string, unknown>)})`);
+        continue;
+      }
+      // Nested relation filter — must fingerprint the FULL inner shape, or two
+      // different nested filters would collide on one cached SQL text.
+      const nestedRel = meta?.relations?.[key];
+      if (nestedRel && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+        const norm = this.normalizeRelationFilter(nestedRel, value as Record<string, unknown>);
+        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
+          const inner: string[] = [];
+          for (const op of ['some', 'none', 'every', 'is', 'isNot'] as const) {
+            if (norm[op] === undefined) continue;
+            inner.push(
+              norm[op] === null
+                ? `${op}(null)`
+                : `${op}(${this.fingerprintRelFilter(nestedRel.to, norm[op] as Record<string, unknown>)})`,
+            );
+          }
+          parts.push(`${key}:rel[${inner.join(',')}]`);
+          continue;
+        }
+      }
       if (value === null) {
         parts.push(`${key}:null`);
       } else if (isWhereOperator(value)) {
@@ -2783,7 +3018,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Relation filters
       const relationDef = this.tableMeta.relations[key];
       if (relationDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        const filterObj = value as Record<string, unknown>;
+        const filterObj = this.normalizeRelationFilter(relationDef, value as Record<string, unknown>);
         if (
           'some' in filterObj ||
           'every' in filterObj ||
@@ -2791,15 +3026,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
           'is' in filterObj ||
           'isNot' in filterObj
         ) {
-          if (filterObj.some !== undefined)
+          if (filterObj.some !== undefined && filterObj.some !== null)
             this.collectRelFilterParams(relationDef.to, filterObj.some as Record<string, unknown>, params);
-          if (filterObj.none !== undefined)
+          if (filterObj.none !== undefined && filterObj.none !== null)
             this.collectRelFilterParams(relationDef.to, filterObj.none as Record<string, unknown>, params);
-          if (filterObj.every !== undefined)
+          if (filterObj.every !== undefined && filterObj.every !== null)
             this.collectRelFilterParams(relationDef.to, filterObj.every as Record<string, unknown>, params);
-          if (filterObj.is !== undefined)
+          if (filterObj.is !== undefined && filterObj.is !== null)
             this.collectRelFilterParams(relationDef.to, filterObj.is as Record<string, unknown>, params);
-          if (filterObj.isNot !== undefined)
+          if (filterObj.isNot !== undefined && filterObj.isNot !== null)
             this.collectRelFilterParams(relationDef.to, filterObj.isNot as Record<string, unknown>, params);
           continue;
         }
@@ -2866,6 +3101,33 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const value = subWhere[field];
       if (value === undefined) continue;
       if (value === null) continue;
+      if (field === 'OR' || field === 'AND') {
+        const arr = value as Record<string, unknown>[];
+        if (!Array.isArray(arr)) continue;
+        for (const branch of arr) this.collectRelFilterParams(targetTable, branch, params);
+        continue;
+      }
+      if (field === 'NOT') {
+        this.collectRelFilterParams(targetTable, value as Record<string, unknown>, params);
+        continue;
+      }
+      const nestedRel = meta.relations?.[field];
+      if (nestedRel && typeof value === 'object' && !Array.isArray(value)) {
+        const norm = this.normalizeRelationFilter(nestedRel, value as Record<string, unknown>);
+        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
+          // Same order as buildRelationFilter pushes params: some, none, every, is, isNot.
+          if (norm.some != null)
+            this.collectRelFilterParams(nestedRel.to, norm.some as Record<string, unknown>, params);
+          if (norm.none != null)
+            this.collectRelFilterParams(nestedRel.to, norm.none as Record<string, unknown>, params);
+          if (norm.every != null)
+            this.collectRelFilterParams(nestedRel.to, norm.every as Record<string, unknown>, params);
+          if (norm.is != null) this.collectRelFilterParams(nestedRel.to, norm.is as Record<string, unknown>, params);
+          if (norm.isNot != null)
+            this.collectRelFilterParams(nestedRel.to, norm.isNot as Record<string, unknown>, params);
+          continue;
+        }
+      }
       const col = meta.columnMap[field] ?? camelToSnake(field);
       if (isWhereOperator(value)) {
         this.collectOperatorParams(col, value, params);
@@ -3001,7 +3263,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // `{title: {contains: 'x'}}` emit different SQL so they must not share
       // a fingerprint)
       if (opts.where) {
-        subParts.push(`w=${this.fingerprintAliasWhere(opts.where as Record<string, unknown>)}`);
+        subParts.push(
+          `w=${this.fingerprintAliasWhere(opts.where as Record<string, unknown>, meta.relations[relName]?.to)}`,
+        );
       }
 
       // orderBy shape
@@ -3244,7 +3508,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Handle relation filters: { posts: { some: { published: true } } }
       const relationDef = this.tableMeta.relations[key];
       if (relationDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        const filterObj = value as Record<string, unknown>;
+        const filterObj = this.normalizeRelationFilter(relationDef, value as Record<string, unknown>);
         // Check if this is a relation filter (has some/every/none keys)
         if (
           'some' in filterObj ||
@@ -3355,13 +3619,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     relDef: RelationDef,
     filterObj: Record<string, unknown>,
     params: unknown[],
+    parentTable?: string,
   ): string | null {
     const targetTable = relDef.to;
     const targetMeta = this.schema.tables[targetTable];
     if (!targetMeta) return null;
 
     const qt = this.q(targetTable);
-    const qSelf = this.q(this.table);
+    const qSelf = this.q(parentTable ?? this.table);
     const clauses: string[] = [];
 
     // Correlation: link child table to parent table (supports composite FKs)
@@ -3401,20 +3666,30 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
 
-    // "is": EXISTS — for to-one relations (same SQL as "some")
+    // "is": EXISTS — for to-one relations (same SQL as "some").
+    // `is: null` = "no related row" (Prisma semantics) → NOT EXISTS.
     if (filterObj.is !== undefined) {
-      const subWhere = filterObj.is as Record<string, unknown>;
-      const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-      const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-      clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+      if (filterObj.is === null) {
+        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation})`);
+      } else {
+        const subWhere = filterObj.is as Record<string, unknown>;
+        const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
+        const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
+        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+      }
     }
 
-    // "isNot": NOT EXISTS — for to-one relations (same SQL as "none")
+    // "isNot": NOT EXISTS — for to-one relations (same SQL as "none").
+    // `isNot: null` = "a related row exists" → EXISTS.
     if (filterObj.isNot !== undefined) {
-      const subWhere = filterObj.isNot as Record<string, unknown>;
-      const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-      const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-      clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+      if (filterObj.isNot === null) {
+        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation})`);
+      } else {
+        const subWhere = filterObj.isNot as Record<string, unknown>;
+        const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
+        const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
+        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+      }
     }
 
     return clauses.length > 0 ? clauses.join(' AND ') : null;
@@ -3439,6 +3714,36 @@ export class QueryInterface<T extends object, R extends object = {}> {
     for (const field of sortedKeys(subWhere)) {
       const value = subWhere[field];
       if (value === undefined) continue;
+
+      // OR / AND / NOT combinators inside a relation sub-where
+      if (field === 'OR' || field === 'AND') {
+        const arr = value as Record<string, unknown>[];
+        if (!Array.isArray(arr) || arr.length === 0) continue;
+        const parts: string[] = [];
+        for (const branch of arr) {
+          const c = this.buildSubWhereForRelation(targetTable, branch, params);
+          if (c) parts.push(`(${c})`);
+        }
+        if (parts.length) conditions.push(`(${parts.join(field === 'OR' ? ' OR ' : ' AND ')})`);
+        continue;
+      }
+      if (field === 'NOT') {
+        const c = this.buildSubWhereForRelation(targetTable, value as Record<string, unknown>, params);
+        if (c) conditions.push(`NOT (${c})`);
+        continue;
+      }
+
+      // Nested relation filter (relation of the relation target) — recurse
+      // with the TARGET table as the correlation parent.
+      const nestedRel = meta.relations?.[field];
+      if (nestedRel && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+        const norm = this.normalizeRelationFilter(nestedRel, value as Record<string, unknown>);
+        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
+          const c = this.buildRelationFilter(field, nestedRel, norm, params, targetTable);
+          if (c) conditions.push(c);
+          continue;
+        }
+      }
 
       const col = meta.columnMap[field] ?? camelToSnake(field);
       if (!meta.allColumns.includes(col)) {
@@ -3540,6 +3845,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      // Relation filter inside a with-clause where — EXISTS correlated to the
+      // relation alias (some/every/none/is/isNot + bare to-one implicit `is`).
+      const aliasRel = targetMeta.relations?.[key];
+      if (aliasRel && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+        const norm = this.normalizeRelationFilter(aliasRel, value as Record<string, unknown>);
+        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
+          const c = this.buildRelationFilter(key, aliasRel, norm, params, alias);
+          if (c) clauses.push(c);
+          continue;
+        }
+      }
+
       const col = targetMeta.columnMap[key] ?? camelToSnake(key);
       if (!targetMeta.allColumns.includes(col)) {
         throw new ValidationError(`[turbine] Unknown column "${key}" in where for table "${targetTable}"`);
@@ -3592,6 +3909,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       if (value === null) continue;
 
+      const aliasRel = targetMeta.relations?.[key];
+      if (aliasRel && typeof value === 'object' && !Array.isArray(value)) {
+        const norm = this.normalizeRelationFilter(aliasRel, value as Record<string, unknown>);
+        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
+          // Same order as buildRelationFilter pushes params: some, none, every, is, isNot.
+          if (norm.some != null) this.collectRelFilterParams(aliasRel.to, norm.some as Record<string, unknown>, params);
+          if (norm.none != null) this.collectRelFilterParams(aliasRel.to, norm.none as Record<string, unknown>, params);
+          if (norm.every != null)
+            this.collectRelFilterParams(aliasRel.to, norm.every as Record<string, unknown>, params);
+          if (norm.is != null) this.collectRelFilterParams(aliasRel.to, norm.is as Record<string, unknown>, params);
+          if (norm.isNot != null)
+            this.collectRelFilterParams(aliasRel.to, norm.isNot as Record<string, unknown>, params);
+          continue;
+        }
+      }
+
       const col = targetMeta.columnMap[key] ?? camelToSnake(key);
 
       if (isWhereOperator(value)) {
@@ -3610,11 +3943,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * can emit — equality vs null vs operator sets vs combinators — or two
    * differently-shaped wheres would share one cached SQL string.
    */
-  private fingerprintAliasWhere(where: Record<string, unknown>): string {
+  private fingerprintAliasWhere(where: Record<string, unknown>, targetTable?: string): string {
     const keys = Object.keys(where)
       .filter((k) => where[k] !== undefined)
       .sort();
     const parts: string[] = [];
+    const meta = targetTable ? this.schema.tables[targetTable] : undefined;
 
     for (const key of keys) {
       const value = where[key];
@@ -3622,16 +3956,34 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (key === 'OR' || key === 'AND') {
         const arr = value as Record<string, unknown>[];
         if (!Array.isArray(arr) || arr.length === 0) continue;
-        parts.push(`${key}[${arr.map((c) => this.fingerprintAliasWhere(c)).join(',')}]`);
+        parts.push(`${key}[${arr.map((c) => this.fingerprintAliasWhere(c, targetTable)).join(',')}]`);
         continue;
       }
       if (key === 'NOT') {
-        parts.push(`NOT(${this.fingerprintAliasWhere(value as Record<string, unknown>)})`);
+        parts.push(`NOT(${this.fingerprintAliasWhere(value as Record<string, unknown>, targetTable)})`);
         continue;
       }
       if (value === null) {
         parts.push(`${key}:null`);
         continue;
+      }
+      // Relation filter shapes must be fully fingerprinted (cache-key safety).
+      const fpRel = meta?.relations?.[key];
+      if (fpRel && typeof value === 'object' && !Array.isArray(value)) {
+        const norm = this.normalizeRelationFilter(fpRel, value as Record<string, unknown>);
+        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
+          const inner: string[] = [];
+          for (const op of ['some', 'none', 'every', 'is', 'isNot'] as const) {
+            if (norm[op] === undefined) continue;
+            inner.push(
+              norm[op] === null
+                ? `${op}(null)`
+                : `${op}(${this.fingerprintRelFilter(fpRel.to, norm[op] as Record<string, unknown>)})`,
+            );
+          }
+          parts.push(`${key}:rel[${inner.join(',')}]`);
+          continue;
+        }
       }
       if (isWhereOperator(value)) {
         parts.push(`${key}:${fingerprintOperatorShape(value)}`);
@@ -3849,6 +4201,29 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * memoized per table. Used so nested relation rows (camelCase keys) coerce
    * dates the same way top-level rows do.
    */
+
+  /**
+   * Prisma-compat: a plain object on a to-one relation key —
+   * `where: { vendor: { name: { contains: 'x' } } }` — is an implicit `is`
+   * filter. Normalize it to `{ is: obj }` so all downstream handling (SQL,
+   * params, fingerprint) sees one canonical shape. To-many relations still
+   * require an explicit `some`/`every`/`none` (a bare object there is
+   * ambiguous and was never valid in Prisma either).
+   */
+  private normalizeRelationFilter(relDef: RelationDef, filterObj: Record<string, unknown>): Record<string, unknown> {
+    if (
+      (relDef.type === 'belongsTo' || relDef.type === 'hasOne') &&
+      !('some' in filterObj) &&
+      !('every' in filterObj) &&
+      !('none' in filterObj) &&
+      !('is' in filterObj) &&
+      !('isNot' in filterObj)
+    ) {
+      return { is: filterObj };
+    }
+    return filterObj;
+  }
+
   private getCamelDateFields(table: string, meta: TableMetadata): Set<string> {
     let camel = this.camelDateFieldCache.get(table);
     if (!camel) {
@@ -3880,7 +4255,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const field = reverseMap[col] ?? col; // fall back to raw col name, not regex
         // Top-level rows are snake_case (dateCols); nested rows are camelCase (camelDateFields).
         if ((dateCols.has(col) || camelDateFields.has(field)) && value !== null && !(value instanceof Date)) {
-          parsed[field] = new Date(value as string);
+          // Offset-less strings (Postgres `timestamp`, json_agg output) are
+          // pinned to UTC so results don't depend on the server's time zone.
+          parsed[field] = this.utcTimestamps ? parseDbDate(String(value)) : new Date(value as string);
         } else {
           parsed[field] = value;
         }
@@ -3958,6 +4335,167 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return parsed;
   }
 
+  // -------------------------------------------------------------------------
+  // Positional JSON encoding (jsonEncoding: 'positional')
+  //
+  // When active, relation subqueries emit `json_agg(json_build_array(v1, v2, …))`
+  // instead of `json_build_object('k1', v1, …)`, dropping every repeated key
+  // name. The builder knows the exact column order, so it records a recursive
+  // RelationShape during SQL generation; the transform decodes each positional
+  // array back into the object representation the object-encoding would have
+  // produced, then hands it to parseNestedRow — so parsed output is byte-
+  // identical to the object path (same dates, same snake→camel, same recursion).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve the emitted column list for a relation, honoring `select` / `omit`.
+   * Shared by {@link buildRelationSubquery} (json order) and
+   * {@link buildRelationShape} (decode key order) so they can never diverge.
+   */
+  private resolveTargetColumns(spec: true | WithOptions, targetMeta: TableMetadata): string[] {
+    if (spec !== true && spec.select) {
+      const selectedFields = Object.entries(spec.select)
+        .filter(([, v]) => v)
+        .map(([k]) => targetMeta.columnMap[k] ?? camelToSnake(k));
+      return selectedFields.filter((col) => targetMeta.allColumns.includes(col));
+    }
+    if (spec !== true && spec.omit) {
+      const omittedFields = new Set(
+        Object.entries(spec.omit)
+          .filter(([, v]) => v)
+          .map(([k]) => targetMeta.columnMap[k] ?? camelToSnake(k)),
+      );
+      return targetMeta.allColumns.filter((col) => !omittedFields.has(col));
+    }
+    return targetMeta.allColumns;
+  }
+
+  /**
+   * Render a single relation row's JSON: a keyed object (`'object'`) or a
+   * positional array (`'positional'`). The array drops the keys but keeps the
+   * exact expression order, so {@link RelationShape.keys} maps positions back.
+   */
+  private buildJsonRow(jsonPairs: [key: string, expr: string][]): string {
+    if (this.jsonEncoding === 'positional') {
+      // buildJsonArray is defined on postgresDialect; positional is gated to PG
+      // in buildSelectWithRelations, so the `?? buildJsonObject` never fires.
+      return (
+        this.dialect.buildJsonArray?.(jsonPairs.map(([, expr]) => expr)) ?? this.dialect.buildJsonObject(jsonPairs)
+      );
+    }
+    return this.dialect.buildJsonObject(jsonPairs);
+  }
+
+  /**
+   * Build the top-level relation shapes for a `with` clause, mirroring
+   * {@link buildSelectWithRelations}: same relation iteration order, same
+   * per-relation column resolution, same nested recursion.
+   */
+  private buildRelationShapes(table: string, withClause: WithClause): Record<string, RelationShape> {
+    const meta = this.schema.tables[table];
+    if (!meta) return {};
+    const shapes: Record<string, RelationShape> = {};
+    for (const [relName, relSpec] of sortedEntries(withClause)) {
+      const relDef = meta.relations[relName];
+      if (!relDef) continue; // buildSelectWithRelations already threw for this
+      shapes[relName] = this.buildRelationShape(relDef, relSpec, meta);
+    }
+    return shapes;
+  }
+
+  /**
+   * Recursively describe one relation's positional layout: the camelCase key
+   * order (scalar columns first, then nested relation slots in the same order
+   * {@link buildRelationSubquery} appends them), the nested sub-shapes, and the
+   * cardinality (single object for belongsTo/hasOne, array for the rest).
+   */
+  private buildRelationShape(relDef: RelationDef, spec: true | WithOptions, parentMeta: TableMetadata): RelationShape {
+    void parentMeta;
+    const targetMeta = this.schema.tables[relDef.to];
+    if (!targetMeta) return { keys: [], nested: {}, cardinality: 'many' };
+    const targetColumns = this.resolveTargetColumns(spec, targetMeta);
+    const keys = targetColumns.map((col) => targetMeta.reverseColumnMap[col] ?? snakeToCamel(col));
+    const nested: Record<string, RelationShape> = {};
+    if (spec !== true && spec.with) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
+        const nestedRelDef = targetMeta.relations[nestedRelName];
+        if (!nestedRelDef) continue;
+        keys.push(nestedRelName);
+        nested[nestedRelName] = this.buildRelationShape(nestedRelDef, nestedSpec, targetMeta);
+      }
+    }
+    const cardinality: 'many' | 'one' = relDef.type === 'belongsTo' || relDef.type === 'hasOne' ? 'one' : 'many';
+    return { keys, nested, cardinality };
+  }
+
+  /**
+   * Build the row parser for a `with` clause. In object mode this is just
+   * {@link parseNestedRow}. In positional mode it decodes each relation's
+   * positional arrays into the object form first (shapes built once, not per
+   * row), then delegates to parseNestedRow for date/snake-camel coercion.
+   */
+  private makeNestedParser(withClause: WithClause): (row: Record<string, unknown>) => Record<string, unknown> {
+    if (this.jsonEncoding !== 'positional') {
+      return (row) => this.parseNestedRow(row, this.table);
+    }
+    const shapes = this.buildRelationShapes(this.table, withClause);
+    return (row) => this.parseNestedRow(this.decodePositionalRelations(row, shapes), this.table);
+  }
+
+  /**
+   * Return a shallow copy of a top-level row with each relation column decoded
+   * from its positional array(s) into the object representation. Only relation
+   * columns are positional — base scalar columns stay object-keyed — so the
+   * result is exactly what the object encoding would have handed parseNestedRow.
+   */
+  private decodePositionalRelations(
+    row: Record<string, unknown>,
+    shapes: Record<string, RelationShape>,
+  ): Record<string, unknown> {
+    const cloned: Record<string, unknown> = { ...row };
+    for (const [relName, shape] of Object.entries(shapes)) {
+      if (relName in cloned) cloned[relName] = this.decodePositionalValue(cloned[relName], shape);
+    }
+    return cloned;
+  }
+
+  /**
+   * Decode one relation's positional JSON value. `json_agg` returns the value as
+   * a JSON string at the top level (JSON.parse once); nested relation slots are
+   * already-parsed arrays. A `'many'` value is an array of positional arrays; a
+   * `'one'` value is a single positional array or null.
+   */
+  private decodePositionalValue(raw: unknown, shape: RelationShape): unknown {
+    let val = raw;
+    if (typeof val === 'string') {
+      try {
+        val = JSON.parse(val);
+      } catch {
+        return raw; // parseNestedRow's warn path handles unparseable JSON
+      }
+    }
+    if (val === null || val === undefined) {
+      return shape.cardinality === 'many' ? [] : null;
+    }
+    if (shape.cardinality === 'many') {
+      if (!Array.isArray(val)) return val;
+      return val.map((inner) => this.decodePositionalObject(inner, shape));
+    }
+    return this.decodePositionalObject(val, shape);
+  }
+
+  /** Map one positional array back to a keyed object using the shape's key order. */
+  private decodePositionalObject(arr: unknown, shape: RelationShape): unknown {
+    if (!Array.isArray(arr)) return arr;
+    const obj: Record<string, unknown> = {};
+    for (let i = 0; i < shape.keys.length; i++) {
+      const key = shape.keys[i]!;
+      const nestedShape = shape.nested[key];
+      obj[key] = nestedShape ? this.decodePositionalValue(arr[i], nestedShape) : arr[i];
+    }
+    return obj;
+  }
+
   /**
    * Build a SELECT clause that includes both base columns and nested relation subqueries.
    *
@@ -4009,6 +4547,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): string {
     const meta = this.schema.tables[table];
     if (!meta) throw new ValidationError(`[turbine] Unknown table "${table}"`);
+
+    // Positional JSON encoding is Postgres-only in v1. Gate here — the single
+    // entry point for every `with` clause — so no engine ever emits the
+    // json_build_array shape its dialect can't produce (and mssql's FOR JSON
+    // override path is never reached with positional active).
+    if (this.jsonEncoding === 'positional' && this.dialect.name !== 'postgresql') {
+      throw new UnsupportedFeatureError(
+        "jsonEncoding: 'positional'",
+        this.dialect.name,
+        'Positional relation encoding is only available on PostgreSQL in this version.',
+      );
+    }
 
     const cols = columnsList ?? meta.allColumns;
     const qtbl = this.q(table);
@@ -4150,24 +4700,34 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const targetMeta = this.schema.tables[targetTable];
     if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${targetTable}"`);
 
+    // Dev-only: correlated relation loading probes the child table once per parent
+    // row, so a missing FK index multiplies into per-parent full-table scans (a
+    // batched-loader ORM pays the same missing index only once, which is why
+    // schemas migrated from one often lack these). Name the exact index to create
+    // instead of letting the slowness look like an ORM problem.
+    if (process.env.NODE_ENV !== 'production') {
+      const warnKey = `${relDef.from}.${relDef.name}`;
+      if (!unindexedRelationWarned.has(warnKey)) {
+        const miss = missingIndexForRelation(this.schema, relDef);
+        if (miss) {
+          unindexedRelationWarned.add(warnKey);
+          console.warn(
+            `[turbine] Relation "${relDef.name}" on "${relDef.from}" probes ` +
+              `"${miss.table}"(${miss.columns.join(', ')}) which has no covering index — ` +
+              `each parent row scans the full table. Fix: ${miss.createSql}; ` +
+              'or run `npx turbine doctor` for a full report.',
+          );
+        }
+      }
+    }
+
     // Generate a unique alias: t0, t1, t2, ...
     const alias = `t${aliasCounter.n++}`;
 
-    // Resolve which columns to include based on select/omit
-    let targetColumns = targetMeta.allColumns;
-    if (spec !== true && spec.select) {
-      const selectedFields = Object.entries(spec.select)
-        .filter(([, v]) => v)
-        .map(([k]) => targetMeta.columnMap[k] ?? camelToSnake(k));
-      targetColumns = selectedFields.filter((col) => targetMeta.allColumns.includes(col));
-    } else if (spec !== true && spec.omit) {
-      const omittedFields = new Set(
-        Object.entries(spec.omit)
-          .filter(([, v]) => v)
-          .map(([k]) => targetMeta.columnMap[k] ?? camelToSnake(k)),
-      );
-      targetColumns = targetMeta.allColumns.filter((col) => !omittedFields.has(col));
-    }
+    // Resolve which columns to include based on select/omit. Shared with the
+    // positional-shape builder so the emitted json_build_array column order and
+    // the decode-side key order can never drift apart.
+    const targetColumns = this.resolveTargetColumns(spec, targetMeta);
 
     // Engine override seam (additive): a dialect whose JSON-aggregation shape does
     // not map onto buildJsonObject/buildJsonArrayAgg (SQL Server FOR JSON PATH) owns
@@ -4260,7 +4820,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
 
-    const jsonObj = this.dialect.buildJsonObject(jsonPairs);
+    const jsonObj = this.buildJsonRow(jsonPairs);
 
     // Quote parent ref — can be a table name or auto-generated alias
     const qParent = this.q(parentRef);
@@ -4283,11 +4843,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     // Build WHERE — correlate to parent via parentRef (alias or table name).
-    // For hasMany: target has FK, so alias.fk = parentRef.pk
-    // For belongsTo: source has FK, so alias.pk = parentRef.fk (reversed)
+    // For hasMany/hasOne: TARGET has the FK (RelationDef.foreignKey is always
+    // the child-side column), so alias.fk = parentRef.pk. hasOne is just
+    // hasMany with a unique FK — treating it like belongsTo here silently
+    // correlated the wrong columns (caught dogfooding: uuid = varchar).
+    // For belongsTo: SOURCE has the FK, so alias.pk = parentRef.fk (reversed).
     // Supports composite foreign keys (string[]) via buildCorrelation.
     let whereClause: string;
-    if (relDef.type === 'belongsTo' || relDef.type === 'hasOne') {
+    if (relDef.type === 'belongsTo') {
       whereClause = this.dialect.buildCorrelation(alias, relDef.referenceKey, qParent, relDef.foreignKey);
     } else {
       whereClause = this.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
@@ -4348,7 +4911,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             innerJsonPairs.push([nestedRelName, this.dialect.wrapJsonSubresult(nestedSub, fallback)]);
           }
         }
-        const innerJsonObj = this.dialect.buildJsonObject(innerJsonPairs);
+        const innerJsonObj = this.buildJsonRow(innerJsonPairs);
         return `SELECT ${this.dialect.buildJsonArrayAgg(innerJsonObj)} FROM (${innerSql}) ${innerAlias}`;
       }
       // Inline ORDER BY only when the dialect's array-agg supports it (PG). For
@@ -4518,7 +5081,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           innerJsonPairs.push([nestedRelName, this.dialect.wrapJsonSubresult(nestedSub, fallback)]);
         }
       }
-      const innerJsonObj = this.dialect.buildJsonObject(innerJsonPairs);
+      const innerJsonObj = this.buildJsonRow(innerJsonPairs);
       return `SELECT ${this.dialect.buildJsonArrayAgg(innerJsonObj)} FROM (${innerSql}) ${innerAlias}`;
     }
 
@@ -4553,7 +5116,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         jsonPairs.push([nestedRelName, this.dialect.wrapJsonSubresult(nestedSub, fallback)]);
       }
     }
-    const jsonObj = this.dialect.buildJsonObject(jsonPairs);
+    const jsonObj = this.buildJsonRow(jsonPairs);
     return `SELECT ${this.dialect.buildJsonArrayAgg(jsonObj)} ${fromJoin} WHERE ${whereClause}`;
   }
 

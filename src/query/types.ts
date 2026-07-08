@@ -10,6 +10,21 @@
 
 export type OrderDirection = 'asc' | 'desc';
 
+/**
+ * How a query resolves its `with` relations.
+ *
+ *   - `'join'` (default) — one SQL statement with correlated
+ *     `json_agg(json_build_object(...))` subqueries. One round-trip; an index
+ *     seek per parent row when the child FK is indexed.
+ *   - `'batched'` — run the base query, then ONE flat follow-up query per
+ *     relation (`WHERE fk = ANY($1)`), stitching children client-side. D levels
+ *     cost D extra round-trips, but each is a single key-set lookup and rows come
+ *     back flat — a win when FK columns are unindexed or result sets are huge.
+ *
+ * Precedence: per-query arg > client `relationLoadStrategy` config > `'join'`.
+ */
+export type RelationLoadStrategy = 'join' | 'batched';
+
 /** Operator object for advanced where filtering */
 export interface WhereOperator<V = unknown> {
   /**
@@ -44,13 +59,35 @@ export interface WhereOperator<V = unknown> {
  * - A vector distance filter object ({ distance: { to, metric, lt } }) for pgvector columns
  */
 export type WhereValue<V = unknown> =
-  | V
+  | (V extends Array<infer U>
+      ? TypedRelationFilter<U> // to-many relation property → some/every/none
+      : V extends Date
+        ? V
+        : V extends object
+          ? V | TypedToOneFilter<V> | WhereClause<V> // to-one relation → is/isNot or bare where (implicit is)
+          : V)
   | WhereOperator<V>
   | JsonFilter
   | ArrayFilter
   | TextSearchFilter
   | VectorFilter
   | null;
+
+/** Relation filter on a to-many relation property. */
+export interface TypedRelationFilter<U> {
+  some?: WhereClause<U>;
+  every?: WhereClause<U>;
+  none?: WhereClause<U>;
+}
+
+/**
+ * Relation filter on a to-one relation property. A bare object on a to-one
+ * relation key is also accepted at runtime (implicit `is`, Prisma-compatible).
+ */
+export interface TypedToOneFilter<V> {
+  is?: WhereClause<V>;
+  isNot?: WhereClause<V>;
+}
 
 /**
  * Where clause type: each field can be a plain value, null, or operator object.
@@ -278,10 +315,22 @@ export type QueryResult<
   ? O extends undefined
     ? WithResult<T, R, W>
     : O extends Record<string, boolean>
-      ? Omit<WithResult<T, R, W>, Extract<keyof T, TrueKeys<O>>>
+      ? // `omit` narrows scalars only — a key the `with` clause populates stays in
+        // the result (relations are separate JSON subqueries at the SQL level).
+        Omit<WithResult<T, R, W>, Exclude<Extract<keyof T, TrueKeys<O>>, keyof W>>
       : WithResult<T, R, W>
   : S extends Record<string, boolean>
-    ? Pick<WithResult<T, R, W>, Extract<keyof T, TrueKeys<S>> | Exclude<keyof WithResult<T, R, W>, keyof T>>
+    ? Pick<
+        WithResult<T, R, W>,
+        // Selected scalars, plus every key the `with` clause adds. The with-keys
+        // must be named explicitly (not just `Exclude<keyof WithResult, keyof T>`):
+        // when the entity interface itself declares optional relation props, a
+        // with-key is ALSO a `keyof T`, and excluding by `keyof T` would silently
+        // drop the relation from the result type even though the row carries it.
+        | Extract<keyof T, TrueKeys<S>>
+        | Exclude<keyof WithResult<T, R, W>, keyof T>
+        | Extract<keyof W, keyof WithResult<T, R, W>>
+      >
     : WithResult<T, R, W>;
 
 export interface FindUniqueArgs<
@@ -298,6 +347,8 @@ export interface FindUniqueArgs<
   with?: W;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /** Override the client's relation-loading strategy for this query. See {@link RelationLoadStrategy}. */
+  relationLoadStrategy?: RelationLoadStrategy;
 }
 
 export interface FindManyArgs<
@@ -323,6 +374,8 @@ export interface FindManyArgs<
   distinct?: (keyof T & string)[];
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /** Override the client's relation-loading strategy for this query. See {@link RelationLoadStrategy}. */
+  relationLoadStrategy?: RelationLoadStrategy;
 }
 
 export interface FindManyStreamArgs<
@@ -672,6 +725,9 @@ export interface RelationFilter {
   some?: Record<string, unknown>;
   every?: Record<string, unknown>;
   none?: Record<string, unknown>;
+  /** To-one relation match (bare objects on to-one keys are implicit `is`). */
+  is?: Record<string, unknown>;
+  isNot?: Record<string, unknown>;
 }
 
 /** JSONB query operators for where clauses */

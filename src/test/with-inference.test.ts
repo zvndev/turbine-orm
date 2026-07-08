@@ -320,6 +320,57 @@ async function selectOmitCallSite() {
 void selectOmitCallSite;
 
 // ---------------------------------------------------------------------------
+// 11. Select/omit + with on entities that DECLARE optional relation props
+//
+//     Generated entity interfaces (and hand-written ones mirroring them) often
+//     declare relations as optional props (`posts?: Post[]`). The with-key is
+//     then also a `keyof T`, so the select-Pick's `Exclude<keyof WithResult,
+//     keyof T>` no longer surfaces it — the relation must be unioned back in
+//     from `keyof W` or select+with silently drops it from the result TYPE
+//     (runtime always carries it).
+// ---------------------------------------------------------------------------
+
+interface UserWithDeclaredRels {
+  id: number;
+  email: string;
+  posts?: Post[];
+  profile?: Profile | null;
+}
+
+interface UserDeclaredRelations {
+  posts: RelationDescriptor<Post, 'many', PostRelations>;
+  profile: RelationDescriptor<Profile, 'one', NoRelations>;
+}
+
+// --- select + with keeps the with-relation even though `posts` ∈ keyof T ---
+type DeclaredSelectWith = QueryResult<
+  UserWithDeclaredRels,
+  UserDeclaredRelations,
+  { posts: true },
+  { id: true },
+  undefined
+>;
+assertTrue<Equals<DeclaredSelectWith['id'], number>>();
+assertTrue<Equals<DeclaredSelectWith['posts'], Post[]>>();
+type DeclaredSelectWithHasEmail = 'email' extends keyof DeclaredSelectWith ? true : false;
+assertTrue<Equals<DeclaredSelectWithHasEmail, false>>();
+// The undeclared-in-with relation must NOT leak in:
+type DeclaredSelectWithHasProfile = 'profile' extends keyof DeclaredSelectWith ? true : false;
+assertTrue<Equals<DeclaredSelectWithHasProfile, false>>();
+
+// --- omit of a with-key does not remove the relation (runtime keeps it) ---
+type DeclaredOmitWith = QueryResult<
+  UserWithDeclaredRels,
+  UserDeclaredRelations,
+  { posts: true },
+  undefined,
+  { posts: true; email: true }
+>;
+assertTrue<Equals<DeclaredOmitWith['posts'], Post[]>>();
+type DeclaredOmitWithHasEmail = 'email' extends keyof DeclaredOmitWith ? true : false;
+assertTrue<Equals<DeclaredOmitWithHasEmail, false>>();
+
+// ---------------------------------------------------------------------------
 // node:test stub so the runner picks up the file
 // ---------------------------------------------------------------------------
 

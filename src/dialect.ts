@@ -250,6 +250,18 @@ export interface Dialect {
   /** Build a JSON object expression from output keys and SQL expressions. */
   buildJsonObject(pairs: [key: string, expr: string][]): string;
 
+  /**
+   * Build a positional JSON ARRAY expression from ordered SQL expressions —
+   * the key-less counterpart to {@link buildJsonObject} used by the opt-in
+   * `jsonEncoding: 'positional'` mode. Emitting `json_build_array(v1, v2, …)`
+   * instead of `json_build_object('k1', v1, …)` drops every repeated key name
+   * from every nested object of every row (the decode side maps positions back
+   * to keys via a build-time shape descriptor). Postgres-only in v1 — other
+   * engines never reach this because the builder gates positional encoding to
+   * `dialect.name === 'postgresql'`, so the method is optional on the contract.
+   */
+  buildJsonArray?(exprs: string[]): string;
+
   /** Build a JSON array aggregation expression with a dialect-specific empty-array fallback. */
   buildJsonArrayAgg(jsonObjectExpr: string, orderBy?: string): string;
 
@@ -538,7 +550,32 @@ export const postgresDialect: Dialect = {
 
   buildJsonObject(pairs: [key: string, expr: string][]): string {
     const args = pairs.map(([key, expr]) => `'${this.escapeStringLiteral(key)}', ${expr}`);
+    // Postgres caps function calls at 100 arguments (= 50 key/value pairs).
+    // Wide tables (or wide select+relation trees) exceed that, so chunk into
+    // multiple jsonb_build_object calls merged with `||`, cast back to json.
+    if (pairs.length > 50) {
+      const chunks: string[] = [];
+      for (let i = 0; i < args.length; i += 50) {
+        chunks.push(`jsonb_build_object(${args.slice(i, i + 50).join(', ')})`);
+      }
+      return `(${chunks.join(' || ')})::json`;
+    }
     return `json_build_object(${args.join(', ')})`;
+  },
+
+  buildJsonArray(exprs: string[]): string {
+    // Mirror buildJsonObject's chunking at the SAME 50-element threshold: for
+    // wide rows, concatenate 50-element jsonb_build_array calls with `||` (which
+    // concatenates jsonb arrays) and cast back to json. `jsonb ||` preserves
+    // element order, so positions map back to keys unchanged after decode.
+    if (exprs.length > 50) {
+      const chunks: string[] = [];
+      for (let i = 0; i < exprs.length; i += 50) {
+        chunks.push(`jsonb_build_array(${exprs.slice(i, i + 50).join(', ')})`);
+      }
+      return `(${chunks.join(' || ')})::json`;
+    }
+    return `json_build_array(${exprs.join(', ')})`;
   },
 
   buildJsonArrayAgg(jsonObjectExpr: string, orderBy?: string): string {

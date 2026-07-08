@@ -37,7 +37,23 @@ src/
                       subqueries (hasMany/belongsTo/hasOne + manyToMany through junction
                       tables + self-relations), pgvector distance ops, and parameterized
                       queries. Includes dev-only NODE_ENV validation guards.
+    batched-loader.ts — The `relationLoadStrategy: 'batched'` path. Instead of the default
+                      single-statement `json_agg` join, runs the base query without relation
+                      subqueries, then ONE flat follow-up per relation
+                      (`WHERE fk = ANY($1)`, chunked at MAX_RELATION_KEYS=1000) and stitches
+                      client-side — output byte-for-byte equal to the join strategy. Runs on
+                      the caller's executor/connection (tx-safe); per-relation `limit` applied
+                      client-side per parent; composite-key relations throw E017.
+
     index.ts        — Barrel re-export (~65 LOC). All imports use `./query/index.js`.
+
+  index-advisor.ts  — Missing-FK-index advisor. Derives every column set relations probe
+                      (hasMany/hasOne child FKs, belongsTo reference keys, m2m junction keys)
+                      from SchemaMetadata and checks each against the table's indexes/PK
+                      (`findMissingRelationIndexes`). Consumed by `turbine doctor` (CLI report
+                      + `--fix` migration) and the dev-mode runtime warning in query/builder.ts
+                      (`missingIndexForRelation`, gated on `schemaHasIndexInfo` to avoid
+                      false positives on `defineSchema`-only metadata).
 
   client.ts         — TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
@@ -52,7 +68,14 @@ src/
                       and accepts an external pool via TurbineConfig.pool for serverless
                       drivers (Neon, Vercel Postgres, Cloudflare) — when an external pool
                       is supplied, Turbine does NOT call pg.types.setTypeParser and
-                      disconnect() becomes a no-op (caller owns lifecycle).
+                      disconnect() becomes a no-op (caller owns lifecycle). TurbineConfig also
+                      carries the relation/wire tuning added in 0.26.0:
+                      `relationLoadStrategy: 'join' | 'batched'` (client default, overridable
+                      per query → query/batched-loader.ts), `jsonEncoding: 'object' |
+                      'positional'` (Postgres-only lean `json_build_array` wire encoding for
+                      `with` subqueries), and `utcTimestamps` (default true — registers the
+                      OID 1114 parser, only for Turbine-owned pools, so offset-less `timestamp`
+                      values parse as UTC; see parseDbDate in query/utils.ts).
 
   adapters/         — Database adapter layer (~530 LOC) for Postgres-compatible engines.
                       cockroachdb.ts + yugabytedb.ts override the operations with
@@ -306,7 +329,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 
 ## CLI Architecture
 
-The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `studio`.
+The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration), `studio`.
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.js` / `.json`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 

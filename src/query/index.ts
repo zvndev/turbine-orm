@@ -38,6 +38,7 @@ export type {
   QueryResult,
   RelationDescriptor,
   RelationFilter,
+  RelationLoadStrategy,
   SelectResult,
   TextSearchFilter,
   TypedWithClause,

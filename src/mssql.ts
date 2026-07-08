@@ -906,9 +906,12 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
   }
 
   const isToOne = relDef.type === 'belongsTo' || relDef.type === 'hasOne';
-  const correlation = isToOne
-    ? dialect.buildCorrelation(alias, relDef.referenceKey, qParent, relDef.foreignKey)
-    : dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
+  // Correlation direction is about WHERE THE FK LIVES, not cardinality:
+  // belongsTo has it on the source; hasMany AND hasOne have it on the target.
+  const correlation =
+    relDef.type === 'belongsTo'
+      ? dialect.buildCorrelation(alias, relDef.referenceKey, qParent, relDef.foreignKey)
+      : dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
 
   // ----- to-one (belongsTo / hasOne): single object, no paging --------------
   if (isToOne) {

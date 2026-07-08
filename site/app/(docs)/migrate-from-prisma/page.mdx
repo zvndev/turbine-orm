@@ -197,21 +197,51 @@ const active = await db.users.findMany({
 - **Single runtime dependency.** `pg` only. No engine binary, no WASM, no `@prisma/client`.
 - **Postgres only.** Intentional — depth over breadth enables the edge and Studio stories.
 
+## Index your foreign keys first
+
+This is the one migration step that bites people, so do it before you benchmark anything.
+
+**Prisma does not create an index on a relation's foreign key on Postgres** — a `@relation` scalar field is unindexed unless you add `@@index` yourself. Prisma gets away with it because it loads relations by **batching**: one `WHERE fk IN (ids)` query per relation, which pays a missing FK index only *once*. So most Prisma schemas quietly ship without FK indexes and never notice.
+
+Turbine loads relations as **correlated subqueries** — the child table is probed once per parent row. On an indexed FK that's an index seek per parent and it's fast. On an *unindexed* FK it's a full table scan per parent, which multiplies by the parent count. The same missing index that was invisible under Prisma becomes the whole query.
+
+The fix is one command, and once the index exists correlated loading **outperforms** batching. Measured on a production-shaped dataset (659 parents, a 357K-row child table):
+
+| Strategy | Time |
+|---|---|
+| Correlated, FK **unindexed** | 17.8 s |
+| Batched (`WHERE fk IN (…)`) | 92 ms |
+| Correlated, FK **indexed** | **62 ms** |
+
+Right after you generate your client, run:
+
+```bash
+npx turbine doctor --fix
+```
+
+`doctor` introspects your database, finds every relation whose child-side FK (or many-to-many junction key) lacks a covering index, and `--fix` writes a migration that adds them. Review it and apply with `npx turbine migrate up`. See **[CLI → doctor](/cli#turbine-doctor)** for the full report format and the `CREATE INDEX CONCURRENTLY` note for large tables. (If you can't add an index yet, [`relationLoadStrategy: 'batched'`](/relations#load-strategy-join-vs-batched) reproduces Prisma's loading behavior in the meantime.)
+
+## Two behaviors that match Prisma
+
+- **`timestamp` columns parse as UTC.** Turbine reads Postgres `timestamp` (without time zone) values as UTC — the same convention Prisma uses — so a migrated app gets **identical instants**, not values shifted by the server's local zone. (Opt out with `utcTimestamps: false` if you relied on local-time parsing.)
+- **Bare to-one relation filters work without `is`.** `where: { vendor: { name: { contains: 'x' } } }` filters by a to-one relation with no `is` wrapper, exactly like Prisma. `is: null` / `isNot: null` compile to `NOT EXISTS` / `EXISTS`.
+
 ## Migration checklist
 
 1. `npm install turbine-orm && npm uninstall @prisma/client prisma`
 2. Write `schema.ts` mirroring your `.prisma` models (or run `npx turbine pull` to introspect your live DB).
 3. `npx turbine generate` — writes `./generated/turbine/{types,metadata,index}.ts`.
-4. Find/replace:
+4. `npx turbine doctor --fix` — add the FK indexes Prisma left off (see [above](#index-your-foreign-keys-first)), then `npx turbine migrate up`.
+5. Find/replace:
    - `prisma.` → `db.`
    - Singular model names → plural snake-camelCase table names (`prisma.user` → `db.users`)
    - `include:` → `with:`
    - `skip:` → `offset:`
    - `take:` stays as-is at the top level; inside a `with` block, rename it to `limit:`
-5. Replace `import { PrismaClient } from '@prisma/client'` with `import { turbine } from './generated/turbine'`.
-6. Port any raw SQL from `prisma.$queryRaw` to `db.raw\`SELECT ...\``.
-7. Update your error-handling to the typed classes (or keep catching by message during transition).
-8. Delete `schema.prisma` and the `prisma/` directory once the build passes.
+6. Replace `import { PrismaClient } from '@prisma/client'` with `import { turbine } from './generated/turbine'`.
+7. Port any raw SQL from `prisma.$queryRaw` to `db.raw\`SELECT ...\``.
+8. Update your error-handling to the typed classes (or keep catching by message during transition).
+9. Delete `schema.prisma` and the `prisma/` directory once the build passes.
 
 ## See also
 

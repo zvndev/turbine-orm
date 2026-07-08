@@ -6,7 +6,7 @@
  */
 
 import { after, before, it } from 'node:test';
-import { QueryInterface } from '../query/index.js';
+import { QueryInterface, type QueryInterfaceOptions } from '../query/index.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
 /** Test runners returned by {@link skipGate}. */
@@ -87,7 +87,8 @@ export function mockTable(
 export function makeQuery<T extends object = Record<string, unknown>>(
   tableName: string,
   schema: SchemaMetadata,
+  options?: QueryInterfaceOptions,
 ): QueryInterface<T> {
   // biome-ignore lint/suspicious/noExplicitAny: mock pool not needed for build-only tests
-  return new QueryInterface<T>(null as any, tableName, schema);
+  return new QueryInterface<T>(null as any, tableName, schema, undefined, options);
 }

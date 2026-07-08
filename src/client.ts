@@ -40,6 +40,7 @@ import {
   type QueryEventListener,
   QueryInterface,
   type QueryInterfaceOptions,
+  type RelationLoadStrategy,
 } from './query/index.js';
 import { quoteIdent } from './query/utils.js';
 import {
@@ -191,6 +192,44 @@ export interface TurbineConfig {
   defaultLimit?: number;
   /** Log a warning when findMany() is called without a limit (default: false) */
   warnOnUnlimited?: boolean;
+  /**
+   * Interpret Postgres `timestamp` (without time zone) values as UTC — both
+   * at the driver level (OID 1114 type parser, registered only when Turbine
+   * owns the pool) and when coercing nested-relation JSON dates. This is the
+   * Prisma/Rails/Django convention and makes results independent of the
+   * server's local time zone. Default: `true`. Set `false` for the legacy
+   * local-time interpretation.
+   */
+  utcTimestamps?: boolean;
+  /**
+   * Default strategy for resolving `with`-clause relations, applied to every
+   * `findMany`/`findUnique`/`findFirst` unless overridden per query.
+   *
+   *   - `'join'` (default) — one SQL statement using correlated
+   *     `json_agg(json_build_object(...))` subqueries.
+   *   - `'batched'` — run the base query, then one flat follow-up query per
+   *     relation (`WHERE fk = ANY($1)`), stitching children client-side. Wins
+   *     when child FK columns are unindexed or result sets are large.
+   *
+   * Precedence: per-query `relationLoadStrategy` arg > this config > `'join'`.
+   */
+  relationLoadStrategy?: RelationLoadStrategy;
+  /**
+   * How nested-relation subqueries encode each row's JSON.
+   *
+   *   - `'object'` (default) — `json_agg(json_build_object('key', v, …))`. Every
+   *     key name is repeated in every nested object of every row.
+   *   - `'positional'` — `json_agg(json_build_array(v, …))`. Turbine knows the
+   *     column order at build time, so it emits a key-less array and maps
+   *     positions back to keys client-side. Same information, a fraction of the
+   *     bytes on wide/deeply-nested `with` trees. Parsed output is byte-identical
+   *     to `'object'`.
+   *
+   * Postgres-only in v1: setting `'positional'` on a non-Postgres engine throws
+   * `UnsupportedFeatureError` (E017) when a `with` clause is present. Default:
+   * `'object'` (today's behavior, byte-unchanged).
+   */
+  jsonEncoding?: 'object' | 'positional';
   /**
    * Controls how `NotFoundError` (and other where-aware errors) format their
    * messages.
@@ -433,6 +472,7 @@ export class TurbineClient {
   readonly schema: SchemaMetadata;
 
   private static int8ParserRegistered = false;
+  private static utcTimestampParserRegistered = false;
   private readonly logging: boolean;
   /** Active SQL dialect — owns transaction keywords, set_config, raw-SQL placeholders, capability flags. */
   private readonly dialect: Dialect;
@@ -483,6 +523,16 @@ export class TurbineClient {
       });
       TurbineClient.int8ParserRegistered = true;
     }
+    // Parse `timestamp` (OID 1114) as UTC instead of server-local time. The
+    // pg driver's default hands back a Date built in the process's local zone,
+    // so the same row yields a different instant per deployment region. The
+    // ORM convention (Prisma, Rails, Django) — and the only interpretation
+    // that round-trips what Postgres stores — is UTC. Same ownership rule as
+    // the int8 parser: never mutate parser state on external pools.
+    if (!config.pool && config.utcTimestamps !== false && !TurbineClient.utcTimestampParserRegistered) {
+      pg.types.setTypeParser(1114, (val: string) => new Date(`${val.replace(' ', 'T')}Z`));
+      TurbineClient.utcTimestampParserRegistered = true;
+    }
 
     this.logging = config.logging ?? false;
     this.dialect = config.dialect ?? postgresDialect;
@@ -495,6 +545,9 @@ export class TurbineClient {
     this.queryOptions = {
       defaultLimit: config.defaultLimit,
       warnOnUnlimited: config.warnOnUnlimited,
+      utcTimestamps: config.utcTimestamps,
+      relationLoadStrategy: config.relationLoadStrategy,
+      jsonEncoding: config.jsonEncoding,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
       sqlCache: config.sqlCache ?? true,
       dialect: config.dialect,

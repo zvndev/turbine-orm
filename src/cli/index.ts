@@ -12,6 +12,7 @@
  *   turbine migrate status        — Show migration status
  *   turbine seed                  — Run seed file
  *   turbine status                — Show schema summary
+ *   turbine doctor                — Check relations for missing FK indexes (--fix emits migration)
  *   turbine studio                — Launch local read-only web UI
  *   turbine observe               — Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
  *
@@ -25,6 +26,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writ
 import { dirname, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generate } from '../generate.js';
+import { findMissingRelationIndexes } from '../index-advisor.js';
 import { introspect } from '../introspect.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { schemaDiff, schemaPush } from '../schema-sql.js';
@@ -82,6 +84,7 @@ interface CliArgs {
   auto?: boolean;
   allowDrift?: boolean;
   allowEmpty?: boolean;
+  fix?: boolean;
   // studio flags
   port?: number;
   host?: string;
@@ -147,6 +150,9 @@ function parseArgs(): CliArgs {
         break;
       case '--allow-empty':
         result.allowEmpty = true;
+        break;
+      case '--fix':
+        result.fix = true;
         break;
       case '--force':
       case '-f':
@@ -1202,6 +1208,97 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
+// Command: doctor — relation/index health check
+// ---------------------------------------------------------------------------
+
+async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
+  banner();
+  const url = requireUrl(config);
+
+  label('Database', redactUrl(url));
+  label('Schema', config.schema);
+  newline();
+
+  const spinner = new Spinner('Introspecting database').start();
+
+  const schema = await introspect({
+    connectionString: url,
+    schema: config.schema,
+    include: config.include.length ? config.include : undefined,
+    exclude: config.exclude.length ? config.exclude : undefined,
+  });
+
+  const missing = findMissingRelationIndexes(schema);
+
+  if (missing.length === 0) {
+    spinner.succeed('Every relation probe is backed by an index');
+    newline();
+    return;
+  }
+
+  spinner.succeed(`Scanned ${bold(String(Object.keys(schema.tables).length))} tables`);
+  warn(`Found ${bold(String(missing.length))} unindexed relation probe(s)`);
+  newline();
+
+  // Row counts put the findings in severity order: a missing index on a 300-row
+  // table is noise; on a 300K-row table it is the whole page load.
+  const rowCounts = new Map<string, number>();
+  {
+    const { Pool } = (await import('pg')).default;
+    const pool = new Pool({ connectionString: url, max: 1 });
+    try {
+      const tables = [...new Set(missing.map((m) => m.table))];
+      const res = await pool.query<{ relname: string; reltuples: string }>(
+        `SELECT c.relname, c.reltuples::bigint::text AS reltuples
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = $1 AND c.relname = ANY($2)`,
+        [config.schema, tables],
+      );
+      for (const row of res.rows) rowCounts.set(row.relname, Math.max(0, Number(row.reltuples)));
+    } finally {
+      await pool.end();
+    }
+  }
+
+  missing.sort((a, b) => (rowCounts.get(b.table) ?? 0) - (rowCounts.get(a.table) ?? 0));
+
+  console.log(`  ${dim('Turbine loads relations as correlated subqueries — the child table is probed')}`);
+  console.log(`  ${dim('once per parent row, so an unindexed FK costs a full table scan PER PARENT.')}`);
+  newline();
+
+  for (const m of missing) {
+    const rows = rowCounts.get(m.table);
+    const rowsLabel = rows !== undefined ? `~${rows.toLocaleString()} rows` : 'row count unknown';
+    console.log(
+      `  ${yellow(symbols.warning)} ${bold(cyan(m.table))} ${dim(`(${m.columns.join(', ')})`)}  ${gray(rowsLabel)}`,
+    );
+    for (const p of m.probes) {
+      console.log(`    ${dim(symbols.tee)} probed by ${p.from}.${blue(p.relation)} ${dim(`(${p.type})`)}`);
+    }
+    console.log(`    ${dim(symbols.teeEnd)} ${green(m.createSql)}`);
+    newline();
+  }
+
+  if (args.fix) {
+    const up = missing.map((m) => m.createSql).join('\n');
+    const down = missing.map((m) => m.dropSql).join('\n');
+    const file = createMigration(config.migrationsDir, 'add_relation_fk_indexes', { up, down });
+    success(`Created migration: ${bold(file.filename)}`);
+    newline();
+    console.log(`  ${dim('Review it, then apply with:')} ${cyan('npx turbine migrate up')}`);
+    console.log(
+      `  ${dim('Large, hot tables: consider running the statements manually with')} ${cyan('CREATE INDEX CONCURRENTLY')}`,
+    );
+    console.log(`  ${dim('(cannot run inside a transaction, so it is not emitted in the migration).')}`);
+    newline();
+  } else {
+    console.log(`  ${dim('Generate a fix migration with:')} ${cyan('npx turbine doctor --fix')}`);
+    newline();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Command: studio — local read-only web UI
 // ---------------------------------------------------------------------------
 
@@ -1524,6 +1621,9 @@ function showHelp(): void {
   console.log(`      ${dim('status')}           Show applied/pending migrations`);
   console.log(`    ${cyan('seed')}               Run seed file`);
   console.log(`    ${cyan('status')} ${dim('| info')}      Show schema summary`);
+  console.log(
+    `    ${cyan('doctor')}             Check relations for missing FK indexes ${dim('(--fix emits migration)')}`,
+  );
   console.log(`    ${cyan('studio')}             Launch local read-only web UI`);
   console.log(`    ${cyan('observe')}            Launch metrics dashboard ${dim('(requires TURBINE_OBSERVE_URL)')}`);
   newline();
@@ -1693,6 +1793,10 @@ async function main() {
       case 'status':
       case 'info':
         await cmdStatus(args, config);
+        break;
+
+      case 'doctor':
+        await cmdDoctor(args, config);
         break;
 
       case 'studio':

@@ -344,6 +344,30 @@ const db = turbine({
 });
 ```
 
+### Relation loading and wire encoding
+
+A few client options tune how `with` relations are loaded and encoded. All are optional and default to today's behavior.
+
+```typescript
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  // How with-clause relations resolve: 'join' (default, one correlated-subquery
+  // statement) or 'batched' (base query + one flat follow-up per relation).
+  // Override per query on findMany/findFirst/findUnique. See Relations.
+  relationLoadStrategy: 'join',
+  // 'positional' (Postgres-only) drops repeated JSON keys from relation
+  // subqueries — ~39% fewer wire bytes on wide relations, byte-identical output.
+  // Default 'object'.
+  jsonEncoding: 'object',
+  // Parse `timestamp` (without time zone) as UTC — the Prisma/Rails/Django
+  // convention — so results don't shift with the server's local zone.
+  // Default true; set false for the legacy local-time interpretation.
+  utcTimestamps: true,
+});
+```
+
+Run `npx turbine doctor` to catch relations whose child-side FK lacks a covering index — the correlated-subquery strategy probes the child once per parent row, so a missing FK index costs a full scan per parent.
+
 ### Middleware
 
 Middleware wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()` — but it cannot change the query itself.
@@ -579,6 +603,7 @@ Commands:
   migrate status               Show applied/pending migrations
   seed                         Run seed file
   status                       Show database schema summary
+  doctor                       Check relations for missing FK indexes (--fix emits migration)
   studio                       Launch local read-only Studio web UI
   observe                      Launch local metrics dashboard (requires TURBINE_OBSERVE_URL)
 
@@ -890,7 +915,7 @@ Turbine maps Postgres types to TypeScript:
 | `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` (2^53 - 1) are returned as `string` at runtime to avoid precision loss. This affects < 0.01% of use cases (auto-increment IDs, counts, etc. are all safe). |
 | `numeric`, `money` | `string` | Arbitrary precision — kept as string to avoid JS float issues |
 | `text`, `varchar`, `uuid`, `citext` | `string` | |
-| `timestamptz`, `timestamp`, `date` | `Date` | |
+| `timestamptz`, `timestamp`, `date` | `Date` | `timestamp` (without time zone) is parsed as UTC by default (Prisma/Rails/Django convention), so the same row yields the same instant in every region. Opt out with `utcTimestamps: false`. |
 | `boolean` | `boolean` | |
 | `json`, `jsonb` | `unknown` | |
 | `bytea` | `Buffer` | |
