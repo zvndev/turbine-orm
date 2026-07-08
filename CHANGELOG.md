@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.25.0 (2026-07-06)
+
+### Added
+- **`turbineHttp` now accepts your generated client type for fully typed accessors.** `turbineHttp(pool, SCHEMA)` returned the base `TurbineClient`, so the generated typed accessors (`db.users`, `db.posts`, …) were invisible to TypeScript on the serverless/edge path — you had to cast at the call site. It now takes a backward-compatible type parameter: `turbineHttp<TurbineClient>(pool, SCHEMA)` (passing your generated client type) gives the exact same typed accessors as the TCP-path `turbine()` factory, no cast. The runtime object is unchanged — the base constructor already materializes those accessors per schema table — and existing untyped calls keep working (default = base client). Found dogfooding the BataDB edge path. (#30)
+
 ## 0.24.0 (2026-07-06)
 
 **Dogfood fixes from building a fresh Next.js app on 0.23.2 (#28).** Five papercuts that made the first-run experience worse than it should be — a silent empty `generate`, two rejected column types, doc drift, undocumented prereqs, and an inaccurate `serial` type. All fixed; the only behavior change is the `serial` mapping (below), which is safe for existing databases.
