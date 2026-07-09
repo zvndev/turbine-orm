@@ -65,6 +65,8 @@ const SQL_COLUMNS = `
     is_nullable,
     column_default,
     is_identity,
+    is_generated,
+    generation_expression,
     ordinal_position,
     character_maximum_length
   FROM information_schema.columns
@@ -290,6 +292,12 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         isGenerated:
           (typeof row.column_default === 'string' && row.column_default.includes('nextval(')) ||
           row.is_identity === 'YES',
+        // GENERATED ALWAYS AS (expr) STORED — computed by the database, never
+        // writable. Distinct from isGenerated (serial/identity, which a client
+        // MAY override). is_generated is 'ALWAYS' for STORED columns, else 'NEVER'.
+        isGeneratedStored: row.is_generated === 'ALWAYS',
+        generationExpression:
+          row.is_generated === 'ALWAYS' && row.generation_expression ? row.generation_expression : undefined,
         isArray,
         arrayType,
         pgArrayType: arrayType,

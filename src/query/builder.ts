@@ -1594,6 +1594,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildCreate(args: CreateArgs<T>): DeferredQuery<T> {
+    this.assertNoGeneratedColumns(args.data as Record<string, unknown>, 'create');
     const entries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = entries.map(([k]) => this.toSqlColumn(k));
     const params = entries.map(([, v]) => v);
@@ -1678,6 +1679,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
       };
     }
 
+    for (const row of args.data) {
+      this.assertNoGeneratedColumns(row as Record<string, unknown>, 'createMany');
+    }
+
     const keys = Object.keys(args.data[0]!).filter((k) => (args.data[0] as Record<string, unknown>)[k] !== undefined);
     const columns = keys.map((k) => this.toColumn(k));
 
@@ -1723,6 +1728,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   buildUpdate(args: UpdateArgs<T>): DeferredQuery<T> {
     const dataObj = args.data as Record<string, unknown>;
+    this.assertNoGeneratedColumns(dataObj, 'update');
     const whereObj = args.where as Record<string, unknown>;
     const lock = args.optimisticLock;
     const setFp = this.fingerprintSet(dataObj);
@@ -1984,6 +1990,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpsert(args: UpsertArgs<T>): DeferredQuery<T> {
+    this.assertNoGeneratedColumns(args.create as Record<string, unknown>, 'upsert');
+    this.assertNoGeneratedColumns(args.update as Record<string, unknown>, 'upsert');
     // Build the INSERT part from create data
     const createEntries = Object.entries(args.create as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = createEntries.map(([k]) => this.toSqlColumn(k));
@@ -2059,6 +2067,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
     const dataObj = args.data as Record<string, unknown>;
+    this.assertNoGeneratedColumns(dataObj, 'updateMany');
     const whereObj = args.where as Record<string, unknown>;
     const setFp = this.fingerprintSet(dataObj);
     const whereFp = this.fingerprintWhere(whereObj);
@@ -2665,6 +2674,26 @@ export class QueryInterface<T extends object, R extends object = {}> {
       return this.tableMeta.allColumns.filter((col) => !omitCols.has(col));
     }
     return null;
+  }
+
+  /**
+   * Reject a write whose `data` names a `GENERATED ALWAYS AS (...) STORED`
+   * column (H3). Postgres computes these from other columns and errors if you
+   * try to write them; we fail early with a clear {@link ValidationError} (E003)
+   * instead of surfacing a cryptic driver error. Undefined values are ignored
+   * (they're stripped from the statement anyway).
+   */
+  private assertNoGeneratedColumns(data: Record<string, unknown>, operation: string): void {
+    for (const [key, value] of Object.entries(data)) {
+      if (value === undefined) continue;
+      const col = this.tableMeta.columns.find((c) => c.field === key || c.name === key || c.name === camelToSnake(key));
+      if (col?.isGeneratedStored) {
+        throw new ValidationError(
+          `[turbine] Cannot ${operation} "${this.table}": column "${key}" is a GENERATED ALWAYS AS (…) STORED ` +
+            'column whose value the database computes — remove it from your data.',
+        );
+      }
+    }
   }
 
   /** Convert camelCase field name to snake_case column name (unquoted, for non-SQL uses) */

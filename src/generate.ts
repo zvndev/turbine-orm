@@ -179,6 +179,8 @@ export function generateTypes(schema: SchemaMetadata): string {
     lines.push(`/** Input type for creating a row in \`${table.name}\` */`);
     lines.push(`export type ${typeName}Create = {`);
     for (const col of table.columns) {
+      // STORED generated columns are computed by the database — never writable.
+      if (col.isGeneratedStored) continue;
       const isPk = table.primaryKey.includes(col.name);
       const isOptional = col.hasDefault || col.nullable || isPk;
       if (isOptional) {
@@ -195,7 +197,7 @@ export function generateTypes(schema: SchemaMetadata): string {
     // --- Update input type (all fields optional except PK) ---
     // Numeric columns additionally accept `UpdateOperatorInput<number>` so
     // users can write `{ viewCount: { increment: 1 } }` without an `as any`.
-    const nonPkCols = table.columns.filter((c) => !table.primaryKey.includes(c.name));
+    const nonPkCols = table.columns.filter((c) => !table.primaryKey.includes(c.name) && !c.isGeneratedStored);
     lines.push(`/** Input type for updating a row in \`${table.name}\` */`);
     lines.push(`export type ${typeName}Update = {`);
     for (const col of nonPkCols) {
@@ -736,6 +738,11 @@ function serializeColumn(col: ColumnMetadata): string {
   // Emit isGenerated only when set (server-generated serial/identity), so the
   // output stays byte-identical for the common client-default columns.
   if (col.isGenerated) parts.push(`isGenerated: true`);
+  // STORED generated columns — the runtime write guard reads isGeneratedStored.
+  if (col.isGeneratedStored) parts.push(`isGeneratedStored: true`);
+  if (col.generationExpression !== undefined) {
+    parts.push(`generationExpression: '${escSQ(col.generationExpression)}'`);
+  }
   if (col.maxLength !== undefined) parts.push(`maxLength: ${col.maxLength}`);
   return `{ ${parts.join(', ')} }`;
 }
