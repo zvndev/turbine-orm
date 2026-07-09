@@ -726,6 +726,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       defaultLimit: undefined,
       warnOnUnlimited: false,
     };
+    // Capture the query's opt-out now (set synchronously by buildFindMany); the
+    // loader runs async, so it must not read the mutable this.currentSkip later.
+    const skip = this.currentSkip;
     return {
       parentMeta: this.tableMeta,
       schema: this.schema,
@@ -736,6 +739,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
       buildInClause: (expr, paramRef, negated) => this.inClause(expr, paramRef, negated),
       inClauseParam: (values) => this.inParam(values),
       paramPlaceholder: (index) => this.p(index),
+      skipGlobalFilters: skip,
+      tableGlobalFilter: (table, alias, precedingParams) => {
+        const gf = this.resolveGlobalFilter(table, skip);
+        if (!gf) return null;
+        const meta = this.schema.tables[table];
+        if (!meta) return null;
+        // Seed the param array with `precedingParams` placeholders so
+        // buildAliasWhere numbers the gf params after the already-bound ones.
+        const seeded: unknown[] = new Array(precedingParams).fill(undefined);
+        const clause = this.buildAliasWhere(table, meta, alias, gf, seeded);
+        if (!clause) return null;
+        return { clause, params: seeded.slice(precedingParams) };
+      },
     };
   }
 
@@ -3107,16 +3123,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           'is' in filterObj ||
           'isNot' in filterObj
         ) {
-          if (filterObj.some !== undefined && filterObj.some !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.some as Record<string, unknown>, params);
-          if (filterObj.none !== undefined && filterObj.none !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.none as Record<string, unknown>, params);
-          if (filterObj.every !== undefined && filterObj.every !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.every as Record<string, unknown>, params);
-          if (filterObj.is !== undefined && filterObj.is !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.is as Record<string, unknown>, params);
-          if (filterObj.isNot !== undefined && filterObj.isNot !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.isNot as Record<string, unknown>, params);
+          this.collectRelationFilterParams(relationDef, filterObj, params);
           continue;
         }
       }
@@ -3173,6 +3180,49 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /** Collect params from a relation filter sub-where. Mirrors buildSubWhereForRelation. */
+  /**
+   * Param-collect mirror of {@link buildRelationFilter} for one relation-filter
+   * object (`{ some/every/none/is/isNot }`, already normalized). Pushes, per
+   * present branch and in the canonical order some→none→every→is→isNot, the
+   * branch's sub-where params THEN the target table's global-filter params —
+   * exactly the order buildRelationFilter emits. When no global filter applies
+   * the gf calls are no-ops, so this stays byte-identical to the pre-0.28 path.
+   * Shared by every collect site that mirrors buildRelationFilter
+   * (collectWhereParams, collectRelFilterParams, collectAliasWhereParams).
+   */
+  private collectRelationFilterParams(
+    relDef: RelationDef,
+    filterObj: Record<string, unknown>,
+    params: unknown[],
+  ): void {
+    const target = relDef.to;
+    if (filterObj.some !== undefined && filterObj.some !== null) {
+      this.collectRelFilterParams(target, filterObj.some as Record<string, unknown>, params);
+      this.collectTargetGlobalFilterExists(target, params);
+    }
+    if (filterObj.none !== undefined && filterObj.none !== null) {
+      this.collectRelFilterParams(target, filterObj.none as Record<string, unknown>, params);
+      this.collectTargetGlobalFilterExists(target, params);
+    }
+    if (filterObj.every !== undefined && filterObj.every !== null) {
+      // gf is only emitted (build) when the `every` sub-where compiles to a
+      // filter — otherwise `every` is trivially true and no subquery is built.
+      if (this.buildSubWhereForRelation(target, filterObj.every as Record<string, unknown>, []) !== null) {
+        this.collectRelFilterParams(target, filterObj.every as Record<string, unknown>, params);
+        this.collectTargetGlobalFilterExists(target, params);
+      }
+    }
+    if (filterObj.is !== undefined) {
+      if (filterObj.is !== null) this.collectRelFilterParams(target, filterObj.is as Record<string, unknown>, params);
+      this.collectTargetGlobalFilterExists(target, params);
+    }
+    if (filterObj.isNot !== undefined) {
+      if (filterObj.isNot !== null)
+        this.collectRelFilterParams(target, filterObj.isNot as Record<string, unknown>, params);
+      this.collectTargetGlobalFilterExists(target, params);
+    }
+  }
+
   private collectRelFilterParams(targetTable: string, subWhere: Record<string, unknown>, params: unknown[]): void {
     const meta = this.schema.tables[targetTable];
     if (!meta) return;
@@ -3196,16 +3246,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (nestedRel && typeof value === 'object' && !Array.isArray(value)) {
         const norm = this.normalizeRelationFilter(nestedRel, value as Record<string, unknown>);
         if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          // Same order as buildRelationFilter pushes params: some, none, every, is, isNot.
-          if (norm.some != null)
-            this.collectRelFilterParams(nestedRel.to, norm.some as Record<string, unknown>, params);
-          if (norm.none != null)
-            this.collectRelFilterParams(nestedRel.to, norm.none as Record<string, unknown>, params);
-          if (norm.every != null)
-            this.collectRelFilterParams(nestedRel.to, norm.every as Record<string, unknown>, params);
-          if (norm.is != null) this.collectRelFilterParams(nestedRel.to, norm.is as Record<string, unknown>, params);
-          if (norm.isNot != null)
-            this.collectRelFilterParams(nestedRel.to, norm.isNot as Record<string, unknown>, params);
+          // Mirrors buildRelationFilter (some→none→every→is→isNot, each: sub-where
+          // params then target global-filter params).
+          this.collectRelationFilterParams(nestedRel, norm, params);
           continue;
         }
       }
@@ -3275,6 +3318,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // never push a param that the build path rejected (or vice versa).
         this.vectorOperator(key, rawColumn, dir.distance.metric);
         this.pushVectorParam(key, rawColumn, dir.distance.to, params);
+        continue;
+      }
+      // To-many relation orderBy (`{ posts: { _count } }`) uses the same count
+      // subquery as `_count` — mirror its global-filter params. To-one relation
+      // orderBy pushes none (its scalar subquery carries no global filter).
+      if (this.isRelationOrderByValue(dir)) {
+        const relDef = this.tableMeta.relations[key];
+        if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
+          this.collectRelationCountParams(relDef, params);
+        }
       }
     }
   }
@@ -3400,6 +3453,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (!relDef) continue;
       this.collectRelationSubqueryParams(relDef, relSpec, params, table ?? this.table);
     }
+
+    // `_count` global-filter params — mirror buildSelectWithRelations, which
+    // appends the count subqueries (and any target-filter params) AFTER every
+    // relation subquery, in resolveCountRelations order.
+    const countSpec = (withClause as { _count?: WithCount })._count;
+    if (countSpec !== undefined) {
+      for (const rel of resolveCountRelations(meta, countSpec)) {
+        this.collectRelationCountParams(rel, params);
+      }
+    }
   }
 
   /**
@@ -3423,6 +3486,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (spec.where) {
         this.collectAliasWhereParams(targetTable, targetMeta, spec.where as Record<string, unknown>, params);
       }
+      this.collectTargetGlobalFilterAlias(targetTable, params);
       if (spec.limit !== undefined && !this.dialect.inlineLimitOffset) {
         params.push(Number(spec.limit));
       }
@@ -3453,6 +3517,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (spec.where) {
       this.collectAliasWhereParams(targetTable, targetMeta, spec.where as Record<string, unknown>, params);
     }
+
+    // Global filter on the target — mirrors targetGlobalFilterAlias in
+    // buildRelationSubquery (pushed after spec.where, before limit).
+    this.collectTargetGlobalFilterAlias(targetTable, params);
 
     // limit param — only hasMany parameterizes its limit (mirrors
     // buildRelationSubquery). belongsTo/hasOne ignore limit (always LIMIT 1), so
@@ -3549,10 +3617,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * filter, honoring the active query's `skipGlobalFilters`. Returns `null` when
    * no filter applies, the query opted out, or the filter is empty.
    */
-  private resolveGlobalFilter(table: string): Record<string, unknown> | null {
+  private resolveGlobalFilter(
+    table: string,
+    skip: SkipGlobalFilters | undefined = this.currentSkip,
+  ): Record<string, unknown> | null {
     const filters = this.globalFilters;
     if (!filters) return null;
-    const skip = this.currentSkip;
     if (skip === true) return null;
     if (Array.isArray(skip) && skip.includes(table)) return null;
     const raw = filters[table];
@@ -3859,30 +3929,45 @@ export class QueryInterface<T extends object, R extends object = {}> {
       correlation = this.dialect.buildCorrelation(qt, relDef.referenceKey, qSelf, relDef.foreignKey);
     }
 
-    // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter)
+    // The target table's global filter (soft-delete / tenancy) restricts the
+    // DOMAIN of correlated rows in EVERY branch: `some`/`none`/`is`/`isNot`
+    // ignore filtered-out rows, and `every` quantifies over only the surviving
+    // rows ("every NON-deleted related row matches P"). It is ANDed into the
+    // correlation and its params pushed AFTER the per-branch filter — mirrored
+    // exactly in collectWhereParams' relation-filter branch. `qt` is the bare
+    // target table, matching the `FROM ${qt}` here (see targetGlobalFilterExists).
+    const gfAnd = (): string => {
+      const gf = this.targetGlobalFilterExists(targetTable, params);
+      return gf ? ` AND ${gf}` : '';
+    };
+
+    // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
     if (filterObj.some !== undefined) {
       const subWhere = filterObj.some as Record<string, unknown>;
       const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-      const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-      clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+      const filterAnd = filterClause ? ` AND ${filterClause}` : '';
+      clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
     }
 
-    // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter)
+    // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
     if (filterObj.none !== undefined) {
       const subWhere = filterObj.none as Record<string, unknown>;
       const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-      const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-      clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+      const filterAnd = filterClause ? ` AND ${filterClause}` : '';
+      clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
     }
 
-    // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND NOT (filter))
+    // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND gf AND NOT (filter))
     if (filterObj.every !== undefined) {
       const subWhere = filterObj.every as Record<string, unknown>;
       const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
       if (filterClause) {
-        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation} AND NOT (${filterClause}))`);
+        // gf params pushed AFTER filter params (collect mirrors this order), but
+        // placed textually inside the domain so it restricts which rows count.
+        const gf = gfAnd();
+        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gf} AND NOT (${filterClause}))`);
       } else {
-        // "every" with empty filter = true (all match trivially)
+        // "every" with empty filter = true (all match trivially) — gf irrelevant.
       }
     }
 
@@ -3890,12 +3975,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `is: null` = "no related row" (Prisma semantics) → NOT EXISTS.
     if (filterObj.is !== undefined) {
       if (filterObj.is === null) {
-        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation})`);
+        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gfAnd()})`);
       } else {
         const subWhere = filterObj.is as Record<string, unknown>;
         const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-        const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+        const filterAnd = filterClause ? ` AND ${filterClause}` : '';
+        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
       }
     }
 
@@ -3903,12 +3988,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `isNot: null` = "a related row exists" → EXISTS.
     if (filterObj.isNot !== undefined) {
       if (filterObj.isNot === null) {
-        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation})`);
+        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gfAnd()})`);
       } else {
         const subWhere = filterObj.isNot as Record<string, unknown>;
         const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-        const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+        const filterAnd = filterClause ? ` AND ${filterClause}` : '';
+        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
       }
     }
 
@@ -4133,14 +4218,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (aliasRel && typeof value === 'object' && !Array.isArray(value)) {
         const norm = this.normalizeRelationFilter(aliasRel, value as Record<string, unknown>);
         if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          // Same order as buildRelationFilter pushes params: some, none, every, is, isNot.
-          if (norm.some != null) this.collectRelFilterParams(aliasRel.to, norm.some as Record<string, unknown>, params);
-          if (norm.none != null) this.collectRelFilterParams(aliasRel.to, norm.none as Record<string, unknown>, params);
-          if (norm.every != null)
-            this.collectRelFilterParams(aliasRel.to, norm.every as Record<string, unknown>, params);
-          if (norm.is != null) this.collectRelFilterParams(aliasRel.to, norm.is as Record<string, unknown>, params);
-          if (norm.isNot != null)
-            this.collectRelFilterParams(aliasRel.to, norm.isNot as Record<string, unknown>, params);
+          // Mirrors buildRelationFilter (some→none→every→is→isNot, each: sub-where
+          // params then target global-filter params).
+          this.collectRelationFilterParams(aliasRel, norm, params);
           continue;
         }
       }
@@ -4368,7 +4448,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // keyed by a relation name (`{ posts: { _count: 'desc' } }` / `{ author:
         // { name: 'asc' } }`).
         if (this.isRelationOrderByValue(value)) {
-          return this.buildRelationOrderBy(key, value as Record<string, unknown>, `ord${relOrdCounter++}`);
+          return this.buildRelationOrderBy(key, value as Record<string, unknown>, `ord${relOrdCounter++}`, params);
         }
 
         // Scalar column ordering — a plain direction or an OrderBySpec (nulls).
@@ -4426,7 +4506,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Validation: relation must exist (E005); to-many only allows `_count`, and
    * to-one only allows real target columns (E003).
    */
-  private buildRelationOrderBy(relName: string, value: Record<string, unknown>, alias: string): string {
+  private buildRelationOrderBy(
+    relName: string,
+    value: Record<string, unknown>,
+    alias: string,
+    params?: unknown[],
+  ): string {
     const relDef = this.tableMeta.relations[relName];
     if (!relDef) {
       throw new RelationError(
@@ -4445,7 +4530,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         );
       }
       const { dir } = normalizeOrderBy(value._count as OrderDirection);
-      return `${this.buildRelationCountExpr(relDef, this.table, alias)} ${dir}`;
+      return `${this.buildRelationCountExpr(relDef, this.table, alias, params)} ${dir}`;
     }
 
     // To-one: each entry orders by a correlated scalar subquery on a target column.
@@ -4481,9 +4566,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Build a correlated `(SELECT COUNT(*) …)` scalar subquery for a to-many
    * relation, correlated to `parentRef`. hasMany counts child rows via the FK;
    * manyToMany counts junction rows via the source key. Shared by the `_count`
-   * `with` key and to-many relation orderBy. Emits no bound params.
+   * `with` key and to-many relation orderBy.
+   *
+   * When `params` is supplied and the target has a global filter, it is
+   * AND-merged so the count only sees surviving rows (a soft-deleted child is
+   * not counted): hasMany filters the counted rows directly; manyToMany adds an
+   * `EXISTS` on the target through the junction (the junction rows themselves
+   * carry no filter). Params are mirrored by {@link collectRelationCountParams}.
    */
-  private buildRelationCountExpr(relDef: RelationDef, parentRef: string, alias: string): string {
+  private buildRelationCountExpr(relDef: RelationDef, parentRef: string, alias: string, params?: unknown[]): string {
     const qParent = this.q(parentRef);
     const count = this.castAgg('COUNT(*)', 'int');
     if (relDef.type === 'manyToMany') {
@@ -4496,15 +4587,73 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const jalias = `${alias}j`;
       const sourceKeys = normalizeKeyColumns(relDef.through.sourceKey);
       const refKeys = normalizeKeyColumns(relDef.referenceKey);
-      const where = sourceKeys
+      let where = sourceKeys
         .map((jc, i) => `${jalias}.${this.q(jc)} = ${qParent}.${this.q(refKeys[i]!)}`)
         .join(' AND ');
+      if (params) {
+        const targetExists = this.manyToManyTargetGlobalFilterExists(relDef, alias, jalias, params);
+        if (targetExists) where += ` AND ${targetExists}`;
+      }
       return `(SELECT ${count} FROM ${qJ} ${jalias} WHERE ${where})`;
     }
     // hasMany: child FK correlates to the parent reference key.
     const qTarget = this.q(relDef.to);
-    const where = this.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
+    let where = this.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
+    if (params) {
+      const gf = this.targetGlobalFilterAlias(relDef.to, alias, params);
+      if (gf) where += ` AND ${gf}`;
+    }
     return `(SELECT ${count} FROM ${qTarget} ${alias} WHERE ${where})`;
+  }
+
+  /**
+   * `EXISTS (SELECT 1 FROM <target> <talias> WHERE <join> AND <gf>)` restricting
+   * a manyToMany `_count` to targets that survive their global filter. `''` when
+   * the target has no filter. Pushes gf params; mirror:
+   * {@link collectManyToManyTargetGlobalFilter}.
+   */
+  private manyToManyTargetGlobalFilterExists(
+    relDef: RelationDef,
+    alias: string,
+    jalias: string,
+    params: unknown[],
+  ): string {
+    const gf = this.resolveGlobalFilter(relDef.to);
+    if (!gf || !relDef.through) return '';
+    const tMeta = this.schema.tables[relDef.to];
+    if (!tMeta || tMeta.primaryKey.length === 0) return '';
+    const talias = `${alias}t`;
+    const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
+    const pk = tMeta.primaryKey;
+    if (targetKeys.length !== pk.length) return '';
+    const join = targetKeys.map((jc, i) => `${talias}.${this.q(pk[i]!)} = ${jalias}.${this.q(jc)}`).join(' AND ');
+    const gfClause = this.buildAliasWhere(relDef.to, tMeta, talias, gf, params);
+    const gfAnd = gfClause ? ` AND ${gfClause}` : '';
+    return `EXISTS (SELECT 1 FROM ${this.q(relDef.to)} ${talias} WHERE ${join}${gfAnd})`;
+  }
+
+  /** Param-collect mirror of {@link manyToManyTargetGlobalFilterExists}. */
+  private collectManyToManyTargetGlobalFilter(relDef: RelationDef, params: unknown[]): void {
+    const gf = this.resolveGlobalFilter(relDef.to);
+    if (!gf || !relDef.through) return;
+    const tMeta = this.schema.tables[relDef.to];
+    if (!tMeta || tMeta.primaryKey.length === 0) return;
+    const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
+    if (targetKeys.length !== tMeta.primaryKey.length) return;
+    this.collectAliasWhereParams(relDef.to, tMeta, gf, params);
+  }
+
+  /**
+   * Param-collect mirror of {@link buildRelationCountExpr}'s global-filter
+   * params (hasMany direct filter, or manyToMany EXISTS-on-target). Only pushes
+   * when a filter applies — no-op otherwise.
+   */
+  private collectRelationCountParams(relDef: RelationDef, params: unknown[]): void {
+    if (relDef.type === 'manyToMany') {
+      this.collectManyToManyTargetGlobalFilter(relDef, params);
+    } else {
+      this.collectTargetGlobalFilterAlias(relDef.to, params);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -4979,13 +5128,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     // Reserved `_count` key → one correlated COUNT(*) scalar subquery per
-    // selected to-many relation, aliased `_count__<rel>`. These push no params,
-    // so their SQL position is appended after the relation subqueries. Read via
-    // a cast so WithClause keeps its narrow `true | WithOptions` element type.
+    // selected to-many relation, aliased `_count__<rel>`. Appended after the
+    // relation subqueries; the only params they can push come from a global
+    // filter on the counted target (mirrored at the tail of collectWithParams).
+    // Read via a cast so WithClause keeps its narrow `true | WithOptions` type.
     const countSpec = (withClause as { _count?: WithCount })._count;
     if (countSpec !== undefined) {
       for (const rel of resolveCountRelations(meta, countSpec)) {
-        const expr = this.buildRelationCountExpr(rel, table, `t${aliasCounter.n++}`);
+        const expr = this.buildRelationCountExpr(rel, table, `t${aliasCounter.n++}`, params);
         relationSelects.push(`${expr} AS ${this.q(`_count__${rel.name}`)}`);
       }
     }
@@ -5272,6 +5422,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (extra) whereClause += ` AND ${extra}`;
     }
 
+    // Global filter on the target table (soft-delete / tenancy) — AND-merged so
+    // a `with` never surfaces filtered-out child rows. Pushed AFTER spec.where,
+    // mirrored by collectRelationSubqueryParams.
+    const gfExtra = this.targetGlobalFilterAlias(targetTable, alias, params);
+    if (gfExtra) whereClause += ` AND ${gfExtra}`;
+
     // LIMIT — only meaningful for hasMany. A belongsTo / hasOne subquery returns
     // a single row (literal `LIMIT 1` below), so a `spec.limit` here must NOT push
     // a parameter: doing so orphans an untyped `$N` that the SQL never references,
@@ -5444,6 +5600,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       );
       if (extra) whereClause += ` AND ${extra}`;
     }
+
+    // Global filter on the target table (mirrors collectRelationSubqueryParams'
+    // m2m branch: after spec.where, before limit).
+    const gfExtra = this.targetGlobalFilterAlias(targetTable, talias, params);
+    if (gfExtra) whereClause += ` AND ${gfExtra}`;
 
     // LIMIT — `limit: 0` is honored (LIMIT 0 → empty array)
     let limitClause = '';
