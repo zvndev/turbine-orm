@@ -840,7 +840,9 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         // BIGSERIAL (int8) before 0.24.0 — `push` won't try to shrink them.
         const expectedUdt = schemaTypeToUdt(config);
         if (expectedUdt && !isSerialType(config.type) && dbCol.udtName !== expectedUdt) {
-          const sqlType = config.type === 'VARCHAR' && config.maxLength ? `VARCHAR(${config.maxLength})` : config.type;
+          // resolveDdlType handles enum names, vector(n), arrays, and VARCHAR(n) —
+          // config.type alone would emit the internal ENUM/VECTOR sentinels here.
+          const sqlType = resolveDdlType(config, dialect);
           const oldSqlType = udtToSqlType(dbCol.udtName, dbCol.maxLength);
           const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${sqlType} USING ${dialect.quoteIdentifier(snakeName)}::${sqlType};`;
           const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${oldSqlType} USING ${dialect.quoteIdentifier(snakeName)}::${oldSqlType};`;
@@ -961,11 +963,16 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       }
 
       // --- Named table-level CHECK constraints ---
-      // Only ADD missing named checks and drop+add on expression change. We do
-      // NOT auto-drop DB checks absent from the schema: column-level / inline
-      // checks carry auto-generated names the code-first schema never sees, so
-      // dropping "unknown" checks would be destructive. Unnamed schema checks
-      // are skipped for the same reason (no stable identity to diff on).
+      // Presence-only diffing: ADD checks whose NAME is missing from the DB.
+      // We do NOT auto-drop DB checks absent from the schema (column-level /
+      // inline checks carry auto-generated names the code-first schema never
+      // sees), and we do NOT drop+add on expression mismatch: pg_get_constraintdef
+      // canonicalizes expressions (casts, ANY(ARRAY[...]) rewrites), so authored
+      // text almost never string-matches the stored form — comparing would emit a
+      // spurious full-table-revalidating drop+add on every diff. An apparent
+      // mismatch surfaces as a warning instead; rename the constraint to
+      // intentionally replace its expression. Unnamed schema checks are skipped
+      // (no stable identity to diff on).
       const namedSchemaChecks: CheckSpec[] = (tableDef.checks ?? [])
         .filter((c): c is { name: string; expression: string } => typeof c.name === 'string' && c.name.length > 0)
         .map((c) => ({ name: c.name, expression: c.expression }));
@@ -980,9 +987,11 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
           result.statements.push(addSql);
           result.reverseStatements.unshift(dropSql);
         } else if (normExpr(existing.expression) !== normExpr(sc.expression)) {
-          const reAddOld = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ADD CONSTRAINT ${dialect.quoteIdentifier(sc.name)} CHECK (${existing.expression});`;
-          result.statements.push(dropSql, addSql);
-          result.reverseStatements.unshift(dropSql, reAddOld);
+          result.warnings!.push(
+            `check constraint "${sc.name}" on "${tableName}": stored expression differs from the schema text ` +
+              `(Postgres canonicalizes CHECK expressions, so this is usually cosmetic). ` +
+              `To intentionally replace it, rename the constraint or drop/re-add it in a manual migration.`,
+          );
         }
       }
     }

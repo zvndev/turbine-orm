@@ -720,15 +720,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * and unlimited-warnings silenced — a relation load must fetch every matching
    * child, and the per-relation `limit` is applied client-side by the loader.
    */
-  private batchedContext(timeout: number | undefined): RelationLoadContext {
+  private batchedContext(timeout: number | undefined, skip: SkipGlobalFilters | undefined): RelationLoadContext {
     const childOptions: QueryInterfaceOptions = {
       ...this.options,
       defaultLimit: undefined,
       warnOnUnlimited: false,
     };
-    // Capture the query's opt-out now (set synchronously by buildFindMany); the
-    // loader runs async, so it must not read the mutable this.currentSkip later.
-    const skip = this.currentSkip;
     return {
       parentMeta: this.tableMeta,
       schema: this.schema,
@@ -764,13 +761,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private async runFindManyBatched(args: FindManyArgs<T>): Promise<T[]> {
     const withClause = args.with as WithClause;
+    // Capture the opt-out from the ARGS before any await: this.currentSkip is
+    // instance state on a cached accessor, so a concurrent build during the
+    // base-query await would overwrite it (tenant query loading relations with
+    // another query's skipGlobalFilters).
+    const skip = args.skipGlobalFilters;
     const { baseArgs, strip } = this.prepareBatchedBase(args, withClause);
     // baseArgs.with is always undefined here; the cast just bridges the R generic.
     const deferred = this.buildFindMany(baseArgs as Parameters<QueryInterface<T, R>['buildFindMany']>[0]);
     const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
     const entities = deferred.transform(result) as Record<string, unknown>[];
     if (entities.length > 0) {
-      await loadRelationsBatched(this.batchedContext(args.timeout), entities, withClause, args.timeout);
+      await loadRelationsBatched(this.batchedContext(args.timeout, skip), entities, withClause, args.timeout);
     }
     stripFields(entities, strip);
     return entities as T[];
@@ -1052,7 +1054,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
     const entity = deferred.transform(result) as Record<string, unknown> | null;
     if (!entity) return null;
-    await loadRelationsBatched(this.batchedContext(args.timeout), [entity], withClause, args.timeout);
+    await loadRelationsBatched(
+      this.batchedContext(args.timeout, args.skipGlobalFilters),
+      [entity],
+      withClause,
+      args.timeout,
+    );
     stripFields([entity], proj.strip);
     return entity as T;
   }
@@ -1322,8 +1329,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
         if (cursorEntries.length > 0) {
           const cursorConditions = cursorEntries.map(([k, v]) => {
             const col = this.toSqlColumn(k);
-            const dir = args.orderBy?.[k] ?? 'asc';
-            const op = dir === 'desc' ? '<' : '>';
+            // orderBy values can be the { sort, nulls } spec form — normalize
+            // before comparing, or a desc spec would seek the ascending side.
+            const dir = args.orderBy?.[k];
+            const desc = isOrderBySpec(dir) ? dir.sort === 'desc' : dir === 'desc';
+            const op = desc ? '<' : '>';
             freshParams.push(v);
             return `${qt}.${col} ${op} ${this.p(freshParams.length)}`;
           });
@@ -3230,7 +3240,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
   }
 
-  /** Collect params from a relation filter sub-where. Mirrors buildSubWhereForRelation. */
   /**
    * Param-collect mirror of {@link buildRelationFilter} for one relation-filter
    * object (`{ some/every/none/is/isNot }`, already normalized). Pushes, per
@@ -3373,11 +3382,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
       // To-many relation orderBy (`{ posts: { _count } }`) uses the same count
       // subquery as `_count` — mirror its global-filter params. To-one relation
-      // orderBy pushes none (its scalar subquery carries no global filter).
+      // orderBy carries the target's global filter once per ordered column.
       if (this.isRelationOrderByValue(dir)) {
         const relDef = this.tableMeta.relations[key];
         if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
           this.collectRelationCountParams(relDef, params);
+        } else if (relDef) {
+          for (const _col of Object.keys(dir as Record<string, unknown>)) {
+            this.collectTargetGlobalFilterAlias(relDef.to, params);
+          }
         }
       }
     }
@@ -3756,20 +3769,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (!filters) return '';
     const parts: string[] = [];
     for (const table of Object.keys(filters).sort()) {
-      const gf = this.resolveGlobalFilter(table);
+      // Function filters for OTHER tables may be request-scoped closures that
+      // throw outside their own context; a query on an unrelated table must not
+      // break on them. A throwing filter can't have contributed SQL to this
+      // query either (merging it would have thrown first), so a constant
+      // marker keeps the key shape-distinct without evaluating it.
+      let gf: Record<string, unknown> | null | undefined;
+      try {
+        gf = this.resolveGlobalFilter(table);
+      } catch {
+        parts.push(`${table}:!`);
+        continue;
+      }
       if (gf) parts.push(`${table}:${this.fingerprintWhere(gf)}`);
     }
     return parts.length ? `|gf=${parts.join(';')}` : '';
   }
 
-  /**
-   * Refuse mutations with an empty predicate unless explicitly opted in.
-   *
-   * An empty `where` (e.g. `{}` or `{ id: undefined }`) resolves to a
-   * mutation with no filter — a common footgun when a caller's filter
-   * value accidentally resolves to `undefined`. This guard throws
-   * `ValidationError` in that case unless `allowFullTableScan: true`.
-   */
   /**
    * True when the USER-supplied `where` compiles to no predicate (`{}`,
    * `{ id: undefined }`, `{ OR: [{ a: undefined }] }`, …). This is the exact
@@ -4608,7 +4624,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
           );
         }
         const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
-        return `(SELECT ${alias}.${this.q(snakeCol)} FROM ${qTarget} ${alias} WHERE ${correlation}${this.limitOneClause()}) ${dir}${this.nullsSuffix(nulls)}`;
+        // Target's global filter applies here too — otherwise ordering keys off
+        // a soft-deleted / other-tenant related row's value (matches the with
+        // subquery semantics for belongsTo/hasOne).
+        let where = correlation;
+        if (params) {
+          const gf = this.targetGlobalFilterAlias(relDef.to, alias, params);
+          if (gf) where += ` AND ${gf}`;
+        }
+        return `(SELECT ${alias}.${this.q(snakeCol)} FROM ${qTarget} ${alias} WHERE ${where}${this.limitOneClause()}) ${dir}${this.nullsSuffix(nulls)}`;
       })
       .join(', ');
   }

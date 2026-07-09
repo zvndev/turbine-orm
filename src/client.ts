@@ -639,14 +639,15 @@ export class TurbineClient {
      * of returning a string is correct and matches the generated TypeScript type
      * (numeric → string). Users who want number can cast explicitly in SQL.
      */
-    // Only register the int8 parser when we own at least one pg driver pool —
-    // either the primary (no external `pool`) or a string-based replica.
+    // Only register the int8 parser when the PRIMARY pool is Turbine-owned.
     // External pools (Neon HTTP, Vercel Postgres) may ship their own pg-types
-    // fork and rely on their own parser configuration — don't mutate global
-    // state we don't own. Registration is process-global and constructor-gated
-    // by the static flags, so it happens at most once regardless of how many
-    // owned pools (primary + replicas) exist.
-    const ownsAnyPool = !config.pool || (config.replicas ?? []).some((r) => typeof r === 'string');
+    // fork and rely on their own parser configuration — registration is
+    // process-global, so flipping it because a string replica exists alongside
+    // an external primary would silently change the external primary's parsing
+    // too. String replicas configured next to an external primary therefore
+    // inherit the caller's parser configuration (documented). Registration is
+    // constructor-gated by the static flags, so it happens at most once.
+    const ownsAnyPool = !config.pool;
     if (ownsAnyPool && !TurbineClient.int8ParserRegistered) {
       pg.types.setTypeParser(20, (val: string) => {
         const n = Number(val);
@@ -1355,7 +1356,13 @@ export class TurbineClient {
       for (const dq of queries) {
         let raw: pg.QueryResult;
         try {
-          raw = await client.query(dq.sql, dq.params);
+          // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL)
+          // attach a reselect plan that runs the write plus a follow-up SELECT;
+          // running dq.sql alone would transform a row-less write result.
+          raw =
+            this.dialect.resultStrategy === 'reselect' && dq.reselect
+              ? await dq.reselect((sql, params) => client.query(sql, params))
+              : await client.query(dq.sql, dq.params);
         } catch (err) {
           throw wrapPgError(err);
         }

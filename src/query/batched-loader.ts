@@ -598,12 +598,33 @@ async function loadOneCount(
     const qKey = ctx.quote(childKeyCol);
     const chunks: unknown[][] = [];
     for (let i = 0; i < keys.length; i += MAX_RELATION_KEYS) chunks.push(keys.slice(i, i + MAX_RELATION_KEYS));
-    // Global filter on the counted target (hasMany only — the m2m batched count
-    // groups the junction, not the target, so it keeps the join strategy's
-    // count-of-links semantics). Rendered against the quoted table name (the
-    // FROM has no alias), numbered after the $1 key array. Matches the join
-    // strategy's `_count` filtering so byte-parity holds under a global filter.
-    const gf = rel.type !== 'manyToMany' && ctx.tableGlobalFilter ? ctx.tableGlobalFilter(childTable, qChild, 1) : null;
+    // Global filter on the counted target, matching the join strategy so the
+    // two strategies return identical counts under a filter. hasMany filters
+    // the counted table directly; m2m counts junction rows but restricts them
+    // to junction rows whose TARGET survives the target table's filter via
+    // EXISTS — mirroring buildRelationCountExpr's EXISTS-on-target (which also
+    // skips the filter when the junction targetKey arity doesn't match the
+    // target PK). Rendered after the $1 key array.
+    let gf: { clause: string; params: unknown[] } | null = null;
+    if (ctx.tableGlobalFilter) {
+      if (rel.type === 'manyToMany' && rel.through) {
+        const targetKeys = normalizeKeyColumns(rel.through.targetKey);
+        const targetMeta = ctx.schema.tables[rel.to];
+        const pk = targetMeta?.primaryKey ?? [];
+        if (targetMeta && pk.length > 0 && pk.length === targetKeys.length) {
+          const targetGf = ctx.tableGlobalFilter(rel.to, 't', 1);
+          if (targetGf) {
+            const join = targetKeys.map((jc, i) => `t.${ctx.quote(pk[i]!)} = ${qChild}.${ctx.quote(jc)}`).join(' AND ');
+            gf = {
+              clause: `EXISTS (SELECT 1 FROM ${ctx.quote(rel.to)} t WHERE ${join} AND ${targetGf.clause})`,
+              params: targetGf.params,
+            };
+          }
+        }
+      } else if (rel.type !== 'manyToMany') {
+        gf = ctx.tableGlobalFilter(childTable, qChild, 1);
+      }
+    }
     const gfAnd = gf ? ` AND ${gf.clause}` : '';
     const results = await Promise.all(
       chunks.map((chunk) => {
