@@ -47,6 +47,16 @@ export interface TableMetadata {
    * Optional / defaults to `[]` for back-compat.
    */
   checks?: readonly CheckMetadata[];
+  /**
+   * True when this metadata entry describes a database **view** or
+   * **materialized view** rather than a base table (introspected with the
+   * `includeViews` option). Views are read-only: every write builder
+   * (`create`/`update`/`upsert`/`delete` + their `*Many` forms) throws a
+   * `ValidationError` (E003). A view without a primary key is additionally
+   * excluded from the `findUnique`-family generated accessor types.
+   * Optional / defaults to `false` for back-compat.
+   */
+  isView?: boolean;
 }
 
 export interface CheckMetadata {
@@ -81,6 +91,23 @@ export interface ColumnMetadata {
    * emits the `auto` modifier. Optional / defaults to `false` for back-compat.
    */
   isGenerated?: boolean;
+  /**
+   * True when this is a Postgres **`GENERATED ALWAYS AS (expr) STORED`** column
+   * (`information_schema.columns.is_generated = 'ALWAYS'`). Distinct from
+   * {@link isGenerated} — which flags a server-*assigned* identity/serial value
+   * that a client MAY still override — a STORED generated column's value is
+   * *computed from other columns* and can NEVER be supplied on insert/update
+   * (Postgres rejects it). Codegen therefore omits it from `*Create`/`*Update`
+   * input types, and the write builders reject any `data` containing it with a
+   * {@link ValidationError} (E003). Optional / defaults to `false`.
+   */
+  isGeneratedStored?: boolean;
+  /**
+   * The generation expression for a {@link isGeneratedStored} column
+   * (`information_schema.columns.generation_expression`), e.g. `price * qty`.
+   * Present only when `isGeneratedStored` is true and the catalog exposed it.
+   */
+  generationExpression?: string;
   /** Whether this is an array column */
   isArray: boolean;
   /** Dialect-specific array/bulk-insert type token when needed. */

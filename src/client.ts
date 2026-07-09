@@ -1155,7 +1155,36 @@ export class TurbineClient {
    * }, { timeout: 5000, isolationLevel: 'Serializable' });
    * ```
    */
-  async $transaction<R>(fn: (tx: TransactionClient) => Promise<R>, options?: TransactionOptions): Promise<R> {
+  $transaction<R>(fn: (tx: TransactionClient) => Promise<R>, options?: TransactionOptions): Promise<R>;
+  /**
+   * Batch form — run a tuple of {@link DeferredQuery} objects (produced by the
+   * `build*()` methods, e.g. `db.users.buildFindMany(...)`) atomically inside a
+   * single `BEGIN…COMMIT` on one connection. Returns a positionally-typed tuple
+   * of each query's transformed result; any failure rolls the whole batch back.
+   *
+   * Unlike {@link pipeline}, this never uses the extended-query pipeline
+   * protocol — it executes sequentially on the transaction connection, so it is
+   * safe on every driver (including HTTP/serverless pools).
+   *
+   * @example
+   * ```ts
+   * const [user, count] = await db.$transaction([
+   *   db.users.buildFindUnique({ where: { id: 1 } }),
+   *   db.posts.buildCount({ where: { userId: 1 } }),
+   * ]);
+   * ```
+   */
+  $transaction<T extends readonly DeferredQuery<unknown>[]>(queries: readonly [...T]): Promise<PipelineResults<T>>;
+  async $transaction(
+    fnOrQueries: ((tx: TransactionClient) => Promise<unknown>) | readonly DeferredQuery<unknown>[],
+    options?: TransactionOptions,
+  ): Promise<unknown> {
+    // Batch overload: an array of DeferredQuery objects runs atomically inside
+    // one BEGIN…COMMIT, reusing the raw transaction machinery below.
+    if (Array.isArray(fnOrQueries)) {
+      return this.transactionBatch(fnOrQueries);
+    }
+    const fn = fnOrQueries as (tx: TransactionClient) => Promise<unknown>;
     const client = await this.pool.connect();
     const timeout = options?.timeout;
 
@@ -1223,7 +1252,7 @@ export class TurbineClient {
         }
       }
 
-      let result: R;
+      let result: unknown;
 
       if (timeout) {
         // Race between the function and a timeout. If the timeout fires we
@@ -1280,6 +1309,32 @@ export class TurbineClient {
     } finally {
       releaseOnce();
     }
+  }
+
+  /**
+   * Execute a batch of {@link DeferredQuery} objects atomically inside one
+   * transaction. Backs the `$transaction([...])` array overload. Reuses the raw
+   * {@link transaction} machinery (BEGIN/COMMIT/ROLLBACK + connection release);
+   * queries run sequentially on the single transaction connection and each
+   * result is passed through its query's `transform`.
+   */
+  private async transactionBatch<T extends readonly DeferredQuery<unknown>[]>(queries: T): Promise<PipelineResults<T>> {
+    if (queries.length === 0) {
+      return [] as unknown as PipelineResults<T>;
+    }
+    return this.transaction(async (client) => {
+      const results: unknown[] = [];
+      for (const dq of queries) {
+        let raw: pg.QueryResult;
+        try {
+          raw = await client.query(dq.sql, dq.params);
+        } catch (err) {
+          throw wrapPgError(err);
+        }
+        results.push(dq.transform(raw));
+      }
+      return results as PipelineResults<T>;
+    });
   }
 
   /**
