@@ -107,10 +107,12 @@ export interface CliArgs {
   // generate flags
   zod?: boolean;
   includeViews?: boolean;
-  // studio flags
+  // studio / observe flags
   port?: number;
   host?: string;
   noOpen?: boolean;
+  /** Opt-in to bind Studio/Observe on a non-loopback host. */
+  allowRemote?: boolean;
 }
 
 export function parseArgs(argv = process.argv.slice(2)): CliArgs {
@@ -207,6 +209,9 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--no-open':
         result.noOpen = true;
+        break;
+      case '--allow-remote':
+        result.allowRemote = true;
         break;
       default:
         if (!arg.startsWith('-')) {
@@ -1525,6 +1530,19 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Loopback host gate (Studio / Observe)
+// ---------------------------------------------------------------------------
+
+/**
+ * True when `host` is a loopback address Studio/Observe may bind without
+ * `--allow-remote`. Accepts IPv4, IPv6, and the common bracket form.
+ */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]';
+}
+
+// ---------------------------------------------------------------------------
 // Command: studio — local read-only web UI
 // ---------------------------------------------------------------------------
 
@@ -1541,11 +1559,18 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
     process.exit(1);
   }
 
-  // Warn loudly when an explicit non-loopback --host is used — the user is
-  // opting in, so we proceed rather than refuse. Studio has no real
-  // authentication beyond a random session token, so exposing it on a LAN
-  // interface is foot-gun territory.
-  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+  // Non-loopback binds require an explicit --allow-remote opt-in. Studio has
+  // only a random session token — exposing it on a LAN interface is foot-gun
+  // territory, so we refuse rather than warn-and-proceed.
+  if (!isLoopbackHost(host)) {
+    if (!args.allowRemote) {
+      error(`Studio refuses to bind to ${yellow(host)} without ${cyan('--allow-remote')}.`);
+      newline();
+      console.log(`  ${dim('Loopback only by default')} ${dim('(127.0.0.1, localhost, ::1).')}`);
+      console.log(`  ${dim('Pass')} ${cyan('--allow-remote')} ${dim('to opt in to network exposure.')}`);
+      newline();
+      process.exit(1);
+    }
     console.log(
       warn(
         `Studio is binding to ${yellow(host)} — this is NOT loopback. ` +
@@ -1648,9 +1673,17 @@ async function cmdObserve(args: CliArgs): Promise<void> {
     process.exit(1);
   }
 
-  // Warn loudly when an explicit non-loopback --host is used — the user is
-  // opting in, so we proceed rather than refuse.
-  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+  // Non-loopback binds require an explicit --allow-remote opt-in (same model
+  // as Studio). Refuse without the flag; warn loudly when opted in.
+  if (!isLoopbackHost(host)) {
+    if (!args.allowRemote) {
+      error(`Observe refuses to bind to ${yellow(host)} without ${cyan('--allow-remote')}.`);
+      newline();
+      console.log(`  ${dim('Loopback only by default')} ${dim('(127.0.0.1, localhost, ::1).')}`);
+      console.log(`  ${dim('Pass')} ${cyan('--allow-remote')} ${dim('to opt in to network exposure.')}`);
+      newline();
+      process.exit(1);
+    }
     console.log(
       warn(
         `Observe is binding to ${yellow(host)} — this is NOT loopback. ` +
@@ -1929,6 +1962,7 @@ function showHelp(): void {
   console.log(`    ${cyan('--port')} ${dim('<n>')}           HTTP port ${dim('(default: 4983 studio, 4984 observe)')}`);
   console.log(`    ${cyan('--host')} ${dim('<addr>')}        Bind address ${dim('(default: 127.0.0.1)')}`);
   console.log(`    ${cyan('--no-open')}            Don't auto-open the browser`);
+  console.log(`    ${cyan('--allow-remote')}       Allow non-loopback --host ${dim('(refused without this flag)')}`);
   newline();
 
   console.log(`  ${bold('Config file:')}`);
