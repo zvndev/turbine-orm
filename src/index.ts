@@ -130,6 +130,7 @@ export {
   type FindManyArgs,
   type FindManyStreamArgs,
   type FindUniqueArgs,
+  type GlobalFilters,
   type GroupByArgs,
   type HavingClause,
   type JsonFilter,
@@ -148,6 +149,7 @@ export {
   type RelationDescriptor,
   type RelationFilter,
   type SelectResult,
+  type SkipGlobalFilters,
   type TextSearchFilter,
   type TypedWithClause,
   type UpdateArgs,
@@ -172,8 +174,10 @@ export {
 export { type ActiveSubscription, type NotificationHandler, type Subscription, validateChannel } from './realtime.js';
 // Schema metadata types
 export type {
+  CheckMetadata,
   ColumnMetadata,
   IndexMetadata,
+  ReferentialAction,
   RelationDef,
   SchemaMetadata,
   TableMetadata,
@@ -192,14 +196,17 @@ export {
 // Schema builder — define schemas in TypeScript
 export {
   applyManyToManyRelations,
+  type CheckDef,
   ColumnBuilder,
   type ColumnConfig,
   type ColumnDef,
   type ColumnType,
   type ColumnTypeName,
   column,
+  type DefineSchemaOptions,
   defineSchema,
   type ManyToManyDef,
+  type ReferenceDef,
   type SchemaDef,
   type TableDef,
   // Legacy compat (deprecated — use object format with defineSchema)
@@ -217,6 +224,8 @@ export {
   schemaToSQL,
   schemaToSQLString,
 } from './schema-sql.js';
+// Seed helper
+export { type DefinedSeed, defineSeed, type SeedFunction } from './seed.js';
 // Serverless / edge factory
 export { type TurbineHttpOptions, turbineHttp } from './serverless.js';
 // Typed raw SQL — Turbine's TypedSQL escape hatch

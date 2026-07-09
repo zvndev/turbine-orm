@@ -36,6 +36,7 @@ import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 import {
   type DeferredQuery,
+  type GlobalFilters,
   type QueryEvent,
   type QueryEventListener,
   QueryInterface,
@@ -263,6 +264,54 @@ export interface TurbineConfig {
   sqlCache?: boolean;
   /** SQL dialect implementation. Defaults to PostgreSQL. Internal Phase-1 seam for dialect packages. */
   dialect?: Dialect;
+  /**
+   * Read replicas. When set, read-only operations issued outside a transaction
+   * (`findMany`, `findFirst`, `findUnique`, `*OrThrow`, `count`, `aggregate`,
+   * `groupBy`, `findManyStream`) are round-robin load-balanced across these
+   * pools; the primary handles them along with every write. ALL writes,
+   * `$transaction` bodies, `pipeline`, `raw`/`sql`, `$listen`/`$notify`, and
+   * observability flushes always use the primary.
+   *
+   *   - `string` entries are connection strings — Turbine constructs an owned
+   *     `pg.Pool` for each (same pool-tuning knobs as the primary, and the same
+   *     one-time, constructor-gated type-parser registration). `disconnect()`
+   *     closes them.
+   *   - `PgCompatPool` entries are external pools (Neon, Vercel, a shared
+   *     `pg.Pool`) — Turbine registers no type parsers on them and never ends
+   *     them; the caller owns their lifecycle.
+   *
+   * Use `client.$primary()` to get a view of the client that pins every
+   * operation (reads included) to the primary — e.g. to read your own write
+   * without replication lag. Omitting `replicas` (or passing `[]`) leaves the
+   * default single-pool path completely unchanged.
+   */
+  replicas?: readonly (string | PgCompatPool)[];
+  /**
+   * Automatic WHERE filters applied to every query, keyed by table accessor
+   * (`db[name]`). Each value is AND-merged into the compiled WHERE of every
+   * read and mutation on that table — and into every relation subquery that
+   * targets it — implementing soft-delete and multi-tenancy without repeating
+   * the predicate at each call site.
+   *
+   *   - A `WhereClause` value is a static filter (e.g. `{ deletedAt: null }`).
+   *   - A `() => WhereClause` value is evaluated at query-build time, so a
+   *     closure over per-request state (the current tenant id) yields a
+   *     request-scoped filter.
+   *
+   * `create`/`createMany` are never filtered. A per-query
+   * `skipGlobalFilters: true | string[]` opts out. The empty-`where` guard on
+   * `update`/`delete` still checks the USER-supplied `where`, so a global
+   * filter never turns an unguarded mass mutation into an allowed one.
+   *
+   * @example
+   * ```ts
+   * const db = turbine({ url, schema, globalFilters: {
+   *   posts: { deletedAt: null },              // soft-delete
+   *   orders: () => ({ tenantId: currentTenant() }), // per-request tenancy
+   * }});
+   * ```
+   */
+  globalFilters?: GlobalFilters;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +384,35 @@ const ISOLATION_LEVELS: Record<string, string> = {
  * rejecting loudly before it reaches the database.
  */
 const GUC_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
+
+/**
+ * The read-only `QueryInterface` operations that a read-replica setup may route
+ * to a replica pool. Every other method (all writes, plus internals) stays on
+ * the primary. Kept as a Set so the routing proxy's `get` trap is O(1).
+ */
+const READ_OPERATIONS: ReadonlySet<string> = new Set([
+  'findMany',
+  'findFirst',
+  'findUnique',
+  'findFirstOrThrow',
+  'findUniqueOrThrow',
+  'count',
+  'aggregate',
+  'groupBy',
+  'findManyStream',
+]);
+
+/**
+ * Internal marker on the config object that tells the `TurbineClient`
+ * constructor to build a lightweight "primary-only" view sharing an existing
+ * client's primary pool, dialect, query options, and middleware — instead of
+ * creating a fresh pool. Produced solely by `$primary()`; never public.
+ */
+const PRIMARY_VIEW = Symbol('turbine.primaryView');
+
+interface PrimaryViewSeed {
+  parent: TurbineClient;
+}
 
 // ---------------------------------------------------------------------------
 // TransactionClient — provides typed table accessors within a transaction
@@ -486,7 +564,56 @@ export class TurbineClient {
   /** Active LISTEN subscriptions — torn down on disconnect() so it never hangs */
   private readonly activeSubscriptions = new Set<ActiveSubscription>();
 
+  /**
+   * Read-replica pools in round-robin order. Empty when no replicas are
+   * configured, in which case `table()` takes the original single-pool path.
+   */
+  private readonly replicaPools: PgCompatPool[];
+  /**
+   * The subset of {@link replicaPools} that Turbine created from connection
+   * strings and must close on `disconnect()`. External replica pools are not
+   * listed here (caller owns their lifecycle).
+   */
+  private readonly ownedReplicaPools: PgCompatPool[];
+  /** Rotating index for round-robin replica selection (advances per read op). */
+  private replicaCursor = 0;
+  /** Per-replica `table → QueryInterface` caches, indexed like {@link replicaPools}. */
+  private readonly replicaTableCaches: Array<Map<string, QueryInterface<object>>>;
+  /** Cache of per-table routing proxies (only used when replicas are present). */
+  private readonly routingProxyCache = new Map<string, QueryInterface<object>>();
+  /** Lazily-built, cached primary-only view returned by {@link $primary}. */
+  private primaryView?: TurbineClient;
+
   constructor(config: TurbineConfig = {}, schema: SchemaMetadata) {
+    // Primary-only view: $primary() constructs this to share the parent's
+    // primary pool + derived state instead of creating a fresh pool. It owns
+    // no pool and no replicas, so every operation (reads included) runs on the
+    // primary and disconnect() is a no-op on the shared pool.
+    const seed = (config as Record<PropertyKey, unknown>)[PRIMARY_VIEW] as PrimaryViewSeed | undefined;
+    if (seed) {
+      const parent = seed.parent;
+      this.schema = schema;
+      this.logging = parent.logging;
+      this.dialect = parent.dialect;
+      this.errorMessagesSafe = parent.errorMessagesSafe;
+      this.queryOptions = parent.queryOptions;
+      this.middlewares = parent.middlewares; // shared reference: $use on parent flows through
+      this.pool = parent.pool;
+      this.ownsPool = false;
+      this.replicaPools = [];
+      this.ownedReplicaPools = [];
+      this.replicaTableCaches = [];
+      for (const tableName of Object.keys(schema.tables)) {
+        const camelName = tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+        if (!(camelName in this)) {
+          Object.defineProperty(this, camelName, {
+            get: () => this.table(tableName),
+            enumerable: true,
+          });
+        }
+      }
+      return;
+    }
     // Constructing without schema metadata previously crashed deep in the
     // constructor with an opaque "Cannot read properties of undefined
     // (reading 'tables')". Fail fast with an actionable message instead.
@@ -512,11 +639,16 @@ export class TurbineClient {
      * of returning a string is correct and matches the generated TypeScript type
      * (numeric → string). Users who want number can cast explicitly in SQL.
      */
-    // Only register the int8 parser when we own the pg driver. External
-    // pools (Neon HTTP, Vercel Postgres) may ship their own pg-types fork
-    // and rely on their own parser configuration — don't mutate global state
-    // we don't own.
-    if (!config.pool && !TurbineClient.int8ParserRegistered) {
+    // Only register the int8 parser when the PRIMARY pool is Turbine-owned.
+    // External pools (Neon HTTP, Vercel Postgres) may ship their own pg-types
+    // fork and rely on their own parser configuration — registration is
+    // process-global, so flipping it because a string replica exists alongside
+    // an external primary would silently change the external primary's parsing
+    // too. String replicas configured next to an external primary therefore
+    // inherit the caller's parser configuration (documented). Registration is
+    // constructor-gated by the static flags, so it happens at most once.
+    const ownsAnyPool = !config.pool;
+    if (ownsAnyPool && !TurbineClient.int8ParserRegistered) {
       pg.types.setTypeParser(20, (val: string) => {
         const n = Number(val);
         return Number.isSafeInteger(n) ? n : val;
@@ -529,7 +661,7 @@ export class TurbineClient {
     // ORM convention (Prisma, Rails, Django) — and the only interpretation
     // that round-trips what Postgres stores — is UTC. Same ownership rule as
     // the int8 parser: never mutate parser state on external pools.
-    if (!config.pool && config.utcTimestamps !== false && !TurbineClient.utcTimestampParserRegistered) {
+    if (ownsAnyPool && config.utcTimestamps !== false && !TurbineClient.utcTimestampParserRegistered) {
       pg.types.setTypeParser(1114, (val: string) => new Date(`${val.replace(' ', 'T')}Z`));
       TurbineClient.utcTimestampParserRegistered = true;
     }
@@ -548,6 +680,7 @@ export class TurbineClient {
       utcTimestamps: config.utcTimestamps,
       relationLoadStrategy: config.relationLoadStrategy,
       jsonEncoding: config.jsonEncoding,
+      globalFilters: config.globalFilters,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
       sqlCache: config.sqlCache ?? true,
       dialect: config.dialect,
@@ -617,6 +750,36 @@ export class TurbineClient {
       }
     }
 
+    // Build read-replica pools (if any). String entries become owned pg.Pools
+    // sharing the primary's tuning knobs; PgCompatPool entries are external and
+    // used as-is. Replica selection is round-robin in this array order.
+    this.replicaPools = [];
+    this.ownedReplicaPools = [];
+    for (const replica of config.replicas ?? []) {
+      if (typeof replica === 'string') {
+        const replicaPool = new pg.Pool({
+          connectionString: replica,
+          max: config.poolSize ?? 10,
+          idleTimeoutMillis: config.idleTimeoutMs ?? 30_000,
+          connectionTimeoutMillis: config.connectionTimeoutMs ?? 5_000,
+          ...(config.ssl !== undefined ? { ssl: config.ssl } : {}),
+        });
+        replicaPool.on('error', (err) => {
+          console.error('[turbine] Unexpected replica pool error:', err.message);
+        });
+        this.replicaPools.push(replicaPool as unknown as PgCompatPool);
+        this.ownedReplicaPools.push(replicaPool as unknown as PgCompatPool);
+      } else {
+        this.replicaPools.push(replica);
+      }
+    }
+    this.replicaTableCaches = this.replicaPools.map(() => new Map<string, QueryInterface<object>>());
+    if (this.logging && this.replicaPools.length > 0) {
+      console.log(
+        `[turbine] ${this.replicaPools.length} read replica(s) configured (${this.ownedReplicaPools.length} owned)`,
+      );
+    }
+
     // Auto-create typed table accessors for all tables in the schema
     for (const tableName of Object.keys(schema.tables)) {
       const camelName = tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -671,8 +834,13 @@ export class TurbineClient {
    */
   $use(middleware: Middleware): void {
     this.middlewares.push(middleware);
-    // Clear table cache so new QueryInterfaces pick up the middleware
+    // Clear table caches so new QueryInterfaces pick up the middleware. Covers
+    // the primary cache plus, when replicas are configured, the routing proxies
+    // and per-replica caches. The primary-view (if built) shares the middleware
+    // array by reference, so its QueryInterfaces observe the new middleware too.
     this.tableCache.clear();
+    this.routingProxyCache.clear();
+    for (const cache of this.replicaTableCaches) cache.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -718,16 +886,119 @@ export class TurbineClient {
   /**
    * Get a QueryInterface for a table.
    * Results are cached — calling `table('users')` twice returns the same instance.
+   *
+   * When read replicas are configured, this returns a thin routing proxy: the
+   * read-only operations in {@link READ_OPERATIONS} are dispatched to a
+   * round-robin replica-bound QueryInterface (so an entire read — base rows and
+   * any batched sub-queries — runs against a single consistent replica), while
+   * writes and every other member fall through to the primary-bound instance.
+   * With no replicas the original single-pool instance is returned directly.
    */
   table<T extends object = Record<string, unknown>>(name: string): QueryInterface<T> {
+    if (this.replicaPools.length === 0) {
+      return this.primaryTableQI(name) as QueryInterface<T>;
+    }
+    let proxy = this.routingProxyCache.get(name);
+    if (!proxy) {
+      proxy = this.createRoutingAccessor(name);
+      this.routingProxyCache.set(name, proxy);
+    }
+    return proxy as QueryInterface<T>;
+  }
+
+  /** Get (and cache) the primary-pool-bound QueryInterface for a table. */
+  private primaryTableQI(name: string): QueryInterface<object> {
     let qi = this.tableCache.get(name);
     if (!qi) {
-      qi = this.queryOptions?.queryInterfaceFactory
-        ? this.queryOptions.queryInterfaceFactory(this.pool, name, this.schema, this.middlewares, this.queryOptions)
-        : new QueryInterface<object>(this.pool, name, this.schema, this.middlewares, this.queryOptions);
+      qi = this.buildTableQI(this.pool, name);
       this.tableCache.set(name, qi);
     }
-    return qi as QueryInterface<T>;
+    return qi;
+  }
+
+  /**
+   * Advance the round-robin cursor and return the QueryInterface bound to the
+   * selected replica pool for `name` (cached per replica).
+   */
+  private nextReplicaTableQI(name: string): QueryInterface<object> {
+    const index = this.replicaCursor % this.replicaPools.length;
+    // Reset before overflow so the cursor never grows unbounded.
+    this.replicaCursor = this.replicaCursor + 1 >= Number.MAX_SAFE_INTEGER ? 0 : this.replicaCursor + 1;
+    // index is always in-bounds (`% length`); the pools/cache entries exist.
+    const cache = this.replicaTableCaches[index] as Map<string, QueryInterface<object>>;
+    const pool = this.replicaPools[index] as PgCompatPool;
+    let qi = cache.get(name);
+    if (!qi) {
+      qi = this.buildTableQI(pool, name);
+      cache.set(name, qi);
+    }
+    return qi;
+  }
+
+  /** Construct a QueryInterface bound to `pool` (honoring any injected factory). */
+  private buildTableQI(pool: PgCompatPool, name: string): QueryInterface<object> {
+    const asPgPool = pool as unknown as pg.Pool;
+    return this.queryOptions?.queryInterfaceFactory
+      ? this.queryOptions.queryInterfaceFactory(asPgPool, name, this.schema, this.middlewares, this.queryOptions)
+      : new QueryInterface<object>(asPgPool, name, this.schema, this.middlewares, this.queryOptions);
+  }
+
+  /**
+   * Build the read/write routing proxy for a table. The proxy targets the
+   * primary QueryInterface (so writes, `build*`, and every non-read member work
+   * unchanged); read operations are intercepted and dispatched to a replica.
+   */
+  private createRoutingAccessor(name: string): QueryInterface<object> {
+    const primaryQI = this.primaryTableQI(name);
+    const client = this;
+    return new Proxy(primaryQI, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string' && READ_OPERATIONS.has(prop)) {
+          // Pick the replica at CALL time so round-robin advances per operation.
+          return (...args: unknown[]) => {
+            const replicaQI = client.nextReplicaTableQI(name) as unknown as Record<
+              string,
+              ((...a: unknown[]) => unknown) | undefined
+            >;
+            const method = replicaQI[prop];
+            if (typeof method !== 'function') {
+              return Reflect.get(target, prop, receiver);
+            }
+            return method.apply(replicaQI, args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as unknown as QueryInterface<object>;
+  }
+
+  /**
+   * Return a view of this client that pins EVERY operation — reads included —
+   * to the primary pool, bypassing replica routing. Use it to read your own
+   * write without replication lag, or for any read that must see the latest
+   * committed data.
+   *
+   * The view shares the primary pool, schema, dialect, query options, and
+   * middleware; it owns nothing, so its `disconnect()` is a no-op. When no
+   * replicas are configured this simply returns the client itself (already
+   * primary-only). The view is cached — repeated calls return the same instance.
+   *
+   * @example
+   * ```ts
+   * await db.users.create({ data: { email: 'a@b.com' } });
+   * // Read-after-write: guaranteed to see the row just inserted.
+   * const user = await db.$primary().users.findFirst({ where: { email: 'a@b.com' } });
+   * ```
+   */
+  $primary(): TurbineClient {
+    if (this.replicaPools.length === 0) return this;
+    if (!this.primaryView) {
+      this.primaryView = new TurbineClient(
+        { [PRIMARY_VIEW]: { parent: this } } as unknown as TurbineConfig,
+        this.schema,
+      );
+    }
+    return this.primaryView;
   }
 
   // -------------------------------------------------------------------------
@@ -913,7 +1184,36 @@ export class TurbineClient {
    * }, { timeout: 5000, isolationLevel: 'Serializable' });
    * ```
    */
-  async $transaction<R>(fn: (tx: TransactionClient) => Promise<R>, options?: TransactionOptions): Promise<R> {
+  $transaction<R>(fn: (tx: TransactionClient) => Promise<R>, options?: TransactionOptions): Promise<R>;
+  /**
+   * Batch form — run a tuple of {@link DeferredQuery} objects (produced by the
+   * `build*()` methods, e.g. `db.users.buildFindMany(...)`) atomically inside a
+   * single `BEGIN…COMMIT` on one connection. Returns a positionally-typed tuple
+   * of each query's transformed result; any failure rolls the whole batch back.
+   *
+   * Unlike {@link pipeline}, this never uses the extended-query pipeline
+   * protocol — it executes sequentially on the transaction connection, so it is
+   * safe on every driver (including HTTP/serverless pools).
+   *
+   * @example
+   * ```ts
+   * const [user, count] = await db.$transaction([
+   *   db.users.buildFindUnique({ where: { id: 1 } }),
+   *   db.posts.buildCount({ where: { userId: 1 } }),
+   * ]);
+   * ```
+   */
+  $transaction<T extends readonly DeferredQuery<unknown>[]>(queries: readonly [...T]): Promise<PipelineResults<T>>;
+  async $transaction(
+    fnOrQueries: ((tx: TransactionClient) => Promise<unknown>) | readonly DeferredQuery<unknown>[],
+    options?: TransactionOptions,
+  ): Promise<unknown> {
+    // Batch overload: an array of DeferredQuery objects runs atomically inside
+    // one BEGIN…COMMIT, reusing the raw transaction machinery below.
+    if (Array.isArray(fnOrQueries)) {
+      return this.transactionBatch(fnOrQueries);
+    }
+    const fn = fnOrQueries as (tx: TransactionClient) => Promise<unknown>;
     const client = await this.pool.connect();
     const timeout = options?.timeout;
 
@@ -981,7 +1281,7 @@ export class TurbineClient {
         }
       }
 
-      let result: R;
+      let result: unknown;
 
       if (timeout) {
         // Race between the function and a timeout. If the timeout fires we
@@ -1038,6 +1338,38 @@ export class TurbineClient {
     } finally {
       releaseOnce();
     }
+  }
+
+  /**
+   * Execute a batch of {@link DeferredQuery} objects atomically inside one
+   * transaction. Backs the `$transaction([...])` array overload. Reuses the raw
+   * {@link transaction} machinery (BEGIN/COMMIT/ROLLBACK + connection release);
+   * queries run sequentially on the single transaction connection and each
+   * result is passed through its query's `transform`.
+   */
+  private async transactionBatch<T extends readonly DeferredQuery<unknown>[]>(queries: T): Promise<PipelineResults<T>> {
+    if (queries.length === 0) {
+      return [] as unknown as PipelineResults<T>;
+    }
+    return this.transaction(async (client) => {
+      const results: unknown[] = [];
+      for (const dq of queries) {
+        let raw: pg.QueryResult;
+        try {
+          // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL)
+          // attach a reselect plan that runs the write plus a follow-up SELECT;
+          // running dq.sql alone would transform a row-less write result.
+          raw =
+            this.dialect.resultStrategy === 'reselect' && dq.reselect
+              ? await dq.reselect((sql, params) => client.query(sql, params))
+              : await client.query(dq.sql, dq.params);
+        } catch (err) {
+          throw wrapPgError(err);
+        }
+        results.push(dq.transform(raw));
+      }
+      return results as PipelineResults<T>;
+    });
   }
 
   /**
@@ -1216,9 +1548,22 @@ export class TurbineClient {
       this.activeSubscriptions.clear();
     }
 
+    // Close owned (string-configured) replica pools regardless of whether the
+    // primary is owned — external replica pools are left untouched (caller owns
+    // their lifecycle), same contract as an external primary.
+    for (const replicaPool of this.ownedReplicaPools) {
+      try {
+        await replicaPool.end();
+      } catch (err) {
+        if (this.logging) {
+          console.error('[turbine] Error closing replica pool:', (err as Error).message);
+        }
+      }
+    }
+
     if (!this.ownsPool) {
       if (this.logging) {
-        console.log('[turbine] disconnect() skipped — external pool is not owned by Turbine');
+        console.log('[turbine] disconnect() skipped — external primary pool is not owned by Turbine');
       }
       return;
     }

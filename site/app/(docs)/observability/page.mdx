@@ -92,7 +92,7 @@ TURBINE_OBSERVE_URL=postgres://... npx turbine observe
 npx turbine observe --port 5000 --no-open
 ```
 
-It binds `127.0.0.1:4984` by default and shares [Studio's security model](/studio#security-model): loopback binding with a loud warning on non-loopback hosts, a random per-process session token, and security headers on every response. It reads metrics only — it never connects to your application database.
+It binds `127.0.0.1:4984` by default and shares [Studio's security model](/studio#security-model): loopback by default, non-loopback refused without `--allow-remote`, a random per-process session token, and security headers on every response. It reads metrics only — it never connects to your application database.
 
 ## See also
 

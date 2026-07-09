@@ -10,22 +10,24 @@ npm install turbine-orm
 
 ## Why Turbine?
 
-Every TS ORM now resolves nested relations in a single `json_agg` query — Prisma 7 and Drizzle v2 both ship it, and so does Turbine. That part is table stakes. The reason to reach for Turbine is the **safety bundle**: the boxes a DBA ticks before a query layer goes anywhere near production. It's the only TypeScript ORM that ships all six of these together:
+Every TS ORM now resolves nested relations in a single `json_agg` query — Prisma 7 and Drizzle both ship it, and so does Turbine. That part is table stakes. The reason to reach for Turbine is the **safety bundle**: the boxes a DBA ticks before a query layer goes anywhere near production. It's the only TypeScript ORM that ships all six of these together:
 
 1. **Read-only Studio your DBA will approve.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and — since v0.19 — no raw-SQL surface at all: queries are composed in the ORM's own validated builder. The only TS ORM Studio that physically cannot mutate your database.
 2. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
-3. **One runtime dependency (`pg`).** No engine binary, no WASM adapter, no adapter packages to keep in lockstep. The main entry bundles to ~31 kB brotli (~109 KB minified); the edge entry to ~22 kB brotli. Prisma's WASM query engine alone is 1.6 MB.
+3. **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages to keep in lockstep. The main entry bundles to ~42 kB brotli; the edge entry to ~33 kB brotli. Prisma 7 dropped its Rust query engine, but its client still ships a TypeScript/WASM query compiler — a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
 5. **Edge-native — one import swap.** `turbineHttp(pool, SCHEMA)` — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle, no adapter package, no separate serverless build.
 6. **Pipeline batching via wire protocol.** Real Parse/Bind/Execute pipeline — not queries wrapped in a transaction. N independent queries in one round-trip.
 
 See [How It Works](#how-it-works) for the `json_agg` query strategy itself — but the query strategy isn't why you'd pick Turbine. The safety bundle above is: a Studio that can't mutate prod, errors that never leak PII, one dependency, and checksummed migrations.
 
+**New in 0.28.0:** [global filters](https://turbineorm.dev/global-filters) for soft-delete and multi-tenancy · [read replicas](https://turbineorm.dev/read-replicas) with a `$primary()` escape hatch · a read-only [MCP server](https://turbineorm.dev/mcp) for AI agents · [seed-as-code](https://turbineorm.dev/seeding) and a non-interactive `migrate deploy` for CI · [Zod generation](https://turbineorm.dev/zod) · read-only [views & generated columns](https://turbineorm.dev/views) · `NULLS FIRST/LAST` ordering, relation `_count`, and ordering by a relation · schema referential actions, enums, array, `vector`, and check constraints.
+
 ## Benchmarks
 
 Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizzle 0.45** (relational queries) on a **Neon** PostgreSQL database (pooled endpoint, US-East, PostgreSQL 17.8). 100 iterations, 20 warmup, Node v22. Same schema, same data (1K users, 10K posts, 50K comments), same connection pool config. _Measured April 2026 on turbine-orm 0.7.1; the core read path these scenarios exercise is unchanged through 0.17.0 — see [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) to reproduce._
 
-| Scenario | Turbine | Prisma 7 | Drizzle v2 |
+| Scenario | Turbine | Prisma 7 | Drizzle 0.45 |
 |---|---|---|---|
 | findMany — 100 users (flat) | **51.97 ms** | 52.90 ms | 53.51 ms |
 | findMany — 50 users + posts (L2) | **55.84 ms** | 56.10 ms | 88.80 ms |
@@ -43,7 +45,7 @@ Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizz
 - **Streaming 50K rows.** Turbine's optimized streaming (speculative first fetch + batch size 1000) matches Prisma at ~3.1–3.2 s. Drizzle's keyset pagination is 1.49× slower at 4.6 s. Turbine's cursor still gives you correctness on any `orderBy` and clean early-`break` semantics.
 - **Pipeline batching** puts 5 independent queries through a single round-trip using the Postgres extended-query pipeline protocol — all three ORMs are tied here since each runs 5 queries sequentially in a transaction.
 
-Performance is at parity with Prisma and Drizzle — the real reasons to choose Turbine are elsewhere: **one dependency and no WASM engine** (vs Prisma's 1.6 MB WASM query engine), the **only read-only Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes — no manual assertion, no helper annotation.
+Performance is at parity with Prisma and Drizzle — the real reasons to choose Turbine are elsewhere: **one dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes — no manual assertion, no helper annotation.
 
 > Full analysis with p50/p95/p99 and methodology notes: [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench.ts`
@@ -688,7 +690,7 @@ npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 **Security posture (read-only by design)**
 
 - **No SQL input surface.** There is nothing to inject into — builder requests are validated identifier-by-identifier against the introspected schema, and every value is bound as a `$N` parameter.
-- **Loopback by default** (`127.0.0.1`) with a loud warning if you bind to a non-loopback address.
+- **Loopback by default** (`127.0.0.1`). Non-loopback `--host` is **refused** unless you pass `--allow-remote` (loud warning when you opt in).
 - **Per-process auth token** — 24 random bytes of hex, stored in a `SameSite=Strict` `HttpOnly` cookie.
 - **Every query runs inside `BEGIN READ ONLY`** with a 30s transaction-local statement timeout (parameterized `set_config`). Writes are physically impossible at the transaction level.
 - **Security headers on every response** — CSP, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` — plus per-session rate limiting and cross-origin refusal.
@@ -727,7 +729,7 @@ TURBINE_OBSERVE_URL=postgres://... npx turbine observe
 # Flags: --port (default 4984), --host (default 127.0.0.1), --no-open
 ```
 
-Same security model as Studio: loopback binding by default, per-process random auth token in an `HttpOnly` cookie, CSP headers, and read-only access to the metrics table.
+Same security model as Studio: loopback by default, non-loopback refused without `--allow-remote`, per-process random auth token in an `HttpOnly` cookie, CSP headers, and read-only access to the metrics table.
 
 ## Serverless / Edge
 
@@ -907,7 +909,7 @@ Priority order: CLI flags > environment variables (`DATABASE_URL`) > config file
 
 ## How It Works
 
-Turbine resolves nested relations the same way Prisma 7 and Drizzle v2 do: correlated subqueries with `json_agg` + `json_build_object`, evaluated by PostgreSQL in a single round-trip. No N+1, no client-side stitching, no separate queries per relation. The `with` clause is fully type-inferred end-to-end — write `db.users.findMany({ with: { posts: { with: { comments: { with: { author: true } } } } } })` and `users[0].posts[0].comments[0].author.name` autocompletes with zero manual annotation.
+Turbine resolves nested relations the same way Prisma 7 and Drizzle do: correlated subqueries with `json_agg` + `json_build_object`, evaluated by PostgreSQL in a single round-trip. No N+1, no client-side stitching, no separate queries per relation. The `with` clause is fully type-inferred end-to-end — write `db.users.findMany({ with: { posts: { with: { comments: { with: { author: true } } } } } })` and `users[0].posts[0].comments[0].author.name` autocompletes with zero manual annotation.
 
 The query strategy is table stakes now. What isn't table stakes: the one-dependency, no-WASM footprint, the read-only Studio your DBA will approve, the error messages that never leak PII, and the SQL-first migrations with SHA-256 drift detection. See [Why Turbine?](#why-turbine) for the full breakdown.
 
@@ -931,13 +933,13 @@ Turbine maps Postgres types to TypeScript:
 
 | | **Turbine** | **Prisma** | **Drizzle** | **Kysely** |
 |---|---|---|---|---|
-| **Engine / runtime** | No engine binary (`pg` only) | Client + 1.6 MB WASM engine | No engine | No engine |
-| **Runtime deps** | 1 (`pg`) | `@prisma/client` + adapter | 0 | 0 |
-| **Main bundle (brotli)** | ~31 kB | dominated by 1.6 MB WASM | ~7 KB core | small |
-| **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Paid tier | None |
+| **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
+| **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
+| **Main bundle (brotli)** | ~42 kB | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
+| **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Free; hosted Gateway paid | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, ~22 kB brotli | 1.6 MB WASM adapter | Native | Native |
+| **Edge runtime** | One import swap, ~33 kB brotli | Driver adapter + WASM compiler | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query, shallow inference | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |
@@ -946,7 +948,9 @@ Turbine maps Postgres types to TypeScript:
 | **LISTEN/NOTIFY** | `$listen` / `$notify` | None | None | None |
 | **Multi-DB** | Postgres-first (+ SQLite/MySQL/MSSQL engines) | PG, MySQL, SQLite, MSSQL | PG, MySQL, SQLite | PG, MySQL, SQLite |
 
-All three ORMs now do single-query nested loads — that's table stakes. Turbine's real differentiators: no engine binary or WASM — just one dependency (`pg`), vs Prisma's 1.6 MB WASM query engine; the only read-only Studio in the ecosystem; error messages that never leak PII; and SQL-first migrations with SHA-256 drift detection. See [Benchmarks](#benchmarks) for performance numbers — most scenarios are within noise over a real pooled database.
+All three ORMs now do single-query nested loads — that's table stakes. Turbine's real differentiators: no engine binary or WASM — just one dependency (`pg`), vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler and required driver adapter; the only read-only Studio in the ecosystem; error messages that never leak PII; and SQL-first migrations with SHA-256 drift detection. See [Benchmarks](#benchmarks) for performance numbers — most scenarios are within noise over a real pooled database.
+
+**A note on Kysely.** Kysely's [`jsonArrayFrom` / `jsonObjectFrom`](https://kysely.dev/docs/recipes/relations) relations recipe builds nested results with the same correlated-subquery-plus-JSON approach Turbine uses — good evidence the pattern is the right one. The gap is in what the driver can no longer see once rows are aggregated into JSON: nested fields lose their column types, so a `Date` inside a `jsonArrayFrom` result is typed `Date` but arrives as a **string** at runtime ([kysely-org/kysely#482](https://github.com/kysely-org/kysely/issues/482)), and the nesting isn't type-checked at depth. Turbine's `WithResult` inference types the whole tree, and `parseNestedRow` re-applies date coercion (and snake→camel mapping) to every nested row — so `users[0].posts[0].createdAt` is an actual `Date`, at any depth, with no plugin to wire up.
 
 ## Limitations
 

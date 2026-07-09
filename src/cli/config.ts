@@ -26,7 +26,9 @@ export interface TurbineCliConfig {
   exclude?: string[];
   /** Directory for migration files (default: ./turbine/migrations) */
   migrationsDir?: string;
-  /** Path to seed file (default: ./turbine/seed.ts) */
+  /** Path to seed file. Defaults are resolved from seed.ts, seed.js, then seed.sql. */
+  seed?: string;
+  /** Path to seed file. Deprecated alias for `seed`. */
   seedFile?: string;
   /** Schema builder file path (for push command) */
   schemaFile?: string;
@@ -67,6 +69,7 @@ export function looksLikeSchemaFilePath(schema: string): boolean {
 // ---------------------------------------------------------------------------
 
 const CONFIG_FILES = ['turbine.config.ts', 'turbine.config.mts', 'turbine.config.js', 'turbine.config.mjs'] as const;
+const DEFAULT_SEED_CANDIDATES = ['seed.ts', 'seed.js', 'seed.sql'] as const;
 
 // ---------------------------------------------------------------------------
 // Load config
@@ -129,7 +132,7 @@ export interface ResolvedConfig {
   include: string[];
   exclude: string[];
   migrationsDir: string;
-  seedFile: string;
+  seedFile?: string;
   schemaFile: string;
 }
 
@@ -153,9 +156,28 @@ export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverri
     include: overrides.include ?? fileConfig.include ?? [],
     exclude: overrides.exclude ?? fileConfig.exclude ?? [],
     migrationsDir: fileConfig.migrationsDir ?? './turbine/migrations',
-    seedFile: fileConfig.seedFile ?? './turbine/seed.ts',
+    seedFile: fileConfig.seed ?? fileConfig.seedFile,
     schemaFile: fileConfig.schemaFile ?? './turbine/schema.ts',
   };
+}
+
+/**
+ * Resolve the seed file path. An explicit config value wins even if the file
+ * does not exist yet; otherwise the root-level defaults are tried in order.
+ */
+export function resolveSeedFile(
+  config: Pick<TurbineCliConfig, 'seed' | 'seedFile'>,
+  cwd = process.cwd(),
+): string | null {
+  const explicit = config.seed ?? config.seedFile;
+  if (explicit) return resolve(cwd, explicit);
+
+  for (const candidate of DEFAULT_SEED_CANDIDATES) {
+    const filePath = resolve(cwd, candidate);
+    if (existsSync(filePath)) return filePath;
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,8 +210,8 @@ ${urlLine}
   /** Directory for SQL migration files */
   migrationsDir: './turbine/migrations',
 
-  /** Path to seed file */
-  seedFile: './turbine/seed.ts',
+  /** Path to seed file (defaults: ./seed.ts, ./seed.js, ./seed.sql) */
+  seed: './seed.ts',
 
   /** Path to schema builder file (for turbine push) */
   schemaFile: './turbine/schema.ts',

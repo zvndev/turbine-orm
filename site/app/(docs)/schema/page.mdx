@@ -63,6 +63,85 @@ memberships: {
 
 `findUnique` accepts the composite key as an object: `where: { userId: 1, orgId: 2 }`.
 
+### Foreign keys and referential actions
+
+The short `references: 'table.column'` form emits a plain foreign key. To attach `ON DELETE` / `ON UPDATE` actions, pass an object:
+
+```ts
+posts: {
+  id: { type: 'serial', primaryKey: true },
+  userId: {
+    type: 'bigint',
+    notNull: true,
+    references: { target: 'users.id', onDelete: 'cascade', onUpdate: 'restrict' },
+  },
+}
+// REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE RESTRICT
+```
+
+Supported actions: `'cascade'`, `'restrict'`, `'set null'`, `'set default'`, `'no action'`. Omit a clause to leave it at the SQL default (`NO ACTION`). The plain string form is unchanged — it emits no action clauses. Introspection reads existing actions back from `pg_constraint`, so a `pull` round-trips them and `migrate create --auto` detects action changes.
+
+### Enums
+
+Declare enum types once in the schema options, then reference them from columns by name:
+
+```ts
+export default defineSchema(
+  {
+    posts: {
+      id: { type: 'serial', primaryKey: true },
+      status: { type: 'enum', enumName: 'post_status', notNull: true, default: "'draft'" },
+    },
+  },
+  { enums: { post_status: ['draft', 'published', 'archived'] } },
+);
+```
+
+DDL emits `CREATE TYPE "post_status" AS ENUM ('draft', 'published', 'archived')` before the tables that use it, and the column is typed `"post_status"`. Enum columns generate a string-literal union in `types.ts` (`'draft' | 'published' | 'archived'`).
+
+### Array columns
+
+Add `array: true` to any scalar column:
+
+```ts
+posts: {
+  id: { type: 'serial', primaryKey: true },
+  tags: { type: 'text', array: true, notNull: true },  // TEXT[]
+}
+```
+
+Array columns map to `T[]` in generated types and support the [array WHERE operators](/queries#array-columns) — `has`, `hasEvery`, `hasSome`.
+
+### Vector columns
+
+For pgvector embeddings, use `{ type: 'vector', dimensions: n }`:
+
+```ts
+documents: {
+  id: { type: 'serial', primaryKey: true },
+  embedding: { type: 'vector', dimensions: 1536, notNull: true },  // vector(1536)
+}
+```
+
+A schema containing a vector column prepends `CREATE EXTENSION IF NOT EXISTS vector;` by default. Pass `extensions: 'manual'` to `schemaToSQL` to emit a comment instead and manage the extension yourself. Vector columns map to `number[]`. See [Vector Search](/vector) for querying them.
+
+### Check constraints
+
+Add a column-level `check` for an inline constraint, or table-level `checks` for named ones:
+
+```ts
+products: {
+  id: { type: 'serial', primaryKey: true },
+  price: { type: 'integer', notNull: true, check: 'price >= 0' },
+  cost: { type: 'integer', notNull: true },
+  checks: [{ name: 'price_gt_cost', expression: 'price > cost' }],
+}
+// "price" INTEGER NOT NULL CHECK (price >= 0)
+// CONSTRAINT "price_gt_cost" CHECK (price > cost)
+```
+
+A table-level check without a `name` emits a bare `CHECK (expr)`. Introspection reads check constraints back, so they survive a `pull`. A violated check throws `CheckConstraintError` (TURBINE_E011) at write time.
+
 ## DDL generation
 
 Turbine generates quoted, deterministic DDL from any `SchemaDef`. Every identifier is quoted via `quoteIdent()` so reserved words and mixed case are safe.
@@ -157,6 +236,9 @@ Turbine reads `information_schema` and `pg_catalog` to discover:
 - Indexes (including composite and partial)
 - Enum types
 - Inferred relations (hasMany / belongsTo / hasOne) from foreign keys
+- `STORED` generated columns (read-only, omitted from write inputs)
+
+Pass `--include-views` to also introspect views and materialized views as read-only entities. See [Views & Generated Columns](/views).
 
 Three files land in `./generated/turbine/`:
 

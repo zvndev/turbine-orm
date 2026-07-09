@@ -99,6 +99,50 @@ const sample = await db.posts.findMany({
 
 Per `DISTINCT ON` semantics, which row survives per group is governed by `orderBy` — sort by the distinct fields first, then by whatever should decide the winner within each group.
 
+### Ordering — direction and NULLS placement
+
+`orderBy` maps fields to a direction. A plain `'asc'` or `'desc'` works everywhere. To control where `NULL` values land, pass a spec object instead:
+
+```ts
+const users = await db.users.findMany({
+  orderBy: { lastLoginAt: { sort: 'desc', nulls: 'last' } },
+});
+// ORDER BY "last_login_at" DESC NULLS LAST
+```
+
+Plain and spec entries mix freely, and their order is preserved:
+
+```ts
+orderBy: { name: 'asc', lastLoginAt: { sort: 'desc', nulls: 'last' } }
+// ORDER BY "name" ASC, "last_login_at" DESC NULLS LAST
+```
+
+`{ sort, nulls }` applies everywhere an `orderBy` is compiled — top-level queries, `groupBy`, and the inner subquery of a `with` relation.
+
+> **Pitfall:** `NULLS FIRST` / `NULLS LAST` is a PostgreSQL and SQLite feature. On MySQL and SQL Server, explicit nulls placement throws `UnsupportedFeatureError` (TURBINE_E017) rather than emitting broken SQL. Plain `'asc'` / `'desc'` works on every engine.
+
+### Ordering by a relation
+
+Order a query by an aggregate of its related rows. For a **to-many** relation the only key is `_count` — Turbine adds a correlated `COUNT(*)` subquery:
+
+```ts
+// Users, most posts first
+const users = await db.users.findMany({
+  orderBy: { posts: { _count: 'desc' } },
+});
+```
+
+For a **to-one** relation, order by a column on the target — a correlated scalar subquery, `{ sort, nulls }` supported:
+
+```ts
+// Posts, ordered by their author's name
+const posts = await db.posts.findMany({
+  orderBy: { author: { name: 'asc' } },
+});
+```
+
+Relation ordering adds no bound parameters. An unknown relation throws `RelationError` (TURBINE_E005); a non-`_count` key on a to-many relation, or an unknown column on a to-one relation, throws `ValidationError` (TURBINE_E003).
+
 ## findUnique / findUniqueOrThrow
 
 Look up a row by a unique column (primary key or any `unique` constraint).
@@ -447,6 +491,26 @@ const users = await db.users.findMany({
 ```
 
 Nesting depth is capped at 10 — beyond that, Turbine throws `CircularRelationError` (TURBINE_E007) with the full relation path.
+
+### Counting related rows — `_count`
+
+Add `_count` to a `with` clause to get the number of related rows without loading them. Each counted to-many relation becomes a correlated `COUNT(*)` scalar subquery, assembled into a `_count` object on each row:
+
+```ts
+// Count every to-many relation of the table
+const users = await db.users.findMany({
+  with: { _count: true },
+});
+users[0]._count; // { posts: 12, orgs: 3 }
+
+// Count only the named relations
+const authors = await db.users.findMany({
+  with: { _count: { posts: true } },
+});
+authors[0]._count.posts; // 12
+```
+
+`_count` coexists with real relation subqueries — `with: { posts: true, _count: { posts: true } }` loads the posts *and* counts them. It applies to `hasMany` and `manyToMany` (via the junction) relations; used on a to-one relation it throws `ValidationError` (TURBINE_E003), and an unknown relation throws `RelationError` (TURBINE_E005). The result type carries `_count` as `{ [relation]: number }`, so `users[0]._count.posts` is typed.
 
 ## Transactions
 

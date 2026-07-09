@@ -41,6 +41,29 @@ export interface TableMetadata {
   relations: Record<string, RelationDef>;
   /** Indexes on this table */
   indexes: IndexMetadata[];
+  /**
+   * Named `CHECK` constraints on this table (introspected from
+   * `pg_constraint` where `contype = 'c'`, excluding NOT NULL artifacts).
+   * Optional / defaults to `[]` for back-compat.
+   */
+  checks?: readonly CheckMetadata[];
+  /**
+   * True when this metadata entry describes a database **view** or
+   * **materialized view** rather than a base table (introspected with the
+   * `includeViews` option). Views are read-only: every write builder
+   * (`create`/`update`/`upsert`/`delete` + their `*Many` forms) throws a
+   * `ValidationError` (E003). A view without a primary key is additionally
+   * excluded from the `findUnique`-family generated accessor types.
+   * Optional / defaults to `false` for back-compat.
+   */
+  isView?: boolean;
+}
+
+export interface CheckMetadata {
+  /** Constraint name (system-generated or user-supplied). */
+  name: string;
+  /** The check expression source (`pg_get_constraintdef` inner text). */
+  expression: string;
 }
 
 export interface ColumnMetadata {
@@ -68,6 +91,23 @@ export interface ColumnMetadata {
    * emits the `auto` modifier. Optional / defaults to `false` for back-compat.
    */
   isGenerated?: boolean;
+  /**
+   * True when this is a Postgres **`GENERATED ALWAYS AS (expr) STORED`** column
+   * (`information_schema.columns.is_generated = 'ALWAYS'`). Distinct from
+   * {@link isGenerated} — which flags a server-*assigned* identity/serial value
+   * that a client MAY still override — a STORED generated column's value is
+   * *computed from other columns* and can NEVER be supplied on insert/update
+   * (Postgres rejects it). Codegen therefore omits it from `*Create`/`*Update`
+   * input types, and the write builders reject any `data` containing it with a
+   * {@link ValidationError} (E003). Optional / defaults to `false`.
+   */
+  isGeneratedStored?: boolean;
+  /**
+   * The generation expression for a {@link isGeneratedStored} column
+   * (`information_schema.columns.generation_expression`), e.g. `price * qty`.
+   * Present only when `isGeneratedStored` is true and the catalog exposed it.
+   */
+  generationExpression?: string;
   /** Whether this is an array column */
   isArray: boolean;
   /** Dialect-specific array/bulk-insert type token when needed. */
@@ -78,8 +118,23 @@ export interface ColumnMetadata {
   maxLength?: number;
 }
 
+/**
+ * PostgreSQL referential action for a foreign key's `ON DELETE` / `ON UPDATE`
+ * clause. `'no action'` is the implicit default (matches Postgres) and is
+ * omitted from emitted DDL.
+ */
+export type ReferentialAction = 'cascade' | 'restrict' | 'set null' | 'set default' | 'no action';
+
 export interface RelationDef {
   type: 'hasMany' | 'hasOne' | 'belongsTo' | 'manyToMany';
+  /**
+   * FK `ON DELETE` action (introspected from `pg_constraint.confdeltype`).
+   * Present on `belongsTo`/`hasMany` relations derived from a real FK; omitted
+   * when unknown (e.g. `defineSchema`-only metadata) or `'no action'`.
+   */
+  onDelete?: ReferentialAction;
+  /** FK `ON UPDATE` action (introspected from `pg_constraint.confupdtype`). */
+  onUpdate?: ReferentialAction;
   /** Relation name (camelCase, used as the field name) */
   name: string;
   /** Source table */

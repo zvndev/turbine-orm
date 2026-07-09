@@ -313,12 +313,17 @@ async function releaseLock(client: pg.Client, lockId: number, adapter?: Database
 // Checksum validation
 // ---------------------------------------------------------------------------
 
-interface ChecksumMismatch {
+export interface ChecksumMismatch {
   name: string;
   expected: string;
   actual: string;
   /** 'modified' if file changed, 'missing' if file deleted */
   type: 'modified' | 'missing';
+}
+
+export interface MigrationDeployPlan {
+  pending: MigrationFile[];
+  mismatches: ChecksumMismatch[];
 }
 
 /**
@@ -367,6 +372,95 @@ async function validateChecksums(
   }
 
   return mismatches;
+}
+
+function formatChecksumMismatchError(mismatches: ChecksumMismatch[]): string {
+  const modified = mismatches.filter((m) => m.type === 'modified');
+  const missing = mismatches.filter((m) => m.type === 'missing');
+  const lines: string[] = [
+    '[turbine] Migration drift detected — refusing to apply pending migrations.',
+    '',
+    'Applied migrations should be immutable. The following files no longer match their applied state:',
+    '',
+  ];
+  for (const m of modified) {
+    lines.push(`  - ${m.name}.sql  (modified on disk)`);
+  }
+  for (const m of missing) {
+    lines.push(`  - ${m.name}.sql  (deleted from disk)`);
+  }
+  lines.push('');
+  lines.push('Fix one of these:');
+  lines.push('  1. Restore the file(s) to their original content, OR');
+  lines.push('  2. Roll back the affected migrations with `npx turbine migrate down`, OR');
+  lines.push('  3. Pass `--allow-drift` to bypass this check (advanced — make sure you know what you are doing).');
+  return lines.join('\n');
+}
+
+/**
+ * Build a deploy plan from local migration files and applied migration rows.
+ * This is pure file-system planning; callers with a database connection should
+ * use `inspectMigrationDeploy()` to preserve legacy checksum upgrades.
+ */
+export function planMigrationDeploy(migrationsDir: string, applied: AppliedMigration[]): MigrationDeployPlan {
+  const allFiles = listMigrationFiles(migrationsDir);
+  const fileMap = new Map(allFiles.map((f) => [f.name, f]));
+  const appliedNames = new Set(applied.map((m) => m.name));
+  const mismatches: ChecksumMismatch[] = [];
+
+  for (const migration of applied) {
+    const file = fileMap.get(migration.name);
+    if (!file) {
+      mismatches.push({
+        name: migration.name,
+        expected: migration.checksum,
+        actual: '',
+        type: 'missing',
+      });
+      continue;
+    }
+
+    const currentHash = checksum(readFileSync(file.path, 'utf-8'));
+    if (currentHash !== migration.checksum && !isLegacyChecksum(migration.checksum)) {
+      mismatches.push({
+        name: migration.name,
+        expected: migration.checksum,
+        actual: currentHash,
+        type: 'modified',
+      });
+    }
+  }
+
+  return {
+    pending: allFiles.filter((f) => !appliedNames.has(f.name)),
+    mismatches,
+  };
+}
+
+/**
+ * Inspect deploy status without applying migrations.
+ */
+export async function inspectMigrationDeploy(
+  connectionString: string,
+  migrationsDir: string,
+  options?: { dialect?: Dialect },
+): Promise<MigrationDeployPlan> {
+  const client = new pg.Client({ connectionString });
+  await client.connect();
+  const dialect = options?.dialect ?? postgresDialect;
+
+  try {
+    await ensureTrackingTable(client, dialect);
+    const mismatches = await validateChecksums(client, migrationsDir, dialect);
+    const applied = await getAppliedMigrations(client, dialect);
+    const appliedNames = new Set(applied.map((m) => m.name));
+    return {
+      pending: listMigrationFiles(migrationsDir).filter((f) => !appliedNames.has(f.name)),
+      mismatches,
+    };
+  } finally {
+    await client.end();
+  }
 }
 
 /**
@@ -429,28 +523,7 @@ export async function migrateUp(
       if (!allowDrift) {
         const mismatches = await validateChecksums(client, migrationsDir, dialect);
         if (mismatches.length > 0) {
-          const modified = mismatches.filter((m) => m.type === 'modified');
-          const missing = mismatches.filter((m) => m.type === 'missing');
-          const lines: string[] = [
-            '[turbine] Migration drift detected — refusing to apply pending migrations.',
-            '',
-            'Applied migrations should be immutable. The following files no longer match their applied state:',
-            '',
-          ];
-          for (const m of modified) {
-            lines.push(`  - ${m.name}.sql  (modified on disk)`);
-          }
-          for (const m of missing) {
-            lines.push(`  - ${m.name}.sql  (deleted from disk)`);
-          }
-          lines.push('');
-          lines.push('Fix one of these:');
-          lines.push('  1. Restore the file(s) to their original content, OR');
-          lines.push('  2. Roll back the affected migrations with `npx turbine migrate down`, OR');
-          lines.push(
-            '  3. Pass `--allow-drift` to bypass this check (advanced — make sure you know what you are doing).',
-          );
-          throw new MigrationError(lines.join('\n'));
+          throw new MigrationError(formatChecksumMismatchError(mismatches));
         }
       }
 
@@ -527,6 +600,23 @@ export async function migrateUp(
   } finally {
     await client.end();
   }
+}
+
+/**
+ * Production migration apply. This intentionally applies files as written and
+ * never performs interactive destructive confirmation.
+ */
+export async function migrateDeploy(
+  connectionString: string,
+  migrationsDir: string,
+  options?: { adapter?: DatabaseAdapter; dialect?: Dialect },
+): Promise<{ applied: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
+  return migrateUp(connectionString, migrationsDir, {
+    allowDrift: false,
+    allowDestructive: true,
+    adapter: options?.adapter,
+    dialect: options?.dialect,
+  });
 }
 
 /**

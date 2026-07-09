@@ -24,6 +24,7 @@ npx turbine studio --no-open                # don't auto-open the browser
 npx turbine studio --schema inventory       # non-public Postgres schema
 npx turbine studio --include users,posts    # only these tables
 npx turbine studio --exclude _migrations    # hide tables
+npx turbine studio --host 0.0.0.0 --allow-remote  # non-loopback requires explicit opt-in
 ```
 
 The connection string resolves the same way as every other CLI command: `--url` flag, then `DATABASE_URL`, then `turbine.config.ts`. See [CLI — config resolution](/cli#config-resolution).
@@ -31,7 +32,8 @@ The connection string resolves the same way as every other CLI command: `--url` 
 | Flag | Description |
 |---|---|
 | `--port <n>` | HTTP port (default: `4983`). |
-| `--host <addr>` | Bind address (default: `127.0.0.1`). Non-loopback values trigger a loud warning. |
+| `--host <addr>` | Bind address (default: `127.0.0.1`). Non-loopback values are **refused** unless you also pass `--allow-remote`. |
+| `--allow-remote` | Opt in to binding on a non-loopback `--host`. Emits a loud warning and proceeds. Without this flag, Studio exits with code 1. |
 | `--no-open` | Don't open the browser automatically. |
 | `--include <a,b>` / `--exclude <a,b>` | Limit which tables Studio sees. |
 | `--schema <name>` | Postgres schema (default: `public`). Pinned via `set_config('search_path', ...)` on every query. |
@@ -66,7 +68,7 @@ Saved queries are builder-state only. Entries saved by pre-0.19 Studio versions 
 
 Studio's hardening is the point. Every layer assumes the layer above it failed:
 
-1. **Loopback binding.** Binds `127.0.0.1` by default and warns loudly if you override `--host` to anything non-loopback — Studio is a single-user local tool, not a deployable service.
+1. **Loopback binding.** Binds `127.0.0.1` by default and **refuses** non-loopback `--host` values unless you pass `--allow-remote` (which still emits a loud warning). Studio is a single-user local tool, not a deployable service.
 2. **Per-process token auth.** A random 24-byte (192-bit) hex token is generated at startup and required on every `/api/*` request, compared in constant time. The token lives in the launch URL and a `SameSite=Strict`, `HttpOnly` cookie.
 3. **No raw-SQL surface.** Since v0.19 there is no endpoint that accepts SQL text. Builder requests are ORM args, validated identifier-by-identifier against the introspected schema; all values are `$N` parameters.
 4. **`BEGIN READ ONLY` on every query.** Even if every check above were bypassed, Postgres itself rejects writes — the transaction is read-only at the database level. Belt and suspenders.

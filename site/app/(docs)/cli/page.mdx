@@ -17,17 +17,21 @@ npx turbine <command> [options]
 Commands:
   init                           Initialize a Turbine project
   generate | pull                Introspect database, generate TypeScript types + client
+  generate --zod                 Also emit zod.ts validation schemas
+  generate --include-views       Include views + materialized views as read-only entities
   push                           Apply defineSchema() output to the database
   migrate create <name>          Create a new SQL migration file
   migrate create <name> --auto   Auto-generate migration from schema diff
   migrate up                     Apply pending migrations
+  migrate deploy                 Apply pending migrations without prompts (CI)
   migrate down                   Rollback the last applied migration
   migrate status                 Show applied vs pending migrations
-  seed                           Run the seed file
+  seed                           Run the seed file (.ts / .js / .sql)
   status                         Show connection info + schema summary
   doctor                         Check relations for missing FK indexes
   doctor --fix                   Write a migration that adds the missing indexes
   studio                         Launch local read-only Studio web UI
+  mcp                            Start read-only MCP server over JSON-RPC stdio
   observe                        Launch local metrics dashboard
 ```
 
@@ -70,6 +74,26 @@ Reads `information_schema` + `pg_catalog` and writes three files to the output d
 - `types.ts` — entity interfaces, `Create` / `Update` inputs, relation-included helpers
 - `metadata.ts` — runtime `SchemaMetadata` constant (column maps, relations, indexes)
 - `index.ts` — typed `TurbineClient` subclass + `turbine()` factory
+
+### `--zod`
+
+Emit a fourth file, `zod.ts`, with a Zod schema per table (`XSchema`, `XCreateSchema`, `XUpdateSchema`). The generated file imports the user-side `zod` dependency; the Turbine runtime never does.
+
+```bash
+npx turbine generate --zod
+```
+
+See [Zod Schemas](/zod) for the output shapes and type mapping.
+
+### `--include-views`
+
+Introspect views and materialized views as read-only entities alongside base tables.
+
+```bash
+npx turbine pull --include-views
+```
+
+Views get entity types and read accessors; write builders reject them (TURBINE_E003). See [Views & Generated Columns](/views).
 
 ## `turbine push`
 
@@ -132,6 +156,25 @@ phrase `destroy my data`, then `yes` — or pass `--allow-destructive` explicitl
 (required in CI and other non-interactive shells). Programmatic callers of
 `migrateUp`/`migrateDown` opt in with `allowDestructive: true`.
 
+## `turbine migrate deploy`
+
+Apply pending migrations non-interactively — the command for CI/CD and production deploys. Unlike `migrate up`, `deploy` never prompts, so it works with no TTY.
+
+```bash
+npx turbine migrate deploy
+npx turbine migrate deploy --dry-run   # list pending migrations without applying
+```
+
+`deploy` applies every pending migration inside the same advisory-lock + per-migration-transaction machinery as `migrate up`, and reports `N applied`. It applies files **as written** — the destructive-migration guard runs when you *author* a migration (`create` / `up`), not at deploy time — so it assumes your migration history has already been reviewed.
+
+It refuses to run (exit 1, clear message) on a **checksum mismatch** or a **missing migration file** — a drifted history fails the deploy instead of silently diverging. It never auto-generates, seeds, or pushes; it only applies pending migrations.
+
+```bash
+# Typical CI pipeline
+npx turbine migrate deploy
+npx turbine seed
+```
+
 ## `turbine migrate down`
 
 Roll back the most recently applied migration using its `-- DOWN` section.
@@ -164,14 +207,29 @@ Checksum mismatches are reported here too — edited migrations show as `[modifi
 
 ## `turbine seed`
 
-Run the configured seed file (default: `turbine/seed.ts`).
+Run the configured seed file.
 
 ```bash
 npx turbine seed
 npx turbine seed --verbose
 ```
 
-The seed file is a regular TypeScript module that imports the generated client and runs inserts. Turbine loads it with `tsx` so there's no separate build step.
+Turbine resolves the seed from the `seed` field in `turbine.config.ts`, or the first default candidate found: `seed.ts`, `seed.js`, then `seed.sql`. Each extension has its own runner:
+
+- **`.ts`** — run with `npx tsx` (no build step). Export a `defineSeed(fn)` or run inserts directly.
+- **`.js`** — imported dynamically; a default-export function is called.
+- **`.sql`** — executed as raw SQL.
+
+```ts
+// seed.ts
+import { defineSeed } from 'turbine-orm';
+
+export default defineSeed(async (db) => {
+  await db.raw`INSERT INTO orgs (name) VALUES (${'Acme'}) ON CONFLICT DO NOTHING`;
+});
+```
+
+See [Seeding](/seeding) for `defineSeed`, typed inserts, and the CI deploy-then-seed pipeline.
 
 ## `turbine status`
 
@@ -235,11 +293,25 @@ Launch a local, read-only web UI for exploring your database. The only Postgres 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
 npx turbine studio --port 5173 --no-open
+# Non-loopback bind is refused unless you opt in:
+# npx turbine studio --host 0.0.0.0 --allow-remote
 ```
 
 Three tabs: a visual `findMany` **Query** builder with a live Copy-TS preview (no raw-SQL surface at all), **Data** browsing, and **Schema** inspection — all inside `BEGIN READ ONLY` with loopback binding and per-process token auth.
 
 Studio has its own page covering the builder, saved queries, every flag, and the full security model: **[Studio](/studio)**.
+
+## `turbine mcp`
+
+Start a read-only [Model Context Protocol](https://modelcontextprotocol.io) server so AI agents (Claude Code, Cursor) can inspect your database safely. Speaks JSON-RPC 2.0 over stdio; exposes read-only tools only — no writes, no raw SQL.
+
+```bash
+DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
+```
+
+Six tools: `schema_overview`, `table_detail`, `migrate_status`, `doctor_report`, `explain_query` (schema-validated findMany-style args only — no free-form SQL), and `sample_rows` (≤ 50 rows). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
+
+Full setup, tool reference, and Claude Code / Cursor config: **[MCP Server](/mcp)**.
 
 ## `turbine observe`
 

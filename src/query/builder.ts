@@ -39,6 +39,7 @@ import {
   loadRelationsBatched,
   neededParentKeyFields,
   type RelationLoadContext,
+  resolveCountRelations,
   stripFields,
 } from './batched-loader.js';
 import type {
@@ -53,15 +54,18 @@ import type {
   FindManyArgs,
   FindManyStreamArgs,
   FindUniqueArgs,
+  GlobalFilters,
   GroupByArgs,
   HavingClause,
   HavingFilter,
   HavingNumericOperator,
   JsonFilter,
   OrderByClause,
+  OrderBySpec,
   OrderDirection,
   QueryResult,
   RelationLoadStrategy,
+  SkipGlobalFilters,
   TextSearchFilter,
   TypedWithClause,
   UpdateArgs,
@@ -72,6 +76,7 @@ import type {
   WhereClause,
   WhereOperator,
   WithClause,
+  WithCount,
   WithOptions,
 } from './types.js';
 import { escapeLike, LRUCache, OPERATOR_KEYS, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
@@ -314,6 +319,23 @@ function isVectorOrderBy(value: unknown): value is VectorOrderBy {
   return isVectorFilter(value);
 }
 
+/** Check if an orderBy value is an explicit `{ sort, nulls? }` spec. */
+function isOrderBySpec(value: unknown): value is OrderBySpec {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) && 'sort' in value;
+}
+
+/**
+ * Normalize an orderBy value into `{ direction, nulls }`. Accepts a plain
+ * direction string or an {@link OrderBySpec}. Used by every ORDER BY compile
+ * path (findMany, groupBy, relation inner subqueries).
+ */
+function normalizeOrderBy(value: OrderDirection | OrderBySpec): { dir: 'ASC' | 'DESC'; nulls?: 'first' | 'last' } {
+  if (isOrderBySpec(value)) {
+    return { dir: value.sort.toLowerCase() === 'desc' ? 'DESC' : 'ASC', nulls: value.nulls };
+  }
+  return { dir: String(value).toLowerCase() === 'desc' ? 'DESC' : 'ASC' };
+}
+
 // ---------------------------------------------------------------------------
 // Deferred query descriptor (for pipeline batching)
 // ---------------------------------------------------------------------------
@@ -422,6 +444,13 @@ export interface QueryInterfaceOptions {
    * `with` clause on any other dialect throws `UnsupportedFeatureError` (E017).
    */
   jsonEncoding?: 'object' | 'positional';
+  /**
+   * Automatic WHERE filters keyed by table accessor, AND-merged into every
+   * query on that table and every relation subquery targeting it (soft-delete /
+   * multi-tenancy). Function values are evaluated at query-build time. See
+   * {@link GlobalFilters}.
+   */
+  globalFilters?: GlobalFilters;
   /** @internal Set by TransactionClient — signals that this QI runs inside an active transaction. */
   _txScoped?: boolean;
   /** @internal Callback from TurbineClient for query event emission. */
@@ -477,6 +506,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** Nested-relation JSON encoding: 'object' (default) or 'positional'. */
   private readonly jsonEncoding: 'object' | 'positional';
   /**
+   * Client-level automatic WHERE filters keyed by table accessor (soft-delete /
+   * multi-tenancy). AND-merged into every query on the keyed table and every
+   * relation subquery targeting it. Undefined when none are configured, in
+   * which case every path is byte-identical to the pre-0.28 behavior.
+   */
+  private readonly globalFilters?: GlobalFilters;
+  /**
    * Tracks tables that have already triggered an unlimited-query warning so
    * the user is not spammed once per row. Per-instance state — each
    * QueryInterface is bound to a single table, so this set will only ever
@@ -515,6 +551,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** Set by executeWithMiddleware so queryWithTimeout can include it in events. */
   private currentAction = 'raw';
 
+  /**
+   * The active query's `skipGlobalFilters` opt-out, set at the top of each
+   * `build*` method and read deep in the (synchronous) SQL-build + param-collect
+   * tree — so relation subqueries, relation filters, `_count`, and relation
+   * `orderBy` all see it without threading it through dozens of signatures.
+   * Only load-bearing when {@link globalFilters} is configured; build+collect are
+   * synchronous per call, so this transient is never observed across an await.
+   */
+  private currentSkip: SkipGlobalFilters | undefined;
+
   constructor(
     private readonly pool: pg.Pool,
     private readonly table: string,
@@ -541,6 +587,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.dialect = options?.dialect ?? postgresDialect;
     this.relationLoadStrategy = options?.relationLoadStrategy ?? 'join';
     this.jsonEncoding = options?.jsonEncoding ?? 'object';
+    // Only retain the map when it has at least one entry, so `globalFilters`
+    // stays `undefined` (and every merge path a no-op) for the common case.
+    this.globalFilters =
+      options?.globalFilters && Object.keys(options.globalFilters).length > 0 ? options.globalFilters : undefined;
     this.txScoped = options?._txScoped ?? false;
     this.options = options;
 
@@ -670,7 +720,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * and unlimited-warnings silenced — a relation load must fetch every matching
    * child, and the per-relation `limit` is applied client-side by the loader.
    */
-  private batchedContext(timeout: number | undefined): RelationLoadContext {
+  private batchedContext(timeout: number | undefined, skip: SkipGlobalFilters | undefined): RelationLoadContext {
     const childOptions: QueryInterfaceOptions = {
       ...this.options,
       defaultLimit: undefined,
@@ -686,6 +736,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
       buildInClause: (expr, paramRef, negated) => this.inClause(expr, paramRef, negated),
       inClauseParam: (values) => this.inParam(values),
       paramPlaceholder: (index) => this.p(index),
+      skipGlobalFilters: skip,
+      tableGlobalFilter: (table, alias, precedingParams) => {
+        const gf = this.resolveGlobalFilter(table, skip);
+        if (!gf) return null;
+        const meta = this.schema.tables[table];
+        if (!meta) return null;
+        // Seed the param array with `precedingParams` placeholders so
+        // buildAliasWhere numbers the gf params after the already-bound ones.
+        const seeded: unknown[] = new Array(precedingParams).fill(undefined);
+        const clause = this.buildAliasWhere(table, meta, alias, gf, seeded);
+        if (!clause) return null;
+        return { clause, params: seeded.slice(precedingParams) };
+      },
     };
   }
 
@@ -698,13 +761,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private async runFindManyBatched(args: FindManyArgs<T>): Promise<T[]> {
     const withClause = args.with as WithClause;
+    // Capture the opt-out from the ARGS before any await: this.currentSkip is
+    // instance state on a cached accessor, so a concurrent build during the
+    // base-query await would overwrite it (tenant query loading relations with
+    // another query's skipGlobalFilters).
+    const skip = args.skipGlobalFilters;
     const { baseArgs, strip } = this.prepareBatchedBase(args, withClause);
     // baseArgs.with is always undefined here; the cast just bridges the R generic.
     const deferred = this.buildFindMany(baseArgs as Parameters<QueryInterface<T, R>['buildFindMany']>[0]);
     const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
     const entities = deferred.transform(result) as Record<string, unknown>[];
     if (entities.length > 0) {
-      await loadRelationsBatched(this.batchedContext(args.timeout), entities, withClause, args.timeout);
+      await loadRelationsBatched(this.batchedContext(args.timeout, skip), entities, withClause, args.timeout);
     }
     stripFields(entities, strip);
     return entities as T[];
@@ -986,7 +1054,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
     const entity = deferred.transform(result) as Record<string, unknown> | null;
     if (!entity) return null;
-    await loadRelationsBatched(this.batchedContext(args.timeout), [entity], withClause, args.timeout);
+    await loadRelationsBatched(
+      this.batchedContext(args.timeout, args.skipGlobalFilters),
+      [entity],
+      withClause,
+      args.timeout,
+    );
     stripFields([entity], proj.strip);
     return entity as T;
   }
@@ -995,12 +1068,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
   buildFindUnique<W extends TypedWithClause<R> = {}>(
     args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): DeferredQuery<T | null> {
+    this.currentSkip = args.skipGlobalFilters;
     const columnsList = this.resolveColumns(args.select, args.omit);
-    const whereObj = args.where as Record<string, unknown>;
+    // A global filter turns the where into `{ AND: [...] }`, which the
+    // `isSimpleWhere` test below rejects → the general (buildWhereClause) path
+    // handles the merge and its params uniformly.
+    const whereObj = (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     const colKey = columnsList ? columnsList.join(',') : '*';
     const whereFingerprint = this.fingerprintWhere(whereObj);
     const withFp = args.with ? this.withFingerprint(args.with as WithClause) : '';
-    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}`;
+    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -1183,25 +1260,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
   buildFindMany<W extends TypedWithClause<R> = {}>(
     args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): DeferredQuery<T[]> {
+    this.currentSkip = args?.skipGlobalFilters;
     const columnsList = this.resolveColumns(args?.select, args?.omit);
     const colKey = columnsList ? columnsList.join(',') : '*';
-    const whereObj = (args?.where ?? {}) as Record<string, unknown>;
+    // AND-merge this table's global filter into the user where; `hasWhere` gates
+    // the build/collect just like `args?.where` did (a merged filter can make
+    // an otherwise-absent where present).
+    const effWhere = this.mergeGlobalFilter(args?.where as Record<string, unknown> | undefined);
+    const hasWhere = effWhere !== undefined;
+    const whereObj = (effWhere ?? {}) as Record<string, unknown>;
 
     // Build fingerprint for cache lookup
-    const whereFp = args?.where ? this.fingerprintWhere(whereObj) : '';
+    const whereFp = hasWhere ? this.fingerprintWhere(whereObj) : '';
     const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
     const orderFp = args?.orderBy
       ? Object.entries(args.orderBy)
-          .map(([k, d]) => {
-            // Vector KNN ordering changes the emitted SQL operator by metric and
-            // adds a `::vector` param, so the metric + direction must be part of
-            // the cache key — otherwise two KNN queries differing only in metric
-            // would collide on a single cached SQL string.
-            if (isVectorOrderBy(d)) {
-              return `${k}:vec(${d.distance.metric},${d.distance.direction ?? 'asc'})`;
-            }
-            return `${k}:${d}`;
-          })
+          .map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d)}`)
           .join(',')
       : '';
     const cursorFp = args?.cursor
@@ -1215,14 +1289,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const limitFp = effectiveLimit !== undefined ? '1' : '0';
     const offsetFp = args?.offset !== undefined ? '1' : '0';
 
-    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}`;
+    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
     const entry = this.acquireSql(ck, () => {
       // Fresh build — generates SQL and populates freshParams
       const freshParams: unknown[] = [];
-      const { sql: freshWhereSql } = args?.where
+      const { sql: freshWhereSql } = hasWhere
         ? (() => {
             const clause = this.buildWhereClause(whereObj, freshParams);
             return { sql: clause ? ` WHERE ${clause}` : '' };
@@ -1255,8 +1329,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
         if (cursorEntries.length > 0) {
           const cursorConditions = cursorEntries.map(([k, v]) => {
             const col = this.toSqlColumn(k);
-            const dir = args.orderBy?.[k] ?? 'asc';
-            const op = dir === 'desc' ? '<' : '>';
+            // orderBy values can be the { sort, nulls } spec form — normalize
+            // before comparing, or a desc spec would seek the ascending side.
+            const dir = args.orderBy?.[k];
+            const desc = isOrderBySpec(dir) ? dir.sort === 'desc' : dir === 'desc';
+            const op = desc ? '<' : '>';
             freshParams.push(v);
             return `${qt}.${col} ${op} ${this.p(freshParams.length)}`;
           });
@@ -1305,8 +1382,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     });
 
     // Collect params in exact build order:
-    // 1. WHERE params
-    if (args?.where) {
+    // 1. WHERE params (includes the AND-merged global filter, if any)
+    if (hasWhere) {
       this.collectWhereParams(whereObj, params);
     }
     // 2. WITH relation params
@@ -1583,6 +1660,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildCreate(args: CreateArgs<T>): DeferredQuery<T> {
+    this.assertWritable('create');
+    this.assertNoGeneratedColumns(args.data as Record<string, unknown>, 'create');
     const entries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = entries.map(([k]) => this.toSqlColumn(k));
     const params = entries.map(([, v]) => v);
@@ -1667,6 +1746,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       };
     }
 
+    this.assertWritable('createMany');
+    for (const row of args.data) {
+      this.assertNoGeneratedColumns(row as Record<string, unknown>, 'createMany');
+    }
+
     const keys = Object.keys(args.data[0]!).filter((k) => (args.data[0] as Record<string, unknown>)[k] !== undefined);
     const columns = keys.map((k) => this.toColumn(k));
 
@@ -1711,12 +1795,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpdate(args: UpdateArgs<T>): DeferredQuery<T> {
+    this.assertWritable('update');
+    this.currentSkip = args.skipGlobalFilters;
     const dataObj = args.data as Record<string, unknown>;
-    const whereObj = args.where as Record<string, unknown>;
+    this.assertNoGeneratedColumns(dataObj, 'update');
+    const userWhere = args.where as Record<string, unknown>;
     const lock = args.optimisticLock;
+    // The empty-`where` guard checks the USER predicate only — a global filter
+    // must never turn an unguarded mass update into an allowed one.
+    const userHasPredicate = !this.userPredicateIsEmpty(userWhere) || !!lock;
+    this.assertMutationHasPredicate('update', userHasPredicate ? ' WHERE x' : '', args.allowFullTableScan);
+    // The SQL is built from the global-filter-merged where (soft-delete keeps an
+    // update from touching already-deleted rows).
+    const whereObj = (this.mergeGlobalFilter(userWhere) ?? {}) as Record<string, unknown>;
     const setFp = this.fingerprintSet(dataObj);
     const whereFp = this.fingerprintWhere(whereObj);
-    const ck = lock ? null : `u:${setFp}|${whereFp}`;
+    const ck = lock ? null : `u:${setFp}|${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -1740,7 +1834,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
         whereSql = whereSql ? `${whereSql} AND ${versionCheck}` : ` WHERE ${versionCheck}`;
       }
 
-      this.assertMutationHasPredicate('update', whereSql, args.allowFullTableScan);
       // Engines that inject their returning shape MID-statement (SQL Server
       // `OUTPUT INSERTED.*` between SET and WHERE) override buildUpdateStatement;
       // absent → the trailing-clause PG/SQLite/MySQL form (byte-identical).
@@ -1756,9 +1849,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const entry = this.acquireSql(ck, buildSql);
       sql = entry.sql;
       preparedName = entry.name;
-      if (whereFp === '') {
-        this.assertMutationHasPredicate('update', '', args.allowFullTableScan);
-      }
     } else {
       sql = buildSql();
     }
@@ -1904,30 +1994,30 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildDelete(args: DeleteArgs<T>): DeferredQuery<T> {
-    const whereObj = args.where as Record<string, unknown>;
+    this.assertWritable('delete');
+    this.currentSkip = args.skipGlobalFilters;
+    // Guard the USER predicate (a global filter must not satisfy the guard).
+    this.assertMutationHasPredicate(
+      'delete',
+      this.userPredicateIsEmpty(args.where as Record<string, unknown>) ? '' : ' WHERE x',
+      args.allowFullTableScan,
+    );
+    const whereObj = (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     const whereFp = this.fingerprintWhere(whereObj);
-    const ck = `d:${whereFp}`;
+    const ck = `d:${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
-    // We need to check the mutation predicate. Build the whereSql to test it.
-    // On cache hit we still need to validate (the shape may be empty).
     const entry = this.acquireSql(ck, () => {
       const freshParams: unknown[] = [];
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
-      this.assertMutationHasPredicate('delete', whereSql, args.allowFullTableScan);
       // SQL Server injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and WHERE;
       // absent override → the trailing-clause PG/SQLite/MySQL form (byte-identical).
       return this.dialect.buildDeleteStatement
         ? this.dialect.buildDeleteStatement({ table: this.q(this.table), whereSql, returning: '*' })
         : `DELETE FROM ${this.q(this.table)}${whereSql}${this.dialect.buildReturningClause('*')}`;
     });
-
-    // On cache hit, still validate the predicate
-    if (whereFp === '') {
-      this.assertMutationHasPredicate('delete', '', args.allowFullTableScan);
-    }
 
     this.collectWhereParams(whereObj, params);
 
@@ -1973,6 +2063,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpsert(args: UpsertArgs<T>): DeferredQuery<T> {
+    this.assertWritable('upsert');
+    this.assertNoGeneratedColumns(args.create as Record<string, unknown>, 'upsert');
+    this.assertNoGeneratedColumns(args.update as Record<string, unknown>, 'upsert');
+    this.currentSkip = args.skipGlobalFilters;
     // Build the INSERT part from create data
     const createEntries = Object.entries(args.create as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = createEntries.map(([k]) => this.toSqlColumn(k));
@@ -1997,12 +2091,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params = [...createParams, ...updateParams];
 
+    // Global filter → restrict the conflict-UPDATE (soft-delete / tenancy) so an
+    // upsert never resurrects a soft-deleted row or writes across tenants. Only
+    // on engines whose upsert can carry a predicate (Postgres); the gf params
+    // continue the placeholder numbering after create+update params.
+    let updateWhere: string | undefined;
+    if (this.dialect.supportsUpsertUpdateWhere) {
+      const gf = this.resolveGlobalFilter(this.table);
+      if (gf) updateWhere = this.buildWhereClause(gf, params) ?? undefined;
+    }
+
     const sql = this.dialect.buildUpsertStatement({
       table: this.q(this.table),
       insertColumns: columns,
       valuePlaceholders: placeholders,
       conflictColumns,
       updateSetClauses: setClauses,
+      updateWhere,
       returning: '*',
     });
 
@@ -2027,7 +2132,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
         this.dialect.resultStrategy === 'reselect'
           ? async (exec) => {
               await exec(sql, params);
-              const sel = this.buildReselectByWhere(args.where as Record<string, unknown>);
+              const sel = this.buildReselectByWhere(
+                (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>,
+              );
               return exec(sel.sql, sel.params);
             }
           : undefined,
@@ -2047,11 +2154,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
+    this.assertWritable('updateMany');
+    this.currentSkip = args.skipGlobalFilters;
     const dataObj = args.data as Record<string, unknown>;
-    const whereObj = args.where as Record<string, unknown>;
+    this.assertNoGeneratedColumns(dataObj, 'updateMany');
+    this.assertMutationHasPredicate(
+      'updateMany',
+      this.userPredicateIsEmpty(args.where as Record<string, unknown>) ? '' : ' WHERE x',
+      args.allowFullTableScan,
+    );
+    const whereObj = (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     const setFp = this.fingerprintSet(dataObj);
     const whereFp = this.fingerprintWhere(whereObj);
-    const ck = `um:${setFp}|${whereFp}`;
+    const ck = `um:${setFp}|${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -2061,13 +2176,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, freshParams));
       const whereClause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
-      this.assertMutationHasPredicate('updateMany', whereSql, args.allowFullTableScan);
       return `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}`;
     });
-
-    if (whereFp === '') {
-      this.assertMutationHasPredicate('updateMany', '', args.allowFullTableScan);
-    }
 
     this.collectSetParams(dataObj, params);
     this.collectWhereParams(whereObj, params);
@@ -2094,9 +2204,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildDeleteMany(args: DeleteManyArgs<T>): DeferredQuery<{ count: number }> {
-    const whereObj = args.where as Record<string, unknown>;
+    this.assertWritable('deleteMany');
+    this.currentSkip = args.skipGlobalFilters;
+    this.assertMutationHasPredicate(
+      'deleteMany',
+      this.userPredicateIsEmpty(args.where as Record<string, unknown>) ? '' : ' WHERE x',
+      args.allowFullTableScan,
+    );
+    const whereObj = (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     const whereFp = this.fingerprintWhere(whereObj);
-    const ck = `dm:${whereFp}`;
+    const ck = `dm:${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -2104,13 +2221,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const freshParams: unknown[] = [];
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
-      this.assertMutationHasPredicate('deleteMany', whereSql, args.allowFullTableScan);
       return `DELETE FROM ${this.q(this.table)}${whereSql}`;
     });
-
-    if (whereFp === '') {
-      this.assertMutationHasPredicate('deleteMany', '', args.allowFullTableScan);
-    }
 
     this.collectWhereParams(whereObj, params);
 
@@ -2136,20 +2248,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildCount(args?: CountArgs<T>): DeferredQuery<number> {
-    const whereObj = (args?.where ?? {}) as Record<string, unknown>;
-    const whereFp = args?.where ? this.fingerprintWhere(whereObj) : '';
-    const ck = `cnt:${whereFp}`;
+    this.currentSkip = args?.skipGlobalFilters;
+    const effWhere = this.mergeGlobalFilter(args?.where as Record<string, unknown> | undefined);
+    const hasWhere = effWhere !== undefined;
+    const whereObj = (effWhere ?? {}) as Record<string, unknown>;
+    const whereFp = hasWhere ? this.fingerprintWhere(whereObj) : '';
+    const ck = `cnt:${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
     const entry = this.acquireSql(ck, () => {
       const freshParams: unknown[] = [];
-      const clause = args?.where ? this.buildWhereClause(whereObj, freshParams) : null;
+      const clause = hasWhere ? this.buildWhereClause(whereObj, freshParams) : null;
       const whereSql = clause ? ` WHERE ${clause}` : '';
       return `SELECT ${this.castAgg('COUNT(*)', 'int')} AS count FROM ${this.q(this.table)}${whereSql}`;
     });
 
-    if (args?.where) {
+    if (hasWhere) {
       this.collectWhereParams(whereObj, params);
     }
 
@@ -2183,9 +2298,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
     }
+    this.currentSkip = args.skipGlobalFilters;
     const groupColsRaw = args.by.map((k) => this.toColumn(k as string));
     const groupCols = groupColsRaw.map((c) => this.q(c));
-    const { sql: whereSql, params } = args.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
+    const gbWhere = this.mergeGlobalFilter(args.where as Record<string, unknown> | undefined);
+    const { sql: whereSql, params } = gbWhere
+      ? this.buildWhere(gbWhere as WhereClause<T>)
+      : { sql: '', params: [] as unknown[] };
 
     // Build SELECT expressions: group-by columns + aggregate functions
     const selectExprs = [...groupCols];
@@ -2461,7 +2580,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildAggregate(args: AggregateArgs<T>): DeferredQuery<AggregateResult<T>> {
-    const { sql: whereSql, params } = args.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
+    this.currentSkip = args.skipGlobalFilters;
+    const aggWhere = this.mergeGlobalFilter(args.where as Record<string, unknown> | undefined);
+    const { sql: whereSql, params } = aggWhere
+      ? this.buildWhere(aggWhere as WhereClause<T>)
+      : { sql: '', params: [] as unknown[] };
 
     const meta = this.schema.tables[this.table];
     if (meta) {
@@ -2654,6 +2777,41 @@ export class QueryInterface<T extends object, R extends object = {}> {
       return this.tableMeta.allColumns.filter((col) => !omitCols.has(col));
     }
     return null;
+  }
+
+  /**
+   * Reject any write against a view (H4). Views are introspected with
+   * `isView: true` and are read-only in every engine; a write raises a
+   * {@link ValidationError} (E003) rather than emitting SQL Postgres would
+   * reject (or, worse, silently applying to an updatable view).
+   */
+  private assertWritable(operation: string): void {
+    if (this.tableMeta.isView) {
+      throw new ValidationError(
+        `[turbine] Cannot ${operation} "${this.table}": it is a view (read-only). ` +
+          'Views support reads (findMany/findFirst/…) but not writes.',
+      );
+    }
+  }
+
+  /**
+   * Reject a write whose `data` names a `GENERATED ALWAYS AS (...) STORED`
+   * column (H3). Postgres computes these from other columns and errors if you
+   * try to write them; we fail early with a clear {@link ValidationError} (E003)
+   * instead of surfacing a cryptic driver error. Undefined values are ignored
+   * (they're stripped from the statement anyway).
+   */
+  private assertNoGeneratedColumns(data: Record<string, unknown>, operation: string): void {
+    for (const [key, value] of Object.entries(data)) {
+      if (value === undefined) continue;
+      const col = this.tableMeta.columns.find((c) => c.field === key || c.name === key || c.name === camelToSnake(key));
+      if (col?.isGeneratedStored) {
+        throw new ValidationError(
+          `[turbine] Cannot ${operation} "${this.table}": column "${key}" is a GENERATED ALWAYS AS (…) STORED ` +
+            'column whose value the database computes — remove it from your data.',
+        );
+      }
+    }
   }
 
   /** Convert camelCase field name to snake_case column name (unquoted, for non-SQL uses) */
@@ -3026,16 +3184,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           'is' in filterObj ||
           'isNot' in filterObj
         ) {
-          if (filterObj.some !== undefined && filterObj.some !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.some as Record<string, unknown>, params);
-          if (filterObj.none !== undefined && filterObj.none !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.none as Record<string, unknown>, params);
-          if (filterObj.every !== undefined && filterObj.every !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.every as Record<string, unknown>, params);
-          if (filterObj.is !== undefined && filterObj.is !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.is as Record<string, unknown>, params);
-          if (filterObj.isNot !== undefined && filterObj.isNot !== null)
-            this.collectRelFilterParams(relationDef.to, filterObj.isNot as Record<string, unknown>, params);
+          this.collectRelationFilterParams(relationDef, filterObj, params);
           continue;
         }
       }
@@ -3091,7 +3240,49 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
   }
 
-  /** Collect params from a relation filter sub-where. Mirrors buildSubWhereForRelation. */
+  /**
+   * Param-collect mirror of {@link buildRelationFilter} for one relation-filter
+   * object (`{ some/every/none/is/isNot }`, already normalized). Pushes, per
+   * present branch and in the canonical order some→none→every→is→isNot, the
+   * branch's sub-where params THEN the target table's global-filter params —
+   * exactly the order buildRelationFilter emits. When no global filter applies
+   * the gf calls are no-ops, so this stays byte-identical to the pre-0.28 path.
+   * Shared by every collect site that mirrors buildRelationFilter
+   * (collectWhereParams, collectRelFilterParams, collectAliasWhereParams).
+   */
+  private collectRelationFilterParams(
+    relDef: RelationDef,
+    filterObj: Record<string, unknown>,
+    params: unknown[],
+  ): void {
+    const target = relDef.to;
+    if (filterObj.some !== undefined && filterObj.some !== null) {
+      this.collectRelFilterParams(target, filterObj.some as Record<string, unknown>, params);
+      this.collectTargetGlobalFilterExists(target, params);
+    }
+    if (filterObj.none !== undefined && filterObj.none !== null) {
+      this.collectRelFilterParams(target, filterObj.none as Record<string, unknown>, params);
+      this.collectTargetGlobalFilterExists(target, params);
+    }
+    if (filterObj.every !== undefined && filterObj.every !== null) {
+      // gf is only emitted (build) when the `every` sub-where compiles to a
+      // filter — otherwise `every` is trivially true and no subquery is built.
+      if (this.buildSubWhereForRelation(target, filterObj.every as Record<string, unknown>, []) !== null) {
+        this.collectRelFilterParams(target, filterObj.every as Record<string, unknown>, params);
+        this.collectTargetGlobalFilterExists(target, params);
+      }
+    }
+    if (filterObj.is !== undefined) {
+      if (filterObj.is !== null) this.collectRelFilterParams(target, filterObj.is as Record<string, unknown>, params);
+      this.collectTargetGlobalFilterExists(target, params);
+    }
+    if (filterObj.isNot !== undefined) {
+      if (filterObj.isNot !== null)
+        this.collectRelFilterParams(target, filterObj.isNot as Record<string, unknown>, params);
+      this.collectTargetGlobalFilterExists(target, params);
+    }
+  }
+
   private collectRelFilterParams(targetTable: string, subWhere: Record<string, unknown>, params: unknown[]): void {
     const meta = this.schema.tables[targetTable];
     if (!meta) return;
@@ -3115,16 +3306,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (nestedRel && typeof value === 'object' && !Array.isArray(value)) {
         const norm = this.normalizeRelationFilter(nestedRel, value as Record<string, unknown>);
         if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          // Same order as buildRelationFilter pushes params: some, none, every, is, isNot.
-          if (norm.some != null)
-            this.collectRelFilterParams(nestedRel.to, norm.some as Record<string, unknown>, params);
-          if (norm.none != null)
-            this.collectRelFilterParams(nestedRel.to, norm.none as Record<string, unknown>, params);
-          if (norm.every != null)
-            this.collectRelFilterParams(nestedRel.to, norm.every as Record<string, unknown>, params);
-          if (norm.is != null) this.collectRelFilterParams(nestedRel.to, norm.is as Record<string, unknown>, params);
-          if (norm.isNot != null)
-            this.collectRelFilterParams(nestedRel.to, norm.isNot as Record<string, unknown>, params);
+          // Mirrors buildRelationFilter (some→none→every→is→isNot, each: sub-where
+          // params then target global-filter params).
+          this.collectRelationFilterParams(nestedRel, norm, params);
           continue;
         }
       }
@@ -3194,6 +3378,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // never push a param that the build path rejected (or vice versa).
         this.vectorOperator(key, rawColumn, dir.distance.metric);
         this.pushVectorParam(key, rawColumn, dir.distance.to, params);
+        continue;
+      }
+      // To-many relation orderBy (`{ posts: { _count } }`) uses the same count
+      // subquery as `_count` — mirror its global-filter params. To-one relation
+      // orderBy carries the target's global filter once per ordered column.
+      if (this.isRelationOrderByValue(dir)) {
+        const relDef = this.tableMeta.relations[key];
+        if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
+          this.collectRelationCountParams(relDef, params);
+        } else if (relDef) {
+          for (const _col of Object.keys(dir as Record<string, unknown>)) {
+            this.collectTargetGlobalFilterAlias(relDef.to, params);
+          }
+        }
       }
     }
   }
@@ -3229,6 +3427,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
     for (const relName of relNames) {
       const spec = withClause[relName];
       if (!spec) continue;
+      // Reserved `_count` key — fingerprint by the selected relation set so
+      // `_count: true` and `_count: { posts: true }` never share a cache entry.
+      if (relName === '_count') {
+        const c = spec as unknown as WithCount;
+        parts.push(
+          c === true
+            ? '_count(*)'
+            : `_count(${Object.entries(c)
+                .filter(([, v]) => v)
+                .map(([k]) => k)
+                .sort()
+                .join(',')})`,
+        );
+        continue;
+      }
       const relDef = meta.relations[relName];
       if (!relDef) {
         parts.push(`unknown:${relName}`);
@@ -3268,9 +3481,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
         );
       }
 
-      // orderBy shape
+      // orderBy shape (OrderBySpec nulls placement changes the SQL, so fingerprint it)
       if (opts.orderBy) {
-        const oEntries = Object.entries(opts.orderBy).map(([k, d]) => `${k}:${d}`);
+        const oEntries = Object.entries(opts.orderBy).map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d)}`);
         subParts.push(`o=${oEntries.join(',')}`);
       }
 
@@ -3304,6 +3517,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (!relDef) continue;
       this.collectRelationSubqueryParams(relDef, relSpec, params, table ?? this.table);
     }
+
+    // `_count` global-filter params — mirror buildSelectWithRelations, which
+    // appends the count subqueries (and any target-filter params) AFTER every
+    // relation subquery, in resolveCountRelations order.
+    const countSpec = (withClause as { _count?: WithCount })._count;
+    if (countSpec !== undefined) {
+      for (const rel of resolveCountRelations(meta, countSpec)) {
+        this.collectRelationCountParams(rel, params);
+      }
+    }
   }
 
   /**
@@ -3327,6 +3550,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (spec.where) {
         this.collectAliasWhereParams(targetTable, targetMeta, spec.where as Record<string, unknown>, params);
       }
+      this.collectTargetGlobalFilterAlias(targetTable, params);
       if (spec.limit !== undefined && !this.dialect.inlineLimitOffset) {
         params.push(Number(spec.limit));
       }
@@ -3357,6 +3581,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (spec.where) {
       this.collectAliasWhereParams(targetTable, targetMeta, spec.where as Record<string, unknown>, params);
     }
+
+    // Global filter on the target — mirrors targetGlobalFilterAlias in
+    // buildRelationSubquery (pushed after spec.where, before limit).
+    this.collectTargetGlobalFilterAlias(targetTable, params);
 
     // limit param — only hasMany parameterizes its limit (mirrors
     // buildRelationSubquery). belongsTo/hasOne ignore limit (always LIMIT 1), so
@@ -3434,14 +3662,143 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return { sql: ` WHERE ${clause}`, params };
   }
 
+  // -------------------------------------------------------------------------
+  // Global filters (soft-delete / multi-tenancy — WS-G)
+  //
+  // A configured global filter for a table is AND-merged into the compiled WHERE
+  // of every query on that table (via {@link mergeGlobalFilter}, so the merge is
+  // captured in the where fingerprint/collect for free) and into every relation
+  // subquery targeting it (rendered at build time against the subquery's alias/
+  // table by the `*GlobalFilterAlias`/`*GlobalFilterExists` helpers, with the
+  // shape folded into the SQL-cache key via {@link globalFilterCacheSegment}).
+  // Function filters are evaluated per resolve — at query-build time — enabling
+  // per-request tenancy via a closure. They must return a STABLE shape (same
+  // keys/operators); only values may vary between calls.
+  // -------------------------------------------------------------------------
+
   /**
-   * Refuse mutations with an empty predicate unless explicitly opted in.
-   *
-   * An empty `where` (e.g. `{}` or `{ id: undefined }`) resolves to a
-   * mutation with no filter — a common footgun when a caller's filter
-   * value accidentally resolves to `undefined`. This guard throws
-   * `ValidationError` in that case unless `allowFullTableScan: true`.
+   * Resolve the configured global filter for `table`, evaluating a function
+   * filter, honoring the active query's `skipGlobalFilters`. Returns `null` when
+   * no filter applies, the query opted out, or the filter is empty.
    */
+  private resolveGlobalFilter(
+    table: string,
+    skip: SkipGlobalFilters | undefined = this.currentSkip,
+  ): Record<string, unknown> | null {
+    const filters = this.globalFilters;
+    if (!filters) return null;
+    if (skip === true) return null;
+    if (Array.isArray(skip) && skip.includes(table)) return null;
+    const raw = filters[table];
+    if (raw === undefined) return null;
+    const resolved = typeof raw === 'function' ? raw() : raw;
+    if (resolved === null || resolved === undefined) return null;
+    const obj = resolved as Record<string, unknown>;
+    // An all-undefined filter (e.g. `{ tenantId: undefined }`) contributes
+    // nothing — treat it as absent so it never emits a dangling clause.
+    if (Object.keys(obj).every((k) => obj[k] === undefined)) return null;
+    return obj;
+  }
+
+  /**
+   * AND-merge this table's resolved global filter into a user `where`. Either
+   * side may be absent. When no filter applies the user where is returned by
+   * reference, so fingerprints/SQL stay byte-identical to the pre-0.28 path.
+   */
+  private mergeGlobalFilter(userWhere: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+    const gf = this.resolveGlobalFilter(this.table);
+    if (!gf) return userWhere;
+    if (userWhere === undefined) return gf;
+    return { AND: [userWhere, gf] };
+  }
+
+  /**
+   * SQL clause for `targetTable`'s global filter rendered against `alias`
+   * (relation subqueries, `_count`, relation `orderBy`). Pushes its params to
+   * `params`; returns `''` when no filter applies. Mirror:
+   * {@link collectTargetGlobalFilterAlias}.
+   */
+  private targetGlobalFilterAlias(targetTable: string, alias: string, params: unknown[]): string {
+    const gf = this.resolveGlobalFilter(targetTable);
+    if (!gf) return '';
+    const meta = this.schema.tables[targetTable];
+    if (!meta) return '';
+    return this.buildAliasWhere(targetTable, meta, alias, gf, params) ?? '';
+  }
+
+  /** Param-collect mirror of {@link targetGlobalFilterAlias}. */
+  private collectTargetGlobalFilterAlias(targetTable: string, params: unknown[]): void {
+    const gf = this.resolveGlobalFilter(targetTable);
+    if (!gf) return;
+    const meta = this.schema.tables[targetTable];
+    if (!meta) return;
+    this.collectAliasWhereParams(targetTable, meta, gf, params);
+  }
+
+  /**
+   * SQL clause for `targetTable`'s global filter rendered against the bare
+   * (unaliased) table name — the form used inside relation-filter `EXISTS`
+   * subqueries. Pushes its params; `''` when none. Mirror:
+   * {@link collectTargetGlobalFilterExists}.
+   */
+  private targetGlobalFilterExists(targetTable: string, params: unknown[]): string {
+    const gf = this.resolveGlobalFilter(targetTable);
+    if (!gf) return '';
+    return this.buildSubWhereForRelation(targetTable, gf, params) ?? '';
+  }
+
+  /** Param-collect mirror of {@link targetGlobalFilterExists}. */
+  private collectTargetGlobalFilterExists(targetTable: string, params: unknown[]): void {
+    const gf = this.resolveGlobalFilter(targetTable);
+    if (!gf) return;
+    this.collectRelFilterParams(targetTable, gf, params);
+  }
+
+  /**
+   * Value-invariant SQL-cache-key segment for the active global-filter
+   * environment. Relation-subquery / relation-filter / `_count` / relation-
+   * `orderBy` global filters are rendered at build time but their SHAPE is not
+   * otherwise in the where/with fingerprint, so this segment guards the cache:
+   * two different filter shapes never collide on one cached SQL text, while two
+   * function-filter results of the SAME shape (differing only in values) share
+   * the entry and bind their own params. Empty (`''`) when no filter applies, so
+   * cache keys stay byte-identical when the feature is unused.
+   */
+  private globalFilterCacheSegment(): string {
+    const filters = this.globalFilters;
+    if (!filters) return '';
+    const parts: string[] = [];
+    for (const table of Object.keys(filters).sort()) {
+      // Function filters for OTHER tables may be request-scoped closures that
+      // throw outside their own context; a query on an unrelated table must not
+      // break on them. A throwing filter can't have contributed SQL to this
+      // query either (merging it would have thrown first), so a constant
+      // marker keeps the key shape-distinct without evaluating it.
+      let gf: Record<string, unknown> | null | undefined;
+      try {
+        gf = this.resolveGlobalFilter(table);
+      } catch {
+        parts.push(`${table}:!`);
+        continue;
+      }
+      if (gf) parts.push(`${table}:${this.fingerprintWhere(gf)}`);
+    }
+    return parts.length ? `|gf=${parts.join(';')}` : '';
+  }
+
+  /**
+   * True when the USER-supplied `where` compiles to no predicate (`{}`,
+   * `{ id: undefined }`, `{ OR: [{ a: undefined }] }`, …). This is the exact
+   * signal the empty-`where` guard needs — the compiled emptiness, NOT the
+   * fingerprint (which is non-empty for an all-undefined `OR`/`AND`). It ignores
+   * any configured global filter, so a global filter never lets an unguarded
+   * mass mutation through.
+   */
+  private userPredicateIsEmpty(userWhere: Record<string, unknown>): boolean {
+    const throwaway: unknown[] = [];
+    return this.buildWhereClause(userWhere, throwaway) === null;
+  }
+
   private assertMutationHasPredicate(
     operation: 'update' | 'updateMany' | 'delete' | 'deleteMany',
     whereSql: string,
@@ -3639,30 +3996,45 @@ export class QueryInterface<T extends object, R extends object = {}> {
       correlation = this.dialect.buildCorrelation(qt, relDef.referenceKey, qSelf, relDef.foreignKey);
     }
 
-    // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter)
+    // The target table's global filter (soft-delete / tenancy) restricts the
+    // DOMAIN of correlated rows in EVERY branch: `some`/`none`/`is`/`isNot`
+    // ignore filtered-out rows, and `every` quantifies over only the surviving
+    // rows ("every NON-deleted related row matches P"). It is ANDed into the
+    // correlation and its params pushed AFTER the per-branch filter — mirrored
+    // exactly in collectWhereParams' relation-filter branch. `qt` is the bare
+    // target table, matching the `FROM ${qt}` here (see targetGlobalFilterExists).
+    const gfAnd = (): string => {
+      const gf = this.targetGlobalFilterExists(targetTable, params);
+      return gf ? ` AND ${gf}` : '';
+    };
+
+    // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
     if (filterObj.some !== undefined) {
       const subWhere = filterObj.some as Record<string, unknown>;
       const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-      const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-      clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+      const filterAnd = filterClause ? ` AND ${filterClause}` : '';
+      clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
     }
 
-    // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter)
+    // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
     if (filterObj.none !== undefined) {
       const subWhere = filterObj.none as Record<string, unknown>;
       const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-      const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-      clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+      const filterAnd = filterClause ? ` AND ${filterClause}` : '';
+      clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
     }
 
-    // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND NOT (filter))
+    // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND gf AND NOT (filter))
     if (filterObj.every !== undefined) {
       const subWhere = filterObj.every as Record<string, unknown>;
       const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
       if (filterClause) {
-        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation} AND NOT (${filterClause}))`);
+        // gf params pushed AFTER filter params (collect mirrors this order), but
+        // placed textually inside the domain so it restricts which rows count.
+        const gf = gfAnd();
+        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gf} AND NOT (${filterClause}))`);
       } else {
-        // "every" with empty filter = true (all match trivially)
+        // "every" with empty filter = true (all match trivially) — gf irrelevant.
       }
     }
 
@@ -3670,12 +4042,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `is: null` = "no related row" (Prisma semantics) → NOT EXISTS.
     if (filterObj.is !== undefined) {
       if (filterObj.is === null) {
-        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation})`);
+        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gfAnd()})`);
       } else {
         const subWhere = filterObj.is as Record<string, unknown>;
         const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-        const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+        const filterAnd = filterClause ? ` AND ${filterClause}` : '';
+        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
       }
     }
 
@@ -3683,12 +4055,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `isNot: null` = "a related row exists" → EXISTS.
     if (filterObj.isNot !== undefined) {
       if (filterObj.isNot === null) {
-        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation})`);
+        clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gfAnd()})`);
       } else {
         const subWhere = filterObj.isNot as Record<string, unknown>;
         const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
-        const fullWhere = filterClause ? `${correlation} AND ${filterClause}` : correlation;
-        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${fullWhere})`);
+        const filterAnd = filterClause ? ` AND ${filterClause}` : '';
+        clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
       }
     }
 
@@ -3913,14 +4285,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (aliasRel && typeof value === 'object' && !Array.isArray(value)) {
         const norm = this.normalizeRelationFilter(aliasRel, value as Record<string, unknown>);
         if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          // Same order as buildRelationFilter pushes params: some, none, every, is, isNot.
-          if (norm.some != null) this.collectRelFilterParams(aliasRel.to, norm.some as Record<string, unknown>, params);
-          if (norm.none != null) this.collectRelFilterParams(aliasRel.to, norm.none as Record<string, unknown>, params);
-          if (norm.every != null)
-            this.collectRelFilterParams(aliasRel.to, norm.every as Record<string, unknown>, params);
-          if (norm.is != null) this.collectRelFilterParams(aliasRel.to, norm.is as Record<string, unknown>, params);
-          if (norm.isNot != null)
-            this.collectRelFilterParams(aliasRel.to, norm.isNot as Record<string, unknown>, params);
+          // Mirrors buildRelationFilter (some→none→every→is→isNot, each: sub-where
+          // params then target global-filter params).
+          this.collectRelationFilterParams(aliasRel, norm, params);
           continue;
         }
       }
@@ -4080,10 +4447,36 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * findMany path). When `params` is omitted (groupBy / relation path) a vector
    * ordering throws — KNN ordering is only supported at the top level.
    */
+  /**
+   * Value-shape fingerprint for a single orderBy entry, so two queries whose
+   * ORDER BY differs only in nulls placement, vector metric, or relation-count
+   * vs relation-column never collide on one cached SQL string. Captures the
+   * SQL-shaping bits (direction, nulls, metric, relation keys) — never values.
+   */
+  private orderByEntryFingerprint(d: unknown): string {
+    // Vector KNN ordering changes the emitted operator by metric and adds a
+    // `::vector` param, so metric + direction must be part of the cache key.
+    if (isVectorOrderBy(d)) {
+      return `vec(${d.distance.metric},${d.distance.direction ?? 'asc'})`;
+    }
+    if (isOrderBySpec(d)) return `spec(${d.sort},${d.nulls ?? ''})`;
+    if (d && typeof d === 'object') {
+      // Relation ordering (`{ _count: 'desc' }` or `{ name: 'asc' }`).
+      return `rel(${Object.entries(d as Record<string, unknown>)
+        .map(([k, v]) => `${k}=${this.orderByEntryFingerprint(v)}`)
+        .sort()
+        .join(',')})`;
+    }
+    return String(d);
+  }
+
   private buildOrderBy(orderBy: OrderByClause, params?: unknown[]): string {
-    // Dev-only: validate that orderBy fields exist in the table schema
+    // Dev-only: validate that orderBy fields exist in the table schema. Relation
+    // orderBy keys (object values that are neither a vector nor an OrderBySpec)
+    // are validated in the relation branch below, so skip them here.
     if (process.env.NODE_ENV !== 'production') {
-      for (const key of Object.keys(orderBy)) {
+      for (const [key, value] of Object.entries(orderBy)) {
+        if (this.isRelationOrderByValue(value) && this.tableMeta.relations[key]) continue;
         const snakeKey = camelToSnake(key);
         if (!this.tableMeta.columns.some((c) => c.name === snakeKey) && !(key in this.tableMeta.columnMap)) {
           console.warn(
@@ -4095,33 +4488,247 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     const meta = this.schema.tables[this.table];
+    let relOrdCounter = 0;
     return Object.entries(orderBy)
-      .map(([key, dir]) => {
-        if (meta && !(key in meta.columnMap)) {
-          throw new ValidationError(
-            `[turbine] Unknown field "${key}" in orderBy on table "${this.table}". ` +
-              `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
-          );
-        }
-
+      .map(([key, value]) => {
         // Vector KNN ordering: { distance: { to, metric, direction? } }
-        if (isVectorOrderBy(dir)) {
+        if (isVectorOrderBy(value)) {
+          if (meta && !(key in meta.columnMap)) {
+            throw new ValidationError(
+              `[turbine] Unknown field "${key}" in orderBy on table "${this.table}". ` +
+                `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
+            );
+          }
           if (!params) {
             throw new ValidationError(
               `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
             );
           }
           const rawColumn = this.toColumn(key);
-          const operator = this.vectorOperator(key, rawColumn, dir.distance.metric);
-          const placeholder = this.pushVectorParam(key, rawColumn, dir.distance.to, params);
-          const safeDir = dir.distance.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+          const operator = this.vectorOperator(key, rawColumn, value.distance.metric);
+          const placeholder = this.pushVectorParam(key, rawColumn, value.distance.to, params);
+          const safeDir = value.distance.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
           return `${this.q(rawColumn)} ${operator} ${placeholder} ${safeDir}`;
         }
 
-        const safeDir = (dir as OrderDirection).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-        return `${this.toSqlColumn(key)} ${safeDir}`;
+        // Relation ordering: an object value that is not a vector or OrderBySpec,
+        // keyed by a relation name (`{ posts: { _count: 'desc' } }` / `{ author:
+        // { name: 'asc' } }`).
+        if (this.isRelationOrderByValue(value)) {
+          return this.buildRelationOrderBy(key, value as Record<string, unknown>, `ord${relOrdCounter++}`, params);
+        }
+
+        // Scalar column ordering — a plain direction or an OrderBySpec (nulls).
+        if (meta && !(key in meta.columnMap)) {
+          throw new ValidationError(
+            `[turbine] Unknown field "${key}" in orderBy on table "${this.table}". ` +
+              `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
+          );
+        }
+        const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
+        return `${this.toSqlColumn(key)} ${dir}${this.nullsSuffix(nulls)}`;
       })
       .join(', ');
+  }
+
+  /**
+   * True when an orderBy value is a relation-ordering object: a plain object
+   * that is neither a vector KNN ordering nor an {@link OrderBySpec}. Its key
+   * in the orderBy clause is a relation name.
+   */
+  private isRelationOrderByValue(value: unknown): boolean {
+    return (
+      typeof value === 'object' &&
+      value !== null &&
+      !Array.isArray(value) &&
+      !isVectorOrderBy(value) &&
+      !isOrderBySpec(value)
+    );
+  }
+
+  /**
+   * Render the ` NULLS FIRST` / ` NULLS LAST` suffix for a column ordering.
+   * Only PostgreSQL and SQLite support the `NULLS FIRST/LAST` grammar — on any
+   * other engine a caller asking for explicit nulls placement gets a clear
+   * {@link UnsupportedFeatureError} (E017) instead of broken SQL.
+   */
+  private nullsSuffix(nulls: 'first' | 'last' | undefined): string {
+    if (!nulls) return '';
+    if (this.dialect.name !== 'postgresql' && this.dialect.name !== 'sqlite') {
+      throw new UnsupportedFeatureError(
+        'NULLS FIRST/LAST ordering',
+        this.dialect.name,
+        'Explicit nulls placement in orderBy is only available on PostgreSQL and SQLite.',
+      );
+    }
+    return nulls === 'first' ? ' NULLS FIRST' : ' NULLS LAST';
+  }
+
+  /**
+   * Compile a relation ordering term. For a to-many relation the only allowed
+   * key is `_count`, which becomes a correlated `COUNT(*)` subquery. For a
+   * to-one relation each entry names a target column and becomes a correlated
+   * scalar subquery (supporting {@link OrderBySpec} nulls placement).
+   *
+   * Validation: relation must exist (E005); to-many only allows `_count`, and
+   * to-one only allows real target columns (E003).
+   */
+  private buildRelationOrderBy(
+    relName: string,
+    value: Record<string, unknown>,
+    alias: string,
+    params?: unknown[],
+  ): string {
+    const relDef = this.tableMeta.relations[relName];
+    if (!relDef) {
+      throw new RelationError(
+        `[turbine] Unknown relation "${relName}" in orderBy on table "${this.table}". ` +
+          `Available: ${Object.keys(this.tableMeta.relations).join(', ')}`,
+      );
+    }
+
+    // To-many: only `_count` is meaningful → correlated COUNT(*) subquery.
+    if (relDef.type === 'hasMany' || relDef.type === 'manyToMany') {
+      const keys = Object.keys(value);
+      if (keys.length !== 1 || keys[0] !== '_count') {
+        throw new ValidationError(
+          `[turbine] orderBy on to-many relation "${relName}" only supports "_count" ` +
+            `(got: ${keys.join(', ') || '(empty)'}).`,
+        );
+      }
+      const { dir } = normalizeOrderBy(value._count as OrderDirection);
+      return `${this.buildRelationCountExpr(relDef, this.table, alias, params)} ${dir}`;
+    }
+
+    // To-one: each entry orders by a correlated scalar subquery on a target column.
+    const targetMeta = this.schema.tables[relDef.to];
+    if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
+    const qTarget = this.q(relDef.to);
+    const qParent = this.q(this.table);
+    // belongsTo: alias.referenceKey = parent.foreignKey; hasOne: reversed.
+    const correlation =
+      relDef.type === 'belongsTo'
+        ? this.dialect.buildCorrelation(alias, relDef.referenceKey, qParent, relDef.foreignKey)
+        : this.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
+
+    const entries = Object.entries(value);
+    if (entries.length === 0) {
+      throw new ValidationError(`[turbine] orderBy on to-one relation "${relName}" needs at least one target column.`);
+    }
+    return entries
+      .map(([col, dirValue]) => {
+        const snakeCol = camelToSnake(col);
+        if (!targetMeta.allColumns.includes(snakeCol)) {
+          throw new ValidationError(
+            `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").`,
+          );
+        }
+        const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
+        // Target's global filter applies here too — otherwise ordering keys off
+        // a soft-deleted / other-tenant related row's value (matches the with
+        // subquery semantics for belongsTo/hasOne).
+        let where = correlation;
+        if (params) {
+          const gf = this.targetGlobalFilterAlias(relDef.to, alias, params);
+          if (gf) where += ` AND ${gf}`;
+        }
+        return `(SELECT ${alias}.${this.q(snakeCol)} FROM ${qTarget} ${alias} WHERE ${where}${this.limitOneClause()}) ${dir}${this.nullsSuffix(nulls)}`;
+      })
+      .join(', ');
+  }
+
+  /**
+   * Build a correlated `(SELECT COUNT(*) …)` scalar subquery for a to-many
+   * relation, correlated to `parentRef`. hasMany counts child rows via the FK;
+   * manyToMany counts junction rows via the source key. Shared by the `_count`
+   * `with` key and to-many relation orderBy.
+   *
+   * When `params` is supplied and the target has a global filter, it is
+   * AND-merged so the count only sees surviving rows (a soft-deleted child is
+   * not counted): hasMany filters the counted rows directly; manyToMany adds an
+   * `EXISTS` on the target through the junction (the junction rows themselves
+   * carry no filter). Params are mirrored by {@link collectRelationCountParams}.
+   */
+  private buildRelationCountExpr(relDef: RelationDef, parentRef: string, alias: string, params?: unknown[]): string {
+    const qParent = this.q(parentRef);
+    const count = this.castAgg('COUNT(*)', 'int');
+    if (relDef.type === 'manyToMany') {
+      if (!relDef.through) {
+        throw new ValidationError(
+          `[turbine] manyToMany relation "${relDef.name}" is missing its \`through\` junction.`,
+        );
+      }
+      const qJ = this.q(relDef.through.table);
+      const jalias = `${alias}j`;
+      const sourceKeys = normalizeKeyColumns(relDef.through.sourceKey);
+      const refKeys = normalizeKeyColumns(relDef.referenceKey);
+      let where = sourceKeys
+        .map((jc, i) => `${jalias}.${this.q(jc)} = ${qParent}.${this.q(refKeys[i]!)}`)
+        .join(' AND ');
+      if (params) {
+        const targetExists = this.manyToManyTargetGlobalFilterExists(relDef, alias, jalias, params);
+        if (targetExists) where += ` AND ${targetExists}`;
+      }
+      return `(SELECT ${count} FROM ${qJ} ${jalias} WHERE ${where})`;
+    }
+    // hasMany: child FK correlates to the parent reference key.
+    const qTarget = this.q(relDef.to);
+    let where = this.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
+    if (params) {
+      const gf = this.targetGlobalFilterAlias(relDef.to, alias, params);
+      if (gf) where += ` AND ${gf}`;
+    }
+    return `(SELECT ${count} FROM ${qTarget} ${alias} WHERE ${where})`;
+  }
+
+  /**
+   * `EXISTS (SELECT 1 FROM <target> <talias> WHERE <join> AND <gf>)` restricting
+   * a manyToMany `_count` to targets that survive their global filter. `''` when
+   * the target has no filter. Pushes gf params; mirror:
+   * {@link collectManyToManyTargetGlobalFilter}.
+   */
+  private manyToManyTargetGlobalFilterExists(
+    relDef: RelationDef,
+    alias: string,
+    jalias: string,
+    params: unknown[],
+  ): string {
+    const gf = this.resolveGlobalFilter(relDef.to);
+    if (!gf || !relDef.through) return '';
+    const tMeta = this.schema.tables[relDef.to];
+    if (!tMeta || tMeta.primaryKey.length === 0) return '';
+    const talias = `${alias}t`;
+    const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
+    const pk = tMeta.primaryKey;
+    if (targetKeys.length !== pk.length) return '';
+    const join = targetKeys.map((jc, i) => `${talias}.${this.q(pk[i]!)} = ${jalias}.${this.q(jc)}`).join(' AND ');
+    const gfClause = this.buildAliasWhere(relDef.to, tMeta, talias, gf, params);
+    const gfAnd = gfClause ? ` AND ${gfClause}` : '';
+    return `EXISTS (SELECT 1 FROM ${this.q(relDef.to)} ${talias} WHERE ${join}${gfAnd})`;
+  }
+
+  /** Param-collect mirror of {@link manyToManyTargetGlobalFilterExists}. */
+  private collectManyToManyTargetGlobalFilter(relDef: RelationDef, params: unknown[]): void {
+    const gf = this.resolveGlobalFilter(relDef.to);
+    if (!gf || !relDef.through) return;
+    const tMeta = this.schema.tables[relDef.to];
+    if (!tMeta || tMeta.primaryKey.length === 0) return;
+    const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
+    if (targetKeys.length !== tMeta.primaryKey.length) return;
+    this.collectAliasWhereParams(relDef.to, tMeta, gf, params);
+  }
+
+  /**
+   * Param-collect mirror of {@link buildRelationCountExpr}'s global-filter
+   * params (hasMany direct filter, or manyToMany EXISTS-on-target). Only pushes
+   * when a filter applies — no-op otherwise.
+   */
+  private collectRelationCountParams(relDef: RelationDef, params: unknown[]): void {
+    if (relDef.type === 'manyToMany') {
+      this.collectManyToManyTargetGlobalFilter(relDef, params);
+    } else {
+      this.collectTargetGlobalFilterAlias(relDef.to, params);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -4276,6 +4883,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const parsed = this.parseRow(row, table);
     const meta = this.schema.tables[table];
     if (!meta) return parsed;
+
+    // Assemble reserved `_count__<rel>` scalar columns into a `_count` object.
+    // parseRow copies these unknown columns through under their raw key.
+    let countObj: Record<string, number> | undefined;
+    for (const key of Object.keys(parsed)) {
+      if (key.startsWith('_count__')) {
+        if (countObj === undefined) countObj = {};
+        countObj[key.slice('_count__'.length)] = Number(parsed[key]);
+        delete parsed[key];
+      }
+    }
+    if (countObj) parsed._count = countObj;
 
     for (const [relName, relDef] of Object.entries(meta.relations)) {
       const rawValue = row[relName];
@@ -4568,6 +5187,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const aliasCounter = { n: 0 };
 
     for (const [relName, relSpec] of sortedEntries(withClause)) {
+      // `_count` is a reserved key handled after the relation subqueries.
+      if (relName === '_count') continue;
       const relDef = meta.relations[relName];
       if (!relDef) {
         throw new RelationError(
@@ -4579,6 +5200,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // The main table is not aliased, so pass table name as parentRef
       const subquery = this.buildRelationSubquery(relDef, relSpec, params, table, aliasCounter, depth, path);
       relationSelects.push(`(${subquery}) AS ${this.q(relName)}`);
+    }
+
+    // Reserved `_count` key → one correlated COUNT(*) scalar subquery per
+    // selected to-many relation, aliased `_count__<rel>`. Appended after the
+    // relation subqueries; the only params they can push come from a global
+    // filter on the counted target (mirrored at the tail of collectWithParams).
+    // Read via a cast so WithClause keeps its narrow `true | WithOptions` type.
+    const countSpec = (withClause as { _count?: WithCount })._count;
+    if (countSpec !== undefined) {
+      for (const rel of resolveCountRelations(meta, countSpec)) {
+        const expr = this.buildRelationCountExpr(rel, table, `t${aliasCounter.n++}`, params);
+        relationSelects.push(`${expr} AS ${this.q(`_count__${rel.name}`)}`);
+      }
     }
 
     return [baseCols, ...relationSelects].join(', ');
@@ -4830,13 +5464,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     let orderClause = '';
     if (relOrderEntries.length > 0) {
       const orders = relOrderEntries
-        .map(([k, dir]) => {
+        .map(([k, dirValue]) => {
           const col = camelToSnake(k);
           if (!targetMeta.allColumns.includes(col)) {
             throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
           }
-          const safeDir = String(dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-          return `${alias}.${this.q(col)} ${safeDir}`;
+          const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
+          return `${alias}.${this.q(col)} ${dir}${this.nullsSuffix(nulls)}`;
         })
         .join(', ');
       orderClause = ` ORDER BY ${orders}`;
@@ -4862,6 +5496,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const extra = this.buildAliasWhere(targetTable, targetMeta, alias, spec.where as Record<string, unknown>, params);
       if (extra) whereClause += ` AND ${extra}`;
     }
+
+    // Global filter on the target table (soft-delete / tenancy) — AND-merged so
+    // a `with` never surfaces filtered-out child rows. Pushed AFTER spec.where,
+    // mirrored by collectRelationSubqueryParams.
+    const gfExtra = this.targetGlobalFilterAlias(targetTable, alias, params);
+    if (gfExtra) whereClause += ` AND ${gfExtra}`;
 
     // LIMIT — only meaningful for hasMany. A belongsTo / hasOne subquery returns
     // a single row (literal `LIMIT 1` below), so a `spec.limit` here must NOT push
@@ -5011,13 +5651,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     let orderClause = '';
     if (relOrderEntries.length > 0) {
       const orders = relOrderEntries
-        .map(([k, dir]) => {
+        .map(([k, dirValue]) => {
           const col = camelToSnake(k);
           if (!targetMeta.allColumns.includes(col)) {
             throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
           }
-          const safeDir = String(dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-          return `${talias}.${this.q(col)} ${safeDir}`;
+          const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
+          return `${talias}.${this.q(col)} ${dir}${this.nullsSuffix(nulls)}`;
         })
         .join(', ');
       orderClause = ` ORDER BY ${orders}`;
@@ -5035,6 +5675,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       );
       if (extra) whereClause += ` AND ${extra}`;
     }
+
+    // Global filter on the target table (mirrors collectRelationSubqueryParams'
+    // m2m branch: after spec.where, before limit).
+    const gfExtra = this.targetGlobalFilterAlias(targetTable, talias, params);
+    if (gfExtra) whereClause += ` AND ${gfExtra}`;
 
     // LIMIT — `limit: 0` is honored (LIMIT 0 → empty array)
     let limitClause = '';

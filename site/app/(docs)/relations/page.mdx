@@ -241,6 +241,19 @@ await db.users.findMany({
 
 These compile to `EXISTS` / `NOT EXISTS` subqueries — no relation data is returned, the join is pure filter.
 
+## Counting and ordering by relations
+
+You don't always need the related rows — sometimes you just need how many. Add `_count` to a `with` clause to get a count per to-many relation without loading the children:
+
+```ts
+const users = await db.users.findMany({
+  with: { _count: { posts: true } },
+});
+users[0]._count.posts; // 12
+```
+
+You can also order a query by a relation — `{ posts: { _count: 'desc' } }` for a to-many count, or `{ author: { name: 'asc' } }` for a to-one target column. Both are covered in the API reference: [relation `_count`](/queries#counting-related-rows--_count) and [ordering by a relation](/queries#ordering-by-a-relation).
+
 ## Payload size — when to prefer streaming
 
 The `json_agg` strategy materializes the full object graph in Postgres memory *before* serializing it over the wire. That's fine for bounded queries. It's not fine for unbounded ones.

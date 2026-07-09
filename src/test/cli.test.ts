@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import {
   configTemplate,
   findConfigFile,
@@ -56,7 +57,7 @@ describe('CLI config', () => {
       assert.ok(result.includes("out: './generated/turbine'"));
       assert.ok(result.includes("schema: 'public'"));
       assert.ok(result.includes("migrationsDir: './turbine/migrations'"));
-      assert.ok(result.includes("seedFile: './turbine/seed.ts'"));
+      assert.ok(result.includes("seed: './seed.ts'"));
       assert.ok(result.includes("schemaFile: './turbine/schema.ts'"));
     });
 
@@ -159,7 +160,7 @@ describe('CLI config', () => {
         assert.deepEqual(result.include, []);
         assert.deepEqual(result.exclude, []);
         assert.equal(result.migrationsDir, './turbine/migrations');
-        assert.equal(result.seedFile, './turbine/seed.ts');
+        assert.equal(result.seedFile, undefined);
         assert.equal(result.schemaFile, './turbine/schema.ts');
       } finally {
         if (oldUrl !== undefined) process.env.DATABASE_URL = oldUrl;
@@ -634,20 +635,22 @@ describe('CLI TypeScript loader', () => {
 // ---------------------------------------------------------------------------
 // `turbine generate` — silent-empty-client guard (#28 item 1), end-to-end.
 //
-// Runs the real CLI via tsx in a temp dir (no DB needed — the guard fires
-// before any connection). Asserts a non-zero exit and an actionable message.
+// Runs the real CLI through Node's tsx import hook in a temp dir (no DB needed
+// — the guard fires before any connection). Asserts a non-zero exit and an
+// actionable message.
 // ---------------------------------------------------------------------------
 
 describe('turbine generate — empty-client guard (#28)', () => {
   const repoRoot = process.cwd();
-  const tsxBin = resolve(repoRoot, 'node_modules/.bin/tsx');
+  const tsxPackage = resolve(repoRoot, 'node_modules/tsx');
+  const tsxLoader = pathToFileURL(resolve(repoRoot, 'node_modules/tsx/dist/loader.mjs')).href;
   const cliEntry = resolve(repoRoot, 'src/cli/index.ts');
-  const haveTsx = existsSync(tsxBin);
+  const haveTsx = existsSync(tsxPackage);
 
   /** Run the CLI; returns { code, output } without throwing on non-zero exit. */
   function runGenerate(cwd: string, extraArgs: string[]): { code: number; output: string } {
     try {
-      const stdout = execFileSync(tsxBin, [cliEntry, 'generate', ...extraArgs], {
+      const stdout = execFileSync(process.execPath, ['--import', tsxLoader, cliEntry, 'generate', ...extraArgs], {
         cwd,
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],

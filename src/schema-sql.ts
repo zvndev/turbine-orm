@@ -7,12 +7,42 @@
 
 import pg from 'pg';
 import { type Dialect, postgresDialect } from './dialect.js';
-import { camelToSnake } from './schema.js';
+import { UnsupportedFeatureError } from './errors.js';
+import { pgConfActionToReferential, stripCheckWrapper } from './introspect.js';
+import { camelToSnake, type ReferentialAction } from './schema.js';
 import type { ColumnConfig, SchemaDef, TableDef } from './schema-builder.js';
 
 export interface SchemaSqlOptions {
   /** SQL dialect used for DDL generation. Defaults to PostgreSQL. */
   dialect?: Dialect;
+  /**
+   * How to handle the pgvector extension when the schema contains a `vector`
+   * column. `'auto'` (default) prepends `CREATE EXTENSION IF NOT EXISTS vector;`
+   * — appropriate for `push`. `'manual'` emits a leading comment only, so the
+   * generated `.sql` migration doesn't silently require superuser privileges.
+   */
+  extensions?: 'auto' | 'manual';
+}
+
+/** Map a {@link ReferentialAction} to its SQL keyword form. */
+export function referentialActionToSql(action: ReferentialAction): string {
+  switch (action) {
+    case 'cascade':
+      return 'CASCADE';
+    case 'restrict':
+      return 'RESTRICT';
+    case 'set null':
+      return 'SET NULL';
+    case 'set default':
+      return 'SET DEFAULT';
+    case 'no action':
+      return 'NO ACTION';
+  }
+}
+
+/** Single-quote-escape an enum label for a `CREATE TYPE ... AS ENUM` literal. */
+function quoteEnumLabel(label: string): string {
+  return `'${label.replace(/'/g, "''")}'`;
 }
 
 /**
@@ -23,6 +53,38 @@ export interface SchemaSqlOptions {
  */
 function isSerialType(type: string): boolean {
   return type === 'SERIAL' || type === 'BIGSERIAL';
+}
+
+/** Whether any column in the schema is a pgvector column. */
+function schemaHasVectorColumn(schema: SchemaDef): boolean {
+  for (const table of Object.values(schema.tables)) {
+    for (const col of Object.values(table.columns)) {
+      if (col.vectorDimensions != null) return true;
+    }
+  }
+  return false;
+}
+
+/** Build a `CREATE TYPE "<name>" AS ENUM ('a', 'b')` statement. */
+function generateCreateEnumType(enumName: string, labels: readonly string[], dialect: Dialect): string {
+  const values = labels.map(quoteEnumLabel).join(', ');
+  return `CREATE TYPE ${dialect.quoteIdentifier(enumName)} AS ENUM (${values});`;
+}
+
+/**
+ * Resolve the DDL type token for a column: an enum type name, a `vector(n)`
+ * literal, or the dialect's scalar type — with a trailing `[]` for arrays.
+ */
+function resolveDdlType(config: ColumnConfig, dialect: Dialect): string {
+  let base: string;
+  if (config.enumName) {
+    base = dialect.quoteIdentifier(config.enumName);
+  } else if (config.vectorDimensions != null) {
+    base = `vector(${config.vectorDimensions})`;
+  } else {
+    base = dialect.buildColumnType({ type: config.type, maxLength: config.maxLength });
+  }
+  return config.isArray ? `${base}[]` : base;
 }
 
 // ---------------------------------------------------------------------------
@@ -37,11 +99,30 @@ function isSerialType(type: string): boolean {
  */
 export function schemaToSQL(schema: SchemaDef, options?: SchemaSqlOptions): string[] {
   const dialect = options?.dialect ?? postgresDialect;
+  const extensions = options?.extensions ?? 'auto';
   const statements: string[] = [];
 
   // Topologically sort tables by their foreign key references
   const sorted = topologicalSort(schema);
   const resolveRef = makeRefResolver(schema);
+
+  // pgvector extension line — only when a vector column exists. Postgres-only:
+  // a dialect that can't do pgvector must not silently emit broken DDL.
+  if (schemaHasVectorColumn(schema)) {
+    if (!dialect.supportsVector) {
+      throw new UnsupportedFeatureError('vector columns', dialect.name, 'pgvector is a PostgreSQL-only feature.');
+    }
+    statements.push(
+      extensions === 'manual'
+        ? '-- Requires the pgvector extension: run `CREATE EXTENSION IF NOT EXISTS vector;` before applying.'
+        : 'CREATE EXTENSION IF NOT EXISTS vector;',
+    );
+  }
+
+  // CREATE TYPE for every schema-level enum, before the tables that use them.
+  for (const [enumName, labels] of Object.entries(schema.enums ?? {})) {
+    statements.push(generateCreateEnumType(enumName, labels, dialect));
+  }
 
   // Generate CREATE TABLE statements
   for (const tableName of sorted) {
@@ -173,6 +254,15 @@ function generateCreateTable(
     columnDefs.push(dialect.buildPrimaryKeyConstraint(cols));
   }
 
+  // Table-level CHECK constraints (named → CONSTRAINT "name" CHECK (...)).
+  for (const chk of table.checks ?? []) {
+    columnDefs.push(
+      chk.name
+        ? `CONSTRAINT ${dialect.quoteIdentifier(chk.name)} CHECK (${chk.expression})`
+        : `CHECK (${chk.expression})`,
+    );
+  }
+
   return dialect.buildCreateTableStatement({
     table: dialect.quoteIdentifier(tableName),
     definitions: columnDefs,
@@ -221,16 +311,35 @@ function generateColumnDef(
     }
   }
 
-  return dialect.buildColumnDefinition({
+  // Resolve the DDL type (enum name / vector(n) / scalar, plus [] for arrays).
+  // Passed as a fully-formed `type` token with no maxLength so the dialect
+  // doesn't re-apply VARCHAR(n) on top of it.
+  const ddlType = resolveDdlType(config, dialect);
+
+  let def = dialect.buildColumnDefinition({
     name: dialect.quoteIdentifier(snakeName),
-    type: config.type,
-    maxLength: config.maxLength,
+    type: ddlType,
+    maxLength: null,
     primaryKey: config.isPrimaryKey,
     unique: config.isUnique,
     notNull,
     defaultValue,
     references,
   });
+
+  // Referential actions follow the REFERENCES clause (which buildColumnDefinition
+  // emits last). Postgres omits ON DELETE/UPDATE for the default NO ACTION.
+  if (references) {
+    if (config.onDelete) def += ` ON DELETE ${referentialActionToSql(config.onDelete)}`;
+    if (config.onUpdate) def += ` ON UPDATE ${referentialActionToSql(config.onUpdate)}`;
+  }
+
+  // Column-level CHECK constraint (raw SQL expression, user-authored).
+  if (config.check) {
+    def += ` CHECK (${config.check})`;
+  }
+
+  return def;
 }
 
 /**
@@ -339,6 +448,166 @@ export interface DiffResult {
   statements: string[];
   /** SQL statements to reverse the diff (DOWN direction, for migrations) */
   reverseStatements: string[];
+  /**
+   * Human-readable warnings for changes the diff detected but refuses to apply
+   * automatically because they are destructive or otherwise unsafe (enum value
+   * removal/reorder, etc.). Never executed — surfaced for the operator.
+   */
+  warnings?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Pure diff helpers (no DB) — unit-testable decision logic reused by schemaDiff
+// ---------------------------------------------------------------------------
+
+/** A FK's current referential actions as read from the DB. */
+export interface DbForeignKey {
+  constraintName: string;
+  column: string;
+  targetTable: string;
+  targetColumn: string;
+  onDelete: ReferentialAction;
+  onUpdate: ReferentialAction;
+}
+
+/**
+ * Build the `ADD CONSTRAINT ... FOREIGN KEY` statement for a FK with the given
+ * referential actions. Default (`no action`) clauses are omitted, matching how
+ * Postgres normalizes them, so re-diffing is stable.
+ */
+export function buildAddForeignKeyStatement(
+  table: string,
+  constraintName: string,
+  column: string,
+  targetTable: string,
+  targetColumn: string,
+  onDelete: ReferentialAction,
+  onUpdate: ReferentialAction,
+  dialect: Dialect = postgresDialect,
+): string {
+  const q = (s: string) => dialect.quoteIdentifier(s);
+  let sql = `ALTER TABLE ${q(table)} ADD CONSTRAINT ${q(constraintName)} FOREIGN KEY (${q(column)}) REFERENCES ${q(targetTable)}(${q(targetColumn)})`;
+  if (onDelete !== 'no action') sql += ` ON DELETE ${referentialActionToSql(onDelete)}`;
+  if (onUpdate !== 'no action') sql += ` ON UPDATE ${referentialActionToSql(onUpdate)}`;
+  return `${sql};`;
+}
+
+/**
+ * Decide whether a FK's referential actions changed. When they differ, returns
+ * the DROP + ADD CONSTRAINT statements (and their reverse) — Postgres has no
+ * `ALTER CONSTRAINT` for referential actions, so drop-and-recreate is the only
+ * path. Returns null when the actions already match.
+ */
+export function diffReferentialAction(
+  table: string,
+  db: DbForeignKey,
+  schemaOnDelete: ReferentialAction,
+  schemaOnUpdate: ReferentialAction,
+  dialect: Dialect = postgresDialect,
+): { statements: string[]; reverseStatements: string[] } | null {
+  if (db.onDelete === schemaOnDelete && db.onUpdate === schemaOnUpdate) return null;
+  const q = (s: string) => dialect.quoteIdentifier(s);
+  const drop = `ALTER TABLE ${q(table)} DROP CONSTRAINT ${q(db.constraintName)};`;
+  const add = buildAddForeignKeyStatement(
+    table,
+    db.constraintName,
+    db.column,
+    db.targetTable,
+    db.targetColumn,
+    schemaOnDelete,
+    schemaOnUpdate,
+    dialect,
+  );
+  const reverseAdd = buildAddForeignKeyStatement(
+    table,
+    db.constraintName,
+    db.column,
+    db.targetTable,
+    db.targetColumn,
+    db.onDelete,
+    db.onUpdate,
+    dialect,
+  );
+  return { statements: [drop, add], reverseStatements: [drop, reverseAdd] };
+}
+
+/**
+ * Compute append-only enum value changes. Returns `ALTER TYPE ... ADD VALUE`
+ * statements for labels present in the schema but not the DB (in order), plus a
+ * destructive warning for any DB label the schema dropped or any reorder —
+ * Postgres cannot remove or reorder enum values without recreating the type.
+ */
+export function diffEnumValues(
+  enumName: string,
+  schemaLabels: readonly string[],
+  dbLabels: readonly string[],
+  dialect: Dialect = postgresDialect,
+): { statements: string[]; warnings: string[] } {
+  const statements: string[] = [];
+  const warnings: string[] = [];
+  const dbSet = new Set(dbLabels);
+  for (const label of schemaLabels) {
+    if (!dbSet.has(label)) {
+      statements.push(`ALTER TYPE ${dialect.quoteIdentifier(enumName)} ADD VALUE ${quoteEnumLabel(label)};`);
+    }
+  }
+  const schemaSet = new Set(schemaLabels);
+  const removed = dbLabels.filter((l) => !schemaSet.has(l));
+  if (removed.length > 0) {
+    warnings.push(
+      `Enum "${enumName}": labels [${removed.join(', ')}] exist in the database but not the schema. ` +
+        `Postgres cannot remove enum values in place — recreate the type manually if intended.`,
+    );
+  }
+  return { statements, warnings };
+}
+
+/** A check constraint as declared or read from the DB. */
+export interface CheckSpec {
+  name: string;
+  expression: string;
+}
+
+/**
+ * Diff a table's CHECK constraints (matched by name). Adds constraints missing
+ * from the DB, drops DB constraints absent from the schema, and drop+adds when a
+ * same-named constraint's expression changed. Expression comparison is a naive
+ * whitespace-insensitive match — semantically-equal-but-different-spelled
+ * expressions may re-emit (documented; harmless drop+add).
+ */
+export function diffCheckConstraints(
+  table: string,
+  schemaChecks: readonly CheckSpec[],
+  dbChecks: readonly CheckSpec[],
+  dialect: Dialect = postgresDialect,
+): { statements: string[]; reverseStatements: string[] } {
+  const q = (s: string) => dialect.quoteIdentifier(s);
+  const statements: string[] = [];
+  const reverseStatements: string[] = [];
+  const dbByName = new Map(dbChecks.map((c) => [c.name, c]));
+  const schemaByName = new Map(schemaChecks.map((c) => [c.name, c]));
+  const norm = (e: string) => e.replace(/\s+/g, ' ').trim();
+  const addStmt = (c: CheckSpec) => `ALTER TABLE ${q(table)} ADD CONSTRAINT ${q(c.name)} CHECK (${c.expression});`;
+  const dropStmt = (name: string) => `ALTER TABLE ${q(table)} DROP CONSTRAINT ${q(name)};`;
+
+  for (const sc of schemaChecks) {
+    const existing = dbByName.get(sc.name);
+    if (!existing) {
+      statements.push(addStmt(sc));
+      reverseStatements.push(dropStmt(sc.name));
+    } else if (norm(existing.expression) !== norm(sc.expression)) {
+      // Expression changed → drop + add.
+      statements.push(dropStmt(sc.name), addStmt(sc));
+      reverseStatements.push(dropStmt(sc.name), addStmt(existing));
+    }
+  }
+  for (const dc of dbChecks) {
+    if (!schemaByName.has(dc.name)) {
+      statements.push(dropStmt(dc.name));
+      reverseStatements.push(addStmt(dc));
+    }
+  }
+  return { statements, reverseStatements };
 }
 
 /**
@@ -430,11 +699,91 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       dbUniques[row.table_name]![row.column_name] = row.constraint_name;
     }
 
+    // Existing enums (typname → ordered labels) for CREATE TYPE / ADD VALUE diff.
+    const enumResult = await client.query<{ typname: string; enumlabel: string }>(
+      `SELECT t.typname, e.enumlabel
+       FROM pg_type t
+       JOIN pg_enum e ON t.oid = e.enumtypid
+       JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+       WHERE n.nspname = 'public'
+       ORDER BY t.typname, e.enumsortorder`,
+    );
+    const dbEnums: Record<string, string[]> = {};
+    for (const row of enumResult.rows) {
+      if (!dbEnums[row.typname]) dbEnums[row.typname] = [];
+      dbEnums[row.typname]!.push(row.enumlabel);
+    }
+
+    // Existing single-column FK referential actions, keyed by table → column.
+    const fkResult = await client.query<{
+      table_name: string;
+      constraint_name: string;
+      column: string;
+      target_table: string;
+      target_column: string;
+      confdeltype: string;
+      confupdtype: string;
+    }>(
+      `SELECT rel.relname AS table_name, con.conname AS constraint_name,
+              att.attname AS column, tgt.relname AS target_table,
+              tatt.attname AS target_column, con.confdeltype, con.confupdtype
+       FROM pg_constraint con
+       JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
+       JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+       JOIN pg_catalog.pg_class tgt ON tgt.oid = con.confrelid
+       JOIN pg_catalog.pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = con.conkey[1]
+       JOIN pg_catalog.pg_attribute tatt ON tatt.attrelid = con.confrelid AND tatt.attnum = con.confkey[1]
+       WHERE con.contype = 'f' AND n.nspname = 'public'
+         AND array_length(con.conkey, 1) = 1`,
+    );
+    const dbForeignKeys: Record<string, Record<string, DbForeignKey>> = {};
+    for (const row of fkResult.rows) {
+      if (!dbForeignKeys[row.table_name]) dbForeignKeys[row.table_name] = {};
+      dbForeignKeys[row.table_name]![row.column] = {
+        constraintName: row.constraint_name,
+        column: row.column,
+        targetTable: row.target_table,
+        targetColumn: row.target_column,
+        onDelete: pgConfActionToReferential(row.confdeltype),
+        onUpdate: pgConfActionToReferential(row.confupdtype),
+      };
+    }
+
+    // Existing CHECK constraints (contype='c'), keyed by table.
+    const checkResult = await client.query<{ table_name: string; conname: string; definition: string }>(
+      `SELECT rel.relname AS table_name, con.conname, pg_get_constraintdef(con.oid) AS definition
+       FROM pg_constraint con
+       JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+       JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
+       WHERE con.contype = 'c' AND n.nspname = 'public'`,
+    );
+    const dbChecks: Record<string, CheckSpec[]> = {};
+    for (const row of checkResult.rows) {
+      if (!dbChecks[row.table_name]) dbChecks[row.table_name] = [];
+      dbChecks[row.table_name]!.push({ name: row.conname, expression: stripCheckWrapper(row.definition) });
+    }
+
     // Build a set of DDL-facing snake_case table names that the schema defines.
     const schemaDdlNames = new Set<string>();
     for (const def of Object.values(schema.tables)) schemaDdlNames.add(def.name);
-    const result: DiffResult = { create: [], alter: [], drop: [], statements: [], reverseStatements: [] };
+    const result: DiffResult = { create: [], alter: [], drop: [], statements: [], reverseStatements: [], warnings: [] };
     const resolveRef = makeRefResolver(schema);
+
+    // --- Enums: CREATE TYPE for new enums (before tables), ADD VALUE for grown
+    //     ones, and a warning for any destructive removal/reorder. New CREATE
+    //     TYPEs go first so tables that reference them create cleanly. ---
+    for (const [enumName, labels] of Object.entries(schema.enums ?? {})) {
+      const existing = dbEnums[enumName];
+      if (!existing) {
+        result.statements.push(generateCreateEnumType(enumName, labels, dialect));
+        result.reverseStatements.unshift(`DROP TYPE IF EXISTS ${dialect.quoteIdentifier(enumName)};`);
+      } else {
+        const { statements, warnings } = diffEnumValues(enumName, labels, existing, dialect);
+        result.statements.push(...statements);
+        result.warnings!.push(...warnings);
+        // ADD VALUE cannot be reversed (Postgres can't drop enum values).
+      }
+    }
 
     // Tables to create (in schema but not in DB)
     const sorted = topologicalSort(schema);
@@ -491,7 +840,9 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         // BIGSERIAL (int8) before 0.24.0 — `push` won't try to shrink them.
         const expectedUdt = schemaTypeToUdt(config);
         if (expectedUdt && !isSerialType(config.type) && dbCol.udtName !== expectedUdt) {
-          const sqlType = config.type === 'VARCHAR' && config.maxLength ? `VARCHAR(${config.maxLength})` : config.type;
+          // resolveDdlType handles enum names, vector(n), arrays, and VARCHAR(n) —
+          // config.type alone would emit the internal ENUM/VECTOR sentinels here.
+          const sqlType = resolveDdlType(config, dialect);
           const oldSqlType = udtToSqlType(dbCol.udtName, dbCol.maxLength);
           const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${sqlType} USING ${dialect.quoteIdentifier(snakeName)}::${sqlType};`;
           const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${oldSqlType} USING ${dialect.quoteIdentifier(snakeName)}::${oldSqlType};`;
@@ -589,6 +940,60 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       if (alterDef.columns.length > 0) {
         result.alter.push(alterDef);
       }
+
+      // --- Referential action changes on existing single-column FKs ---
+      // Postgres has no ALTER CONSTRAINT for actions → DROP + ADD CONSTRAINT.
+      const tableFks = dbForeignKeys[tableName] ?? {};
+      for (const [fieldName, config] of Object.entries(tableDef.columns)) {
+        if (!config.referencesTarget) continue;
+        const snakeName = camelToSnake(fieldName);
+        const dbFk = tableFks[snakeName];
+        if (!dbFk) continue; // FK not present in DB yet (or composite) — skip
+        const change = diffReferentialAction(
+          tableName,
+          dbFk,
+          config.onDelete ?? 'no action',
+          config.onUpdate ?? 'no action',
+          dialect,
+        );
+        if (change) {
+          result.statements.push(...change.statements);
+          for (const rev of change.reverseStatements.slice().reverse()) result.reverseStatements.unshift(rev);
+        }
+      }
+
+      // --- Named table-level CHECK constraints ---
+      // Presence-only diffing: ADD checks whose NAME is missing from the DB.
+      // We do NOT auto-drop DB checks absent from the schema (column-level /
+      // inline checks carry auto-generated names the code-first schema never
+      // sees), and we do NOT drop+add on expression mismatch: pg_get_constraintdef
+      // canonicalizes expressions (casts, ANY(ARRAY[...]) rewrites), so authored
+      // text almost never string-matches the stored form — comparing would emit a
+      // spurious full-table-revalidating drop+add on every diff. An apparent
+      // mismatch surfaces as a warning instead; rename the constraint to
+      // intentionally replace its expression. Unnamed schema checks are skipped
+      // (no stable identity to diff on).
+      const namedSchemaChecks: CheckSpec[] = (tableDef.checks ?? [])
+        .filter((c): c is { name: string; expression: string } => typeof c.name === 'string' && c.name.length > 0)
+        .map((c) => ({ name: c.name, expression: c.expression }));
+      const tableDbChecks = dbChecks[tableName] ?? [];
+      const dbCheckByName = new Map(tableDbChecks.map((c) => [c.name, c]));
+      const normExpr = (e: string) => e.replace(/\s+/g, ' ').trim();
+      for (const sc of namedSchemaChecks) {
+        const existing = dbCheckByName.get(sc.name);
+        const addSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ADD CONSTRAINT ${dialect.quoteIdentifier(sc.name)} CHECK (${sc.expression});`;
+        const dropSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP CONSTRAINT ${dialect.quoteIdentifier(sc.name)};`;
+        if (!existing) {
+          result.statements.push(addSql);
+          result.reverseStatements.unshift(dropSql);
+        } else if (normExpr(existing.expression) !== normExpr(sc.expression)) {
+          result.warnings!.push(
+            `check constraint "${sc.name}" on "${tableName}": stored expression differs from the schema text ` +
+              `(Postgres canonicalizes CHECK expressions, so this is usually cosmetic). ` +
+              `To intentionally replace it, rename the constraint or drop/re-add it in a manual migration.`,
+          );
+        }
+      }
     }
 
     return result;
@@ -601,6 +1006,10 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
  * Map a schema column type to its expected PostgreSQL UDT name.
  */
 function schemaTypeToUdt(config: ColumnConfig): string | null {
+  // Enum columns: udt is the enum type name. Vector columns: udt is `vector`.
+  if (config.enumName) return config.enumName;
+  if (config.vectorDimensions != null) return 'vector';
+
   const map: Record<string, string> = {
     SERIAL: 'int4',
     BIGSERIAL: 'int8',
@@ -619,7 +1028,10 @@ function schemaTypeToUdt(config: ColumnConfig): string | null {
     NUMERIC: 'numeric',
     BYTEA: 'bytea',
   };
-  return map[config.type] ?? null;
+  const base = map[config.type] ?? null;
+  // Postgres names an array type `_<element>` (e.g. `_text` for text[]).
+  if (base && config.isArray) return `_${base}`;
+  return base;
 }
 
 /**

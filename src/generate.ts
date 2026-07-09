@@ -11,11 +11,36 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
-import { type ColumnMetadata, type SchemaMetadata, singularize, snakeToPascal } from './schema.js';
+import {
+  type ColumnMetadata,
+  pgTypeToTs,
+  type SchemaMetadata,
+  singularize,
+  snakeToPascal,
+  type TableMetadata,
+} from './schema.js';
 
 /** Get the TypeScript type name for a table (singularized PascalCase) */
 function entityName(tableName: string): string {
   return snakeToPascal(singularize(tableName));
+}
+
+/**
+ * Resolve the TypeScript type for a column, mapping enum-typed columns to their
+ * generated string-literal union (PascalCase enum name) instead of the
+ * `unknown` that {@link pgTypeToTs} yields for user-defined types. Falls back to
+ * the introspected `col.tsType` for every non-enum column.
+ */
+function columnTsType(col: ColumnMetadata, enums: Record<string, string[]>): string {
+  const dt = col.dialectType ?? col.pgType;
+  const isArray = col.isArray || dt.startsWith('_');
+  const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
+  if (Object.hasOwn(enums, base)) {
+    let t = snakeToPascal(base);
+    if (isArray) t += '[]';
+    return col.nullable ? `${t} | null` : t;
+  }
+  return col.tsType;
 }
 
 /** Escape a value for embedding in a single-quoted TypeScript string literal */
@@ -34,6 +59,13 @@ export interface GenerateOptions {
   outDir?: string;
   /** Redact connection string from generated comments */
   connectionString?: string;
+  /**
+   * Also emit `zod.ts` with per-table `XSchema` / `XCreateSchema` /
+   * `XUpdateSchema` Zod validators (H1). The file imports the user-side `zod`
+   * package — it is never imported by Turbine's runtime, so Zod stays out of the
+   * library's dependency graph. Default: `false`.
+   */
+  zod?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +100,13 @@ export function generate(options: GenerateOptions): { outDir: string; files: str
   const indexContent = generateIndex(options.schema);
   writeFileSync(join(outDir, 'index.ts'), indexContent, 'utf-8');
   files.push('index.ts');
+
+  // Generate zod.ts (optional — --zod flag)
+  if (options.zod) {
+    const zodContent = generateZod(options.schema);
+    writeFileSync(join(outDir, 'zod.ts'), zodContent, 'utf-8');
+    files.push('zod.ts');
+  }
 
   return { outDir, files };
 }
@@ -136,7 +175,7 @@ export function generateTypes(schema: SchemaMetadata): string {
       const pkNote = table.primaryKey.includes(col.name) ? ' (primary key)' : '';
       const nullNote = col.nullable ? ' (nullable)' : '';
       lines.push(`  /** Column: ${col.name} — ${col.pgType}${pkNote}${nullNote} */`);
-      lines.push(`  ${col.field}: ${col.tsType};`);
+      lines.push(`  ${col.field}: ${columnTsType(col, schema.enums)};`);
     }
     lines.push('}');
     lines.push('');
@@ -147,14 +186,16 @@ export function generateTypes(schema: SchemaMetadata): string {
     lines.push(`/** Input type for creating a row in \`${table.name}\` */`);
     lines.push(`export type ${typeName}Create = {`);
     for (const col of table.columns) {
+      // STORED generated columns are computed by the database — never writable.
+      if (col.isGeneratedStored) continue;
       const isPk = table.primaryKey.includes(col.name);
       const isOptional = col.hasDefault || col.nullable || isPk;
       if (isOptional) {
         const reason = isPk ? 'auto-generated' : col.hasDefault ? 'has default' : 'nullable';
         lines.push(`  /** Optional: ${reason} */`);
-        lines.push(`  ${col.field}?: ${col.tsType};`);
+        lines.push(`  ${col.field}?: ${columnTsType(col, schema.enums)};`);
       } else {
-        lines.push(`  ${col.field}: ${col.tsType};`);
+        lines.push(`  ${col.field}: ${columnTsType(col, schema.enums)};`);
       }
     }
     lines.push('};');
@@ -163,11 +204,11 @@ export function generateTypes(schema: SchemaMetadata): string {
     // --- Update input type (all fields optional except PK) ---
     // Numeric columns additionally accept `UpdateOperatorInput<number>` so
     // users can write `{ viewCount: { increment: 1 } }` without an `as any`.
-    const nonPkCols = table.columns.filter((c) => !table.primaryKey.includes(c.name));
+    const nonPkCols = table.columns.filter((c) => !table.primaryKey.includes(c.name) && !c.isGeneratedStored);
     lines.push(`/** Input type for updating a row in \`${table.name}\` */`);
     lines.push(`export type ${typeName}Update = {`);
     for (const col of nonPkCols) {
-      lines.push(`  ${col.field}?: ${updateFieldType(col.tsType)};`);
+      lines.push(`  ${col.field}?: ${updateFieldType(columnTsType(col, schema.enums))};`);
     }
     lines.push('};');
     lines.push('');
@@ -315,10 +356,124 @@ export function generateTypes(schema: SchemaMetadata): string {
 }
 
 // ---------------------------------------------------------------------------
+// zod.ts generator (H1 — `turbine generate --zod`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a TypeScript primitive (as produced by {@link pgTypeToTs}) to its Zod
+ * expression. `Date` uses `z.coerce.date()` — the generated schemas double as
+ * request-body validators where dates arrive as ISO strings, and coercion keeps
+ * both a `Date` and a valid date-string acceptable (documented decision).
+ */
+function zodScalar(ts: string): string {
+  switch (ts) {
+    case 'number':
+      return 'z.number()';
+    case 'string':
+      return 'z.string()';
+    case 'boolean':
+      return 'z.boolean()';
+    case 'Date':
+      return 'z.coerce.date()';
+    case 'bigint':
+      return 'z.bigint()';
+    case 'Buffer':
+      return 'z.instanceof(Uint8Array)';
+    case 'number[]':
+      // pgvector — `pgTypeToTs('vector')` yields `number[]`.
+      return 'z.array(z.number())';
+    default:
+      // json/jsonb and any unmapped user-defined type.
+      return 'z.unknown()';
+  }
+}
+
+/**
+ * Base Zod expression for a column, resolving enums → `z.enum([...])`, arrays →
+ * `.array()`, and vectors → `z.array(z.number())`. Does NOT append
+ * `.nullable()` / `.optional()` — callers layer those on per-schema.
+ */
+function zodBaseType(col: ColumnMetadata, enums: Record<string, string[]>): string {
+  const dt = col.dialectType ?? col.pgType;
+  const isArray = col.isArray || dt.startsWith('_');
+  const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
+
+  let expr: string;
+  if (Object.hasOwn(enums, base)) {
+    expr = `z.enum([${enums[base]!.map((l) => `'${escSQ(l)}'`).join(', ')}])`;
+  } else {
+    expr = zodScalar(pgTypeToTs(base, false));
+  }
+  if (isArray) expr += '.array()';
+  return expr;
+}
+
+/**
+ * Generate the contents of `zod.ts`. Emits, per table, `XSchema` (the full
+ * row), `XCreateSchema` (PK/defaulted/nullable columns optional, STORED
+ * generated columns omitted), and `XUpdateSchema` (PK + STORED generated
+ * columns omitted, every remaining column optional). Exported so tests can pin
+ * the output without writing files.
+ */
+export function generateZod(schema: SchemaMetadata): string {
+  const lines: string[] = [...generatedFileHeader()];
+  // `zod` is a USER dependency — this generated file imports it, but the Turbine
+  // library runtime never does, so Zod stays out of the package's dep graph.
+  lines.push("import { z } from 'zod';");
+  lines.push('');
+
+  for (const table of Object.values(schema.tables)) {
+    const typeName = entityName(table.name);
+
+    // Full-row schema.
+    lines.push(`/** Zod schema for a \`${table.name}\` row */`);
+    lines.push(`export const ${typeName}Schema = z.object({`);
+    for (const col of table.columns) {
+      let expr = zodBaseType(col, schema.enums);
+      if (col.nullable) expr += '.nullable()';
+      lines.push(`  ${col.field}: ${expr},`);
+    }
+    lines.push('});');
+    lines.push('');
+
+    // Create schema — STORED generated columns can never be written; PK,
+    // defaulted, and nullable columns are optional.
+    lines.push(`/** Zod schema for creating a \`${table.name}\` row */`);
+    lines.push(`export const ${typeName}CreateSchema = z.object({`);
+    for (const col of table.columns) {
+      if (col.isGeneratedStored) continue;
+      const isPk = table.primaryKey.includes(col.name);
+      let expr = zodBaseType(col, schema.enums);
+      if (col.nullable) expr += '.nullable()';
+      if (col.hasDefault || col.nullable || isPk) expr += '.optional()';
+      lines.push(`  ${col.field}: ${expr},`);
+    }
+    lines.push('});');
+    lines.push('');
+
+    // Update schema — PK and STORED generated columns omitted; all else optional.
+    lines.push(`/** Zod schema for updating a \`${table.name}\` row */`);
+    lines.push(`export const ${typeName}UpdateSchema = z.object({`);
+    for (const col of table.columns) {
+      if (col.isGeneratedStored) continue;
+      if (table.primaryKey.includes(col.name)) continue;
+      let expr = zodBaseType(col, schema.enums);
+      if (col.nullable) expr += '.nullable()';
+      expr += '.optional()';
+      lines.push(`  ${col.field}: ${expr},`);
+    }
+    lines.push('});');
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // metadata.ts generator
 // ---------------------------------------------------------------------------
 
-function generateMetadata(schema: SchemaMetadata): string {
+export function generateMetadata(schema: SchemaMetadata): string {
   const lines: string[] = [
     ...generatedFileHeader(),
     "import type { SchemaMetadata } from 'turbine-orm';",
@@ -416,6 +571,9 @@ function generateMetadata(schema: SchemaMetadata): string {
     }
     lines.push('      ],');
 
+    // isView — read-only marker; the runtime write guard reads it.
+    if (table.isView) lines.push('      isView: true,');
+
     lines.push('    },');
   }
 
@@ -443,7 +601,7 @@ function generateMetadata(schema: SchemaMetadata): string {
 // index.ts generator (configured client with typed table accessors)
 // ---------------------------------------------------------------------------
 
-function generateIndex(schema: SchemaMetadata): string {
+export function generateIndex(schema: SchemaMetadata): string {
   const tableEntries = Object.values(schema.tables);
   const lines: string[] = [
     ...generatedFileHeader(),
@@ -482,7 +640,7 @@ function generateIndex(schema: SchemaMetadata): string {
     const hasRelations = Object.keys(table.relations).length > 0;
     const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
     lines.push(`  /** Query interface for the \`${table.name}\` table (transaction-scoped) */`);
-    lines.push(`  declare readonly ${accessor}: QueryInterface<${genericArgs}>;`);
+    lines.push(`  declare readonly ${accessor}: ${accessorType(table, genericArgs)};`);
   }
   lines.push('}');
   lines.push('');
@@ -525,7 +683,7 @@ function generateIndex(schema: SchemaMetadata): string {
     const hasRelations = Object.keys(table.relations).length > 0;
     const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
     lines.push(`  /** Query interface for the \`${table.name}\` table */`);
-    lines.push(`  declare readonly ${accessor}: QueryInterface<${genericArgs}>;`);
+    lines.push(`  declare readonly ${accessor}: ${accessorType(table, genericArgs)};`);
   }
   lines.push('');
   lines.push('  constructor(config?: TurbineConfig) {');
@@ -574,6 +732,19 @@ function generateIndex(schema: SchemaMetadata): string {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * The generated table-accessor type. A view (`isView`) without a primary key
+ * cannot be looked up by unique key, so its `findUnique`-family methods are
+ * excluded via `Omit`. Everything else is a plain `QueryInterface<…>`.
+ */
+function accessorType(table: TableMetadata, genericArgs: string): string {
+  const base = `QueryInterface<${genericArgs}>`;
+  if (table.isView && table.primaryKey.length === 0) {
+    return `Omit<${base}, 'findUnique' | 'findUniqueOrThrow'>`;
+  }
+  return base;
+}
+
 function serializeColumn(col: ColumnMetadata): string {
   const parts = [
     `name: '${escSQ(col.name)}'`,
@@ -590,6 +761,11 @@ function serializeColumn(col: ColumnMetadata): string {
   // Emit isGenerated only when set (server-generated serial/identity), so the
   // output stays byte-identical for the common client-default columns.
   if (col.isGenerated) parts.push(`isGenerated: true`);
+  // STORED generated columns — the runtime write guard reads isGeneratedStored.
+  if (col.isGeneratedStored) parts.push(`isGeneratedStored: true`);
+  if (col.generationExpression !== undefined) {
+    parts.push(`generationExpression: '${escSQ(col.generationExpression)}'`);
+  }
   if (col.maxLength !== undefined) parts.push(`maxLength: ${col.maxLength}`);
   return `{ ${parts.join(', ')} }`;
 }
