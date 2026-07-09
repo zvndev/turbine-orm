@@ -10,16 +10,27 @@ Install Turbine, point it at your database, generate a typed client, and run you
 
 ## Requirements
 
-- Node.js 18 or newer
-- PostgreSQL 14 or newer (Neon, Vercel Postgres, Supabase, or local all work)
+- **Node.js ≥ 18** (the package `engines` field). The optional [SQLite engine](/engines) uses Node's built-in `node:sqlite` and needs **Node ≥ 22.5**.
+- **PostgreSQL 14+** for the default path (Neon, Vercel Postgres, Supabase, or local all work). Other engines are documented under [Database Engines](/engines).
+- **`"type": "module"`** in your project `package.json`. Turbine is an ESM package; without it, Node tries to `require()` it when loading `turbine.config.ts` / schema files and fails.
+- **`tsx` as a dev dependency** so the CLI can load TypeScript config and schema files (`turbine.config.ts`, `turbine/schema.ts`, TypeScript seeds).
 
 ## 1. Install
 
 ```bash
 npm install turbine-orm
+npm install --save-dev tsx
 ```
 
-Turbine has exactly one runtime dependency (`pg`). ESM and CommonJS both work.
+Turbine has exactly one runtime dependency (`pg`). ESM and CommonJS both work for importing the library; the CLI still needs `tsx` for `.ts` project files.
+
+If your `package.json` does not already say so, set:
+
+```json
+{
+  "type": "module"
+}
+```
 
 ## 2. Set `DATABASE_URL`
 
@@ -53,16 +64,47 @@ const config: TurbineCliConfig = {
 export default config;
 ```
 
+> **`schema` vs `schemaFile`:**  
+> - **`schema`** is the **Postgres schema name** (the namespace — almost always `'public'`).  
+> - **`schemaFile`** is the **path** to your `defineSchema()` TypeScript file (used by `turbine push` and auto-diff migrations).  
+>  
+> Never put a file path in `schema`. A value like `'./turbine/schema.ts'` makes introspection look for `WHERE table_schema = './turbine/schema.ts'`, which matches zero tables. Put the path in `schemaFile` only.
+
 ## 4. Generate the typed client
 
-If you already have tables in your database, introspect them and emit a fully-typed client:
+After `init`, pick the path that matches your database.
+
+### Path A — Existing tables
+
+If the database already has tables, introspect them and emit a fully-typed client:
 
 ```bash
-npx turbine pull
-# or: npx turbine generate
+npx turbine generate
+# or: npx turbine pull
 ```
 
-Turbine reads `information_schema` + `pg_catalog`, discovers your tables, columns, relations, and indexes, then writes three files to `./generated/turbine/`:
+### Path B — Empty database
+
+If the database is empty (or you want to own the schema in TypeScript first), define tables, push them, then generate:
+
+1. Edit `turbine/schema.ts` with `defineSchema(...)` — see [Schema & Migrations](/schema).
+2. Apply it to the database:
+
+```bash
+npx turbine push
+```
+
+3. Generate the typed client from the live schema:
+
+```bash
+npx turbine generate
+```
+
+`push` is the fast local path. For production, prefer SQL migrations (`turbine migrate`) instead of push — details on the [schema page](/schema).
+
+### What gets written
+
+Either path writes three files to `./generated/turbine/` (or your config `out`):
 
 - `types.ts` — entity interfaces and `Create` / `Update` input types
 - `metadata.ts` — runtime schema metadata
@@ -117,5 +159,6 @@ Turbine compiles the `with` clause to a single SQL statement using PostgreSQL's 
 - **[Observability](/observability)** — query lifecycle events and built-in metrics aggregation.
 - **[API Reference](/queries)** — every query method, WHERE operator, and nested `with` option.
 - **[Schema & Migrations](/schema)** — define your schema in TypeScript and ship migrations.
+- **[Database Engines](/engines)** — SQLite, MySQL, SQL Server, and PowDB behind the same typed API.
 - **[CLI](/cli)** — every command with examples.
 - **[Benchmarks](/benchmarks)** — honest numbers against Prisma 7 and Drizzle 0.45 on Neon.
