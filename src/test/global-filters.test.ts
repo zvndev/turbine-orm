@@ -365,6 +365,23 @@ describe('global filters — relation filters', () => {
     assertParamsAligned(sql, params);
   });
 
+  it('some with a VALUE target filter keeps EXISTS params aligned', () => {
+    const { sql, params } = qi('users', { posts: { title: { not: 'spam' } } }).buildFindMany({
+      where: { id: 9, posts: { some: { title: 'x' } } },
+    });
+    assert.match(sql, /EXISTS \(SELECT 1 FROM "posts" WHERE .*"posts"\."title" != \$/);
+    assert.ok(params.includes('x') && params.includes('spam') && params.includes(9));
+    assertParamsAligned(sql, params);
+  });
+
+  it('every with a VALUE target filter keeps params aligned', () => {
+    const { sql, params } = qi('users', { posts: { title: { not: 'spam' } } }).buildFindMany({
+      where: { posts: { every: { title: 'x' } } },
+    });
+    assert.match(sql, /NOT EXISTS \(SELECT 1 FROM "posts" WHERE .*"posts"\."title" != \$.* AND NOT \(/);
+    assertParamsAligned(sql, params);
+  });
+
   it('belongsTo `is` filter is restricted by the target filter', () => {
     const { sql, params } = qi('posts', { users: softDelete }).buildFindMany({
       where: { author: { is: { name: 'x' } } },
@@ -391,6 +408,22 @@ describe('global filters — SQL cache', () => {
     assert.match(a.sql, /"deleted_at" IS NULL/);
     assert.match(b.sql, /"tenant_id" = \$1/);
     assert.deepEqual(b.params, ['t']);
+  });
+
+  it('cache HIT re-collects relation-subquery + _count gf params in build order', () => {
+    // Build twice on ONE QI: the second call hits the SQL cache and rebuilds
+    // params via the collect path only. A value gf in the subquery + _count is
+    // the desync-prone case — both builds must stay aligned and identical.
+    const q = qi('users', { posts: { title: { not: 'spam' } } });
+    const args = {
+      where: { id: 3 },
+      with: { posts: { where: { title: 'hi' } }, _count: { posts: true } },
+    } as const;
+    const first = q.buildFindMany(args);
+    const second = q.buildFindMany(args);
+    assert.equal(first.sql, second.sql);
+    assert.deepEqual(first.params, second.params);
+    assertParamsAligned(second.sql, second.params);
   });
 
   it('same shape, different values → same SQL text, distinct params', () => {
