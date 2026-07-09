@@ -21,6 +21,8 @@ Every TS ORM now resolves nested relations in a single `json_agg` query — Pris
 
 See [How It Works](#how-it-works) for the `json_agg` query strategy itself — but the query strategy isn't why you'd pick Turbine. The safety bundle above is: a Studio that can't mutate prod, errors that never leak PII, one dependency, and checksummed migrations.
 
+**New in 0.28.0:** [global filters](https://turbineorm.dev/global-filters) for soft-delete and multi-tenancy · [read replicas](https://turbineorm.dev/read-replicas) with a `$primary()` escape hatch · a read-only [MCP server](https://turbineorm.dev/mcp) for AI agents · [seed-as-code](https://turbineorm.dev/seeding) and a non-interactive `migrate deploy` for CI · [Zod generation](https://turbineorm.dev/zod) · read-only [views & generated columns](https://turbineorm.dev/views) · `NULLS FIRST/LAST` ordering, relation `_count`, and ordering by a relation · schema referential actions, enums, array, `vector`, and check constraints.
+
 ## Benchmarks
 
 Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizzle 0.45** (relational queries) on a **Neon** PostgreSQL database (pooled endpoint, US-East, PostgreSQL 17.8). 100 iterations, 20 warmup, Node v22. Same schema, same data (1K users, 10K posts, 50K comments), same connection pool config. _Measured April 2026 on turbine-orm 0.7.1; the core read path these scenarios exercise is unchanged through 0.17.0 — see [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) to reproduce._
@@ -934,7 +936,7 @@ Turbine maps Postgres types to TypeScript:
 | **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
 | **Main bundle (brotli)** | ~31 kB | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
-| **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Paid tier | None |
+| **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Free; hosted Gateway paid | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
 | **Edge runtime** | One import swap, ~22 kB brotli | Driver adapter + WASM compiler | Native | Native |

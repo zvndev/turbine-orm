@@ -1,0 +1,75 @@
+export const metadata = {
+  title: 'Read Replicas',
+  description:
+    'Route reads to Postgres read replicas and writes to the primary in Turbine ORM — round-robin load balancing, the full routing matrix, and the $primary() escape hatch.',
+  alternates: { canonical: '/read-replicas' },
+};
+
+# Read Replicas
+
+Configure one or more read replicas and Turbine load-balances read-only queries across them, round-robin, while every write stays on the primary. It's one config field — no query-site changes, no separate client.
+
+```ts
+import { turbine } from './generated/turbine';
+
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,          // primary
+  replicas: [
+    process.env.REPLICA_URL_1,
+    process.env.REPLICA_URL_2,
+  ],
+});
+```
+
+Reads now round-robin across the two replicas; writes go to the primary. Nothing else changes.
+
+## What routes where
+
+The split is by operation, not by table. Read-only operations issued **outside a transaction** go to a replica; everything else uses the primary.
+
+| Goes to a replica | Always uses the primary |
+|---|---|
+| `findMany`, `findFirst`, `findUnique` | `create`, `createMany` |
+| `findFirstOrThrow`, `findUniqueOrThrow` | `update`, `updateMany`, `delete`, `deleteMany`, `upsert` |
+| `count`, `aggregate`, `groupBy` | Everything inside a `$transaction` body (reads included) |
+| `findManyStream` | `pipeline`, `raw`, `sql` |
+| | `$listen` / `$notify`, observability flushes |
+
+Reads inside a transaction stay on the primary because a transaction is a single connection — splitting it across pools would break its consistency guarantees.
+
+## Replica entries — strings vs pools
+
+Each entry in `replicas` is either a connection string or an external pool, and the two follow different lifecycles:
+
+- **Connection string** — Turbine constructs an owned `pg.Pool` for it, with the same pool tuning and one-time type-parser registration as the primary. `disconnect()` closes it.
+- **`PgCompatPool`** (Neon, Vercel Postgres, a shared `pg.Pool`) — Turbine registers no type parsers and never ends it. The caller owns its lifecycle, exactly like the [external-pool contract](/serverless) for the primary.
+
+Omitting `replicas` (or passing `[]`) leaves the default single-pool path completely unchanged — there's no proxy, no routing overhead.
+
+## Replication lag — reading your own writes
+
+Replicas are eventually consistent. A row you just wrote on the primary may not be on a replica yet, so a read routed there can miss it. When you need read-your-writes consistency, pin the read to the primary with `$primary()`:
+
+```ts
+const created = await db.orders.create({ data: { total: 100 } });
+
+// This read might hit a lagging replica and not see `created`:
+const maybeStale = await db.orders.findUnique({ where: { id: created.id } });
+
+// Force the primary — guaranteed to see the write:
+const fresh = await db.$primary().orders.findUnique({ where: { id: created.id } });
+```
+
+`$primary()` returns a view of the client — same schema, same config — with every operation (reads included) pinned to the primary. The instance is cached, so calling it repeatedly is cheap. When no replicas are configured, `$primary()` returns the client itself.
+
+> **Note:** Turbine does not detect lag or "wait for" a replica to catch up. Route reads that must observe a recent write through `$primary()` (or run them inside the same `$transaction` as the write).
+
+## Interaction with global filters
+
+Read routing is orthogonal to [global filters](/global-filters). A filtered read routed to a replica carries the same compiled `WHERE` it would on the primary — soft-delete and tenancy filters apply identically wherever the query runs.
+
+## See also
+
+- **[Serverless & Edge](/serverless)** — the external-pool contract replicas reuse.
+- **[Transactions](/transactions)** — why transaction bodies stay on the primary.
+- **[Global Filters](/global-filters)** — filters apply to replica reads too.

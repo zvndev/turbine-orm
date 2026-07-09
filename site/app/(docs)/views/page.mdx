@@ -1,0 +1,85 @@
+export const metadata = {
+  title: 'Views & Generated Columns',
+  description:
+    'Introspect Postgres views and materialized views as read-only entities in Turbine ORM, and how STORED generated columns are handled on read and write.',
+  alternates: { canonical: '/views' },
+};
+
+# Views & Generated Columns
+
+Turbine can generate typed accessors for database views, and it understands `STORED` generated columns — computed by Postgres and never writable. Both are read-safe by construction: the type system and the query builder stop you from writing where a write is impossible.
+
+## Views
+
+Pass `--include-views` to `generate` / `pull` and Turbine introspects views and materialized views alongside base tables:
+
+```bash
+npx turbine pull --include-views
+```
+
+Each view becomes a table in the generated metadata with `isView: true`. Codegen emits an entity type and read accessors for it — `findMany`, `findFirst`, `count`, `aggregate`, and so on — exactly like a base table:
+
+```ts
+// active_users is a Postgres VIEW
+const active = await db.activeUsers.findMany({
+  where: { orgId: 1 },
+  orderBy: { name: 'asc' },
+});
+```
+
+### Views are read-only
+
+Every write builder refuses a view. `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, and `upsert` throw `ValidationError` (TURBINE_E003) — "cannot write to a view" — before any SQL runs:
+
+```ts
+await db.activeUsers.create({ data: { name: 'x' } });
+// ❌ ValidationError (TURBINE_E003): cannot write to a view
+```
+
+The guard is enforced at the query builder, so it holds on every engine, not just Postgres.
+
+### Views without a primary key
+
+A view without a primary key can't be uniquely addressed, so its generated accessor omits the `findUnique` family. The type is `Omit<QueryInterface<T>, 'findUnique' | 'findUniqueOrThrow'>` — `findUnique` on a PK-less view is a compile error, not a runtime surprise. A view that does expose a unique/primary key keeps the full read surface.
+
+## STORED generated columns
+
+A `GENERATED ALWAYS AS (...) STORED` column is computed by Postgres from other columns. You read it, you never write it. Introspection detects these (via `is_generated` / the generation expression) and marks them on the column metadata.
+
+Consider:
+
+```sql
+CREATE TABLE invoices (
+  id    bigserial PRIMARY KEY,
+  qty   integer NOT NULL,
+  price integer NOT NULL,
+  total integer GENERATED ALWAYS AS (qty * price) STORED
+);
+```
+
+### On read — present and typed
+
+`total` appears in the generated `Invoice` entity type and comes back on every read, just like any other column.
+
+```ts
+const invoice = await db.invoices.findUnique({ where: { id: 1 } });
+invoice.total; // number — computed by Postgres
+```
+
+### On write — omitted and rejected
+
+`total` is omitted from the `InvoiceCreate` and `InvoiceUpdate` input types, so passing it is a compile error. If it reaches the builder at runtime anyway (say, from untyped data), `create`, `update`, and `upsert` throw `ValidationError` (TURBINE_E003) naming the column — before hitting Postgres:
+
+```ts
+await db.invoices.create({ data: { qty: 2, price: 3 } });
+// ✅ total is computed by Postgres as 6
+
+await db.invoices.create({ data: { qty: 2, price: 3, total: 6 } });
+// ❌ ValidationError (TURBINE_E003): cannot write generated column "total"
+```
+
+## See also
+
+- **[Schema & Migrations](/schema)** — introspection and the type mapping.
+- **[Zod Schemas](/zod)** — generated columns are dropped from Create/Update Zod schemas too.
+- **[Typed Errors](/errors)** — `ValidationError` (TURBINE_E003).

@@ -1,0 +1,123 @@
+export const metadata = {
+  title: 'Global Filters',
+  description:
+    'Automatic WHERE filters for soft-delete and multi-tenancy in Turbine ORM — applied to every read, mutation, and relation subquery, with a per-query opt-out.',
+  alternates: { canonical: '/global-filters' },
+};
+
+# Global Filters
+
+A global filter is a `WHERE` predicate Turbine merges into **every** query on a table — reads, mutations, and the relation subqueries that target it — so you never repeat it at the call site. Two patterns motivate it:
+
+- **Soft delete** — hide rows where `deletedAt` is set, everywhere, without threading `where: { deletedAt: null }` through every query.
+- **Multi-tenancy** — scope every query to the current tenant, evaluated per request.
+
+Global filters are configured once on the client and are `AND`-merged into the compiled `WHERE`. Values are always parameterized.
+
+## Configuration
+
+Pass `globalFilters` to the client, keyed by table accessor (`db.<table>`). Each value is a `WhereClause` — or a function that returns one:
+
+```ts
+import { turbine } from './generated/turbine';
+
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  globalFilters: {
+    // Soft delete — static filter
+    posts: { deletedAt: null },
+    users: { deletedAt: null },
+
+    // Multi-tenancy — evaluated per query build
+    orders: () => ({ tenantId: currentTenant() }),
+  },
+});
+```
+
+With this in place, `db.posts.findMany()` compiles to `... WHERE "deleted_at" IS NULL` — no `where` needed.
+
+```ts
+const posts = await db.posts.findMany();
+// SELECT ... FROM "posts" WHERE "deleted_at" IS NULL
+
+const active = await db.users.findMany({ where: { role: 'admin' } });
+// SELECT ... FROM "users" WHERE "role" = $1 AND "deleted_at" IS NULL
+```
+
+## Function filters — per-request tenancy
+
+A function filter is evaluated **every time a query is built**, so a closure over per-request state produces a request-scoped filter. This is the clean way to enforce tenant isolation:
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  globalFilters: {
+    orders: () => ({ tenantId: getCurrentTenantId() }),
+  },
+});
+
+// Later, inside a request handler where getCurrentTenantId() returns 't-42':
+const orders = await db.orders.findMany();
+// SELECT ... FROM "orders" WHERE "tenant_id" = $1   -- params: ['t-42']
+```
+
+The filter's **shape** participates in the SQL cache, and its **values** are re-collected on every build — so two requests with different tenant ids reuse the same cached SQL but bind their own parameters. A filter that changes shape (say, `{ deletedAt: null }` one call and `{ tenantId: 't' }` the next) never collides on a single cache entry.
+
+## Filters flow into relations
+
+The reason global filters are more than a call-site helper: they apply to **relation subqueries** too. A filter on `posts` restricts `posts` wherever it appears — including when loaded through a parent's `with` clause.
+
+```ts
+// globalFilters: { posts: { deletedAt: null } }
+const users = await db.users.findMany({
+  with: { posts: true },
+});
+// The correlated posts subquery ANDs "deleted_at" IS NULL —
+// soft-deleted posts never appear under any user.
+```
+
+This coverage is complete. A target-table filter is applied to:
+
+- The `with` relation subquery (both the default `join` strategy and the `batched` strategy)
+- Relation filters — `some`, `every`, `none`, and belongsTo `is`
+- Relation `_count` and relation `orderBy: { posts: { _count: 'desc' } }`
+
+So a soft-delete filter on `posts` means a user's post `_count` counts only live posts, and `where: { posts: { some: {...} } }` only matches live posts — consistently, with no extra code.
+
+## Mutations and the empty-where guard
+
+Global filters apply to `update`, `updateMany`, `delete`, `deleteMany`, and the conflict-`UPDATE` of `upsert`. `create` and `createMany` are **never** filtered — you're inserting a new row, there's nothing to scope.
+
+One deliberate interaction: a global filter does **not** satisfy the [empty-where guard](/queries#delete--deletemany). The guard checks the *user-supplied* `where`, so an unguarded mass mutation is still refused even when a filter is configured:
+
+```ts
+// globalFilters: { users: { deletedAt: null } }
+await db.users.deleteMany({ where: {} });
+// ❌ ValidationError (TURBINE_E003) — the filter does NOT make this safe.
+
+await db.users.deleteMany({ where: { orgId: 1 } });
+// ✅ Deletes org-1 users, AND-merged with "deleted_at" IS NULL.
+```
+
+The filter still compiles into the `WHERE` — it just can't turn `{}` into an allowed statement.
+
+## Opting out — `skipGlobalFilters`
+
+Any read or mutation accepts `skipGlobalFilters` to bypass filters for that call. Pass `true` to skip all of them, or an array of table names to skip only those:
+
+```ts
+// See a soft-deleted row (admin tooling)
+const all = await db.posts.findMany({ skipGlobalFilters: true });
+
+// Skip only the `posts` filter, keep others
+const some = await db.users.findMany({
+  with: { posts: true },
+  skipGlobalFilters: ['posts'],
+});
+```
+
+## See also
+
+- **[API Reference](/queries)** — the `where` operators and the empty-where guard.
+- **[Read Replicas](/read-replicas)** — filters apply identically to reads routed to a replica.
+- **[Transactions](/transactions)** — RLS `sessionContext` for database-enforced multi-tenancy.

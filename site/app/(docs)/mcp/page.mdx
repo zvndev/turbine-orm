@@ -1,0 +1,80 @@
+export const metadata = {
+  title: 'MCP Server',
+  description:
+    'Expose your database to AI coding agents through Turbine ORM’s built-in, read-only Model Context Protocol server — schema, migrations, doctor, EXPLAIN, and sample rows over JSON-RPC stdio.',
+  alternates: { canonical: '/mcp' },
+};
+
+# MCP Server
+
+`turbine mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent — Claude Code, Cursor, or any MCP client — inspect your database safely. It speaks JSON-RPC 2.0 over stdio, ships with the package (no extra dependency), and exposes **read-only** tools only. There is no write surface and no raw-SQL execution: the same safety stance as [Studio](/studio).
+
+```bash
+DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
+```
+
+The server handles the MCP `initialize` handshake (protocol version `2025-06-18`, server name `turbine-orm`), then serves `tools/list` and `tools/call`. Malformed input returns a JSON-RPC error and never crashes the process.
+
+## The tools
+
+Six read-only tools. Every database access runs inside a `BEGIN READ ONLY` transaction with a statement timeout — an agent physically cannot mutate your data through them.
+
+| Tool | What it returns |
+|---|---|
+| `schema_overview` | Tables, columns, relations, indexes, and estimated row counts for the schema. |
+| `table_detail` | Columns, indexes, and relations for one named table. |
+| `migrate_status` | Migration files and the tracking table — applied vs pending, without applying anything. |
+| `doctor_report` | Missing relation indexes, from the same [index advisor](/cli#turbine-doctor) `turbine doctor` uses. |
+| `explain_query` | `EXPLAIN (FORMAT JSON)` for a single `SELECT`. Non-`SELECT` input is rejected. |
+| `sample_rows` | Up to 50 rows from a table whose name is validated against the introspected schema. |
+
+`explain_query` is `SELECT`-only and `sample_rows` caps at 50 rows and validates the table name against the live schema, so an agent can explore query plans and real data without a path to writing or to arbitrary SQL.
+
+## Options
+
+| Option | Description |
+|---|---|
+| `--url`, `-u <url>` | Postgres connection string. Overrides `DATABASE_URL`. |
+| `--schema`, `-s <name>` | Postgres schema (default: `public`). |
+| `--include <tables>` | Comma-separated tables to include. |
+| `--exclude <tables>` | Comma-separated tables to exclude. |
+
+## Connect it to Claude Code
+
+Add the server to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "turbine": {
+      "command": "npx",
+      "args": ["turbine", "mcp"],
+      "env": { "DATABASE_URL": "postgres://user:pass@localhost:5432/mydb" }
+    }
+  }
+}
+```
+
+Claude Code launches `npx turbine mcp` on startup and can then answer questions like "what indexes is the `orders` table missing?" or "show me a few rows from `users`" — grounded in your real schema.
+
+## Connect it to Cursor
+
+Cursor uses the same shape in `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "turbine": {
+      "command": "npx",
+      "args": ["turbine", "mcp"],
+      "env": { "DATABASE_URL": "postgres://user:pass@localhost:5432/mydb" }
+    }
+  }
+}
+```
+
+## See also
+
+- **[Studio](/studio)** — the same read-only stance, as a web UI for humans.
+- **[CLI](/cli)** — `turbine doctor` and `migrate status` on the command line.
+- **[Schema & Migrations](/schema)** — what the schema tools introspect.

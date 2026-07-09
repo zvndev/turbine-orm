@@ -1,0 +1,101 @@
+export const metadata = {
+  title: 'Seeding',
+  description:
+    'Seed your database with TypeScript, JavaScript, or SQL in Turbine ORM — the defineSeed helper, file resolution order, and a CI-safe deploy-then-seed pipeline.',
+  alternates: { canonical: '/seeding' },
+};
+
+# Seeding
+
+`turbine seed` runs a seed file to populate your database. The file can be TypeScript, JavaScript, or SQL — Turbine picks the right runner for each. TypeScript seeds run through `tsx`, so there's no separate build step.
+
+```bash
+npx turbine seed
+```
+
+## `defineSeed` — TypeScript seeds
+
+`defineSeed` wraps a function that receives a connected client. It reads `DATABASE_URL`, runs your function, and disconnects when it's done — you don't manage the connection lifecycle.
+
+```ts
+// seed.ts
+import { defineSeed } from 'turbine-orm';
+
+export default defineSeed(async (db) => {
+  await db.raw`
+    INSERT INTO organizations (name, slug) VALUES (${'Acme'}, ${'acme'})
+    ON CONFLICT (slug) DO NOTHING
+  `;
+  console.log('Seeded.');
+});
+```
+
+The `db` handed to the callback is a base client — use [`db.raw`](/queries#raw-sql) or [`db.sql`](/queries#typed-raw-sql--dbsqlt) for inserts. For fully typed table accessors, import your generated client instead and manage its lifecycle yourself:
+
+```ts
+// seed.ts
+import { turbine } from './generated/turbine';
+
+const db = turbine({ connectionString: process.env.DATABASE_URL });
+
+await db.organizations.createMany({
+  data: [
+    { name: 'Acme', slug: 'acme' },
+    { name: 'Widgets', slug: 'widgets' },
+  ],
+});
+
+await db.disconnect();
+```
+
+Either file runs the same way: `npx turbine seed`.
+
+## JavaScript and SQL seeds
+
+- **`.js`** — imported dynamically. If the default export is a function, Turbine calls it.
+- **`.sql`** — executed as raw SQL against the database.
+
+```sql
+-- seed.sql
+INSERT INTO organizations (name, slug) VALUES ('Acme', 'acme')
+ON CONFLICT (slug) DO NOTHING;
+```
+
+> **Note:** TypeScript seeds need `tsx` available (a dev dependency in most TypeScript projects). If it's missing, Turbine tells you to install `tsx` or use a `.js` / `.sql` seed instead.
+
+## File resolution
+
+Turbine resolves the seed file in this order:
+
+1. The `seed` field in `turbine.config.ts` (an explicit path always wins — even if the file doesn't exist yet).
+2. The first default candidate found: `seed.ts`, then `seed.js`, then `seed.sql`.
+
+```ts
+// turbine.config.ts
+import type { TurbineCliConfig } from 'turbine-orm/cli';
+
+export default {
+  url: process.env.DATABASE_URL,
+  seed: './turbine/seed.ts',
+} satisfies TurbineCliConfig;
+```
+
+(`seedFile` is still accepted as an alias for `seed`.)
+
+## Seeding in CI/CD
+
+For automated environments, pair `migrate deploy` with `seed`. `migrate deploy` applies pending migrations non-interactively — it never prompts, so it's safe in a pipeline — then seed on top:
+
+```bash
+# CI: bring a fresh database up to date, then seed it
+npx turbine migrate deploy
+npx turbine seed
+```
+
+`migrate deploy` refuses to run on a checksum mismatch or a missing migration file (exit 1 with a clear message), so a drifted migration history fails the build instead of silently diverging. See [`migrate deploy`](/cli#turbine-migrate-deploy) for the full contract.
+
+## See also
+
+- **[CLI](/cli)** — `turbine seed`, `turbine migrate deploy`, and every flag.
+- **[Schema & Migrations](/schema)** — the migration workflow seeds run on top of.
+- **[API Reference](/queries)** — `createMany`, `raw`, and `sql` for writing seed data.
