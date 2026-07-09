@@ -7,11 +7,15 @@ const nodePlatform = (config) => {
   return config;
 };
 
+// 0.28.0 parity sprint: global filters, read replicas, relation _count,
+// relation orderBy, and the view/generated-column write guards all live in the
+// shared client/query graph, growing every entry by ~5-7 kB brotli. Budgets
+// re-baselined to the measured sizes + ~2 kB headroom.
 export default [
   {
     name: "main entry — import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
-    limit: '35 kB',
+    limit: '44 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
@@ -22,21 +26,21 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '26 kB',
+    limit: '34 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'sqlite entry — turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
-    limit: '30 kB',
+    limit: '37 kB',
     ignore: ['pg', 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'mysql entry — turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
     path: 'dist/mysql.js',
-    limit: '30 kB',
+    limit: '38 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
     // it is never in the static graph — exclude it (and pg) from the footprint.
     ignore: ['pg', 'mysql2', 'mysql2/promise'],
@@ -47,7 +51,7 @@ export default [
     path: 'dist/mssql.js',
     // Slightly larger than the other engines: the FOR JSON PATH relation generator
     // and the INFORMATION_SCHEMA/sys introspector add real code (no extra deps).
-    limit: '33 kB',
+    limit: '39 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph — exclude it (and pg) from the footprint.
     ignore: ['pg', 'mssql'],
