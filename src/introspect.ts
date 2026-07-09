@@ -169,6 +169,13 @@ export interface IntrospectOptions {
   /** Tables to exclude (default: none). Applied after include. */
   exclude?: string[];
   /**
+   * Also introspect **views** and **materialized views** as read-only
+   * {@link TableMetadata} entries (`isView: true`). Off by default. Write
+   * builders reject views (E003); a view without a primary key is excluded from
+   * the generated `findUnique`-family accessor types.
+   */
+  includeViews?: boolean;
+  /**
    * Dialect whose {@link Dialect.introspector} drives the catalog reads.
    * Defaults to {@link postgresDialect}. Engines plug their own introspector
    * here so `introspect()` works across databases.

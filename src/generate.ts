@@ -11,7 +11,7 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
-import { type ColumnMetadata, type SchemaMetadata, singularize, snakeToPascal } from './schema.js';
+import { type ColumnMetadata, pgTypeToTs, type SchemaMetadata, singularize, snakeToPascal } from './schema.js';
 
 /** Get the TypeScript type name for a table (singularized PascalCase) */
 function entityName(tableName: string): string {
@@ -52,6 +52,13 @@ export interface GenerateOptions {
   outDir?: string;
   /** Redact connection string from generated comments */
   connectionString?: string;
+  /**
+   * Also emit `zod.ts` with per-table `XSchema` / `XCreateSchema` /
+   * `XUpdateSchema` Zod validators (H1). The file imports the user-side `zod`
+   * package — it is never imported by Turbine's runtime, so Zod stays out of the
+   * library's dependency graph. Default: `false`.
+   */
+  zod?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +93,13 @@ export function generate(options: GenerateOptions): { outDir: string; files: str
   const indexContent = generateIndex(options.schema);
   writeFileSync(join(outDir, 'index.ts'), indexContent, 'utf-8');
   files.push('index.ts');
+
+  // Generate zod.ts (optional — --zod flag)
+  if (options.zod) {
+    const zodContent = generateZod(options.schema);
+    writeFileSync(join(outDir, 'zod.ts'), zodContent, 'utf-8');
+    files.push('zod.ts');
+  }
 
   return { outDir, files };
 }
@@ -326,6 +340,120 @@ export function generateTypes(schema: SchemaMetadata): string {
     lines.push(`  where: ${typeName}WhereUnique;`);
     lines.push(`  create: ${createRefType};`);
     lines.push('}');
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// zod.ts generator (H1 — `turbine generate --zod`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a TypeScript primitive (as produced by {@link pgTypeToTs}) to its Zod
+ * expression. `Date` uses `z.coerce.date()` — the generated schemas double as
+ * request-body validators where dates arrive as ISO strings, and coercion keeps
+ * both a `Date` and a valid date-string acceptable (documented decision).
+ */
+function zodScalar(ts: string): string {
+  switch (ts) {
+    case 'number':
+      return 'z.number()';
+    case 'string':
+      return 'z.string()';
+    case 'boolean':
+      return 'z.boolean()';
+    case 'Date':
+      return 'z.coerce.date()';
+    case 'bigint':
+      return 'z.bigint()';
+    case 'Buffer':
+      return 'z.instanceof(Uint8Array)';
+    case 'number[]':
+      // pgvector — `pgTypeToTs('vector')` yields `number[]`.
+      return 'z.array(z.number())';
+    default:
+      // json/jsonb and any unmapped user-defined type.
+      return 'z.unknown()';
+  }
+}
+
+/**
+ * Base Zod expression for a column, resolving enums → `z.enum([...])`, arrays →
+ * `.array()`, and vectors → `z.array(z.number())`. Does NOT append
+ * `.nullable()` / `.optional()` — callers layer those on per-schema.
+ */
+function zodBaseType(col: ColumnMetadata, enums: Record<string, string[]>): string {
+  const dt = col.dialectType ?? col.pgType;
+  const isArray = col.isArray || dt.startsWith('_');
+  const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
+
+  let expr: string;
+  if (Object.hasOwn(enums, base)) {
+    expr = `z.enum([${enums[base]!.map((l) => `'${escSQ(l)}'`).join(', ')}])`;
+  } else {
+    expr = zodScalar(pgTypeToTs(base, false));
+  }
+  if (isArray) expr += '.array()';
+  return expr;
+}
+
+/**
+ * Generate the contents of `zod.ts`. Emits, per table, `XSchema` (the full
+ * row), `XCreateSchema` (PK/defaulted/nullable columns optional, STORED
+ * generated columns omitted), and `XUpdateSchema` (PK + STORED generated
+ * columns omitted, every remaining column optional). Exported so tests can pin
+ * the output without writing files.
+ */
+export function generateZod(schema: SchemaMetadata): string {
+  const lines: string[] = [...generatedFileHeader()];
+  // `zod` is a USER dependency — this generated file imports it, but the Turbine
+  // library runtime never does, so Zod stays out of the package's dep graph.
+  lines.push("import { z } from 'zod';");
+  lines.push('');
+
+  for (const table of Object.values(schema.tables)) {
+    const typeName = entityName(table.name);
+
+    // Full-row schema.
+    lines.push(`/** Zod schema for a \`${table.name}\` row */`);
+    lines.push(`export const ${typeName}Schema = z.object({`);
+    for (const col of table.columns) {
+      let expr = zodBaseType(col, schema.enums);
+      if (col.nullable) expr += '.nullable()';
+      lines.push(`  ${col.field}: ${expr},`);
+    }
+    lines.push('});');
+    lines.push('');
+
+    // Create schema — STORED generated columns can never be written; PK,
+    // defaulted, and nullable columns are optional.
+    lines.push(`/** Zod schema for creating a \`${table.name}\` row */`);
+    lines.push(`export const ${typeName}CreateSchema = z.object({`);
+    for (const col of table.columns) {
+      if (col.isGeneratedStored) continue;
+      const isPk = table.primaryKey.includes(col.name);
+      let expr = zodBaseType(col, schema.enums);
+      if (col.nullable) expr += '.nullable()';
+      if (col.hasDefault || col.nullable || isPk) expr += '.optional()';
+      lines.push(`  ${col.field}: ${expr},`);
+    }
+    lines.push('});');
+    lines.push('');
+
+    // Update schema — PK and STORED generated columns omitted; all else optional.
+    lines.push(`/** Zod schema for updating a \`${table.name}\` row */`);
+    lines.push(`export const ${typeName}UpdateSchema = z.object({`);
+    for (const col of table.columns) {
+      if (col.isGeneratedStored) continue;
+      if (table.primaryKey.includes(col.name)) continue;
+      let expr = zodBaseType(col, schema.enums);
+      if (col.nullable) expr += '.nullable()';
+      expr += '.optional()';
+      lines.push(`  ${col.field}: ${expr},`);
+    }
+    lines.push('});');
     lines.push('');
   }
 
