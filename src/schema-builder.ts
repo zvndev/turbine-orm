@@ -26,7 +26,9 @@
 // Type-only import — erased at runtime, so it cannot introduce a circular
 // runtime dependency (the local `camelToSnakeLocal` copy avoids that for the
 // value-level helper).
-import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
+import type { ReferentialAction, RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
+
+export type { ReferentialAction } from './schema.js';
 
 // ---------------------------------------------------------------------------
 // Column types — lowercase shorthand mapped to Postgres types
@@ -51,7 +53,9 @@ export type ColumnTypeName =
   | 'real' // REAL
   | 'double' // DOUBLE PRECISION
   | 'numeric' // NUMERIC
-  | 'bytea'; // BYTEA
+  | 'bytea' // BYTEA
+  | 'enum' // user-defined enum type (requires `enumName`)
+  | 'vector'; // pgvector vector(n) (requires `dimensions`)
 
 /** Maps shorthand names to actual Postgres type strings */
 const TYPE_MAP: Record<ColumnTypeName, string> = {
@@ -82,11 +86,25 @@ const TYPE_MAP: Record<ColumnTypeName, string> = {
   double: 'DOUBLE PRECISION',
   numeric: 'NUMERIC',
   bytea: 'BYTEA',
+  // Sentinels — the real DDL type is derived from `enumName` / `dimensions`
+  // in schema-sql.ts, never from these placeholders.
+  enum: 'ENUM',
+  vector: 'VECTOR',
 };
 
 // ---------------------------------------------------------------------------
 // Column definition — the user-facing type
 // ---------------------------------------------------------------------------
+
+/** Foreign key reference with optional referential actions. */
+export interface ReferenceDef {
+  /** REFERENCES target in "table.column" form. */
+  target: string;
+  /** `ON DELETE` action. Omit for the Postgres default (`NO ACTION`). */
+  onDelete?: ReferentialAction;
+  /** `ON UPDATE` action. Omit for the Postgres default (`NO ACTION`). */
+  onUpdate?: ReferentialAction;
+}
 
 /** Column definition as a plain object. This is what users write. */
 export interface ColumnDef {
@@ -102,10 +120,21 @@ export interface ColumnDef {
   unique?: boolean;
   /** DEFAULT expression (raw SQL, e.g. 'now()' or "'active'") */
   default?: string;
-  /** REFERENCES target in "table.column" form */
-  references?: string;
+  /**
+   * REFERENCES target. Either the "table.column" string form or an object with
+   * referential actions ({@link ReferenceDef}).
+   */
+  references?: string | ReferenceDef;
   /** Max length for varchar columns */
   maxLength?: number;
+  /** Enum type name — required when `type: 'enum'`. */
+  enumName?: string;
+  /** pgvector dimension count — required when `type: 'vector'`. */
+  dimensions?: number;
+  /** When true, the column is an array of `type` (e.g. `text[]`). */
+  array?: boolean;
+  /** Column-level `CHECK` expression (raw SQL, e.g. `price >= 0`). */
+  check?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +158,9 @@ export type ColumnType =
   | 'NUMERIC'
   | 'BYTEA'
   | 'DATE'
-  | 'VARCHAR';
+  | 'VARCHAR'
+  | 'ENUM'
+  | 'VECTOR';
 
 export interface ColumnConfig {
   type: ColumnType;
@@ -140,6 +171,18 @@ export interface ColumnConfig {
   defaultValue: string | null;
   referencesTarget: string | null;
   maxLength: number | null;
+  /** FK `ON DELETE` action, or null for the Postgres default. */
+  onDelete: ReferentialAction | null;
+  /** FK `ON UPDATE` action, or null for the Postgres default. */
+  onUpdate: ReferentialAction | null;
+  /** Enum type name when `type === 'ENUM'`, else null. */
+  enumName: string | null;
+  /** pgvector dimensions when `type === 'VECTOR'`, else null. */
+  vectorDimensions: number | null;
+  /** Whether the column is an array of its base type. */
+  isArray: boolean;
+  /** Column-level `CHECK` expression, or null. */
+  check: string | null;
 }
 
 /** Convert a user-facing ColumnDef to the internal ColumnConfig */
@@ -147,6 +190,25 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
   if (!(def.type in TYPE_MAP)) {
     throw new Error(`Invalid column type "${def.type}". Valid types: ${Object.keys(TYPE_MAP).join(', ')}`);
   }
+  if (def.type === 'enum' && !def.enumName) {
+    throw new Error(`Column of type "enum" requires an "enumName" (the CREATE TYPE name).`);
+  }
+  if (def.type === 'vector' && (def.dimensions == null || def.dimensions <= 0)) {
+    throw new Error(`Column of type "vector" requires a positive "dimensions" count.`);
+  }
+
+  // `references` is either the "table.column" string or a { target, onDelete, onUpdate } object.
+  let referencesTarget: string | null = null;
+  let onDelete: ReferentialAction | null = null;
+  let onUpdate: ReferentialAction | null = null;
+  if (typeof def.references === 'string') {
+    referencesTarget = def.references;
+  } else if (def.references) {
+    referencesTarget = def.references.target;
+    onDelete = def.references.onDelete ?? null;
+    onUpdate = def.references.onUpdate ?? null;
+  }
+
   return {
     type: TYPE_MAP[def.type] as ColumnType,
     isPrimaryKey: def.primaryKey ?? false,
@@ -154,8 +216,14 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
     isNullable: def.nullable ?? false,
     isUnique: def.unique ?? false,
     defaultValue: def.default ?? null,
-    referencesTarget: def.references ?? null,
+    referencesTarget,
     maxLength: def.maxLength ?? null,
+    onDelete,
+    onUpdate,
+    enumName: def.enumName ?? null,
+    vectorDimensions: def.dimensions ?? null,
+    isArray: def.array ?? false,
+    check: def.check ?? null,
   };
 }
 
@@ -194,6 +262,14 @@ export interface ManyToManyDef {
   references?: string | readonly string[];
 }
 
+/** A table-level named (or unnamed) `CHECK` constraint. */
+export interface CheckDef {
+  /** Optional constraint name → `CONSTRAINT "name" CHECK (...)`. */
+  name?: string;
+  /** Raw SQL boolean expression, e.g. `price > cost`. */
+  expression: string;
+}
+
 export interface TableDef {
   /**
    * DDL-facing table name (snake_case). This is the name used when generating
@@ -225,6 +301,8 @@ export interface TableDef {
    * {@link SchemaMetadata} with `manyToMany` {@link RelationDef}s.
    */
   manyToMany?: readonly ManyToManyDef[];
+  /** Table-level `CHECK` constraints. */
+  checks?: readonly CheckDef[];
 }
 
 /**
@@ -236,8 +314,10 @@ export interface TableInput {
   primaryKey?: readonly string[];
   /** Optional explicit many-to-many relations on this table */
   manyToMany?: readonly ManyToManyDef[];
+  /** Optional table-level CHECK constraints */
+  checks?: readonly CheckDef[];
   /** Column definitions keyed by camelCase field name */
-  [columnName: string]: ColumnDef | readonly string[] | readonly ManyToManyDef[] | undefined;
+  [columnName: string]: ColumnDef | readonly string[] | readonly ManyToManyDef[] | readonly CheckDef[] | undefined;
 }
 
 export interface SchemaDef {
@@ -247,6 +327,23 @@ export interface SchemaDef {
    * name is available as `tables[key].name`.
    */
   tables: Record<string, TableDef>;
+  /**
+   * Schema-level enum declarations (`CREATE TYPE "<name>" AS ENUM (...)`),
+   * keyed by DDL enum type name → ordered labels. Consumed by `schema-sql.ts`
+   * to emit `CREATE TYPE` before the tables that reference them and by
+   * `generate.ts` for string-literal union codegen. Omitted when no enums are
+   * declared (back-compat with `{ tables }`-only consumers).
+   */
+  enums?: Record<string, readonly string[]>;
+}
+
+/** Options accepted by {@link defineSchema}. */
+export interface DefineSchemaOptions {
+  /**
+   * Schema-level enum declarations, keyed by DDL enum type name → ordered
+   * labels. Columns opt in via `{ type: 'enum', enumName: '<name>' }`.
+   */
+  enums?: Record<string, readonly string[]>;
 }
 
 /** Input format: table name -> column defs (object format) or TableDef (legacy builder) */
@@ -276,7 +373,7 @@ function isTableDef(v: unknown): v is TableDef {
  * });
  * ```
  */
-export function defineSchema(input: SchemaInput): SchemaDef {
+export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions): SchemaDef {
   const tables: Record<string, TableDef> = {};
 
   for (const [accessor, value] of Object.entries(input)) {
@@ -296,6 +393,7 @@ export function defineSchema(input: SchemaInput): SchemaDef {
       const columns: Record<string, ColumnConfig> = {};
       let pk: readonly string[] | undefined;
       let m2m: readonly ManyToManyDef[] | undefined;
+      let checks: readonly CheckDef[] | undefined;
 
       for (const [fieldName, def] of Object.entries(raw)) {
         if (fieldName === 'manyToMany') {
@@ -304,6 +402,15 @@ export function defineSchema(input: SchemaInput): SchemaDef {
               throw new Error(`Table "${accessor}": "manyToMany" must be an array of relation declarations`);
             }
             m2m = def as readonly ManyToManyDef[];
+          }
+          continue;
+        }
+        if (fieldName === 'checks') {
+          if (def !== undefined) {
+            if (!Array.isArray(def)) {
+              throw new Error(`Table "${accessor}": "checks" must be an array of { name?, expression } objects`);
+            }
+            checks = def as readonly CheckDef[];
           }
           continue;
         }
@@ -353,11 +460,12 @@ export function defineSchema(input: SchemaInput): SchemaDef {
         columns,
         ...(pk && pk.length > 0 ? { primaryKey: pk } : {}),
         ...(m2m && m2m.length > 0 ? { manyToMany: m2m } : {}),
+        ...(checks && checks.length > 0 ? { checks } : {}),
       };
     }
   }
 
-  return { tables };
+  return { tables, ...(options?.enums ? { enums: options.enums } : {}) };
 }
 
 /**
@@ -385,6 +493,12 @@ export class ColumnBuilder {
       defaultValue: null,
       referencesTarget: null,
       maxLength: null,
+      onDelete: null,
+      onUpdate: null,
+      enumName: null,
+      vectorDimensions: null,
+      isArray: false,
+      check: null,
     };
   }
 
@@ -483,8 +597,18 @@ export class ColumnBuilder {
     this._config.defaultValue = val;
     return this;
   }
-  references(target: string): this {
+  references(target: string, opts?: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction }): this {
     this._config.referencesTarget = target;
+    this._config.onDelete = opts?.onDelete ?? null;
+    this._config.onUpdate = opts?.onUpdate ?? null;
+    return this;
+  }
+  check(expression: string): this {
+    this._config.check = expression;
+    return this;
+  }
+  array(): this {
+    this._config.isArray = true;
     return this;
   }
 

@@ -18,8 +18,112 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { defineSchema } from '../schema-builder.js';
-import { schemaDiff, schemaToSQL, schemaToSQLString } from '../schema-sql.js';
+import {
+  buildAddForeignKeyStatement,
+  type DbForeignKey,
+  diffCheckConstraints,
+  diffEnumValues,
+  diffReferentialAction,
+  schemaDiff,
+  schemaToSQL,
+  schemaToSQLString,
+} from '../schema-sql.js';
 import { skipGate } from './helpers.js';
+
+// ---------------------------------------------------------------------------
+// WS-B pure diff helpers (no DB) — referential actions, enums, checks
+// ---------------------------------------------------------------------------
+
+describe('B1 — diffReferentialAction (pure)', () => {
+  const db: DbForeignKey = {
+    constraintName: 'posts_user_id_fkey',
+    column: 'user_id',
+    targetTable: 'users',
+    targetColumn: 'id',
+    onDelete: 'no action',
+    onUpdate: 'no action',
+  };
+
+  it('returns null when actions match', () => {
+    assert.equal(diffReferentialAction('posts', db, 'no action', 'no action'), null);
+  });
+
+  it('emits DROP + ADD CONSTRAINT when onDelete changes', () => {
+    const change = diffReferentialAction('posts', db, 'cascade', 'no action')!;
+    assert.ok(change);
+    assert.equal(change.statements.length, 2);
+    assert.match(change.statements[0]!, /DROP CONSTRAINT "posts_user_id_fkey"/);
+    assert.match(
+      change.statements[1]!,
+      /ADD CONSTRAINT "posts_user_id_fkey" FOREIGN KEY \("user_id"\) REFERENCES "users"\("id"\) ON DELETE CASCADE/,
+    );
+    // reverse restores the old (no action → no clause)
+    assert.ok(!change.reverseStatements[1]!.includes('ON DELETE'));
+  });
+
+  it('buildAddForeignKeyStatement omits default (no action) clauses', () => {
+    const sql = buildAddForeignKeyStatement('posts', 'fk', 'user_id', 'users', 'id', 'no action', 'no action');
+    assert.ok(!sql.includes('ON DELETE'));
+    assert.ok(!sql.includes('ON UPDATE'));
+  });
+});
+
+describe('B2 — diffEnumValues (pure)', () => {
+  it('appends new labels in order via ALTER TYPE ADD VALUE', () => {
+    const { statements, warnings } = diffEnumValues(
+      'post_status',
+      ['draft', 'published', 'archived'],
+      ['draft', 'published'],
+    );
+    assert.deepEqual(statements, [`ALTER TYPE "post_status" ADD VALUE 'archived';`]);
+    assert.equal(warnings.length, 0);
+  });
+
+  it('warns (does not auto-apply) on label removal/reorder', () => {
+    const { statements, warnings } = diffEnumValues('post_status', ['draft'], ['draft', 'published']);
+    assert.equal(statements.length, 0);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /cannot remove enum values/i);
+  });
+
+  it('no change → no statements', () => {
+    const { statements, warnings } = diffEnumValues('m', ['a', 'b'], ['a', 'b']);
+    assert.equal(statements.length, 0);
+    assert.equal(warnings.length, 0);
+  });
+});
+
+describe('B5 — diffCheckConstraints (pure)', () => {
+  it('adds a named check missing from the DB', () => {
+    const { statements } = diffCheckConstraints('products', [{ name: 'price_pos', expression: 'price >= 0' }], []);
+    assert.deepEqual(statements, [`ALTER TABLE "products" ADD CONSTRAINT "price_pos" CHECK (price >= 0);`]);
+  });
+
+  it('drops a DB check absent from the schema', () => {
+    const { statements } = diffCheckConstraints('products', [], [{ name: 'old_chk', expression: 'x > 0' }]);
+    assert.deepEqual(statements, [`ALTER TABLE "products" DROP CONSTRAINT "old_chk";`]);
+  });
+
+  it('drop+add on expression change (same name)', () => {
+    const { statements } = diffCheckConstraints(
+      'products',
+      [{ name: 'chk', expression: 'price > cost' }],
+      [{ name: 'chk', expression: 'price >= cost' }],
+    );
+    assert.equal(statements.length, 2);
+    assert.match(statements[0]!, /DROP CONSTRAINT "chk"/);
+    assert.match(statements[1]!, /ADD CONSTRAINT "chk" CHECK \(price > cost\)/);
+  });
+
+  it('whitespace-only difference is not a change', () => {
+    const { statements } = diffCheckConstraints(
+      'products',
+      [{ name: 'chk', expression: 'price  >   0' }],
+      [{ name: 'chk', expression: 'price > 0' }],
+    );
+    assert.equal(statements.length, 0);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Unit tests: schemaToSQL patterns for CREATE TABLE (UP) and DROP TABLE (DOWN)
@@ -356,6 +460,103 @@ integrationDescribe('schemaDiff() integration — live database', () => {
     assert.ok(Array.isArray(diff.drop));
     assert.ok(Array.isArray(diff.statements));
     assert.ok(Array.isArray(diff.reverseStatements));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WS-B round-trip integration — defineSchema → push → diff = empty
+// ---------------------------------------------------------------------------
+
+describe('WS-B round-trip — extended features push then diff clean', () => {
+  const { it, before, after } = skipGate(!DATABASE_URL, 'DATABASE_URL not set');
+
+  // Unique names so we never collide with (or clobber) real public tables.
+  const suffix = `wsb_${Date.now()}`;
+  const orgTable = `orgs_${suffix}`;
+  const memberTable = `members_${suffix}`;
+  const enumName = `member_role_${suffix}`;
+
+  const buildSchema = () =>
+    defineSchema(
+      {
+        [orgTable]: {
+          id: { type: 'serial', primaryKey: true },
+          name: { type: 'text', notNull: true },
+        },
+        [memberTable]: {
+          id: { type: 'serial', primaryKey: true },
+          orgId: {
+            type: 'integer',
+            notNull: true,
+            references: { target: `${orgTable}.id`, onDelete: 'cascade' },
+          },
+          role: { type: 'enum', enumName, notNull: true, default: "'member'" },
+          seats: { type: 'integer', notNull: true, check: 'seats >= 0' },
+          checks: [{ name: `${memberTable}_seats_cap`, expression: 'seats <= 100' }],
+        },
+      },
+      { enums: { [enumName]: ['member', 'admin', 'owner'] } },
+    );
+
+  after(async () => {
+    const pg = await import('pg');
+    const client = new pg.default.Client({ connectionString: DATABASE_URL });
+    await client.connect();
+    await client.query(`DROP TABLE IF EXISTS "${memberTable}" CASCADE`);
+    await client.query(`DROP TABLE IF EXISTS "${orgTable}" CASCADE`);
+    await client.query(`DROP TYPE IF EXISTS "${enumName}"`);
+    await client.end();
+  });
+
+  before(async () => {
+    const { schemaPush } = await import('../schema-sql.js');
+    await schemaPush(buildSchema(), DATABASE_URL!);
+  });
+
+  it('re-diffing the pushed schema produces no statements for its objects', async () => {
+    const diff = await schemaDiff(buildSchema(), DATABASE_URL!);
+    const mine = diff.statements.filter((s) => s.includes(orgTable) || s.includes(memberTable) || s.includes(enumName));
+    assert.deepEqual(mine, [], `expected empty diff for WS-B objects, got:\n${mine.join('\n')}`);
+  });
+
+  it('appending an enum value is detected as ALTER TYPE ADD VALUE', async () => {
+    const grown = defineSchema(
+      {
+        [orgTable]: { id: { type: 'serial', primaryKey: true }, name: { type: 'text', notNull: true } },
+        [memberTable]: {
+          id: { type: 'serial', primaryKey: true },
+          orgId: { type: 'integer', notNull: true, references: { target: `${orgTable}.id`, onDelete: 'cascade' } },
+          role: { type: 'enum', enumName, notNull: true, default: "'member'" },
+          seats: { type: 'integer', notNull: true, check: 'seats >= 0' },
+          checks: [{ name: `${memberTable}_seats_cap`, expression: 'seats <= 100' }],
+        },
+      },
+      { enums: { [enumName]: ['member', 'admin', 'owner', 'billing'] } },
+    );
+    const diff = await schemaDiff(grown, DATABASE_URL!);
+    assert.ok(
+      diff.statements.some((s) => s.includes(`ALTER TYPE "${enumName}" ADD VALUE 'billing'`)),
+      `expected ADD VALUE for 'billing', got:\n${diff.statements.join('\n')}`,
+    );
+  });
+
+  it('changing a FK referential action is detected as DROP + ADD CONSTRAINT', async () => {
+    const changed = defineSchema(
+      {
+        [orgTable]: { id: { type: 'serial', primaryKey: true }, name: { type: 'text', notNull: true } },
+        [memberTable]: {
+          id: { type: 'serial', primaryKey: true },
+          orgId: { type: 'integer', notNull: true, references: { target: `${orgTable}.id`, onDelete: 'set null' } },
+          role: { type: 'enum', enumName, notNull: true, default: "'member'" },
+          seats: { type: 'integer', notNull: true, check: 'seats >= 0' },
+          checks: [{ name: `${memberTable}_seats_cap`, expression: 'seats <= 100' }],
+        },
+      },
+      { enums: { [enumName]: ['member', 'admin', 'owner'] } },
+    );
+    const diff = await schemaDiff(changed, DATABASE_URL!);
+    assert.ok(diff.statements.some((s) => /DROP CONSTRAINT/.test(s) && s.includes(memberTable)));
+    assert.ok(diff.statements.some((s) => /ADD CONSTRAINT.*ON DELETE SET NULL/.test(s)));
   });
 });
 
