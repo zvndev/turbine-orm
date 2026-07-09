@@ -10,13 +10,19 @@ Close remaining **security honesty gaps** (MCP free-form SQL, Studio non-loopbac
 
 ## Success Criteria
 
-- [ ] MCP has no free-form user SQL execution path for EXPLAIN
-- [ ] Studio/Observe refuse non-loopback host without `--allow-remote`
-- [ ] Site quickstart documents tsx, `"type": "module"`, schema vs schemaFile, empty-DB path
-- [ ] `npm run examples` works or is removed; dogfood still valid
-- [ ] `mssql` peer range includes what we test (^12)
-- [ ] Unit tests pass; docs match new flags/tool shapes
-- [ ] CHANGELOG notes security + hygiene (PM consolidates after merge)
+- [x] MCP has no free-form user SQL execution path for EXPLAIN
+- [x] Studio/Observe refuse non-loopback host without `--allow-remote`
+- [x] Site quickstart documents tsx, `"type": "module"`, schema vs schemaFile, empty-DB path
+- [x] `npm run examples` works or is removed; dogfood still valid
+- [x] `mssql` peer range includes what we test (^12)
+- [x] Unit tests pass; docs match new flags/tool shapes
+- [x] CHANGELOG notes security + hygiene (PM consolidates after merge)
+
+## Sprint status (2026-07-09)
+
+**Implemented and merged** on `sprint/v0.28.0-parity` (8 commits ahead of origin).  
+**Verify:** typecheck + lint + 1341 unit pass / 0 fail; size budgets green.  
+**Not done in this sprint:** npm publish, vercel prod, push to origin (manual).
 
 ## Already done on branch (do not re-do)
 
