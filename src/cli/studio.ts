@@ -6,10 +6,11 @@
  * raw-SQL input surface — the Query tab builds `findMany` args that are
  * validated against introspected metadata and compiled by QueryInterface
  * (`/api/builder`). Pure Node (built-in `http` module), no runtime
- * dependencies beyond `pg`, bound to 127.0.0.1 only.
+ * dependencies beyond `pg`. CLI defaults to 127.0.0.1 and refuses non-loopback
+ * hosts unless `npx turbine studio --allow-remote` is set.
  *
  * Security model:
- *   • Bind 127.0.0.1 only (never 0.0.0.0 — no LAN exposure)
+ *   • Loopback by default; CLI refuses non-loopback without --allow-remote
  *   • Random auth token generated per process, required in Cookie header
  *   • No SQL input surface at all — every identifier in a builder request is
  *     validated against the introspected schema; all values are $N params

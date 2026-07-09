@@ -28,7 +28,7 @@ Six read-only tools. Every database access runs inside a `BEGIN READ ONLY` trans
 | `explain_query` | `EXPLAIN (FORMAT JSON)` for a schema-validated `findMany` plan (see below). |
 | `sample_rows` | Up to 50 rows from a table whose name is validated against the introspected schema. |
 
-`explain_query` never accepts free-form SQL. You pass builder args — the same shape Studio’s Query tab compiles — and Turbine validates identifiers against the introspected schema, builds parameterized SQL via `QueryInterface.buildFindMany`, then runs `EXPLAIN (FORMAT JSON)` on that SQL with bound params only.
+`explain_query` never accepts free-form SQL. You pass a **subset** of Studio’s builder args (`table` + optional `where` / `orderBy` / `limit` / `select` — not `with` / `omit`). Turbine validates identifiers against the introspected schema, builds parameterized SQL via `QueryInterface.buildFindMany`, then runs `EXPLAIN (FORMAT JSON)` on that SQL with bound params only.
 
 | Argument | Required | Description |
 |---|---|---|

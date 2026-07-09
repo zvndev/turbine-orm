@@ -690,7 +690,7 @@ npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 **Security posture (read-only by design)**
 
 - **No SQL input surface.** There is nothing to inject into — builder requests are validated identifier-by-identifier against the introspected schema, and every value is bound as a `$N` parameter.
-- **Loopback by default** (`127.0.0.1`) with a loud warning if you bind to a non-loopback address.
+- **Loopback by default** (`127.0.0.1`). Non-loopback `--host` is **refused** unless you pass `--allow-remote` (loud warning when you opt in).
 - **Per-process auth token** — 24 random bytes of hex, stored in a `SameSite=Strict` `HttpOnly` cookie.
 - **Every query runs inside `BEGIN READ ONLY`** with a 30s transaction-local statement timeout (parameterized `set_config`). Writes are physically impossible at the transaction level.
 - **Security headers on every response** — CSP, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` — plus per-session rate limiting and cross-origin refusal.
@@ -729,7 +729,7 @@ TURBINE_OBSERVE_URL=postgres://... npx turbine observe
 # Flags: --port (default 4984), --host (default 127.0.0.1), --no-open
 ```
 
-Same security model as Studio: loopback binding by default, per-process random auth token in an `HttpOnly` cookie, CSP headers, and read-only access to the metrics table.
+Same security model as Studio: loopback by default, non-loopback refused without `--allow-remote`, per-process random auth token in an `HttpOnly` cookie, CSP headers, and read-only access to the metrics table.
 
 ## Serverless / Edge
 
