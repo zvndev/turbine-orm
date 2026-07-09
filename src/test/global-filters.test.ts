@@ -113,7 +113,7 @@ function schema(): SchemaMetadata {
 /** A soft-delete filter (`deletedAt: null`) — the parameterless canonical case. */
 const softDelete = { deletedAt: null };
 
-function qi(table: string, filters: QueryInterfaceOptions['globalFilters']): QueryInterface {
+function qi(table: string, filters: QueryInterfaceOptions['globalFilters']): QueryInterface<Record<string, unknown>> {
   return makeQuery(table, schema(), { globalFilters: filters });
 }
 
