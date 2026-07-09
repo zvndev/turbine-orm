@@ -54,6 +54,14 @@ export interface UpsertStatementInput {
   conflictColumns: string[];
   /** SQL-ready update SET clauses. */
   updateSetClauses: string[];
+  /**
+   * Optional SQL-ready predicate (no `WHERE` keyword) restricting the
+   * conflict-UPDATE to matching rows — used by global filters (soft-delete /
+   * multi-tenancy) so an upsert never resurrects/steals a row outside the
+   * filter. Only honored by dialects that set
+   * {@link Dialect.supportsUpsertUpdateWhere}; others must never receive it.
+   */
+  updateWhere?: string;
   /** Optional SQL-ready RETURNING selection. */
   returning?: string;
 }
@@ -297,6 +305,16 @@ export interface Dialect {
   /** Whether INSERT/UPDATE/DELETE support RETURNING rows. */
   readonly supportsReturning: boolean;
 
+  /**
+   * Whether {@link buildUpsertStatement} honors {@link UpsertStatementInput.updateWhere}
+   * (a predicate on the conflict-UPDATE, e.g. Postgres `ON CONFLICT … DO UPDATE
+   * SET … WHERE …`). Global filters only push a conflict-UPDATE predicate when
+   * this is true, so engines whose upsert cannot express one (MySQL
+   * `ON DUPLICATE KEY UPDATE`) never receive an orphaned parameter. Optional —
+   * absent is treated as `false`.
+   */
+  readonly supportsUpsertUpdateWhere?: boolean;
+
   /** Whether this dialect/engine supports pgvector distance ops (KNN / distance WHERE). */
   readonly supportsVector: boolean;
 
@@ -526,6 +544,7 @@ export const postgresDialect: Dialect = {
   name: 'postgresql',
   resultStrategy: 'returning',
   supportsReturning: true,
+  supportsUpsertUpdateWhere: true,
   supportsILike: true,
   jsonPathSupport: 'native',
   emptyJsonArrayLiteral: "'[]'::json",
@@ -611,6 +630,7 @@ export const postgresDialect: Dialect = {
     return (
       `INSERT INTO ${input.table} (${input.insertColumns.join(', ')}) VALUES (${input.valuePlaceholders.join(', ')})` +
       ` ON CONFLICT (${input.conflictColumns.join(', ')}) DO UPDATE SET ${input.updateSetClauses.join(', ')}` +
+      (input.updateWhere ? ` WHERE ${input.updateWhere}` : '') +
       this.buildReturningClause(input.returning)
     );
   },

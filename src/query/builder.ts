@@ -54,6 +54,7 @@ import type {
   FindManyArgs,
   FindManyStreamArgs,
   FindUniqueArgs,
+  GlobalFilters,
   GroupByArgs,
   HavingClause,
   HavingFilter,
@@ -64,6 +65,7 @@ import type {
   OrderDirection,
   QueryResult,
   RelationLoadStrategy,
+  SkipGlobalFilters,
   TextSearchFilter,
   TypedWithClause,
   UpdateArgs,
@@ -442,6 +444,13 @@ export interface QueryInterfaceOptions {
    * `with` clause on any other dialect throws `UnsupportedFeatureError` (E017).
    */
   jsonEncoding?: 'object' | 'positional';
+  /**
+   * Automatic WHERE filters keyed by table accessor, AND-merged into every
+   * query on that table and every relation subquery targeting it (soft-delete /
+   * multi-tenancy). Function values are evaluated at query-build time. See
+   * {@link GlobalFilters}.
+   */
+  globalFilters?: GlobalFilters;
   /** @internal Set by TransactionClient — signals that this QI runs inside an active transaction. */
   _txScoped?: boolean;
   /** @internal Callback from TurbineClient for query event emission. */
@@ -497,6 +506,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** Nested-relation JSON encoding: 'object' (default) or 'positional'. */
   private readonly jsonEncoding: 'object' | 'positional';
   /**
+   * Client-level automatic WHERE filters keyed by table accessor (soft-delete /
+   * multi-tenancy). AND-merged into every query on the keyed table and every
+   * relation subquery targeting it. Undefined when none are configured, in
+   * which case every path is byte-identical to the pre-0.28 behavior.
+   */
+  private readonly globalFilters?: GlobalFilters;
+  /**
    * Tracks tables that have already triggered an unlimited-query warning so
    * the user is not spammed once per row. Per-instance state — each
    * QueryInterface is bound to a single table, so this set will only ever
@@ -535,6 +551,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** Set by executeWithMiddleware so queryWithTimeout can include it in events. */
   private currentAction = 'raw';
 
+  /**
+   * The active query's `skipGlobalFilters` opt-out, set at the top of each
+   * `build*` method and read deep in the (synchronous) SQL-build + param-collect
+   * tree — so relation subqueries, relation filters, `_count`, and relation
+   * `orderBy` all see it without threading it through dozens of signatures.
+   * Only load-bearing when {@link globalFilters} is configured; build+collect are
+   * synchronous per call, so this transient is never observed across an await.
+   */
+  private currentSkip: SkipGlobalFilters | undefined;
+
   constructor(
     private readonly pool: pg.Pool,
     private readonly table: string,
@@ -561,6 +587,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.dialect = options?.dialect ?? postgresDialect;
     this.relationLoadStrategy = options?.relationLoadStrategy ?? 'join';
     this.jsonEncoding = options?.jsonEncoding ?? 'object';
+    // Only retain the map when it has at least one entry, so `globalFilters`
+    // stays `undefined` (and every merge path a no-op) for the common case.
+    this.globalFilters =
+      options?.globalFilters && Object.keys(options.globalFilters).length > 0 ? options.globalFilters : undefined;
     this.txScoped = options?._txScoped ?? false;
     this.options = options;
 
@@ -1015,12 +1045,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
   buildFindUnique<W extends TypedWithClause<R> = {}>(
     args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): DeferredQuery<T | null> {
+    this.currentSkip = args.skipGlobalFilters;
     const columnsList = this.resolveColumns(args.select, args.omit);
-    const whereObj = args.where as Record<string, unknown>;
+    // A global filter turns the where into `{ AND: [...] }`, which the
+    // `isSimpleWhere` test below rejects → the general (buildWhereClause) path
+    // handles the merge and its params uniformly.
+    const whereObj = (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     const colKey = columnsList ? columnsList.join(',') : '*';
     const whereFingerprint = this.fingerprintWhere(whereObj);
     const withFp = args.with ? this.withFingerprint(args.with as WithClause) : '';
-    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}`;
+    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -1203,12 +1237,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
   buildFindMany<W extends TypedWithClause<R> = {}>(
     args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): DeferredQuery<T[]> {
+    this.currentSkip = args?.skipGlobalFilters;
     const columnsList = this.resolveColumns(args?.select, args?.omit);
     const colKey = columnsList ? columnsList.join(',') : '*';
-    const whereObj = (args?.where ?? {}) as Record<string, unknown>;
+    // AND-merge this table's global filter into the user where; `hasWhere` gates
+    // the build/collect just like `args?.where` did (a merged filter can make
+    // an otherwise-absent where present).
+    const effWhere = this.mergeGlobalFilter(args?.where as Record<string, unknown> | undefined);
+    const hasWhere = effWhere !== undefined;
+    const whereObj = (effWhere ?? {}) as Record<string, unknown>;
 
     // Build fingerprint for cache lookup
-    const whereFp = args?.where ? this.fingerprintWhere(whereObj) : '';
+    const whereFp = hasWhere ? this.fingerprintWhere(whereObj) : '';
     const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
     const orderFp = args?.orderBy
       ? Object.entries(args.orderBy)
@@ -1226,14 +1266,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const limitFp = effectiveLimit !== undefined ? '1' : '0';
     const offsetFp = args?.offset !== undefined ? '1' : '0';
 
-    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}`;
+    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
     const entry = this.acquireSql(ck, () => {
       // Fresh build — generates SQL and populates freshParams
       const freshParams: unknown[] = [];
-      const { sql: freshWhereSql } = args?.where
+      const { sql: freshWhereSql } = hasWhere
         ? (() => {
             const clause = this.buildWhereClause(whereObj, freshParams);
             return { sql: clause ? ` WHERE ${clause}` : '' };
@@ -1316,8 +1356,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     });
 
     // Collect params in exact build order:
-    // 1. WHERE params
-    if (args?.where) {
+    // 1. WHERE params (includes the AND-merged global filter, if any)
+    if (hasWhere) {
       this.collectWhereParams(whereObj, params);
     }
     // 2. WITH relation params
@@ -1722,12 +1762,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpdate(args: UpdateArgs<T>): DeferredQuery<T> {
+    this.currentSkip = args.skipGlobalFilters;
     const dataObj = args.data as Record<string, unknown>;
-    const whereObj = args.where as Record<string, unknown>;
+    const userWhere = args.where as Record<string, unknown>;
     const lock = args.optimisticLock;
+    // The empty-`where` guard checks the USER predicate only — a global filter
+    // must never turn an unguarded mass update into an allowed one.
+    const userHasPredicate = !this.userPredicateIsEmpty(userWhere) || !!lock;
+    this.assertMutationHasPredicate('update', userHasPredicate ? ' WHERE x' : '', args.allowFullTableScan);
+    // The SQL is built from the global-filter-merged where (soft-delete keeps an
+    // update from touching already-deleted rows).
+    const whereObj = (this.mergeGlobalFilter(userWhere) ?? {}) as Record<string, unknown>;
     const setFp = this.fingerprintSet(dataObj);
     const whereFp = this.fingerprintWhere(whereObj);
-    const ck = lock ? null : `u:${setFp}|${whereFp}`;
+    const ck = lock ? null : `u:${setFp}|${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -1751,7 +1799,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
         whereSql = whereSql ? `${whereSql} AND ${versionCheck}` : ` WHERE ${versionCheck}`;
       }
 
-      this.assertMutationHasPredicate('update', whereSql, args.allowFullTableScan);
       // Engines that inject their returning shape MID-statement (SQL Server
       // `OUTPUT INSERTED.*` between SET and WHERE) override buildUpdateStatement;
       // absent → the trailing-clause PG/SQLite/MySQL form (byte-identical).
@@ -1767,9 +1814,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const entry = this.acquireSql(ck, buildSql);
       sql = entry.sql;
       preparedName = entry.name;
-      if (whereFp === '') {
-        this.assertMutationHasPredicate('update', '', args.allowFullTableScan);
-      }
     } else {
       sql = buildSql();
     }
@@ -1915,30 +1959,29 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildDelete(args: DeleteArgs<T>): DeferredQuery<T> {
-    const whereObj = args.where as Record<string, unknown>;
+    this.currentSkip = args.skipGlobalFilters;
+    // Guard the USER predicate (a global filter must not satisfy the guard).
+    this.assertMutationHasPredicate(
+      'delete',
+      this.userPredicateIsEmpty(args.where as Record<string, unknown>) ? '' : ' WHERE x',
+      args.allowFullTableScan,
+    );
+    const whereObj = (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     const whereFp = this.fingerprintWhere(whereObj);
-    const ck = `d:${whereFp}`;
+    const ck = `d:${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
-    // We need to check the mutation predicate. Build the whereSql to test it.
-    // On cache hit we still need to validate (the shape may be empty).
     const entry = this.acquireSql(ck, () => {
       const freshParams: unknown[] = [];
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
-      this.assertMutationHasPredicate('delete', whereSql, args.allowFullTableScan);
       // SQL Server injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and WHERE;
       // absent override → the trailing-clause PG/SQLite/MySQL form (byte-identical).
       return this.dialect.buildDeleteStatement
         ? this.dialect.buildDeleteStatement({ table: this.q(this.table), whereSql, returning: '*' })
         : `DELETE FROM ${this.q(this.table)}${whereSql}${this.dialect.buildReturningClause('*')}`;
     });
-
-    // On cache hit, still validate the predicate
-    if (whereFp === '') {
-      this.assertMutationHasPredicate('delete', '', args.allowFullTableScan);
-    }
 
     this.collectWhereParams(whereObj, params);
 
@@ -1984,6 +2027,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpsert(args: UpsertArgs<T>): DeferredQuery<T> {
+    this.currentSkip = args.skipGlobalFilters;
     // Build the INSERT part from create data
     const createEntries = Object.entries(args.create as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = createEntries.map(([k]) => this.toSqlColumn(k));
@@ -2008,12 +2052,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params = [...createParams, ...updateParams];
 
+    // Global filter → restrict the conflict-UPDATE (soft-delete / tenancy) so an
+    // upsert never resurrects a soft-deleted row or writes across tenants. Only
+    // on engines whose upsert can carry a predicate (Postgres); the gf params
+    // continue the placeholder numbering after create+update params.
+    let updateWhere: string | undefined;
+    if (this.dialect.supportsUpsertUpdateWhere) {
+      const gf = this.resolveGlobalFilter(this.table);
+      if (gf) updateWhere = this.buildWhereClause(gf, params) ?? undefined;
+    }
+
     const sql = this.dialect.buildUpsertStatement({
       table: this.q(this.table),
       insertColumns: columns,
       valuePlaceholders: placeholders,
       conflictColumns,
       updateSetClauses: setClauses,
+      updateWhere,
       returning: '*',
     });
 
@@ -2038,7 +2093,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
         this.dialect.resultStrategy === 'reselect'
           ? async (exec) => {
               await exec(sql, params);
-              const sel = this.buildReselectByWhere(args.where as Record<string, unknown>);
+              const sel = this.buildReselectByWhere(
+                (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>,
+              );
               return exec(sel.sql, sel.params);
             }
           : undefined,
@@ -2058,11 +2115,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
+    this.currentSkip = args.skipGlobalFilters;
     const dataObj = args.data as Record<string, unknown>;
-    const whereObj = args.where as Record<string, unknown>;
+    this.assertMutationHasPredicate(
+      'updateMany',
+      this.userPredicateIsEmpty(args.where as Record<string, unknown>) ? '' : ' WHERE x',
+      args.allowFullTableScan,
+    );
+    const whereObj = (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     const setFp = this.fingerprintSet(dataObj);
     const whereFp = this.fingerprintWhere(whereObj);
-    const ck = `um:${setFp}|${whereFp}`;
+    const ck = `um:${setFp}|${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -2072,13 +2135,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, freshParams));
       const whereClause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
-      this.assertMutationHasPredicate('updateMany', whereSql, args.allowFullTableScan);
       return `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}`;
     });
-
-    if (whereFp === '') {
-      this.assertMutationHasPredicate('updateMany', '', args.allowFullTableScan);
-    }
 
     this.collectSetParams(dataObj, params);
     this.collectWhereParams(whereObj, params);
@@ -2105,9 +2163,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildDeleteMany(args: DeleteManyArgs<T>): DeferredQuery<{ count: number }> {
-    const whereObj = args.where as Record<string, unknown>;
+    this.currentSkip = args.skipGlobalFilters;
+    this.assertMutationHasPredicate(
+      'deleteMany',
+      this.userPredicateIsEmpty(args.where as Record<string, unknown>) ? '' : ' WHERE x',
+      args.allowFullTableScan,
+    );
+    const whereObj = (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     const whereFp = this.fingerprintWhere(whereObj);
-    const ck = `dm:${whereFp}`;
+    const ck = `dm:${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -2115,13 +2179,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const freshParams: unknown[] = [];
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
-      this.assertMutationHasPredicate('deleteMany', whereSql, args.allowFullTableScan);
       return `DELETE FROM ${this.q(this.table)}${whereSql}`;
     });
-
-    if (whereFp === '') {
-      this.assertMutationHasPredicate('deleteMany', '', args.allowFullTableScan);
-    }
 
     this.collectWhereParams(whereObj, params);
 
@@ -2147,20 +2206,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildCount(args?: CountArgs<T>): DeferredQuery<number> {
-    const whereObj = (args?.where ?? {}) as Record<string, unknown>;
-    const whereFp = args?.where ? this.fingerprintWhere(whereObj) : '';
-    const ck = `cnt:${whereFp}`;
+    this.currentSkip = args?.skipGlobalFilters;
+    const effWhere = this.mergeGlobalFilter(args?.where as Record<string, unknown> | undefined);
+    const hasWhere = effWhere !== undefined;
+    const whereObj = (effWhere ?? {}) as Record<string, unknown>;
+    const whereFp = hasWhere ? this.fingerprintWhere(whereObj) : '';
+    const ck = `cnt:${whereFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
     const entry = this.acquireSql(ck, () => {
       const freshParams: unknown[] = [];
-      const clause = args?.where ? this.buildWhereClause(whereObj, freshParams) : null;
+      const clause = hasWhere ? this.buildWhereClause(whereObj, freshParams) : null;
       const whereSql = clause ? ` WHERE ${clause}` : '';
       return `SELECT ${this.castAgg('COUNT(*)', 'int')} AS count FROM ${this.q(this.table)}${whereSql}`;
     });
 
-    if (args?.where) {
+    if (hasWhere) {
       this.collectWhereParams(whereObj, params);
     }
 
@@ -2194,9 +2256,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
     }
+    this.currentSkip = args.skipGlobalFilters;
     const groupColsRaw = args.by.map((k) => this.toColumn(k as string));
     const groupCols = groupColsRaw.map((c) => this.q(c));
-    const { sql: whereSql, params } = args.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
+    const gbWhere = this.mergeGlobalFilter(args.where as Record<string, unknown> | undefined);
+    const { sql: whereSql, params } = gbWhere
+      ? this.buildWhere(gbWhere as WhereClause<T>)
+      : { sql: '', params: [] as unknown[] };
 
     // Build SELECT expressions: group-by columns + aggregate functions
     const selectExprs = [...groupCols];
@@ -2472,7 +2538,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildAggregate(args: AggregateArgs<T>): DeferredQuery<AggregateResult<T>> {
-    const { sql: whereSql, params } = args.where ? this.buildWhere(args.where) : { sql: '', params: [] as unknown[] };
+    this.currentSkip = args.skipGlobalFilters;
+    const aggWhere = this.mergeGlobalFilter(args.where as Record<string, unknown> | undefined);
+    const { sql: whereSql, params } = aggWhere
+      ? this.buildWhere(aggWhere as WhereClause<T>)
+      : { sql: '', params: [] as unknown[] };
 
     const meta = this.schema.tables[this.table];
     if (meta) {
@@ -3460,6 +3530,117 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return { sql: ` WHERE ${clause}`, params };
   }
 
+  // -------------------------------------------------------------------------
+  // Global filters (soft-delete / multi-tenancy — WS-G)
+  //
+  // A configured global filter for a table is AND-merged into the compiled WHERE
+  // of every query on that table (via {@link mergeGlobalFilter}, so the merge is
+  // captured in the where fingerprint/collect for free) and into every relation
+  // subquery targeting it (rendered at build time against the subquery's alias/
+  // table by the `*GlobalFilterAlias`/`*GlobalFilterExists` helpers, with the
+  // shape folded into the SQL-cache key via {@link globalFilterCacheSegment}).
+  // Function filters are evaluated per resolve — at query-build time — enabling
+  // per-request tenancy via a closure. They must return a STABLE shape (same
+  // keys/operators); only values may vary between calls.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve the configured global filter for `table`, evaluating a function
+   * filter, honoring the active query's `skipGlobalFilters`. Returns `null` when
+   * no filter applies, the query opted out, or the filter is empty.
+   */
+  private resolveGlobalFilter(table: string): Record<string, unknown> | null {
+    const filters = this.globalFilters;
+    if (!filters) return null;
+    const skip = this.currentSkip;
+    if (skip === true) return null;
+    if (Array.isArray(skip) && skip.includes(table)) return null;
+    const raw = filters[table];
+    if (raw === undefined) return null;
+    const resolved = typeof raw === 'function' ? raw() : raw;
+    if (resolved === null || resolved === undefined) return null;
+    const obj = resolved as Record<string, unknown>;
+    // An all-undefined filter (e.g. `{ tenantId: undefined }`) contributes
+    // nothing — treat it as absent so it never emits a dangling clause.
+    if (Object.keys(obj).every((k) => obj[k] === undefined)) return null;
+    return obj;
+  }
+
+  /**
+   * AND-merge this table's resolved global filter into a user `where`. Either
+   * side may be absent. When no filter applies the user where is returned by
+   * reference, so fingerprints/SQL stay byte-identical to the pre-0.28 path.
+   */
+  private mergeGlobalFilter(userWhere: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+    const gf = this.resolveGlobalFilter(this.table);
+    if (!gf) return userWhere;
+    if (userWhere === undefined) return gf;
+    return { AND: [userWhere, gf] };
+  }
+
+  /**
+   * SQL clause for `targetTable`'s global filter rendered against `alias`
+   * (relation subqueries, `_count`, relation `orderBy`). Pushes its params to
+   * `params`; returns `''` when no filter applies. Mirror:
+   * {@link collectTargetGlobalFilterAlias}.
+   */
+  private targetGlobalFilterAlias(targetTable: string, alias: string, params: unknown[]): string {
+    const gf = this.resolveGlobalFilter(targetTable);
+    if (!gf) return '';
+    const meta = this.schema.tables[targetTable];
+    if (!meta) return '';
+    return this.buildAliasWhere(targetTable, meta, alias, gf, params) ?? '';
+  }
+
+  /** Param-collect mirror of {@link targetGlobalFilterAlias}. */
+  private collectTargetGlobalFilterAlias(targetTable: string, params: unknown[]): void {
+    const gf = this.resolveGlobalFilter(targetTable);
+    if (!gf) return;
+    const meta = this.schema.tables[targetTable];
+    if (!meta) return;
+    this.collectAliasWhereParams(targetTable, meta, gf, params);
+  }
+
+  /**
+   * SQL clause for `targetTable`'s global filter rendered against the bare
+   * (unaliased) table name — the form used inside relation-filter `EXISTS`
+   * subqueries. Pushes its params; `''` when none. Mirror:
+   * {@link collectTargetGlobalFilterExists}.
+   */
+  private targetGlobalFilterExists(targetTable: string, params: unknown[]): string {
+    const gf = this.resolveGlobalFilter(targetTable);
+    if (!gf) return '';
+    return this.buildSubWhereForRelation(targetTable, gf, params) ?? '';
+  }
+
+  /** Param-collect mirror of {@link targetGlobalFilterExists}. */
+  private collectTargetGlobalFilterExists(targetTable: string, params: unknown[]): void {
+    const gf = this.resolveGlobalFilter(targetTable);
+    if (!gf) return;
+    this.collectRelFilterParams(targetTable, gf, params);
+  }
+
+  /**
+   * Value-invariant SQL-cache-key segment for the active global-filter
+   * environment. Relation-subquery / relation-filter / `_count` / relation-
+   * `orderBy` global filters are rendered at build time but their SHAPE is not
+   * otherwise in the where/with fingerprint, so this segment guards the cache:
+   * two different filter shapes never collide on one cached SQL text, while two
+   * function-filter results of the SAME shape (differing only in values) share
+   * the entry and bind their own params. Empty (`''`) when no filter applies, so
+   * cache keys stay byte-identical when the feature is unused.
+   */
+  private globalFilterCacheSegment(): string {
+    const filters = this.globalFilters;
+    if (!filters) return '';
+    const parts: string[] = [];
+    for (const table of Object.keys(filters).sort()) {
+      const gf = this.resolveGlobalFilter(table);
+      if (gf) parts.push(`${table}:${this.fingerprintWhere(gf)}`);
+    }
+    return parts.length ? `|gf=${parts.join(';')}` : '';
+  }
+
   /**
    * Refuse mutations with an empty predicate unless explicitly opted in.
    *
@@ -3468,6 +3649,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * value accidentally resolves to `undefined`. This guard throws
    * `ValidationError` in that case unless `allowFullTableScan: true`.
    */
+  /**
+   * True when the USER-supplied `where` compiles to no predicate (`{}`,
+   * `{ id: undefined }`, `{ OR: [{ a: undefined }] }`, …). This is the exact
+   * signal the empty-`where` guard needs — the compiled emptiness, NOT the
+   * fingerprint (which is non-empty for an all-undefined `OR`/`AND`). It ignores
+   * any configured global filter, so a global filter never lets an unguarded
+   * mass mutation through.
+   */
+  private userPredicateIsEmpty(userWhere: Record<string, unknown>): boolean {
+    const throwaway: unknown[] = [];
+    return this.buildWhereClause(userWhere, throwaway) === null;
+  }
+
   private assertMutationHasPredicate(
     operation: 'update' | 'updateMany' | 'delete' | 'deleteMany',
     whereSql: string,
