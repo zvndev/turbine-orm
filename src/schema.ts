@@ -41,6 +41,19 @@ export interface TableMetadata {
   relations: Record<string, RelationDef>;
   /** Indexes on this table */
   indexes: IndexMetadata[];
+  /**
+   * Named `CHECK` constraints on this table (introspected from
+   * `pg_constraint` where `contype = 'c'`, excluding NOT NULL artifacts).
+   * Optional / defaults to `[]` for back-compat.
+   */
+  checks?: readonly CheckMetadata[];
+}
+
+export interface CheckMetadata {
+  /** Constraint name (system-generated or user-supplied). */
+  name: string;
+  /** The check expression source (`pg_get_constraintdef` inner text). */
+  expression: string;
 }
 
 export interface ColumnMetadata {
@@ -78,8 +91,23 @@ export interface ColumnMetadata {
   maxLength?: number;
 }
 
+/**
+ * PostgreSQL referential action for a foreign key's `ON DELETE` / `ON UPDATE`
+ * clause. `'no action'` is the implicit default (matches Postgres) and is
+ * omitted from emitted DDL.
+ */
+export type ReferentialAction = 'cascade' | 'restrict' | 'set null' | 'set default' | 'no action';
+
 export interface RelationDef {
   type: 'hasMany' | 'hasOne' | 'belongsTo' | 'manyToMany';
+  /**
+   * FK `ON DELETE` action (introspected from `pg_constraint.confdeltype`).
+   * Present on `belongsTo`/`hasMany` relations derived from a real FK; omitted
+   * when unknown (e.g. `defineSchema`-only metadata) or `'no action'`.
+   */
+  onDelete?: ReferentialAction;
+  /** FK `ON UPDATE` action (introspected from `pg_constraint.confupdtype`). */
+  onUpdate?: ReferentialAction;
   /** Relation name (camelCase, used as the field name) */
   name: string;
   /** Source table */

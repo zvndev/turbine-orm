@@ -11,16 +11,38 @@
 import pg from 'pg';
 import { type Dialect, postgresDialect } from './dialect.js';
 import {
+  type CheckMetadata,
   type ColumnMetadata,
   type IndexMetadata,
   isDateType,
   pgTypeToTs,
+  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
   singularize,
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+
+/**
+ * Map a `pg_constraint.confdeltype` / `confupdtype` character to a
+ * {@link ReferentialAction}. Postgres encodes: `a` = NO ACTION, `r` = RESTRICT,
+ * `c` = CASCADE, `n` = SET NULL, `d` = SET DEFAULT.
+ */
+export function pgConfActionToReferential(ch: string): ReferentialAction {
+  switch (ch) {
+    case 'c':
+      return 'cascade';
+    case 'r':
+      return 'restrict';
+    case 'n':
+      return 'set null';
+    case 'd':
+      return 'set default';
+    default:
+      return 'no action';
+  }
+}
 
 // ---------------------------------------------------------------------------
 // SQL queries (all parameterized, no interpolation)
@@ -103,6 +125,27 @@ const SQL_INDEXES = `
   WHERE schemaname = $1
 `;
 
+// Foreign-key referential actions (ON DELETE / ON UPDATE) live in pg_catalog,
+// not information_schema. Keyed by constraint name for join with SQL_FOREIGN_KEYS.
+const SQL_FK_ACTIONS = `
+  SELECT con.conname, con.confdeltype, con.confupdtype
+  FROM pg_constraint con
+  JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
+  WHERE con.contype = 'f'
+    AND n.nspname = $1
+`;
+
+// CHECK constraints (contype = 'c'). NOT NULL is stored as attnotnull, not a
+// check constraint, so it never appears here.
+const SQL_CHECKS = `
+  SELECT rel.relname AS table_name, con.conname, pg_get_constraintdef(con.oid) AS definition
+  FROM pg_constraint con
+  JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+  JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
+  WHERE con.contype = 'c'
+    AND n.nspname = $1
+`;
+
 const SQL_ENUMS = `
   SELECT t.typname, e.enumlabel
   FROM pg_type t
@@ -168,15 +211,36 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
 
   try {
     // Run all information_schema queries in parallel
-    const [tablesResult, columnsResult, pkResult, fkResult, uniqueResult, indexResult, enumResult] = await Promise.all([
+    const [
+      tablesResult,
+      columnsResult,
+      pkResult,
+      fkResult,
+      fkActionsResult,
+      uniqueResult,
+      indexResult,
+      checkResult,
+      enumResult,
+    ] = await Promise.all([
       pool.query(SQL_TABLES, [schema]),
       pool.query(SQL_COLUMNS, [schema]),
       pool.query(SQL_PRIMARY_KEYS, [schema]),
       pool.query(SQL_FOREIGN_KEYS, [schema]),
+      pool.query(SQL_FK_ACTIONS, [schema]),
       pool.query(SQL_UNIQUE_CONSTRAINTS, [schema]),
       pool.query(SQL_INDEXES, [schema]),
+      pool.query(SQL_CHECKS, [schema]),
       pool.query(SQL_ENUMS, [schema]),
     ]);
+
+    // constraint_name → { onDelete, onUpdate } referential actions.
+    const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+    for (const row of fkActionsResult.rows) {
+      fkActions.set(row.conname, {
+        onDelete: pgConfActionToReferential(row.confdeltype),
+        onUpdate: pgConfActionToReferential(row.confupdtype),
+      });
+    }
 
     // Filter tables by include/exclude
     let tableNames: string[] = tablesResult.rows.map((r: { table_name: string }) => r.table_name);
@@ -273,6 +337,19 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       });
     }
 
+    // ----- Group check constraints by table -----
+    // pg_get_constraintdef yields e.g. `CHECK ((price >= 0))`; strip the leading
+    // `CHECK ` and the outermost paren pair to recover the raw expression.
+    const checksByTable = new Map<string, CheckMetadata[]>();
+    for (const row of checkResult.rows) {
+      if (!tableSet.has(row.table_name)) continue;
+      if (!checksByTable.has(row.table_name)) checksByTable.set(row.table_name, []);
+      checksByTable.get(row.table_name)!.push({
+        name: row.conname,
+        expression: stripCheckWrapper(row.definition),
+      });
+    }
+
     // ----- Collect enums -----
     const enums: Record<string, string[]> = {};
     for (const row of enumResult.rows) {
@@ -337,6 +414,12 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
           : snakeToCamel(fk.constraintName.replace(/^fk_/, '').replace(/_fkey$/, ''))
         : singularize(snakeToCamel(fk.targetTable));
 
+      // Referential actions (omit the 'no action' default to keep metadata lean).
+      const actions = fkActions.get(fk.constraintName);
+      const actionFields: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction } = {};
+      if (actions?.onDelete && actions.onDelete !== 'no action') actionFields.onDelete = actions.onDelete;
+      if (actions?.onUpdate && actions.onUpdate !== 'no action') actionFields.onUpdate = actions.onUpdate;
+
       if (!relationsByTable.has(fk.sourceTable)) relationsByTable.set(fk.sourceTable, {});
       relationsByTable.get(fk.sourceTable)![belongsToName] = {
         type: 'belongsTo',
@@ -345,6 +428,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         to: fk.targetTable,
         foreignKey,
         referenceKey,
+        ...actionFields,
       };
 
       // --- hasMany on the target (parent) table ---
@@ -363,6 +447,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         to: fk.sourceTable,
         foreignKey,
         referenceKey,
+        ...actionFields,
       };
     }
 
@@ -483,6 +568,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         uniqueColumns: uniqueByTable.get(tableName) ?? [],
         relations: relationsByTable.get(tableName) ?? {},
         indexes: indexesByTable.get(tableName) ?? [],
+        checks: checksByTable.get(tableName) ?? [],
       };
     }
 
@@ -490,4 +576,33 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
   } finally {
     await pool.end();
   }
+}
+
+/**
+ * Recover the raw check expression from `pg_get_constraintdef` output, which
+ * wraps it as `CHECK ((expr))`. Strips the leading `CHECK ` keyword and one
+ * balanced outer paren pair; leaves anything unexpected untouched.
+ */
+export function stripCheckWrapper(def: string): string {
+  let s = def.trim();
+  const m = /^CHECK\s*\((.*)\)$/is.exec(s);
+  if (m) s = m[1]!.trim();
+  // pg double-wraps single expressions: `(price >= 0)` → unwrap one more pair
+  // only when the parens are balanced across the whole string.
+  if (s.startsWith('(') && s.endsWith(')')) {
+    let depth = 0;
+    let balanced = true;
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')') {
+        depth--;
+        if (depth === 0 && i < s.length - 1) {
+          balanced = false;
+          break;
+        }
+      }
+    }
+    if (balanced) s = s.slice(1, -1).trim();
+  }
+  return s;
 }

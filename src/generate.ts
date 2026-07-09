@@ -18,6 +18,24 @@ function entityName(tableName: string): string {
   return snakeToPascal(singularize(tableName));
 }
 
+/**
+ * Resolve the TypeScript type for a column, mapping enum-typed columns to their
+ * generated string-literal union (PascalCase enum name) instead of the
+ * `unknown` that {@link pgTypeToTs} yields for user-defined types. Falls back to
+ * the introspected `col.tsType` for every non-enum column.
+ */
+function columnTsType(col: ColumnMetadata, enums: Record<string, string[]>): string {
+  const dt = col.dialectType ?? col.pgType;
+  const isArray = col.isArray || dt.startsWith('_');
+  const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
+  if (Object.hasOwn(enums, base)) {
+    let t = snakeToPascal(base);
+    if (isArray) t += '[]';
+    return col.nullable ? `${t} | null` : t;
+  }
+  return col.tsType;
+}
+
 /** Escape a value for embedding in a single-quoted TypeScript string literal */
 function escSQ(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
@@ -136,7 +154,7 @@ export function generateTypes(schema: SchemaMetadata): string {
       const pkNote = table.primaryKey.includes(col.name) ? ' (primary key)' : '';
       const nullNote = col.nullable ? ' (nullable)' : '';
       lines.push(`  /** Column: ${col.name} — ${col.pgType}${pkNote}${nullNote} */`);
-      lines.push(`  ${col.field}: ${col.tsType};`);
+      lines.push(`  ${col.field}: ${columnTsType(col, schema.enums)};`);
     }
     lines.push('}');
     lines.push('');
@@ -152,9 +170,9 @@ export function generateTypes(schema: SchemaMetadata): string {
       if (isOptional) {
         const reason = isPk ? 'auto-generated' : col.hasDefault ? 'has default' : 'nullable';
         lines.push(`  /** Optional: ${reason} */`);
-        lines.push(`  ${col.field}?: ${col.tsType};`);
+        lines.push(`  ${col.field}?: ${columnTsType(col, schema.enums)};`);
       } else {
-        lines.push(`  ${col.field}: ${col.tsType};`);
+        lines.push(`  ${col.field}: ${columnTsType(col, schema.enums)};`);
       }
     }
     lines.push('};');
@@ -167,7 +185,7 @@ export function generateTypes(schema: SchemaMetadata): string {
     lines.push(`/** Input type for updating a row in \`${table.name}\` */`);
     lines.push(`export type ${typeName}Update = {`);
     for (const col of nonPkCols) {
-      lines.push(`  ${col.field}?: ${updateFieldType(col.tsType)};`);
+      lines.push(`  ${col.field}?: ${updateFieldType(columnTsType(col, schema.enums))};`);
     }
     lines.push('};');
     lines.push('');
