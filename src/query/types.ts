@@ -105,6 +105,29 @@ export type WhereClause<T> = {
 };
 
 /**
+ * Client-level automatic WHERE filters, keyed by table accessor (the name used
+ * in `db[name]` / `client.table(name)`). Each value is AND-merged into the
+ * compiled WHERE of every read and mutation on that table, and into every
+ * relation subquery that targets it — the mechanism behind soft-delete and
+ * multi-tenancy. A function value is evaluated at query-build time (per query),
+ * so a closure over per-request state (e.g. the current tenant id) enables
+ * request-scoped filters. `create`/`createMany` are never filtered.
+ */
+export type GlobalFilters = {
+  // biome-ignore lint/suspicious/noExplicitAny: filters are keyed by table name; per-table entity types are not known here
+  [tableAccessor: string]: WhereClause<any> | (() => WhereClause<any>);
+};
+
+/**
+ * Per-query opt-out of the configured {@link GlobalFilters}. `true` skips the
+ * global filter on the query's own table AND on every relation target it
+ * touches; an array skips only the named table accessors (own table and/or
+ * relation targets). Global filters never satisfy the empty-`where` guard for
+ * `update`/`delete` — that guard always checks the user-supplied `where`.
+ */
+export type SkipGlobalFilters = true | readonly string[];
+
+/**
  * Reserved key in a `with` clause that requests correlated relation counts.
  * `_count: true` counts every to-many relation of the table; a record form
  * (`_count: { posts: true }`) counts only the named to-many relations. Each
@@ -387,6 +410,8 @@ export interface FindUniqueArgs<
   timeout?: number;
   /** Override the client's relation-loading strategy for this query. See {@link RelationLoadStrategy}. */
   relationLoadStrategy?: RelationLoadStrategy;
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 export interface FindManyArgs<
@@ -414,6 +439,8 @@ export interface FindManyArgs<
   timeout?: number;
   /** Override the client's relation-loading strategy for this query. See {@link RelationLoadStrategy}. */
   relationLoadStrategy?: RelationLoadStrategy;
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 export interface FindManyStreamArgs<
@@ -527,6 +554,8 @@ export interface UpdateArgs<
    * ```
    */
   optimisticLock?: { field: keyof T & string; expected: number };
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 export interface UpdateManyArgs<T> {
@@ -536,6 +565,8 @@ export interface UpdateManyArgs<T> {
   timeout?: number;
   /** See {@link UpdateArgs.allowFullTableScan}. */
   allowFullTableScan?: boolean;
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 export interface DeleteArgs<T> {
@@ -544,6 +575,8 @@ export interface DeleteArgs<T> {
   timeout?: number;
   /** See {@link UpdateArgs.allowFullTableScan}. */
   allowFullTableScan?: boolean;
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 export interface DeleteManyArgs<T> {
@@ -552,6 +585,8 @@ export interface DeleteManyArgs<T> {
   timeout?: number;
   /** See {@link UpdateArgs.allowFullTableScan}. */
   allowFullTableScan?: boolean;
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 export interface UpsertArgs<T> {
@@ -560,6 +595,8 @@ export interface UpsertArgs<T> {
   update: Partial<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +689,8 @@ export interface CountArgs<T> {
   where?: WhereClause<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 /**
@@ -730,6 +769,8 @@ export interface GroupByArgs<T> {
   orderBy?: Record<string, OrderDirection | OrderBySpec>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 /** Arguments for the standalone aggregate method */
@@ -747,6 +788,8 @@ export interface AggregateArgs<T> {
   _max?: Partial<Record<keyof T & string, boolean>>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
+  /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
+  skipGlobalFilters?: SkipGlobalFilters;
 }
 
 /** Result type for aggregate queries */

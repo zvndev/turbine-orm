@@ -51,7 +51,7 @@ import type pg from 'pg';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableMetadata } from '../schema.js';
 import type { ReselectExecutor } from './builder.js';
-import type { WithClause, WithCount, WithOptions } from './types.js';
+import type { SkipGlobalFilters, WithClause, WithCount, WithOptions } from './types.js';
 
 /**
  * Max parent keys per follow-up query. On Postgres the whole key set travels as
@@ -106,6 +106,24 @@ export interface RelationLoadContext {
   inClauseParam: (values: unknown[]) => unknown;
   /** Placeholder for a 1-indexed parameter position (PG: `$n`). */
   paramPlaceholder: (index: number) => string;
+  /**
+   * The query's `skipGlobalFilters` opt-out, threaded onto every child
+   * `buildFindMany` so relation row loads honor (or skip) the target table's
+   * global filter exactly as the join strategy would.
+   */
+  skipGlobalFilters?: SkipGlobalFilters;
+  /**
+   * Render `table`'s global filter against `alias` for a raw follow-up query
+   * (the batched `_count`), numbering its `$n` placeholders AFTER
+   * `precedingParams` already-bound params. Returns `null` when no filter
+   * applies. Provided by the owning QueryInterface so this module needs no
+   * filter machinery of its own.
+   */
+  tableGlobalFilter?: (
+    table: string,
+    alias: string,
+    precedingParams: number,
+  ) => { clause: string; params: unknown[] } | null;
 }
 
 /**
@@ -337,6 +355,7 @@ async function loadToOneOrMany(
         select: proj.select,
         omit: proj.omit,
         orderBy: options.orderBy,
+        skipGlobalFilters: ctx.skipGlobalFilters,
       });
       const result = await ctx.exec(deferred.sql, deferred.params, deferred.preparedName);
       return deferred.transform(result) as Record<string, unknown>[];
@@ -461,6 +480,7 @@ async function loadManyToMany(
         select: proj.select,
         omit: proj.omit,
         orderBy: options.orderBy,
+        skipGlobalFilters: ctx.skipGlobalFilters,
       });
       const result = await ctx.exec(deferred.sql, deferred.params, deferred.preparedName);
       return deferred.transform(result) as Record<string, unknown>[];
@@ -578,13 +598,20 @@ async function loadOneCount(
     const qKey = ctx.quote(childKeyCol);
     const chunks: unknown[][] = [];
     for (let i = 0; i < keys.length; i += MAX_RELATION_KEYS) chunks.push(keys.slice(i, i + MAX_RELATION_KEYS));
+    // Global filter on the counted target (hasMany only — the m2m batched count
+    // groups the junction, not the target, so it keeps the join strategy's
+    // count-of-links semantics). Rendered against the quoted table name (the
+    // FROM has no alias), numbered after the $1 key array. Matches the join
+    // strategy's `_count` filtering so byte-parity holds under a global filter.
+    const gf = rel.type !== 'manyToMany' && ctx.tableGlobalFilter ? ctx.tableGlobalFilter(childTable, qChild, 1) : null;
+    const gfAnd = gf ? ` AND ${gf.clause}` : '';
     const results = await Promise.all(
       chunks.map((chunk) => {
-        const params: unknown[] = [ctx.inClauseParam(chunk)];
+        const params: unknown[] = [ctx.inClauseParam(chunk), ...(gf ? gf.params : [])];
         const predicate = ctx.buildInClause(`${qChild}.${qKey}`, ctx.paramPlaceholder(1), false);
         const sql =
           `SELECT ${qChild}.${qKey} AS "k", COUNT(*) AS "c" FROM ${qChild} ` +
-          `WHERE ${predicate} GROUP BY ${qChild}.${qKey}`;
+          `WHERE ${predicate}${gfAnd} GROUP BY ${qChild}.${qKey}`;
         return ctx.exec(sql, params);
       }),
     );

@@ -36,6 +36,7 @@ import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 import {
   type DeferredQuery,
+  type GlobalFilters,
   type QueryEvent,
   type QueryEventListener,
   QueryInterface,
@@ -285,6 +286,32 @@ export interface TurbineConfig {
    * default single-pool path completely unchanged.
    */
   replicas?: readonly (string | PgCompatPool)[];
+  /**
+   * Automatic WHERE filters applied to every query, keyed by table accessor
+   * (`db[name]`). Each value is AND-merged into the compiled WHERE of every
+   * read and mutation on that table — and into every relation subquery that
+   * targets it — implementing soft-delete and multi-tenancy without repeating
+   * the predicate at each call site.
+   *
+   *   - A `WhereClause` value is a static filter (e.g. `{ deletedAt: null }`).
+   *   - A `() => WhereClause` value is evaluated at query-build time, so a
+   *     closure over per-request state (the current tenant id) yields a
+   *     request-scoped filter.
+   *
+   * `create`/`createMany` are never filtered. A per-query
+   * `skipGlobalFilters: true | string[]` opts out. The empty-`where` guard on
+   * `update`/`delete` still checks the USER-supplied `where`, so a global
+   * filter never turns an unguarded mass mutation into an allowed one.
+   *
+   * @example
+   * ```ts
+   * const db = turbine({ url, schema, globalFilters: {
+   *   posts: { deletedAt: null },              // soft-delete
+   *   orders: () => ({ tenantId: currentTenant() }), // per-request tenancy
+   * }});
+   * ```
+   */
+  globalFilters?: GlobalFilters;
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +679,7 @@ export class TurbineClient {
       utcTimestamps: config.utcTimestamps,
       relationLoadStrategy: config.relationLoadStrategy,
       jsonEncoding: config.jsonEncoding,
+      globalFilters: config.globalFilters,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
       sqlCache: config.sqlCache ?? true,
       dialect: config.dialect,
