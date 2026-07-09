@@ -392,7 +392,7 @@ export default async function Home() {
                 ['Engine / runtime', 'No engine binary (pg only)', 'Client + TS/WASM query compiler', 'No engine'],
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
                 ['Main bundle (brotli)', '~31 KB', '~1.6 MB client (TS/WASM compiler)', '~7 KB core'],
-                ['Studio', 'Read-only, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (paid tier)'],
+                ['Studio', 'Read-only, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
                 ['Edge runtime', 'One import swap, ~22 KB brotli', 'Driver adapter + WASM compiler', 'Native'],

@@ -35,6 +35,22 @@ const result = await db.$transaction(async (tx) => {
 
 The `tx` client has the same surface as `db` — every table accessor, every method. Queries *must* use `tx`, not `db`, or they'll run on a different connection outside the transaction.
 
+## $transaction — batch form
+
+Pass an array of `DeferredQuery` objects (the `build*` methods, same as [`pipeline`](#pipeline--n-queries-1-round-trip)) and `$transaction` runs them atomically on one connection — `BEGIN`, each query in order, `COMMIT` — returning a positionally-typed tuple of each query's result. Any error rolls the whole batch back and rethrows. Unlike a pipeline, this **is** atomic.
+
+```ts
+const [user, postCount] = await db.$transaction([
+  db.users.buildFindUnique({ where: { id: 1 } }),
+  db.posts.buildCount({ where: { userId: 1 } }),
+]);
+// user: User | null, postCount: number — all-or-nothing
+```
+
+Use the batch form when you have a fixed set of independent statements that must succeed or fail together and you don't need a callback's control flow. An empty array resolves to `[]` without opening a transaction. The callback form above is unchanged — `$transaction` accepts either.
+
+> **Batch form vs pipeline:** both take `DeferredQuery[]`. The [pipeline](#pipeline--n-queries-1-round-trip) optimizes for latency (one round-trip, **not** atomic); the batch `$transaction` optimizes for atomicity (`BEGIN`…`COMMIT`, rollback on any failure).
+
 ## Isolation levels
 
 Pass `isolationLevel` to set the transaction's isolation on `BEGIN`:
