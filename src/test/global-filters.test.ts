@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
-import type { QueryInterface, QueryInterfaceOptions, WithClause } from '../query/index.js';
+import type { QueryInterfaceOptions, WithClause } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 

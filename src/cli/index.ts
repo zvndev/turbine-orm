@@ -25,7 +25,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { dirname, extname, relative, resolve } from 'node:path';
+import { basename, dirname, extname, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generate } from '../generate.js';
 import { findMissingRelationIndexes } from '../index-advisor.js';
@@ -2132,13 +2132,24 @@ async function main() {
 }
 
 function isCliEntry(): boolean {
+  // Decide from process.argv[1] instead of import.meta.url so the same code
+  // compiles cleanly for both the ESM and CJS builds (see showVersion above).
+  // The CLI runs via the bin shim ("turbine"), the built output
+  // (dist/[cjs/]cli/index.{js,cjs}), or tsx on the source (src/cli/index.ts).
+  // Test files import this module with their own path in argv[1], which never
+  // matches these shapes.
   const entry = process.argv[1];
   if (!entry) return false;
+  let real = entry;
   try {
-    return import.meta.url === pathToFileURL(realpathSync(entry)).href;
+    real = realpathSync(entry);
   } catch {
-    return import.meta.url === pathToFileURL(resolve(entry)).href;
+    real = resolve(entry);
   }
+  const base = basename(real);
+  if (base === 'turbine' || base === 'turbine-orm') return true;
+  const isIndexFile = base === 'index.js' || base === 'index.cjs' || base === 'index.ts';
+  return isIndexFile && basename(dirname(real)) === 'cli';
 }
 
 if (isCliEntry()) {

@@ -65,7 +65,15 @@ describe('seed-as-code execution plan', () => {
       called = true;
     });
     assert.equal(typeof run, 'function');
-    await assert.rejects(run(), /DATABASE_URL/);
-    assert.equal(called, false);
+    // Clear DATABASE_URL so the missing-URL rejection path is exercised even
+    // when the suite runs in an integration environment with a real database.
+    const savedUrl = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL;
+    try {
+      await assert.rejects(run(), /DATABASE_URL/);
+      assert.equal(called, false);
+    } finally {
+      if (savedUrl !== undefined) process.env.DATABASE_URL = savedUrl;
+    }
   });
 });

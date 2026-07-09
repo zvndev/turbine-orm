@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import pg from 'pg';
 import { findMissingRelationIndexes } from '../index-advisor.js';
@@ -19,8 +19,35 @@ import {
 } from '../schema.js';
 import { listMigrationFiles } from './migrate.js';
 
-const require = createRequire(import.meta.url);
-const pkg = require('../../package.json') as { version?: string };
+/**
+ * Walk up from the running script to find turbine-orm's own package.json.
+ * Uses process.argv[1] instead of import.meta.url so the same code compiles
+ * cleanly for both the ESM and CJS builds (same convention as cli/index.ts).
+ */
+function readOwnVersion(): string {
+  try {
+    let entry = process.argv[1] ?? '';
+    try {
+      entry = realpathSync(entry);
+    } catch {
+      // keep the raw path if realpath fails
+    }
+    let dir = dirname(entry);
+    for (let i = 0; i < 6; i++) {
+      const candidate = resolve(dir, 'package.json');
+      if (existsSync(candidate)) {
+        const pkg = JSON.parse(readFileSync(candidate, 'utf8')) as { name?: string; version?: string };
+        if (pkg.name === 'turbine-orm' && pkg.version) return pkg.version;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    // fall through
+  }
+  return '0.0.0';
+}
 
 const PROTOCOL_VERSION = '2025-06-18';
 const STATEMENT_TIMEOUT = '30s';
@@ -192,7 +219,7 @@ async function dispatch(request: JsonRpcRequest, ctx: McpContext): Promise<unkno
     case 'initialize':
       return {
         protocolVersion: PROTOCOL_VERSION,
-        serverInfo: { name: 'turbine-orm', version: pkg.version ?? '0.0.0' },
+        serverInfo: { name: 'turbine-orm', version: readOwnVersion() },
         capabilities: { tools: {} },
       };
     case 'notifications/initialized':

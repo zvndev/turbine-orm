@@ -2,6 +2,7 @@ import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { TurbineClient } from './client.js';
+import { ConnectionError } from './errors.js';
 import type { SchemaMetadata } from './schema.js';
 
 export type SeedFunction = (db: TurbineClient) => Promise<void> | void;
@@ -45,7 +46,7 @@ function isDirectSeedModule(): boolean {
 async function runSeed(fn: SeedFunction): Promise<void> {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
-    throw new Error('[turbine] DATABASE_URL is required to run this seed.');
+    throw new ConnectionError('[turbine] DATABASE_URL is required to run this seed.');
   }
 
   const db = new TurbineClient({ connectionString }, emptySchema);
