@@ -8,6 +8,7 @@
  *   turbine push                  — Apply schema-builder definitions to database
  *   turbine migrate create <name> — Create a new SQL migration file
  *   turbine migrate up            — Apply pending migrations
+ *   turbine migrate deploy        — Apply pending migrations without prompts
  *   turbine migrate down          — Rollback last migration
  *   turbine migrate status        — Show migration status
  *   turbine seed                  — Run seed file
@@ -24,7 +25,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { dirname, relative, resolve } from 'node:path';
+import { dirname, extname, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generate } from '../generate.js';
 import { findMissingRelationIndexes } from '../index-advisor.js';
@@ -32,10 +33,25 @@ import { introspect } from '../introspect.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { schemaDiff, schemaPush } from '../schema-sql.js';
 import type { CliOverrides, ResolvedConfig } from './config.js';
-import { configTemplate, findConfigFile, loadConfig, looksLikeSchemaFilePath, resolveConfig } from './config.js';
+import {
+  configTemplate,
+  findConfigFile,
+  loadConfig,
+  looksLikeSchemaFilePath,
+  resolveConfig,
+  resolveSeedFile,
+} from './config.js';
 import { canResolveTsx, getTsLoaderError, needsTsLoader, registerTsLoader } from './loader.js';
 import { runMcpServer } from './mcp.js';
-import { createMigration, listMigrationFiles, migrateDown, migrateStatus, migrateUp } from './migrate.js';
+import {
+  createMigration,
+  inspectMigrationDeploy,
+  listMigrationFiles,
+  migrateDeploy,
+  migrateDown,
+  migrateStatus,
+  migrateUp,
+} from './migrate.js';
 import { startObserve } from './observe.js';
 import { startStudio } from './studio.js';
 import {
@@ -69,7 +85,7 @@ import {
 // Argument parsing (zero deps — just process.argv)
 // ---------------------------------------------------------------------------
 
-interface CliArgs {
+export interface CliArgs {
   command: string;
   subcommand?: string;
   positional: string[];
@@ -94,8 +110,8 @@ interface CliArgs {
   noOpen?: boolean;
 }
 
-function parseArgs(): CliArgs {
-  const args = process.argv.slice(2);
+export function parseArgs(argv = process.argv.slice(2)): CliArgs {
+  const args = argv;
   const result: CliArgs = {
     command: args[0] ?? 'help',
     positional: [],
@@ -382,38 +398,34 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   }
 
   // Create seed file template
-  const seedDir = config.seedFile.substring(0, config.seedFile.lastIndexOf('/'));
-  if (!existsSync(config.seedFile)) {
+  const initSeedFile = config.seedFile ?? './seed.ts';
+  const seedDir = dirname(initSeedFile);
+  if (!existsSync(initSeedFile)) {
     if (!existsSync(seedDir)) {
       mkdirSync(seedDir, { recursive: true });
     }
     writeFileSync(
-      config.seedFile,
+      initSeedFile,
       `/**
  * Turbine seed file
  *
  * Run with: npx turbine seed
  */
 
-// import { turbine } from '${config.out.replace('./', '')}';
-//
-// const db = turbine({ connectionString: process.env.DATABASE_URL });
-//
-// async function seed() {
-//   console.log('Seeding database...');
-//
-//   // Add your seed data here:
-//   // await db.users.create({ data: { email: 'admin@example.com', name: 'Admin' } });
-//
-//   console.log('Done!');
-//   await db.disconnect();
-// }
-//
-// seed();
+import { defineSeed } from 'turbine-orm';
+
+export default defineSeed(async (db) => {
+  console.log('Seeding database...');
+
+  // Add your seed data here:
+  // await db.raw\`INSERT INTO users (email, name) VALUES (\${'admin@example.com'}, \${'Admin'})\`;
+
+  console.log('Done!');
+});
 `,
       'utf-8',
     );
-    success(`Created ${cyan(config.seedFile)}`);
+    success(`Created ${cyan(initSeedFile)}`);
   }
 
   // Create schema builder template
@@ -780,6 +792,7 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`    ${cyan('create <name>')}         Create a new migration file`);
     console.log(`    ${cyan('create <name> --auto')}  Auto-generate from schema diff`);
     console.log(`    ${cyan('up')}                    Apply pending migrations`);
+    console.log(`    ${cyan('deploy')}                Apply pending migrations without prompts`);
     console.log(`    ${cyan('down')}                  Rollback last migration`);
     console.log(`    ${cyan('status')}                Show migration status`);
     newline();
@@ -795,6 +808,7 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`    ${dim('npx turbine migrate create add_users_table')}`);
     console.log(`    ${dim('npx turbine migrate create add_email_index --auto')}`);
     console.log(`    ${dim('npx turbine migrate up')}`);
+    console.log(`    ${dim('npx turbine migrate deploy --dry-run')}`);
     console.log(`    ${dim('npx turbine migrate down --step 2')}`);
     newline();
     return;
@@ -806,6 +820,9 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
       break;
     case 'up':
       await cmdMigrateUp(args, config);
+      break;
+    case 'deploy':
+      await cmdMigrateDeploy(args, config);
       break;
     case 'down':
       await cmdMigrateDown(args, config);
@@ -989,6 +1006,82 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
   newline();
 }
 
+export function buildMigrateDeployOptions(_args: CliArgs): {
+  allowDrift: false;
+  allowDestructive: true;
+  step: undefined;
+} {
+  return {
+    allowDrift: false,
+    allowDestructive: true,
+    step: undefined,
+  };
+}
+
+async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<void> {
+  banner();
+  const url = requireUrl(config);
+
+  label('Database', redactUrl(url));
+  label('Migrations', config.migrationsDir);
+  newline();
+
+  if (args.dryRun) {
+    const spinner = new Spinner('Checking pending migrations').start();
+    const plan = await inspectMigrationDeploy(url, config.migrationsDir);
+    if (plan.mismatches.length > 0) {
+      spinner.fail('Deploy blocked by migration drift');
+      for (const mismatch of plan.mismatches) {
+        const reason = mismatch.type === 'missing' ? 'deleted from disk' : 'modified on disk';
+        console.log(`    ${red(symbols.cross)} ${mismatch.name}.sql ${dim(`(${reason})`)}`);
+      }
+      newline();
+      process.exit(1);
+    }
+
+    if (plan.pending.length === 0) {
+      spinner.succeed('No pending migrations');
+      newline();
+      return;
+    }
+
+    spinner.succeed(`${bold(String(plan.pending.length))} pending migration(s)`);
+    for (const file of plan.pending) {
+      console.log(`    ${yellow(symbols.dot)} ${file.filename}`);
+    }
+    newline();
+    return;
+  }
+
+  const spinner = new Spinner('Deploying migrations').start();
+  const result = await migrateDeploy(url, config.migrationsDir);
+
+  if (result.applied.length === 0 && result.errors.length === 0) {
+    spinner.succeed('0 applied — all migrations are up to date');
+    newline();
+    return;
+  }
+
+  if (result.applied.length > 0) {
+    spinner.succeed(`${bold(String(result.applied.length))} applied`);
+    for (const file of result.applied) {
+      console.log(`    ${green(symbols.check)} ${file.filename}`);
+    }
+  }
+
+  if (result.errors.length > 0) {
+    spinner.fail('Deploy failed');
+    for (const { file, error: msg } of result.errors) {
+      console.log(`    ${red(symbols.cross)} ${file.filename}`);
+      console.log(`      ${dim(msg)}`);
+    }
+    newline();
+    process.exit(1);
+  }
+
+  newline();
+}
+
 /** True when the error is migrate up/down's destructive-statement refusal. */
 function isDestructiveRefusal(err: unknown): boolean {
   return err instanceof Error && err.message.includes('DESTRUCTIVE');
@@ -1160,18 +1253,85 @@ async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise
 // Command: seed
 // ---------------------------------------------------------------------------
 
+export type SeedExecutionPlan =
+  | { kind: 'tsx'; command: 'npx'; args: string[] }
+  | { kind: 'js'; file: string }
+  | { kind: 'sql'; file: string };
+
+export function getSeedExecutionPlan(seedFile: string): SeedExecutionPlan {
+  const ext = extname(seedFile).toLowerCase();
+  if (ext === '.ts' || ext === '.mts' || ext === '.cts') {
+    return { kind: 'tsx', command: 'npx', args: ['tsx', seedFile] };
+  }
+  if (ext === '.js' || ext === '.mjs' || ext === '.cjs') {
+    return { kind: 'js', file: seedFile };
+  }
+  if (ext === '.sql') {
+    return { kind: 'sql', file: seedFile };
+  }
+  throw new Error(`Unsupported seed file extension: ${ext || '(none)'}. Use seed.ts, seed.js, or seed.sql.`);
+}
+
+async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Promise<void> {
+  const oldDatabaseUrl = process.env.DATABASE_URL;
+  if (config.url) process.env.DATABASE_URL = config.url;
+
+  try {
+    if (plan.kind === 'tsx') {
+      if (!canResolveTsx()) {
+        throw new Error('TypeScript seed files require tsx — install tsx or use seed.js/seed.sql.');
+      }
+      const { execFileSync } = await import('node:child_process');
+      execFileSync(plan.command, plan.args, {
+        stdio: 'inherit',
+        env: {
+          ...process.env,
+          DATABASE_URL: config.url || process.env.DATABASE_URL,
+        },
+      });
+      return;
+    }
+
+    if (plan.kind === 'js') {
+      const mod = await import(pathToFileURL(plan.file).href);
+      if (typeof mod.default === 'function') {
+        await mod.default();
+      }
+      return;
+    }
+
+    const url = requireUrl(config);
+    const { default: pg } = await import('pg');
+    const client = new pg.Client({ connectionString: url });
+    await client.connect();
+    try {
+      await client.query(readFileSync(plan.file, 'utf-8'));
+    } finally {
+      await client.end();
+    }
+  } finally {
+    if (oldDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL;
+    } else {
+      process.env.DATABASE_URL = oldDatabaseUrl;
+    }
+  }
+}
+
 async function cmdSeed(_args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
 
-  const seedFile = resolve(config.seedFile);
-  label('Seed file', config.seedFile);
+  const seedFile = resolveSeedFile(config);
+  label('Seed file', seedFile ? relative(process.cwd(), seedFile) || seedFile : '(not found)');
   newline();
 
-  if (!existsSync(seedFile)) {
-    error(`Seed file not found: ${config.seedFile}`);
+  if (!seedFile || !existsSync(seedFile)) {
+    error(`Seed file not found.`);
     newline();
-    console.log(`  ${dim('Create one with:')} ${cyan('npx turbine init')}`);
-    console.log(`  ${dim('Or set a custom path in')} ${cyan('turbine.config.ts')}`);
+    console.log(
+      `  ${dim('Create one of:')} ${cyan('seed.ts')}${dim(',')} ${cyan('seed.js')}${dim(',')} ${cyan('seed.sql')}`,
+    );
+    console.log(`  ${dim('Or set')} ${cyan('seed')} ${dim('in')} ${cyan('turbine.config.ts')}`);
     newline();
     process.exit(1);
   }
@@ -1179,40 +1339,7 @@ async function cmdSeed(_args: CliArgs, config: ResolvedConfig): Promise<void> {
   const spinner = new Spinner('Running seed file').start();
 
   try {
-    // Use child_process to run the seed file via tsx or node
-    const { execFileSync } = await import('node:child_process');
-
-    // Try tsx first (most compatible with .ts files), fall back to node --experimental-strip-types
-    const runners = [
-      { cmd: 'npx', args: ['tsx', seedFile], name: 'tsx' },
-      { cmd: 'node', args: ['--experimental-strip-types', seedFile], name: 'node' },
-    ];
-
-    let ran = false;
-    for (const runner of runners) {
-      try {
-        execFileSync(runner.cmd, runner.args, {
-          stdio: 'inherit',
-          env: {
-            ...process.env,
-            DATABASE_URL: config.url || process.env.DATABASE_URL,
-          },
-        });
-        ran = true;
-        break;
-      } catch (err) {
-        // If tsx not found, try next runner
-        if (err instanceof Error && 'status' in err && err.status === null) {
-          continue;
-        }
-        throw err;
-      }
-    }
-
-    if (!ran) {
-      throw new Error('Could not find tsx or compatible Node.js version to run .ts files');
-    }
-
+    await runSeedPlan(getSeedExecutionPlan(seedFile), config);
     spinner.succeed('Seed completed');
   } catch (err) {
     spinner.fail('Seed failed');
@@ -1652,6 +1779,7 @@ function showMigrateHelp(): void {
   console.log(`  ${bold('Subcommands:')}`);
   console.log(`    ${cyan('create')} ${dim('<name>')}   Create a new migration file`);
   console.log(`    ${cyan('up')}              Apply pending migrations`);
+  console.log(`    ${cyan('deploy')}          Apply pending migrations without prompts`);
   console.log(`    ${cyan('down')}            Rollback last migration`);
   console.log(`    ${cyan('status')}          Show applied/pending migrations`);
   newline();
@@ -1670,6 +1798,7 @@ function showMigrateHelp(): void {
   console.log(`    ${dim('$')} npx turbine migrate create add_users_table`);
   console.log(`    ${dim('$')} npx turbine migrate create add_email_index --auto`);
   console.log(`    ${dim('$')} npx turbine migrate up`);
+  console.log(`    ${dim('$')} npx turbine migrate deploy --dry-run`);
   console.log(`    ${dim('$')} npx turbine migrate down --step 2`);
   console.log(`    ${dim('$')} npx turbine migrate status`);
   newline();
@@ -1683,7 +1812,11 @@ function showSeedHelp(): void {
   console.log(`    npx turbine seed ${dim('[options]')}`);
   newline();
   console.log(`  Runs the seed file specified in ${cyan('turbine.config.ts')}`);
-  console.log(`  ${dim('(default: ./turbine/seed.ts)')}`);
+  console.log(`  ${dim('or the first default candidate: ./seed.ts, ./seed.js, ./seed.sql')}`);
+  newline();
+  console.log(
+    `  ${dim('TypeScript seeds run with')} ${cyan('npx tsx')} ${dim('and can export')} ${cyan('defineSeed(fn)')}${dim('.')}`,
+  );
   newline();
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
@@ -1742,6 +1875,7 @@ function showHelp(): void {
   console.log(`    ${cyan('migrate')} ${dim('<sub>')}      SQL migration management`);
   console.log(`      ${dim('create <name>')}    Create a new migration file`);
   console.log(`      ${dim('up')}               Apply pending migrations`);
+  console.log(`      ${dim('deploy')}           Apply pending migrations without prompts`);
   console.log(`      ${dim('down')}             Rollback last migration`);
   console.log(`      ${dim('status')}           Show applied/pending migrations`);
   console.log(`    ${cyan('seed')}               Run seed file`);
@@ -1791,6 +1925,7 @@ function showHelp(): void {
   console.log(`    ${dim('$')} DATABASE_URL=postgres://... npx turbine generate`);
   console.log(`    ${dim('$')} npx turbine migrate create add_users_table`);
   console.log(`    ${dim('$')} npx turbine migrate up`);
+  console.log(`    ${dim('$')} npx turbine migrate deploy --dry-run`);
   console.log(`    ${dim('$')} npx turbine push --dry-run`);
   newline();
 }
@@ -1980,4 +2115,16 @@ async function main() {
   }
 }
 
-main();
+function isCliEntry(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(entry)).href;
+  } catch {
+    return import.meta.url === pathToFileURL(resolve(entry)).href;
+  }
+}
+
+if (isCliEntry()) {
+  void main();
+}
