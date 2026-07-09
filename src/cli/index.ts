@@ -104,6 +104,9 @@ export interface CliArgs {
   allowEmpty?: boolean;
   allowDestructive?: boolean;
   fix?: boolean;
+  // generate flags
+  zod?: boolean;
+  includeViews?: boolean;
   // studio flags
   port?: number;
   host?: string;
@@ -172,6 +175,12 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--fix':
         result.fix = true;
+        break;
+      case '--zod':
+        result.zod = true;
+        break;
+      case '--include-views':
+        result.includeViews = true;
         break;
       case '--allow-destructive':
         result.allowDestructive = true;
@@ -596,6 +605,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     schema: config.schema,
     include: config.include.length ? config.include : undefined,
     exclude: config.exclude.length ? config.exclude : undefined,
+    includeViews: args.includeViews,
   });
 
   const tableNames = Object.keys(schema.tables);
@@ -657,6 +667,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     schema,
     outDir: config.out,
     connectionString: url,
+    zod: args.zod,
   });
 
   genSpinner.succeed(`Generated ${bold(String(result.files.length))} files in ${elapsed(startTime)}`);
@@ -1739,6 +1750,7 @@ function showGenerateHelp(): void {
   console.log(`    ${dim('•')} ${cyan('types.ts')}    — Entity interfaces, Create/Update input types`);
   console.log(`    ${dim('•')} ${cyan('metadata.ts')} — Runtime schema metadata`);
   console.log(`    ${dim('•')} ${cyan('index.ts')}    — Configured client with typed table accessors`);
+  console.log(`    ${dim('•')} ${cyan('zod.ts')}      — Zod schemas ${dim('(with --zod)')}`);
   newline();
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);
@@ -1748,6 +1760,10 @@ function showGenerateHelp(): void {
   console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}   Postgres schema ${dim('(default: public)')}`);
   console.log(`    ${cyan('--include')} ${dim('<tables>')}    Comma-separated tables to include`);
   console.log(`    ${cyan('--exclude')} ${dim('<tables>')}    Comma-separated tables to exclude`);
+  console.log(
+    `    ${cyan('--zod')}                 Also emit ${cyan('zod.ts')} validation schemas ${dim('(needs the zod dep)')}`,
+  );
+  console.log(`    ${cyan('--include-views')}       Include views + materialized views as read-only entities`);
   console.log(`    ${cyan('--allow-empty')}         Generate even when introspection matches 0 tables`);
   newline();
 }
