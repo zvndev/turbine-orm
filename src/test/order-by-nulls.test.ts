@@ -108,3 +108,25 @@ describe('orderBy NULLS FIRST / LAST', () => {
     assert.match(sql, /ORDER BY t\d+\."created_at" DESC NULLS LAST/);
   });
 });
+
+describe('orderBy spec form + cursor pagination', () => {
+  it('desc spec seeks with < (same as plain desc)', () => {
+    const q = makeQuery('users', schema());
+    const { sql, params } = q.buildFindMany({
+      cursor: { id: 100 },
+      orderBy: { id: { sort: 'desc', nulls: 'last' } },
+    } as never);
+    assert.match(sql, /"users"\."id" < \$1/);
+    assert.match(sql, /ORDER BY "id" DESC NULLS LAST/);
+    assert.deepEqual(params, [100]);
+  });
+
+  it('asc spec seeks with > (same as plain asc)', () => {
+    const q = makeQuery('users', schema());
+    const { sql } = q.buildFindMany({
+      cursor: { id: 100 },
+      orderBy: { id: { sort: 'asc' } },
+    } as never);
+    assert.match(sql, /"users"\."id" > \$1/);
+  });
+});

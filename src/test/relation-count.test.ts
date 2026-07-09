@@ -242,3 +242,92 @@ describe('relation _count — batched strategy', () => {
     assert.deepEqual(res[0]!._count, { orgs: 3 });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Global-filter interaction (review fixes: batched skip capture, m2m EXISTS,
+// cache-segment guard)
+// ---------------------------------------------------------------------------
+
+function usersQiFiltered(pool: unknown, strategy: 'join' | 'batched', globalFilters: Record<string, unknown>) {
+  return new QueryInterface(
+    // biome-ignore lint/suspicious/noExplicitAny: fake pool
+    pool as any,
+    'users',
+    schema(),
+    [],
+    {
+      preparedStatements: false,
+      warnOnUnlimited: false,
+      relationLoadStrategy: strategy,
+      // biome-ignore lint/suspicious/noExplicitAny: test shape
+      globalFilters: globalFilters as any,
+    },
+  );
+}
+
+describe('relation _count — global filters', () => {
+  it('batched hasMany _count ANDs the target filter into the grouped follow-up', async () => {
+    const { pool, calls } = makeFakePool({
+      users: [{ id: 1, name: 'alice' }],
+      posts: [{ k: 1, c: 1 }],
+    });
+    await usersQiFiltered(pool, 'batched', { posts: { title: { not: 'spam' } } }).findMany({
+      with: { _count: { posts: true } },
+    } as never);
+    const follow = calls.find((c) => /FROM "posts"/.test(c.sql))!;
+    assert.match(follow.sql, /"user_id" = ANY\(\$1\) AND .*"title".*\$2.* GROUP BY/);
+    assert.deepEqual(follow.params, [[1], 'spam']);
+    assertParamsAligned(follow.sql, follow.params);
+  });
+
+  it('batched m2m _count restricts junction rows to surviving targets via EXISTS', async () => {
+    const { pool, calls } = makeFakePool({
+      users: [{ id: 1, name: 'alice' }],
+      user_orgs: [{ k: 1, c: 2 }],
+    });
+    await usersQiFiltered(pool, 'batched', { orgs: { name: { not: 'closed' } } }).findMany({
+      with: { _count: { orgs: true } },
+    } as never);
+    const follow = calls.find((c) => /FROM "user_orgs"/.test(c.sql))!;
+    assert.match(follow.sql, /EXISTS \(SELECT 1 FROM "orgs" t WHERE t\."id" = "user_orgs"\."org_id" AND /);
+    assert.deepEqual(follow.params, [[1], 'closed']);
+    assertParamsAligned(follow.sql, follow.params);
+  });
+
+  it('batched m2m _count matches the join strategy under a target filter', () => {
+    // Join: EXISTS-on-target inside the junction count subquery — same semantics.
+    const q = usersQiFiltered(makeFakePool({}).pool, 'join', { orgs: { name: { not: 'closed' } } });
+    const { sql, params } = q.buildFindMany({ with: { _count: { orgs: true } } } as never);
+    assert.match(
+      sql,
+      /FROM "user_orgs" t\d+j WHERE t\d+j\."user_id" = "users"\."id" AND EXISTS \(SELECT 1 FROM "orgs"/,
+    );
+    assert.equal(params[0], 'closed');
+    assertParamsAligned(sql, params);
+  });
+
+  it('skipGlobalFilters reaches the batched count follow-up (captured pre-await)', async () => {
+    const { pool, calls } = makeFakePool({
+      users: [{ id: 1, name: 'alice' }],
+      posts: [{ k: 1, c: 5 }],
+    });
+    await usersQiFiltered(pool, 'batched', { posts: { title: { not: 'spam' } } }).findMany({
+      skipGlobalFilters: true,
+      with: { _count: { posts: true } },
+    } as never);
+    const follow = calls.find((c) => /FROM "posts"/.test(c.sql))!;
+    assert.doesNotMatch(follow.sql, /"title"/);
+    assert.deepEqual(follow.params, [[1]]);
+  });
+
+  it('a throwing function filter on an UNRELATED table does not break the build', () => {
+    const q = usersQiFiltered(makeFakePool({}).pool, 'join', {
+      profiles: () => {
+        throw new Error('request-scoped: no tenant in context');
+      },
+    });
+    // users query touches posts (_count) but never profiles — must still build.
+    const { sql } = q.buildFindMany({ with: { _count: { posts: true } } } as never);
+    assert.match(sql, /_count__posts/);
+  });
+});
