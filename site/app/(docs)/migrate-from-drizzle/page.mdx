@@ -177,8 +177,8 @@ await db.$transaction(async (tx) => {
 
 | Feature | Drizzle | Turbine |
 |---|---|---|
-| Single-query nested relations | Multi-query via `with` | Single SQL via `json_agg` subqueries |
-| Typed errors with codes | Generic Error | 16 error classes with SQLSTATE mapping |
+| Single-query nested relations | Yes — relational queries (RQBv2) | Yes, via `json_agg` — typed and date-coerced at any depth |
+| Typed errors with codes | Generic Error (raw pg errors) | 16 error classes with SQLSTATE mapping |
 | Optimistic locking | Manual | Built-in `optimisticLock: { field, expected }` |
 | Retry with backoff | Manual | `withRetry()` + `isRetryable` errors |
 | Full-text search | Raw SQL | `{ search: 'query' }` operator |
@@ -186,6 +186,7 @@ await db.$transaction(async (tx) => {
 | Relation filters | Manual subquery | `where: { posts: { some: { published: true } } }` |
 | Pipeline batching | N/A | Multiple queries in one round-trip |
 | Schema introspection | External tools | `npx turbine pull` → full metadata |
+| Down migrations | None — `drizzle-kit drop` removed in v1 | SQL `-- DOWN` sections, checksummed |
 | Local Studio UI | Drizzle Studio (paid) | `npx turbine studio` (free, built-in) |
 | Runtime deps | 0 (pg adapter separate) | 1 (`pg`) |
 | Select/omit type narrowing | Yes (via `.select()`) | Yes (via `select`/`omit` args) |

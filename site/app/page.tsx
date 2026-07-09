@@ -43,9 +43,9 @@ WHERE "users"."org_id" = $1`;
 
 const features = [
   {
-    title: 'One dependency. No WASM engine.',
+    title: 'One dependency. No WASM.',
     description:
-      'Turbine ships pg and nothing else. No WASM engine (Prisma: 1.6 MB), no adapter chain, no lockstep package upgrades. The main entry bundles to ~31 KB brotli, ~22 KB on the edge.',
+      'Turbine ships pg and nothing else — no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. No adapter chain, no lockstep package upgrades. The main entry bundles to ~31 KB brotli, ~22 KB on the edge.',
     stat: '1',
     statLabel: 'runtime dep',
   },
@@ -281,7 +281,7 @@ export default async function Home() {
               <p>
                 Every ORM claims single-query nested loads now. Turbine uses
                 the same <code>json_agg</code> approach as Prisma 7 and
-                Drizzle v2. The difference isn&apos;t the query strategy &mdash; it&apos;s
+                Drizzle. The difference isn&apos;t the query strategy &mdash; it&apos;s
                 everything around it: the one-dependency, no-WASM footprint, the
                 read-only Studio, and the error messages that never expose user data.
               </p>
@@ -389,13 +389,13 @@ export default async function Home() {
             </thead>
             <tbody>
               {[
-                ['Engine / runtime', 'No engine binary (pg only)', 'Client + 1.6 MB WASM engine', 'No engine'],
-                ['Runtime deps', '1 (pg)', '@prisma/client + adapter', '0'],
-                ['Main bundle (brotli)', '~31 KB', 'dominated by 1.6 MB WASM', '~7 KB core'],
+                ['Engine / runtime', 'No engine binary (pg only)', 'Client + TS/WASM query compiler', 'No engine'],
+                ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
+                ['Main bundle (brotli)', '~31 KB', '~1.6 MB client (TS/WASM compiler)', '~7 KB core'],
                 ['Studio', 'Read-only, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (paid tier)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, ~22 KB brotli', '1.6 MB WASM adapter', 'Native'],
+                ['Edge runtime', 'One import swap, ~22 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 ['Nested relations', '1 query, deep type inference', '1 query, shallow inference', 'relations() re-declaration'],
@@ -448,6 +448,26 @@ export default async function Home() {
             </tbody>
           </table>
         </div>
+
+        <p
+          style={{
+            marginTop: '1.5rem',
+            maxWidth: '48rem',
+            color: 'var(--text-secondary)',
+            fontSize: '0.9rem',
+            lineHeight: 1.7,
+          }}
+        >
+          Building nested reads by hand? Kysely&apos;s <code>jsonArrayFrom</code>{' '}
+          recipe uses the same correlated-subquery-plus-JSON approach &mdash;
+          proof the pattern is right. But once rows are aggregated into JSON the
+          driver can no longer see their types, so a <code>Date</code> inside a{' '}
+          <code>jsonArrayFrom</code> result is typed <code>Date</code> yet arrives
+          as a string, and the nesting isn&apos;t type-checked at depth. Turbine
+          types the whole tree and re-applies date coercion to every nested row,
+          so <code>users[0].posts[0].createdAt</code> is a real <code>Date</code>{' '}
+          at any depth &mdash; no plugin to wire up.
+        </p>
       </section>
 
       {/* ========== CTA ========== */}

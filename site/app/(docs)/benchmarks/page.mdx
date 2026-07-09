@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'Benchmarks',
   description:
-    'Turbine ORM vs Prisma 7 vs Drizzle v2 on a real pooled Neon database. Honest numbers.',
+    'Turbine ORM vs Prisma 7 vs Drizzle 0.45 on a real pooled Neon database. Honest numbers.',
   alternates: { canonical: '/benchmarks' },
 };
 
@@ -27,7 +27,7 @@ Three-way head-to-head against **Prisma 7.6** (`@prisma/adapter-pg`, `relationJo
 
 Average wall-clock ms per operation (lower is better). Bold = fastest.
 
-| Scenario | Turbine | Prisma 7 | Drizzle v2 |
+| Scenario | Turbine | Prisma 7 | Drizzle 0.45 |
 |---|---|---|---|
 | findMany — 100 users (flat) | **51.97 ms** | 52.90 ms | 53.51 ms |
 | findMany — 50 users + posts (L2) | **55.84 ms** | 56.10 ms | 88.80 ms |
@@ -44,7 +44,7 @@ Average wall-clock ms per operation (lower is better). Bold = fastest.
 
 `1.00x` = fastest on that scenario. Higher = slower.
 
-| Scenario | Turbine | Prisma 7 | Drizzle v2 |
+| Scenario | Turbine | Prisma 7 | Drizzle 0.45 |
 |---|---|---|---|
 | findMany — flat | **1.00x** | 1.02x | 1.03x |
 | findMany — L2 | **1.00x** | 1.00x | 1.59x |
