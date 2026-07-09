@@ -217,6 +217,8 @@ export {
   schemaToSQL,
   schemaToSQLString,
 } from './schema-sql.js';
+// Seed helper
+export { type DefinedSeed, defineSeed, type SeedFunction } from './seed.js';
 // Serverless / edge factory
 export { type TurbineHttpOptions, turbineHttp } from './serverless.js';
 // Typed raw SQL — Turbine's TypedSQL escape hatch
