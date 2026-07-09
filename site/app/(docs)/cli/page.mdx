@@ -293,6 +293,8 @@ Launch a local, read-only web UI for exploring your database. The only Postgres 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
 npx turbine studio --port 5173 --no-open
+# Non-loopback bind is refused unless you opt in:
+# npx turbine studio --host 0.0.0.0 --allow-remote
 ```
 
 Three tabs: a visual `findMany` **Query** builder with a live Copy-TS preview (no raw-SQL surface at all), **Data** browsing, and **Schema** inspection — all inside `BEGIN READ ONLY` with loopback binding and per-process token auth.
@@ -307,7 +309,7 @@ Start a read-only [Model Context Protocol](https://modelcontextprotocol.io) serv
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
 ```
 
-Six tools: `schema_overview`, `table_detail`, `migrate_status`, `doctor_report`, `explain_query` (SELECT-only), and `sample_rows` (≤ 50 rows). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
+Six tools: `schema_overview`, `table_detail`, `migrate_status`, `doctor_report`, `explain_query` (schema-validated findMany-style args only — no free-form SQL), and `sample_rows` (≤ 50 rows). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
 
 Full setup, tool reference, and Claude Code / Cursor config: **[MCP Server](/mcp)**.
 
