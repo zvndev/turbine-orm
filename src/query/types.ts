@@ -105,8 +105,21 @@ export type WhereClause<T> = {
 };
 
 /**
+ * Reserved key in a `with` clause that requests correlated relation counts.
+ * `_count: true` counts every to-many relation of the table; a record form
+ * (`_count: { posts: true }`) counts only the named to-many relations. Each
+ * selected relation resolves to a number on the result row's `_count` object.
+ */
+export type WithCount = true | Record<string, true>;
+
+/**
  * Unparameterized with clause — accepts any relation name.
  * Used internally by the query builder at runtime.
+ *
+ * The reserved `_count` key (see {@link WithCount}) is also accepted at runtime;
+ * the builder reads it via a cast so the narrow `true | WithOptions` element
+ * type is preserved for the relation-subquery machinery. Typed callers get a
+ * fully-typed `_count` through {@link TypedWithClause}.
  */
 export interface WithClause {
   [relation: string]: true | WithOptions;
@@ -127,6 +140,9 @@ export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
   ? WithClause
   : {
       [K in keyof R]?: true | WithOptions<RelationRelations<R[K]> & object>;
+    } & {
+      /** Reserved: correlated relation counts. `true` counts all to-many relations. */
+      _count?: true | { [K in keyof R]?: true };
     };
 
 /**
@@ -142,7 +158,7 @@ export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
 export interface WithOptions<NestedR extends object = {}> {
   with?: TypedWithClause<NestedR>;
   where?: Record<string, unknown>;
-  orderBy?: Record<string, OrderDirection>;
+  orderBy?: Record<string, OrderDirection | OrderBySpec>;
   limit?: number;
   /** Only include these fields from the relation */
   select?: Record<string, boolean>;
@@ -253,22 +269,44 @@ type ApplyCardinality<Rel, Resolved> =
 export type WithResult<T, R extends object, W> = [keyof R] extends [never]
   ? T
   : W extends object
-    ? [keyof W & keyof R] extends [never]
-      ? T
-      : T & {
-          [K in keyof W & keyof R]: W[K] extends true
-            ? // Leaf inclusion — no further `with`. Project the relation's runtime shape.
-              ApplyCardinality<R[K], RelationTarget<R[K]>>
-            : W[K] extends { with?: infer NestedW }
-              ? NestedW extends object
-                ? // Recursive case — drill into the target's relations map.
-                  ApplyCardinality<R[K], WithResult<RelationTarget<R[K]>, RelationRelations<R[K]> & object, NestedW>>
-                : // `with` was passed but is not an object literal — treat as leaf.
-                  ApplyCardinality<R[K], RelationTarget<R[K]>>
-              : // `WithOptions` was passed without a nested `with` — treat as leaf.
-                ApplyCardinality<R[K], RelationTarget<R[K]>>;
-        }
+    ? W extends { _count: infer C }
+      ? // `_count` requested — add the typed count object alongside any relations.
+        WithRelationAdditions<T, R, W> & { _count: CountResult<C> }
+      : WithRelationAdditions<T, R, W>
     : T;
+
+/**
+ * The relation additions grafted onto `T` by a `with` clause (the `_count`
+ * reserved key is handled separately by {@link WithResult}). Kept as its own
+ * alias so the no-`_count` path stays byte-identical to the pre-`_count` type.
+ */
+type WithRelationAdditions<T, R extends object, W> = [keyof W & keyof R] extends [never]
+  ? T
+  : T & {
+      [K in keyof W & keyof R]: W[K] extends true
+        ? // Leaf inclusion — no further `with`. Project the relation's runtime shape.
+          ApplyCardinality<R[K], RelationTarget<R[K]>>
+        : W[K] extends { with?: infer NestedW }
+          ? NestedW extends object
+            ? // Recursive case — drill into the target's relations map.
+              ApplyCardinality<R[K], WithResult<RelationTarget<R[K]>, RelationRelations<R[K]> & object, NestedW>>
+            : // `with` was passed but is not an object literal — treat as leaf.
+              ApplyCardinality<R[K], RelationTarget<R[K]>>
+          : // `WithOptions` was passed without a nested `with` — treat as leaf.
+            ApplyCardinality<R[K], RelationTarget<R[K]>>;
+    };
+
+/**
+ * Compute the shape of the `_count` object on a result row. `_count: true`
+ * counts every to-many relation (keys unknown at the type level → an open
+ * `Record<string, number>`); the record form (`_count: { posts: true }`) yields
+ * `{ [K in selected]: number }`.
+ */
+type CountResult<C> = C extends true
+  ? Record<string, number>
+  : C extends object
+    ? { [K in keyof C]: number }
+    : Record<string, number>;
 
 // ---------------------------------------------------------------------------
 // Select / Omit compile-time type narrowing
@@ -688,8 +726,8 @@ export interface GroupByArgs<T> {
   _max?: Partial<Record<keyof T & string, boolean>>;
   /** Filter whole groups by their aggregate values (SQL HAVING). */
   having?: HavingClause<T>;
-  /** Order groups */
-  orderBy?: Record<string, OrderDirection>;
+  /** Order groups (supports {@link OrderBySpec} for NULLS placement). */
+  orderBy?: Record<string, OrderDirection | OrderBySpec>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
 }
@@ -835,7 +873,35 @@ export interface VectorOrderBy {
 }
 
 /**
- * An orderBy clause maps each column to either a plain direction (`'asc'` /
- * `'desc'`) or, for pgvector columns, a KNN distance ordering object.
+ * Explicit ordering spec for a column: a direction plus an optional NULLS
+ * placement. `{ sort: 'desc', nulls: 'last' }` compiles to
+ * `ORDER BY "col" DESC NULLS LAST`. The plain `'asc' | 'desc'` shorthand is
+ * still accepted and unchanged. `nulls` is only emitted on engines that
+ * support the `NULLS FIRST/LAST` grammar (PostgreSQL, SQLite); requesting it
+ * elsewhere throws {@link UnsupportedFeatureError} (E017).
  */
-export type OrderByClause = Record<string, OrderDirection | VectorOrderBy>;
+export interface OrderBySpec {
+  sort: OrderDirection;
+  nulls?: 'first' | 'last';
+}
+
+/**
+ * Ordering by a relation, keyed by the relation name in an {@link OrderByClause}:
+ *
+ *  - to-many (hasMany / manyToMany): `{ posts: { _count: 'desc' } }` — orders by
+ *    a correlated `COUNT(*)` of the related rows.
+ *  - to-one (belongsTo / hasOne): `{ author: { name: 'asc' } }` — orders by a
+ *    correlated scalar subquery on the target column (an {@link OrderBySpec} with
+ *    `nulls` is accepted too).
+ */
+export type RelationOrderBy = { _count: OrderDirection } | Record<string, OrderDirection | OrderBySpec>;
+
+/**
+ * An orderBy clause maps each key to one of:
+ *  - a plain direction (`'asc'` / `'desc'`),
+ *  - an {@link OrderBySpec} (`{ sort, nulls }`) for NULLS placement,
+ *  - for pgvector columns, a KNN distance ordering ({@link VectorOrderBy}),
+ *  - for a relation name, a {@link RelationOrderBy} (`_count` for to-many, a
+ *    target column for to-one).
+ */
+export type OrderByClause = Record<string, OrderDirection | OrderBySpec | VectorOrderBy | RelationOrderBy>;
