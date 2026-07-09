@@ -23,7 +23,8 @@
 - **Batch `$transaction(DeferredQuery[])` overload.** Pass an array of `build*` deferred queries and they run atomically on one connection (`BEGIN` … each query … `COMMIT`), returning a positionally-typed results tuple. Any error rolls the whole batch back and rethrows; an empty array resolves to `[]`. The callback form is unchanged — `$transaction` accepts either.
 
 ### Added — CLI & tooling
-- **`turbine mcp` — zero-dependency, read-only MCP server.** Speaks JSON-RPC 2.0 over stdio (protocol `2025-06-18`, server name `turbine-orm`) for AI agents like Claude Code and Cursor. Six read-only tools — `schema_overview`, `table_detail`, `migrate_status`, `doctor_report`, `explain_query` (SELECT-only), `sample_rows` (≤ 50 rows, table validated against the introspected schema). Every database access runs inside `BEGIN READ ONLY`; there is no write surface and no raw-SQL execution. Malformed frames return a JSON-RPC error without crashing. `--include`/`--exclude` scope the exposed tables.
+- **`turbine mcp` — zero-dependency, read-only MCP server.** Speaks JSON-RPC 2.0 over stdio (protocol `2025-06-18`, server name `turbine-orm`) for AI agents like Claude Code and Cursor. Six read-only tools — `schema_overview`, `table_detail`, `migrate_status`, `doctor_report`, `explain_query` (schema-validated `findMany`-style builder args only — **no free-form SQL**), `sample_rows` (≤ 50 rows, table validated against the introspected schema). Every database access runs inside `BEGIN READ ONLY`; there is no write surface and no raw-SQL execution path. Malformed frames return a JSON-RPC error without crashing. `--include`/`--exclude` scope the exposed tables.
+- **Studio / Observe refuse non-loopback binds by default.** `--host` other than loopback (`127.0.0.1` / `localhost` / `::1`) exits 1 unless you pass **`--allow-remote`** (loud warning when you do). Matches the “local single-user tool” security model instead of warn-and-proceed.
 - **`turbine migrate deploy` — non-interactive production apply.** Never prompts (works with no TTY): applies all pending migrations inside the same advisory-lock + per-migration-transaction machinery as `migrate up`, reports `N applied`, and supports `--dry-run` to list pending without applying. Refuses to run (exit 1, clear message) on a checksum mismatch or a missing migration file, so a drifted history fails the deploy instead of diverging. It never auto-generates, seeds, or pushes.
 - **Seed-as-code.** `turbine seed` resolves the seed from the config `seed` field (or `seedFile` alias) or the first default candidate — `seed.ts`, `seed.js`, then `seed.sql`. `.ts` runs through `npx tsx` (clear error if `tsx` is missing), `.js` is imported (a default-export function is called), `.sql` runs as SQL. New `defineSeed(fn)` export wires up a client from `DATABASE_URL`, runs your function, and disconnects.
 - **`turbine generate --zod`.** Emits a `zod.ts` file alongside the generated types with a `XSchema` / `XCreateSchema` / `XUpdateSchema` per table, derived from column metadata (scalars, `z.coerce.date()` for dates, `z.enum([...])` for enums, `.array()`, `z.array(z.number())` for vectors, `.nullable()`; Create/Update optionality mirrors the generated input types). The generated file imports the user-side `zod` dep; the Turbine runtime never does.
@@ -32,7 +33,12 @@
 
 ### Docs
 - New pages: **Global Filters**, **Read Replicas**, **MCP Server**, **Seeding**, **Zod Schemas**, and **Views & Generated Columns**. Extended the API Reference (NULLS ordering, relation `_count`, ordering by a relation), Schema & Migrations (referential actions, enums, arrays, vector, checks), Transactions (batch `$transaction`), Relations, and the CLI page (`migrate deploy`, `mcp`, `--zod`, `--include-views`, seed-as-code).
+- **Quickstart honesty:** site `/quickstart` documents `tsx`, `"type": "module"`, `schema` vs `schemaFile`, and the empty-DB path (`defineSchema` → `push` → `generate`) alongside the existing-tables path.
 - **Comparison copy corrected:** the Drizzle Studio row previously read "paid tier" — local Drizzle Studio is free (only the hosted Drizzle Gateway is paid). Softened across the README, landing page, and Drizzle migration guide.
+
+### Chore
+- Removed broken root `npm run examples` script (missing `examples/examples.ts`); added `examples/README.md` index. `npm run dogfood` unchanged.
+- Widened optional peer `mssql` to `^10 || ^11 || ^12` (matches tested `mssql@12`).
 
 ## 0.27.1 (2026-07-08)
 
