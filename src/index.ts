@@ -172,8 +172,10 @@ export {
 export { type ActiveSubscription, type NotificationHandler, type Subscription, validateChannel } from './realtime.js';
 // Schema metadata types
 export type {
+  CheckMetadata,
   ColumnMetadata,
   IndexMetadata,
+  ReferentialAction,
   RelationDef,
   SchemaMetadata,
   TableMetadata,
@@ -192,14 +194,17 @@ export {
 // Schema builder — define schemas in TypeScript
 export {
   applyManyToManyRelations,
+  type CheckDef,
   ColumnBuilder,
   type ColumnConfig,
   type ColumnDef,
   type ColumnType,
   type ColumnTypeName,
   column,
+  type DefineSchemaOptions,
   defineSchema,
   type ManyToManyDef,
+  type ReferenceDef,
   type SchemaDef,
   type TableDef,
   // Legacy compat (deprecated — use object format with defineSchema)
