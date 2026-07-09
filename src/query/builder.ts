@@ -39,6 +39,7 @@ import {
   loadRelationsBatched,
   neededParentKeyFields,
   type RelationLoadContext,
+  resolveCountRelations,
   stripFields,
 } from './batched-loader.js';
 import type {
@@ -59,6 +60,7 @@ import type {
   HavingNumericOperator,
   JsonFilter,
   OrderByClause,
+  OrderBySpec,
   OrderDirection,
   QueryResult,
   RelationLoadStrategy,
@@ -72,6 +74,7 @@ import type {
   WhereClause,
   WhereOperator,
   WithClause,
+  WithCount,
   WithOptions,
 } from './types.js';
 import { escapeLike, LRUCache, OPERATOR_KEYS, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
@@ -312,6 +315,23 @@ function isVectorFilter(value: unknown): value is VectorFilter {
 /** Check if an orderBy value is a vector KNN ordering: `{ distance: { to, metric } }` */
 function isVectorOrderBy(value: unknown): value is VectorOrderBy {
   return isVectorFilter(value);
+}
+
+/** Check if an orderBy value is an explicit `{ sort, nulls? }` spec. */
+function isOrderBySpec(value: unknown): value is OrderBySpec {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) && 'sort' in value;
+}
+
+/**
+ * Normalize an orderBy value into `{ direction, nulls }`. Accepts a plain
+ * direction string or an {@link OrderBySpec}. Used by every ORDER BY compile
+ * path (findMany, groupBy, relation inner subqueries).
+ */
+function normalizeOrderBy(value: OrderDirection | OrderBySpec): { dir: 'ASC' | 'DESC'; nulls?: 'first' | 'last' } {
+  if (isOrderBySpec(value)) {
+    return { dir: value.sort.toLowerCase() === 'desc' ? 'DESC' : 'ASC', nulls: value.nulls };
+  }
+  return { dir: String(value).toLowerCase() === 'desc' ? 'DESC' : 'ASC' };
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,16 +1212,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
     const orderFp = args?.orderBy
       ? Object.entries(args.orderBy)
-          .map(([k, d]) => {
-            // Vector KNN ordering changes the emitted SQL operator by metric and
-            // adds a `::vector` param, so the metric + direction must be part of
-            // the cache key — otherwise two KNN queries differing only in metric
-            // would collide on a single cached SQL string.
-            if (isVectorOrderBy(d)) {
-              return `${k}:vec(${d.distance.metric},${d.distance.direction ?? 'asc'})`;
-            }
-            return `${k}:${d}`;
-          })
+          .map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d)}`)
           .join(',')
       : '';
     const cursorFp = args?.cursor
@@ -3229,6 +3240,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
     for (const relName of relNames) {
       const spec = withClause[relName];
       if (!spec) continue;
+      // Reserved `_count` key — fingerprint by the selected relation set so
+      // `_count: true` and `_count: { posts: true }` never share a cache entry.
+      if (relName === '_count') {
+        const c = spec as unknown as WithCount;
+        parts.push(
+          c === true
+            ? '_count(*)'
+            : `_count(${Object.entries(c)
+                .filter(([, v]) => v)
+                .map(([k]) => k)
+                .sort()
+                .join(',')})`,
+        );
+        continue;
+      }
       const relDef = meta.relations[relName];
       if (!relDef) {
         parts.push(`unknown:${relName}`);
@@ -3268,9 +3294,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
         );
       }
 
-      // orderBy shape
+      // orderBy shape (OrderBySpec nulls placement changes the SQL, so fingerprint it)
       if (opts.orderBy) {
-        const oEntries = Object.entries(opts.orderBy).map(([k, d]) => `${k}:${d}`);
+        const oEntries = Object.entries(opts.orderBy).map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d)}`);
         subParts.push(`o=${oEntries.join(',')}`);
       }
 
@@ -4080,10 +4106,36 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * findMany path). When `params` is omitted (groupBy / relation path) a vector
    * ordering throws — KNN ordering is only supported at the top level.
    */
+  /**
+   * Value-shape fingerprint for a single orderBy entry, so two queries whose
+   * ORDER BY differs only in nulls placement, vector metric, or relation-count
+   * vs relation-column never collide on one cached SQL string. Captures the
+   * SQL-shaping bits (direction, nulls, metric, relation keys) — never values.
+   */
+  private orderByEntryFingerprint(d: unknown): string {
+    // Vector KNN ordering changes the emitted operator by metric and adds a
+    // `::vector` param, so metric + direction must be part of the cache key.
+    if (isVectorOrderBy(d)) {
+      return `vec(${d.distance.metric},${d.distance.direction ?? 'asc'})`;
+    }
+    if (isOrderBySpec(d)) return `spec(${d.sort},${d.nulls ?? ''})`;
+    if (d && typeof d === 'object') {
+      // Relation ordering (`{ _count: 'desc' }` or `{ name: 'asc' }`).
+      return `rel(${Object.entries(d as Record<string, unknown>)
+        .map(([k, v]) => `${k}=${this.orderByEntryFingerprint(v)}`)
+        .sort()
+        .join(',')})`;
+    }
+    return String(d);
+  }
+
   private buildOrderBy(orderBy: OrderByClause, params?: unknown[]): string {
-    // Dev-only: validate that orderBy fields exist in the table schema
+    // Dev-only: validate that orderBy fields exist in the table schema. Relation
+    // orderBy keys (object values that are neither a vector nor an OrderBySpec)
+    // are validated in the relation branch below, so skip them here.
     if (process.env.NODE_ENV !== 'production') {
-      for (const key of Object.keys(orderBy)) {
+      for (const [key, value] of Object.entries(orderBy)) {
+        if (this.isRelationOrderByValue(value) && this.tableMeta.relations[key]) continue;
         const snakeKey = camelToSnake(key);
         if (!this.tableMeta.columns.some((c) => c.name === snakeKey) && !(key in this.tableMeta.columnMap)) {
           console.warn(
@@ -4095,33 +4147,170 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     const meta = this.schema.tables[this.table];
+    let relOrdCounter = 0;
     return Object.entries(orderBy)
-      .map(([key, dir]) => {
-        if (meta && !(key in meta.columnMap)) {
-          throw new ValidationError(
-            `[turbine] Unknown field "${key}" in orderBy on table "${this.table}". ` +
-              `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
-          );
-        }
-
+      .map(([key, value]) => {
         // Vector KNN ordering: { distance: { to, metric, direction? } }
-        if (isVectorOrderBy(dir)) {
+        if (isVectorOrderBy(value)) {
+          if (meta && !(key in meta.columnMap)) {
+            throw new ValidationError(
+              `[turbine] Unknown field "${key}" in orderBy on table "${this.table}". ` +
+                `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
+            );
+          }
           if (!params) {
             throw new ValidationError(
               `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
             );
           }
           const rawColumn = this.toColumn(key);
-          const operator = this.vectorOperator(key, rawColumn, dir.distance.metric);
-          const placeholder = this.pushVectorParam(key, rawColumn, dir.distance.to, params);
-          const safeDir = dir.distance.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+          const operator = this.vectorOperator(key, rawColumn, value.distance.metric);
+          const placeholder = this.pushVectorParam(key, rawColumn, value.distance.to, params);
+          const safeDir = value.distance.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
           return `${this.q(rawColumn)} ${operator} ${placeholder} ${safeDir}`;
         }
 
-        const safeDir = (dir as OrderDirection).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-        return `${this.toSqlColumn(key)} ${safeDir}`;
+        // Relation ordering: an object value that is not a vector or OrderBySpec,
+        // keyed by a relation name (`{ posts: { _count: 'desc' } }` / `{ author:
+        // { name: 'asc' } }`).
+        if (this.isRelationOrderByValue(value)) {
+          return this.buildRelationOrderBy(key, value as Record<string, unknown>, `ord${relOrdCounter++}`);
+        }
+
+        // Scalar column ordering — a plain direction or an OrderBySpec (nulls).
+        if (meta && !(key in meta.columnMap)) {
+          throw new ValidationError(
+            `[turbine] Unknown field "${key}" in orderBy on table "${this.table}". ` +
+              `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
+          );
+        }
+        const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
+        return `${this.toSqlColumn(key)} ${dir}${this.nullsSuffix(nulls)}`;
       })
       .join(', ');
+  }
+
+  /**
+   * True when an orderBy value is a relation-ordering object: a plain object
+   * that is neither a vector KNN ordering nor an {@link OrderBySpec}. Its key
+   * in the orderBy clause is a relation name.
+   */
+  private isRelationOrderByValue(value: unknown): boolean {
+    return (
+      typeof value === 'object' &&
+      value !== null &&
+      !Array.isArray(value) &&
+      !isVectorOrderBy(value) &&
+      !isOrderBySpec(value)
+    );
+  }
+
+  /**
+   * Render the ` NULLS FIRST` / ` NULLS LAST` suffix for a column ordering.
+   * Only PostgreSQL and SQLite support the `NULLS FIRST/LAST` grammar — on any
+   * other engine a caller asking for explicit nulls placement gets a clear
+   * {@link UnsupportedFeatureError} (E017) instead of broken SQL.
+   */
+  private nullsSuffix(nulls: 'first' | 'last' | undefined): string {
+    if (!nulls) return '';
+    if (this.dialect.name !== 'postgresql' && this.dialect.name !== 'sqlite') {
+      throw new UnsupportedFeatureError(
+        'NULLS FIRST/LAST ordering',
+        this.dialect.name,
+        'Explicit nulls placement in orderBy is only available on PostgreSQL and SQLite.',
+      );
+    }
+    return nulls === 'first' ? ' NULLS FIRST' : ' NULLS LAST';
+  }
+
+  /**
+   * Compile a relation ordering term. For a to-many relation the only allowed
+   * key is `_count`, which becomes a correlated `COUNT(*)` subquery. For a
+   * to-one relation each entry names a target column and becomes a correlated
+   * scalar subquery (supporting {@link OrderBySpec} nulls placement).
+   *
+   * Validation: relation must exist (E005); to-many only allows `_count`, and
+   * to-one only allows real target columns (E003).
+   */
+  private buildRelationOrderBy(relName: string, value: Record<string, unknown>, alias: string): string {
+    const relDef = this.tableMeta.relations[relName];
+    if (!relDef) {
+      throw new RelationError(
+        `[turbine] Unknown relation "${relName}" in orderBy on table "${this.table}". ` +
+          `Available: ${Object.keys(this.tableMeta.relations).join(', ')}`,
+      );
+    }
+
+    // To-many: only `_count` is meaningful → correlated COUNT(*) subquery.
+    if (relDef.type === 'hasMany' || relDef.type === 'manyToMany') {
+      const keys = Object.keys(value);
+      if (keys.length !== 1 || keys[0] !== '_count') {
+        throw new ValidationError(
+          `[turbine] orderBy on to-many relation "${relName}" only supports "_count" ` +
+            `(got: ${keys.join(', ') || '(empty)'}).`,
+        );
+      }
+      const { dir } = normalizeOrderBy(value._count as OrderDirection);
+      return `${this.buildRelationCountExpr(relDef, this.table, alias)} ${dir}`;
+    }
+
+    // To-one: each entry orders by a correlated scalar subquery on a target column.
+    const targetMeta = this.schema.tables[relDef.to];
+    if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
+    const qTarget = this.q(relDef.to);
+    const qParent = this.q(this.table);
+    // belongsTo: alias.referenceKey = parent.foreignKey; hasOne: reversed.
+    const correlation =
+      relDef.type === 'belongsTo'
+        ? this.dialect.buildCorrelation(alias, relDef.referenceKey, qParent, relDef.foreignKey)
+        : this.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
+
+    const entries = Object.entries(value);
+    if (entries.length === 0) {
+      throw new ValidationError(`[turbine] orderBy on to-one relation "${relName}" needs at least one target column.`);
+    }
+    return entries
+      .map(([col, dirValue]) => {
+        const snakeCol = camelToSnake(col);
+        if (!targetMeta.allColumns.includes(snakeCol)) {
+          throw new ValidationError(
+            `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").`,
+          );
+        }
+        const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
+        return `(SELECT ${alias}.${this.q(snakeCol)} FROM ${qTarget} ${alias} WHERE ${correlation}${this.limitOneClause()}) ${dir}${this.nullsSuffix(nulls)}`;
+      })
+      .join(', ');
+  }
+
+  /**
+   * Build a correlated `(SELECT COUNT(*) …)` scalar subquery for a to-many
+   * relation, correlated to `parentRef`. hasMany counts child rows via the FK;
+   * manyToMany counts junction rows via the source key. Shared by the `_count`
+   * `with` key and to-many relation orderBy. Emits no bound params.
+   */
+  private buildRelationCountExpr(relDef: RelationDef, parentRef: string, alias: string): string {
+    const qParent = this.q(parentRef);
+    const count = this.castAgg('COUNT(*)', 'int');
+    if (relDef.type === 'manyToMany') {
+      if (!relDef.through) {
+        throw new ValidationError(
+          `[turbine] manyToMany relation "${relDef.name}" is missing its \`through\` junction.`,
+        );
+      }
+      const qJ = this.q(relDef.through.table);
+      const jalias = `${alias}j`;
+      const sourceKeys = normalizeKeyColumns(relDef.through.sourceKey);
+      const refKeys = normalizeKeyColumns(relDef.referenceKey);
+      const where = sourceKeys
+        .map((jc, i) => `${jalias}.${this.q(jc)} = ${qParent}.${this.q(refKeys[i]!)}`)
+        .join(' AND ');
+      return `(SELECT ${count} FROM ${qJ} ${jalias} WHERE ${where})`;
+    }
+    // hasMany: child FK correlates to the parent reference key.
+    const qTarget = this.q(relDef.to);
+    const where = this.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
+    return `(SELECT ${count} FROM ${qTarget} ${alias} WHERE ${where})`;
   }
 
   // -------------------------------------------------------------------------
@@ -4276,6 +4465,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const parsed = this.parseRow(row, table);
     const meta = this.schema.tables[table];
     if (!meta) return parsed;
+
+    // Assemble reserved `_count__<rel>` scalar columns into a `_count` object.
+    // parseRow copies these unknown columns through under their raw key.
+    let countObj: Record<string, number> | undefined;
+    for (const key of Object.keys(parsed)) {
+      if (key.startsWith('_count__')) {
+        if (countObj === undefined) countObj = {};
+        countObj[key.slice('_count__'.length)] = Number(parsed[key]);
+        delete parsed[key];
+      }
+    }
+    if (countObj) parsed._count = countObj;
 
     for (const [relName, relDef] of Object.entries(meta.relations)) {
       const rawValue = row[relName];
@@ -4568,6 +4769,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const aliasCounter = { n: 0 };
 
     for (const [relName, relSpec] of sortedEntries(withClause)) {
+      // `_count` is a reserved key handled after the relation subqueries.
+      if (relName === '_count') continue;
       const relDef = meta.relations[relName];
       if (!relDef) {
         throw new RelationError(
@@ -4579,6 +4782,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // The main table is not aliased, so pass table name as parentRef
       const subquery = this.buildRelationSubquery(relDef, relSpec, params, table, aliasCounter, depth, path);
       relationSelects.push(`(${subquery}) AS ${this.q(relName)}`);
+    }
+
+    // Reserved `_count` key → one correlated COUNT(*) scalar subquery per
+    // selected to-many relation, aliased `_count__<rel>`. These push no params,
+    // so their SQL position is appended after the relation subqueries. Read via
+    // a cast so WithClause keeps its narrow `true | WithOptions` element type.
+    const countSpec = (withClause as { _count?: WithCount })._count;
+    if (countSpec !== undefined) {
+      for (const rel of resolveCountRelations(meta, countSpec)) {
+        const expr = this.buildRelationCountExpr(rel, table, `t${aliasCounter.n++}`);
+        relationSelects.push(`${expr} AS ${this.q(`_count__${rel.name}`)}`);
+      }
     }
 
     return [baseCols, ...relationSelects].join(', ');
@@ -4830,13 +5045,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     let orderClause = '';
     if (relOrderEntries.length > 0) {
       const orders = relOrderEntries
-        .map(([k, dir]) => {
+        .map(([k, dirValue]) => {
           const col = camelToSnake(k);
           if (!targetMeta.allColumns.includes(col)) {
             throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
           }
-          const safeDir = String(dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-          return `${alias}.${this.q(col)} ${safeDir}`;
+          const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
+          return `${alias}.${this.q(col)} ${dir}${this.nullsSuffix(nulls)}`;
         })
         .join(', ');
       orderClause = ` ORDER BY ${orders}`;
@@ -5011,13 +5226,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     let orderClause = '';
     if (relOrderEntries.length > 0) {
       const orders = relOrderEntries
-        .map(([k, dir]) => {
+        .map(([k, dirValue]) => {
           const col = camelToSnake(k);
           if (!targetMeta.allColumns.includes(col)) {
             throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
           }
-          const safeDir = String(dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-          return `${talias}.${this.q(col)} ${safeDir}`;
+          const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
+          return `${talias}.${this.q(col)} ${dir}${this.nullsSuffix(nulls)}`;
         })
         .join(', ');
       orderClause = ` ORDER BY ${orders}`;

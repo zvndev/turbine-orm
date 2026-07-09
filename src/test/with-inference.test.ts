@@ -371,6 +371,46 @@ type DeclaredOmitWithHasEmail = 'email' extends keyof DeclaredOmitWith ? true : 
 assertTrue<Equals<DeclaredOmitWithHasEmail, false>>();
 
 // ---------------------------------------------------------------------------
+// 12. Relation `_count` in `with` (WS-A / A4)
+//
+//     `_count: true` types the result's `_count` as an open Record<string,
+//     number>; the record form narrows it to exactly the selected relations.
+//     `_count` coexists with real relation inclusions.
+// ---------------------------------------------------------------------------
+
+// --- _count: true → open record of numbers ---
+type CountAll = WithResult<User, UserRelations, { _count: true }>;
+assertTrue<Equals<CountAll['_count'], Record<string, number>>>();
+
+// --- _count: { posts: true } → { posts: number } ---
+type CountPosts = WithResult<User, UserRelations, { _count: { posts: true } }>;
+assertTrue<Equals<CountPosts['_count'], { posts: number }>>();
+
+// --- _count coexists with a real relation inclusion ---
+type CountWithRel = WithResult<User, UserRelations, { posts: true; _count: { posts: true } }>;
+assertTrue<Equals<CountWithRel['posts'], Post[]>>();
+assertTrue<Equals<CountWithRel['_count'], { posts: number }>>();
+
+// --- a with clause WITHOUT _count must NOT gain a _count key ---
+type NoCount = WithResult<User, UserRelations, { posts: true }>;
+type NoCountHasCount = '_count' extends keyof NoCount ? true : false;
+assertTrue<Equals<NoCountHasCount, false>>();
+
+// --- Call-site inference: _count on the result of findMany ---
+async function countCallSite() {
+  if (false as boolean) {
+    const withCount = await users.findMany({ with: { _count: { posts: true } } });
+    type WithCountItem = (typeof withCount)[number];
+    assertTrue<Equals<WithCountItem['_count'], { posts: number }>>();
+
+    const countAll = await users.findMany({ with: { _count: true } });
+    type CountAllItem = (typeof countAll)[number];
+    assertTrue<Equals<CountAllItem['_count'], Record<string, number>>>();
+  }
+}
+void countCallSite;
+
+// ---------------------------------------------------------------------------
 // node:test stub so the runner picks up the file
 // ---------------------------------------------------------------------------
 

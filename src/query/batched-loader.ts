@@ -48,10 +48,10 @@
  */
 
 import type pg from 'pg';
-import { CircularRelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableMetadata } from '../schema.js';
 import type { ReselectExecutor } from './builder.js';
-import type { WithClause, WithOptions } from './types.js';
+import type { WithClause, WithCount, WithOptions } from './types.js';
 
 /**
  * Max parent keys per follow-up query. On Postgres the whole key set travels as
@@ -166,6 +166,13 @@ export function neededParentKeyFields(parentMeta: TableMetadata, withClause: Wit
   const fields = new Set<string>();
   for (const [relName, spec] of Object.entries(withClause)) {
     if (!spec) continue;
+    // `_count` needs each counted relation's parent-side key to stitch counts.
+    if (relName === '_count') {
+      for (const rel of resolveCountRelations(parentMeta, spec as unknown as WithCount)) {
+        for (const col of localKeyColumns(rel)) fields.add(parentMeta.reverseColumnMap[col] ?? col);
+      }
+      continue;
+    }
     const rel = parentMeta.relations[relName];
     if (!rel) continue; // unknown relation — the join path throws; let the loader surface it
     for (const col of localKeyColumns(rel)) {
@@ -184,6 +191,41 @@ export function neededParentKeyFields(parentMeta: TableMetadata, withClause: Wit
 function localKeyColumns(rel: RelationDef): string[] {
   if (rel.type === 'belongsTo') return normalizeKeyColumns(rel.foreignKey);
   return normalizeKeyColumns(rel.referenceKey);
+}
+
+/**
+ * Resolve the set of to-many relations a `_count` spec selects. `true` counts
+ * every to-many relation (hasMany + manyToMany) of the table; the record form
+ * counts only the enabled names. Shared by the join builder and the batched
+ * loader so both count the exact same relations.
+ *
+ * Errors: E005 ({@link RelationError}) for an unknown relation name, E003
+ * ({@link ValidationError}) when a named relation is to-one.
+ */
+export function resolveCountRelations(parentMeta: TableMetadata, countSpec: WithCount): RelationDef[] {
+  const isToMany = (r: RelationDef): boolean => r.type === 'hasMany' || r.type === 'manyToMany';
+  if (countSpec === true) {
+    return Object.values(parentMeta.relations).filter(isToMany);
+  }
+  const out: RelationDef[] = [];
+  for (const [relName, enabled] of Object.entries(countSpec)) {
+    if (!enabled) continue;
+    const rel = parentMeta.relations[relName];
+    if (!rel) {
+      throw new RelationError(
+        `[turbine] Unknown relation "${relName}" in _count on table "${parentMeta.name}". ` +
+          `Available: ${Object.keys(parentMeta.relations).join(', ')}`,
+      );
+    }
+    if (!isToMany(rel)) {
+      throw new ValidationError(
+        `[turbine] _count is only supported for to-many relations; "${relName}" on ` +
+          `"${parentMeta.name}" is a to-one relation.`,
+      );
+    }
+    out.push(rel);
+  }
+  return out;
 }
 
 /** Stringified stitch key — robust to number/uuid/bigint type drift across a join. */
@@ -213,6 +255,11 @@ export async function loadRelationsBatched(
   const loads: Promise<void>[] = [];
   for (const [relName, spec] of Object.entries(withClause)) {
     if (!spec) continue;
+    // Reserved `_count` key — one grouped COUNT(*) follow-up per counted relation.
+    if (relName === '_count') {
+      loads.push(loadCounts(ctx, parents, spec as unknown as WithCount));
+      continue;
+    }
     const rel = ctx.parentMeta.relations[relName];
     if (!rel) {
       throw new ValidationError(
@@ -220,7 +267,7 @@ export async function loadRelationsBatched(
           `Available: ${Object.keys(ctx.parentMeta.relations).join(', ')}`,
       );
     }
-    const options: WithOptions = spec === true ? {} : spec;
+    const options: WithOptions = spec === true ? {} : (spec as WithOptions);
 
     loads.push(
       rel.type === 'manyToMany'
@@ -457,6 +504,100 @@ async function loadManyToMany(
   }
 
   stripFields(targetsInOrder, proj.strip);
+}
+
+/**
+ * Load correlated `_count` values for the counted relations. One grouped
+ * follow-up per relation (`SELECT key, COUNT(*) … WHERE key = ANY($1) GROUP BY
+ * key`), attached onto each parent's `_count` object (0 when a parent has no
+ * matching rows) — byte-identical to the join strategy's `_count` output.
+ */
+async function loadCounts(
+  ctx: RelationLoadContext,
+  parents: Record<string, unknown>[],
+  countSpec: WithCount,
+): Promise<void> {
+  const rels = resolveCountRelations(ctx.parentMeta, countSpec);
+  // Initialise every parent's `_count` up-front so the concurrent per-relation
+  // loads below (each writing its own key) never race on the object creation.
+  for (const parent of parents) {
+    if (parent._count === undefined) parent._count = {};
+  }
+  await Promise.all(rels.map((rel) => loadOneCount(ctx, parents, rel)));
+}
+
+/** One grouped COUNT(*) follow-up for a single to-many relation. */
+async function loadOneCount(
+  ctx: RelationLoadContext,
+  parents: Record<string, unknown>[],
+  rel: RelationDef,
+): Promise<void> {
+  let parentKeyCol: string;
+  let childTable: string;
+  let childKeyCol: string;
+
+  if (rel.type === 'manyToMany') {
+    const through = rel.through;
+    if (!through) {
+      throw new ValidationError(`[turbine] manyToMany relation "${rel.name}" is missing its junction (\`through\`).`);
+    }
+    const sourceRef = normalizeKeyColumns(rel.referenceKey);
+    const sourceJ = normalizeKeyColumns(through.sourceKey);
+    if (sourceRef.length > 1 || sourceJ.length > 1) {
+      throw new UnsupportedFeatureError(
+        'composite-key batched _count',
+        'relationLoadStrategy: "batched"',
+        `relation "${rel.name}" — use the default 'join' strategy for composite-key m2m _count`,
+      );
+    }
+    parentKeyCol = sourceRef[0]!;
+    childTable = through.table;
+    childKeyCol = sourceJ[0]!;
+  } else {
+    // hasMany: child FK correlates to the parent reference key.
+    const fk = normalizeKeyColumns(rel.foreignKey);
+    const rk = normalizeKeyColumns(rel.referenceKey);
+    if (fk.length > 1 || rk.length > 1) {
+      throw new UnsupportedFeatureError(
+        'composite-key batched _count',
+        'relationLoadStrategy: "batched"',
+        `relation "${rel.name}" — use the default 'join' strategy for composite-key _count`,
+      );
+    }
+    parentKeyCol = rk[0]!;
+    childTable = rel.to;
+    childKeyCol = fk[0]!;
+  }
+
+  const parentKeyField = ctx.parentMeta.reverseColumnMap[parentKeyCol] ?? parentKeyCol;
+  const keys = uniqueKeys(parents, parentKeyField);
+
+  const counts = new Map<string, number>();
+  if (keys.length > 0) {
+    const qChild = ctx.quote(childTable);
+    const qKey = ctx.quote(childKeyCol);
+    const chunks: unknown[][] = [];
+    for (let i = 0; i < keys.length; i += MAX_RELATION_KEYS) chunks.push(keys.slice(i, i + MAX_RELATION_KEYS));
+    const results = await Promise.all(
+      chunks.map((chunk) => {
+        const params: unknown[] = [ctx.inClauseParam(chunk)];
+        const predicate = ctx.buildInClause(`${qChild}.${qKey}`, ctx.paramPlaceholder(1), false);
+        const sql =
+          `SELECT ${qChild}.${qKey} AS "k", COUNT(*) AS "c" FROM ${qChild} ` +
+          `WHERE ${predicate} GROUP BY ${qChild}.${qKey}`;
+        return ctx.exec(sql, params);
+      }),
+    );
+    for (const { rows } of results) {
+      for (const row of rows as Record<string, unknown>[]) {
+        counts.set(keyOf(row.k), Number(row.c));
+      }
+    }
+  }
+
+  for (const parent of parents) {
+    (parent._count as Record<string, number>)[rel.name] = counts.get(keyOf(parent[parentKeyField])) ?? 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
