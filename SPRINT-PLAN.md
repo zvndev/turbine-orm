@@ -1,66 +1,127 @@
-# Sprint Plan — Turbine ORM
-Generated: 2026-06-25
-Based on: AUDIT-REPORT.md (5-agent product review, v0.19.2)
+# Sprint Plan — Turbine ORM (post product-review)
+
+Generated: 2026-07-09  
+Based on: product-review findings (conversation) rebased on `sprint/v0.28.0-parity`  
+Skipped (per Kirby): npm token rotation
 
 ## Sprint Goal
-Eliminate every onboarding-breaking doc bug and the one security gap, document the
-two undocumented competitive features (nested writes, optimistic locking), reposition
-the top-line messaging around the real moat (the safety bundle), and put automated
-tests around the Studio security perimeter — without touching injection-critical code.
+
+Close remaining **security honesty gaps** (MCP free-form SQL, Studio non-loopback warn-only) and **launch hygiene** (quickstart that works, broken examples script, peer/engines alignment) so 0.28 can ship with claims that match the code.
 
 ## Success Criteria
-- [ ] All P0/P1 broken/misleading items resolved (casing, `$queryRaw`, `timeoutMs`, Observe XSS, `withRetry` claim, quickstart `.author`)
-- [ ] Studio security perimeter has automated tests (token 401 / rate-limit 429 / cross-origin 403 / read-only write rejection)
-- [ ] Nested writes + optimistic locking documented
-- [ ] README + landing hero lead with the safety bundle
-- [ ] Build, typecheck, lint, and unit tests all green after merge
-- [ ] No file edited by two tracks (zero merge conflicts)
 
-## Dev Tracks (4) — zero file overlap
+- [ ] MCP has no free-form user SQL execution path for EXPLAIN
+- [ ] Studio/Observe refuse non-loopback host without `--allow-remote`
+- [ ] Site quickstart documents tsx, `"type": "module"`, schema vs schemaFile, empty-DB path
+- [ ] `npm run examples` works or is removed; dogfood still valid
+- [ ] `mssql` peer range includes what we test (^12)
+- [ ] Unit tests pass; docs match new flags/tool shapes
+- [ ] CHANGELOG notes security + hygiene (PM consolidates after merge)
 
-### Track 1: Code & Security Hardening — backend/security specialist
-**Files owned:** `src/cli/observe-ui.ts`, `src/cli/observe.ts`, `src/cli/studio.ts`, `src/cli/index.ts`, `src/generate.ts`, `src/adapters/cockroachdb.ts`, `src/test/generate*.test.ts` (snapshot fixups only), `generated/turbine/metadata.ts` (if tracked), `package.json`, `CLAUDE.md`
+## Already done on branch (do not re-do)
+
+- Bundle sizes green (~42 / ~33 kB) + marketing updated
+- MCP page + CLI docs for migrate deploy / zod / views / destructive
+- Sitemap includes engines, nested-writes, optimistic-locking, recipes, mcp
+- 0.28 parity feature code + CHANGELOG draft
+
+## Intentionally deferred (post-sprint backlog)
+
+- Split `builder.ts` into WHERE / relation / DML modules
+- Hard-gate MySQL/SQLite CI (`continue-on-error` removal)
+- Third-party re-benchmark at 0.28
+- Quarterly competitive copy refresh
+- npm publish + vercel prod (manual / Kirby after sprint green)
+
+---
+
+## Dev Tracks (no overlapping file ownership)
+
+### Track 1: MCP EXPLAIN lockdown — Security
+**Files owned:**
+- `src/cli/mcp.ts`
+- `src/test/mcp.test.ts`
+- `site/app/(docs)/mcp/page.mdx`
+
 **Tasks:**
-- [ ] T1-1 (LOW-sec): Escape `row.model`/`row.action` via the existing `escapeHtml` pattern in `observe-ui.ts:138,155`
-- [ ] T1-2 (P3): Harden Studio/Observe token check to `crypto.timingSafeEqual` over SHA-256 digests (constant length, no throw, no length leak)
-- [ ] T1-3 (P2): Make the "Refuse to bind" comments at `cli/index.ts:~1138,~1229` accurate (warn-and-proceed on explicit `--host`)
-- [ ] T1-4 (P1): Export a lowercase `schema` alias alongside `SCHEMA` in `generate.ts` generateMetadata; update tracked fixture + any generate snapshot test
-- [ ] T1-5 (P2): Fix stale `cockroachdb.ts:77` comment (`SHOW INDEXES` → `pg_indexes`)
-- [ ] T1-6 (P3): Move `@types/pg` `dependencies` → `devDependencies`
-- [ ] T1-7 (P2): Fix stale CLAUDE.md invariant ("cli/ never imports query/")
+- [ ] TASK-01: Replace free-form `explain_query` `{ sql }` with schema-validated builder args (table + findMany-like where/orderBy/limit/select). Compile via `QueryInterface.buildFindMany` (Studio pattern). Run `EXPLAIN (FORMAT JSON)` only on compiled SQL + bound params.
+- [ ] TASK-02: Reject unknown tables/fields; keep READ ONLY + statement timeout + semicolon not needed if no free SQL.
+- [ ] TASK-03: Update `mcp.test.ts` — reject free-form / injection; happy path on mock or build-only where possible.
+- [ ] TASK-04: Update MCP docs — remove false “no raw-SQL” if still accurate only after fix; document new tool input.
 
-### Track 2: README + Landing Positioning — product/copy specialist
-**Files owned:** `README.md`, `site/app/page.tsx`
+**Must NOT edit:** `src/cli/index.ts`, package.json, quickstart, studio docs.
+
+---
+
+### Track 2: Studio/Observe `--allow-remote` hard-fail — Security
+**Files owned:**
+- `src/cli/index.ts` (host gate + flag parse + help only for studio/observe)
+- `src/test/cli-flags.test.ts` and/or `src/test/studio.test.ts` / `studio-security.test.ts` as appropriate
+- `site/app/(docs)/studio/page.mdx`
+
 **Tasks:**
-- [ ] T2-1 (P2-strategy): Reposition README hero around the safety bundle (DBA-approvable read-only Studio, PII-safe errors, one dependency, checksummed migrations) — re-order the lead, keep all technical content
-- [ ] T2-2 (P1): Fix `schema` → `SCHEMA` in README serverless examples (~lines 708–757)
-- [ ] T2-3 (P1): Correct the `withRetry()` "built-in" claim in the README comparison table
-- [ ] T2-4 (P2-strategy): Align the landing hero (`site/app/page.tsx`) with the same safety-bundle lead; fix `withRetry` in the landing comparison table if present
+- [ ] TASK-05: Non-loopback `--host` without `--allow-remote` → exit 1 with clear error (studio + observe).
+- [ ] TASK-06: With `--allow-remote`, proceed + keep loud warning.
+- [ ] TASK-07: Loopback defaults unchanged (`127.0.0.1`, `localhost`, `::1`).
+- [ ] TASK-08: Parse `--allow-remote`; document in CLI help + studio page.
 
-### Track 3: Docs Pages (MDX) — docs specialist
-**Files owned:** `site/app/(docs)/**` (MDX + docs nav/layout only)
+**Must NOT edit:** `src/cli/mcp.ts`, package.json, quickstart, mcp page.
+
+---
+
+### Track 3: Quickstart onboarding honesty — Docs
+**Files owned:**
+- `site/app/(docs)/quickstart/page.mdx`
+
 **Tasks:**
-- [ ] T3-1 (P1): Fix `schema` → `SCHEMA` in `serverless/page.mdx` (all blocks)
-- [ ] T3-2 (P1): Fix `db.$queryRaw` → `db.raw` / `db.sql` in `compatibility/page.mdx`
-- [ ] T3-3 (P1): Fix `timeoutMs` → `timeout` in `transactions/page.mdx`
-- [ ] T3-4 (P1): Fix quickstart `.author` example (`quickstart/page.mdx:106`) — load `author` via nested `with` or remove the access
-- [ ] T3-5 (P2): NEW page — nested writes (verify against `src/nested-write.ts`)
-- [ ] T3-6 (P2): NEW page — optimistic locking (verify against `builder.ts` optimisticLock)
-- [ ] T3-7 (P3): NEW recipe — Next.js/Express route handler + end-to-end RLS example with policy DDL
-- [ ] T3-8: Update docs nav to include new pages
+- [ ] TASK-09: Document prerequisites: `tsx` devDep, `"type": "module"`, Node ≥ 18 (link engines for SQLite ≥ 22.5).
+- [ ] TASK-10: Call out `schema` vs `schemaFile`.
+- [ ] TASK-11: Two paths: existing tables → generate; empty DB → defineSchema → push → generate.
+- [ ] TASK-12: Install block includes `npm i -D tsx`.
 
-### Track 4: Test Coverage — test specialist
-**Files owned:** `src/test/**` EXCEPT `src/test/generate*.test.ts` (Track 1 owns those)
+**Must NOT edit:** other site pages, src/, package.json.
+
+---
+
+### Track 4: Package hygiene — Chore
+**Files owned:**
+- `package.json` (scripts.examples + peerDependencies.mssql only)
+- `examples/README.md` (create if needed)
+- Optionally remove dead script only — do not invent large demos
+
 **Tasks:**
-- [ ] T4-1 (P1): Studio security-perimeter tests through the HTTP dispatch layer — invalid token → 401, rate limit → 429, cross-origin → 403, write under `BEGIN READ ONLY` → rejected. Test behavior, not implementation.
-- [ ] T4-2 (P2): Fix `with-inference.test.ts` docstring (real guard is the typecheck job, not `tsx --test`)
-- [ ] T4-3 (P3): Relabel `sql-safety-property.test.ts` to reflect it is a fixed adversarial corpus (no new deps); optionally expand the corpus
+- [ ] TASK-13: Fix or remove broken `"examples": "tsx examples/examples.ts"` (file missing). Prefer: remove script + add `examples/README.md` index of real demos; keep `dogfood`.
+- [ ] TASK-14: Widen `peerDependencies.mssql` to include `^12` (align with devDependency `^12.7.0`).
 
-## Intentionally skipped (with reason)
-- Refresh benchmarks — needs a live DB at 1M+ rows; manual follow-up.
-- Configure `NPM_TOKEN` — user must add the CI secret (manual).
-- Split `builder.ts` — injection-critical; too risky to bundle here.
+**Must NOT edit:** src/, site/, CHANGELOG.
 
-## Manual actions for the user
-- Add the `NPM_TOKEN` repo secret to re-enable automated publishing.
-- Run a fresh large-dataset benchmark (correlated-subquery vs LATERAL) before 1.0.
+---
+
+### Track 5 (PM after merge): Docs sync + CHANGELOG
+**Files owned after merge only:**
+- `CHANGELOG.md` (append Security / Docs notes under 0.28.0 if needed)
+- README Studio/MCP bullets if they contradict new behavior
+- `site/app/(docs)/cli/page.mdx` only if host flag / mcp tool shape missing
+
+## Quality bar (all agents)
+
+- Read before edit; match existing style (Biome, ESM, no new deps).
+- Prefer tests that prove the gate without requiring a live DB when possible.
+- Commit in worktree with message: `Track N: <summary>`.
+- Do not push, publish, or force-push.
+- Do not touch npm tokens / `.npmrc`.
+
+## Merge order
+
+1. Track 4 (package.json — least conflict risk)
+2. Track 3 (docs quickstart)
+3. Track 1 (mcp)
+4. Track 2 (cli index — largest)
+5. PM CHANGELOG / residual docs
+
+## Verification after merge
+
+```bash
+npm run typecheck && npm run lint && npm run test:unit
+npm run size   # must stay green
+```
