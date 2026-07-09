@@ -14,6 +14,7 @@
  *   turbine status                — Show schema summary
  *   turbine doctor                — Check relations for missing FK indexes (--fix emits migration)
  *   turbine studio                — Launch local read-only web UI
+ *   turbine mcp                   — Start read-only MCP server over JSON-RPC stdio
  *   turbine observe               — Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
  *
  * Usage:
@@ -33,6 +34,7 @@ import { schemaDiff, schemaPush } from '../schema-sql.js';
 import type { CliOverrides, ResolvedConfig } from './config.js';
 import { configTemplate, findConfigFile, loadConfig, looksLikeSchemaFilePath, resolveConfig } from './config.js';
 import { canResolveTsx, getTsLoaderError, needsTsLoader, registerTsLoader } from './loader.js';
+import { runMcpServer } from './mcp.js';
 import { createMigration, listMigrationFiles, migrateDown, migrateStatus, migrateUp } from './migrate.js';
 import { startObserve } from './observe.js';
 import { startStudio } from './studio.js';
@@ -1468,6 +1470,21 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Command: mcp — read-only JSON-RPC stdio server
+// ---------------------------------------------------------------------------
+
+async function cmdMcp(_args: CliArgs, config: ResolvedConfig): Promise<void> {
+  const url = requireUrl(config);
+  await runMcpServer({
+    url,
+    schema: config.schema,
+    migrationsDir: config.migrationsDir,
+    include: config.include.length ? config.include : undefined,
+    exclude: config.exclude.length ? config.exclude : undefined,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Command: observe
 // ---------------------------------------------------------------------------
 
@@ -1558,6 +1575,7 @@ function showSubcommandHelp(command: string): boolean {
     migration: showMigrateHelp,
     seed: showSeedHelp,
     status: showStatusHelp,
+    mcp: showMcpHelp,
   };
   const fn = helpMap[command];
   if (fn) {
@@ -1688,6 +1706,24 @@ function showStatusHelp(): void {
   newline();
 }
 
+function showMcpHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine mcp')} — Start read-only MCP server over stdio`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine mcp ${dim('[options]')}`);
+  newline();
+  console.log(`  Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and exposes`);
+  console.log(`  schema, migration status, doctor, EXPLAIN, and sample-row tools.`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);
+  console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}   Postgres schema ${dim('(default: public)')}`);
+  console.log(`    ${cyan('--include')} ${dim('<tables>')}    Comma-separated tables to include`);
+  console.log(`    ${cyan('--exclude')} ${dim('<tables>')}    Comma-separated tables to exclude`);
+  newline();
+}
+
 // ---------------------------------------------------------------------------
 // Help
 // ---------------------------------------------------------------------------
@@ -1714,6 +1750,7 @@ function showHelp(): void {
     `    ${cyan('doctor')}             Check relations for missing FK indexes ${dim('(--fix emits migration)')}`,
   );
   console.log(`    ${cyan('studio')}             Launch local read-only web UI`);
+  console.log(`    ${cyan('mcp')}                Start read-only MCP server over stdio`);
   console.log(`    ${cyan('observe')}            Launch metrics dashboard ${dim('(requires TURBINE_OBSERVE_URL)')}`);
   newline();
 
@@ -1890,6 +1927,10 @@ async function main() {
 
       case 'studio':
         await cmdStudio(args, config);
+        break;
+
+      case 'mcp':
+        await cmdMcp(args, config);
         break;
 
       case 'observe':
