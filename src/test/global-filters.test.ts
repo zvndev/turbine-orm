@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
-import type { QueryInterface, QueryInterfaceOptions } from '../query/index.js';
+import type { QueryInterface, QueryInterfaceOptions, WithClause } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -113,7 +113,7 @@ function schema(): SchemaMetadata {
 /** A soft-delete filter (`deletedAt: null`) — the parameterless canonical case. */
 const softDelete = { deletedAt: null };
 
-function qi(table: string, filters: QueryInterfaceOptions['globalFilters']): QueryInterface<Record<string, unknown>> {
+function qi(table: string, filters: QueryInterfaceOptions['globalFilters']) {
   return makeQuery(table, schema(), { globalFilters: filters });
 }
 
@@ -321,7 +321,10 @@ describe('global filters — relation subqueries (join)', () => {
   });
 
   it('_count filters the counted target', () => {
-    const { sql, params } = qi('users', { posts: softDelete }).buildFindMany({ with: { _count: { posts: true } } });
+    const { sql, params } = qi('users', { posts: softDelete }).buildFindMany({
+      // Record-form _count needs a cast on untyped clients (see WS-A note in types.ts)
+      with: { _count: { posts: true } } as unknown as WithClause,
+    });
     assert.match(sql, /SELECT COUNT\(\*\)::int FROM "posts" .* AND .*"deleted_at" IS NULL.* AS "_count__posts"/);
     assertParamsAligned(sql, params);
   });
@@ -417,8 +420,8 @@ describe('global filters — SQL cache', () => {
     const q = qi('users', { posts: { title: { not: 'spam' } } });
     const args = {
       where: { id: 3 },
-      with: { posts: { where: { title: 'hi' } }, _count: { posts: true } },
-    } as const;
+      with: { posts: { where: { title: 'hi' } }, _count: { posts: true } } as unknown as WithClause,
+    };
     const first = q.buildFindMany(args);
     const second = q.buildFindMany(args);
     assert.equal(first.sql, second.sql);
