@@ -118,6 +118,20 @@ npx turbine migrate up --dry-run
 
 Checks for checksum mismatches before applying — if a previously-applied migration file has been edited, the command halts and reports the conflict.
 
+### Destructive-migration guard
+
+`migrate up` and `migrate down` scan the SQL they are about to run for statements that
+destroy data (`DROP TABLE`, `DROP SCHEMA`, `DROP COLUMN`, `TRUNCATE`, `DELETE FROM`,
+`UPDATE` without a `WHERE`, `ALTER COLUMN … TYPE`). Comments and string literals are
+ignored, and structure-only drops (`DROP INDEX`, `DROP CONSTRAINT`, `DROP TRIGGER`) are
+not flagged.
+
+When a destructive statement is found, Turbine **refuses to run anything** and prints an
+itemized report. To proceed you must either confirm interactively — typing the literal
+phrase `destroy my data`, then `yes` — or pass `--allow-destructive` explicitly
+(required in CI and other non-interactive shells). Programmatic callers of
+`migrateUp`/`migrateDown` opt in with `allowDestructive: true`.
+
 ## `turbine migrate down`
 
 Roll back the most recently applied migration using its `-- DOWN` section.

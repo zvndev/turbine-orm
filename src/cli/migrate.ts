@@ -20,6 +20,7 @@ import type { DatabaseAdapter } from '../adapters/index.js';
 import { postgresql } from '../adapters/index.js';
 import { type Dialect, postgresDialect } from '../dialect.js';
 import { MigrationError } from '../errors.js';
+import { DESTRUCTIVE_KIND_LABEL, type DestructiveStatement, scanDestructiveSql } from './destructive.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -389,6 +390,8 @@ export async function migrateUp(
     step?: number;
     allowDrift?: boolean;
     force?: boolean /** @deprecated use allowDrift */;
+    /** Run migrations even when they contain data-destroying statements. Default false. */
+    allowDestructive?: boolean;
     adapter?: DatabaseAdapter;
     dialect?: Dialect;
   },
@@ -461,6 +464,34 @@ export async function migrateUp(
         pending = pending.slice(0, options.step);
       }
 
+      // Data-loss gate: refuse to run pending migrations containing destructive
+      // statements unless the caller has EXPLICITLY opted in. The CLI layers an
+      // interactive typed confirmation on top of this; programmatic callers must
+      // pass `allowDestructive: true`. Safe-by-default is the whole point — a
+      // DROP TABLE should never run just because a file exists.
+      if (!options?.allowDestructive) {
+        const offenders: Array<{ file: string; hits: DestructiveStatement[] }> = [];
+        for (const file of pending) {
+          const { up } = parseMigrationSQL(file.path);
+          if (!up) continue;
+          const hits = scanDestructiveSql(up);
+          if (hits.length > 0) offenders.push({ file: file.filename, hits });
+        }
+        if (offenders.length > 0) {
+          const lines = ['[turbine] Refusing to apply migrations containing DESTRUCTIVE statements:', ''];
+          for (const o of offenders) {
+            lines.push(`  ${o.file}`);
+            for (const h of o.hits) {
+              lines.push(`    - [${h.kind}] ${h.target} — ${DESTRUCTIVE_KIND_LABEL[h.kind]}`);
+            }
+          }
+          lines.push('');
+          lines.push('Review the statements above. To proceed: run `npx turbine migrate up` interactively');
+          lines.push('and confirm, pass --allow-destructive, or set allowDestructive: true programmatically.');
+          throw new MigrationError(lines.join('\n'));
+        }
+      }
+
       const results: MigrationFile[] = [];
       const errors: Array<{ file: MigrationFile; error: string }> = [];
 
@@ -509,7 +540,7 @@ export async function migrateUp(
 export async function migrateDown(
   connectionString: string,
   migrationsDir: string,
-  options?: { step?: number; adapter?: DatabaseAdapter; dialect?: Dialect },
+  options?: { step?: number; allowDestructive?: boolean; adapter?: DatabaseAdapter; dialect?: Dialect },
 ): Promise<{ rolledBack: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
   const client = new pg.Client({ connectionString });
   await client.connect();
@@ -540,6 +571,34 @@ export async function migrateDown(
 
       // Reverse order — rollback most recent first
       const toRollback = applied.reverse().slice(0, options?.step ?? 1);
+
+      // Same data-loss gate as migrateUp — DOWN sections routinely contain
+      // DROP TABLE (the legitimate reverse of a CREATE), which still destroys
+      // every row written since the migration ran. Explicit opt-in required.
+      if (!options?.allowDestructive) {
+        const offenders: Array<{ file: string; hits: DestructiveStatement[] }> = [];
+        for (const migration of toRollback) {
+          const file = fileMap.get(migration.name);
+          if (!file) continue;
+          const { down } = parseMigrationSQL(file.path);
+          if (!down) continue;
+          const hits = scanDestructiveSql(down);
+          if (hits.length > 0) offenders.push({ file: file.filename, hits });
+        }
+        if (offenders.length > 0) {
+          const lines = ['[turbine] Refusing to roll back migrations whose DOWN sections are DESTRUCTIVE:', ''];
+          for (const o of offenders) {
+            lines.push(`  ${o.file}`);
+            for (const h of o.hits) {
+              lines.push(`    - [${h.kind}] ${h.target} — ${DESTRUCTIVE_KIND_LABEL[h.kind]}`);
+            }
+          }
+          lines.push('');
+          lines.push('To proceed: run `npx turbine migrate down` interactively and confirm, pass');
+          lines.push('--allow-destructive, or set allowDestructive: true programmatically.');
+          throw new MigrationError(lines.join('\n'));
+        }
+      }
 
       const results: MigrationFile[] = [];
       const errors: Array<{ file: MigrationFile; error: string }> = [];

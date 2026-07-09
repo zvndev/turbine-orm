@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.27.1 (2026-07-08)
+
+Identical to 0.27.0 with an internal lint cleanup in the destructive-statement scanner; 0.27.1 is the canonical release (0.27.0's npm artifact predates the tagged source).
+
+## 0.27.0 (2026-07-08)
+
+**Destructive migrations now require explicit, triple confirmation.** A migration file containing data-destroying SQL should never run just because it exists — and "one flag and your table is gone" is too easy.
+
+### Added
+- **Data-loss gate on `migrate up` and `migrate down`.** Before applying, Turbine scans every pending migration (UP direction) / every DOWN section being rolled back for destructive statements: `DROP TABLE`, `DROP SCHEMA`, `DROP COLUMN`, `TRUNCATE`, `DELETE FROM`, `UPDATE` without a `WHERE`, and `ALTER COLUMN … TYPE` (potentially lossy cast). Comments, string literals, and dollar-quoted bodies are stripped first, so `-- DROP TABLE x` or a seeded string containing SQL never false-positives; `DROP INDEX`/`DROP CONSTRAINT`/`DROP TRIGGER` are deliberately not flagged (recreatable, no row data). When something is found:
+  - **Interactive CLI**: prints an itemized report (statement kind, target object, what it destroys), then requires typing the literal phrase `destroy my data`, then a final `yes`. Anything else aborts with nothing applied.
+  - **Non-interactive (CI/pipes)**: always refuses; proceeding requires the explicit `--allow-destructive` flag, which also prints a loud warning.
+  - **Programmatic API** (`migrateUp`/`migrateDown`): refuses by default with an itemized `MigrationError`; opt in with `allowDestructive: true`.
+  - The refusal is checked BEFORE anything runs — a refused batch applies zero migrations.
+- (`turbine push` and `migrate create --auto` were already non-destructive: the schema differ has never emitted forward `DROP TABLE`/`DROP COLUMN` statements — dropped columns are detected but excluded from executable statements.)
+
 ## 0.26.0 (2026-07-08)
 
 **Dogfood release from migrating a large production Prisma app onto Turbine** — a batch of correctness fixes the migration surfaced, plus the tooling that makes Turbine's correlated relation loading robust on schemas that grew up under batched-loader ORMs: a missing-FK-index doctor, an opt-in batched loading strategy, and an opt-in lean JSON wire encoding.

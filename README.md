@@ -661,6 +661,12 @@ npx turbine migrate down
 npx turbine migrate status
 ```
 
+**Destructive migrations require explicit confirmation.** If a pending migration (or a DOWN
+section being rolled back) contains data-destroying SQL — `DROP TABLE`, `DROP COLUMN`,
+`TRUNCATE`, `DELETE FROM`, `UPDATE` without `WHERE`, `ALTER COLUMN … TYPE` — Turbine refuses
+to run it and prints an itemized report. Interactively you must type `destroy my data` and
+then `yes`; in CI you must pass `--allow-destructive`. A refused batch applies nothing.
+
 ## Studio
 
 The only Postgres ORM with a Studio your DBA will approve. `turbine studio` launches a local, read-only web UI for exploring your database — no mutations, no writes, and since v0.19 **no raw-SQL surface at all**: every query is composed visually in the ORM and compiled by the same validated query builder your application uses.

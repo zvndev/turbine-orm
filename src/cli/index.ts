@@ -84,6 +84,7 @@ interface CliArgs {
   auto?: boolean;
   allowDrift?: boolean;
   allowEmpty?: boolean;
+  allowDestructive?: boolean;
   fix?: boolean;
   // studio flags
   port?: number;
@@ -153,6 +154,9 @@ function parseArgs(): CliArgs {
         break;
       case '--fix':
         result.fix = true;
+        break;
+      case '--allow-destructive':
+        result.allowDestructive = true;
         break;
       case '--force':
       case '-f':
@@ -927,12 +931,35 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
     newline();
   }
 
+  if (args.allowDestructive) {
+    warn('--allow-destructive is set — data-destroying statements in migrations WILL run.');
+    newline();
+  }
+
   const spinner = new Spinner('Applying migrations').start();
 
-  const result = await migrateUp(url, config.migrationsDir, {
-    step: args.step,
-    allowDrift: args.allowDrift,
-  });
+  let result: Awaited<ReturnType<typeof migrateUp>>;
+  try {
+    result = await migrateUp(url, config.migrationsDir, {
+      step: args.step,
+      allowDrift: args.allowDrift,
+      allowDestructive: args.allowDestructive,
+    });
+  } catch (err) {
+    if (!isDestructiveRefusal(err)) throw err;
+    spinner.stop();
+    if (!(await confirmDestructive((err as Error).message))) {
+      error('Aborted — no migrations were applied and no data was touched.');
+      newline();
+      process.exit(1);
+    }
+    spinner.start();
+    result = await migrateUp(url, config.migrationsDir, {
+      step: args.step,
+      allowDrift: args.allowDrift,
+      allowDestructive: true,
+    });
+  }
 
   if (result.applied.length === 0 && result.errors.length === 0) {
     spinner.succeed('All migrations are up to date');
@@ -960,6 +987,48 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
   newline();
 }
 
+/** True when the error is migrate up/down's destructive-statement refusal. */
+function isDestructiveRefusal(err: unknown): boolean {
+  return err instanceof Error && err.message.includes('DESTRUCTIVE');
+}
+
+/**
+ * Triple confirmation for destructive migrations:
+ *   1. show the full itemized report (statement kinds + targets),
+ *   2. require typing the literal phrase `destroy my data`,
+ *   3. require a final explicit `yes`.
+ * Non-interactive shells (CI, pipes) can never pass this — they must use the
+ * explicit `--allow-destructive` flag instead. Anything but exact answers aborts.
+ */
+async function confirmDestructive(report: string): Promise<boolean> {
+  newline();
+  error('DESTRUCTIVE MIGRATION DETECTED');
+  newline();
+  for (const line of report.split('\n'))
+    console.log(`  ${line.includes('[turbine]') ? line.replace('[turbine] ', '') : line}`);
+  newline();
+
+  if (!process.stdin.isTTY) {
+    console.log(`  ${dim('Non-interactive shell: rerun with')} ${cyan('--allow-destructive')} ${dim('to proceed.')}`);
+    newline();
+    return false;
+  }
+
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    console.log(`  ${yellow('This will permanently destroy data. There is no undo.')}`);
+    const phrase = await rl.question(`  Type ${bold('destroy my data')} to continue, anything else to abort: `);
+    if (phrase.trim() !== 'destroy my data') return false;
+    const finalAnswer = await rl.question(
+      `  Final confirmation — apply the destructive statements above? Type ${bold('yes')}: `,
+    );
+    return finalAnswer.trim() === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
 async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
   const url = requireUrl(config);
@@ -970,9 +1039,26 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
 
   const spinner = new Spinner('Rolling back migration(s)').start();
 
-  const result = await migrateDown(url, config.migrationsDir, {
-    step: args.step ?? 1,
-  });
+  let result: Awaited<ReturnType<typeof migrateDown>>;
+  try {
+    result = await migrateDown(url, config.migrationsDir, {
+      step: args.step ?? 1,
+      allowDestructive: args.allowDestructive,
+    });
+  } catch (err) {
+    if (!isDestructiveRefusal(err)) throw err;
+    spinner.stop();
+    if (!(await confirmDestructive((err as Error).message))) {
+      error('Aborted — nothing was rolled back and no data was touched.');
+      newline();
+      process.exit(1);
+    }
+    spinner.start();
+    result = await migrateDown(url, config.migrationsDir, {
+      step: args.step ?? 1,
+      allowDestructive: true,
+    });
+  }
 
   if (result.rolledBack.length === 0 && result.errors.length === 0) {
     spinner.succeed('No migrations to roll back');
@@ -1557,6 +1643,9 @@ function showMigrateHelp(): void {
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
   console.log(`    ${cyan('--dry-run')}         Show SQL without executing`);
   console.log(`    ${cyan('--allow-drift')}     Bypass checksum validation ${dim('(migrate up only — advanced)')}`);
+  console.log(
+    `    ${cyan('--allow-destructive')} Run data-destroying migration statements without the interactive confirm`,
+  );
   console.log(`    ${cyan('--verbose, -v')}     Show detailed output`);
   newline();
   console.log(`  ${bold('Examples:')}`);
