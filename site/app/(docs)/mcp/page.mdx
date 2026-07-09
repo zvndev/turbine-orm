@@ -7,7 +7,7 @@ export const metadata = {
 
 # MCP Server
 
-`turbine mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent — Claude Code, Cursor, or any MCP client — inspect your database safely. It speaks JSON-RPC 2.0 over stdio, ships with the package (no extra dependency), and exposes **read-only** tools only. There is no write surface and no raw-SQL execution: the same safety stance as [Studio](/studio).
+`turbine mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent — Claude Code, Cursor, or any MCP client — inspect your database safely. It speaks JSON-RPC 2.0 over stdio, ships with the package (no extra dependency), and exposes **read-only** tools only. There is no write surface and no free-form SQL input: the same safety stance as [Studio](/studio).
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
@@ -25,10 +25,20 @@ Six read-only tools. Every database access runs inside a `BEGIN READ ONLY` trans
 | `table_detail` | Columns, indexes, and relations for one named table. |
 | `migrate_status` | Migration files and the tracking table — applied vs pending, without applying anything. |
 | `doctor_report` | Missing relation indexes, from the same [index advisor](/cli#turbine-doctor) `turbine doctor` uses. |
-| `explain_query` | `EXPLAIN (FORMAT JSON)` for a single `SELECT`. Non-`SELECT` input is rejected. |
+| `explain_query` | `EXPLAIN (FORMAT JSON)` for a schema-validated `findMany` plan (see below). |
 | `sample_rows` | Up to 50 rows from a table whose name is validated against the introspected schema. |
 
-`explain_query` is `SELECT`-only and `sample_rows` caps at 50 rows and validates the table name against the live schema, so an agent can explore query plans and real data without a path to writing or to arbitrary SQL.
+`explain_query` never accepts free-form SQL. You pass builder args — the same shape Studio’s Query tab compiles — and Turbine validates identifiers against the introspected schema, builds parameterized SQL via `QueryInterface.buildFindMany`, then runs `EXPLAIN (FORMAT JSON)` on that SQL with bound params only.
+
+| Argument | Required | Description |
+|---|---|---|
+| `table` | yes | Table name; must exist in the live schema. |
+| `where` | no | `findMany`-style where clause (field names validated). |
+| `orderBy` | no | `findMany`-style orderBy (object or array). |
+| `limit` | no | Positive integer row limit for the planned query. |
+| `select` | no | Field selection map (`{ field: true }`). |
+
+`sample_rows` caps at 50 rows and validates the table name against the live schema. Together, an agent can explore query plans and real data without a path to writing or to arbitrary SQL.
 
 ## Options
 

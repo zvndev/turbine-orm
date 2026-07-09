@@ -4,7 +4,8 @@ import { dirname, resolve } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import pg from 'pg';
 import { findMissingRelationIndexes } from '../index-advisor.js';
-import { quoteIdent } from '../query/index.js';
+import type { FindManyArgs } from '../query/index.js';
+import { QueryInterface, quoteIdent } from '../query/index.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -124,11 +125,27 @@ const TOOLS: ToolDefinition[] = [
   },
   {
     name: 'explain_query',
-    description: 'Run EXPLAIN (FORMAT JSON) for a single SELECT statement.',
+    description:
+      'Run EXPLAIN (FORMAT JSON) for a schema-validated findMany query. Pass table + optional where/orderBy/limit/select — free-form SQL is rejected.',
     inputSchema: {
       type: 'object',
-      properties: { sql: { type: 'string' } },
-      required: ['sql'],
+      properties: {
+        table: { type: 'string', description: 'Table name (must exist in the introspected schema).' },
+        where: {
+          type: 'object',
+          description: 'findMany-style where clause; field names validated against the schema.',
+        },
+        orderBy: {
+          description: 'findMany-style orderBy (object or array of objects); field names validated against the schema.',
+        },
+        limit: { type: 'number', minimum: 1, description: 'Optional row limit for the planned query.' },
+        select: {
+          type: 'object',
+          description: 'Optional field selection map (camelCase or column names → true).',
+          additionalProperties: { type: 'boolean' },
+        },
+      },
+      required: ['table'],
       additionalProperties: false,
     },
   },
@@ -256,7 +273,7 @@ async function callTool(params: unknown, ctx: McpContext): Promise<unknown> {
       result = await doctorReport(ctx);
       break;
     case 'explain_query':
-      result = await explainQuery(ctx, requiredString(args, 'sql'));
+      result = await explainQuery(ctx, args);
       break;
     case 'sample_rows':
       result = await sampleRows(ctx, requiredString(args, 'table'), optionalLimit(args.limit));
@@ -383,17 +400,91 @@ async function doctorReport(ctx: McpContext): Promise<unknown> {
   });
 }
 
-async function explainQuery(ctx: McpContext, sql: string): Promise<unknown> {
-  const trimmed = sql.trim();
-  if (!trimmed) throw jsonRpcError(-32602, 'sql is required');
-  if (trimmed.includes(';')) throw jsonRpcError(-32602, 'explain_query rejects semicolons');
-  if (!/^select\b/i.test(trimmed)) throw jsonRpcError(-32602, 'explain_query only accepts SELECT statements');
+/**
+ * EXPLAIN a schema-validated findMany query. Free-form SQL is never accepted —
+ * table/field identifiers are checked against introspected metadata and the
+ * SELECT is compiled by QueryInterface (same stance as Studio `/api/builder`).
+ */
+async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown> {
+  // Explicit rejection so agents that still send the old `{ sql }` shape get a
+  // clear migration error instead of a silent "table is required".
+  if ('sql' in args) {
+    throw jsonRpcError(
+      -32602,
+      'explain_query no longer accepts free-form SQL; pass table + findMany-style args (where/orderBy/limit/select)',
+    );
+  }
+
+  const tableName = requiredString(args, 'table');
+  const findManyArgs = parseExplainFindManyArgs(args);
 
   return withReadOnly(ctx, async (client) => {
+    const metadata = await loadSchemaMetadata(client, ctx.options);
+    const table = requireTable(metadata, tableName);
+
+    let deferred: ReturnType<QueryInterface<Record<string, unknown>>['buildFindMany']>;
+    try {
+      // Build-only: pool is unused for SQL generation (mirrors Studio).
+      const qi = new QueryInterface<Record<string, unknown>>(ctx.pool, table.name, metadata, [], {
+        warnOnUnlimited: false,
+        sqlCache: false,
+        preparedStatements: false,
+      });
+      deferred = qi.buildFindMany(findManyArgs);
+    } catch (err) {
+      // Unknown columns/operators/relations → invalid params, not internal error.
+      throw jsonRpcError(-32602, err instanceof Error ? err.message : String(err));
+    }
+
+    // QueryInterface emits unqualified identifiers; pin search_path like Studio.
     await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
-    const result = await client.query(`EXPLAIN (FORMAT JSON) ${trimmed}`);
-    return { plan: result.rows[0]?.['QUERY PLAN'] ?? null };
+    const result = await client.query(`EXPLAIN (FORMAT JSON) ${deferred.sql}`, deferred.params);
+    return {
+      table: table.name,
+      sql: deferred.sql,
+      params: deferred.params,
+      plan: result.rows[0]?.['QUERY PLAN'] ?? null,
+    };
   });
+}
+
+/**
+ * Extract the allowed findMany subset for explain_query (no `with` / raw SQL).
+ * Returns a plain object cast at the buildFindMany call site — same pattern as Studio.
+ */
+function parseExplainFindManyArgs(args: JsonObject): FindManyArgs<Record<string, unknown>> {
+  const findManyArgs: Record<string, unknown> = {};
+
+  if (args.where !== undefined) {
+    if (!isObject(args.where)) throw jsonRpcError(-32602, 'where must be an object');
+    findManyArgs.where = args.where;
+  }
+
+  if (args.orderBy !== undefined) {
+    if (typeof args.orderBy !== 'object' || args.orderBy === null) {
+      throw jsonRpcError(-32602, 'orderBy must be an object or array of objects');
+    }
+    findManyArgs.orderBy = args.orderBy;
+  }
+
+  if (args.limit !== undefined) {
+    if (typeof args.limit !== 'number' || !Number.isInteger(args.limit) || args.limit < 1) {
+      throw jsonRpcError(-32602, 'limit must be a positive integer');
+    }
+    findManyArgs.limit = args.limit;
+  }
+
+  if (args.select !== undefined) {
+    if (!isObject(args.select)) throw jsonRpcError(-32602, 'select must be an object');
+    for (const [key, value] of Object.entries(args.select)) {
+      if (typeof value !== 'boolean') {
+        throw jsonRpcError(-32602, `select.${key} must be a boolean`);
+      }
+    }
+    findManyArgs.select = args.select;
+  }
+
+  return findManyArgs as FindManyArgs<Record<string, unknown>>;
 }
 
 async function sampleRows(ctx: McpContext, tableName: string, limit: number): Promise<unknown> {

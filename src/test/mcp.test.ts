@@ -97,7 +97,17 @@ describe('turbine mcp protocol', () => {
     input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'tools', method: 'tools/list' })}\n`);
 
     const parsed = (await responses) as Array<{
-      result: { tools: Array<{ name: string; inputSchema: { type: string } }> };
+      result: {
+        tools: Array<{
+          name: string;
+          inputSchema: {
+            type: string;
+            required?: string[];
+            properties?: Record<string, unknown>;
+            additionalProperties?: boolean;
+          };
+        }>;
+      };
     }>;
     const response = parsed[0];
     assert.ok(response);
@@ -107,6 +117,17 @@ describe('turbine mcp protocol', () => {
       ['schema_overview', 'table_detail', 'migrate_status', 'doctor_report', 'explain_query', 'sample_rows'],
     );
     assert.equal(response.result.tools[0]?.inputSchema.type, 'object');
+
+    const explain = response.result.tools.find((tool) => tool.name === 'explain_query');
+    assert.ok(explain);
+    assert.deepEqual(explain.inputSchema.required, ['table']);
+    assert.ok(explain.inputSchema.properties?.table);
+    assert.ok(explain.inputSchema.properties?.where);
+    assert.ok(explain.inputSchema.properties?.orderBy);
+    assert.ok(explain.inputSchema.properties?.limit);
+    assert.ok(explain.inputSchema.properties?.select);
+    assert.equal(explain.inputSchema.properties?.sql, undefined);
+    assert.equal(explain.inputSchema.additionalProperties, false);
 
     await handle.dispose();
   });
@@ -133,6 +154,114 @@ describe('turbine mcp protocol', () => {
     assert.match(parseError.error?.message ?? '', /Parse error/);
     assert.equal(initialize.id, 2);
     assert.equal(initialize.result?.protocolVersion, '2025-06-18');
+
+    await handle.dispose();
+  });
+
+  it('explain_query rejects free-form SQL without contacting the database', async () => {
+    const { input, output, handle } = createHarness();
+    const responses = readJsonLines(output, 2);
+
+    // Legacy shape: arbitrary SELECT text must not be accepted.
+    input.write(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 10,
+        method: 'tools/call',
+        params: {
+          name: 'explain_query',
+          arguments: { sql: 'SELECT 1; DROP TABLE users' },
+        },
+      })}\n`,
+    );
+
+    // Missing table also fails argument validation before any pool connect.
+    input.write(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 11,
+        method: 'tools/call',
+        params: {
+          name: 'explain_query',
+          arguments: { where: { id: 1 } },
+        },
+      })}\n`,
+    );
+
+    const parsed = (await responses) as Array<{
+      id: number;
+      error?: { code: number; message: string };
+    }>;
+    const freeForm = parsed[0];
+    const missingTable = parsed[1];
+    assert.ok(freeForm);
+    assert.ok(missingTable);
+
+    assert.equal(freeForm.id, 10);
+    assert.equal(freeForm.error?.code, -32602);
+    assert.match(freeForm.error?.message ?? '', /no longer accepts free-form SQL/i);
+
+    assert.equal(missingTable.id, 11);
+    assert.equal(missingTable.error?.code, -32602);
+    assert.match(missingTable.error?.message ?? '', /table is required/i);
+
+    await handle.dispose();
+  });
+
+  it('explain_query rejects invalid builder arg shapes without contacting the database', async () => {
+    const { input, output, handle } = createHarness();
+    const responses = readJsonLines(output, 3);
+
+    input.write(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 20,
+        method: 'tools/call',
+        params: {
+          name: 'explain_query',
+          arguments: { table: 'users', limit: 0 },
+        },
+      })}\n`,
+    );
+    input.write(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 21,
+        method: 'tools/call',
+        params: {
+          name: 'explain_query',
+          arguments: { table: 'users', where: 'id = 1' },
+        },
+      })}\n`,
+    );
+    input.write(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 22,
+        method: 'tools/call',
+        params: {
+          name: 'explain_query',
+          arguments: { table: 'users', select: { id: 'yes' } },
+        },
+      })}\n`,
+    );
+
+    const parsed = (await responses) as Array<{
+      id: number;
+      error?: { code: number; message: string };
+    }>;
+
+    assert.equal(parsed[0]?.id, 20);
+    assert.equal(parsed[0]?.error?.code, -32602);
+    assert.match(parsed[0]?.error?.message ?? '', /limit must be a positive integer/i);
+
+    assert.equal(parsed[1]?.id, 21);
+    assert.equal(parsed[1]?.error?.code, -32602);
+    assert.match(parsed[1]?.error?.message ?? '', /where must be an object/i);
+
+    assert.equal(parsed[2]?.id, 22);
+    assert.equal(parsed[2]?.error?.code, -32602);
+    assert.match(parsed[2]?.error?.message ?? '', /select\.id must be a boolean/i);
 
     await handle.dispose();
   });
