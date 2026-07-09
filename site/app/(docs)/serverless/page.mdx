@@ -7,7 +7,7 @@ export const metadata = {
 
 # Serverless & Edge
 
-Turbine's edge entry (`turbine-orm/serverless`) is a thin shim that pulls in the query engine — about **22 kB brotli** bundled on the edge, with no WASM. It takes any pg-compatible pool — Neon's HTTP driver, Vercel Postgres, Cloudflare Hyperdrive, Supabase, `postgres.js`, your own — and binds it to a `SchemaMetadata` object. The full query API runs unchanged.
+Turbine's edge entry (`turbine-orm/serverless`) is a thin shim that pulls in the query engine — about **33 kB brotli** bundled on the edge, with no WASM. It takes any pg-compatible pool — Neon's HTTP driver, Vercel Postgres, Cloudflare Hyperdrive, Supabase, `postgres.js`, your own — and binds it to a `SchemaMetadata` object. The full query API runs unchanged.
 
 When you pass an external pool, Turbine:
 
