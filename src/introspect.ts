@@ -148,6 +148,49 @@ const SQL_CHECKS = `
     AND n.nspname = $1
 `;
 
+// Views (relkind 'v') — column metadata comes free from information_schema.columns.
+const SQL_VIEWS = `
+  SELECT table_name
+  FROM information_schema.views
+  WHERE table_schema = $1
+  ORDER BY table_name
+`;
+
+// Materialized views (relkind 'm') — NOT in information_schema; read from pg_catalog.
+const SQL_MATVIEWS = `
+  SELECT matviewname AS table_name
+  FROM pg_matviews
+  WHERE schemaname = $1
+  ORDER BY matviewname
+`;
+
+// Materialized-view columns — information_schema.columns omits matviews, so pull
+// them from pg_attribute. Aliased to mirror SQL_COLUMNS so the same row-mapping
+// applies (array types surface as data_type 'ARRAY' + a '_'-prefixed udt_name).
+const SQL_MATVIEW_COLUMNS = `
+  SELECT
+    c.relname AS table_name,
+    a.attname AS column_name,
+    t.typname AS udt_name,
+    CASE WHEN t.typcategory = 'A' THEN 'ARRAY' ELSE 'base' END AS data_type,
+    CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+    NULL AS column_default,
+    'NO' AS is_identity,
+    'NEVER' AS is_generated,
+    NULL AS generation_expression,
+    a.attnum AS ordinal_position,
+    NULL::int AS character_maximum_length
+  FROM pg_catalog.pg_attribute a
+  JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+  JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+  WHERE n.nspname = $1
+    AND c.relkind = 'm'
+    AND a.attnum > 0
+    AND NOT a.attisdropped
+  ORDER BY c.relname, a.attnum
+`;
+
 const SQL_ENUMS = `
   SELECT t.typname, e.enumlabel
   FROM pg_type t
@@ -242,6 +285,22 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       pool.query(SQL_ENUMS, [schema]),
     ]);
 
+    // Views + materialized views (opt-in). Regular-view columns are already in
+    // columnsResult (information_schema.columns); matview columns need a separate
+    // pg_catalog read, which we splice into the column rows below.
+    const viewNameSet = new Set<string>();
+    const matviewColumnRows: Array<Record<string, unknown>> = [];
+    if (options.includeViews) {
+      const [viewsResult, matviewsResult, matviewColsResult] = await Promise.all([
+        pool.query(SQL_VIEWS, [schema]),
+        pool.query(SQL_MATVIEWS, [schema]),
+        pool.query(SQL_MATVIEW_COLUMNS, [schema]),
+      ]);
+      for (const r of viewsResult.rows) viewNameSet.add(r.table_name);
+      for (const r of matviewsResult.rows) viewNameSet.add(r.table_name);
+      matviewColumnRows.push(...matviewColsResult.rows);
+    }
+
     // constraint_name → { onDelete, onUpdate } referential actions.
     const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
     for (const row of fkActionsResult.rows) {
@@ -251,8 +310,9 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       });
     }
 
-    // Filter tables by include/exclude
-    let tableNames: string[] = tablesResult.rows.map((r: { table_name: string }) => r.table_name);
+    // Filter tables by include/exclude. Views/matviews join the base tables as
+    // candidates so include/exclude apply uniformly.
+    let tableNames: string[] = [...tablesResult.rows.map((r: { table_name: string }) => r.table_name), ...viewNameSet];
     if (options.include?.length) {
       const includeSet = new Set(options.include);
       tableNames = tableNames.filter((t) => includeSet.has(t));
@@ -265,8 +325,10 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     const tableSet = new Set(tableNames);
 
     // ----- Group columns by table -----
+    // Base-table + regular-view columns come from information_schema.columns;
+    // materialized-view columns are appended from the pg_catalog read.
     const columnsByTable = new Map<string, ColumnMetadata[]>();
-    for (const row of columnsResult.rows) {
+    for (const row of [...columnsResult.rows, ...matviewColumnRows]) {
       const tableName: string = row.table_name;
       if (!tableSet.has(tableName)) continue;
 
@@ -584,6 +646,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         relations: relationsByTable.get(tableName) ?? {},
         indexes: indexesByTable.get(tableName) ?? [],
         checks: checksByTable.get(tableName) ?? [],
+        ...(viewNameSet.has(tableName) ? { isView: true } : {}),
       };
     }
 

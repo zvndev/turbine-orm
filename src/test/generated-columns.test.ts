@@ -81,9 +81,8 @@ describe('H3 — write builders reject STORED generated columns (E003)', () => {
   const qi = makeQuery('invoices', SCHEMA);
 
   it('create rejects data with a generated column', () => {
-    // biome-ignore lint/suspicious/noExplicitAny: exercising a runtime guard
     assert.throws(
-      () => qi.buildCreate({ data: { qty: 2, price: 3, total: 6 } as any }),
+      () => qi.buildCreate({ data: { qty: 2, price: 3, total: 6 } as never }),
       (err: unknown) => {
         assert.ok(err instanceof ValidationError);
         assert.equal(err.code, 'TURBINE_E003');
@@ -95,14 +94,12 @@ describe('H3 — write builders reject STORED generated columns (E003)', () => {
   });
 
   it('create allows data without generated columns', () => {
-    // biome-ignore lint/suspicious/noExplicitAny: build-only
-    assert.doesNotThrow(() => qi.buildCreate({ data: { qty: 2, price: 3 } as any }));
+    assert.doesNotThrow(() => qi.buildCreate({ data: { qty: 2, price: 3 } as never }));
   });
 
   it('update rejects data with a generated column', () => {
     assert.throws(
-      // biome-ignore lint/suspicious/noExplicitAny: exercising a runtime guard
-      () => qi.buildUpdate({ where: { id: 1 } as any, data: { total: 9 } as any }),
+      () => qi.buildUpdate({ where: { id: 1 } as never, data: { total: 9 } as never }),
       (err: unknown) => err instanceof ValidationError && err.code === 'TURBINE_E003',
     );
   });
@@ -111,12 +108,9 @@ describe('H3 — write builders reject STORED generated columns (E003)', () => {
     assert.throws(
       () =>
         qi.buildUpsert({
-          // biome-ignore lint/suspicious/noExplicitAny: exercising a runtime guard
-          where: { id: 1 } as any,
-          // biome-ignore lint/suspicious/noExplicitAny: exercising a runtime guard
-          create: { qty: 1, price: 1, total: 1 } as any,
-          // biome-ignore lint/suspicious/noExplicitAny: exercising a runtime guard
-          update: { qty: 1 } as any,
+          where: { id: 1 } as never,
+          create: { qty: 1, price: 1, total: 1 } as never,
+          update: { qty: 1 } as never,
         }),
       (err: unknown) => err instanceof ValidationError && err.code === 'TURBINE_E003',
     );

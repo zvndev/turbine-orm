@@ -11,7 +11,14 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
-import { type ColumnMetadata, pgTypeToTs, type SchemaMetadata, singularize, snakeToPascal } from './schema.js';
+import {
+  type ColumnMetadata,
+  pgTypeToTs,
+  type SchemaMetadata,
+  singularize,
+  snakeToPascal,
+  type TableMetadata,
+} from './schema.js';
 
 /** Get the TypeScript type name for a table (singularized PascalCase) */
 function entityName(tableName: string): string {
@@ -466,7 +473,7 @@ export function generateZod(schema: SchemaMetadata): string {
 // metadata.ts generator
 // ---------------------------------------------------------------------------
 
-function generateMetadata(schema: SchemaMetadata): string {
+export function generateMetadata(schema: SchemaMetadata): string {
   const lines: string[] = [
     ...generatedFileHeader(),
     "import type { SchemaMetadata } from 'turbine-orm';",
@@ -564,6 +571,9 @@ function generateMetadata(schema: SchemaMetadata): string {
     }
     lines.push('      ],');
 
+    // isView — read-only marker; the runtime write guard reads it.
+    if (table.isView) lines.push('      isView: true,');
+
     lines.push('    },');
   }
 
@@ -591,7 +601,7 @@ function generateMetadata(schema: SchemaMetadata): string {
 // index.ts generator (configured client with typed table accessors)
 // ---------------------------------------------------------------------------
 
-function generateIndex(schema: SchemaMetadata): string {
+export function generateIndex(schema: SchemaMetadata): string {
   const tableEntries = Object.values(schema.tables);
   const lines: string[] = [
     ...generatedFileHeader(),
@@ -630,7 +640,7 @@ function generateIndex(schema: SchemaMetadata): string {
     const hasRelations = Object.keys(table.relations).length > 0;
     const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
     lines.push(`  /** Query interface for the \`${table.name}\` table (transaction-scoped) */`);
-    lines.push(`  declare readonly ${accessor}: QueryInterface<${genericArgs}>;`);
+    lines.push(`  declare readonly ${accessor}: ${accessorType(table, genericArgs)};`);
   }
   lines.push('}');
   lines.push('');
@@ -673,7 +683,7 @@ function generateIndex(schema: SchemaMetadata): string {
     const hasRelations = Object.keys(table.relations).length > 0;
     const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
     lines.push(`  /** Query interface for the \`${table.name}\` table */`);
-    lines.push(`  declare readonly ${accessor}: QueryInterface<${genericArgs}>;`);
+    lines.push(`  declare readonly ${accessor}: ${accessorType(table, genericArgs)};`);
   }
   lines.push('');
   lines.push('  constructor(config?: TurbineConfig) {');
@@ -721,6 +731,19 @@ function generateIndex(schema: SchemaMetadata): string {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * The generated table-accessor type. A view (`isView`) without a primary key
+ * cannot be looked up by unique key, so its `findUnique`-family methods are
+ * excluded via `Omit`. Everything else is a plain `QueryInterface<…>`.
+ */
+function accessorType(table: TableMetadata, genericArgs: string): string {
+  const base = `QueryInterface<${genericArgs}>`;
+  if (table.isView && table.primaryKey.length === 0) {
+    return `Omit<${base}, 'findUnique' | 'findUniqueOrThrow'>`;
+  }
+  return base;
+}
 
 function serializeColumn(col: ColumnMetadata): string {
   const parts = [

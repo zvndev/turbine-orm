@@ -1594,6 +1594,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildCreate(args: CreateArgs<T>): DeferredQuery<T> {
+    this.assertWritable('create');
     this.assertNoGeneratedColumns(args.data as Record<string, unknown>, 'create');
     const entries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = entries.map(([k]) => this.toSqlColumn(k));
@@ -1679,6 +1680,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       };
     }
 
+    this.assertWritable('createMany');
     for (const row of args.data) {
       this.assertNoGeneratedColumns(row as Record<string, unknown>, 'createMany');
     }
@@ -1727,6 +1729,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpdate(args: UpdateArgs<T>): DeferredQuery<T> {
+    this.assertWritable('update');
     const dataObj = args.data as Record<string, unknown>;
     this.assertNoGeneratedColumns(dataObj, 'update');
     const whereObj = args.where as Record<string, unknown>;
@@ -1921,6 +1924,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildDelete(args: DeleteArgs<T>): DeferredQuery<T> {
+    this.assertWritable('delete');
     const whereObj = args.where as Record<string, unknown>;
     const whereFp = this.fingerprintWhere(whereObj);
     const ck = `d:${whereFp}`;
@@ -1990,6 +1994,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpsert(args: UpsertArgs<T>): DeferredQuery<T> {
+    this.assertWritable('upsert');
     this.assertNoGeneratedColumns(args.create as Record<string, unknown>, 'upsert');
     this.assertNoGeneratedColumns(args.update as Record<string, unknown>, 'upsert');
     // Build the INSERT part from create data
@@ -2066,6 +2071,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
+    this.assertWritable('updateMany');
     const dataObj = args.data as Record<string, unknown>;
     this.assertNoGeneratedColumns(dataObj, 'updateMany');
     const whereObj = args.where as Record<string, unknown>;
@@ -2114,6 +2120,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildDeleteMany(args: DeleteManyArgs<T>): DeferredQuery<{ count: number }> {
+    this.assertWritable('deleteMany');
     const whereObj = args.where as Record<string, unknown>;
     const whereFp = this.fingerprintWhere(whereObj);
     const ck = `dm:${whereFp}`;
@@ -2674,6 +2681,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
       return this.tableMeta.allColumns.filter((col) => !omitCols.has(col));
     }
     return null;
+  }
+
+  /**
+   * Reject any write against a view (H4). Views are introspected with
+   * `isView: true` and are read-only in every engine; a write raises a
+   * {@link ValidationError} (E003) rather than emitting SQL Postgres would
+   * reject (or, worse, silently applying to an updatable view).
+   */
+  private assertWritable(operation: string): void {
+    if (this.tableMeta.isView) {
+      throw new ValidationError(
+        `[turbine] Cannot ${operation} "${this.table}": it is a view (read-only). ` +
+          'Views support reads (findMany/findFirst/…) but not writes.',
+      );
+    }
   }
 
   /**
