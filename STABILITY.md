@@ -22,7 +22,7 @@ These are the surfaces we intend to carry to 1.0 and beyond. We will not break t
 | **Query API** | `findMany`, `findUnique`, `findFirst`, `findUniqueOrThrow`, `findFirstOrThrow`, `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, `upsert`, `count`, `aggregate`, `groupBy` — including their `where`, `with`, `orderBy`, `select`, `omit`, and `limit`/cursor arguments and the types they return. |
 | **`with`-clause type inference** | The compile-time return types produced by `with`, `select`, and `omit`. We treat a regression in inference as a bug, not a free minor change. |
 | **Typed errors** | The `TurbineError` hierarchy and the **error codes** (`TURBINE_E001`–`TURBINE_E017`). A code, once assigned, keeps its meaning. Structured fields on errors (`.code`, `.columns`, `.constraint`, `.where`, `.cause`) are stable; human-readable `.message` *text* is not (see below). |
-| **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|status`, `seed`, `status`, `studio`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. |
+| **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|deploy\|status`, `seed`, `status`, `doctor`, `studio`, `mcp`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. |
 | **Client configuration** | `TurbineConfig` fields and the `$transaction`, `$use`, `$on`/`$off`, `pipeline`, and raw-SQL tagged-template APIs on `TurbineClient`. |
 
 ### Experimental surfaces

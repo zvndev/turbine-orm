@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.28.2 (2026-07-10)
+
+**Post-smoke-audit patch** for 0.28.1 — consumer typecheck + docs honesty.
+
+### Fixed
+- **`@types/pg` restored to `dependencies`.** Moving it to `devDependencies` in 0.28.1 broke strict `tsc` for consumers whose projects do not set `skipLibCheck` (published `.d.ts` files import `pg` types). Runtime was always fine; TypeScript-first installs were not. Release gate now requires a pack-install + strict consumer typecheck before publish.
+- **README PowDB capability blurb** rewritten to match the real engine (returning writes, auto or UUID PKs, client-side relation loads incl. m2m, nested writes for hasMany/hasOne/belongsTo).
+- **Bundle-size claim** clarified as brotli *import graph* excluding `pg`, not dual-build install size.
+- **STABILITY.md** stable CLI list includes `doctor`, `mcp`, `migrate deploy`.
+- **Committed `site/lib/version.ts`** regenerated so the git tree matches the package version.
+
 ## 0.28.1 (2026-07-10)
 
 **Gold-standard OSS hygiene pass** — trust surface for consumers and CI, not a feature drop.
