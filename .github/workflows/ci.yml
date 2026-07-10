@@ -417,7 +417,7 @@ jobs:
           cache: npm
       - run: npm ci
       # Hard gate: any HIGH or CRITICAL vulnerability in the PRODUCTION
-      # dependency tree fails CI. (The prod tree is just `pg`;
+      # dependency tree fails CI. (The prod tree is `pg` + `@types/pg`;
       # currently 0 vulns, so this passes — and stays meaningful.)
       - name: Audit production dependencies (blocking)
         run: npm audit --omit=dev --audit-level=high
