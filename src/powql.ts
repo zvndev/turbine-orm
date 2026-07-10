@@ -10,7 +10,7 @@
  * it separate also means the four SQL engines are untouched.
  *
  * Behavioural deltas from the SQL path, all driven by PowDB's wire reality (see
- * `docs/strategy/powdb-parity-matrix.md`, every row verified against a live
+ * `docs/internal/strategy/powdb-parity-matrix.md`, every row verified against a live
  * server):
  *   - `create`/`createMany`/`update`/`delete` use PowDB 0.7.0's trailing
  *     `returning` keyword (`RETURNING *`, all columns) to surface affected rows

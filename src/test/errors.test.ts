@@ -19,6 +19,8 @@ import {
   MigrationError,
   NotFoundError,
   NotNullViolationError,
+  OptimisticLockError,
+  PipelineError,
   RelationError,
   SerializationFailureError,
   setErrorMessageMode,
@@ -26,6 +28,7 @@ import {
   TurbineError,
   TurbineErrorCode,
   UniqueConstraintError,
+  UnsupportedFeatureError,
   ValidationError,
   wrapPgError,
 } from '../errors.js';
@@ -42,7 +45,7 @@ describe('TurbineError', () => {
 
   it('sets .message from constructor', () => {
     const err = new TurbineError(TurbineErrorCode.VALIDATION, 'bad input');
-    assert.equal(err.message, 'bad input');
+    assert.equal(err.message, '[TURBINE_E003] bad input');
   });
 
   it('sets .name to TurbineError', () => {
@@ -63,12 +66,12 @@ describe('TurbineError', () => {
 describe('NotFoundError', () => {
   it('has default message "Record not found" (back-compat, no args)', () => {
     const err = new NotFoundError();
-    assert.equal(err.message, 'Record not found');
+    assert.equal(err.message, '[TURBINE_E001] Record not found');
   });
 
   it('accepts a custom string message (back-compat)', () => {
     const err = new NotFoundError('User 42 not found');
-    assert.equal(err.message, 'User 42 not found');
+    assert.equal(err.message, '[TURBINE_E001] User 42 not found');
   });
 
   it('has .code === TURBINE_E001', () => {
@@ -118,7 +121,7 @@ describe('NotFoundError', () => {
       operation: 'findUniqueOrThrow',
       message: 'custom override',
     });
-    assert.equal(err.message, 'custom override');
+    assert.equal(err.message, '[TURBINE_E001] custom override');
     // fields are still populated
     assert.equal(err.table, 'users');
     assert.equal(err.operation, 'findUniqueOrThrow');
@@ -132,7 +135,7 @@ describe('NotFoundError', () => {
 
   it('options object: empty object falls back to generic message', () => {
     const err = new NotFoundError({});
-    assert.equal(err.message, '[turbine] Record not found');
+    assert.equal(err.message, '[TURBINE_E001] [turbine] Record not found');
     assert.equal(err.table, undefined);
     assert.equal(err.where, undefined);
     assert.equal(err.operation, undefined);
@@ -164,12 +167,12 @@ describe('TimeoutError', () => {
 
   it('message includes timeout value and default context', () => {
     const err = new TimeoutError(3000);
-    assert.equal(err.message, '[turbine] Query timed out after 3000ms');
+    assert.equal(err.message, '[TURBINE_E002] [turbine] Query timed out after 3000ms');
   });
 
   it('message includes custom context', () => {
     const err = new TimeoutError(1500, 'Transaction');
-    assert.equal(err.message, '[turbine] Transaction timed out after 1500ms');
+    assert.equal(err.message, '[TURBINE_E002] [turbine] Transaction timed out after 1500ms');
   });
 
   it('has .code === TURBINE_E002', () => {
@@ -186,7 +189,7 @@ describe('TimeoutError', () => {
 describe('ValidationError', () => {
   it('passes message through', () => {
     const err = new ValidationError('Unknown column "foo"');
-    assert.equal(err.message, 'Unknown column "foo"');
+    assert.equal(err.message, '[TURBINE_E003] Unknown column "foo"');
   });
 
   it('has .code === TURBINE_E003', () => {
@@ -209,7 +212,7 @@ describe('ConnectionError', () => {
 
   it('passes message through', () => {
     const err = new ConnectionError('could not connect to server');
-    assert.equal(err.message, 'could not connect to server');
+    assert.equal(err.message, '[TURBINE_E004] could not connect to server');
   });
 });
 
@@ -226,7 +229,7 @@ describe('RelationError', () => {
 
   it('passes message through', () => {
     const err = new RelationError('No relation "foo" on model "bar"');
-    assert.equal(err.message, 'No relation "foo" on model "bar"');
+    assert.equal(err.message, '[TURBINE_E005] No relation "foo" on model "bar"');
   });
 });
 
@@ -243,7 +246,7 @@ describe('MigrationError', () => {
 
   it('passes message through', () => {
     const err = new MigrationError('Column "age" already exists');
-    assert.equal(err.message, 'Column "age" already exists');
+    assert.equal(err.message, '[TURBINE_E006] Column "age" already exists');
   });
 });
 
@@ -397,7 +400,7 @@ describe('UniqueConstraintError', () => {
 
   it('default message is generic when no fields are passed', () => {
     const err = new UniqueConstraintError();
-    assert.equal(err.message, '[turbine] Unique constraint violation');
+    assert.equal(err.message, '[TURBINE_E008] [turbine] Unique constraint violation');
   });
 
   it('default message includes constraint name when passed', () => {
@@ -453,7 +456,7 @@ describe('UniqueConstraintError', () => {
 
   it('honors explicit message override', () => {
     const err = new UniqueConstraintError({ message: 'custom message' });
-    assert.equal(err.message, 'custom message');
+    assert.equal(err.message, '[TURBINE_E008] custom message');
   });
 });
 
@@ -742,7 +745,7 @@ describe('DeadlockError', () => {
 
   it('default message is generic when no cause is passed', () => {
     const err = new DeadlockError();
-    assert.equal(err.message, '[turbine] Deadlock detected');
+    assert.equal(err.message, '[TURBINE_E012] [turbine] Deadlock detected');
   });
 
   it('default message embeds pg cause message', () => {
@@ -760,7 +763,7 @@ describe('DeadlockError', () => {
 
   it('honors explicit message override', () => {
     const err = new DeadlockError({ message: 'custom' });
-    assert.equal(err.message, 'custom');
+    assert.equal(err.message, '[TURBINE_E012] custom');
   });
 
   it('is instanceof TurbineError and Error', () => {
@@ -794,7 +797,7 @@ describe('SerializationFailureError', () => {
 
   it('default message is generic when no cause is passed', () => {
     const err = new SerializationFailureError();
-    assert.equal(err.message, '[turbine] Serializable transaction conflict');
+    assert.equal(err.message, '[TURBINE_E013] [turbine] Serializable transaction conflict');
   });
 
   it('default message embeds pg cause message', () => {
@@ -812,7 +815,7 @@ describe('SerializationFailureError', () => {
 
   it('honors explicit message override', () => {
     const err = new SerializationFailureError({ message: 'custom' });
-    assert.equal(err.message, 'custom');
+    assert.equal(err.message, '[TURBINE_E013] custom');
   });
 
   it('is instanceof TurbineError and Error', () => {
@@ -866,7 +869,7 @@ describe('NotFoundError redaction modes', () => {
         where: { id: 1 },
         operation: 'findUniqueOrThrow',
       });
-      assert.ok(err.message.startsWith('[turbine] findUniqueOrThrow on "users" found no record'));
+      assert.ok(err.message.startsWith('[TURBINE_E001] [turbine] findUniqueOrThrow on "users" found no record'));
     } finally {
       restore();
     }
@@ -905,7 +908,7 @@ describe('NotFoundError redaction modes', () => {
         where: { id: 1 },
         operation: 'findUniqueOrThrow',
       });
-      assert.ok(err.message.startsWith('[turbine] findUniqueOrThrow on "users" found no record'));
+      assert.ok(err.message.startsWith('[TURBINE_E001] [turbine] findUniqueOrThrow on "users" found no record'));
     } finally {
       restore();
     }
@@ -989,5 +992,45 @@ describe('constraint errors are PII-safe by default', () => {
       const err = wrapPgError(pgUnique) as UniqueConstraintError;
       assert.equal((err.cause as { code?: string }).code, '23505');
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Message format: every TurbineError message starts with [TURBINE_E0NN]
+// ---------------------------------------------------------------------------
+
+describe('error message code prefix', () => {
+  it('prefixes default messages with the stable code tag', () => {
+    const samples: Array<{ err: Error; code: string }> = [
+      { err: new NotFoundError(), code: 'TURBINE_E001' },
+      { err: new TimeoutError(100), code: 'TURBINE_E002' },
+      { err: new ValidationError('x'), code: 'TURBINE_E003' },
+      { err: new ConnectionError('x'), code: 'TURBINE_E004' },
+      { err: new RelationError('x'), code: 'TURBINE_E005' },
+      { err: new MigrationError('x'), code: 'TURBINE_E006' },
+      { err: new CircularRelationError(['a', 'b']), code: 'TURBINE_E007' },
+      { err: new UniqueConstraintError(), code: 'TURBINE_E008' },
+      { err: new ForeignKeyError(), code: 'TURBINE_E009' },
+      { err: new NotNullViolationError(), code: 'TURBINE_E010' },
+      { err: new CheckConstraintError(), code: 'TURBINE_E011' },
+      { err: new DeadlockError(), code: 'TURBINE_E012' },
+      { err: new SerializationFailureError(), code: 'TURBINE_E013' },
+      {
+        err: new PipelineError({ results: [{ status: 'error', error: new Error('e') }] }),
+        code: 'TURBINE_E014',
+      },
+      {
+        err: new OptimisticLockError({ table: 't', versionField: 'v', expectedVersion: 1 }),
+        code: 'TURBINE_E015',
+      },
+      { err: new ExclusionConstraintError(), code: 'TURBINE_E016' },
+      { err: new UnsupportedFeatureError('vector', 'sqlite'), code: 'TURBINE_E017' },
+    ];
+    for (const { err, code } of samples) {
+      assert.ok(
+        err.message.startsWith(`[${code}]`),
+        `${err.constructor.name} message should start with [${code}], got: ${err.message}`,
+      );
+    }
   });
 });

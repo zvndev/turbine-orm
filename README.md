@@ -990,13 +990,13 @@ Turbine is focused and opinionated. Here's what it doesn't do:
 
 ## Requirements
 
-- Node.js >= 18.0.0
+- Node.js >= 20.0.0
 - PostgreSQL >= 14
 - Works with both ESM (`import`) and CommonJS (`require`)
 
 ## Contributing
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the test strategy, and the PR checklist. The unit suite runs without a database:
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the test strategy, and the PR checklist. Participants agree to the [Code of Conduct](CODE_OF_CONDUCT.md). The unit suite runs without a database:
 
 ```bash
 npm install

@@ -119,13 +119,12 @@ jobs:
   # `transaction_timeout` SQL is accepted by a real CRDB server (not just a
   # mock). It runs studio-timeout-integration.test.ts with
   # TURBINE_TEST_ENGINE=cockroachdb so the CRDB-specific adapter SQL is the SQL
-  # actually sent over the wire. Marked continue-on-error until it has run green
+  # actually sent over the wire. Hard gate — engine integration regressions fail the PR.
   # in CI a few times — it exercises a real engine but the container topology
   # hasn't been proven on GitHub runners yet; promote to a hard gate once it has.
   cockroachdb-integration:
     name: cockroachdb-integration
     runs-on: ubuntu-latest
-    continue-on-error: true
     services:
       cockroachdb:
         # Pinned to the v24.1 major (rolling within the major) so an upstream
@@ -187,13 +186,12 @@ jobs:
   # create(reselect) / upsert / update / delete / transactions / typed errors.
   # Without MYSQL_URL (locally + the unit-tests job) those tests skip cleanly while
   # the build-only + mock-driver tests still run. mysql2 is a devDep, so `npm ci`
-  # installs it. Marked continue-on-error until the container topology has run green
+  # installs it. Hard gate — engine integration regressions fail the PR.
   # on GitHub runners a few times (same posture as cockroachdb-integration); promote
   # to a hard gate once proven.
   mysql-integration:
     name: mysql-integration
     runs-on: ubuntu-latest
-    continue-on-error: true
     services:
       mysql:
         image: mysql:8
@@ -229,13 +227,12 @@ jobs:
   # nested-with / create(output) / upsert(MERGE) / update / delete / transactions / typed
   # errors. Without MSSQL_URL (locally + the unit-tests job) those tests skip cleanly while
   # the build-only + mock-driver tests still run. mssql is a devDep, so `npm ci` installs
-  # it. Marked continue-on-error until the container topology has run green on GitHub
+  # it. Hard gate — engine integration regressions fail the PR.
   # runners a few times (same posture as mysql/cockroachdb); promote to a hard gate once
   # proven.
   mssql-integration:
     name: mssql-integration
     runs-on: ubuntu-latest
-    continue-on-error: true
     services:
       mssql:
         image: mcr.microsoft.com/mssql/server:2022-latest
@@ -295,13 +292,10 @@ jobs:
   # transactions (commit/rollback + nested/re-entrant throw), chunked relation
   # loads, and the E017 guards against a real database. On a platform without a
   # prebuilt binary the suite's skipGate fires and every test skips cleanly, so
-  # `npm run test:unit` stays green without the addon. continue-on-error until the
-  # job has run green on GitHub runners a few times (same posture as the other
-  # engine jobs); promote to a hard gate once proven.
+  # `npm run test:unit` stays green without the addon. Hard gate — embedded PowDB integration must pass on every PR.
   powdb-integration:
     name: powdb-integration
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -400,6 +394,19 @@ jobs:
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/mssql'); if (m.mssqlDialect?.name !== 'mssql' || typeof m.turbineMssql !== 'function') { console.error('mssql subpath broken'); process.exit(1); } console.log('mssql subpath OK (no mssql needed to import)');"
 
+      - name: Verify sqlite subpath import
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/sqlite'); if (m.sqliteDialect?.name !== 'sqlite' || typeof m.turbineSqlite !== 'function') { console.error('sqlite subpath broken'); process.exit(1); } console.log('sqlite subpath OK');"
+      - name: Verify powdb subpath import (peers NOT installed — must not crash)
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/powdb'); if (typeof m.turbinePowDB !== 'function') { console.error('powdb subpath broken'); process.exit(1); } console.log('powdb subpath OK (no peer needed to import)');"
+      - name: Verify adapters subpath import
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/adapters'); if (!m.cockroachdb || !m.yugabytedb || !m.postgresql) { console.error('adapters subpath broken'); process.exit(1); } console.log('adapters subpath OK', Object.keys(m).slice(0,8).join(','));"
+
   security:
     runs-on: ubuntu-latest
     steps:
@@ -410,7 +417,7 @@ jobs:
           cache: npm
       - run: npm ci
       # Hard gate: any HIGH or CRITICAL vulnerability in the PRODUCTION
-      # dependency tree fails CI. (The prod tree is just `pg` + `@types/pg`,
+      # dependency tree fails CI. (The prod tree is just `pg`;
       # currently 0 vulns, so this passes — and stays meaningful.)
       - name: Audit production dependencies (blocking)
         run: npm audit --omit=dev --audit-level=high

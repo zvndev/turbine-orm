@@ -21,7 +21,7 @@ These are the surfaces we intend to carry to 1.0 and beyond. We will not break t
 |---|---|
 | **Query API** | `findMany`, `findUnique`, `findFirst`, `findUniqueOrThrow`, `findFirstOrThrow`, `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, `upsert`, `count`, `aggregate`, `groupBy` — including their `where`, `with`, `orderBy`, `select`, `omit`, and `limit`/cursor arguments and the types they return. |
 | **`with`-clause type inference** | The compile-time return types produced by `with`, `select`, and `omit`. We treat a regression in inference as a bug, not a free minor change. |
-| **Typed errors** | The `TurbineError` hierarchy and the **error codes** (`TURBINE_E001`–`TURBINE_E016`). A code, once assigned, keeps its meaning. Structured fields on errors (`.code`, `.columns`, `.constraint`, `.where`, `.cause`) are stable; human-readable `.message` *text* is not (see below). |
+| **Typed errors** | The `TurbineError` hierarchy and the **error codes** (`TURBINE_E001`–`TURBINE_E017`). A code, once assigned, keeps its meaning. Structured fields on errors (`.code`, `.columns`, `.constraint`, `.where`, `.cause`) are stable; human-readable `.message` *text* is not (see below). |
 | **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|status`, `seed`, `status`, `studio`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. |
 | **Client configuration** | `TurbineConfig` fields and the `$transaction`, `$use`, `$on`/`$off`, `pipeline`, and raw-SQL tagged-template APIs on `TurbineClient`. |
 
@@ -44,7 +44,7 @@ Turbine errors are designed to be **safe to log**. By default (`errorMessages: '
 
 Two consequences for stability:
 
-- The **wording** of `.message` may change between any two releases. Do not parse it. Branch on `err.code` and read structured fields instead.
+- The **wording** of `.message` may change between any two releases. Do not parse it. Branch on `err.code` and read structured fields instead. Messages are prefixed with the stable code tag (e.g. `[TURBINE_E008] …`) for log greppability; that tag mirrors `.code` and is the only substring that is intentionally stable.
 - The **values** in `.message` may change. As of [0.17.0](./docs/releases/v0.17.0.md), constraint errors no longer append Postgres's raw `detail` (which could contain row data) in the default `safe` mode. If you relied on the old behavior, opt in with `errorMessages: 'verbose'` when constructing the client. Full detail is always available programmatically via `.columns`, `.constraint`, `.where`, and `.cause`, regardless of mode.
 
 ## Deprecation policy
@@ -63,9 +63,9 @@ Turbine is pre-1.0. **Security and correctness fixes land on the latest minor re
 
 | Version | Supported |
 |---|---|
-| 0.17.x | Yes |
-| 0.16.x | Yes |
-| < 0.16 | No |
+| 0.28.x | Yes |
+| 0.27.x | Yes (security fixes prefer 0.28.x) |
+| < 0.27 | No |
 
 The practical guidance: stay on the latest minor. We do not backport fixes to older minors. To report a vulnerability privately, email **dev@zvndev.com** — see [SECURITY.md](./SECURITY.md) for the process.
 
@@ -76,17 +76,18 @@ The practical guidance: stay on the latest minor. We do not backport fixes to ol
 - **Stable-surface API freeze, sustained.** No breaking change to a Stable surface for **three consecutive minor releases**. If we have to break one, the clock resets.
 - **A real parity suite, green.** The non-Postgres adapters move from Experimental to a defined support tier only once a cross-dialect parity suite passes against real engines — not mocks. (The 0.17.0 Studio bug shipped green precisely because a test mocked the pool instead of hitting a server; we are not repeating that.)
 - **Real-engine CI.** Integration tests run against live PostgreSQL in CI on every change, not only locally. The full suite (1127 tests as of 0.17.0) stays green.
-- **Coverage gate held.** The configured thresholds (lines 78%, functions 83%, branches 86% as of 0.17.0) stay green on the full unit set, with no silently-narrowed subset.
+- **Coverage gate held.** The configured thresholds in `.c8rc.json` (lines 80%, functions 82%, branches 82% as of 0.28.x) stay green on the unit set, with no silently-narrowed subset. Floors are ratcheted up only after measured actuals leave headroom.
 - **Published releases, in sync.** Every release has a matching `vX.Y.Z` git tag **and** a published GitHub Release with notes. npm, git tags, and GitHub Releases agree. (See [docs/releases/](./docs/releases/).)
 - **Migration durability.** The migration format and `_turbine_migrations` schema are committed to as-is — a 1.0 upgrade must not require re-checksumming or re-applying existing migrations.
 
-### Honest status today (0.17.0)
+### Honest status today (0.28.0)
 
 We are **not at 1.0 yet**, and the gaps are specific:
 
-- Published GitHub Releases and git tags have lagged npm. We are closing this gap starting with [0.17.0](./docs/releases/v0.17.0.md); going forward, each release gets a notes file under [docs/releases/](./docs/releases/) and a matching tag + GitHub Release.
-- The non-Postgres adapters are Experimental and lack a real-engine parity suite.
-- The Stable query API has been shape-stable since the `with`-inference work landed in 0.7.1, but we have not yet held a formal multi-release freeze on top of real-engine CI.
+- Real-engine CI runs Postgres 14–17 on every PR, plus MySQL / SQL Server / CockroachDB / PowDB integration jobs as hard gates. Non-Postgres engines remain **Experimental** for the public API contract.
+- Multi-dialect engines (SQLite / MySQL / MSSQL / PowDB) ship as subpath exports but are not yet on the Stable tier — see Experimental surfaces.
+- Git tags track npm for current minors; GitHub Releases may lag slightly behind npm — notes live in [CHANGELOG.md](./CHANGELOG.md) and [docs/releases/](./docs/releases/).
+- The Stable query API has been shape-stable since the `with`-inference work landed in 0.7.1; we have not yet held a formal multi-release freeze on top of real-engine CI.
 
 When those are addressed, we'll cut 1.0 — and not before. Until then, the safe way to adopt Turbine is to **pin a version** and read the CHANGELOG before upgrading. Stable surfaces should carry you across minors without code changes; Experimental surfaces may not.
 

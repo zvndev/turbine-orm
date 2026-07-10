@@ -7,7 +7,7 @@ export const metadata = {
 
 # Typed Errors
 
-Turbine throws typed errors you can catch with `instanceof`. Every error extends `TurbineError` and carries a stable `readonly code` field you can use for programmatic handling. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes automatically via `wrapPgError()`.
+Turbine throws typed errors you can catch with `instanceof`. Every error extends `TurbineError` and carries a stable `readonly code` field you can use for programmatic handling. Human-readable `.message` strings also start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable without structured field access — but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes automatically via `wrapPgError()`.
 
 ## Error code table
 

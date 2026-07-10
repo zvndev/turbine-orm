@@ -2,7 +2,7 @@
  * turbine-orm — High-priority gap tests
  *
  * Targeted second pass after comprehensive.test.ts. Each test fills a gap
- * identified in TEST-MATRIX.md that wasn't already covered. Focus areas:
+ * identified in docs/internal/TEST-MATRIX.md that wasn't already covered. Focus areas:
  *   - Multi-column orderBy (mixed asc/desc)
  *   - Edge-case operator inputs (`in: []`, `limit: 0`, `limit: 1`, very large limit)
  *   - Nullable column round-trips (set to null, set from null back to value)

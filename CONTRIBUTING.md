@@ -1,6 +1,6 @@
 # Contributing to Turbine ORM
 
-Thanks for your interest in contributing.
+Thanks for your interest in contributing. By participating, you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Development Setup
 
@@ -56,11 +56,15 @@ npm run typecheck  # Type checking only
 ```
 src/
   client.ts         — Connection pool, transactions, middleware
-  query/             — SQL generation, split into submodules:
+  query/            — SQL generation, split into submodules:
     types.ts          — Public query arg types
     utils.ts          — quoteIdent, escapeLike, LRUCache
-    builder.ts        — QueryInterface: WHERE clauses, json_agg nesting
+    filters.ts        — Where-filter type guards + shape fingerprints
+    builder.ts        — QueryInterface: WHERE, DML, json_agg nesting
+    batched-loader.ts — relationLoadStrategy: 'batched'
     index.ts          — Barrel re-export
+  dialect.ts        — Multi-engine Dialect contract (Postgres default)
+  sqlite.ts / mysql.ts / mssql.ts / powdb.ts — engine entrypoints
   nested-write.ts   — Tree-walking nested create/update engine
   schema.ts         — Type definitions, PG-to-TS mapping
   schema-builder.ts — defineSchema() API
@@ -71,10 +75,11 @@ src/
   observe.ts        — Observability / query metrics
   serverless.ts     — Edge/serverless driver binding (turbineHttp)
   adapters/         — Dialect adapters (CockroachDB, YugabyteDB, …)
+  errors.ts         — Typed TurbineError hierarchy (E001–E017)
   cli/              — CLI commands (init, generate, migrate, studio, etc.)
 ```
 
-The query builder (`query/builder.ts`) is the core — it generates `json_agg` + `json_build_object` subqueries for nested relations, resolving entire object graphs in a single SQL statement.
+The query builder (`query/builder.ts`) is the core — it generates `json_agg` + `json_build_object` subqueries for nested relations, resolving entire object graphs in a single SQL statement. Filter-shape detection lives in `query/filters.ts`.
 
 ## Reporting Bugs
 

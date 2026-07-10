@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.28.1 (2026-07-10)
+
+**Gold-standard OSS hygiene pass** — trust surface for consumers and CI, not a feature drop.
+
+### Improved
+- **Error messages include stable codes.** Every `TurbineError` message is prefixed with its code tag (e.g. `[TURBINE_E008] …`) so logs are greppable without structured field access. Branch on `err.code` / `instanceof` — do not parse the message text.
+- **Coverage floors ratcheted** to lines/statements 80%, functions 82%, branches 82% (measured actuals ~82–84%).
+- **Engine CI jobs are hard gates** (MySQL, SQL Server, CockroachDB, PowDB) — no longer `continue-on-error`.
+- **Pack-smoke** verifies `sqlite`, `powdb`, and `adapters` subpath exports in addition to main/serverless/mysql/mssql.
+- **Seeded generative SQL-safety fuzz** (`sql-safety-fuzz.test.ts`) over `quoteIdent`, equality/LIKE, and numeric filters.
+- **Query module split:** `query/filters.ts` (filter-shape guards + fingerprints) and `query/deferred.ts` (`DeferredQuery` / options types) extracted from `builder.ts`.
+- **`@types/pg` moved to `devDependencies`** — runtime `dependencies` is just `pg`.
+- **`engines.node` is `>=20`** (matches the CI matrix; Node 18 is EOL).
+- **SECURITY.md / STABILITY.md** supported-version tables updated for 0.28.x.
+- **CODE_OF_CONDUCT.md** added; linked from README + CONTRIBUTING.
+- Internal sprint/strategy scaffolding moved under `docs/internal/`.
+
 ## 0.28.0 (2026-07-09)
 
 **Parity sprint — the largest feature release since multi-engine support.** A batch of gaps closed at once: query ergonomics (NULLS ordering, relation `_count`, ordering by a relation), schema completeness (referential actions, code-first enums/arrays/vector/checks), global filters for soft-delete and multi-tenancy, read replicas, a read-only MCP server for AI agents, seed-as-code, a non-interactive `migrate deploy`, Zod generation, and views + generated columns. Everything is additive — the Postgres default and the existing `findMany`/`with`/`where` API are unchanged, and `npm i turbine-orm` still installs only `pg`.

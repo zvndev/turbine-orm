@@ -9,7 +9,7 @@
  * seam. The four SQL engines are untouched.
  *
  * PowDB realities shape the design (all verified firsthand against a live
- * `powdb-server` / the embedded addon, see `docs/strategy/powdb-parity-matrix.md`):
+ * `powdb-server` / the embedded addon, see `docs/internal/strategy/powdb-parity-matrix.md`):
  *   - **`RETURNING` (since 0.7.0)** — `create/createMany/update/delete` append the
  *     trailing `returning` keyword (`RETURNING *`, all columns) and read the
  *     affected rows back in one round-trip. `upsert` is the lone exception (its

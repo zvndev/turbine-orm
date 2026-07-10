@@ -31,7 +31,12 @@ src/
     utils.ts        — Pure utility functions (~130 LOC): quoteIdent(), escapeLike(),
                       LRUCache (1K entry cap), fnv1a64Hex(), sqlToPreparedName(),
                       OPERATOR_KEYS constant.
-    builder.ts      — QueryInterface class (~4.4K LOC): SQL generation for all operations
+    filters.ts      — Where-filter type guards + shape fingerprints (isWhereOperator,
+                      isJsonFilter/isArrayFilter/isVectorFilter, sortedKeys/sortedEntries,
+                      normalizeOrderBy). Kept out of builder.ts so the class stays about
+                      SQL assembly rather than filter-shape bookkeeping.
+    deferred.ts     — DeferredQuery, QueryInterfaceOptions, middleware/event types.
+    builder.ts      — QueryInterface class (~5.5K LOC): SQL generation for all operations
                       (findMany, findUnique, create, update, delete, aggregate, count,
                       groupBy + HAVING). Builds WHERE clauses, json_agg nested relation
                       subqueries (hasMany/belongsTo/hasOne + manyToMany through junction
@@ -192,7 +197,7 @@ src/
                       `src/test/powdb.integration.test.ts` (CI `powdb-integration` job, in-process, no
                       container). (≤0.6.2 reselect + float-literal workarounds retired in 0.7.0; embedded
                       `syncMode`/`memoryLimit` + `count(*)`-fix picked up in 0.7.1.) See
-                      `docs/strategy/powdb-parity-matrix.md`.
+                      `docs/internal/strategy/powdb-parity-matrix.md`.
 
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code
                       (TURBINE_E001-E017). wrapPgError() translates pg driver errors

@@ -28,12 +28,25 @@ export const TurbineErrorCode = {
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
 
+/**
+ * Prefix a human message with its stable error code so logs are greppable
+ * without requiring structured field access. Idempotent if the message already
+ * starts with `[TURBINE_E0NN]`.
+ */
+function formatErrorMessage(code: TurbineErrorCode, message: string): string {
+  const tag = `[${code}]`;
+  if (message.startsWith(tag)) return message;
+  // Empty message → just the code (defensive; callers always pass text today).
+  if (!message) return tag;
+  return `${tag} ${message}`;
+}
+
 /** Base error class for all Turbine errors */
 export class TurbineError extends Error {
   readonly code: TurbineErrorCode;
 
   constructor(code: TurbineErrorCode, message: string, options?: { cause?: unknown }) {
-    super(message, options);
+    super(formatErrorMessage(code, message), options);
     this.name = 'TurbineError';
     this.code = code;
   }

@@ -18,13 +18,13 @@ You will receive a response within 48 hours. We will work with you to understand
 
 ## Supported Versions
 
-Turbine is pre-1.0; security fixes land on the latest minor release.
+Turbine is pre-1.0; security fixes land on the **latest minor release** only (no backports to older minors).
 
 | Version | Supported |
 |---------|-----------|
-| 0.19.x  | Yes       |
-| 0.18.x  | Yes       |
-| < 0.18  | No        |
+| 0.28.x  | Yes       |
+| 0.27.x  | Yes (security fixes prefer 0.28.x) |
+| < 0.27  | No        |
 
 ## Security Measures
 
@@ -37,3 +37,4 @@ Turbine ORM takes SQL injection prevention seriously:
 - Migration tracking table name quoted via `quoteIdent()`
 - Connection strings redacted in all CLI error output
 - Generated output paths are validated against traversal
+- Studio is read-only (`BEGIN READ ONLY`), loopback-bound by default, token-authenticated

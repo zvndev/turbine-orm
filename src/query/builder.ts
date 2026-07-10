@@ -42,6 +42,27 @@ import {
   resolveCountRelations,
   stripFields,
 } from './batched-loader.js';
+import {
+  assertBindableEqualsOperand,
+  findArrayUniqueKey,
+  findJsonUniqueKey,
+  fingerprintOperatorShape,
+  isArrayFilter,
+  isJsonFilter,
+  isOrderBySpec,
+  isTextSearchFilter,
+  isUnmatchedPlainObject,
+  isVectorFilter,
+  isVectorOrderBy,
+  isWhereOperator,
+  normalizeOrderBy,
+  sortedEntries,
+  sortedKeys,
+  UPDATE_OPERATOR_KEYS,
+  VECTOR_DISTANCE_COMPARATORS,
+  VECTOR_METRIC_OPERATORS,
+  validateTextSearchConfig,
+} from './filters.js';
 import type {
   AggregateArgs,
   AggregateResult,
@@ -72,7 +93,6 @@ import type {
   UpdateManyArgs,
   UpsertArgs,
   VectorFilter,
-  VectorOrderBy,
   WhereClause,
   WhereOperator,
   WithClause,
@@ -81,395 +101,23 @@ import type {
 } from './types.js';
 import { escapeLike, LRUCache, OPERATOR_KEYS, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
 
-// ---------------------------------------------------------------------------
-// Internal detection helpers — used by QueryInterface
-// ---------------------------------------------------------------------------
-
-/** Check if a value is a where operator object (has at least one known operator key) */
-function isWhereOperator(value: unknown): value is WhereOperator {
-  if (
-    value === null ||
-    value === undefined ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    value instanceof Date
-  ) {
-    return false;
-  }
-  const keys = Object.keys(value);
-  return keys.length > 0 && keys.every((k) => OPERATOR_KEYS.has(k));
-}
-
-/**
- * True for a *plain object literal* that reached an equality fallthrough
- * without matching any known filter shape — the misspelled-operator case.
- * Class instances (Buffer for bytea, Decimal wrappers, ...) are legitimate
- * bind values and return false, as do arrays and Dates.
- */
-function isUnmatchedPlainObject(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null || Array.isArray(value) || value instanceof Date) return false;
-  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-/**
- * Fingerprint the SHAPE of a where-operator object. Null-valued `equals` /
- * `not` compile to parameterless `IS NULL` / `IS NOT NULL` (different SQL, no
- * param pushed), so null-ness is part of the shape — without it a cache entry
- * warmed by `{ not: 5 }` would serve `{ not: null }` with a desynced param list.
- */
-function fingerprintOperatorShape(value: WhereOperator): string {
-  const obj = value as Record<string, unknown>;
-  const opKeys = Object.keys(obj)
-    .filter((k) => k !== 'mode')
-    .map((k) => ((k === 'equals' || k === 'not') && obj[k] === null ? `${k}:null` : k))
-    .sort();
-  const modeStr = value.mode === 'insensitive' ? ':i' : '';
-  return `op(${opKeys.join(',')}${modeStr})`;
-}
-
-/**
- * Guard for the value of an `equals` operator reaching the plain-equality
- * operator path. A plain object literal can only legitimately be an equality
- * value on a json/jsonb column — and those route to the JSONB filter branch
- * BEFORE the operator branch, so any plain object that reaches here is a
- * mistake (e.g. `{ equals: { foo: 1 } }` on a text column). Shared by the
- * SQL-build path and the cache-hit param-collect path so a warmed cache can
- * never skip the check.
- */
-function assertBindableEqualsOperand(value: unknown, column: string): void {
-  if (!isUnmatchedPlainObject(value)) return;
-  throw new ValidationError(
-    `[turbine] Plain-object value for operator 'equals' on ${column}: ` +
-      `objects are only valid 'equals' values on JSON (json/jsonb) columns, ` +
-      `where 'equals' is the JSONB containment filter.`,
-  );
-}
-
-/**
- * Object keys in sorted order, mirroring the canonical order used by every
- * cache fingerprint. The SQL-build and cache-hit param-collect paths MUST
- * enumerate object keys in this exact order: fingerprints sort keys, so two
- * where clauses with the same fields in different insertion order share one
- * cache entry — if build/collect iterated insertion order, the cached SQL's
- * `$N` placeholders would bind the wrong values (cross-tenant-leak class).
- * Array order (OR/AND members) is positional and is never sorted.
- */
-function sortedKeys(obj: Record<string, unknown>): string[] {
-  return Object.keys(obj).sort();
-}
-
-/** {@link sortedKeys}, but yielding `[key, value]` pairs. */
-function sortedEntries<V>(obj: Record<string, V>): [string, V][] {
-  return Object.entries(obj).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-}
-
-/** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
 /** Relations already warned about missing FK indexes (once per process, dev only). */
 const unindexedRelationWarned = new Set<string>();
 
-const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
-
-/** Known JSONB operator keys */
-const JSONB_OPERATOR_KEYS = new Set<string>(['path', 'equals', 'contains', 'hasKey']);
-
-/**
- * JSONB operator keys that are *unique* to {@link JsonFilter} — they cannot
- * appear in any other where-filter shape, so the presence of one of these is
- * an unambiguous signal that the user meant a JSON filter. Used by the
- * strict-validation path so that `{ contains: 'foo' }` (which is also a valid
- * `WhereOperator` for LIKE) is not misclassified. Note `equals` is NOT in this
- * set: on non-JSON columns it is a plain equality operator (`WhereOperator`),
- * so it must fall through instead of throwing.
- */
-const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'hasKey']);
-
-/** Check if a value is a JSONB filter object */
-function isJsonFilter(value: unknown): value is JsonFilter {
-  if (
-    value === null ||
-    value === undefined ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    value instanceof Date
-  ) {
-    return false;
-  }
-  const keys = Object.keys(value);
-  return keys.length > 0 && keys.some((k) => JSONB_OPERATOR_KEYS.has(k));
-}
-
-/**
- * Returns the first JSON-unique key found in `value`, or `null` if none.
- * Used to drive the strict-validation error message.
- */
-function findJsonUniqueKey(value: object): string | null {
-  for (const k of Object.keys(value)) {
-    if (JSONB_UNIQUE_KEYS.has(k)) return k;
-  }
-  return null;
-}
-
-/** Known Array operator keys */
-const ARRAY_OPERATOR_KEYS = new Set<string>(['has', 'hasEvery', 'hasSome', 'isEmpty']);
-
-/**
- * Array operator keys that are *unique* to {@link ArrayFilter}. None of the
- * array operators currently overlap with `WhereOperator` or `JsonFilter`, so
- * this set equals {@link ARRAY_OPERATOR_KEYS}; it is kept as a separate
- * constant so a future overlap (e.g. a `contains` for arrays) is easy to
- * carve out.
- */
-const ARRAY_UNIQUE_KEYS = new Set<string>(['has', 'hasEvery', 'hasSome', 'isEmpty']);
-
-/** Check if a value is an Array filter object */
-function isArrayFilter(value: unknown): value is ArrayFilter {
-  if (
-    value === null ||
-    value === undefined ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    value instanceof Date
-  ) {
-    return false;
-  }
-  const keys = Object.keys(value);
-  return keys.length > 0 && keys.some((k) => ARRAY_OPERATOR_KEYS.has(k));
-}
-
-/**
- * Returns the first array-unique key found in `value`, or `null` if none.
- * Used to drive the strict-validation error message.
- */
-function findArrayUniqueKey(value: object): string | null {
-  for (const k of Object.keys(value)) {
-    if (ARRAY_UNIQUE_KEYS.has(k)) return k;
-  }
-  return null;
-}
-
-/** Known text search operator keys */
-const TEXT_SEARCH_KEYS = new Set<string>(['search', 'config']);
-
-/** Check if a value is a TextSearchFilter object */
-function isTextSearchFilter(value: unknown): value is TextSearchFilter {
-  if (
-    value === null ||
-    value === undefined ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    value instanceof Date
-  ) {
-    return false;
-  }
-  const keys = Object.keys(value);
-  // Must have 'search' key and only known text search keys
-  return keys.includes('search') && keys.every((k) => TEXT_SEARCH_KEYS.has(k));
-}
-
-/**
- * Validate a text search config name. Only alphanumeric characters and
- * underscores are allowed to prevent SQL injection via the config parameter.
- */
-function validateTextSearchConfig(config: string): boolean {
-  return /^[a-zA-Z0-9_]+$/.test(config);
-}
-
-/**
- * pgvector distance metric → operator allow-list. This is the ONLY mapping
- * from a user-supplied metric token to a SQL operator; any token not present
- * here is rejected, so a user value can never become an arbitrary operator.
- *
- *  - `l2`     → `<->` (Euclidean / L2 distance)
- *  - `cosine` → `<=>` (cosine distance)
- *  - `ip`     → `<#>` (negative inner product)
- */
-const VECTOR_METRIC_OPERATORS: Record<string, string> = {
-  l2: '<->',
-  cosine: '<=>',
-  ip: '<#>',
-};
-
-/** Comparison keys allowed on a {@link VectorDistanceFilter}. */
-const VECTOR_DISTANCE_COMPARATORS: Record<string, string> = {
-  lt: '<',
-  lte: '<=',
-  gt: '>',
-  gte: '>=',
-};
-
-/** Check if a value is a vector distance WHERE filter: `{ distance: { to, metric } }` */
-function isVectorFilter(value: unknown): value is VectorFilter {
-  if (value === null || typeof value !== 'object' || Array.isArray(value) || value instanceof Date) {
-    return false;
-  }
-  const dist = (value as { distance?: unknown }).distance;
-  return (
-    typeof dist === 'object' &&
-    dist !== null &&
-    !Array.isArray(dist) &&
-    'to' in (dist as object) &&
-    'metric' in (dist as object)
-  );
-}
-
-/** Check if an orderBy value is a vector KNN ordering: `{ distance: { to, metric } }` */
-function isVectorOrderBy(value: unknown): value is VectorOrderBy {
-  return isVectorFilter(value);
-}
-
-/** Check if an orderBy value is an explicit `{ sort, nulls? }` spec. */
-function isOrderBySpec(value: unknown): value is OrderBySpec {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) && 'sort' in value;
-}
-
-/**
- * Normalize an orderBy value into `{ direction, nulls }`. Accepts a plain
- * direction string or an {@link OrderBySpec}. Used by every ORDER BY compile
- * path (findMany, groupBy, relation inner subqueries).
- */
-function normalizeOrderBy(value: OrderDirection | OrderBySpec): { dir: 'ASC' | 'DESC'; nulls?: 'first' | 'last' } {
-  if (isOrderBySpec(value)) {
-    return { dir: value.sort.toLowerCase() === 'desc' ? 'DESC' : 'ASC', nulls: value.nulls };
-  }
-  return { dir: String(value).toLowerCase() === 'desc' ? 'DESC' : 'ASC' };
-}
-
 // ---------------------------------------------------------------------------
-// Deferred query descriptor (for pipeline batching)
+// Deferred query + option types (see deferred.ts)
 // ---------------------------------------------------------------------------
 
-/**
- * Runs a SQL statement and resolves its raw result. Passed to a
- * {@link DeferredQuery.reselect} plan so it can run the write and the follow-up
- * SELECT through the same timeout/instrumentation path as the primary query.
- */
-export type ReselectExecutor = (sql: string, params: unknown[], preparedName?: string) => Promise<pg.QueryResult>;
+export type {
+  DeferredQuery,
+  MiddlewareFn,
+  QueryEvent,
+  QueryEventListener,
+  QueryInterfaceOptions,
+  ReselectExecutor,
+} from './deferred.js';
 
-export interface DeferredQuery<T> {
-  /** SQL text with $1, $2 placeholders */
-  sql: string;
-  /** Bound parameter values */
-  params: unknown[];
-  /** How to transform the raw pg.QueryResult into the final value */
-  transform: (result: pg.QueryResult) => T;
-  /** Tag for debugging / logging */
-  tag: string;
-  /** Prepared statement name (t_<16hex>). Set when SQL cache is enabled. */
-  preparedName?: string;
-  /**
-   * Execution plan for dialects whose {@link Dialect.resultStrategy} is
-   * `'reselect'` (no RETURNING — e.g. MySQL). Owns the statement ordering: it
-   * runs the write and the follow-up row-fetching SELECT(s) via `exec`, and
-   * resolves the result whose rows {@link DeferredQuery.transform} consumes.
-   * Absent for `'returning'`/`'output'` dialects (the statement returns its own
-   * rows), so the PostgreSQL path never allocates or consults it.
-   */
-  reselect?: (exec: ReselectExecutor) => Promise<pg.QueryResult>;
-}
-
-// ---------------------------------------------------------------------------
-// QueryInterface — the object returned by db.users, db.posts, etc.
-// ---------------------------------------------------------------------------
-
-/** Middleware function type — imported from client to avoid circular deps */
-export type MiddlewareFn = (
-  params: { model: string; action: string; args: Record<string, unknown> },
-  next: (params: { model: string; action: string; args: Record<string, unknown> }) => Promise<unknown>,
-) => Promise<unknown>;
-
-/** Emitted after every query execution (success or failure). */
-export interface QueryEvent {
-  sql: string;
-  params: unknown[];
-  duration: number;
-  model: string;
-  action: string;
-  rows: number;
-  timestamp: Date;
-  error?: Error;
-}
-
-export type QueryEventListener = (event: QueryEvent) => void;
-
-/** Options passed from TurbineClient to QueryInterface */
-export interface QueryInterfaceOptions {
-  /** Default LIMIT applied to findMany() when no limit is specified */
-  defaultLimit?: number;
-  /**
-   * Log a one-time warning when {@link QueryInterface.findMany} is called
-   * without a `limit`. Defaults to `true` so that accidental unbounded
-   * queries are surfaced loudly during development. Pass `false` to silence
-   * the warning entirely (e.g. for CLI tooling that intentionally streams
-   * full tables).
-   */
-  warnOnUnlimited?: boolean;
-  /**
-   * Enable prepared statements. When true, queries are submitted with a
-   * `{ name, text, values }` object to the pg driver, which caches the
-   * parse+plan on the server per connection.
-   *
-   * Default: `true` for Turbine-owned pools, `false` for external pools
-   * (serverless drivers may not support named statements).
-   */
-  preparedStatements?: boolean;
-  /**
-   * Enable the SQL template cache. When true, repeated queries with the
-   * same shape (same keys, operators, relations — different values) reuse
-   * cached SQL text instead of rebuilding from scratch.
-   *
-   * Default: `true`. Set to `false` as a nuclear kill switch.
-   */
-  sqlCache?: boolean;
-  /** SQL dialect implementation. Defaults to PostgreSQL. */
-  dialect?: Dialect;
-  /**
-   * Interpret offset-less timestamp strings (Postgres `timestamp` without
-   * time zone, and the JSON emitted by nested-relation subqueries) as UTC.
-   * This is the Prisma/Rails/Django convention and makes results independent
-   * of the server's local time zone. Default: `true`. Set `false` to restore
-   * the pre-0.26 behavior (JS local-time interpretation).
-   */
-  utcTimestamps?: boolean;
-  /**
-   * Client-level default relation-loading strategy for `with` clauses. Per-query
-   * `relationLoadStrategy` args override this; both default to `'join'`.
-   */
-  relationLoadStrategy?: RelationLoadStrategy;
-  /**
-   * How nested-relation subqueries encode each row's JSON: `'object'` (default,
-   * `json_build_object`) or `'positional'` (`json_build_array`, key-less — see
-   * {@link Dialect.buildJsonArray}). Positional is Postgres-only in v1; a
-   * `with` clause on any other dialect throws `UnsupportedFeatureError` (E017).
-   */
-  jsonEncoding?: 'object' | 'positional';
-  /**
-   * Automatic WHERE filters keyed by table accessor, AND-merged into every
-   * query on that table and every relation subquery targeting it (soft-delete /
-   * multi-tenancy). Function values are evaluated at query-build time. See
-   * {@link GlobalFilters}.
-   */
-  globalFilters?: GlobalFilters;
-  /** @internal Set by TransactionClient — signals that this QI runs inside an active transaction. */
-  _txScoped?: boolean;
-  /** @internal Callback from TurbineClient for query event emission. */
-  _onQuery?: (event: QueryEvent) => void;
-  /**
-   * @internal Factory that builds the per-table query interface. Defaults to
-   * `new QueryInterface` (the SQL path). Non-SQL backends (PowDB) supply a
-   * factory returning a structurally-compatible interface that generates their
-   * own query language instead of SQL. The SQL dialects never set this, so their
-   * `table()` behavior is byte-identical.
-   */
-  queryInterfaceFactory?: (
-    pool: pg.Pool,
-    table: string,
-    schema: SchemaMetadata,
-    middlewares: MiddlewareFn[],
-    options: QueryInterfaceOptions,
-  ) => QueryInterface<object>;
-}
+import type { DeferredQuery, MiddlewareFn, QueryInterfaceOptions, ReselectExecutor } from './deferred.js';
 
 /**
  * Decode descriptor for `jsonEncoding: 'positional'`. Built during SQL
