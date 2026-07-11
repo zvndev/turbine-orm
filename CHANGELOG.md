@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.28.3 (2026-07-11)
+
+**Patch:** `turbine generate` output typechecks again.
+
+### Fixed
+- **Generated client failed `tsc` with TS2415 ("incorrectly extends") since 0.26.** The base `TurbineClient.$transaction` gained the batch-array overload (`$transaction([...queries])`), but the generator's interface-merge for the typed client still emitted only the callback signature — and a merged member must be compatible with the base member on its own. The generated `TurbineClient` interface now redeclares both overloads (typed callback + batch array). Found dogfooding the BataDB demo app on 0.28.2.
+- **New regression gate:** `generate-typecheck.test.ts` compiles freshly generated output with `tsc --noEmit` against the repo's own source types (path-mapped), so template ↔ client-type drift can never ship again — string-pin tests alone stayed green through this break.
+
 ## 0.28.2 (2026-07-10)
 
 **Post-smoke-audit patch** for 0.28.1 — consumer typecheck + docs honesty.

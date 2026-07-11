@@ -606,7 +606,7 @@ export function generateIndex(schema: SchemaMetadata): string {
   const lines: string[] = [
     ...generatedFileHeader(),
     "import { TurbineClient as BaseTurbineClient, TransactionClient as BaseTransactionClient, QueryInterface } from 'turbine-orm';",
-    "import type { TurbineConfig, TransactionOptions } from 'turbine-orm';",
+    "import type { TurbineConfig, TransactionOptions, DeferredQuery, PipelineResults } from 'turbine-orm';",
     "import { SCHEMA } from './metadata.js';",
   ];
 
@@ -693,9 +693,13 @@ export function generateIndex(schema: SchemaMetadata): string {
   lines.push('');
   // Augment TurbineClient via interface merging with a typed $transaction
   // overload. The callback parameter is narrowed to `TypedTransactionClient`
-  // so users get autocomplete on `tx.users`, `tx.posts`, etc. The base
-  // signature (callback parameter `BaseTransactionClient`) remains valid as
-  // an overload, so prior usage continues to typecheck.
+  // so users get autocomplete on `tx.users`, `tx.posts`, etc.
+  //
+  // IMPORTANT: the merged member must be compatible with the base class's
+  // $transaction ON ITS OWN (TS2415) — since v0.26 the base method also has a
+  // batch-array overload (`$transaction([...queries])`), so the merged
+  // interface must redeclare BOTH signatures. Emitting only the callback form
+  // makes every generated client fail `tsc` with "incorrectly extends".
   lines.push('export interface TurbineClient {');
   lines.push('  /**');
   lines.push('   * Run a callback inside a transaction. The callback receives a typed');
@@ -705,6 +709,13 @@ export function generateIndex(schema: SchemaMetadata): string {
   lines.push('    fn: (tx: TypedTransactionClient) => Promise<R>,');
   lines.push('    options?: TransactionOptions,');
   lines.push('  ): Promise<R>;');
+  lines.push('  /**');
+  lines.push('   * Batch form: run several deferred queries in one transaction and get');
+  lines.push('   * their results as a tuple (same as the base client).');
+  lines.push('   */');
+  lines.push('  $transaction<T extends readonly DeferredQuery<unknown>[]>(');
+  lines.push('    queries: readonly [...T],');
+  lines.push('  ): Promise<PipelineResults<T>>;');
   lines.push('}');
   lines.push('');
 
