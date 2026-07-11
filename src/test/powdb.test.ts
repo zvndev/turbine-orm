@@ -9,6 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { TurbineClient } from '../client.js';
 import {
   ConnectionError,
   NotNullViolationError,
@@ -24,7 +25,7 @@ import {
   materializePowql,
   PowdbEmbeddedPool,
   PowdbFloatParam,
-  type PowdbPool,
+  PowdbPool,
   parsePowdbUrl,
   powdbDialect,
   powqlColumnType,
@@ -33,6 +34,7 @@ import {
   wrapPowdbError,
 } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
+import type { DeferredQuery } from '../query/index.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
 // ---------------------------------------------------------------------------
@@ -715,6 +717,115 @@ describe('powdb: transaction model (single-writer)', () => {
     await assert.rejects(() => pool.query('start transaction'), UnsupportedFeatureError);
     await pool.query('ROLLBACK');
     await assert.doesNotReject(() => pool.query('begin'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Batch pipelining — the networked driver advertises FIFO in-flight support,
+// so `$transaction([...])` dispatches all statements in one write burst.
+// ---------------------------------------------------------------------------
+
+/** Let the promise chain progress until it blocks on an unresolved reply. */
+function drainMicrotasks(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * A fake `@zvndev/powdb-client` pool with ONE client whose non-transaction
+ * queries stay pending until the test releases them — so "dispatched before
+ * any reply" assertions are exact, never timing-based. Mirrors the real
+ * client's contract: requests are written immediately, replies match FIFO.
+ */
+function fakeNetworkedClientPool() {
+  const sent: string[] = [];
+  const pending: { powql: string; resolve: (r: unknown) => void; reject: (e: Error) => void }[] = [];
+  const client = {
+    serverVersion: '0.8.0',
+    query(powql: string, _params?: unknown[]) {
+      sent.push(powql);
+      if (powql === 'begin' || powql === 'commit' || powql === 'rollback') {
+        return Promise.resolve({ kind: 'message', message: 'ok' });
+      }
+      return new Promise((resolve, reject) => {
+        pending.push({ powql, resolve, reject });
+      });
+    },
+    close: async () => {},
+  };
+  const pool = {
+    acquire: async () => client,
+    release() {},
+    destroy() {},
+    withClient: async (fn: (c: typeof client) => Promise<unknown>) => fn(client),
+    close: async () => {},
+  };
+  return { pool: pool as unknown as ConstructorParameters<typeof PowdbPool>[0], sent, pending };
+}
+
+describe('powdb: batch $transaction pipelining (networked driver)', () => {
+  it('PowdbPool.connect() advertises supportsPipelining', async () => {
+    const fake = fakeNetworkedClientPool();
+    const client = await new PowdbPool(fake.pool).connect();
+    assert.equal(client.supportsPipelining, true);
+    client.release();
+  });
+
+  it('PowdbEmbeddedPool.connect() does NOT (in-process, nothing to pipeline)', async () => {
+    const { pool } = fakeEmbeddedDb();
+    const client = await pool.connect();
+    assert.equal(client.supportsPipelining, undefined);
+    client.release();
+  });
+
+  it('dispatches every batch statement before any reply arrives, inside begin…commit', async () => {
+    const fake = fakeNetworkedClientPool();
+    const db = new TurbineClient({ pool: new PowdbPool(fake.pool), dialect: powdbDialect }, { tables: {}, enums: {} });
+
+    const dq = (powql: string): DeferredQuery<number> => ({
+      sql: powql,
+      params: [],
+      tag: 'raw',
+      transform: (r) => r.rowCount ?? -1,
+    });
+    const batch = db.$transaction([dq('app_user filter .age > 27 update { active := false }'), dq('post delete')]);
+    await drainMicrotasks();
+
+    // Both statements hit the wire while zero replies have arrived (1 round
+    // trip of waiting instead of one per statement).
+    assert.deepEqual(fake.sent, ['begin', 'app_user filter .age > 27 update { active := false }', 'post delete']);
+    assert.equal(fake.pending.length, 2, 'both statements in flight at once');
+
+    fake.pending[0]!.resolve({ kind: 'ok', affected: 3n });
+    fake.pending[1]!.resolve({ kind: 'ok', affected: 5n });
+
+    assert.deepEqual(await batch, [3, 5], 'results stay positional and pg-compat adapted');
+    assert.equal(fake.sent.at(-1), 'commit', 'commit only after every reply');
+  });
+
+  it('a mid-batch failure rolls back and surfaces the wrapped first error', async () => {
+    const fake = fakeNetworkedClientPool();
+    const db = new TurbineClient({ pool: new PowdbPool(fake.pool), dialect: powdbDialect }, { tables: {}, enums: {} });
+
+    const dq = (powql: string): DeferredQuery<number> => ({
+      sql: powql,
+      params: [],
+      tag: 'raw',
+      transform: (r) => r.rowCount ?? -1,
+    });
+    const batch = db.$transaction([dq('insert app_user { id := "u1" } returning'), dq('post delete')]);
+    await drainMicrotasks();
+    assert.equal(fake.pending.length, 2, 'pipelined: the statement after the failure was already sent');
+
+    fake.pending[0]!.reject(
+      Object.assign(new Error('query failed: unique constraint violation on app_user.id'), {
+        code: 'query_failed',
+      }),
+    );
+    fake.pending[1]!.resolve({ kind: 'ok', affected: 1n });
+
+    await assert.rejects(batch, UniqueConstraintError);
+    assert.equal(fake.sent.at(-1), 'rollback', 'rolled back after draining in-flight replies');
+    assert.ok(!fake.sent.includes('commit'), 'never committed');
   });
 });
 
