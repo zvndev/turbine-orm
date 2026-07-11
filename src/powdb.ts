@@ -22,8 +22,14 @@
  *     `string` PKs hold UUID strings.
  *   - **No JSON aggregation / link navigation** — single-query nested `with` is
  *     impossible → it degrades to batched N+1 loaders (Phase B).
- *   - **Single global write lock; no savepoints/isolation/pipelining** — nested
+ *   - **Single global write lock; no savepoints/isolation** — nested
  *     transactions / isolation / vector / LISTEN-NOTIFY / RLS throw.
+ *   - **The wire protocol pipelines** — `@zvndev/powdb-client` writes each
+ *     request frame immediately and matches replies FIFO, so multiple queries
+ *     may be in flight on one connection. {@link PowdbPool}'s checked-out
+ *     clients advertise `supportsPipelining`, which lets the batch
+ *     `$transaction([...])` overload dispatch all statements in one write
+ *     burst (~1 round trip) instead of one round trip per statement.
  *
  * `@zvndev/powdb-client` is an **optional peer dependency** loaded by dynamic
  * import; `npm i turbine-orm` still pulls only `pg`.
@@ -550,6 +556,16 @@ export class PowdbPool implements PgCompatPool {
     const client = await this.pool.acquire();
     let broken = false;
     return {
+      // The networked client's query() supports concurrent in-flight calls on
+      // one connection: every request frame is written to the socket
+      // immediately and replies are matched to callers in FIFO order. That
+      // lets the batch `$transaction([...])` path dispatch all statements in
+      // one write burst instead of paying a round trip per statement. Safe
+      // for the batch's rollback contract because a failed statement leaves
+      // the engine's transaction open (no aborted state, no auto-rollback) —
+      // later pipelined statements execute inside the same still-open
+      // transaction and the final `rollback` discards every effect.
+      supportsPipelining: true,
       // biome-ignore lint/suspicious/noExplicitAny: see query() above.
       query: async (text: QueryArg, values?: unknown[]): Promise<any> => {
         const { text: powql, params } = normalizeQueryArgs(text, values);

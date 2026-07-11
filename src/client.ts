@@ -112,6 +112,17 @@ export interface PgCompatQueryResult<R = Record<string, unknown>> {
 export interface PgCompatPoolClient {
   query<R = Record<string, unknown>>(text: string, values?: unknown[]): Promise<PgCompatQueryResult<R>>;
   release(err?: Error | boolean): void;
+  /**
+   * Optional driver capability: `true` when `query()` may be called again on
+   * this connection while earlier calls are still in flight, with replies
+   * delivered to callers in FIFO submission order. Drivers that set this let
+   * the batch `$transaction([...])` overload dispatch every statement in one
+   * write burst (~1 network round trip plus server time) instead of awaiting
+   * each reply before sending the next (N round trips). Leave unset for
+   * drivers (node-postgres included) whose batch path must stay strictly
+   * sequential.
+   */
+  readonly supportsPipelining?: boolean;
 }
 
 /**
@@ -1192,8 +1203,13 @@ export class TurbineClient {
    * of each query's transformed result; any failure rolls the whole batch back.
    *
    * Unlike {@link pipeline}, this never uses the extended-query pipeline
-   * protocol — it executes sequentially on the transaction connection, so it is
-   * safe on every driver (including HTTP/serverless pools).
+   * protocol. Statements run on the single transaction connection: strictly
+   * sequentially by default (safe on every driver, including HTTP/serverless
+   * pools), or — when the checked-out connection advertises
+   * {@link PgCompatPoolClient.supportsPipelining} — dispatched in one write
+   * burst with replies collected in order, saving a network round trip per
+   * statement. Either way the failure contract is identical: the first
+   * (lowest-index) failure aborts the batch and rolls everything back.
    *
    * @example
    * ```ts
@@ -1344,14 +1360,51 @@ export class TurbineClient {
    * Execute a batch of {@link DeferredQuery} objects atomically inside one
    * transaction. Backs the `$transaction([...])` array overload. Reuses the raw
    * {@link transaction} machinery (BEGIN/COMMIT/ROLLBACK + connection release);
-   * queries run sequentially on the single transaction connection and each
-   * result is passed through its query's `transform`.
+   * each result is passed through its query's `transform`.
+   *
+   * Execution strategy on the single transaction connection:
+   *   - **Sequential (default).** Await each statement's reply before sending
+   *     the next. Safe on every driver; on a networked driver a batch of N
+   *     costs N round trips.
+   *   - **Pipelined.** When the checked-out connection advertises
+   *     {@link PgCompatPoolClient.supportsPipelining} (its `query()` accepts
+   *     concurrent calls and completes them in FIFO submission order), all
+   *     statements are dispatched in one write burst and the replies are
+   *     collected in order — ~1 round trip plus server time. Only taken when
+   *     the dialect's writes surface rows directly (`resultStrategy` !==
+   *     'reselect'): a reselect plan is itself a sequential write+read pair.
+   *
+   * The two paths share one failure contract: the first (lowest-index) failed
+   * statement's error is thrown (wrapped via {@link wrapPgError}) and the
+   * surrounding transaction rolls back, so no statement's effect survives. The
+   * pipelined path drains every in-flight reply (`Promise.allSettled`) before
+   * rethrowing, which keeps the connection's request/reply pairing intact and
+   * means ROLLBACK is only issued once no statement is still in flight.
    */
   private async transactionBatch<T extends readonly DeferredQuery<unknown>[]>(queries: T): Promise<PipelineResults<T>> {
     if (queries.length === 0) {
       return [] as unknown as PipelineResults<T>;
     }
     return this.transaction(async (client) => {
+      const pipelined =
+        (client as unknown as PgCompatPoolClient).supportsPipelining === true &&
+        this.dialect.resultStrategy !== 'reselect';
+
+      if (pipelined) {
+        // Dispatch every statement before awaiting any reply. The driver's
+        // FIFO guarantee makes settled[i] the reply to queries[i].
+        const settled = await Promise.allSettled(queries.map((dq) => client.query(dq.sql, dq.params)));
+        const results: unknown[] = [];
+        for (let i = 0; i < settled.length; i++) {
+          const outcome = settled[i]!;
+          if (outcome.status === 'rejected') {
+            throw wrapPgError(outcome.reason);
+          }
+          results.push(queries[i]!.transform(outcome.value));
+        }
+        return results as PipelineResults<T>;
+      }
+
       const results: unknown[] = [];
       for (const dq of queries) {
         let raw: pg.QueryResult;

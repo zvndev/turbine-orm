@@ -14,6 +14,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { TurbineClient } from '../client.js';
+import { type Dialect, postgresDialect } from '../dialect.js';
 import type { DeferredQuery } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 
@@ -149,5 +150,168 @@ describe('H2 — $transaction(DeferredQuery[]) batch overload', () => {
     const texts = mock.queries.map((r) => r.text);
     assert.equal(texts[0], 'BEGIN');
     assert.ok(texts.includes('COMMIT'));
+  });
+
+  it('stays sequential on a non-pipelining client: a failure stops later statements from being sent', async () => {
+    const mock = recordingPool({ throwOn: 'FAIL' });
+    const db = new TurbineClient({ pool: mock.pool }, SCHEMA);
+
+    await assert.rejects(() => db.$transaction([q('FAIL', [], 'a'), q('SELECT 2 AS n', [], 'b')]), /boom: FAIL/);
+
+    const texts = mock.queries.map((r) => r.text);
+    assert.ok(!texts.includes('SELECT 2 AS n'), 'statement after the failure was never dispatched');
+    assert.ok(texts.includes('ROLLBACK'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pipelined batch — drivers whose pool client sets `supportsPipelining` get
+// all statements dispatched in one write burst, replies collected in order.
+// ---------------------------------------------------------------------------
+
+/** Let the promise chain progress until it blocks on an unresolved reply. */
+function drainMicrotasks(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+interface PendingReply {
+  text: string;
+  resolve: (r: { rows: unknown[]; rowCount: number }) => void;
+  reject: (e: Error) => void;
+}
+
+/**
+ * A mock pool whose single client advertises `supportsPipelining` and records
+ * the exact dispatch order. Transaction-control statements resolve
+ * immediately; every other statement stays pending until the test releases it
+ * via `reply()`/`fail()` — so assertions about "dispatched before any reply"
+ * are exact, never timing-based.
+ */
+function pipeliningPool() {
+  const dispatched: string[] = [];
+  const pending: PendingReply[] = [];
+  let released = 0;
+  const client = {
+    supportsPipelining: true,
+    query(text: string, _values?: unknown[]) {
+      dispatched.push(text);
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      }
+      return new Promise<{ rows: unknown[]; rowCount: number }>((resolve, reject) => {
+        pending.push({ text, resolve, reject });
+      });
+    },
+    release() {
+      released++;
+    },
+  };
+  const pool = {
+    async query(_text: string, _values?: unknown[]) {
+      return { rows: [], rowCount: 0 };
+    },
+    async connect() {
+      return client;
+    },
+    async end() {},
+  };
+  return {
+    pool: pool as unknown as import('../client.js').PgCompatPool,
+    dispatched,
+    pending,
+    get released() {
+      return released;
+    },
+    /** Resolve the pending statement whose text matches, with `rows[0].n = value`. */
+    reply(text: string, value: number) {
+      const idx = pending.findIndex((p) => p.text === text);
+      assert.notEqual(idx, -1, `no pending statement matching "${text}"`);
+      const [entry] = pending.splice(idx, 1);
+      entry!.resolve({ rows: [{ n: value }], rowCount: 1 });
+    },
+    /** Reject the pending statement whose text matches. */
+    fail(text: string) {
+      const idx = pending.findIndex((p) => p.text === text);
+      assert.notEqual(idx, -1, `no pending statement matching "${text}"`);
+      const [entry] = pending.splice(idx, 1);
+      entry!.reject(new Error(`boom: ${text}`));
+    },
+  };
+}
+
+describe('H2 — pipelined batch on a supportsPipelining client', () => {
+  it('dispatches every statement before any reply arrives (single write burst)', async () => {
+    const mock = pipeliningPool();
+    const db = new TurbineClient({ pool: mock.pool }, SCHEMA);
+
+    const batch = db.$transaction([q('S1', [], 'a'), q('S2', [], 'b'), q('S3', [], 'c')]);
+    await drainMicrotasks();
+
+    // All three statements are on the wire while zero replies have arrived.
+    assert.deepEqual(mock.dispatched, ['BEGIN', 'S1', 'S2', 'S3']);
+    assert.equal(mock.pending.length, 3, 'all three statements in flight at once');
+
+    mock.reply('S1', 1);
+    mock.reply('S2', 2);
+    mock.reply('S3', 3);
+
+    assert.deepEqual(await batch, [1, 2, 3]);
+    assert.equal(mock.dispatched.at(-1), 'COMMIT', 'COMMIT only after every reply');
+    assert.equal(mock.released, 1);
+  });
+
+  it('keeps results positional even when replies settle out of order', async () => {
+    const mock = pipeliningPool();
+    const db = new TurbineClient({ pool: mock.pool }, SCHEMA);
+
+    const batch = db.$transaction([q('S1', [], 'a'), q('S2', [], 'b'), q('S3', [], 'c')]);
+    await drainMicrotasks();
+
+    mock.reply('S3', 3);
+    mock.reply('S1', 1);
+    mock.reply('S2', 2);
+
+    assert.deepEqual(await batch, [1, 2, 3], 'results align to batch order, not settlement order');
+  });
+
+  it('throws the lowest-index failure, drains in-flight replies, then rolls back', async () => {
+    const mock = pipeliningPool();
+    const db = new TurbineClient({ pool: mock.pool }, SCHEMA);
+
+    const batch = db.$transaction([q('S1', [], 'a'), q('S2', [], 'b'), q('S3', [], 'c')]);
+    await drainMicrotasks();
+    assert.equal(mock.pending.length, 3, 'pipelined: the statements after the failure were already sent');
+
+    mock.reply('S1', 1);
+    mock.fail('S2');
+    // ROLLBACK must wait for S3's reply too — the batch drains all in-flight
+    // statements before surfacing the error.
+    await drainMicrotasks();
+    assert.ok(!mock.dispatched.includes('ROLLBACK'), 'no ROLLBACK while a statement is still in flight');
+
+    mock.fail('S3'); // both fail — the FIRST (lowest-index) error must win
+
+    await assert.rejects(batch, /boom: S2/);
+    assert.equal(mock.dispatched.at(-1), 'ROLLBACK');
+    assert.ok(!mock.dispatched.includes('COMMIT'), 'never COMMITted');
+    assert.equal(mock.released, 1);
+  });
+
+  it("stays sequential when the dialect's writes need a reselect plan", async () => {
+    const mock = pipeliningPool();
+    const reselectDialect: Dialect = { ...postgresDialect, name: 'reselect-test', resultStrategy: 'reselect' };
+    const db = new TurbineClient({ pool: mock.pool, dialect: reselectDialect }, SCHEMA);
+
+    const batch = db.$transaction([q('S1', [], 'a'), q('S2', [], 'b')]);
+    await drainMicrotasks();
+
+    // Sequential: S2 must not be dispatched until S1's reply arrives.
+    assert.deepEqual(mock.dispatched, ['BEGIN', 'S1']);
+    mock.reply('S1', 1);
+    await drainMicrotasks();
+    assert.deepEqual(mock.dispatched, ['BEGIN', 'S1', 'S2']);
+    mock.reply('S2', 2);
+
+    assert.deepEqual(await batch, [1, 2]);
   });
 });
