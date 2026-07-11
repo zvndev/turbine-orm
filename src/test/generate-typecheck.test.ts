@@ -100,11 +100,7 @@ describe('generated client typechecks against the shipped client types', () => {
         encoding: 'utf-8',
         timeout: 120_000,
       });
-      assert.equal(
-        result.status,
-        0,
-        `generated client failed to typecheck:\n${result.stdout}\n${result.stderr}`,
-      );
+      assert.equal(result.status, 0, `generated client failed to typecheck:\n${result.stdout}\n${result.stderr}`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
