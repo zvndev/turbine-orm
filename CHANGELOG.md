@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.29.0 (2026-07-12)
+
+**Feature:** batch `$transaction([...])` pipelines on drivers that support it.
+
+### Changed
+- **Batch `$transaction` is one write burst on pipelining drivers.** The array
+  form previously awaited each deferred query sequentially — N statements cost
+  N round trips even though the batch is a single atomic unit. When the
+  checked-out `PgCompatPoolClient` advertises the new additive capability flag
+  `supportsPipelining: true`, `transactionBatch` now dispatches every statement
+  back-to-back inside BEGIN/COMMIT and collects replies in order
+  (`Promise.allSettled` — all in-flight replies drain before a ROLLBACK, and
+  the lowest-index failure is thrown, wrapped as before). The PowDB pool's
+  checked-out clients advertise the flag; `node-postgres` paths are
+  byte-identical to 0.28.x (flag absent → sequential path unchanged), and the
+  pipelined path is disabled for dialects with `resultStrategy: 'reselect'`.
+
+### Added
+- `PgCompatPoolClient.supportsPipelining?: boolean` — optional, additive; any
+  PgCompat driver whose connection preserves FIFO reply order over a single
+  socket can opt in to get the batched-transaction fast path.
+
 ## 0.28.3 (2026-07-11)
 
 **Patch:** `turbine generate` output typechecks again.
