@@ -25,20 +25,49 @@ export type OrderDirection = 'asc' | 'desc';
  */
 export type RelationLoadStrategy = 'join' | 'batched';
 
+/**
+ * Reference to ANOTHER COLUMN of the same table inside a where operator,
+ * enabling column-to-column comparison:
+ *
+ * ```ts
+ * where: { currentVersionId: { equals: { col: 'publishedVersionId' } } }
+ * // → WHERE "current_version_id" = "published_version_id"
+ * ```
+ *
+ * Accepted by `equals`, `not`, `gt`, `gte`, `lt`, and `lte`. The referenced
+ * field resolves through the table's columnMap (camelCase accepted, same as a
+ * where key) and compiles to a quoted identifier: NO parameter is bound.
+ * An unknown referenced field throws {@link ValidationError} (E003).
+ *
+ * Notes:
+ *  - `mode: 'insensitive'` cannot be combined with a column reference: it
+ *    throws E003 (use `client.sql` for `lower(a) = lower(b)`).
+ *  - On json/jsonb columns `equals` routes to the JSONB containment filter
+ *    first, so `{ equals: { col } }` there is treated as a JSON value, not a
+ *    column reference.
+ *
+ * `F` narrows the referenced name to the table's field names when the
+ * surrounding {@link WhereClause} knows the entity type.
+ */
+export interface ColumnRef<F extends string = string> {
+  col: F;
+}
+
 /** Operator object for advanced where filtering */
-export interface WhereOperator<V = unknown> {
+export interface WhereOperator<V = unknown, F extends string = string> {
   /**
    * Explicit equality: `{ equals: value }` → `column = $n`.
    * `{ equals: null }` → `column IS NULL`.
+   * `{ equals: { col: 'otherField' } }` → `column = "other_field"` ({@link ColumnRef}).
    * On json/jsonb columns `equals` routes to the JSONB containment filter
    * ({@link JsonFilter}) instead.
    */
-  equals?: V | null;
-  gt?: V;
-  gte?: V;
-  lt?: V;
-  lte?: V;
-  not?: V | null;
+  equals?: V | ColumnRef<F> | null;
+  gt?: V | ColumnRef<F>;
+  gte?: V | ColumnRef<F>;
+  lt?: V | ColumnRef<F>;
+  lte?: V | ColumnRef<F>;
+  not?: V | ColumnRef<F> | null;
   in?: V[];
   notIn?: V[];
   contains?: string;
@@ -58,7 +87,7 @@ export interface WhereOperator<V = unknown> {
  * - A text search filter object ({ search, config? })
  * - A vector distance filter object ({ distance: { to, metric, lt } }) for pgvector columns
  */
-export type WhereValue<V = unknown> =
+export type WhereValue<V = unknown, F extends string = string> =
   | (V extends Array<infer U>
       ? TypedRelationFilter<U> // to-many relation property → some/every/none
       : V extends Date
@@ -66,7 +95,7 @@ export type WhereValue<V = unknown> =
         : V extends object
           ? V | TypedToOneFilter<V> | WhereClause<V> // to-one relation → is/isNot or bare where (implicit is)
           : V)
-  | WhereOperator<V>
+  | WhereOperator<V, F>
   | JsonFilter
   | ArrayFilter
   | TextSearchFilter
@@ -95,7 +124,7 @@ export interface TypedToOneFilter<V> {
  * Relation names can be used with some/every/none sub-filters.
  */
 export type WhereClause<T> = {
-  [K in keyof T]?: WhereValue<T[K]>;
+  [K in keyof T]?: WhereValue<T[K], Extract<keyof T, string>>;
 } & {
   OR?: WhereClause<T>[];
   AND?: WhereClause<T>[];
@@ -181,7 +210,7 @@ export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
 export interface WithOptions<NestedR extends object = {}> {
   with?: TypedWithClause<NestedR>;
   where?: Record<string, unknown>;
-  orderBy?: Record<string, OrderDirection | OrderBySpec>;
+  orderBy?: Record<string, OrderDirection | OrderBySpec | JsonPathOrderBy | RelationOrderBy>;
   limit?: number;
   /** Only include these fields from the relation */
   select?: Record<string, boolean>;
@@ -948,6 +977,33 @@ export interface OrderBySpec {
 }
 
 /**
+ * Ordering by a JSON path on a json/jsonb column of the SAME table:
+ *
+ * ```ts
+ * orderBy: { data: { path: ['weight'], direction: 'asc', type: 'numeric' } }
+ * // → ORDER BY ("data" #>> $n::text[])::numeric ASC
+ * ```
+ *
+ * The path is bound as a single text[] parameter (never interpolated).
+ * Comparison rule: values extracted from the path compare as TEXT by default;
+ * pass `type: 'numeric'` to cast for numeric comparison (`::numeric` on
+ * PostgreSQL). The column must be json/jsonb: anything else throws
+ * {@link ValidationError} (E003). Non-Postgres engines route through the same
+ * dialect JSON-extract hook the JSON where-filters use. Cross-relation
+ * (lateral) JSON ordering is NOT supported: same-table columns only.
+ */
+export interface JsonPathOrderBy {
+  /** JSON path into the column (each element a key or array index). Bound as one text[] param. */
+  path: (string | number)[];
+  /** Sort direction. Defaults to `'asc'`. */
+  direction?: OrderDirection;
+  /** Comparison kind for the extracted value. Defaults to `'text'`; `'numeric'` adds a numeric cast. */
+  type?: 'numeric' | 'text';
+  /** NULLS placement (PostgreSQL / SQLite only: see {@link OrderBySpec}). */
+  nulls?: 'first' | 'last';
+}
+
+/**
  * Ordering by a relation, keyed by the relation name in an {@link OrderByClause}:
  *
  *  - to-many (hasMany / manyToMany): `{ posts: { _count: 'desc' } }` — orders by
@@ -962,8 +1018,12 @@ export type RelationOrderBy = { _count: OrderDirection } | Record<string, OrderD
  * An orderBy clause maps each key to one of:
  *  - a plain direction (`'asc'` / `'desc'`),
  *  - an {@link OrderBySpec} (`{ sort, nulls }`) for NULLS placement,
+ *  - for json/jsonb columns, a JSON-path ordering ({@link JsonPathOrderBy}),
  *  - for pgvector columns, a KNN distance ordering ({@link VectorOrderBy}),
  *  - for a relation name, a {@link RelationOrderBy} (`_count` for to-many, a
  *    target column for to-one).
  */
-export type OrderByClause = Record<string, OrderDirection | OrderBySpec | VectorOrderBy | RelationOrderBy>;
+export type OrderByClause = Record<
+  string,
+  OrderDirection | OrderBySpec | JsonPathOrderBy | VectorOrderBy | RelationOrderBy
+>;

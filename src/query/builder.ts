@@ -49,7 +49,9 @@ import {
   fingerprintJsonFilterShape,
   fingerprintOperatorShape,
   isArrayFilter,
+  isColumnRef,
   isJsonFilter,
+  isJsonPathOrderBy,
   isOrderBySpec,
   isTextSearchFilter,
   isUnmatchedPlainObject,
@@ -69,6 +71,7 @@ import type {
   AggregateArgs,
   AggregateResult,
   ArrayFilter,
+  ColumnRef,
   CountArgs,
   CreateArgs,
   CreateManyArgs,
@@ -83,6 +86,7 @@ import type {
   HavingFilter,
   HavingNumericOperator,
   JsonFilter,
+  JsonPathOrderBy,
   OrderByClause,
   OrderBySpec,
   OrderDirection,
@@ -105,6 +109,20 @@ import { escapeLike, LRUCache, OPERATOR_KEYS, parseDbDate, type SqlCacheEntry, s
 
 /** Relations already warned about missing FK indexes (once per process, dev only). */
 const unindexedRelationWarned = new Set<string>();
+
+/**
+ * Column-reference resolution context threaded into
+ * {@link QueryInterface.buildOperatorClauses} / `collectOperatorParams`: the
+ * table whose fields a `{ col }` reference may name, plus the SQL prefix
+ * (`''` top-level, `"table".` in relation-filter subqueries, `t0.` against a
+ * relation alias) the compiled identifier must carry so it resolves in the
+ * same scope as the operator's own column.
+ */
+interface ColumnRefContext {
+  meta: TableMetadata;
+  table: string;
+  prefix: string;
+}
 
 // ---------------------------------------------------------------------------
 // Deferred query + option types (see deferred.ts)
@@ -2926,7 +2944,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // Operator objects
       if (isWhereOperator(value)) {
-        this.collectOperatorParams(rawColumn, value, params);
+        this.collectOperatorParams(rawColumn, value, params, {
+          meta: this.tableMeta,
+          table: this.table,
+          prefix: '',
+        });
         continue;
       }
 
@@ -3032,7 +3054,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       if (isWhereOperator(value)) {
-        this.collectOperatorParams(col, value, params);
+        this.collectOperatorParams(col, value, params, { meta, table: targetTable, prefix: '' });
         continue;
       }
       this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(meta, col), targetTable);
@@ -3040,17 +3062,27 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
   }
 
-  /** Collect params from operator clauses. Mirrors buildOperatorClauses. */
-  private collectOperatorParams(column: string, op: WhereOperator, params: unknown[]): void {
-    if (op.equals !== undefined && op.equals !== null) {
+  /**
+   * Collect params from operator clauses. Mirrors buildOperatorClauses:
+   * {@link ColumnRef} values compile into the SQL text, so they push NOTHING -
+   * but they re-run the same validation (unknown ref / insensitive mode) so a
+   * warmed cache can never skip a check the build path enforces.
+   */
+  private collectOperatorParams(column: string, op: WhereOperator, params: unknown[], refCtx?: ColumnRefContext): void {
+    const skipRef = (v: unknown): boolean => {
+      if (!isColumnRef(v)) return false;
+      if (refCtx) this.resolveColumnRef(v, refCtx, op.mode);
+      return true;
+    };
+    if (op.equals !== undefined && op.equals !== null && !skipRef(op.equals)) {
       assertBindableEqualsOperand(op.equals, `"${column}"`);
       params.push(op.equals);
     }
-    if (op.gt !== undefined) params.push(op.gt);
-    if (op.gte !== undefined) params.push(op.gte);
-    if (op.lt !== undefined) params.push(op.lt);
-    if (op.lte !== undefined) params.push(op.lte);
-    if (op.not !== undefined && op.not !== null) params.push(op.not);
+    if (op.gt !== undefined && !skipRef(op.gt)) params.push(op.gt);
+    if (op.gte !== undefined && !skipRef(op.gte)) params.push(op.gte);
+    if (op.lt !== undefined && !skipRef(op.lt)) params.push(op.lt);
+    if (op.lte !== undefined && !skipRef(op.lte)) params.push(op.lte);
+    if (op.not !== undefined && op.not !== null && !skipRef(op.not)) params.push(op.not);
     if (op.in !== undefined) params.push(this.inParam(op.in));
     if (op.notIn !== undefined) params.push(this.inParam(op.notIn));
     if (op.contains !== undefined) params.push(`%${escapeLike(op.contains)}%`);
@@ -3100,10 +3132,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * Collect params for an orderBy clause. Only vector KNN ordering pushes a
-   * param (the `$n::vector` query vector); plain direction ordering is
-   * parameterless. Mirrors buildOrderBy's push order exactly so the cached-SQL
-   * param re-collection stays in lockstep.
+   * Collect params for an orderBy clause. Vector KNN ordering pushes the
+   * `$n::vector` query vector and JSON-path ordering pushes its text[] path;
+   * plain direction ordering is parameterless. Mirrors buildOrderBy's push
+   * order exactly so the cached-SQL param re-collection stays in lockstep.
    */
   private collectOrderByParams(orderBy: OrderByClause, params: unknown[]): void {
     for (const [key, dir] of Object.entries(orderBy)) {
@@ -3113,6 +3145,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // never push a param that the build path rejected (or vice versa).
         this.vectorOperator(key, rawColumn, dir.distance.metric);
         this.pushVectorParam(key, rawColumn, dir.distance.to, params);
+        continue;
+      }
+      // JSON-path ordering: mirrors buildJsonPathOrderEntry: same validation,
+      // then the path bound as one text[] param.
+      if (isJsonPathOrderBy(dir)) {
+        this.validateJsonPathOrderBy(this.table, this.tableMeta, key, dir);
+        params.push(dir.path.map(String));
         continue;
       }
       // To-many relation orderBy (`{ posts: { _count } }`) uses the same count
@@ -3279,9 +3318,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const targetMeta = this.schema.tables[targetTable];
     if (!targetMeta) return;
 
+    // A dialect that owns the whole subquery (buildRelationSubquery override,
+    // SQL Server FOR JSON) compiles orderBy through its OWN paging clause -
+    // plain directions only, no order params: so the native order-param
+    // mirrors below must stay off for it (its documented contract remains
+    // where → limit → nested).
+    const nativeOrderPath = !this.dialect.buildRelationSubquery;
+
     // manyToMany param order mirrors buildManyToManySubquery:
-    //   where params → limit param → nested-with params (always, both paths).
+    //   orderBy params → where params → limit param → nested-with params
+    //   (always, both paths).
     if (relDef.type === 'manyToMany') {
+      const m2mOrderEntries = spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+      if (nativeOrderPath && m2mOrderEntries.length > 0) {
+        this.collectRelationOrderParams(targetTable, targetMeta, m2mOrderEntries, params);
+      }
       if (spec.where) {
         this.collectAliasWhereParams(targetTable, targetMeta, spec.where as Record<string, unknown>, params);
       }
@@ -3300,7 +3351,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     // Mirrors buildRelationSubquery's willWrap: `orderBy: {}` is treated as absent.
-    const hasOrder = spec.orderBy ? Object.values(spec.orderBy).some((dir) => dir !== undefined) : false;
+    const relOrderEntries = spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+    const hasOrder = relOrderEntries.length > 0;
     const willWrap = relDef.type === 'hasMany' && (spec.limit !== undefined || hasOrder);
 
     // Non-wrapped path: nested relations BEFORE where/limit
@@ -3310,6 +3362,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
         if (!nestedRelDef) continue;
         this.collectRelationSubqueryParams(nestedRelDef, nestedSpec, params, 'alias', depth + 1);
       }
+    }
+
+    // orderBy params (JSON paths / relation-order global filters): mirrors
+    // buildRelationSubquery, which builds its ORDER BY terms BEFORE compiling
+    // spec.where (both wrapped and non-wrapped paths).
+    if (nativeOrderPath && hasOrder) {
+      this.collectRelationOrderParams(targetTable, targetMeta, relOrderEntries, params);
     }
 
     // where params — mirrors buildAliasWhere push order
@@ -3682,7 +3741,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // Handle operator objects
       if (isWhereOperator(value)) {
-        const opClauses = this.buildOperatorClauses(column, value, params);
+        const opClauses = this.buildOperatorClauses(column, value, params, {
+          meta: this.tableMeta,
+          table: this.table,
+          prefix: '',
+        });
         andClauses.push(...opClauses);
         continue;
       }
@@ -3902,7 +3965,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       if (isWhereOperator(value)) {
-        const opClauses = this.buildOperatorClauses(qCol, value, params);
+        const opClauses = this.buildOperatorClauses(qCol, value, params, {
+          meta,
+          table: targetTable,
+          prefix: `${qt}.`,
+        });
         conditions.push(...opClauses);
         continue;
       }
@@ -4086,7 +4153,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       if (isWhereOperator(value)) {
-        clauses.push(...this.buildOperatorClauses(qCol, value, params));
+        clauses.push(
+          ...this.buildOperatorClauses(qCol, value, params, {
+            meta: targetMeta,
+            table: targetTable,
+            prefix: `${alias}.`,
+          }),
+        );
         continue;
       }
 
@@ -4158,7 +4231,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       if (isWhereOperator(value)) {
-        this.collectOperatorParams(col, value, params);
+        this.collectOperatorParams(col, value, params, { meta: targetMeta, table: targetTable, prefix: '' });
         continue;
       }
 
@@ -4244,15 +4317,66 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Validate a `{ col }` column reference against its table and return the
+   * resolved snake_case column name. Shared by the SQL-build path
+   * ({@link buildOperatorClauses}) and the cache-hit param-collect path
+   * (`collectOperatorParams`) so both always throw identically: a warmed
+   * cache can never skip the check.
+   */
+  private resolveColumnRef(ref: ColumnRef, ctx: ColumnRefContext, mode?: 'default' | 'insensitive'): string {
+    if (mode === 'insensitive') {
+      throw new ValidationError(
+        `[turbine] mode: 'insensitive' cannot be combined with a column reference ({ col: "${ref.col}" }). ` +
+          `Case-insensitive column-to-column comparison is not supported: use client.sql\`...\` ` +
+          `for lower(a) = lower(b).`,
+      );
+    }
+    const col = ctx.meta.columnMap[ref.col] ?? camelToSnake(ref.col);
+    if (!ctx.meta.allColumns.includes(col)) {
+      throw new ValidationError(
+        `[turbine] Unknown field "${ref.col}" referenced by { col } in where on table "${ctx.table}". ` +
+          `Known fields: ${Object.keys(ctx.meta.columnMap).join(', ') || '(none)'}.`,
+      );
+    }
+    return col;
+  }
+
+  /**
+   * Compile a `{ col }` reference to its quoted, prefix-matched SQL identifier.
+   * NO param is bound: the referenced column is part of the SQL text (and of
+   * the where fingerprint, see {@link fingerprintOperatorShape}).
+   */
+  private columnRefSql(ref: ColumnRef, ctx: ColumnRefContext | undefined, mode?: 'default' | 'insensitive'): string {
+    if (!ctx) {
+      throw new ValidationError(
+        `[turbine] Column reference { col: "${ref.col}" } is not supported in this filter context.`,
+      );
+    }
+    return `${ctx.prefix}${this.q(this.resolveColumnRef(ref, ctx, mode))}`;
+  }
+
+  /**
    * Build SQL clauses for a single operator object on a column.
    * Each operator key becomes its own clause, all ANDed together.
+   *
+   * `equals`/`not`/`gt`/`gte`/`lt`/`lte` also accept a {@link ColumnRef}
+   * (`{ col: 'otherField' }`) which compiles to a column-to-column comparison
+   * against `refCtx`: no param bound, so `collectOperatorParams` mirrors by
+   * pushing nothing and the referenced name lives in the fingerprint.
    */
-  private buildOperatorClauses(column: string, op: WhereOperator, params: unknown[]): string[] {
+  private buildOperatorClauses(
+    column: string,
+    op: WhereOperator,
+    params: unknown[],
+    refCtx?: ColumnRefContext,
+  ): string[] {
     const clauses: string[] = [];
 
     if (op.equals !== undefined) {
       if (op.equals === null) {
         clauses.push(`${column} IS NULL`);
+      } else if (isColumnRef(op.equals)) {
+        clauses.push(`${column} = ${this.columnRefSql(op.equals, refCtx, op.mode)}`);
       } else {
         assertBindableEqualsOperand(op.equals, column);
         params.push(op.equals);
@@ -4260,24 +4384,42 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
     if (op.gt !== undefined) {
-      params.push(op.gt);
-      clauses.push(`${column} > ${this.p(params.length)}`);
+      if (isColumnRef(op.gt)) {
+        clauses.push(`${column} > ${this.columnRefSql(op.gt, refCtx, op.mode)}`);
+      } else {
+        params.push(op.gt);
+        clauses.push(`${column} > ${this.p(params.length)}`);
+      }
     }
     if (op.gte !== undefined) {
-      params.push(op.gte);
-      clauses.push(`${column} >= ${this.p(params.length)}`);
+      if (isColumnRef(op.gte)) {
+        clauses.push(`${column} >= ${this.columnRefSql(op.gte, refCtx, op.mode)}`);
+      } else {
+        params.push(op.gte);
+        clauses.push(`${column} >= ${this.p(params.length)}`);
+      }
     }
     if (op.lt !== undefined) {
-      params.push(op.lt);
-      clauses.push(`${column} < ${this.p(params.length)}`);
+      if (isColumnRef(op.lt)) {
+        clauses.push(`${column} < ${this.columnRefSql(op.lt, refCtx, op.mode)}`);
+      } else {
+        params.push(op.lt);
+        clauses.push(`${column} < ${this.p(params.length)}`);
+      }
     }
     if (op.lte !== undefined) {
-      params.push(op.lte);
-      clauses.push(`${column} <= ${this.p(params.length)}`);
+      if (isColumnRef(op.lte)) {
+        clauses.push(`${column} <= ${this.columnRefSql(op.lte, refCtx, op.mode)}`);
+      } else {
+        params.push(op.lte);
+        clauses.push(`${column} <= ${this.p(params.length)}`);
+      }
     }
     if (op.not !== undefined) {
       if (op.not === null) {
         clauses.push(`${column} IS NOT NULL`);
+      } else if (isColumnRef(op.not)) {
+        clauses.push(`${column} != ${this.columnRefSql(op.not, refCtx, op.mode)}`);
       } else {
         params.push(op.not);
         clauses.push(`${column} != ${this.p(params.length)}`);
@@ -4332,6 +4474,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (isVectorOrderBy(d)) {
       return `vec(${d.distance.metric},${d.distance.direction ?? 'asc'})`;
     }
+    // JSON-path ordering: direction, cast kind, and nulls placement change the
+    // SQL text; the path itself is a bound param and stays OUT of the key.
+    if (isJsonPathOrderBy(d)) {
+      return `jp(${d.direction ?? 'asc'},${d.type === 'numeric' ? 'num' : 'text'},${d.nulls ?? ''})`;
+    }
     if (isOrderBySpec(d)) return `spec(${d.sort},${d.nulls ?? ''})`;
     if (d && typeof d === 'object') {
       // Relation ordering (`{ _count: 'desc' }` or `{ name: 'asc' }`).
@@ -4384,6 +4531,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
           return `${this.q(rawColumn)} ${operator} ${placeholder} ${safeDir}`;
         }
 
+        // JSON-path ordering: { path: [...], direction?, type?, nulls? } on a
+        // json/jsonb column of THIS table. Path is bound as one text[] param.
+        if (isJsonPathOrderBy(value)) {
+          return this.buildJsonPathOrderEntry(this.table, this.tableMeta, key, value, '', params);
+        }
+
         // Relation ordering: an object value that is not a vector or OrderBySpec,
         // keyed by a relation name (`{ posts: { _count: 'desc' } }` / `{ author:
         // { name: 'asc' } }`).
@@ -4415,6 +4568,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       value !== null &&
       !Array.isArray(value) &&
       !isVectorOrderBy(value) &&
+      !isJsonPathOrderBy(value) &&
       !isOrderBySpec(value)
     );
   }
@@ -4438,6 +4592,81 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Resolve an orderBy key to its snake_case column via the table's columnMap
+   * (camelToSnake fallback), throwing the SAME unknown-field E003 the top-level
+   * where path uses. Shared by top-level JSON-path ordering and every nested
+   * relation orderBy path so nested orderBy accepts exactly what top-level
+   * accepts (the 0.30.x bug: nested orderBy skipped the columnMap and rejected
+   * camelCase-named DB columns like "sortOrder").
+   */
+  private resolveOrderByColumn(table: string, meta: TableMetadata, key: string): string {
+    const col = meta.columnMap[key] ?? camelToSnake(key);
+    if (!meta.allColumns.includes(col)) {
+      throw new ValidationError(
+        `[turbine] Unknown field "${key}" in orderBy on table "${table}". ` +
+          `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
+      );
+    }
+    return col;
+  }
+
+  /**
+   * Validate a {@link JsonPathOrderBy} entry: column must exist AND be
+   * json/jsonb, path must be a non-empty array of keys/indexes: and return
+   * the resolved column. Shared by the SQL-build path
+   * ({@link buildJsonPathOrderEntry}) and the cache-hit param-collect mirrors
+   * so both always throw identically.
+   */
+  private validateJsonPathOrderBy(table: string, meta: TableMetadata, field: string, spec: JsonPathOrderBy): string {
+    const col = this.resolveOrderByColumn(table, meta, field);
+    if (
+      spec.path.length === 0 ||
+      spec.path.some((el) => typeof el !== 'string' && !(typeof el === 'number' && Number.isFinite(el)))
+    ) {
+      throw new ValidationError(
+        `[turbine] JSON-path orderBy on "${field}" (table "${table}") requires a non-empty \`path\` array ` +
+          `of keys/indexes (e.g. { path: ['weight'], direction: 'asc' }).`,
+      );
+    }
+    const colType = this.pgTypeForColumn(meta, col);
+    if (colType !== 'json' && colType !== 'jsonb') {
+      throw new ValidationError(
+        `[turbine] JSON-path orderBy on "${field}": column "${col}" on table "${table}" is not a JSON column ` +
+          `(actual type: ${colType}).`,
+      );
+    }
+    return col;
+  }
+
+  /**
+   * Compile one {@link JsonPathOrderBy} entry:
+   * `("col" #>> $n::text[])::numeric ASC`: the numeric cast only with
+   * `type: 'numeric'` (default is text comparison), the extraction routed
+   * through the dialect's JSON hook exactly like the JSON where-filters, the
+   * path bound as ONE text[] param (mirrored by the order-param collectors).
+   * `prefix` scopes the column (`''` top-level, `t0.` inside a relation
+   * subquery).
+   */
+  private buildJsonPathOrderEntry(
+    table: string,
+    meta: TableMetadata,
+    field: string,
+    spec: JsonPathOrderBy,
+    prefix: string,
+    params?: unknown[],
+  ): string {
+    const col = this.validateJsonPathOrderBy(table, meta, field, spec);
+    if (!params) {
+      throw new ValidationError(`[turbine] JSON-path ordering on "${field}" is not supported in this orderBy context.`);
+    }
+    params.push(spec.path.map(String));
+    const extract = this.dialect.buildJsonPathExtract(`${prefix}${this.q(col)}`, this.p(params.length));
+    const lhs = spec.type === 'numeric' ? this.castJsonNumeric(extract) : extract;
+    const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    return `${lhs} ${dir}${this.nullsSuffix(spec.nulls)}`;
+  }
+
+  /**
    * Compile a relation ordering term. For a to-many relation the only allowed
    * key is `_count`, which becomes a correlated `COUNT(*)` subquery. For a
    * to-one relation each entry names a target column and becomes a correlated
@@ -4445,18 +4674,26 @@ export class QueryInterface<T extends object, R extends object = {}> {
    *
    * Validation: relation must exist (E005); to-many only allows `_count`, and
    * to-one only allows real target columns (E003).
+   *
+   * `ctx` generalizes the term beyond the root table: inside a relation
+   * subquery's orderBy the relations live on the TARGET table's metadata and
+   * the correlation parent is the relation's alias, not `this.table`.
    */
   private buildRelationOrderBy(
     relName: string,
     value: Record<string, unknown>,
     alias: string,
     params?: unknown[],
+    ctx?: { meta: TableMetadata; table: string; parentRef: string },
   ): string {
-    const relDef = this.tableMeta.relations[relName];
+    const ownerMeta = ctx?.meta ?? this.tableMeta;
+    const ownerTable = ctx?.table ?? this.table;
+    const parentRef = ctx?.parentRef ?? this.table;
+    const relDef = ownerMeta.relations[relName];
     if (!relDef) {
       throw new RelationError(
-        `[turbine] Unknown relation "${relName}" in orderBy on table "${this.table}". ` +
-          `Available: ${Object.keys(this.tableMeta.relations).join(', ')}`,
+        `[turbine] Unknown relation "${relName}" in orderBy on table "${ownerTable}". ` +
+          `Available: ${Object.keys(ownerMeta.relations).join(', ')}`,
       );
     }
 
@@ -4470,14 +4707,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
         );
       }
       const { dir } = normalizeOrderBy(value._count as OrderDirection);
-      return `${this.buildRelationCountExpr(relDef, this.table, alias, params)} ${dir}`;
+      return `${this.buildRelationCountExpr(relDef, parentRef, alias, params)} ${dir}`;
     }
 
     // To-one: each entry orders by a correlated scalar subquery on a target column.
     const targetMeta = this.schema.tables[relDef.to];
     if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
     const qTarget = this.q(relDef.to);
-    const qParent = this.q(this.table);
+    const qParent = this.q(parentRef);
     // belongsTo: alias.referenceKey = parent.foreignKey; hasOne: reversed.
     const correlation =
       relDef.type === 'belongsTo'
@@ -4490,7 +4727,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
     return entries
       .map(([col, dirValue]) => {
-        const snakeCol = camelToSnake(col);
+        // columnMap-first resolution (camelToSnake fallback): mirrors the
+        // scalar orderBy path so camelCase-named DB columns resolve here too.
+        const snakeCol = targetMeta.columnMap[col] ?? camelToSnake(col);
         if (!targetMeta.allColumns.includes(snakeCol)) {
           throw new ValidationError(
             `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").`,
@@ -4508,6 +4747,96 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return `(SELECT ${alias}.${this.q(snakeCol)} FROM ${qTarget} ${alias} WHERE ${where}${this.limitOneClause()}) ${dir}${this.nullsSuffix(nulls)}`;
       })
       .join(', ');
+  }
+
+  /**
+   * Compile the ORDER BY terms of a relation `with` clause against the
+   * relation's table alias. One unified path for every relation shape
+   * (hasMany / manyToMany / belongsTo / hasOne) supporting exactly what the
+   * top-level orderBy accepts at this level:
+   *
+   *  - scalar columns via columnMap resolution (camelToSnake fallback) with
+   *    {@link OrderBySpec} nulls placement,
+   *  - {@link JsonPathOrderBy} entries (path bound as one text[] param),
+   *  - relation ordering on the TARGET's relations (`_count` for to-many, a
+   *    target column for to-one), correlated to the relation alias,
+   *  - vector KNN ordering stays top-level-only (E003, same as before).
+   *
+   * Param pushes (JSON paths, relation-order global filters) MUST be mirrored,
+   * in the same order, by {@link collectRelationOrderParams}.
+   */
+  private buildRelationOrderClause(
+    targetTable: string,
+    targetMeta: TableMetadata,
+    alias: string,
+    orderEntries: [string, unknown][],
+    params: unknown[],
+  ): string {
+    let relOrdCounter = 0;
+    const orders = orderEntries
+      .map(([key, dirValue]) => {
+        if (isVectorOrderBy(dirValue)) {
+          throw new ValidationError(
+            `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
+          );
+        }
+        if (isJsonPathOrderBy(dirValue)) {
+          return this.buildJsonPathOrderEntry(targetTable, targetMeta, key, dirValue, `${alias}.`, params);
+        }
+        if (this.isRelationOrderByValue(dirValue)) {
+          return this.buildRelationOrderBy(
+            key,
+            dirValue as Record<string, unknown>,
+            `${alias}ord${relOrdCounter++}`,
+            params,
+            { meta: targetMeta, table: targetTable, parentRef: alias },
+          );
+        }
+        const col = this.resolveOrderByColumn(targetTable, targetMeta, key);
+        const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
+        return `${alias}.${this.q(col)} ${dir}${this.nullsSuffix(nulls)}`;
+      })
+      .join(', ');
+    return ` ORDER BY ${orders}`;
+  }
+
+  /**
+   * Param-collect mirror of {@link buildRelationOrderClause}: JSON-path
+   * entries push their path (one text[] param each); relation-order entries
+   * mirror {@link collectOrderByParams}' relation branch (count / to-one
+   * global-filter params); scalar entries push nothing but re-run the same
+   * column validation so a warmed cache can never skip it.
+   */
+  private collectRelationOrderParams(
+    targetTable: string,
+    targetMeta: TableMetadata,
+    orderEntries: [string, unknown][],
+    params: unknown[],
+  ): void {
+    for (const [key, dirValue] of orderEntries) {
+      if (isVectorOrderBy(dirValue)) {
+        throw new ValidationError(
+          `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
+        );
+      }
+      if (isJsonPathOrderBy(dirValue)) {
+        this.validateJsonPathOrderBy(targetTable, targetMeta, key, dirValue);
+        params.push(dirValue.path.map(String));
+        continue;
+      }
+      if (this.isRelationOrderByValue(dirValue)) {
+        const relDef = targetMeta.relations[key];
+        if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
+          this.collectRelationCountParams(relDef, params);
+        } else if (relDef) {
+          for (const _col of Object.keys(dirValue as Record<string, unknown>)) {
+            this.collectTargetGlobalFilterAlias(relDef.to, params);
+          }
+        }
+        continue;
+      }
+      this.resolveOrderByColumn(targetTable, targetMeta, key);
+    }
   }
 
   /**
@@ -5333,20 +5662,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const qParent = this.q(parentRef);
     const qTarget = this.q(targetTable);
 
-    // Build ORDER BY for json_agg
+    // Build ORDER BY for json_agg: unified with the top-level orderBy surface
+    // (columnMap resolution, OrderBySpec nulls, JSON-path, relation ordering).
+    // Param pushes here land BEFORE the spec.where params, mirrored by
+    // collectRelationSubqueryParams.
     let orderClause = '';
     if (relOrderEntries.length > 0) {
-      const orders = relOrderEntries
-        .map(([k, dirValue]) => {
-          const col = camelToSnake(k);
-          if (!targetMeta.allColumns.includes(col)) {
-            throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
-          }
-          const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
-          return `${alias}.${this.q(col)} ${dir}${this.nullsSuffix(nulls)}`;
-        })
-        .join(', ');
-      orderClause = ` ORDER BY ${orders}`;
+      orderClause = this.buildRelationOrderClause(targetTable, targetMeta, alias, relOrderEntries, params);
     }
 
     // Build WHERE — correlate to parent via parentRef (alias or table name).
@@ -5434,8 +5756,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
       return `SELECT ${this.dialect.buildJsonArrayAgg(jsonObj, inlineOrder)} FROM ${qTarget} ${alias} WHERE ${whereClause}`;
     }
 
-    // belongsTo / hasOne — return single object
-    return `SELECT ${jsonObj} FROM ${qTarget} ${alias} WHERE ${whereClause} LIMIT 1`;
+    // belongsTo / hasOne: return single object. An orderBy picks WHICH row
+    // the LIMIT 1 keeps (deterministic hasOne over a non-unique FK): matching
+    // the batched strategy, which orders its flat follow-up and takes bucket[0].
+    return `SELECT ${jsonObj} FROM ${qTarget} ${alias} WHERE ${whereClause}${orderClause} LIMIT 1`;
   }
 
   /**
@@ -5517,23 +5841,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       .map((jcol, i) => `${jalias}.${this.q(jcol)} = ${qParent}.${this.q(refKeys[i]!)}`)
       .join(' AND ');
 
-    // ORDER BY on the target rows. `orderBy: {}` (no defined entries) is
-    // treated as absent — it must not render a dangling `ORDER BY `.
+    // ORDER BY on the target rows: unified with the top-level orderBy surface
+    // (columnMap resolution, OrderBySpec nulls, JSON-path, relation ordering).
+    // `orderBy: {}` (no defined entries) is treated as absent: it must not
+    // render a dangling `ORDER BY `. Param pushes here land BEFORE the
+    // spec.where params, mirrored by collectRelationSubqueryParams' m2m branch.
     const relOrderEntries =
       spec !== true && spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
     let orderClause = '';
     if (relOrderEntries.length > 0) {
-      const orders = relOrderEntries
-        .map(([k, dirValue]) => {
-          const col = camelToSnake(k);
-          if (!targetMeta.allColumns.includes(col)) {
-            throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
-          }
-          const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
-          return `${talias}.${this.q(col)} ${dir}${this.nullsSuffix(nulls)}`;
-        })
-        .join(', ');
-      orderClause = ` ORDER BY ${orders}`;
+      orderClause = this.buildRelationOrderClause(targetTable, targetMeta, talias, relOrderEntries, params);
     }
 
     // Additional WHERE filters on the target — full scalar where surface,
