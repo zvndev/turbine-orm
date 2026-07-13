@@ -43,7 +43,7 @@ import {
   hasRelationFields,
   type NestedWriteContext,
 } from './nested-write.js';
-import { PowdbFloatParam, type PowdbPool, powqlColumnType, rowToEntity } from './powdb.js';
+import { PowdbFloatParam, type PowdbPool, powqlColumnType, quotePowqlIdent, rowToEntity } from './powdb.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
 import type {
   AggregateArgs,
@@ -479,7 +479,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         const params: unknown[] = [];
         const ph = chunk.map((v) => this.param(v, params)).join(', ');
         const { rows } = await this.exec(
-          `${through.table} filter .${targetJCol} in (${ph}) { .${sourceJCol} }`,
+          `${quotePowqlIdent(through.table)} filter .${targetJCol} in (${ph}) { .${sourceJCol} }`,
           params,
           timeout,
         );
@@ -650,7 +650,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
     const limitClause = limit !== undefined ? ` limit ${this.param(limit, params)}` : '';
     const offsetClause = args.offset ? ` offset ${this.param(args.offset, params)}` : '';
-    const powql = `${this.table}${distinct}${filter}${order}${limitClause}${offsetClause} ${this.projection(cols)}`;
+    const powql = `${this.qt}${distinct}${filter}${order}${limitClause}${offsetClause} ${this.projection(cols)}`;
     const { rows } = await this.exec(powql, params, args.timeout);
     return rows;
   }
@@ -812,7 +812,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const chunk = parentKeys.slice(i, i + MAX_RELATION_KEYS);
       const params: unknown[] = [];
       const placeholders = chunk.map((v) => this.param(v, params)).join(', ');
-      const powql = `${through.table} filter .${sourceJCol} in (${placeholders}) { .${sourceJCol}, .${targetJCol} }`;
+      const powql = `${quotePowqlIdent(through.table)} filter .${sourceJCol} in (${placeholders}) { .${sourceJCol}, .${targetJCol} }`;
       const { rows } = await this.exec(powql, params, timeout);
       for (const row of rows) {
         const sv = String(row[sourceJCol]);
@@ -903,6 +903,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return out;
   }
 
+  /**
+   * The table name as a PowQL type reference — backtick-quoted when it is a
+   * reserved word (e.g. a table named `order`). Used in every emitted
+   * statement; plain `this.table` stays in error messages.
+   */
+  private get qt(): string {
+    return quotePowqlIdent(this.table);
+  }
+
   async create(args: CreateArgs<T>): Promise<T> {
     return this.withMiddleware('create', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.meta)) {
@@ -911,9 +920,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const data = this.applyPkDefault(args.data as Record<string, unknown>);
       const assigns = this.scalarData(data);
       const params: unknown[] = [];
-      const body = assigns.map((a) => `${a.col.name} := ${this.writeRef(a.value, a.col, params)}`).join(', ');
+      const body = assigns
+        .map((a) => `${quotePowqlIdent(a.col.name)} := ${this.writeRef(a.value, a.col, params)}`)
+        .join(', ');
       // `returning` surfaces the inserted row (all columns, schema order) in one round-trip.
-      const { rows } = await this.exec(`insert ${this.table} { ${body} } returning`, params, args.timeout);
+      const { rows } = await this.exec(`insert ${this.qt} { ${body} } returning`, params, args.timeout);
       const row = rows.length ? this.shape(rows)[0]! : null;
       if (!row) throw new NotFoundError({ table: this.table, where: data });
       return row;
@@ -927,10 +938,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const params: unknown[] = [];
       const tuples = inputs.map((d) => {
         const assigns = this.scalarData(d);
-        return `{ ${assigns.map((a) => `${a.col.name} := ${this.writeRef(a.value, a.col, params)}`).join(', ')} }`;
+        return `{ ${assigns.map((a) => `${quotePowqlIdent(a.col.name)} := ${this.writeRef(a.value, a.col, params)}`).join(', ')} }`;
       });
       // Multi-row insert with `returning` hands back every inserted row in one round-trip.
-      const { rows } = await this.exec(`insert ${this.table} ${tuples.join(', ')} returning`, params, args.timeout);
+      const { rows } = await this.exec(`insert ${this.qt} ${tuples.join(', ')} returning`, params, args.timeout);
       return this.shape(rows);
     });
   }
@@ -947,7 +958,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       // `returning` hands back the post-update row(s); take the first (single-row contract).
       const { rows } = await this.exec(
-        `${this.table} filter ${where} update { ${setClause} } returning`,
+        `${this.qt} filter ${where} update { ${setClause} } returning`,
         params,
         args.timeout,
       );
@@ -965,7 +976,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       this.assertCompiledWhere(where, args.allowFullTableScan, 'updateMany');
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       const filter = where ? ` filter ${where}` : '';
-      const { rowCount } = await this.exec(`${this.table}${filter} update { ${setClause} }`, params, args.timeout);
+      const { rowCount } = await this.exec(`${this.qt}${filter} update { ${setClause} }`, params, args.timeout);
       return { count: rowCount };
     });
   }
@@ -984,7 +995,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       }
       const colMeta = this.column(field);
       const ref = this.ref(field);
-      const col = colMeta.name;
+      const col = quotePowqlIdent(colMeta.name);
       if (value !== null && typeof value === 'object' && !(value instanceof Date)) {
         const opObj = value as Record<string, unknown>;
         if ('set' in opObj) parts.push(`${col} := ${this.writeRef(opObj.set, colMeta, params)}`);
@@ -1042,8 +1053,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     // drifts from `powdbDialect`; falls back to the literal lowercase keywords.
     const d = this.options.dialect;
     const client = await this.pool.connect();
+    let began = false;
     try {
       await client.query(d?.beginStatement?.() ?? 'begin');
+      began = true;
       const { TransactionClient } = await import('./client.js');
       const tx = new TransactionClient(
         client as unknown as never,
@@ -1056,10 +1069,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       await client.query(d?.commitStatement?.() ?? 'commit');
       return result;
     } catch (err) {
-      try {
-        await client.query(d?.rollbackStatement?.() ?? 'rollback');
-      } catch {
-        /* best-effort — the connection may be gone */
+      // Only roll back a transaction we actually opened — a failed BEGIN
+      // (queue timeout, re-entrancy E017) must not emit a stray ROLLBACK that
+      // could land inside another transaction on a shared engine handle.
+      if (began) {
+        try {
+          await client.query(d?.rollbackStatement?.() ?? 'rollback');
+        } catch {
+          /* best-effort — the connection may be gone */
+        }
       }
       throw err;
     } finally {
@@ -1084,7 +1102,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, false, 'delete');
       // `returning` hands back the deleted row(s) — no separate pre-image reselect needed.
-      const { rows } = await this.exec(`${this.table} filter ${where} delete returning`, params, args.timeout);
+      const { rows } = await this.exec(`${this.qt} filter ${where} delete returning`, params, args.timeout);
       const row = rows.length ? this.shape(rows)[0]! : null;
       if (!row) throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
       return row;
@@ -1098,7 +1116,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, args.allowFullTableScan, 'deleteMany');
       const filter = where ? ` filter ${where}` : '';
-      const { rowCount } = await this.exec(`${this.table}${filter} delete`, params, args.timeout);
+      const { rowCount } = await this.exec(`${this.qt}${filter} delete`, params, args.timeout);
       return { count: rowCount };
     });
   }
@@ -1114,7 +1132,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       }
       const params: unknown[] = [];
       const createBody = this.scalarData(createData)
-        .map((a) => `${a.col.name} := ${this.writeRef(a.value, a.col, params)}`)
+        .map((a) => `${quotePowqlIdent(a.col.name)} := ${this.writeRef(a.value, a.col, params)}`)
         .join(', ');
       const updateBody = this.buildUpdateAssignments(args.update as Record<string, unknown>, params);
       // PowDB 0.7.0's `upsert` statement does NOT accept a trailing `returning`
@@ -1122,7 +1140,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // atomic insert-or-update, not two branches. So upsert alone keeps the
       // reselect-by-PK fetch; create/update/delete all use `returning`.
       await this.exec(
-        `upsert ${this.table} on .${pkCol} { ${createBody} } on conflict { ${updateBody} }`,
+        `upsert ${this.qt} on .${pkCol} { ${createBody} } on conflict { ${updateBody} }`,
         params,
         args.timeout,
       );
@@ -1174,7 +1192,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
       const where = this.buildWhere(resolvedWhere, params);
       const filter = where ? ` filter ${where}` : '';
-      const { rows } = await this.exec(`count(${this.table}${filter})`, params, args.timeout);
+      const { rows } = await this.exec(`count(${this.qt}${filter})`, params, args.timeout);
       return Number((rows[0]?.value ?? rows[0]?.count ?? 0) as string | number);
     });
   }
@@ -1195,11 +1213,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       };
       if (args._count) {
         if (args._count === true) {
-          result._count = (await scalar(`count(${this.table}${filter})`)) ?? 0;
+          result._count = (await scalar(`count(${this.qt}${filter})`)) ?? 0;
         } else {
           const counts: Record<string, number> = {};
           for (const field of Object.keys(args._count).filter((f) => (args._count as Record<string, boolean>)[f])) {
-            counts[field] = (await scalar(`count(${this.table}${filter} { ${this.ref(field)} })`)) ?? 0;
+            counts[field] = (await scalar(`count(${this.qt}${filter} { ${this.ref(field)} })`)) ?? 0;
           }
           result._count = counts;
         }
@@ -1210,7 +1228,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         const acc: Record<string, number | null> = {};
         for (const field of Object.keys(spec).filter((f) => (spec as Record<string, boolean>)[f])) {
           const powfn = fn.slice(1); // sum/avg/min/max
-          acc[field] = await scalar(`${powfn}(${this.table}${filter} { ${this.ref(field)} })`);
+          acc[field] = await scalar(`${powfn}(${this.qt}${filter} { ${this.ref(field)} })`);
         }
         (result as Record<string, unknown>)[fn] = acc;
       }
@@ -1244,7 +1262,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       }
       const having = this.buildHaving(args.having, params);
       const order = this.buildOrder(args.orderBy as OrderByClause | undefined);
-      const powql = `${this.table}${filter} group ${groupKeys.join(', ')}${having}${order} { ${proj.join(', ')} }`;
+      const powql = `${this.qt}${filter} group ${groupKeys.join(', ')}${having}${order} { ${proj.join(', ')} }`;
       const { rows } = await this.exec(powql, params, args.timeout);
       // Reshape: group keys → camel fields + coerced; aggregates → nested {_sum:{field}}.
       return rows.map((raw) => {

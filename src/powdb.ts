@@ -299,6 +299,128 @@ function isDateColumn(col: ColumnMetadata): boolean {
  * `auto` modifier, so PowDB assigns a monotonic id on insert and Turbine stops
  * synthesizing a client-side value for it.
  */
+/**
+ * PowQL reserved words — the v0.10 lexer keyword table from POWQL.md's
+ * "Reserved Words and Quoting" section, including the v0.10 additions
+ * `schema` and `describe`. Keyword matching is case-sensitive in the lexer,
+ * so only the exact lowercase form collides.
+ */
+export const POWQL_KEYWORDS: ReadonlySet<string> = new Set([
+  'abs',
+  'add',
+  'alter',
+  'and',
+  'as',
+  'asc',
+  'auto',
+  'avg',
+  'begin',
+  'between',
+  'case',
+  'cast',
+  'ceil',
+  'column',
+  'commit',
+  'concat',
+  'conflict',
+  'count',
+  'cross',
+  'date_add',
+  'date_diff',
+  'default',
+  'delete',
+  'dense_rank',
+  'desc',
+  'describe',
+  'distinct',
+  'drop',
+  'else',
+  'end',
+  'exists',
+  'explain',
+  'extract',
+  'false',
+  'filter',
+  'floor',
+  'group',
+  'having',
+  'in',
+  'index',
+  'inner',
+  'insert',
+  'is',
+  'join',
+  'left',
+  'length',
+  'let',
+  'like',
+  'limit',
+  'link',
+  'lower',
+  'match',
+  'materialize',
+  'materialized',
+  'max',
+  'min',
+  'multi',
+  'not',
+  'now',
+  'null',
+  'offset',
+  'on',
+  'or',
+  'order',
+  'outer',
+  'over',
+  'partition',
+  'pow',
+  'rank',
+  'refresh',
+  'required',
+  'returning',
+  'right',
+  'rollback',
+  'round',
+  'row_number',
+  'schema',
+  'select',
+  'sqrt',
+  'substring',
+  'sum',
+  'then',
+  'transaction',
+  'trim',
+  'true',
+  'type',
+  'union',
+  'unique',
+  'update',
+  'upper',
+  'upsert',
+  'view',
+  'when',
+]);
+
+const POWQL_BARE_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Backtick-quote an identifier when PowQL would otherwise lex it as a keyword
+ * (or when it contains characters outside the bare-identifier grammar).
+ * Applied only in bare-identifier positions — DDL type/field names, index DDL,
+ * and `insert`/`update`/`upsert` assignment targets. Dotted references
+ * (`.col` in filters/projections/ordering) bypass keyword lookup on every
+ * engine version and deliberately stay bare for ≤0.9 compatibility. Backticks
+ * parse on PowDB ≥ 0.10; on older engines these names were already parse
+ * errors when emitted bare, so quoting is strictly an improvement.
+ */
+export function quotePowqlIdent(name: string): string {
+  if (name.includes('`')) {
+    // The lexer has no backtick escape inside a quoted identifier.
+    throw new ValidationError(`[turbine] Identifier "${name}" contains a backtick, which PowQL cannot represent.`);
+  }
+  return POWQL_KEYWORDS.has(name) || !POWQL_BARE_IDENT.test(name) ? `\`${name}\`` : name;
+}
+
 export function powqlSchemaDDL(schema: SchemaMetadata): string[] {
   const stmts: string[] = [];
   for (const meta of Object.values(schema.tables)) {
@@ -317,13 +439,13 @@ export function powqlSchemaDDL(schema: SchemaMetadata): string[] {
       // rejects it alongside a `default`; non-int generated columns fall back to
       // a plain typed column (Turbine assigns the value client-side instead).
       if (col.isGenerated && powqlColumnType(col) === 'int') mods.push('auto');
-      return `  ${mods.join(' ')}${mods.length ? ' ' : ''}${col.name}: ${powqlColumnType(col)}`;
+      return `  ${mods.join(' ')}${mods.length ? ' ' : ''}${quotePowqlIdent(col.name)}: ${powqlColumnType(col)}`;
     });
-    stmts.push(`type ${meta.name} {\n${fields.join(',\n')}\n}`);
+    stmts.push(`type ${quotePowqlIdent(meta.name)} {\n${fields.join(',\n')}\n}`);
     // Secondary unique constraints (beyond the PK) become unique indexes.
     for (const uniq of meta.uniqueColumns) {
       if (uniq.length === 1 && !pkSet.has(uniq[0]!)) {
-        stmts.push(`alter ${meta.name} add unique .${uniq[0]}`);
+        stmts.push(`alter ${quotePowqlIdent(meta.name)} add unique .${quotePowqlIdent(uniq[0]!)}`);
       }
     }
   }
@@ -422,6 +544,12 @@ export function wrapPowdbError(err: unknown): Error {
   if (/required|not[- ]?null|no value/i.test(msg)) {
     const m = /column ['"]?(\w+)['"]?/i.exec(msg);
     return new NotNullViolationError({ column: m?.[1], cause: err as Error });
+  }
+  // Server-side transaction-gate wait bound (PowDB ≥ 0.10, default 5s): another
+  // connection held the single global write lock past the server's
+  // --tx-wait-timeout-ms. Retryable timeout, not a query defect.
+  if (/transaction gate timeout/i.test(msg)) {
+    return new TimeoutError(0, 'PowDB transaction gate');
   }
   // Type mismatch / parse / execution / storage / unexpected → validation
   // (E003). On the embedded transport these are the only signal we get

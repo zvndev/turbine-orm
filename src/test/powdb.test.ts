@@ -31,6 +31,7 @@ import {
   powdbDialect,
   powqlColumnType,
   powqlSchemaDDL,
+  quotePowqlIdent,
   rowToEntity,
   turbinePowDB,
   wrapPowdbError,
@@ -1174,5 +1175,87 @@ describe('powdb: warnOnUnlimited per-table map (N-6)', () => {
   it('a map naming OTHER tables keeps the default (warn)', async () => {
     const warnings = await warningsFor({ posts: false });
     assert.equal(warnings.length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PowQL reserved-word quoting (PowDB ≥ 0.10 backticks) + gate-timeout mapping
+// ---------------------------------------------------------------------------
+
+describe('powdb: reserved-word identifiers are backtick-quoted in bare positions', () => {
+  // A table named `order` with columns named `type` and `limit` — all PowQL
+  // keywords. Dotted references (.type in filters/projections) bypass keyword
+  // lookup on every engine version and must stay bare for ≤0.9 compat.
+  const kwSchema: SchemaMetadata = {
+    enums: {},
+    tables: {
+      order: table('order', [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('type', 'type', 'string', 'text'),
+        col('limit', 'limit', 'number', 'int4', { nullable: true }),
+        col('name', 'name', 'string', 'text', { nullable: true }),
+      ]),
+    },
+  };
+  const kwQi = (m: ReturnType<typeof mockPool>) => new PowqlInterface(m.pool, 'order', kwSchema);
+
+  it('quotePowqlIdent quotes keywords and illegal identifiers, passes normal names through', () => {
+    assert.equal(quotePowqlIdent('order'), '`order`');
+    assert.equal(quotePowqlIdent('schema'), '`schema`'); // new v0.10 keyword
+    assert.equal(quotePowqlIdent('describe'), '`describe`'); // new v0.10 keyword
+    assert.equal(quotePowqlIdent('users'), 'users');
+    assert.equal(quotePowqlIdent('Order'), 'Order'); // keyword match is case-sensitive
+    assert.equal(quotePowqlIdent('full name'), '`full name`');
+    assert.throws(() => quotePowqlIdent('back`tick'), /backtick/);
+  });
+
+  it('powqlSchemaDDL quotes keyword type and field names (incl. index DDL)', () => {
+    const uniq = { ...kwSchema.tables.order!, uniqueColumns: [['id'], ['type']] };
+    const ddl = powqlSchemaDDL({ enums: {}, tables: { order: uniq } });
+    assert.match(ddl[0]!, /^type `order` \{/);
+    assert.match(ddl[0]!, /required `type`: str/);
+    assert.match(ddl[0]!, /`limit`: int/);
+    assert.match(ddl[0]!, /required unique id: str/); // normal names stay bare
+    assert.equal(ddl[1], 'alter `order` add unique .`type`');
+  });
+
+  it('insert/update/upsert quote the table ref and assignment targets; dotted refs stay bare', async () => {
+    const m = mockPool();
+    m.setRows([{ id: 'x', type: 'news', limit: null, name: null }]);
+    await kwQi(m).create({ data: { type: 'news' } as never });
+    assert.match(m.last().powql, /^insert `order` \{ /);
+    assert.match(m.last().powql, /`type` := \$\d/);
+
+    await kwQi(m).update({ where: { type: 'news' }, data: { limit: { increment: 1 } } as never });
+    // filter uses the dotted ref (bare); the assignment target is quoted.
+    assert.match(m.last().powql, /^`order` filter \.type = \$1 update \{ `limit` := \.limit \+ \$2 \} returning$/);
+
+    await kwQi(m).upsert({
+      where: { id: 'x' },
+      create: { id: 'x', type: 'a' },
+      update: { type: 'b' },
+    } as never);
+    const upsert = m.calls.find((c) => c.powql.startsWith('upsert'))!;
+    assert.match(upsert.powql, /^upsert `order` on \.id \{ /);
+    assert.match(upsert.powql, /`type` := \$\d/);
+  });
+
+  it('findMany quotes the table ref only — filter/order/projection stay dotted-bare', async () => {
+    const m = mockPool();
+    await kwQi(m).findMany({ where: { type: 'news' }, orderBy: { limit: 'asc' }, limit: 5 });
+    assert.match(
+      m.last().powql,
+      /^`order` filter \.type = \$1 order \.limit asc limit \$2 \{ \.id, \.type, \.limit, \.name \}$/,
+    );
+  });
+});
+
+describe('powdb: server tx-gate timeout maps to TimeoutError (PowDB ≥ 0.10)', () => {
+  it('maps the message shape on both transports', () => {
+    assert.ok(
+      wrapPowdbError({ code: 'query_failed', message: 'transaction gate timeout after 5000ms' }) instanceof
+        TimeoutError,
+    );
+    assert.ok(wrapPowdbError({ code: 'GenericFailure', message: 'Transaction gate timeout' }) instanceof TimeoutError);
   });
 });
