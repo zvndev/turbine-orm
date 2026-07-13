@@ -15,6 +15,7 @@
  *   - empty-where guard on the COMPILED filter (FIX 1)
  *   - transactions: single-level commit + rollback
  *   - nested `tx.$transaction` and re-entrant `db.$transaction` throw typed (FIX 2)
+ *   - independent concurrent `db.$transaction` calls queue FIFO and all succeed (T-7)
  *   - chunked relation load over > MAX_RELATION_KEYS parents (FIX 4)
  *   - E017 unsupported guards (vector / cursor stream)
  */
@@ -328,6 +329,25 @@ describe('powdb integration (embedded)', () => {
       await assert.rejects(() => guarded, UnsupportedFeatureError);
       // the pool still works afterwards (flag cleared)
       assert.equal(typeof (await db.table('app_user').count({})), 'number');
+    });
+  });
+
+  it('T-7: 10 concurrent db.$transaction writers all succeed (FIFO queue, no E017)', async () => {
+    await withDb(async (db) => {
+      // The dogfood failure shape: 10-way concurrent transactional creates
+      // used to fail ~54% of the time on the begin-while-active guard. They
+      // now queue on the single-writer gate and run one at a time.
+      const results = await Promise.all(
+        Array.from({ length: 10 }, (_, i) =>
+          db.$transaction(async (tx: DB) => {
+            const created = await tx.table('app_user').create({ data: { email: `queued${i}@x`, name: `Q${i}` } });
+            return created.email;
+          }),
+        ),
+      );
+      assert.equal(new Set(results).size, 10, 'every concurrent transaction committed');
+      const count = await db.table('app_user').count({ where: { email: { startsWith: 'queued' } } });
+      assert.equal(count, 10);
     });
   });
 

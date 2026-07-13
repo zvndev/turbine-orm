@@ -24,6 +24,11 @@
  *     impossible → it degrades to batched N+1 loaders (Phase B).
  *   - **Single global write lock; no savepoints/isolation** — nested
  *     transactions / isolation / vector / LISTEN-NOTIFY / RLS throw.
+ *     Independent concurrent `db.$transaction` calls do NOT throw: they queue
+ *     FIFO on a pool-level gate and run one at a time (see {@link PowdbTxGate}).
+ *     Only a *re-entrant* transaction — a `db.$transaction` opened from inside
+ *     an active transaction callback's async context, which queueing would
+ *     deadlock — fails fast with E017.
  *   - **The wire protocol pipelines** — `@zvndev/powdb-client` writes each
  *     request frame immediately and matches replies FIFO, so multiple queries
  *     may be in flight on one connection. {@link PowdbPool}'s checked-out
@@ -48,6 +53,7 @@
  * @module
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   type PgCompatPool,
   type PgCompatPoolClient,
@@ -64,6 +70,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
+import importOptionalPeer from './optional-peer-import.cjs';
 import type { QueryInterface, QueryInterfaceOptions } from './query/index.js';
 import type { ColumnMetadata, SchemaMetadata, TableMetadata } from './schema.js';
 
@@ -82,9 +89,11 @@ import type { ColumnMetadata, SchemaMetadata, TableMetadata } from './schema.js'
  *     {@link UnsupportedFeatureError} (E017): a nested `tx.$transaction` emits a
  *     savepoint synchronously (before any DB call) and so fails fast with a
  *     clear typed error instead of leaking PowDB's cryptic `Parse(... 'sp_1')`.
- *     The pool-level begin-while-active guard (see {@link PowdbPool}) catches the
- *     other re-entrant shape — a fresh top-level `db.$transaction` opened inside
- *     an already-open one — before it can deadlock on the write lock.
+ *     The pool-level transaction gate (see {@link PowdbTxGate}) handles the
+ *     other shapes: a fresh top-level `db.$transaction` opened inside an
+ *     already-open one throws E017 before it can deadlock on the write lock,
+ *     while INDEPENDENT concurrent `db.$transaction` calls queue FIFO and run
+ *     one at a time instead of failing.
  * Isolation levels remain Phase B.
  */
 export const powdbDialect: Dialect = {
@@ -465,19 +474,159 @@ function txControl(powql: string): 'begin' | 'commit' | 'rollback' | null {
 }
 
 /**
- * The error a pool throws when a `begin` arrives while a transaction is already
- * open. PowDB has ONE global write lock and supports neither concurrent nor
- * nested transactions: on the networked transport a second `begin` checks out a
- * fresh pooled connection and blocks forever on the lock the open transaction
- * holds. This guard converts that hang into a fast, typed error.
+ * The error a pool throws when a `begin` arrives from INSIDE an already-open
+ * transaction's async context (a re-entrant `db.$transaction`). PowDB has ONE
+ * global write lock and no savepoints: queueing a re-entrant transaction would
+ * deadlock (the outer callback awaits the inner transaction, which waits on
+ * the write lock the outer transaction holds), and on the networked transport
+ * it would block a fresh pooled connection on the lock forever. This guard
+ * converts that hang into a fast, typed error. Independent concurrent
+ * transactions do NOT hit this — they queue FIFO on {@link PowdbTxGate}.
  */
 function reentrantTransactionError(): UnsupportedFeatureError {
   return new UnsupportedFeatureError(
-    'concurrent or nested transactions',
+    're-entrant transactions',
     'powdb',
-    'PowDB is single-writer — it has one global write lock. A second transaction would block on it forever; ' +
-      'complete the open transaction first.',
+    'PowDB is single-writer — a transaction opened from inside an active transaction callback would deadlock ' +
+      'on the write lock the open transaction holds. Use the `tx` client the callback receives, or start the ' +
+      'second transaction after the first completes. (Independent concurrent transactions queue automatically.)',
   );
+}
+
+// ---------------------------------------------------------------------------
+// Single-writer transaction gate — FIFO queueing + re-entrancy detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Default cap (ms) on how long a `begin` may wait in the FIFO queue for
+ * PowDB's single global write lock before failing with a typed
+ * {@link TimeoutError} (E002). Prevents silent starvation behind a wedged
+ * transaction. Override via `transactionQueueTimeoutMs`
+ * ({@link TurbinePowdbOptions} / {@link PowdbPoolOptions}); `0` or `Infinity`
+ * waits without limit.
+ */
+export const DEFAULT_TX_QUEUE_TIMEOUT_MS = 30_000;
+
+/**
+ * Marker stored in the async context of everything that runs inside an open
+ * transaction — the begin-to-commit span, including the user's `$transaction`
+ * callback. Lets the gate tell a RE-ENTRANT `begin` (same async context —
+ * would deadlock, must throw) from an INDEPENDENT concurrent one (different
+ * context — safe to queue).
+ */
+interface PowdbTxContext {
+  /** The gate (one per pool) whose transaction this context belongs to. */
+  readonly gate: PowdbTxGate;
+  /** Flips once the transaction commits / rolls back / is torn down — a later `begin` in the same context is then fine. */
+  done: boolean;
+}
+
+const powdbTxStorage = new AsyncLocalStorage<PowdbTxContext>();
+
+/** A held slot on the single-writer gate. `finish()` is idempotent. */
+interface PowdbTxHold {
+  /** Mark the transaction finished and hand the gate to the next queued `begin`. */
+  finish(): void;
+}
+
+/**
+ * FIFO gate serializing transactions across a whole pool. PowDB holds one
+ * global write lock, so at most one transaction may be open per database:
+ * without this gate a second `begin` on the networked transport checks out a
+ * fresh connection and blocks forever on the lock the open transaction holds
+ * (and the embedded engine rejects it with a raw parse error).
+ *
+ * `acquire()` is called (synchronously, see below) for every `begin`:
+ *   - a **re-entrant** `begin` — issued from inside an active transaction's
+ *     async context, detected via {@link powdbTxStorage} — throws E017
+ *     immediately. Queueing it can never succeed: the open transaction cannot
+ *     commit while its callback awaits the queued one.
+ *   - an **independent** `begin` waits its FIFO turn, bounded by the queue
+ *     timeout, then returns a {@link PowdbTxHold} the caller finishes on
+ *     commit / rollback / connection release.
+ *
+ * Context propagation relies on `AsyncLocalStorage.enterWith()` running in the
+ * caller's *synchronous* execution: the pools call `acquire()` from the
+ * synchronous prologue of `query('begin')`, so when `TurbineClient.$transaction`
+ * awaits that begin, its continuation — and therefore the user callback — runs
+ * with the marker set, while sibling contexts (concurrent transactions, the
+ * caller after `$transaction` resolves) captured their snapshots earlier and
+ * never see it.
+ */
+class PowdbTxGate {
+  /** Tail of the FIFO queue — resolves once every earlier transaction has finished. */
+  private tail: Promise<void> = Promise.resolve();
+
+  constructor(private readonly queueTimeoutMs: number) {}
+
+  /**
+   * Take a place in the transaction queue. MUST be invoked in the same
+   * synchronous execution as the caller's `begin` (no `await` before it) so
+   * the re-entrancy marker propagates into the transaction's async scope.
+   */
+  async acquire(): Promise<PowdbTxHold> {
+    // --- synchronous section (runs before the caller's first await) ---
+    const current = powdbTxStorage.getStore();
+    if (current && current.gate === this && !current.done) {
+      throw reentrantTransactionError();
+    }
+    const ctx: PowdbTxContext = { gate: this, done: false };
+    powdbTxStorage.enterWith(ctx);
+
+    let handOff!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      handOff = resolve;
+    });
+    const ahead = this.tail;
+    this.tail = ahead.then(() => finished);
+
+    const hold: PowdbTxHold = {
+      finish: () => {
+        if (ctx.done) return;
+        ctx.done = true;
+        handOff();
+      },
+    };
+
+    // --- FIFO wait (optionally bounded) ---
+    const timeoutMs = this.queueTimeoutMs;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      await ahead;
+      return hold;
+    }
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        // Give up the queue slot: finishing resolves our `finished` link, so
+        // once every transaction ahead completes, later waiters skip straight
+        // past us instead of stalling behind a slot nobody will release.
+        hold.finish();
+        reject(new TimeoutError(timeoutMs, 'PowDB transaction (queued behind the single-writer lock)'));
+      }, timeoutMs);
+      void ahead.then(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    return hold;
+  }
+}
+
+/** Tuning options shared by {@link PowdbPool} and {@link PowdbEmbeddedPool}. */
+export interface PowdbPoolOptions {
+  /**
+   * Max time (ms) a concurrent transaction's `begin` may wait in the FIFO
+   * queue for the single-writer lock before failing with a
+   * {@link TimeoutError}. Default {@link DEFAULT_TX_QUEUE_TIMEOUT_MS};
+   * `0` / `Infinity` = wait without limit. Note this is a separate surface
+   * from `$transaction`'s `timeout` option, which only covers the callback
+   * *after* the transaction has begun.
+   */
+  transactionQueueTimeoutMs?: number;
 }
 
 /** Adapt a PowDB result into the pg-compat `{ rows, rowCount, fields }` shape. */
@@ -511,50 +660,56 @@ function adaptResult(r: PowdbResult): PgCompatQueryResult {
 export class PowdbPool implements PgCompatPool {
   private closed = false;
   /**
-   * Pool-level single-writer guard. PowDB holds one global write lock, so at
-   * most one transaction may be open across the whole pool. A `begin` issued
-   * while this is `true` is rejected (it would otherwise check out a second
-   * connection and block on the lock forever — the networked re-entrant hang).
+   * Pool-level single-writer gate. PowDB holds one global write lock, so at
+   * most one transaction may be open across the whole pool. Concurrent
+   * `begin`s queue FIFO on the gate (instead of checking out a second
+   * connection and blocking on the lock forever — the networked hang);
+   * re-entrant `begin`s throw E017 (see {@link PowdbTxGate}).
    */
-  private activeTransaction = false;
+  private readonly txGate: PowdbTxGate;
+  /** Hold taken by a `begin` issued via `query()` directly (no checked-out client). */
+  private poolHold: PowdbTxHold | null = null;
 
   constructor(
     readonly pool: PowdbClientPool,
     private readonly toParam: (v: unknown, i: number) => PowdbParam = (v) => toPowdbParam(v),
-  ) {}
-
-  /**
-   * Enforce the single-writer model on a transaction-control statement. Throws
-   * (before any query runs) if a `begin` arrives while a transaction is open;
-   * otherwise flips the pool-level flag. Returns the control kind so the caller
-   * can decide whether it even needs to hit the engine.
-   */
-  private guardTxControl(powql: string): 'begin' | 'commit' | 'rollback' | null {
-    const ctl = txControl(powql);
-    if (ctl === 'begin') {
-      if (this.activeTransaction) throw reentrantTransactionError();
-      this.activeTransaction = true;
-    } else if (ctl === 'commit' || ctl === 'rollback') {
-      this.activeTransaction = false;
-    }
-    return ctl;
+    options: PowdbPoolOptions = {},
+  ) {
+    this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
     const { text: powql, params } = normalizeQueryArgs(text, values);
-    this.guardTxControl(powql);
+    const ctl = txControl(powql);
+    if (ctl === 'begin') {
+      // Gate BEFORE touching the engine: a re-entrant begin throws fast, an
+      // independent concurrent one waits its FIFO turn. (acquire()'s
+      // re-entrancy check + context mark run synchronously right here.)
+      this.poolHold = await this.txGate.acquire();
+    }
     try {
       const result = await this.pool.withClient((c) => c.query(powql, params.map(this.toParam)));
       return adaptResult(result);
     } catch (err) {
+      if (ctl === 'begin') {
+        this.poolHold?.finish();
+        this.poolHold = null;
+      }
       throw wrapPowdbError(err);
+    } finally {
+      if (ctl === 'commit' || ctl === 'rollback') {
+        this.poolHold?.finish();
+        this.poolHold = null;
+      }
     }
   }
 
   async connect(): Promise<PgCompatPoolClient> {
     const client = await this.pool.acquire();
     let broken = false;
+    /** The gate hold of the transaction begun through THIS connection (if any). */
+    let hold: PowdbTxHold | null = null;
     return {
       // The networked client's query() supports concurrent in-flight calls on
       // one connection: every request frame is written to the socket
@@ -564,27 +719,45 @@ export class PowdbPool implements PgCompatPool {
       // for the batch's rollback contract because a failed statement leaves
       // the engine's transaction open (no aborted state, no auto-rollback) —
       // later pipelined statements execute inside the same still-open
-      // transaction and the final `rollback` discards every effect.
+      // transaction and the final `rollback` discards every effect. (The
+      // batch path awaits `begin` before dispatching the burst, so the gate
+      // wait below never reorders statements around it.)
       supportsPipelining: true,
       // biome-ignore lint/suspicious/noExplicitAny: see query() above.
       query: async (text: QueryArg, values?: unknown[]): Promise<any> => {
         const { text: powql, params } = normalizeQueryArgs(text, values);
-        // Guard BEFORE acquiring the engine — a re-entrant begin throws fast
-        // instead of blocking on the global write lock the open tx holds.
-        this.guardTxControl(powql);
+        const ctl = txControl(powql);
+        if (ctl === 'begin') {
+          // Gate BEFORE hitting the engine — a re-entrant begin throws fast
+          // instead of blocking on the global write lock the open tx holds;
+          // an independent concurrent begin queues FIFO.
+          hold = await this.txGate.acquire();
+        }
         try {
           return adaptResult(await client.query(powql, params.map(this.toParam)));
         } catch (err) {
           broken = true;
+          if (ctl === 'begin') {
+            hold?.finish();
+            hold = null;
+          }
           throw wrapPowdbError(err);
+        } finally {
+          if (ctl === 'commit' || ctl === 'rollback') {
+            hold?.finish();
+            hold = null;
+          }
         }
       },
       release: () => {
-        // Releasing this connection ends its transaction scope. Clear the flag
-        // as a safety net so a tx torn down without an explicit commit/rollback
-        // (e.g. a timeout that destroys the connection) never leaves the pool
-        // permanently believing a transaction is still open.
-        this.activeTransaction = false;
+        // Releasing this connection ends its transaction scope. Finish the
+        // hold as a safety net so a tx torn down without an explicit
+        // commit/rollback (e.g. a timeout that destroys the connection) hands
+        // the gate to the next queued transaction instead of wedging the
+        // queue. Only THIS connection's hold — releasing an unrelated (read)
+        // connection never touches another transaction's slot.
+        hold?.finish();
+        hold = null;
         return broken ? this.pool.destroy(client) : this.pool.release(client);
       },
     };
@@ -721,57 +894,88 @@ export function materializePowql(powql: string, params: unknown[]): string {
 export class PowdbEmbeddedPool implements PgCompatPool {
   private closed = false;
   /**
-   * Single-writer guard. The embedded engine is one handle with one global
+   * Single-writer gate. The embedded engine is one handle with one global
    * write lock — only one transaction may be open at a time. A re-entrant
-   * `begin` (a fresh top-level `db.$transaction` opened inside an open one)
-   * would otherwise hit PowDB's raw "already in a transaction" parse error;
-   * this surfaces a typed error instead. (Nested `tx.$transaction` is caught
-   * earlier still, by the savepoint override in {@link powdbDialect}.)
+   * `begin` (a fresh top-level `db.$transaction` opened inside an open one's
+   * callback) would otherwise hit PowDB's raw "already in a transaction"
+   * parse error; the gate surfaces a typed E017 instead, while INDEPENDENT
+   * concurrent transactions queue FIFO and run one at a time. (Nested
+   * `tx.$transaction` is caught earlier still, by the savepoint override in
+   * {@link powdbDialect}.)
    */
-  private activeTransaction = false;
+  private readonly txGate: PowdbTxGate;
+  /** Hold taken by a `begin` issued via `query()` directly (no checked-out client). */
+  private readonly poolHoldRef: { hold: PowdbTxHold | null } = { hold: null };
 
-  constructor(private readonly db: EmbeddedDatabase) {}
-
-  /** Enforce the single-writer model on a transaction-control statement. */
-  private guardTxControl(powql: string): void {
-    const ctl = txControl(powql);
-    if (ctl === 'begin') {
-      if (this.activeTransaction) throw reentrantTransactionError();
-      this.activeTransaction = true;
-    } else if (ctl === 'commit' || ctl === 'rollback') {
-      this.activeTransaction = false;
-    }
+  constructor(
+    private readonly db: EmbeddedDatabase,
+    options: PowdbPoolOptions = {},
+  ) {
+    this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
   }
 
-  private run(powql: string, params: unknown[]): PgCompatQueryResult {
-    this.guardTxControl(powql);
+  /** Materialize `$N` params and hand the PowQL to the in-process engine. */
+  private exec(powql: string, params: unknown[]): PgCompatQueryResult {
+    const materialized = materializePowql(powql, params);
+    return adaptResult(normalizeEmbeddedResult(this.db.query(materialized)));
+  }
+
+  /**
+   * Run one statement, gating transaction control. `holdRef` scopes the gate
+   * hold to whoever issued the `begin` (the pool itself or one checked-out
+   * client), so finishing a transaction can never release a slot a different
+   * transaction is holding.
+   */
+  private async run(
+    powql: string,
+    params: unknown[],
+    holdRef: { hold: PowdbTxHold | null },
+  ): Promise<PgCompatQueryResult> {
+    const ctl = txControl(powql);
+    if (ctl === 'begin') {
+      // Gate BEFORE hitting the engine — re-entrant begins throw fast,
+      // independent concurrent ones wait their FIFO turn. (acquire()'s
+      // re-entrancy check + context mark run synchronously right here.)
+      holdRef.hold = await this.txGate.acquire();
+    }
     try {
-      const materialized = materializePowql(powql, params);
-      return adaptResult(normalizeEmbeddedResult(this.db.query(materialized)));
+      return this.exec(powql, params);
     } catch (err) {
+      if (ctl === 'begin') {
+        holdRef.hold?.finish();
+        holdRef.hold = null;
+      }
       throw wrapPowdbError(err);
+    } finally {
+      if (ctl === 'commit' || ctl === 'rollback') {
+        holdRef.hold?.finish();
+        holdRef.hold = null;
+      }
     }
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
     const { text: powql, params } = normalizeQueryArgs(text, values);
-    return this.run(powql, params);
+    return this.run(powql, params, this.poolHoldRef);
   }
 
   async connect(): Promise<PgCompatPoolClient> {
     // Single in-process handle — the "client" shares the one Database; tx
-    // keywords run serially on it.
+    // keywords run serially on it. Each checked-out client scopes its own
+    // gate hold so release() only ever finishes ITS transaction.
+    const holdRef: { hold: PowdbTxHold | null } = { hold: null };
     return {
       // biome-ignore lint/suspicious/noExplicitAny: see query() above.
       query: async (text: QueryArg, values?: unknown[]): Promise<any> => {
         const { text: powql, params } = normalizeQueryArgs(text, values);
-        return this.run(powql, params);
+        return this.run(powql, params, holdRef);
       },
       release: () => {
         // End-of-scope safety net (see PowdbPool.connect()): a tx torn down
-        // without an explicit commit/rollback must not wedge the handle.
-        this.activeTransaction = false;
+        // without an explicit commit/rollback must not wedge the queue.
+        holdRef.hold?.finish();
+        holdRef.hold = null;
       },
     };
   }
@@ -799,6 +1003,16 @@ export { PowqlInterface } from './powql.js';
 export interface TurbinePowdbOptions extends Pick<TurbineConfig, 'logging' | 'defaultLimit' | 'warnOnUnlimited'> {
   /** Max pooled connections (default 10). Networked transport only. */
   connectionLimit?: number;
+  /**
+   * Max time (ms) a concurrent `$transaction` waits in the FIFO queue for
+   * PowDB's single global write lock before failing with a typed
+   * `TimeoutError` (default {@link DEFAULT_TX_QUEUE_TIMEOUT_MS} = 30 000;
+   * `0` / `Infinity` = wait without limit). Independent concurrent
+   * transactions queue and run one at a time; only a re-entrant
+   * `db.$transaction` (opened inside an active transaction callback) throws
+   * E017 — queueing that shape would deadlock.
+   */
+  transactionQueueTimeoutMs?: number;
 }
 
 /**
@@ -833,10 +1047,14 @@ export interface TurbinePowdbEmbeddedTarget {
  */
 async function loadPowdb(): Promise<PowdbModule> {
   try {
-    return (await import('@zvndev/powdb-client')) as unknown as PowdbModule;
+    // Via the .cts helper so the CJS build keeps a path to a REAL dynamic
+    // import() — @zvndev/powdb-client ≥ 0.9 is ESM-only, and the CommonJS
+    // pass transpiles a plain `import()` here into an unusable `require()`.
+    return (await importOptionalPeer('@zvndev/powdb-client')) as unknown as PowdbModule;
   } catch (err) {
     throw new ConnectionError(
-      "[turbine] turbine-orm/powdb requires the optional peer dependency '@zvndev/powdb-client'. Install it: npm i @zvndev/powdb-client. " +
+      "[turbine] turbine-orm/powdb requires the optional peer dependency '@zvndev/powdb-client'. Install it: npm i @zvndev/powdb-client — " +
+        'or construct the PowDB pool yourself and inject it: turbinePowDB(pool, schema). ' +
         `(${(err as Error).message})`,
     );
   }
@@ -852,13 +1070,16 @@ async function loadPowdb(): Promise<PowdbModule> {
 async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
   let mod: EmbeddedModule;
   try {
-    mod = (await import('@zvndev/powdb-embedded')) as unknown as EmbeddedModule;
+    // Via the .cts helper — keeps a real dynamic import() available to the
+    // CJS build in case a future addon version ships ESM-only (see loadPowdb).
+    mod = (await importOptionalPeer('@zvndev/powdb-embedded')) as unknown as EmbeddedModule;
   } catch (err) {
     throw new ConnectionError(
       "[turbine] turbine-orm/powdb embedded mode requires the optional peer '@zvndev/powdb-embedded'. " +
         'Install it: npm i @zvndev/powdb-embedded. If install succeeded but loading failed, your platform has no ' +
         'prebuilt binary (prebuilts ship for macOS arm64/x64 and Linux glibc x64/arm64; Intel-mac/musl/Windows ' +
-        'build from source) — build it with `npm run build` in the addon, then retry. ' +
+        'build from source) — build it with `npm run build` in the addon, then retry. You can also construct the ' +
+        'pool yourself and inject it: turbinePowDB(pool, schema). ' +
         `(${(err as Error).message})`,
     );
   }
@@ -872,7 +1093,10 @@ async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
 }
 
 /** Open an embedded database handle, wrapping engine open failures (corrupt dir, etc.). */
-async function openEmbeddedPool(target: TurbinePowdbEmbeddedTarget): Promise<PowdbEmbeddedPool> {
+async function openEmbeddedPool(
+  target: TurbinePowdbEmbeddedTarget,
+  poolOptions: PowdbPoolOptions = {},
+): Promise<PowdbEmbeddedPool> {
   const mod = await loadPowdbEmbedded();
   const { embedded: dir, syncMode, memoryLimit } = target;
   let db: EmbeddedDatabase;
@@ -897,7 +1121,7 @@ async function openEmbeddedPool(target: TurbinePowdbEmbeddedTarget): Promise<Pow
     }
     db.setSyncMode(syncMode);
   }
-  return new PowdbEmbeddedPool(db);
+  return new PowdbEmbeddedPool(db, poolOptions);
 }
 
 /**
@@ -925,25 +1149,27 @@ export async function turbinePowDB(
 ): Promise<TurbineClient> {
   let pool: PgCompatPool;
   let owns = false;
+  const poolOptions: PowdbPoolOptions = { transactionQueueTimeoutMs: options.transactionQueueTimeoutMs };
 
   if (typeof target === 'string') {
     const mod = await loadPowdb();
     const clientPool = new mod.Pool({ ...parsePowdbUrl(target), max: options.connectionLimit ?? 10 });
     await assertNetworkedVersion(clientPool);
-    pool = new PowdbPool(clientPool);
+    pool = new PowdbPool(clientPool, undefined, poolOptions);
     owns = true;
   } else if (target instanceof PowdbPool) {
+    // An injected PowdbPool carries its own PowdbPoolOptions.
     pool = target;
   } else if (isEmbeddedTarget(target)) {
-    pool = await openEmbeddedPool(target);
+    pool = await openEmbeddedPool(target, poolOptions);
     owns = true;
   } else if (isPowdbClientPool(target)) {
-    pool = new PowdbPool(target);
+    pool = new PowdbPool(target, undefined, poolOptions);
   } else {
     const mod = await loadPowdb();
     const clientPool = new mod.Pool({ ...(target as PowdbConnOptions), max: options.connectionLimit ?? 10 });
     await assertNetworkedVersion(clientPool);
-    pool = new PowdbPool(clientPool);
+    pool = new PowdbPool(clientPool, undefined, poolOptions);
     owns = true;
   }
 

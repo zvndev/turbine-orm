@@ -80,6 +80,7 @@ import {
   type UpsertStatementInput,
 } from './dialect.js';
 import { ConnectionError, UnsupportedFeatureError } from './errors.js';
+import importOptionalPeer from './optional-peer-import.cjs';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -1084,7 +1085,10 @@ type CreatePool = (config: any) => Mysql2Pool;
 async function loadCreatePool(): Promise<CreatePool> {
   let mod: { createPool?: CreatePool; default?: { createPool?: CreatePool } };
   try {
-    mod = (await import('mysql2/promise')) as typeof mod;
+    // Via the .cts helper so the CJS build keeps a path to a REAL dynamic
+    // import() even if a future mysql2 major goes ESM-only (the CommonJS pass
+    // transpiles a plain `import()` here into `require()`).
+    mod = (await importOptionalPeer('mysql2/promise')) as typeof mod;
   } catch (err) {
     throw new ConnectionError(
       "[turbine] turbine-orm/mysql requires the optional peer dependency 'mysql2'. Install it: npm i mysql2. " +
