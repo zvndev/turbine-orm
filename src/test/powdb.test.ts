@@ -698,14 +698,25 @@ describe('powdb: transaction model (single-writer)', () => {
     assert.equal(powdbDialect.rollbackStatement(), 'rollback');
   });
 
-  it('PowdbEmbeddedPool rejects a re-entrant begin (begin while a tx is open)', async () => {
-    const { pool } = fakeEmbeddedDb();
+  it('a second same-context raw begin QUEUES behind the open manual tx (markers are callback-scoped)', async () => {
+    // Since the Capa cold-burst fix, the re-entrancy marker exists ONLY inside
+    // a $transaction callback's async subtree. A manual raw `begin` span does
+    // not mark its caller, so a second begin from the same context is treated
+    // as an independent concurrent transaction: it waits FIFO for the manual
+    // commit instead of throwing E017 (the old contract) or hitting the engine.
+    const { pool, seen } = fakeEmbeddedDb();
     await pool.query('begin');
-    // A SECOND begin while the first is open → typed error, not a raw engine reject.
-    await assert.rejects(() => pool.query('begin'), UnsupportedFeatureError);
-    // After commit, a fresh begin is allowed again.
+    const second = (async () => {
+      const c = await pool.connect();
+      await c.query('begin');
+      await c.query('commit');
+      c.release();
+    })();
+    await drainMicrotasks();
+    assert.deepEqual(seen, ['begin'], 'the second begin must still be queued while the manual tx is open');
     await pool.query('commit');
-    await assert.doesNotReject(() => pool.query('begin'));
+    await second;
+    assert.deepEqual(seen, ['begin', 'commit', 'begin', 'commit'], 'strict FIFO serialization');
   });
 
   it('PowdbEmbeddedPool clears the flag on connect().release() (timeout safety net)', async () => {
@@ -718,11 +729,15 @@ describe('powdb: transaction model (single-writer)', () => {
   });
 
   it('recognizes the SQL-spelling transaction keywords case-insensitively', async () => {
-    const { pool } = fakeEmbeddedDb();
+    const { pool, seen } = fakeEmbeddedDb(undefined, { transactionQueueTimeoutMs: 25 });
     await pool.query('BEGIN TRANSACTION');
-    await assert.rejects(() => pool.query('start transaction'), UnsupportedFeatureError);
+    // 'start transaction' is recognized as a begin: it queues on the gate
+    // (timing out here) instead of being forwarded into the open transaction.
+    await assert.rejects(() => pool.query('start transaction'), TimeoutError);
+    assert.deepEqual(seen, ['BEGIN TRANSACTION'], 'the queued begin never reached the engine');
     await pool.query('ROLLBACK');
     await assert.doesNotReject(() => pool.query('begin'));
+    await pool.query('commit');
   });
 
   it('REVIEW 1: a stray commit/rollback with no gate hold never reaches the embedded engine', async () => {
@@ -771,20 +786,72 @@ describe('powdb: transaction model (single-writer)', () => {
 
 describe('powdb: cross-pool re-entrancy (chained ALS marker)', () => {
   it("REVIEW 2: an inner begin on the OUTER pool throws E017 even with another pool's tx in between", async () => {
+    // dbA tx → dbB tx → dbA tx. dbB's marker goes innermost, chaining to dbA's
+    // (PowdbTxContext.parent); the chain walk must find the live dbA ancestor
+    // and throw re-entrant E017 instead of queueing behind dbA's own open
+    // transaction (deadlock until the queue timeout).
     const a = fakeEmbeddedDb();
     const b = fakeEmbeddedDb();
-    await a.pool.query('begin'); // pool A's marker enters the context…
-    await b.pool.query('begin'); // …pool B's marker goes innermost, chaining to A's
-    // Re-entrant on pool A THROUGH pool B's context: without the chain walk
-    // this queued behind A's own open tx (deadlock until the queue timeout).
-    await assert.rejects(() => a.pool.query('begin'), UnsupportedFeatureError);
-    await b.pool.query('commit');
-    await a.pool.query('commit');
-    // Both gates recovered — done markers are pruned, fresh begins pass.
-    await assert.doesNotReject(() => a.pool.query('begin'));
-    await a.pool.query('commit');
-    assert.deepEqual(a.seen, ['begin', 'commit', 'begin', 'commit']);
-    assert.deepEqual(b.seen, ['begin', 'commit']);
+    const dbA = new TurbineClient({ pool: a.pool, dialect: powdbDialect }, { tables: {}, enums: {} });
+    const dbB = new TurbineClient({ pool: b.pool, dialect: powdbDialect }, { tables: {}, enums: {} });
+    await assert.rejects(
+      dbA.$transaction(async () => {
+        await dbB.$transaction(async () => {
+          await dbA.$transaction(async () => 'inner'); // re-entrant on A through B's context
+        });
+      }),
+      UnsupportedFeatureError,
+    );
+    // Both gates recovered: done markers are pruned, fresh transactions pass.
+    assert.equal(await dbA.$transaction(async () => 'a-after'), 'a-after');
+    assert.equal(await dbB.$transaction(async () => 'b-after'), 'b-after');
+    assert.deepEqual(a.seen, ['begin', 'rollback', 'begin', 'commit']);
+    assert.deepEqual(b.seen, ['begin', 'rollback', 'begin', 'commit']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Capa regression (ITEM 3): the re-entrancy marker is scoped to the
+// transaction CALLBACK's async subtree. acquire() used to enterWith() the
+// marker into the CALLER's context, so a context that merely had a begin in
+// its await chain was falsely flagged re-entrant: on a cold client, the first
+// same-tick burst of db.$transaction calls saw call #1's live marker from
+// every sibling (9/10 rejected E017 in production).
+// ---------------------------------------------------------------------------
+
+describe('powdb: re-entrancy marker never leaks into the caller context (Capa cold-burst fix)', () => {
+  it('a context that opened a manual tx is not falsely re-entrant: $transaction queues FIFO', async () => {
+    const { pool, seen } = fakeEmbeddedDb();
+    const db = new TurbineClient({ pool, dialect: powdbDialect }, { tables: {}, enums: {} });
+    // Open a manual transaction from THIS context. Before the fix, acquire()'s
+    // enterWith() left a LIVE marker in this context, and the $transaction
+    // below threw instant E017 even though queueing it is perfectly safe. This is
+    // the deterministic reduction of the cold-client same-tick burst: a live
+    // marker visible from a context that is NOT inside any tx callback.
+    await pool.query('begin');
+    const queued = db.$transaction(async () => 'queued-ok');
+    await drainMicrotasks();
+    assert.deepEqual(seen, ['begin'], 'the $transaction begin must queue behind the manual tx');
+    await pool.query('commit');
+    assert.equal(await queued, 'queued-ok');
+    assert.deepEqual(seen, ['begin', 'commit', 'begin', 'commit']);
+  });
+
+  it('10 db.$transaction calls launched in the SAME synchronous tick on a fresh client all succeed', async () => {
+    const { pool } = fakeEmbeddedDb();
+    const db = new TurbineClient({ pool, dialect: powdbDialect }, { tables: {}, enums: {} });
+    // The reported cold-client shape: no prior transaction on this client,
+    // all launches in one tick: zero E017, strict FIFO success.
+    const ps = Array.from({ length: 10 }, (_, i) => db.$transaction(async () => i));
+    assert.deepEqual(await Promise.all(ps), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  });
+
+  it('sequential awaited transactions from one long-lived context never chain into false E017', async () => {
+    const { pool } = fakeEmbeddedDb();
+    const db = new TurbineClient({ pool, dialect: powdbDialect }, { tables: {}, enums: {} });
+    for (let i = 0; i < 5; i++) {
+      assert.equal(await db.$transaction(async () => i), i);
+    }
   });
 });
 
@@ -1257,5 +1324,168 @@ describe('powdb: server tx-gate timeout maps to TimeoutError (PowDB ≥ 0.10)', 
         TimeoutError,
     );
     assert.ok(wrapPowdbError({ code: 'GenericFailure', message: 'Transaction gate timeout' }) instanceof TimeoutError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Capa regression (ITEM 1): owned-pool disconnect() must close every driver
+// client. client.ts treats TurbineConfig.pool as external (ownsPool = false)
+// and skips pool.end(), so turbinePowDB patches disconnect()/end() on owned
+// pools; and the driver Pool.close() only closes IDLE clients, so
+// PowdbPool.end() destroys any still checked out.
+// ---------------------------------------------------------------------------
+
+/**
+ * A fake `@zvndev/powdb-client` module whose Pool mirrors the real dist
+ * (`clients/ts/src/pool.ts`) semantics that matter here: `acquire` reuses an
+ * idle client or creates one, `release` returns to idle (or closes when the
+ * pool is closed), `destroy`/`close` close clients. Crucially,
+ * `close()` closes IDLE clients only. Every created client is counted so the
+ * tests can assert zero live sockets after disconnect().
+ */
+function fakeCountingClientModule() {
+  type FakeClient = {
+    serverVersion: string;
+    closed: boolean;
+    query: (powql: string, params?: unknown[]) => Promise<unknown>;
+    close: () => Promise<void>;
+  };
+  const clients: FakeClient[] = [];
+  let closeCalled = false;
+  // The real Pool constructor takes connection options; a default constructor
+  // accepts (and ignores) them at runtime just the same.
+  class FakePool {
+    private idle: FakeClient[] = [];
+    private poolClosed = false;
+    async acquire(): Promise<FakeClient> {
+      if (this.poolClosed) throw new Error('pool closed');
+      const existing = this.idle.pop();
+      if (existing) return existing;
+      const c: FakeClient = {
+        serverVersion: '0.10.0',
+        closed: false,
+        query: async () => ({ kind: 'message', message: 'ok' }),
+        close: async () => {
+          c.closed = true;
+        },
+      };
+      clients.push(c);
+      return c;
+    }
+    release(c: FakeClient): void {
+      if (this.poolClosed) {
+        void c.close();
+        return;
+      }
+      this.idle.push(c);
+    }
+    destroy(c: FakeClient): void {
+      void c.close();
+    }
+    async withClient<T>(fn: (c: FakeClient) => Promise<T>): Promise<T> {
+      const c = await this.acquire();
+      try {
+        const out = await fn(c);
+        this.release(c);
+        return out;
+      } catch (err) {
+        this.destroy(c);
+        throw err;
+      }
+    }
+    async close(): Promise<void> {
+      closeCalled = true;
+      this.poolClosed = true;
+      // Real semantics: close IDLE clients only; checked-out ones are the
+      // caller's responsibility ("Checked-out clients are NOT tracked").
+      const idle = this.idle.splice(0, this.idle.length);
+      await Promise.all(idle.map((c) => c.close()));
+    }
+  }
+  const mod = {
+    Client: {
+      connect: async (): Promise<never> => {
+        throw new Error('fake module: Client.connect unused');
+      },
+    },
+    Pool: FakePool,
+  };
+  return {
+    mod: mod as unknown as NonNullable<Parameters<typeof turbinePowDB>[2]>['powdbClientModule'],
+    clients,
+    live: () => clients.filter((c) => !c.closed).length,
+    closeCalled: () => closeCalled,
+  };
+}
+
+describe('powdb: owned-pool disconnect() closes every driver client (socket-leak fix)', () => {
+  it('connect → version probe → query → disconnect leaves ZERO live clients', async () => {
+    const fake = fakeCountingClientModule();
+    // Owned networked form (conn options), including the serverVersion probe
+    // (the prime leak suspect): its client must be released AND closed.
+    const db = await turbinePowDB(
+      { host: '127.0.0.1', port: 5433 },
+      { tables: {}, enums: {} },
+      {
+        powdbClientModule: fake.mod,
+      },
+    );
+    assert.ok(fake.clients.length >= 1, 'the version probe checked out a client');
+    await db.raw(['note work'] as never);
+    await db.$transaction(async () => 'tx-work');
+    await db.disconnect();
+    assert.ok(fake.closeCalled(), 'disconnect() must close the OWNED driver pool (was skipped entirely)');
+    assert.equal(fake.live(), 0, `every client the pool ever created is closed (${fake.clients.length} created)`);
+  });
+
+  it('the powdb:// URL form is patched the same way', async () => {
+    const fake = fakeCountingClientModule();
+    const db = await turbinePowDB(
+      'powdb://127.0.0.1:5433',
+      { tables: {}, enums: {} },
+      {
+        powdbClientModule: fake.mod,
+      },
+    );
+    await db.raw(['note work'] as never);
+    await db.end(); // the end() alias must be patched too
+    assert.equal(fake.live(), 0);
+  });
+
+  it('PowdbPool.end() destroys clients still CHECKED OUT (driver close() only closes idle)', async () => {
+    const fake = fakeCountingClientModule();
+    const db = await turbinePowDB(
+      { host: '127.0.0.1', port: 5433 },
+      { tables: {}, enums: {} },
+      {
+        powdbClientModule: fake.mod,
+      },
+    );
+    // Check out a connection and never release it (e.g. a caller that crashed
+    // mid-transaction). disconnect() must still not leak its socket.
+    const client = await (
+      db as unknown as { pool: { connect(): Promise<{ query(t: string): Promise<unknown> }> } }
+    ).pool.connect();
+    await client.query('note held');
+    await db.disconnect();
+    assert.equal(fake.live(), 0, 'the checked-out client was destroyed on disconnect');
+  });
+
+  it('an INJECTED driver pool stays the caller responsibility (disconnect no-op)', async () => {
+    const fake = fakeCountingClientModule();
+    const FakePool = (fake.mod as unknown as { Pool: new (o: unknown) => unknown }).Pool;
+    const driverPool = new FakePool({});
+    const db = await turbinePowDB(driverPool as never, { tables: {}, enums: {} });
+    await db.raw(['note work'] as never);
+    await db.disconnect();
+    assert.ok(!fake.closeCalled(), 'injected pool must NOT be closed by disconnect()');
+  });
+
+  it('embedded: queries after disconnect() fail with a typed ConnectionError (pool really closed)', async () => {
+    const { pool } = fakeEmbeddedDb();
+    // Owned-embedded shape reduced to the pool: end() marks it closed.
+    await pool.query('note before');
+    await pool.end();
+    await assert.rejects(() => pool.query('note after'), ConnectionError);
   });
 });

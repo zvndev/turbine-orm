@@ -16,6 +16,8 @@
  *   - transactions: single-level commit + rollback
  *   - nested `tx.$transaction` and re-entrant `db.$transaction` throw typed (FIX 2)
  *   - independent concurrent `db.$transaction` calls queue FIFO and all succeed (T-7)
+ *   - COLD-CLIENT same-tick `db.$transaction` burst: zero false E017 (Capa ITEM 3)
+ *   - disconnect() really closes the owned pool (Capa ITEM 1)
  *   - chunked relation load over > MAX_RELATION_KEYS parents (FIX 4)
  *   - E017 unsupported guards (vector / cursor stream)
  */
@@ -26,6 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe } from 'node:test';
 import {
+  ConnectionError,
   NotNullViolationError,
   TimeoutError,
   UniqueConstraintError,
@@ -173,6 +176,65 @@ async function withDb(fn: (db: DB) => Promise<void>): Promise<void> {
 // ---------------------------------------------------------------------------
 
 describe('powdb integration (embedded)', () => {
+  // KEEP THIS TEST FIRST. The Capa cold-client bug (ITEM 3) only bit when NO
+  // transaction had ever run in the process/context: acquire()'s enterWith()
+  // planted call #1's live re-entrancy marker where sibling same-tick calls
+  // could see it, so 9/10 were falsely rejected E017, and one warm-up
+  // transaction masked it (its pruned `done` marker changed the propagation
+  // shape). Any earlier transaction in this file would be exactly such a
+  // warm-up; runner isolation (one process per test file) plus first place in
+  // declaration order keeps this genuinely cold. The leak's visibility is
+  // runtime-dependent (ALS enterWith propagation differs across Node
+  // versions/runtimes); the deterministic reduction lives in powdb.test.ts
+  // ('re-entrancy marker never leaks into the caller context').
+  it('CAPA 3: cold client, 10 db.$transaction calls in ONE synchronous tick, all succeed with zero E017', async () => {
+    await withDb(async (db) => {
+      const ps = Array.from({ length: 10 }, (_, i) =>
+        db.$transaction(async (tx: DB) => {
+          const created = await tx.table('app_user').create({ data: { email: `cold${i}@x`, name: `C${i}` } });
+          return created.email;
+        }),
+      );
+      const results = await Promise.all(ps);
+      assert.deepEqual(
+        results,
+        Array.from({ length: 10 }, (_, i) => `cold${i}@x`),
+        'every same-tick transaction committed, FIFO, no false re-entrancy',
+      );
+      assert.equal(await db.table('app_user').count({ where: { email: { startsWith: 'cold' } } }), 10);
+    });
+  });
+
+  it('CAPA 3: sequential transactions from one long-lived context never chain into false E017', async () => {
+    await withDb(async (db) => {
+      for (let i = 0; i < 5; i++) {
+        const out = await db.$transaction(async (tx: DB) => {
+          await tx.table('app_user').create({ data: { email: `seq${i}@x` } });
+          return i;
+        });
+        assert.equal(out, i);
+      }
+      assert.equal(await db.table('app_user').count({ where: { email: { startsWith: 'seq' } } }), 5);
+    });
+  });
+
+  it('CAPA 1: disconnect() really closes the OWNED embedded pool (queries afterwards fail typed)', async () => {
+    // client.ts sees TurbineConfig.pool as external and skips pool.end();
+    // before the fix, turbinePowDB's owned path never patched disconnect(),
+    // so the pool outlived it (on the networked transport that left a live
+    // socket holding the process open for powdb-server's 300s idle timeout).
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-it-close-'));
+    const db: DB = await turbinePowDB({ embedded: dir }, schema, { warnOnUnlimited: false });
+    try {
+      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      await db.table('app_user').create({ data: { email: 'pre-close@x' } });
+      await db.disconnect();
+      await assert.rejects(() => db.table('app_user').count({}), ConnectionError);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('syncMode:"normal" (addon ≥0.7.1) opens and round-trips a write', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'powdb-it-sync-'));
     const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, schema, { warnOnUnlimited: false });

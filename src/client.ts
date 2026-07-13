@@ -123,6 +123,19 @@ export interface PgCompatPoolClient {
    * sequential.
    */
   readonly supportsPipelining?: boolean;
+  /**
+   * Optional engine seam: scope a transaction's user callback to its own
+   * async subtree. When present, `TurbineClient.transaction` / `$transaction`
+   * invoke the callback as `wrapTransactionCallback(() => fn(tx))` instead of
+   * `fn(tx)` directly. Single-writer engines (PowDB) implement it with
+   * `AsyncLocalStorage.run()` to plant their re-entrancy marker so that it
+   * exists ONLY inside the callback's async subtree: a transaction opened
+   * from inside the callback is detected as re-entrant (typed E017), while
+   * the CALLER's context stays unmarked, so same-tick sibling transactions
+   * queue FIFO instead of being falsely flagged. Absent on pg and every other
+   * engine, in which case the callback runs unwrapped (zero behavior change).
+   */
+  wrapTransactionCallback?<R>(fn: () => Promise<R>): Promise<R>;
 }
 
 /**
@@ -1175,7 +1188,12 @@ export class TurbineClient {
     try {
       await client.query(this.dialect.beginStatement());
       began = true;
-      const result = await fn(client);
+      // Engine seam: single-writer engines scope their transaction re-entrancy
+      // marker to the callback's async subtree (see
+      // PgCompatPoolClient.wrapTransactionCallback). Absent everywhere else.
+      const wrap = (client as unknown as PgCompatPoolClient).wrapTransactionCallback;
+      // `.call` erases the generic, so the callback's Promise<T> is re-asserted.
+      const result = wrap ? ((await wrap.call(client, () => fn(client))) as T) : await fn(client);
       await client.query(this.dialect.commitStatement());
       return result;
     } catch (err) {
@@ -1329,6 +1347,13 @@ export class TurbineClient {
 
       let result: unknown;
 
+      // Engine seam: when the checked-out connection exposes
+      // wrapTransactionCallback (single-writer engines such as PowDB), run the user
+      // callback through it so the engine can scope its re-entrancy marker to
+      // the callback's async subtree. All other drivers: plain fn(tx).
+      const wrap = (client as unknown as PgCompatPoolClient).wrapTransactionCallback;
+      const runCallback = (): Promise<unknown> => (wrap ? wrap.call(client, () => fn(tx)) : fn(tx));
+
       if (timeout) {
         // Race between the function and a timeout. If the timeout fires we
         // need to actually abort the in-flight query — otherwise the backend
@@ -1350,12 +1375,12 @@ export class TurbineClient {
           }, timeout);
         });
         try {
-          result = await Promise.race([fn(tx), timeoutPromise]);
+          result = await Promise.race([runCallback(), timeoutPromise]);
         } finally {
           clearTimeout(timer);
         }
       } else {
-        result = await fn(tx);
+        result = await runCallback();
       }
 
       await client.query(this.dialect.commitStatement());

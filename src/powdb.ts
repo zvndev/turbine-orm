@@ -636,11 +636,12 @@ function reentrantTransactionError(): UnsupportedFeatureError {
 export const DEFAULT_TX_QUEUE_TIMEOUT_MS = 30_000;
 
 /**
- * Marker stored in the async context of everything that runs inside an open
- * transaction — the begin-to-commit span, including the user's `$transaction`
- * callback. Lets the gate tell a RE-ENTRANT `begin` (same async context —
- * would deadlock, must throw) from an INDEPENDENT concurrent one (different
- * context — safe to queue).
+ * Marker stored in the async context of a transaction CALLBACK's subtree.
+ * It is planted by the pool's `wrapTransactionCallback` via
+ * `powdbTxStorage.run(hold.ctx, fn)` around the user callback, never written
+ * into the caller's context. Lets the gate tell a RE-ENTRANT `begin` (issued
+ * from inside an active transaction callback, which would deadlock and must
+ * throw) from an INDEPENDENT concurrent one (unmarked context, safe to queue).
  */
 interface PowdbTxContext {
   /** The gate (one per pool) whose transaction this context belongs to. */
@@ -663,6 +664,15 @@ const powdbTxStorage = new AsyncLocalStorage<PowdbTxContext>();
 
 /** A held slot on the single-writer gate. `finish()` is idempotent. */
 interface PowdbTxHold {
+  /**
+   * The re-entrancy marker for this transaction. The pool's
+   * `wrapTransactionCallback` runs the user callback inside
+   * `powdbTxStorage.run(ctx, fn)`: the SAME object `finish()` flips `done`
+   * on, so a begin issued from a context that outlives the callback (e.g. a
+   * fire-and-forget launched inside it) sees the completed state and queues
+   * as an independent transaction.
+   */
+  readonly ctx: PowdbTxContext;
   /** Mark the transaction finished and hand the gate to the next queued `begin`. */
   finish(): void;
 }
@@ -683,25 +693,35 @@ interface PowdbTxHold {
  *     timeout, then returns a {@link PowdbTxHold} the caller finishes on
  *     commit / rollback / connection release.
  *
- * Context propagation relies on `AsyncLocalStorage.enterWith()` running in the
- * caller's *synchronous* execution: the pools call `acquire()` from the
- * synchronous prologue of `query('begin')`, so when `TurbineClient.$transaction`
- * awaits that begin, its continuation — and therefore the user callback — runs
- * with the marker set, while sibling contexts (concurrent transactions, the
- * caller after `$transaction` resolves) captured their snapshots earlier and
- * never see it. Markers form a chain ({@link PowdbTxContext.parent}) so
- * transactions nested across DIFFERENT pools cannot shadow an outer marker on
- * this gate — the re-entrancy check walks every live ancestor.
+ * Context propagation: `acquire()` only READS the async context (the
+ * chain-walking check in its prologue); it never writes it. The marker is
+ * planted by the pool's `wrapTransactionCallback` (`TurbineClient` invokes
+ * the user callback as `powdbTxStorage.run(hold.ctx, fn)`), so it exists
+ * exclusively inside the transaction CALLBACK's async subtree. Everything
+ * launched from inside the callback (table ops on the `tx` client, a
+ * fire-and-forget `db.$transaction`, nested-write implicit transactions)
+ * inherits it; the CALLER's context stays unmarked. This is load-bearing: the
+ * pre-0.31 implementation used `enterWith()` in acquire's prologue, which
+ * mutates the caller's shared context. On a cold client the FIRST same-tick
+ * burst of `db.$transaction` calls saw call #1's live marker from every
+ * sibling and falsely threw re-entrant E017 (9/10 rejected in production;
+ * one warm-up transaction masked it because its pruned `done` marker changed
+ * the propagation shape). With `run()` the sibling contexts are unmarked by
+ * construction, so they queue FIFO as intended. Markers form a chain
+ * ({@link PowdbTxContext.parent}) so transactions nested across DIFFERENT
+ * pools cannot shadow an outer marker on this gate; the re-entrancy check
+ * walks every live ancestor.
  *
- * **Residual limitation:** a re-entrant begin issued from an async context
- * created BEFORE the transaction opened (e.g. a job-queue worker loop whose
- * continuations captured their ALS snapshot up front) carries no marker, so it
- * cannot be told apart from a legitimate independent concurrent transaction.
- * It queues FIFO and — because the open transaction is awaiting it — times out
- * after `transactionQueueTimeoutMs` with a typed {@link TimeoutError} rather
- * than throwing E017 instantly. The 30s default is the backstop for exactly
- * this case: do not set `transactionQueueTimeoutMs: 0` (wait forever) in code
- * paths that may start transactions from pre-existing async contexts.
+ * **Residual limitation:** a transaction begun OUTSIDE a `$transaction`
+ * callback plants no marker (a manual raw `begin` span, or a worker loop
+ * whose continuations captured their context before the transaction opened).
+ * A deadlocking re-entrant begin from such a context cannot be told apart
+ * from a legitimate independent concurrent transaction: it queues FIFO and,
+ * because the open transaction is awaiting it, times out after
+ * `transactionQueueTimeoutMs` with a typed {@link TimeoutError} rather than
+ * throwing E017 instantly. The 30s default is the backstop for exactly this
+ * case: do not set `transactionQueueTimeoutMs: 0` (wait forever) in code
+ * paths that may start transactions from unmarked contexts.
  */
 class PowdbTxGate {
   /** Tail of the FIFO queue — resolves once every earlier transaction has finished. */
@@ -710,12 +730,14 @@ class PowdbTxGate {
   constructor(private readonly queueTimeoutMs: number) {}
 
   /**
-   * Take a place in the transaction queue. MUST be invoked in the same
-   * synchronous execution as the caller's `begin` (no `await` before it) so
-   * the re-entrancy marker propagates into the transaction's async scope.
+   * Take a place in the transaction queue. The prologue walks the caller's
+   * marker chain (planted around transaction callbacks by the pool's
+   * `wrapTransactionCallback`) and throws re-entrant E017 when any live
+   * ancestor holds THIS gate. It never marks the caller's context itself;
+   * the returned hold carries the fresh marker (`hold.ctx`) for
+   * `wrapTransactionCallback` to scope around the user callback.
    */
   async acquire(): Promise<PowdbTxHold> {
-    // --- synchronous section (runs before the caller's first await) ---
     // Walk the WHOLE marker chain, not just the innermost marker: with two
     // pools, dbA-tx → dbB-tx → dbA-begin leaves dbB's marker innermost, but
     // the dbA ancestor is still open — queueing the inner dbA begin behind it
@@ -731,7 +753,6 @@ class PowdbTxGate {
       }
     }
     const ctx: PowdbTxContext = { gate: this, done: false, parent };
-    powdbTxStorage.enterWith(ctx);
 
     let handOff!: () => void;
     const finished = new Promise<void>((resolve) => {
@@ -741,6 +762,7 @@ class PowdbTxGate {
     this.tail = ahead.then(() => finished);
 
     const hold: PowdbTxHold = {
+      ctx,
       finish: () => {
         if (ctx.done) return;
         ctx.done = true;
@@ -829,6 +851,14 @@ export class PowdbPool implements PgCompatPool {
   private readonly txGate: PowdbTxGate;
   /** Hold taken by a `begin` issued via `query()` directly (no checked-out client). */
   private poolHold: PowdbTxHold | null = null;
+  /**
+   * Clients currently checked out via {@link connect}. The driver pool's
+   * `close()` only closes IDLE clients (checked-out ones are documented as the
+   * caller's responsibility), so {@link end} destroys these explicitly;
+   * otherwise a `disconnect()` racing an unreleased connection would leave a
+   * live socket holding the process open until the server's idle timeout.
+   */
+  private readonly checkedOut = new Set<PowdbClient>();
 
   constructor(
     readonly pool: PowdbClientPool,
@@ -843,9 +873,9 @@ export class PowdbPool implements PgCompatPool {
     const { text: powql, params } = normalizeQueryArgs(text, values);
     const ctl = txControl(powql);
     if (ctl === 'begin') {
-      // Gate BEFORE touching the engine: a re-entrant begin throws fast, an
-      // independent concurrent one waits its FIFO turn. (acquire()'s
-      // re-entrancy check + context mark run synchronously right here.)
+      // Gate BEFORE touching the engine: a begin from inside an active
+      // transaction callback throws re-entrant E017 fast; an independent
+      // concurrent one waits its FIFO turn.
       this.poolHold = await this.txGate.acquire();
     }
     if ((ctl === 'commit' || ctl === 'rollback') && this.poolHold === null) {
@@ -874,6 +904,7 @@ export class PowdbPool implements PgCompatPool {
 
   async connect(): Promise<PgCompatPoolClient> {
     const client = await this.pool.acquire();
+    this.checkedOut.add(client);
     let broken = false;
     /** The gate hold of the transaction begun through THIS connection (if any). */
     let hold: PowdbTxHold | null = null;
@@ -895,9 +926,10 @@ export class PowdbPool implements PgCompatPool {
         const { text: powql, params } = normalizeQueryArgs(text, values);
         const ctl = txControl(powql);
         if (ctl === 'begin') {
-          // Gate BEFORE hitting the engine — a re-entrant begin throws fast
-          // instead of blocking on the global write lock the open tx holds;
-          // an independent concurrent begin queues FIFO.
+          // Gate BEFORE hitting the engine: a begin from inside an active
+          // transaction callback throws re-entrant E017 fast instead of
+          // blocking on the global write lock the open tx holds; an
+          // independent concurrent begin queues FIFO.
           hold = await this.txGate.acquire();
         }
         if ((ctl === 'commit' || ctl === 'rollback') && hold === null) {
@@ -923,6 +955,16 @@ export class PowdbPool implements PgCompatPool {
           }
         }
       },
+      // Single-writer re-entrancy scoping: TurbineClient runs the user's
+      // transaction callback through this, so the gate's marker lives ONLY
+      // in the callback's async subtree (everything inside it, tx table ops
+      // and fire-and-forget db.$transaction alike, inherits it; the caller's
+      // context stays unmarked). `hold.ctx` is the same object `finish()` flips, so
+      // done-pruning keeps working for contexts that outlive the callback.
+      wrapTransactionCallback: <R>(fn: () => Promise<R>): Promise<R> => {
+        const ctx = hold?.ctx;
+        return ctx ? powdbTxStorage.run(ctx, fn) : fn();
+      },
       release: () => {
         // Releasing this connection ends its transaction scope. Finish the
         // hold as a safety net so a tx torn down without an explicit
@@ -932,6 +974,7 @@ export class PowdbPool implements PgCompatPool {
         // connection never touches another transaction's slot.
         hold?.finish();
         hold = null;
+        this.checkedOut.delete(client);
         return broken ? this.pool.destroy(client) : this.pool.release(client);
       },
     };
@@ -940,7 +983,16 @@ export class PowdbPool implements PgCompatPool {
   async end(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    // close() rejects pending waiters and closes every IDLE client…
     await this.pool.close();
+    // …but NOT checked-out ones (documented in @zvndev/powdb-client: "callers
+    // that still hold one when close() is called are responsible for closing
+    // it themselves"). Destroy any stragglers so end() never leaves a live
+    // socket keeping the process alive until the server's idle timeout.
+    for (const client of this.checkedOut) {
+      this.pool.destroy(client);
+    }
+    this.checkedOut.clear();
   }
 }
 
@@ -1105,11 +1157,16 @@ export class PowdbEmbeddedPool implements PgCompatPool {
     params: unknown[],
     holdRef: { hold: PowdbTxHold | null },
   ): Promise<PgCompatQueryResult> {
+    if (this.closed) {
+      throw new ConnectionError(
+        '[turbine] The PowDB embedded pool is closed: disconnect() was already called on this client.',
+      );
+    }
     const ctl = txControl(powql);
     if (ctl === 'begin') {
-      // Gate BEFORE hitting the engine — re-entrant begins throw fast,
-      // independent concurrent ones wait their FIFO turn. (acquire()'s
-      // re-entrancy check + context mark run synchronously right here.)
+      // Gate BEFORE hitting the engine: a begin from inside an active
+      // transaction callback throws re-entrant E017 fast; independent
+      // concurrent ones wait their FIFO turn.
       holdRef.hold = await this.txGate.acquire();
     }
     if ((ctl === 'commit' || ctl === 'rollback') && holdRef.hold === null) {
@@ -1155,6 +1212,12 @@ export class PowdbEmbeddedPool implements PgCompatPool {
         const { text: powql, params } = normalizeQueryArgs(text, values);
         return this.run(powql, params, holdRef);
       },
+      // Scope the gate's re-entrancy marker to the user callback's async
+      // subtree (see PowdbPool.connect(), identical contract).
+      wrapTransactionCallback: <R>(fn: () => Promise<R>): Promise<R> => {
+        const ctx = holdRef.hold?.ctx;
+        return ctx ? powdbTxStorage.run(ctx, fn) : fn();
+      },
       release: () => {
         // End-of-scope safety net (see PowdbPool.connect()): a tx torn down
         // without an explicit commit/rollback must not wedge the queue.
@@ -1167,8 +1230,11 @@ export class PowdbEmbeddedPool implements PgCompatPool {
   async end(): Promise<void> {
     if (this.closed) return;
     // The addon exposes no explicit close — drop the reference and let GC /
-    // the engine's checkpoint flush. Caveat: durability is checkpoint-bound, so
-    // hold the process open long enough for the final WAL flush in short scripts.
+    // the engine's checkpoint flush. Marking the pool closed makes later
+    // queries fail with a typed ConnectionError instead of silently running
+    // against a handle the caller believes is gone. Caveat: durability is
+    // checkpoint-bound, so hold the process open long enough for the final
+    // WAL flush in short scripts.
     this.closed = true;
   }
 }
@@ -1197,6 +1263,13 @@ export interface TurbinePowdbOptions extends Pick<TurbineConfig, 'logging' | 'de
    * E017 — queueing that shape would deadlock.
    */
   transactionQueueTimeoutMs?: number;
+  /**
+   * Driver-module injection for the networked target forms (URL / host+port):
+   * bypasses the dynamic `import('@zvndev/powdb-client')` and uses this object
+   * as the driver module instead. Intended for tests (a fake pool that counts
+   * connections) and advanced embedding; everyday callers never set it.
+   */
+  powdbClientModule?: PowdbModule;
 }
 
 /**
@@ -1336,7 +1409,7 @@ export async function turbinePowDB(
   const poolOptions: PowdbPoolOptions = { transactionQueueTimeoutMs: options.transactionQueueTimeoutMs };
 
   if (typeof target === 'string') {
-    const mod = await loadPowdb();
+    const mod = options.powdbClientModule ?? (await loadPowdb());
     const clientPool = new mod.Pool({ ...parsePowdbUrl(target), max: options.connectionLimit ?? 10 });
     await assertNetworkedVersion(clientPool);
     pool = new PowdbPool(clientPool, undefined, poolOptions);
@@ -1350,7 +1423,7 @@ export async function turbinePowDB(
   } else if (isPowdbClientPool(target)) {
     pool = new PowdbPool(target, undefined, poolOptions);
   } else {
-    const mod = await loadPowdb();
+    const mod = options.powdbClientModule ?? (await loadPowdb());
     const clientPool = new mod.Pool({ ...(target as PowdbConnOptions), max: options.connectionLimit ?? 10 });
     await assertNetworkedVersion(clientPool);
     pool = new PowdbPool(clientPool, undefined, poolOptions);
@@ -1381,7 +1454,22 @@ export async function turbinePowDB(
     schema,
   );
 
-  if (!owns) {
+  if (owns) {
+    // Turbine built this pool / embedded handle, so disconnect()/end() must
+    // close it. client.ts sees TurbineConfig.pool as EXTERNAL (ownsPool =
+    // false) and skips pool.end(); before this patch an owned networked
+    // client leaked its live socket(s) on disconnect(), holding the process
+    // open until powdb-server's idle timeout (~300s) closed them. Consistent
+    // with turbineMssql's owned-pool patch.
+    const baseDisconnect = client.disconnect.bind(client);
+    const close = async (): Promise<void> => {
+      await baseDisconnect();
+      await pool.end();
+    };
+    const patch = client as unknown as { disconnect: () => Promise<void>; end: () => Promise<void> };
+    patch.disconnect = close;
+    patch.end = close;
+  } else {
     // Injected pool — the caller owns its lifecycle.
     (client as { disconnect: () => Promise<void> }).disconnect = async () => {};
   }
