@@ -2,9 +2,9 @@
 
 ## 0.31.0 (2026-07-13)
 
-**Capa production-adoption round** — the second Capa CMS dogfood report
-(`CAPA_ASKS_TURBINE_2026-07`): the three bugs gating their v3 adoption
-decision plus two of the three remaining raw-SQL escape hatches.
+**Production-adoption round** — a second round of dogfooding feedback from a
+real multi-tenant CMS workload: three production-blocking bugs plus two of the
+three remaining raw-SQL escape hatches.
 
 ### Fixed
 - **Owned-pool `disconnect()` leaked every driver connection** on the
@@ -13,23 +13,23 @@ decision plus two of the three remaining raw-SQL escape hatches.
   script hung until the server's 300s idle timeout. Owned pools now close on
   `disconnect()`, and `PowdbPool.end()` additionally destroys still-checked-out
   clients (the driver's `close()` only reaps idle ones). Queries after
-  `disconnect()` throw a typed `ConnectionError` on both transports. (Capa #1)
+  `disconnect()` throw a typed `ConnectionError` on both transports.
 - **Nested-relation `orderBy` rejected camelCase columns** —
   `with: { fields: { orderBy: { sortOrder: 'asc' } } }` threw E003 because the
   relation-subquery path skipped the target table's columnMap. Nested orderBy
   now accepts exactly what top-level orderBy accepts, unified across the join
   strategy, batched loader, m2m, and the MSSQL override; belongsTo/hasOne
-  subqueries with an `orderBy` now order before their `LIMIT 1`. (Capa #2)
+  subqueries with an `orderBy` now order before their `LIMIT 1`.
 - **Cold-client false E017 on a same-tick transaction burst** — the
   re-entrancy marker was planted with `AsyncLocalStorage.enterWith()` in the
   caller's context, so sibling `$transaction` calls launched in one tick could
-  see each other's markers (runtime-dependent; Capa measured 9/10 rejected).
+  see each other's markers (runtime-dependent; measured 9/10 rejected in the reporting workload).
   The marker now lives only inside the transaction callback's async subtree
   via a new optional `wrapTransactionCallback` driver seam — the failure is
   impossible by construction. Implicit nested-write transactions plant the
   same marker. One contract change: a second raw manual `begin` from the same
   context now queues FIFO (bounded by `transactionQueueTimeoutMs`) instead of
-  throwing E017. (Capa #3)
+  throwing E017.
 - **Connection release now honors the destroy contract** (adversarial-review
   finding): `release(err)` with a truthy error destroys the connection instead
   of re-idling it, and any release with an un-ended `begin` fires a bounded
@@ -41,22 +41,22 @@ decision plus two of the three remaining raw-SQL escape hatches.
 - **Column-to-column `where` comparison** — `{ equals: { col: 'otherField' } }`
   (also `not`/`gt`/`gte`/`lt`/`lte`) compiles to `"a" = "b"` with no bound
   param; cache-fingerprint-safe, works in relation filters and `with.where`.
-  On json/jsonb columns an `equals` object stays a JSON value. (Capa #4c)
+  On json/jsonb columns an `equals` object stays a JSON value.
 - **JSON-path `orderBy`** on same-table json/jsonb columns —
   `orderBy: { data: { path: ['weight'], direction: 'asc', type: 'numeric' } }`,
   top-level and in nested `with` orderBy. Cross-relation JSON ordering and
-  grouped JSON aggregates (Capa #4a-lateral/#4b) are deferred to a designed
-  0.32. (Capa #4a)
+  grouped JSON aggregates are deferred to a designed
+  0.32.
 
 ### Docs
 - `docs/internal/NEXT-INTEGRATIONS.md` no longer claims PowDB was "declined" —
-  the driver shipped in 0.22 and is load-bearing. (Capa #5; the other #5 ask,
-  per-call/per-table `warnOnUnlimited`, already shipped in 0.30.0.)
+  the driver shipped in 0.22 and is load-bearing. (Per-call/per-table
+  `warnOnUnlimited`, also requested, already shipped in 0.30.0.)
 
 ## 0.30.0 (2026-07-13)
 
-**The Capa dogfood release** — every fix traces to a real consumer porting
-production Prisma workloads (JSONB-heavy versioned CMS content) to Turbine,
+**The dogfood release** — every fix traces to a real workload porting
+production Prisma usage (JSONB-heavy versioned CMS content) to Turbine,
 plus alignment with PowDB 0.10. Built and adversarially reviewed by a
 multi-agent pipeline; 15 review findings (including one critical) fixed
 before ship.
@@ -67,14 +67,14 @@ before ship.
   `with.where` — compiled to a broken jsonb equality and matched nothing, with
   no error. Both paths now route through the real JSON/array clause builders,
   with the SQL-cache fingerprint and cache-hit param-collect mirrors kept in
-  lockstep. (Capa T-1)
+  lockstep.
 - **Postgres enum columns failed `createMany` with "column is of type X but
   expression is of type text".** The bulk `UNNEST($n::text[])` form defeated
   Postgres's enum inference. Enum columns (recognized via introspected
   metadata) now get an explicit `::"EnumName"` cast on every write bind —
   create, createMany (`::"EnumName"[]`), update, updateMany, upsert. Gated to
   the Postgres dialect; cross-schema type-name collisions are excluded via the
-  newly recorded type schema. (Capa T-3)
+  newly recorded type schema.
 - **FK/relation name collisions produced unsound generated types and
   unreachable relations.** A camelCase FK like `currentVersionId` derived a
   belongsTo that shadowed the scalar column (TS2430 under `--strict`,
@@ -84,13 +84,13 @@ before ship.
   its relations. `turbine mcp`, the SQLite/MySQL/MSSQL introspectors, and the
   new `schemaDefToMetadata` all share one naming implementation, and the
   generate-typecheck CI gate now compiles the colliding fixture under strict
-  tsc. (Capa T-4)
+  tsc.
 - **`turbine-orm/powdb` was unusable from CommonJS with ESM-only
   `@zvndev/powdb-client` ≥ 0.9** (`ERR_PACKAGE_PATH_NOT_EXPORTED`): the CJS
   build lowered the lazy `import()` to `require()`. Optional-peer loads
   (powdb, mysql2, mssql) now route through a `.cts` helper whose
   NodeNext-built copy keeps a real `import()`. Peer ranges widened to
-  `>=0.7.1 <1.0.0`. (Capa T-5)
+  `>=0.7.1 <1.0.0`.
 - **A failed BEGIN no longer emits a best-effort ROLLBACK** (all engines).
   Previously a `$transaction` whose BEGIN threw (e.g. PowDB queue timeout)
   still sent ROLLBACK, which on single-handle engines (embedded PowDB) landed
@@ -102,21 +102,21 @@ before ship.
 - **JsonFilter range operators** `gt`/`gte`/`lt`/`lte` (with `path`): numeric
   values compare via a `::numeric` cast, strings as extracted text.
   `db.products.findMany({ where: { data: { path: ['rating'], gte: 4 } } })`.
-  (Capa T-2)
+ 
 - **`schemaDefToMetadata(def)`** — pure `SchemaDef` → `SchemaMetadata`
   converter, so code-first schemas drive non-SQL engines without a live
-  database: `turbinePowDB(pool, schemaDefToMetadata(mySchema))`. (Capa T-6)
+  database: `turbinePowDB(pool, schemaDefToMetadata(mySchema))`.
 - **PowDB concurrent transactions queue FIFO** instead of throwing E017 under
   the single-writer lock. Re-entrant and nested transactions still throw E017
   immediately (queueing them would deadlock; detection via a chained
   AsyncLocalStorage marker that survives cross-pool nesting). New
   `transactionQueueTimeoutMs` option (default 30000; `0`/`Infinity` waits
-  forever) → `TimeoutError` E002 on elapse. (Capa T-7)
+  forever) → `TimeoutError` E002 on elapse.
 - **`turbine generate --no-timestamp`** — omits the `Generated at:` header so
-  regenerated output is byte-identical. (Capa T-8)
+  regenerated output is byte-identical.
 - **`warnOnUnlimited` per call and per table** — `findMany({ warnOnUnlimited:
   false })`, or `warnOnUnlimited: { userProfiles: false }` in config (accessor
-  or snake_case keys). (Capa T-8)
+  or snake_case keys).
 - **PowDB 0.10 alignment:** reserved PowQL words (incl. the new `schema` /
   `describe` keywords) are backtick-quoted automatically in bare-identifier
   positions of generated PowQL; the server's new "transaction gate timeout"
