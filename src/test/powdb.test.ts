@@ -26,11 +26,13 @@ import {
   PowdbEmbeddedPool,
   PowdbFloatParam,
   PowdbPool,
+  type PowdbPoolOptions,
   parsePowdbUrl,
   powdbDialect,
   powqlColumnType,
   powqlSchemaDDL,
   rowToEntity,
+  turbinePowDB,
   wrapPowdbError,
 } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
@@ -624,7 +626,10 @@ describe('powdb: materializePowql ($N substitution)', () => {
 // ---------------------------------------------------------------------------
 
 /** A fake @zvndev/powdb-embedded Database that records the materialized query string. */
-function fakeEmbeddedDb(result: Record<string, unknown> = { kind: 'ok', affected: 1n }) {
+function fakeEmbeddedDb(
+  result: Record<string, unknown> = { kind: 'ok', affected: 1n },
+  options: PowdbPoolOptions = {},
+) {
   const seen: string[] = [];
   const db = {
     query(powql: string) {
@@ -636,7 +641,7 @@ function fakeEmbeddedDb(result: Record<string, unknown> = { kind: 'ok', affected
     isPoisoned: () => false,
   };
   // PowdbEmbeddedPool's constructor takes the EmbeddedDatabase interface.
-  return { pool: new PowdbEmbeddedPool(db as never), seen };
+  return { pool: new PowdbEmbeddedPool(db as never, options), seen };
 }
 
 describe('powdb: PowdbEmbeddedPool param materialization', () => {
@@ -871,5 +876,181 @@ describe('powdb: assertSupportedPowdbVersion', () => {
     assert.doesNotThrow(() => assertSupportedPowdbVersion(undefined));
     assert.doesNotThrow(() => assertSupportedPowdbVersion(''));
     assert.doesNotThrow(() => assertSupportedPowdbVersion('dev'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T-7 — concurrent transactions queue FIFO on the single-writer gate instead
+// of failing fast with E017. Re-entrant transactions (which queueing would
+// deadlock) still throw. Queue waits are bounded by transactionQueueTimeoutMs.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run one begin…marker…commit transaction through a checked-out client. The
+ * `await pool.connect()` before `begin` matters: it puts the transaction in
+ * its own async continuation — like any real concurrent caller — so begin's
+ * re-entrancy marker stays confined to this transaction's context instead of
+ * leaking into the test's.
+ */
+async function runClientTx(pool: PowdbEmbeddedPool, marker: string): Promise<string> {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    await client.query(`note ${marker}`);
+    await client.query('commit');
+    return marker;
+  } finally {
+    client.release();
+  }
+}
+
+describe('powdb: concurrent transactions queue FIFO (single-writer gate)', () => {
+  it('10 concurrent transactions all succeed, serialized in submission order', async () => {
+    const { pool, seen } = fakeEmbeddedDb();
+    const results = await Promise.all(Array.from({ length: 10 }, (_, i) => runClientTx(pool, `t${i}`)));
+    assert.deepEqual(
+      results,
+      Array.from({ length: 10 }, (_, i) => `t${i}`),
+    );
+    // Strict serialization: every begin…commit span is contiguous, in FIFO order.
+    const expected = Array.from({ length: 10 }, (_, i) => ['begin', `note t${i}`, 'commit']).flat();
+    assert.deepEqual(seen, expected);
+  });
+
+  it('a second db.$transaction queues (no begin on the wire) until the first commits', async () => {
+    const fake = fakeNetworkedClientPool();
+    const db = new TurbineClient({ pool: new PowdbPool(fake.pool), dialect: powdbDialect }, { tables: {}, enums: {} });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const p1 = db.$transaction(async () => {
+      await firstGate;
+      return 1;
+    });
+    const p2 = db.$transaction(async () => 2);
+    await drainMicrotasks();
+    assert.deepEqual(fake.sent, ['begin'], 'the second begin waits in the queue, never racing the open tx');
+    releaseFirst();
+    assert.deepEqual(await Promise.all([p1, p2]), [1, 2]);
+    assert.deepEqual(fake.sent, ['begin', 'commit', 'begin', 'commit']);
+  });
+
+  it('a failed transaction rolls back and hands the gate to the next in line', async () => {
+    const { pool, seen } = fakeEmbeddedDb();
+    const db = new TurbineClient({ pool, dialect: powdbDialect }, { tables: {}, enums: {} });
+    const p1 = db.$transaction(async () => {
+      throw new Error('boom');
+    });
+    const p2 = db.$transaction(async () => 'second');
+    await assert.rejects(p1, /boom/);
+    assert.equal(await p2, 'second');
+    assert.deepEqual(seen, ['begin', 'rollback', 'begin', 'commit']);
+  });
+});
+
+describe('powdb: re-entrant transactions still throw E017 (queueing would deadlock)', () => {
+  it('db.$transaction inside an active db.$transaction callback throws, then the queue recovers', async () => {
+    const { pool } = fakeEmbeddedDb();
+    const db = new TurbineClient({ pool, dialect: powdbDialect }, { tables: {}, enums: {} });
+    await assert.rejects(
+      db.$transaction(async () => {
+        // The outer callback awaits an inner db.$transaction — the inner would
+        // queue behind the outer's lock while the outer waits on the inner:
+        // a deadlock. The gate detects the shared async context and throws.
+        await db.$transaction(async () => 'inner');
+      }),
+      UnsupportedFeatureError,
+    );
+    // The gate is not wedged: a fresh transaction runs fine afterwards.
+    assert.equal(await db.$transaction(async () => 'after'), 'after');
+  });
+
+  it('the same re-entrant shape throws on the networked pool too', async () => {
+    const fake = fakeNetworkedClientPool();
+    const db = new TurbineClient({ pool: new PowdbPool(fake.pool), dialect: powdbDialect }, { tables: {}, enums: {} });
+    await assert.rejects(
+      db.$transaction(async () => {
+        await db.$transaction(async () => 'inner');
+      }),
+      UnsupportedFeatureError,
+    );
+    assert.equal(await db.$transaction(async () => 'after'), 'after');
+  });
+
+  it('nested tx.$transaction throws E017 via the savepoint override', async () => {
+    const { pool } = fakeEmbeddedDb();
+    const db = new TurbineClient({ pool, dialect: powdbDialect }, { tables: {}, enums: {} });
+    await assert.rejects(
+      db.$transaction(async (tx) => {
+        await tx.$transaction(async () => {});
+      }),
+      UnsupportedFeatureError,
+    );
+  });
+});
+
+describe('powdb: transaction queue timeout', () => {
+  it('a queued transaction fails with TimeoutError after transactionQueueTimeoutMs', async () => {
+    const { pool } = fakeEmbeddedDb(undefined, { transactionQueueTimeoutMs: 25 });
+    const holder = await pool.connect();
+    await (async () => {
+      await Promise.resolve(); // own async context — see runClientTx
+      await holder.query('begin');
+    })();
+    await assert.rejects(
+      (async () => {
+        await Promise.resolve();
+        await pool.query('begin');
+      })(),
+      TimeoutError,
+    );
+    // The timed-out waiter gave up its queue slot: once the holder finishes,
+    // the next transaction proceeds instead of stalling behind a dead slot.
+    await holder.query('rollback');
+    holder.release();
+    assert.equal(await runClientTx(pool, 'after-timeout'), 'after-timeout');
+  });
+
+  it('transactionQueueTimeoutMs: 0 waits without limit', async () => {
+    const { pool } = fakeEmbeddedDb(undefined, { transactionQueueTimeoutMs: 0 });
+    const holder = await pool.connect();
+    await (async () => {
+      await Promise.resolve();
+      await holder.query('begin');
+    })();
+    let began = false;
+    const queued = (async () => {
+      await Promise.resolve();
+      await pool.query('begin');
+      began = true;
+      await pool.query('commit');
+    })();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(began, false, 'still queued after 60ms — no default timeout applied');
+    await holder.query('commit');
+    holder.release();
+    await queued;
+    assert.equal(began, true);
+  });
+
+  it('turbinePowDB plumbs transactionQueueTimeoutMs through to the pool', async () => {
+    const fake = fakeNetworkedClientPool();
+    const db = await turbinePowDB(fake.pool as never, { tables: {}, enums: {} }, { transactionQueueTimeoutMs: 20 });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const p1 = db.$transaction(async () => {
+      await firstGate;
+      return 1;
+    });
+    await drainMicrotasks();
+    await assert.rejects(
+      db.$transaction(async () => 2),
+      TimeoutError,
+    );
+    releaseFirst();
+    assert.equal(await p1, 1);
   });
 });

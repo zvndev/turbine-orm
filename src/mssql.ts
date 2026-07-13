@@ -110,6 +110,7 @@ import {
   type UpsertStatementInput,
 } from './dialect.js';
 import { ConnectionError, RelationError, UnsupportedFeatureError, ValidationError } from './errors.js';
+import importOptionalPeer from './optional-peer-import.cjs';
 import {
   type ColumnMetadata,
   camelToSnake,
@@ -1415,11 +1416,12 @@ async function loadMssql(): Promise<MssqlModule> {
   let mod: { default?: MssqlModule } & Partial<MssqlModule>;
   try {
     // `mssql` ships no bundled type declarations (it needs @types/mssql, which
-    // Turbine deliberately does not depend on) — the structural MssqlModule above
-    // is our typed surface. Import through a widened specifier so tsc treats the
-    // typeless module as `any` instead of erroring (TS7016).
-    const specifier: string = 'mssql';
-    mod = (await import(specifier)) as typeof mod;
+    // Turbine deliberately does not depend on) — the structural MssqlModule
+    // above is our typed surface; the helper returns `unknown` so no TS7016.
+    // Via the .cts helper so the CJS build keeps a path to a REAL dynamic
+    // import() even if a future mssql major goes ESM-only (the CommonJS pass
+    // transpiles a plain `import()` here into `require()`).
+    mod = (await importOptionalPeer('mssql')) as typeof mod;
   } catch (err) {
     throw new ConnectionError(
       "[turbine] turbine-orm/mssql requires the optional peer dependency 'mssql'. Install it: npm i mssql. " +

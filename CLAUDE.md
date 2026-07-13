@@ -180,9 +180,12 @@ src/
                       `required` only — PowDB has no composite-unique, so per-column `unique` is emitted
                       ONLY for a single-column PK. **Single global write lock — single-writer transactions:**
                       a nested `tx.$transaction` throws E017 (`powdbDialect` savepoint keywords throw), and a
-                      re-entrant/concurrent `db.$transaction` throws E017 via a pool-level
-                      `activeTransaction` guard (this prevents the networked second-`begin` HANG on the
-                      held lock). The empty-where guard gates on the COMPILED PowQL filter (like the SQL
+                      RE-ENTRANT `db.$transaction` (opened inside an active tx callback's async context,
+                      detected via AsyncLocalStorage — queueing it would deadlock) throws E017; INDEPENDENT
+                      concurrent `db.$transaction` calls queue FIFO on the pool-level `PowdbTxGate` and run
+                      one at a time (this prevents the networked second-`begin` HANG on the held lock),
+                      bounded by `transactionQueueTimeoutMs` (default 30s → TimeoutError; 0/Infinity waits
+                      forever). The empty-where guard gates on the COMPILED PowQL filter (like the SQL
                       path), so `{OR:[]}`/`{AND:[]}`/`{NOT:{}}` are refused. `wrapPowdbError` maps BOTH
                       transports: the embedded napi addon tags every error `code:'GenericFailure'`, so
                       it maps by message shape (required/no-value→E010, type-mismatch/Parse/Execution/
@@ -390,7 +393,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 ## Don't
 
-- Don't add runtime dependencies beyond `pg`. Root `dependencies` stays exactly `{ pg, @types/pg }` — `@types/pg` is required because published `.d.ts` files import `pg` types; moving it to `devDependencies` alone breaks consumer strict `tsc` (0.28.1 regression). Marketing "one dependency" means one **runtime** dep (`pg`); types packages that surface in public declarations stay in `dependencies`. The only sanctioned engine exception: `mysql2`, `mssql`, `@zvndev/powdb-client`, and `@zvndev/powdb-embedded` are **devDependencies + optional `peerDependencies`** (`peerDependenciesMeta.*.optional = true`), loaded lazily via dynamic `import()` from the `mysql`/`mssql`/`powdb` subpaths and never required for Postgres users; SQLite needs nothing at all (it uses the `node:sqlite` builtin).
+- Don't add runtime dependencies beyond `pg`. Root `dependencies` stays exactly `{ pg, @types/pg }` — `@types/pg` is required because published `.d.ts` files import `pg` types; moving it to `devDependencies` alone breaks consumer strict `tsc` (0.28.1 regression). Marketing "one dependency" means one **runtime** dep (`pg`); types packages that surface in public declarations stay in `dependencies`. The only sanctioned engine exception: `mysql2`, `mssql`, `@zvndev/powdb-client`, and `@zvndev/powdb-embedded` are **devDependencies + optional `peerDependencies`** (`peerDependenciesMeta.*.optional = true`), loaded lazily via dynamic `import()` from the `mysql`/`mssql`/`powdb` subpaths and never required for Postgres users; SQLite needs nothing at all (it uses the `node:sqlite` builtin). Those peer loads route through `src/optional-peer-import.cts` — the CJS build (`module: CommonJS`) lowers a plain `import()` to `require()`, which cannot load ESM-only peers (e.g. `@zvndev/powdb-client` ≥ 0.9, `ERR_PACKAGE_PATH_NOT_EXPORTED`); the `.cts` helper's NodeNext-built copy at `dist/optional-peer-import.cjs` keeps a REAL `import()` that the lowered copy falls back to. Don't replace it with a bare `import()` in the engine modules.
 - Don't use `eval`, `new Function`, or shell interpolation
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings — always use `$N` parameterization
