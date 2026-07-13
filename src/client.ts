@@ -1163,13 +1163,29 @@ export class TurbineClient {
    */
   async transaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
+    /**
+     * Only true once BEGIN has actually succeeded. If BEGIN itself throws
+     * (e.g. a single-writer engine's transaction gate times out or rejects a
+     * re-entrant begin), issuing a "best-effort" ROLLBACK would be a stray
+     * statement from a context that never opened a transaction — on a driver
+     * with one shared engine handle (PowDB embedded) it would roll back a
+     * DIFFERENT caller's open transaction.
+     */
+    let began = false;
     try {
       await client.query(this.dialect.beginStatement());
+      began = true;
       const result = await fn(client);
       await client.query(this.dialect.commitStatement());
       return result;
     } catch (err) {
-      await client.query(this.dialect.rollbackStatement());
+      if (began) {
+        try {
+          await client.query(this.dialect.rollbackStatement());
+        } catch {
+          // Best-effort rollback — the connection may have died mid-query.
+        }
+      }
       throw err;
     } finally {
       client.release();
@@ -1254,12 +1270,22 @@ export class TurbineClient {
     };
 
     let timedOut = false;
+    /**
+     * Only true once BEGIN has actually succeeded. If BEGIN itself throws —
+     * e.g. a single-writer engine's transaction gate times out in its FIFO
+     * queue or rejects a re-entrant begin (PowDB, E002/E017) — this context
+     * never opened a transaction, so the catch below must NOT issue its
+     * best-effort ROLLBACK: on a driver with one shared engine handle that
+     * stray ROLLBACK would tear down a DIFFERENT caller's open transaction.
+     */
+    let began = false;
 
     try {
       // BEGIN with optional isolation level — the dialect owns the keyword and
       // BEGIN+isolation composition (Postgres appends ` ISOLATION LEVEL …`).
       const isolationSql = options?.isolationLevel ? ISOLATION_LEVELS[options.isolationLevel] : undefined;
       await client.query(this.dialect.beginStatement(isolationSql));
+      began = true;
 
       // Apply transaction-local session context (RLS / multi-tenant GUCs).
       // Order matters: BEGIN -> isolation level (above) -> set_config loop ->
@@ -1343,8 +1369,11 @@ export class TurbineClient {
       // If the timeout fired we already destroyed the connection — issuing a
       // ROLLBACK on a released client would throw "Client has already been
       // released". Skip the rollback in that case (the backend rolled back
-      // when its socket was closed).
-      if (!timedOut && !released) {
+      // when its socket was closed). Likewise skip it when BEGIN never
+      // succeeded (`began` false) — there is no transaction to roll back and
+      // the stray statement could hit another caller's transaction on a
+      // shared-handle engine.
+      if (began && !timedOut && !released) {
         try {
           await client.query(this.dialect.rollbackStatement());
         } catch {

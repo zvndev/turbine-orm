@@ -723,6 +723,68 @@ describe('powdb: transaction model (single-writer)', () => {
     await pool.query('ROLLBACK');
     await assert.doesNotReject(() => pool.query('begin'));
   });
+
+  it('REVIEW 1: a stray commit/rollback with no gate hold never reaches the embedded engine', async () => {
+    const { pool, seen } = fakeEmbeddedDb();
+    // No begin ever ran in this scope — e.g. a "best-effort" ROLLBACK issued
+    // after a begin that failed its queue timeout. On the ONE shared handle,
+    // forwarding it would end whatever transaction ANOTHER caller has open.
+    const rolled = await pool.query('rollback');
+    assert.deepEqual(rolled.rows, []);
+    await pool.query('commit');
+    assert.deepEqual(seen, [], 'the stray commit/rollback must not hit the engine');
+    // A checked-out client that never began is guarded the same way.
+    const client = await pool.connect();
+    await client.query('rollback');
+    client.release();
+    assert.deepEqual(seen, []);
+    // A REAL transaction still forwards its own control statements.
+    await pool.query('begin');
+    await pool.query('commit');
+    assert.deepEqual(seen, ['begin', 'commit']);
+  });
+
+  it('REVIEW 1 (networked): a stray commit/rollback with no gate hold never reaches the wire', async () => {
+    const fake = fakeNetworkedClientPool();
+    const pool = new PowdbPool(fake.pool);
+    await pool.query('rollback');
+    await pool.query('commit');
+    assert.deepEqual(fake.sent, []);
+    const client = await pool.connect();
+    await client.query('rollback');
+    client.release();
+    assert.deepEqual(fake.sent, []);
+    // A real begin…commit through a checked-out client still hits the wire.
+    const c2 = await pool.connect();
+    await c2.query('begin');
+    await c2.query('commit');
+    c2.release();
+    assert.deepEqual(fake.sent, ['begin', 'commit']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-pool re-entrancy — the ALS marker is a CHAIN, so a transaction on a
+// second pool cannot shadow the outer pool's marker (single-slot storage).
+// ---------------------------------------------------------------------------
+
+describe('powdb: cross-pool re-entrancy (chained ALS marker)', () => {
+  it("REVIEW 2: an inner begin on the OUTER pool throws E017 even with another pool's tx in between", async () => {
+    const a = fakeEmbeddedDb();
+    const b = fakeEmbeddedDb();
+    await a.pool.query('begin'); // pool A's marker enters the context…
+    await b.pool.query('begin'); // …pool B's marker goes innermost, chaining to A's
+    // Re-entrant on pool A THROUGH pool B's context: without the chain walk
+    // this queued behind A's own open tx (deadlock until the queue timeout).
+    await assert.rejects(() => a.pool.query('begin'), UnsupportedFeatureError);
+    await b.pool.query('commit');
+    await a.pool.query('commit');
+    // Both gates recovered — done markers are pruned, fresh begins pass.
+    await assert.doesNotReject(() => a.pool.query('begin'));
+    await a.pool.query('commit');
+    assert.deepEqual(a.seen, ['begin', 'commit', 'begin', 'commit']);
+    assert.deepEqual(b.seen, ['begin', 'commit']);
+  });
 });
 
 // ---------------------------------------------------------------------------

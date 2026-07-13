@@ -125,6 +125,98 @@ describe('TurbineClient.$transaction — isolation levels', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 1b. Failed BEGIN — no stray ROLLBACK (adversarial-review regression)
+// ---------------------------------------------------------------------------
+//
+// If BEGIN itself throws (e.g. a single-writer engine's transaction gate times
+// out or rejects a re-entrant begin), the catch path must NOT issue its
+// best-effort ROLLBACK: this context never opened a transaction, and on a
+// driver with one shared engine handle (PowDB embedded) the stray statement
+// rolled back a DIFFERENT caller's open transaction (live-reproduced silent
+// partial commit).
+
+const createBeginFailPool = (): { pool: PgCompatPool; calls: QueryCall[] } => {
+  const calls: QueryCall[] = [];
+  const client = {
+    async query(text: string, values?: unknown[]) {
+      calls.push({ text, values, via: 'client' as const });
+      if (text.startsWith('BEGIN')) throw new Error('begin refused (gate timeout)');
+      return { rows: [], rowCount: 0, fields: [] };
+    },
+    release(_err?: Error | boolean) {},
+  };
+  const pool: PgCompatPool = {
+    async query(text: string, values?: unknown[]) {
+      calls.push({ text, values, via: 'pool' });
+      return { rows: [], rowCount: 0, fields: [] };
+    },
+    async connect() {
+      return client;
+    },
+    async end() {},
+  };
+  return { pool, calls };
+};
+
+describe('TurbineClient — failed BEGIN issues no stray ROLLBACK', () => {
+  it('$transaction: BEGIN failure propagates and sends NO rollback', async () => {
+    const { pool, calls } = createBeginFailPool();
+    const db = new TurbineClient({ pool }, buildSchema());
+
+    await assert.rejects(
+      db.$transaction(async () => {}),
+      /begin refused/,
+    );
+    assert.ok(
+      !calls.some((c) => c.text.includes('ROLLBACK')),
+      `no ROLLBACK may follow a failed BEGIN, got: ${JSON.stringify(calls.map((c) => c.text))}`,
+    );
+  });
+
+  it('transaction(): BEGIN failure propagates and sends NO rollback', async () => {
+    const { pool, calls } = createBeginFailPool();
+    const db = new TurbineClient({ pool }, buildSchema());
+
+    await assert.rejects(
+      db.transaction(async () => {}),
+      /begin refused/,
+    );
+    assert.ok(
+      !calls.some((c) => c.text.includes('ROLLBACK')),
+      `no ROLLBACK may follow a failed BEGIN, got: ${JSON.stringify(calls.map((c) => c.text))}`,
+    );
+  });
+
+  it('control: a failure AFTER a successful BEGIN still rolls back (both APIs)', async () => {
+    const { pool, calls } = createMockPool();
+    const db = new TurbineClient({ pool }, buildSchema());
+
+    await assert.rejects(
+      db.$transaction(async () => {
+        throw new Error('fn failed');
+      }),
+      /fn failed/,
+    );
+    assert.ok(
+      calls.some((c) => c.text === 'ROLLBACK'),
+      '$transaction must still roll back after a successful BEGIN',
+    );
+
+    calls.length = 0;
+    await assert.rejects(
+      db.transaction(async () => {
+        throw new Error('fn failed');
+      }),
+      /fn failed/,
+    );
+    assert.ok(
+      calls.some((c) => c.text === 'ROLLBACK'),
+      'transaction() must still roll back after a successful BEGIN',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2. Nested transactions — SAVEPOINT / RELEASE / ROLLBACK TO
 // ---------------------------------------------------------------------------
 

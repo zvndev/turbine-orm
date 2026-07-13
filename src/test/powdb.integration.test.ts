@@ -25,7 +25,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe } from 'node:test';
-import { NotNullViolationError, UniqueConstraintError, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import {
+  NotNullViolationError,
+  TimeoutError,
+  UniqueConstraintError,
+  UnsupportedFeatureError,
+  ValidationError,
+} from '../errors.js';
 import { powqlSchemaDDL, turbinePowDB } from '../powdb.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
@@ -371,6 +377,135 @@ describe('powdb integration (embedded)', () => {
       assert.ok(loaded.every((u: { posts: unknown[] }) => Array.isArray(u.posts) && u.posts.length === 1));
       const totalChildren = loaded.reduce((s: number, u: { posts: unknown[] }) => s + u.posts.length, 0);
       assert.equal(totalChildren, N);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Adversarial-review regressions: stray ROLLBACK after a failed BEGIN must
+  // never touch the OTHER transaction on the single shared engine handle, and
+  // cross-pool nesting must not defeat the re-entrancy marker.
+  // -------------------------------------------------------------------------
+
+  it('REVIEW 1: a queued tx timing out (E002) never rolls back the OTHER open transaction', async () => {
+    // Live-reproduced corruption shape: tx2's begin times out in the FIFO
+    // queue, its $transaction catch used to fire a best-effort ROLLBACK that
+    // the embedded pool forwarded to the ONE shared handle — discarding tx1's
+    // first write, autocommitting its second, and failing its COMMIT (E003).
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-it-gate-'));
+    const db: DB = await turbinePowDB({ embedded: dir }, schema, {
+      warnOnUnlimited: false,
+      transactionQueueTimeoutMs: 150,
+    });
+    try {
+      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      const tx1 = db.$transaction(async (tx: DB) => {
+        await tx.table('app_user').create({ data: { email: 'atomic-a@x', name: 'A' } });
+        await sleep(450); // hold the gate well past tx2's 150ms queue timeout
+        await tx.table('app_user').create({ data: { email: 'atomic-b@x', name: 'B' } });
+      });
+      await sleep(50); // let tx1's begin own the gate before tx2 queues behind it
+      const tx2 = db.$transaction(async (tx: DB) => {
+        await tx.table('app_user').create({ data: { email: 'late@x' } });
+      });
+      const [r1, r2] = await Promise.allSettled([tx1, tx2]);
+      assert.equal(
+        r1.status,
+        'fulfilled',
+        `tx1 must commit atomically, got: ${r1.status === 'rejected' ? (r1 as PromiseRejectedResult).reason : ''}`,
+      );
+      assert.equal(r2.status, 'rejected', 'tx2 must fail with the queue timeout');
+      const reason = (r2 as PromiseRejectedResult).reason;
+      assert.ok(reason instanceof TimeoutError, `tx2 error must be TimeoutError, got: ${reason}`);
+      assert.equal(reason.code, 'TURBINE_E002');
+      // BOTH tx1 rows present — the repro had A silently discarded and B autocommitted.
+      assert.ok(await db.table('app_user').findUnique({ where: { email: 'atomic-a@x' } }), 'tx1 first write kept');
+      assert.ok(await db.table('app_user').findUnique({ where: { email: 'atomic-b@x' } }), 'tx1 second write kept');
+      assert.equal(await db.table('app_user').findUnique({ where: { email: 'late@x' } }), null, 'tx2 wrote nothing');
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('REVIEW 1: a fire-and-forget db.$transaction inside a tx callback leaves the outer tx atomic', async () => {
+    await withDb(async (db) => {
+      let innerErr: unknown;
+      await db.$transaction(async (tx: DB) => {
+        await tx.table('app_user').create({ data: { email: 'ff-a@x' } });
+        // Fire-and-forget: NOT awaited before the outer tx's next write. Its
+        // re-entrant begin throws E017; the failed $transaction must not emit
+        // a stray ROLLBACK onto the shared handle (which used to discard
+        // ff-a@x and autocommit ff-b@x).
+        const inner = db
+          .$transaction(async (t2: DB) => {
+            await t2.table('app_user').create({ data: { email: 'ff-inner@x' } });
+          })
+          .catch((e: unknown) => {
+            innerErr = e;
+          });
+        await tx.table('app_user').create({ data: { email: 'ff-b@x' } });
+        await inner; // settle before commit so the assertions are deterministic
+      });
+      assert.ok(innerErr instanceof UnsupportedFeatureError, `inner tx must throw E017, got: ${innerErr}`);
+      assert.ok(await db.table('app_user').findUnique({ where: { email: 'ff-a@x' } }), 'outer first write kept');
+      assert.ok(await db.table('app_user').findUnique({ where: { email: 'ff-b@x' } }), 'outer second write kept');
+      assert.equal(await db.table('app_user').findUnique({ where: { email: 'ff-inner@x' } }), null);
+    });
+  });
+
+  it('REVIEW 2: cross-pool nesting — inner re-entrant begin on the OUTER pool throws E017 instantly', async () => {
+    // dbA tx → dbB tx → dbA tx. dbB's ALS marker used to SHADOW dbA's
+    // (single-slot store), so the inner dbA begin queued behind dbA's own
+    // open transaction and deadlocked until the queue timeout. The chained
+    // marker walk must throw re-entrant E017 immediately instead.
+    const dirA = mkdtempSync(join(tmpdir(), 'powdb-it-xpa-'));
+    const dirB = mkdtempSync(join(tmpdir(), 'powdb-it-xpb-'));
+    const opts = { warnOnUnlimited: false, transactionQueueTimeoutMs: 10_000 };
+    const dbA: DB = await turbinePowDB({ embedded: dirA }, schema, opts);
+    const dbB: DB = await turbinePowDB({ embedded: dirB }, schema, opts);
+    try {
+      for (const stmt of powqlSchemaDDL(schema)) await dbA.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(schema)) await dbB.raw([stmt]);
+      const start = Date.now();
+      await assert.rejects(
+        dbA.$transaction(async (txA: DB) => {
+          await txA.table('app_user').create({ data: { email: 'xp-a@x' } });
+          await dbB.$transaction(async (txB: DB) => {
+            await txB.table('app_user').create({ data: { email: 'xp-b@x' } });
+            await dbA.$transaction(async () => {}); // re-entrant on dbA through dbB's context
+          });
+        }),
+        UnsupportedFeatureError,
+      );
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 2000, `re-entrancy must be detected instantly, took ${elapsed}ms (queue timeout is 10s)`);
+      // Both pools rolled back cleanly.
+      assert.equal(await dbA.table('app_user').findUnique({ where: { email: 'xp-a@x' } }), null);
+      assert.equal(await dbB.table('app_user').findUnique({ where: { email: 'xp-b@x' } }), null);
+      // Both pools still usable afterwards.
+      assert.equal(typeof (await dbA.table('app_user').count({})), 'number');
+      assert.equal(typeof (await dbB.table('app_user').count({})), 'number');
+    } finally {
+      await dbA.disconnect();
+      await dbB.disconnect();
+      rmSync(dirA, { recursive: true, force: true });
+      rmSync(dirB, { recursive: true, force: true });
+    }
+  });
+
+  it('REVIEW 2: plain single-pool re-entrancy still throws E017 instantly (fast path kept)', async () => {
+    // withDb's default queue timeout is 30s — a regression that queues the
+    // re-entrant begin instead of throwing would blow this timing bound.
+    await withDb(async (db) => {
+      const start = Date.now();
+      await assert.rejects(
+        db.$transaction(async () => {
+          await db.$transaction(async () => {});
+        }),
+        UnsupportedFeatureError,
+      );
+      assert.ok(Date.now() - start < 2000, 'single-pool re-entrancy must not wait on the queue timeout');
     });
   });
 

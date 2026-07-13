@@ -519,6 +519,16 @@ interface PowdbTxContext {
   readonly gate: PowdbTxGate;
   /** Flips once the transaction commits / rolls back / is torn down — a later `begin` in the same context is then fine. */
   done: boolean;
+  /**
+   * The marker that was already in scope when this transaction began — i.e.
+   * the enclosing transaction, possibly on a DIFFERENT pool. AsyncLocalStorage
+   * holds ONE value per store, so without this link a cross-pool nesting
+   * (dbA tx → dbB tx → dbA begin) would let dbB's marker shadow dbA's and the
+   * inner dbA begin would queue behind dbA's own open transaction (deadlock)
+   * instead of throwing re-entrant E017. The re-entrancy check walks this
+   * chain to find ANY live ancestor on the same gate.
+   */
+  readonly parent: PowdbTxContext | undefined;
 }
 
 const powdbTxStorage = new AsyncLocalStorage<PowdbTxContext>();
@@ -551,7 +561,19 @@ interface PowdbTxHold {
  * awaits that begin, its continuation — and therefore the user callback — runs
  * with the marker set, while sibling contexts (concurrent transactions, the
  * caller after `$transaction` resolves) captured their snapshots earlier and
- * never see it.
+ * never see it. Markers form a chain ({@link PowdbTxContext.parent}) so
+ * transactions nested across DIFFERENT pools cannot shadow an outer marker on
+ * this gate — the re-entrancy check walks every live ancestor.
+ *
+ * **Residual limitation:** a re-entrant begin issued from an async context
+ * created BEFORE the transaction opened (e.g. a job-queue worker loop whose
+ * continuations captured their ALS snapshot up front) carries no marker, so it
+ * cannot be told apart from a legitimate independent concurrent transaction.
+ * It queues FIFO and — because the open transaction is awaiting it — times out
+ * after `transactionQueueTimeoutMs` with a typed {@link TimeoutError} rather
+ * than throwing E017 instantly. The 30s default is the backstop for exactly
+ * this case: do not set `transactionQueueTimeoutMs: 0` (wait forever) in code
+ * paths that may start transactions from pre-existing async contexts.
  */
 class PowdbTxGate {
   /** Tail of the FIFO queue — resolves once every earlier transaction has finished. */
@@ -566,11 +588,21 @@ class PowdbTxGate {
    */
   async acquire(): Promise<PowdbTxHold> {
     // --- synchronous section (runs before the caller's first await) ---
-    const current = powdbTxStorage.getStore();
-    if (current && current.gate === this && !current.done) {
-      throw reentrantTransactionError();
+    // Walk the WHOLE marker chain, not just the innermost marker: with two
+    // pools, dbA-tx → dbB-tx → dbA-begin leaves dbB's marker innermost, but
+    // the dbA ancestor is still open — queueing the inner dbA begin behind it
+    // would deadlock. Any live ancestor on this gate ⇒ re-entrant E017.
+    // Prune completed heads first (`done` never flips back) so sequential
+    // transactions issued from one long-lived context do not chain — and leak
+    // — unboundedly; what remains is bounded by real nesting depth.
+    let parent = powdbTxStorage.getStore();
+    while (parent?.done) parent = parent.parent;
+    for (let c: PowdbTxContext | undefined = parent; c !== undefined; c = c.parent) {
+      if (c.gate === this && !c.done) {
+        throw reentrantTransactionError();
+      }
     }
-    const ctx: PowdbTxContext = { gate: this, done: false };
+    const ctx: PowdbTxContext = { gate: this, done: false, parent };
     powdbTxStorage.enterWith(ctx);
 
     let handOff!: () => void;
@@ -688,6 +720,13 @@ export class PowdbPool implements PgCompatPool {
       // re-entrancy check + context mark run synchronously right here.)
       this.poolHold = await this.txGate.acquire();
     }
+    if ((ctl === 'commit' || ctl === 'rollback') && this.poolHold === null) {
+      // No gate hold → our `begin` never ran (gate timeout / re-entrant
+      // E017 / no begin at all). Never forward a stray commit/rollback to
+      // the engine — PowDB is single-writer, so it could only ever end a
+      // DIFFERENT caller's open transaction. Empty success instead.
+      return { rows: [], rowCount: 0, fields: [] };
+    }
     try {
       const result = await this.pool.withClient((c) => c.query(powql, params.map(this.toParam)));
       return adaptResult(result);
@@ -732,6 +771,13 @@ export class PowdbPool implements PgCompatPool {
           // instead of blocking on the global write lock the open tx holds;
           // an independent concurrent begin queues FIFO.
           hold = await this.txGate.acquire();
+        }
+        if ((ctl === 'commit' || ctl === 'rollback') && hold === null) {
+          // This connection never acquired the gate — its `begin` never ran
+          // (gate timeout / re-entrant E017). A stray commit/rollback must
+          // never reach the single-writer engine, where it could only end a
+          // DIFFERENT caller's open transaction. Empty success instead.
+          return { rows: [], rowCount: 0, fields: [] };
         }
         try {
           return adaptResult(await client.query(powql, params.map(this.toParam)));
@@ -937,6 +983,16 @@ export class PowdbEmbeddedPool implements PgCompatPool {
       // independent concurrent ones wait their FIFO turn. (acquire()'s
       // re-entrancy check + context mark run synchronously right here.)
       holdRef.hold = await this.txGate.acquire();
+    }
+    if ((ctl === 'commit' || ctl === 'rollback') && holdRef.hold === null) {
+      // This context never acquired the gate — its `begin` never ran (the
+      // gate timed out / threw re-entrant E017, or no begin was issued at
+      // all). The engine is ONE shared handle: forwarding this stray
+      // commit/rollback would hit whatever transaction ANOTHER caller has
+      // open on it (live-reproduced: a best-effort ROLLBACK after a failed
+      // begin silently discarded a concurrent transaction's writes). Swallow
+      // it as an empty success instead — there is nothing of ours to end.
+      return { rows: [], rowCount: 0, fields: [] };
     }
     try {
       return this.exec(powql, params);
