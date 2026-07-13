@@ -212,6 +212,8 @@ export {
   // Legacy compat (deprecated — use object format with defineSchema)
   table,
 } from './schema-builder.js';
+// Schema metadata bridge — defineSchema() → SchemaMetadata without a live DB
+export { schemaDefToMetadata } from './schema-metadata.js';
 // Schema SQL — generate DDL, diff, and push
 export {
   type AlterColumnDef,
