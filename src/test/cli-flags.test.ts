@@ -117,3 +117,29 @@ describe('parseArgs — studio / observe flags', () => {
     assert.equal(args.allowRemote, undefined);
   });
 });
+
+describe('parseArgs — generate flags (T-8b)', () => {
+  it('parses --no-timestamp as a boolean flag', () => {
+    const args = parseArgs(['generate', '--no-timestamp']);
+    assert.equal(args.command, 'generate');
+    assert.equal(args.noTimestamp, true);
+  });
+
+  it('leaves noTimestamp undefined by default (timestamp stays on)', () => {
+    const args = parseArgs(['generate']);
+    assert.equal(args.noTimestamp, undefined);
+  });
+
+  it('composes with other generate flags', () => {
+    const args = parseArgs(['generate', '--zod', '--no-timestamp', '--include-views']);
+    assert.equal(args.zod, true);
+    assert.equal(args.noTimestamp, true);
+    assert.equal(args.includeViews, true);
+  });
+
+  it('help text documents --no-timestamp', () => {
+    const source = readFileSync(CLI_INDEX, 'utf-8');
+    assert.ok(source.includes("'--no-timestamp'"), 'parseArgs() must handle --no-timestamp');
+    assert.ok(source.includes('--no-timestamp'), 'generate help must mention --no-timestamp');
+  });
+});

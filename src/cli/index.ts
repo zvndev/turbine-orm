@@ -107,6 +107,8 @@ export interface CliArgs {
   // generate flags
   zod?: boolean;
   includeViews?: boolean;
+  /** Omit the `Generated at:` header line for reproducible (diff-stable) output. */
+  noTimestamp?: boolean;
   // studio / observe flags
   port?: number;
   host?: string;
@@ -183,6 +185,9 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--include-views':
         result.includeViews = true;
+        break;
+      case '--no-timestamp':
+        result.noTimestamp = true;
         break;
       case '--allow-destructive':
         result.allowDestructive = true;
@@ -673,6 +678,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     outDir: config.out,
     connectionString: url,
     zod: args.zod,
+    noTimestamp: args.noTimestamp,
   });
 
   genSpinner.succeed(`Generated ${bold(String(result.files.length))} files in ${elapsed(startTime)}`);
@@ -1797,6 +1803,9 @@ function showGenerateHelp(): void {
     `    ${cyan('--zod')}                 Also emit ${cyan('zod.ts')} validation schemas ${dim('(needs the zod dep)')}`,
   );
   console.log(`    ${cyan('--include-views')}       Include views + materialized views as read-only entities`);
+  console.log(
+    `    ${cyan('--no-timestamp')}        Omit the ${dim('Generated at:')} header line ${dim('(reproducible, diff-stable output)')}`,
+  );
   console.log(`    ${cyan('--allow-empty')}         Generate even when introspection matches 0 tables`);
   newline();
 }
