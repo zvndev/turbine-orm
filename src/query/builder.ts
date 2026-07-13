@@ -179,6 +179,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** Pre-computed column type lookups (avoids linear scans per query) */
   private readonly columnPgTypeMap: Map<string, string>;
   private readonly columnArrayTypeMap: Map<string, string>;
+  /**
+   * Columns whose type lives in a DIFFERENT schema than the introspected one
+   * (ColumnMetadata.pgTypeSchema is recorded only in that case) — such columns
+   * must never receive this schema's `::"enum"` cast (see enumTypeForColumn).
+   */
+  private readonly crossSchemaTypeColumns: Set<string>;
 
   /** Tracks tables that have already triggered a deep-with warning (one-time) */
   private readonly deepWithWarned = new Set<string>();
@@ -232,9 +238,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `warnOnUnlimited: false`, per table with `warnOnUnlimited: { users:
     // false }` (unlisted tables keep the default), or per call via
     // `findMany({ warnOnUnlimited: false })`.
+    // Per-table maps accept BOTH key forms — the snake_case table name
+    // (`user_profiles`) and the camelCase accessor (`userProfiles`) — since
+    // users naturally key by the accessor they type everywhere else. The
+    // snake_case entry wins when both are present.
     const warnOpt = options?.warnOnUnlimited;
     this.warnOnUnlimited =
-      typeof warnOpt === 'object' && warnOpt !== null ? warnOpt[table] !== false : warnOpt !== false;
+      typeof warnOpt === 'object' && warnOpt !== null
+        ? (warnOpt[table] ?? warnOpt[snakeToCamel(table)]) !== false
+        : warnOpt !== false;
     this.utcTimestamps = options?.utcTimestamps !== false;
     this.preparedStatementsEnabled = options?.preparedStatements ?? true;
     this.sqlCacheEnabled = options?.sqlCache !== false;
@@ -251,9 +263,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Pre-compute column type lookup maps (TASK-26)
     this.columnPgTypeMap = new Map();
     this.columnArrayTypeMap = new Map();
+    this.crossSchemaTypeColumns = new Set();
     for (const col of this.tableMeta.columns) {
       this.columnPgTypeMap.set(col.name, col.dialectType ?? col.pgType);
       this.columnArrayTypeMap.set(col.name, col.arrayType ?? col.pgArrayType);
+      if (col.pgTypeSchema !== undefined) this.crossSchemaTypeColumns.add(col.name);
     }
   }
 
@@ -3928,6 +3942,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (this.dialect.name !== 'postgresql') return null;
     const enums = this.schema.enums;
     if (!enums) return null;
+    // Cross-schema guard (N-5): introspection records pgTypeSchema ONLY when
+    // the column's type lives OUTSIDE the introspected schema. A same-named
+    // enum in another schema must not get this schema's cast — search_path
+    // would resolve `::"status"` to the wrong type. Skipping the cast restores
+    // the pre-cast behavior for such columns. Columns without pgTypeSchema
+    // (same-schema types, defineSchema/legacy metadata) keep the cast.
+    if (this.crossSchemaTypeColumns.has(column)) return null;
     const pgType = this.columnPgTypeMap.get(column) ?? this.tableMeta.pgTypes?.[column];
     if (!pgType || pgType.startsWith('_')) return null;
     return Object.hasOwn(enums, pgType) ? pgType : null;

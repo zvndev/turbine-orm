@@ -1116,3 +1116,63 @@ describe('powdb: transaction queue timeout', () => {
     assert.equal(await p1, 1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// N-6 — warnOnUnlimited per-table map handling on the PowQL interface.
+// PowqlInterface previously treated an object map as plain truthy, so ANY map
+// (even `{ userProfiles: false }` for this exact table) left the warning on.
+// It now applies the same per-table resolution as QueryInterface: snake_case
+// table name OR camelCase accessor key, snake_case winning on conflict.
+// ---------------------------------------------------------------------------
+
+describe('powdb: warnOnUnlimited per-table map (N-6)', () => {
+  const profilesSchema: SchemaMetadata = {
+    enums: {},
+    tables: {
+      user_profiles: table('user_profiles', [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('bio', 'bio', 'string', 'text'),
+      ]),
+    },
+  };
+
+  async function warningsFor(warnOnUnlimited?: boolean | Record<string, boolean>): Promise<string[]> {
+    const mock = mockPool();
+    const q = new PowqlInterface(mock.pool, 'user_profiles', profilesSchema, [], { warnOnUnlimited });
+    const captured: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      captured.push(args.map(String).join(' '));
+    };
+    try {
+      await q.findMany({});
+    } finally {
+      console.warn = original;
+    }
+    return captured;
+  }
+
+  it('warns by default without a limit', async () => {
+    const warnings = await warningsFor(undefined);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /user_profiles/);
+  });
+
+  it('accessor-keyed map ({ userProfiles: false }) suppresses the warning', async () => {
+    assert.deepEqual(await warningsFor({ userProfiles: false }), []);
+  });
+
+  it('snake-keyed map ({ user_profiles: false }) suppresses the warning', async () => {
+    assert.deepEqual(await warningsFor({ user_profiles: false }), []);
+  });
+
+  it('snake_case wins on conflict', async () => {
+    const warnings = await warningsFor({ user_profiles: true, userProfiles: false });
+    assert.equal(warnings.length, 1);
+  });
+
+  it('a map naming OTHER tables keeps the default (warn)', async () => {
+    const warnings = await warningsFor({ posts: false });
+    assert.equal(warnings.length, 1);
+  });
+});

@@ -826,6 +826,10 @@ function serializeColumn(col: ColumnMetadata): string {
     `arrayType: '${escSQ(col.arrayType ?? col.pgArrayType)}'`,
     `pgArrayType: '${escSQ(col.pgArrayType)}'`,
   ];
+  // Cross-schema type marker — introspection records it only for types living
+  // outside the introspected schema; it must survive codegen or the runtime
+  // enum-cast guard in query/builder.ts loses the signal (N-5).
+  if (col.pgTypeSchema !== undefined) parts.push(`pgTypeSchema: '${escSQ(col.pgTypeSchema)}'`);
   // Emit isGenerated only when set (server-generated serial/identity), so the
   // output stays byte-identical for the common client-default columns.
   if (col.isGenerated) parts.push(`isGenerated: true`);

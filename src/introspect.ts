@@ -61,6 +61,7 @@ const SQL_COLUMNS = `
     table_name,
     column_name,
     udt_name,
+    udt_schema,
     data_type,
     is_nullable,
     column_default,
@@ -172,6 +173,7 @@ const SQL_MATVIEW_COLUMNS = `
     c.relname AS table_name,
     a.attname AS column_name,
     t.typname AS udt_name,
+    tn.nspname AS udt_schema,
     CASE WHEN t.typcategory = 'A' THEN 'ARRAY' ELSE 'base' END AS data_type,
     CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
     NULL AS column_default,
@@ -184,6 +186,7 @@ const SQL_MATVIEW_COLUMNS = `
   JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+  JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace
   WHERE n.nspname = $1
     AND c.relkind = 'm'
     AND a.attnum > 0
@@ -364,6 +367,14 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         arrayType,
         pgArrayType: arrayType,
         maxLength: row.character_maximum_length ?? undefined,
+        // Record the type's schema ONLY when it lives outside the introspected
+        // schema (and isn't a pg_catalog builtin). A same-named enum in another
+        // schema must NOT get this schema's `::"enum"` cast — search_path would
+        // resolve the cast to the wrong type (see enumTypeForColumn). Omitting
+        // it for the common case keeps generated metadata byte-identical.
+        ...(typeof row.udt_schema === 'string' && row.udt_schema !== schema && row.udt_schema !== 'pg_catalog'
+          ? { pgTypeSchema: row.udt_schema }
+          : {}),
       };
 
       if (!columnsByTable.has(tableName)) columnsByTable.set(tableName, []);
@@ -463,10 +474,23 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     // relation can never shadow a column (which generated unsound types and
     // made both surfaces unusable — dogfood T-4).
     const columnFieldsByTable = new Map<string, Set<string>>();
+    const unknownTypedFieldsByTable = new Map<string, Set<string>>();
     for (const [tbl, cols] of columnsByTable) {
       columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
+      // Enum-typed columns also report tsType 'unknown' here, but generate.ts
+      // gives them a concrete union type — a shadow of one was type-broken on
+      // main, so only genuine json/jsonb columns qualify as historical shadows.
+      unknownTypedFieldsByTable.set(
+        tbl,
+        new Set(cols.filter((c) => isUnknownTsType(c.tsType) && !Object.hasOwn(enums, c.pgType)).map((c) => c.field)),
+      );
     }
-    const relationsByTable = buildRelationsFromForeignKeys(foreignKeys, columnFieldsByTable, fkActions);
+    const relationsByTable = buildRelationsFromForeignKeys(
+      foreignKeys,
+      columnFieldsByTable,
+      fkActions,
+      unknownTypedFieldsByTable,
+    );
 
     // ----- Conservative many-to-many auto-detection (PURELY ADDITIVE) -----
     //
@@ -487,67 +511,17 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     // For such a J linking A and B we ADD a `manyToMany` relation on A → B and
     // symmetrically on B → A, both routed `through` J. The existing belongsTo /
     // hasMany relations derived from J's FKs are left untouched — this block
-    // never removes or renames anything. If the chosen relation name already
-    // exists on the source table (e.g. another relation grabbed it), we SKIP to
-    // stay additive.
-    for (const tableName of tableNames) {
-      const pk = pkByTable.get(tableName) ?? [];
-      if (pk.length !== 2) continue;
-
-      // FKs whose source is this table.
-      const tableFks = foreignKeys.filter((fk) => fk.sourceTable === tableName);
-      if (tableFks.length !== 2) continue;
-      // Both FKs must be single-column.
-      if (tableFks.some((fk) => fk.sourceColumns.length !== 1)) continue;
-
-      const fkCols = tableFks.map((fk) => fk.sourceColumns[0]!);
-      const pkSet = new Set(pk);
-      // Both FK columns must be the PK columns (and vice-versa).
-      if (!fkCols.every((c) => pkSet.has(c))) continue;
-      if (new Set(fkCols).size !== 2) continue;
-
-      // Two DISTINCT target tables.
-      const [fkA, fkB] = tableFks as [ForeignKeyEntry, ForeignKeyEntry];
-      if (fkA.targetTable === fkB.targetTable) continue;
-
-      // No payload columns: J's columns are exactly the two FK/PK columns.
-      const jCols = (columnsByTable.get(tableName) ?? []).map((c) => c.name);
-      if (jCols.length !== 2) continue;
-
-      // For each direction, the m2m `referenceKey` is the *targeted* table's
-      // referenced column(s); the junction's sourceKey is the FK column pointing
-      // to that table; the targetKey is the FK column pointing to the OTHER table.
-      const addM2M = (self: ForeignKeyEntry, other: ForeignKeyEntry) => {
-        const sourceTbl = self.targetTable; // A
-        const targetTbl = other.targetTable; // B
-        const relName = snakeToCamel(targetTbl); // plural table name → e.g. "tags"
-        if (!relationsByTable.has(sourceTbl)) relationsByTable.set(sourceTbl, {});
-        const existing = relationsByTable.get(sourceTbl)!;
-        // Additive-only: never clobber an existing relation name, and never
-        // shadow a scalar column field (that would generate unsound types).
-        if (existing[relName]) return;
-        if (columnFieldsByTable.get(sourceTbl)?.has(relName)) return;
-        existing[relName] = {
-          type: 'manyToMany',
-          name: relName,
-          from: sourceTbl,
-          to: targetTbl,
-          // referenceKey = A's referenced column(s) that J's sourceKey points at.
-          referenceKey: self.targetColumns.length === 1 ? self.targetColumns[0]! : self.targetColumns,
-          // foreignKey is unused for m2m correlation but kept for shape parity
-          // (mirrors the source-side reference for back-compat consumers).
-          foreignKey: self.targetColumns.length === 1 ? self.targetColumns[0]! : self.targetColumns,
-          through: {
-            table: tableName,
-            sourceKey: self.sourceColumns[0]!, // J col → A
-            targetKey: other.sourceColumns[0]!, // J col → B
-          },
-        };
-      };
-
-      addM2M(fkA, fkB); // A → B
-      addM2M(fkB, fkA); // B → A
-    }
+    // never removes or renames anything. Naming/collision handling lives in the
+    // shared addAutoManyToManyRelations helper.
+    addAutoManyToManyRelations(
+      tableNames,
+      foreignKeys,
+      pkByTable,
+      new Map(Array.from(columnsByTable, ([tbl, cols]) => [tbl, cols.map((c) => c.name)])),
+      relationsByTable,
+      columnFieldsByTable,
+      unknownTypedFieldsByTable,
+    );
 
     // ----- Assemble TableMetadata for each table -----
     const tables: Record<string, TableMetadata> = {};
@@ -663,6 +637,16 @@ function upperFirst(s: string): string {
 }
 
 /**
+ * True for the tsType forms a json/jsonb column maps to (`unknown`, nullable
+ * `unknown | null`). A relation shadowing such a column is a HISTORICAL shadow
+ * that worked at runtime and compiled (`unknown` absorbs the relation
+ * payload), so the legacy-first naming keeps it instead of renaming.
+ */
+export function isUnknownTsType(tsType: string): boolean {
+  return tsType === 'unknown' || tsType === 'unknown | null';
+}
+
+/**
  * Resolve a derived relation name against the names already taken on the
  * table (scalar column fields + previously assigned relations). On collision,
  * applies a deterministic `Rel` / `Rel2` / `Rel3`… suffix and warns — a
@@ -681,26 +665,40 @@ function resolveRelationNameCollision(candidate: string, taken: Set<string>, tab
 
 /**
  * Build the belongsTo/hasMany relation maps for every table from its foreign
- * keys. Naming rules:
+ * keys. Naming rules (LEGACY-FIRST — a relation name that previously worked at
+ * runtime must never change out from under a regenerating app):
  *
- *   - Single FK to a target: belongsTo is the singularized target table
- *     (`posts.user_id` → `post.user`), hasMany is the source table
- *     (`users.posts`). Unchanged historical behavior.
- *   - Several FKs to the SAME target (e.g. `model_instances.current_version_id`
- *     and `.published_version_id` → `model_instance_versions`): each relation
- *     name derives from its own column with the `_id`/`Id` suffix stripped
- *     (`currentVersion`, `publishedVersion`), and the reverse hasMany side gets
- *     a distinct per-column name (`modelInstancesByCurrentVersion`, …).
- *   - Any derived name that would collide with a scalar column field or an
- *     already-assigned relation gets a deterministic `Rel` suffix + warning.
+ *   1. First compute the historical derivation exactly as it shipped before
+ *      the collision guard existed: belongsTo strips a case-SENSITIVE `_id`
+ *      suffix (`snakeToCamel(col.replace(/_id$/, ''))` when several FKs point
+ *      at the same target, else the singularized target table), and hasMany is
+ *      `snakeToCamel(`${source}_by_${strippedColumn}`)` (else the source
+ *      table). If that legacy name is free, KEEP IT — even when it looks odd
+ *      (`blogPostsByAuthorId`, `postsBy_Author`): those names were collision-
+ *      free and worked, so regenerating must not rename them.
+ *   2. If the legacy name collides ONLY with a scalar column whose tsType is
+ *      `unknown` (json/jsonb), keep it anyway with a warning: the shadow is
+ *      historical, ran fine at runtime, and compiled (`unknown` absorbs the
+ *      relation payload; generate.ts's typeSafeRelations omits the relation
+ *      from the type layer).
+ *   3. On a genuine collision (concrete-typed column shadow, or a previously
+ *      assigned relation), fall back to the modern derivation — the `_id`/`Id`
+ *      case-insensitive strip of {@link relationNameFromColumn} plus the
+ *      `By`-composed reverse name — which fixes the camelCase-FK shadowing
+ *      shapes that were actually BROKEN before (relation name === scalar FK
+ *      field → unusable types).
+ *   4. Last resort: deterministic `Rel`/`Rel2` suffix + warning.
  *
  * @param columnFieldsByTable camelCase column *fields* per table — used to
- *   guarantee relations never shadow scalar columns.
+ *   guarantee relations never shadow concrete-typed scalar columns.
+ * @param unknownTypedFieldsByTable subset of the column fields whose tsType is
+ *   `unknown` (json/jsonb) — legacy shadows of these are preserved (rule 2).
  */
 export function buildRelationsFromForeignKeys(
   foreignKeys: ForeignKeyEntry[],
   columnFieldsByTable: Map<string, Set<string>>,
   fkActions?: Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>,
+  unknownTypedFieldsByTable?: Map<string, Set<string>>,
 ): Map<string, Record<string, RelationDef>> {
   // Count FKs per (source, target) pair for disambiguation.
   const fkCounts = new Map<string, number>();
@@ -722,14 +720,46 @@ export function buildRelationsFromForeignKeys(
     }
     return taken;
   };
+  // Relation names actually assigned so far (as opposed to column fields) —
+  // needed to tell "collides only with a column" apart from "collides with an
+  // already-assigned relation" for the legacy-shadow-preserving rule.
+  const assignedByTable = new Map<string, Set<string>>();
+  const assignedFor = (table: string): Set<string> => {
+    let assigned = assignedByTable.get(table);
+    if (!assigned) {
+      assigned = new Set();
+      assignedByTable.set(table, assigned);
+    }
+    return assigned;
+  };
+
+  /** Legacy-first name resolution — see the naming rules in the JSDoc above. */
+  const resolveName = (legacy: string, modern: string | null, table: string, source: string): string => {
+    const taken = takenFor(table);
+    if (!taken.has(legacy)) return legacy;
+    // Historical json/jsonb shadow: previously worked at runtime AND compiled
+    // (tsType `unknown` absorbs the relation payload). Keep the name, warn —
+    // typeSafeRelations() keeps the generated type layer sound.
+    if (!assignedFor(table).has(legacy) && unknownTypedFieldsByTable?.get(table)?.has(legacy)) {
+      console.warn(
+        `[turbine] Relation "${legacy}" on table "${table}" (from ${source}) shadows the json/jsonb column ` +
+          `"${legacy}" — keeping the historical name for runtime compatibility; the relation is omitted from ` +
+          `the generated types. Rename the column to expose it.`,
+      );
+      return legacy;
+    }
+    if (modern !== null && modern !== legacy && !taken.has(modern)) return modern;
+    return resolveRelationNameCollision(modern ?? legacy, taken, table, source);
+  };
 
   for (const fk of foreignKeys) {
     const pairKey = `${fk.sourceTable}→${fk.targetTable}`;
     const needsDisambiguation = (fkCounts.get(pairKey) ?? 0) > 1;
+    const singleColumn = fk.sourceColumns.length === 1;
 
     // For single-column FKs, keep string form for backwards compatibility.
     // For multi-column (composite) FKs, use array form.
-    const foreignKey = fk.sourceColumns.length === 1 ? fk.sourceColumns[0]! : fk.sourceColumns;
+    const foreignKey = singleColumn ? fk.sourceColumns[0]! : fk.sourceColumns;
     const referenceKey = fk.targetColumns.length === 1 ? fk.targetColumns[0]! : fk.targetColumns;
 
     // Composite FKs have no single column to derive from — fall back to the
@@ -738,19 +768,15 @@ export function buildRelationsFromForeignKeys(
 
     // --- belongsTo on the source (child) table ---
     // e.g. posts.user_id → users.id creates posts.user (belongsTo)
-    const belongsToCandidate = needsDisambiguation
-      ? fk.sourceColumns.length === 1
-        ? relationNameFromColumn(fk.sourceColumns[0]!)
+    const legacyBelongsTo = needsDisambiguation
+      ? singleColumn
+        ? snakeToCamel(fk.sourceColumns[0]!.replace(/_id$/, ''))
         : snakeToCamel(constraintBase)
       : singularize(snakeToCamel(fk.targetTable));
-    const sourceTaken = takenFor(fk.sourceTable);
-    const belongsToName = resolveRelationNameCollision(
-      belongsToCandidate,
-      sourceTaken,
-      fk.sourceTable,
-      `FK ${fk.constraintName}`,
-    );
-    sourceTaken.add(belongsToName);
+    const modernBelongsTo = needsDisambiguation && singleColumn ? relationNameFromColumn(fk.sourceColumns[0]!) : null;
+    const belongsToName = resolveName(legacyBelongsTo, modernBelongsTo, fk.sourceTable, `FK ${fk.constraintName}`);
+    takenFor(fk.sourceTable).add(belongsToName);
+    assignedFor(fk.sourceTable).add(belongsToName);
 
     // Referential actions (omit the 'no action' default to keep metadata lean).
     const actions = fkActions?.get(fk.constraintName);
@@ -771,19 +797,19 @@ export function buildRelationsFromForeignKeys(
 
     // --- hasMany on the target (parent) table ---
     // e.g. posts.user_id → users.id creates users.posts (hasMany)
-    const hasManyCandidate = needsDisambiguation
-      ? fk.sourceColumns.length === 1
+    const legacyHasMany = needsDisambiguation
+      ? singleColumn
+        ? snakeToCamel(`${fk.sourceTable}_by_${fk.sourceColumns[0]!.replace(/_id$/, '')}`)
+        : snakeToCamel(`${fk.sourceTable}_by_${constraintBase}`)
+      : snakeToCamel(fk.sourceTable);
+    const modernHasMany = needsDisambiguation
+      ? singleColumn
         ? `${snakeToCamel(fk.sourceTable)}By${upperFirst(relationNameFromColumn(fk.sourceColumns[0]!))}`
         : `${snakeToCamel(fk.sourceTable)}By${upperFirst(snakeToCamel(constraintBase))}`
-      : snakeToCamel(fk.sourceTable);
-    const targetTaken = takenFor(fk.targetTable);
-    const hasManyName = resolveRelationNameCollision(
-      hasManyCandidate,
-      targetTaken,
-      fk.targetTable,
-      `FK ${fk.constraintName}`,
-    );
-    targetTaken.add(hasManyName);
+      : null;
+    const hasManyName = resolveName(legacyHasMany, modernHasMany, fk.targetTable, `FK ${fk.constraintName}`);
+    takenFor(fk.targetTable).add(hasManyName);
+    assignedFor(fk.targetTable).add(hasManyName);
 
     if (!relationsByTable.has(fk.targetTable)) relationsByTable.set(fk.targetTable, {});
     relationsByTable.get(fk.targetTable)![hasManyName] = {
@@ -797,5 +823,150 @@ export function buildRelationsFromForeignKeys(
     };
   }
 
+  return relationsByTable;
+}
+
+/**
+ * Conservative auto-`manyToMany` detection over pure junction tables, shared
+ * by the Postgres introspector, the engine introspectors (SQLite / MySQL /
+ * MSSQL), the MCP server, and `schemaDefToMetadata()` so all surfaces derive
+ * IDENTICAL relation names for the same logical schema.
+ *
+ * A table J is a PURE junction only when ALL of these hold:
+ *   1. J's primary key is exactly two columns.
+ *   2. J has exactly two FKs, each single-column.
+ *   3. Each FK's source column is one of J's two PK columns.
+ *   4. The two FKs target two DISTINCT tables (A and B).
+ *   5. J has no payload columns beyond the two FK/PK columns.
+ *
+ * For such a J linking A and B this ADDS a `manyToMany` on A → B and B → A
+ * routed `through` J. It never removes or renames an existing relation:
+ *   - an already-assigned relation with the same name → SKIP (additive-only,
+ *     unchanged historical behavior);
+ *   - a shadowed json/jsonb (`unknown`-typed) column → keep the historical
+ *     name + warn (it worked at runtime and compiled);
+ *   - a shadowed concrete-typed column → deterministic `Rel` suffix + warn
+ *     instead of silently dropping the relation.
+ */
+export function addAutoManyToManyRelations(
+  tableNames: Iterable<string>,
+  foreignKeys: ForeignKeyEntry[],
+  pkByTable: Map<string, string[]>,
+  columnNamesByTable: Map<string, string[]>,
+  relationsByTable: Map<string, Record<string, RelationDef>>,
+  columnFieldsByTable?: Map<string, Set<string>>,
+  unknownTypedFieldsByTable?: Map<string, Set<string>>,
+): void {
+  for (const tableName of tableNames) {
+    const pk = pkByTable.get(tableName) ?? [];
+    if (pk.length !== 2) continue;
+
+    // FKs whose source is this table — both must be single-column.
+    const tableFks = foreignKeys.filter((fk) => fk.sourceTable === tableName);
+    if (tableFks.length !== 2) continue;
+    if (tableFks.some((fk) => fk.sourceColumns.length !== 1)) continue;
+
+    const fkCols = tableFks.map((fk) => fk.sourceColumns[0]!);
+    const pkSet = new Set(pk);
+    // Both FK columns must be the PK columns (and vice-versa).
+    if (!fkCols.every((c) => pkSet.has(c))) continue;
+    if (new Set(fkCols).size !== 2) continue;
+
+    // Two DISTINCT target tables.
+    const [fkA, fkB] = tableFks as [ForeignKeyEntry, ForeignKeyEntry];
+    if (fkA.targetTable === fkB.targetTable) continue;
+
+    // No payload columns: J's columns are exactly the two FK/PK columns.
+    const jCols = columnNamesByTable.get(tableName) ?? [];
+    if (jCols.length !== 2) continue;
+
+    // For each direction, the m2m `referenceKey` is the *targeted* table's
+    // referenced column(s); the junction's sourceKey is the FK column pointing
+    // to that table; the targetKey is the FK column pointing to the OTHER table.
+    const addM2M = (self: ForeignKeyEntry, other: ForeignKeyEntry) => {
+      const sourceTbl = self.targetTable; // A
+      const targetTbl = other.targetTable; // B
+      let relName = snakeToCamel(targetTbl); // plural table name → e.g. "tags"
+      if (!relationsByTable.has(sourceTbl)) relationsByTable.set(sourceTbl, {});
+      const existing = relationsByTable.get(sourceTbl)!;
+      // Additive-only: never clobber an existing relation name.
+      if (existing[relName]) return;
+      const columnFields = columnFieldsByTable?.get(sourceTbl);
+      if (columnFields?.has(relName)) {
+        if (unknownTypedFieldsByTable?.get(sourceTbl)?.has(relName)) {
+          // Historical json/jsonb shadow — worked at runtime, compiled fine.
+          console.warn(
+            `[turbine] Relation "${relName}" on table "${sourceTbl}" (junction ${tableName}) shadows the ` +
+              `json/jsonb column "${relName}" — keeping the historical name for runtime compatibility; ` +
+              `the relation is omitted from the generated types.`,
+          );
+        } else {
+          const taken = new Set([...columnFields, ...Object.keys(existing)]);
+          relName = resolveRelationNameCollision(relName, taken, sourceTbl, `junction ${tableName}`);
+        }
+      }
+      existing[relName] = {
+        type: 'manyToMany',
+        name: relName,
+        from: sourceTbl,
+        to: targetTbl,
+        // referenceKey = A's referenced column(s) that J's sourceKey points at.
+        referenceKey: self.targetColumns.length === 1 ? self.targetColumns[0]! : self.targetColumns,
+        // foreignKey is unused for m2m correlation but kept for shape parity
+        // (mirrors the source-side reference for back-compat consumers).
+        foreignKey: self.targetColumns.length === 1 ? self.targetColumns[0]! : self.targetColumns,
+        through: {
+          table: tableName,
+          sourceKey: self.sourceColumns[0]!, // J col → A
+          targetKey: other.sourceColumns[0]!, // J col → B
+        },
+      };
+    };
+
+    addM2M(fkA, fkB); // A → B
+    addM2M(fkB, fkA); // B → A
+  }
+}
+
+/**
+ * One-stop relation derivation for the engine introspectors (SQLite / MySQL /
+ * MSSQL): filters the FK list to the introspected table set, seeds the
+ * taken-name / json-shadow maps from the engine's column metadata, and runs
+ * the SAME `buildRelationsFromForeignKeys` + `addAutoManyToManyRelations`
+ * pipeline as the Postgres introspector — so every engine derives identical
+ * relation names for the same logical schema (the engines previously carried
+ * stale copies of a retired naming scheme).
+ */
+export function deriveEngineRelations(
+  tableNames: string[],
+  foreignKeys: ForeignKeyEntry[],
+  pkByTable: Map<string, string[]>,
+  columnsByTable: Map<string, Pick<ColumnMetadata, 'name' | 'field' | 'tsType'>[]>,
+): Map<string, Record<string, RelationDef>> {
+  const tableSet = new Set(tableNames);
+  const fks = foreignKeys.filter((fk) => tableSet.has(fk.sourceTable) && tableSet.has(fk.targetTable));
+
+  const columnFieldsByTable = new Map<string, Set<string>>();
+  const unknownTypedFieldsByTable = new Map<string, Set<string>>();
+  for (const [tbl, cols] of columnsByTable) {
+    columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
+    unknownTypedFieldsByTable.set(tbl, new Set(cols.filter((c) => isUnknownTsType(c.tsType)).map((c) => c.field)));
+  }
+
+  const relationsByTable = buildRelationsFromForeignKeys(
+    fks,
+    columnFieldsByTable,
+    undefined,
+    unknownTypedFieldsByTable,
+  );
+  addAutoManyToManyRelations(
+    tableNames,
+    fks,
+    pkByTable,
+    new Map(Array.from(columnsByTable, ([tbl, cols]) => [tbl, cols.map((c) => c.name)])),
+    relationsByTable,
+    columnFieldsByTable,
+    unknownTypedFieldsByTable,
+  );
   return relationsByTable;
 }

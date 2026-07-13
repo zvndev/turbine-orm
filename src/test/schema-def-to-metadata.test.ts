@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { schemaHasIndexInfo } from '../index-advisor.js';
+import { addAutoManyToManyRelations, buildRelationsFromForeignKeys, type ForeignKeyEntry } from '../introspect.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { defineSchema } from '../schema-builder.js';
 import { schemaDefToMetadata } from '../schema-metadata.js';
@@ -437,5 +438,246 @@ describe('schemaDefToMetadata — QueryInterface integration (build-only)', () =
     const deferred = q.buildFindMany({ where: { authorId: 7 } });
     assert.match(deferred.sql, /"author_id" = \$1/);
     assert.deepStrictEqual(deferred.params, [7]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N-4 — shared naming/collision resolution (parity with introspection)
+// ---------------------------------------------------------------------------
+
+/** Run fn while capturing console.warn calls; returns [result, warnings]. */
+function captureWarnings<T>(fn: () => T): [T, string[]] {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  try {
+    return [fn(), warnings];
+  } finally {
+    console.warn = original;
+  }
+}
+
+describe('schemaDefToMetadata — collision guard parity with introspection (N-4)', () => {
+  it('renames a belongsTo that would shadow a concrete scalar column (posts.user text + userId FK)', () => {
+    // The verified repro: relation 'user' shadowed the scalar text column, so
+    // `where: { user: { contains: 'bob' } }` threw E003 at runtime. The shared
+    // resolver now Rel-suffixes it, keeping BOTH the scalar and the relation.
+    const def = defineSchema({
+      users: { id: { type: 'serial', primaryKey: true } },
+      posts: {
+        id: { type: 'serial', primaryKey: true },
+        user: { type: 'text' },
+        userId: { type: 'integer', notNull: true, references: 'users.id' },
+      },
+    });
+    const [meta, warnings] = captureWarnings(() => schemaDefToMetadata(def));
+
+    const posts = meta.tables.posts!;
+    assert.equal(posts.relations.user, undefined);
+    assert.equal(posts.relations.userRel!.type, 'belongsTo');
+    assert.equal(posts.relations.userRel!.foreignKey, 'user_id');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /userRel/);
+
+    // The scalar column stays targetable through the real SQL builder — the
+    // reviewer's exact failing call now compiles into a LIKE filter.
+    const q = makeQuery('posts', meta);
+    const deferred = q.buildFindMany({ where: { user: { contains: 'bob' } } as never });
+    assert.match(deferred.sql, /"user" LIKE \$1/);
+    assert.deepStrictEqual(deferred.params, ['%bob%']);
+    // And the relation still resolves as a with-clause.
+    const withRel = q.buildFindMany({ with: { userRel: true } as never });
+    assert.match(withRel.sql, /"id" = "posts"\."user_id"/);
+  });
+
+  it('keeps a legacy belongsTo that shadows ONLY a jsonb column (historical shadow, N-1b rule)', () => {
+    const def = defineSchema({
+      users: { id: { type: 'serial', primaryKey: true } },
+      posts: {
+        id: { type: 'serial', primaryKey: true },
+        user: { type: 'jsonb' },
+        userId: { type: 'integer', notNull: true, references: 'users.id' },
+      },
+    });
+    const [meta, warnings] = captureWarnings(() => schemaDefToMetadata(def));
+    assert.equal(meta.tables.posts!.relations.user!.type, 'belongsTo');
+    assert.equal(meta.tables.posts!.relations.userRel, undefined);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /json\/jsonb/);
+  });
+
+  it('sibling clobber: two FKs to the same target deriving the same name BOTH survive with correct bindings', () => {
+    // Old Pass 3 derived 'sponsor' for BOTH sponsorId (strip) and sponsor
+    // (no suffix) — the second silently overwrote the first, and the survivor
+    // bound whichever FK came last. Now both survive under distinct names,
+    // each bound to its own FK column.
+    const def = defineSchema({
+      users: { id: { type: 'serial', primaryKey: true } },
+      events: {
+        id: { type: 'serial', primaryKey: true },
+        sponsorId: { type: 'integer', references: 'users.id' },
+        sponsor: { type: 'integer', references: 'users.id' },
+      },
+    });
+    const [meta, warnings] = captureWarnings(() => schemaDefToMetadata(def));
+
+    const rels = meta.tables.events!.relations;
+    const belongsTos = Object.values(rels).filter((r) => r.type === 'belongsTo');
+    assert.equal(belongsTos.length, 2, 'both belongsTo relations must survive');
+    const names = belongsTos.map((r) => r.name);
+    assert.equal(new Set(names).size, 2, 'names must be distinct');
+    const byFk = new Map(belongsTos.map((r) => [r.foreignKey, r.name]));
+    assert.ok(byFk.has('sponsor_id'), 'sponsorId FK survives');
+    assert.ok(byFk.has('sponsor'), 'sponsor FK survives');
+    assert.notEqual(byFk.get('sponsor_id'), byFk.get('sponsor'));
+    // Both collided with scalar column fields → warnings for each rename.
+    assert.ok(warnings.length >= 1);
+
+    // Reverse side: two distinct hasMany names on users, one per FK.
+    const userRels = Object.values(meta.tables.users!.relations).filter((r) => r.type === 'hasMany');
+    assert.equal(userRels.length, 2);
+    assert.equal(new Set(userRels.map((r) => r.name)).size, 2);
+  });
+
+  it('Pass-4 auto-m2m applies the shadow guard (concrete column → Rel suffix, not silent drop)', () => {
+    const def = defineSchema({
+      students: {
+        id: { type: 'serial', primaryKey: true },
+        courses: { type: 'text' }, // concrete scalar shadowing the m2m name
+      },
+      courses: { id: { type: 'serial', primaryKey: true } },
+      studentsCourses: {
+        studentId: { type: 'integer', references: 'students.id' },
+        courseId: { type: 'integer', references: 'courses.id' },
+        primaryKey: ['studentId', 'courseId'],
+      },
+    });
+    const [meta, warnings] = captureWarnings(() => schemaDefToMetadata(def));
+    const students = meta.tables.students!;
+    assert.equal(students.relations.courses, undefined);
+    assert.equal(students.relations.coursesRel!.type, 'manyToMany');
+    assert.deepStrictEqual(students.relations.coursesRel!.through, {
+      table: 'students_courses',
+      sourceKey: 'student_id',
+      targetKey: 'course_id',
+    });
+    assert.ok(warnings.some((w) => w.includes('coursesRel')));
+    // The reverse direction is unaffected.
+    assert.equal(meta.tables.courses!.relations.students!.type, 'manyToMany');
+  });
+});
+
+describe('schemaDefToMetadata — relation-name parity with buildRelationsFromForeignKeys (N-4)', () => {
+  it('derives IDENTICAL names to introspection-shaped FK entries for the divergent shapes', () => {
+    // One logical schema exercising: (1) the posts.user/userId shadow shape,
+    // (2) the Capa two-FKs-to-one-target shape, (3) a pure junction m2m.
+    const def = defineSchema({
+      users: { id: { type: 'serial', primaryKey: true } },
+      posts: {
+        id: { type: 'serial', primaryKey: true },
+        user: { type: 'text' },
+        userId: { type: 'integer', notNull: true, references: 'users.id' },
+      },
+      modelInstances: {
+        id: { type: 'serial', primaryKey: true },
+        currentVersionId: { type: 'integer', references: 'modelInstanceVersions.id' },
+        publishedVersionId: { type: 'integer', references: 'modelInstanceVersions.id' },
+      },
+      modelInstanceVersions: { id: { type: 'serial', primaryKey: true } },
+      tags: { id: { type: 'serial', primaryKey: true } },
+      postTags: {
+        postId: { type: 'integer', references: 'posts.id' },
+        tagId: { type: 'integer', references: 'tags.id' },
+        primaryKey: ['postId', 'tagId'],
+      },
+    });
+
+    // (a) the defineSchema path
+    const [meta] = captureWarnings(() => schemaDefToMetadata(def));
+
+    // (b) the introspection path, fed the FK entries a live catalog would
+    // report for the SAME schema (snake_case columns, pg-default constraint
+    // names) plus the same column-field seeds.
+    const fks: ForeignKeyEntry[] = [
+      {
+        sourceTable: 'posts',
+        sourceColumns: ['user_id'],
+        targetTable: 'users',
+        targetColumns: ['id'],
+        constraintName: 'posts_user_id_fkey',
+      },
+      {
+        sourceTable: 'model_instances',
+        sourceColumns: ['current_version_id'],
+        targetTable: 'model_instance_versions',
+        targetColumns: ['id'],
+        constraintName: 'model_instances_current_version_id_fkey',
+      },
+      {
+        sourceTable: 'model_instances',
+        sourceColumns: ['published_version_id'],
+        targetTable: 'model_instance_versions',
+        targetColumns: ['id'],
+        constraintName: 'model_instances_published_version_id_fkey',
+      },
+      {
+        sourceTable: 'post_tags',
+        sourceColumns: ['post_id'],
+        targetTable: 'posts',
+        targetColumns: ['id'],
+        constraintName: 'post_tags_post_id_fkey',
+      },
+      {
+        sourceTable: 'post_tags',
+        sourceColumns: ['tag_id'],
+        targetTable: 'tags',
+        targetColumns: ['id'],
+        constraintName: 'post_tags_tag_id_fkey',
+      },
+    ];
+    const columnFieldsByTable = new Map<string, Set<string>>([
+      ['users', new Set(['id'])],
+      ['posts', new Set(['id', 'user', 'userId'])],
+      ['model_instances', new Set(['id', 'currentVersionId', 'publishedVersionId'])],
+      ['model_instance_versions', new Set(['id'])],
+      ['tags', new Set(['id'])],
+      ['post_tags', new Set(['postId', 'tagId'])],
+    ]);
+    const [introspected] = captureWarnings(() => {
+      const rels = buildRelationsFromForeignKeys(fks, columnFieldsByTable);
+      addAutoManyToManyRelations(
+        ['users', 'posts', 'model_instances', 'model_instance_versions', 'tags', 'post_tags'],
+        fks,
+        new Map([
+          ['users', ['id']],
+          ['posts', ['id']],
+          ['model_instances', ['id']],
+          ['model_instance_versions', ['id']],
+          ['tags', ['id']],
+          ['post_tags', ['post_id', 'tag_id']],
+        ]),
+        new Map([
+          ['users', ['id']],
+          ['posts', ['id', 'user', 'user_id']],
+          ['model_instances', ['id', 'current_version_id', 'published_version_id']],
+          ['model_instance_versions', ['id']],
+          ['tags', ['id']],
+          ['post_tags', ['post_id', 'tag_id']],
+        ]),
+        rels,
+        columnFieldsByTable,
+      );
+      return rels;
+    });
+
+    for (const table of ['users', 'posts', 'model_instances', 'model_instance_versions', 'tags', 'post_tags']) {
+      assert.deepStrictEqual(
+        Object.keys(meta.tables[table]!.relations).sort(),
+        Object.keys(introspected.get(table) ?? {}).sort(),
+        `relation-name parity on "${table}"`,
+      );
+    }
   });
 });

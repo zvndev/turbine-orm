@@ -131,3 +131,72 @@ describe('Postgres enum write casts (T-3)', () => {
     assert.match(d.sql, /\$1::"weird""enum"/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// N-5 — cross-schema enum false positive
+//
+// A column typed `other_schema.status` shares its NAME with an enum
+// introspected from the target schema. Introspection records
+// `pgTypeSchema: 'other_schema'` on such columns (and ONLY such columns);
+// the builder must then SKIP the cast — `::"status"` would resolve through
+// search_path to the WRONG type and break writes that worked before casts
+// existed. Same-schema / defineSchema / legacy metadata (no pgTypeSchema)
+// keep the cast.
+// ---------------------------------------------------------------------------
+
+describe('Postgres enum write casts — cross-schema guard (N-5)', () => {
+  function crossSchemaSchema(): SchemaMetadata {
+    const tables: Record<string, TableMetadata> = {};
+    tables.fields = mockTable('fields', [
+      { name: 'id', field: 'id' },
+      { name: 'title', field: 'title', pgType: 'text' },
+      { name: 'status', field: 'status', pgType: 'status' },
+    ]);
+    // Mark the column's type as living in ANOTHER schema — exactly what
+    // introspection records for `other_schema.status`.
+    const statusCol = tables.fields.columns.find((c) => c.name === 'status')!;
+    statusCol.pgTypeSchema = 'other_schema';
+    // The introspected (local) schema ALSO has an enum named `status`.
+    return { tables, enums: { status: ['open', 'closed'] } };
+  }
+
+  it('create: NO cast when the column type lives in another schema (false-positive shape)', () => {
+    const q = makeQuery('fields', crossSchemaSchema());
+    const d = q.buildCreate({ data: { title: 'a', status: 'open' } as never });
+    assert.match(d.sql, /VALUES \(\$1, \$2\)/);
+    assert.doesNotMatch(d.sql, /::"status"/);
+  });
+
+  it('createMany: UNNEST stays text[] for the cross-schema column', () => {
+    const q = makeQuery('fields', crossSchemaSchema());
+    const d = q.buildCreateMany({ data: [{ status: 'open' }, { status: 'closed' }] as never });
+    assert.doesNotMatch(d.sql, /::"status"\[\]/);
+  });
+
+  it('update: NO cast on the SET bind for the cross-schema column', () => {
+    const q = makeQuery('fields', crossSchemaSchema());
+    const d = q.buildUpdate({ where: { id: 1 } as never, data: { status: 'closed' } as never });
+    assert.match(d.sql, /SET "status" = \$1 WHERE/);
+    assert.doesNotMatch(d.sql, /::"status"/);
+  });
+
+  it('true positive: absent pgTypeSchema (same schema / legacy metadata) keeps the cast', () => {
+    const tables: Record<string, TableMetadata> = {};
+    tables.fields = mockTable('fields', [
+      { name: 'id', field: 'id' },
+      { name: 'status', field: 'status', pgType: 'status' },
+    ]);
+    const q = makeQuery('fields', { tables, enums: { status: ['open', 'closed'] } });
+    const d = q.buildCreate({ data: { status: 'open' } as never });
+    assert.match(d.sql, /\$1::"status"/);
+  });
+
+  it('generateMetadata serializes pgTypeSchema so the guard survives codegen', async () => {
+    const { generateMetadata } = await import('../generate.js');
+    const schema = crossSchemaSchema();
+    const out = generateMetadata(schema, { noTimestamp: true });
+    assert.match(out, /pgTypeSchema: 'other_schema'/);
+    // Columns without the marker stay untouched (no `pgTypeSchema: undefined`).
+    assert.equal(out.match(/pgTypeSchema/g)?.length, 1);
+  });
+});

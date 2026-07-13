@@ -156,9 +156,11 @@ export type PublishedVersionRel = ModelInstanceRelations['publishedVersion'];
 type AssertOne<T extends RelationDescriptor<ModelInstanceVersion, 'one', ModelInstanceVersionRelations>> = T;
 export type _one = AssertOne<PublishedVersionRel>;
 
-// The reverse hasMany side gets one distinct relation per FK column.
-export type ByCurrent = ModelInstanceVersionRelations['modelInstancesByCurrentVersion'];
-export type ByPublished = ModelInstanceVersionRelations['modelInstancesByPublishedVersion'];
+// The reverse hasMany side gets one distinct relation per FK column. These
+// keep main's LEGACY derivation (the raw column with '_by_' composition —
+// collision-free, so it must survive a regen unchanged; N-1a).
+export type ByCurrent = ModelInstanceVersionRelations['modelInstancesByCurrentVersionId'];
+export type ByPublished = ModelInstanceVersionRelations['modelInstancesByPublishedVersionId'];
 type AssertMany<T extends RelationDescriptor<ModelInstance, 'many', ModelInstanceRelations>> = T;
 export type _many = AssertMany<ByCurrent>;
 `;

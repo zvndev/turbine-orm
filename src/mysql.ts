@@ -80,6 +80,7 @@ import {
   type UpsertStatementInput,
 } from './dialect.js';
 import { ConnectionError, UnsupportedFeatureError } from './errors.js';
+import { deriveEngineRelations } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import {
   type ColumnMetadata,
@@ -87,7 +88,6 @@ import {
   isDateType,
   type RelationDef,
   type SchemaMetadata,
-  singularize,
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
@@ -705,10 +705,12 @@ interface FKEntry {
 }
 
 /**
- * Derive belongsTo + hasMany relations (and conservatively-detected manyToMany
- * junctions) from a flat foreign-key list. Mirrors the PostgreSQL / SQLite
- * introspectors so the produced {@link SchemaMetadata} has an identical relation
- * shape across engines.
+ * Derive relations from the FK list via the SHARED introspection pipeline
+ * (`deriveEngineRelations` → `buildRelationsFromForeignKeys` +
+ * `addAutoManyToManyRelations` in introspect.ts), so this engine derives
+ * IDENTICAL relation names to `turbine generate` against Postgres for the
+ * same logical schema — legacy-first naming, per-column disambiguation, and
+ * collision resolution against scalar column fields included.
  */
 function buildRelationsFromForeignKeys(
   tableNames: string[],
@@ -716,92 +718,7 @@ function buildRelationsFromForeignKeys(
   pkByTable: Map<string, string[]>,
   columnsByTable: Map<string, ColumnMetadata[]>,
 ): Map<string, Record<string, RelationDef>> {
-  const tableSet = new Set(tableNames);
-  const fkCounts = new Map<string, number>();
-  for (const fk of foreignKeys) {
-    const key = `${fk.sourceTable}->${fk.targetTable}`;
-    fkCounts.set(key, (fkCounts.get(key) ?? 0) + 1);
-  }
-  const relationsByTable = new Map<string, Record<string, RelationDef>>();
-  for (const fk of foreignKeys) {
-    if (!tableSet.has(fk.targetTable)) continue;
-    const needsDisambiguation = (fkCounts.get(`${fk.sourceTable}->${fk.targetTable}`) ?? 0) > 1;
-    const foreignKey = fk.sourceColumns.length === 1 ? fk.sourceColumns[0]! : fk.sourceColumns;
-    const referenceKey = fk.targetColumns.length === 1 ? fk.targetColumns[0]! : fk.targetColumns;
-
-    const belongsToName =
-      needsDisambiguation && fk.sourceColumns.length === 1
-        ? snakeToCamel(fk.sourceColumns[0]!.replace(/_id$/, ''))
-        : singularize(snakeToCamel(fk.targetTable));
-    if (!relationsByTable.has(fk.sourceTable)) relationsByTable.set(fk.sourceTable, {});
-    relationsByTable.get(fk.sourceTable)![belongsToName] = {
-      type: 'belongsTo',
-      name: belongsToName,
-      from: fk.sourceTable,
-      to: fk.targetTable,
-      foreignKey,
-      referenceKey,
-    };
-
-    const hasManyName =
-      needsDisambiguation && fk.sourceColumns.length === 1
-        ? snakeToCamel(`${fk.sourceTable}_by_${fk.sourceColumns[0]!.replace(/_id$/, '')}`)
-        : snakeToCamel(fk.sourceTable);
-    if (!relationsByTable.has(fk.targetTable)) relationsByTable.set(fk.targetTable, {});
-    relationsByTable.get(fk.targetTable)![hasManyName] = {
-      type: 'hasMany',
-      name: hasManyName,
-      from: fk.targetTable,
-      to: fk.sourceTable,
-      foreignKey,
-      referenceKey,
-    };
-  }
-
-  // Conservative many-to-many auto-detection (additive): a table J is a pure
-  // junction iff PK is exactly two columns, exactly two single-column FKs whose
-  // source columns ARE the PK, two distinct target tables, and no payload columns.
-  for (const tableName of tableNames) {
-    const pk = pkByTable.get(tableName) ?? [];
-    if (pk.length !== 2) continue;
-    const tableFks = foreignKeys.filter((fk) => fk.sourceTable === tableName);
-    if (tableFks.length !== 2) continue;
-    if (tableFks.some((fk) => fk.sourceColumns.length !== 1)) continue;
-    const fkCols = tableFks.map((fk) => fk.sourceColumns[0]!);
-    const pkSet = new Set(pk);
-    if (!fkCols.every((c) => pkSet.has(c))) continue;
-    if (new Set(fkCols).size !== 2) continue;
-    const [fkA, fkB] = tableFks as [FKEntry, FKEntry];
-    if (fkA.targetTable === fkB.targetTable) continue;
-    const jCols = (columnsByTable.get(tableName) ?? []).map((c) => c.name);
-    if (jCols.length !== 2) continue;
-
-    const addM2M = (self: FKEntry, other: FKEntry) => {
-      const sourceTbl = self.targetTable;
-      const targetTbl = other.targetTable;
-      const relName = snakeToCamel(targetTbl);
-      if (!relationsByTable.has(sourceTbl)) relationsByTable.set(sourceTbl, {});
-      const existing = relationsByTable.get(sourceTbl)!;
-      if (existing[relName]) return;
-      existing[relName] = {
-        type: 'manyToMany',
-        name: relName,
-        from: sourceTbl,
-        to: targetTbl,
-        referenceKey: self.targetColumns.length === 1 ? self.targetColumns[0]! : self.targetColumns,
-        foreignKey: self.targetColumns.length === 1 ? self.targetColumns[0]! : self.targetColumns,
-        through: {
-          table: tableName,
-          sourceKey: self.sourceColumns[0]!,
-          targetKey: other.sourceColumns[0]!,
-        },
-      };
-    };
-    addM2M(fkA, fkB);
-    addM2M(fkB, fkA);
-  }
-
-  return relationsByTable;
+  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable);
 }
 
 /**
