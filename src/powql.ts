@@ -1065,7 +1065,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         this.options,
       );
       const ctx: NestedWriteContext = { schema: this.schema, tx: tx as unknown as NestedWriteContext['tx'] };
-      const result = await fn(ctx);
+      // Plant the single-writer re-entrancy marker for the implicit tx's
+      // subtree (same seam TurbineClient.$transaction uses) — user code that
+      // fires db.$transaction from inside (e.g. $use middleware around a
+      // nested-write child op) must fast-fail E017, not queue into deadlock.
+      const wrap = (client as { wrapTransactionCallback?: <T>(f: () => Promise<T>) => Promise<T> })
+        .wrapTransactionCallback;
+      const result = await (wrap ? wrap(() => fn(ctx)) : fn(ctx));
       await client.query(d?.commitStatement?.() ?? 'commit');
       return result;
     } catch (err) {

@@ -1489,3 +1489,141 @@ describe('powdb: owned-pool disconnect() closes every driver client (socket-leak
     await assert.rejects(() => pool.query('note after'), ConnectionError);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.31 review fixes — release destroy contract, closed guards, implicit-tx marker
+// ---------------------------------------------------------------------------
+
+describe('powdb: connection release honors the destroy contract (review fix)', () => {
+  function countingClientPool() {
+    const sent: string[] = [];
+    let released = 0;
+    let destroyed = 0;
+    const client = {
+      serverVersion: '0.8.0',
+      query: async (powql: string) => {
+        sent.push(powql);
+        return { kind: 'message', message: 'ok' };
+      },
+      close: async () => {},
+    };
+    const pool = {
+      acquire: async () => client,
+      release() {
+        released++;
+      },
+      destroy() {
+        destroyed++;
+      },
+      withClient: async (fn: (c: typeof client) => Promise<unknown>) => fn(client),
+      close: async () => {},
+    };
+    return {
+      pool: pool as unknown as ConstructorParameters<typeof PowdbPool>[0],
+      sent,
+      counts: () => ({ released, destroyed }),
+    };
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 10));
+
+  it('release(err) after an un-ended begin rolls back, then DESTROYS (never re-idles)', async () => {
+    const fake = countingClientPool();
+    const client = await new PowdbPool(fake.pool).connect();
+    await client.query('begin');
+    client.release(new Error('tx timeout'));
+    await settle();
+    assert.deepEqual(fake.sent, ['begin', 'rollback'], 'open server-side tx is ended before the gate moves on');
+    assert.deepEqual(fake.counts(), { released: 0, destroyed: 1 });
+  });
+
+  it('release() with an open hold but no error still rolls back; clean rollback re-idles', async () => {
+    const fake = countingClientPool();
+    const client = await new PowdbPool(fake.pool).connect();
+    await client.query('begin');
+    client.release();
+    await settle();
+    assert.deepEqual(fake.sent, ['begin', 'rollback']);
+    assert.deepEqual(fake.counts(), { released: 1, destroyed: 0 });
+  });
+
+  it('clean commit then release() re-idles with no extra rollback', async () => {
+    const fake = countingClientPool();
+    const client = await new PowdbPool(fake.pool).connect();
+    await client.query('begin');
+    await client.query('commit');
+    client.release();
+    await settle();
+    assert.deepEqual(fake.sent, ['begin', 'commit']);
+    assert.deepEqual(fake.counts(), { released: 1, destroyed: 0 });
+  });
+
+  it('the gate hands over only after the teardown rollback completes', async () => {
+    const fake = countingClientPool();
+    const pool = new PowdbPool(fake.pool);
+    const c1 = await pool.connect();
+    await c1.query('begin');
+    const c2 = await pool.connect();
+    const secondBegin = c2.query('begin');
+    c1.release(new Error('boom'));
+    await secondBegin;
+    const beginIdx = fake.sent.lastIndexOf('begin');
+    const rollbackIdx = fake.sent.indexOf('rollback');
+    assert.ok(rollbackIdx >= 0 && rollbackIdx < beginIdx, `rollback precedes next begin: ${fake.sent}`);
+    await c2.query('commit');
+    c2.release();
+  });
+});
+
+describe('powdb: closed-pool guard is typed on BOTH transports (review fix)', () => {
+  it('networked query()/connect() after end() throw ConnectionError E004', async () => {
+    const fake = fakeNetworkedClientPool();
+    const pool = new PowdbPool(fake.pool);
+    await pool.end();
+    await assert.rejects(pool.query('app_user { .id }'), ConnectionError);
+    await assert.rejects(pool.connect(), ConnectionError);
+  });
+
+  it("wrapPowdbError classifies the driver's raw pool lifecycle errors", () => {
+    assert.ok(wrapPowdbError(new Error('pool closed')) instanceof ConnectionError);
+    assert.ok(wrapPowdbError(new Error('pool acquire timeout after 5000ms')) instanceof ConnectionError);
+  });
+});
+
+describe('powdb: runInImplicitTx plants the re-entrancy marker (review fix)', () => {
+  it('nested-write implicit tx runs its callback through wrapTransactionCallback', async () => {
+    let wrapped = 0;
+    const sent: string[] = [];
+    const client = {
+      query: async (powql: string) => {
+        sent.push(powql);
+        if (/^insert app_user/.test(powql)) {
+          return {
+            rows: [{ id: 'u1', name: 'x', age: null, score: null, active: null, created_at: null }],
+            rowCount: 1,
+          };
+        }
+        if (/^insert post/.test(powql)) {
+          return { rows: [{ id: 'p1', author_id: 'u1', title: 't', views: null }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      wrapTransactionCallback: <R>(fn: () => Promise<R>): Promise<R> => {
+        wrapped++;
+        return fn();
+      },
+      release() {},
+    };
+    const pool = {
+      query: async () => ({ rows: [], rowCount: 0 }),
+      connect: async () => client,
+    } as unknown as PowdbPool;
+    const qi = new PowqlInterface(pool, 'app_user', schema, [], {
+      queryInterfaceFactory: (p: never, t: string, s: never, m: never, o: never) =>
+        new PowqlInterface(p, t, s, m, o) as never,
+    } as never);
+    const row = await qi.create({ data: { name: 'x', posts: { create: [{ title: 't' }] } } } as never);
+    assert.equal(wrapped, 1, 'user callback subtree carries the single-writer marker');
+    assert.equal((row as { id: string }).id, 'u1');
+    assert.ok(sent.includes('begin') && sent.includes('commit'));
+  });
+});

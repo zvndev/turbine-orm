@@ -545,6 +545,11 @@ export function wrapPowdbError(err: unknown): Error {
     const m = /column ['"]?(\w+)['"]?/i.exec(msg);
     return new NotNullViolationError({ column: m?.[1], cause: err as Error });
   }
+  // Driver pool lifecycle errors (acquire after close, acquire timeout) carry
+  // no .code — classify by message so both transports surface E004.
+  if (/pool closed|pool acquire timeout/i.test(msg)) {
+    return new ConnectionError(`[turbine] PowDB connection unavailable: ${msg}`);
+  }
   // Server-side transaction-gate wait bound (PowDB ≥ 0.10, default 5s): another
   // connection held the single global write lock past the server's
   // --tx-wait-timeout-ms. Retryable timeout, not a query defect.
@@ -634,6 +639,14 @@ function reentrantTransactionError(): UnsupportedFeatureError {
  * waits without limit.
  */
 export const DEFAULT_TX_QUEUE_TIMEOUT_MS = 30_000;
+
+/**
+ * Upper bound on the best-effort `rollback` a release-with-open-hold fires
+ * before handing the gate to the next queued transaction. Keeps a dead socket
+ * from wedging the FIFO queue while still letting the engine drop its global
+ * write lock cleanly in the normal case.
+ */
+const RELEASE_ROLLBACK_TIMEOUT_MS = 2_000;
 
 /**
  * Marker stored in the async context of a transaction CALLBACK's subtree.
@@ -870,6 +883,7 @@ export class PowdbPool implements PgCompatPool {
 
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
+    this.assertOpen();
     const { text: powql, params } = normalizeQueryArgs(text, values);
     const ctl = txControl(powql);
     if (ctl === 'begin') {
@@ -902,8 +916,25 @@ export class PowdbPool implements PgCompatPool {
     }
   }
 
+  /**
+   * Typed guard mirroring {@link PowdbEmbeddedPool}: after `end()` the driver
+   * pool throws a raw `Error('pool closed')` that {@link wrapPowdbError}
+   * cannot classify — surface the same ConnectionError on both transports.
+   */
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new ConnectionError('[turbine] The PowDB pool is closed — disconnect() was already called on this client.');
+    }
+  }
+
   async connect(): Promise<PgCompatPoolClient> {
-    const client = await this.pool.acquire();
+    this.assertOpen();
+    let client: PowdbClient;
+    try {
+      client = await this.pool.acquire();
+    } catch (err) {
+      throw wrapPowdbError(err);
+    }
     this.checkedOut.add(client);
     let broken = false;
     /** The gate hold of the transaction begun through THIS connection (if any). */
@@ -965,17 +996,48 @@ export class PowdbPool implements PgCompatPool {
         const ctx = hold?.ctx;
         return ctx ? powdbTxStorage.run(ctx, fn) : fn();
       },
-      release: () => {
-        // Releasing this connection ends its transaction scope. Finish the
-        // hold as a safety net so a tx torn down without an explicit
-        // commit/rollback (e.g. a timeout that destroys the connection) hands
-        // the gate to the next queued transaction instead of wedging the
-        // queue. Only THIS connection's hold — releasing an unrelated (read)
-        // connection never touches another transaction's slot.
-        hold?.finish();
+      release: (err?: Error | boolean) => {
+        // Releasing this connection ends its transaction scope. pg semantics:
+        // a truthy `err` means "destroy, don't re-idle" — client.ts's
+        // $transaction timeout path relies on that to keep an abandoned
+        // callback's connection out of the pool. Additionally, an OPEN hold
+        // here means the tx begun on this connection never saw commit/rollback
+        // (timeout teardown or caller bug): fire a best-effort bounded
+        // `rollback` FIRST so the engine drops its global write lock and the
+        // server-side transaction ends (destroying the socket alone leaves it
+        // open until the server's idle timeout), THEN hand the gate to the
+        // next queued transaction. If the rollback fails or times out the
+        // connection is treated as broken and destroyed. Never throws — a
+        // teardown error must not mask the transaction's real outcome.
+        const openHold = hold;
         hold = null;
         this.checkedOut.delete(client);
-        return broken ? this.pool.destroy(client) : this.pool.release(client);
+        const teardown = async (): Promise<void> => {
+          let rolledBack = false;
+          if (openHold) {
+            try {
+              await Promise.race([
+                client.query('rollback', []).then(() => {
+                  rolledBack = true;
+                }),
+                new Promise<void>((resolve) => {
+                  const t = setTimeout(resolve, RELEASE_ROLLBACK_TIMEOUT_MS);
+                  t.unref?.();
+                }),
+              ]);
+            } catch {
+              /* best-effort */
+            }
+            openHold.finish();
+          }
+          const mustDestroy = broken || Boolean(err) || (openHold !== null && !rolledBack);
+          try {
+            await (mustDestroy ? this.pool.destroy(client) : this.pool.release(client));
+          } catch {
+            /* the pool may already be closed */
+          }
+        };
+        void teardown();
       },
     };
   }
@@ -1220,9 +1282,22 @@ export class PowdbEmbeddedPool implements PgCompatPool {
       },
       release: () => {
         // End-of-scope safety net (see PowdbPool.connect()): a tx torn down
-        // without an explicit commit/rollback must not wedge the queue.
-        holdRef.hold?.finish();
-        holdRef.hold = null;
+        // without an explicit commit/rollback must not wedge the queue — and
+        // on the ONE shared embedded handle its open engine transaction must
+        // actually be rolled back before the gate moves on, or the next
+        // transaction's work interleaves into it. run() owns the
+        // finish/null-out in its commit/rollback finally; the .finally here
+        // is the fallback when run() itself rejects.
+        const h = holdRef.hold;
+        if (!h) return;
+        void this.run('rollback', [], holdRef)
+          .catch(() => {
+            /* best-effort */
+          })
+          .finally(() => {
+            h.finish();
+            holdRef.hold = null;
+          });
       },
     };
   }
