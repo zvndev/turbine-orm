@@ -68,6 +68,7 @@ import {
   normalizeKeyColumns,
   type RelationDef,
   type SchemaMetadata,
+  snakeToCamel,
   type TableMetadata,
 } from './schema.js';
 
@@ -139,7 +140,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
     this.meta = meta;
     this.defaultLimit = options.defaultLimit;
-    this.warnOnUnlimited = options.warnOnUnlimited !== false;
+    // Same per-table resolution as QueryInterface: an object map accepts BOTH
+    // the snake_case table name and the camelCase accessor as keys (snake_case
+    // wins on conflict); unlisted tables keep the default (warn on).
+    const warnOpt = options.warnOnUnlimited;
+    this.warnOnUnlimited =
+      typeof warnOpt === 'object' && warnOpt !== null
+        ? (warnOpt[table] ?? warnOpt[snakeToCamel(table)]) !== false
+        : warnOpt !== false;
     this.onQuery = options._onQuery;
   }
 

@@ -73,10 +73,12 @@ export interface QueryInterfaceOptions {
    * without a `limit`. Defaults to `true` so that accidental unbounded
    * queries are surfaced loudly during development. Pass `false` to silence
    * the warning entirely (e.g. for CLI tooling that intentionally streams
-   * full tables), or a per-table map (`{ users: false }`) to silence only
-   * the tables that intentionally read full sets — unlisted tables keep the
-   * default. Individual calls can also override via
-   * `findMany({ warnOnUnlimited: false })`.
+   * full tables), or a per-table map (`{ userProfiles: false }`) to silence
+   * only the tables that intentionally read full sets — unlisted tables keep
+   * the default. Map keys accept BOTH the camelCase accessor name
+   * (`userProfiles`) and the snake_case table name (`user_profiles`); the
+   * snake_case entry wins if both are present. Individual calls can also
+   * override via `findMany({ warnOnUnlimited: false })`.
    */
   warnOnUnlimited?: boolean | Record<string, boolean>;
   /**

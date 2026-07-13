@@ -44,15 +44,20 @@
  */
 
 import {
+  addAutoManyToManyRelations,
+  buildRelationsFromForeignKeys,
+  type ForeignKeyEntry,
+  isUnknownTsType,
+} from './introspect.js';
+import {
   type ColumnMetadata,
   camelToSnake,
   isDateType,
   pgArrayType,
   pgTypeToTs,
+  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
-  singularize,
-  snakeToCamel,
   type TableMetadata,
 } from './schema.js';
 import { applyManyToManyRelations, type ColumnConfig, type ColumnType, type SchemaDef } from './schema-builder.js';
@@ -203,63 +208,74 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
     }
   }
 
-  // ----- Pass 3: derive belongsTo / hasMany relations (mirrors introspect) --
-  const fkCounts = new Map<string, number>();
+  // ----- Pass 3: derive belongsTo / hasMany relations (SHARED with introspect)
+  //
+  // Delegates to the exact same builder introspection uses
+  // (`buildRelationsFromForeignKeys`), so the same logical schema yields
+  // IDENTICAL relation names whether it arrives via `defineSchema()` or a live
+  // catalog: legacy-first naming, per-column disambiguation for several FKs to
+  // the same target, and collision resolution against scalar column fields
+  // (json/jsonb `unknown`-typed shadows keep the historical name). The old
+  // local reimplementation had NO collision guard — `posts.user` (text) +
+  // `userId references users.id` produced a relation `user` that shadowed the
+  // scalar, and two FKs deriving the same name silently clobbered each other
+  // (N-4).
+  //
+  // Constraint names are synthesized in pg's default `<table>_<column>_fkey`
+  // form; they only feed the referential-action lookup and composite-FK
+  // naming (never hit here — `references:` is single-column by design).
+  const fkEntries: ForeignKeyEntry[] = [];
+  const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
   for (const fk of foreignKeys) {
-    const key = `${fk.sourceTable}→${fk.targetTable}`;
-    fkCounts.set(key, (fkCounts.get(key) ?? 0) + 1);
+    const constraintName = `${fk.sourceTable}_${fk.sourceColumn}_fkey`;
+    fkEntries.push({
+      sourceTable: fk.sourceTable,
+      sourceColumns: [fk.sourceColumn],
+      targetTable: fk.targetTable,
+      targetColumns: [fk.targetColumn],
+      constraintName,
+    });
+    fkActions.set(constraintName, {
+      onDelete: fk.onDelete ?? 'no action',
+      onUpdate: fk.onUpdate ?? 'no action',
+    });
   }
 
-  const relationsByTable = new Map<string, Record<string, RelationDef>>();
-  const relationsFor = (table: string): Record<string, RelationDef> => {
-    let rels = relationsByTable.get(table);
-    if (!rels) {
-      rels = {};
-      relationsByTable.set(table, rels);
-    }
-    return rels;
-  };
-
-  for (const fk of foreignKeys) {
-    const needsDisambiguation = (fkCounts.get(`${fk.sourceTable}→${fk.targetTable}`) ?? 0) > 1;
-
-    // Referential actions — omit the 'no action' default to keep metadata lean.
-    const actionFields: { onDelete?: RelationDef['onDelete']; onUpdate?: RelationDef['onUpdate'] } = {};
-    if (fk.onDelete && fk.onDelete !== 'no action') actionFields.onDelete = fk.onDelete;
-    if (fk.onUpdate && fk.onUpdate !== 'no action') actionFields.onUpdate = fk.onUpdate;
-
-    // belongsTo on the child: posts.user_id → users.id gives posts.user
-    const belongsToName = needsDisambiguation
-      ? snakeToCamel(fk.sourceColumn.replace(/_id$/, ''))
-      : singularize(snakeToCamel(fk.targetTable));
-    relationsFor(fk.sourceTable)[belongsToName] = {
-      type: 'belongsTo',
-      name: belongsToName,
-      from: fk.sourceTable,
-      to: fk.targetTable,
-      foreignKey: fk.sourceColumn,
-      referenceKey: fk.targetColumn,
-      ...actionFields,
-    };
-
-    // hasMany on the parent: posts.user_id → users.id gives users.posts
-    const hasManyName = needsDisambiguation
-      ? snakeToCamel(`${fk.sourceTable}_by_${fk.sourceColumn.replace(/_id$/, '')}`)
-      : snakeToCamel(fk.sourceTable);
-    relationsFor(fk.targetTable)[hasManyName] = {
-      type: 'hasMany',
-      name: hasManyName,
-      from: fk.targetTable,
-      to: fk.sourceTable,
-      foreignKey: fk.sourceColumn,
-      referenceKey: fk.targetColumn,
-      ...actionFields,
-    };
+  // Taken-name seeds: every table's camelCase column fields (the SchemaDef
+  // keys ARE the fields) + which of them are json/jsonb (`unknown`-typed).
+  const columnFieldsByTable = new Map<string, Set<string>>();
+  const unknownTypedFieldsByTable = new Map<string, Set<string>>();
+  for (const tableDef of Object.values(def.tables)) {
+    const fields = Object.keys(tableDef.columns);
+    columnFieldsByTable.set(tableDef.name, new Set(fields));
+    // ENUM columns map to concrete union types in the generated layer, so
+    // only genuine json/jsonb (`unknown`-typed) columns qualify as shadows.
+    unknownTypedFieldsByTable.set(
+      tableDef.name,
+      new Set(
+        fields.filter((f) => {
+          const config = tableDef.columns[f]!;
+          if (config.type === 'ENUM') return false;
+          const wire = config.isArray ? `_${udtName(config)}` : udtName(config);
+          return isUnknownTsType(pgTypeToTs(wire, false));
+        }),
+      ),
+    );
   }
 
-  // ----- Pass 4: conservative junction auto-m2m (mirrors introspect) -------
-  // A table J is a PURE junction only when its PK is exactly the two
-  // single-column FKs to two DISTINCT tables and it has no payload columns.
+  const relationsByTable = buildRelationsFromForeignKeys(
+    fkEntries,
+    columnFieldsByTable,
+    fkActions,
+    unknownTypedFieldsByTable,
+  );
+
+  // ----- Pass 4: conservative junction auto-m2m (SHARED with introspect) ---
+  // Same shared detector + naming/collision rules as introspection: a table J
+  // is a PURE junction only when its PK is exactly the two single-column FKs
+  // to two DISTINCT tables and it has no payload columns.
+  const pkByTable = new Map<string, string[]>();
+  const columnNamesByTable = new Map<string, string[]>();
   for (const tableDef of Object.values(def.tables)) {
     const pkFields =
       tableDef.primaryKey && tableDef.primaryKey.length > 0
@@ -267,45 +283,18 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
         : Object.entries(tableDef.columns)
             .filter(([, c]) => c.isPrimaryKey)
             .map(([f]) => f);
-    if (pkFields.length !== 2) continue;
-
-    const tableFks = foreignKeys.filter((fk) => fk.sourceTable === tableDef.name);
-    if (tableFks.length !== 2) continue;
-
-    const pkSet = new Set(pkFields.map(camelToSnake));
-    const fkCols = tableFks.map((fk) => fk.sourceColumn);
-    if (!fkCols.every((c) => pkSet.has(c))) continue;
-    if (new Set(fkCols).size !== 2) continue;
-
-    const [fkA, fkB] = tableFks as [ResolvedFk, ResolvedFk];
-    if (fkA.targetTable === fkB.targetTable) continue;
-
-    // No payload columns: J's columns are exactly the two FK/PK columns.
-    if (Object.keys(tableDef.columns).length !== 2) continue;
-
-    const addM2M = (self: ResolvedFk, other: ResolvedFk) => {
-      const relName = snakeToCamel(other.targetTable);
-      const existing = relationsFor(self.targetTable);
-      // Additive-only: never clobber an existing relation name.
-      if (existing[relName]) return;
-      existing[relName] = {
-        type: 'manyToMany',
-        name: relName,
-        from: self.targetTable,
-        to: other.targetTable,
-        referenceKey: self.targetColumn,
-        // foreignKey is unused for m2m correlation but kept for shape parity.
-        foreignKey: self.targetColumn,
-        through: {
-          table: tableDef.name,
-          sourceKey: self.sourceColumn,
-          targetKey: other.sourceColumn,
-        },
-      };
-    };
-    addM2M(fkA, fkB);
-    addM2M(fkB, fkA);
+    pkByTable.set(tableDef.name, pkFields.map(camelToSnake));
+    columnNamesByTable.set(tableDef.name, Object.keys(tableDef.columns).map(camelToSnake));
   }
+  addAutoManyToManyRelations(
+    Object.values(def.tables).map((t) => t.name),
+    fkEntries,
+    pkByTable,
+    columnNamesByTable,
+    relationsByTable,
+    columnFieldsByTable,
+    unknownTypedFieldsByTable,
+  );
 
   // ----- Pass 5: assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = {};

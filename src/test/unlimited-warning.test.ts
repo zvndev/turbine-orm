@@ -146,3 +146,61 @@ describe('findMany unlimited-query warning', () => {
     assert.equal(third.length, 1, 'reset re-enables the warning');
   });
 });
+
+// ---------------------------------------------------------------------------
+// N-6 — per-table map accepts BOTH key forms (snake_case table name AND
+// camelCase accessor). Client accessors are camelCase (db.userProfiles), so
+// accessor-keyed maps silently no-oped when the map was matched against the
+// snake_case table name only.
+// ---------------------------------------------------------------------------
+
+describe('findMany unlimited-query warning — multi-word table key forms (N-6)', () => {
+  function multiWordSchema(): SchemaMetadata {
+    const tables: Record<string, TableMetadata> = {};
+    tables.user_profiles = mockTable('user_profiles', [
+      { name: 'id', field: 'id' },
+      { name: 'bio', field: 'bio', pgType: 'text' },
+    ]);
+    return { tables, enums: {} };
+  }
+
+  it('accessor-keyed config ({ userProfiles: false }) suppresses the warning', async () => {
+    const q = new QueryInterface(stubPool(), 'user_profiles', multiWordSchema(), undefined, {
+      warnOnUnlimited: { userProfiles: false },
+    });
+    const warnings = await captureWarnings(() => q.findMany());
+    assert.equal(warnings.length, 0, 'camelCase accessor key must be honored');
+  });
+
+  it('snake-keyed config ({ user_profiles: false }) suppresses the warning', async () => {
+    const q = new QueryInterface(stubPool(), 'user_profiles', multiWordSchema(), undefined, {
+      warnOnUnlimited: { user_profiles: false },
+    });
+    const warnings = await captureWarnings(() => q.findMany());
+    assert.equal(warnings.length, 0);
+  });
+
+  it('snake_case wins on conflict ({ user_profiles: true, userProfiles: false } → warn)', async () => {
+    const q = new QueryInterface(stubPool(), 'user_profiles', multiWordSchema(), undefined, {
+      warnOnUnlimited: { user_profiles: true, userProfiles: false },
+    });
+    const warnings = await captureWarnings(() => q.findMany());
+    assert.equal(warnings.length, 1);
+  });
+
+  it('per-call warnOnUnlimited still wins over the per-table map', async () => {
+    // Map silences the table; per-call true forces the warning anyway.
+    const q = new QueryInterface(stubPool(), 'user_profiles', multiWordSchema(), undefined, {
+      warnOnUnlimited: { userProfiles: false },
+    });
+    const forced = await captureWarnings(() => q.findMany({ warnOnUnlimited: true }));
+    assert.equal(forced.length, 1, 'per-call true overrides the map');
+
+    // And per-call false wins over a map that leaves the table warned.
+    const q2 = new QueryInterface(stubPool(), 'user_profiles', multiWordSchema(), undefined, {
+      warnOnUnlimited: { somethingElse: false },
+    });
+    const suppressed = await captureWarnings(() => q2.findMany({ warnOnUnlimited: false }));
+    assert.equal(suppressed.length, 0, 'per-call false overrides the map');
+  });
+});

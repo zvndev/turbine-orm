@@ -4,6 +4,12 @@ import { dirname, resolve } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import pg from 'pg';
 import { findMissingRelationIndexes } from '../index-advisor.js';
+import {
+  addAutoManyToManyRelations,
+  buildRelationsFromForeignKeys,
+  type ForeignKeyEntry,
+  isUnknownTsType,
+} from '../introspect.js';
 import type { FindManyArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
 import {
@@ -14,7 +20,6 @@ import {
   pgTypeToTs,
   type RelationDef,
   type SchemaMetadata,
-  singularize,
   snakeToCamel,
   type TableMetadata,
 } from '../schema.js';
@@ -681,7 +686,7 @@ async function loadSchemaMetadata(client: pg.PoolClient, options: McpServerOptio
     enums[row.typname] = labels;
   }
 
-  const relationsByTable = buildRelations(tableNames, columnsByTable, pkByTable, fkResult.rows);
+  const relationsByTable = buildRelations(tableNames, columnsByTable, pkByTable, fkResult.rows, enums);
   const tables: Record<string, TableMetadata> = {};
   for (const tableName of tableNames) {
     const columns = columnsByTable.get(tableName) ?? [];
@@ -731,19 +736,20 @@ interface ForeignKeyRow {
   constraint_name: string;
 }
 
-interface ForeignKeyEntry {
-  sourceTable: string;
-  sourceColumns: string[];
-  targetTable: string;
-  targetColumns: string[];
-  constraintName: string;
-}
-
-function buildRelations(
+/**
+ * Group raw FK rows into constraint-level entries and delegate relation
+ * naming to the SHARED introspection builder (`buildRelationsFromForeignKeys`
+ * + `addAutoManyToManyRelations` in ../introspect.ts). MCP previously carried
+ * a stale copy of a retired naming scheme, so `turbine mcp` and `turbine
+ * generate` derived DIFFERENT relation names from the same database (N-3).
+ * Exported for the parity unit test.
+ */
+export function buildRelations(
   tableNames: string[],
   columnsByTable: Map<string, ColumnMetadata[]>,
   pkByTable: Map<string, string[]>,
   rows: ForeignKeyRow[],
+  enums: Record<string, string[]> = {},
 ): Map<string, Record<string, RelationDef>> {
   const tableSet = new Set(tableNames);
   const groups = new Map<string, ForeignKeyEntry>();
@@ -760,108 +766,36 @@ function buildRelations(
     group.targetColumns.push(row.target_column);
     groups.set(row.constraint_name, group);
   }
-
   const foreignKeys = [...groups.values()];
-  const fkCounts = new Map<string, number>();
-  for (const fk of foreignKeys) {
-    const key = `${fk.sourceTable}→${fk.targetTable}`;
-    fkCounts.set(key, (fkCounts.get(key) ?? 0) + 1);
+
+  const columnFieldsByTable = new Map<string, Set<string>>();
+  const unknownTypedFieldsByTable = new Map<string, Set<string>>();
+  for (const [tbl, cols] of columnsByTable) {
+    columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
+    // Enum-typed columns also report tsType 'unknown', but the generated type
+    // layer gives them a concrete union — only json/jsonb qualify as shadows.
+    unknownTypedFieldsByTable.set(
+      tbl,
+      new Set(cols.filter((c) => isUnknownTsType(c.tsType) && !Object.hasOwn(enums, c.pgType)).map((c) => c.field)),
+    );
   }
 
-  const relations = new Map<string, Record<string, RelationDef>>();
-  for (const fk of foreignKeys) {
-    const pairKey = `${fk.sourceTable}→${fk.targetTable}`;
-    const needsDisambiguation = (fkCounts.get(pairKey) ?? 0) > 1;
-    const foreignKey = oneOrMany(fk.sourceColumns);
-    const referenceKey = oneOrMany(fk.targetColumns);
-    const belongsToName = needsDisambiguation
-      ? fk.sourceColumns.length === 1
-        ? snakeToCamel(fk.sourceColumns[0]!.replace(/_id$/, ''))
-        : snakeToCamel(fk.constraintName.replace(/^fk_/, '').replace(/_fkey$/, ''))
-      : singularize(snakeToCamel(fk.targetTable));
-    const hasManyName = needsDisambiguation
-      ? fk.sourceColumns.length === 1
-        ? snakeToCamel(`${fk.sourceTable}_by_${fk.sourceColumns[0]!.replace(/_id$/, '')}`)
-        : snakeToCamel(`${fk.sourceTable}_by_${fk.constraintName.replace(/^fk_/, '').replace(/_fkey$/, '')}`)
-      : snakeToCamel(fk.sourceTable);
-
-    const sourceRels = relations.get(fk.sourceTable) ?? {};
-    sourceRels[belongsToName] = {
-      type: 'belongsTo',
-      name: belongsToName,
-      from: fk.sourceTable,
-      to: fk.targetTable,
-      foreignKey,
-      referenceKey,
-    };
-    relations.set(fk.sourceTable, sourceRels);
-
-    const targetRels = relations.get(fk.targetTable) ?? {};
-    targetRels[hasManyName] = {
-      type: 'hasMany',
-      name: hasManyName,
-      from: fk.targetTable,
-      to: fk.sourceTable,
-      foreignKey,
-      referenceKey,
-    };
-    relations.set(fk.targetTable, targetRels);
-  }
-
-  addManyToManyRelations(tableNames, columnsByTable, pkByTable, foreignKeys, relations);
+  const relations = buildRelationsFromForeignKeys(
+    foreignKeys,
+    columnFieldsByTable,
+    undefined,
+    unknownTypedFieldsByTable,
+  );
+  addAutoManyToManyRelations(
+    tableNames,
+    foreignKeys,
+    pkByTable,
+    new Map(Array.from(columnsByTable, ([tbl, cols]) => [tbl, cols.map((c) => c.name)])),
+    relations,
+    columnFieldsByTable,
+    unknownTypedFieldsByTable,
+  );
   return relations;
-}
-
-function addManyToManyRelations(
-  tableNames: string[],
-  columnsByTable: Map<string, ColumnMetadata[]>,
-  pkByTable: Map<string, string[]>,
-  foreignKeys: ForeignKeyEntry[],
-  relations: Map<string, Record<string, RelationDef>>,
-): void {
-  for (const tableName of tableNames) {
-    const pk = pkByTable.get(tableName) ?? [];
-    if (pk.length !== 2) continue;
-    const tableFks = foreignKeys.filter((fk) => fk.sourceTable === tableName);
-    if (tableFks.length !== 2 || tableFks.some((fk) => fk.sourceColumns.length !== 1)) continue;
-    const fkCols = tableFks.map((fk) => fk.sourceColumns[0]!);
-    const pkSet = new Set(pk);
-    if (!fkCols.every((column) => pkSet.has(column)) || new Set(fkCols).size !== 2) continue;
-    const [fkA, fkB] = tableFks as [ForeignKeyEntry, ForeignKeyEntry];
-    if (fkA.targetTable === fkB.targetTable) continue;
-    const junctionColumns = (columnsByTable.get(tableName) ?? []).map((column) => column.name);
-    if (junctionColumns.length !== 2) continue;
-
-    addManyToManyDirection(relations, tableName, fkA, fkB);
-    addManyToManyDirection(relations, tableName, fkB, fkA);
-  }
-}
-
-function addManyToManyDirection(
-  relations: Map<string, Record<string, RelationDef>>,
-  junctionTable: string,
-  self: ForeignKeyEntry,
-  other: ForeignKeyEntry,
-): void {
-  const sourceTable = self.targetTable;
-  const targetTable = other.targetTable;
-  const relName = snakeToCamel(targetTable);
-  const tableRelations = relations.get(sourceTable) ?? {};
-  if (tableRelations[relName]) return;
-  tableRelations[relName] = {
-    type: 'manyToMany',
-    name: relName,
-    from: sourceTable,
-    to: targetTable,
-    referenceKey: oneOrMany(self.targetColumns),
-    foreignKey: oneOrMany(self.targetColumns),
-    through: {
-      table: junctionTable,
-      sourceKey: self.sourceColumns[0]!,
-      targetKey: other.sourceColumns[0]!,
-    },
-  };
-  relations.set(sourceTable, tableRelations);
 }
 
 async function estimateRows(client: pg.PoolClient, schema: string): Promise<Map<string, number>> {
@@ -895,10 +829,6 @@ function extractIndexColumns(indexdef: string): string[] {
       .replace(/ (ASC|DESC)$/i, '')
       .replace(/^"|"$/g, ''),
   );
-}
-
-function oneOrMany(columns: string[]): string | string[] {
-  return columns.length === 1 ? columns[0]! : columns;
 }
 
 function optionalLimit(value: unknown): number {

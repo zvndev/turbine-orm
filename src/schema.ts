@@ -75,6 +75,16 @@ export interface ColumnMetadata {
   dialectType?: string;
   /** Postgres base type (e.g. 'int8', 'text', 'timestamptz'). Back-compat alias for dialectType. */
   pgType: string;
+  /**
+   * Schema the column's Postgres type lives in, recorded by introspection
+   * ONLY when it differs from the introspected schema (and isn't a
+   * `pg_catalog` builtin) — e.g. an enum or domain owned by another schema.
+   * Consumers use it as a cross-schema guard: a same-named enum in another
+   * schema must not receive this schema's `::"enum"` cast (search_path would
+   * resolve it to the wrong type). Absent for same-schema types, builtins,
+   * `defineSchema()` output, and legacy generated metadata.
+   */
+  pgTypeSchema?: string;
   /** TypeScript type string (e.g. 'number', 'string', 'Date') */
   tsType: string;
   /** Whether the column allows NULL */
