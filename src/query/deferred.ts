@@ -73,9 +73,12 @@ export interface QueryInterfaceOptions {
    * without a `limit`. Defaults to `true` so that accidental unbounded
    * queries are surfaced loudly during development. Pass `false` to silence
    * the warning entirely (e.g. for CLI tooling that intentionally streams
-   * full tables).
+   * full tables), or a per-table map (`{ users: false }`) to silence only
+   * the tables that intentionally read full sets — unlisted tables keep the
+   * default. Individual calls can also override via
+   * `findMany({ warnOnUnlimited: false })`.
    */
-  warnOnUnlimited?: boolean;
+  warnOnUnlimited?: boolean | Record<string, boolean>;
   /**
    * Enable prepared statements. When true, queries are submitted with a
    * `{ name, text, values }` object to the pg driver, which caches the

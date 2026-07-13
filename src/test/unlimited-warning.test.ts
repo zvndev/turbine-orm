@@ -94,6 +94,39 @@ describe('findMany unlimited-query warning', () => {
     assert.equal(warnings.length, 0);
   });
 
+  it('per-call opt-out: findMany({ warnOnUnlimited: false }) silences only that call', async () => {
+    const q = new QueryInterface(stubPool(), 'users', buildSchema());
+    const suppressed = await captureWarnings(() => q.findMany({ warnOnUnlimited: false }));
+    assert.equal(suppressed.length, 0, 'per-call opt-out must silence the warning');
+    // The next unbounded call without the opt-out still warns (was not deduped away).
+    const warned = await captureWarnings(() => q.findMany());
+    assert.equal(warned.length, 1, 'config-level default stays in effect for other calls');
+  });
+
+  it('per-call warnOnUnlimited: true forces the warning past a config-level opt-out', async () => {
+    const q = new QueryInterface(stubPool(), 'users', buildSchema(), undefined, {
+      warnOnUnlimited: false,
+    });
+    const warnings = await captureWarnings(() => q.findMany({ warnOnUnlimited: true }));
+    assert.equal(warnings.length, 1);
+  });
+
+  it('per-table config: { users: false } silences that table', async () => {
+    const q = new QueryInterface(stubPool(), 'users', buildSchema(), undefined, {
+      warnOnUnlimited: { users: false },
+    });
+    const warnings = await captureWarnings(() => q.findMany());
+    assert.equal(warnings.length, 0);
+  });
+
+  it('per-table config: unlisted tables keep the default warning', async () => {
+    const q = new QueryInterface(stubPool(), 'users', buildSchema(), undefined, {
+      warnOnUnlimited: { posts: false },
+    });
+    const warnings = await captureWarnings(() => q.findMany());
+    assert.equal(warnings.length, 1);
+  });
+
   it('does NOT warn when defaultLimit is configured', async () => {
     const q = new QueryInterface(stubPool(), 'users', buildSchema(), undefined, {
       defaultLimit: 100,

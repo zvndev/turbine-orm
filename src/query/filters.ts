@@ -114,6 +114,38 @@ export const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrem
 export const JSONB_OPERATOR_KEYS = new Set<string>(['path', 'equals', 'contains', 'hasKey']);
 
 /**
+ * JSON range comparison operators → SQL comparison tokens, in the FIXED order
+ * the build and collect paths iterate them. These keys are deliberately NOT in
+ * {@link JSONB_OPERATOR_KEYS}: `gt`/`gte`/`lt`/`lte` overlap with
+ * `WhereOperator`, so a bare `{ gt: 5 }` must keep its column-comparison
+ * meaning. They only compile as JSON range ops when the object is already a
+ * {@link JsonFilter} (detected via `path` / `equals` / `contains` / `hasKey`),
+ * and they always require `path`.
+ */
+export const JSON_RANGE_OPERATORS: Record<'gt' | 'gte' | 'lt' | 'lte', string> = {
+  gt: '>',
+  gte: '>=',
+  lt: '<',
+  lte: '<=',
+};
+
+/**
+ * Value-invariant shape fingerprint for a {@link JsonFilter}. Range operators
+ * are annotated with the comparison value's kind (`#n` numeric / `#s` string)
+ * because a numeric comparison compiles to a `::numeric` cast — a different
+ * SQL text than the text comparison — so the two must never share a cached
+ * SQL entry.
+ */
+export function fingerprintJsonFilterShape(filter: JsonFilter): string {
+  const obj = filter as Record<string, unknown>;
+  const parts = Object.keys(obj)
+    .filter((k) => obj[k] !== undefined)
+    .sort()
+    .map((k) => (k in JSON_RANGE_OPERATORS ? `${k}#${typeof obj[k] === 'number' ? 'n' : 's'}` : k));
+  return `json(${parts.join(',')})`;
+}
+
+/**
  * JSONB operator keys that are *unique* to {@link JsonFilter} — they cannot
  * appear in any other where-filter shape, so the presence of one of these is
  * an unambiguous signal that the user meant a JSON filter. Used by the

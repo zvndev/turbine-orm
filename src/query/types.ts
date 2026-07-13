@@ -441,6 +441,13 @@ export interface FindManyArgs<
   relationLoadStrategy?: RelationLoadStrategy;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
+  /**
+   * Per-call override of the unbounded-findMany warning. Pass `false` when
+   * this call intentionally reads the full table (the config-level
+   * `warnOnUnlimited` stays in effect for every other call); pass `true` to
+   * force the warning even when it is disabled in config.
+   */
+  warnOnUnlimited?: boolean;
 }
 
 export interface FindManyStreamArgs<
@@ -821,6 +828,18 @@ export interface JsonFilter {
   contains?: unknown;
   /** Key existence check: column ? key */
   hasKey?: string;
+  /**
+   * Greater-than comparison of the value at `path` (required). Numbers cast
+   * the extracted text to numeric — `(col #>> path)::numeric > $n` — while
+   * strings compare as text.
+   */
+  gt?: number | string;
+  /** Greater-than-or-equal comparison of the value at `path` (required). See {@link JsonFilter.gt}. */
+  gte?: number | string;
+  /** Less-than comparison of the value at `path` (required). See {@link JsonFilter.gt}. */
+  lt?: number | string;
+  /** Less-than-or-equal comparison of the value at `path` (required). See {@link JsonFilter.gt}. */
+  lte?: number | string;
 }
 
 /** Array query operators for where clauses */

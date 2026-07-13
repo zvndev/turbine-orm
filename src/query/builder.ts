@@ -46,6 +46,7 @@ import {
   assertBindableEqualsOperand,
   findArrayUniqueKey,
   findJsonUniqueKey,
+  fingerprintJsonFilterShape,
   fingerprintOperatorShape,
   isArrayFilter,
   isJsonFilter,
@@ -55,6 +56,7 @@ import {
   isVectorFilter,
   isVectorOrderBy,
   isWhereOperator,
+  JSON_RANGE_OPERATORS,
   normalizeOrderBy,
   sortedEntries,
   sortedKeys,
@@ -226,9 +228,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.middlewares = middlewares ?? [];
     this.defaultLimit = options?.defaultLimit;
     // Default to ON: surfacing accidental full-table scans is more valuable
-    // than the (small) risk of noisy logs. Callers explicitly opt out with
-    // `warnOnUnlimited: false`.
-    this.warnOnUnlimited = options?.warnOnUnlimited !== false;
+    // than the (small) risk of noisy logs. Callers opt out globally with
+    // `warnOnUnlimited: false`, per table with `warnOnUnlimited: { users:
+    // false }` (unlisted tables keep the default), or per call via
+    // `findMany({ warnOnUnlimited: false })`.
+    const warnOpt = options?.warnOnUnlimited;
+    this.warnOnUnlimited =
+      typeof warnOpt === 'object' && warnOpt !== null ? warnOpt[table] !== false : warnOpt !== false;
     this.utcTimestamps = options?.utcTimestamps !== false;
     this.preparedStatementsEnabled = options?.preparedStatements ?? true;
     this.sqlCacheEnabled = options?.sqlCache !== false;
@@ -874,10 +880,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * loop calling `db.users.findMany()` thousands of times only logs once.
    * Suppressed when `defaultLimit` is configured (the caller has already
    * opted in to a bounded query) and when the user passed an explicit
-   * `limit`, `take`, or `cursor`.
+   * `limit`, `take`, or `cursor`. A per-call `warnOnUnlimited` overrides the
+   * config-level setting in either direction (`false` silences a call that
+   * intentionally reads the full set; `true` forces the warning even when
+   * disabled in config).
    */
-  private maybeWarnUnlimited(args?: { limit?: number; take?: number; cursor?: unknown }): void {
-    if (!this.warnOnUnlimited) return;
+  private maybeWarnUnlimited(args?: {
+    limit?: number;
+    take?: number;
+    cursor?: unknown;
+    warnOnUnlimited?: boolean;
+  }): void {
+    const perCall = args?.warnOnUnlimited;
+    if (perCall === false) return;
+    if (perCall === undefined && !this.warnOnUnlimited) return;
     if (this.defaultLimit !== undefined) return;
     const hasExplicitLimit = args?.limit !== undefined || args?.take !== undefined || args?.cursor !== undefined;
     if (hasExplicitLimit) return;
@@ -885,7 +901,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.warnedTables.add(this.table);
     console.warn(
       `[turbine] warning: findMany on "${this.table}" has no limit — this will fetch every row. ` +
-        'Pass `limit` or set `warnOnUnlimited: false` in config to silence.',
+        'Pass `limit`, or silence with `warnOnUnlimited: false` (per call, per table, or in config).',
     );
   }
 
@@ -1313,7 +1329,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const entries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = entries.map(([k]) => this.toSqlColumn(k));
     const params = entries.map(([, v]) => v);
-    const placeholders = entries.map((_, i) => `${this.p(i + 1)}`);
+    // Enum columns get an explicit `::"EnumName"` cast (see enumTypeForColumn).
+    const placeholders = entries.map(([k], i) => `${this.p(i + 1)}${this.enumCastSuffix(this.toColumn(k))}`);
 
     const sql = this.dialect.buildInsertStatement({
       table: this.q(this.table),
@@ -1408,7 +1425,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     });
 
     // Use actual Postgres types for array casts in the default PostgreSQL dialect.
-    const typeCasts = columns.map((col) => this.getColumnArrayType(col));
+    // Enum columns cast to `"EnumName"[]` — the generic text[] fallback would
+    // type the UNNEST output as text, which Postgres refuses to coerce to the
+    // enum ("column X is of type Y but expression is of type text").
+    const typeCasts = columns.map((col) => {
+      const enumType = this.enumTypeForColumn(col);
+      return enumType ? `${this.q(enumType)}[]` : this.getColumnArrayType(col);
+    });
     const quotedColumns = columns.map((c) => this.q(c));
 
     const built = this.dialect.buildBulkInsertStatement({
@@ -1719,7 +1742,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const createEntries = Object.entries(args.create as Record<string, unknown>).filter(([, v]) => v !== undefined);
     const columns = createEntries.map(([k]) => this.toSqlColumn(k));
     const createParams = createEntries.map(([, v]) => v);
-    const placeholders = createEntries.map((_, i) => `${this.p(i + 1)}`);
+    // Enum columns get an explicit `::"EnumName"` cast (see enumTypeForColumn).
+    const placeholders = createEntries.map(([k], i) => `${this.p(i + 1)}${this.enumCastSuffix(this.toColumn(k))}`);
 
     // The conflict target comes from `where` keys — must be unique/PK columns
     const conflictKeys = Object.keys(args.where as Record<string, unknown>).filter(
@@ -1731,7 +1755,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const updateEntries = Object.entries(args.update as Record<string, unknown>).filter(([, v]) => v !== undefined);
     let paramIdx = createParams.length + 1;
     const setClauses = updateEntries.map(([k]) => {
-      const clause = `${this.toSqlColumn(k)} = ${this.p(paramIdx)}`;
+      const clause = `${this.toSqlColumn(k)} = ${this.p(paramIdx)}${this.enumCastSuffix(this.toColumn(k))}`;
       paramIdx++;
       return clause;
     });
@@ -2507,6 +2531,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private buildSetClause(key: string, value: unknown, params: unknown[]): string {
     const col = this.toSqlColumn(key);
+    // Enum columns get an explicit `::"EnumName"` cast on their value bind
+    // (see enumTypeForColumn); `''` everywhere else. Value-invariant, so the
+    // SQL cache and collectSetParams are unaffected.
+    const cast = this.enumCastSuffix(this.toColumn(key));
 
     // Detect atomic-operator object: plain object (not null, not array, not
     // Date, not Buffer) with EXACTLY one key matching an operator name.
@@ -2525,7 +2553,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
         if (op === 'set') {
           params.push(opValue);
-          return `${col} = ${this.p(params.length)}`;
+          return `${col} = ${this.p(params.length)}${cast}`;
         }
 
         // Arithmetic operators: must be finite numbers
@@ -2558,7 +2586,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Plain value (including null, Date, Buffer, arrays, JSON objects)
     params.push(value);
-    return `${col} = ${this.p(params.length)}`;
+    return `${col} = ${this.p(params.length)}${cast}`;
   }
 
   // =========================================================================
@@ -2674,10 +2702,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
-      // JSON filter
+      // JSON filter — range ops carry a numeric/string annotation because the
+      // numeric compile emits a cast (different SQL shape).
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
-        const jKeys = Object.keys(value as object).sort();
-        parts.push(`${key}:json(${jKeys.join(',')})`);
+        parts.push(`${key}:${fingerprintJsonFilterShape(value as JsonFilter)}`);
         continue;
       }
 
@@ -2769,6 +2797,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
         parts.push(`${key}:null`);
       } else if (isWhereOperator(value)) {
         parts.push(`${key}:${fingerprintOperatorShape(value)}`);
+      } else if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
+        // Mirrors fingerprintWhere: JSON filters inside relation sub-wheres
+        // build real JSON clauses (buildSubWhereForRelation), so their shape
+        // must be cache-distinct from plain equality.
+        parts.push(`${key}:${fingerprintJsonFilterShape(value as JsonFilter)}`);
+      } else if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value as ArrayFilter)) {
+        parts.push(`${key}:arr(${this.fingerprintArrayFilter(value as ArrayFilter)})`);
       } else if (isUnmatchedPlainObject(value)) {
         parts.push(
           `${key}:obj(${Object.keys(value as object)
@@ -2855,7 +2890,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.getColumnPgType(rawColumn);
         if (colType === 'json' || colType === 'jsonb') {
-          this.collectJsonFilterParams(value, params);
+          this.collectJsonFilterParams(value, params, this.q(rawColumn));
           continue;
         }
       }
@@ -2961,6 +2996,27 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
       const col = meta.columnMap[field] ?? camelToSnake(field);
+
+      // JSONB filter — mirrors buildSubWhereForRelation (which mirrors the
+      // top-level buildWhereClause): route to the JSON param collector when
+      // the target column is json/jsonb.
+      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
+        const colType = this.pgTypeForColumn(meta, col);
+        if (colType === 'json' || colType === 'jsonb') {
+          this.collectJsonFilterParams(value, params, `${this.q(targetTable)}.${this.q(col)}`);
+          continue;
+        }
+      }
+
+      // Array filter — mirrors buildSubWhereForRelation.
+      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
+        const colType = this.pgTypeForColumn(meta, col);
+        if (colType.startsWith('_')) {
+          this.collectArrayFilterParams(value, params);
+          continue;
+        }
+      }
+
       if (isWhereOperator(value)) {
         this.collectOperatorParams(col, value, params);
         continue;
@@ -2988,10 +3044,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (op.endsWith !== undefined) params.push(`%${escapeLike(op.endsWith)}`);
   }
 
-  /** Collect params from JSON filter. Mirrors buildJsonFilterClauses. */
-  private collectJsonFilterParams(filter: JsonFilter, params: unknown[]): void {
+  /**
+   * Collect params from JSON filter. Mirrors buildJsonFilterClauses exactly:
+   * the `path` is bound at most once (its placeholder is shared by every
+   * extraction clause), then equals/contains/hasKey values, then the range
+   * comparison values in {@link JSON_RANGE_OPERATORS} order.
+   */
+  private collectJsonFilterParams(filter: JsonFilter, params: unknown[], column: string): void {
+    let pathPushed = false;
+    const pushPathOnce = (): void => {
+      if (!pathPushed) {
+        params.push(filter.path);
+        pathPushed = true;
+      }
+    };
+
     if (filter.path !== undefined && filter.equals !== undefined) {
-      params.push(filter.path);
+      pushPathOnce();
       params.push(String(filter.equals));
     } else if (filter.equals !== undefined) {
       params.push(JSON.stringify(filter.equals));
@@ -3001,6 +3070,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
     if (filter.hasKey !== undefined) {
       params.push(filter.hasKey);
+    }
+    for (const { value } of this.jsonRangeEntries(filter, column)) {
+      pushPathOnce();
+      params.push(value);
     }
   }
 
@@ -3779,6 +3852,41 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      // JSONB filter on a json/jsonb column of the relation target — mirrors
+      // the top-level WHERE path (buildWhereClause). Without this branch the
+      // filter object used to fall through to plain equality and bind as a
+      // jsonb value, silently matching nothing.
+      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
+        const colType = this.pgTypeForColumn(meta, col);
+        if (colType === 'json' || colType === 'jsonb') {
+          conditions.push(...this.buildJsonFilterClauses(qCol, value, params));
+          continue;
+        }
+        const jsonKey = findJsonUniqueKey(value);
+        if (jsonKey) {
+          throw new ValidationError(
+            `[turbine] Column "${col}" on table "${targetTable}" is not a JSON column ` +
+              `(actual type: ${colType}); cannot apply JSON operator '${jsonKey}'.`,
+          );
+        }
+      }
+
+      // Array filter on an array column of the relation target — same mirror.
+      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
+        const colType = this.pgTypeForColumn(meta, col);
+        if (colType.startsWith('_')) {
+          conditions.push(...this.buildArrayFilterClauses(qCol, value, params, colType));
+          continue;
+        }
+        const arrayKey = findArrayUniqueKey(value);
+        if (arrayKey) {
+          throw new ValidationError(
+            `[turbine] Column "${col}" on table "${targetTable}" is not an array column ` +
+              `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
+          );
+        }
+      }
+
       if (isWhereOperator(value)) {
         const opClauses = this.buildOperatorClauses(qCol, value, params);
         conditions.push(...opClauses);
@@ -3799,6 +3907,40 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private pgTypeForColumn(meta: TableMetadata, column: string): string {
     return meta.dialectTypes?.[column] ?? meta.pgTypes?.[column] ?? 'text';
+  }
+
+  /**
+   * The Postgres enum type name for a column, when the schema knows one.
+   *
+   * Introspection stores each column's `udt_name` in `pgTypes` and every
+   * database enum in `schema.enums` (typname → labels); a column whose type
+   * matches an enum key needs an explicit `::"EnumName"` cast on its write
+   * binds — bulk-insert forms like `UNNEST($1::text[])` otherwise type the
+   * value as text and Postgres refuses the implicit text→enum coercion
+   * ("column X is of type Y but expression is of type text").
+   *
+   * Postgres-only by construction: gated on the active dialect being
+   * `postgresql` AND on `schema.enums` having entries (only PG introspection
+   * produces them — `defineSchema` and the other engines leave it empty), so
+   * SQLite/MySQL/MSSQL/PowDB output is byte-identical.
+   */
+  private enumTypeForColumn(column: string): string | null {
+    if (this.dialect.name !== 'postgresql') return null;
+    const enums = this.schema.enums;
+    if (!enums) return null;
+    const pgType = this.columnPgTypeMap.get(column) ?? this.tableMeta.pgTypes?.[column];
+    if (!pgType || pgType.startsWith('_')) return null;
+    return Object.hasOwn(enums, pgType) ? pgType : null;
+  }
+
+  /**
+   * `::"EnumName"` cast suffix for a write-bind placeholder on an enum
+   * column; `''` for every other column, so non-enum SQL stays byte-identical.
+   * The type name is an introspected identifier and is quoted via the dialect.
+   */
+  private enumCastSuffix(column: string): string {
+    const enumType = this.enumTypeForColumn(column);
+    return enumType ? `::${this.q(enumType)}` : '';
   }
 
   /**
@@ -3888,6 +4030,40 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
 
+      // JSONB filter on a json/jsonb column — mirrors the top-level WHERE path
+      // (buildWhereClause) so a `with.where` JSON filter is never silently
+      // bound as a plain equality value.
+      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
+        const colType = this.pgTypeForColumn(targetMeta, col);
+        if (colType === 'json' || colType === 'jsonb') {
+          clauses.push(...this.buildJsonFilterClauses(qCol, value, params));
+          continue;
+        }
+        const jsonKey = findJsonUniqueKey(value);
+        if (jsonKey) {
+          throw new ValidationError(
+            `[turbine] Column "${col}" on table "${targetTable}" is not a JSON column ` +
+              `(actual type: ${colType}); cannot apply JSON operator '${jsonKey}'.`,
+          );
+        }
+      }
+
+      // Array filter on an array column — same mirror.
+      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
+        const colType = this.pgTypeForColumn(targetMeta, col);
+        if (colType.startsWith('_')) {
+          clauses.push(...this.buildArrayFilterClauses(qCol, value, params, colType));
+          continue;
+        }
+        const arrayKey = findArrayUniqueKey(value);
+        if (arrayKey) {
+          throw new ValidationError(
+            `[turbine] Column "${col}" on table "${targetTable}" is not an array column ` +
+              `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
+          );
+        }
+      }
+
       if (isWhereOperator(value)) {
         clauses.push(...this.buildOperatorClauses(qCol, value, params));
         continue;
@@ -3941,6 +4117,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       const col = targetMeta.columnMap[key] ?? camelToSnake(key);
+
+      // JSONB filter — mirrors buildAliasWhere.
+      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
+        const colType = this.pgTypeForColumn(targetMeta, col);
+        if (colType === 'json' || colType === 'jsonb') {
+          this.collectJsonFilterParams(value, params, this.q(col));
+          continue;
+        }
+      }
+
+      // Array filter — mirrors buildAliasWhere.
+      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
+        const colType = this.pgTypeForColumn(targetMeta, col);
+        if (colType.startsWith('_')) {
+          this.collectArrayFilterParams(value, params);
+          continue;
+        }
+      }
 
       if (isWhereOperator(value)) {
         this.collectOperatorParams(col, value, params);
@@ -4002,6 +4196,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
       if (isWhereOperator(value)) {
         parts.push(`${key}:${fingerprintOperatorShape(value)}`);
+        continue;
+      }
+      // JSON / array filters build real clauses in buildAliasWhere, so their
+      // shape must be cache-distinct from plain equality (mirrors fingerprintWhere).
+      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
+        parts.push(`${key}:${fingerprintJsonFilterShape(value as JsonFilter)}`);
+        continue;
+      }
+      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value as ArrayFilter)) {
+        parts.push(`${key}:arr(${this.fingerprintArrayFilter(value as ArrayFilter)})`);
         continue;
       }
       if (isUnmatchedPlainObject(value)) {
@@ -5447,18 +5651,64 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Validate and enumerate the range comparisons (`gt`/`gte`/`lt`/`lte`) on a
+   * JSON filter, in the fixed {@link JSON_RANGE_OPERATORS} order. Shared by
+   * the SQL-build path ({@link buildJsonFilterClauses}) and the cache-hit
+   * param-collect path ({@link collectJsonFilterParams}) so both always agree
+   * on which params are pushed — and both throw identically for invalid
+   * shapes, so a warmed cache can never skip validation.
+   */
+  private jsonRangeEntries(filter: JsonFilter, column: string): { sqlOp: string; value: number | string }[] {
+    const entries: { sqlOp: string; value: number | string }[] = [];
+    for (const [op, sqlOp] of Object.entries(JSON_RANGE_OPERATORS)) {
+      const value = (filter as Record<string, unknown>)[op];
+      if (value === undefined) continue;
+      if (filter.path === undefined) {
+        throw new ValidationError(
+          `[turbine] JSON range operator '${op}' on ${column} requires a \`path\` ` +
+            `(e.g. { path: ['meta', 'score'], ${op}: ${JSON.stringify(value)} }).`,
+        );
+      }
+      if (typeof value !== 'number' && typeof value !== 'string') {
+        throw new ValidationError(
+          `[turbine] JSON range operator '${op}' on ${column} requires a number or string, ` +
+            `got ${JSON.stringify(value)}.`,
+        );
+      }
+      if (typeof value === 'number' && !Number.isFinite(value)) {
+        throw new ValidationError(`[turbine] JSON range operator '${op}' on ${column} requires a finite number.`);
+      }
+      entries.push({ sqlOp, value });
+    }
+    return entries;
+  }
+
+  /**
    * Build SQL clauses for JSONB filter operators on a column.
-   * Supports: path, equals, contains, hasKey.
+   * Supports: path, equals, contains, hasKey, gt, gte, lt, lte.
+   *
+   * The `path` param is bound at most once and its placeholder is shared by
+   * every clause that extracts it (equals + range ops), so the param list
+   * stays byte-identical to {@link collectJsonFilterParams}.
    */
   private buildJsonFilterClauses(column: string, filter: JsonFilter, params: unknown[]): string[] {
     const clauses: string[] = [];
 
+    // Lazily bind the path once; reuse the same $N in every extraction clause.
+    let pathParamIdx: number | null = null;
+    const pathExtract = (): string => {
+      if (pathParamIdx === null) {
+        params.push(filter.path);
+        pathParamIdx = params.length;
+      }
+      return this.dialect.buildJsonPathExtract(column, this.p(pathParamIdx));
+    };
+
     if (filter.path !== undefined && filter.equals !== undefined) {
       // Path access + equals: column #>> $N::text[] = $M
-      params.push(filter.path);
-      const pathParam = params.length;
+      const extract = pathExtract();
       params.push(String(filter.equals));
-      clauses.push(`${this.dialect.buildJsonPathExtract(column, this.p(pathParam))} = ${this.p(params.length)}`);
+      clauses.push(`${extract} = ${this.p(params.length)}`);
     } else if (filter.equals !== undefined) {
       // Containment equality: column @> $N::jsonb
       params.push(JSON.stringify(filter.equals));
@@ -5477,7 +5727,28 @@ export class QueryInterface<T extends object, R extends object = {}> {
       clauses.push(`${column} ? ${this.p(params.length)}`);
     }
 
+    // Range comparisons on the extracted path: numbers compare numerically
+    // (cast through the dialect), strings compare as text.
+    for (const { sqlOp, value } of this.jsonRangeEntries(filter, column)) {
+      const extract = pathExtract();
+      params.push(value);
+      const lhs = typeof value === 'number' ? this.castJsonNumeric(extract) : extract;
+      clauses.push(`${lhs} ${sqlOp} ${this.p(params.length)}`);
+    }
+
     return clauses;
+  }
+
+  /**
+   * Cast an extracted JSON path text value to a numeric type for range
+   * comparison. PostgreSQL uses `(expr)::numeric` (exact — the right way to
+   * compare JSON numbers, and `::float` would lose precision on big ints);
+   * other dialects route through {@link Dialect.castAggregate} (SQLite/MySQL/
+   * SQL Server have no `::` operator) as a float cast.
+   */
+  private castJsonNumeric(extract: string): string {
+    if (this.dialect.name === 'postgresql') return `(${extract})::numeric`;
+    return this.dialect.castAggregate ? this.dialect.castAggregate(`(${extract})`, 'float') : `(${extract})::numeric`;
   }
 
   /**
