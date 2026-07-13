@@ -9,7 +9,9 @@
 import { ValidationError } from '../errors.js';
 import type {
   ArrayFilter,
+  ColumnRef,
   JsonFilter,
+  JsonPathOrderBy,
   OrderBySpec,
   OrderDirection,
   TextSearchFilter,
@@ -52,16 +54,46 @@ export function isUnmatchedPlainObject(value: unknown): boolean {
 }
 
 /**
+ * Operator keys that accept a {@link ColumnRef} (`{ col: 'otherField' }`)
+ * value for column-to-column comparison. `in`/`notIn` and the LIKE operators
+ * take values only.
+ */
+export const COLUMN_REF_OPERATORS = new Set<string>(['equals', 'not', 'gt', 'gte', 'lt', 'lte']);
+
+/**
+ * Check if an operator value is a column reference: a plain object whose ONLY
+ * key is `col` with a string value. Anything else (extra keys, non-string
+ * `col`) is treated as a plain value so JSON payloads that merely contain a
+ * `col` property keep their equality meaning.
+ */
+export function isColumnRef(value: unknown): value is ColumnRef {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || value instanceof Date) return false;
+  const keys = Object.keys(value);
+  return keys.length === 1 && keys[0] === 'col' && typeof (value as { col?: unknown }).col === 'string';
+}
+
+/**
  * Fingerprint the SHAPE of a where-operator object. Null-valued `equals` /
  * `not` compile to parameterless `IS NULL` / `IS NOT NULL` (different SQL, no
  * param pushed), so null-ness is part of the shape — without it a cache entry
  * warmed by `{ not: 5 }` would serve `{ not: null }` with a desynced param list.
+ *
+ * Column references ({@link ColumnRef}) compile the referenced column into the
+ * SQL TEXT (no param bound), so the referenced field name is part of the shape
+ *: `{ equals: { col: 'a' } }` and `{ equals: { col: 'b' } }` must never share
+ * a cache entry. The name is JSON-encoded so exotic field names cannot collide
+ * with other fingerprint tokens.
  */
 export function fingerprintOperatorShape(value: WhereOperator): string {
   const obj = value as Record<string, unknown>;
   const opKeys = Object.keys(obj)
     .filter((k) => k !== 'mode')
-    .map((k) => ((k === 'equals' || k === 'not') && obj[k] === null ? `${k}:null` : k))
+    .map((k) => {
+      const v = obj[k];
+      if ((k === 'equals' || k === 'not') && v === null) return `${k}:null`;
+      if (COLUMN_REF_OPERATORS.has(k) && isColumnRef(v)) return `${k}:col(${JSON.stringify(v.col)})`;
+      return k;
+    })
     .sort();
   const modeStr = value.mode === 'insensitive' ? ':i' : '';
   return `op(${opKeys.join(',')}${modeStr})`;
@@ -293,6 +325,19 @@ export function isVectorOrderBy(value: unknown): value is VectorOrderBy {
 /** Check if an orderBy value is an explicit `{ sort, nulls? }` spec. */
 export function isOrderBySpec(value: unknown): value is OrderBySpec {
   return typeof value === 'object' && value !== null && !Array.isArray(value) && 'sort' in value;
+}
+
+/**
+ * Check if an orderBy value is a JSON-path ordering: `{ path: [...] }` with an
+ * ARRAY path. The array requirement disambiguates from relation orderBy values
+ * (whose entries are directions/specs keyed by target column: a target column
+ * literally named `path` maps to a string direction, never an array), and the
+ * `distance`/`sort` exclusions keep vector and spec shapes out.
+ */
+export function isJsonPathOrderBy(value: unknown): value is JsonPathOrderBy {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  if ('distance' in value || 'sort' in value) return false;
+  return Array.isArray((value as { path?: unknown }).path);
 }
 
 /**

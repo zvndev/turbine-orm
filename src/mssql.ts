@@ -882,11 +882,40 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
     if (hasOrder) {
       const orderBy = orderEntries
         .map(([k, dir]) => {
-          const col = camelToSnake(k);
-          if (!targetMeta.allColumns.includes(col)) {
-            throw new ValidationError(`[turbine] Unknown column "${k}" in orderBy for table "${targetTable}"`);
+          // FOR JSON nested ordering supports plain directions and { sort }
+          // specs only. Object shapes the core builder compiles with params
+          // (JSON-path / vector / relation ordering) must throw here: the
+          // shared param-collect mirror is gated on the native path, so a
+          // silently-ignored object would desync SQL text from params.
+          let rawDir: unknown = dir;
+          if (typeof dir === 'object' && dir !== null) {
+            const sortValue = (dir as { sort?: unknown }).sort;
+            if (typeof sortValue !== 'string') {
+              throw new ValidationError(
+                `[turbine] Nested orderBy on "${k}" (table "${targetTable}"): only plain directions and ` +
+                  `{ sort } specs are supported inside a relation orderBy on SQL Server.`,
+              );
+            }
+            if ((dir as { nulls?: unknown }).nulls !== undefined) {
+              throw new UnsupportedFeatureError(
+                'NULLS FIRST/LAST ordering',
+                'sqlserver',
+                'Explicit nulls placement in orderBy is only available on PostgreSQL and SQLite.',
+              );
+            }
+            rawDir = sortValue;
           }
-          const safeDir = String(dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+          // columnMap-first resolution (camelToSnake fallback): matches the
+          // core builder's nested orderBy path so camelCase-named DB columns
+          // resolve on SQL Server too.
+          const col = targetMeta.columnMap[k] ?? camelToSnake(k);
+          if (!targetMeta.allColumns.includes(col)) {
+            throw new ValidationError(
+              `[turbine] Unknown field "${k}" in orderBy on table "${targetTable}". ` +
+                `Known fields: ${Object.keys(targetMeta.columnMap).join(', ') || '(none)'}.`,
+            );
+          }
+          const safeDir = String(rawDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
           return `${a}.${q(col)} ${safeDir}`;
         })
         .join(', ');
