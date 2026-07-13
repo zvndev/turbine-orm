@@ -699,7 +699,7 @@ describe('powdb: transaction model (single-writer)', () => {
   });
 
   it('a second same-context raw begin QUEUES behind the open manual tx (markers are callback-scoped)', async () => {
-    // Since the Capa cold-burst fix, the re-entrancy marker exists ONLY inside
+    // Since the cold-burst fix, the re-entrancy marker exists ONLY inside
     // a $transaction callback's async subtree. A manual raw `begin` span does
     // not mark its caller, so a second begin from the same context is treated
     // as an independent concurrent transaction: it waits FIFO for the manual
@@ -811,7 +811,7 @@ describe('powdb: cross-pool re-entrancy (chained ALS marker)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Capa regression (ITEM 3): the re-entrancy marker is scoped to the
+// the dogfood consumer regression (ITEM 3): the re-entrancy marker is scoped to the
 // transaction CALLBACK's async subtree. acquire() used to enterWith() the
 // marker into the CALLER's context, so a context that merely had a begin in
 // its await chain was falsely flagged re-entrant: on a cold client, the first
@@ -819,7 +819,7 @@ describe('powdb: cross-pool re-entrancy (chained ALS marker)', () => {
 // every sibling (9/10 rejected E017 in production).
 // ---------------------------------------------------------------------------
 
-describe('powdb: re-entrancy marker never leaks into the caller context (Capa cold-burst fix)', () => {
+describe('powdb: re-entrancy marker never leaks into the caller context (dogfood report)', () => {
   it('a context that opened a manual tx is not falsely re-entrant: $transaction queues FIFO', async () => {
     const { pool, seen } = fakeEmbeddedDb();
     const db = new TurbineClient({ pool, dialect: powdbDialect }, { tables: {}, enums: {} });
@@ -1328,7 +1328,7 @@ describe('powdb: server tx-gate timeout maps to TimeoutError (PowDB ≥ 0.10)', 
 });
 
 // ---------------------------------------------------------------------------
-// Capa regression (ITEM 1): owned-pool disconnect() must close every driver
+// the dogfood consumer regression (ITEM 1): owned-pool disconnect() must close every driver
 // client. client.ts treats TurbineConfig.pool as external (ownsPool = false)
 // and skips pool.end(), so turbinePowDB patches disconnect()/end() on owned
 // pools; and the driver Pool.close() only closes IDLE clients, so

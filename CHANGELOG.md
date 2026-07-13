@@ -2,9 +2,9 @@
 
 ## 0.31.0 (2026-07-13)
 
-**Production-adoption round** — a second round of dogfooding feedback from a
-real multi-tenant CMS workload: three production-blocking bugs plus two of the
-three remaining raw-SQL escape hatches.
+Three production-blocking bug fixes plus two new query capabilities that
+eliminate common raw-SQL escape hatches in version-driven / multi-tenant
+data models.
 
 ### Fixed
 - **Owned-pool `disconnect()` leaked every driver connection** on the
@@ -23,7 +23,7 @@ three remaining raw-SQL escape hatches.
 - **Cold-client false E017 on a same-tick transaction burst** — the
   re-entrancy marker was planted with `AsyncLocalStorage.enterWith()` in the
   caller's context, so sibling `$transaction` calls launched in one tick could
-  see each other's markers (runtime-dependent; measured 9/10 rejected in the reporting workload).
+  see each other's markers (runtime-dependent).
   The marker now lives only inside the transaction callback's async subtree
   via a new optional `wrapTransactionCallback` driver seam — the failure is
   impossible by construction. Implicit nested-write transactions plant the
@@ -55,11 +55,9 @@ three remaining raw-SQL escape hatches.
 
 ## 0.30.0 (2026-07-13)
 
-**The dogfood release** — every fix traces to a real workload porting
-production Prisma usage (JSONB-heavy versioned CMS content) to Turbine,
-plus alignment with PowDB 0.10. Built and adversarially reviewed by a
-multi-agent pipeline; 15 review findings (including one critical) fixed
-before ship.
+Fixes and features for JSONB-heavy, Prisma-migrated workloads, plus
+alignment with PowDB 0.10. Adversarially reviewed before ship; 15 review
+findings (including one critical) fixed pre-release.
 
 ### Fixed
 - **JSON/array filters inside relation filters were silently dropped.** A

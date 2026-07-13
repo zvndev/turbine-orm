@@ -16,8 +16,8 @@
  *   - transactions: single-level commit + rollback
  *   - nested `tx.$transaction` and re-entrant `db.$transaction` throw typed (FIX 2)
  *   - independent concurrent `db.$transaction` calls queue FIFO and all succeed (T-7)
- *   - COLD-CLIENT same-tick `db.$transaction` burst: zero false E017 (Capa ITEM 3)
- *   - disconnect() really closes the owned pool (Capa ITEM 1)
+ *   - COLD-CLIENT same-tick `db.$transaction` burst: zero false E017 (dogfood item 3)
+ *   - disconnect() really closes the owned pool (dogfood item 1)
  *   - chunked relation load over > MAX_RELATION_KEYS parents (FIX 4)
  *   - E017 unsupported guards (vector / cursor stream)
  */
@@ -176,7 +176,7 @@ async function withDb(fn: (db: DB) => Promise<void>): Promise<void> {
 // ---------------------------------------------------------------------------
 
 describe('powdb integration (embedded)', () => {
-  // KEEP THIS TEST FIRST. The Capa cold-client bug (ITEM 3) only bit when NO
+  // KEEP THIS TEST FIRST. The cold-client bug (ITEM 3) only bit when NO
   // transaction had ever run in the process/context: acquire()'s enterWith()
   // planted call #1's live re-entrancy marker where sibling same-tick calls
   // could see it, so 9/10 were falsely rejected E017, and one warm-up
@@ -187,7 +187,7 @@ describe('powdb integration (embedded)', () => {
   // runtime-dependent (ALS enterWith propagation differs across Node
   // versions/runtimes); the deterministic reduction lives in powdb.test.ts
   // ('re-entrancy marker never leaks into the caller context').
-  it('CAPA 3: cold client, 10 db.$transaction calls in ONE synchronous tick, all succeed with zero E017', async () => {
+  it('COLD CLIENT: cold client, 10 db.$transaction calls in ONE synchronous tick, all succeed with zero E017', async () => {
     await withDb(async (db) => {
       const ps = Array.from({ length: 10 }, (_, i) =>
         db.$transaction(async (tx: DB) => {
@@ -205,7 +205,7 @@ describe('powdb integration (embedded)', () => {
     });
   });
 
-  it('CAPA 3: sequential transactions from one long-lived context never chain into false E017', async () => {
+  it('COLD CLIENT: sequential transactions from one long-lived context never chain into false E017', async () => {
     await withDb(async (db) => {
       for (let i = 0; i < 5; i++) {
         const out = await db.$transaction(async (tx: DB) => {
@@ -218,7 +218,7 @@ describe('powdb integration (embedded)', () => {
     });
   });
 
-  it('CAPA 1: disconnect() really closes the OWNED embedded pool (queries afterwards fail typed)', async () => {
+  it('OWNED POOL: disconnect() really closes the OWNED embedded pool (queries afterwards fail typed)', async () => {
     // client.ts sees TurbineConfig.pool as external and skips pool.end();
     // before the fix, turbinePowDB's owned path never patched disconnect(),
     // so the pool outlived it (on the networked transport that left a live

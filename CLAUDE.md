@@ -200,7 +200,7 @@ src/
                       `src/test/powdb.integration.test.ts` (CI `powdb-integration` job, in-process, no
                       container). (≤0.6.2 reselect + float-literal workarounds retired in 0.7.0; embedded
                       `syncMode`/`memoryLimit` + `count(*)`-fix picked up in 0.7.1.) See
-                      `docs/internal/strategy/powdb-parity-matrix.md`.
+                      `docs/internal/strategy/powdb-parity-matrix.md` (local-only, untracked).
 
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code
                       (TURBINE_E001-E017). wrapPgError() translates pg driver errors
@@ -274,7 +274,7 @@ This repo ships the library **and** its marketing/docs site. The site lives at `
 - Library work stays in `src/`. Site work stays in `site/`. Don't cross the streams.
 - Every release updates **both** surfaces in a single commit: library + `site/` + `CHANGELOG.md` + version bump, then `npm publish` + `vercel --prod`.
 - Root-level helpers: `npm run site:dev`, `npm run site:build`, `npm run site:deploy`.
-- See `AGENTS.md` at the repo root for the full release playbook, the npm publish auth notes (granular token with bypass-2FA), and the verification checklist. Don't duplicate that content here — AGENTS.md is the source of truth.
+- See `AGENTS.md` at the repo root (local-only, untracked) for the full release playbook, the npm publish auth notes, and the verification checklist. Don't duplicate that content here — AGENTS.md is the source of truth.
 
 ## The json_agg Algorithm
 
@@ -395,6 +395,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 - Don't add runtime dependencies beyond `pg`. Root `dependencies` stays exactly `{ pg, @types/pg }` — `@types/pg` is required because published `.d.ts` files import `pg` types; moving it to `devDependencies` alone breaks consumer strict `tsc` (0.28.1 regression). Marketing "one dependency" means one **runtime** dep (`pg`); types packages that surface in public declarations stay in `dependencies`. The only sanctioned engine exception: `mysql2`, `mssql`, `@zvndev/powdb-client`, and `@zvndev/powdb-embedded` are **devDependencies + optional `peerDependencies`** (`peerDependenciesMeta.*.optional = true`), loaded lazily via dynamic `import()` from the `mysql`/`mssql`/`powdb` subpaths and never required for Postgres users; SQLite needs nothing at all (it uses the `node:sqlite` builtin). Those peer loads route through `src/optional-peer-import.cts` — the CJS build (`module: CommonJS`) lowers a plain `import()` to `require()`, which cannot load ESM-only peers (e.g. `@zvndev/powdb-client` ≥ 0.9, `ERR_PACKAGE_PATH_NOT_EXPORTED`); the `.cts` helper's NodeNext-built copy at `dist/optional-peer-import.cjs` keeps a REAL `import()` that the lowered copy falls back to. Don't replace it with a bare `import()` in the engine modules.
 - Don't use `eval`, `new Function`, or shell interpolation
+- Don't reference internal project names, client names, dogfood-source projects, or internal planning documents in ANY tracked file — code comments, test names, CHANGELOG, release notes, commit messages, site. This repo is public. Describe changes by what they do, never by who asked for them or where feedback came from. `docs/internal/` and `AGENTS.md` are gitignored (local-only); the pre-commit hook enforces a private blocklist via `scripts/check-private-terms.mjs` + `.private-terms`.
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings — always use `$N` parameterization
 - Don't import `client.ts` from `query/` (would create circular dependency)

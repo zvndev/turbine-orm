@@ -1,5 +1,5 @@
 /**
- * turbine-orm: nested-relation orderBy columnMap resolution (Capa item 2)
+ * turbine-orm: nested-relation orderBy columnMap resolution (dogfood item 2)
  *
  * Regression: `findFirst({ with: { fields: { orderBy: { sortOrder: 'asc' } } } })`
  * threw [TURBINE_E003] Unknown column "sortOrder" whenever the DB column was
@@ -23,7 +23,7 @@ import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
 /**
- * The Capa shape: DB columns named in camelCase (introspected columnMap maps
+ * The reported shape: DB columns named in camelCase (introspected columnMap maps
  * the field to the identical camelCase column), plus a classic snake_case
  * column to prove the fallback still works.
  */
@@ -79,7 +79,7 @@ function schema(): SchemaMetadata {
         [
           { name: 'id', field: 'id' },
           { name: 'content_type_id', field: 'contentTypeId' },
-          // camelCase-named DB column: the Capa repro shape
+          // camelCase-named DB column: the reported repro shape
           { name: 'sortOrder', field: 'sortOrder' },
           { name: 'created_at', field: 'createdAt', pgType: 'timestamptz' },
         ],
@@ -120,8 +120,8 @@ function schema(): SchemaMetadata {
   };
 }
 
-describe('nested orderBy: camelCase columnMap resolution (Capa repro)', () => {
-  it('hasMany orderBy on a camelCase-named DB column compiles (the exact Capa shape)', () => {
+describe('nested orderBy: camelCase columnMap resolution (reported repro)', () => {
+  it('hasMany orderBy on a camelCase-named DB column compiles (the exact reported shape)', () => {
     const q = makeQuery('content_types', schema());
     const { sql, params } = q.buildFindMany({ with: { fields: { orderBy: { sortOrder: 'asc' } } }, limit: 1 } as never);
     assert.ok(sql.includes('ORDER BY t0."sortOrder" ASC'), sql);

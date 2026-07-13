@@ -5,7 +5,7 @@
  * — the pure naming core extracted from `introspect()` so the FK→relation
  * naming rules are testable without a database.
  *
- * Regression context (Capa CMS dogfood report): `model_instances` carries TWO
+ * Regression context (dogfood report): `model_instances` carries TWO
  * FK columns to `model_instance_versions` (`current_version_id`,
  * `published_version_id` — or Prisma-style quoted camelCase `currentVersionId`
  * / `publishedVersionId`). The old naming derived both belongsTo names from
@@ -327,7 +327,7 @@ describe('buildRelationsFromForeignKeys — main-parity table (N-1)', () => {
       expectedWarnings: 0,
     },
     {
-      // MIXED — the Capa camelCase two-FK regression shape (N-1a):
+      // MIXED — the the dogfood consumer camelCase two-FK regression shape (N-1a):
       //   belongsTo LEGITIMATELY CHANGED: main derived 'authorId'/'editorId',
       //   which SHADOWED the concrete scalar FK fields (broken types) → the
       //   modern Id-stripped names apply.

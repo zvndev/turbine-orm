@@ -572,7 +572,7 @@ describe('schemaDefToMetadata — collision guard parity with introspection (N-4
 describe('schemaDefToMetadata — relation-name parity with buildRelationsFromForeignKeys (N-4)', () => {
   it('derives IDENTICAL names to introspection-shaped FK entries for the divergent shapes', () => {
     // One logical schema exercising: (1) the posts.user/userId shadow shape,
-    // (2) the Capa two-FKs-to-one-target shape, (3) a pure junction m2m.
+    // (2) the the dogfood consumer two-FKs-to-one-target shape, (3) a pure junction m2m.
     const def = defineSchema({
       users: { id: { type: 'serial', primaryKey: true } },
       posts: {
