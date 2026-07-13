@@ -480,6 +480,33 @@ const topRated = await db.products.findMany({
 
 > **Note:** A bare `{ gt: 5 }` with no `path` on a jsonb column is the plain column comparison, not a JSON test — reach for `path` whenever you mean "the value inside the document."
 
+### Column-to-column comparison
+
+Compare a column against **another column of the same table** by passing `{ col: 'field' }` to `equals`, `not`, `gt`, `gte`, `lt`, or `lte` (new in v0.31). The referenced column is compiled into the SQL — no value is bound:
+
+```ts
+// Instances whose published version lags behind the draft
+const stale = await db.modelInstances.findMany({
+  where: { currentVersionId: { not: { col: 'publishedVersionId' } } },
+});
+// → WHERE "current_version_id" <> "published_version_id"
+```
+
+An unknown referenced field throws `ValidationError` (`TURBINE_E003`), and `mode: 'insensitive'` cannot be combined with a column reference. On `json`/`jsonb` columns an `equals` object is always a JSON value (containment), never a column reference — use `path` filters for JSON tests.
+
+### Ordering by a JSON path
+
+`orderBy` accepts a JSON-path spec on `json`/`jsonb` columns (new in v0.31). Pass `type: 'numeric'` to sort numerically; the default compares the extracted value as text:
+
+```ts
+const byWeight = await db.blocks.findMany({
+  orderBy: { data: { path: ['weight'], direction: 'asc', type: 'numeric' } },
+});
+// → ORDER BY ("data" #>> $1::text[])::numeric ASC
+```
+
+Works top-level and inside a `with` relation's `orderBy`. (Ordering a parent by a JSON path in a *related* row is on the roadmap — today that still needs `client.sql`.)
+
 ### Relation filters
 
 Filter parent rows by predicates on their child rows.

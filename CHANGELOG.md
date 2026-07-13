@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.31.0 (2026-07-13)
+
+**Capa production-adoption round** — the second Capa CMS dogfood report
+(`CAPA_ASKS_TURBINE_2026-07`): the three bugs gating their v3 adoption
+decision plus two of the three remaining raw-SQL escape hatches.
+
+### Fixed
+- **Owned-pool `disconnect()` leaked every driver connection** on the
+  networked PowDB path — `turbinePowDB({host, port})` never patched
+  `disconnect()`, so the driver pool's `close()` never ran and a one-shot
+  script hung until the server's 300s idle timeout. Owned pools now close on
+  `disconnect()`, and `PowdbPool.end()` additionally destroys still-checked-out
+  clients (the driver's `close()` only reaps idle ones). Queries after
+  `disconnect()` throw a typed `ConnectionError` on both transports. (Capa #1)
+- **Nested-relation `orderBy` rejected camelCase columns** —
+  `with: { fields: { orderBy: { sortOrder: 'asc' } } }` threw E003 because the
+  relation-subquery path skipped the target table's columnMap. Nested orderBy
+  now accepts exactly what top-level orderBy accepts, unified across the join
+  strategy, batched loader, m2m, and the MSSQL override; belongsTo/hasOne
+  subqueries with an `orderBy` now order before their `LIMIT 1`. (Capa #2)
+- **Cold-client false E017 on a same-tick transaction burst** — the
+  re-entrancy marker was planted with `AsyncLocalStorage.enterWith()` in the
+  caller's context, so sibling `$transaction` calls launched in one tick could
+  see each other's markers (runtime-dependent; Capa measured 9/10 rejected).
+  The marker now lives only inside the transaction callback's async subtree
+  via a new optional `wrapTransactionCallback` driver seam — the failure is
+  impossible by construction. Implicit nested-write transactions plant the
+  same marker. One contract change: a second raw manual `begin` from the same
+  context now queues FIFO (bounded by `transactionQueueTimeoutMs`) instead of
+  throwing E017. (Capa #3)
+- **Connection release now honors the destroy contract** (adversarial-review
+  finding): `release(err)` with a truthy error destroys the connection instead
+  of re-idling it, and any release with an un-ended `begin` fires a bounded
+  best-effort `rollback` first — so a `$transaction` timeout can no longer
+  return a connection with an open server-side transaction to the pool (which
+  blocked the next transaction on PowDB's global write lock).
+
+### Added
+- **Column-to-column `where` comparison** — `{ equals: { col: 'otherField' } }`
+  (also `not`/`gt`/`gte`/`lt`/`lte`) compiles to `"a" = "b"` with no bound
+  param; cache-fingerprint-safe, works in relation filters and `with.where`.
+  On json/jsonb columns an `equals` object stays a JSON value. (Capa #4c)
+- **JSON-path `orderBy`** on same-table json/jsonb columns —
+  `orderBy: { data: { path: ['weight'], direction: 'asc', type: 'numeric' } }`,
+  top-level and in nested `with` orderBy. Cross-relation JSON ordering and
+  grouped JSON aggregates (Capa #4a-lateral/#4b) are deferred to a designed
+  0.32. (Capa #4a)
+
+### Docs
+- `docs/internal/NEXT-INTEGRATIONS.md` no longer claims PowDB was "declined" —
+  the driver shipped in 0.22 and is load-bearing. (Capa #5; the other #5 ask,
+  per-call/per-table `warnOnUnlimited`, already shipped in 0.30.0.)
+
 ## 0.30.0 (2026-07-13)
 
 **The Capa dogfood release** — every fix traces to a real consumer porting
