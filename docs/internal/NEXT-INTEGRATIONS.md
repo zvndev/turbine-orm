@@ -98,9 +98,24 @@ Drizzle's strategy is "three core dialects + any driver." Each dialect is a sepa
 
 - **Verdict:** **hard skip.** Mapping SQL semantics onto documents is a philosophical mistake. If users want MongoDB they want MongoDB's query model, not Turbine's.
 
-### Tier 4 — declined, explicit
+### Tier 4 — shipped after re-evaluation
 
-#### 6. **PowDB**
+#### 6. **PowDB** — SHIPPED (v0.22.0, June 2026; load-bearing since)
+
+> **Historical note:** we declined PowDB in April 2026 for the reasons preserved
+> below. That call was reversed in June 2026: instead of forcing PowDB through the
+> SQL `Dialect` seam, we shipped a parallel PowQL generator (`src/powql.ts`,
+> `PowqlInterface`) wired in via `queryInterfaceFactory` — exactly the
+> "PowQL-native client with Turbine DX" shape this doc originally recommended to
+> the PowDB team, except it lives inside turbine-orm as the `turbine-orm/powdb`
+> subpath. Both transports (networked + embedded) are supported, relations load
+> client-side (batched N+1 incl. m2m), nested writes reuse the shared engine, and
+> schema is code-first via `defineSchema` + `schemaDefToMetadata()`. As of v0.30.0
+> it is a production-candidate driver for Capa CMS. See CLAUDE.md's powdb section
+> and `docs/internal/strategy/powdb-parity-matrix.md` for current status.
+
+<details>
+<summary>Original April 2026 evaluation (superseded)</summary>
 
 We evaluated this in April 2026. Outcome: **declined for now**, revisit when PowDB ships its PG-wire-protocol compatibility layer.
 
@@ -122,10 +137,11 @@ Adding PowDB support today would not be "adding a dialect" — it would be writi
 
 When those three ship, PowDB moves to Tier 1 alongside CockroachDB — the integration effort drops to "compat testing and docs."
 
+*(What actually happened: none of the three shipped — we built the PowQL-native path instead.)*
+
 **Alternative we recommend to the PowDB team:** build a PowQL-native TypeScript client with DX patterns mirrored from Turbine (see `USING-TURBINE-ORM.md` for the reference). Leaning into PowQL's pipeline model gets better ergonomics than forcing SQL abstractions onto it, and preserves PowDB's core thesis ("skip SQL translation overhead").
 
----
-
+</details>
 ## Execution order (recommended)
 
 ```
