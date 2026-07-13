@@ -202,8 +202,12 @@ export interface TurbineConfig {
   logging?: boolean;
   /** Default LIMIT applied to findMany() when no limit is specified (opt-in, default: undefined) */
   defaultLimit?: number;
-  /** Log a warning when findMany() is called without a limit (default: false) */
-  warnOnUnlimited?: boolean;
+  /**
+   * Log a warning when findMany() is called without a limit (default: false).
+   * Pass a per-table map (`{ users: false }`) to override the default for
+   * specific tables; per-call `warnOnUnlimited` on findMany args wins over both.
+   */
+  warnOnUnlimited?: boolean | Record<string, boolean>;
   /**
    * Interpret Postgres `timestamp` (without time zone) values as UTC — both
    * at the driver level (OID 1114 type parser, registered only when Turbine
