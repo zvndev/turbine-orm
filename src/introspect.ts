@@ -437,14 +437,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     // ----- Build foreign key map -----
     // Group FK rows by constraint_name to correctly handle multi-column composite FKs.
     // Each constraint becomes one FKEntry with arrays of columns.
-    interface FKEntry {
-      sourceTable: string;
-      sourceColumns: string[];
-      targetTable: string;
-      targetColumns: string[];
-      constraintName: string;
-    }
-    const fkGroups = new Map<string, FKEntry>();
+    const fkGroups = new Map<string, ForeignKeyEntry>();
     for (const row of fkResult.rows) {
       if (!tableSet.has(row.source_table) || !tableSet.has(row.target_table)) continue;
       const key = row.constraint_name as string;
@@ -464,69 +457,16 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     const foreignKeys = Array.from(fkGroups.values());
 
     // ----- Build relations from foreign keys -----
-    // Count FKs per (source, target) pair for disambiguation
-    const fkCounts = new Map<string, number>();
-    for (const fk of foreignKeys) {
-      const key = `${fk.sourceTable}→${fk.targetTable}`;
-      fkCounts.set(key, (fkCounts.get(key) ?? 0) + 1);
+    // Delegated to the pure, unit-testable builder. Relation names are derived
+    // per-FK-column when several FKs point at the same target, and every name
+    // is collision-checked against the table's scalar column fields so a
+    // relation can never shadow a column (which generated unsound types and
+    // made both surfaces unusable — dogfood T-4).
+    const columnFieldsByTable = new Map<string, Set<string>>();
+    for (const [tbl, cols] of columnsByTable) {
+      columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
     }
-
-    const relationsByTable = new Map<string, Record<string, RelationDef>>();
-
-    for (const fk of foreignKeys) {
-      const pairKey = `${fk.sourceTable}→${fk.targetTable}`;
-      const needsDisambiguation = (fkCounts.get(pairKey) ?? 0) > 1;
-
-      // For single-column FKs, keep string form for backwards compatibility.
-      // For multi-column (composite) FKs, use array form.
-      const foreignKey = fk.sourceColumns.length === 1 ? fk.sourceColumns[0]! : fk.sourceColumns;
-      const referenceKey = fk.targetColumns.length === 1 ? fk.targetColumns[0]! : fk.targetColumns;
-
-      // --- belongsTo on the source (child) table ---
-      // e.g. posts.user_id → users.id creates posts.user (belongsTo)
-      // For composite FKs with disambiguation, use the constraint name
-      const belongsToName = needsDisambiguation
-        ? fk.sourceColumns.length === 1
-          ? snakeToCamel(fk.sourceColumns[0]!.replace(/_id$/, ''))
-          : snakeToCamel(fk.constraintName.replace(/^fk_/, '').replace(/_fkey$/, ''))
-        : singularize(snakeToCamel(fk.targetTable));
-
-      // Referential actions (omit the 'no action' default to keep metadata lean).
-      const actions = fkActions.get(fk.constraintName);
-      const actionFields: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction } = {};
-      if (actions?.onDelete && actions.onDelete !== 'no action') actionFields.onDelete = actions.onDelete;
-      if (actions?.onUpdate && actions.onUpdate !== 'no action') actionFields.onUpdate = actions.onUpdate;
-
-      if (!relationsByTable.has(fk.sourceTable)) relationsByTable.set(fk.sourceTable, {});
-      relationsByTable.get(fk.sourceTable)![belongsToName] = {
-        type: 'belongsTo',
-        name: belongsToName,
-        from: fk.sourceTable,
-        to: fk.targetTable,
-        foreignKey,
-        referenceKey,
-        ...actionFields,
-      };
-
-      // --- hasMany on the target (parent) table ---
-      // e.g. posts.user_id → users.id creates users.posts (hasMany)
-      const hasManyName = needsDisambiguation
-        ? fk.sourceColumns.length === 1
-          ? snakeToCamel(`${fk.sourceTable}_by_${fk.sourceColumns[0]!.replace(/_id$/, '')}`)
-          : snakeToCamel(`${fk.sourceTable}_by_${fk.constraintName.replace(/^fk_/, '').replace(/_fkey$/, '')}`)
-        : snakeToCamel(fk.sourceTable);
-
-      if (!relationsByTable.has(fk.targetTable)) relationsByTable.set(fk.targetTable, {});
-      relationsByTable.get(fk.targetTable)![hasManyName] = {
-        type: 'hasMany',
-        name: hasManyName,
-        from: fk.targetTable,
-        to: fk.sourceTable,
-        foreignKey,
-        referenceKey,
-        ...actionFields,
-      };
-    }
+    const relationsByTable = buildRelationsFromForeignKeys(foreignKeys, columnFieldsByTable, fkActions);
 
     // ----- Conservative many-to-many auto-detection (PURELY ADDITIVE) -----
     //
@@ -567,7 +507,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       if (new Set(fkCols).size !== 2) continue;
 
       // Two DISTINCT target tables.
-      const [fkA, fkB] = tableFks as [FKEntry, FKEntry];
+      const [fkA, fkB] = tableFks as [ForeignKeyEntry, ForeignKeyEntry];
       if (fkA.targetTable === fkB.targetTable) continue;
 
       // No payload columns: J's columns are exactly the two FK/PK columns.
@@ -577,14 +517,16 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       // For each direction, the m2m `referenceKey` is the *targeted* table's
       // referenced column(s); the junction's sourceKey is the FK column pointing
       // to that table; the targetKey is the FK column pointing to the OTHER table.
-      const addM2M = (self: FKEntry, other: FKEntry) => {
+      const addM2M = (self: ForeignKeyEntry, other: ForeignKeyEntry) => {
         const sourceTbl = self.targetTable; // A
         const targetTbl = other.targetTable; // B
         const relName = snakeToCamel(targetTbl); // plural table name → e.g. "tags"
         if (!relationsByTable.has(sourceTbl)) relationsByTable.set(sourceTbl, {});
         const existing = relationsByTable.get(sourceTbl)!;
-        // Additive-only: never clobber an existing relation name.
+        // Additive-only: never clobber an existing relation name, and never
+        // shadow a scalar column field (that would generate unsound types).
         if (existing[relName]) return;
+        if (columnFieldsByTable.get(sourceTbl)?.has(relName)) return;
         existing[relName] = {
           type: 'manyToMany',
           name: relName,
@@ -683,4 +625,177 @@ export function stripCheckWrapper(def: string): string {
     if (balanced) s = s.slice(1, -1).trim();
   }
   return s;
+}
+
+// ---------------------------------------------------------------------------
+// Relation derivation from foreign keys (pure — unit-testable without a DB)
+// ---------------------------------------------------------------------------
+
+/** A foreign-key constraint grouped by constraint name (composite FKs carry column arrays). */
+export interface ForeignKeyEntry {
+  sourceTable: string;
+  sourceColumns: string[];
+  targetTable: string;
+  targetColumns: string[];
+  constraintName: string;
+}
+
+/**
+ * Derive a belongsTo relation name from its FK column. Strips a trailing
+ * `_id` (snake_case) or `Id` (camelCase column names — common in Prisma-ported
+ * schemas where columns are quoted camelCase identifiers), then camelCases:
+ * `current_version_id` and `currentVersionId` both yield `currentVersion`.
+ * Stripping is what keeps the scalar FK field (`currentVersionId`) targetable
+ * alongside the relation. A column literally named `id` (nothing left after
+ * stripping) keeps its own name.
+ */
+export function relationNameFromColumn(column: string): string {
+  let base = column;
+  if (/_id$/i.test(base)) base = base.slice(0, -3);
+  else if (/[a-z0-9]Id$/.test(base)) base = base.slice(0, -2);
+  if (base.length === 0) base = column;
+  return snakeToCamel(base);
+}
+
+/** Uppercase the first character (camelCase → PascalCase join helper). */
+function upperFirst(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/**
+ * Resolve a derived relation name against the names already taken on the
+ * table (scalar column fields + previously assigned relations). On collision,
+ * applies a deterministic `Rel` / `Rel2` / `Rel3`… suffix and warns — a
+ * colliding name would otherwise shadow a column field and generate types
+ * that fail `tsc --strict` (TS2430/TS2322).
+ */
+function resolveRelationNameCollision(candidate: string, taken: Set<string>, table: string, source: string): string {
+  if (!taken.has(candidate)) return candidate;
+  let name = `${candidate}Rel`;
+  for (let i = 2; taken.has(name); i++) name = `${candidate}Rel${i}`;
+  console.warn(
+    `[turbine] Relation name "${candidate}" on table "${table}" (from ${source}) collides with an existing column or relation — using "${name}" instead.`,
+  );
+  return name;
+}
+
+/**
+ * Build the belongsTo/hasMany relation maps for every table from its foreign
+ * keys. Naming rules:
+ *
+ *   - Single FK to a target: belongsTo is the singularized target table
+ *     (`posts.user_id` → `post.user`), hasMany is the source table
+ *     (`users.posts`). Unchanged historical behavior.
+ *   - Several FKs to the SAME target (e.g. `model_instances.current_version_id`
+ *     and `.published_version_id` → `model_instance_versions`): each relation
+ *     name derives from its own column with the `_id`/`Id` suffix stripped
+ *     (`currentVersion`, `publishedVersion`), and the reverse hasMany side gets
+ *     a distinct per-column name (`modelInstancesByCurrentVersion`, …).
+ *   - Any derived name that would collide with a scalar column field or an
+ *     already-assigned relation gets a deterministic `Rel` suffix + warning.
+ *
+ * @param columnFieldsByTable camelCase column *fields* per table — used to
+ *   guarantee relations never shadow scalar columns.
+ */
+export function buildRelationsFromForeignKeys(
+  foreignKeys: ForeignKeyEntry[],
+  columnFieldsByTable: Map<string, Set<string>>,
+  fkActions?: Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>,
+): Map<string, Record<string, RelationDef>> {
+  // Count FKs per (source, target) pair for disambiguation.
+  const fkCounts = new Map<string, number>();
+  for (const fk of foreignKeys) {
+    const key = `${fk.sourceTable}→${fk.targetTable}`;
+    fkCounts.set(key, (fkCounts.get(key) ?? 0) + 1);
+  }
+
+  const relationsByTable = new Map<string, Record<string, RelationDef>>();
+
+  // Names already taken per table: seeded with the scalar column fields so a
+  // relation can never shadow a column; relation names are added as assigned.
+  const takenByTable = new Map<string, Set<string>>();
+  const takenFor = (table: string): Set<string> => {
+    let taken = takenByTable.get(table);
+    if (!taken) {
+      taken = new Set(columnFieldsByTable.get(table) ?? []);
+      takenByTable.set(table, taken);
+    }
+    return taken;
+  };
+
+  for (const fk of foreignKeys) {
+    const pairKey = `${fk.sourceTable}→${fk.targetTable}`;
+    const needsDisambiguation = (fkCounts.get(pairKey) ?? 0) > 1;
+
+    // For single-column FKs, keep string form for backwards compatibility.
+    // For multi-column (composite) FKs, use array form.
+    const foreignKey = fk.sourceColumns.length === 1 ? fk.sourceColumns[0]! : fk.sourceColumns;
+    const referenceKey = fk.targetColumns.length === 1 ? fk.targetColumns[0]! : fk.targetColumns;
+
+    // Composite FKs have no single column to derive from — fall back to the
+    // constraint name (with the usual fk_/-_fkey affixes stripped).
+    const constraintBase = fk.constraintName.replace(/^fk_/, '').replace(/_fkey$/, '');
+
+    // --- belongsTo on the source (child) table ---
+    // e.g. posts.user_id → users.id creates posts.user (belongsTo)
+    const belongsToCandidate = needsDisambiguation
+      ? fk.sourceColumns.length === 1
+        ? relationNameFromColumn(fk.sourceColumns[0]!)
+        : snakeToCamel(constraintBase)
+      : singularize(snakeToCamel(fk.targetTable));
+    const sourceTaken = takenFor(fk.sourceTable);
+    const belongsToName = resolveRelationNameCollision(
+      belongsToCandidate,
+      sourceTaken,
+      fk.sourceTable,
+      `FK ${fk.constraintName}`,
+    );
+    sourceTaken.add(belongsToName);
+
+    // Referential actions (omit the 'no action' default to keep metadata lean).
+    const actions = fkActions?.get(fk.constraintName);
+    const actionFields: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction } = {};
+    if (actions?.onDelete && actions.onDelete !== 'no action') actionFields.onDelete = actions.onDelete;
+    if (actions?.onUpdate && actions.onUpdate !== 'no action') actionFields.onUpdate = actions.onUpdate;
+
+    if (!relationsByTable.has(fk.sourceTable)) relationsByTable.set(fk.sourceTable, {});
+    relationsByTable.get(fk.sourceTable)![belongsToName] = {
+      type: 'belongsTo',
+      name: belongsToName,
+      from: fk.sourceTable,
+      to: fk.targetTable,
+      foreignKey,
+      referenceKey,
+      ...actionFields,
+    };
+
+    // --- hasMany on the target (parent) table ---
+    // e.g. posts.user_id → users.id creates users.posts (hasMany)
+    const hasManyCandidate = needsDisambiguation
+      ? fk.sourceColumns.length === 1
+        ? `${snakeToCamel(fk.sourceTable)}By${upperFirst(relationNameFromColumn(fk.sourceColumns[0]!))}`
+        : `${snakeToCamel(fk.sourceTable)}By${upperFirst(snakeToCamel(constraintBase))}`
+      : snakeToCamel(fk.sourceTable);
+    const targetTaken = takenFor(fk.targetTable);
+    const hasManyName = resolveRelationNameCollision(
+      hasManyCandidate,
+      targetTaken,
+      fk.targetTable,
+      `FK ${fk.constraintName}`,
+    );
+    targetTaken.add(hasManyName);
+
+    if (!relationsByTable.has(fk.targetTable)) relationsByTable.set(fk.targetTable, {});
+    relationsByTable.get(fk.targetTable)![hasManyName] = {
+      type: 'hasMany',
+      name: hasManyName,
+      from: fk.targetTable,
+      to: fk.sourceTable,
+      foreignKey,
+      referenceKey,
+      ...actionFields,
+    };
+  }
+
+  return relationsByTable;
 }
