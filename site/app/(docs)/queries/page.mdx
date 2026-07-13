@@ -40,6 +40,17 @@ const users = await db.users.findMany({
 
 The entire object graph resolves in one SQL statement. `users[0].posts[0].comments[0]` is fully typed.
 
+### Silencing the unlimited-query warning
+
+When `warnOnUnlimited` is enabled, a `findMany` with no `limit` / `take` / `cursor` logs a one-time warning. Silence it for a query you know is bounded by passing `warnOnUnlimited: false` on the call:
+
+```ts
+// This one is fine — a tiny lookup table
+const roles = await db.roles.findMany({ warnOnUnlimited: false });
+```
+
+You can also set it per table on the client — `warnOnUnlimited: { userProfiles: false }` (accessor or `snake_case` keys) — leaving the warning on everywhere else. Precedence is per-call, then per-table, then the global boolean.
+
 ### select / omit
 
 Pick or drop columns at the query level. Either one — not both.
@@ -446,6 +457,29 @@ LIKE wildcards in user input (`%`, `_`, `\`) are escaped automatically.
 
 The query string is bound as a parameter and uses `to_tsquery` syntax (`&`, `|`, `!`, `<->`). The `config` name is validated (alphanumeric + underscore only) before it reaches the SQL.
 
+### JSON columns (`json` / `jsonb`)
+
+Filter into a JSON document with a `JsonFilter`. `path` drills into nested keys before the test runs; the other keys pick the comparison.
+
+| Operator | Description | Example |
+|---|---|---|
+| `path` | Drill into nested keys (`#>>`) before applying the test | `where: { data: { path: ['meta', 'tier'], equals: 'pro' } }` |
+| `equals` | Value at `path` equals | `where: { data: { path: ['tier'], equals: 'pro' } }` |
+| `contains` | jsonb containment (`@>`) | `where: { data: { contains: { active: true } } }` |
+| `hasKey` | Top-level key exists (`?`) | `where: { data: { hasKey: 'meta' } }` |
+| `gt` / `gte` / `lt` / `lte` | Range-compare the value at `path` | `where: { data: { path: ['rating'], gte: 4 } }` |
+
+The range operators (`gt` / `gte` / `lt` / `lte`, new in v0.30) require `path`. A numeric value casts the extracted text — `(col #>> path)::numeric >= $n` — while a string value compares as text:
+
+```ts
+// Products rated 4 or higher, read out of a jsonb column
+const topRated = await db.products.findMany({
+  where: { data: { path: ['rating'], gte: 4 } },
+});
+```
+
+> **Note:** A bare `{ gt: 5 }` with no `path` on a jsonb column is the plain column comparison, not a JSON test — reach for `path` whenever you mean "the value inside the document."
+
 ### Relation filters
 
 Filter parent rows by predicates on their child rows.
@@ -455,6 +489,15 @@ Filter parent rows by predicates on their child rows.
 | `some` | At least one related row matches | `where: { posts: { some: { published: true } } }` |
 | `every` | Every related row matches | `where: { posts: { every: { published: true } } }` |
 | `none` | No related row matches | `where: { posts: { none: { published: false } } }` |
+
+Any operator above — including JSON filters — composes inside `some` / `every` / `none`. As of v0.30, a JSON filter nested in a relation filter (or in a `with` relation's `where`) compiles correctly; earlier versions silently degraded it to a broken equality that matched nothing.
+
+```ts
+// Users who own at least one product rated 4+
+const users = await db.users.findMany({
+  where: { products: { some: { data: { path: ['rating'], gte: 4 } } } },
+});
+```
 
 ### Combinators
 

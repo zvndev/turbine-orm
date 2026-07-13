@@ -19,6 +19,7 @@ Commands:
   generate | pull                Introspect database, generate TypeScript types + client
   generate --zod                 Also emit zod.ts validation schemas
   generate --include-views       Include views + materialized views as read-only entities
+  generate --no-timestamp        Omit the "Generated at:" header for byte-identical regens
   push                           Apply defineSchema() output to the database
   migrate create <name>          Create a new SQL migration file
   migrate create <name> --auto   Auto-generate migration from schema diff
@@ -94,6 +95,16 @@ npx turbine pull --include-views
 ```
 
 Views get entity types and read accessors; write builders reject them (TURBINE_E003). See [Views & Generated Columns](/views).
+
+### `--no-timestamp`
+
+Every generated file carries a `Generated at: <ISO timestamp>` header, which changes on every run and shows up as noise in diffs. Pass `--no-timestamp` to omit it, so regenerating an unchanged schema produces byte-identical output.
+
+```bash
+npx turbine generate --no-timestamp
+```
+
+Useful when generated code is committed to source control or checked in CI — a `generate` that changes nothing leaves the tree clean.
 
 ## `turbine push`
 

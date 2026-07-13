@@ -99,6 +99,8 @@ export default defineSchema(
 
 DDL emits `CREATE TYPE "post_status" AS ENUM ('draft', 'published', 'archived')` before the tables that use it, and the column is typed `"post_status"`. Enum columns generate a string-literal union in `types.ts` (`'draft' | 'published' | 'archived'`).
 
+Writes to an enum column get an explicit `::"post_status"` cast on every path (`create`, `createMany`, `update`, `upsert`), driven by the introspected metadata and schema-qualified so it is safe across schemas. This is automatic and needs no code change — it removes the `column is of type post_status but expression is of type text` error that `createMany` could hit before v0.30.
+
 ### Array columns
 
 Add `array: true` to any scalar column:
@@ -141,6 +143,25 @@ products: {
 ```
 
 A table-level check without a `name` emits a bare `CHECK (expr)`. Introspection reads check constraints back, so they survive a `pull`. A violated check throws `CheckConstraintError` (TURBINE_E011) at write time.
+
+### Runtime metadata without a database — `schemaDefToMetadata`
+
+The runtime `SchemaMetadata` a client needs normally comes from `turbine generate` (which reads a live database). `schemaDefToMetadata(def)` derives the same object directly from a `defineSchema` result — no connection, no codegen step:
+
+```ts
+import { defineSchema, schemaDefToMetadata } from 'turbine-orm';
+
+const schema = defineSchema({ /* ... */ });
+const metadata = schemaDefToMetadata(schema);
+```
+
+This is the code-first path for engines with no wire introspection — most notably PowDB, where you can now hand a `defineSchema` straight to the factory instead of writing metadata by hand:
+
+```ts
+import { turbinePowDB } from 'turbine-orm/powdb';
+
+const db = await turbinePowDB({ embedded: './data' }, schemaDefToMetadata(schema));
+```
 
 ## DDL generation
 
@@ -239,6 +260,8 @@ Turbine reads `information_schema` and `pg_catalog` to discover:
 - `STORED` generated columns (read-only, omitted from write inputs)
 
 Pass `--include-views` to also introspect views and materialized views as read-only entities. See [Views & Generated Columns](/views).
+
+> **Note:** When a derived relation name would collide with a scalar column — e.g. a `currentVersionId` foreign key producing a relation that shadowed the `currentVersion` field — v0.30 disambiguates the relation name instead of overwriting the column. Names that were already collision-free are preserved, so regenerating an existing, working schema does not rename its relations. The `turbine mcp` server and the SQLite / MySQL / SQL Server introspectors share the same naming logic.
 
 Three files land in `./generated/turbine/`:
 

@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.29.0",
+  "version": "0.30.0",
   "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "exports": {

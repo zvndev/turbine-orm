@@ -157,16 +157,17 @@ npm install turbine-orm @zvndev/powdb-embedded
 npm install turbine-orm @zvndev/powdb-client
 ```
 
-PowDB has no wire introspection, so you define the schema in code with `defineSchema` (there is no `turbine generate` for PowDB):
+PowDB has no wire introspection, so you define the schema in code with `defineSchema` (there is no `turbine generate` for PowDB). As of v0.30, `schemaDefToMetadata` derives the runtime metadata the client needs straight from that definition — no hand-written metadata:
 
 ```ts
 // Embedded — in-process, opens a data directory. async; resolves to a TurbineClient.
 import { turbinePowDB } from 'turbine-orm/powdb';
+import { schemaDefToMetadata } from 'turbine-orm';
 import { schema } from './schema.js'; // defineSchema({...}) — PowDB has no introspection
 
 const db = await turbinePowDB(
   { embedded: './data', syncMode: 'normal' },
-  schema,
+  schemaDefToMetadata(schema),
 );
 
 const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
@@ -176,12 +177,15 @@ await db.disconnect();
 ```ts
 // Networked — same API, talks to a running powdb-server.
 import { turbinePowDB } from 'turbine-orm/powdb';
+import { schemaDefToMetadata } from 'turbine-orm';
 import { schema } from './schema.js';
 
-const db = await turbinePowDB('powdb://127.0.0.1:7070', schema);
+const db = await turbinePowDB('powdb://127.0.0.1:7070', schemaDefToMetadata(schema));
 ```
 
-`turbinePowDB(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` is either an embedded descriptor (`{ embedded: dir, syncMode?, memoryLimit? }` or an open embedded handle) or a networked target (`powdb://host:port` string, a config object, or an existing PowDB pool — injection, so `disconnect()` becomes a no-op). The networked path probes the server version and requires **PowDB ≥ 0.7.1**.
+See [`schemaDefToMetadata`](/schema#runtime-metadata-without-a-database--schemadeftometadata) for the code-first metadata path in full.
+
+`turbinePowDB(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` is either an embedded descriptor (`{ embedded: dir, syncMode?, memoryLimit? }` or an open embedded handle) or a networked target (`powdb://host:port` string, a config object, or an existing PowDB pool — injection, so `disconnect()` becomes a no-op). The networked path probes the server version and requires **PowDB ≥ 0.7.1**; the optional peer range is `>=0.7.1 <1.0.0`. The ESM-only `@zvndev/powdb-client` ≥ 0.9 loads correctly even from a CommonJS build (Turbine reaches it through a dynamic-import shim).
 
 ### Embedded durability — `syncMode`
 
@@ -215,9 +219,11 @@ PowDB is a younger, intentionally smaller engine, so Turbine's PowQL backend dif
 - **Nested `with` uses N+1 loaders, not a single query.** PowDB has no `json_agg`/link-navigation, so each relation level — including **many-to-many through a junction table** — is a separate batched lookup (keys chunked at 1,000). Correctness is identical; depth-D nesting costs D round-trips, not one.
 - **Primary keys can be server-assigned _or_ client-assigned.** Declare an `auto` int PK (`isGenerated`) and PowDB assigns a monotonic id on `create` (read back automatically); otherwise a defaulted string PK gets a client-generated UUID.
 - **Relation filters resolve to a literal list, not a subquery.** `where: { tags: { some } }` runs the inner predicate first and filters with `in (<keys>)` — one extra round-trip, but it sidesteps a PowDB engine quirk where a repeated `in (<subquery>)` of the same shape can return a stale cached result. Correct on every cardinality and nesting level.
-- **Nested writes run as one flat transaction.** `create`/`update` with relation ops (`create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert` on hasMany/hasOne/belongsTo) commit or roll back together. PowDB is single-writer with one global write lock — a nested or concurrent `$transaction` throws `UnsupportedFeatureError` (no savepoints) rather than deadlocking.
+- **Nested writes run as one flat transaction.** `create`/`update` with relation ops (`create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert` on hasMany/hasOne/belongsTo) commit or roll back together. PowDB is single-writer with one global write lock, so top-level `$transaction` calls **queue FIFO** (as of v0.30) instead of failing — a second concurrent transaction waits for the first to finish rather than throwing. A **re-entrant / nested** `$transaction` still throws `UnsupportedFeatureError` immediately, since PowDB has no savepoints and waiting on the lock it already holds would deadlock. Cap the wait with `transactionQueueTimeoutMs` (default `30000`; `0` or `Infinity` waits forever) — on elapse the queued transaction rejects with `TimeoutError` (`TURBINE_E002`).
 - **Schema is code-only.** No wire introspection → define schemas with `defineSchema`; `turbine generate` / `turbine migrate` are Postgres-only.
 - **Type mapping is narrowed.** PowDB stores `str` / `int` / `float` / `bool`; Turbine never emits `uuid` / `datetime` / `bytes` on the wire, and maps `Date` to integer microseconds.
+- **Reserved PowQL words are quoted automatically.** A column named after a PowQL keyword — `type`, `order`, and the new PowDB 0.10 words `schema` / `describe` — is backtick-quoted in the generated PowQL, so reserved-word columns just work (PowDB ≥ 0.10).
+- **Server-side timeouts surface as `TimeoutError`.** PowDB 0.10's server-side "transaction gate timeout" maps to `TimeoutError` (`TURBINE_E002`), matching the client-side `transactionQueueTimeoutMs` behavior above.
 
 ### Unsupported features → `TURBINE_E017`
 
