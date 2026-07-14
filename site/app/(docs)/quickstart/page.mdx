@@ -10,7 +10,7 @@ Install Turbine, point it at your database, generate a typed client, and run you
 
 ## Requirements
 
-- **Node.js ≥ 18** (the package `engines` field). The optional [SQLite engine](/engines) uses Node's built-in `node:sqlite` and needs **Node ≥ 22.5**.
+- **Node.js ≥ 20** (the package `engines` field). The optional [SQLite engine](/engines) uses Node's built-in `node:sqlite` and needs **Node ≥ 22.5**.
 - **PostgreSQL 14+** for the default path (Neon, Vercel Postgres, Supabase, or local all work). Other engines are documented under [Database Engines](/engines).
 - **`"type": "module"`** in your project `package.json`. Turbine is an ESM package; without it, Node tries to `require()` it when loading `turbine.config.ts` / schema files and fails.
 - **`tsx` as a dev dependency** so the CLI can load TypeScript config and schema files (`turbine.config.ts`, `turbine/schema.ts`, TypeScript seeds).

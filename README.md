@@ -66,14 +66,20 @@ npx turbine generate
 
 > **CLI prerequisites.** The `turbine` CLI loads your `turbine.config.ts` / `turbine/schema.ts` directly, so a fresh project needs (1) `tsx` installed — otherwise `.ts` config loading fails with *"Loading .ts config / schema files requires tsx to be installed"* — and (2) `"type": "module"` in `package.json`, since Turbine is ESM. Without it you'll hit `Error [ERR_REQUIRE_ESM]: Cannot require() ES Module`. `create-next-app` sets neither by default. See [USING-TURBINE-ORM.md §0](docs/USING-TURBINE-ORM.md) for details.
 
-Works with both ESM and CommonJS:
+The `turbine-orm` package ships real dual builds, so importing the package works from either module system:
 
 ```typescript
 // ESM
-import { turbine } from './generated/turbine';
+import { turbine } from 'turbine-orm';
 
 // CommonJS
-const { turbine } = require('./generated/turbine');
+const { turbine } = require('turbine-orm');
+```
+
+The generated client (`./generated/turbine/`) is TypeScript source: it re-exports across files with ESM-style `./metadata.js` specifiers, so you consume it through your bundler, `tsx`, or `tsc` like the rest of your app:
+
+```typescript
+import { turbine } from './generated/turbine';
 ```
 
 This introspects your database and generates a fully-typed client at `./generated/turbine/`.
@@ -601,12 +607,14 @@ Commands:
   migrate create <name>        Create a new SQL migration file
   migrate create <name> --auto Auto-generate from schema diff
   migrate up                   Apply pending migrations
+  migrate deploy               Apply pending migrations without prompts
   migrate down                 Rollback last migration
   migrate status               Show applied/pending migrations
   seed                         Run seed file
   status                       Show database schema summary
   doctor                       Check relations for missing FK indexes (--fix emits migration)
   studio                       Launch local read-only Studio web UI
+  mcp                          Start read-only MCP server over JSON-RPC stdio
   observe                      Launch local metrics dashboard (requires TURBINE_OBSERVE_URL)
 
 Options:
