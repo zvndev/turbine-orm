@@ -720,6 +720,78 @@ describe('wrapPgError', () => {
       assert.ok(wrapped.message.includes('could not serialize access'), 'message should embed pg detail');
     }
   });
+
+  it('wraps 57014 (query_canceled) into TimeoutError', () => {
+    const err = Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof TimeoutError, 'expected TimeoutError');
+    if (wrapped instanceof TimeoutError) {
+      assert.equal(wrapped.code, 'TURBINE_E002');
+      assert.equal(wrapped.cause, err);
+      assert.equal(wrapped.timeoutMs, 0, 'server-side cancel has no client-side budget');
+      assert.ok(
+        wrapped.message.includes('Query canceled by server-side statement_timeout'),
+        'message should name the server-side statement_timeout cause',
+      );
+    }
+  });
+
+  const CONNECTION_SQLSTATES = [
+    '08000',
+    '08001',
+    '08003',
+    '08004',
+    '08006',
+    '08P01',
+    '53300',
+    '57P01',
+    '57P02',
+    '57P03',
+  ];
+  for (const code of CONNECTION_SQLSTATES) {
+    it(`wraps pg SQLSTATE ${code} into ConnectionError`, () => {
+      const err = Object.assign(new Error(`connection problem for ${code}`), { code });
+      const wrapped = wrapPgError(err);
+      assert.ok(wrapped instanceof ConnectionError, `expected ConnectionError for ${code}`);
+      if (wrapped instanceof ConnectionError) {
+        assert.equal(wrapped.code, 'TURBINE_E004');
+        assert.equal(wrapped.cause, err);
+        assert.ok(wrapped.message.includes('connection'), 'message should mention connection');
+        assert.ok(wrapped.message.includes(`connection problem for ${code}`), 'message should embed pg detail');
+      }
+    });
+  }
+
+  const DRIVER_CONN_CODES = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EPIPE'];
+  for (const code of DRIVER_CONN_CODES) {
+    it(`wraps Node driver code ${code} into ConnectionError`, () => {
+      const err = Object.assign(new Error(`socket ${code}`), { code });
+      const wrapped = wrapPgError(err);
+      assert.ok(wrapped instanceof ConnectionError, `expected ConnectionError for ${code}`);
+      if (wrapped instanceof ConnectionError) {
+        assert.equal(wrapped.code, 'TURBINE_E004');
+        assert.equal(wrapped.cause, err);
+      }
+    });
+  }
+
+  it('falls back to a code-only ConnectionError message when the driver error has no message', () => {
+    const err = { code: 'ECONNREFUSED' };
+    const wrapped = wrapPgError(err);
+    assert.ok(wrapped instanceof ConnectionError);
+    if (wrapped instanceof ConnectionError) {
+      assert.ok(wrapped.message.includes('ECONNREFUSED'), 'message should carry the code when no pg message exists');
+      assert.equal(wrapped.cause, err);
+    }
+  });
+
+  it('does not treat 57014 as a connection-class error', () => {
+    // 57014 shares the "57" class prefix with the connection codes but must map
+    // to TimeoutError, not ConnectionError.
+    const wrapped = wrapPgError(Object.assign(new Error('timeout'), { code: '57014' }));
+    assert.ok(wrapped instanceof TimeoutError);
+    assert.ok(!(wrapped instanceof ConnectionError));
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -176,8 +176,16 @@ export class NotFoundError extends TurbineError {
 export class TimeoutError extends TurbineError {
   readonly timeoutMs: number;
 
-  constructor(timeoutMs: number, context = 'Query') {
-    super(TurbineErrorCode.TIMEOUT, `[turbine] ${context} timed out after ${timeoutMs}ms`);
+  /**
+   * @param timeoutMs the client-side timeout budget in ms. Pass `0` when the
+   *   duration is unknown (e.g. a server-side `statement_timeout` cancellation
+   *   surfaced via `wrapPgError`, where Turbine did not set the deadline).
+   * @param context human label for the operation ("Query", "Transaction").
+   * @param options optional `message` override and pg `cause` to preserve, used
+   *   when wrapping a driver error rather than a client-side timer expiry.
+   */
+  constructor(timeoutMs: number, context = 'Query', options?: { message?: string; cause?: unknown }) {
+    super(TurbineErrorCode.TIMEOUT, options?.message ?? `[turbine] ${context} timed out after ${timeoutMs}ms`, options);
     this.name = 'TimeoutError';
     this.timeoutMs = timeoutMs;
   }
@@ -193,8 +201,13 @@ export class ValidationError extends TurbineError {
 
 /** Thrown when a database connection fails */
 export class ConnectionError extends TurbineError {
-  constructor(message: string) {
-    super(TurbineErrorCode.CONNECTION, message);
+  /**
+   * @param message human-readable connection failure description.
+   * @param options optional pg/driver `cause` to preserve, used when wrapping a
+   *   connection-class driver error via `wrapPgError`.
+   */
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(TurbineErrorCode.CONNECTION, message, options);
     this.name = 'ConnectionError';
   }
 }
@@ -605,6 +618,36 @@ function parseColumnsFromDetail(detail: string): string[] | undefined {
 }
 
 /**
+ * Connection-class error codes. Covers both pg SQLSTATEs (class 08
+ * connection_exception, plus a few class-53/57 admin/availability codes) and
+ * Node driver-level error codes that arrive on the same `.code` field when the
+ * socket never reaches Postgres. All map to {@link ConnectionError} (E004).
+ *
+ * `57014` (query_canceled, a server-side `statement_timeout` cancellation) is
+ * intentionally NOT here: it maps to {@link TimeoutError} (E002) instead.
+ */
+const CONNECTION_ERROR_CODES = new Set<string>([
+  // pg SQLSTATE class 08 — connection_exception
+  '08000', // connection_exception
+  '08001', // sqlclient_unable_to_establish_sqlconnection
+  '08003', // connection_does_not_exist
+  '08004', // sqlserver_rejected_establishment_of_sqlconnection
+  '08006', // connection_failure
+  '08P01', // protocol_violation
+  // pg SQLSTATE class 53/57 (server unavailable / shutting down)
+  '53300', // too_many_connections
+  '57P01', // admin_shutdown
+  '57P02', // crash_shutdown
+  '57P03', // cannot_connect_now
+  // Node driver-level socket errors (surface on err.code too)
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EPIPE',
+]);
+
+/**
  * Translate a pg driver error into a typed Turbine error.
  * If the error doesn't match a known constraint code, returns it unchanged.
  *
@@ -616,6 +659,8 @@ function parseColumnsFromDetail(detail: string): string[] | undefined {
  *   23P01 (exclusion_violation)   -> ExclusionConstraintError
  *   40P01 (deadlock_detected)     -> DeadlockError       (retryable)
  *   40001 (serialization_failure) -> SerializationFailureError (retryable)
+ *   57014 (query_canceled)        -> TimeoutError (server-side statement_timeout)
+ *   connection-class codes        -> ConnectionError (see CONNECTION_ERROR_CODES)
  *
  * The original pg error is preserved as `.cause` on the wrapped error.
  */
@@ -674,7 +719,24 @@ export function wrapPgError(err: unknown): unknown {
       return new SerializationFailureError({
         cause: err,
       });
+    case '57014':
+      // query_canceled: a server-side statement_timeout cancelled the query.
+      // Turbine did not set the deadline (that lives in Postgres config), so
+      // there is no client-side budget to report → timeoutMs = 0.
+      return new TimeoutError(0, 'Query', {
+        message: '[turbine] Query canceled by server-side statement_timeout',
+        cause: err,
+      });
     default:
+      if (CONNECTION_ERROR_CODES.has(e.code)) {
+        const pgMessage = typeof e.message === 'string' && e.message.length > 0 ? e.message : undefined;
+        return new ConnectionError(
+          pgMessage
+            ? `[turbine] Database connection error: ${pgMessage}`
+            : `[turbine] Database connection error (${e.code})`,
+          { cause: err },
+        );
+      }
       return err;
   }
 }
