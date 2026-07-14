@@ -115,7 +115,9 @@ Either path writes three files to `./generated/turbine/` (or your config `out`):
 ```ts
 import { turbine } from './generated/turbine';
 
-const db = turbine({ connectionString: process.env.DATABASE_URL });
+// No arguments needed: turbine() reads DATABASE_URL from the environment.
+// (Pass { connectionString } explicitly if you'd rather not rely on the env var.)
+const db = turbine();
 
 const users = await db.users.findMany({
   where: { role: 'admin' },
@@ -127,6 +129,13 @@ console.log(users);
 
 await db.disconnect();
 ```
+
+> **Loading `.env` in your app:** the `turbine` CLI auto-loads a local `.env`,
+> but your application does not (the library never reads files). Populate
+> `process.env.DATABASE_URL` the standard way, e.g. run the script with Node's
+> built-in flag: `node --env-file=.env app.js` (Node 20.12+), or call
+> `process.loadEnvFile()` at startup. Any framework that already loads `.env`
+> (Next.js, etc.) works too.
 
 `db.users` is typed — autocompletion surfaces every column, every operator, every relation. `users[0].createdAt` is a `Date`, `users[0].email` is a `string`, everything is inferred from the generated types.
 

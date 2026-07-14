@@ -750,8 +750,25 @@ export class TurbineClient {
         connectionTimeoutMillis: config.connectionTimeoutMs ?? 5_000,
       };
 
+      // Did the caller supply ANY explicit connection target? If not, and a
+      // DATABASE_URL is present in the environment, fall back to it so
+      // `turbine()` with no arguments just works (the convention Prisma/Drizzle
+      // use, and what the generated factory JSDoc + `turbine init` promise).
+      // We only read the already-populated env var; the library never parses
+      // .env files (that is the CLI's job). An explicit host/port/db/user/pass
+      // still takes precedence, so this never overrides a deliberate config.
+      const hasExplicitConnection =
+        config.connectionString != null ||
+        config.host != null ||
+        config.port != null ||
+        config.database != null ||
+        config.user != null ||
+        config.password != null;
+
       if (config.connectionString) {
         poolConfig.connectionString = config.connectionString;
+      } else if (!hasExplicitConnection && process.env.DATABASE_URL) {
+        poolConfig.connectionString = process.env.DATABASE_URL;
       } else {
         poolConfig.host = config.host ?? 'localhost';
         poolConfig.port = config.port ?? 5432;

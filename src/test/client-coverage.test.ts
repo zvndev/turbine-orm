@@ -671,3 +671,80 @@ describe('TransactionClient — table accessor', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// 9. DATABASE_URL fallback for turbine() with no connection fields
+// ---------------------------------------------------------------------------
+
+/** Read the connection options off the owned pg.Pool the client built. */
+function poolOptions(db: TurbineClient): { connectionString?: string; host?: string } {
+  return (db as unknown as { pool: { options: { connectionString?: string; host?: string } } }).pool.options;
+}
+
+describe('TurbineClient DATABASE_URL fallback', () => {
+  // test:unit runs with DATABASE_URL='' (falsy); each case sets/restores it
+  // explicitly so nothing leaks between tests.
+  function withDatabaseUrl(value: string | undefined, fn: () => Promise<void> | void): Promise<void> {
+    const prev = process.env.DATABASE_URL;
+    if (value === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = value;
+    return (async () => {
+      try {
+        await fn();
+      } finally {
+        if (prev === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = prev;
+      }
+    })();
+  }
+
+  it('uses DATABASE_URL when constructed with no connection fields', async () => {
+    await withDatabaseUrl('postgres://envuser:envpass@envhost:5432/envdb', async () => {
+      const db = new TurbineClient({}, buildSchema());
+      try {
+        const opts = poolOptions(db);
+        assert.equal(opts.connectionString, 'postgres://envuser:envpass@envhost:5432/envdb');
+      } finally {
+        await db.disconnect();
+      }
+    });
+  });
+
+  it('does NOT apply the fallback when an explicit host is given', async () => {
+    await withDatabaseUrl('postgres://envuser:envpass@envhost:5432/envdb', async () => {
+      const db = new TurbineClient({ host: 'explicit-host', database: 'explicit-db' }, buildSchema());
+      try {
+        const opts = poolOptions(db);
+        assert.equal(opts.connectionString, undefined, 'must not override an explicit host with DATABASE_URL');
+        assert.equal(opts.host, 'explicit-host');
+      } finally {
+        await db.disconnect();
+      }
+    });
+  });
+
+  it('prefers an explicit connectionString over DATABASE_URL', async () => {
+    await withDatabaseUrl('postgres://envuser:envpass@envhost:5432/envdb', async () => {
+      const db = new TurbineClient({ connectionString: 'postgres://explicit:pw@explicithost:5432/db' }, buildSchema());
+      try {
+        const opts = poolOptions(db);
+        assert.equal(opts.connectionString, 'postgres://explicit:pw@explicithost:5432/db');
+      } finally {
+        await db.disconnect();
+      }
+    });
+  });
+
+  it('falls back to localhost defaults when neither config nor DATABASE_URL is set', async () => {
+    await withDatabaseUrl(undefined, async () => {
+      const db = new TurbineClient({}, buildSchema());
+      try {
+        const opts = poolOptions(db);
+        assert.equal(opts.connectionString, undefined);
+        assert.equal(opts.host, 'localhost');
+      } finally {
+        await db.disconnect();
+      }
+    });
+  });
+});

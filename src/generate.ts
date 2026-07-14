@@ -780,7 +780,8 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   lines.push('/**');
   lines.push(' * Create a new Turbine client instance.');
   lines.push(' *');
-  lines.push(' * @param config - Connection configuration. Falls back to DATABASE_URL env var.');
+  lines.push(' * @param config - Connection configuration. Omit it (or pass no connection');
+  lines.push(' *   fields) to fall back to the `DATABASE_URL` environment variable.');
   lines.push(' * @returns A fully-typed TurbineClient with table accessors.');
   lines.push(' */');
   lines.push('export function turbine(config?: TurbineConfig): TurbineClient {');

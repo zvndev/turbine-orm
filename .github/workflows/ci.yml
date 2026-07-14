@@ -407,6 +407,48 @@ jobs:
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/adapters'); if (!m.cockroachdb || !m.yugabytedb || !m.postgresql) { console.error('adapters subpath broken'); process.exit(1); } console.log('adapters subpath OK', Object.keys(m).slice(0,8).join(','));"
 
+  # Simulates the real first-run a brand-new user gets from npm 11 defaults and
+  # runs the documented quickstart end-to-end against a real Postgres. This is
+  # the exact path that silently broke in the field and that unit tests could
+  # not catch: a "type": "commonjs" project (npm init -y), a TypeScript
+  # turbine.config.ts + schema.ts loaded through tsx, DATABASE_URL supplied ONLY
+  # via a .env file, and turbine() called with NO arguments in the user's
+  # script. The scratch project installs the packed tarball, then runs
+  # init -> push -> generate -> query and asserts real rows round-trip. The core
+  # steps live in scripts/quickstart-smoke.sh so a developer can run the same
+  # thing locally. Gates PRs.
+  quickstart-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: turbine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Pack tarball
+        run: echo "TARBALL=$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)" >> "$GITHUB_ENV"
+      - name: Run quickstart smoke (real Postgres, .env + no-arg turbine())
+        run: bash scripts/quickstart-smoke.sh
+        env:
+          TARBALL: ${{ env.TARBALL }}
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+
   security:
     runs-on: ubuntu-latest
     steps:

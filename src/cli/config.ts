@@ -75,12 +75,91 @@ const DEFAULT_SEED_CANDIDATES = ['seed.ts', 'seed.js', 'seed.sql'] as const;
 // Load config
 // ---------------------------------------------------------------------------
 
+/** A config-file load attempt that failed, kept so the CLI can surface it. */
+export interface ConfigLoadError {
+  /** The config file whose import threw (e.g. `turbine.config.ts`). */
+  filename: string;
+  /** The underlying error thrown by the dynamic import. */
+  error: unknown;
+}
+
+/** Result of {@link loadConfigResult}: the resolved config plus any load failure. */
+export interface ConfigLoadResult {
+  config: TurbineCliConfig;
+  /**
+   * Set when a config file existed but failed to import. The config is still
+   * returned as `{}` so resolution falls through to env vars and CLI flags, but
+   * the CLI should surface this rather than let it masquerade as a missing URL.
+   */
+  loadError?: ConfigLoadError;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /**
- * Attempt to load a turbine config file from the current directory.
- * Returns the config if found, or an empty object.
+ * True when `value` is a pure ESM/CJS-interop wrapper: an object whose only
+ * meaningful export is `default` (the `__esModule` marker is ignored). No
+ * Turbine config field is named `default`, so a real config never matches.
  */
-export async function loadConfig(cwd?: string): Promise<TurbineCliConfig> {
+function isPureDefaultWrapper(value: Record<string, unknown>): boolean {
+  const keys = Object.keys(value).filter((k) => k !== '__esModule');
+  return keys.length === 1 && keys[0] === 'default';
+}
+
+/**
+ * Unwrap the module object returned by `import(configFile)` down to the actual
+ * config value.
+ *
+ * With `"type": "commonjs"` in the consumer's package.json (the `npm init -y`
+ * default) plus the tsx loader, importing `turbine.config.ts` yields a
+ * CJS-interop DOUBLE-wrapped default: `mod.default` is itself `{ default: config }`.
+ * A naive `mod.default ?? mod` then reads every field as `undefined`, so every
+ * command fails with a misleading "No database URL provided".
+ *
+ * This prefers `default` when present (the historical behavior) and then keeps
+ * descending through any additional pure `{ default: … }` wrappers, so both the
+ * correct single-default shape and the double-wrapped shape resolve to the same
+ * config. A genuine config object (which has real fields, never a lone
+ * `default`) is returned untouched.
+ */
+export function unwrapModuleDefault(mod: unknown): unknown {
+  // Step 1: prefer `default` at the top level (mirrors `mod.default ?? mod`).
+  let value: unknown = isPlainObject(mod) && mod.default != null ? mod.default : mod;
+
+  // Step 2: peel off any further pure interop wrappers, bounded to avoid a
+  // pathological self-referential object spinning forever.
+  for (let depth = 0; depth < 10 && isPlainObject(value) && isPureDefaultWrapper(value); depth++) {
+    value = value.default;
+  }
+
+  return value;
+}
+
+/**
+ * {@link unwrapModuleDefault} specialized for config files: a non-object export
+ * collapses to `{}` so downstream resolution falls through to env vars/flags.
+ */
+export function unwrapConfigModule(mod: unknown): TurbineCliConfig {
+  const value = unwrapModuleDefault(mod);
+  return isPlainObject(value) ? (value as TurbineCliConfig) : {};
+}
+
+/**
+ * Attempt to load a turbine config file from the given directory, returning the
+ * resolved config together with any load failure so the caller can surface it.
+ *
+ * Candidates are tried in {@link CONFIG_FILES} priority order. The first one
+ * that imports successfully wins. If a candidate exists but throws (syntax
+ * error, ESM/CJS interop failure, etc.) we remember the first such error and
+ * keep trying lower-priority candidates; if none load, the remembered error is
+ * returned in `loadError` while `config` stays `{}` so env/flag resolution can
+ * still proceed.
+ */
+export async function loadConfigResult(cwd?: string): Promise<ConfigLoadResult> {
   const dir = cwd ?? process.cwd();
+  let loadError: ConfigLoadError | undefined;
 
   for (const filename of CONFIG_FILES) {
     const filePath = join(dir, filename);
@@ -90,22 +169,27 @@ export async function loadConfig(cwd?: string): Promise<TurbineCliConfig> {
       const absPath = resolve(filePath);
       const fileUrl = pathToFileURL(absPath).href;
 
-      // For .ts files, we need to rely on Node's --experimental-strip-types
-      // or the tsx loader. Dynamic import handles .js/.mjs natively.
+      // For .ts files, we rely on the tsx loader being registered by the CLI
+      // before this runs. Dynamic import handles .js/.mjs natively.
       const mod = await import(fileUrl);
-      const config: TurbineCliConfig = mod.default ?? mod;
-
-      return config;
+      return { config: unwrapConfigModule(mod) };
     } catch (err) {
-      // If importing a .ts file fails, try the next one
-      if (filename.endsWith('.ts') || filename.endsWith('.mts')) {
-        continue;
-      }
-      throw new Error(`Failed to load config from ${filename}: ${err instanceof Error ? err.message : String(err)}`);
+      // Remember the first real load failure but keep trying lower-priority
+      // candidates (e.g. a working .js next to a broken .ts).
+      if (!loadError) loadError = { filename, error: err };
     }
   }
 
-  return {};
+  return loadError ? { config: {}, loadError } : { config: {} };
+}
+
+/**
+ * Attempt to load a turbine config file from the current directory.
+ * Returns the config if found, or an empty object. Load failures are swallowed
+ * here; callers that need to surface them should use {@link loadConfigResult}.
+ */
+export async function loadConfig(cwd?: string): Promise<TurbineCliConfig> {
+  return (await loadConfigResult(cwd)).config;
 }
 
 /**

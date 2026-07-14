@@ -18,11 +18,14 @@ import {
   configTemplate,
   findConfigFile,
   loadConfig,
+  loadConfigResult,
   looksLikeSchemaFilePath,
   resolveConfig,
   type TurbineCliConfig,
   type TurbineConfig,
+  unwrapConfigModule,
 } from '../cli/config.js';
+import { detectConsumerModuleType, loadDotEnvForCli } from '../cli/index.js';
 import { _resetTsLoaderStateForTests, canResolveTsx, needsTsLoader, registerTsLoader } from '../cli/loader.js';
 import { parseMigrationContent } from '../cli/migrate.js';
 import { box, redactUrl, stripAnsi, table } from '../cli/ui.js';
@@ -140,6 +143,139 @@ describe('CLI config', () => {
       const config = await loadConfig(dir);
       assert.equal(config.out, './custom-output');
       assert.equal(config.schema, 'myschema');
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('surfaces a load error (via loadConfigResult) instead of swallowing it', async () => {
+      const dir = join(tmpdir(), `turbine-cli-test-loaderr-${Date.now()}`);
+      mkdirSync(dir, { recursive: true });
+      // A .mjs with a hard syntax error fails to import.
+      writeFileSync(join(dir, 'turbine.config.mjs'), `export default { this is not valid javascript`);
+      const result = await loadConfigResult(dir);
+      assert.deepEqual(result.config, {}, 'config falls through to {} so env/flags still resolve');
+      assert.ok(result.loadError, 'the underlying load failure is surfaced, not swallowed');
+      assert.equal(result.loadError?.filename, 'turbine.config.mjs');
+      rmSync(dir, { recursive: true, force: true });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // CLI config: unwrapConfigModule()
+  // ---------------------------------------------------------------------------
+
+  describe('unwrapConfigModule()', () => {
+    const config: TurbineCliConfig = { url: 'postgres://x', out: './out', schema: 'public' };
+
+    it('unwraps the normal single-default ESM shape', () => {
+      assert.deepEqual(unwrapConfigModule({ default: config }), config);
+    });
+
+    it('unwraps the CJS-interop double-wrapped default (the "type: commonjs" bug)', () => {
+      // With "type":"commonjs" + the tsx loader, mod.default is itself
+      // { default: config } is the shape that made every field read undefined.
+      assert.deepEqual(unwrapConfigModule({ default: { default: config } }), config);
+    });
+
+    it('ignores __esModule interop markers while descending', () => {
+      const mod = { default: { default: config, __esModule: true }, __esModule: true };
+      assert.deepEqual(unwrapConfigModule(mod), config);
+    });
+
+    it('returns a config that has no default export untouched (CJS module.exports = config)', () => {
+      assert.deepEqual(unwrapConfigModule(config), config);
+    });
+
+    it('prefers default when the namespace also carries named exports', () => {
+      const mod = { default: config, someHelper: () => 42 };
+      assert.deepEqual(unwrapConfigModule(mod), config);
+    });
+
+    it('does not over-descend a single-field config whose only key is not "default"', () => {
+      const singleField: TurbineCliConfig = { url: 'postgres://only' };
+      assert.deepEqual(unwrapConfigModule({ default: singleField }), singleField);
+    });
+
+    it('returns {} for a non-object export', () => {
+      assert.deepEqual(unwrapConfigModule(undefined), {});
+      assert.deepEqual(unwrapConfigModule(null), {});
+      assert.deepEqual(unwrapConfigModule('nope'), {});
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // CLI: loadDotEnvForCli()
+  // ---------------------------------------------------------------------------
+
+  describe('loadDotEnvForCli()', () => {
+    it('short-circuits (existing env wins) when DATABASE_URL is already set', () => {
+      let called = false;
+      const result = loadDotEnvForCli({
+        env: { DATABASE_URL: 'postgres://already-set' },
+        fileExists: () => true,
+        loadEnvFile: () => {
+          called = true;
+        },
+      });
+      assert.equal(result, 'has-url');
+      assert.equal(called, false, 'must not read .env when DATABASE_URL is already in the environment');
+    });
+
+    it('returns "no-file" when no .env exists', () => {
+      const result = loadDotEnvForCli({ env: {}, fileExists: () => false });
+      assert.equal(result, 'no-file');
+    });
+
+    it('tolerates a runtime without process.loadEnvFile (returns "unsupported", no throw)', () => {
+      const result = loadDotEnvForCli({ env: {}, fileExists: () => true, loadEnvFile: null });
+      assert.equal(result, 'unsupported');
+    });
+
+    it('loads the .env at the working directory and preserves already-present vars', () => {
+      const env: NodeJS.ProcessEnv = { PRESET: 'keep-me' };
+      let loadedPath: string | undefined;
+      const result = loadDotEnvForCli({
+        env,
+        cwd: '/tmp/project',
+        fileExists: () => true,
+        // Mimic Node's process.loadEnvFile: never override an existing var.
+        loadEnvFile: (path) => {
+          loadedPath = path;
+          if (!('PRESET' in env)) env.PRESET = 'from-file';
+          if (!('DATABASE_URL' in env)) env.DATABASE_URL = 'postgres://from-file';
+        },
+      });
+      assert.equal(result, 'loaded');
+      assert.equal(loadedPath, join('/tmp/project', '.env'));
+      assert.equal(env.PRESET, 'keep-me', 'existing env var must win over .env');
+      assert.equal(env.DATABASE_URL, 'postgres://from-file', 'new var from .env is applied');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // CLI: detectConsumerModuleType()
+  // ---------------------------------------------------------------------------
+
+  describe('detectConsumerModuleType()', () => {
+    it('returns "module" for an ESM package.json', () => {
+      const dir = join(tmpdir(), `turbine-cli-test-esm-${Date.now()}`);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
+      assert.equal(detectConsumerModuleType(dir), 'module');
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('returns "commonjs" when the type field is absent (npm init -y default)', () => {
+      const dir = join(tmpdir(), `turbine-cli-test-cjs-${Date.now()}`);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'x' }));
+      assert.equal(detectConsumerModuleType(dir), 'commonjs');
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('returns "none" when there is no package.json', () => {
+      const dir = join(tmpdir(), `turbine-cli-test-nopkg-${Date.now()}`);
+      mkdirSync(dir, { recursive: true });
+      assert.equal(detectConsumerModuleType(dir), 'none');
       rmSync(dir, { recursive: true, force: true });
     });
   });

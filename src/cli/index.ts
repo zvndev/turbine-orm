@@ -25,7 +25,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { basename, dirname, extname, relative, resolve } from 'node:path';
+import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generate } from '../generate.js';
 import { findMissingRelationIndexes } from '../index-advisor.js';
@@ -36,10 +36,11 @@ import type { CliOverrides, ResolvedConfig } from './config.js';
 import {
   configTemplate,
   findConfigFile,
-  loadConfig,
+  loadConfigResult,
   looksLikeSchemaFilePath,
   resolveConfig,
   resolveSeedFile,
+  unwrapModuleDefault,
 } from './config.js';
 import { canResolveTsx, getTsLoaderError, needsTsLoader, registerTsLoader } from './loader.js';
 import { runMcpServer } from './mcp.js';
@@ -282,7 +283,9 @@ function requireUrl(config: ResolvedConfig): string {
     newline();
     console.log(`  ${dim('Set it in one of these ways:')}`);
     console.log(`    ${dim('1.')} Add ${cyan('url')} to ${cyan('turbine.config.ts')}`);
-    console.log(`    ${dim('2.')} Set ${cyan('DATABASE_URL')} environment variable`);
+    console.log(
+      `    ${dim('2.')} Set ${cyan('DATABASE_URL')} in your environment or a ${cyan('.env')} file ${dim('(auto-loaded)')}`,
+    );
     console.log(`    ${dim('3.')} Pass ${cyan('--url')} flag`);
     newline();
     process.exit(1);
@@ -311,8 +314,12 @@ async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
   try {
     const fileUrl = pathToFileURL(absPath).href;
     const mod = await import(fileUrl);
-    const schema: SchemaDef = mod.default ?? mod;
-    if (!schema.tables) {
+    // Unwrap the same CJS-interop double-wrapped default that bites config files
+    // in a "type": "commonjs" project under the tsx loader (see
+    // unwrapModuleDefault). Without this, `mod.default ?? mod` reads
+    // `{ default: schemaDef }` and `.tables` is undefined.
+    const schema = unwrapModuleDefault(mod) as SchemaDef | undefined;
+    if (!schema?.tables) {
       error('Schema file must export a SchemaDef with a "tables" property.');
       process.exit(1);
     }
@@ -359,6 +366,73 @@ function printCjsHintIfApplicable(err: Error): void {
 }
 
 // ---------------------------------------------------------------------------
+// .env loading (CLI-only: the library never reads .env files)
+// ---------------------------------------------------------------------------
+
+export type DotEnvLoadResult = 'loaded' | 'has-url' | 'no-file' | 'unsupported';
+
+/**
+ * Load a local `.env` into `process.env` for the CLI, mirroring what
+ * `node --env-file=.env` does. Runs only when `DATABASE_URL` is not already set
+ * and a `.env` file is present in the working directory.
+ *
+ * Values already in the environment ALWAYS win: `process.loadEnvFile()` never
+ * overrides an existing variable, so a real shell/CI `DATABASE_URL` beats the
+ * file. We also short-circuit on an existing `DATABASE_URL` before touching the
+ * file at all.
+ *
+ * `process.loadEnvFile` is Node 20.12+. Turbine's engines allow `>=20.0.0`, so
+ * on older runtimes this silently no-ops (returns `'unsupported'`) rather than
+ * throwing. This is deliberately CLI-only: the library must never read files.
+ *
+ * Dependencies are injectable purely so this is unit-testable without mutating
+ * the real process environment.
+ */
+export function loadDotEnvForCli(
+  deps: {
+    env?: NodeJS.ProcessEnv;
+    cwd?: string;
+    fileExists?: (path: string) => boolean;
+    loadEnvFile?: ((path: string) => void) | null;
+  } = {},
+): DotEnvLoadResult {
+  const env = deps.env ?? process.env;
+  if (env.DATABASE_URL) return 'has-url';
+
+  const cwd = deps.cwd ?? process.cwd();
+  const fileExists = deps.fileExists ?? existsSync;
+  const envPath = join(cwd, '.env');
+  if (!fileExists(envPath)) return 'no-file';
+
+  const loader =
+    deps.loadEnvFile !== undefined
+      ? deps.loadEnvFile
+      : typeof process.loadEnvFile === 'function'
+        ? process.loadEnvFile.bind(process)
+        : null;
+  if (!loader) return 'unsupported';
+
+  loader(envPath);
+  return 'loaded';
+}
+
+/**
+ * Read the consumer's `package.json` `"type"` field. Returns `'module'` for an
+ * ESM project, `'commonjs'` for an explicit or absent (defaulted) CommonJS
+ * project, and `'none'` when there is no readable/parseable package.json.
+ */
+export function detectConsumerModuleType(cwd = process.cwd()): 'module' | 'commonjs' | 'none' {
+  const pkgPath = join(cwd, 'package.json');
+  if (!existsSync(pkgPath)) return 'none';
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { type?: unknown };
+    return pkg.type === 'module' ? 'module' : 'commonjs';
+  } catch {
+    return 'none';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Command: init
 // ---------------------------------------------------------------------------
 
@@ -366,21 +440,38 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
   header('Initializing Turbine project');
 
-  // Detect environment
+  // Detect environment. main() has already auto-loaded a local `.env` into
+  // process.env (when DATABASE_URL was not otherwise set), so these messages
+  // describe the real, post-load state, no more "if set" hand-waving.
   const envUrl = process.env.DATABASE_URL;
   const hasEnvFile = existsSync('.env');
   const hasEnvLocal = existsSync('.env.local');
 
   if (envUrl) {
-    success(`Detected ${cyan('DATABASE_URL')} in environment`);
-  } else if (hasEnvLocal) {
-    info(`Found ${cyan('.env.local')} — Turbine will use ${cyan('DATABASE_URL')} from it if set`);
+    success(`Detected ${cyan('DATABASE_URL')} in the environment`);
   } else if (hasEnvFile) {
-    info(`Found ${cyan('.env')} — Turbine will use ${cyan('DATABASE_URL')} from it if set`);
+    // .env exists but did not provide DATABASE_URL; if it had, the auto-load
+    // in main() would have populated envUrl above.
+    info(`Found ${cyan('.env')} ${dim('(no')} ${cyan('DATABASE_URL')} ${dim('set in it yet)')}`);
+  } else if (hasEnvLocal) {
+    info(`Found ${cyan('.env.local')} ${dim('(note: Turbine only auto-loads')} ${cyan('.env')}${dim(')')}`);
   } else {
     info(`No ${cyan('DATABASE_URL')} found in environment`);
   }
   newline();
+
+  // Heads-up (not an edit) about the consumer's module system. A CommonJS
+  // project (`npm init -y` default, or no "type" field) works fine now that the
+  // config loader unwraps the CJS-interop double-wrapped default, but ESM is the
+  // smoother path for a TypeScript config file.
+  const moduleType = detectConsumerModuleType();
+  if (moduleType === 'commonjs') {
+    info(`Your ${cyan('package.json')} is a CommonJS project ${dim('(no')} ${cyan('"type": "module"')}${dim(').')}`);
+    console.log(
+      `  ${dim('Turbine works either way. For the smoothest TypeScript config experience, consider adding')} ${cyan('"type": "module"')}${dim('.')}`,
+    );
+    newline();
+  }
 
   const configPath = findConfigFile();
 
@@ -2050,6 +2141,12 @@ async function main() {
     return;
   }
 
+  // Load a local `.env` so `DATABASE_URL` from it is available to the config
+  // file, to `turbine()` in user scripts, and to command resolution: exactly
+  // what the quickstart promises. A pre-existing env var always wins. No-op on
+  // Node builds without process.loadEnvFile (< 20.12).
+  loadDotEnvForCli();
+
   // If the user has a TypeScript config file, register the tsx ESM loader
   // before we attempt to import it. Otherwise Node throws
   // ERR_UNKNOWN_FILE_EXTENSION for `.ts`.
@@ -2061,15 +2158,15 @@ async function main() {
     }
   }
 
-  // Load config file
-  let fileConfig = {};
-  try {
-    fileConfig = await loadConfig();
-  } catch (err) {
-    if (args.command !== 'init') {
-      warn(`Could not load config: ${err instanceof Error ? err.message : String(err)}`);
-      if (err instanceof Error) printCjsHintIfApplicable(err);
-    }
+  // Load config file. A config that exists but fails to import is surfaced
+  // loudly (with a name + the underlying error) instead of being swallowed and
+  // later misreported as a missing database URL.
+  const { config: fileConfig, loadError } = await loadConfigResult();
+  if (loadError && args.command !== 'init') {
+    const underlying = loadError.error instanceof Error ? loadError.error.message : String(loadError.error);
+    warn(`Could not load ${cyan(loadError.filename)}: ${underlying}`);
+    if (loadError.error instanceof Error) printCjsHintIfApplicable(loadError.error);
+    newline();
   }
 
   const overrides: CliOverrides = {
