@@ -115,6 +115,94 @@ import { escapeLike, LRUCache, OPERATOR_KEYS, parseDbDate, type SqlCacheEntry, s
 const unindexedRelationWarned = new Set<string>();
 
 /**
+ * Dev-mode SQL-cache lockstep cross-check gate.
+ *
+ * The SQL template cache requires three code paths to enumerate where-clause
+ * keys identically: `fingerprintWhere` (builds the cache key),
+ * `buildWhereClause` (builds SQL + `$N` params on a MISS), and
+ * `collectWhereParams` (re-collects params on a HIT without rebuilding). They
+ * are synchronized only by convention, and drift has shipped silent
+ * wrong-results bugs before (permuted where-key order; an orderBy fingerprint
+ * collision). This check catches such drift loudly the moment a cache HIT
+ * happens by rebuilding the SQL + params fresh and comparing them against what
+ * the cache-hit path produced.
+ *
+ * Enabled only when `NODE_ENV !== 'production'` (same convention as the other
+ * dev-only guards in this file) AND `TURBINE_DISABLE_CACHE_CHECK !== '1'`. The
+ * env vars are read inline (not captured once) so tests and perf-sensitive dev
+ * traffic can toggle them per process. In production the check never runs, so
+ * the hot path is unchanged.
+ */
+function cacheCrossCheckEnabled(): boolean {
+  return process.env.NODE_ENV !== 'production' && process.env.TURBINE_DISABLE_CACHE_CHECK !== '1';
+}
+
+/**
+ * Strict structural equality for a single SQL parameter value. Handles the
+ * value shapes Turbine binds: primitives (incl. `NaN` and `bigint`), `null`/
+ * `undefined`, `Date` (by time), `Buffer`/typed arrays (by bytes), arrays
+ * (`in` lists, pgvector arrays), and plain objects (JSON filter payloads).
+ */
+function cacheParamValueEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true; // identical ref or equal primitive (covers matching null/undefined)
+  if (a === null || b === null || a === undefined || b === undefined) return false;
+  const ta = typeof a;
+  if (ta !== typeof b) return false;
+  if (ta !== 'object') {
+    // Primitives that failed `===` — only NaN is legitimately "equal" to itself.
+    return typeof a === 'number' && Number.isNaN(a) && Number.isNaN(b as number);
+  }
+  if (a instanceof Date || b instanceof Date) {
+    return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
+  }
+  const aView = ArrayBuffer.isView(a);
+  const bView = ArrayBuffer.isView(b);
+  if (aView || bView) {
+    if (!aView || !bView) return false;
+    const ua = a as Uint8Array;
+    const ub = b as Uint8Array;
+    if (ua.byteLength !== ub.byteLength) return false;
+    const va = new Uint8Array(ua.buffer, ua.byteOffset, ua.byteLength);
+    const vb = new Uint8Array(ub.buffer, ub.byteOffset, ub.byteLength);
+    for (let i = 0; i < va.length; i++) {
+      if (va[i] !== vb[i]) return false;
+    }
+    return true;
+  }
+  const aArr = Array.isArray(a);
+  const bArr = Array.isArray(b);
+  if (aArr || bArr) {
+    if (!aArr || !bArr) return false;
+    const arrA = a as unknown[];
+    const arrB = b as unknown[];
+    if (arrA.length !== arrB.length) return false;
+    for (let i = 0; i < arrA.length; i++) {
+      if (!cacheParamValueEqual(arrA[i], arrB[i])) return false;
+    }
+    return true;
+  }
+  const objA = a as Record<string, unknown>;
+  const objB = b as Record<string, unknown>;
+  const keysA = Object.keys(objA);
+  const keysB = Object.keys(objB);
+  if (keysA.length !== keysB.length) return false;
+  for (const k of keysA) {
+    if (!Object.hasOwn(objB, k)) return false;
+    if (!cacheParamValueEqual(objA[k], objB[k])) return false;
+  }
+  return true;
+}
+
+/** Element-wise strict equality of two SQL parameter arrays. */
+function cacheParamsEqual(a: unknown[], b: unknown[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!cacheParamValueEqual(a[i], b[i])) return false;
+  }
+  return true;
+}
+
+/**
  * Column-reference resolution context threaded into
  * {@link QueryInterface.buildOperatorClauses} / `collectOperatorParams`: the
  * table whose fields a `{ col }` reference may name, plus the SQL prefix
@@ -166,6 +254,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly tableMeta: TableMetadata;
   /** SQL template cache: cacheKey → SqlCacheEntry (sql + prepared statement name) */
   private readonly sqlTemplateCache = new LRUCache<string, SqlCacheEntry>(1000);
+  /**
+   * Whether the most recent {@link acquireSql} call was a cache HIT. Read by
+   * {@link crossCheckCache} to decide whether to run the dev-mode lockstep
+   * cross-check. Safe as a single mutable flag: each `build*()` method calls
+   * `acquireSql` then `crossCheckCache` synchronously with no intervening
+   * `await` and no re-entrant `acquireSql` (relation subqueries are built
+   * inline, not through the top-level cache).
+   */
+  private lastCacheHit = false;
   private readonly middlewares: MiddlewareFn[];
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
@@ -516,10 +613,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * On hit, increments counters and returns the cached entry.
    *
    * When `sqlCache` is disabled, always calls `build()` without caching.
+   *
+   * `build` receives a fresh `$N` param scratch array. On a miss those params
+   * are discarded (the returned params come from each call site's dedicated
+   * collect path); the array exists so the build path can number placeholders
+   * via `params.length` exactly as it does today. On a HIT, `build` is skipped
+   * here but re-run by {@link crossCheckCache} (dev only) with a fresh array to
+   * verify the collect path stayed in lockstep with the build path.
+   *
+   * Sets {@link lastCacheHit} so the caller's `crossCheckCache` knows whether a
+   * cross-check is warranted.
    */
-  private acquireSql(cacheKey: string, build: () => string): SqlCacheEntry {
+  private acquireSql(cacheKey: string, build: (params: unknown[]) => string): SqlCacheEntry {
     if (!this.sqlCacheEnabled) {
-      const sql = build();
+      this.lastCacheHit = false;
+      const sql = build([]);
       this.cacheMisses++;
       return { sql, name: sqlToPreparedName(sql) };
     }
@@ -527,14 +635,75 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const cached = this.sqlTemplateCache.get(cacheKey);
     if (cached) {
       this.cacheHits++;
+      this.lastCacheHit = true;
       return cached;
     }
 
-    const sql = build();
+    this.lastCacheHit = false;
+    const sql = build([]);
     const entry: SqlCacheEntry = { sql, name: sqlToPreparedName(sql) };
     this.sqlTemplateCache.set(cacheKey, entry);
     this.cacheMisses++;
     return entry;
+  }
+
+  /**
+   * Dev-mode SQL-cache lockstep cross-check (see {@link cacheCrossCheckEnabled}).
+   *
+   * Runs only when the most recent {@link acquireSql} was a cache HIT and the
+   * check is enabled. Rebuilds the SQL + `$N` params fresh via the same `build`
+   * closure the caller passed to `acquireSql`, then compares:
+   *   (a) the cached SQL string byte-for-byte against the fresh SQL, and
+   *   (b) the params the cache-hit collect path produced against the fresh
+   *       build-path params (length and element-wise strict deep-equal).
+   *
+   * A mismatch means the fingerprint / build / collect paths have drifted out
+   * of lockstep (the exact class of bug that has silently corrupted results
+   * before), so it throws a {@link ValidationError} (E003) naming the
+   * fingerprint, the operation, and both SQL strings (truncated). Failing loud
+   * in dev/test is the point. Production never reaches the comparison.
+   *
+   * @param op human label of the calling build method (for the error message).
+   * @param cacheKey the cache fingerprint that HIT.
+   * @param entry the cached SQL entry that will be executed.
+   * @param build the same closure passed to `acquireSql`; re-run here to
+   *   capture the fresh build-path SQL + params.
+   * @param collectedParams the params the caller's collect path produced.
+   */
+  private crossCheckCache(
+    op: string,
+    cacheKey: string,
+    entry: SqlCacheEntry,
+    build: (params: unknown[]) => string,
+    collectedParams: unknown[],
+  ): void {
+    if (!this.lastCacheHit) return;
+    if (!cacheCrossCheckEnabled()) return;
+
+    const freshParams: unknown[] = [];
+    const freshSql = build(freshParams);
+    const sqlOk = freshSql === entry.sql;
+    const paramsOk = cacheParamsEqual(collectedParams, freshParams);
+    if (sqlOk && paramsOk) return;
+
+    const truncate = (s: string): string => (s.length > 300 ? `${s.slice(0, 300)}… (${s.length} chars total)` : s);
+    const details: string[] = [];
+    if (!sqlOk) {
+      details.push(
+        `cached SQL and freshly-built SQL diverge:\n  cached = <${truncate(entry.sql)}>\n  fresh  = <${truncate(freshSql)}>`,
+      );
+    }
+    if (!paramsOk) {
+      details.push(
+        `cache-hit params and freshly-built params diverge (collected ${collectedParams.length}, built ${freshParams.length})`,
+      );
+    }
+    throw new ValidationError(
+      `[turbine] SQL cache lockstep violation on ${op} (fingerprint "${cacheKey}"). ` +
+        `This is a Turbine internal invariant violation, please report it at ` +
+        `https://github.com/zvndev/turbine-orm/issues. The fingerprint, SQL-build, and ` +
+        `param-collect paths must enumerate where-clause keys identically.\n${details.join('\n')}`,
+    );
   }
 
   /**
@@ -794,20 +963,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // Simple path: plain equality, no operators/null/OR
     if (!args.with && isSimpleWhere) {
-      const entry = this.acquireSql(ck, () => {
+      const buildSql = (freshParams: unknown[]): string => {
         const qt = this.q(this.table);
-        const tempParams: unknown[] = whereKeys.map((k) => whereObj[k]);
-        const whereClauses = whereKeys.map((k, i) => `${this.toSqlColumn(k)} = ${this.p(i + 1)}`);
+        const whereClauses = whereKeys.map((k, i) => {
+          freshParams.push(whereObj[k]);
+          return `${this.toSqlColumn(k)} = ${this.p(i + 1)}`;
+        });
         const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
         const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
-        void tempParams; // params are positional, SQL is value-invariant
         return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}`;
-      });
+      };
+      const entry = this.acquireSql(ck, buildSql);
 
       // Collect params (same order as build)
       for (const k of whereKeys) {
         params.push(whereObj[k]);
       }
+      this.crossCheckCache('findUnique', ck, entry, buildSql, params);
 
       return {
         sql: entry.sql,
@@ -823,17 +995,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // General path (with operators, null, OR, with clause)
     if (!args.with) {
-      const entry = this.acquireSql(ck, () => {
-        const freshParams: unknown[] = [];
+      const buildSql = (freshParams: unknown[]): string => {
         const clause = this.buildWhereClause(whereObj, freshParams);
         const whereSql = clause ? ` WHERE ${clause}` : '';
         const qt = this.q(this.table);
         const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
         return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}`;
-      });
+      };
+      const entry = this.acquireSql(ck, buildSql);
 
       // Collect params
       this.collectWhereParams(whereObj, params);
+      this.crossCheckCache('findUnique', ck, entry, buildSql, params);
 
       return {
         sql: entry.sql,
@@ -852,17 +1025,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
     //   1. buildWhere pushes where params
     //   2. buildSelectWithRelations pushes relation params to same array
     // We must preserve this exact order.
-    const entry = this.acquireSql(ck, () => {
-      const freshParams: unknown[] = [];
+    const buildSql = (freshParams: unknown[]): string => {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
       const selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, freshParams, columnsList);
       return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql}${this.limitOneClause()}`;
-    });
+    };
+    const entry = this.acquireSql(ck, buildSql);
 
     // Collect params in exact build order: where first, then with-clause relations
     this.collectWhereParams(whereObj, params);
     this.collectWithParams(args.with as WithClause, params);
+    this.crossCheckCache('findUnique', ck, entry, buildSql, params);
 
     const parseWith = this.makeNestedParser(args.with as WithClause);
 
@@ -1016,9 +1190,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params: unknown[] = [];
 
-    const entry = this.acquireSql(ck, () => {
-      // Fresh build — generates SQL and populates freshParams
-      const freshParams: unknown[] = [];
+    const buildSql = (freshParams: unknown[]): string => {
+      // Fresh build: generates SQL and populates freshParams
       const { sql: freshWhereSql } = hasWhere
         ? (() => {
             const clause = this.buildWhereClause(whereObj, freshParams);
@@ -1102,7 +1275,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       sql += this.buildPagination(limitPh, offsetPh, !!args?.orderBy);
 
       return sql;
-    });
+    };
+    const entry = this.acquireSql(ck, buildSql);
 
     // Collect params in exact build order:
     // 1. WHERE params (includes the AND-merged global filter, if any)
@@ -1134,6 +1308,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.offset !== undefined && !this.dialect.inlineLimitOffset) {
       params.push(Number(args.offset));
     }
+    this.crossCheckCache('findMany', ck, entry, buildSql, params);
 
     // Build the row parser once (positional shapes are computed here, not per row).
     const parseWith = args?.with ? this.makeNestedParser(args.with as WithClause) : null;
@@ -1544,8 +1719,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params: unknown[] = [];
 
-    const buildSql = () => {
-      const freshParams: unknown[] = [];
+    const buildSql = (freshParams: unknown[]): string => {
       const setEntries = Object.entries(dataObj).filter(([, v]) => v !== undefined);
       const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, freshParams));
 
@@ -1574,13 +1748,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     let sql: string;
     let preparedName: string | undefined;
+    let cacheEntry: SqlCacheEntry | undefined;
 
     if (ck) {
-      const entry = this.acquireSql(ck, buildSql);
-      sql = entry.sql;
-      preparedName = entry.name;
+      cacheEntry = this.acquireSql(ck, buildSql);
+      sql = cacheEntry.sql;
+      preparedName = cacheEntry.name;
     } else {
-      sql = buildSql();
+      // optimisticLock path: value-variant version check → uncacheable, no cross-check.
+      sql = buildSql([]);
     }
 
     // Collect params: SET first, then WHERE, then version check (same order as fresh build)
@@ -1588,6 +1764,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.collectWhereParams(whereObj, params);
     if (lock) {
       params.push(lock.expected);
+    }
+    if (ck && cacheEntry) {
+      this.crossCheckCache('update', ck, cacheEntry, buildSql, params);
     }
 
     return {
@@ -1738,8 +1917,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params: unknown[] = [];
 
-    const entry = this.acquireSql(ck, () => {
-      const freshParams: unknown[] = [];
+    const buildSql = (freshParams: unknown[]): string => {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
       // SQL Server injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and WHERE;
@@ -1747,9 +1925,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       return this.dialect.buildDeleteStatement
         ? this.dialect.buildDeleteStatement({ table: this.q(this.table), whereSql, returning: '*' })
         : `DELETE FROM ${this.q(this.table)}${whereSql}${this.dialect.buildReturningClause('*')}`;
-    });
+    };
+    const entry = this.acquireSql(ck, buildSql);
 
     this.collectWhereParams(whereObj, params);
+    this.crossCheckCache('delete', ck, entry, buildSql, params);
 
     return {
       sql: entry.sql,
@@ -1901,17 +2081,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params: unknown[] = [];
 
-    const entry = this.acquireSql(ck, () => {
-      const freshParams: unknown[] = [];
+    const buildSql = (freshParams: unknown[]): string => {
       const setEntries = Object.entries(dataObj).filter(([, v]) => v !== undefined);
       const setClauses = setEntries.map(([k, v]) => this.buildSetClause(k, v, freshParams));
       const whereClause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
       return `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}`;
-    });
+    };
+    const entry = this.acquireSql(ck, buildSql);
 
     this.collectSetParams(dataObj, params);
     this.collectWhereParams(whereObj, params);
+    this.crossCheckCache('updateMany', ck, entry, buildSql, params);
 
     return {
       sql: entry.sql,
@@ -1948,14 +2129,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params: unknown[] = [];
 
-    const entry = this.acquireSql(ck, () => {
-      const freshParams: unknown[] = [];
+    const buildSql = (freshParams: unknown[]): string => {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
       return `DELETE FROM ${this.q(this.table)}${whereSql}`;
-    });
+    };
+    const entry = this.acquireSql(ck, buildSql);
 
     this.collectWhereParams(whereObj, params);
+    this.crossCheckCache('deleteMany', ck, entry, buildSql, params);
 
     return {
       sql: entry.sql,
@@ -1988,16 +2170,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const params: unknown[] = [];
 
-    const entry = this.acquireSql(ck, () => {
-      const freshParams: unknown[] = [];
+    const buildSql = (freshParams: unknown[]): string => {
       const clause = hasWhere ? this.buildWhereClause(whereObj, freshParams) : null;
       const whereSql = clause ? ` WHERE ${clause}` : '';
       return `SELECT ${this.castAgg('COUNT(*)', 'int')} AS count FROM ${this.q(this.table)}${whereSql}`;
-    });
+    };
+    const entry = this.acquireSql(ck, buildSql);
 
     if (hasWhere) {
       this.collectWhereParams(whereObj, params);
     }
+    this.crossCheckCache('count', ck, entry, buildSql, params);
 
     return {
       sql: entry.sql,

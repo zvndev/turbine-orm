@@ -92,10 +92,19 @@ export interface QueryInterfaceOptions {
   preparedStatements?: boolean;
   /**
    * Enable the SQL template cache. When true, repeated queries with the
-   * same shape (same keys, operators, relations — different values) reuse
+   * same shape (same keys, operators, relations, different values) reuse
    * cached SQL text instead of rebuilding from scratch.
    *
    * Default: `true`. Set to `false` as a nuclear kill switch.
+   *
+   * Dev-mode safety net: when `NODE_ENV !== 'production'`, every cache HIT is
+   * cross-checked by rebuilding the SQL + params fresh and comparing them
+   * against the cache-hit result, catching any drift between the fingerprint,
+   * SQL-build, and param-collect paths (which has silently corrupted results
+   * before). A mismatch throws a `ValidationError` (E003). This runs only
+   * outside production, so it never touches the production hot path. Set the
+   * env var `TURBINE_DISABLE_CACHE_CHECK=1` to opt out when dev traffic is
+   * perf-sensitive.
    */
   sqlCache?: boolean;
   /** SQL dialect implementation. Defaults to PostgreSQL. */
