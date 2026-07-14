@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.32.0 (2026-07-13)
+
+The last two raw-SQL escape hatches for version-driven data models, designed
+first and adversarially reviewed (14 findings confirmed and fixed pre-release,
+including two cache/SQL-validity bugs in the new code itself).
+
+### Added
+- **Pick-row relation ordering.** Order parents by a column or JSON path taken
+  from ONE row of a to-many relation, chosen by an inner ordering and optional
+  filter: `orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' },
+  where: {...} }, by: { field: 'data', path: ['title'] }, direction: 'asc' } }`.
+  Compiles to a correlated scalar subquery in ORDER BY (no FROM-clause
+  restructuring), cache-safe, works with both relation-load strategies.
+  Parents with zero related rows sort last by default. hasMany only;
+  not combinable with `distinct` (clear error); plain-column `by` works on
+  SQLite/MySQL/SQL Server, JSON `by` follows the JSON-ordering dialect rules.
+- **JSON-path group keys and aggregate targets in `groupBy`.**
+  `by: [{ field: 'data', path: ['category'], alias? }]` and
+  `_sum: { price: { field: 'data', path: ['price'] } }` (also `_avg`, `_min`,
+  `_max`; `_sum`/`_avg` always cast numeric). `having` works on the aliases;
+  result-key collisions are detected on the EMITTED column names and throw
+  upfront.
+- **`distinctOn` row source for `groupBy`** (Postgres only): aggregate over the
+  newest row per key, `distinctOn: { columns: ['instanceId'], orderBy:
+  { createdAt: 'desc' } }` wraps the row source in `SELECT DISTINCT ON`.
+
+### Fixed
+- **`distinct` combined with any relation-based `orderBy`** (`_count`, to-one
+  column, and the new pick shape) crashed at runtime with invalid SQL
+  ("missing FROM-clause entry"). Now rejected with a clear `ValidationError`
+  upfront. The `_count`/to-one crash predates this release.
+- **SQL-cache collision on multi-column to-one relation `orderBy`.** The cache
+  fingerprint sorted entries while the compiler preserved their order, so
+  `{ name: 'asc', email: 'desc' }` and the swapped literal shared one cache
+  entry and a warm cache silently served the wrong ORDER BY precedence. The
+  fingerprint now captures insertion order. Predates this release.
+- **JSON-path parameters now encode per dialect.** SQLite/MySQL/SQL Server
+  JSON extraction takes a `'$.a.b'` JSONPath string, not a Postgres
+  `text[]` — JSON filters, JSON ordering, and the new JSON groupBy now
+  actually execute on those engines (verified live on `node:sqlite`).
+  Predates this release for JSON filters/ordering.
+
 ## 0.31.0 (2026-07-13)
 
 Three production-blocking bug fixes plus two new query capabilities that
