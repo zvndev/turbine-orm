@@ -14,6 +14,7 @@ import type {
   JsonPathOrderBy,
   OrderBySpec,
   OrderDirection,
+  RelationPickOrderBy,
   TextSearchFilter,
   VectorFilter,
   VectorOrderBy,
@@ -338,6 +339,20 @@ export function isJsonPathOrderBy(value: unknown): value is JsonPathOrderBy {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   if ('distance' in value || 'sort' in value) return false;
   return Array.isArray((value as { path?: unknown }).path);
+}
+
+/**
+ * Check if an orderBy value is a pick-row relation ordering:
+ * `{ pick: {...}, by: ... }`. The `pick` + `by` pair is unambiguous against
+ * `_count` relation ordering, to-one column-ordering objects (whose values
+ * are directions/specs: a target column literally named `pick` maps to a
+ * direction, never an object paired with `by`), vector orderings
+ * (`distance`), and JSON-path orderings (top-level array `path`).
+ */
+export function isRelationPickOrderBy(value: unknown): value is RelationPickOrderBy {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  if ('distance' in value || 'sort' in value || Array.isArray((value as { path?: unknown }).path)) return false;
+  return 'pick' in value && 'by' in value;
 }
 
 /**

@@ -786,20 +786,93 @@ export type HavingClause<T> = {
   [K in keyof T & string]?: HavingAggregateFilter;
 };
 
+/**
+ * A JSON-path group key in {@link GroupByArgs.by}: groups by the value
+ * extracted at `path` from a json/jsonb column. Emits
+ * `(col #>> $n::text[]) AS "alias"` in SELECT and the same expression in
+ * GROUP BY (the path is bound as one text[] param, never interpolated).
+ * Result rows key by `alias` (default: the last path segment; a collision
+ * with another result key throws {@link ValidationError} E003).
+ */
+export interface JsonPathGroupKey {
+  /** json/jsonb column (camelCase field name, columnMap-resolved). */
+  field: string;
+  /** JSON path into the column (each element a key or array index). Bound as one text[] param. */
+  path: (string | number)[];
+  /** Result key for the group value. Defaults to the last path segment. */
+  alias?: string;
+}
+
+/**
+ * A JSON-path aggregate target inside `_sum` / `_avg` / `_min` / `_max` of
+ * {@link GroupByArgs}: aggregates the value extracted at `path` from a
+ * json/jsonb column, e.g. `SUM((col #>> $n::text[])::numeric)`. The arg key
+ * is the result alias. `_sum`/`_avg` always cast numeric (a text sum is
+ * meaningless); `_min`/`_max` compare as text unless `type: 'numeric'`.
+ */
+export interface JsonPathAggregateTarget {
+  /** json/jsonb column (camelCase field name, columnMap-resolved). */
+  field: string;
+  /** JSON path into the column (each element a key or array index). Bound as one text[] param. */
+  path: (string | number)[];
+  /** Comparison/aggregation kind. `_sum`/`_avg` are always numeric; `_min`/`_max` default to text. */
+  type?: 'numeric' | 'text';
+}
+
+/**
+ * Per-aggregate spec map for `_sum` / `_avg` / `_min` / `_max` in
+ * {@link GroupByArgs}: `true` keeps the existing plain-column behavior (the
+ * key is a column field name); a {@link JsonPathAggregateTarget} aggregates a
+ * JSON path (the key doubles as the result alias).
+ */
+export type GroupByAggregateSpec<T> =
+  | Partial<Record<keyof T & string, boolean>>
+  | Record<string, boolean | JsonPathAggregateTarget>;
+
+/**
+ * DISTINCT ON row source for {@link GroupByArgs} (PostgreSQL only: other
+ * engines throw {@link UnsupportedFeatureError} E017): the groupBy runs over
+ * one representative row per `columns` combination instead of the raw table.
+ *
+ * ```sql
+ * FROM (
+ *   SELECT DISTINCT ON ("instance_id") * FROM "versions"
+ *   WHERE <args.where> ORDER BY "instance_id", "created_at" DESC
+ * ) AS "versions"
+ * ```
+ *
+ * `orderBy` is REQUIRED (it decides which row survives per combination:
+ * without it the picked row would be nondeterministic); the wrapper ORDER BY
+ * is `columns` first, then this orderBy. `args.where` applies INSIDE the
+ * wrapper (filter before picking).
+ */
+export interface GroupByDistinctOn<T> {
+  /** DISTINCT ON columns: one surviving row per combination. */
+  columns: (keyof T & string)[];
+  /** Which row survives per combination (required for determinism). */
+  orderBy: Record<string, OrderDirection | OrderBySpec | JsonPathOrderBy>;
+}
+
 export interface GroupByArgs<T> {
-  by: (keyof T & string)[];
+  /** Group keys: plain column field names and/or JSON-path keys ({@link JsonPathGroupKey}). */
+  by: ((keyof T & string) | JsonPathGroupKey)[];
   where?: WhereClause<T>;
+  /**
+   * PostgreSQL only: group over one representative row per column combination
+   * (`SELECT DISTINCT ON … ORDER BY …` row source). See {@link GroupByDistinctOn}.
+   */
+  distinctOn?: GroupByDistinctOn<T>;
   /** Include count of each group */
   _count?: true;
-  /** Sum of numeric fields in each group */
-  _sum?: Partial<Record<keyof T & string, boolean>>;
-  /** Average of numeric fields in each group */
-  _avg?: Partial<Record<keyof T & string, boolean>>;
-  /** Minimum value of fields in each group */
-  _min?: Partial<Record<keyof T & string, boolean>>;
-  /** Maximum value of fields in each group */
-  _max?: Partial<Record<keyof T & string, boolean>>;
-  /** Filter whole groups by their aggregate values (SQL HAVING). */
+  /** Sum of numeric fields (or JSON paths: see {@link JsonPathAggregateTarget}) in each group */
+  _sum?: GroupByAggregateSpec<T>;
+  /** Average of numeric fields (or JSON paths) in each group */
+  _avg?: GroupByAggregateSpec<T>;
+  /** Minimum value of fields (or JSON paths) in each group */
+  _min?: GroupByAggregateSpec<T>;
+  /** Maximum value of fields (or JSON paths) in each group */
+  _max?: GroupByAggregateSpec<T>;
+  /** Filter whole groups by their aggregate values (SQL HAVING). JSON-path aggregates key by their alias. */
   having?: HavingClause<T>;
   /** Order groups (supports {@link OrderBySpec} for NULLS placement). */
   orderBy?: Record<string, OrderDirection | OrderBySpec>;
@@ -1015,15 +1088,76 @@ export interface JsonPathOrderBy {
 export type RelationOrderBy = { _count: OrderDirection } | Record<string, OrderDirection | OrderBySpec>;
 
 /**
+ * The ordering value extracted from the picked row in a
+ * {@link RelationPickOrderBy}: either a plain target column name (camelCase,
+ * columnMap-resolved) or a JSON path into a json/jsonb target column.
+ * Values extracted from a JSON path compare as TEXT by default; pass
+ * `type: 'numeric'` to add a numeric cast.
+ */
+export type RelationPickBy =
+  | string
+  | {
+      /** json/jsonb column on the relation target. */
+      field: string;
+      /** JSON path into the column (each element a key or array index). Bound as one text[] param. */
+      path: (string | number)[];
+      /** Comparison kind for the extracted value. Defaults to `'text'`. */
+      type?: 'numeric' | 'text';
+    };
+
+/**
+ * Pick-row relation ordering: order a parent query by a value read from ONE
+ * related row of a hasMany relation, keyed by the relation name in an
+ * {@link OrderByClause}. Compiles to a correlated scalar subquery in ORDER BY:
+ *
+ * ```ts
+ * orderBy: {
+ *   versions: {
+ *     pick: { orderBy: { createdAt: 'desc' } }, // which related row
+ *     by: { field: 'data', path: ['title'] },   // value to sort the parents by
+ *     direction: 'asc',
+ *     nulls: 'last',
+ *   },
+ * }
+ * // → ORDER BY (SELECT ord0."data" #>> $n::text[] FROM "versions" ord0
+ * //             WHERE ord0."instance_id" = "instances"."id"
+ * //             ORDER BY ord0."created_at" DESC LIMIT 1) ASC NULLS LAST
+ * ```
+ *
+ * `pick.orderBy` is REQUIRED (it makes the picked row deterministic) and
+ * supports the same surface as a relation `with` orderBy on the target (plain
+ * columns, {@link OrderBySpec} nulls, {@link JsonPathOrderBy}). `pick.where`
+ * optionally filters the candidate rows before picking. hasMany relations
+ * only; top-level findMany orderBy only (manyToMany, to-one relations, and
+ * nested `with` orderBy throw {@link ValidationError} E003).
+ */
+export interface RelationPickOrderBy {
+  /** Which related row supplies the value. */
+  pick: {
+    /** Inner ORDER BY choosing the row (required for determinism). */
+    orderBy: Record<string, OrderDirection | OrderBySpec | JsonPathOrderBy>;
+    /** Optional filter on the candidate rows before picking. */
+    where?: Record<string, unknown>;
+  };
+  /** The value on the picked row to order the parents by. */
+  by: RelationPickBy;
+  /** Sort direction for the parents. Defaults to `'asc'`. */
+  direction?: OrderDirection;
+  /** NULLS placement (PostgreSQL / SQLite only: see {@link OrderBySpec}). */
+  nulls?: 'first' | 'last';
+}
+
+/**
  * An orderBy clause maps each key to one of:
  *  - a plain direction (`'asc'` / `'desc'`),
  *  - an {@link OrderBySpec} (`{ sort, nulls }`) for NULLS placement,
  *  - for json/jsonb columns, a JSON-path ordering ({@link JsonPathOrderBy}),
  *  - for pgvector columns, a KNN distance ordering ({@link VectorOrderBy}),
  *  - for a relation name, a {@link RelationOrderBy} (`_count` for to-many, a
- *    target column for to-one).
+ *    target column for to-one) or a pick-row ordering
+ *    ({@link RelationPickOrderBy}, hasMany only).
  */
 export type OrderByClause = Record<
   string,
-  OrderDirection | OrderBySpec | JsonPathOrderBy | VectorOrderBy | RelationOrderBy
+  OrderDirection | OrderBySpec | JsonPathOrderBy | VectorOrderBy | RelationOrderBy | RelationPickOrderBy
 >;

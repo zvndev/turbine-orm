@@ -1244,15 +1244,35 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
     return this.withMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
+      // The SQL-only groupBy extensions (DISTINCT ON row source, JSON-path
+      // group keys / aggregate targets) have no PowQL equivalent: refuse
+      // clearly instead of emitting broken PowQL.
+      if (args.distinctOn) {
+        throw new UnsupportedFeatureError('groupBy distinctOn row source', 'PowDB');
+      }
+      for (const entry of args.by) {
+        if (typeof entry !== 'string') {
+          throw new UnsupportedFeatureError('JSON-path groupBy keys', 'PowDB');
+        }
+      }
+      for (const fn of ['_sum', '_avg', '_min', '_max'] as const) {
+        const spec = args[fn];
+        if (!spec) continue;
+        for (const value of Object.values(spec)) {
+          if (value !== undefined && typeof value !== 'boolean') {
+            throw new UnsupportedFeatureError(`JSON-path ${fn} aggregate targets`, 'PowDB');
+          }
+        }
+      }
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
       const where = this.buildWhere(resolvedWhere, params);
       const filter = where ? ` filter ${where}` : '';
-      const groupKeys = args.by.map((f) => this.ref(f));
+      const groupKeys = (args.by as string[]).map((f) => this.ref(f));
       // Safe aliases — PowQL rejects reserved-word aliases (e.g. `count:`).
       const aliasMap: { alias: string; fn: string; field: string | null; outKey: string }[] = [];
       let n = 0;
-      const proj: string[] = args.by.map((f) => this.ref(f));
+      const proj: string[] = (args.by as string[]).map((f) => this.ref(f));
       if (args._count) {
         aliasMap.push({ alias: `agg_${n++}`, fn: 'count', field: null, outKey: '_count' });
       }
@@ -1273,7 +1293,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // Reshape: group keys → camel fields + coerced; aggregates → nested {_sum:{field}}.
       return rows.map((raw) => {
         const out: Record<string, unknown> = {};
-        for (const f of args.by) {
+        for (const f of args.by as string[]) {
           const col = this.column(f);
           out[f] =
             typeof raw[col.name] === 'string' ? coerceScalar(raw[col.name] as string, col.tsType) : raw[col.name];

@@ -53,6 +53,7 @@ import {
   isJsonFilter,
   isJsonPathOrderBy,
   isOrderBySpec,
+  isRelationPickOrderBy,
   isTextSearchFilter,
   isUnmatchedPlainObject,
   isVectorFilter,
@@ -86,12 +87,14 @@ import type {
   HavingFilter,
   HavingNumericOperator,
   JsonFilter,
+  JsonPathAggregateTarget,
   JsonPathOrderBy,
   OrderByClause,
   OrderBySpec,
   OrderDirection,
   QueryResult,
   RelationLoadStrategy,
+  RelationPickOrderBy,
   SkipGlobalFilters,
   TextSearchFilter,
   TypedWithClause,
@@ -971,7 +974,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
     const orderFp = args?.orderBy
       ? Object.entries(args.orderBy)
-          .map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d)}`)
+          .map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d, this.tableMeta.relations[k]?.to)}`)
           .join(',')
       : '';
     const cursorFp = args?.cursor
@@ -1997,21 +2000,62 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = this.schema.tables[this.table];
     if (meta) {
       for (const key of args.by) {
-        if (!((key as string) in meta.columnMap)) {
-          throw new ValidationError(`Unknown column "${key as string}" in groupBy for table "${this.table}"`);
+        if (typeof key === 'string' && !(key in meta.columnMap)) {
+          throw new ValidationError(`Unknown column "${key}" in groupBy for table "${this.table}"`);
         }
       }
     }
     this.currentSkip = args.skipGlobalFilters;
-    const groupColsRaw = args.by.map((k) => this.toColumn(k as string));
-    const groupCols = groupColsRaw.map((c) => this.q(c));
     const gbWhere = this.mergeGlobalFilter(args.where as Record<string, unknown> | undefined);
     const { sql: whereSql, params } = gbWhere
       ? this.buildWhere(gbWhere as WhereClause<T>)
       : { sql: '', params: [] as unknown[] };
 
-    // Build SELECT expressions: group-by columns + aggregate functions
-    const selectExprs = [...groupCols];
+    // Row source. Plain: `"table"<WHERE>`. With `distinctOn` (PostgreSQL
+    // only), the groupBy runs over one representative row per column
+    // combination: the wrapper carries args.where INSIDE it (filter before
+    // picking) and is aliased as the table name so every outer expression is
+    // byte-identical either way.
+    const fromSql = args.distinctOn
+      ? this.buildDistinctOnSource(args.distinctOn, whereSql, params)
+      : `${this.q(this.table)}${whereSql}`;
+
+    // Group keys: plain columns and/or JSON-path keys. Result-key collisions
+    // (two keys landing on the same output name) are rejected up front:
+    // otherwise one group value would silently overwrite the other.
+    const groupExprs: string[] = [];
+    const selectExprs: string[] = [];
+    /** by entries in order: how to read each group key off the result row. */
+    const byReaders: { resultKey: string; rowKey: string; raw: boolean }[] = [];
+    const usedResultKeys = new Set<string>();
+    const claimResultKey = (key: string, what: string): void => {
+      if (key === '_count' || usedResultKeys.has(key)) {
+        throw new ValidationError(
+          `[turbine] groupBy result key "${key}" (${what}) collides with another result key on table ` +
+            `"${this.table}": set an explicit \`alias\` to disambiguate.`,
+        );
+      }
+      usedResultKeys.add(key);
+    };
+    for (const entry of args.by) {
+      if (typeof entry === 'string') {
+        const col = this.toColumn(entry);
+        claimResultKey(entry, `column "${col}"`);
+        groupExprs.push(this.q(col));
+        selectExprs.push(this.q(col));
+        byReaders.push({ resultKey: entry, rowKey: col, raw: false });
+      } else {
+        const col = this.resolveJsonPathTarget('group key', entry.field, entry.path);
+        params.push(entry.path.map(String));
+        const extract = this.dialect.buildJsonPathExtract(this.q(col), this.p(params.length));
+        const alias = entry.alias ?? String(entry.path[entry.path.length - 1]);
+        claimResultKey(alias, `JSON path on "${entry.field}"`);
+        // Same expression (and the same $n placeholder) in SELECT and GROUP BY.
+        selectExprs.push(`(${extract}) AS ${this.q(alias)}`);
+        groupExprs.push(extract);
+        byReaders.push({ resultKey: alias, rowKey: alias, raw: true });
+      }
+    }
 
     // _count
     if (args._count === true || args._count === undefined) {
@@ -2019,53 +2063,58 @@ export class QueryInterface<T extends object, R extends object = {}> {
       selectExprs.push(`${this.castAgg('COUNT(*)', 'int')} AS _count`);
     }
 
-    // _sum
-    if (args._sum) {
-      for (const [field, enabled] of Object.entries(args._sum)) {
-        if (enabled) {
-          const col = this.toColumn(field);
-          selectExprs.push(`SUM(${this.q(col)}) AS ${this.q(`_sum_${col}`)}`);
+    // _sum / _avg / _min / _max: `true` keeps the plain-column behavior; a
+    // {@link JsonPathAggregateTarget} aggregates a JSON path under the arg key
+    // as alias. `jsonAggFields` routes each JSON-aggregate row key back to its
+    // alias (and coercion kind) in the transform; `jsonAggExprs` lets HAVING
+    // reuse the exact aggregate expression (same placeholders) by alias.
+    const jsonAggFields = new Map<string, { field: string; numeric: boolean }>();
+    const jsonAggExprs = new Map<string, string>();
+    const buildAggregates = (
+      aggKey: '_sum' | '_avg' | '_min' | '_max',
+      sqlFn: 'SUM' | 'AVG' | 'MIN' | 'MAX',
+      spec: Record<string, boolean | JsonPathAggregateTarget | undefined> | undefined,
+    ): void => {
+      if (!spec) return;
+      for (const [key, target] of Object.entries(spec)) {
+        if (!target) continue;
+        if (target === true) {
+          const col = this.toColumn(key);
+          const inner = `${sqlFn}(${this.q(col)})`;
+          const expr = aggKey === '_avg' ? this.castAgg(inner, 'float') : inner;
+          selectExprs.push(`${expr} AS ${this.q(`${aggKey}_${col}`)}`);
+          continue;
         }
-      }
-    }
-
-    // _avg
-    if (args._avg) {
-      for (const [field, enabled] of Object.entries(args._avg)) {
-        if (enabled) {
-          const col = this.toColumn(field);
-          selectExprs.push(`${this.castAgg(`AVG(${this.q(col)})`, 'float')} AS ${this.q(`_avg_${col}`)}`);
+        const col = this.resolveJsonPathTarget(`${aggKey} target "${key}"`, target.field, target.path);
+        const alwaysNumeric = aggKey === '_sum' || aggKey === '_avg';
+        if (alwaysNumeric && target.type === 'text') {
+          throw new ValidationError(
+            `[turbine] groupBy ${aggKey} target "${key}" on table "${this.table}": ` +
+              `${aggKey} over a JSON path is always numeric: remove \`type: 'text'\`.`,
+          );
         }
+        const numeric = alwaysNumeric || target.type === 'numeric';
+        params.push(target.path.map(String));
+        const extract = this.dialect.buildJsonPathExtract(this.q(col), this.p(params.length));
+        const inner = `${sqlFn}(${numeric ? this.castJsonNumeric(extract) : extract})`;
+        const expr = aggKey === '_avg' ? this.castAgg(inner, 'float') : inner;
+        selectExprs.push(`${expr} AS ${this.q(`${aggKey}_${key}`)}`);
+        jsonAggFields.set(`${aggKey}_${key}`, { field: key, numeric });
+        jsonAggExprs.set(`${key}:${aggKey}`, expr);
       }
-    }
+    };
+    buildAggregates('_sum', 'SUM', args._sum as Record<string, boolean | JsonPathAggregateTarget> | undefined);
+    buildAggregates('_avg', 'AVG', args._avg as Record<string, boolean | JsonPathAggregateTarget> | undefined);
+    buildAggregates('_min', 'MIN', args._min as Record<string, boolean | JsonPathAggregateTarget> | undefined);
+    buildAggregates('_max', 'MAX', args._max as Record<string, boolean | JsonPathAggregateTarget> | undefined);
 
-    // _min
-    if (args._min) {
-      for (const [field, enabled] of Object.entries(args._min)) {
-        if (enabled) {
-          const col = this.toColumn(field);
-          selectExprs.push(`MIN(${this.q(col)}) AS ${this.q(`_min_${col}`)}`);
-        }
-      }
-    }
-
-    // _max
-    if (args._max) {
-      for (const [field, enabled] of Object.entries(args._max)) {
-        if (enabled) {
-          const col = this.toColumn(field);
-          selectExprs.push(`MAX(${this.q(col)}) AS ${this.q(`_max_${col}`)}`);
-        }
-      }
-    }
-
-    let sql = `SELECT ${selectExprs.join(', ')} FROM ${this.q(this.table)}${whereSql} GROUP BY ${groupCols.join(', ')}`;
+    let sql = `SELECT ${selectExprs.join(', ')} FROM ${fromSql} GROUP BY ${groupExprs.join(', ')}`;
 
     // HAVING — filter whole groups by their aggregate values.
     // Appends to the same `params` array, so placeholders continue from the
     // WHERE clause's parameter positions (this.p(params.length) below).
     if (args.having) {
-      const havingClauses = this.buildHavingClauses(args.having, params);
+      const havingClauses = this.buildHavingClauses(args.having, params, jsonAggExprs);
       if (havingClauses.length > 0) {
         sql += ` HAVING ${havingClauses.join(' AND ')}`;
       }
@@ -2085,9 +2134,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
           // Restructure aggregate results into nested objects (Prisma-style)
           const restructured: Record<string, unknown> = {};
 
-          // Copy group-by fields
-          for (const field of args.by) {
-            restructured[field] = parsed[field];
+          // Copy group-by fields. JSON-path keys read their alias off the raw
+          // row (the alias is not a table column, so parseRow's snake→camel
+          // mapping must not touch it).
+          for (const reader of byReaders) {
+            restructured[reader.resultKey] = reader.raw ? row[reader.rowKey] : parsed[reader.resultKey];
           }
 
           // _count
@@ -2107,26 +2158,26 @@ export class QueryInterface<T extends object, R extends object = {}> {
             hasMins = false,
             hasMaxs = false;
 
+          // JSON-path aggregates keep their arg key verbatim; plain-column
+          // aggregates keep the snake→camel field mapping.
+          const jsonAgg = (rawKey: string) => jsonAggFields.get(rawKey);
+          const fieldFor = (rawKey: string, col: string): string =>
+            jsonAgg(rawKey)?.field ?? this.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
+
           for (const [rawKey, rawValue] of Object.entries(row)) {
             if (rawKey.startsWith('_sum_')) {
-              const col = rawKey.slice(5);
-              const field = this.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-              sumObj[field] = rawValue !== null ? Number(rawValue) : null;
+              sumObj[fieldFor(rawKey, rawKey.slice(5))] = rawValue !== null ? Number(rawValue) : null;
               hasSums = true;
             } else if (rawKey.startsWith('_avg_')) {
-              const col = rawKey.slice(5);
-              const field = this.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-              avgObj[field] = rawValue !== null ? Number(rawValue) : null;
+              avgObj[fieldFor(rawKey, rawKey.slice(5))] = rawValue !== null ? Number(rawValue) : null;
               hasAvgs = true;
             } else if (rawKey.startsWith('_min_')) {
-              const col = rawKey.slice(5);
-              const field = this.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-              minObj[field] = rawValue;
+              const j = jsonAgg(rawKey);
+              minObj[fieldFor(rawKey, rawKey.slice(5))] = j?.numeric && rawValue !== null ? Number(rawValue) : rawValue;
               hasMins = true;
             } else if (rawKey.startsWith('_max_')) {
-              const col = rawKey.slice(5);
-              const field = this.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-              maxObj[field] = rawValue;
+              const j = jsonAgg(rawKey);
+              maxObj[fieldFor(rawKey, rawKey.slice(5))] = j?.numeric && rawValue !== null ? Number(rawValue) : rawValue;
               hasMaxs = true;
             }
           }
@@ -2143,6 +2194,99 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Validate a JSON-path target (group key or aggregate target) in groupBy:
+   * the field must resolve to a real json/jsonb column and the path must be a
+   * non-empty array of keys/indexes. Returns the resolved snake_case column.
+   */
+  private resolveJsonPathTarget(context: string, field: string, path: (string | number)[]): string {
+    if (typeof field !== 'string') {
+      throw new ValidationError(`[turbine] groupBy ${context} on table "${this.table}" requires a string \`field\`.`);
+    }
+    const col = this.toColumn(field);
+    if (
+      !Array.isArray(path) ||
+      path.length === 0 ||
+      path.some((el) => typeof el !== 'string' && !(typeof el === 'number' && Number.isFinite(el)))
+    ) {
+      throw new ValidationError(
+        `[turbine] groupBy ${context} on "${field}" (table "${this.table}") requires a non-empty \`path\` ` +
+          `array of keys/indexes (e.g. { field: '${field}', path: ['category'] }).`,
+      );
+    }
+    const colType = this.pgTypeForColumn(this.tableMeta, col);
+    if (colType !== 'json' && colType !== 'jsonb') {
+      throw new ValidationError(
+        `[turbine] groupBy ${context} on "${field}": column "${col}" on table "${this.table}" is not a JSON ` +
+          `column (actual type: ${colType}).`,
+      );
+    }
+    return col;
+  }
+
+  /**
+   * Build the `distinctOn` row source for groupBy (PostgreSQL only: other
+   * engines throw {@link UnsupportedFeatureError} E017):
+   *
+   * ```sql
+   * (SELECT DISTINCT ON ("c1") * FROM "table"<WHERE> ORDER BY "c1", <orderBy>) AS "table"
+   * ```
+   *
+   * The wrapper is aliased as the table name so every outer expression (group
+   * keys, aggregates, HAVING, ORDER BY) is byte-identical to the plain path.
+   * `distinctOn.orderBy` is required (it decides which row survives) and
+   * supports plain columns, {@link OrderBySpec} nulls, and JSON-path specs;
+   * JSON paths push their text[] param here, after the WHERE params.
+   */
+  private buildDistinctOnSource(
+    distinctOn: NonNullable<GroupByArgs<T>['distinctOn']>,
+    whereSql: string,
+    params: unknown[],
+  ): string {
+    if (this.dialect.name !== 'postgresql') {
+      throw new UnsupportedFeatureError(
+        'DISTINCT ON row source (groupBy distinctOn)',
+        this.dialect.name,
+        'groupBy({ distinctOn }) requires PostgreSQL: SELECT DISTINCT ON is not portable.',
+      );
+    }
+    if (!Array.isArray(distinctOn.columns) || distinctOn.columns.length === 0) {
+      throw new ValidationError(
+        `[turbine] groupBy distinctOn on table "${this.table}" requires a non-empty \`columns\` array.`,
+      );
+    }
+    const orderEntries = Object.entries(distinctOn.orderBy ?? {});
+    if (orderEntries.length === 0) {
+      throw new ValidationError(
+        `[turbine] groupBy distinctOn on table "${this.table}" requires \`orderBy\` to pick ONE row per ` +
+          "column combination deterministically (e.g. orderBy: { createdAt: 'desc' }).",
+      );
+    }
+    const distinctCols = distinctOn.columns.map((c) => this.q(this.toColumn(c)));
+    // DISTINCT ON expressions must lead the ORDER BY; the user's orderBy then
+    // decides which row survives per combination.
+    const orderParts: string[] = [...distinctCols];
+    for (const [key, value] of orderEntries) {
+      if (isJsonPathOrderBy(value)) {
+        orderParts.push(this.buildJsonPathOrderEntry(this.table, this.tableMeta, key, value, '', params));
+        continue;
+      }
+      if (isVectorOrderBy(value) || this.isRelationOrderByValue(value)) {
+        throw new ValidationError(
+          `[turbine] groupBy distinctOn.orderBy on "${key}" (table "${this.table}") supports plain columns, ` +
+            'sort specs, and JSON-path orderings only.',
+        );
+      }
+      const col = this.resolveOrderByColumn(this.table, this.tableMeta, key);
+      const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
+      orderParts.push(`${this.q(col)} ${dir}${this.nullsSuffix(nulls)}`);
+    }
+    return (
+      `(SELECT DISTINCT ON (${distinctCols.join(', ')}) * FROM ${this.q(this.table)}${whereSql} ` +
+      `ORDER BY ${orderParts.join(', ')}) AS ${this.q(this.table)}`
+    );
+  }
+
+  /**
    * Build the SQL fragments for a {@link HavingClause}.
    *
    * Each aggregate expression (`COUNT(*)`, `SUM("col")`, etc.) is constructed
@@ -2152,8 +2296,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * comparison value is pushed onto the shared `params` array and referenced by
    * a `$N` placeholder via {@link buildHavingNumericClauses} — there is no string
    * interpolation of user values.
+   *
+   * `jsonAggExprs` (from {@link buildGroupBy}) maps `alias:aggKey` to the
+   * exact aggregate expression a JSON-path aggregate emitted in SELECT
+   * (including its already-bound path placeholder), so HAVING on a JSON-path
+   * aggregate alias reuses the same expression instead of resolving the alias
+   * as a column.
    */
-  private buildHavingClauses(having: HavingClause<T>, params: unknown[]): string[] {
+  private buildHavingClauses(having: HavingClause<T>, params: unknown[], jsonAggExprs?: Map<string, string>): string[] {
     const clauses: string[] = [];
 
     // Maps the per-field aggregate key to its SQL function name. The set of
@@ -2186,8 +2336,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // toColumn validates the field against schema metadata (throws
       // ValidationError on unknown columns) and q() quotes the identifier — no
-      // unvalidated identifier ever reaches the SQL string.
-      const quotedCol = this.q(this.toColumn(key));
+      // unvalidated identifier ever reaches the SQL string. Resolution is lazy:
+      // a JSON-path aggregate alias is not a column, so it must not hit
+      // toColumn when every aggregate under it resolves via `jsonAggExprs`.
+      let quotedCol: string | null = null;
+      const columnExpr = (): string => {
+        quotedCol ??= this.q(this.toColumn(key));
+        return quotedCol;
+      };
 
       for (const [aggKey, filter] of Object.entries(value as Record<string, HavingFilter>)) {
         if (filter === undefined) continue;
@@ -2198,7 +2354,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
               `Supported: ${Object.keys(aggFnByKey).join(', ')}.`,
           );
         }
-        const expr = `${fn}(${quotedCol})`;
+        const expr = jsonAggExprs?.get(`${key}:${aggKey}`) ?? `${fn}(${columnExpr()})`;
         clauses.push(...this.buildHavingNumericClauses(expr, filter, params));
       }
     }
@@ -3155,11 +3311,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
       // To-many relation orderBy (`{ posts: { _count } }`) uses the same count
-      // subquery as `_count` — mirror its global-filter params. To-one relation
-      // orderBy carries the target's global filter once per ordered column.
+      // subquery as `_count`: mirror its global-filter params. Pick-row
+      // ordering mirrors its full param chain (by-path / global filter /
+      // pick.where / pick.orderBy paths). To-one relation orderBy carries the
+      // target's global filter once per ordered column.
       if (this.isRelationOrderByValue(dir)) {
         const relDef = this.tableMeta.relations[key];
-        if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
+        if (relDef && isRelationPickOrderBy(dir)) {
+          this.collectRelationPickOrderParams(key, relDef, dir, params);
+        } else if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
           this.collectRelationCountParams(relDef, params);
         } else if (relDef) {
           for (const _col of Object.keys(dir as Record<string, unknown>)) {
@@ -3257,7 +3417,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       // orderBy shape (OrderBySpec nulls placement changes the SQL, so fingerprint it)
       if (opts.orderBy) {
-        const oEntries = Object.entries(opts.orderBy).map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d)}`);
+        const targetRels = this.schema.tables[relDef.to]?.relations;
+        const oEntries = Object.entries(opts.orderBy).map(
+          ([k, d]) => `${k}:${this.orderByEntryFingerprint(d, targetRels?.[k]?.to)}`,
+        );
         subParts.push(`o=${oEntries.join(',')}`);
       }
 
@@ -4468,7 +4631,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * vs relation-column never collide on one cached SQL string. Captures the
    * SQL-shaping bits (direction, nulls, metric, relation keys) — never values.
    */
-  private orderByEntryFingerprint(d: unknown): string {
+  private orderByEntryFingerprint(d: unknown, targetTable?: string): string {
     // Vector KNN ordering changes the emitted operator by metric and adds a
     // `::vector` param, so metric + direction must be part of the cache key.
     if (isVectorOrderBy(d)) {
@@ -4478,6 +4641,26 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // SQL text; the path itself is a bound param and stays OUT of the key.
     if (isJsonPathOrderBy(d)) {
       return `jp(${d.direction ?? 'asc'},${d.type === 'numeric' ? 'num' : 'text'},${d.nulls ?? ''})`;
+    }
+    // Pick-row relation ordering: the by-shape (column vs JSON path vs cast),
+    // direction, nulls, pick.orderBy shape, and pick.where SHAPE are all SQL
+    // text; the JSON paths and pick.where values are bound params and stay OUT
+    // of the key. `targetTable` (the relation's target, resolved by the
+    // caller) lets the pick.where fingerprint distinguish relation-filter
+    // shapes inside it: two pick.wheres that differ only in shape must never
+    // share one cached SQL string.
+    if (isRelationPickOrderBy(d)) {
+      const by =
+        typeof d.by === 'string'
+          ? `col=${JSON.stringify(d.by)}`
+          : `jp(${JSON.stringify(d.by?.field)},${d.by?.type === 'numeric' ? 'num' : 'text'})`;
+      const pickOrder = Object.entries(d.pick?.orderBy ?? {})
+        .map(([k, v]) => `${k}:${this.orderByEntryFingerprint(v)}`)
+        .join(',');
+      const pickWhere = d.pick?.where
+        ? `;pw=${this.fingerprintAliasWhere(d.pick.where as Record<string, unknown>, targetTable)}`
+        : '';
+      return `pick(${by},${d.direction ?? 'asc'},${d.nulls ?? ''};po=${pickOrder}${pickWhere})`;
     }
     if (isOrderBySpec(d)) return `spec(${d.sort},${d.nulls ?? ''})`;
     if (d && typeof d === 'object') {
@@ -4697,13 +4880,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
       );
     }
 
+    // Pick-row ordering (`{ pick, by }`): order by a value from ONE related
+    // row: a correlated scalar subquery with its own ORDER BY … LIMIT 1.
+    // Top-level findMany only (`ctx` present means we are inside a relation
+    // subquery's orderBy) and hasMany only: validatePickOrderBy throws the
+    // scope errors, shared with the cache-hit collect mirror.
+    if (isRelationPickOrderBy(value)) {
+      this.validatePickOrderBy(relName, relDef, value, ctx !== undefined);
+      return this.buildRelationPickOrderBy(relName, relDef, value, alias, parentRef, params);
+    }
+
     // To-many: only `_count` is meaningful → correlated COUNT(*) subquery.
     if (relDef.type === 'hasMany' || relDef.type === 'manyToMany') {
       const keys = Object.keys(value);
       if (keys.length !== 1 || keys[0] !== '_count') {
         throw new ValidationError(
           `[turbine] orderBy on to-many relation "${relName}" only supports "_count" ` +
-            `(got: ${keys.join(', ') || '(empty)'}).`,
+            `or a pick-row ordering ({ pick, by }) (got: ${keys.join(', ') || '(empty)'}).`,
         );
       }
       const { dir } = normalizeOrderBy(value._count as OrderDirection);
@@ -4747,6 +4940,168 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return `(SELECT ${alias}.${this.q(snakeCol)} FROM ${qTarget} ${alias} WHERE ${where}${this.limitOneClause()}) ${dir}${this.nullsSuffix(nulls)}`;
       })
       .join(', ');
+  }
+
+  /**
+   * Validate a {@link RelationPickOrderBy} entry's scope and shape. Shared by
+   * the SQL-build path ({@link buildRelationPickOrderBy}) and the cache-hit
+   * param-collect mirror ({@link collectRelationPickOrderParams}) so both
+   * always throw identically:
+   *
+   *  - `nested` (inside a relation subquery's orderBy or a pick.orderBy):
+   *    top-level findMany only in this release (E003),
+   *  - manyToMany: not supported (E003 naming the limitation),
+   *  - to-one: order by the target column directly instead (E003),
+   *  - `pick.orderBy` is REQUIRED (deterministic row choice),
+   *  - `by` must be a target column name or a `{ field, path }` JSON-path spec.
+   */
+  private pickOrderNestedError(relName: string): ValidationError {
+    return new ValidationError(
+      `[turbine] Pick-row ordering on relation "${relName}" is only supported in a top-level ` +
+        'findMany orderBy: nested `with` orderBy does not support it.',
+    );
+  }
+
+  private validatePickOrderBy(relName: string, relDef: RelationDef, spec: RelationPickOrderBy, nested: boolean): void {
+    if (nested) {
+      throw this.pickOrderNestedError(relName);
+    }
+    if (relDef.type === 'manyToMany') {
+      throw new ValidationError(
+        `[turbine] Pick-row ordering is not supported on manyToMany relation "${relName}": ` +
+          'hasMany relations only.',
+      );
+    }
+    if (relDef.type !== 'hasMany') {
+      throw new ValidationError(
+        `[turbine] Pick-row ordering is only for to-many (hasMany) relations; "${relName}" is ${relDef.type}. ` +
+          `Order by the target column directly instead ({ ${relName}: { <column>: 'asc' } }).`,
+      );
+    }
+    const pickOrder = spec.pick?.orderBy;
+    if (
+      typeof spec.pick !== 'object' ||
+      spec.pick === null ||
+      typeof pickOrder !== 'object' ||
+      pickOrder === null ||
+      Object.keys(pickOrder).length === 0
+    ) {
+      throw new ValidationError(
+        `[turbine] Pick-row ordering on relation "${relName}" requires \`pick.orderBy\` to choose ONE ` +
+          "related row deterministically (e.g. pick: { orderBy: { createdAt: 'desc' } }).",
+      );
+    }
+    const by = spec.by;
+    const validJsonBy = typeof by === 'object' && by !== null && typeof by.field === 'string' && Array.isArray(by.path);
+    if (typeof by !== 'string' && !validJsonBy) {
+      throw new ValidationError(
+        `[turbine] Pick-row ordering on relation "${relName}" requires \`by\`: a target column name ` +
+          "or a JSON-path spec ({ field: 'data', path: ['title'] }).",
+      );
+    }
+  }
+
+  /**
+   * Compile a {@link RelationPickOrderBy} term: a correlated scalar subquery
+   * that picks ONE related row (`ORDER BY <pick.orderBy> LIMIT 1`, optionally
+   * filtered by `pick.where` and the target's global filter) and surfaces one
+   * value from it (a plain target column or a JSON-path extraction) as the
+   * parent ORDER BY key:
+   *
+   * ```sql
+   * (SELECT ord0."data" #>> $1::text[] FROM "versions" ord0
+   *   WHERE ord0."instance_id" = "instances"."id" AND ord0."is_current" = $2
+   *   ORDER BY ord0."created_at" DESC LIMIT 1) ASC NULLS LAST
+   * ```
+   *
+   * Param-push order (mirrored EXACTLY by
+   * {@link collectRelationPickOrderParams}): `by` JSON path (if any) →
+   * target global filter → `pick.where` → `pick.orderBy` JSON paths.
+   */
+  private buildRelationPickOrderBy(
+    relName: string,
+    relDef: RelationDef,
+    spec: RelationPickOrderBy,
+    alias: string,
+    parentRef: string,
+    params?: unknown[],
+  ): string {
+    if (!params) {
+      throw new ValidationError(
+        `[turbine] Pick-row ordering on relation "${relName}" is only supported in a top-level findMany orderBy.`,
+      );
+    }
+    const targetMeta = this.schema.tables[relDef.to];
+    if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
+
+    // The value surfaced from the picked row (SELECT list: its param binds first).
+    let byExpr: string;
+    if (typeof spec.by === 'string') {
+      const col = this.resolveOrderByColumn(relDef.to, targetMeta, spec.by);
+      byExpr = `${alias}.${this.q(col)}`;
+    } else {
+      const col = this.validateJsonPathOrderBy(relDef.to, targetMeta, spec.by.field, {
+        path: spec.by.path,
+      } as JsonPathOrderBy);
+      params.push(spec.by.path.map(String));
+      const extract = this.dialect.buildJsonPathExtract(`${alias}.${this.q(col)}`, this.p(params.length));
+      byExpr = spec.by.type === 'numeric' ? this.castJsonNumeric(extract) : extract;
+    }
+
+    // Correlation to the parent row, then the target's global filter (a
+    // soft-deleted / other-tenant row must never be picked: matches the
+    // `with` subquery and to-one relation-orderBy semantics), then pick.where.
+    let where = this.dialect.buildCorrelation(alias, relDef.foreignKey, this.q(parentRef), relDef.referenceKey);
+    const gf = this.targetGlobalFilterAlias(relDef.to, alias, params);
+    if (gf) where += ` AND ${gf}`;
+    if (spec.pick.where) {
+      const pickWhere = this.buildAliasWhere(relDef.to, targetMeta, alias, spec.pick.where, params);
+      if (pickWhere) where += ` AND ${pickWhere}`;
+    }
+
+    // pick.orderBy: same surface as a relation `with` orderBy on the target
+    // (plain columns, OrderBySpec nulls, JSON-path specs); a nested pick in
+    // here routes back through buildRelationOrderBy with ctx set and throws
+    // the top-level-only E003.
+    const orderClause = this.buildRelationOrderClause(
+      relDef.to,
+      targetMeta,
+      alias,
+      Object.entries(spec.pick.orderBy),
+      params,
+    );
+
+    const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    const limitOne = this.buildPagination('1', undefined, true);
+    return `(SELECT ${byExpr} FROM ${this.q(relDef.to)} ${alias} WHERE ${where}${orderClause}${limitOne}) ${dir}${this.nullsSuffix(spec.nulls)}`;
+  }
+
+  /**
+   * Param-collect mirror of {@link buildRelationPickOrderBy}: re-runs the same
+   * validation (a warmed cache can never skip it), then pushes in the same
+   * order: `by` JSON path → target global filter → `pick.where` →
+   * `pick.orderBy` JSON paths.
+   */
+  private collectRelationPickOrderParams(
+    relName: string,
+    relDef: RelationDef,
+    spec: RelationPickOrderBy,
+    params: unknown[],
+  ): void {
+    this.validatePickOrderBy(relName, relDef, spec, false);
+    const targetMeta = this.schema.tables[relDef.to];
+    if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
+    if (typeof spec.by === 'string') {
+      this.resolveOrderByColumn(relDef.to, targetMeta, spec.by);
+    } else {
+      this.validateJsonPathOrderBy(relDef.to, targetMeta, spec.by.field, { path: spec.by.path } as JsonPathOrderBy);
+      params.push(spec.by.path.map(String));
+    }
+    this.collectTargetGlobalFilterAlias(relDef.to, params);
+    if (spec.pick.where) {
+      this.collectAliasWhereParams(relDef.to, targetMeta, spec.pick.where, params);
+    }
+    this.collectRelationOrderParams(relDef.to, targetMeta, Object.entries(spec.pick.orderBy), params);
   }
 
   /**
@@ -4825,6 +5180,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
       if (this.isRelationOrderByValue(dirValue)) {
+        // Pick-row ordering is top-level-only: the build path throws the same
+        // E003 (buildRelationOrderBy with ctx set), so the mirror must too.
+        if (isRelationPickOrderBy(dirValue)) {
+          throw this.pickOrderNestedError(key);
+        }
         const relDef = targetMeta.relations[key];
         if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
           this.collectRelationCountParams(relDef, params);
