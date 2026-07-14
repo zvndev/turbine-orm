@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# quickstart-smoke.sh — simulate the real first-run a brand-new user gets from
+# quickstart-smoke.sh: simulate the real first-run a brand-new user gets from
 # npm 11 defaults, and run the documented quickstart end-to-end.
 #
 # It reproduces the exact environment that silently broke in the field:
@@ -40,7 +40,7 @@ fi
 echo "==> Using tarball: $TARBALL"
 
 # ---------------------------------------------------------------------------
-# 2. Scratch project — the "brand-new user" sandbox.
+# 2. Scratch project: the "brand-new user" sandbox.
 # ---------------------------------------------------------------------------
 SMOKE_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$SMOKE_DIR"; }
@@ -49,7 +49,7 @@ cd "$SMOKE_DIR"
 echo "==> Scratch project: $SMOKE_DIR"
 
 # npm init -y already writes "type":"commonjs" on npm 11, but set it explicitly
-# so this job is deterministic on any npm version — commonjs is the case that
+# so this job is deterministic on any npm version: commonjs is the case that
 # broke (config double-wrap under the tsx loader).
 npm init -y >/dev/null
 npm pkg set type=commonjs
@@ -61,7 +61,7 @@ npm install "$TARBALL" tsx typescript --no-audit --no-fund >/dev/null
 # ---------------------------------------------------------------------------
 # 3. .env is the single source of the connection string (as documented).
 #    In DB-less mode we still write a (bogus) URL so we can prove the CLI
-#    actually READS it — the item-1 symptom was reading undefined and then
+#    actually READS it: the item-1 symptom was reading undefined and then
 #    printing "No database URL provided".
 # ---------------------------------------------------------------------------
 LIVE=0
@@ -71,11 +71,11 @@ printf 'DATABASE_URL=%s\n' "$DB_URL" > .env
 echo "==> Wrote .env (live DB: $LIVE)"
 
 # Run the CLI with DATABASE_URL unset in the shell so the ONLY way it can get a
-# URL is by auto-loading .env — exercising product-review item 2 for real.
+# URL is by auto-loading .env: exercising product-review item 2 for real.
 turbine() { env -u DATABASE_URL npx --no-install turbine "$@"; }
 
 # ---------------------------------------------------------------------------
-# 4. init — a commonjs project + a .ts config must load (item 1), and .env must
+# 4. init: a commonjs project + a .ts config must load (item 1), and .env must
 #    feed DATABASE_URL (item 2).
 # ---------------------------------------------------------------------------
 echo "==> turbine init"
@@ -106,7 +106,7 @@ if [ "$LIVE" -eq 0 ]; then
   set -e
   printf '%s\n' "$OUT"
   if printf '%s' "$OUT" | grep -qi "No database URL provided"; then
-    echo "FAIL: DATABASE_URL from .env was not read — product-review item 1/2 regression"
+    echo "FAIL: DATABASE_URL from .env was not read: product-review item 1/2 regression"
     exit 1
   fi
   if [ "$CODE" -eq 0 ]; then
@@ -114,7 +114,7 @@ if [ "$LIVE" -eq 0 ]; then
     exit 1
   fi
   echo "PASS (no live DB): commonjs + .ts config loaded and DATABASE_URL was read from .env."
-  echo "     Skipped push/generate/query — set DATABASE_URL to run the full live flow."
+  echo "     Skipped push/generate/query: set DATABASE_URL to run the full live flow."
   exit 0
 fi
 
@@ -127,7 +127,7 @@ turbine push
 echo "==> turbine generate"
 turbine generate
 
-# The user's first query — turbine() with NO arguments (product-review item 3).
+# The user's first query: turbine() with NO arguments (product-review item 3).
 # The app loads .env exactly as the quickstart documents (Node 20.12+), which is
 # what populates process.env.DATABASE_URL for the no-arg factory fallback.
 cat > query.ts <<'EOF'
@@ -136,14 +136,14 @@ import { turbine } from './generated/turbine/index.js';
 
 if (typeof process.loadEnvFile === 'function') process.loadEnvFile('.env');
 
-const db = turbine(); // no args — connection comes from DATABASE_URL
+const db = turbine(); // no args: connection comes from DATABASE_URL
 
 async function main() {
   await db.notes.create({ data: { body: 'hello from quickstart-smoke' } });
   const rows = await db.notes.findMany();
   assert.ok(rows.length >= 1, 'expected at least one note to round-trip');
   assert.equal(rows[0].body, 'hello from quickstart-smoke', 'row content must round-trip');
-  console.log(`OK — round-tripped ${rows.length} note(s) via turbine() with no args`);
+  console.log(`OK: round-tripped ${rows.length} note(s) via turbine() with no args`);
   await db.disconnect();
 }
 

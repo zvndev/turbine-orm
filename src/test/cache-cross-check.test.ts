@@ -1,5 +1,5 @@
 /**
- * turbine-orm — dev-mode SQL-cache lockstep cross-check suite
+ * turbine-orm: dev-mode SQL-cache lockstep cross-check suite
  *
  * The SQL template cache requires three code paths to enumerate where-clause
  * keys identically: `fingerprintWhere` (cache key), `buildWhereClause` (SQL +
@@ -78,7 +78,7 @@ describe('cache cross-check: legitimate hits pass', () => {
   it('permuted where-key order on a warmed cache does not trip the check', () => {
     const q = makeQuery('users', buildSchema());
 
-    // Warm, then hit with keys swapped — the invariant holds, so no throw and
+    // Warm, then hit with keys swapped: the invariant holds, so no throw and
     // each column still binds its own value.
     q.buildFindMany({ where: { age: 1, score: 2 } } as never);
     const second = q.buildFindMany({ where: { score: 20, age: 10 } } as never);
@@ -162,7 +162,7 @@ describe('cache cross-check: escape hatches skip the check', () => {
     entry.sql = 'SELECT 1 -- corrupted but check disabled';
 
     withEnv({ TURBINE_DISABLE_CACHE_CHECK: '1' }, () => {
-      // Corruption is present, but the disabled check must not fire — the stale
+      // Corruption is present, but the disabled check must not fire: the stale
       // cached SQL is returned as-is.
       const result = q.buildFindMany({ where: { age: 2 } } as never);
       assert.equal(result.sql, 'SELECT 1 -- corrupted but check disabled');

@@ -149,7 +149,7 @@ function cacheParamValueEqual(a: unknown, b: unknown): boolean {
   const ta = typeof a;
   if (ta !== typeof b) return false;
   if (ta !== 'object') {
-    // Primitives that failed `===` — only NaN is legitimately "equal" to itself.
+    // Primitives that failed `===`: only NaN is legitimately "equal" to itself.
     return typeof a === 'number' && Number.isNaN(a) && Number.isNaN(b as number);
   }
   if (a instanceof Date || b instanceof Date) {

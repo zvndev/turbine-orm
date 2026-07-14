@@ -627,7 +627,7 @@ function parseColumnsFromDetail(detail: string): string[] | undefined {
  * intentionally NOT here: it maps to {@link TimeoutError} (E002) instead.
  */
 const CONNECTION_ERROR_CODES = new Set<string>([
-  // pg SQLSTATE class 08 — connection_exception
+  // pg SQLSTATE class 08: connection_exception
   '08000', // connection_exception
   '08001', // sqlclient_unable_to_establish_sqlconnection
   '08003', // connection_does_not_exist
