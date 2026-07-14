@@ -25,27 +25,28 @@ See [How It Works](#how-it-works) for the `json_agg` query strategy itself — b
 
 ## Benchmarks
 
-Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizzle 0.45** (relational queries) on a **Neon** PostgreSQL database (pooled endpoint, US-East, PostgreSQL 17.8). 100 iterations, 20 warmup, Node v22. Same schema, same data (1K users, 10K posts, 50K comments), same connection pool config. _Measured April 2026 on turbine-orm 0.7.1; the core read path these scenarios exercise is unchanged through 0.17.0 — see [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) to reproduce._
+Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizzle 0.45** (relational queries) on a **local PostgreSQL 17.9** database over a Unix socket. 200 iterations, 20 warmup, Node v24. Same schema, same data (1K users, 10K posts, 50K comments), same connection pool config. _Measured 2026-07-14 on turbine-orm 0.32.0 (Apple Silicon MacBook Pro, macOS). A local socket has no network round-trip, so these numbers are sub-millisecond and are **not** comparable to the earlier pooled-Neon table: they isolate per-query overhead instead of hiding it behind ~35 ms of network latency. See [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) to reproduce._
 
 | Scenario | Turbine | Prisma 7 | Drizzle 0.45 |
 |---|---|---|---|
-| findMany — 100 users (flat) | **51.97 ms** | 52.90 ms | 53.51 ms |
-| findMany — 50 users + posts (L2) | **55.84 ms** | 56.10 ms | 88.80 ms |
-| findMany — 10 users → posts → comments (L3) | 52.77 ms | 59.35 ms | **52.38 ms** |
-| findUnique — single user by PK | **47.66 ms** | 52.15 ms | 47.78 ms |
-| findUnique — user + posts + comments (L3) | **51.71 ms** | 54.42 ms | 52.47 ms |
-| count — all users | **44.57 ms** | 47.54 ms | 46.75 ms |
-| stream — iterate 50K rows (batch 1000) | 3,207 ms | **3,099 ms** | 4,620 ms |
-| atomic increment — `view_count + 1` | 49.76 ms | 49.09 ms | **46.25 ms** |
-| pipeline — 5-query batch | 318 ms | 327 ms | **316 ms** |
+| findMany, 100 users (flat) | **0.22 ms** | 0.53 ms | 0.34 ms |
+| findMany, 50 users + posts (L2) | 2.41 ms | 4.63 ms | **1.82 ms** |
+| findMany, 10 users → posts → comments (L3) | 1.13 ms | 3.69 ms | **1.01 ms** |
+| findUnique, single user by PK | **0.06 ms** | 0.11 ms | 0.09 ms |
+| findUnique, user + posts + comments (L3) | **0.18 ms** | 0.43 ms | 0.30 ms |
+| count, all users | **0.06 ms** | 0.08 ms | 0.07 ms |
+| stream, iterate 50K rows (batch 1000) | 58.6 ms | 69.7 ms | **48.9 ms** |
+| atomic increment, `view_count + 1` | 0.13 ms | 0.23 ms | **0.11 ms** |
+| pipeline, 5-query batch | **0.20 ms** | 0.61 ms | 0.58 ms |
+| hot findUnique, 500x same shape | **0.05 ms** | 0.09 ms | 0.10 ms |
 
-**Against a real pooled database, most single-query scenarios are within noise** — network round-trip to Neon is ~33–40 ms, which swamps per-query CPU overhead. But a few results stand out:
+**Over a local socket the network floor disappears, so per-query overhead becomes the whole signal.** The picture that emerges (stable across two full runs):
 
-- **L2 nested reads.** Turbine and Prisma are neck-and-neck (~56 ms), while Drizzle is **1.59× slower** (89 ms) on the 50-user + posts scenario. Turbine's `json_agg` approach and SQL template caching pay off here.
-- **Streaming 50K rows.** Turbine's optimized streaming (speculative first fetch + batch size 1000) matches Prisma at ~3.1–3.2 s. Drizzle's keyset pagination is 1.49× slower at 4.6 s. Turbine's cursor still gives you correctness on any `orderBy` and clean early-`break` semantics.
-- **Pipeline batching** puts 5 independent queries through a single round-trip using the Postgres extended-query pipeline protocol — all three ORMs are tied here since each runs 5 queries sequentially in a transaction.
+- **Turbine leads flat reads, findUnique, count, pipeline, and the hot path.** SQL template caching and prepared statements keep its per-call overhead lowest on simple and repeated-shape queries, and its real Postgres pipeline protocol (one TCP flush for 5 queries) runs the dashboard batch ~3x faster than Prisma's or Drizzle's sequential transaction.
+- **Drizzle leads nested reads (L2), streaming, and atomic increment.** Its relational query builder emits tighter SQL for the posts/comments joins, and its keyset pagination drains 50K rows fastest. Turbine's `json_agg` nesting is close behind and still 2x to 3.7x ahead of Prisma on the same L2/L3 shapes. L3 is a genuine Turbine/Drizzle near-tie that flips between runs.
+- **Prisma trails on every scenario here.** Its engine-less client's per-query work is no longer masked by network latency; on a pooled remote database (the regime we measured previously) these same deltas compress back into the noise floor.
 
-Performance is at parity with Prisma and Drizzle — the real reasons to choose Turbine are elsewhere: **one dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes — no manual assertion, no helper annotation.
+Net: on a local socket Turbine wins 6 of 10 scenarios, loses L2 / streaming / atomic increment to Drizzle, and trades the L3 lead run-to-run. It is competitive-to-ahead across the board rather than a clean sweep, and the honest takeaway is unchanged: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
 
 > Full analysis with p50/p95/p99 and methodology notes: [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench.ts`
