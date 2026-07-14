@@ -1116,7 +1116,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (this.warnedTables.has(this.table)) return;
     this.warnedTables.add(this.table);
     console.warn(
-      `[turbine] warning: findMany on "${this.table}" has no limit — this will fetch every row. ` +
+      `[turbine] warning: findMany on "${this.table}" has no limit: this will fetch every row. ` +
         'Pass `limit`, or silence with `warnOnUnlimited: false` (per call, per table, or in config).',
     );
   }
@@ -1181,10 +1181,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
           .sort()
           .join(',')
       : '';
-    const distinctFp = args?.distinct ? args.distinct.slice().sort().join(',') : '';
+    // distinct must fingerprint in USER order: the SQL emits `DISTINCT ON` in
+    // the caller's column order, so a permuted array rebuilds different SQL and
+    // must not collapse onto the same cache entry (would trip the cross-check).
+    const distinctFp = args?.distinct ? args.distinct.join(',') : '';
     const effectiveLimit = args?.take ?? args?.limit ?? this.defaultLimit;
-    const limitFp = effectiveLimit !== undefined ? '1' : '0';
-    const offsetFp = args?.offset !== undefined ? '1' : '0';
+    // On engines that inline the literal LIMIT/OFFSET into the SQL text
+    // (dialect.inlineLimitOffset, MySQL), the value is part of the SQL, not the
+    // params, so it MUST be part of the fingerprint or two different limits share
+    // one cached statement (silent wrong row counts). Parameterized engines
+    // (PG/SQLite/SQL Server, whose buildLimitOffset uses placeholders) keep the
+    // presence-only fingerprint so the cache is not needlessly fragmented.
+    const inlinePagination = this.dialect.inlineLimitOffset === true;
+    const limitFp = effectiveLimit !== undefined ? (inlinePagination ? `v${effectiveLimit}` : '1') : '0';
+    const offsetFp = args?.offset !== undefined ? (inlinePagination ? `v${args.offset}` : '1') : '0';
 
     const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}${this.globalFilterCacheSegment()}`;
 
@@ -3645,9 +3655,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
         subParts.push(`o=${oEntries.join(',')}`);
       }
 
-      // limit presence
+      // limit presence, but on inline-pagination engines (MySQL) the literal
+      // value is baked into the subquery SQL, so fingerprint the value there or
+      // `{limit:3}` and `{limit:5}` would share one cached statement.
       if (opts.limit !== undefined) {
-        subParts.push('l=1');
+        subParts.push(this.dialect.inlineLimitOffset ? `l=${opts.limit}` : 'l=1');
       }
 
       // nested with (recurse)

@@ -33,13 +33,7 @@ The `turbine` CLI loads your `turbine.config.ts` and `turbine/schema.ts` files d
 
    (Or rename your config/schema files to `.mjs` and skip `tsx` entirely.)
 
-2. **`"type": "module"` in `package.json`** — Turbine is an ESM package. In a CommonJS project, `tsx` transpiles your `.ts` files to CJS and then can't `require()` Turbine's ESM build:
-
-   ```
-   Error [ERR_REQUIRE_ESM]: Cannot require() ES Module .../turbine-orm/dist/index.js
-   ```
-
-   Add `"type": "module"` to your `package.json` to fix it. (`create-next-app` does not set this by default.)
+2. **ESM is recommended, but CommonJS works too.** Turbine ships both an ESM build and a CommonJS build, so `import` and `require('turbine-orm')` both resolve, and the `turbine` CLI loads your `turbine.config.ts` / `turbine/schema.ts` correctly whether your project is ESM (`"type": "module"`) or CommonJS. ESM is the smoother path for a TypeScript config file, so if you are starting fresh, adding `"type": "module"` to `package.json` is the recommended (not required) choice.
 
 ### Recommended project layout
 
@@ -546,7 +540,7 @@ try {
 
 ## 8. Pipeline batching
 
-N independent queries, one round-trip. Not atomic.
+N independent queries, one round-trip. Atomic by default: all queries run inside a single `BEGIN`/`COMMIT`, and any failure rolls the whole batch back. Pass `{ transactional: false }` to opt into independent execution (each query stands alone, no surrounding transaction).
 
 ```ts
 const [user, posts, count] = await db.pipeline([
@@ -562,7 +556,7 @@ Each `build*` method returns `DeferredQuery<T>` — `{ sql, params, transform, t
 
 **Use when:** dashboard loads, edge fan-out reads, independent widget queries.
 
-**Don't use when:** you need atomicity (use `$transaction`) or one query depends on another's result (must be independent).
+**Don't use when:** one query depends on another's result (pipeline queries must be independent). For interdependent writes with mid-transaction reads, use `$transaction`.
 
 **Port note:** pipelining maps to different primitives across stores. For PowDB, consider whether PowQL supports a batch-submit mode — if so, expose it as `pipeline()` with the same deferred-query shape. If not, document that `pipeline()` on PowDB falls back to sequential and skip it for now.
 

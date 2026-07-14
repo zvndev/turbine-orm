@@ -25,7 +25,7 @@ import {
   type TurbineConfig,
   unwrapConfigModule,
 } from '../cli/config.js';
-import { detectConsumerModuleType, loadDotEnvForCli } from '../cli/index.js';
+import { detectConsumerModuleType, dotEnvUrlConflictWarning, loadDotEnvForCli } from '../cli/index.js';
 import { _resetTsLoaderStateForTests, canResolveTsx, needsTsLoader, registerTsLoader } from '../cli/loader.js';
 import { parseMigrationContent } from '../cli/migrate.js';
 import { box, redactUrl, stripAnsi, table } from '../cli/ui.js';
@@ -207,30 +207,57 @@ describe('CLI config', () => {
   // ---------------------------------------------------------------------------
 
   describe('loadDotEnvForCli()', () => {
-    it('short-circuits (existing env wins) when DATABASE_URL is already set', () => {
+    it('loads the .env even when DATABASE_URL is already set, so OTHER vars still apply (shell URL still wins)', () => {
+      // Finding 6: no more short-circuit. The file is loaded so a var like
+      // STAGING_DB_URL reaches process.env; process.loadEnvFile never overrides
+      // the pre-set DATABASE_URL, so the shell value wins and provenance='shell'.
+      const env: NodeJS.ProcessEnv = { DATABASE_URL: 'postgres://already-set' };
       let called = false;
       const result = loadDotEnvForCli({
-        env: { DATABASE_URL: 'postgres://already-set' },
+        env,
         fileExists: () => true,
         loadEnvFile: () => {
           called = true;
+          if (!('OTHER' in env)) env.OTHER = 'from-file';
+          // Mimic Node: DATABASE_URL is already set, so it is NOT overridden.
         },
       });
-      assert.equal(result, 'has-url');
-      assert.equal(called, false, 'must not read .env when DATABASE_URL is already in the environment');
+      assert.equal(called, true, 'the .env is read even when DATABASE_URL is pre-set');
+      assert.equal(result.loaded, true);
+      assert.equal(result.databaseUrlProvenance, 'shell', 'a pre-set (shell) DATABASE_URL still wins');
+      assert.equal(env.DATABASE_URL, 'postgres://already-set');
+      assert.equal(env.OTHER, 'from-file', 'other .env vars are applied');
     });
 
-    it('returns "no-file" when no .env exists', () => {
+    it('reports no file when no .env exists', () => {
       const result = loadDotEnvForCli({ env: {}, fileExists: () => false });
-      assert.equal(result, 'no-file');
+      assert.equal(result.fileExists, false);
+      assert.equal(result.loaded, false);
+      assert.equal(result.databaseUrlProvenance, 'none');
     });
 
-    it('tolerates a runtime without process.loadEnvFile (returns "unsupported", no throw)', () => {
+    it('tolerates a runtime without process.loadEnvFile (unsupported, no throw)', () => {
       const result = loadDotEnvForCli({ env: {}, fileExists: () => true, loadEnvFile: null });
-      assert.equal(result, 'unsupported');
+      assert.equal(result.fileExists, true);
+      assert.equal(result.unsupported, true);
+      assert.equal(result.loaded, false);
     });
 
-    it('loads the .env at the working directory and preserves already-present vars', () => {
+    it('catches a loader that throws (EACCES / dir named .env) and surfaces loadError instead of crashing', () => {
+      // Finding 4: an unreadable .env must not crash the CLI.
+      const result = loadDotEnvForCli({
+        env: {},
+        fileExists: () => true,
+        loadEnvFile: () => {
+          throw new Error("EACCES: permission denied, open '.env'");
+        },
+      });
+      assert.equal(result.loaded, false);
+      assert.ok(result.loadError?.includes('EACCES'), 'the loader error is surfaced');
+      assert.equal(result.databaseUrlProvenance, 'none');
+    });
+
+    it('loads the .env, preserves already-present vars, and marks a NEW DATABASE_URL as dotenv-sourced', () => {
       const env: NodeJS.ProcessEnv = { PRESET: 'keep-me' };
       let loadedPath: string | undefined;
       const result = loadDotEnvForCli({
@@ -244,10 +271,93 @@ describe('CLI config', () => {
           if (!('DATABASE_URL' in env)) env.DATABASE_URL = 'postgres://from-file';
         },
       });
-      assert.equal(result, 'loaded');
+      assert.equal(result.loaded, true);
       assert.equal(loadedPath, join('/tmp/project', '.env'));
       assert.equal(env.PRESET, 'keep-me', 'existing env var must win over .env');
       assert.equal(env.DATABASE_URL, 'postgres://from-file', 'new var from .env is applied');
+      // Finding 3: absent-before + present-after => provenance is 'dotenv'.
+      assert.equal(result.databaseUrlProvenance, 'dotenv');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // CLI: dotEnvUrlConflictWarning(): Finding 3 warn-decision logic
+  // -------------------------------------------------------------------------
+
+  describe('dotEnvUrlConflictWarning()', () => {
+    it('warns when a dotenv-sourced DATABASE_URL differs from a non-empty config url', () => {
+      const msg = dotEnvUrlConflictWarning({
+        provenance: 'dotenv',
+        envUrl: 'postgres://env-host/db',
+        fileConfigUrl: 'postgres://config-host/db',
+        overrideUrl: undefined,
+      });
+      assert.ok(msg, 'a warning is produced');
+      assert.ok(msg?.includes('.env'));
+      assert.ok(msg?.includes('config'));
+    });
+
+    it('does not warn when a CLI --url override is present (explicit intent)', () => {
+      const msg = dotEnvUrlConflictWarning({
+        provenance: 'dotenv',
+        envUrl: 'postgres://env-host/db',
+        fileConfigUrl: 'postgres://config-host/db',
+        overrideUrl: 'postgres://cli-host/db',
+      });
+      assert.equal(msg, null);
+    });
+
+    it('does not warn for a shell-sourced DATABASE_URL (silent, as before)', () => {
+      const msg = dotEnvUrlConflictWarning({
+        provenance: 'shell',
+        envUrl: 'postgres://env-host/db',
+        fileConfigUrl: 'postgres://config-host/db',
+        overrideUrl: undefined,
+      });
+      assert.equal(msg, null);
+    });
+
+    it('does not warn when the config url is empty or absent', () => {
+      assert.equal(
+        dotEnvUrlConflictWarning({
+          provenance: 'dotenv',
+          envUrl: 'postgres://env-host/db',
+          fileConfigUrl: '',
+          overrideUrl: undefined,
+        }),
+        null,
+      );
+      assert.equal(
+        dotEnvUrlConflictWarning({
+          provenance: 'dotenv',
+          envUrl: 'postgres://env-host/db',
+          fileConfigUrl: undefined,
+          overrideUrl: undefined,
+        }),
+        null,
+      );
+    });
+
+    it('does not warn when the two URLs are identical', () => {
+      const msg = dotEnvUrlConflictWarning({
+        provenance: 'dotenv',
+        envUrl: 'postgres://same/db',
+        fileConfigUrl: 'postgres://same/db',
+        overrideUrl: undefined,
+      });
+      assert.equal(msg, null);
+    });
+
+    it('redacts passwords in the warning', () => {
+      const msg = dotEnvUrlConflictWarning({
+        provenance: 'dotenv',
+        envUrl: 'postgres://user:secret@env-host/db',
+        fileConfigUrl: 'postgres://user:hunter2@config-host/db',
+        overrideUrl: undefined,
+      });
+      assert.ok(msg, 'a warning is produced');
+      assert.ok(!msg?.includes('secret'), 'env password redacted');
+      assert.ok(!msg?.includes('hunter2'), 'config password redacted');
     });
   });
 

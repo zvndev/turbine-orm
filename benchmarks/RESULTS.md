@@ -112,7 +112,7 @@ Drizzle's relational query builder is fastest on L2 (50 users + posts, 1.82 ms
 vs Turbine's 2.41 ms) and edges L3 in this run. Its keyset-pagination drain of
 50K comments is fastest at ~49 ms, and its tagged-`sql` atomic increment is
 fastest at ~0.11 ms. Turbine's `json_agg` nesting sits just behind Drizzle and
-comfortably ahead of Prisma (2x to 3.7x) on the same shapes. L3 is a genuine
+comfortably ahead of Prisma (1.9x to 3.3x) on the same shapes. L3 is a genuine
 near-tie: Drizzle edged it in the first run (1.01 vs 1.13 ms), Turbine in the
 second (1.05 vs 1.34 ms).
 

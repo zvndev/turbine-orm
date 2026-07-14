@@ -283,8 +283,11 @@ function requireUrl(config: ResolvedConfig): string {
     newline();
     console.log(`  ${dim('Set it in one of these ways:')}`);
     console.log(`    ${dim('1.')} Add ${cyan('url')} to ${cyan('turbine.config.ts')}`);
+    // .env auto-load needs Node 20.12+ (process.loadEnvFile); be honest below it.
+    const envFileNote =
+      typeof process.loadEnvFile === 'function' ? '(auto-loaded)' : '(needs Node 20.12+ to auto-load)';
     console.log(
-      `    ${dim('2.')} Set ${cyan('DATABASE_URL')} in your environment or a ${cyan('.env')} file ${dim('(auto-loaded)')}`,
+      `    ${dim('2.')} Set ${cyan('DATABASE_URL')} in your environment or a ${cyan('.env')} file ${dim(envFileNote)}`,
     );
     console.log(`    ${dim('3.')} Pass ${cyan('--url')} flag`);
     newline();
@@ -369,21 +372,41 @@ function printCjsHintIfApplicable(err: Error): void {
 // .env loading (CLI-only: the library never reads .env files)
 // ---------------------------------------------------------------------------
 
-export type DotEnvLoadResult = 'loaded' | 'has-url' | 'no-file' | 'unsupported';
+/** Where a resolved `DATABASE_URL` came from, after the `.env` load. */
+export type DotEnvProvenance = 'shell' | 'dotenv' | 'none';
+
+/** Structured outcome of {@link loadDotEnvForCli}. */
+export interface DotEnvLoadResult {
+  /** A `.env` file was present in the working directory. */
+  fileExists: boolean;
+  /** The `.env` was actually read into the environment. */
+  loaded: boolean;
+  /** A `.env` exists but this runtime cannot auto-load it (Node < 20.12). */
+  unsupported: boolean;
+  /** Where `DATABASE_URL` ended up coming from once the load settled. */
+  databaseUrlProvenance: DotEnvProvenance;
+  /** Set when the loader threw (e.g. EACCES / a directory named `.env`). */
+  loadError?: string;
+}
 
 /**
  * Load a local `.env` into `process.env` for the CLI, mirroring what
- * `node --env-file=.env` does. Runs only when `DATABASE_URL` is not already set
- * and a `.env` file is present in the working directory.
+ * `node --env-file=.env` does. Loaded UNCONDITIONALLY when a `.env` is present,
+ * so every variable it defines (not just `DATABASE_URL`) reaches the config
+ * file and user scripts.
  *
- * Values already in the environment ALWAYS win: `process.loadEnvFile()` never
- * overrides an existing variable, so a real shell/CI `DATABASE_URL` beats the
- * file. We also short-circuit on an existing `DATABASE_URL` before touching the
- * file at all.
+ * A pre-existing variable ALWAYS wins: `process.loadEnvFile()` never overrides
+ * an already-set variable, so a real shell/CI `DATABASE_URL` beats the file.
+ * Provenance is tracked so callers can warn when an `.env`-sourced
+ * `DATABASE_URL` silently overrides a differing `url` in `turbine.config.ts`:
+ * `DATABASE_URL` is `'dotenv'`-sourced only when it was absent before the load
+ * and present after.
  *
  * `process.loadEnvFile` is Node 20.12+. Turbine's engines allow `>=20.0.0`, so
- * on older runtimes this silently no-ops (returns `'unsupported'`) rather than
- * throwing. This is deliberately CLI-only: the library must never read files.
+ * on older runtimes this no-ops with `unsupported: true` (never throws). A
+ * loader that throws (unreadable file, a directory named `.env`) is caught and
+ * surfaced as `loadError`, never a raw unhandled rejection. Deliberately
+ * CLI-only: the library must never read files.
  *
  * Dependencies are injectable purely so this is unit-testable without mutating
  * the real process environment.
@@ -397,12 +420,16 @@ export function loadDotEnvForCli(
   } = {},
 ): DotEnvLoadResult {
   const env = deps.env ?? process.env;
-  if (env.DATABASE_URL) return 'has-url';
-
   const cwd = deps.cwd ?? process.cwd();
   const fileExists = deps.fileExists ?? existsSync;
   const envPath = join(cwd, '.env');
-  if (!fileExists(envPath)) return 'no-file';
+
+  const hadUrlBefore = Boolean(env.DATABASE_URL);
+  const shellOrNone: DotEnvProvenance = hadUrlBefore ? 'shell' : 'none';
+
+  if (!fileExists(envPath)) {
+    return { fileExists: false, loaded: false, unsupported: false, databaseUrlProvenance: shellOrNone };
+  }
 
   const loader =
     deps.loadEnvFile !== undefined
@@ -410,10 +437,57 @@ export function loadDotEnvForCli(
       : typeof process.loadEnvFile === 'function'
         ? process.loadEnvFile.bind(process)
         : null;
-  if (!loader) return 'unsupported';
+  if (!loader) {
+    return { fileExists: true, loaded: false, unsupported: true, databaseUrlProvenance: shellOrNone };
+  }
 
-  loader(envPath);
-  return 'loaded';
+  try {
+    loader(envPath);
+  } catch (err) {
+    return {
+      fileExists: true,
+      loaded: false,
+      unsupported: false,
+      databaseUrlProvenance: shellOrNone,
+      loadError: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  // `.env`-sourced only if DATABASE_URL was absent before and present after.
+  const provenance: DotEnvProvenance = hadUrlBefore ? 'shell' : env.DATABASE_URL ? 'dotenv' : 'none';
+  return { fileExists: true, loaded: true, unsupported: false, databaseUrlProvenance: provenance };
+}
+
+/**
+ * Decide whether to warn that an `.env`-sourced `DATABASE_URL` is overriding a
+ * differing, non-empty `url` in the config file. Pure so it is unit-testable.
+ *
+ * Precedence is unchanged (`.env` `DATABASE_URL` still wins), this only decides
+ * whether that override is silent or loud. We warn ONLY when all hold:
+ *   - no CLI `--url` override (an explicit override is the user's clear intent),
+ *   - `DATABASE_URL` came from `.env` (shell-exported stays silent, as before),
+ *   - the config file has a non-empty `url`, and
+ *   - the two URLs actually differ.
+ *
+ * Returns the warning message (URLs redacted), or `null` for no warning.
+ */
+export function dotEnvUrlConflictWarning(input: {
+  provenance: DotEnvProvenance;
+  envUrl: string | undefined;
+  fileConfigUrl: string | undefined;
+  overrideUrl: string | undefined;
+}): string | null {
+  if (input.overrideUrl) return null;
+  if (input.provenance !== 'dotenv') return null;
+  const fileUrl = input.fileConfigUrl?.trim();
+  if (!fileUrl) return null;
+  if (!input.envUrl) return null;
+  if (fileUrl === input.envUrl) return null;
+  return (
+    `DATABASE_URL from .env (${redactUrl(input.envUrl)}) is overriding the url in your config file ` +
+    `(${redactUrl(fileUrl)}). Using the .env value. Remove DATABASE_URL from .env, or unset the config url, ` +
+    `to silence this.`
+  );
 }
 
 /**
@@ -446,9 +520,16 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const envUrl = process.env.DATABASE_URL;
   const hasEnvFile = existsSync('.env');
   const hasEnvLocal = existsSync('.env.local');
+  // On Node < 20.12 (no process.loadEnvFile) main() could not auto-load .env, so
+  // we cannot claim it "has no DATABASE_URL"; we simply could not read it.
+  const canAutoLoadEnv = typeof process.loadEnvFile === 'function';
 
   if (envUrl) {
     success(`Detected ${cyan('DATABASE_URL')} in the environment`);
+  } else if (hasEnvFile && !canAutoLoadEnv) {
+    info(
+      `Found ${cyan('.env')} ${dim('(this Node version cannot auto-load it. Upgrade to Node 20.12+ or export')} ${cyan('DATABASE_URL')}${dim(')')}`,
+    );
   } else if (hasEnvFile) {
     // .env exists but did not provide DATABASE_URL; if it had, the auto-load
     // in main() would have populated envUrl above.
@@ -2141,11 +2222,19 @@ async function main() {
     return;
   }
 
-  // Load a local `.env` so `DATABASE_URL` from it is available to the config
-  // file, to `turbine()` in user scripts, and to command resolution: exactly
-  // what the quickstart promises. A pre-existing env var always wins. No-op on
-  // Node builds without process.loadEnvFile (< 20.12).
-  loadDotEnvForCli();
+  // Load a local `.env` so `DATABASE_URL` (and every other var it defines) is
+  // available to the config file, to `turbine()` in user scripts, and to command
+  // resolution: exactly what the quickstart promises. A pre-existing env var
+  // always wins. Surfaces the honest state when the file cannot be read.
+  const dotEnv = loadDotEnvForCli();
+  if (dotEnv.loadError) {
+    warn(`Could not read ${cyan('.env')}: ${dotEnv.loadError}. Continuing without it.`);
+  } else if (dotEnv.fileExists && dotEnv.unsupported) {
+    warn(
+      `Found ${cyan('.env')} but this Node version cannot auto-load it. ` +
+        `Upgrade to Node 20.12+ or export ${cyan('DATABASE_URL')} yourself.`,
+    );
+  }
 
   // If the user has a TypeScript config file, register the tsx ESM loader
   // before we attempt to import it. Otherwise Node throws
@@ -2178,6 +2267,20 @@ async function main() {
   };
 
   const config = resolveConfig(fileConfig, overrides);
+
+  // Warn (don't change precedence) when an .env-sourced DATABASE_URL is silently
+  // overriding a differing, non-empty url in the config file (a wrong-database
+  // hazard for push/migrate/seed). Shell-exported DATABASE_URL stays silent.
+  const urlConflict = dotEnvUrlConflictWarning({
+    provenance: dotEnv.databaseUrlProvenance,
+    envUrl: process.env.DATABASE_URL,
+    fileConfigUrl: fileConfig.url,
+    overrideUrl: overrides.url,
+  });
+  if (urlConflict && args.command !== 'init') {
+    warn(urlConflict);
+    newline();
+  }
 
   try {
     switch (args.command) {

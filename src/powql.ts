@@ -662,7 +662,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const limit = args.limit ?? (args as { take?: number }).take ?? this.defaultLimit;
     if (limit === undefined && this.warnOnUnlimited && !this.warnedUnlimited) {
       this.warnedUnlimited = true;
-      console.warn(`[turbine] findMany on "${this.table}" has no limit — this scans the whole table.`);
+      console.warn(`[turbine] findMany on "${this.table}" has no limit: this scans the whole table.`);
     }
     const limitClause = limit !== undefined ? ` limit ${this.param(limit, params)}` : '';
     const offsetClause = args.offset ? ` offset ${this.param(args.offset, params)}` : '';
