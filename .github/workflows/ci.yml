@@ -355,6 +355,24 @@ jobs:
           TARBALL=$(npm pack --silent | tail -1)
           echo "TARBALL=$GITHUB_WORKSPACE/$TARBALL" >> "$GITHUB_ENV"
           echo "EXPECTED_VERSION=$(jq -r .version package.json)" >> "$GITHUB_ENV"
+      - name: Verify packed manifest has no install scripts
+        # The published tarball must not ship prepare/preinstall/install/postinstall.
+        # prepack strips the husky-installing `prepare` script; postpack restores it
+        # locally. A leaked install script triggers allow-scripts warnings for
+        # consumers and would run on git-dependency installs.
+        run: |
+          MANIFEST=$(tar -xzOf "$TARBALL" package/package.json)
+          BANNED=$(echo "$MANIFEST" | jq -r '
+            (.scripts // {}) | keys[]
+            | select(. == "prepare" or . == "preinstall" or . == "install" or . == "postinstall")
+          ')
+          if [ -n "$BANNED" ]; then
+            echo "Published manifest must not contain install scripts, found:"
+            echo "$BANNED"
+            echo "$MANIFEST" | jq '.scripts'
+            exit 1
+          fi
+          echo "Packed manifest has no install scripts OK"
       - name: Install tarball in temp project
         run: |
           SMOKE_DIR=$(mktemp -d)
