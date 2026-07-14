@@ -343,16 +343,25 @@ export function isJsonPathOrderBy(value: unknown): value is JsonPathOrderBy {
 
 /**
  * Check if an orderBy value is a pick-row relation ordering:
- * `{ pick: {...}, by: ... }`. The `pick` + `by` pair is unambiguous against
- * `_count` relation ordering, to-one column-ordering objects (whose values
- * are directions/specs: a target column literally named `pick` maps to a
- * direction, never an object paired with `by`), vector orderings
- * (`distance`), and JSON-path orderings (top-level array `path`).
+ * `{ pick: { orderBy, ... }, by, direction?, nulls? }`. The full shape is
+ * required — `pick` must be an object carrying `orderBy`, `by` must be
+ * present, and no keys outside `{ pick, by, direction, nulls }` — so a to-one
+ * relation whose target has real columns literally named `pick` and `by`
+ * (whose values are direction strings or `{ sort, nulls }` specs, never an
+ * object with `orderBy`) still falls through to column ordering. `distance`
+ * (vector), `sort` (OrderBySpec), and a top-level array `path` (JSON-path
+ * ordering) are excluded up front.
  */
 export function isRelationPickOrderBy(value: unknown): value is RelationPickOrderBy {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   if ('distance' in value || 'sort' in value || Array.isArray((value as { path?: unknown }).path)) return false;
-  return 'pick' in value && 'by' in value;
+  const v = value as Record<string, unknown>;
+  if (!('pick' in v) || !('by' in v)) return false;
+  if (typeof v.pick !== 'object' || v.pick === null || Array.isArray(v.pick) || !('orderBy' in v.pick)) return false;
+  for (const key of Object.keys(v)) {
+    if (key !== 'pick' && key !== 'by' && key !== 'direction' && key !== 'nulls') return false;
+  }
+  return true;
 }
 
 /**

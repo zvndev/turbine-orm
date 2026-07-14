@@ -44,6 +44,7 @@ import {
   type NestedWriteContext,
 } from './nested-write.js';
 import { PowdbFloatParam, type PowdbPool, powqlColumnType, quotePowqlIdent, rowToEntity } from './powdb.js';
+import { isRelationPickOrderBy } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
 import type {
   AggregateArgs,
@@ -542,7 +543,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if (!keys.length) return '';
     const parts = keys.map(([field, dir]) => {
       if (dir && typeof dir === 'object') {
-        throw new UnsupportedFeatureError('vector / distance ordering', 'PowDB', `field "${field}"`);
+        // Name the actual feature in the refusal — a pick-row ordering
+        // reported as "vector / distance ordering" sends users hunting for
+        // pgvector docs. All object-valued orderings stay E017 on PowDB.
+        const o = dir as Record<string, unknown>;
+        const feature = isRelationPickOrderBy(dir)
+          ? 'relation pick-row ordering'
+          : 'distance' in o
+            ? 'vector / distance ordering'
+            : Array.isArray(o.path)
+              ? 'JSON-path ordering'
+              : '_count' in o
+                ? 'relation _count ordering'
+                : 'sort' in o || 'nulls' in o
+                  ? 'NULLS placement / sort-spec ordering'
+                  : 'object-valued ordering';
+        throw new UnsupportedFeatureError(feature, 'PowDB', `field "${field}"`);
       }
       return `${this.ref(field)} ${dir === 'desc' ? 'desc' : 'asc'}`;
     });

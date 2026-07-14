@@ -1099,7 +1099,11 @@ export type RelationPickBy =
   | {
       /** json/jsonb column on the relation target. */
       field: string;
-      /** JSON path into the column (each element a key or array index). Bound as one text[] param. */
+      /**
+       * JSON path into the column (each element a key or array index). Bound
+       * as ONE param: a text[] on PostgreSQL, a `'$'`-rooted JSONPath string
+       * on engines whose JSON functions take one (SQLite/MySQL/SQL Server).
+       */
       path: (string | number)[];
       /** Comparison kind for the extracted value. Defaults to `'text'`. */
       type?: 'numeric' | 'text';
@@ -1143,7 +1147,15 @@ export interface RelationPickOrderBy {
   by: RelationPickBy;
   /** Sort direction for the parents. Defaults to `'asc'`. */
   direction?: OrderDirection;
-  /** NULLS placement (PostgreSQL / SQLite only: see {@link OrderBySpec}). */
+  /**
+   * NULLS placement (PostgreSQL / SQLite only: see {@link OrderBySpec}).
+   *
+   * A parent with NO related rows sorts by NULL. When `nulls` is not set,
+   * pick ordering defaults to `NULLS LAST` in BOTH directions, so parents
+   * with zero related rows always come last (Postgres's own DESC default is
+   * NULLS FIRST, which would put every childless parent at the top of a
+   * "highest first" sort). Set `nulls` explicitly to override.
+   */
   nulls?: 'first' | 'last';
 }
 

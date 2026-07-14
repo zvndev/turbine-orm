@@ -51,6 +51,7 @@ import type pg from 'pg';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableMetadata } from '../schema.js';
 import type { ReselectExecutor } from './builder.js';
+import { isRelationPickOrderBy } from './filters.js';
 import type { SkipGlobalFilters, WithClause, WithCount, WithOptions } from './types.js';
 
 /**
@@ -252,6 +253,35 @@ function keyOf(value: unknown): string {
 }
 
 /**
+ * Reject pick-row relation ordering anywhere inside a `with` tree's orderBy —
+ * strategy parity with the join path, which throws this exact E003 at SQL
+ * build time (`pickOrderNestedError` in builder.ts). Without this guard the
+ * loaders would forward `options.orderBy` as the child reader's TOP-LEVEL
+ * findMany orderBy, where the pick shape compiles fine — so the same query
+ * would execute on 'batched' but throw on 'join'. Walks the whole tree up
+ * front so acceptance never depends on which levels have rows — the batched
+ * runners in builder.ts call this BEFORE the base query (a zero-row base
+ * result must still reject, exactly like the join strategy's build-time throw).
+ */
+export function rejectNestedPickOrder(withClause: WithClause): void {
+  for (const spec of Object.values(withClause)) {
+    if (!spec || spec === true) continue;
+    const options = spec as WithOptions;
+    if (options.orderBy) {
+      for (const [key, value] of Object.entries(options.orderBy)) {
+        if (isRelationPickOrderBy(value)) {
+          throw new ValidationError(
+            `[turbine] Pick-row ordering on relation "${key}" is only supported in a top-level ` +
+              'findMany orderBy: nested `with` orderBy does not support it.',
+          );
+        }
+      }
+    }
+    if (options.with) rejectNestedPickOrder(options.with as WithClause);
+  }
+}
+
+/**
  * Load every relation in `withClause` for `parents` and attach it onto each row
  * in place. Mirrors the join strategy's output shape exactly. Recurses for nested
  * `with` by re-running itself against the freshly-loaded child rows.
@@ -265,6 +295,9 @@ export async function loadRelationsBatched(
   path: string[] = [ctx.parentMeta.name],
 ): Promise<void> {
   if (depth >= MAX_DEPTH) throw new CircularRelationError([...path, '…']);
+  // Scope-rule parity with the join strategy: validate the whole tree BEFORE
+  // the empty-parents early return, so accept/reject never depends on data.
+  if (depth === 0) rejectNestedPickOrder(withClause);
   if (parents.length === 0) return;
 
   // Sibling relations are independent (each writes only its own parent[relName]

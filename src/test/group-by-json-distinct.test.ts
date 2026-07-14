@@ -20,15 +20,18 @@
  */
 
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
+import { mysqlDialect } from '../mysql.js';
 import type { PowdbPool } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
 import type { SchemaMetadata } from '../schema.js';
-import { sqliteDialect } from '../sqlite.js';
+import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
 
 function schema(): SchemaMetadata {
@@ -116,13 +119,55 @@ describe('groupBy JSON-path group keys', () => {
             { field: 'data', path: ['nested', 'category'] },
           ],
         } as never),
-      /result key "category" .* collides .* set an explicit `alias`/,
+      /output name "category" .* collides .* set an explicit `alias`/,
     );
     assert.throws(
       () => q.buildGroupBy({ by: ['status', { field: 'data', path: ['x'], alias: 'status' }] } as never),
       /collides/,
     );
     assert.throws(() => q.buildGroupBy({ by: [{ field: 'data', path: ['x'], alias: '_count' }] } as never), /"_count"/);
+  });
+
+  it('collision check runs over EMITTED output column names, not just given keys', () => {
+    const q = makeQuery('versions', schema());
+    // A JSON alias equal to another group key's snake_case OUTPUT column: both
+    // land on "created_at" on the wire; the driver keeps only the last one.
+    assert.throws(
+      () => q.buildGroupBy({ by: ['createdAt', { field: 'data', path: ['created_at'] }] } as never),
+      /output name "created_at" .* collides/,
+    );
+    // Same with an explicit alias.
+    assert.throws(
+      () => q.buildGroupBy({ by: ['createdAt', { field: 'data', path: ['x'], alias: 'created_at' }] } as never),
+      /output name "created_at" .* collides/,
+    );
+    // Aggregate output aliases share the namespace: a plain-column _sum emits
+    // `_sum_<snake_col>` while a JSON-path _sum emits `_sum_<argKey>` — a
+    // camel/snake sibling pair lands on ONE output column and drops a value.
+    assert.throws(
+      () =>
+        q.buildGroupBy({
+          by: [{ field: 'data', path: ['category'] }],
+          _sum: { instanceId: true, instance_id: { field: 'data', path: ['price'] } },
+        } as never),
+      /output name "_sum_instance_id" .* collides/,
+    );
+    // A group-key alias equal to an aggregate output alias collides too.
+    assert.throws(
+      () =>
+        q.buildGroupBy({
+          by: [{ field: 'data', path: ['category'], alias: '_sum_price' }],
+          _sum: { price: { field: 'data', path: ['price'] } },
+        } as never),
+      /output name "_sum_price" .* collides/,
+    );
+    // Non-colliding shapes still build.
+    const ok = q.buildGroupBy({
+      by: ['createdAt', { field: 'data', path: ['created_at'], alias: 'dataCreatedAt' }],
+      _sum: { instanceId: true },
+    } as never);
+    assert.ok(ok.sql.includes('"created_at"'), ok.sql);
+    assert.ok(ok.sql.includes('"_sum_instance_id"'), ok.sql);
   });
 
   it('rejects a non-JSON column, an unknown field, and an empty path (E003)', () => {
@@ -357,6 +402,86 @@ describe('groupBy distinctOn row source', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Non-Postgres dialects: JSON paths bind as '$'-rooted JSONPath STRING params
+// (the pool shims JSON.stringify non-primitive params, so a raw array would
+// reach json_extract/JSON_EXTRACT/JSON_VALUE as '["x"]' — an invalid path
+// that fails at the driver).
+// ---------------------------------------------------------------------------
+
+describe('groupBy JSON paths on non-Postgres dialects', () => {
+  it('SQLite: group key + aggregate target bind JSONPath strings', () => {
+    const q = makeQuery('versions', schema(), { dialect: sqliteDialect, sqlCache: false });
+    const { sql, params } = q.buildGroupBy({
+      by: [{ field: 'data', path: ['category'] }],
+      _sum: { price: { field: 'data', path: ['meta', 0, 'price'] } },
+    } as never);
+    assert.ok(sql.includes('json_extract('), sql);
+    assert.deepEqual(params, ['$."category"', '$."meta"[0]."price"']);
+  });
+
+  it('MySQL: group key binds a JSONPath string', () => {
+    const q = makeQuery('versions', schema(), { dialect: mysqlDialect, sqlCache: false });
+    const { sql, params } = q.buildGroupBy({
+      by: [{ field: 'data', path: ['category'] }],
+    } as never);
+    assert.ok(sql.includes('JSON_EXTRACT('), sql);
+    assert.deepEqual(params, ['$."category"']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live SQLite (node:sqlite, in-process — runs in the unit lane): the JSON-path
+// groupBy keys/aggregates, JSON-path orderBy, and JSON range filters must
+// actually EXECUTE on a non-Postgres engine, not just compile.
+// ---------------------------------------------------------------------------
+
+const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() => {
+  try {
+    return createRequire(process.cwd())('node:sqlite').DatabaseSync;
+  } catch {
+    return undefined;
+  }
+})();
+
+describe('groupBy JSON paths live on SQLite', () => {
+  const skip = DatabaseSync ? false : 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)';
+
+  it('JSON group keys, aggregate targets, orderBy, and range filters execute end-to-end', { skip }, async () => {
+    const handle = new DatabaseSync!(':memory:');
+    handle.exec('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, data JSON)');
+    handle.exec(`INSERT INTO items (name, data) VALUES
+      ('a', '{"weight": 3, "cat": "x"}'),
+      ('b', '{"weight": 1, "cat": "y"}'),
+      ('c', '{"weight": 2, "cat": "x"}')`);
+    const liveSchema = introspectSqliteDatabase(handle);
+    // biome-ignore lint/suspicious/noExplicitAny: dynamic table accessor
+    const db = turbineSqlite(handle, liveSchema, { warnOnUnlimited: false }) as any;
+    try {
+      const grouped = await db.items.groupBy({
+        by: [{ field: 'data', path: ['cat'] }],
+        _sum: { weight: { field: 'data', path: ['weight'] } },
+      });
+      grouped.sort((a: { cat: string }, b: { cat: string }) => a.cat.localeCompare(b.cat));
+      assert.deepEqual(grouped, [
+        { cat: 'x', _count: 2, _sum: { weight: 5 } },
+        { cat: 'y', _count: 1, _sum: { weight: 1 } },
+      ]);
+
+      const ordered = await db.items.findMany({ orderBy: { data: { path: ['weight'], type: 'numeric' } } });
+      assert.deepEqual(
+        ordered.map((r: { name: string }) => r.name),
+        ['b', 'c', 'a'],
+      );
+
+      const filtered = await db.items.findMany({ where: { data: { path: ['weight'], gt: 1 } } });
+      assert.deepEqual(filtered.map((r: { name: string }) => r.name).sort(), ['a', 'c']);
+    } finally {
+      await db.disconnect();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // PowDB: the SQL-only groupBy extensions refuse with E017
 // ---------------------------------------------------------------------------
 
@@ -389,6 +514,32 @@ describe('groupBy extensions on PowDB (E017)', () => {
       } as never),
       UnsupportedFeatureError,
     );
+  });
+
+  it('pick-row orderBy throws E017 NAMING the feature (not "vector / distance ordering")', async () => {
+    await assert.rejects(
+      powqlQuery().findMany({
+        orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title' } },
+      } as never),
+      (err: unknown) => {
+        assert.ok(err instanceof UnsupportedFeatureError);
+        assert.match((err as Error).message, /relation pick-row ordering/);
+        assert.doesNotMatch((err as Error).message, /vector \/ distance/);
+        return true;
+      },
+    );
+  });
+
+  it('other object orderBy shapes each get their own E017 feature name', async () => {
+    const cases: [Record<string, unknown>, RegExp][] = [
+      [{ data: { path: ['x'] } }, /JSON-path ordering/],
+      [{ rel: { _count: 'desc' } }, /relation _count ordering/],
+      [{ status: { sort: 'asc', nulls: 'last' } }, /NULLS placement \/ sort-spec ordering/],
+      [{ vec: { distance: { to: [1], metric: 'l2' } } }, /vector \/ distance ordering/],
+    ];
+    for (const [orderBy, expected] of cases) {
+      await assert.rejects(powqlQuery().findMany({ orderBy } as never), expected);
+    }
   });
 });
 

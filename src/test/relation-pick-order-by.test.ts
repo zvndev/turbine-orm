@@ -85,6 +85,7 @@ function schema(): SchemaMetadata {
       owners: mockTable('owners', [
         { name: 'id', field: 'id' },
         { name: 'name', field: 'name', pgType: 'text' },
+        { name: 'email', field: 'email', pgType: 'text' },
       ]),
     },
   };
@@ -196,7 +197,27 @@ describe('pick-row relation ordering: SQL generation', () => {
         name: 'asc',
       },
     } as never);
-    assert.match(sql, /LIMIT 1\) ASC, "name" ASC/);
+    assert.match(sql, /LIMIT 1\) ASC NULLS LAST, "name" ASC/);
+  });
+
+  it('defaults to NULLS LAST in both directions (childless parents sort last); explicit nulls overrides', () => {
+    const q = makeQuery('instances', schema());
+    const asc = q.buildFindMany({
+      orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title' } },
+    } as never);
+    assert.match(asc.sql, /LIMIT 1\) ASC NULLS LAST/);
+    // Postgres's own DESC default is NULLS FIRST — a "highest first" sort would
+    // put every parent with zero related rows at the top without this default.
+    const desc = q.buildFindMany({
+      orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', direction: 'desc' } },
+    } as never);
+    assert.match(desc.sql, /LIMIT 1\) DESC NULLS LAST/);
+    const explicit = q.buildFindMany({
+      orderBy: {
+        versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', direction: 'desc', nulls: 'first' },
+      },
+    } as never);
+    assert.match(explicit.sql, /LIMIT 1\) DESC NULLS FIRST/);
   });
 });
 
@@ -229,13 +250,16 @@ describe('pick-row relation ordering: scope errors', () => {
 
   it('missing pick.orderBy throws E003 (determinism required)', () => {
     const q = makeQuery('instances', schema());
+    // `pick: {}` (no `orderBy` key at all) is not a pick shape — it falls
+    // through to relation column ordering, where the to-many branch rejects it
+    // while still pointing at the pick-row form.
     assert.throws(
       () => q.buildFindMany({ orderBy: { versions: { pick: {}, by: 'title' } } } as never),
-      /requires `pick\.orderBy` to choose ONE related row deterministically/,
+      /only supports "_count" or a pick-row ordering \(\{ pick, by \}\)/,
     );
     assert.throws(
       () => q.buildFindMany({ orderBy: { versions: { pick: { orderBy: {} }, by: 'title' } } } as never),
-      /requires `pick\.orderBy`/,
+      /requires `pick\.orderBy` to choose ONE related row deterministically/,
     );
   });
 
@@ -342,9 +366,107 @@ describe('pick-row relation ordering: scope errors', () => {
       /only supported in a top-level findMany orderBy/,
     );
   });
+
+  it('`distinct` + ANY relation orderBy throws E003 (pick, _count, to-one) — never invalid SQL', () => {
+    // The distinct path re-orders in an outer wrapper where a correlated
+    // relation subquery would reference the parent table out of scope: a
+    // guaranteed "missing FROM-clause entry" Postgres crash without the guard.
+    const q = makeQuery('instances', schema());
+    const relOrders = [
+      { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title' } },
+      { versions: { _count: 'desc' } },
+      { owner: { name: 'asc' } },
+    ];
+    for (const orderBy of relOrders) {
+      assert.throws(
+        () => q.buildFindMany({ distinct: ['name'], orderBy } as never),
+        (err: unknown) => {
+          assert.ok(err instanceof ValidationError);
+          assert.match(err.message, /`distinct` cannot be combined with relation orderBy/);
+          return true;
+        },
+      );
+    }
+    // Throws on a warm cache too (the guard runs before the SQL cache).
+    assert.throws(
+      () => q.buildFindMany({ distinct: ['name'], orderBy: relOrders[0] } as never),
+      /`distinct` cannot be combined with relation orderBy/,
+    );
+    // Plain column / spec ordering with distinct still builds.
+    const ok = q.buildFindMany({ distinct: ['name'], orderBy: { name: 'asc' } } as never);
+    assert.match(ok.sql, /DISTINCT ON \("name"\)/);
+  });
+});
+
+describe('pick-row relation ordering: back-compat with target columns literally named pick/by', () => {
+  function pickByColsSchema(): SchemaMetadata {
+    const s = schema();
+    s.tables.owners = mockTable('owners', [
+      { name: 'id', field: 'id' },
+      { name: 'pick', field: 'pick', pgType: 'text' },
+      { name: 'by', field: 'by', pgType: 'text' },
+    ]);
+    return s;
+  }
+
+  it('to-one relation orderBy on real columns named pick/by compiles to column ordering (not E003)', () => {
+    const q = makeQuery('instances', pickByColsSchema());
+    const { sql } = q.buildFindMany({
+      orderBy: { owner: { pick: 'asc', by: 'desc' } },
+    } as never);
+    assert.match(
+      sql,
+      /ORDER BY \(SELECT ord0\."pick" FROM "owners" ord0 WHERE ord0\."id" = "instances"\."owner_id" LIMIT 1\) ASC, \(SELECT ord0\."by" FROM "owners" ord0 WHERE ord0\."id" = "instances"\."owner_id" LIMIT 1\) DESC/,
+    );
+  });
+
+  it('OrderBySpec-form values on those columns also stay column ordering', () => {
+    const q = makeQuery('instances', pickByColsSchema());
+    const { sql } = q.buildFindMany({
+      orderBy: { owner: { pick: { sort: 'asc', nulls: 'last' }, by: 'desc' } },
+    } as never);
+    assert.match(sql, /\(SELECT ord0\."pick" FROM "owners" ord0 .*LIMIT 1\) ASC NULLS LAST/);
+    assert.match(sql, /\(SELECT ord0\."by" FROM "owners" ord0 .*LIMIT 1\) DESC/);
+  });
+
+  it('an extra key outside { pick, by, direction, nulls } is not a pick shape', () => {
+    const q = makeQuery('instances', schema());
+    // Falls through to relation column ordering → to-many relations reject it
+    // with the _count/pick guidance instead of compiling a half-pick.
+    assert.throws(
+      () =>
+        q.buildFindMany({
+          orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', limit: 1 } },
+        } as never),
+      /only supports "_count" or a pick-row ordering/,
+    );
+  });
 });
 
 describe('pick-row relation ordering: dialect gating', () => {
+  it("JSON-path by binds a '$'-rooted JSONPath STRING param on SQLite/MySQL (never a JS array)", () => {
+    // The non-Postgres pool shims JSON.stringify non-primitive params, so a raw
+    // array would reach json_extract/JSON_EXTRACT as '["title"]' — an invalid
+    // path that fails at the driver. The path is encoded per dialect instead.
+    const sqlite = makeQuery('instances', schema(), { dialect: sqliteDialect, sqlCache: false });
+    const s = sqlite.buildFindMany({
+      orderBy: {
+        versions: { pick: { orderBy: { createdAt: 'desc' } }, by: { field: 'data', path: ['title'] } },
+      },
+    } as never);
+    assert.ok(s.sql.includes('json_extract('), s.sql);
+    assert.deepEqual(s.params, ['$."title"']);
+
+    const mysql = makeQuery('instances', schema(), { dialect: mysqlDialect, sqlCache: false });
+    const m = mysql.buildFindMany({
+      orderBy: {
+        versions: { pick: { orderBy: { createdAt: 'desc' } }, by: { field: 'data', path: ['meta', 0, 'kind'] } },
+      },
+    } as never);
+    assert.ok(m.sql.includes('JSON_EXTRACT('), m.sql);
+    assert.deepEqual(m.params, ['$."meta"[0]."kind"']);
+  });
+
   it('plain-column pick ordering compiles on SQLite', () => {
     const q = makeQuery('instances', schema(), { dialect: sqliteDialect, sqlCache: false });
     const { sql } = q.buildFindMany({
@@ -450,8 +572,10 @@ describe('pick-row relation ordering: cache safety', () => {
     const desc = q.buildFindMany({
       orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', direction: 'desc' } },
     } as never);
+    // nulls: 'last' matches the default (NULLS LAST) — 'first' is the variant
+    // that must produce different SQL text.
     const nulls = q.buildFindMany({
-      orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', nulls: 'last' } },
+      orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', nulls: 'first' } },
     } as never);
     const pickAsc = q.buildFindMany({
       orderBy: { versions: { pick: { orderBy: { createdAt: 'asc' } }, by: 'title' } },
@@ -477,6 +601,46 @@ describe('pick-row relation ordering: cache safety', () => {
       orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title' } },
     } as never);
     assert.notEqual(count.sql, pick.sql);
+  });
+
+  it('multi-column to-one relation orderBy: swapped insertion order never shares one cached SQL', () => {
+    // The rel() fingerprint used to SORT entries while the compile side emits
+    // insertion order — the second call was silently served the first call's
+    // cached ORDER BY precedence (wrong row order, no error).
+    const q = makeQuery('instances', schema());
+    const a = q.buildFindMany({ orderBy: { owner: { name: 'asc', email: 'desc' } } } as never);
+    const b = q.buildFindMany({ orderBy: { owner: { email: 'desc', name: 'asc' } } } as never);
+    assert.notEqual(a.sql, b.sql);
+    assert.match(a.sql, /\(SELECT ord0\."name"[^)]+\) ASC, \(SELECT ord0\."email"[^)]+\) DESC/);
+    assert.match(b.sql, /\(SELECT ord0\."email"[^)]+\) DESC, \(SELECT ord0\."name"[^)]+\) ASC/);
+  });
+
+  it('swapped multi-column to-one ordering INSIDE pick.orderBy never shares one cached SQL', () => {
+    const s = schema();
+    s.tables.versions!.relations = {
+      author: {
+        type: 'belongsTo',
+        name: 'author',
+        from: 'versions',
+        to: 'owners',
+        foreignKey: 'author_id',
+        referenceKey: 'id',
+      },
+    };
+    const q = makeQuery('instances', s);
+    const a = q.buildFindMany({
+      orderBy: {
+        versions: { pick: { orderBy: { author: { name: 'asc', email: 'desc' } } }, by: 'title' },
+      },
+    } as never);
+    const b = q.buildFindMany({
+      orderBy: {
+        versions: { pick: { orderBy: { author: { email: 'desc', name: 'asc' } } }, by: 'title' },
+      },
+    } as never);
+    assert.notEqual(a.sql, b.sql);
+    assert.match(a.sql, /"name"[^)]+\) ASC, \(SELECT [^)]*"email"[^)]+\) DESC/);
+    assert.match(b.sql, /"email"[^)]+\) DESC, \(SELECT [^)]*"name"[^)]+\) ASC/);
   });
 
   it('warmed cache still validates: a bad shape throws on the second call too', () => {
@@ -597,6 +761,28 @@ describe('pick-row relation ordering: integration', () => {
       rows.map((r) => r.name),
       ['p2', 'p1', 'p3'],
     );
+  });
+
+  it("direction 'desc' with nulls UNSET sorts parents with zero related rows LAST (default NULLS LAST)", async () => {
+    const rel = versionsRelation();
+    // "Highest first" — without the NULLS LAST default, Postgres's DESC
+    // NULLS FIRST would put p4 (no versions) and p3 (NULL title) at the TOP.
+    const rows = (await db.table(PARENTS).findMany({
+      orderBy: {
+        [rel]: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', direction: 'desc' },
+      },
+    } as never)) as { name: string }[];
+    // Newest titles: p1=banana, p2=apple → desc: p1, p2, then the NULL-key parents.
+    assert.deepEqual(rows.map((r) => r.name).slice(0, 2), ['p1', 'p2']);
+    assert.deepEqual(new Set(rows.map((r) => r.name).slice(2)), new Set(['p3', 'p4']));
+    // Explicit nulls: 'first' still overrides the default.
+    const overridden = (await db.table(PARENTS).findMany({
+      orderBy: {
+        [rel]: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', direction: 'desc', nulls: 'first' },
+      },
+    } as never)) as { name: string }[];
+    assert.deepEqual(new Set(overridden.map((r) => r.name).slice(0, 2)), new Set(['p3', 'p4']));
+    assert.deepEqual(overridden.map((r) => r.name).slice(2), ['p1', 'p2']);
   });
 
   it('tie behavior: pick.orderBy decides which row supplies the key', async () => {

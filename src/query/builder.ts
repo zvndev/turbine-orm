@@ -39,6 +39,7 @@ import {
   loadRelationsBatched,
   neededParentKeyFields,
   type RelationLoadContext,
+  rejectNestedPickOrder,
   resolveCountRelations,
   stripFields,
 } from './batched-loader.js';
@@ -450,6 +451,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private async runFindManyBatched(args: FindManyArgs<T>): Promise<T[]> {
     const withClause = args.with as WithClause;
+    // Scope-rule parity with the join strategy (which throws at SQL build):
+    // reject nested pick-row ordering BEFORE the base query so acceptance
+    // never depends on how many rows come back.
+    rejectNestedPickOrder(withClause);
     // Capture the opt-out from the ARGS before any await: this.currentSkip is
     // instance state on a cached accessor, so a concurrent build during the
     // base-query await would overwrite it (tenant query loading relations with
@@ -732,6 +737,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private async runFindUniqueBatched(args: FindUniqueArgs<T>): Promise<T | null> {
     const withClause = args.with as WithClause;
+    // Same scope-rule parity as runFindManyBatched: reject before querying.
+    rejectNestedPickOrder(withClause);
     const needed = neededParentKeyFields(this.tableMeta, withClause);
     const proj = includeKeysForBatching(
       args.select as Record<string, boolean> | undefined,
@@ -960,6 +967,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
     args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): DeferredQuery<T[]> {
     this.currentSkip = args?.skipGlobalFilters;
+    // `distinct` + relation orderBy is refused up front (E003): the distinct
+    // path re-orders in an outer wrapper (`... AS "<table>_distinct" ORDER BY
+    // <userOrder>`) where a correlated relation subquery (pick-row, `_count`,
+    // to-one relation ordering) would reference the parent table name out of
+    // scope — a guaranteed "missing FROM-clause entry" crash on Postgres.
+    // Checked BEFORE the SQL cache so build and warm-cache paths throw
+    // identically (same rule as the vector guard inside the distinct branch).
+    if (args?.distinct && args.distinct.length > 0 && args.orderBy) {
+      for (const d of Object.values(args.orderBy)) {
+        if (this.isRelationOrderByValue(d)) {
+          throw new ValidationError(
+            '[turbine] `distinct` cannot be combined with relation orderBy (pick-row, `_count`, or ' +
+              'to-one relation ordering): the outer re-order cannot reference the parent table.',
+          );
+        }
+      }
+    }
     const columnsList = this.resolveColumns(args?.select, args?.omit);
     const colKey = columnsList ? columnsList.join(',') : '*';
     // AND-merge this table's global filter into the user where; `hasWhere` gates
@@ -2020,9 +2044,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
       ? this.buildDistinctOnSource(args.distinctOn, whereSql, params)
       : `${this.q(this.table)}${whereSql}`;
 
-    // Group keys: plain columns and/or JSON-path keys. Result-key collisions
-    // (two keys landing on the same output name) are rejected up front:
-    // otherwise one group value would silently overwrite the other.
+    // Group keys: plain columns and/or JSON-path keys. Output-name collisions
+    // are rejected up front — and the check runs over the EMITTED SQL output
+    // column names (snake_case column / JSON alias / `_agg_key` aggregate
+    // alias), not just the given arg keys: the driver keeps only the LAST
+    // duplicate field per row object, so a JSON alias equal to another key's
+    // snake_case column (or an aggregate output alias) would silently clobber
+    // that value in the results.
     const groupExprs: string[] = [];
     const selectExprs: string[] = [];
     /** by entries in order: how to read each group key off the result row. */
@@ -2031,8 +2059,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const claimResultKey = (key: string, what: string): void => {
       if (key === '_count' || usedResultKeys.has(key)) {
         throw new ValidationError(
-          `[turbine] groupBy result key "${key}" (${what}) collides with another result key on table ` +
-            `"${this.table}": set an explicit \`alias\` to disambiguate.`,
+          `[turbine] groupBy output name "${key}" (${what}) collides with another output column on table ` +
+            `"${this.table}": set an explicit \`alias\` (or rename the aggregate key) to disambiguate.`,
         );
       }
       usedResultKeys.add(key);
@@ -2041,12 +2069,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (typeof entry === 'string') {
         const col = this.toColumn(entry);
         claimResultKey(entry, `column "${col}"`);
+        // The emitted output column is the snake_case name; claim it too (when
+        // it differs from the result key) so a JSON alias like 'created_at'
+        // cannot silently shadow the 'createdAt' group key on the wire.
+        if (col !== entry) claimResultKey(col, `column "${col}"`);
         groupExprs.push(this.q(col));
         selectExprs.push(this.q(col));
         byReaders.push({ resultKey: entry, rowKey: col, raw: false });
       } else {
         const col = this.resolveJsonPathTarget('group key', entry.field, entry.path);
-        params.push(entry.path.map(String));
+        params.push(this.jsonPathParam(entry.path));
         const extract = this.dialect.buildJsonPathExtract(this.q(col), this.p(params.length));
         const alias = entry.alias ?? String(entry.path[entry.path.length - 1]);
         claimResultKey(alias, `JSON path on "${entry.field}"`);
@@ -2080,6 +2112,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
         if (!target) continue;
         if (target === true) {
           const col = this.toColumn(key);
+          // Aggregate output aliases share the same output-name namespace as
+          // the group keys: `_sum: { totalPrice: true, total_price: {json} }`
+          // would emit two "_sum_total_price" columns and silently drop one.
+          claimResultKey(`${aggKey}_${col}`, `${aggKey} of column "${col}"`);
           const inner = `${sqlFn}(${this.q(col)})`;
           const expr = aggKey === '_avg' ? this.castAgg(inner, 'float') : inner;
           selectExprs.push(`${expr} AS ${this.q(`${aggKey}_${col}`)}`);
@@ -2094,7 +2130,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
           );
         }
         const numeric = alwaysNumeric || target.type === 'numeric';
-        params.push(target.path.map(String));
+        claimResultKey(`${aggKey}_${key}`, `${aggKey} JSON target "${key}"`);
+        params.push(this.jsonPathParam(target.path));
         const extract = this.dialect.buildJsonPathExtract(this.q(col), this.p(params.length));
         const inner = `${sqlFn}(${numeric ? this.castJsonNumeric(extract) : extract})`;
         const expr = aggKey === '_avg' ? this.castAgg(inner, 'float') : inner;
@@ -2214,7 +2251,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       );
     }
     const colType = this.pgTypeForColumn(this.tableMeta, col);
-    if (colType !== 'json' && colType !== 'jsonb') {
+    if (!this.isJsonColumnType(colType)) {
       throw new ValidationError(
         `[turbine] groupBy ${context} on "${field}": column "${col}" on table "${this.table}" is not a JSON ` +
           `column (actual type: ${colType}).`,
@@ -3077,7 +3114,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // JSONB filter
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.getColumnPgType(rawColumn);
-        if (colType === 'json' || colType === 'jsonb') {
+        if (this.isJsonColumnType(colType)) {
           this.collectJsonFilterParams(value, params, this.q(rawColumn));
           continue;
         }
@@ -3194,7 +3231,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // the target column is json/jsonb.
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.pgTypeForColumn(meta, col);
-        if (colType === 'json' || colType === 'jsonb') {
+        if (this.isJsonColumnType(colType)) {
           this.collectJsonFilterParams(value, params, `${this.q(targetTable)}.${this.q(col)}`);
           continue;
         }
@@ -3256,7 +3293,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     let pathPushed = false;
     const pushPathOnce = (): void => {
       if (!pathPushed) {
-        params.push(filter.path);
+        // Only reached when a path-requiring clause validated filter.path.
+        params.push(this.jsonPathParam(filter.path!, filter.path));
         pathPushed = true;
       }
     };
@@ -3307,7 +3345,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // then the path bound as one text[] param.
       if (isJsonPathOrderBy(dir)) {
         this.validateJsonPathOrderBy(this.table, this.tableMeta, key, dir);
-        params.push(dir.path.map(String));
+        params.push(this.jsonPathParam(dir.path));
         continue;
       }
       // To-many relation orderBy (`{ posts: { _count } }`) uses the same count
@@ -3856,7 +3894,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Handle JSONB filter operators (for json/jsonb columns)
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.getColumnPgType(rawColumn);
-        if (colType === 'json' || colType === 'jsonb') {
+        if (this.isJsonColumnType(colType)) {
           const jsonClauses = this.buildJsonFilterClauses(column, value, params);
           andClauses.push(...jsonClauses);
           continue;
@@ -4098,7 +4136,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // jsonb value, silently matching nothing.
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.pgTypeForColumn(meta, col);
-        if (colType === 'json' || colType === 'jsonb') {
+        if (this.isJsonColumnType(colType)) {
           conditions.push(...this.buildJsonFilterClauses(qCol, value, params));
           continue;
         }
@@ -4205,7 +4243,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private assertBindableEqualityValue(rawColumn: string, value: unknown, columnPgType: string, table: string): void {
     if (!isUnmatchedPlainObject(value)) return;
-    if (columnPgType === 'json' || columnPgType === 'jsonb') return;
+    if (this.isJsonColumnType(columnPgType)) return;
     const badKeys = Object.keys(value as Record<string, unknown>);
     throw new ValidationError(
       badKeys.length === 0
@@ -4286,7 +4324,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // bound as a plain equality value.
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.pgTypeForColumn(targetMeta, col);
-        if (colType === 'json' || colType === 'jsonb') {
+        if (this.isJsonColumnType(colType)) {
           clauses.push(...this.buildJsonFilterClauses(qCol, value, params));
           continue;
         }
@@ -4378,7 +4416,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // JSONB filter — mirrors buildAliasWhere.
       if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
         const colType = this.pgTypeForColumn(targetMeta, col);
-        if (colType === 'json' || colType === 'jsonb') {
+        if (this.isJsonColumnType(colType)) {
           this.collectJsonFilterParams(value, params, this.q(col));
           continue;
         }
@@ -4665,9 +4703,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (isOrderBySpec(d)) return `spec(${d.sort},${d.nulls ?? ''})`;
     if (d && typeof d === 'object') {
       // Relation ordering (`{ _count: 'desc' }` or `{ name: 'asc' }`).
+      // INSERTION order, never sorted: the compile side (buildRelationOrderBy)
+      // emits one ORDER BY term per entry in Object.entries order, so entry
+      // order is SQL-shaping precedence. A sorted fingerprint made
+      // `{ name: 'asc', email: 'desc' }` and the swapped literal share one
+      // cached SQL string — silently mis-ordered results on a warm cache.
       return `rel(${Object.entries(d as Record<string, unknown>)
         .map(([k, v]) => `${k}=${this.orderByEntryFingerprint(v)}`)
-        .sort()
         .join(',')})`;
     }
     return String(d);
@@ -4812,7 +4854,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       );
     }
     const colType = this.pgTypeForColumn(meta, col);
-    if (colType !== 'json' && colType !== 'jsonb') {
+    if (!this.isJsonColumnType(colType)) {
       throw new ValidationError(
         `[turbine] JSON-path orderBy on "${field}": column "${col}" on table "${table}" is not a JSON column ` +
           `(actual type: ${colType}).`,
@@ -4842,7 +4884,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (!params) {
       throw new ValidationError(`[turbine] JSON-path ordering on "${field}" is not supported in this orderBy context.`);
     }
-    params.push(spec.path.map(String));
+    params.push(this.jsonPathParam(spec.path));
     const extract = this.dialect.buildJsonPathExtract(`${prefix}${this.q(col)}`, this.p(params.length));
     const lhs = spec.type === 'numeric' ? this.castJsonNumeric(extract) : extract;
     const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
@@ -5043,7 +5085,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const col = this.validateJsonPathOrderBy(relDef.to, targetMeta, spec.by.field, {
         path: spec.by.path,
       } as JsonPathOrderBy);
-      params.push(spec.by.path.map(String));
+      params.push(this.jsonPathParam(spec.by.path));
       const extract = this.dialect.buildJsonPathExtract(`${alias}.${this.q(col)}`, this.p(params.length));
       byExpr = spec.by.type === 'numeric' ? this.castJsonNumeric(extract) : extract;
     }
@@ -5073,7 +5115,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
     const limitOne = this.buildPagination('1', undefined, true);
-    return `(SELECT ${byExpr} FROM ${this.q(relDef.to)} ${alias} WHERE ${where}${orderClause}${limitOne}) ${dir}${this.nullsSuffix(spec.nulls)}`;
+    // Parents with ZERO surviving related rows make the correlated subquery
+    // yield NULL. Without a nulls clause, Postgres DESC defaults to NULLS
+    // FIRST — every childless parent would top a "highest first" sort. Default
+    // to NULLS LAST in BOTH directions (deterministic across engines: SQLite's
+    // NULL-is-smallest default diverges from Postgres) unless the caller set
+    // `nulls` explicitly; the grammar gate matches nullsSuffix (PG + SQLite).
+    const nullsSql = spec.nulls
+      ? this.nullsSuffix(spec.nulls)
+      : this.dialect.name === 'postgresql' || this.dialect.name === 'sqlite'
+        ? ' NULLS LAST'
+        : '';
+    return `(SELECT ${byExpr} FROM ${this.q(relDef.to)} ${alias} WHERE ${where}${orderClause}${limitOne}) ${dir}${nullsSql}`;
   }
 
   /**
@@ -5095,7 +5148,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       this.resolveOrderByColumn(relDef.to, targetMeta, spec.by);
     } else {
       this.validateJsonPathOrderBy(relDef.to, targetMeta, spec.by.field, { path: spec.by.path } as JsonPathOrderBy);
-      params.push(spec.by.path.map(String));
+      params.push(this.jsonPathParam(spec.by.path));
     }
     this.collectTargetGlobalFilterAlias(relDef.to, params);
     if (spec.pick.where) {
@@ -5176,7 +5229,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
       if (isJsonPathOrderBy(dirValue)) {
         this.validateJsonPathOrderBy(targetTable, targetMeta, key, dirValue);
-        params.push(dirValue.path.map(String));
+        params.push(this.jsonPathParam(dirValue.path));
         continue;
       }
       if (this.isRelationOrderByValue(dirValue)) {
@@ -6320,6 +6373,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Used to detect JSONB/array columns for specialized operators.
    * Uses pre-computed Map for O(1) lookup instead of linear scan.
    */
+  /**
+   * Case-insensitive json/jsonb column-type check. Postgres reports lowercase
+   * udt_names, but SQLite/MySQL introspection surfaces the DECLARED type
+   * (e.g. `JSON`), so every JSON-feature gate compares through this predicate
+   * — build and collect sides alike, keeping the SQL-cache lockstep.
+   */
+  private isJsonColumnType(colType: string): boolean {
+    const t = colType.toLowerCase();
+    return t === 'json' || t === 'jsonb';
+  }
+
   private getColumnPgType(column: string): string {
     return this.columnPgTypeMap.get(column) ?? 'text';
   }
@@ -6396,7 +6460,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     let pathParamIdx: number | null = null;
     const pathExtract = (): string => {
       if (pathParamIdx === null) {
-        params.push(filter.path);
+        // Only reached when a path-requiring clause validated filter.path.
+        params.push(this.jsonPathParam(filter.path!, filter.path));
         pathParamIdx = params.length;
       }
       return this.dialect.buildJsonPathExtract(column, this.p(pathParamIdx));
@@ -6435,6 +6500,26 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     return clauses;
+  }
+
+  /**
+   * Bind value for a JSON path parameter, encoded per dialect. PostgreSQL's
+   * `#>>` takes a `text[]` (the segments as strings — or `nativeForm` when the
+   * caller has a specific native binding, e.g. JsonFilter's raw path array).
+   * Every other engine's JSON function (`json_extract` / `JSON_EXTRACT` /
+   * `JSON_VALUE`) takes a `'$'`-rooted JSONPath STRING: binding the raw array
+   * would arrive as `'["a"]'` (the driver shims JSON.stringify non-primitive
+   * params) and fail at runtime with the engine's bad-JSON-path error. The
+   * encoded path stays a bound parameter — never spliced into SQL text — so
+   * the build/collect param mirrors stay in lockstep and injection-safe.
+   */
+  private jsonPathParam(path: readonly (string | number)[], nativeForm?: unknown): unknown {
+    if (this.dialect.jsonPathSupport === 'native') return nativeForm ?? path.map(String);
+    return `$${path
+      .map((seg) =>
+        typeof seg === 'number' || /^\d+$/.test(String(seg)) ? `[${seg}]` : `."${String(seg).replace(/"/g, '\\"')}"`,
+      )
+      .join('')}`;
   }
 
   /**

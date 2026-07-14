@@ -8,6 +8,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { ValidationError } from '../errors.js';
 import { QueryInterface } from '../query/index.js';
 import type { RelationDef, SchemaMetadata } from '../schema.js';
 
@@ -340,5 +341,68 @@ describe('batched relation loading — strategy precedence', () => {
     );
     await qi.findMany({ with: { posts: true } });
     assert.match(calls[0]!.sql, /json_agg/i);
+  });
+});
+
+describe('batched relation loading — nested pick-row orderBy parity with join', () => {
+  const pickOrder = { author: { pick: { orderBy: { name: 'desc' } }, by: 'name' } };
+
+  it('throws the IDENTICAL E003 the join strategy throws (strategy parity)', async () => {
+    const args = { with: { posts: { orderBy: pickOrder } } };
+
+    const { pool: joinPool } = makeFakePool(CANNED);
+    const joinQi = new QueryInterface(
+      // biome-ignore lint/suspicious/noExplicitAny: fake pool
+      joinPool as any,
+      'users',
+      makeSchema(),
+      [],
+      { preparedStatements: false, warnOnUnlimited: false }, // default 'join'
+    );
+    let joinErr: unknown;
+    try {
+      await joinQi.findMany(args as never);
+    } catch (e) {
+      joinErr = e;
+    }
+
+    const { pool: batchedPool, calls } = makeFakePool(CANNED);
+    let batchedErr: unknown;
+    try {
+      await usersQi(batchedPool, CANNED).findMany(args as never);
+    } catch (e) {
+      batchedErr = e;
+    }
+
+    assert.ok(joinErr instanceof ValidationError, 'join strategy must reject nested pick');
+    assert.ok(batchedErr instanceof ValidationError, 'batched strategy must reject nested pick');
+    assert.equal((batchedErr as Error).message, (joinErr as Error).message);
+    assert.match((batchedErr as Error).message, /only supported in a top-level findMany orderBy/);
+    // The batched loader must reject BEFORE issuing any follow-up query.
+    assert.ok(
+      calls.every((c) => !/FROM "posts"/.test(c.sql)),
+      'no child follow-up query may run',
+    );
+  });
+
+  it('rejects even when the base query returns zero parents (acceptance never depends on data)', async () => {
+    const empty = { ...CANNED, users: [] as Record<string, unknown>[] };
+    const { pool } = makeFakePool(empty);
+    await assert.rejects(
+      usersQi(pool, empty).findMany({ with: { posts: { orderBy: pickOrder } } } as never),
+      /only supported in a top-level findMany orderBy/,
+    );
+  });
+
+  it('rejects a pick buried in a DEEPER with level', async () => {
+    const { pool } = makeFakePool(CANNED);
+    await assert.rejects(
+      usersQi(pool, CANNED).findMany({
+        with: {
+          posts: { with: { author: { orderBy: { posts: { pick: { orderBy: { title: 'asc' } }, by: 'title' } } } } },
+        },
+      } as never),
+      /only supported in a top-level findMany orderBy/,
+    );
   });
 });
