@@ -809,6 +809,11 @@ export interface JsonPathGroupKey {
  * json/jsonb column, e.g. `SUM((col #>> $n::text[])::numeric)`. The arg key
  * is the result alias. `_sum`/`_avg` always cast numeric (a text sum is
  * meaningless); `_min`/`_max` compare as text unless `type: 'numeric'`.
+ *
+ * Engine note: when a group has NO value at the path, SQL engines return
+ * `null` for `_sum` (SUM over zero rows), while PowDB returns `0` (engine
+ * sum semantics). Treat `null` and `0` totals as equivalent when a group can
+ * be empty at the path.
  */
 export interface JsonPathAggregateTarget {
   /** json/jsonb column (camelCase field name, columnMap-resolved). */
@@ -1134,7 +1139,13 @@ export interface JsonPathOrderBy {
   direction?: OrderDirection;
   /** Comparison kind for the extracted value. Defaults to `'text'`; `'numeric'` adds a numeric cast. */
   type?: 'numeric' | 'text';
-  /** NULLS placement (PostgreSQL / SQLite only: see {@link OrderBySpec}). */
+  /**
+   * NULLS placement (PostgreSQL / SQLite only: see {@link OrderBySpec}).
+   * Rows whose document lacks the path extract to NULL and sort LAST in BOTH
+   * directions by default (matching pick-row ordering and the PowDB engine
+   * contract, so ordering is predictable across drivers); set `nulls` to
+   * override on PostgreSQL / SQLite.
+   */
   nulls?: 'first' | 'last';
 }
 

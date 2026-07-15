@@ -5218,7 +5218,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const extract = this.dialect.buildJsonPathExtract(`${prefix}${this.q(col)}`, this.p(params.length));
     const lhs = spec.type === 'numeric' ? this.castJsonNumeric(extract) : extract;
     const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-    return `${lhs} ${dir}${this.nullsSuffix(spec.nulls)}`;
+    // Rows whose document lacks the path extract to NULL. Without a nulls
+    // clause, Postgres DESC defaults to NULLS FIRST, which both diverges from
+    // pick-row ordering (NULLS LAST both directions since 0.33) and from
+    // engines whose path ordering is nulls-last in both directions. Default to
+    // NULLS LAST in BOTH directions unless the caller set `nulls` explicitly;
+    // the grammar gate matches nullsSuffix.
+    const nullsSql = spec.nulls
+      ? this.nullsSuffix(spec.nulls)
+      : this.dialect.name === 'postgresql' || this.dialect.name === 'sqlite'
+        ? ' NULLS LAST'
+        : '';
+    return `${lhs} ${dir}${nullsSql}`;
   }
 
   /**

@@ -338,7 +338,7 @@ describe('groupBy distinctOn row source', () => {
       },
       by: ['status'],
     } as never);
-    assert.ok(sql.includes('"created_at" DESC NULLS LAST, ("data" #>> $1::text[])::numeric ASC)'), sql);
+    assert.ok(sql.includes('"created_at" DESC NULLS LAST, ("data" #>> $1::text[])::numeric ASC NULLS LAST)'), sql);
     assert.deepEqual(params, [['rev']]);
   });
 

@@ -199,11 +199,17 @@ describe('JSON-path orderBy: cache safety', () => {
     const base = q.buildFindMany({ orderBy: { data: { path: ['w'] } } } as never);
     const desc = q.buildFindMany({ orderBy: { data: { path: ['w'], direction: 'desc' } } } as never);
     const numeric = q.buildFindMany({ orderBy: { data: { path: ['w'], type: 'numeric' } } } as never);
-    const nulls = q.buildFindMany({ orderBy: { data: { path: ['w'], nulls: 'last' } } } as never);
+    const nullsFirst = q.buildFindMany({ orderBy: { data: { path: ['w'], nulls: 'first' } } } as never);
+    const nullsLast = q.buildFindMany({ orderBy: { data: { path: ['w'], nulls: 'last' } } } as never);
     assert.notEqual(base.sql, desc.sql);
     assert.notEqual(base.sql, numeric.sql);
-    assert.notEqual(base.sql, nulls.sql);
+    assert.notEqual(base.sql, nullsFirst.sql);
     assert.notEqual(desc.sql, numeric.sql);
+    // The default IS nulls-last in both directions (cross-driver contract), so
+    // an explicit nulls:'last' compiles to the same SQL as the default, and
+    // DESC keeps NULLS LAST instead of Postgres's NULLS FIRST default.
+    assert.equal(base.sql, nullsLast.sql);
+    assert.ok(desc.sql.includes('DESC NULLS LAST'), desc.sql);
   });
 
   it('a JSON-path orderBy never collides with a plain direction on the same column', () => {

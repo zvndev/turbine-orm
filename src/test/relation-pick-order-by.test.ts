@@ -162,7 +162,7 @@ describe('pick-row relation ordering: SQL generation', () => {
         },
       },
     } as never);
-    assert.ok(sql.includes('ORDER BY (ord0."data" #>> $1::text[])::numeric DESC LIMIT 1'), sql);
+    assert.ok(sql.includes('ORDER BY (ord0."data" #>> $1::text[])::numeric DESC NULLS LAST LIMIT 1'), sql);
     assert.deepEqual(params, [['rev']]);
   });
 

@@ -547,10 +547,10 @@ An unknown referenced field throws `ValidationError` (`TURBINE_E003`), and `mode
 const byWeight = await db.blocks.findMany({
   orderBy: { data: { path: ['weight'], direction: 'asc', type: 'numeric' } },
 });
-// → ORDER BY ("data" #>> $1::text[])::numeric ASC
+// → ORDER BY ("data" #>> $1::text[])::numeric ASC NULLS LAST
 ```
 
-Works top-level and inside a `with` relation's `orderBy`.
+Works top-level and inside a `with` relation's `orderBy`. Rows whose document lacks the path sort **last in both directions** by default, so ordering behaves the same across every engine; pass `nulls: 'first' | 'last'` to override (PostgreSQL/SQLite).
 
 ### Ordering by a value from one related row
 
