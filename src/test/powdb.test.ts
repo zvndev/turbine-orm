@@ -25,6 +25,7 @@ import {
   coerceValue,
   encodePowqlLiteral,
   isJsonColumn,
+  isStaleFramePowdbError,
   materializePowql,
   PowdbEmbeddedPool,
   PowdbFloatParam,
@@ -1846,5 +1847,235 @@ describe('powdb: injected client pool runs the version probe (B1 fix)', () => {
   it('accepts an injected pool on a supported server and derives its capabilities', async () => {
     const db = await turbinePowDB(injectedClientPool('0.13.0'), schema, { warnOnUnlimited: false });
     await db.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3: native typed wire (queryNativeRaw) materialization + feature-detect
+// ---------------------------------------------------------------------------
+
+/**
+ * A fake `@zvndev/powdb-client` pool whose ONE client optionally exposes
+ * `queryNativeRaw`. `nativeRows` are returned as a native (WireValue) rows
+ * result; every non-native call falls back to a legacy string result. `calls`
+ * records which surface (`native` / `legacy`) served each statement.
+ */
+function fakeNativeClientPool(opts: {
+  nativeRows?: { columns: string[]; rows: unknown[][] };
+  legacyRows?: { columns: string[]; rows: string[][] };
+  withNative?: boolean;
+}) {
+  const calls: { surface: 'native' | 'legacy'; powql: string }[] = [];
+  const legacy = opts.legacyRows ?? { columns: [], rows: [] };
+  const client: Record<string, unknown> = {
+    serverVersion: '0.13.0',
+    query: async (powql: string) => {
+      calls.push({ surface: 'legacy', powql });
+      return { kind: 'rows', columns: legacy.columns, rows: legacy.rows };
+    },
+    close: async () => {},
+  };
+  if (opts.withNative !== false) {
+    client.queryNativeRaw = async (powql: string) => {
+      calls.push({ surface: 'native', powql });
+      const nr = opts.nativeRows ?? { columns: [], rows: [] };
+      return { kind: 'rows', columns: nr.columns, rows: nr.rows };
+    };
+  }
+  const pool = {
+    acquire: async () => client,
+    release() {},
+    destroy() {},
+    withClient: async (fn: (c: typeof client) => Promise<unknown>) => fn(client),
+    close: async () => {},
+  } as unknown as ConstructorParameters<typeof PowdbPool>[0];
+  return { pool, calls };
+}
+
+const nativeCaps = { ...ALL_POWDB_CAPABILITIES, engineVersion: '0.13.0', nativeRaw: true };
+
+describe('powdb: F3 native wire materialization', () => {
+  it('decodes every WireValue cell type into JS via queryNativeRaw', async () => {
+    const uuidBytes = new Uint8Array([
+      0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    ]);
+    const { pool, calls } = fakeNativeClientPool({
+      nativeRows: {
+        columns: ['e', 'i', 'f', 'b', 's', 'snull', 'dt', 'uid', 'jdoc', 'jnull'],
+        rows: [
+          [
+            { type: 'empty' },
+            { type: 'int', value: 42n },
+            { type: 'float', value: 9.5 },
+            { type: 'bool', value: true },
+            { type: 'str', value: 'hi' },
+            { type: 'str', value: 'null' }, // a genuine str "null" stays a string on native
+            { type: 'datetime', value: 1_577_836_800_000_000n },
+            { type: 'uuid', value: uuidBytes },
+            { type: 'json', value: { a: [1, null], b: 'x' }, pj1: new Uint8Array() },
+            { type: 'json', value: null }, // a JSON-null document (distinct from empty)
+          ],
+        ],
+      },
+    });
+    const p = new PowdbPool(pool, undefined, { capabilities: nativeCaps });
+    const res = await p.query('app_user filter .id = $1 { .id }', ['x']);
+    assert.equal(calls[0]!.surface, 'native', 'nativeRaw capability routes through queryNativeRaw');
+    const row = res.rows[0] as Record<string, unknown>;
+    assert.equal(row.e, null); // empty -> null
+    assert.equal(row.i, 42n); // int stays bigint (row layer applies the int8 policy)
+    assert.equal(row.f, 9.5);
+    assert.equal(row.b, true);
+    assert.equal(row.s, 'hi');
+    assert.equal(row.snull, 'null'); // NOT collapsed to null on the native wire
+    assert.equal(row.dt, 1_577_836_800_000_000n); // datetime stays bigint micros
+    assert.equal(row.uid, '01234567-89ab-cdef-0123-456789abcdef');
+    assert.deepEqual(row.jdoc, { a: [1, null], b: 'x' }); // no re-parse
+    assert.equal(row.jnull, null); // JSON-null document decodes to null
+  });
+
+  it('falls back to the legacy wire when the client lacks queryNativeRaw (feature-detect)', async () => {
+    const { pool, calls } = fakeNativeClientPool({
+      withNative: false,
+      legacyRows: { columns: ['id'], rows: [['u1']] },
+    });
+    const p = new PowdbPool(pool, undefined, { capabilities: nativeCaps });
+    const res = await p.query('app_user { .id }', []);
+    assert.equal(calls[0]!.surface, 'legacy', 'a client with no queryNativeRaw uses the legacy query path');
+    assert.deepEqual(res.rows, [{ id: 'u1' }]);
+  });
+
+  it('uses the legacy wire when the server capability nativeRaw is off (even if the method exists)', async () => {
+    const { pool, calls } = fakeNativeClientPool({
+      legacyRows: { columns: ['id'], rows: [['u1']] },
+      nativeRows: { columns: ['id'], rows: [[{ type: 'str', value: 'NOPE' }]] },
+    });
+    // capabilities.nativeRaw defaults false (ALL_POWDB_CAPABILITIES).
+    const p = new PowdbPool(pool);
+    const res = await p.query('app_user { .id }', []);
+    assert.equal(calls[0]!.surface, 'legacy');
+    assert.deepEqual(res.rows, [{ id: 'u1' }]);
+  });
+});
+
+describe('powdb: F3 rowToEntity native branch', () => {
+  const meta = table('app_user', [
+    col('id', 'id', 'string', 'text'),
+    col('name', 'name', 'string', 'text', { nullable: true }),
+    col('age', 'age', 'number', 'int4', { nullable: true }),
+    col('big', 'big', 'number', 'int8', { nullable: true }), // number-typed int8 → safe-int policy
+    col('bigc', 'bigc', 'bigint', 'int8', { nullable: true }), // bigint-typed → passthrough
+    col('created_at', 'createdAt', 'Date', 'timestamptz', { nullable: true }),
+    col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+  ]);
+
+  it('coerces pre-typed native cells and never collapses a genuine str "null"', () => {
+    const entity = rowToEntity(
+      {
+        id: 'u1',
+        name: 'null', // native str "null", stays the string, NOT null
+        age: 30n, // int -> safe number
+        big: 9_007_199_254_740_993n, // number column, beyond safe int -> string (int8 policy)
+        bigc: 9_007_199_254_740_993n, // bigint column -> bigint passthrough
+        created_at: 1_577_836_800_000_000n, // datetime micros -> Date
+        data: { a: 1 }, // NativeJson doc passthrough
+      },
+      meta,
+      true,
+    );
+    assert.equal(entity.name, 'null');
+    assert.equal(entity.age, 30);
+    assert.equal(entity.big, '9007199254740993');
+    assert.equal(entity.bigc, 9_007_199_254_740_993n);
+    assert.ok(entity.createdAt instanceof Date);
+    assert.equal((entity.createdAt as Date).toISOString(), '2020-01-01T00:00:00.000Z');
+    assert.deepEqual(entity.data, { a: 1 });
+  });
+
+  it('an empty-decoded null stays null; the legacy branch is unchanged (default arg)', () => {
+    const nativeNull = rowToEntity({ name: null }, meta, true);
+    assert.equal(nativeNull.name, null);
+    // Legacy default: a string "null" on a nullable str still collapses (documented wart).
+    const legacy = rowToEntity({ name: 'null' }, meta);
+    assert.equal(legacy.name, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F5: typed connection errors + stale-frame classification
+// ---------------------------------------------------------------------------
+
+describe('powdb: F5 wrapPowdbError connection-class reclassification', () => {
+  it('maps the stale "received unexpected frame from server" to ConnectionError (was E003), cause preserved', () => {
+    const raw = Object.assign(new Error('received unexpected frame from server'), { code: 'protocol_error' });
+    const wrapped = wrapPowdbError(raw);
+    assert.ok(wrapped instanceof ConnectionError, 'stale frame is a connection defect, not a query defect');
+    assert.match(wrapped.message, /connection is in an invalid state/);
+    assert.equal((wrapped as { cause?: unknown }).cause, raw);
+  });
+
+  it('maps a bare protocol_error code (any message) to ConnectionError with cause', () => {
+    const raw = { code: 'protocol_error', message: 'truncated payload' };
+    const wrapped = wrapPowdbError(raw);
+    assert.ok(wrapped instanceof ConnectionError);
+    assert.equal((wrapped as { cause?: unknown }).cause, raw);
+  });
+
+  it('classifies unknown-message / bad-framing shapes by message even without protocol_error code', () => {
+    assert.ok(wrapPowdbError({ message: 'unknown message type 99' }) instanceof ConnectionError);
+    assert.ok(wrapPowdbError({ message: 'bad framing on the wire' }) instanceof ConnectionError);
+  });
+
+  it('does NOT reclassify a Parse "unexpected token" (stays a query ValidationError E003)', () => {
+    const wrapped = wrapPowdbError({
+      code: 'query_failed',
+      message: `Parse("unexpected token in expression: '='")`,
+    });
+    assert.ok(wrapped instanceof ValidationError, 'a parse error is still a query defect');
+  });
+
+  it('maps auth_failed to ConnectionError with a remediation hint and cause', () => {
+    const raw = { code: 'auth_failed', message: 'invalid password' };
+    const wrapped = wrapPowdbError(raw);
+    assert.ok(wrapped instanceof ConnectionError);
+    assert.match(wrapped.message, /authentication failed/);
+    assert.match(wrapped.message, /user \/ password \/ dbName/);
+    assert.equal((wrapped as { cause?: unknown }).cause, raw);
+  });
+
+  it('connect_failed / timeout keep their classes and now carry the cause', () => {
+    const cf = { code: 'connect_failed', message: 'ECONNREFUSED' };
+    const wrappedCf = wrapPowdbError(cf);
+    assert.ok(wrappedCf instanceof ConnectionError);
+    assert.equal((wrappedCf as { cause?: unknown }).cause, cf);
+
+    const to = { code: 'timeout', message: 'query timed out' };
+    const wrappedTo = wrapPowdbError(to);
+    assert.ok(wrappedTo instanceof TimeoutError);
+    assert.equal((wrappedTo as { cause?: unknown }).cause, to);
+  });
+
+  it('size_exceeded stays a ValidationError (E003)', () => {
+    assert.ok(wrapPowdbError({ code: 'size_exceeded', message: 'frame too big' }) instanceof ValidationError);
+  });
+});
+
+describe('powdb: F5 isStaleFramePowdbError predicate + retryStaleReads plumbing', () => {
+  it('recognizes exactly the stale-frame ConnectionError (for the read-retry seam)', () => {
+    const stale = wrapPowdbError(
+      Object.assign(new Error('received unexpected frame from server'), { code: 'protocol_error' }),
+    );
+    assert.equal(isStaleFramePowdbError(stale), true);
+    // A protocol_error whose message lacks the phrase still qualifies via the cause code.
+    assert.equal(isStaleFramePowdbError(wrapPowdbError({ code: 'protocol_error', message: 'bad framing' })), true);
+    // Non-stale errors do not.
+    assert.equal(isStaleFramePowdbError(wrapPowdbError({ code: 'query_failed', message: 'boom' })), false);
+    assert.equal(isStaleFramePowdbError(wrapPowdbError({ code: 'connect_failed', message: 'x' })), false);
+    assert.equal(isStaleFramePowdbError(new Error('plain')), false);
+  });
+
+  it('retryStaleReads plumbs onto the pool for the interface to read (default false)', () => {
+    assert.equal(new PowdbPool({} as never).retryStaleReads, false);
+    assert.equal(new PowdbPool({} as never, undefined, { retryStaleReads: true }).retryStaleReads, true);
   });
 });

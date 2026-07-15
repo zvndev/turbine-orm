@@ -35,7 +35,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from '../errors.js';
-import { powqlSchemaDDL, turbinePowDB } from '../powdb.js';
+import { PowdbJsonParam, powqlSchemaDDL, turbinePowDB } from '../powdb.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
 
@@ -818,6 +818,113 @@ describe('powdb integration: Phase B', () => {
       assert.equal(upd.points, 99);
       const rows = await db.table('pscore').findMany({ where: { memberId: 1, tagId: 2 } });
       assert.equal(rows.length, 1);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 / B1: native `json` document round-trip on the EMBEDDED transport
+//
+// The embedded addon exposes only the legacy string wire (its rows are
+// `string[][]`), so the acceptance here is: json document CONTENTS are lossless
+// (distinct canonical JSON texts parse back to distinct objects), while the
+// documented CELL-level residuals (a top-level JSON-null document vs an absent
+// value both render `null`; a nullable str "null" collapses) are asserted
+// explicitly so a future native embedded surface flips them loudly.
+//
+// Writes go through raw PowQL carrying a PowdbJsonParam (the embedded pool
+// materializes it via encodePowqlLiteral); the read path exercises the real
+// findMany -> coerceValue json parsing. The create()/findMany json write path
+// (param() constructing PowdbJsonParam for a json column) lands with F1.
+// ---------------------------------------------------------------------------
+
+const docSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    doc: makeTable(
+      'doc',
+      [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+        col('s', 's', 'string', 'text', { nullable: true }),
+      ],
+      {},
+    ),
+  },
+};
+
+async function withDocDb(fn: (db: DB) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'powdb-json-it-'));
+  const db: DB = await turbinePowDB({ embedded: dir }, docSchema, { warnOnUnlimited: false });
+  try {
+    await db.raw([`drop doc`]).catch(() => {});
+    for (const stmt of powqlSchemaDDL(docSchema)) await db.raw([stmt]);
+    await fn(db);
+  } finally {
+    await db.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Insert one doc row via raw PowQL, encoding `data` as a json document. */
+async function insertDoc(db: DB, id: string, data: PowdbJsonParam | null, s?: string | null): Promise<void> {
+  if (s === undefined) {
+    await db.raw(['insert doc { id := ', ', data := ', ' } returning'], id, data);
+  } else {
+    await db.raw(['insert doc { id := ', ', data := ', ', s := ', ' } returning'], id, data, s);
+  }
+}
+
+describe('powdb integration (embedded): json document round-trip', () => {
+  it('ACCEPTANCE: {a:null} vs {} vs {a:"null"} read back as three DISTINCT documents', async () => {
+    await withDocDb(async (db) => {
+      await insertDoc(db, 'd1', new PowdbJsonParam({ a: null }));
+      await insertDoc(db, 'd2', new PowdbJsonParam({}));
+      await insertDoc(db, 'd3', new PowdbJsonParam({ a: 'null' }));
+      const rows = await db.table('doc').findMany({ orderBy: { id: 'asc' } });
+      assert.deepEqual(
+        rows.map((r: { data: unknown }) => r.data),
+        [{ a: null }, {}, { a: 'null' }],
+        'json contents are lossless and mutually distinct on the embedded transport',
+      );
+    });
+  });
+
+  it('round-trips nested documents, arrays, and int/float/bool distinctions', async () => {
+    await withDocDb(async (db) => {
+      const doc = { n: 7, f: 2.5, b: true, arr: [1, 2, { deep: 'x' }], nested: { k: null } };
+      await insertDoc(db, 'x1', new PowdbJsonParam(doc));
+      const [row] = await db.table('doc').findMany({ where: { id: 'x1' } });
+      assert.deepEqual(row.data, doc);
+    });
+  });
+
+  it('DOCUMENTED RESIDUAL: an absent json column and a JSON-null document both read null on embedded', async () => {
+    await withDocDb(async (db) => {
+      // Absent value (data := null).
+      await insertDoc(db, 'absent', null);
+      // A top-level JSON-null document.
+      await insertDoc(db, 'jsonnull', new PowdbJsonParam(null));
+      const rows = await db.table('doc').findMany({ orderBy: { id: 'asc' } });
+      const byId = Object.fromEntries(rows.map((r: { id: string; data: unknown }) => [r.id, r.data]));
+      // Both collapse to null on the legacy string wire (fixed only on the
+      // native networked transport). If a future embedded native surface lands,
+      // THIS assertion flips loudly and forces the mapping to be revisited.
+      assert.equal(byId.absent, null);
+      assert.equal(byId.jsonnull, null);
+    });
+  });
+
+  it('DOCUMENTED WART: a nullable str holding "null" reads null on the embedded legacy wire', async () => {
+    await withDocDb(async (db) => {
+      await insertDoc(db, 's1', new PowdbJsonParam({}), 'null'); // s = the string "null"
+      await insertDoc(db, 's2', new PowdbJsonParam({}), null); // s = SQL null
+      const rows = await db.table('doc').findMany({ orderBy: { id: 'asc' } });
+      const byId = Object.fromEntries(rows.map((r: { id: string; s: unknown }) => [r.id, r.s]));
+      // Legacy-wire wart: indistinguishable on embedded (both null). The native
+      // networked transport keeps "null" a string (covered by the pool unit test).
+      assert.equal(byId.s1, null);
+      assert.equal(byId.s2, null);
     });
   });
 });

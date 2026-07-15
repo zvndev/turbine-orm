@@ -167,16 +167,51 @@ export class PowdbJsonParam {
   constructor(readonly value: unknown) {}
 }
 
-/** The four shapes a PowQL result takes over the wire. */
+/** The four shapes a PowQL result takes over the legacy string wire. */
 type PowdbResult =
   | { kind: 'rows'; columns: string[]; rows: string[][] }
   | { kind: 'scalar'; value: string }
   | { kind: 'ok'; affected: bigint }
   | { kind: 'message'; message: string };
 
+/**
+ * Local structural mirror of `@zvndev/powdb-client`'s `WireValue` (the lossless
+ * typed cell of the native wire surface). Defined here rather than imported so
+ * the optional peer's types never leak into Turbine's published `.d.ts` (a
+ * consumer without the peer installed must still `tsc` cleanly, same rule as
+ * every other optional-peer type in this module). `empty` = an unset value
+ * (distinct, for a json column, from a JSON-null document, which is
+ * `{ type: 'json', value: null }`).
+ */
+type PowdbWireValue =
+  | { type: 'empty' }
+  | { type: 'int'; value: bigint }
+  | { type: 'float'; value: number }
+  | { type: 'bool'; value: boolean }
+  | { type: 'str'; value: string }
+  | { type: 'datetime'; value: bigint }
+  | { type: 'uuid'; value: Uint8Array }
+  | { type: 'bytes'; value: Uint8Array }
+  | { type: 'json'; value: unknown; pj1?: Uint8Array };
+
+/** The native (lossless typed) result shape, mirroring `RawNativeQueryResult`. */
+type PowdbRawNativeResult =
+  | { kind: 'rows'; columns: string[]; rows: PowdbWireValue[][] }
+  | { kind: 'scalar'; value: PowdbWireValue }
+  | { kind: 'ok'; affected: bigint }
+  | { kind: 'message'; message: string };
+
 interface PowdbClient {
   readonly serverVersion: string;
   query(query: string, params?: PowdbParam[], opts?: { signal?: AbortSignal }): Promise<PowdbResult>;
+  /**
+   * Lossless typed wire surface (client ≥ 0.13, server ≥ 0.13). Optional: an
+   * older client omits it, so every call site feature-detects
+   * `typeof c.queryNativeRaw === 'function'` before using it and falls back to
+   * {@link query}. It NEVER retries as a legacy query, replaying an ambiguous
+   * mutation is unsafe, so its use is additionally version-gated server-side.
+   */
+  queryNativeRaw?(query: string, params?: PowdbParam[], opts?: { signal?: AbortSignal }): Promise<PowdbRawNativeResult>;
   close(): Promise<void>;
 }
 
@@ -678,19 +713,61 @@ export function coerceValue(raw: string, col: ColumnMetadata): unknown {
 }
 
 /**
- * Map one raw PowDB row (snake-cased columns → raw wire strings, as produced by
- * {@link PowdbPool}) into a typed entity (camelCase fields, coerced values).
- * Only the columns present in `raw` are emitted, so partial `select` projections
- * round-trip unchanged.
+ * Coerce a single cell that arrived over the NATIVE typed wire (decoded from a
+ * {@link PowdbWireValue}, so already a JS `bigint`/`number`/`boolean`/`string`/
+ * `NativeJson`/`Uint8Array`/`null`, never a bare `"null"` string). Unlike
+ * {@link coerceValue} this NEVER collapses the string `"null"` to `null`: an
+ * absent value already decoded to `null` (from the `empty` cell), so a genuine
+ * str `"null"` stays the string `"null"` (fixes the legacy-wire wart on the
+ * native transport). `datetime`-shaped cells (int micros) become `Date`; a
+ * bigint on a `number` column follows the int8 safe-integer policy.
  */
-export function rowToEntity(raw: Record<string, unknown>, meta: TableMetadata): Record<string, unknown> {
+function coerceNativeValue(value: unknown, col: ColumnMetadata): unknown {
+  if (value === undefined || value === null) return null;
+  if (isDateColumn(col)) {
+    if (typeof value === 'bigint') return new Date(Number(value) / 1000);
+    if (typeof value === 'number') return new Date(value / 1000);
+    return value;
+  }
+  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
+  if (typeof value === 'bigint') {
+    if (ts === 'bigint') return value;
+    if (ts === 'number') {
+      const n = Number(value);
+      return Number.isSafeInteger(n) ? n : value.toString(); // int8 policy: keep big ints as strings
+    }
+    return value;
+  }
+  return value; // number / boolean / string / NativeJson document / Uint8Array
+}
+
+/**
+ * Map one raw PowDB row into a typed entity (camelCase fields, coerced values).
+ * Only the columns present in `raw` are emitted, so partial `select`
+ * projections round-trip unchanged. `native` selects the coercion policy: the
+ * default `false` handles the legacy string wire (every cell is a string, via
+ * {@link coerceValue}); `true` handles the native typed wire, where non-string
+ * cells arrive pre-typed and go through {@link coerceNativeValue} (see F3).
+ * Callers on the native transport pass `this.pool.capabilities.nativeRaw`.
+ */
+export function rowToEntity(
+  raw: Record<string, unknown>,
+  meta: TableMetadata,
+  native = false,
+): Record<string, unknown> {
   const byName = new Map(meta.columns.map((c) => [c.name, c]));
   const out: Record<string, unknown> = {};
   for (const snake of Object.keys(raw)) {
     const col = byName.get(snake);
     const field = meta.reverseColumnMap[snake] ?? snake;
     const value = raw[snake];
-    out[field] = col && typeof value === 'string' ? coerceValue(value, col) : value;
+    if (!col) {
+      out[field] = value;
+    } else if (native) {
+      out[field] = coerceNativeValue(value, col);
+    } else {
+      out[field] = typeof value === 'string' ? coerceValue(value, col) : value;
+    }
   }
   return out;
 }
@@ -731,18 +808,33 @@ export function wrapPowdbError(err: unknown): Error {
   // Driver pool lifecycle errors (acquire after close, acquire timeout) carry
   // no .code — classify by message so both transports surface E004.
   if (/pool closed|pool acquire timeout/i.test(msg)) {
-    return new ConnectionError(`[turbine] PowDB connection unavailable: ${msg}`);
+    return new ConnectionError(`[turbine] PowDB connection unavailable: ${msg}`, { cause: err });
   }
   // Server-side transaction-gate wait bound (PowDB ≥ 0.10, default 5s): another
   // connection held the single global write lock past the server's
   // --tx-wait-timeout-ms. Retryable timeout, not a query defect.
   if (/transaction gate timeout/i.test(msg)) {
-    return new TimeoutError(0, 'PowDB transaction gate');
+    return new TimeoutError(0, 'PowDB transaction gate', { cause: err });
   }
-  // Type mismatch / parse / execution / storage / unexpected → validation
-  // (E003). On the embedded transport these are the only signal we get
-  // (code is always 'GenericFailure'); on the networked path they are a
-  // safety net before the .code switch.
+  // Stale / violated WIRE state → ConnectionError (E004), NOT a query defect.
+  // A `protocol_error`-class failure means the socket's framing state is gone
+  // (the client cannot safely reuse it and the pool must destroy it). The
+  // canonical trigger is the "received unexpected frame from server" that a
+  // fresh request hits after a multi-minute idle gap; sibling shapes are an
+  // unknown message type, a truncated payload, or bad framing. Runs BEFORE the
+  // validation regex below, whose `unexpected` token would otherwise misclass
+  // "received unexpected frame" as an E003 query defect. `.cause` preserved so
+  // callers (and the opt-in stale-read retry) can inspect the driver code.
+  if (
+    e.code === 'protocol_error' ||
+    /received unexpected frame|unknown message type|truncated payload|bad framing/i.test(msg)
+  ) {
+    return new ConnectionError(`[turbine] PowDB connection is in an invalid state: ${msg}`, { cause: err });
+  }
+  // Type mismatch / parse / execution / storage / unexpected(token) / row too
+  // large → validation (E003). On the embedded transport these are the only
+  // signal we get (code is always 'GenericFailure'); on the networked path they
+  // are a safety net before the .code switch.
   if (/type mismatch|\bParse\b|\bExecution\b|StorageError|unexpected|row too large/i.test(msg)) {
     return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
   }
@@ -750,18 +842,41 @@ export function wrapPowdbError(err: unknown): Error {
   switch (e.code) {
     case 'connect_failed':
     case 'closed':
-      return new ConnectionError(`[turbine] PowDB connection failed: ${msg}`);
+      return new ConnectionError(`[turbine] PowDB connection failed: ${msg}`, { cause: err });
+    case 'auth_failed':
+      // Connection-establishment class, non-retryable: the handshake was
+      // rejected. Surface E004 with a concrete remediation hint instead of
+      // letting it fall through to the raw error.
+      return new ConnectionError(
+        `[turbine] PowDB authentication failed: ${msg} (check the user / password / dbName for this connection).`,
+        { cause: err },
+      );
     case 'timeout':
     case 'aborted':
-      return new TimeoutError(0, 'PowDB query');
+      return new TimeoutError(0, 'PowDB query', { cause: err });
     case 'query_failed':
     case 'type_coercion_failed':
-    case 'protocol_error':
     case 'size_exceeded':
       return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
     default:
-      return err instanceof Error ? err : new ConnectionError(`[turbine] PowDB error: ${msg}`);
+      return err instanceof Error ? err : new ConnectionError(`[turbine] PowDB error: ${msg}`, { cause: err });
   }
+}
+
+/**
+ * True when `err` is the stale-wire-frame {@link ConnectionError} produced by
+ * {@link wrapPowdbError} (its `.cause` is a `protocol_error` PowDBError, or the
+ * message carries the invalid-state signature). The opt-in read retry
+ * (`retryStaleReads`, evaluated in {@link PowqlInterface}'s exec seam) uses this
+ * to decide whether a first-statement READ may be replayed once on a fresh
+ * connection; writes are NEVER retried (an ambiguous mutation reply is unsafe
+ * to replay, matching the client's own native-path policy).
+ */
+export function isStaleFramePowdbError(err: unknown): boolean {
+  if (!(err instanceof ConnectionError)) return false;
+  const cause = (err as { cause?: { code?: string } }).cause;
+  if (cause && typeof cause === 'object' && cause.code === 'protocol_error') return true;
+  return /PowDB connection is in an invalid state/.test(err.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,6 +1127,14 @@ export interface PowdbPoolOptions {
    * directly-constructed pool: a "trusted caller".
    */
   capabilities?: PowdbCapabilities;
+  /**
+   * Opt in to replaying a first-statement READ once, on a fresh connection,
+   * when it fails with the stale-wire-frame {@link ConnectionError} (see
+   * {@link isStaleFramePowdbError}). Networked only; writes and mid-transaction
+   * statements are NEVER retried. Read by {@link PowqlInterface}'s exec seam.
+   * Default `false` (typed-error-only).
+   */
+  retryStaleReads?: boolean;
 }
 
 /** Adapt a PowDB result into the pg-compat `{ rows, rowCount, fields }` shape. */
@@ -1031,6 +1154,64 @@ function adaptResult(r: PowdbResult): PgCompatQueryResult {
       return { rows: [], rowCount: Number(r.affected), fields: [] };
     case 'scalar':
       return { rows: [{ value: r.value }], rowCount: 1, fields: [{ name: 'value', dataTypeID: 0 }] };
+    default:
+      return { rows: [], rowCount: 0, fields: [] };
+  }
+}
+
+/** Format 16 raw UUID bytes as a canonical `8-4-4-4-12` hex string. */
+function uuidBytesToHex(bytes: Uint8Array): string {
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  if (hex.length !== 32) return hex; // defensive: non-16B payloads pass through as raw hex
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * Decode one native {@link PowdbWireValue} cell into a JS value. `empty` →
+ * `null` (an unset value; for a json column this cleanly distinguishes absent
+ * from a JSON-null document, which arrives as `{ type: 'json', value: null }`).
+ * `int`/`datetime` stay `bigint` so the row layer ({@link coerceNativeValue})
+ * applies the int8 policy / Date conversion by column; `uuid` becomes canonical
+ * hex; `bytes` stay `Uint8Array`; `json` passes the decoded document through
+ * with no re-parse (its `pj1` raw bytes are dropped).
+ */
+function decodeWireValue(cell: PowdbWireValue): unknown {
+  switch (cell.type) {
+    case 'empty':
+      return null;
+    case 'int':
+    case 'datetime':
+      return cell.value; // bigint; row layer decides Date vs number vs bigint per column
+    case 'float':
+    case 'bool':
+    case 'str':
+      return cell.value;
+    case 'uuid':
+      return uuidBytesToHex(cell.value);
+    case 'bytes':
+      return cell.value; // Uint8Array
+    case 'json':
+      return cell.value; // NativeJson document, already recursive data
+  }
+}
+
+/** Adapt a native (typed-wire) PowDB result into the pg-compat shape, decoding every {@link PowdbWireValue} cell. */
+function adaptNativeResult(r: PowdbRawNativeResult): PgCompatQueryResult {
+  switch (r.kind) {
+    case 'rows': {
+      const rows = r.rows.map((row) => {
+        const o: Record<string, unknown> = {};
+        r.columns.forEach((c, i) => {
+          o[c] = decodeWireValue(row[i] ?? { type: 'empty' });
+        });
+        return o;
+      });
+      return { rows, rowCount: rows.length, fields: r.columns.map((name) => ({ name, dataTypeID: 0 })) };
+    }
+    case 'ok':
+      return { rows: [], rowCount: Number(r.affected), fields: [] };
+    case 'scalar':
+      return { rows: [{ value: decodeWireValue(r.value) }], rowCount: 1, fields: [{ name: 'value', dataTypeID: 0 }] };
     default:
       return { rows: [], rowCount: 0, fields: [] };
   }
@@ -1062,8 +1243,10 @@ export class PowdbPool implements PgCompatPool {
    * live socket holding the process open until the server's idle timeout.
    */
   private readonly checkedOut = new Set<PowdbClient>();
-  /** Feature capabilities of the bound server (probed version). */
+  /** Feature capabilities of the bound server (probed version + native-wire feature-detect). */
   readonly capabilities: PowdbCapabilities;
+  /** Opt-in first-statement-read replay on a stale wire frame (read by {@link PowqlInterface}). */
+  readonly retryStaleReads: boolean;
 
   constructor(
     readonly pool: PowdbClientPool,
@@ -1072,6 +1255,21 @@ export class PowdbPool implements PgCompatPool {
   ) {
     this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
     this.capabilities = options.capabilities ?? ALL_POWDB_CAPABILITIES;
+    this.retryStaleReads = options.retryStaleReads ?? false;
+  }
+
+  /**
+   * Run one statement on `c`, choosing the lossless native typed wire when the
+   * server supports it (`capabilities.nativeRaw`) AND this client exposes
+   * `queryNativeRaw` (a defensive per-call feature-detect, so a heterogeneous
+   * injected pool cannot crash). Otherwise the legacy string wire, unchanged.
+   */
+  private async runOnClient(c: PowdbClient, powql: string, params: unknown[]): Promise<PgCompatQueryResult> {
+    const bound = params.map(this.toParam);
+    if (this.capabilities.nativeRaw && typeof c.queryNativeRaw === 'function') {
+      return adaptNativeResult(await c.queryNativeRaw(powql, bound));
+    }
+    return adaptResult(await c.query(powql, bound));
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
@@ -1093,8 +1291,7 @@ export class PowdbPool implements PgCompatPool {
       return { rows: [], rowCount: 0, fields: [] };
     }
     try {
-      const result = await this.pool.withClient((c) => c.query(powql, params.map(this.toParam)));
-      return adaptResult(result);
+      return await this.pool.withClient((c) => this.runOnClient(c, powql, params));
     } catch (err) {
       if (ctl === 'begin') {
         this.poolHold?.finish();
@@ -1164,7 +1361,7 @@ export class PowdbPool implements PgCompatPool {
           return { rows: [], rowCount: 0, fields: [] };
         }
         try {
-          return adaptResult(await client.query(powql, params.map(this.toParam)));
+          return await this.runOnClient(client, powql, params);
         } catch (err) {
           broken = true;
           if (ctl === 'begin') {
@@ -1396,6 +1593,8 @@ export class PowdbEmbeddedPool implements PgCompatPool {
    * no native typed-wire surface (its rows are `string[][]`, the legacy wire).
    */
   readonly capabilities: PowdbCapabilities;
+  /** Carried for surface uniformity with {@link PowdbPool}; inert on embedded (no protocol_error frames). */
+  readonly retryStaleReads: boolean;
 
   constructor(
     private readonly db: EmbeddedDatabase,
@@ -1403,6 +1602,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
   ) {
     this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
     this.capabilities = options.capabilities ?? ALL_POWDB_CAPABILITIES;
+    this.retryStaleReads = options.retryStaleReads ?? false;
   }
 
   /** Materialize `$N` params and hand the PowQL to the in-process engine. */
@@ -1541,6 +1741,15 @@ export interface TurbinePowdbOptions extends Pick<TurbineConfig, 'logging' | 'de
    * E017 — queueing that shape would deadlock.
    */
   transactionQueueTimeoutMs?: number;
+  /**
+   * Opt in to replaying a first-statement READ once (on a fresh connection)
+   * when it fails with the stale-wire-frame {@link ConnectionError} that a
+   * request can hit after a long idle gap. Networked only; WRITES and any
+   * statement inside a transaction are NEVER retried (an ambiguous mutation
+   * reply is unsafe to replay). Default `false`: the error is surfaced typed
+   * so the caller can decide. See the retry recipe in the docs.
+   */
+  retryStaleReads?: boolean;
   /**
    * Override the detected engine version used for capability gating. For exotic
    * deployments and injected pools whose version cannot be probed (a non-semver
@@ -1716,6 +1925,7 @@ export async function turbinePowDB(
   let owns = false;
   const poolOptions: PowdbPoolOptions = {
     transactionQueueTimeoutMs: options.transactionQueueTimeoutMs,
+    retryStaleReads: options.retryStaleReads,
   };
   const max = options.connectionLimit ?? 10;
 
