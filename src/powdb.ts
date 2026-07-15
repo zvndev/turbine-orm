@@ -838,7 +838,7 @@ export function wrapPowdbError(err: unknown): Error {
   const msg = e.message ?? 'unknown PowDB error';
 
   // Unique-constraint — message-based on both transports.
-  if (/unique constraint violation/i.test(msg)) {
+  if (/unique (constraint|expression index) violation/i.test(msg)) {
     const m = /on\s+\S+\.(\w+)/i.exec(msg);
     return new UniqueConstraintError({ constraint: m?.[1], cause: err as Error });
   }

@@ -994,12 +994,12 @@ describe('powdb integration (embedded): doc-field expression index DDL', () => {
       assert.deepEqual(miss, []);
 
       // The unique doc-field index is enforced by the engine: a duplicate `ext`
-      // value is rejected. (The engine reports "unique expression index
-      // violation", which differs from the regular "unique constraint
-      // violation" message, so wrapPowdbError does not yet classify it as E008
-      // (noted for the powdb.ts owner); here we assert the write is refused.)
-      await assert.rejects(() =>
-        db.raw(['insert doc { id := ', ', data := ', ' } returning'], 'c', new PowdbJsonParam({ ext: 'x1' })),
+      // value is rejected, and the engine's "unique expression index violation"
+      // message maps to UniqueConstraintError (E008) like the regular
+      // "unique constraint violation" wording.
+      await assert.rejects(
+        () => db.raw(['insert doc { id := ', ', data := ', ' } returning'], 'c', new PowdbJsonParam({ ext: 'x1' })),
+        (err: Error & { code?: string }) => err.code === 'TURBINE_E008',
       );
 
       // The drop path works (design mentions `alter … drop index`).
