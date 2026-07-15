@@ -54,6 +54,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createRequire } from 'node:module';
 import {
   type PgCompatPool,
   type PgCompatPoolClient,
@@ -152,6 +153,20 @@ export class PowdbFloatParam {
   constructor(readonly value: number) {}
 }
 
+/**
+ * Marker wrapper for a JS object/array bound to a `json` document column. Both
+ * transports serialize `value` with `JSON.stringify` and send the text as a
+ * `str` param / string literal, exactly how the PowDB docs insert a json
+ * document (the engine validates it as JSON text and stores the canonical
+ * binary form). Constructed in {@link PowqlInterface.param} when the target
+ * column is `json` and the value is a non-null object/array; a JS string
+ * written to a json column passes through RAW (same contract as pg jsonb,
+ * pass `'"x"'` to store the JSON string `"x"`), and `null` stays `null`.
+ */
+export class PowdbJsonParam {
+  constructor(readonly value: unknown) {}
+}
+
 /** The four shapes a PowQL result takes over the wire. */
 type PowdbResult =
   | { kind: 'rows'; columns: string[]; rows: string[][] }
@@ -242,11 +257,146 @@ export function assertSupportedPowdbVersion(version: string | undefined): void {
 }
 
 // ---------------------------------------------------------------------------
+// Capability gating: per-version / per-transport feature flags
+// ---------------------------------------------------------------------------
+
+/**
+ * Feature capabilities of a bound PowDB connection. Resolved once (from the
+ * probed server version on the networked transport, or the addon package
+ * version on embedded) and carried on the pool so {@link PowqlInterface} can
+ * gate PowQL features that only exist on newer engines, an old engine gets a
+ * typed {@link UnsupportedFeatureError} (E017) with a version hint instead of a
+ * raw PowQL parse error.
+ */
+export interface PowdbCapabilities {
+  /** Best-known engine version (e.g. `'0.13.0'`), or `null` when unknowable. */
+  engineVersion: string | null;
+  /** ≥ 0.12: `json` column type, `->` path filters / ordering / grouping. */
+  jsonDocs: boolean;
+  /** ≥ 0.13: `alter T add index (.col->seg)` expression indexes. */
+  docFieldIndexes: boolean;
+  /** ≥ 0.10: `schema` / `describe` introspection statements. */
+  introspection: boolean;
+  /** Networked only: server ≥ 0.13 AND the client exposes `queryNativeRaw`. */
+  nativeRaw: boolean;
+}
+
+/** The feature-gate capability keys (everything except the version/nativeRaw metadata). */
+type PowdbFeatureKey = 'jsonDocs' | 'docFieldIndexes' | 'introspection';
+
+/** Minimum engine version each gated feature needs, for the E017 hint text. */
+const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
+  introspection: '0.10',
+  jsonDocs: '0.12',
+  docFieldIndexes: '0.13',
+};
+
+/**
+ * Trusted-caller default: every FEATURE gate on, engine version unknown. Used
+ * for a directly-constructed {@link PowdbPool} / {@link PowdbEmbeddedPool} that
+ * did not go through {@link turbinePowDB}'s version probe (e.g. an injected
+ * pool, or a unit-test pool). `nativeRaw` stays OFF here because it flips the
+ * actual wire path and must only be enabled after a real server-version probe,
+ * never inferred from a bare construction.
+ */
+export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
+  engineVersion: null,
+  jsonDocs: true,
+  docFieldIndexes: true,
+  introspection: true,
+  nativeRaw: false,
+};
+
+/** Parse a PowDB semver prefix (`0.13.0`, `0.13`, `1.2.3-rc`) into components, or `null`. */
+function parsePowdbSemver(version: string | undefined | null): { major: number; minor: number; patch: number } | null {
+  const m = /^(\d+)\.(\d+)(?:\.(\d+))?/.exec(String(version ?? '').trim());
+  if (!m) return null;
+  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3] ?? 0) };
+}
+
+/** Is `sem` at least `major.minor`? */
+function atLeastVersion(sem: { major: number; minor: number }, major: number, minor: number): boolean {
+  return sem.major > major || (sem.major === major && sem.minor >= minor);
+}
+
+/**
+ * Derive {@link PowdbCapabilities} from an engine version string. A non-semver /
+ * unknown version turns every gate OFF (the E017 hint then tells the caller to
+ * upgrade or pass `assumeEngineVersion`). `nativeRaw` requires BOTH the client
+ * to expose `queryNativeRaw` (passed in) AND server ≥ 0.13.
+ */
+export function capabilitiesFromVersion(
+  version: string | undefined | null,
+  opts: { hasNativeRaw?: boolean } = {},
+): PowdbCapabilities {
+  const sem = parsePowdbSemver(version);
+  if (!sem) {
+    return {
+      engineVersion: version ?? null,
+      jsonDocs: false,
+      docFieldIndexes: false,
+      introspection: false,
+      nativeRaw: false,
+    };
+  }
+  return {
+    engineVersion: `${sem.major}.${sem.minor}.${sem.patch}`,
+    introspection: atLeastVersion(sem, 0, 10),
+    jsonDocs: atLeastVersion(sem, 0, 12),
+    docFieldIndexes: atLeastVersion(sem, 0, 13),
+    nativeRaw: Boolean(opts.hasNativeRaw) && atLeastVersion(sem, 0, 13),
+  };
+}
+
+/**
+ * Throw a version-hinting {@link UnsupportedFeatureError} (E017) when a gated
+ * PowQL feature is used on an engine that does not support it. Keeps old engines
+ * getting clean typed errors instead of raw PowQL parse failures.
+ */
+export function requireCapability(caps: PowdbCapabilities, key: PowdbFeatureKey, feature: string): void {
+  if (caps[key]) return;
+  const min = POWDB_FEATURE_MIN_VERSION[key];
+  const reported = caps.engineVersion
+    ? `this connection reports ${caps.engineVersion}`
+    : 'this connection could not report a version';
+  throw new UnsupportedFeatureError(
+    feature,
+    'PowDB',
+    `${feature} requires PowDB >= ${min}; ${reported}. Upgrade powdb-server / @zvndev/powdb-embedded ` +
+      '(or pass `assumeEngineVersion` if the version cannot be detected).',
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Type mapping — Turbine schema type → PowQL DDL type, and value coercion
 // ---------------------------------------------------------------------------
 
-/** PowQL column types Turbine is willing to emit (the four writable scalars). */
-export type PowqlType = 'str' | 'int' | 'float' | 'bool';
+/**
+ * PowQL column types Turbine emits: the four writable scalars plus PowDB's
+ * native `json` document type (added to the map in the 0.12/0.13 parity round,
+ * see {@link isJsonColumn}). A `json` column stores a canonical binary document
+ * (sorted keys, int/float distinction preserved) that Turbine writes as a JSON
+ * string literal and reads back by parsing the canonical JSON text.
+ */
+export type PowqlType = 'str' | 'int' | 'float' | 'bool' | 'json';
+
+/**
+ * Does this column map to PowDB's native `json` document type? A Postgres
+ * `json`/`jsonb` type (via `dialectType`/`pgType`) is authoritative; otherwise
+ * the tsType heuristic (`Record<…>`, `object`, `unknown`, an object/array
+ * literal) that the four scalar branches do not claim. Array columns never map
+ * to json, a PowDB array only exists INSIDE a json document, so a Postgres
+ * array column has no PowDB shape and still throws in {@link powqlColumnType}.
+ */
+export function isJsonColumn(col: ColumnMetadata): boolean {
+  if (col.isArray) return false;
+  const dbType = (col.dialectType ?? col.pgType ?? '').toLowerCase();
+  if (dbType === 'json' || dbType === 'jsonb') return true;
+  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
+  if (ts === 'Date' || ts === 'boolean' || ts === 'number' || ts === 'bigint' || ts === 'string') return false;
+  if (ts === 'Buffer' || ts === 'Uint8Array') return false;
+  return /Record<|object|unknown|\[\]|\{/.test(ts);
+}
 
 /**
  * Map a Turbine column to the PowQL DDL type used in `defineSchema` →
@@ -254,8 +404,9 @@ export type PowqlType = 'str' | 'int' | 'float' | 'bool';
  * which cannot hold client-supplied values on the wire (no literal, no cast):
  *   - `Date` → `int` (epoch micros)   - `boolean` → `bool`
  *   - integral `number`/`bigint` → `int`   - fractional `number` → `float`
+ *   - JSON / object columns → `json` (native PowDB document type, ≥ 0.12)
  *   - everything else (incl. UUID/PK strings) → `str`
- * Array / JSON / bytes columns throw — they have no PowDB equivalent.
+ * Array (non-json) and bytes columns throw, they have no PowDB equivalent.
  */
 export function powqlColumnType(col: ColumnMetadata): PowqlType {
   if (col.isArray) {
@@ -263,6 +414,7 @@ export function powqlColumnType(col: ColumnMetadata): PowqlType {
       `[turbine] Column "${col.name}" is an array — PowDB has no array type. Arrays are unsupported on the PowDB backend.`,
     );
   }
+  if (isJsonColumn(col)) return 'json';
   const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
   if (ts === 'Date') return 'int'; // epoch micros
   if (ts === 'boolean') return 'bool';
@@ -272,11 +424,6 @@ export function powqlColumnType(col: ColumnMetadata): PowqlType {
   if (ts === 'Buffer' || ts === 'Uint8Array') {
     throw new ValidationError(
       `[turbine] Column "${col.name}" is binary — PowDB cannot store client-supplied bytes on the wire. Use a string (e.g. base64) instead.`,
-    );
-  }
-  if (/Record<|object|unknown|\[\]|\{/.test(ts)) {
-    throw new ValidationError(
-      `[turbine] Column "${col.name}" (${col.tsType}) maps to JSON/object, which PowDB has no type for. Flatten it or store a JSON string.`,
     );
   }
   return 'str';
@@ -424,7 +571,20 @@ export function quotePowqlIdent(name: string): string {
   return POWQL_KEYWORDS.has(name) || !POWQL_BARE_IDENT.test(name) ? `\`${name}\`` : name;
 }
 
-export function powqlSchemaDDL(schema: SchemaMetadata): string[] {
+/**
+ * Options for {@link powqlSchemaDDL}. Additive: with no options the DDL is
+ * emitted unconditionally (pure-function callers / tests); pass `capabilities`
+ * to gate engine-version-specific features (json columns, and, since the
+ * 0.13 parity round, doc-field expression indexes) behind the connection's
+ * real capabilities. Doc-field expression index declarations plug into the
+ * per-table `indexes` surface consumed here without further signature churn.
+ */
+export interface PowqlSchemaDDLOptions {
+  capabilities?: PowdbCapabilities;
+}
+
+export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptions = {}): string[] {
+  const caps = opts.capabilities;
   const stmts: string[] = [];
   for (const meta of Object.values(schema.tables)) {
     const pkSet = new Set(meta.primaryKey);
@@ -435,14 +595,19 @@ export function powqlSchemaDDL(schema: SchemaMetadata): string[] {
     // cannot enforce the tuple's uniqueness at the engine level.
     const pkIsSingle = meta.primaryKey.length === 1;
     const fields = meta.columns.map((col) => {
+      const powqlType = powqlColumnType(col);
+      // Gate `json` columns behind the engine's jsonDocs capability when a
+      // caller supplied one, an old engine has no `json` type and would reject
+      // the DDL. Pure-function callers (no opts) emit unconditionally.
+      if (powqlType === 'json' && caps) requireCapability(caps, 'jsonDocs', 'JSON document columns');
       const mods: string[] = [];
       if (!col.nullable || pkSet.has(col.name)) mods.push('required');
       if (pkSet.has(col.name) && pkIsSingle) mods.push('unique');
       // `auto` = server-generated monotonic int. PowDB requires it be `int` and
       // rejects it alongside a `default`; non-int generated columns fall back to
       // a plain typed column (Turbine assigns the value client-side instead).
-      if (col.isGenerated && powqlColumnType(col) === 'int') mods.push('auto');
-      return `  ${mods.join(' ')}${mods.length ? ' ' : ''}${quotePowqlIdent(col.name)}: ${powqlColumnType(col)}`;
+      if (col.isGenerated && powqlType === 'int') mods.push('auto');
+      return `  ${mods.join(' ')}${mods.length ? ' ' : ''}${quotePowqlIdent(col.name)}: ${powqlType}`;
     });
     stmts.push(`type ${quotePowqlIdent(meta.name)} {\n${fields.join(',\n')}\n}`);
     // Secondary unique constraints (beyond the PK) become unique indexes.
@@ -458,6 +623,9 @@ export function powqlSchemaDDL(schema: SchemaMetadata): string[] {
 /** Coerce a JS value into a PowDB positional param (the write side). */
 function toPowdbParam(value: unknown, col?: ColumnMetadata): PowdbParam {
   if (value instanceof PowdbFloatParam) return value.value; // wire-side: a float column takes the plain number
+  // json document: serialize to canonical JSON text and bind as a str param,
+  // the engine validates it as JSON and stores the canonical binary form.
+  if (value instanceof PowdbJsonParam) return JSON.stringify(value.value);
   if (value === undefined || value === null) return null;
   if (value instanceof Date) return BigInt(value.getTime()) * 1000n; // ms → micros (int column)
   if (col && isDateColumn(col) && typeof value === 'number') return BigInt(value) * 1000n;
@@ -480,9 +648,21 @@ function toPowdbParam(value: unknown, col?: ColumnMetadata): PowdbParam {
  */
 export function coerceValue(raw: string, col: ColumnMetadata): unknown {
   const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
+  const json = isJsonColumn(col);
   // NULL bareword: unambiguous for non-string columns; for `str` we cannot tell a
   // literal "null" from SQL NULL, so a nullable str of value "null" reads as null.
-  if (raw === 'null' && (ts !== 'string' || col.nullable)) return null;
+  // For a `json` column the bareword `null` (a legacy-wire rendering shared by an
+  // absent value AND a top-level JSON-null document, documented residual,
+  // resolved on the native transport by the WireValue path) maps to null; a JSON
+  // string document "null" renders WITH quotes (`"null"`) and parses distinctly.
+  if (raw === 'null' && (json || ts !== 'string' || col.nullable)) return null;
+  if (json) {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw; // defensive: canonical JSON text always parses
+    }
+  }
   if (ts === 'Date') {
     const micros = Number(raw);
     return Number.isFinite(micros) ? new Date(micros / 1000) : null;
@@ -825,6 +1005,13 @@ export interface PowdbPoolOptions {
    * *after* the transaction has begun.
    */
   transactionQueueTimeoutMs?: number;
+  /**
+   * Feature capabilities of the bound connection. Set by {@link turbinePowDB}
+   * from the probed engine version; defaults to {@link ALL_POWDB_CAPABILITIES}
+   * (feature gates on, `nativeRaw` off, engine version unknown) for a
+   * directly-constructed pool: a "trusted caller".
+   */
+  capabilities?: PowdbCapabilities;
 }
 
 /** Adapt a PowDB result into the pg-compat `{ rows, rowCount, fields }` shape. */
@@ -875,6 +1062,8 @@ export class PowdbPool implements PgCompatPool {
    * live socket holding the process open until the server's idle timeout.
    */
   private readonly checkedOut = new Set<PowdbClient>();
+  /** Feature capabilities of the bound server (probed version). */
+  readonly capabilities: PowdbCapabilities;
 
   constructor(
     readonly pool: PowdbClientPool,
@@ -882,6 +1071,7 @@ export class PowdbPool implements PgCompatPool {
     options: PowdbPoolOptions = {},
   ) {
     this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
+    this.capabilities = options.capabilities ?? ALL_POWDB_CAPABILITIES;
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
@@ -1129,6 +1319,9 @@ export function encodePowqlLiteral(value: unknown): string {
     // Force a float-form literal so an integer-valued float column stays a float.
     return Number.isInteger(n) ? `${n}.0` : String(n);
   }
+  // json document: emit the canonical JSON text as a PowQL string literal (the
+  // embedded engine validates and stores it as a json document).
+  if (value instanceof PowdbJsonParam) return encodePowqlString(JSON.stringify(value.value));
   if (value === undefined || value === null) return 'null';
   if (value instanceof Date) return `${BigInt(value.getTime()) * 1000n}`; // epoch micros (int column)
   if (typeof value === 'boolean') return value ? 'true' : 'false';
@@ -1197,12 +1390,19 @@ export class PowdbEmbeddedPool implements PgCompatPool {
   private readonly txGate: PowdbTxGate;
   /** Hold taken by a `begin` issued via `query()` directly (no checked-out client). */
   private readonly poolHoldRef: { hold: PowdbTxHold | null } = { hold: null };
+  /**
+   * Feature capabilities of the embedded engine (resolved from the addon
+   * package version). `nativeRaw` is always false: the embedded addon exposes
+   * no native typed-wire surface (its rows are `string[][]`, the legacy wire).
+   */
+  readonly capabilities: PowdbCapabilities;
 
   constructor(
     private readonly db: EmbeddedDatabase,
     options: PowdbPoolOptions = {},
   ) {
     this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
+    this.capabilities = options.capabilities ?? ALL_POWDB_CAPABILITIES;
   }
 
   /** Materialize `$N` params and hand the PowQL to the in-process engine. */
@@ -1342,6 +1542,15 @@ export interface TurbinePowdbOptions extends Pick<TurbineConfig, 'logging' | 'de
    */
   transactionQueueTimeoutMs?: number;
   /**
+   * Override the detected engine version used for capability gating. For exotic
+   * deployments and injected pools whose version cannot be probed (a non-semver
+   * server string, or an addon whose package.json cannot be resolved): pass
+   * e.g. `'0.13.0'` to unlock the features that version supports. Without it, an
+   * undetectable version turns every version-gated feature OFF (with a hinting
+   * E017).
+   */
+  assumeEngineVersion?: string;
+  /**
    * Driver-module injection for the networked target forms (URL / host+port):
    * bypasses the dynamic `import('@zvndev/powdb-client')` and uses this object
    * as the driver module instead. Intended for tests (a fake pool that counts
@@ -1427,10 +1636,27 @@ async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
   return mod;
 }
 
+/**
+ * Resolve the embedded addon's engine version. The addon vendors the engine and
+ * exports no version, but `@zvndev/powdb-embedded/package.json` has no `exports`
+ * map, so `require.resolve` reaches it: the package version IS the engine
+ * version. Returns `null` when it cannot be resolved.
+ */
+function resolveEmbeddedVersion(): string | null {
+  try {
+    const require = createRequire(import.meta.url);
+    const pkg = require(require.resolve('@zvndev/powdb-embedded/package.json')) as { version?: string };
+    return pkg.version ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Open an embedded database handle, wrapping engine open failures (corrupt dir, etc.). */
 async function openEmbeddedPool(
   target: TurbinePowdbEmbeddedTarget,
   poolOptions: PowdbPoolOptions = {},
+  assumeEngineVersion?: string,
 ): Promise<PowdbEmbeddedPool> {
   const mod = await loadPowdbEmbedded();
   const { embedded: dir, syncMode, memoryLimit } = target;
@@ -1456,7 +1682,11 @@ async function openEmbeddedPool(
     }
     db.setSyncMode(syncMode);
   }
-  return new PowdbEmbeddedPool(db, poolOptions);
+  // Embedded exposes no native typed-wire surface, so nativeRaw is always false.
+  const capabilities = capabilitiesFromVersion(assumeEngineVersion ?? resolveEmbeddedVersion(), {
+    hasNativeRaw: false,
+  });
+  return new PowdbEmbeddedPool(db, { ...poolOptions, capabilities });
 }
 
 /**
@@ -1484,27 +1714,34 @@ export async function turbinePowDB(
 ): Promise<TurbineClient> {
   let pool: PgCompatPool;
   let owns = false;
-  const poolOptions: PowdbPoolOptions = { transactionQueueTimeoutMs: options.transactionQueueTimeoutMs };
+  const poolOptions: PowdbPoolOptions = {
+    transactionQueueTimeoutMs: options.transactionQueueTimeoutMs,
+  };
+  const max = options.connectionLimit ?? 10;
 
   if (typeof target === 'string') {
     const mod = options.powdbClientModule ?? (await loadPowdb());
-    const clientPool = new mod.Pool({ ...parsePowdbUrl(target), max: options.connectionLimit ?? 10 });
-    await assertNetworkedVersion(clientPool);
-    pool = new PowdbPool(clientPool, undefined, poolOptions);
+    const clientPool = new mod.Pool({ ...parsePowdbUrl(target), max });
+    const capabilities = await assertNetworkedVersion(clientPool, options.assumeEngineVersion);
+    pool = new PowdbPool(clientPool, undefined, { ...poolOptions, capabilities });
     owns = true;
   } else if (target instanceof PowdbPool) {
-    // An injected PowdbPool carries its own PowdbPoolOptions.
+    // An injected PowdbPool carries its own PowdbPoolOptions (incl. capabilities).
     pool = target;
   } else if (isEmbeddedTarget(target)) {
-    pool = await openEmbeddedPool(target, poolOptions);
+    pool = await openEmbeddedPool(target, poolOptions, options.assumeEngineVersion);
     owns = true;
   } else if (isPowdbClientPool(target)) {
-    pool = new PowdbPool(target, undefined, poolOptions);
+    // Injected client pool: run the SAME probe as the URL / host+port paths so
+    // it gets real capabilities AND the version-floor check (this branch used
+    // to skip the probe entirely (an injected pool silently bypassed both).
+    const capabilities = await assertNetworkedVersion(target, options.assumeEngineVersion);
+    pool = new PowdbPool(target, undefined, { ...poolOptions, capabilities });
   } else {
     const mod = options.powdbClientModule ?? (await loadPowdb());
-    const clientPool = new mod.Pool({ ...(target as PowdbConnOptions), max: options.connectionLimit ?? 10 });
-    await assertNetworkedVersion(clientPool);
-    pool = new PowdbPool(clientPool, undefined, poolOptions);
+    const clientPool = new mod.Pool({ ...(target as PowdbConnOptions), max });
+    const capabilities = await assertNetworkedVersion(clientPool, options.assumeEngineVersion);
+    pool = new PowdbPool(clientPool, undefined, { ...poolOptions, capabilities });
     owns = true;
   }
 
@@ -1555,14 +1792,23 @@ export async function turbinePowDB(
 }
 
 /**
- * Probe a networked pool's `serverVersion` (declared on {@link PowdbClient}) and
- * fail fast if the server is older than {@link MIN_POWDB_VERSION}. Best-effort:
- * a driver that does not surface a version is left untouched (we cannot prove it
- * too old). Errors from the probe itself surface as the normal connect failure.
+ * Probe a networked pool's `serverVersion` (declared on {@link PowdbClient}),
+ * fail fast if the server is older than {@link MIN_POWDB_VERSION}, and derive
+ * the {@link PowdbCapabilities} for it: the version gates PLUS `nativeRaw`
+ * (server ≥ 0.13 AND the client exposes `queryNativeRaw`, feature-detected
+ * here). `assumeEngineVersion` overrides the version used for capability
+ * derivation (the floor check still runs against the real reported version).
+ * Errors from the probe itself surface as the normal connect failure.
  */
-async function assertNetworkedVersion(clientPool: PowdbClientPool): Promise<void> {
-  await clientPool.withClient(async (c) => {
+async function assertNetworkedVersion(
+  clientPool: PowdbClientPool,
+  assumeEngineVersion?: string,
+): Promise<PowdbCapabilities> {
+  return clientPool.withClient(async (c) => {
     assertSupportedPowdbVersion(c.serverVersion);
+    const version = assumeEngineVersion ?? c.serverVersion;
+    const hasNativeRaw = typeof (c as { queryNativeRaw?: unknown }).queryNativeRaw === 'function';
+    return capabilitiesFromVersion(version, { hasNativeRaw });
   });
 }
 

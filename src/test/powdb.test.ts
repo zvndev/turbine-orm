@@ -19,12 +19,16 @@ import {
   ValidationError,
 } from '../errors.js';
 import {
+  ALL_POWDB_CAPABILITIES,
   assertSupportedPowdbVersion,
+  capabilitiesFromVersion,
   coerceValue,
   encodePowqlLiteral,
+  isJsonColumn,
   materializePowql,
   PowdbEmbeddedPool,
   PowdbFloatParam,
+  PowdbJsonParam,
   PowdbPool,
   type PowdbPoolOptions,
   parsePowdbUrl,
@@ -32,6 +36,7 @@ import {
   powqlColumnType,
   powqlSchemaDDL,
   quotePowqlIdent,
+  requireCapability,
   rowToEntity,
   turbinePowDB,
   wrapPowdbError,
@@ -172,10 +177,21 @@ describe('powdb: type mapping', () => {
     assert.equal(powqlColumnType(col('created', 'created', 'Date', 'timestamptz')), 'int'); // epoch micros
   });
 
-  it('rejects array / bytes / JSON columns (no PowDB equivalent)', () => {
+  it('rejects array / bytes columns (no PowDB equivalent)', () => {
     assert.throws(() => powqlColumnType(col('tags', 'tags', 'string[]', 'text', { isArray: true })), ValidationError);
     assert.throws(() => powqlColumnType(col('blob', 'blob', 'Buffer', 'bytea')), ValidationError);
-    assert.throws(() => powqlColumnType(col('meta', 'meta', 'Record<string, unknown>', 'jsonb')), ValidationError);
+  });
+
+  it('maps JSON / object columns onto the native `json` document type', () => {
+    // pgType jsonb is authoritative...
+    assert.equal(powqlColumnType(col('meta', 'meta', 'Record<string, unknown>', 'jsonb')), 'json');
+    assert.equal(powqlColumnType(col('doc', 'doc', 'unknown', 'json')), 'json');
+    // ...as is the tsType heuristic when the db type is unspecific.
+    assert.equal(powqlColumnType(col('cfg', 'cfg', 'Record<string, number>', 'text')), 'json');
+    // A jsonb column keeps mapping to json even when tsType reads `string`.
+    assert.equal(powqlColumnType(col('raw', 'raw', 'string', 'jsonb')), 'json');
+    // A json array column (jsonb, isArray) still throws, PowDB arrays only live inside a document.
+    assert.throws(() => powqlColumnType(col('list', 'list', 'unknown[]', 'jsonb', { isArray: true })), ValidationError);
   });
 
   it('emits PowQL DDL with required/unique PK and float column', () => {
@@ -1625,5 +1641,210 @@ describe('powdb: runInImplicitTx plants the re-entrancy marker (review fix)', ()
     assert.equal(wrapped, 1, 'user callback subtree carries the single-writer marker');
     assert.equal((row as { id: string }).id, 'u1');
     assert.ok(sent.includes('begin') && sent.includes('commit'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B1: capability gating (per-version feature flags + version-hint E017s)
+// ---------------------------------------------------------------------------
+
+describe('powdb: capability gating (PowdbCapabilities)', () => {
+  it('derives feature gates from the engine semver', () => {
+    // Pre-introspection (< 0.10): nothing gated on.
+    const v09 = capabilitiesFromVersion('0.9.5');
+    assert.deepEqual(v09, {
+      engineVersion: '0.9.5',
+      introspection: false,
+      jsonDocs: false,
+      docFieldIndexes: false,
+      nativeRaw: false,
+    });
+    // 0.10: introspection only.
+    assert.equal(capabilitiesFromVersion('0.10.0').introspection, true);
+    assert.equal(capabilitiesFromVersion('0.10.0').jsonDocs, false);
+    // 0.12: json docs unlocked, expression indexes still gated.
+    const v12 = capabilitiesFromVersion('0.12.3');
+    assert.equal(v12.jsonDocs, true);
+    assert.equal(v12.docFieldIndexes, false);
+    // 0.13: everything, plus nativeRaw when the client exposes queryNativeRaw.
+    assert.equal(capabilitiesFromVersion('0.13.0').docFieldIndexes, true);
+    assert.equal(capabilitiesFromVersion('0.13.0', { hasNativeRaw: true }).nativeRaw, true);
+    // nativeRaw needs BOTH the feature AND server >= 0.13.
+    assert.equal(capabilitiesFromVersion('0.13.0', { hasNativeRaw: false }).nativeRaw, false);
+    assert.equal(capabilitiesFromVersion('0.12.9', { hasNativeRaw: true }).nativeRaw, false);
+  });
+
+  it('turns every gate OFF for an unknown / non-semver version', () => {
+    const caps = capabilitiesFromVersion('preview-build');
+    assert.deepEqual(caps, {
+      engineVersion: 'preview-build',
+      introspection: false,
+      jsonDocs: false,
+      docFieldIndexes: false,
+      nativeRaw: false,
+    });
+    assert.equal(capabilitiesFromVersion(null).engineVersion, null);
+  });
+
+  it('requireCapability throws a version-hinting E017 when the gate is off', () => {
+    const caps = capabilitiesFromVersion('0.11.0');
+    let thrown: UnsupportedFeatureError | undefined;
+    try {
+      requireCapability(caps, 'jsonDocs', 'JSON path filters');
+    } catch (e) {
+      thrown = e as UnsupportedFeatureError;
+    }
+    assert.ok(thrown instanceof UnsupportedFeatureError);
+    assert.match(thrown.message, /JSON path filters requires PowDB >= 0.12/);
+    assert.match(thrown.message, /this connection reports 0\.11\.0/);
+    assert.match(thrown.message, /assumeEngineVersion/);
+    // A satisfied gate is a no-op.
+    assert.doesNotThrow(() =>
+      requireCapability(capabilitiesFromVersion('0.13.0'), 'docFieldIndexes', 'expression indexes'),
+    );
+  });
+
+  it('the E017 hint notes an undetectable version distinctly', () => {
+    // A null (unresolvable) version reads "could not report a version"...
+    assert.throws(
+      () => requireCapability(capabilitiesFromVersion(null), 'introspection', 'describe introspection'),
+      /could not report a version/,
+    );
+    // ...while a reported-but-non-semver string is echoed verbatim.
+    assert.throws(
+      () => requireCapability(capabilitiesFromVersion('weird'), 'introspection', 'describe introspection'),
+      /this connection reports weird/,
+    );
+  });
+
+  it('ALL_POWDB_CAPABILITIES is the trusted-caller default (feature gates on, nativeRaw off)', () => {
+    assert.deepEqual(ALL_POWDB_CAPABILITIES, {
+      engineVersion: null,
+      jsonDocs: true,
+      docFieldIndexes: true,
+      introspection: true,
+      nativeRaw: false,
+    });
+    // A directly-constructed pool defaults to it.
+    assert.deepEqual(new PowdbPool({} as never).capabilities, ALL_POWDB_CAPABILITIES);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B1: native `json` document column type
+// ---------------------------------------------------------------------------
+
+describe('powdb: json document column type', () => {
+  it('isJsonColumn keys off jsonb/json db type, then the tsType heuristic', () => {
+    assert.equal(isJsonColumn(col('m', 'm', 'Record<string, unknown>', 'jsonb')), true);
+    assert.equal(isJsonColumn(col('m', 'm', 'unknown', 'json')), true);
+    assert.equal(isJsonColumn(col('m', 'm', 'string', 'jsonb')), true); // db type authoritative
+    assert.equal(isJsonColumn(col('m', 'm', 'MyShape', 'text')), false); // scalar-shaped tsType
+    assert.equal(isJsonColumn(col('m', 'm', 'string', 'text')), false);
+    assert.equal(isJsonColumn(col('m', 'm', 'number', 'int4')), false);
+    // A json array COLUMN is not a json column (PowDB arrays live inside docs).
+    assert.equal(isJsonColumn(col('m', 'm', 'unknown[]', 'jsonb', { isArray: true })), false);
+  });
+
+  it('powqlSchemaDDL emits `data: json` and gates it on the jsonDocs capability', () => {
+    const s: SchemaMetadata = {
+      enums: {},
+      tables: {
+        doc: table('doc', [
+          col('id', 'id', 'string', 'text', { hasDefault: true }),
+          col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+        ]),
+      },
+    };
+    // No capabilities → unconditional emission.
+    assert.match(powqlSchemaDDL(s).find((x) => x.startsWith('type doc'))!, /data: json/);
+    // jsonDocs on → still emits.
+    assert.doesNotThrow(() => powqlSchemaDDL(s, { capabilities: capabilitiesFromVersion('0.12.0') }));
+    // jsonDocs off → E017 with the version hint.
+    assert.throws(
+      () => powqlSchemaDDL(s, { capabilities: capabilitiesFromVersion('0.11.0') }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0.12/.test((e as Error).message),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B1: json write encoding (PowdbJsonParam) + read coercion
+// ---------------------------------------------------------------------------
+
+describe('powdb: json value round-trip (encode + coerce)', () => {
+  const jcol = (nullable = true) => col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable });
+
+  it('encodePowqlLiteral serializes a PowdbJsonParam to a canonical JSON string literal', () => {
+    assert.equal(encodePowqlLiteral(new PowdbJsonParam({ a: 1, b: 'x' })), '"{\\"a\\":1,\\"b\\":\\"x\\"}"');
+    assert.equal(encodePowqlLiteral(new PowdbJsonParam({ a: null })), '"{\\"a\\":null}"');
+    assert.equal(encodePowqlLiteral(new PowdbJsonParam([1, 2, 3])), '"[1,2,3]"');
+    // The wrapped JSON STRING "null" is distinct from a bare null.
+    assert.equal(encodePowqlLiteral(new PowdbJsonParam('null')), '"\\"null\\""');
+  });
+
+  it('materializePowql inlines a PowdbJsonParam without corrupting the $N scan', () => {
+    // A json document containing a literal `$1` must round-trip as data, never
+    // be re-scanned as a placeholder (the value is a param, not inlined text).
+    const powql = 'insert doc { data := $1 } returning';
+    const out = materializePowql(powql, [new PowdbJsonParam({ note: 'costs $1 today', x: 2 })]);
+    assert.equal(out, 'insert doc { data := "{\\"note\\":\\"costs $1 today\\",\\"x\\":2}" } returning');
+  });
+
+  it('coerceValue JSON.parses a json column and distinguishes null / "null" / documents', () => {
+    assert.deepEqual(coerceValue('{"a":null}', jcol()), { a: null });
+    assert.deepEqual(coerceValue('{}', jcol()), {});
+    assert.deepEqual(coerceValue('{"a":"null"}', jcol()), { a: 'null' });
+    assert.deepEqual(coerceValue('[1,2,3]', jcol()), [1, 2, 3]);
+    // A json STRING document renders WITH quotes and parses to the string.
+    assert.equal(coerceValue('"null"', jcol()), 'null');
+    // The bare `null` bareword (absent OR a top-level JSON-null doc, legacy-wire
+    // ambiguity) maps to null.
+    assert.equal(coerceValue('null', jcol()), null);
+    // Defensive: non-JSON text falls through to the raw string.
+    assert.equal(coerceValue('not json', jcol()), 'not json');
+  });
+
+  it('rowToEntity parses a json column end-to-end', () => {
+    const meta = table('doc', [
+      col('id', 'id', 'string', 'text'),
+      col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+    ]);
+    const entity = rowToEntity({ id: 'd1', data: '{"a":[1,{"b":true}]}' }, meta);
+    assert.deepEqual(entity.data, { a: [1, { b: true }] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B1: injected-client-pool version probe fix
+// ---------------------------------------------------------------------------
+
+describe('powdb: injected client pool runs the version probe (B1 fix)', () => {
+  /** A minimal PowdbClientPool whose single client reports `serverVersion`. */
+  function injectedClientPool(serverVersion: string) {
+    const client = {
+      serverVersion,
+      query: async () => ({ kind: 'ok', affected: 0n }),
+      close: async () => {},
+    };
+    return {
+      acquire: async () => client,
+      release() {},
+      destroy() {},
+      withClient: async (fn: (c: typeof client) => Promise<unknown>) => fn(client),
+      close: async () => {},
+    } as unknown as ConstructorParameters<typeof PowdbPool>[0];
+  }
+
+  it('rejects an injected pool whose server is below the floor (previously skipped)', async () => {
+    await assert.rejects(
+      () => turbinePowDB(injectedClientPool('0.6.0'), schema, { warnOnUnlimited: false }),
+      ConnectionError,
+    );
+  });
+
+  it('accepts an injected pool on a supported server and derives its capabilities', async () => {
+    const db = await turbinePowDB(injectedClientPool('0.13.0'), schema, { warnOnUnlimited: false });
+    await db.disconnect();
   });
 });
