@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.33.0 (2026-07-15)
+
+### Added
+- **Opt-in LATERAL plan for pick-row relation ordering** (PostgreSQL). Pick-row
+  ordering entries accept `plan: 'lateral'` to compile as
+  `LEFT JOIN LATERAL (SELECT ... ORDER BY ... LIMIT 1) ON true` instead of the
+  default correlated scalar subquery. Results are identical (verified
+  row-for-row on live PostgreSQL, including NULLS placement, pagination, the
+  batched relation-load strategy, and streaming); the join plan can be
+  substantially faster on large parent sets where the ordering subquery
+  dominates. The default plan's SQL is byte-for-byte unchanged. `plan` is
+  validated strictly: unknown values throw E003, and dialects without lateral
+  join support (SQLite, MySQL, SQL Server, PowDB) throw a typed E017 via the
+  new `supportsLateralJoin` dialect capability flag rather than emitting
+  broken SQL. Lateral applies to top-level ordering entries; nested pick
+  ordering keeps the subquery plan.
+
 ## 0.32.2 (2026-07-15)
 
 ### Fixed
