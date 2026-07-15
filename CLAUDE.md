@@ -353,7 +353,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 **Integration tests** need a PostgreSQL instance with seeded data. Set `DATABASE_URL` env var. The small correctness fixture is `src/test/fixtures/seed.sql` (8 users / 10 posts / 20 comments / 5 orgs). The larger benchmark seed lives in `benchmarks/seed-neon.ts` and defaults to 1K users / 10K posts / 50K comments (override via `USERS`/`POSTS_PER_USER`/`COMMENTS_PER_POST`). Tests that require a database are gated via the `skipGate()` helper in `src/test/helpers.ts` when `DATABASE_URL` is absent — each test registers with `{ skip }` so the reporter shows real skipped counts, not silent passes.
 
-**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, and `src/index.ts`. Thresholds: 65% lines, 70% functions, 82% branches, 65% statements.
+**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, and `src/index.ts`. Thresholds: 80% lines, 82% functions, 82% branches, 80% statements.
 
 ## Key Patterns
 

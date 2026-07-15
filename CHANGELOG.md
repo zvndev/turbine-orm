@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.32.1 (2026-07-14)
+
+A first-run and hardening release: the new-project funnel now works out of the
+box on current tooling defaults, the SQL cache polices its own invariants in
+dev, and a latent MySQL pagination-cache bug is fixed. Fully adversarially
+reviewed (11 findings confirmed and fixed pre-release).
+
+### Fixed
+- **CommonJS projects work with the CLI.** `npm init -y` on npm 11 writes
+  `"type": "commonjs"`; in such projects the config and schema loaders received
+  a CJS-interop double-wrapped `default` export, read every field as
+  `undefined`, and every command failed with a misleading "No database URL
+  provided". Both loaders now unwrap the interop shape, and config load errors
+  are surfaced with the file name and cause instead of being silently
+  swallowed. `turbine init` prints a note about the project module type.
+- **MySQL pagination cache correctness.** On dialects that inline LIMIT/OFFSET
+  literals into SQL (MySQL), the values are now part of the SQL-cache
+  fingerprint (top-level and per-relation `with` limits). Previously a cache
+  hit could silently reuse a different limit or offset value. Parameterized
+  dialects (PostgreSQL, SQLite, SQL Server) are unaffected.
+- **`distinct` cache fingerprint** now uses the user-supplied column order,
+  matching the emitted `DISTINCT ON` clause.
+- **Published tarball ships no install scripts.** `prepare` is stripped at pack
+  time and restored afterward, so consumers using install-script auditing get
+  no warnings. Local dev hook installation is unchanged.
+- **Docs accuracy sweep** in `docs/USING-TURBINE-ORM.md`, the README, and the
+  site: Studio described as it exists today (ORM-native builder, port 4983),
+  the real `db.pipeline([...])` API (atomic by default, `{ transactional:
+  false }` to opt out), error table extended through E017, CLI command list
+  matches `turbine --help` (including `mcp` and `migrate deploy`), CJS wording
+  made precise, and the quickstart requires Node 20 to match `engines`.
+
+### Added
+- **CLI auto-loads `.env`.** Every `turbine` command loads a local `.env` at
+  startup (via `process.loadEnvFile`, Node 20.12+). Variables already in the
+  environment always win, a warning is printed when an `.env`-sourced
+  `DATABASE_URL` overrides a differing `url` in `turbine.config.ts`, and
+  unreadable `.env` files degrade to a warning instead of crashing.
+- **`turbine()` with no arguments** now falls back to the `DATABASE_URL`
+  environment variable when no pool, connection string, or explicit connection
+  fields are provided, matching what the docs and generated JSDoc always said.
+- **Dev-mode SQL-cache cross-check.** When `NODE_ENV` is not `production`,
+  every SQL-cache hit rebuilds the statement fresh and verifies the cached SQL
+  and parameters match exactly, throwing a `ValidationError` (E003) on any
+  lockstep mismatch. Zero overhead in production; disable with
+  `TURBINE_DISABLE_CACHE_CHECK=1`. This class of invariant violation shipped
+  silent wrong-results bugs twice before; it now fails loudly at development
+  time.
+- **Broader driver-error mapping.** `wrapPgError` now maps `57014`
+  (server-side `statement_timeout` cancellation) to `TimeoutError` (E002), and
+  connection-class failures (SQLSTATE `08xxx`, `53300`, `57P01`-`57P03`, plus
+  driver-level `ECONNREFUSED`/`ECONNRESET`/`ETIMEDOUT`/`ENOTFOUND`/`EPIPE`) to
+  `ConnectionError` (E004), all preserving the original error as `.cause`.
+- **Quickstart smoke gate in CI.** A new job installs the packed tarball into a
+  scratch CommonJS project and runs the documented quickstart literally (init,
+  push, generate, first query via `turbine()` with an `.env`-sourced URL)
+  against a real PostgreSQL service.
+
+### Changed
+- **Benchmarks re-measured on 0.32.0** against Prisma 7.6 (adapter-pg,
+  `relationJoins`) and Drizzle 0.45 on local PostgreSQL 17.9 over a Unix
+  socket, which isolates per-query overhead instead of hiding it behind
+  network latency. All ten scenarios published, including the ones Turbine
+  does not win. README, the site benchmarks page, and `benchmarks/RESULTS.md`
+  all carry the new numbers and methodology.
+
 ## 0.32.0 (2026-07-13)
 
 The last two raw-SQL escape hatches for version-driven data models, designed
