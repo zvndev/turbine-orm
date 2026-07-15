@@ -645,10 +645,53 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
       return `  ${mods.join(' ')}${mods.length ? ' ' : ''}${quotePowqlIdent(col.name)}: ${powqlType}`;
     });
     stmts.push(`type ${quotePowqlIdent(meta.name)} {\n${fields.join(',\n')}\n}`);
+    // Track which single columns already carry a unique constraint (the
+    // single-column PK is inlined `required unique` in the type body above) so
+    // a redundant `add unique .col` is never emitted twice.
+    const emittedUnique = new Set<string>();
+    if (pkIsSingle && meta.primaryKey[0] !== undefined) emittedUnique.add(meta.primaryKey[0]);
     // Secondary unique constraints (beyond the PK) become unique indexes.
     for (const uniq of meta.uniqueColumns) {
       if (uniq.length === 1 && !pkSet.has(uniq[0]!)) {
         stmts.push(`alter ${quotePowqlIdent(meta.name)} add unique .${quotePowqlIdent(uniq[0]!)}`);
+        emittedUnique.add(uniq[0]!);
+      }
+    }
+    // Declared indexes: PowDB doc-field expression indexes (docPath) and plain
+    // single-column indexes. A doc-field index MUST be parenthesized (the engine
+    // rejects a bare JSON path); string path segments emit lexer-exact via the
+    // shared `encodePowqlString`, integer array indexes emit bare. A json
+    // document column reference stays dotted-bare (`.col`), which bypasses
+    // keyword lookup on every engine version exactly like a filter path.
+    for (const idx of meta.indexes) {
+      const kind = idx.unique ? 'unique' : 'index';
+      if (idx.docPath) {
+        if (caps) requireCapability(caps, 'docFieldIndexes', 'JSON doc-field expression indexes');
+        const column = idx.columns[0];
+        if (column === undefined) {
+          throw new ValidationError(
+            `[turbine] Doc-field index "${idx.name}" on ${meta.name} has no target json column.`,
+          );
+        }
+        const segs = idx.docPath.map((s) => (typeof s === 'number' ? `->${s}` : `->${encodePowqlString(s)}`)).join('');
+        stmts.push(`alter ${quotePowqlIdent(meta.name)} add ${kind} (.${column}${segs})`);
+      } else {
+        // Plain column index. PowDB has no composite index (`add index` takes a
+        // single `.column`), so a multi-column entry is a typed E017.
+        if (idx.columns.length !== 1) {
+          throw new UnsupportedFeatureError(
+            'composite indexes',
+            'PowDB',
+            `PowDB has no composite index. Index "${idx.name}" on ${meta.name} lists ` +
+              `${idx.columns.length} columns; declare a single-column index (or a doc-field index) instead.`,
+          );
+        }
+        const column = idx.columns[0]!;
+        // A unique index whose column already carries a unique constraint (the
+        // PK, or a column-level unique) would be a redundant duplicate, so skip it.
+        if (idx.unique && emittedUnique.has(column)) continue;
+        stmts.push(`alter ${quotePowqlIdent(meta.name)} add ${kind} .${quotePowqlIdent(column)}`);
+        if (idx.unique) emittedUnique.add(column);
       }
     }
   }
@@ -1721,6 +1764,12 @@ export class PowdbEmbeddedPool implements PgCompatPool {
 // PowqlInterface — the PowQL query generator (Phase A: flat CRUD via returning)
 // ---------------------------------------------------------------------------
 
+// `describe`-based introspection (programmatic API; see powdb-introspect.ts).
+export {
+  introspectPowdbDatabase,
+  type PowdbExec,
+  type PowdbIntrospectOptions,
+} from './powdb-introspect.js';
 export { PowqlInterface } from './powql.js';
 
 // ---------------------------------------------------------------------------

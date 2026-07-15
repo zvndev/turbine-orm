@@ -270,6 +270,48 @@ export interface CheckDef {
   expression: string;
 }
 
+/** A plain (column-list) index declaration. */
+export interface ColumnIndexDef {
+  /** camelCase field name(s) the index covers. */
+  columns: string[];
+  /** Whether the index enforces uniqueness. */
+  unique?: boolean;
+  /** Optional explicit index name (auto-derived when omitted). */
+  name?: string;
+}
+
+/**
+ * A doc-field expression index on a JSON document column (PowDB ≥ 0.13).
+ * Indexes the value at `docField-><path>` inside the json document, so a
+ * `JsonFilter`/`orderBy` on that path can use an index instead of a scan.
+ */
+export interface DocFieldIndexDef {
+  /** camelCase field name of the json document column. */
+  docField: string;
+  /** JSON path into the document: string keys and integer array indexes. */
+  path: (string | number)[];
+  /** Whether the expression index enforces uniqueness. */
+  unique?: boolean;
+  /** Optional explicit index name (auto-derived when omitted). */
+  name?: string;
+}
+
+/**
+ * A single index declaration on a table: either a plain column-list index
+ * ({@link ColumnIndexDef}) or a doc-field expression index into a json column
+ * ({@link DocFieldIndexDef}).
+ *
+ * Consumed today by the PowDB DDL generator (`powqlSchemaDDL`) and carried onto
+ * {@link import('./schema.js').IndexMetadata} by `schemaDefToMetadata`. The SQL
+ * DDL generators (`schema-sql.ts` / `schemaDiff`) do NOT consume these yet.
+ */
+export type SchemaIndexDef = ColumnIndexDef | DocFieldIndexDef;
+
+/** Type guard: is this index declaration a doc-field expression index? */
+export function isDocFieldIndexDef(idx: SchemaIndexDef): idx is DocFieldIndexDef {
+  return 'docField' in idx && typeof (idx as DocFieldIndexDef).docField === 'string';
+}
+
 export interface TableDef {
   /**
    * DDL-facing table name (snake_case). This is the name used when generating
@@ -303,6 +345,13 @@ export interface TableDef {
   manyToMany?: readonly ManyToManyDef[];
   /** Table-level `CHECK` constraints. */
   checks?: readonly CheckDef[];
+  /**
+   * Index declarations for this table (plain column indexes and/or PowDB
+   * doc-field expression indexes). Consumed by the PowDB DDL generator
+   * (`powqlSchemaDDL`) and carried onto `IndexMetadata` by
+   * `schemaDefToMetadata`; the SQL DDL generators do not consume them yet.
+   */
+  indexes?: readonly SchemaIndexDef[];
 }
 
 /**
@@ -316,8 +365,16 @@ export interface TableInput {
   manyToMany?: readonly ManyToManyDef[];
   /** Optional table-level CHECK constraints */
   checks?: readonly CheckDef[];
+  /** Optional index declarations (plain column and/or doc-field expression) */
+  indexes?: readonly SchemaIndexDef[];
   /** Column definitions keyed by camelCase field name */
-  [columnName: string]: ColumnDef | readonly string[] | readonly ManyToManyDef[] | readonly CheckDef[] | undefined;
+  [columnName: string]:
+    | ColumnDef
+    | readonly string[]
+    | readonly ManyToManyDef[]
+    | readonly CheckDef[]
+    | readonly SchemaIndexDef[]
+    | undefined;
 }
 
 export interface SchemaDef {
@@ -394,8 +451,18 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
       let pk: readonly string[] | undefined;
       let m2m: readonly ManyToManyDef[] | undefined;
       let checks: readonly CheckDef[] | undefined;
+      let indexes: readonly SchemaIndexDef[] | undefined;
 
       for (const [fieldName, def] of Object.entries(raw)) {
+        if (fieldName === 'indexes') {
+          if (def !== undefined) {
+            if (!Array.isArray(def)) {
+              throw new Error(`Table "${accessor}": "indexes" must be an array of index declarations`);
+            }
+            indexes = def as readonly SchemaIndexDef[];
+          }
+          continue;
+        }
         if (fieldName === 'manyToMany') {
           if (def !== undefined) {
             if (!Array.isArray(def)) {
@@ -461,6 +528,7 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
         ...(pk && pk.length > 0 ? { primaryKey: pk } : {}),
         ...(m2m && m2m.length > 0 ? { manyToMany: m2m } : {}),
         ...(checks && checks.length > 0 ? { checks } : {}),
+        ...(indexes && indexes.length > 0 ? { indexes } : {}),
       };
     }
   }

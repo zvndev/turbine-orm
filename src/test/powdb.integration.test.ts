@@ -35,7 +35,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from '../errors.js';
-import { PowdbJsonParam, powqlSchemaDDL, turbinePowDB } from '../powdb.js';
+import { introspectPowdbDatabase, PowdbJsonParam, powqlSchemaDDL, turbinePowDB } from '../powdb.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
 
@@ -926,5 +926,238 @@ describe('powdb integration (embedded): json document round-trip', () => {
       assert.equal(byId.s1, null);
       assert.equal(byId.s2, null);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4a: doc-field expression index DDL. The real embedded engine must ACCEPT
+// the `alter T add index (.data->"seg")` statements powqlSchemaDDL emits, and
+// an index-backed path query returns the right rows (an index must never
+// change results). Doc index DDL is executed via powqlSchemaDDL(db.raw).
+// ---------------------------------------------------------------------------
+
+/** A `doc` table with a doc-field index (path `data->ns->value`) and a unique one on `data->ext`. */
+const idxSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    doc: {
+      ...makeTable(
+        'doc',
+        [
+          col('id', 'id', 'string', 'text', { hasDefault: true }),
+          col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+        ],
+        {},
+      ),
+      indexes: [
+        { name: 'doc_data_ns_value_idx', columns: ['data'], unique: false, definition: '', docPath: ['ns', 'value'] },
+        { name: 'doc_data_ext_idx', columns: ['data'], unique: true, definition: '', docPath: ['ext'] },
+      ],
+    },
+  },
+};
+
+describe('powdb integration (embedded): doc-field expression index DDL', () => {
+  it('the engine accepts the emitted doc-field index DDL and index-backed queries return correct rows', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-idx-it-'));
+    const db: DB = await turbinePowDB({ embedded: dir }, idxSchema, { warnOnUnlimited: false });
+    try {
+      const ddl = powqlSchemaDDL(idxSchema);
+      // The emitted DDL must include the parenthesized doc-field statements.
+      assert.ok(
+        ddl.some((s) => s === 'alter doc add index (.data->"ns"->"value")'),
+        `expected doc index DDL, got:\n${ddl.join('\n')}`,
+      );
+      assert.ok(ddl.some((s) => s === 'alter doc add unique (.data->"ext")'));
+      // The real engine ACCEPTS every statement (a malformed path would throw).
+      for (const stmt of ddl) await db.raw([stmt]);
+
+      // Seed docs and query over the indexed path via raw PowQL (F1's ORM-level
+      // JsonFilter lands separately; the index must not alter results either way).
+      await db.raw(
+        ['insert doc { id := ', ', data := ', ' } returning'],
+        'a',
+        new PowdbJsonParam({ ns: { value: 7 }, ext: 'x1' }),
+      );
+      await db.raw(
+        ['insert doc { id := ', ', data := ', ' } returning'],
+        'b',
+        new PowdbJsonParam({ ns: { value: 9 }, ext: 'x2' }),
+      );
+
+      const hit = (await db.raw(['doc filter .data->"ns"->"value" = 7 { .id }'])) as { id: string }[];
+      assert.deepEqual(
+        hit.map((r) => r.id),
+        ['a'],
+      );
+      const miss = (await db.raw(['doc filter .data->"ns"->"value" = 8 { .id }'])) as { id: string }[];
+      assert.deepEqual(miss, []);
+
+      // The unique doc-field index is enforced by the engine: a duplicate `ext`
+      // value is rejected. (The engine reports "unique expression index
+      // violation", which differs from the regular "unique constraint
+      // violation" message, so wrapPowdbError does not yet classify it as E008
+      // (noted for the powdb.ts owner); here we assert the write is refused.)
+      await assert.rejects(() =>
+        db.raw(['insert doc { id := ', ', data := ', ' } returning'], 'c', new PowdbJsonParam({ ext: 'x1' })),
+      );
+
+      // The drop path works (design mentions `alter … drop index`).
+      await db.raw(['alter doc drop index (.data->"ns"->"value")']);
+      const stillHit = (await db.raw(['doc filter .data->"ns"->"value" = 9 { .id }'])) as { id: string }[];
+      assert.deepEqual(
+        stillHit.map((r) => r.id),
+        ['b'],
+      ); // results unchanged after drop
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4b: describe-based introspection. Introspect a live embedded database via
+// `introspectPowdbDatabase(exec)` (exec built from the client's `raw` tagged
+// template) and assert the SchemaMetadata shape, then prove a generated-style
+// workflow (introspect → open a fresh client on the introspected metadata →
+// query) round-trips.
+// ---------------------------------------------------------------------------
+
+/** A `widget` table exercising every read-mapped PowQL type + a doc index (invisible to describe). */
+const wSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    widget: {
+      ...makeTable(
+        'widget',
+        [
+          col('id', 'id', 'string', 'text', { hasDefault: true }),
+          col('label', 'label', 'string', 'text', { nullable: true }),
+          col('qty', 'qty', 'number', 'int4', { nullable: true }),
+          col('score', 'score', 'number', 'float8', { nullable: true }),
+          col('active', 'active', 'boolean', 'bool', { nullable: true }),
+          col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+        ],
+        {},
+      ),
+      // A secondary unique column (beyond the PK) + an invisible doc-field index.
+      uniqueColumns: [['id'], ['label']],
+      indexes: [{ name: 'widget_data_k_idx', columns: ['data'], unique: false, definition: '', docPath: ['k'] }],
+    },
+  },
+};
+
+describe('powdb integration (embedded): describe-based introspection', () => {
+  it('introspects columns/types/nullability/PK-heuristic/unique and hides expression indexes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-introspect-it-'));
+    const db: DB = await turbinePowDB({ embedded: dir }, wSchema, { warnOnUnlimited: false });
+    try {
+      for (const stmt of powqlSchemaDDL(wSchema)) await db.raw([stmt]);
+
+      const exec = async (powql: string) => ({ rows: await db.raw([powql]) });
+      const meta = await introspectPowdbDatabase(exec);
+
+      const widget = meta.tables.widget!;
+      assert.ok(widget, 'widget table introspected');
+      assert.deepEqual(widget.allColumns, ['id', 'label', 'qty', 'score', 'active', 'data']);
+
+      const byName = Object.fromEntries(widget.columns.map((c) => [c.name, c]));
+      // PK column: non-nullable, str.
+      assert.equal(byName.id!.nullable, false);
+      assert.equal(byName.id!.tsType, 'string');
+      // Nullable columns carry the ` | null` suffix (introspection convention).
+      assert.equal(byName.label!.tsType, 'string | null');
+      assert.equal(byName.qty!.nullable, true);
+      assert.equal(byName.qty!.tsType, 'number | null');
+      assert.equal(byName.qty!.dialectType, 'int');
+      assert.equal(byName.score!.dialectType, 'float');
+      assert.equal(byName.active!.tsType, 'boolean | null');
+      // json column maps to unknown + dialectType json (so isJsonColumn classifies it).
+      assert.equal(byName.data!.tsType, 'unknown | null');
+      assert.equal(byName.data!.dialectType, 'json');
+
+      // PK heuristic: first non-nullable unique column, preferring `id`.
+      assert.deepEqual(widget.primaryKey, ['id']);
+      // Every `unique` column is a singleton unique set (id + label).
+      assert.deepEqual(widget.uniqueColumns.map((u) => u[0]).sort(), ['id', 'label']);
+      // Relations are always empty (PowDB has no declared FKs).
+      assert.deepEqual(widget.relations, {});
+      // The doc-field expression index is invisible to `describe` → absent.
+      assert.ok(!widget.indexes.some((i) => i.docPath), 'expression indexes do not round-trip');
+      // The two column-level unique indexes (id, label) DO appear.
+      assert.deepEqual(
+        widget.indexes
+          .filter((i) => i.unique)
+          .map((i) => i.columns[0])
+          .sort(),
+        ['id', 'label'],
+      );
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('generated-style workflow: introspect one db, then drive a fresh db from ONLY the introspected metadata', async () => {
+    // The embedded addon keeps a data dir open until GC (no explicit close), so
+    // reopening the SAME dir in one process is unreliable. Instead this proves
+    // the full generated-style loop: introspect db1 → the introspected metadata
+    // provisions (powqlSchemaDDL) and drives CRUD on a fresh db2 in its own dir.
+    const dir1 = mkdtempSync(join(tmpdir(), 'powdb-introspect-src-'));
+    const dir2 = mkdtempSync(join(tmpdir(), 'powdb-introspect-gen-'));
+    const db1: DB = await turbinePowDB({ embedded: dir1 }, wSchema, { warnOnUnlimited: false });
+    let meta: SchemaMetadata;
+    try {
+      for (const stmt of powqlSchemaDDL(wSchema)) await db1.raw([stmt]);
+      // Introspect the live database into fresh metadata (no rows needed; the
+      // catalog shape is what drives the generated client).
+      meta = await introspectPowdbDatabase(async (q: string) => ({ rows: await db1.raw([q]) }));
+    } finally {
+      await db1.disconnect();
+    }
+
+    // Drive a brand-new database from ONLY the introspected metadata.
+    const db2: DB = await turbinePowDB({ embedded: dir2 }, meta, { warnOnUnlimited: false });
+    try {
+      // 1) The introspected metadata provisions the schema (json column + PK).
+      for (const stmt of powqlSchemaDDL(meta)) await db2.raw([stmt]);
+      // 2) Seed via raw PowQL (the ORM-level json write path lands with F1); the
+      //    json column rides in a PowdbJsonParam the embedded pool materializes.
+      await db2.raw(
+        [
+          'insert widget { id := ',
+          ', label := ',
+          ', qty := ',
+          ', score := ',
+          ', active := ',
+          ', data := ',
+          ' } returning',
+        ],
+        'w1',
+        'Ada',
+        5,
+        1.5,
+        true,
+        new PowdbJsonParam({ k: 1 }),
+      );
+      // 3) Query through the TurbineClient built on the introspected metadata.
+      const rows = await db2.table('widget').findMany({ where: { id: 'w1' } });
+      assert.equal(rows.length, 1);
+      const row = rows[0]!;
+      assert.equal(row.id, 'w1');
+      assert.equal(row.label, 'Ada');
+      assert.equal(row.qty, 5);
+      assert.equal(row.score, 1.5);
+      assert.equal(row.active, true);
+      assert.deepEqual(row.data, { k: 1 }); // json read-coercion via introspected dialectType
+      // findUnique by the heuristic PK works (proves primaryKey: ['id'] resolved).
+      const one = await db2.table('widget').findUnique({ where: { id: 'w1' } });
+      assert.equal(one.label, 'Ada');
+    } finally {
+      await db2.disconnect();
+      rmSync(dir1, { recursive: true, force: true });
+      rmSync(dir2, { recursive: true, force: true });
+    }
   });
 });

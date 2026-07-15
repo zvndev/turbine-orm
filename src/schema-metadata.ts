@@ -24,10 +24,12 @@
  *     the same conservative auto-`manyToMany` treatment as introspection.
  *   - Explicit `manyToMany` declarations on the SchemaDef are merged via
  *     {@link applyManyToManyRelations} (additive, never clobbering).
- *   - `indexes` is always `[]` — SchemaDef cannot express indexes, and an
- *     empty list keeps `schemaHasIndexInfo()` false so the index advisor
- *     and the dev-mode missing-index warning stay silent instead of
- *     producing blanket false positives.
+ *   - `indexes` carries any declared `TableDef.indexes` (plain column and/or
+ *     PowDB doc-field expression indexes); a table with none declared gets
+ *     `[]`, which keeps `schemaHasIndexInfo()` false so the index advisor and
+ *     the dev-mode missing-index warning stay silent instead of producing
+ *     blanket false positives. Doc-field (docPath) indexes are ignored by the
+ *     advisor, so a doc-only index set never flips `schemaHasIndexInfo()`.
  *
  * @example
  * ```ts
@@ -52,6 +54,7 @@ import {
 import {
   type ColumnMetadata,
   camelToSnake,
+  type IndexMetadata,
   isDateType,
   pgArrayType,
   pgTypeToTs,
@@ -60,7 +63,15 @@ import {
   type SchemaMetadata,
   type TableMetadata,
 } from './schema.js';
-import { applyManyToManyRelations, type ColumnConfig, type ColumnType, type SchemaDef } from './schema-builder.js';
+import {
+  applyManyToManyRelations,
+  type ColumnConfig,
+  type ColumnType,
+  isDocFieldIndexDef,
+  type SchemaDef,
+  type SchemaIndexDef,
+  type TableDef,
+} from './schema-builder.js';
 
 // ---------------------------------------------------------------------------
 // DDL type → Postgres udt_name (what introspection reads from the catalog)
@@ -134,6 +145,56 @@ function resolveColumnName(raw: string, target: ResolvedTable | undefined): stri
 }
 
 // ---------------------------------------------------------------------------
+// Index declarations → IndexMetadata
+// ---------------------------------------------------------------------------
+
+/**
+ * Render a doc-field JSON path into an illustrative PowQL fragment for the
+ * `IndexMetadata.definition` field (debuggability only; the authoritative,
+ * lexer-exact emission lives in `powqlSchemaDDL`). String segments are shown
+ * double-quoted, integer array indexes bare.
+ */
+function docPathFragment(column: string, path: (string | number)[]): string {
+  const segs = path.map((s) => (typeof s === 'number' ? `->${s}` : `->"${s}"`)).join('');
+  return `(.${column}${segs})`;
+}
+
+/**
+ * Convert a table's {@link SchemaIndexDef} list into {@link IndexMetadata}.
+ * A doc-field index carries `docPath` and `columns: [<json column>]`; a plain
+ * column index carries its snake_case column list and no `docPath`. Names are
+ * auto-derived (`<table>_<cols>_idx`) when not supplied.
+ */
+function mapIndexes(tableDef: TableDef, declared: readonly SchemaIndexDef[] | undefined): IndexMetadata[] {
+  if (!declared || declared.length === 0) return [];
+  const out: IndexMetadata[] = [];
+  for (const idx of declared) {
+    if (isDocFieldIndexDef(idx)) {
+      const column = camelToSnake(idx.docField);
+      const segPart = idx.path.map((s) => (typeof s === 'number' ? String(s) : s)).join('_');
+      const name = idx.name ?? `${tableDef.name}_${column}_${segPart}_idx`;
+      out.push({
+        name,
+        columns: [column],
+        unique: idx.unique ?? false,
+        definition: `${idx.unique ? 'unique ' : 'index '}${docPathFragment(column, idx.path)}`,
+        docPath: [...idx.path],
+      });
+    } else {
+      const columns = idx.columns.map(camelToSnake);
+      const name = idx.name ?? `${tableDef.name}_${columns.join('_')}_idx`;
+      out.push({
+        name,
+        columns,
+        unique: idx.unique ?? false,
+        definition: `${idx.unique ? 'unique ' : 'index '}(${columns.join(', ')})`,
+      });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // The converter
 // ---------------------------------------------------------------------------
 
@@ -160,10 +221,14 @@ function resolveColumnName(raw: string, target: ResolvedTable | undefined): stri
  *   - Explicit `manyToMany` declarations → merged additively.
  *   - Schema-level `enums`.
  *
+ * What maps (continued):
+ *   - `indexes` → declared `TableDef.indexes` become `IndexMetadata` (plain
+ *     column indexes and PowDB doc-field expression indexes, the latter
+ *     carrying `docPath`). A table with no declared indexes gets `[]`, keeping
+ *     `schemaHasIndexInfo()` false so index-advisor consumers produce no false
+ *     positives on index-less code-first metadata.
+ *
  * What SchemaDef cannot express (and how it degrades):
- *   - Indexes → every table gets `indexes: []`, which keeps
- *     `schemaHasIndexInfo()` false so index-advisor consumers produce no
- *     false positives on code-first metadata.
  *   - Views → never marked (`isView` is introspection-only).
  *   - Composite foreign keys → `references:` is single-column by design.
  */
@@ -363,9 +428,12 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
       primaryKey: pk,
       uniqueColumns,
       relations: relationsByTable.get(tableDef.name) ?? {},
-      // SchemaDef cannot express indexes. An empty list keeps
-      // schemaHasIndexInfo() false → no index-advisor false positives.
-      indexes: [],
+      // Declared `indexes` (plain column + doc-field expression) carry through;
+      // an undeclared table gets `[]`, which keeps schemaHasIndexInfo() false so
+      // the index advisor stays silent. Doc-field (docPath) indexes are ignored
+      // by the advisor entirely (see index-advisor.ts), so a doc-only index set
+      // never flips schemaHasIndexInfo() and never produces FK false positives.
+      indexes: mapIndexes(tableDef, tableDef.indexes),
     };
   }
 

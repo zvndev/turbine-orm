@@ -231,6 +231,103 @@ describe('powdb: type mapping', () => {
 });
 
 // ---------------------------------------------------------------------------
+// F4a: doc-field expression index DDL
+// ---------------------------------------------------------------------------
+
+describe('powdb: powqlSchemaDDL doc-field expression indexes', () => {
+  /** A `doc` table whose json column carries the supplied index declarations. */
+  function docTable(indexes: TableMetadata['indexes']): SchemaMetadata {
+    const t: TableMetadata = {
+      ...table('doc', [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+      ]),
+      indexes,
+    };
+    return { enums: {}, tables: { doc: t } };
+  }
+
+  /** The `alter doc add …` statements from a DDL emission (skip the `type` block). */
+  function alters(schema: SchemaMetadata): string[] {
+    return powqlSchemaDDL(schema).filter((s) => s.startsWith('alter'));
+  }
+
+  it('emits a MANDATORY-parenthesized doc-field index', () => {
+    const ddl = alters(
+      docTable([
+        { name: 'doc_data_ns_value_idx', columns: ['data'], unique: false, definition: '', docPath: ['ns', 'value'] },
+      ]),
+    );
+    assert.deepEqual(ddl, ['alter doc add index (.data->"ns"->"value")']);
+  });
+
+  it('emits a doc-field UNIQUE expression index', () => {
+    const ddl = alters(
+      docTable([{ name: 'doc_data_ext_idx', columns: ['data'], unique: true, definition: '', docPath: ['ext'] }]),
+    );
+    assert.deepEqual(ddl, ['alter doc add unique (.data->"ext")']);
+  });
+
+  it('emits integer array-index segments bare (not quoted)', () => {
+    const ddl = alters(
+      docTable([{ name: 'i', columns: ['data'], unique: false, definition: '', docPath: ['tags', 0] }]),
+    );
+    assert.deepEqual(ddl, ['alter doc add index (.data->"tags"->0)']);
+  });
+
+  it('escapes hostile string segments lexer-exact (quotes/backslashes)', () => {
+    const ddl = alters(
+      docTable([{ name: 'i', columns: ['data'], unique: false, definition: '', docPath: ['a"b\\c'] }]),
+    );
+    assert.deepEqual(ddl, ['alter doc add index (.data->"a\\"b\\\\c")']);
+  });
+
+  it('a JSON `$1`-shaped segment is inert DDL text (never a placeholder)', () => {
+    // DDL is executed directly, never routed through materializePowql, so a
+    // literal `$1` in a segment cannot be rewritten; it is emitted verbatim.
+    const ddl = alters(docTable([{ name: 'i', columns: ['data'], unique: false, definition: '', docPath: ['$1'] }]));
+    assert.deepEqual(ddl, ['alter doc add index (.data->"$1")']);
+  });
+
+  it('emits a plain single-column index / unique when no docPath is set', () => {
+    const idxDdl = alters(docTable([{ name: 'i', columns: ['data'], unique: false, definition: '' }]));
+    assert.deepEqual(idxDdl, ['alter doc add index .data']);
+    const uniqDdl = alters(docTable([{ name: 'u', columns: ['data'], unique: true, definition: '' }]));
+    assert.deepEqual(uniqDdl, ['alter doc add unique .data']);
+  });
+
+  it('throws E017 for a composite (multi-column) plain index', () => {
+    assert.throws(
+      () => powqlSchemaDDL(docTable([{ name: 'c', columns: ['id', 'data'], unique: false, definition: '' }])),
+      UnsupportedFeatureError,
+    );
+  });
+
+  it('does not double-emit a plain unique index that duplicates the PK', () => {
+    // `id` is already `required unique` inline; a redundant unique index on it
+    // must be skipped.
+    const ddl = alters(docTable([{ name: 'dup', columns: ['id'], unique: true, definition: '' }]));
+    assert.deepEqual(ddl, []);
+  });
+
+  it('gates doc-field indexes behind the docFieldIndexes capability', () => {
+    const schema = docTable([{ name: 'i', columns: ['data'], unique: false, definition: '', docPath: ['k'] }]);
+    // Capability OFF (engine < 0.13) → typed E017 with a version hint.
+    assert.throws(
+      () => powqlSchemaDDL(schema, { capabilities: capabilitiesFromVersion('0.12.0') }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /0\.13/.test((e as Error).message),
+    );
+    // Capability ON → emits.
+    const ddl = powqlSchemaDDL(schema, { capabilities: capabilitiesFromVersion('0.13.0') }).filter((s) =>
+      s.startsWith('alter'),
+    );
+    assert.deepEqual(ddl, ['alter doc add index (.data->"k")']);
+    // No capabilities supplied (pure-function caller) → emits unconditionally.
+    assert.deepEqual(alters(schema), ['alter doc add index (.data->"k")']);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Value coercion
 // ---------------------------------------------------------------------------
 

@@ -188,6 +188,20 @@ export interface IndexMetadata {
   columns: string[];
   unique: boolean;
   definition: string;
+  /**
+   * Set only for a PowDB doc-field expression index: the JSON path (string keys
+   * and integer array indexes) into the single json document column named by
+   * `columns[0]`. When present, `columns` is `[<json column>]` and the index
+   * targets `columns[0]-><segments>` rather than the raw column.
+   *
+   * Consumed by the PowDB DDL generator (`powqlSchemaDDL` emits
+   * `alter T add index (.col->"seg")`). The missing-FK index advisor ignores
+   * doc-field indexes entirely (a JSON expression index never covers an
+   * equality probe on the raw column). Doc-field indexes are invisible to
+   * `describe`-based introspection, so they do NOT round-trip through
+   * introspection.
+   */
+  docPath?: (string | number)[];
 }
 
 // ---------------------------------------------------------------------------

@@ -179,3 +179,48 @@ test('builder emits a dev-mode warning once for unindexed relation probes', asyn
   assert.match(relevant[0]!, /CREATE INDEX "idx_posts_user_id"/);
   assert.match(relevant[0]!, /turbine doctor/);
 });
+
+// ---------------------------------------------------------------------------
+// F4a: doc-field (docPath) expression indexes are ignored by the advisor
+// ---------------------------------------------------------------------------
+
+test('a doc-field index never satisfies an equality probe on its column', () => {
+  const schema = makeSchema();
+  const posts = schema.tables.posts!;
+  // A doc-field expression index on `user_id` targets `user_id->seg`, not the
+  // raw column, so it must NOT cover an equality probe on `user_id`.
+  posts.indexes = [
+    { name: 'posts_user_id_ns_idx', columns: ['user_id'], unique: false, definition: '', docPath: ['ns'] },
+  ];
+  assert.equal(isProbeIndexed(posts, ['user_id']), false);
+});
+
+test('a doc-only index set keeps schemaHasIndexInfo() false', () => {
+  const schema = makeSchema();
+  schema.tables.posts!.indexes = [
+    { name: 'posts_user_id_ns_idx', columns: ['user_id'], unique: false, definition: '', docPath: ['ns'] },
+  ];
+  // Doc-field indexes carry no FK-coverage info → the schema stays "unknown".
+  assert.equal(schemaHasIndexInfo(schema), false);
+  // ...and a plain index alongside it flips it true.
+  schema.tables.users!.indexes = [{ name: 'u', columns: ['id'], unique: true, definition: '' }];
+  // WeakMap cache is keyed on the object identity; make a fresh schema to avoid
+  // a stale cached answer.
+  const fresh = makeSchema();
+  fresh.tables.posts!.indexes = [{ name: 'd', columns: ['user_id'], unique: false, definition: '', docPath: ['ns'] }];
+  fresh.tables.users!.indexes = [{ name: 'u', columns: ['id'], unique: true, definition: '' }];
+  assert.equal(schemaHasIndexInfo(fresh), true);
+});
+
+test('a doc-field index on an FK column does not spuriously clear a missing-index finding', () => {
+  const schema = makeSchema();
+  // Real index info exists (so the advisor runs)...
+  schema.tables.users!.indexes = [{ name: 'users_pkey', columns: ['id'], unique: true, definition: '' }];
+  // ...and posts carries ONLY a doc-field index on the FK column.
+  schema.tables.posts!.indexes = [
+    { name: 'posts_user_id_ns_idx', columns: ['user_id'], unique: false, definition: '', docPath: ['ns'] },
+  ];
+  const missing = findMissingRelationIndexes(schema);
+  // posts(user_id) is still flagged; the doc index does not cover it.
+  assert.ok(missing.some((m) => m.table === 'posts' && m.columns.includes('user_id')));
+});

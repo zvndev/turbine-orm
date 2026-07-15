@@ -681,3 +681,88 @@ describe('schemaDefToMetadata — relation-name parity with buildRelationsFromFo
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// F4a: defineSchema `indexes` surface → IndexMetadata carry-through
+// ---------------------------------------------------------------------------
+
+describe('schemaDefToMetadata: index declarations', () => {
+  it('carries a doc-field expression index onto IndexMetadata with docPath', () => {
+    const def = defineSchema({
+      docs: {
+        id: { type: 'serial', primaryKey: true },
+        data: { type: 'jsonb', nullable: true },
+        indexes: [{ docField: 'data', path: ['ns', 'value'] }],
+      },
+    });
+    const meta = schemaDefToMetadata(def);
+    const idx = meta.tables.docs!.indexes;
+    assert.equal(idx.length, 1);
+    assert.deepStrictEqual(idx[0]!.columns, ['data']);
+    assert.deepStrictEqual(idx[0]!.docPath, ['ns', 'value']);
+    assert.equal(idx[0]!.unique, false);
+    // Auto-derived name: <table>_<col>_<segs joined by _>_idx.
+    assert.equal(idx[0]!.name, 'docs_data_ns_value_idx');
+  });
+
+  it('carries a unique doc-field index and a camelCase → snake column name', () => {
+    const def = defineSchema({
+      docs: {
+        id: { type: 'serial', primaryKey: true },
+        payload: { type: 'jsonb', nullable: true },
+        indexes: [{ docField: 'payload', path: ['externalId'], unique: true, name: 'my_ext_idx' }],
+      },
+    });
+    const idx = schemaDefToMetadata(def).tables.docs!.indexes[0]!;
+    assert.equal(idx.unique, true);
+    assert.equal(idx.name, 'my_ext_idx');
+    assert.deepStrictEqual(idx.columns, ['payload']);
+    assert.deepStrictEqual(idx.docPath, ['externalId']);
+  });
+
+  it('carries a plain column index (no docPath), snake-casing field names', () => {
+    const def = defineSchema({
+      docs: {
+        id: { type: 'serial', primaryKey: true },
+        ownerId: { type: 'integer', notNull: true },
+        indexes: [{ columns: ['ownerId'] }],
+      },
+    });
+    const idx = schemaDefToMetadata(def).tables.docs!.indexes[0]!;
+    assert.deepStrictEqual(idx.columns, ['owner_id']);
+    assert.equal(idx.docPath, undefined);
+    assert.equal(idx.name, 'docs_owner_id_idx');
+  });
+
+  it('a doc-only index set keeps schemaHasIndexInfo() false (advisor stays silent)', () => {
+    const def = defineSchema({
+      docs: {
+        id: { type: 'serial', primaryKey: true },
+        data: { type: 'jsonb', nullable: true },
+        indexes: [{ docField: 'data', path: ['k'] }],
+      },
+    });
+    const meta = schemaDefToMetadata(def);
+    // The doc index is present in metadata...
+    assert.equal(meta.tables.docs!.indexes.length, 1);
+    // ...but does not flip schemaHasIndexInfo (doc-field indexes carry no
+    // FK-coverage info → no blanket false positives).
+    assert.equal(schemaHasIndexInfo(meta), false);
+  });
+
+  it('a plain column index DOES flip schemaHasIndexInfo() (real coverage info)', () => {
+    const def = defineSchema({
+      docs: {
+        id: { type: 'serial', primaryKey: true },
+        ownerId: { type: 'integer', notNull: true },
+        indexes: [{ columns: ['ownerId'] }],
+      },
+    });
+    assert.equal(schemaHasIndexInfo(schemaDefToMetadata(def)), true);
+  });
+
+  it('a table with no `indexes` still gets []', () => {
+    const def = defineSchema({ docs: { id: { type: 'serial', primaryKey: true } } });
+    assert.deepStrictEqual(schemaDefToMetadata(def).tables.docs!.indexes, []);
+  });
+});
