@@ -27,6 +27,7 @@ import {
   isJsonColumn,
   isStaleFramePowdbError,
   materializePowql,
+  type PowdbCapabilities,
   PowdbEmbeddedPool,
   PowdbFloatParam,
   PowdbJsonParam,
@@ -125,15 +126,23 @@ const schema: SchemaMetadata = {
         },
       },
     ),
+    // A json-document table for F1/F2 (JSON path filters, ordering, grouping).
+    doc: table('doc', [
+      col('id', 'id', 'string', 'text', { hasDefault: true }),
+      col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+      col('region', 'region', 'string', 'text', { nullable: true }),
+    ]),
   },
 };
 
 /** A mock PowdbPool that records every emitted PowQL and returns canned rows. */
-function mockPool() {
+function mockPool(caps: PowdbCapabilities = ALL_POWDB_CAPABILITIES) {
   const calls: { powql: string; params: unknown[] }[] = [];
   let nextRows: Record<string, unknown>[] = [];
   let nextScalar = '0';
   const pool = {
+    capabilities: caps,
+    retryStaleReads: false,
     query(powql: string, params: unknown[]) {
       calls.push({ powql, params });
       const head = powql.trimStart();
@@ -2077,5 +2086,396 @@ describe('powdb: F5 isStaleFramePowdbError predicate + retryStaleReads plumbing'
   it('retryStaleReads plumbs onto the pool for the interface to read (default false)', () => {
     assert.equal(new PowdbPool({} as never).retryStaleReads, false);
     assert.equal(new PowdbPool({} as never, undefined, { retryStaleReads: true }).retryStaleReads, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1: JsonFilter → PowQL path filters
+// ---------------------------------------------------------------------------
+
+describe('powdb F1: JsonFilter → PowQL path filters', () => {
+  it('equals with path → `.data->$1->$2 = $3` with typed params', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({ where: { data: { path: ['ns', 'value'], equals: 7 } }, limit: 1 });
+    assert.match(m.last().powql, /^doc filter \.data->\$1->\$2 = \$3 order.*|^doc filter \.data->\$1->\$2 = \$3 limit/);
+    assert.deepEqual(m.last().params.slice(0, 3), ['ns', 'value', 7]);
+  });
+
+  it('equals binds string / boolean / int / float by JS shape (never stringified)', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({
+      where: { AND: [{ data: { path: ['a'], equals: 'x' } }, { data: { path: ['b'], equals: true } }] },
+      limit: 1,
+    });
+    // ns/value params: $1='a',$2='x',$3='b',$4=true, typed, not String()'d.
+    assert.deepEqual(m.last().params.slice(0, 4), ['a', 'x', 'b', true]);
+    const m2 = mockPool();
+    await qi(m2, 'doc').findMany({ where: { data: { path: ['f'], equals: 2.5 } }, limit: 1 });
+    assert.equal(m2.last().params[1], 2.5);
+    assert.equal(typeof m2.last().params[1], 'number');
+  });
+
+  it('equals: null → `is null` (matches JSON null OR missing key)', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({ where: { data: { path: ['a'], equals: null } }, limit: 1 });
+    assert.match(m.last().powql, /\.data->\$1 is null/);
+    // Only the path segment binds; no equals value param.
+    assert.deepEqual(m.last().params.slice(0, 1), ['a']);
+  });
+
+  it('range ops → `.data->$n > $m`, joined with `and`, path required + reused', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({ where: { data: { path: ['k'], gte: 1, lt: 10 } }, limit: 1 });
+    assert.match(m.last().powql, /\(\.data->\$1 >= \$2 and \.data->\$1 < \$3\)/);
+    assert.deepEqual(m.last().params.slice(0, 3), ['k', 1, 10]);
+  });
+
+  it('hasKey → `json_type(.data->$n) is not null` (ignores path, mirrors PG `?`)', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({ where: { data: { hasKey: 'tag' } }, limit: 1 });
+    assert.match(m.last().powql, /json_type\(\.data->\$1\) is not null/);
+    assert.equal(m.last().params[0], 'tag');
+  });
+
+  it('numeric-index and quote/backslash/$N path segments bind as params (materializer-safe)', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({ where: { data: { path: ['a"; drop', '$1'], equals: 1 } }, limit: 1 });
+    // Segments are $1/$2 tokens; hostile text is a param value, never inlined.
+    assert.match(m.last().powql, /\.data->\$1->\$2 = \$3/);
+    assert.deepEqual(m.last().params.slice(0, 3), ['a"; drop', '$1', 1]);
+  });
+
+  it('combinators (OR/NOT) wrap JSON conditions', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({
+      where: { OR: [{ data: { path: ['a'], equals: 1 } }, { NOT: { data: { path: ['b'], gt: 2 } } }] },
+      limit: 1,
+    });
+    assert.match(m.last().powql, /\(\.data->\$1 = \$2 or not \(\.data->\$3 > \$4\)\)/);
+  });
+
+  it('contains → E017 (PowQL has no containment operator)', async () => {
+    const m = mockPool();
+    await assert.rejects(
+      qi(m, 'doc').findMany({ where: { data: { contains: { a: 1 } } as never }, limit: 1 }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /containment/i.test((e as Error).message),
+    );
+  });
+
+  it('pathless equals → E017 (no whole-document containment)', async () => {
+    const m = mockPool();
+    await assert.rejects(
+      qi(m, 'doc').findMany({ where: { data: { equals: { a: 1 } } as never }, limit: 1 }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /equals without path/i.test((e as Error).message),
+    );
+  });
+
+  it('jsonDocs capability OFF → E017 with a version hint', async () => {
+    const m = mockPool(capabilitiesFromVersion('0.11.0'));
+    await assert.rejects(
+      qi(m, 'doc').findMany({ where: { data: { path: ['a'], equals: 1 } }, limit: 1 }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0\.12/.test((e as Error).message),
+    );
+  });
+
+  it('a bare `{ path }` compiles to no clauses → mutation refused by the empty-where guard', async () => {
+    const m = mockPool();
+    await assert.rejects(
+      qi(m, 'doc').updateMany({ where: { data: { path: ['a'] } }, data: { region: 'z' } }),
+      (e: unknown) => e instanceof ValidationError && /where` clause is empty/.test((e as Error).message),
+    );
+  });
+
+  it('relation-filter resolution flows a JSON inner where through the same compiler', async () => {
+    // app_user.posts (hasMany). The inner where on the child runs as a real
+    // findMany; give it a JSON filter and assert that inner statement's PowQL.
+    const relSchema: SchemaMetadata = {
+      enums: {},
+      tables: {
+        app_user: table('app_user', [col('id', 'id', 'string', 'text', { hasDefault: true })], {
+          docs: {
+            type: 'hasMany',
+            name: 'docs',
+            from: 'app_user',
+            to: 'doc2',
+            foreignKey: 'owner_id',
+            referenceKey: 'id',
+          },
+        }),
+        doc2: table('doc2', [
+          col('id', 'id', 'string', 'text', { hasDefault: true }),
+          col('owner_id', 'ownerId', 'string', 'text'),
+          col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+        ]),
+      },
+    };
+    const m = mockPool();
+    m.setRows([]); // inner collect returns no keys → outer resolves to a no-match
+    const userQi = new PowqlInterface(m.pool, 'app_user', relSchema, [], { warnOnUnlimited: false });
+    await userQi.findMany({ where: { docs: { some: { data: { path: ['k'], equals: 5 } } } }, limit: 1 });
+    const inner = m.calls.find((c) => c.powql.startsWith('doc2'));
+    assert.ok(inner, 'inner child query ran');
+    assert.match(inner!.powql, /\.data->\$1 = \$2/);
+    assert.deepEqual(inner!.params.slice(0, 2), ['k', 5]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F2: JSON-path orderBy and groupBy
+// ---------------------------------------------------------------------------
+
+describe('powdb F2: JSON-path orderBy', () => {
+  it('path order → `order .data->$n asc`', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({ orderBy: { data: { path: ['k'] } } as never, limit: 1 });
+    assert.match(m.last().powql, / order \.data->\$1 asc /);
+  });
+
+  it('desc + numeric cast', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({
+      orderBy: { data: { path: ['n'], direction: 'desc', type: 'numeric' } } as never,
+      limit: 1,
+    });
+    assert.match(m.last().powql, / order cast\(\.data->\$1, "float"\) desc /);
+  });
+
+  it('nulls:last accepted (no-op); nulls:first → E017', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({ orderBy: { data: { path: ['k'], nulls: 'last' } } as never, limit: 1 });
+    assert.match(m.last().powql, / order \.data->\$1 asc /);
+    await assert.rejects(
+      qi(mockPool(), 'doc').findMany({ orderBy: { data: { path: ['k'], nulls: 'first' } } as never, limit: 1 }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /NULLS FIRST/i.test((e as Error).message),
+    );
+  });
+
+  it('OrderBySpec { sort, nulls:last } accepted; nulls:first → E017', async () => {
+    const m = mockPool();
+    await qi(m, 'doc').findMany({ orderBy: { region: { sort: 'desc', nulls: 'last' } } as never, limit: 1 });
+    assert.match(m.last().powql, / order \.region desc /);
+    await assert.rejects(
+      qi(mockPool(), 'doc').findMany({ orderBy: { region: { sort: 'asc', nulls: 'first' } } as never, limit: 1 }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /NULLS FIRST/i.test((e as Error).message),
+    );
+  });
+
+  it('jsonDocs OFF → E017 version hint on path order', async () => {
+    await assert.rejects(
+      new PowqlInterface(mockPool(capabilitiesFromVersion('0.11.0')).pool, 'doc', schema).findMany({
+        orderBy: { data: { path: ['k'] } } as never,
+        limit: 1,
+      }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0\.12/.test((e as Error).message),
+    );
+  });
+});
+
+describe('powdb F2: JSON-path + aggregate groupBy', () => {
+  it('JSON group key → `group .data->$1` with `gk_0` alias + `min(json_type)` discriminator + `count(*)`', async () => {
+    const m = mockPool();
+    m.setRows([]);
+    await qi(m, 'doc').groupBy({ by: [{ field: 'data', path: ['a'] }] as never, _count: true });
+    const p = m.last().powql;
+    assert.match(p, /group \.data->\$1/);
+    assert.match(p, /gk_0: \.data->\$1/);
+    assert.match(p, /gt_0: min\(json_type\(\.data->\$1\)\)/);
+    assert.match(p, /agg_0: count\(\*\)/);
+    assert.equal(m.last().params[0], 'a');
+  });
+
+  it('native pool omits the discriminator projection', async () => {
+    const m = mockPool({ ...ALL_POWDB_CAPABILITIES, nativeRaw: true });
+    m.setRows([]);
+    await qi(m, 'doc').groupBy({ by: [{ field: 'data', path: ['a'] }] as never, _count: true });
+    assert.doesNotMatch(m.last().powql, /json_type/);
+    assert.match(m.last().powql, /gk_0: \.data->\$1/);
+  });
+
+  it('JSON aggregate target → `sum(cast(.data->$n, "float"))`; _sum type:text → E003', async () => {
+    const m = mockPool();
+    m.setRows([]);
+    await qi(m, 'doc').groupBy({
+      by: ['region'],
+      _sum: { rev: { field: 'data', path: ['rev'] } } as never,
+    });
+    assert.match(m.last().powql, /agg_0: sum\(cast\(\.data->\$1, "float"\)\)/);
+    await assert.rejects(
+      qi(mockPool(), 'doc').groupBy({
+        by: ['region'],
+        _sum: { rev: { field: 'data', path: ['rev'], type: 'text' } } as never,
+      }),
+      (e: unknown) => e instanceof ValidationError && /always numeric/.test((e as Error).message),
+    );
+  });
+
+  it('orderBy by _count / _sum alias emits `order .agg_N`; unrequested aggregate → E003', async () => {
+    const m = mockPool();
+    m.setRows([]);
+    await qi(m, 'doc').groupBy({ by: ['region'], _count: true, orderBy: { _count: 'desc' } });
+    assert.match(m.last().powql, / order \.agg_0 desc /);
+    // _sum not requested → E003 listing valid keys.
+    await assert.rejects(
+      qi(mockPool(), 'doc').groupBy({ by: ['region'], _count: true, orderBy: { _sum: { rev: 'desc' } } }),
+      (e: unknown) => e instanceof ValidationError && /not requested/.test((e as Error).message),
+    );
+  });
+
+  it('orderBy by an unknown key → E003 listing orderable keys', async () => {
+    await assert.rejects(
+      qi(mockPool(), 'doc').groupBy({ by: ['region'], _count: true, orderBy: { nope: 'asc' } }),
+      (e: unknown) => e instanceof ValidationError && /Unknown field "nope"/.test((e as Error).message),
+    );
+  });
+
+  it('JSON group-key alias collision with a by-column → E003', async () => {
+    await assert.rejects(
+      qi(mockPool(), 'doc').groupBy({ by: ['region', { field: 'data', path: ['region'] }] as never }),
+      (e: unknown) => e instanceof ValidationError && /collides/.test((e as Error).message),
+    );
+  });
+
+  it('HAVING _count uses count(*)', async () => {
+    const m = mockPool();
+    m.setRows([]);
+    await qi(m, 'doc').groupBy({ by: ['region'], _count: true, having: { _count: { gt: 1 } } });
+    assert.match(m.last().powql, /having count\(\*\) > \$/);
+  });
+
+  it('groupBy nulls:first ordering → E017', async () => {
+    await assert.rejects(
+      qi(mockPool(), 'doc').groupBy({
+        by: ['region'],
+        _count: true,
+        orderBy: { region: { sort: 'asc', nulls: 'first' } },
+      }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /NULLS FIRST/.test((e as Error).message),
+    );
+  });
+
+  it('jsonDocs OFF → E017 version hint on JSON group key', async () => {
+    await assert.rejects(
+      new PowqlInterface(mockPool(capabilitiesFromVersion('0.11.0')).pool, 'doc', schema).groupBy({
+        by: [{ field: 'data', path: ['a'] }] as never,
+        _count: true,
+      }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0\.12/.test((e as Error).message),
+    );
+  });
+
+  it('discriminator disambiguates the legacy-wire null / string-"null" groups in the transform', async () => {
+    const m = mockPool();
+    // Two "null"-rendering groups: gt_0="null" → JS null; gt_0="string" → "null".
+    m.setRows([
+      { gk_0: 'null', gt_0: 'null', agg_0: '2' },
+      { gk_0: 'null', gt_0: 'string', agg_0: '1' },
+      { gk_0: '7', gt_0: 'number', agg_0: '3' },
+    ]);
+    const out = await qi(m, 'doc').groupBy({ by: [{ field: 'data', path: ['a'] }] as never, _count: true });
+    assert.deepEqual(out, [
+      { a: null, _count: 2 },
+      { a: 'null', _count: 1 },
+      { a: '7', _count: 3 },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration hooks: PowdbJsonParam write path, nativeRaw shape() threading,
+// retryStaleReads exec retry
+// ---------------------------------------------------------------------------
+
+describe('powdb hook: param() wraps a json document in PowdbJsonParam on write', () => {
+  it('create binds an object/array value as a PowdbJsonParam for a json column', async () => {
+    const m = mockPool();
+    m.setRows([{ id: 'd1', data: '{"a":1}', region: null }]);
+    await qi(m, 'doc').create({ data: { id: 'd1', data: { a: 1 }, region: null } as never });
+    const jsonParam = m.last().params.find((p) => p instanceof PowdbJsonParam) as PowdbJsonParam | undefined;
+    assert.ok(jsonParam, 'the object value is wrapped in PowdbJsonParam');
+    assert.deepEqual(jsonParam!.value, { a: 1 });
+    // A JS string to a json column passes through raw (not wrapped).
+    const m2 = mockPool();
+    m2.setRows([{ id: 'd2', data: '"x"', region: null }]);
+    await qi(m2, 'doc').create({ data: { id: 'd2', data: '"x"' } as never });
+    assert.equal(
+      m2.last().params.some((p) => p instanceof PowdbJsonParam),
+      false,
+    );
+  });
+});
+
+describe('powdb hook: shape() threads capabilities.nativeRaw into rowToEntity', () => {
+  it('native pool keeps a genuine str "null" (no legacy collapse)', async () => {
+    const m = mockPool({ ...ALL_POWDB_CAPABILITIES, nativeRaw: true });
+    // Native cells arrive pre-typed: region "null" is a real string, absent id is null.
+    m.setRows([{ id: 'd1', data: { a: 1 }, region: 'null' }]);
+    const [row] = await qi(m, 'doc').findMany({ limit: 1 });
+    assert.equal((row as { region: string }).region, 'null');
+    assert.deepEqual((row as { data: unknown }).data, { a: 1 });
+  });
+
+  it('legacy pool collapses a str "null" to null (unchanged wart)', async () => {
+    const m = mockPool(); // nativeRaw false
+    m.setRows([{ id: 'd1', region: 'null' }]);
+    const [row] = await qi(m, 'doc').findMany({ limit: 1 });
+    assert.equal((row as { region: unknown }).region, null);
+  });
+});
+
+describe('powdb hook: retryStaleReads replays a READ once, never a write, never in a tx', () => {
+  /** A pool whose query() throws the stale-frame error on the first N calls, then succeeds. */
+  function flakyPool(failFirst: number, opts: { retryStaleReads?: boolean } = {}) {
+    let attempts = 0;
+    const pool = {
+      capabilities: ALL_POWDB_CAPABILITIES,
+      retryStaleReads: opts.retryStaleReads ?? true,
+      query(_powql: string, _params: unknown[]) {
+        attempts++;
+        if (attempts <= failFirst) {
+          return Promise.reject(
+            wrapPowdbError(
+              Object.assign(new Error('received unexpected frame from server'), { code: 'protocol_error' }),
+            ),
+          );
+        }
+        return Promise.resolve({ rows: [{ id: 'ok' }], rowCount: 1 });
+      },
+    } as unknown as PowdbPool;
+    return { pool, attempts: () => attempts };
+  }
+
+  it('a findMany retries exactly once on the stale-frame error and succeeds', async () => {
+    const f = flakyPool(1);
+    const rows = await new PowqlInterface(f.pool, 'doc', schema).findMany({ limit: 1 });
+    assert.equal(rows.length, 1);
+    assert.equal(f.attempts(), 2, 'one original + one retry');
+  });
+
+  it('does NOT retry when retryStaleReads is off', async () => {
+    const f = flakyPool(1, { retryStaleReads: false });
+    await assert.rejects(new PowqlInterface(f.pool, 'doc', schema).findMany({ limit: 1 }), ConnectionError);
+    assert.equal(f.attempts(), 1);
+  });
+
+  it('does NOT retry a WRITE (create): one attempt, error surfaces', async () => {
+    const f = flakyPool(1);
+    await assert.rejects(
+      new PowqlInterface(f.pool, 'doc', schema).create({ data: { id: 'x' } as never }),
+      ConnectionError,
+    );
+    assert.equal(f.attempts(), 1);
+  });
+
+  it('does NOT retry inside a _txScoped interface', async () => {
+    const f = flakyPool(1);
+    const txQi = new PowqlInterface(f.pool, 'doc', schema, [], { _txScoped: true } as never);
+    await assert.rejects(txQi.findMany({ limit: 1 }), ConnectionError);
+    assert.equal(f.attempts(), 1);
+  });
+
+  it('gives up after one retry when the error persists', async () => {
+    const f = flakyPool(2);
+    await assert.rejects(new PowqlInterface(f.pool, 'doc', schema).findMany({ limit: 1 }), ConnectionError);
+    assert.equal(f.attempts(), 2, 'original + exactly one retry, then throws');
   });
 });
