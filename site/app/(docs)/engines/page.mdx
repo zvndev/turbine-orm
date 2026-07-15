@@ -157,7 +157,7 @@ npm install turbine-orm @zvndev/powdb-embedded
 npm install turbine-orm @zvndev/powdb-client
 ```
 
-PowDB has no wire introspection, so you define the schema in code with `defineSchema` (there is no `turbine generate` for PowDB). As of v0.30, `schemaDefToMetadata` derives the runtime metadata the client needs straight from that definition — no hand-written metadata:
+Schemas are code-first: define them with `defineSchema`, and `schemaDefToMetadata` (v0.30) derives the runtime metadata the client needs straight from that definition. As of v0.34 a programmatic introspector also exists — `introspectPowdbDatabase` (exported from `turbine-orm/powdb`) reads a live catalog via PowDB 0.10+'s `schema` / `describe` statements into `SchemaMetadata` — but PowDB has no declared foreign keys, so introspected metadata carries no relations and `defineSchema` remains the recommended, relation-aware path (`turbine generate` CLI support is not wired yet):
 
 ```ts
 // Embedded — in-process, opens a data directory. async; resolves to a TurbineClient.
@@ -220,16 +220,26 @@ PowDB is a younger, intentionally smaller engine, so Turbine's PowQL backend dif
 - **Primary keys can be server-assigned _or_ client-assigned.** Declare an `auto` int PK (`isGenerated`) and PowDB assigns a monotonic id on `create` (read back automatically); otherwise a defaulted string PK gets a client-generated UUID.
 - **Relation filters resolve to a literal list, not a subquery.** `where: { tags: { some } }` runs the inner predicate first and filters with `in (<keys>)` — one extra round-trip, but it sidesteps a PowDB engine quirk where a repeated `in (<subquery>)` of the same shape can return a stale cached result. Correct on every cardinality and nesting level.
 - **Nested writes run as one flat transaction.** `create`/`update` with relation ops (`create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert` on hasMany/hasOne/belongsTo) commit or roll back together. PowDB is single-writer with one global write lock, so top-level `$transaction` calls **queue FIFO** (as of v0.30) instead of failing — a second concurrent transaction waits for the first to finish rather than throwing. A **re-entrant / nested** `$transaction` still throws `UnsupportedFeatureError` immediately, since PowDB has no savepoints and waiting on the lock it already holds would deadlock. Cap the wait with `transactionQueueTimeoutMs` (default `30000`; `0` or `Infinity` waits forever) — on elapse the queued transaction rejects with `TimeoutError` (`TURBINE_E002`).
-- **Schema is code-only.** No wire introspection → define schemas with `defineSchema`; `turbine generate` / `turbine migrate` are Postgres-only.
-- **Type mapping is narrowed.** PowDB stores `str` / `int` / `float` / `bool`; Turbine never emits `uuid` / `datetime` / `bytes` on the wire, and maps `Date` to integer microseconds.
+- **Schema is code-first.** Define schemas with `defineSchema`; `turbine migrate` is Postgres-only. (A programmatic `describe`-based introspector exists since v0.34, relations excluded — see above.)
+- **Type mapping is narrowed.** PowDB stores `str` / `int` / `float` / `bool` / `json` (the `json` document type needs engine ≥ 0.12); Turbine never emits `uuid` / `datetime` / `bytes` on the wire, and maps `Date` to integer microseconds.
 - **Reserved PowQL words are quoted automatically.** A column named after a PowQL keyword — `type`, `order`, and the new PowDB 0.10 words `schema` / `describe` — is backtick-quoted in the generated PowQL, so reserved-word columns just work (PowDB ≥ 0.10).
 - **Server-side timeouts surface as `TimeoutError`.** PowDB 0.10's server-side "transaction gate timeout" maps to `TimeoutError` (`TURBINE_E002`), matching the client-side `transactionQueueTimeoutMs` behavior above.
+- **Connection failures surface as `ConnectionError`.** As of v0.34, protocol-level failures (including the "received unexpected frame" shape a stale idle socket produces) map to `ConnectionError` (`TURBINE_E004`) with the original error as `.cause` — previously these surfaced as `ValidationError` (E003). An opt-in `retryStaleReads` replays a first-statement **read** once on that exact signature (never a write, never inside a transaction).
+
+### JSON documents (PowDB ≥ 0.12 / 0.13)
+
+PowDB 0.12 added a native `json` document column type and 0.13 added path filters, path ordering, doc-field grouped aggregates, and doc-field expression indexes. Turbine 0.34 maps its existing JSON API onto them, so the same queries you write on Postgres `jsonb` run on PowDB (every feature is version-gated: an older engine throws a typed E017 with an upgrade hint, never a parse error):
+
+- **`JsonFilter` where-filters** — `where: { data: { path: ['ns', 'value'], gte: 5 } }` compiles to a PowQL path comparison with every segment and value bound as a typed parameter. A digit-only segment addresses an array index, matching the SQL engines. `equals: null` matches a JSON `null` **or** a missing key on PowDB. `contains` and pathless `equals` stay E017 (PowQL has no containment operator).
+- **JSON-path `orderBy` and `groupBy`** — path ordering (missing keys sort last in both directions, same as every other driver since v0.34) and JSON-path group keys / aggregate targets with the same alias and `orderBy` semantics as the SQL engines.
+- **Doc-field expression indexes** — declare them in `defineSchema` (`indexes: [{ docField: 'data', path: ['ns', 'value'] }]`) and `powqlSchemaDDL` emits the parenthesized `alter T add index (.data->"ns"->"value")` DDL (engine ≥ 0.13). Unique doc-field violations map to `UniqueConstraintError` (E008).
+- **Native typed wire** — on engine ≥ 0.13 the networked transport uses PowDB's lossless `queryNativeRaw` API, so a JSON `null`, a missing field, and the string `"null"` are all distinguishable end-to-end, and each result is coerced according to the wire that actually served it.
 
 ### Unsupported features → `TURBINE_E017`
 
 Beyond the Postgres-only trio every non-Postgres engine throws on (pgvector, LISTEN/NOTIFY, RLS `sessionContext`), PowDB throws `UnsupportedFeatureError` for the capabilities PowQL genuinely can't express:
 
-- **Filters:** JSON path/key, array, full-text, and pgvector-distance filters; vector / distance ordering.
+- **Filters:** array, full-text, and pgvector-distance filters; vector / distance ordering. (JSON path filters are supported on engine ≥ 0.12 — see the JSON documents section above; `contains` and pathless `equals` remain E017.)
 - **Composite keys via subqueries:** composite-key relation filters, composite-key nested reads, and composite-junction many-to-many — PowQL has no tuple-`in` (`(a, b) in (…)`). (A single-row `findUnique`/`upsert` on a composite PK works — it's plain `AND`-of-equalities.)
 - **Writes:** nested writes inside `createMany` / `upsert` (use `create` / `update`).
 - **Reads:** cursor pagination and `findManyStream` (no server-side cursor — page with `findMany({ limit, offset })`).

@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.34.0 (2026-07-15)
+
+PowDB engine parity with PowDB 0.12/0.13: the JSON document API, the lossless
+native wire, code-first doc-field indexes, catalog introspection, and typed
+connection errors. Adversarially reviewed pre-release (16 findings confirmed
+and fixed, including a CJS build break and a retry race).
+
+### Added
+- **JSON documents on PowDB (engine >= 0.12).** The `json` column type is
+  first-class: objects and arrays bind as typed document parameters, and
+  Turbine's existing JSON API compiles to PowQL path expressions with every
+  path segment and value bound as a typed parameter:
+  - `JsonFilter` where-filters (`equals`/`not`/`gt`/`gte`/`lt`/`lte`/`hasKey`),
+    top-level and inside relation filters. A digit-only segment addresses an
+    array index (SQL-engine parity). `equals: null` matches a JSON `null` or a
+    missing key on PowDB (documented divergence). `contains` and pathless
+    `equals` throw a per-operator E017 (PowQL has no containment operator).
+  - JSON-path `orderBy` (with numeric casting) and `groupBy` JSON-path group
+    keys and aggregate targets, with the same alias, ordering, and error
+    semantics as the SQL engines (including `_count` being selected by
+    default and orderable without being requested).
+  Every JSON feature is capability-gated: pre-0.12 engines get a typed E017
+  with an upgrade hint instead of an engine parse error.
+- **Native typed wire (engine >= 0.13, networked).** The networked transport
+  uses PowDB's lossless `queryNativeRaw` API when the client and server
+  support it: a JSON `null`, a missing field, and the string `"null"` are
+  distinguishable end-to-end, and every result is coerced according to the
+  wire that actually served it (heterogeneous injected pools included).
+- **Doc-field expression indexes (engine >= 0.13).** `defineSchema` accepts
+  `indexes: [{ docField, path, unique? }]` (and plain column indexes);
+  `powqlSchemaDDL` emits the parenthesized `alter T add index (.col->"seg")`
+  DDL. Numeric path segments are validated as non-negative integers at
+  schema-build time. Declared code-first indexes never arm the missing-index
+  advisor (SQL DDL generators do not create them).
+- **Catalog introspection (engine >= 0.10).** `introspectPowdbDatabase`
+  (exported from `turbine-orm/powdb`) reads a live PowDB catalog via
+  `schema` and `describe` statements into `SchemaMetadata`. Relations are
+  always empty (PowDB has no declared foreign keys) and the primary key is
+  inferred heuristically, so `defineSchema` remains the recommended path.
+- **Typed connection errors + opt-in stale-read retry.** Protocol-level
+  failures (including the "received unexpected frame" shape produced by a
+  stale idle socket) map to `ConnectionError` (E004) with `.cause` preserved,
+  and `auth_failed` maps to a typed error. The `retryStaleReads` option
+  replays a first-statement read once on that exact signature: never a
+  write, never inside a transaction (the action is threaded per call, so
+  concurrent operations cannot confuse the retry decision).
+- Unique doc-field index violations map to `UniqueConstraintError` (E008).
+
+### Changed
+- **JSON-path `orderBy` defaults to NULLS LAST in both directions** on
+  PostgreSQL and SQLite (previously PostgreSQL's `DESC` default put
+  null/missing-path rows first). This matches pick-row relation ordering
+  (0.33) and engines whose path ordering is nulls-last in both directions,
+  so the same query orders identically across every driver. Pass
+  `nulls: 'first' | 'last'` to override.
+- **PowDB `protocol_error`-class failures now surface as `ConnectionError`
+  (E004) instead of `ValidationError` (E003).** Update error handling that
+  matched on E003 for connection-shaped failures.
+- Engine note documented: `_sum` over a group with no value at the JSON path
+  returns `null` on SQL engines and `0` on PowDB.
+
 ## 0.33.0 (2026-07-15)
 
 ### Added
