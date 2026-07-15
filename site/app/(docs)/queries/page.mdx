@@ -363,6 +363,24 @@ const revenueByCategory = await db.orderItems.groupBy({
 
 `_sum`/`_avg` always cast numeric; `_min`/`_max` compare as text unless `type: 'numeric'`. `having` works on the alias. Result-key collisions throw upfront rather than silently overwriting.
 
+### Ordering groups
+
+`orderBy` sorts the result groups by any column the result actually contains: a plain by-column, a JSON group-key alias, or a requested aggregate. Aggregates are ordered by `_count` directly, or by `_sum` / `_avg` / `_min` / `_max` keyed by the aggregate field (or its JSON alias):
+
+```ts
+const topCategories = await db.orderItems.groupBy({
+  by: [{ field: 'data', path: ['category'] }],           // result key: 'category'
+  _count: true,
+  _sum: { price: { field: 'data', path: ['price'] } },    // result key: 'price'
+  orderBy: {
+    _sum: { price: 'desc' },   // biggest revenue first (by the JSON aggregate)
+    category: 'asc',           // tie-break by the group-key alias
+  },
+});
+```
+
+Each key re-emits the exact SQL expression it selected (the same one `having` uses), so aggregate and JSON-alias ordering works on every engine. Ordering by an aggregate you did not request, or by an unknown key, throws with the list of valid keys. `{ sort, nulls }` specs apply here too (Postgres / SQLite).
+
 ### Latest row per parent: `distinctOn`
 
 Aggregate over only the newest row per group of some key (a version store's "latest version per instance") with `distinctOn` (Postgres only, new in v0.32):

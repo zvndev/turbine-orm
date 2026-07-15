@@ -27,6 +27,7 @@ import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
+import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
 import type { PowdbPool } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
@@ -430,6 +431,169 @@ describe('groupBy JSON paths on non-Postgres dialects', () => {
 });
 
 // ---------------------------------------------------------------------------
+// B4: ordering the result GROUPS. orderBy resolves against the columns the
+// groupBy result actually contains (by-fields, JSON group-key aliases, and
+// requested aggregates), NOT the table's physical columns. Each key re-emits
+// the exact SELECT expression (mirroring HAVING), so it works on every dialect
+// without relying on SELECT-alias references in ORDER BY.
+// ---------------------------------------------------------------------------
+
+describe('groupBy orderBy over result columns', () => {
+  it('orders by a JSON group-key alias, reusing the extract expression + $n', () => {
+    const q = makeQuery('versions', schema());
+    const { sql, params } = q.buildGroupBy({
+      by: [{ field: 'data', path: ['region'], alias: 'region' }],
+      _sum: { viewCount: true },
+      orderBy: { region: 'asc' },
+    } as never);
+    // Re-emits the same extract expression (same $1) in ORDER BY, not "region".
+    assert.match(sql, /ORDER BY "data" #>> \$1::text\[\] ASC$/);
+    assert.doesNotMatch(sql, /ORDER BY "region"/);
+    // No extra param bound for ORDER BY: the group-key path param is reused.
+    assert.deepEqual(params, [['region']]);
+  });
+
+  it('orders by the DEFAULT (unaliased) JSON group-key name', () => {
+    const q = makeQuery('versions', schema());
+    const { sql } = q.buildGroupBy({
+      by: [{ field: 'data', path: ['region'] }],
+      orderBy: { region: 'asc' },
+    } as never);
+    assert.match(sql, /ORDER BY "data" #>> \$1::text\[\] ASC$/);
+  });
+
+  it('orders by a JSON alias with an OrderBySpec (NULLS placement)', () => {
+    const q = makeQuery('versions', schema());
+    const { sql } = q.buildGroupBy({
+      by: [{ field: 'data', path: ['region'], alias: 'region' }],
+      orderBy: { region: { sort: 'desc', nulls: 'last' } },
+    } as never);
+    assert.match(sql, /ORDER BY "data" #>> \$1::text\[\] DESC NULLS LAST$/);
+  });
+
+  it('orders by _count', () => {
+    const q = makeQuery('versions', schema());
+    const { sql } = q.buildGroupBy({ by: ['status'], orderBy: { _count: 'desc' } } as never);
+    assert.match(sql, /ORDER BY COUNT\(\*\) DESC$/);
+  });
+
+  it('orders by a plain-column _sum aggregate', () => {
+    const q = makeQuery('versions', schema());
+    const { sql } = q.buildGroupBy({
+      by: ['status'],
+      _sum: { viewCount: true },
+      orderBy: { _sum: { viewCount: 'desc' } },
+    } as never);
+    assert.match(sql, /ORDER BY SUM\("view_count"\) DESC$/);
+  });
+
+  it('orders by a JSON-path aggregate alias, reusing its aggregate expression', () => {
+    const q = makeQuery('versions', schema());
+    const { sql } = q.buildGroupBy({
+      by: ['status'],
+      _sum: { revenue: { field: 'data', path: ['rev'], type: 'numeric' } },
+      orderBy: { _sum: { revenue: 'desc' } },
+    } as never);
+    assert.match(sql, /ORDER BY SUM\(\("data" #>> \$1::text\[\]\)::numeric\) DESC$/);
+  });
+
+  it('orders by a plain by-column (unchanged behavior)', () => {
+    const q = makeQuery('versions', schema());
+    const { sql } = q.buildGroupBy({ by: ['status'], orderBy: { status: 'asc' } } as never);
+    assert.match(sql, /ORDER BY "status" ASC$/);
+  });
+
+  it('combines a by-key and an aggregate ordering in order', () => {
+    const q = makeQuery('versions', schema());
+    const { sql } = q.buildGroupBy({
+      by: ['status'],
+      _sum: { viewCount: true },
+      orderBy: { status: 'asc', _sum: { viewCount: 'desc' } },
+    } as never);
+    assert.match(sql, /ORDER BY "status" ASC, SUM\("view_count"\) DESC$/);
+  });
+
+  it('supports _avg / _min / _max ordering', () => {
+    const q = makeQuery('versions', schema());
+    for (const [agg, expr] of [
+      ['_avg', 'AVG\\("view_count"\\)::float'],
+      ['_min', 'MIN\\("view_count"\\)'],
+      ['_max', 'MAX\\("view_count"\\)'],
+    ] as const) {
+      const { sql } = q.buildGroupBy({
+        by: ['status'],
+        [agg]: { viewCount: true },
+        orderBy: { [agg]: { viewCount: 'desc' } },
+      } as never);
+      assert.match(sql, new RegExp(`ORDER BY ${expr} DESC$`));
+    }
+  });
+
+  it('throws E003 ordering by an aggregate that was NOT requested', () => {
+    const q = makeQuery('versions', schema());
+    assert.throws(
+      () =>
+        q.buildGroupBy({
+          by: ['status'],
+          _sum: { viewCount: true },
+          orderBy: { _avg: { viewCount: 'desc' } },
+        } as never),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.match(err.message, /aggregate is not requested/);
+        assert.match(err.message, /Orderable keys: status, _count, _sum\.viewCount/);
+        return true;
+      },
+    );
+  });
+
+  it('throws E003 ordering by _count when _count is not selected', () => {
+    const q = makeQuery('versions', schema());
+    assert.throws(
+      () => q.buildGroupBy({ by: ['status'], _count: false as never, orderBy: { _count: 'desc' } } as never),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.match(err.message, /_count is not selected/);
+        return true;
+      },
+    );
+  });
+
+  it('throws E003 on an unknown orderBy key, listing the valid keys', () => {
+    const q = makeQuery('versions', schema());
+    assert.throws(
+      () => q.buildGroupBy({ by: ['status'], orderBy: { nope: 'asc' } } as never),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.match(err.message, /Unknown field "nope" in groupBy orderBy/);
+        assert.match(err.message, /Orderable keys: status, _count/);
+        return true;
+      },
+    );
+  });
+
+  it('compiles alias + aggregate ordering on MySQL / SQLite / MSSQL', () => {
+    const cases = [
+      {
+        dialect: mysqlDialect,
+        alias: /ORDER BY JSON_UNQUOTE\(JSON_EXTRACT\(`data`, :p1\)\) ASC, SUM\(`view_count`\) DESC$/,
+      },
+      { dialect: sqliteDialect, alias: /ORDER BY json_extract\("data", :p1\) ASC, SUM\("view_count"\) DESC$/ },
+      { dialect: mssqlDialect, alias: /ORDER BY JSON_VALUE\(\[data\], @p1\) ASC, SUM\(\[view_count\]\) DESC$/ },
+    ];
+    for (const { dialect, alias } of cases) {
+      const q = makeQuery('versions', schema(), { dialect, sqlCache: false });
+      const { sql } = q.buildGroupBy({
+        by: [{ field: 'data', path: ['region'], alias: 'region' }],
+        _sum: { viewCount: true },
+        orderBy: { region: 'asc', _sum: { viewCount: 'desc' } },
+      } as never);
+      assert.match(sql, alias);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Live SQLite (node:sqlite, in-process — runs in the unit lane): the JSON-path
 // groupBy keys/aggregates, JSON-path orderBy, and JSON range filters must
 // actually EXECUTE on a non-Postgres engine, not just compile.
@@ -514,6 +678,24 @@ describe('groupBy extensions on PowDB (E017)', () => {
       } as never),
       UnsupportedFeatureError,
     );
+  });
+
+  it('aggregate orderBy keys throw E017 (never silently emit an invalid ._count sort)', async () => {
+    for (const orderBy of [{ _count: 'desc' }, { _sum: { viewCount: 'desc' } }] as const) {
+      await assert.rejects(
+        powqlQuery().groupBy({ by: ['status'], _count: true, _sum: { viewCount: true }, orderBy } as never),
+        (err: unknown) => {
+          assert.ok(err instanceof UnsupportedFeatureError);
+          assert.match((err as Error).message, /groupBy ordering by an aggregate/);
+          return true;
+        },
+      );
+    }
+  });
+
+  it('plain by-field orderBy still compiles on PowDB', async () => {
+    // Does not throw (buildOrder handles a plain-column direction).
+    await assert.doesNotReject(powqlQuery().groupBy({ by: ['status'], orderBy: { status: 'asc' } } as never));
   });
 
   it('pick-row orderBy throws E017 NAMING the feature (not "vector / distance ordering")', async () => {

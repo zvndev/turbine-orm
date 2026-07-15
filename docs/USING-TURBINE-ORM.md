@@ -283,9 +283,12 @@ const stats = await db.posts.aggregate({
 const byRole = await db.users.groupBy({
   by: ['role'],
   _count: true,
-  orderBy: { _count: { role: 'desc' } },
+  _sum: { viewCount: true },
+  // Order groups by any result column: a by-column, a JSON group-key alias, or
+  // a requested aggregate (`_count`, or `_sum`/`_avg`/`_min`/`_max` by field).
+  orderBy: { _count: 'desc', _sum: { viewCount: 'desc' } },
 });
-// [{ role: 'admin', _count: 3 }, { role: 'member', _count: 42 }]
+// [{ role: 'member', _count: 42, _sum: { viewCount: 9001 } }, { role: 'admin', _count: 3, _sum: { viewCount: 120 } }]
 ```
 
 ---

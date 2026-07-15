@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.32.2 (2026-07-15)
+
+### Fixed
+- **`groupBy` can order by every column the result actually contains.**
+  `orderBy` on `groupBy` previously validated keys against the table's
+  physical columns only, so ordering by a JSON-path group-key alias threw
+  E003 and ordering by an aggregate threw E005, even though HAVING already
+  accepted both. `orderBy` now supports plain by-columns, JSON-path group-key
+  aliases (explicit or default), `_count`, and `_sum`/`_avg`/`_min`/`_max`
+  blocks including JSON aggregate targets keyed by their alias, with
+  `{ sort, nulls }` specs, on all four SQL dialects. The ORDER BY re-emits
+  the same expression as the SELECT list (already-bound JSON path parameters
+  are reused, no extra binds). Ordering by an aggregate that was not
+  requested, or by an unknown key, throws a `ValidationError` listing the
+  valid keys for that call. PowDB refuses aggregate order keys with a typed
+  E017 instead of emitting invalid PowQL.
+
 ## 0.32.1 (2026-07-14)
 
 A first-run and hardening release: the new-project funnel now works out of the

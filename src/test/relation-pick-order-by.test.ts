@@ -355,7 +355,7 @@ describe('pick-row relation ordering: scope errors', () => {
     );
   });
 
-  it('groupBy orderBy context throws E003', () => {
+  it('groupBy orderBy context throws E003 (a relation is not a groupBy result column)', () => {
     const q = makeQuery('instances', schema());
     assert.throws(
       () =>
@@ -363,7 +363,7 @@ describe('pick-row relation ordering: scope errors', () => {
           by: ['name'],
           orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title' } },
         } as never),
-      /only supported in a top-level findMany orderBy/,
+      /Unknown field "versions" in groupBy orderBy/,
     );
   });
 

@@ -1303,6 +1303,17 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         proj.push(`${a.alias}: ${a.fn}(${a.field ? this.ref(a.field) : `.${this.meta.primaryKey[0]}`})`);
       }
       const having = this.buildHaving(args.having, params);
+      // groupBy aggregate ordering (`_count` / `_sum` / … keys) has no PowQL
+      // equivalent here: `buildOrder` treats an `orderBy` key as a field ref, so
+      // a bare `_count: 'desc'` would silently emit an invalid `._count` sort.
+      // Refuse those keys explicitly; plain by-field ordering still flows through.
+      if (args.orderBy) {
+        for (const key of Object.keys(args.orderBy)) {
+          if (key === '_count' || key === '_sum' || key === '_avg' || key === '_min' || key === '_max') {
+            throw new UnsupportedFeatureError('groupBy ordering by an aggregate', 'PowDB', `orderBy key "${key}"`);
+          }
+        }
+      }
       const order = this.buildOrder(args.orderBy as OrderByClause | undefined);
       const powql = `${this.qt}${filter} group ${groupKeys.join(', ')}${having}${order} { ${proj.join(', ')} }`;
       const { rows } = await this.exec(powql, params, args.timeout);

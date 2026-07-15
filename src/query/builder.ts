@@ -84,6 +84,7 @@ import type {
   FindUniqueArgs,
   GlobalFilters,
   GroupByArgs,
+  GroupByOrderBy,
   HavingClause,
   HavingFilter,
   HavingNumericOperator,
@@ -2248,6 +2249,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const selectExprs: string[] = [];
     /** by entries in order: how to read each group key off the result row. */
     const byReaders: { resultKey: string; rowKey: string; raw: boolean }[] = [];
+    // ORDER BY registries: map each key the groupBy RESULT actually contains to
+    // the exact SELECT expression that produced it, so `orderBy` re-emits that
+    // expression (never a SELECT alias, since not every dialect accepts alias
+    // references in ORDER BY, and re-emitting mirrors HAVING's `jsonAggExprs`).
+    // `byOrderExprs`: plain by-field name / JSON group-key alias → column or
+    // extract expression. `aggOrderExprs`: `${aggKey}:${field}` → aggregate
+    // expression (including any already-bound JSON-path placeholder, reused
+    // exactly like HAVING since ORDER BY is appended after all other params).
+    const byOrderExprs = new Map<string, string>();
     const usedResultKeys = new Set<string>();
     const claimResultKey = (key: string, what: string): void => {
       if (key === '_count' || usedResultKeys.has(key)) {
@@ -2269,6 +2279,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         groupExprs.push(this.q(col));
         selectExprs.push(this.q(col));
         byReaders.push({ resultKey: entry, rowKey: col, raw: false });
+        byOrderExprs.set(entry, this.q(col));
       } else {
         const col = this.resolveJsonPathTarget('group key', entry.field, entry.path);
         params.push(this.jsonPathParam(entry.path));
@@ -2279,14 +2290,25 @@ export class QueryInterface<T extends object, R extends object = {}> {
         selectExprs.push(`(${extract}) AS ${this.q(alias)}`);
         groupExprs.push(extract);
         byReaders.push({ resultKey: alias, rowKey: alias, raw: true });
+        // ORDER BY by this JSON alias re-emits the extract expression (with its
+        // already-bound $n): the same reuse HAVING does for JSON aggregates.
+        byOrderExprs.set(alias, extract);
       }
     }
 
     // _count
-    if (args._count === true || args._count === undefined) {
+    const countSelected = args._count === true || args._count === undefined;
+    if (countSelected) {
       // default: always include count
       selectExprs.push(`${this.castAgg('COUNT(*)', 'int')} AS _count`);
     }
+
+    // ORDER BY aggregate expressions, keyed `${aggKey}:${field}` (plus a bare
+    // `_count`). Populated alongside the SELECT list below so `orderBy` can only
+    // reference an aggregate that is actually requested. `COUNT(*)` (uncast) is
+    // the ordering expression (the SELECT cast is only for the returned value).
+    const aggOrderExprs = new Map<string, string>();
+    if (countSelected) aggOrderExprs.set('_count', 'COUNT(*)');
 
     // _sum / _avg / _min / _max: `true` keeps the plain-column behavior; a
     // {@link JsonPathAggregateTarget} aggregates a JSON path under the arg key
@@ -2312,6 +2334,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           const inner = `${sqlFn}(${this.q(col)})`;
           const expr = aggKey === '_avg' ? this.castAgg(inner, 'float') : inner;
           selectExprs.push(`${expr} AS ${this.q(`${aggKey}_${col}`)}`);
+          aggOrderExprs.set(`${aggKey}:${key}`, expr);
           continue;
         }
         const col = this.resolveJsonPathTarget(`${aggKey} target "${key}"`, target.field, target.path);
@@ -2331,6 +2354,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         selectExprs.push(`${expr} AS ${this.q(`${aggKey}_${key}`)}`);
         jsonAggFields.set(`${aggKey}_${key}`, { field: key, numeric });
         jsonAggExprs.set(`${key}:${aggKey}`, expr);
+        aggOrderExprs.set(`${aggKey}:${key}`, expr);
       }
     };
     buildAggregates('_sum', 'SUM', args._sum as Record<string, boolean | JsonPathAggregateTarget> | undefined);
@@ -2350,9 +2374,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
 
-    // ORDER BY
+    // ORDER BY, over the groupBy RESULT columns (by-fields, JSON aliases, and
+    // requested aggregates), not the table's physical columns.
     if (args.orderBy) {
-      sql += ` ORDER BY ${this.buildOrderBy(args.orderBy)}`;
+      const orderSql = this.buildGroupByOrderBy(args.orderBy, byOrderExprs, aggOrderExprs);
+      if (orderSql) sql += ` ORDER BY ${orderSql}`;
     }
 
     return {
@@ -2421,6 +2447,88 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }),
       tag: `${this.table}.groupBy`,
     };
+  }
+
+  /**
+   * Compile a groupBy `orderBy` into an ORDER BY body. Unlike findMany ORDER BY
+   * ({@link buildOrderBy}, which validates keys against the table's physical
+   * columns), groupBy ordering targets the columns the RESULT actually
+   * contains: plain by-fields, JSON group-key aliases, and requested aggregates
+   * (`_count` / `_sum` / `_avg` / `_min` / `_max`). Each key re-emits the exact
+   * SELECT expression that produced it (`byOrderExprs` / `aggOrderExprs`),
+   * mirroring how HAVING re-emits aggregate expressions, so no dialect ever has
+   * to accept a SELECT-alias reference in ORDER BY, and any already-bound
+   * JSON-path placeholder is reused verbatim (ORDER BY is the last clause, so
+   * no `$n` renumbering). An aggregate key that was not requested, or an unknown
+   * by-key, throws {@link ValidationError} E003 listing the valid keys.
+   */
+  private buildGroupByOrderBy(
+    orderBy: GroupByOrderBy,
+    byOrderExprs: Map<string, string>,
+    aggOrderExprs: Map<string, string>,
+  ): string {
+    const aggBlocks = new Set(['_count', '_sum', '_avg', '_min', '_max']);
+    /** Human-readable list of every key this call can order by (for E003). */
+    const validKeys = (): string => {
+      const keys = [...byOrderExprs.keys()];
+      for (const k of aggOrderExprs.keys()) {
+        keys.push(k.includes(':') ? k.replace(':', '.') : k);
+      }
+      return keys.join(', ') || '(none)';
+    };
+
+    const parts: string[] = [];
+    for (const [key, value] of Object.entries(orderBy)) {
+      if (value === undefined) continue;
+
+      // Aggregate ordering blocks.
+      if (aggBlocks.has(key)) {
+        if (key === '_count') {
+          const expr = aggOrderExprs.get('_count');
+          if (!expr) {
+            throw new ValidationError(
+              `[turbine] Cannot order groupBy by "_count" on table "${this.table}": _count is not selected. ` +
+                `Orderable keys: ${validKeys()}.`,
+            );
+          }
+          const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
+          parts.push(`${expr} ${dir}${this.nullsSuffix(nulls)}`);
+          continue;
+        }
+        // `_sum` / `_avg` / `_min` / `_max`: an object of field → direction/spec.
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+          throw new ValidationError(
+            `[turbine] Invalid groupBy orderBy for "${key}" on table "${this.table}": ` +
+              `expected a field map like { ${key}: { amount: 'desc' } }.`,
+          );
+        }
+        for (const [field, dirSpec] of Object.entries(value as Record<string, OrderDirection | OrderBySpec>)) {
+          if (dirSpec === undefined) continue;
+          const expr = aggOrderExprs.get(`${key}:${field}`);
+          if (!expr) {
+            throw new ValidationError(
+              `[turbine] Cannot order groupBy by "${key}.${field}" on table "${this.table}": ` +
+                `that aggregate is not requested in this call. Orderable keys: ${validKeys()}.`,
+            );
+          }
+          const { dir, nulls } = normalizeOrderBy(dirSpec);
+          parts.push(`${expr} ${dir}${this.nullsSuffix(nulls)}`);
+        }
+        continue;
+      }
+
+      // Plain by-field name or JSON group-key alias.
+      const expr = byOrderExprs.get(key);
+      if (!expr) {
+        throw new ValidationError(
+          `[turbine] Unknown field "${key}" in groupBy orderBy on table "${this.table}". ` +
+            `Orderable keys: ${validKeys()}.`,
+        );
+      }
+      const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
+      parts.push(`${expr} ${dir}${this.nullsSuffix(nulls)}`);
+    }
+    return parts.join(', ');
   }
 
   /**

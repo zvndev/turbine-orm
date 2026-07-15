@@ -853,6 +853,39 @@ export interface GroupByDistinctOn<T> {
   orderBy: Record<string, OrderDirection | OrderBySpec | JsonPathOrderBy>;
 }
 
+/** A per-field aggregate ordering block: field/alias → direction or sort spec. */
+export type GroupByAggregateOrderBy = Record<string, OrderDirection | OrderBySpec>;
+
+/**
+ * {@link GroupByArgs.orderBy}: order the result groups by any column the
+ * groupBy result contains.
+ *
+ * - A plain **by-column** field name, or a **JSON group-key alias** (explicit
+ *   `alias`, else the last path segment): `{ region: 'asc' }`.
+ * - An **aggregate block**: `_count` takes a direction/spec directly
+ *   (`{ _count: 'desc' }`); `_sum`/`_avg`/`_min`/`_max` take a field map keyed
+ *   by a requested aggregate field/alias (`{ _sum: { amount: 'desc' } }`).
+ *
+ * An aggregate ordering that references an aggregate not requested in the same
+ * call (or an unknown by-key) throws {@link ValidationError} (E003). Every
+ * value accepts an {@link OrderBySpec} for `NULLS FIRST/LAST` placement
+ * (PostgreSQL / SQLite only).
+ */
+export interface GroupByOrderBy {
+  /** Order by the group's row count (requires `_count` to be selected). */
+  _count?: OrderDirection | OrderBySpec;
+  /** Order by a requested `_sum` aggregate, keyed by its field/alias. */
+  _sum?: GroupByAggregateOrderBy;
+  /** Order by a requested `_avg` aggregate, keyed by its field/alias. */
+  _avg?: GroupByAggregateOrderBy;
+  /** Order by a requested `_min` aggregate, keyed by its field/alias. */
+  _min?: GroupByAggregateOrderBy;
+  /** Order by a requested `_max` aggregate, keyed by its field/alias. */
+  _max?: GroupByAggregateOrderBy;
+  /** A by-column field name or JSON group-key alias → direction or sort spec. */
+  [key: string]: OrderDirection | OrderBySpec | GroupByAggregateOrderBy | undefined;
+}
+
 export interface GroupByArgs<T> {
   /** Group keys: plain column field names and/or JSON-path keys ({@link JsonPathGroupKey}). */
   by: ((keyof T & string) | JsonPathGroupKey)[];
@@ -874,8 +907,15 @@ export interface GroupByArgs<T> {
   _max?: GroupByAggregateSpec<T>;
   /** Filter whole groups by their aggregate values (SQL HAVING). JSON-path aggregates key by their alias. */
   having?: HavingClause<T>;
-  /** Order groups (supports {@link OrderBySpec} for NULLS placement). */
-  orderBy?: Record<string, OrderDirection | OrderBySpec>;
+  /**
+   * Order the result groups. Keys may be any column the groupBy result actually
+   * contains: a plain by-column field name, a JSON group-key alias (explicit
+   * `alias`, or the last path segment when unaliased), or an aggregate block
+   * (`_count`, or `_sum`/`_avg`/`_min`/`_max` mapping a requested field/alias to
+   * its direction). Every value supports {@link OrderBySpec} for NULLS
+   * placement. See {@link GroupByOrderBy}.
+   */
+  orderBy?: GroupByOrderBy;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
