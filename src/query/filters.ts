@@ -343,9 +343,9 @@ export function isJsonPathOrderBy(value: unknown): value is JsonPathOrderBy {
 
 /**
  * Check if an orderBy value is a pick-row relation ordering:
- * `{ pick: { orderBy, ... }, by, direction?, nulls? }`. The full shape is
- * required — `pick` must be an object carrying `orderBy`, `by` must be
- * present, and no keys outside `{ pick, by, direction, nulls }` — so a to-one
+ * `{ pick: { orderBy, ... }, by, direction?, nulls?, plan? }`. The full shape
+ * is required (`pick` must be an object carrying `orderBy`, `by` must be
+ * present, and no keys outside `{ pick, by, direction, nulls, plan }`), so a to-one
  * relation whose target has real columns literally named `pick` and `by`
  * (whose values are direction strings or `{ sort, nulls }` specs, never an
  * object with `orderBy`) still falls through to column ordering. `distance`
@@ -359,7 +359,7 @@ export function isRelationPickOrderBy(value: unknown): value is RelationPickOrde
   if (!('pick' in v) || !('by' in v)) return false;
   if (typeof v.pick !== 'object' || v.pick === null || Array.isArray(v.pick) || !('orderBy' in v.pick)) return false;
   for (const key of Object.keys(v)) {
-    if (key !== 'pick' && key !== 'by' && key !== 'direction' && key !== 'nulls') return false;
+    if (key !== 'pick' && key !== 'by' && key !== 'direction' && key !== 'nulls' && key !== 'plan') return false;
   }
   return true;
 }

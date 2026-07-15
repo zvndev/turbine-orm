@@ -1197,6 +1197,17 @@ export interface RelationPickOrderBy {
    * "highest first" sort). Set `nulls` explicitly to override.
    */
   nulls?: 'first' | 'last';
+  /**
+   * Physical plan for the pick. `'subquery'` (default) compiles a correlated
+   * scalar subquery in ORDER BY. `'lateral'` (PostgreSQL only, E017 elsewhere)
+   * compiles a `LEFT JOIN LATERAL (... LIMIT 1) ON true` and orders by the
+   * joined value. Identical results; the lateral form can be significantly
+   * faster on large parent sets where the ordering subquery dominates the plan.
+   * Never falls back silently: contexts that cannot take a lateral (non-Postgres
+   * engines, `distinct`, nested `with` orderBy, a parent column literally named
+   * `__turbine_pick`) throw.
+   */
+  plan?: 'subquery' | 'lateral';
 }
 
 /**

@@ -327,6 +327,14 @@ export interface Dialect {
   /** Whether this dialect/engine supports advisory-lock-style migration locking. */
   readonly supportsAdvisoryLock: boolean;
 
+  /**
+   * Whether this dialect supports `LEFT JOIN LATERAL (...) ON true` in the FROM
+   * clause. Gates the opt-in `plan: 'lateral'` pick-row ordering. Optional:
+   * absent is treated as `false`, so only dialects that set it true admit the
+   * lateral plan (else E017). PostgreSQL only in this release.
+   */
+  readonly supportsLateralJoin?: boolean;
+
   /** Build a dialect-specific RETURNING clause. Return an empty string when unsupported. */
   buildReturningClause(selection?: string): string;
 
@@ -554,6 +562,7 @@ export const postgresDialect: Dialect = {
   supportsListenNotify: true,
   supportsRLS: true,
   supportsAdvisoryLock: true,
+  supportsLateralJoin: true,
 
   paramPlaceholder(index: number): string {
     return `$${index}`;

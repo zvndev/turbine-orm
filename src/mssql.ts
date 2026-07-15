@@ -546,6 +546,9 @@ export const mssqlDialect: Dialect = {
   supportsVector: false,
   supportsListenNotify: false,
   supportsRLS: false,
+  // SQL Server has OUTER APPLY, not FROM-clause LATERAL: the lateral pick plan
+  // is Postgres-only (out of scope here).
+  supportsLateralJoin: false,
   // sp_getapplock / sp_releaseapplock exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // FOR JSON over zero rows is NULL → coalesced in the relation override.

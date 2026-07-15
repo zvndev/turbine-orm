@@ -1228,15 +1228,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
         selectClause = `${qt}.*`;
       }
 
-      let sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${freshWhereSql}`;
+      // Piece-then-assemble. The join-sink between FROM and WHERE carries any
+      // `plan: 'lateral'` pick joins; it is populated during the ORDER BY build
+      // below and spliced in at final assembly. Empty for every other query
+      // shape → the assembled SQL is byte-identical to the incremental-append
+      // form for the default plan (asserted by the byte-equality snapshot test).
+      const lateralJoins: string[] = [];
 
+      // WHERE + cursor conditions accumulate into `tail`, pushing params in
+      // where → cursor order (the collect path mirrors this exactly).
+      let tail = freshWhereSql;
       if (args?.cursor) {
         // Sorted (canonical) order — MUST match cursorFp and the cache-hit collect below.
         const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
         if (cursorEntries.length > 0) {
           const cursorConditions = cursorEntries.map(([k, v]) => {
             const col = this.toSqlColumn(k);
-            // orderBy values can be the { sort, nulls } spec form — normalize
+            // orderBy values can be the { sort, nulls } spec form: normalize
             // before comparing, or a desc spec would seek the ascending side.
             const dir = args.orderBy?.[k];
             const desc = isOrderBySpec(dir) ? dir.sort === 'desc' : dir === 'desc';
@@ -1244,32 +1252,38 @@ export class QueryInterface<T extends object, R extends object = {}> {
             freshParams.push(v);
             return `${qt}.${col} ${op} ${this.p(freshParams.length)}`;
           });
-          if (freshWhereSql) {
-            sql += ` AND ${cursorConditions.join(' AND ')}`;
-          } else {
-            sql += ` WHERE ${cursorConditions.join(' AND ')}`;
-          }
+          tail += freshWhereSql ? ` AND ${cursorConditions.join(' AND ')}` : ` WHERE ${cursorConditions.join(' AND ')}`;
         }
       }
 
-      if (args?.orderBy) {
-        if (distinctPrefix) {
-          // Postgres requires DISTINCT ON expressions to lead the ORDER BY.
-          // Prisma semantics ("first row per combination, result in the user's
-          // order") need two levels: inner DISTINCT ON ordered by the distinct
-          // columns then the user's order (picks the right representative row),
-          // outer re-ordered by the user's order alone.
-          if (Object.values(args.orderBy).some((d) => isVectorOrderBy(d))) {
-            throw new ValidationError('[turbine] `distinct` cannot be combined with vector distance ordering.');
-          }
-          const userOrder = this.buildOrderBy(args.orderBy, freshParams);
-          sql += ` ORDER BY ${distinctCols.map((c) => `${c} ASC`).join(', ')}, ${userOrder}`;
-          sql = `SELECT * FROM (${sql}) AS ${this.q(`${this.table}_distinct`)} ORDER BY ${userOrder}`;
-        } else {
-          // Pass freshParams so vector KNN ordering binds its `$n::vector` query
-          // vector at the correct position (after cursor params, before LIMIT).
-          sql += ` ORDER BY ${this.buildOrderBy(args.orderBy, freshParams)}`;
+      // ORDER BY is built AFTER the cursor pushes (param order
+      // where → with → cursor → orderBy → limit → offset) and BEFORE final
+      // assembly (so the lateral sink is filled before the FROM clause is
+      // written). distinct + relation orderBy is refused up front, so a lateral
+      // pick can never reach the distinct branch (lateralJoins stays empty).
+      let sql: string;
+      if (args?.orderBy && distinctPrefix) {
+        // Postgres requires DISTINCT ON expressions to lead the ORDER BY. Prisma
+        // semantics ("first row per combination, result in the user's order")
+        // need two levels: inner DISTINCT ON ordered by the distinct columns then
+        // the user's order (picks the right representative row), outer re-ordered
+        // by the user's order alone.
+        if (Object.values(args.orderBy).some((d) => isVectorOrderBy(d))) {
+          throw new ValidationError('[turbine] `distinct` cannot be combined with vector distance ordering.');
         }
+        const userOrder = this.buildOrderBy(args.orderBy, freshParams);
+        const inner = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${tail} ORDER BY ${distinctCols
+          .map((c) => `${c} ASC`)
+          .join(', ')}, ${userOrder}`;
+        sql = `SELECT * FROM (${inner}) AS ${this.q(`${this.table}_distinct`)} ORDER BY ${userOrder}`;
+      } else {
+        // Pass freshParams so vector KNN ordering binds its `$n::vector` query
+        // vector at the correct position (after cursor params, before LIMIT), and
+        // lateralJoins so a lateral pick splices its join into the FROM clause.
+        const orderBySql = args?.orderBy
+          ? ` ORDER BY ${this.buildOrderBy(args.orderBy, freshParams, lateralJoins)}`
+          : '';
+        sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${lateralJoins.join('')}${tail}${orderBySql}`;
       }
 
       // Pagination — push params in the same order the collect path mirrors
@@ -5001,7 +5015,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const pickWhere = d.pick?.where
         ? `;pw=${this.fingerprintAliasWhere(d.pick.where as Record<string, unknown>, targetTable)}`
         : '';
-      return `pick(${by},${d.direction ?? 'asc'},${d.nulls ?? ''};po=${pickOrder}${pickWhere})`;
+      // Plan discriminator: the lateral plan emits DIFFERENT SQL (a FROM-clause
+      // join + a qualified order term) so a warm cache must never serve one
+      // plan's SQL for the other. Emitted ONLY for `'lateral'`: absent means
+      // the default subquery plan, keeping every pre-existing cache key
+      // byte-identical (no cold-cache churn on upgrade).
+      const planTag = d.plan === 'lateral' ? ';plan=lat' : '';
+      return `pick(${by},${d.direction ?? 'asc'},${d.nulls ?? ''};po=${pickOrder}${pickWhere}${planTag})`;
     }
     if (isOrderBySpec(d)) return `spec(${d.sort},${d.nulls ?? ''})`;
     if (d && typeof d === 'object') {
@@ -5018,7 +5038,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return String(d);
   }
 
-  private buildOrderBy(orderBy: OrderByClause, params?: unknown[]): string {
+  private buildOrderBy(orderBy: OrderByClause, params?: unknown[], lateralSink?: string[]): string {
     // Dev-only: validate that orderBy fields exist in the table schema. Relation
     // orderBy keys (object values that are neither a vector nor an OrderBySpec)
     // are validated in the relation branch below, so skip them here.
@@ -5069,7 +5089,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // keyed by a relation name (`{ posts: { _count: 'desc' } }` / `{ author:
         // { name: 'asc' } }`).
         if (this.isRelationOrderByValue(value)) {
-          return this.buildRelationOrderBy(key, value as Record<string, unknown>, `ord${relOrdCounter++}`, params);
+          return this.buildRelationOrderBy(
+            key,
+            value as Record<string, unknown>,
+            `ord${relOrdCounter++}`,
+            params,
+            undefined,
+            lateralSink,
+          );
         }
 
         // Scalar column ordering — a plain direction or an OrderBySpec (nulls).
@@ -5213,6 +5240,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     alias: string,
     params?: unknown[],
     ctx?: { meta: TableMetadata; table: string; parentRef: string },
+    lateralSink?: string[],
   ): string {
     const ownerMeta = ctx?.meta ?? this.tableMeta;
     const ownerTable = ctx?.table ?? this.table;
@@ -5232,7 +5260,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // scope errors, shared with the cache-hit collect mirror.
     if (isRelationPickOrderBy(value)) {
       this.validatePickOrderBy(relName, relDef, value, ctx !== undefined);
-      return this.buildRelationPickOrderBy(relName, relDef, value, alias, parentRef, params);
+      return this.buildRelationPickOrderBy(relName, relDef, value, alias, parentRef, params, lateralSink);
     }
 
     // To-many: only `_count` is meaningful → correlated COUNT(*) subquery.
@@ -5344,6 +5372,33 @@ export class QueryInterface<T extends object, R extends object = {}> {
           "or a JSON-path spec ({ field: 'data', path: ['title'] }).",
       );
     }
+    // Physical plan gate. A typo like `plan: 'latreal'` must never silently run
+    // the subquery plan (a silent plan change wearing a validation gap). Shared
+    // by build and cache-hit collect so a warmed cache throws identically.
+    if (spec.plan !== undefined && spec.plan !== 'subquery' && spec.plan !== 'lateral') {
+      throw new ValidationError(
+        `[turbine] Pick-row ordering on relation "${relName}" has an invalid \`plan\`: ` +
+          `${JSON.stringify(spec.plan)}. Use 'subquery' (default) or 'lateral'.`,
+      );
+    }
+    if (spec.plan === 'lateral') {
+      if (!this.dialect.supportsLateralJoin) {
+        throw new UnsupportedFeatureError(
+          "pick-row ordering with plan: 'lateral'",
+          this.dialect.name,
+          "LATERAL joins are only available on PostgreSQL. Omit `plan` (or use 'subquery').",
+        );
+      }
+      // The lateral exposes one reserved output column, `__turbine_pick`. A
+      // parent column with that exact name would make the unqualified WHERE
+      // reference ambiguous once the join is in scope; refuse it explicitly.
+      if (this.tableMeta.allColumns.includes('__turbine_pick')) {
+        throw new ValidationError(
+          `[turbine] Pick-row ordering with plan: 'lateral' cannot be used: table "${this.tableMeta.name}" ` +
+            'has a column named "__turbine_pick", which the lateral join output reserves.',
+        );
+      }
+    }
   }
 
   /**
@@ -5370,6 +5425,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     alias: string,
     parentRef: string,
     params?: unknown[],
+    lateralSink?: string[],
   ): string {
     if (!params) {
       throw new ValidationError(
@@ -5379,28 +5435,96 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const targetMeta = this.schema.tables[relDef.to];
     if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
 
+    const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    const limitOne = this.buildPagination('1', undefined, true);
+    // Parents with ZERO surviving related rows have no row to pick: the
+    // correlated subquery yields NULL, and the LEFT JOIN LATERAL null-extends
+    // its single row identically. Without a nulls clause, Postgres DESC
+    // defaults to NULLS FIRST (every childless parent tops a "highest first"
+    // sort). Default to NULLS LAST in BOTH directions (deterministic across
+    // engines: SQLite's NULL-is-smallest default diverges from Postgres) unless
+    // the caller set `nulls` explicitly; the grammar gate matches nullsSuffix.
+    const nullsSql = spec.nulls
+      ? this.nullsSuffix(spec.nulls)
+      : this.dialect.name === 'postgresql' || this.dialect.name === 'sqlite'
+        ? ' NULLS LAST'
+        : '';
+
+    // Lateral plan: splice a `LEFT JOIN LATERAL (... LIMIT 1) ON true` into the
+    // FROM clause (via the sink) and order by its single reserved output column.
+    // Param push order is IDENTICAL to the subquery plan (compilePickPieces is
+    // shared), so the cache-hit collect mirror needs no changes. Scope +
+    // capability were already enforced by validatePickOrderBy (shared with the
+    // collect path); the missing-sink guard catches a non-findMany build
+    // context and hard-fails rather than silently emitting a subquery.
+    if (spec.plan === 'lateral') {
+      if (!lateralSink) {
+        throw new ValidationError(
+          `[turbine] Pick-row ordering with plan: 'lateral' on relation "${relName}" is only supported ` +
+            'in a top-level findMany orderBy.',
+        );
+      }
+      const childAlias = `${alias}i`;
+      const { byExpr, where, orderClause } = this.compilePickPieces(
+        relDef,
+        targetMeta,
+        spec,
+        childAlias,
+        parentRef,
+        params,
+      );
+      lateralSink.push(
+        ` LEFT JOIN LATERAL (SELECT ${byExpr} AS ${this.q('__turbine_pick')} FROM ${this.q(relDef.to)} ${childAlias}` +
+          ` WHERE ${where}${orderClause}${limitOne}) ${alias} ON true`,
+      );
+      return `${alias}.${this.q('__turbine_pick')} ${dir}${nullsSql}`;
+    }
+
+    // Subquery plan (default): a correlated scalar subquery in ORDER BY.
+    const { byExpr, where, orderClause } = this.compilePickPieces(relDef, targetMeta, spec, alias, parentRef, params);
+    return `(SELECT ${byExpr} FROM ${this.q(relDef.to)} ${alias} WHERE ${where}${orderClause}${limitOne}) ${dir}${nullsSql}`;
+  }
+
+  /**
+   * Compile the shared inner pieces of a pick-row ordering against `childAlias`
+   * (the table alias the related row is read from): the `by` value expression,
+   * the correlation + target global filter + `pick.where` predicate, and the
+   * `pick.orderBy` clause. Factored out of {@link buildRelationPickOrderBy} so
+   * the subquery and lateral plans build IDENTICAL pieces in the SAME param
+   * push order (`by` JSON path → target global filter → `pick.where` →
+   * `pick.orderBy` JSON paths), which is why the collect mirror
+   * ({@link collectRelationPickOrderParams}) is plan-agnostic.
+   */
+  private compilePickPieces(
+    relDef: RelationDef,
+    targetMeta: TableMetadata,
+    spec: RelationPickOrderBy,
+    childAlias: string,
+    parentRef: string,
+    params: unknown[],
+  ): { byExpr: string; where: string; orderClause: string } {
     // The value surfaced from the picked row (SELECT list: its param binds first).
     let byExpr: string;
     if (typeof spec.by === 'string') {
       const col = this.resolveOrderByColumn(relDef.to, targetMeta, spec.by);
-      byExpr = `${alias}.${this.q(col)}`;
+      byExpr = `${childAlias}.${this.q(col)}`;
     } else {
       const col = this.validateJsonPathOrderBy(relDef.to, targetMeta, spec.by.field, {
         path: spec.by.path,
       } as JsonPathOrderBy);
       params.push(this.jsonPathParam(spec.by.path));
-      const extract = this.dialect.buildJsonPathExtract(`${alias}.${this.q(col)}`, this.p(params.length));
+      const extract = this.dialect.buildJsonPathExtract(`${childAlias}.${this.q(col)}`, this.p(params.length));
       byExpr = spec.by.type === 'numeric' ? this.castJsonNumeric(extract) : extract;
     }
 
     // Correlation to the parent row, then the target's global filter (a
     // soft-deleted / other-tenant row must never be picked: matches the
     // `with` subquery and to-one relation-orderBy semantics), then pick.where.
-    let where = this.dialect.buildCorrelation(alias, relDef.foreignKey, this.q(parentRef), relDef.referenceKey);
-    const gf = this.targetGlobalFilterAlias(relDef.to, alias, params);
+    let where = this.dialect.buildCorrelation(childAlias, relDef.foreignKey, this.q(parentRef), relDef.referenceKey);
+    const gf = this.targetGlobalFilterAlias(relDef.to, childAlias, params);
     if (gf) where += ` AND ${gf}`;
     if (spec.pick.where) {
-      const pickWhere = this.buildAliasWhere(relDef.to, targetMeta, alias, spec.pick.where, params);
+      const pickWhere = this.buildAliasWhere(relDef.to, targetMeta, childAlias, spec.pick.where, params);
       if (pickWhere) where += ` AND ${pickWhere}`;
     }
 
@@ -5411,25 +5535,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const orderClause = this.buildRelationOrderClause(
       relDef.to,
       targetMeta,
-      alias,
+      childAlias,
       Object.entries(spec.pick.orderBy),
       params,
     );
-
-    const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-    const limitOne = this.buildPagination('1', undefined, true);
-    // Parents with ZERO surviving related rows make the correlated subquery
-    // yield NULL. Without a nulls clause, Postgres DESC defaults to NULLS
-    // FIRST — every childless parent would top a "highest first" sort. Default
-    // to NULLS LAST in BOTH directions (deterministic across engines: SQLite's
-    // NULL-is-smallest default diverges from Postgres) unless the caller set
-    // `nulls` explicitly; the grammar gate matches nullsSuffix (PG + SQLite).
-    const nullsSql = spec.nulls
-      ? this.nullsSuffix(spec.nulls)
-      : this.dialect.name === 'postgresql' || this.dialect.name === 'sqlite'
-        ? ' NULLS LAST'
-        : '';
-    return `(SELECT ${byExpr} FROM ${this.q(relDef.to)} ${alias} WHERE ${where}${orderClause}${limitOne}) ${dir}${nullsSql}`;
+    return { byExpr, where, orderClause };
   }
 
   /**

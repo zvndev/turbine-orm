@@ -570,6 +570,21 @@ const instances = await db.modelInstances.findMany({
 
 `pick.orderBy` is required (it makes the choice deterministic); `pick.where` optionally filters first (for example, a flagged row). Compiles to a correlated scalar subquery in `ORDER BY`, so it composes with both relation-load strategies and the SQL cache. Parents with zero related rows sort last by default (`nulls` overrides). Postgres-first; plain-column `by` also works on SQLite/MySQL/SQL Server. Not combinable with `distinct`, and hasMany only, in this release.
 
+**Choosing the plan (`plan: 'lateral'`).** By default the pick compiles as a correlated scalar subquery (`plan: 'subquery'`). On PostgreSQL you can opt into a `LEFT JOIN LATERAL (... LIMIT 1) ON true` instead, which can be significantly faster on large parent sets where the ordering subquery dominates the query plan:
+
+```ts
+orderBy: {
+  versions: {
+    pick: { orderBy: { createdAt: 'desc' } },
+    by: { field: 'data', path: ['title'] },
+    direction: 'asc',
+    plan: 'lateral',   // PostgreSQL only; identical results to the default
+  },
+}
+```
+
+The results are identical to the default plan (measure both to decide, since the faster plan depends on your data and indexes). The lateral plan is PostgreSQL only: it throws on the other engines rather than falling back silently. Set it per ordering entry, so a query with two picks can use a lateral for the large relation and the default subquery for a small, indexed one.
+
 ### Relation filters
 
 Filter parent rows by predicates on their child rows.

@@ -154,6 +154,83 @@ describe('cache cross-check: corrupted entries throw E003', () => {
   });
 });
 
+/** Schema with a hasMany relation, for exercising pick-row lateral ordering. */
+function buildPickSchema(): SchemaMetadata {
+  return {
+    enums: {},
+    tables: {
+      instances: mockTable(
+        'instances',
+        [
+          { name: 'id', field: 'id' },
+          { name: 'name', field: 'name', pgType: 'text' },
+        ],
+        {
+          versions: {
+            type: 'hasMany',
+            name: 'versions',
+            from: 'instances',
+            to: 'versions',
+            foreignKey: 'instance_id',
+            referenceKey: 'id',
+          },
+        },
+      ),
+      versions: mockTable('versions', [
+        { name: 'id', field: 'id' },
+        { name: 'instance_id', field: 'instanceId' },
+        { name: 'title', field: 'title', pgType: 'text' },
+        { name: 'data', field: 'data', pgType: 'jsonb' },
+        { name: 'created_at', field: 'createdAt', pgType: 'timestamptz' },
+        { name: 'is_current', field: 'isCurrent', pgType: 'bool' },
+      ]),
+    },
+  };
+}
+
+describe("cache cross-check: pick-row plan: 'lateral' path", () => {
+  it('a warm cache HIT on a lateral pick passes the live cross-check (SQL + params in lockstep)', () => {
+    const q = makeQuery('instances', buildPickSchema());
+    const args = {
+      where: { name: 'n' },
+      orderBy: {
+        versions: {
+          pick: { orderBy: { createdAt: 'desc' }, where: { isCurrent: true } },
+          by: { field: 'data', path: ['title'] },
+          plan: 'lateral',
+        },
+      },
+      limit: 5,
+    } as never;
+    // First call warms; the cross-check only runs on HITs, so a second call is
+    // what exercises it. The lateral join text and its params must rebuild
+    // byte-identically or crossCheckCache throws E003.
+    q.buildFindMany(args);
+    assert.doesNotThrow(() => q.buildFindMany(args));
+  });
+
+  it('a corrupted cached SQL string on a lateral pick throws E003 on the next HIT', () => {
+    const q = makeQuery('instances', buildPickSchema());
+    const args = {
+      orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', plan: 'lateral' } },
+    } as never;
+    q.buildFindMany(args); // warm
+    const entry = firstCacheEntry(q as unknown as QueryInterface<Record<string, unknown>>);
+    assert.ok(entry.sql.includes('LEFT JOIN LATERAL'), 'expected the lateral join in the cached SQL');
+    entry.sql = 'SELECT 1 -- corrupted lateral entry';
+
+    assert.throws(
+      () => q.buildFindMany(args),
+      (err: unknown) =>
+        err instanceof ValidationError &&
+        err.code === 'TURBINE_E003' &&
+        /SQL cache lockstep violation on findMany/.test(err.message) &&
+        /cached SQL and freshly-built SQL diverge/.test(err.message) &&
+        err.message.includes('corrupted lateral entry'),
+    );
+  });
+});
+
 describe('cache cross-check: escape hatches skip the check', () => {
   it('TURBINE_DISABLE_CACHE_CHECK=1 skips the check even with a corrupted entry', () => {
     const q = makeQuery('users', buildSchema());

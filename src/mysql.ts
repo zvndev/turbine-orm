@@ -431,6 +431,9 @@ export const mysqlDialect: Dialect = {
   supportsVector: false,
   supportsListenNotify: false,
   supportsRLS: false,
+  // MySQL 8.0.14+ supports LATERAL, but the opt-in lateral pick plan stays
+  // Postgres-only in this release (flipping it on is a one-line change + tests).
+  supportsLateralJoin: false,
   // GET_LOCK / RELEASE_LOCK exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // JSON_ARRAYAGG has no inline ORDER BY argument → force the inner-subquery

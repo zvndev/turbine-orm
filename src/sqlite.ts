@@ -417,6 +417,8 @@ export const sqliteDialect: Dialect = {
   supportsListenNotify: false,
   supportsRLS: false,
   supportsAdvisoryLock: false,
+  // No FROM-clause LATERAL: the opt-in lateral pick plan is Postgres-only.
+  supportsLateralJoin: false,
   // json_group_array / json_object have no inline ORDER BY argument, so every
   // ordered to-many relation is forced through the inner-subquery rewrite.
   aggSupportsInlineOrderBy: false,
