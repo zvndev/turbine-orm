@@ -649,11 +649,13 @@ describe('groupBy JSON paths live on SQLite', () => {
 // PowDB: the SQL-only groupBy extensions refuse with E017
 // ---------------------------------------------------------------------------
 
-describe('groupBy extensions on PowDB (E017)', () => {
+describe('groupBy / orderBy extensions on PowDB (JSON supported since 0.12; others E017)', () => {
+  // A trusted-caller pool (no explicit capabilities → all feature gates on),
+  // so the JSON path features compile; refusals below are structural, not gated.
   const pool = { query: () => Promise.resolve({ rows: [], rowCount: 0 }) } as unknown as PowdbPool;
-  const powqlQuery = () => new PowqlInterface(pool, 'versions', schema());
+  const powqlQuery = () => new PowqlInterface(pool, 'versions', schema(), [], { warnOnUnlimited: false });
 
-  it('distinctOn throws E017', async () => {
+  it('distinctOn throws E017 (no DISTINCT ON row source)', async () => {
     await assert.rejects(
       powqlQuery().groupBy({
         distinctOn: { columns: ['instanceId'], orderBy: { createdAt: 'desc' } },
@@ -663,38 +665,49 @@ describe('groupBy extensions on PowDB (E017)', () => {
     );
   });
 
-  it('JSON-path group keys throw E017', async () => {
-    await assert.rejects(
-      powqlQuery().groupBy({ by: [{ field: 'data', path: ['category'] }] } as never),
-      UnsupportedFeatureError,
+  it('JSON-path group keys compile (F2, jsonDocs on)', async () => {
+    await assert.doesNotReject(
+      powqlQuery().groupBy({ by: [{ field: 'data', path: ['category'] }], _count: true } as never),
     );
   });
 
-  it('JSON-path aggregate targets throw E017', async () => {
-    await assert.rejects(
+  it('JSON-path aggregate targets compile (F2)', async () => {
+    await assert.doesNotReject(
+      powqlQuery().groupBy({ by: ['status'], _sum: { price: { field: 'data', path: ['price'] } } } as never),
+    );
+  });
+
+  it('aggregate orderBy over a REQUESTED aggregate compiles via its projection alias (F2 R3-1 parity)', async () => {
+    await assert.doesNotReject(
       powqlQuery().groupBy({
         by: ['status'],
-        _sum: { price: { field: 'data', path: ['price'] } },
+        _count: true,
+        _sum: { viewCount: true },
+        orderBy: { _count: 'desc' },
       } as never),
-      UnsupportedFeatureError,
+    );
+    await assert.doesNotReject(
+      powqlQuery().groupBy({
+        by: ['status'],
+        _count: true,
+        _sum: { viewCount: true },
+        orderBy: { _sum: { viewCount: 'desc' } },
+      } as never),
     );
   });
 
-  it('aggregate orderBy keys throw E017 (never silently emit an invalid ._count sort)', async () => {
-    for (const orderBy of [{ _count: 'desc' }, { _sum: { viewCount: 'desc' } }] as const) {
-      await assert.rejects(
-        powqlQuery().groupBy({ by: ['status'], _count: true, _sum: { viewCount: true }, orderBy } as never),
-        (err: unknown) => {
-          assert.ok(err instanceof UnsupportedFeatureError);
-          assert.match((err as Error).message, /groupBy ordering by an aggregate/);
-          return true;
-        },
-      );
-    }
+  it('aggregate orderBy over an UNREQUESTED aggregate throws E003 listing valid keys', async () => {
+    await assert.rejects(
+      powqlQuery().groupBy({ by: ['status'], _count: true, orderBy: { _sum: { viewCount: 'desc' } } } as never),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.match((err as Error).message, /not requested/);
+        return true;
+      },
+    );
   });
 
   it('plain by-field orderBy still compiles on PowDB', async () => {
-    // Does not throw (buildOrder handles a plain-column direction).
     await assert.doesNotReject(powqlQuery().groupBy({ by: ['status'], orderBy: { status: 'asc' } } as never));
   });
 
@@ -712,14 +725,17 @@ describe('groupBy extensions on PowDB (E017)', () => {
     );
   });
 
-  it('other object orderBy shapes each get their own E017 feature name', async () => {
-    const cases: [Record<string, unknown>, RegExp][] = [
-      [{ data: { path: ['x'] } }, /JSON-path ordering/],
+  it('object orderBy: JSON path + nulls:last now compile; relation / vector / nulls:first stay E017', async () => {
+    // F2 supports JSON-path ordering on a json column and OrderBySpec nulls:last.
+    await assert.doesNotReject(powqlQuery().findMany({ orderBy: { data: { path: ['x'] } } } as never));
+    await assert.doesNotReject(powqlQuery().findMany({ orderBy: { status: { sort: 'asc', nulls: 'last' } } } as never));
+    // Still refused, each with its own feature name.
+    const stillE017: [Record<string, unknown>, RegExp][] = [
       [{ rel: { _count: 'desc' } }, /relation _count ordering/],
-      [{ status: { sort: 'asc', nulls: 'last' } }, /NULLS placement \/ sort-spec ordering/],
       [{ vec: { distance: { to: [1], metric: 'l2' } } }, /vector \/ distance ordering/],
+      [{ status: { sort: 'asc', nulls: 'first' } }, /NULLS FIRST/],
     ];
-    for (const [orderBy, expected] of cases) {
+    for (const [orderBy, expected] of stillE017) {
       await assert.rejects(powqlQuery().findMany({ orderBy } as never), expected);
     }
   });

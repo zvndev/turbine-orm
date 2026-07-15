@@ -43,8 +43,20 @@ import {
   hasRelationFields,
   type NestedWriteContext,
 } from './nested-write.js';
-import { PowdbFloatParam, type PowdbPool, powqlColumnType, quotePowqlIdent, rowToEntity } from './powdb.js';
-import { isRelationPickOrderBy } from './query/filters.js';
+import {
+  ALL_POWDB_CAPABILITIES,
+  isJsonColumn,
+  isStaleFramePowdbError,
+  type PowdbCapabilities,
+  PowdbFloatParam,
+  PowdbJsonParam,
+  type PowdbPool,
+  powqlColumnType,
+  quotePowqlIdent,
+  requireCapability,
+  rowToEntity,
+} from './powdb.js';
+import { isJsonFilter, isRelationPickOrderBy } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
 import type {
   AggregateArgs,
@@ -57,7 +69,13 @@ import type {
   FindManyArgs,
   FindUniqueArgs,
   GroupByArgs,
+  GroupByOrderBy,
+  JsonFilter,
+  JsonPathAggregateTarget,
+  JsonPathGroupKey,
+  JsonPathOrderBy,
   OrderByClause,
+  OrderBySpec,
   UpdateArgs,
   UpdateManyArgs,
   UpsertArgs,
@@ -80,6 +98,22 @@ import {
  * before grouping. Mirrors the chunking the parity matrix documents.
  */
 const MAX_RELATION_KEYS = 1000;
+
+/**
+ * Read-shaped actions whose statement may be transparently replayed once on a
+ * stale wire frame when `retryStaleReads` is enabled (see
+ * {@link PowqlInterface.execOnce}). Writes are deliberately absent: replaying a
+ * mutation after an ambiguous reply can double-execute, matching the client's
+ * own native-path policy.
+ */
+const POWQL_READ_ACTIONS: ReadonlySet<string> = new Set([
+  'findMany',
+  'findUnique',
+  'findFirst',
+  'count',
+  'aggregate',
+  'groupBy',
+]);
 
 /** Operator keys recognised inside a `WhereOperator` object. */
 const OPERATOR_KEYS = new Set([
@@ -184,7 +218,16 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * {@link toPowdbParam}, so the wire param is unchanged.
    */
   private param(value: unknown, params: unknown[], col?: ColumnMetadata): string {
-    const tagged = col && typeof value === 'number' && this.isFloatCol(col) ? new PowdbFloatParam(value) : value;
+    let tagged: unknown = value;
+    if (col && typeof value === 'number' && this.isFloatCol(col)) {
+      // Float column: force a float-form literal even for an integer value.
+      tagged = new PowdbFloatParam(value);
+    } else if (col && value !== null && typeof value === 'object' && !(value instanceof Date) && isJsonColumn(col)) {
+      // json document column: a JS object/array is serialized to canonical JSON
+      // text and stored as a json document (a JS string passes through raw, same
+      // contract as pg jsonb; `null` stays `null`).
+      tagged = new PowdbJsonParam(value);
+    }
     params.push(tagged);
     return `$${params.length}`;
   }
@@ -212,6 +255,16 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * The bound pool's {@link PowdbCapabilities}. Falls back to the trusted-caller
+   * default (all feature gates on, `nativeRaw` off) when a directly-constructed
+   * pool did not carry them, matching {@link PowdbPool}'s own constructor
+   * default so a hand-built test pool never crashes the version gates.
+   */
+  private get capabilities(): PowdbCapabilities {
+    return this.pool.capabilities ?? ALL_POWDB_CAPABILITIES;
   }
 
   /** A predicate that is always false — the empty-`in` / contradiction sentinel. */
@@ -250,7 +303,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           `[turbine] internal: relation filter "${key}" reached buildWhere unresolved (missing resolveRelationFilters()).`,
         );
       } else {
-        parts.push(this.buildFieldCondition(key, value, params));
+        // A JsonFilter (or a bare `{ path }`) can compile to zero clauses; skip
+        // empty results so buildWhere never emits a dangling ` and `.
+        const cond = this.buildFieldCondition(key, value, params);
+        if (cond) parts.push(cond);
       }
     }
     return parts.join(' and ');
@@ -258,12 +314,21 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   /** Build a single `field: value | operator` condition. */
   private buildFieldCondition(field: string, value: unknown, params: unknown[]): string {
+    const colMeta = this.column(field);
     const ref = this.ref(field);
     if (value === null) return `${ref} is null`;
     if (value instanceof Date || typeof value !== 'object') {
-      return `${ref} = ${this.param(value, params)}`;
+      return `${ref} = ${this.param(value, params, colMeta)}`;
     }
     const op = value as Record<string, unknown>;
+    // JSON path / key filters on a json document column compile to PowQL `->`
+    // path filters (≥ 0.12). `isJsonFilter` matches `path`/`equals`/`contains`/
+    // `hasKey`; on a NON-json column those fall through to the scalar operator
+    // path below (e.g. `equals` stays a plain equality), exactly like SQL.
+    if (isJsonColumn(colMeta) && isJsonFilter(value)) {
+      requireCapability(this.capabilities, 'jsonDocs', 'JSON path filters');
+      return this.buildJsonPathCondition(colMeta, value, params);
+    }
     rejectUnsupportedFilter(op, field);
     if (!Object.keys(op).some((k) => OPERATOR_KEYS.has(k))) {
       // A bare object that is not an operator set — equality by value.
@@ -313,6 +378,103 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       }
     }
     return conds.length > 1 ? `(${conds.join(' and ')})` : (conds[0] ?? this.alwaysFalse());
+  }
+
+  /**
+   * PowQL JSON path expression `.col->$a->$b…`, binding EVERY path segment as a
+   * positional param (a string segment as a `str` token, an integer index as an
+   * `int` token). `->` binds tighter than every operator, so no parens are
+   * needed around the path in a comparison. Segments are bound (never inlined)
+   * to keep {@link materializePowql}'s `$N`-scan invariant intact: a segment
+   * that literally contained `$1` would otherwise be rewritten. Shared by the
+   * F1 where-filter path and the F2 orderBy / groupBy path emitters.
+   */
+  private jsonPathExpr(col: ColumnMetadata, path: (string | number)[], params: unknown[]): string {
+    let expr = `.${col.name}`;
+    for (const seg of path) expr += `->${this.param(seg, params)}`;
+    return expr;
+  }
+
+  /**
+   * Compile a {@link JsonFilter} on a json document column into a PowQL filter
+   * (≥ 0.12). Operators PowQL cannot express EXACTLY throw a per-operator E017
+   * (never a wrong result): containment (`contains`, and `equals` without a
+   * `path`) has no PowQL operator. The mapped shapes:
+   *   - `{ path, equals: v }`  → `P = $n` (typed: string→str, bool→bool,
+   *      integral number→int, fractional→float; NOT stringified)
+   *   - `{ path, equals: null }` → `P is null` (matches JSON null AND a missing
+   *      key, a deliberate divergence from the PG driver, documented on
+   *      {@link JsonFilter})
+   *   - `{ path, gt|gte|lt|lte: v }` → `P > $n` … (range ops require `path`; the
+   *      engine coerces int/float numerically)
+   *   - `{ hasKey: k }` → `json_type(.col->$n) is not null` (top-level key test,
+   *      ignoring `path`, mirroring PG `col ? key`; includes keys holding JSON
+   *      null)
+   * A bare `{ path }` with no operators compiles to zero clauses (byte-parity
+   * with SQL), so a mutation whose only `where` is a bare `{ path }` is refused
+   * by the empty-where guard.
+   */
+  private buildJsonPathCondition(col: ColumnMetadata, filter: JsonFilter, params: unknown[]): string {
+    const conds: string[] = [];
+    // Bind the path segments at most once and reuse the expression string across
+    // equals + range comparisons (they share the same `path`).
+    let pathExpr: string | null = null;
+    const pathP = (): string => {
+      pathExpr ??= this.jsonPathExpr(col, filter.path!, params);
+      return pathExpr;
+    };
+
+    if (filter.contains !== undefined) {
+      throw new UnsupportedFeatureError(
+        'JSON containment filters (contains)',
+        'PowDB',
+        `column "${col.name}": PowQL has no JSON containment operator`,
+      );
+    }
+    if (filter.equals !== undefined) {
+      if (filter.path === undefined || filter.path.length === 0) {
+        throw new UnsupportedFeatureError(
+          'JSON containment (equals without path)',
+          'PowDB',
+          `column "${col.name}": pass a \`path\` to compare a specific json value; PowQL has no whole-document containment`,
+        );
+      }
+      conds.push(filter.equals === null ? `${pathP()} is null` : `${pathP()} = ${this.param(filter.equals, params)}`);
+    }
+    if (filter.hasKey !== undefined) {
+      // Top-level key existence, independent of `path` (mirrors PG `col ? key`).
+      conds.push(`json_type(.${col.name}->${this.param(filter.hasKey, params)}) is not null`);
+    }
+    // Range comparisons on the extracted path, in the fixed gt/gte/lt/lte order.
+    // Same validation as SQL `jsonRangeEntries`: `path` required, value a finite
+    // number or a string.
+    for (const [op, powOp] of [
+      ['gt', '>'],
+      ['gte', '>='],
+      ['lt', '<'],
+      ['lte', '<='],
+    ] as const) {
+      const v = (filter as Record<string, unknown>)[op];
+      if (v === undefined) continue;
+      if (filter.path === undefined) {
+        throw new ValidationError(
+          `[turbine] JSON range operator '${op}' on ${col.name} requires a \`path\` ` +
+            `(e.g. { path: ['meta', 'score'], ${op}: ${JSON.stringify(v)} }).`,
+        );
+      }
+      if (typeof v !== 'number' && typeof v !== 'string') {
+        throw new ValidationError(
+          `[turbine] JSON range operator '${op}' on ${col.name} requires a number or string, got ${JSON.stringify(v)}.`,
+        );
+      }
+      if (typeof v === 'number' && !Number.isFinite(v)) {
+        throw new ValidationError(`[turbine] JSON range operator '${op}' on ${col.name} requires a finite number.`);
+      }
+      conds.push(`${pathP()} ${powOp} ${this.param(v, params)}`);
+    }
+
+    if (!conds.length) return '';
+    return conds.length > 1 ? `(${conds.join(' and ')})` : conds[0]!;
   }
 
   /** Bind a value, lowercasing for case-insensitive comparisons. */
@@ -536,33 +698,81 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return `{ ${cols.map((c) => `.${c}`).join(', ')} }`;
   }
 
-  /** `order .c1 asc, .c2 desc` clause (empty string when no orderBy). */
-  private buildOrder(orderBy: OrderByClause | undefined): string {
+  /**
+   * `order .c1 asc, .c2 desc` clause (empty string when no orderBy). Supports,
+   * besides a plain direction:
+   *   - {@link JsonPathOrderBy} on a json column (≥ 0.12): `{ data: { path: […],
+   *     type?, direction? } }` → `order .data->$n asc` (or
+   *     `cast(.data->$n, "float")` for `type: 'numeric'`);
+   *   - {@link OrderBySpec} `{ sort, nulls }`: `nulls: 'last'` is accepted as a
+   *     no-op (PowDB is always nulls-last), `nulls: 'first'` throws E017.
+   *
+   * PowDB orders missing / JSON-null keys LAST in BOTH directions (an engine
+   * contract): for identical cross-engine results pass `nulls: 'last'`
+   * explicitly on Postgres, which defaults nulls-first for `desc`.
+   */
+  private buildOrder(orderBy: OrderByClause | undefined, params: unknown[]): string {
     if (!orderBy) return '';
     const keys = Object.entries(orderBy).filter(([, dir]) => dir !== undefined);
     if (!keys.length) return '';
     const parts = keys.map(([field, dir]) => {
       if (dir && typeof dir === 'object') {
+        const o = dir as Record<string, unknown>;
+        // JSON-path ordering on a json column.
+        if (Array.isArray(o.path)) {
+          return this.buildJsonPathOrder(field, dir as JsonPathOrderBy, params);
+        }
+        // OrderBySpec { sort, nulls }: accept nulls-last (PowDB default), refuse
+        // nulls-first (no placement grammar). Distinct from vector/pick/_count.
+        if ('sort' in o && !('distance' in o) && !('_count' in o) && !isRelationPickOrderBy(dir)) {
+          const spec = dir as OrderBySpec;
+          if (spec.nulls === 'first') {
+            throw new UnsupportedFeatureError(
+              'NULLS FIRST placement',
+              'PowDB',
+              `field "${field}": PowDB orders NULLs / missing keys LAST in both directions`,
+            );
+          }
+          return `${this.ref(field)} ${spec.sort === 'desc' ? 'desc' : 'asc'}`;
+        }
         // Name the actual feature in the refusal — a pick-row ordering
         // reported as "vector / distance ordering" sends users hunting for
-        // pgvector docs. All object-valued orderings stay E017 on PowDB.
-        const o = dir as Record<string, unknown>;
+        // pgvector docs. Everything else stays E017 on PowDB.
         const feature = isRelationPickOrderBy(dir)
           ? 'relation pick-row ordering'
           : 'distance' in o
             ? 'vector / distance ordering'
-            : Array.isArray(o.path)
-              ? 'JSON-path ordering'
-              : '_count' in o
-                ? 'relation _count ordering'
-                : 'sort' in o || 'nulls' in o
-                  ? 'NULLS placement / sort-spec ordering'
-                  : 'object-valued ordering';
+            : '_count' in o
+              ? 'relation _count ordering'
+              : 'nulls' in o
+                ? 'NULLS placement / sort-spec ordering'
+                : 'object-valued ordering';
         throw new UnsupportedFeatureError(feature, 'PowDB', `field "${field}"`);
       }
       return `${this.ref(field)} ${dir === 'desc' ? 'desc' : 'asc'}`;
     });
     return ` order ${parts.join(', ')}`;
+  }
+
+  /** Compile one {@link JsonPathOrderBy} entry to `order .col->$n asc` (+ optional numeric cast). */
+  private buildJsonPathOrder(field: string, spec: JsonPathOrderBy, params: unknown[]): string {
+    const col = this.column(field);
+    if (!isJsonColumn(col)) {
+      throw new UnsupportedFeatureError('JSON-path ordering', 'PowDB', `field "${field}" is not a json column`);
+    }
+    requireCapability(this.capabilities, 'jsonDocs', 'JSON path ordering');
+    if (spec.nulls === 'first') {
+      throw new UnsupportedFeatureError(
+        'NULLS FIRST placement',
+        'PowDB',
+        `field "${field}": PowDB orders missing / JSON-null keys LAST in both directions`,
+      );
+    }
+    const pathExpr = this.jsonPathExpr(col, spec.path, params);
+    // `type: 'numeric'` casts a JSON STRING number for numeric ordering; native
+    // JSON numbers already order numerically without a cast.
+    const expr = spec.type === 'numeric' ? `cast(${pathExpr}, "float")` : pathExpr;
+    return `${expr} ${spec.direction === 'desc' ? 'desc' : 'asc'}`;
   }
 
   // -------------------------------------------------------------------------
@@ -574,6 +784,26 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     powql: string,
     params: unknown[],
     timeout?: number,
+  ): Promise<{ rows: Record<string, unknown>[]; rowCount: number }> {
+    return this.execOnce(powql, params, timeout, false);
+  }
+
+  /**
+   * Execute one statement, with the opt-in single stale-frame READ replay. When
+   * `retryStaleReads` is on and a first-statement READ fails with the stale-wire
+   * {@link isStaleFramePowdbError} ConnectionError (a socket idle-gap "received
+   * unexpected frame" that the client cannot recover), the statement is retried
+   * exactly once on a fresh pooled connection (the broken one was destroyed).
+   * The replay is refused for writes (an ambiguous mutation reply is unsafe to
+   * replay) and inside a transaction (a mid-tx statement cannot move connection),
+   * so only the read-shaped actions in {@link POWQL_READ_ACTIONS}, outside a
+   * `_txScoped` interface, are eligible.
+   */
+  private async execOnce(
+    powql: string,
+    params: unknown[],
+    timeout: number | undefined,
+    isRetry: boolean,
   ): Promise<{ rows: Record<string, unknown>[]; rowCount: number }> {
     const start = performance.now();
     const run = this.pool.query(powql, params) as Promise<{ rows: Record<string, unknown>[]; rowCount: number }>;
@@ -587,9 +817,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       this.emit(powql, params, performance.now() - start, result.rowCount ?? result.rows.length);
       return result;
     } catch (err) {
+      if (!isRetry && this.shouldRetryStaleRead(err)) {
+        // Transparent single replay on a fresh connection; the first (swallowed)
+        // failure is not emitted, only the retried outcome is observed.
+        return this.execOnce(powql, params, timeout, true);
+      }
       this.emit(powql, params, performance.now() - start, 0, err as Error);
       throw err;
     }
+  }
+
+  /** Is `err` a replayable stale-frame failure for the CURRENT (read-shaped, non-tx) action? */
+  private shouldRetryStaleRead(err: unknown): boolean {
+    if (!this.pool.retryStaleReads) return false;
+    if (this.isTxScoped()) return false;
+    if (!POWQL_READ_ACTIONS.has(this.currentAction)) return false;
+    return isStaleFramePowdbError(err);
   }
 
   private emit(sql: string, params: unknown[], duration: number, rows: number, error?: Error): void {
@@ -626,9 +869,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return next({ model: this.table, action, args: { ...args } }) as Promise<R>;
   }
 
-  /** Map raw rows to typed entities. */
+  /** Map raw rows to typed entities. Passes the native-wire flag so cells that
+   * arrived pre-typed over `queryNativeRaw` (F3) skip the legacy string coercion
+   * (e.g. a genuine str `"null"` stays `"null"` instead of collapsing to null). */
   private shape(rows: Record<string, unknown>[]): T[] {
-    return rows.map((r) => rowToEntity(r, this.meta) as T);
+    const native = Boolean(this.capabilities.nativeRaw);
+    return rows.map((r) => rowToEntity(r, this.meta, native) as T);
   }
 
   // -------------------------------------------------------------------------
@@ -658,7 +904,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
     const distinct = args.distinct?.length ? ' distinct' : '';
     const filter = where ? ` filter ${where}` : '';
-    const order = this.buildOrder(args.orderBy);
+    const order = this.buildOrder(args.orderBy, params);
     const limit = args.limit ?? (args as { take?: number }).take ?? this.defaultLimit;
     if (limit === undefined && this.warnOnUnlimited && !this.warnedUnlimited) {
       this.warnedUnlimited = true;
@@ -1260,79 +1506,170 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
     return this.withMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
-      // The SQL-only groupBy extensions (DISTINCT ON row source, JSON-path
-      // group keys / aggregate targets) have no PowQL equivalent: refuse
-      // clearly instead of emitting broken PowQL.
+      // DISTINCT ON has no PowQL equivalent (no DISTINCT ON row source).
       if (args.distinctOn) {
         throw new UnsupportedFeatureError('groupBy distinctOn row source', 'PowDB');
       }
-      for (const entry of args.by) {
-        if (typeof entry !== 'string') {
-          throw new UnsupportedFeatureError('JSON-path groupBy keys', 'PowDB');
-        }
+      // JSON-path group keys / aggregate targets (≥ 0.12) are gated once here.
+      const usesJson =
+        args.by.some((e) => typeof e !== 'string') ||
+        (['_sum', '_avg', '_min', '_max'] as const).some((fn) => {
+          const spec = args[fn];
+          return spec !== undefined && Object.values(spec).some((v) => v != null && typeof v === 'object');
+        });
+      if (usesJson) {
+        requireCapability(this.capabilities, 'jsonDocs', 'JSON-path groupBy keys / aggregate targets');
       }
-      for (const fn of ['_sum', '_avg', '_min', '_max'] as const) {
-        const spec = args[fn];
-        if (!spec) continue;
-        for (const value of Object.values(spec)) {
-          if (value !== undefined && typeof value !== 'boolean') {
-            throw new UnsupportedFeatureError(`JSON-path ${fn} aggregate targets`, 'PowDB');
-          }
-        }
-      }
+
+      const native = Boolean(this.capabilities.nativeRaw);
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
       const where = this.buildWhere(resolvedWhere, params);
       const filter = where ? ` filter ${where}` : '';
-      const groupKeys = (args.by as string[]).map((f) => this.ref(f));
-      // Safe aliases — PowQL rejects reserved-word aliases (e.g. `count:`).
-      const aliasMap: { alias: string; fn: string; field: string | null; outKey: string }[] = [];
-      let n = 0;
-      const proj: string[] = (args.by as string[]).map((f) => this.ref(f));
-      if (args._count) {
-        aliasMap.push({ alias: `agg_${n++}`, fn: 'count', field: null, outKey: '_count' });
-      }
-      for (const fn of ['_sum', '_avg', '_min', '_max'] as const) {
-        const spec = args[fn];
-        if (!spec) continue;
-        for (const field of Object.keys(spec).filter((f) => (spec as Record<string, boolean>)[f])) {
-          aliasMap.push({ alias: `agg_${n++}`, fn: fn.slice(1), field, outKey: `${fn}:${field}` });
+
+      // Result-key namespace, mirroring the SQL builder's `claimResultKey`
+      // (query/builder.ts): a group-key / aggregate output-name collision (with
+      // `_count`, another key, or an aggregate output) throws E003.
+      const usedKeys = new Set<string>();
+      const claim = (key: string, what: string): void => {
+        if (key === '_count' || usedKeys.has(key)) {
+          throw new ValidationError(
+            `[turbine] groupBy output name "${key}" (${what}) collides with another output column on table ` +
+              `"${this.table}": set an explicit \`alias\` (or rename the aggregate key) to disambiguate.`,
+          );
+        }
+        usedKeys.add(key);
+      };
+
+      // Group keys + projection. `byReaders` drives the transform: a plain column
+      // coerces by tsType; a JSON key reads its `gk_N` alias, disambiguating the
+      // legacy-wire `null` / string-`"null"` group via its `gt_N` discriminator.
+      type ByReader =
+        | { kind: 'plain'; resultKey: string; rowKey: string; col: ColumnMetadata }
+        | { kind: 'json'; resultKey: string; rowKey: string; discrim?: string };
+      const groupExprs: string[] = [];
+      const proj: string[] = [];
+      const byOrderExprs = new Map<string, string>();
+      const byReaders: ByReader[] = [];
+      let gkN = 0;
+      let gtN = 0;
+      for (const entry of args.by as ((keyof T & string) | JsonPathGroupKey)[]) {
+        if (typeof entry === 'string') {
+          const col = this.column(entry);
+          claim(entry, `column "${col.name}"`);
+          if (col.name !== entry) claim(col.name, `column "${col.name}"`);
+          groupExprs.push(`.${col.name}`);
+          proj.push(`.${col.name}`);
+          byOrderExprs.set(entry, `.${col.name}`);
+          byReaders.push({ kind: 'plain', resultKey: entry, rowKey: col.name, col });
+        } else {
+          const col = this.column(entry.field);
+          if (!isJsonColumn(col)) {
+            throw new ValidationError(
+              `[turbine] groupBy JSON group key on "${entry.field}" (table "${this.table}") requires a json column.`,
+            );
+          }
+          this.assertJsonPath('group key', entry.field, entry.path);
+          const pathExpr = this.jsonPathExpr(col, entry.path, params);
+          const alias = entry.alias ?? String(entry.path[entry.path.length - 1]);
+          claim(alias, `JSON path on "${entry.field}"`);
+          const gkAlias = `gk_${gkN++}`;
+          groupExprs.push(pathExpr);
+          proj.push(`${gkAlias}: ${pathExpr}`);
+          byOrderExprs.set(alias, `.${gkAlias}`);
+          let discrim: string | undefined;
+          if (!native) {
+            // Legacy wire renders a missing value, JSON null, AND the string
+            // "null" all as the cell "null". `min(json_type(path))` over the
+            // group is "string" ONLY for the string-"null" group and "null"
+            // otherwise (a bare `json_type` projection is not group-correlated).
+            discrim = `gt_${gtN++}`;
+            proj.push(`${discrim}: min(json_type(${pathExpr}))`);
+          }
+          byReaders.push({ kind: 'json', resultKey: alias, rowKey: gkAlias, discrim });
         }
       }
-      for (const a of aliasMap) {
-        proj.push(`${a.alias}: ${a.fn}(${a.field ? this.ref(a.field) : `.${this.meta.primaryKey[0]}`})`);
+
+      // Aggregates: `agg_N` internal aliases (PowQL rejects reserved-word
+      // aliases like `count:`). `aggInner` lets HAVING re-emit the exact inner
+      // expression by user key; `aggOrderExprs` lets orderBy reference the alias.
+      const aggReaders: { alias: string; outKey: string; numeric: boolean }[] = [];
+      const aggOrderExprs = new Map<string, string>();
+      const aggInner = new Map<string, string>();
+      let aggN = 0;
+      if (args._count) {
+        const alias = `agg_${aggN++}`;
+        proj.push(`${alias}: count(*)`);
+        aggReaders.push({ alias, outKey: '_count', numeric: true });
+        aggOrderExprs.set('_count', `.${alias}`);
       }
-      const having = this.buildHaving(args.having, params);
-      // groupBy aggregate ordering (`_count` / `_sum` / … keys) has no PowQL
-      // equivalent here: `buildOrder` treats an `orderBy` key as a field ref, so
-      // a bare `_count: 'desc'` would silently emit an invalid `._count` sort.
-      // Refuse those keys explicitly; plain by-field ordering still flows through.
-      if (args.orderBy) {
-        for (const key of Object.keys(args.orderBy)) {
-          if (key === '_count' || key === '_sum' || key === '_avg' || key === '_min' || key === '_max') {
-            throw new UnsupportedFeatureError('groupBy ordering by an aggregate', 'PowDB', `orderBy key "${key}"`);
+      for (const fn of ['_sum', '_avg', '_min', '_max'] as const) {
+        const spec = args[fn] as Record<string, boolean | JsonPathAggregateTarget | undefined> | undefined;
+        if (!spec) continue;
+        const powfn = fn.slice(1); // sum/avg/min/max
+        for (const [key, target] of Object.entries(spec)) {
+          if (!target) continue;
+          const alias = `agg_${aggN++}`;
+          if (target === true) {
+            const col = this.column(key);
+            claim(`${fn}_${col.name}`, `${fn} of column "${col.name}"`);
+            const inner = `.${col.name}`;
+            proj.push(`${alias}: ${powfn}(${inner})`);
+            aggReaders.push({ alias, outKey: `${fn}:${key}`, numeric: true });
+            aggOrderExprs.set(`${fn}:${key}`, `.${alias}`);
+            aggInner.set(key, inner);
+          } else {
+            const col = this.column(target.field);
+            if (!isJsonColumn(col)) {
+              throw new ValidationError(
+                `[turbine] groupBy ${fn} target "${key}" on "${target.field}" (table "${this.table}") requires a json column.`,
+              );
+            }
+            this.assertJsonPath(`${fn} target "${key}"`, target.field, target.path);
+            const alwaysNumeric = fn === '_sum' || fn === '_avg';
+            if (alwaysNumeric && target.type === 'text') {
+              throw new ValidationError(
+                `[turbine] groupBy ${fn} target "${key}" on table "${this.table}": ` +
+                  `${fn} over a JSON path is always numeric: remove \`type: 'text'\`.`,
+              );
+            }
+            const numeric = alwaysNumeric || target.type === 'numeric';
+            claim(`${fn}_${key}`, `${fn} JSON target "${key}"`);
+            const pathExpr = this.jsonPathExpr(col, target.path, params);
+            const inner = numeric ? `cast(${pathExpr}, "float")` : pathExpr;
+            proj.push(`${alias}: ${powfn}(${inner})`);
+            aggReaders.push({ alias, outKey: `${fn}:${key}`, numeric });
+            aggOrderExprs.set(`${fn}:${key}`, `.${alias}`);
+            aggInner.set(key, inner);
           }
         }
       }
-      const order = this.buildOrder(args.orderBy as OrderByClause | undefined);
-      const powql = `${this.qt}${filter} group ${groupKeys.join(', ')}${having}${order} { ${proj.join(', ')} }`;
+
+      const having = this.buildHaving(args.having, params, aggInner);
+      const order = this.buildGroupOrder(args.orderBy, byOrderExprs, aggOrderExprs);
+      const powql = `${this.qt}${filter} group ${groupExprs.join(', ')}${having}${order} { ${proj.join(', ')} }`;
       const { rows } = await this.exec(powql, params, args.timeout);
-      // Reshape: group keys → camel fields + coerced; aggregates → nested {_sum:{field}}.
+
+      // Reshape: group keys → user fields (coerced / null-disambiguated),
+      // aggregates → nested `{ _sum: { field } }`; discriminators are stripped.
       return rows.map((raw) => {
         const out: Record<string, unknown> = {};
-        for (const f of args.by as string[]) {
-          const col = this.column(f);
-          out[f] =
-            typeof raw[col.name] === 'string' ? coerceScalar(raw[col.name] as string, col.tsType) : raw[col.name];
+        for (const r of byReaders) {
+          if (r.kind === 'plain') {
+            const cell = raw[r.rowKey];
+            out[r.resultKey] = typeof cell === 'string' ? coerceScalar(cell, r.col.tsType) : cell;
+          } else {
+            out[r.resultKey] = decodeGroupKeyCell(raw[r.rowKey], r.discrim ? raw[r.discrim] : undefined, native);
+          }
         }
-        for (const a of aliasMap) {
-          const val = raw[a.alias];
-          const num = val == null || val === 'null' ? null : Number(val);
-          if (a.outKey === '_count') out._count = num ?? 0;
+        for (const a of aggReaders) {
+          const cell = raw[a.alias];
+          const v = cell == null || cell === 'null' ? null : a.numeric ? Number(cell) : cell;
+          if (a.outKey === '_count') out._count = (v as number) ?? 0;
           else {
             const [bucket, field] = a.outKey.split(':') as [string, string];
             out[bucket] ??= {} as Record<string, unknown>;
-            (out[bucket] as Record<string, unknown>)[field] = num;
+            (out[bucket] as Record<string, unknown>)[field] = v;
           }
         }
         return out;
@@ -1340,8 +1677,27 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
   }
 
-  /** `having <expr>` over group aggregates (count/sum/avg/min/max). */
-  private buildHaving(having: GroupByArgs<T>['having'], params: unknown[]): string {
+  /** Validate a JSON-path target (group key / aggregate target): non-empty array of keys/indexes. */
+  private assertJsonPath(context: string, field: string, path: (string | number)[]): void {
+    if (
+      !Array.isArray(path) ||
+      path.length === 0 ||
+      path.some((el) => typeof el !== 'string' && !(typeof el === 'number' && Number.isFinite(el)))
+    ) {
+      throw new ValidationError(
+        `[turbine] groupBy ${context} on "${field}" (table "${this.table}") requires a non-empty \`path\` ` +
+          `array of keys/indexes (e.g. { field: '${field}', path: ['category'] }).`,
+      );
+    }
+  }
+
+  /**
+   * `having <expr>` over group aggregates. `_count` compares `count(*)` (parity
+   * with the projection); a per-field aggregate re-emits its inner expression
+   * (from `aggInner` when the field is a requested aggregate, so a JSON-path
+   * aggregate reuses its bound placeholders, else `.field` for a plain column).
+   */
+  private buildHaving(having: GroupByArgs<T>['having'], params: unknown[], aggInner: Map<string, string>): string {
     if (!having) return '';
     const conds: string[] = [];
     const cmp = (expr: string, filter: unknown) => {
@@ -1356,15 +1712,99 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (const [key, spec] of Object.entries(having)) {
       if (spec == null) continue;
       if (key === '_count') {
-        conds.push(cmp(`count(.${this.meta.primaryKey[0]})`, spec));
+        conds.push(cmp('count(*)', spec));
       } else {
         for (const [fn, filter] of Object.entries(spec as Record<string, unknown>)) {
           if (filter == null) continue;
-          conds.push(cmp(`${fn.slice(1)}(${this.ref(key)})`, filter));
+          const inner = aggInner.get(key) ?? this.ref(key);
+          conds.push(cmp(`${fn.slice(1)}(${inner})`, filter));
         }
       }
     }
     return conds.length ? ` having ${conds.join(' and ')}` : '';
+  }
+
+  /**
+   * Compile a groupBy `orderBy` into a PowQL `order` body over the group RESULT
+   * columns (by-fields, JSON group-key aliases, and requested aggregates). PowQL
+   * cannot re-emit an aggregate EXPRESSION in `order` (engine error), but CAN
+   * order by a projection alias on a grouped query (probed), so each key maps to
+   * its projected alias (`.agg_N` / `.gk_N` / `.col`). Semantics and error
+   * surface mirror the SQL `buildGroupByOrderBy` (0.32.2 R3-1): an aggregate not
+   * requested in this call, or an unknown by-key, throws E003 listing the valid
+   * keys. `nulls: 'first'` stays E017 (PowDB has no NULLS placement grammar).
+   */
+  private buildGroupOrder(
+    orderBy: GroupByOrderBy | undefined,
+    byOrderExprs: Map<string, string>,
+    aggOrderExprs: Map<string, string>,
+  ): string {
+    if (!orderBy) return '';
+    const aggBlocks = new Set(['_count', '_sum', '_avg', '_min', '_max']);
+    const validKeys = (): string => {
+      const keys = [...byOrderExprs.keys()];
+      for (const k of aggOrderExprs.keys()) keys.push(k.includes(':') ? k.replace(':', '.') : k);
+      return keys.join(', ') || '(none)';
+    };
+    const parts: string[] = [];
+    for (const [key, value] of Object.entries(orderBy)) {
+      if (value === undefined) continue;
+      if (aggBlocks.has(key)) {
+        if (key === '_count') {
+          const expr = aggOrderExprs.get('_count');
+          if (!expr) {
+            throw new ValidationError(
+              `[turbine] Cannot order groupBy by "_count" on table "${this.table}": _count is not selected. ` +
+                `Orderable keys: ${validKeys()}.`,
+            );
+          }
+          parts.push(`${expr} ${this.groupOrderDir(value, '_count')}`);
+          continue;
+        }
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+          throw new ValidationError(
+            `[turbine] Invalid groupBy orderBy for "${key}" on table "${this.table}": ` +
+              `expected a field map like { ${key}: { amount: 'desc' } }.`,
+          );
+        }
+        for (const [field, dirSpec] of Object.entries(value as Record<string, unknown>)) {
+          if (dirSpec === undefined) continue;
+          const expr = aggOrderExprs.get(`${key}:${field}`);
+          if (!expr) {
+            throw new ValidationError(
+              `[turbine] Cannot order groupBy by "${key}.${field}" on table "${this.table}": ` +
+                `that aggregate is not requested in this call. Orderable keys: ${validKeys()}.`,
+            );
+          }
+          parts.push(`${expr} ${this.groupOrderDir(dirSpec, `${key}.${field}`)}`);
+        }
+        continue;
+      }
+      const expr = byOrderExprs.get(key);
+      if (!expr) {
+        throw new ValidationError(
+          `[turbine] Unknown field "${key}" in groupBy orderBy on table "${this.table}". Orderable keys: ${validKeys()}.`,
+        );
+      }
+      parts.push(`${expr} ${this.groupOrderDir(value, key)}`);
+    }
+    return parts.length ? ` order ${parts.join(', ')}` : '';
+  }
+
+  /** Resolve a groupBy order direction, refusing `nulls: 'first'` (E017); `nulls: 'last'` is a no-op. */
+  private groupOrderDir(value: unknown, keyForMsg: string): string {
+    if (value !== null && typeof value === 'object') {
+      const spec = value as OrderBySpec;
+      if (spec.nulls === 'first') {
+        throw new UnsupportedFeatureError(
+          'NULLS FIRST placement',
+          'PowDB',
+          `groupBy orderBy "${keyForMsg}": PowDB orders NULLs / missing keys LAST in both directions`,
+        );
+      }
+      return spec.sort === 'desc' ? 'desc' : 'asc';
+    }
+    return value === 'desc' ? 'desc' : 'asc';
   }
 
   // -------------------------------------------------------------------------
@@ -1425,4 +1865,23 @@ function coerceScalar(raw: string, tsType: string): unknown {
   if (ts === 'boolean') return raw === 'true';
   if (ts === 'Date') return new Date(Number(raw) / 1000);
   return raw;
+}
+
+/**
+ * Decode a JSON group-key cell, resolving the legacy-wire `null` ambiguity. On
+ * the native typed wire (`native`) a cell is already typed: an unset value
+ * arrived as `null` and a genuine string `"null"` stays the string, so it is
+ * returned as-is. On the legacy string wire a missing value, JSON null, AND the
+ * string `"null"` all render the cell `"null"`; the group's `min(json_type(…))`
+ * discriminator is `"string"` ONLY for the string-`"null"` group (and any other
+ * type name: `"null"` for JSON null, missing renders `"null"` too), so the cell
+ * is the string `"null"` iff the discriminator is `"string"`, else `null`. Other
+ * cell values pass through as the extracted string (parity with PG `#>>` text
+ * group keys).
+ */
+function decodeGroupKeyCell(cell: unknown, discrim: unknown, native: boolean): unknown {
+  if (native) return cell ?? null;
+  if (cell == null) return null;
+  if (cell === 'null') return discrim === 'string' ? 'null' : null;
+  return cell;
 }

@@ -1017,6 +1017,226 @@ describe('powdb integration (embedded): doc-field expression index DDL', () => {
 });
 
 // ---------------------------------------------------------------------------
+// F1 / F2: JSON path filters, ordering, and grouped aggregates against the real
+// embedded 0.13 engine. Writes go through the real create() path (param() wraps
+// the object in a PowdbJsonParam); reads/filters/orders/groups exercise the full
+// PowqlInterface emission end-to-end.
+// ---------------------------------------------------------------------------
+
+const jsonSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    jdoc: makeTable('jdoc', [
+      col('id', 'id', 'string', 'text', { hasDefault: true }),
+      col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+      col('region', 'region', 'string', 'text', { nullable: true }),
+    ]),
+    // Parent/child pair for the relation-filter-with-JSON-inner-where test.
+    owner: makeTable('owner', [col('id', 'id', 'string', 'text', { hasDefault: true })], {
+      items: { type: 'hasMany', name: 'items', from: 'owner', to: 'item', foreignKey: 'owner_id', referenceKey: 'id' },
+    }),
+    item: makeTable('item', [
+      col('id', 'id', 'string', 'text', { hasDefault: true }),
+      col('owner_id', 'ownerId', 'string', 'text'),
+      col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+    ]),
+  },
+};
+
+async function withJsonDb(fn: (db: DB) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'powdb-json2-it-'));
+  const db: DB = await turbinePowDB({ embedded: dir }, jsonSchema, { warnOnUnlimited: false });
+  try {
+    for (const t of ['jdoc', 'owner', 'item']) await db.raw([`drop ${t}`]).catch(() => {});
+    for (const stmt of powqlSchemaDDL(jsonSchema)) await db.raw([stmt]);
+    await fn(db);
+  } finally {
+    await db.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Seed the five canonical docs from the design (section 0). */
+async function seedJdocs(db: DB): Promise<void> {
+  await db.table('jdoc').create({ data: { id: 'jnull', data: { a: null } } });
+  await db.table('jdoc').create({ data: { id: 'jmiss', data: {} } });
+  await db.table('jdoc').create({ data: { id: 'jstr', data: { a: 'null' } } });
+  await db.table('jdoc').create({ data: { id: 'jnum', data: { a: 7, k: 2, f: 2.5 } } });
+  await db.table('jdoc').create({ data: { id: 'jbool', data: { a: true } } });
+}
+
+describe('powdb integration (embedded): F1 JsonFilter where round-trip', () => {
+  it('equals matches the exact typed value (int 7)', async () => {
+    await withJsonDb(async (db) => {
+      await seedJdocs(db);
+      const rows = await db.table('jdoc').findMany({ where: { data: { path: ['a'], equals: 7 } } });
+      assert.deepEqual(
+        rows.map((r: { id: string }) => r.id),
+        ['jnum'],
+      );
+    });
+  });
+
+  it('equals: null matches JSON null AND a missing key', async () => {
+    await withJsonDb(async (db) => {
+      await seedJdocs(db);
+      const rows = await db.table('jdoc').findMany({
+        where: { data: { path: ['a'], equals: null } },
+        orderBy: { id: 'asc' },
+      });
+      // jnull (a:null) + jmiss (no key). NOT jstr (a:"null"), NOT jnum/jbool.
+      assert.deepEqual(rows.map((r: { id: string }) => r.id).sort(), ['jmiss', 'jnull']);
+    });
+  });
+
+  it('range op (gt) coerces int/float numerically', async () => {
+    await withJsonDb(async (db) => {
+      await seedJdocs(db);
+      const rows = await db.table('jdoc').findMany({ where: { data: { path: ['f'], gt: 2 } } });
+      assert.deepEqual(
+        rows.map((r: { id: string }) => r.id),
+        ['jnum'],
+      ); // f:2.5 > 2
+    });
+  });
+
+  it('hasKey tests top-level key existence (includes keys holding JSON null)', async () => {
+    await withJsonDb(async (db) => {
+      await seedJdocs(db);
+      const rows = await db.table('jdoc').findMany({ where: { data: { hasKey: 'a' } }, orderBy: { id: 'asc' } });
+      // Every doc with an "a" key: jnull, jstr, jnum, jbool. NOT jmiss.
+      assert.deepEqual(rows.map((r: { id: string }) => r.id).sort(), ['jbool', 'jnull', 'jnum', 'jstr']);
+    });
+  });
+
+  it('a hostile path segment round-trips as a no-match filter, never a parse error', async () => {
+    await withJsonDb(async (db) => {
+      await seedJdocs(db);
+      const rows = await db.table('jdoc').findMany({ where: { data: { path: ['a"; drop', '$1'], equals: 1 } } });
+      assert.deepEqual(rows, []);
+    });
+  });
+
+  it('a JSON inner where inside a relation filter resolves client-side', async () => {
+    await withJsonDb(async (db) => {
+      await db.table('owner').create({ data: { id: 'o1' } });
+      await db.table('owner').create({ data: { id: 'o2' } });
+      await db.table('item').create({ data: { id: 'i1', ownerId: 'o1', data: { kind: 'x' } } });
+      await db.table('item').create({ data: { id: 'i2', ownerId: 'o2', data: { kind: 'y' } } });
+      const owners = await db.table('owner').findMany({
+        where: { items: { some: { data: { path: ['kind'], equals: 'x' } } } },
+        orderBy: { id: 'asc' },
+      });
+      assert.deepEqual(
+        owners.map((o: { id: string }) => o.id),
+        ['o1'],
+      );
+    });
+  });
+});
+
+describe('powdb integration (embedded): F2 JSON-path orderBy', () => {
+  it('orders by a JSON path asc/desc with missing/JSON-null keys LAST in both directions', async () => {
+    await withJsonDb(async (db) => {
+      // vals: v1=3, v2=1, jn=json-null, jm=missing → asc [v2,v1,jn,jm-ish], nulls last.
+      await db.table('jdoc').create({ data: { id: 'v1', data: { w: 3 } } });
+      await db.table('jdoc').create({ data: { id: 'v2', data: { w: 1 } } });
+      await db.table('jdoc').create({ data: { id: 'jn', data: { w: null } } });
+      await db.table('jdoc').create({ data: { id: 'jm', data: {} } });
+      const asc = await db.table('jdoc').findMany({ orderBy: { data: { path: ['w'] } } });
+      const desc = await db.table('jdoc').findMany({ orderBy: { data: { path: ['w'], direction: 'desc' } } });
+      // Present keys sort by value; missing/null cluster LAST in BOTH directions.
+      assert.deepEqual(
+        asc.slice(0, 2).map((r: { id: string }) => r.id),
+        ['v2', 'v1'],
+      );
+      assert.deepEqual(
+        desc.slice(0, 2).map((r: { id: string }) => r.id),
+        ['v1', 'v2'],
+      );
+      for (const rows of [asc, desc]) {
+        const tail = rows
+          .slice(2)
+          .map((r: { id: string }) => r.id)
+          .sort();
+        assert.deepEqual(tail, ['jm', 'jn'], 'missing + json-null sort last');
+      }
+    });
+  });
+
+  it('type:numeric casts JSON STRING numbers so "9" < "10"', async () => {
+    await withJsonDb(async (db) => {
+      await db.table('jdoc').create({ data: { id: 's9', data: { w: '9' } } });
+      await db.table('jdoc').create({ data: { id: 's10', data: { w: '10' } } });
+      const rows = await db.table('jdoc').findMany({
+        where: { data: { hasKey: 'w' } },
+        orderBy: { data: { path: ['w'], type: 'numeric' } },
+      });
+      assert.deepEqual(
+        rows.map((r: { id: string }) => r.id),
+        ['s9', 's10'],
+      );
+    });
+  });
+});
+
+describe('powdb integration (embedded): F2 JSON groupBy', () => {
+  it('groups {a:null} / {} / {a:"null"} into THREE result groups (null / "null" disambiguated)', async () => {
+    await withJsonDb(async (db) => {
+      await seedJdocs(db);
+      const groups = await db.table('jdoc').groupBy({ by: [{ field: 'data', path: ['a'] }], _count: true });
+      const byKey = new Map<unknown, number>(groups.map((g: { a: unknown; _count: number }) => [g.a, g._count]));
+      // The empty-set group (JSON null + missing) = jnull + jmiss → 2 under `null`.
+      assert.equal(byKey.get(null), 2);
+      // The string-"null" group = jstr → 1 under the STRING "null".
+      assert.equal(byKey.get('null'), 1);
+      // Value groups render as strings (parity with PG #>> text keys).
+      assert.equal(byKey.get('7'), 1);
+      assert.equal(byKey.get('true'), 1);
+    });
+  });
+
+  it('aggregate + orderBy over projection alias (_count desc) and JSON _sum target', async () => {
+    await withJsonDb(async (db) => {
+      // Two regions with numeric json amounts.
+      await db.table('jdoc').create({ data: { id: 'r1', region: 'us', data: { amt: 10 } } });
+      await db.table('jdoc').create({ data: { id: 'r2', region: 'us', data: { amt: 5 } } });
+      await db.table('jdoc').create({ data: { id: 'r3', region: 'eu', data: { amt: 3 } } });
+      const byCount = await db.table('jdoc').groupBy({
+        by: ['region'],
+        _count: true,
+        _sum: { amt: { field: 'data', path: ['amt'] } },
+        orderBy: { _count: 'desc' },
+      });
+      assert.deepEqual(
+        byCount.map((g: { region: string }) => g.region),
+        ['us', 'eu'],
+      );
+      const us = byCount.find((g: { region: string }) => g.region === 'us');
+      assert.equal(us._count, 2);
+      assert.equal(us._sum.amt, 15); // 10 + 5
+    });
+  });
+
+  it('HAVING over count(*) filters whole groups', async () => {
+    await withJsonDb(async (db) => {
+      await db.table('jdoc').create({ data: { id: 'h1', region: 'a' } });
+      await db.table('jdoc').create({ data: { id: 'h2', region: 'a' } });
+      await db.table('jdoc').create({ data: { id: 'h3', region: 'b' } });
+      const groups = await db.table('jdoc').groupBy({
+        by: ['region'],
+        _count: true,
+        having: { _count: { gt: 1 } },
+      });
+      assert.deepEqual(
+        groups.map((g: { region: string }) => g.region),
+        ['a'],
+      );
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // F4b: describe-based introspection. Introspect a live embedded database via
 // `introspectPowdbDatabase(exec)` (exec built from the client's `raw` tagged
 // template) and assert the SchemaMetadata shape, then prove a generated-style
@@ -1158,6 +1378,57 @@ describe('powdb integration (embedded): describe-based introspection', () => {
       await db2.disconnect();
       rmSync(dir1, { recursive: true, force: true });
       rmSync(dir2, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Networked live server (opt-in). Proves param-in-segment JSON filters over the
+// real binary TCP transport (design V1). Skip-gated on POWDB_URL so CI, which
+// has no server, never runs it. Run locally with:
+//   POWDB_URL=powdb://127.0.0.1:5599 npx tsx --test src/test/powdb.integration.test.ts
+// ---------------------------------------------------------------------------
+
+const powdbUrl = process.env.POWDB_URL;
+const { it: liveIt } = skipGate(!powdbUrl, 'set POWDB_URL to run the live networked PowDB suite');
+
+describe('powdb integration (networked): F1 param-in-segment JSON filters over TCP', () => {
+  liveIt('binds `.data->$1->$2 = $3` path segments as params on a live server', async () => {
+    const db: DB = await turbinePowDB(powdbUrl!, jsonSchema, { warnOnUnlimited: false });
+    const suffix = Date.now().toString(36);
+    const t = `jdoc_${suffix}`;
+    const liveSchema: SchemaMetadata = {
+      enums: {},
+      tables: {
+        [t]: makeTable(t, [
+          col('id', 'id', 'string', 'text', { hasDefault: true }),
+          col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+        ]),
+      },
+    };
+    const liveDb: DB = await turbinePowDB(powdbUrl!, liveSchema, { warnOnUnlimited: false });
+    try {
+      for (const stmt of powqlSchemaDDL(liveSchema)) await liveDb.raw([stmt]);
+      await liveDb.table(t).create({ data: { id: 'a', data: { ns: { value: 7 } } } });
+      await liveDb.table(t).create({ data: { id: 'b', data: { ns: { value: 9 } } } });
+      const hit = await liveDb.table(t).findMany({ where: { data: { path: ['ns', 'value'], equals: 7 } } });
+      assert.deepEqual(
+        hit.map((r: { id: string }) => r.id),
+        ['a'],
+      );
+      const miss = await liveDb.table(t).findMany({ where: { data: { path: ['ns', 'value'], equals: 8 } } });
+      assert.deepEqual(miss, []);
+      const ordered = await liveDb
+        .table(t)
+        .findMany({ orderBy: { data: { path: ['ns', 'value'], direction: 'desc' } } });
+      assert.deepEqual(
+        ordered.map((r: { id: string }) => r.id),
+        ['b', 'a'],
+      );
+    } finally {
+      await liveDb.raw([`drop ${t}`]).catch(() => {});
+      await liveDb.disconnect();
+      await db.disconnect();
     }
   });
 });
