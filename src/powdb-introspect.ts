@@ -12,11 +12,22 @@
  * {@link introspectPowdbDatabase} turns those into the same {@link SchemaMetadata}
  * shape the SQL introspectors produce, so a code-first PowDB database can be
  * introspected for bootstrap/verification. It is transport-agnostic: the caller
- * supplies an `exec(powql)` that returns row objects keyed by column name.
+ * supplies an `exec(powql)` that returns row objects **keyed by column name**.
  *   - Embedded / owned pool: `exec = async (q) => ({ rows: await db.raw([q]) })`
  *     using a live `turbinePowDB` client's `raw` tagged template.
- *   - Networked: `exec = async (q) => ({ rows: (await client.query(q)).rows })`
- *     over `@zvndev/powdb-client`.
+ *   - Networked: the raw `@zvndev/powdb-client` returns POSITIONAL rows
+ *     (`{ columns: string[], rows: string[][] }`), so zip them into records.
+ *     A bare `(await client.query(q)).rows` would hand this function `string[][]`
+ *     whose `.name` cell is `undefined` and every table would silently drop out:
+ *     ```ts
+ *     const exec = async (q) => {
+ *       const r = await client.query(q);
+ *       return { rows: r.rows.map((row) => Object.fromEntries(r.columns.map((c, i) => [c, row[i]]))) };
+ *     };
+ *     ```
+ *     (A mis-shaped exec is now caught: if `schema` returns rows but none carry
+ *     a `name`, {@link introspectPowdbDatabase} throws instead of returning an
+ *     empty schema.)
  *
  * IMPORTANT LIMITATIONS (all documented, none silent):
  *   - Relations are ALWAYS `{}`: PowDB has no declared foreign keys, so
@@ -43,7 +54,8 @@
  * funnel to construct a PowDB client instead of a `pg` client for `powdb://`.
  */
 
-import { quotePowqlIdent } from './powdb.js';
+import { ValidationError } from './errors.js';
+import { type PowdbCapabilities, quotePowqlIdent, requireCapability } from './powdb.js';
 import type { ColumnMetadata, IndexMetadata, SchemaMetadata, TableMetadata } from './schema.js';
 import { snakeToCamel } from './schema.js';
 
@@ -56,6 +68,14 @@ export interface PowdbIntrospectOptions {
   include?: string[];
   /** Skip these table names. */
   exclude?: string[];
+  /**
+   * Bound connection capabilities. When supplied AND `introspection` (engine
+   * >= 0.10) is false, this throws a version-hinting {@link UnsupportedFeatureError}
+   * (E017) up front instead of letting a pre-0.10 engine reject the `schema` /
+   * `describe` keywords with an opaque parse error. Omit it (the bare-exec path)
+   * to run ungated; the pool paths that know the version pass it through.
+   */
+  capabilities?: PowdbCapabilities;
 }
 
 /** One row of a `describe <T>` result, after string-coercing each cell. */
@@ -115,9 +135,28 @@ export async function introspectPowdbDatabase(
   exec: PowdbExec,
   options: PowdbIntrospectOptions = {},
 ): Promise<SchemaMetadata> {
+  // Gate on the engine's introspection capability (>= 0.10) when the caller
+  // knows the version, so a pre-0.10 engine gets a typed E017 hint instead of
+  // an opaque `unexpected token schema` parse error.
+  if (options.capabilities) {
+    requireCapability(options.capabilities, 'introspection', 'PowDB `describe` introspection');
+  }
+
   // ----- Types (one row per table, columns `name`, `columns`) -----
   const schemaRows = (await exec('schema')).rows;
   let tableNames = schemaRows.map((r) => asString(r.name)).filter((n) => n.length > 0);
+
+  // A mis-shaped `exec` (e.g. the raw client's positional `string[][]` rows
+  // passed straight through) yields rows whose `name` cell is `undefined`, so
+  // every table filters out and the schema comes back silently empty. Refuse
+  // that instead of losing data: real rows must carry a `name`.
+  if (schemaRows.length > 0 && tableNames.length === 0) {
+    throw new ValidationError(
+      `[turbine] PowDB introspection: the \`schema\` statement returned ${schemaRows.length} row(s) but none carried a ` +
+        '`name` cell. The `exec` you supplied likely returns POSITIONAL rows (string[][]) rather than records keyed by ' +
+        'column name; zip `columns` with each row (see introspectPowdbDatabase docs).',
+    );
+  }
 
   if (options.include?.length) {
     const inc = new Set(options.include);

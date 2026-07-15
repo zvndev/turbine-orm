@@ -9,6 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { ValidationError } from '../errors.js';
 import { schemaHasIndexInfo } from '../index-advisor.js';
 import { addAutoManyToManyRelations, buildRelationsFromForeignKeys, type ForeignKeyEntry } from '../introspect.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
@@ -750,7 +751,13 @@ describe('schemaDefToMetadata: index declarations', () => {
     assert.equal(schemaHasIndexInfo(meta), false);
   });
 
-  it('a plain column index DOES flip schemaHasIndexInfo() (real coverage info)', () => {
+  it('a DECLARED plain column index keeps schemaHasIndexInfo() false (SQL DDL never creates it)', () => {
+    // A code-first `indexes: [{ columns }]` is NOT emitted by the SQL DDL
+    // generators, so it does not reflect a real database index. Counting it
+    // would arm blanket FK false positives (the FK auto-index the push path DID
+    // create would be reported "missing"); a pure code-first schema therefore
+    // stays "index-info unknown" exactly as it did before TableDef.indexes
+    // existed. Marked via IndexMetadata.declared.
     const def = defineSchema({
       docs: {
         id: { type: 'serial', primaryKey: true },
@@ -758,11 +765,39 @@ describe('schemaDefToMetadata: index declarations', () => {
         indexes: [{ columns: ['ownerId'] }],
       },
     });
-    assert.equal(schemaHasIndexInfo(schemaDefToMetadata(def)), true);
+    const meta = schemaDefToMetadata(def);
+    assert.equal(meta.tables.docs!.indexes[0]!.declared, true);
+    assert.equal(schemaHasIndexInfo(meta), false);
   });
 
   it('a table with no `indexes` still gets []', () => {
     const def = defineSchema({ docs: { id: { type: 'serial', primaryKey: true } } });
     assert.deepStrictEqual(schemaDefToMetadata(def).tables.docs!.indexes, []);
+  });
+
+  it('rejects a negative / fractional / NaN doc-field array-index segment with a typed ValidationError', () => {
+    for (const bad of [-1, 1.5, Number.NaN]) {
+      const def = defineSchema({
+        docs: {
+          id: { type: 'serial', primaryKey: true },
+          data: { type: 'jsonb', nullable: true },
+          indexes: [{ docField: 'data', path: [bad] }],
+        },
+      });
+      assert.throws(
+        () => schemaDefToMetadata(def),
+        (e: unknown) => e instanceof ValidationError && /must be a non-negative integer/.test((e as Error).message),
+        `path segment ${bad} should be rejected`,
+      );
+    }
+    // A valid non-negative integer index is accepted.
+    const ok = defineSchema({
+      docs: {
+        id: { type: 'serial', primaryKey: true },
+        data: { type: 'jsonb', nullable: true },
+        indexes: [{ docField: 'data', path: ['tags', 0] }],
+      },
+    });
+    assert.deepStrictEqual(schemaDefToMetadata(ok).tables.docs!.indexes[0]!.docPath, ['tags', 0]);
   });
 });

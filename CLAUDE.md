@@ -156,7 +156,7 @@ src/
                       factory when present, else `new QueryInterface` (SQL engines untouched).
                       powdb.ts holds the driver shims (`PowdbPool` over the client `Pool`;
                       `PowdbEmbeddedPool` over a single `Database` handle), type mapping
-                      (Turbine→PowQL `str/int/float/bool`; never emits `uuid/datetime/bytes`;
+                      (Turbine→PowQL `str/int/float/bool/json`; never emits `uuid/datetime/bytes`;
                       `Date`→int micros), `powqlSchemaDDL`, `wrapPowdbError`, and `powdbDialect`
                       (`supportsReturning: true`; the Postgres-only flags stay false →
                       `$listen`/`$notify`/RLS/pgvector throw E017). PowDB realities shaping it:
@@ -167,8 +167,14 @@ src/
                       PowDB's `auto` modifier (`powqlSchemaDDL`) and let the engine assign the id;
                       otherwise a defaulted string PK gets a client UUID (`applyPkDefault`). No
                       JSON-agg/link-nav (→N+1 `with` loaders incl. **m2m via the junction**
-                      `loadManyToMany`, keys chunked at `MAX_RELATION_KEYS=1000`); no wire introspection
-                      (→`defineSchema` only). **Relation filters (`some`/`none`/`every`, all
+                      `loadManyToMany`, keys chunked at `MAX_RELATION_KEYS=1000`). **`describe`-based
+                      introspection** (`introspectPowdbDatabase` in `powdb-introspect.ts`, exported from
+                      the `turbine-orm/powdb` subpath) reads a live catalog (`schema` + `describe T`) into
+                      `SchemaMetadata` for bootstrap; relations are always `{}` (PowDB has no declared FKs)
+                      and the PK is a heuristic, so `defineSchema` stays the relation-aware path. The
+                      exec must be RECORD-keyed (zip the raw client's positional rows); a mis-shaped exec
+                      that yields zero named tables throws rather than returning an empty schema, and an
+                      optional `capabilities` arg gates it (E017 below 0.10). **Relation filters (`some`/`none`/`every`, all
                       cardinalities incl. m2m) resolve CLIENT-SIDE** (`resolveRelationFilters` →
                       literal `in (list)`), NEVER an IN-subquery: PowDB's executor caches a subquery
                       result by plan shape ignoring the literal → a repeated `in (<subquery>)` returns
@@ -199,7 +205,33 @@ src/
                       per-row cap, macOS-arm64/x64 + Linux-glibc only; live regression coverage in
                       `src/test/powdb.integration.test.ts` (CI `powdb-integration` job, in-process, no
                       container). (≤0.6.2 reselect + float-literal workarounds retired in 0.7.0; embedded
-                      `syncMode`/`memoryLimit` + `count(*)`-fix picked up in 0.7.1.) See
+                      `syncMode`/`memoryLimit` + `count(*)`-fix picked up in 0.7.1.)
+                      **0.12/0.13 parity round (capabilities-gated):** a bound connection resolves
+                      `PowdbCapabilities` (`capabilitiesFromVersion`: networked reads the probed
+                      `serverVersion`, embedded reads the addon package.json version via the
+                      `.cts` optional-peer helper so it compiles under both module targets), and every
+                      version-gated feature calls `requireCapability` for a typed E017 with an upgrade
+                      hint instead of a raw parse error. **`json` is a first-class column type** (≥0.12):
+                      `powqlColumnType` maps json/jsonb columns to `json`, a JS object/array binds as a
+                      `PowdbJsonParam` (serialized to canonical JSON text), and `JsonFilter` path
+                      filters / orderBy / groupBy compile to PowQL `->` path expressions (segments bound
+                      as params; a digit-only string segment binds as an int array index for SQL parity;
+                      `contains` and pathless `equals` stay E017). **Doc-field expression indexes** (≥0.13)
+                      are declared via `defineSchema` `indexes: [{ docField, path }]` and emitted by
+                      `powqlSchemaDDL` (`alter T add index (.col->"seg")`; numeric path segments validated
+                      non-negative-integer at build time). Code-first declared indexes carry
+                      `IndexMetadata.declared` so they never flip `schemaHasIndexInfo` (the SQL DDL
+                      generators do not emit them, so counting them would arm FK-advisor false positives).
+                      **Native typed wire** (≥0.13, `nativeRaw` capability): networked pools route through
+                      `queryNativeRaw`, so cells arrive pre-typed (int as bigint, datetime as micros); each
+                      result is TAGGED with the serving wire and `PowqlInterface` coerces PER-RESULT (never
+                      the pool flag), so a genuine str `"null"` survives and groupBy keys (plain + JSON)
+                      come back with PG-text parity across transports. **`retryStaleReads`** (networked
+                      opt-in) replays a first-statement READ once on a stale-frame `ConnectionError`; the
+                      action is threaded per-call so a concurrent op can never turn a WRITE into a replayed
+                      insert. **Error reclassification:** `protocol_error` (and the "received unexpected
+                      frame" idle-socket shape) now maps to `ConnectionError` E004 (was E003), `.cause`
+                      preserved. See
                       `docs/internal/strategy/powdb-parity-matrix.md` (local-only, untracked).
 
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code

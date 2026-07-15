@@ -45,6 +45,7 @@ import {
 } from './nested-write.js';
 import {
   ALL_POWDB_CAPABILITIES,
+  coerceNativeValue,
   isJsonColumn,
   isStaleFramePowdbError,
   type PowdbCapabilities,
@@ -157,7 +158,6 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
   private readonly onQuery?: (event: QueryEvent) => void;
-  private currentAction = 'raw';
   private warnedUnlimited = false;
 
   constructor(
@@ -388,10 +388,21 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * to keep {@link materializePowql}'s `$N`-scan invariant intact: a segment
    * that literally contained `$1` would otherwise be rewritten. Shared by the
    * F1 where-filter path and the F2 orderBy / groupBy path emitters.
+   *
+   * A digit-only STRING segment (`'0'`) binds as an `int` array index, matching
+   * the SQL engines: `JsonFilter.path` is typed `string[]`, so an array index
+   * can only be expressed as a digit string, and the SQL builder converts it the
+   * same way (`/^\d+$/ → [n]`, query/builder.ts). Without this, PowDB's typed
+   * `->` treats `'0'` as a string KEY and silently matches nothing on an array
+   * (a wrong result, not an error). Same object-key-`'0'` caveat SQL accepts: a
+   * json object whose key is literally `"0"` is addressed as an array index.
    */
   private jsonPathExpr(col: ColumnMetadata, path: (string | number)[], params: unknown[]): string {
     let expr = `.${col.name}`;
-    for (const seg of path) expr += `->${this.param(seg, params)}`;
+    for (const seg of path) {
+      const bound = typeof seg === 'string' && /^\d+$/.test(seg) ? Number(seg) : seg;
+      expr += `->${this.param(bound, params)}`;
+    }
     return expr;
   }
 
@@ -645,6 +656,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           `${quotePowqlIdent(through.table)} filter .${targetJCol} in (${ph}) { .${sourceJCol} }`,
           params,
           timeout,
+          'findMany',
         );
         for (const r of rows) {
           const v = r[sourceJCol];
@@ -779,13 +791,21 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   // Execution plumbing
   // -------------------------------------------------------------------------
 
-  /** Run PowQL with optional timeout, emitting a query event either way. */
+  /**
+   * Run PowQL with optional timeout, emitting a query event either way. The
+   * `action` is passed PER CALL (never read from shared instance state) so the
+   * retry-eligibility and the emitted event action stay correct even when a
+   * concurrent operation runs on the same cached interface: a WRITE statement
+   * carries a write action and can therefore never be mistaken for a replayable
+   * read. Read statements pass a read-shaped action from {@link POWQL_READ_ACTIONS}.
+   */
   private async exec(
     powql: string,
     params: unknown[],
     timeout?: number,
-  ): Promise<{ rows: Record<string, unknown>[]; rowCount: number }> {
-    return this.execOnce(powql, params, timeout, false);
+    action = 'raw',
+  ): Promise<{ rows: Record<string, unknown>[]; rowCount: number; native: boolean }> {
+    return this.execOnce(powql, params, timeout, action, false);
   }
 
   /**
@@ -797,16 +817,23 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * The replay is refused for writes (an ambiguous mutation reply is unsafe to
    * replay) and inside a transaction (a mid-tx statement cannot move connection),
    * so only the read-shaped actions in {@link POWQL_READ_ACTIONS}, outside a
-   * `_txScoped` interface, are eligible.
+   * `_txScoped` interface, are eligible. `action` is a per-call argument (never
+   * `this`-state), so a concurrent op flipping instance fields cannot turn a
+   * write into a retryable read.
    */
   private async execOnce(
     powql: string,
     params: unknown[],
     timeout: number | undefined,
+    action: string,
     isRetry: boolean,
-  ): Promise<{ rows: Record<string, unknown>[]; rowCount: number }> {
+  ): Promise<{ rows: Record<string, unknown>[]; rowCount: number; native: boolean }> {
     const start = performance.now();
-    const run = this.pool.query(powql, params) as Promise<{ rows: Record<string, unknown>[]; rowCount: number }>;
+    const run = this.pool.query(powql, params) as Promise<{
+      rows: Record<string, unknown>[];
+      rowCount: number;
+      native?: boolean;
+    }>;
     try {
       const result = timeout
         ? await Promise.race([
@@ -814,28 +841,35 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             new Promise<never>((_, reject) => setTimeout(() => reject(new TimeoutError(timeout)), timeout)),
           ])
         : await run;
-      this.emit(powql, params, performance.now() - start, result.rowCount ?? result.rows.length);
-      return result;
+      this.emit(action, powql, params, performance.now() - start, result.rowCount ?? result.rows.length);
+      // The pool tags each result with the wire that actually served it
+      // (adaptResult → false, adaptNativeResult → true). A heterogeneous
+      // injected pool can fall back to the legacy wire per call, so read the
+      // per-result flag and only fall back to the pool-level capability when a
+      // hand-built pool (tests) omits the tag; never coerce legacy rows with
+      // the native policy just because the pool reports nativeRaw.
+      const native = result.native ?? Boolean(this.capabilities.nativeRaw);
+      return { rows: result.rows, rowCount: result.rowCount ?? result.rows.length, native };
     } catch (err) {
-      if (!isRetry && this.shouldRetryStaleRead(err)) {
+      if (!isRetry && this.shouldRetryStaleRead(err, action)) {
         // Transparent single replay on a fresh connection; the first (swallowed)
         // failure is not emitted, only the retried outcome is observed.
-        return this.execOnce(powql, params, timeout, true);
+        return this.execOnce(powql, params, timeout, action, true);
       }
-      this.emit(powql, params, performance.now() - start, 0, err as Error);
+      this.emit(action, powql, params, performance.now() - start, 0, err as Error);
       throw err;
     }
   }
 
-  /** Is `err` a replayable stale-frame failure for the CURRENT (read-shaped, non-tx) action? */
-  private shouldRetryStaleRead(err: unknown): boolean {
+  /** Is `err` a replayable stale-frame failure for THIS (per-call) read-shaped, non-tx action? */
+  private shouldRetryStaleRead(err: unknown, action: string): boolean {
     if (!this.pool.retryStaleReads) return false;
     if (this.isTxScoped()) return false;
-    if (!POWQL_READ_ACTIONS.has(this.currentAction)) return false;
+    if (!POWQL_READ_ACTIONS.has(action)) return false;
     return isStaleFramePowdbError(err);
   }
 
-  private emit(sql: string, params: unknown[], duration: number, rows: number, error?: Error): void {
+  private emit(action: string, sql: string, params: unknown[], duration: number, rows: number, error?: Error): void {
     if (!this.onQuery) return;
     try {
       this.onQuery({
@@ -843,7 +877,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         params,
         duration,
         model: this.table,
-        action: this.currentAction,
+        action,
         rows,
         timestamp: new Date(),
         error,
@@ -859,7 +893,6 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     args: Record<string, unknown>,
     executor: () => Promise<R>,
   ): Promise<R> {
-    this.currentAction = action;
     if (this.middlewares.length === 0) return executor();
     let index = 0;
     const next = async (p: { model: string; action: string; args: Record<string, unknown> }): Promise<unknown> => {
@@ -869,11 +902,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return next({ model: this.table, action, args: { ...args } }) as Promise<R>;
   }
 
-  /** Map raw rows to typed entities. Passes the native-wire flag so cells that
-   * arrived pre-typed over `queryNativeRaw` (F3) skip the legacy string coercion
-   * (e.g. a genuine str `"null"` stays `"null"` instead of collapsing to null). */
-  private shape(rows: Record<string, unknown>[]): T[] {
-    const native = Boolean(this.capabilities.nativeRaw);
+  /** Map raw rows to typed entities. `native` is the wire that ACTUALLY served
+   * this result (threaded from {@link execOnce}, not the pool-level capability),
+   * so cells that arrived pre-typed over `queryNativeRaw` (F3) skip the legacy
+   * string coercion (a genuine str `"null"` stays `"null"` instead of collapsing
+   * to null) while a per-call legacy fallback on a native-capable pool still
+   * coerces its string cells correctly. Defaults to the pool capability for the
+   * rare caller with no per-result flag (hand-built test pools). */
+  private shape(rows: Record<string, unknown>[], native = Boolean(this.capabilities.nativeRaw)): T[] {
     return rows.map((r) => rowToEntity(r, this.meta, native) as T);
   }
 
@@ -883,15 +919,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     return this.withMiddleware('findMany', args as unknown as Record<string, unknown>, async () => {
-      const rows = await this.runFind(args);
-      const entities = this.shape(rows);
+      const { rows, native } = await this.runFind(args, 'findMany');
+      const entities = this.shape(rows, native);
       if (args.with) await this.loadRelations(entities, args.with as Record<string, unknown>, args.timeout);
       return entities;
     });
   }
 
-  /** Build + run the flat findMany select; returns raw rows. */
-  private async runFind(args: FindManyArgs<T>): Promise<Record<string, unknown>[]> {
+  /** Build + run the flat findMany select; returns raw rows + the serving wire. */
+  private async runFind(
+    args: FindManyArgs<T>,
+    action = 'findMany',
+  ): Promise<{ rows: Record<string, unknown>[]; native: boolean }> {
     if ((args as { cursor?: unknown }).cursor) {
       throw new UnsupportedFeatureError('cursor pagination', 'PowDB', 'use limit/offset instead');
     }
@@ -913,15 +952,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const limitClause = limit !== undefined ? ` limit ${this.param(limit, params)}` : '';
     const offsetClause = args.offset ? ` offset ${this.param(args.offset, params)}` : '';
     const powql = `${this.qt}${distinct}${filter}${order}${limitClause}${offsetClause} ${this.projection(cols)}`;
-    const { rows } = await this.exec(powql, params, args.timeout);
-    return rows;
+    const { rows, native } = await this.exec(powql, params, args.timeout, action);
+    return { rows, native };
   }
 
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
     return this.withMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
-      const rows = await this.runFind({ ...args, limit: 1 } as FindManyArgs<T>);
+      const { rows, native } = await this.runFind({ ...args, limit: 1 } as FindManyArgs<T>, 'findUnique');
       if (!rows.length) return null;
-      const entities = this.shape(rows);
+      const entities = this.shape(rows, native);
       if (args.with) await this.loadRelations(entities, args.with as Record<string, unknown>, args.timeout);
       return entities[0]!;
     });
@@ -929,9 +968,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
     return this.withMiddleware('findFirst', args as unknown as Record<string, unknown>, async () => {
-      const rows = await this.runFind({ ...args, limit: 1 } as FindManyArgs<T>);
+      const { rows, native } = await this.runFind({ ...args, limit: 1 } as FindManyArgs<T>, 'findFirst');
       if (!rows.length) return null;
-      const entities = this.shape(rows);
+      const entities = this.shape(rows, native);
       if (args.with) await this.loadRelations(entities, args.with as Record<string, unknown>, args.timeout);
       return entities[0]!;
     });
@@ -1075,7 +1114,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const params: unknown[] = [];
       const placeholders = chunk.map((v) => this.param(v, params)).join(', ');
       const powql = `${quotePowqlIdent(through.table)} filter .${sourceJCol} in (${placeholders}) { .${sourceJCol}, .${targetJCol} }`;
-      const { rows } = await this.exec(powql, params, timeout);
+      const { rows } = await this.exec(powql, params, timeout, 'findMany');
       for (const row of rows) {
         const sv = String(row[sourceJCol]);
         const tv = String(row[targetJCol]);
@@ -1186,8 +1225,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         .map((a) => `${quotePowqlIdent(a.col.name)} := ${this.writeRef(a.value, a.col, params)}`)
         .join(', ');
       // `returning` surfaces the inserted row (all columns, schema order) in one round-trip.
-      const { rows } = await this.exec(`insert ${this.qt} { ${body} } returning`, params, args.timeout);
-      const row = rows.length ? this.shape(rows)[0]! : null;
+      const { rows, native } = await this.exec(
+        `insert ${this.qt} { ${body} } returning`,
+        params,
+        args.timeout,
+        'create',
+      );
+      const row = rows.length ? this.shape(rows, native)[0]! : null;
       if (!row) throw new NotFoundError({ table: this.table, where: data });
       return row;
     });
@@ -1203,8 +1247,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         return `{ ${assigns.map((a) => `${quotePowqlIdent(a.col.name)} := ${this.writeRef(a.value, a.col, params)}`).join(', ')} }`;
       });
       // Multi-row insert with `returning` hands back every inserted row in one round-trip.
-      const { rows } = await this.exec(`insert ${this.qt} ${tuples.join(', ')} returning`, params, args.timeout);
-      return this.shape(rows);
+      const { rows, native } = await this.exec(
+        `insert ${this.qt} ${tuples.join(', ')} returning`,
+        params,
+        args.timeout,
+        'createMany',
+      );
+      return this.shape(rows, native);
     });
   }
 
@@ -1219,12 +1268,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       this.assertCompiledWhere(where, false, 'update');
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       // `returning` hands back the post-update row(s); take the first (single-row contract).
-      const { rows } = await this.exec(
+      const { rows, native } = await this.exec(
         `${this.qt} filter ${where} update { ${setClause} } returning`,
         params,
         args.timeout,
+        'update',
       );
-      const row = rows.length ? this.shape(rows)[0]! : null;
+      const row = rows.length ? this.shape(rows, native)[0]! : null;
       if (!row) throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
       return row;
     });
@@ -1238,7 +1288,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       this.assertCompiledWhere(where, args.allowFullTableScan, 'updateMany');
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       const filter = where ? ` filter ${where}` : '';
-      const { rowCount } = await this.exec(`${this.qt}${filter} update { ${setClause} }`, params, args.timeout);
+      const { rowCount } = await this.exec(
+        `${this.qt}${filter} update { ${setClause} }`,
+        params,
+        args.timeout,
+        'updateMany',
+      );
       return { count: rowCount };
     });
   }
@@ -1370,8 +1425,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, false, 'delete');
       // `returning` hands back the deleted row(s) — no separate pre-image reselect needed.
-      const { rows } = await this.exec(`${this.qt} filter ${where} delete returning`, params, args.timeout);
-      const row = rows.length ? this.shape(rows)[0]! : null;
+      const { rows, native } = await this.exec(
+        `${this.qt} filter ${where} delete returning`,
+        params,
+        args.timeout,
+        'delete',
+      );
+      const row = rows.length ? this.shape(rows, native)[0]! : null;
       if (!row) throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
       return row;
     });
@@ -1384,7 +1444,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, args.allowFullTableScan, 'deleteMany');
       const filter = where ? ` filter ${where}` : '';
-      const { rowCount } = await this.exec(`${this.qt}${filter} delete`, params, args.timeout);
+      const { rowCount } = await this.exec(`${this.qt}${filter} delete`, params, args.timeout, 'deleteMany');
       return { count: rowCount };
     });
   }
@@ -1411,6 +1471,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         `upsert ${this.qt} on .${pkCol} { ${createBody} } on conflict { ${updateBody} }`,
         params,
         args.timeout,
+        'upsert',
       );
       const pkField = this.meta.reverseColumnMap[pkCol] ?? pkCol;
       const row = await this.reselectByPk(createData[pkField], args.timeout);
@@ -1460,7 +1521,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
       const where = this.buildWhere(resolvedWhere, params);
       const filter = where ? ` filter ${where}` : '';
-      const { rows } = await this.exec(`count(${this.qt}${filter})`, params, args.timeout);
+      const { rows } = await this.exec(`count(${this.qt}${filter})`, params, args.timeout, 'count');
       return Number((rows[0]?.value ?? rows[0]?.count ?? 0) as string | number);
     });
   }
@@ -1475,7 +1536,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const filter = where ? ` filter ${where}` : '';
       const scalar = async (expr: string): Promise<number | null> => {
         const params = [...filterParams];
-        const { rows } = await this.exec(expr, params, args.timeout);
+        const { rows } = await this.exec(expr, params, args.timeout, 'aggregate');
         const v = rows[0]?.value;
         return v == null || v === 'null' ? null : Number(v);
       };
@@ -1521,7 +1582,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         requireCapability(this.capabilities, 'jsonDocs', 'JSON-path groupBy keys / aggregate targets');
       }
 
-      const native = Boolean(this.capabilities.nativeRaw);
+      // `emitNative` decides whether the query GENERATION needs the legacy-wire
+      // `json_type` discriminator (pool-level capability). The DECODE side reads
+      // the wire that ACTUALLY served the result (`resultNative`, from exec), so
+      // a per-call legacy fallback on a native-capable pool still decodes right.
+      const emitNative = Boolean(this.capabilities.nativeRaw);
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
       const where = this.buildWhere(resolvedWhere, params);
@@ -1578,7 +1643,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           proj.push(`${gkAlias}: ${pathExpr}`);
           byOrderExprs.set(alias, `.${gkAlias}`);
           let discrim: string | undefined;
-          if (!native) {
+          if (!emitNative) {
             // Legacy wire renders a missing value, JSON null, AND the string
             // "null" all as the cell "null". `min(json_type(path))` over the
             // group is "string" ONLY for the string-"null" group and "null"
@@ -1597,7 +1662,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const aggOrderExprs = new Map<string, string>();
       const aggInner = new Map<string, string>();
       let aggN = 0;
-      if (args._count) {
+      // Parity with the SQL builder (query/builder.ts): `_count` is selected by
+      // DEFAULT unless the caller explicitly opts out with `_count: false`, so
+      // every groupBy row carries `_count` and `orderBy: { _count }` works
+      // without requesting it (the alias is seeded into `aggOrderExprs`).
+      const countSelected = args._count === true || args._count === undefined;
+      if (countSelected) {
         const alias = `agg_${aggN++}`;
         proj.push(`${alias}: count(*)`);
         aggReaders.push({ alias, outKey: '_count', numeric: true });
@@ -1648,18 +1718,27 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const having = this.buildHaving(args.having, params, aggInner);
       const order = this.buildGroupOrder(args.orderBy, byOrderExprs, aggOrderExprs);
       const powql = `${this.qt}${filter} group ${groupExprs.join(', ')}${having}${order} { ${proj.join(', ')} }`;
-      const { rows } = await this.exec(powql, params, args.timeout);
+      const { rows, native: resultNative } = await this.exec(powql, params, args.timeout, 'groupBy');
 
       // Reshape: group keys → user fields (coerced / null-disambiguated),
       // aggregates → nested `{ _sum: { field } }`; discriminators are stripped.
+      // Group-key cells go through the SAME coercion policy `rowToEntity` uses,
+      // by the wire that actually served this result, so a native-wire int cell
+      // (bigint) or datetime cell (micros) never leaks into the result: it
+      // becomes the same number / Date / PG-text-parity string an embedded /
+      // legacy / SQL groupBy returns for the identical query.
       return rows.map((raw) => {
         const out: Record<string, unknown> = {};
         for (const r of byReaders) {
           if (r.kind === 'plain') {
             const cell = raw[r.rowKey];
-            out[r.resultKey] = typeof cell === 'string' ? coerceScalar(cell, r.col.tsType) : cell;
+            out[r.resultKey] = resultNative
+              ? coerceNativeValue(cell, r.col)
+              : typeof cell === 'string'
+                ? coerceScalar(cell, r.col.tsType)
+                : cell;
           } else {
-            out[r.resultKey] = decodeGroupKeyCell(raw[r.rowKey], r.discrim ? raw[r.discrim] : undefined, native);
+            out[r.resultKey] = decodeGroupKeyCell(raw[r.rowKey], r.discrim ? raw[r.discrim] : undefined, resultNative);
           }
         }
         for (const a of aggReaders) {
@@ -1827,12 +1906,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   /** Reselect a single row by its single-column primary key value. */
   private async reselectByPk(pkValue: unknown, timeout?: number): Promise<T | null> {
     const pkField = this.meta.reverseColumnMap[this.meta.primaryKey[0]!] ?? this.meta.primaryKey[0]!;
-    const rows = await this.runFind({
+    const { rows, native } = await this.runFind({
       where: { [pkField]: pkValue } as WhereClause<T>,
       limit: 1,
       timeout,
     } as FindManyArgs<T>);
-    return rows.length ? this.shape(rows)[0]! : null;
+    return rows.length ? this.shape(rows, native)[0]! : null;
   }
 
   /**
@@ -1868,20 +1947,45 @@ function coerceScalar(raw: string, tsType: string): unknown {
 }
 
 /**
- * Decode a JSON group-key cell, resolving the legacy-wire `null` ambiguity. On
- * the native typed wire (`native`) a cell is already typed: an unset value
- * arrived as `null` and a genuine string `"null"` stays the string, so it is
- * returned as-is. On the legacy string wire a missing value, JSON null, AND the
- * string `"null"` all render the cell `"null"`; the group's `min(json_type(…))`
- * discriminator is `"string"` ONLY for the string-`"null"` group (and any other
- * type name: `"null"` for JSON null, missing renders `"null"` too), so the cell
- * is the string `"null"` iff the discriminator is `"string"`, else `null`. Other
- * cell values pass through as the extracted string (parity with PG `#>>` text
- * group keys).
+ * Decode a JSON group-key cell, resolving the legacy-wire `null` ambiguity AND
+ * normalizing the native typed wire to the SAME PG-`#>>`-text-parity shape.
+ *
+ * On the native typed wire (`native`) a cell arrives pre-typed (a JSON int as a
+ * `bigint`, a bool as `boolean`, an unset value as `null`). Returned as-is that
+ * would diverge from every other transport: the embedded / legacy / SQL wire
+ * all yield the extracted TEXT (`'7'`, `'true'`), and a raw `bigint` even throws
+ * on `JSON.stringify`. So a native scalar cell is rendered to its text form
+ * ({@link nativeJsonKeyText}); `null`/`empty` stays `null`, and a genuine string
+ * `"null"` stays the string (the wart the native wire was adopted to fix).
+ *
+ * On the legacy string wire a missing value, JSON null, AND the string `"null"`
+ * all render the cell `"null"`; the group's `min(json_type(…))` discriminator is
+ * `"string"` ONLY for the string-`"null"` group, so the cell is the string
+ * `"null"` iff the discriminator is `"string"`, else `null`. Other cell values
+ * pass through as the extracted string.
  */
 function decodeGroupKeyCell(cell: unknown, discrim: unknown, native: boolean): unknown {
-  if (native) return cell ?? null;
+  if (native) return nativeJsonKeyText(cell);
   if (cell == null) return null;
   if (cell === 'null') return discrim === 'string' ? 'null' : null;
   return cell;
+}
+
+/**
+ * Render a native-wire JSON group-key cell to the extracted-text shape the other
+ * transports return (PG `#>>` / embedded legacy / SQL all give text keys). Keeps
+ * `null` as `null`; a scalar (`bigint`/`number`/`boolean`/`string`) becomes its
+ * string form; an object/array json sub-document is stringified (best-effort
+ * parity: canonical byte-for-byte matching is not guaranteed for nested docs).
+ */
+function nativeJsonKeyText(cell: unknown): unknown {
+  if (cell === null || cell === undefined) return null;
+  if (typeof cell === 'bigint') return cell.toString();
+  if (typeof cell === 'number' || typeof cell === 'boolean') return String(cell);
+  if (typeof cell === 'string') return cell;
+  try {
+    return JSON.stringify(cell);
+  } catch {
+    return String(cell);
+  }
 }

@@ -45,6 +45,7 @@
  * ```
  */
 
+import { ValidationError } from './errors.js';
 import {
   addAutoManyToManyRelations,
   buildRelationsFromForeignKeys,
@@ -173,12 +174,25 @@ function mapIndexes(tableDef: TableDef, declared: readonly SchemaIndexDef[] | un
       const column = camelToSnake(idx.docField);
       const segPart = idx.path.map((s) => (typeof s === 'number' ? String(s) : s)).join('_');
       const name = idx.name ?? `${tableDef.name}_${column}_${segPart}_idx`;
+      // Validate numeric (array-index) segments up front: PowDB rejects a
+      // negative / fractional / NaN JSON-path index at migration time with an
+      // opaque parse error, so fail here with a typed ValidationError naming the
+      // index instead of emitting malformed PowQL later.
+      for (const seg of idx.path) {
+        if (typeof seg === 'number' && (!Number.isInteger(seg) || seg < 0)) {
+          throw new ValidationError(
+            `[turbine] Doc-field index "${name}" on "${tableDef.name}": array-index path segment ${seg} must be a ` +
+              'non-negative integer (a JSON array index). Use a string for an object key.',
+          );
+        }
+      }
       out.push({
         name,
         columns: [column],
         unique: idx.unique ?? false,
         definition: `${idx.unique ? 'unique ' : 'index '}${docPathFragment(column, idx.path)}`,
         docPath: [...idx.path],
+        declared: true,
       });
     } else {
       const columns = idx.columns.map(camelToSnake);
@@ -188,6 +202,7 @@ function mapIndexes(tableDef: TableDef, declared: readonly SchemaIndexDef[] | un
         columns,
         unique: idx.unique ?? false,
         definition: `${idx.unique ? 'unique ' : 'index '}(${columns.join(', ')})`,
+        declared: true,
       });
     }
   }

@@ -202,6 +202,17 @@ export interface IndexMetadata {
    * introspection.
    */
   docPath?: (string | number)[];
+  /**
+   * Set for indexes DECLARED in a code-first `defineSchema` (`TableDef.indexes`)
+   * rather than read from a live database by introspection. The SQL DDL
+   * generators (`schema-sql.ts` / `schemaDiff`) do NOT emit these yet, so a
+   * declared index does not reflect a real database index on the SQL engines.
+   * The missing-FK index advisor therefore treats declared indexes as
+   * "index-info unknown" (same as an index-less schema): counting them would
+   * both arm blanket FK false positives and suppress warnings for indexes that
+   * were never created. Introspected metadata never sets this.
+   */
+  declared?: boolean;
 }
 
 // ---------------------------------------------------------------------------

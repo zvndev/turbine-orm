@@ -1432,3 +1432,128 @@ describe('powdb integration (networked): F1 param-in-segment JSON filters over T
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Networked F2/F3: the design's dual-transport assertions run over the real
+// native typed wire (nativeRaw auto-enabled for a >= 0.13 server). These are
+// the tests whose absence let the BigInt-group-key defect ship; they prove
+// group-key / coercion parity between the native wire and the legacy/embedded
+// shapes, and that no native cell (bigint / raw micros) leaks into a result.
+// ---------------------------------------------------------------------------
+
+describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
+  /** Build a fresh live table (id/n/s/data) with a unique name, run `fn`, drop it. */
+  async function withLive(cols: ColumnMetadata[], fn: (db: DB, t: string) => Promise<void>): Promise<void> {
+    const t = `jnet_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e4)}`;
+    const liveSchema: SchemaMetadata = { enums: {}, tables: { [t]: makeTable(t, cols) } };
+    const db: DB = await turbinePowDB(powdbUrl!, liveSchema, { warnOnUnlimited: false });
+    try {
+      await db.raw([`drop ${t}`]).catch(() => {});
+      for (const stmt of powqlSchemaDDL(liveSchema)) await db.raw([stmt]);
+      await fn(db, t);
+    } finally {
+      await db.raw([`drop ${t}`]).catch(() => {});
+      await db.disconnect();
+    }
+  }
+
+  liveIt('groupBy JSON key over the native wire returns PG-text-parity STRING keys (no bigint leak)', async () => {
+    await withLive(
+      [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+      ],
+      async (db, t) => {
+        await db.table(t).create({ data: { id: 'a', data: { k: 7 } } });
+        await db.table(t).create({ data: { id: 'b', data: { k: 7 } } });
+        await db.table(t).create({ data: { id: 'c', data: { k: 9 } } });
+        const groups = await db.table(t).groupBy({ by: [{ field: 'data', path: ['k'] }], _count: true });
+        const byKey = new Map(groups.map((g: { k: unknown; _count: number }) => [g.k, g._count]));
+        // Native wire: keys come back as the extracted TEXT '7'/'9' (parity with
+        // embedded / PG #>>), NOT bigint 7n/9n.
+        assert.equal(byKey.get('7'), 2);
+        assert.equal(byKey.get('9'), 1);
+        assert.ok(
+          [...byKey.keys()].every((k) => typeof k === 'string'),
+          'group keys are strings, not bigint',
+        );
+        // The common serialize-to-HTTP path must not throw on a native result.
+        assert.doesNotThrow(() => JSON.stringify(groups));
+      },
+    );
+  });
+
+  liveIt('groupBy by a plain int column over native wire: bigint→number and _count default-selected', async () => {
+    await withLive(
+      [col('id', 'id', 'string', 'text', { hasDefault: true }), col('n', 'n', 'number', 'int4', { nullable: true })],
+      async (db, t) => {
+        await db.table(t).create({ data: { id: 'a', n: 1 } });
+        await db.table(t).create({ data: { id: 'b', n: 1 } });
+        await db.table(t).create({ data: { id: 'c', n: 2 } });
+        // No explicit _count; SQL parity means it is still selected.
+        const groups = await db.table(t).groupBy({ by: ['n'] });
+        assert.ok(
+          groups.every((g: { n: unknown }) => typeof g.n === 'number'),
+          'int group key is a number, not bigint',
+        );
+        assert.ok(
+          groups.every((g: { _count: unknown }) => typeof g._count === 'number'),
+          '_count default-selected',
+        );
+        const byN = new Map(groups.map((g: { n: number; _count: number }) => [g.n, g._count]));
+        assert.equal(byN.get(1), 2);
+        assert.equal(byN.get(2), 1);
+        assert.doesNotThrow(() => JSON.stringify(groups));
+      },
+    );
+  });
+
+  liveIt('a digit-string json path segment matches an ARRAY element on the live server', async () => {
+    await withLive(
+      [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+      ],
+      async (db, t) => {
+        await db.table(t).create({ data: { id: 'a', data: { tags: ['x', 'y'] } } });
+        const hit = await db.table(t).findMany({ where: { data: { path: ['tags', '0'], equals: 'x' } } });
+        assert.deepEqual(
+          hit.map((r: { id: string }) => r.id),
+          ['a'],
+        );
+      },
+    );
+  });
+
+  liveIt(
+    'native wire preserves a genuine str "null" (no legacy collapse) and str-null distinct from SQL NULL',
+    async () => {
+      await withLive(
+        [col('id', 'id', 'string', 'text', { hasDefault: true }), col('s', 's', 'string', 'text', { nullable: true })],
+        async (db, t) => {
+          await db.table(t).create({ data: { id: 'lit', s: 'null' } }); // the STRING "null"
+          await db.table(t).create({ data: { id: 'nul', s: null } }); // SQL NULL
+          const lit = await db.table(t).findUnique({ where: { id: 'lit' } });
+          const nul = await db.table(t).findUnique({ where: { id: 'nul' } });
+          assert.equal(lit.s, 'null'); // native wire keeps the literal string
+          assert.equal(nul.s, null); // absent stays null, distinguishable
+        },
+      );
+    },
+  );
+
+  liveIt('introspectPowdbDatabase reads the live server real tables (documented networked flow)', async () => {
+    await withLive(
+      [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('label', 'label', 'string', 'text', { nullable: true }),
+      ],
+      async (db, t) => {
+        const exec = async (q: string) => ({ rows: await db.raw([q]) });
+        const meta = await introspectPowdbDatabase(exec, { include: [t] });
+        assert.deepEqual(Object.keys(meta.tables), [t]);
+        assert.ok(meta.tables[t]!.columns.some((c) => c.name === 'label'));
+      },
+    );
+  });
+});

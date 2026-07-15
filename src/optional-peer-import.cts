@@ -85,4 +85,31 @@ async function importOptionalPeer(specifier: string, allowEsmFallback = true): P
   }
 }
 
+/**
+ * Merged namespace so callers can reach {@link peerPackageVersion} off the same
+ * default import (`importOptionalPeer.peerPackageVersion(...)`). Lives in this
+ * `.cts` file for the same reason the dynamic import does: a `.cts` compiles to
+ * CommonJS in BOTH build passes, so `require` / `require.resolve` are natively
+ * available and `import.meta` is never emitted (which would break the CJS build
+ * and crash CJS consumers, see `resolveEmbeddedVersion` in powdb.ts).
+ */
+namespace importOptionalPeer {
+  /**
+   * Resolve an optional peer's declared `package.json` version WITHOUT loading
+   * the package itself (so an ESM-only peer never trips `require`). `require` is
+   * anchored on THIS module's location (inside the published `dist/`), so bare
+   * resolution walks up `node_modules` and finds the peer exactly where
+   * `import.meta.url` used to point, but it compiles under `module: CommonJS`
+   * too. Returns `null` when the peer / its package.json cannot be resolved.
+   */
+  export function peerPackageVersion(specifier: string): string | null {
+    try {
+      const pkg = require(`${specifier}/package.json`) as { version?: string };
+      return typeof pkg.version === 'string' ? pkg.version : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
 export = importOptionalPeer;

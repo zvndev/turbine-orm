@@ -54,7 +54,6 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createRequire } from 'node:module';
 import {
   type PgCompatPool,
   type PgCompatPoolClient,
@@ -765,7 +764,7 @@ export function coerceValue(raw: string, col: ColumnMetadata): unknown {
  * native transport). `datetime`-shaped cells (int micros) become `Date`; a
  * bigint on a `number` column follows the int8 safe-integer policy.
  */
-function coerceNativeValue(value: unknown, col: ColumnMetadata): unknown {
+export function coerceNativeValue(value: unknown, col: ColumnMetadata): unknown {
   if (value === undefined || value === null) return null;
   if (isDateColumn(col)) {
     if (typeof value === 'bigint') return new Date(Number(value) / 1000);
@@ -1180,8 +1179,17 @@ export interface PowdbPoolOptions {
   retryStaleReads?: boolean;
 }
 
-/** Adapt a PowDB result into the pg-compat `{ rows, rowCount, fields }` shape. */
-function adaptResult(r: PowdbResult): PgCompatQueryResult {
+/**
+ * A pg-compat result tagged with the wire that produced it. `native: false` for
+ * the legacy string wire ({@link adaptResult}), `true` for the typed native wire
+ * ({@link adaptNativeResult}). {@link PowqlInterface} reads this PER RESULT (not
+ * the pool-level capability) so a per-call legacy fallback on a native-capable
+ * pool coerces its string cells correctly instead of with the native policy.
+ */
+type PowdbTaggedResult = PgCompatQueryResult & { native: boolean };
+
+/** Adapt a PowDB (legacy string wire) result into the pg-compat `{ rows, rowCount, fields }` shape. */
+function adaptResult(r: PowdbResult): PowdbTaggedResult {
   switch (r.kind) {
     case 'rows': {
       const rows = r.rows.map((row) => {
@@ -1191,14 +1199,14 @@ function adaptResult(r: PowdbResult): PgCompatQueryResult {
         });
         return o;
       });
-      return { rows, rowCount: rows.length, fields: r.columns.map((name) => ({ name, dataTypeID: 0 })) };
+      return { rows, rowCount: rows.length, fields: r.columns.map((name) => ({ name, dataTypeID: 0 })), native: false };
     }
     case 'ok':
-      return { rows: [], rowCount: Number(r.affected), fields: [] };
+      return { rows: [], rowCount: Number(r.affected), fields: [], native: false };
     case 'scalar':
-      return { rows: [{ value: r.value }], rowCount: 1, fields: [{ name: 'value', dataTypeID: 0 }] };
+      return { rows: [{ value: r.value }], rowCount: 1, fields: [{ name: 'value', dataTypeID: 0 }], native: false };
     default:
-      return { rows: [], rowCount: 0, fields: [] };
+      return { rows: [], rowCount: 0, fields: [], native: false };
   }
 }
 
@@ -1239,7 +1247,7 @@ function decodeWireValue(cell: PowdbWireValue): unknown {
 }
 
 /** Adapt a native (typed-wire) PowDB result into the pg-compat shape, decoding every {@link PowdbWireValue} cell. */
-function adaptNativeResult(r: PowdbRawNativeResult): PgCompatQueryResult {
+function adaptNativeResult(r: PowdbRawNativeResult): PowdbTaggedResult {
   switch (r.kind) {
     case 'rows': {
       const rows = r.rows.map((row) => {
@@ -1249,22 +1257,31 @@ function adaptNativeResult(r: PowdbRawNativeResult): PgCompatQueryResult {
         });
         return o;
       });
-      return { rows, rowCount: rows.length, fields: r.columns.map((name) => ({ name, dataTypeID: 0 })) };
+      return { rows, rowCount: rows.length, fields: r.columns.map((name) => ({ name, dataTypeID: 0 })), native: true };
     }
     case 'ok':
-      return { rows: [], rowCount: Number(r.affected), fields: [] };
+      return { rows: [], rowCount: Number(r.affected), fields: [], native: true };
     case 'scalar':
-      return { rows: [{ value: decodeWireValue(r.value) }], rowCount: 1, fields: [{ name: 'value', dataTypeID: 0 }] };
+      return {
+        rows: [{ value: decodeWireValue(r.value) }],
+        rowCount: 1,
+        fields: [{ name: 'value', dataTypeID: 0 }],
+        native: true,
+      };
     default:
-      return { rows: [], rowCount: 0, fields: [] };
+      return { rows: [], rowCount: 0, fields: [], native: true };
   }
 }
 
 /**
  * A {@link PgCompatPool} backed by a `@zvndev/powdb-client` `Pool`. The query
- * `text` is **PowQL**, not SQL — {@link PowqlInterface} generates it. Rows come
- * back as raw strings here; per-column JS coercion happens in `PowqlInterface`
- * (it owns the schema metadata).
+ * `text` is **PowQL**, not SQL ({@link PowqlInterface} generates it). On the
+ * legacy string wire cells come back as strings; when `capabilities.nativeRaw`
+ * is set (server ≥ 0.13 + a client exposing `queryNativeRaw`) this pool routes
+ * through the typed native wire instead, so cells arrive pre-typed (a json int
+ * as `bigint`, etc.) and each result is tagged with the wire that served it
+ * ({@link PowdbTaggedResult}). Per-column JS coercion still happens in
+ * `PowqlInterface` (it owns the schema metadata), keyed on that per-result tag.
  */
 export class PowdbPool implements PgCompatPool {
   private closed = false;
@@ -1788,6 +1805,9 @@ export interface TurbinePowdbOptions extends Pick<TurbineConfig, 'logging' | 'de
    * transactions queue and run one at a time; only a re-entrant
    * `db.$transaction` (opened inside an active transaction callback) throws
    * E017 — queueing that shape would deadlock.
+   *
+   * Ignored when you inject an already-constructed {@link PowdbPool} (it carries
+   * its own {@link PowdbPoolOptions}); set it on that pool's constructor instead.
    */
   transactionQueueTimeoutMs?: number;
   /**
@@ -1797,6 +1817,9 @@ export interface TurbinePowdbOptions extends Pick<TurbineConfig, 'logging' | 'de
    * statement inside a transaction are NEVER retried (an ambiguous mutation
    * reply is unsafe to replay). Default `false`: the error is surfaced typed
    * so the caller can decide. See the retry recipe in the docs.
+   *
+   * Ignored when you inject an already-constructed {@link PowdbPool} (it carries
+   * its own {@link PowdbPoolOptions}); set it on that pool's constructor instead.
    */
   retryStaleReads?: boolean;
   /**
@@ -1897,17 +1920,14 @@ async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
 /**
  * Resolve the embedded addon's engine version. The addon vendors the engine and
  * exports no version, but `@zvndev/powdb-embedded/package.json` has no `exports`
- * map, so `require.resolve` reaches it: the package version IS the engine
- * version. Returns `null` when it cannot be resolved.
+ * map, so a bare `require` of it resolves: the package version IS the engine
+ * version. Delegated to the `.cts` optional-peer helper so the resolution uses a
+ * real CommonJS `require` in BOTH build outputs; `import.meta.url` here would
+ * fail `tsc` under `tsconfig.cjs.json` (module: CommonJS) and crash any CJS
+ * consumer of `turbine-orm/powdb`. Returns `null` when it cannot be resolved.
  */
 function resolveEmbeddedVersion(): string | null {
-  try {
-    const require = createRequire(import.meta.url);
-    const pkg = require(require.resolve('@zvndev/powdb-embedded/package.json')) as { version?: string };
-    return pkg.version ?? null;
-  } catch {
-    return null;
-  }
+  return importOptionalPeer.peerPackageVersion('@zvndev/powdb-embedded');
 }
 
 /** Open an embedded database handle, wrapping engine open failures (corrupt dir, etc.). */

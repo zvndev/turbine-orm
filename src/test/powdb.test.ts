@@ -24,6 +24,7 @@ import {
   capabilitiesFromVersion,
   coerceValue,
   encodePowqlLiteral,
+  introspectPowdbDatabase,
   isJsonColumn,
   isStaleFramePowdbError,
   materializePowql,
@@ -1837,6 +1838,45 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
   });
 });
 
+describe('powdb: introspectPowdbDatabase gating + mis-shaped exec guard', () => {
+  it('gates on the introspection capability (< 0.10 → E017 hint, not a raw parse error)', async () => {
+    const exec = async () => ({ rows: [] as Record<string, unknown>[] });
+    await assert.rejects(
+      introspectPowdbDatabase(exec, { capabilities: capabilitiesFromVersion('0.9.0') }),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0\.10/.test((e as Error).message),
+    );
+  });
+
+  it('runs when the introspection capability is present (>= 0.10)', async () => {
+    // schema returns one table; describe returns its columns, all record-keyed.
+    const exec = async (q: string) => {
+      if (q === 'schema') return { rows: [{ name: 'widget', columns: '1' }] };
+      return { rows: [{ column: 'id', type: 'str', nullable: 'false', index: 'unique' }] };
+    };
+    const meta = await introspectPowdbDatabase(exec, { capabilities: capabilitiesFromVersion('0.10.0') });
+    assert.deepEqual(Object.keys(meta.tables), ['widget']);
+  });
+
+  it('throws on a mis-shaped exec (positional rows) instead of returning an empty schema', async () => {
+    // Simulates the raw client's positional string[][] rows passed straight
+    // through: `name` is undefined, so every table would silently drop out.
+    const exec = async (q: string) => {
+      if (q === 'schema') return { rows: [['widget', '3'] as unknown as Record<string, unknown>] };
+      return { rows: [] as Record<string, unknown>[] };
+    };
+    await assert.rejects(
+      introspectPowdbDatabase(exec),
+      (e: unknown) => e instanceof ValidationError && /POSITIONAL rows/.test((e as Error).message),
+    );
+  });
+
+  it('an empty database (zero schema rows) returns an empty schema, not an error', async () => {
+    const exec = async () => ({ rows: [] as Record<string, unknown>[] });
+    const meta = await introspectPowdbDatabase(exec);
+    assert.deepEqual(meta, { tables: {}, enums: {} });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // B1: native `json` document column type
 // ---------------------------------------------------------------------------
@@ -2242,6 +2282,19 @@ describe('powdb F1: JsonFilter → PowQL path filters', () => {
     assert.deepEqual(m.last().params.slice(0, 3), ['a"; drop', '$1', 1]);
   });
 
+  it('a digit-only STRING segment binds as an int array index (SQL parity, matches arrays)', async () => {
+    // JsonFilter.path is typed string[], so an array index can only be a digit
+    // string. It must bind as an int token (like the SQL builder's `[n]`) or
+    // PowDB's typed `->` treats it as a string KEY and silently matches nothing
+    // on an array.
+    const m = mockPool();
+    await qi(m, 'doc').findMany({ where: { data: { path: ['tags', '0'], equals: 'x' } }, limit: 1 });
+    assert.match(m.last().powql, /\.data->\$1->\$2 = \$3/);
+    // 'tags' stays a str; '0' becomes the number 0 (int index); value 'x'.
+    assert.deepEqual(m.last().params.slice(0, 3), ['tags', 0, 'x']);
+    assert.equal(typeof m.last().params[1], 'number');
+  });
+
   it('combinators (OR/NOT) wrap JSON conditions', async () => {
     const m = mockPool();
     await qi(m, 'doc').findMany({
@@ -2396,7 +2449,10 @@ describe('powdb F2: JSON-path + aggregate groupBy', () => {
       by: ['region'],
       _sum: { rev: { field: 'data', path: ['rev'] } } as never,
     });
-    assert.match(m.last().powql, /agg_0: sum\(cast\(\.data->\$1, "float"\)\)/);
+    // `_count` is default-selected (SQL parity), so it takes `agg_0` and the
+    // `_sum` target shifts to `agg_1`.
+    assert.match(m.last().powql, /agg_0: count\(\*\)/);
+    assert.match(m.last().powql, /agg_1: sum\(cast\(\.data->\$1, "float"\)\)/);
     await assert.rejects(
       qi(mockPool(), 'doc').groupBy({
         by: ['region'],
@@ -2517,6 +2573,82 @@ describe('powdb hook: shape() threads capabilities.nativeRaw into rowToEntity', 
     const [row] = await qi(m, 'doc').findMany({ limit: 1 });
     assert.equal((row as { region: unknown }).region, null);
   });
+
+  it('per-result native flag overrides the pool capability (heterogeneous legacy fallback)', async () => {
+    // Pool advertises nativeRaw, but THIS result was served by the legacy wire
+    // (native:false tag from adaptResult): shape() must key coercion on the
+    // per-result flag, so a legacy-wire str "null" still collapses instead of
+    // being handed to the native no-collapse policy.
+    const pool = {
+      capabilities: { ...ALL_POWDB_CAPABILITIES, nativeRaw: true },
+      retryStaleReads: false,
+      query: () => Promise.resolve({ rows: [{ id: 'd1', region: 'null' }], rowCount: 1, native: false }),
+    } as unknown as PowdbPool;
+    const [row] = await new PowqlInterface(pool, 'doc', schema).findMany({ limit: 1 });
+    assert.equal((row as { region: unknown }).region, null);
+  });
+
+  it('a native-tagged result keeps a genuine str "null" even on a legacy-capability pool', async () => {
+    const pool = {
+      capabilities: { ...ALL_POWDB_CAPABILITIES, nativeRaw: false },
+      retryStaleReads: false,
+      query: () => Promise.resolve({ rows: [{ id: 'd1', region: 'null' }], rowCount: 1, native: true }),
+    } as unknown as PowdbPool;
+    const [row] = await new PowqlInterface(pool, 'doc', schema).findMany({ limit: 1 });
+    assert.equal((row as { region: string }).region, 'null');
+  });
+});
+
+describe('powdb hook: groupBy result cells go through the same native coercion as findMany', () => {
+  it('native plain by-key int cell (bigint) becomes a number, not a leaked bigint', async () => {
+    const m = mockPool({ ...ALL_POWDB_CAPABILITIES, nativeRaw: true });
+    m.setRows([{ age: 30n, agg_0: 2n }]);
+    const out = await qi(m, 'app_user').groupBy({ by: ['age'] });
+    assert.equal(out[0]!.age, 30);
+    assert.equal(typeof out[0]!.age, 'number');
+    assert.equal(out[0]!._count, 2); // _count default-selected (SQL parity)
+    assert.doesNotThrow(() => JSON.stringify(out), 'no BigInt serialize crash');
+  });
+
+  it('native plain by-key datetime cell (bigint micros) becomes a Date', async () => {
+    const m = mockPool({ ...ALL_POWDB_CAPABILITIES, nativeRaw: true });
+    const micros = BigInt(Date.UTC(2026, 0, 1)) * 1000n;
+    m.setRows([{ created_at: micros, agg_0: 1n }]);
+    const out = await qi(m, 'app_user').groupBy({ by: ['createdAt'] });
+    assert.ok(out[0]!.createdAt instanceof Date);
+    assert.equal((out[0]!.createdAt as Date).toISOString(), '2026-01-01T00:00:00.000Z');
+  });
+
+  it('native plain by-key str "null" stays "null" (no legacy collapse in groupBy)', async () => {
+    const m = mockPool({ ...ALL_POWDB_CAPABILITIES, nativeRaw: true });
+    m.setRows([{ region: 'null', agg_0: 1n }]);
+    const out = await qi(m, 'doc').groupBy({ by: ['region'] });
+    assert.equal(out[0]!.region, 'null');
+  });
+
+  it('native JSON group key (bigint / bool) comes back as PG-text-parity strings', async () => {
+    const m = mockPool({ ...ALL_POWDB_CAPABILITIES, nativeRaw: true });
+    m.setRows([
+      { gk_0: 7n, agg_0: 2n },
+      { gk_0: true, agg_0: 1n },
+      { gk_0: null, agg_0: 3n },
+    ]);
+    const out = await qi(m, 'doc').groupBy({ by: [{ field: 'data', path: ['k'] }] as never });
+    assert.equal(out[0]!.k, '7'); // not 7n
+    assert.equal(out[1]!.k, 'true');
+    assert.equal(out[2]!.k, null);
+    assert.doesNotThrow(() => JSON.stringify(out), 'no BigInt serialize crash');
+  });
+
+  it('legacy and native groupBy agree on value types for the same data (int key)', async () => {
+    const legacy = mockPool();
+    legacy.setRows([{ age: '30', agg_0: '2' }]);
+    const l = await qi(legacy, 'app_user').groupBy({ by: ['age'] });
+    const native = mockPool({ ...ALL_POWDB_CAPABILITIES, nativeRaw: true });
+    native.setRows([{ age: 30n, agg_0: 2n }]);
+    const n = await qi(native, 'app_user').groupBy({ by: ['age'] });
+    assert.deepEqual(l, n); // identical shape across transports
+  });
 });
 
 describe('powdb hook: retryStaleReads replays a READ once, never a write, never in a tx', () => {
@@ -2574,5 +2706,50 @@ describe('powdb hook: retryStaleReads replays a READ once, never a write, never 
     const f = flakyPool(2);
     await assert.rejects(new PowqlInterface(f.pool, 'doc', schema).findMany({ limit: 1 }), ConnectionError);
     assert.equal(f.attempts(), 2, 'original + exactly one retry, then throws');
+  });
+
+  it('a concurrent READ never turns a failing WRITE into a replayed insert (per-call action, not shared state)', async () => {
+    // Regression for the currentAction race: TurbineClient caches ONE
+    // PowqlInterface per table, so a concurrent findMany used to flip the
+    // shared `currentAction` to a read action while a create's insert was in
+    // flight; when the insert then hit the stale-frame error, the retry gate
+    // read the flipped state and REPLAYED the mutation (double insert). The
+    // action is now a per-call argument, so a write is never mistaken for a
+    // read no matter what a sibling op is doing.
+    let inserts = 0;
+    let releaseInsert!: () => void;
+    const insertGate = new Promise<void>((r) => {
+      releaseInsert = r;
+    });
+    const pool = {
+      capabilities: ALL_POWDB_CAPABILITIES,
+      retryStaleReads: true,
+      async query(powql: string) {
+        if (/^insert .* returning$/.test(powql)) {
+          inserts++;
+          // Fail only AFTER the concurrent read has run (which, in the old
+          // code, had already flipped the shared action to 'findMany').
+          await insertGate;
+          throw wrapPowdbError(
+            Object.assign(new Error('received unexpected frame from server'), { code: 'protocol_error' }),
+          );
+        }
+        // The read: it has now started concurrently, release the insert's failure.
+        releaseInsert();
+        return { rows: [{ id: 'ok' }], rowCount: 1 };
+      },
+    } as unknown as PowdbPool;
+    const iface = new PowqlInterface(pool, 'doc', schema);
+    const [createResult, readResult] = await Promise.allSettled([
+      iface.create({ data: { id: 'x' } as never }),
+      iface.findMany({ limit: 1 }),
+    ]);
+    assert.equal(readResult.status, 'fulfilled', 'the concurrent read still succeeds');
+    assert.equal(createResult.status, 'rejected', 'the write surfaces its error, never a replayed success');
+    assert.ok(
+      (createResult as PromiseRejectedResult).reason instanceof ConnectionError,
+      'the write rejects with the typed ConnectionError (E004)',
+    );
+    assert.equal(inserts, 1, 'the insert executed EXACTLY once: the write was never replayed');
   });
 });

@@ -960,15 +960,37 @@ export interface RelationFilter {
   isNot?: Record<string, unknown>;
 }
 
-/** JSONB query operators for where clauses */
+/**
+ * JSONB query operators for where clauses.
+ *
+ * PowDB (`turbine-orm/powdb`) semantic deltas. The PowDB engine evaluates
+ * `->` path filters with full type knowledge, so a few behaviours differ from
+ * the Postgres `#>>`-text driver (documented, never silently wrong):
+ *   - `{ path, equals: null }` matches JSON null OR a MISSING key on PowDB
+ *     (compiles to `is null`), whereas the PG driver compares extracted text
+ *     against the string `'null'` and matches only a JSON string `"null"`.
+ *   - equality is TYPE-STRICT on PowDB: `{ path, equals: 7 }` matches a stored
+ *     JSON int `7` but not `7.0` or the JSON string `"7"` (PG text-extraction
+ *     matches `equals: 7` against the string `"7"`). Range ops (`gt`/`lt`/…)
+ *     still coerce int/float numerically.
+ *   - a digit-only path segment (`path: ['tags', '0']`) is an ARRAY INDEX on
+ *     both PowDB and the SQL engines (a json object key that is literally `"0"`
+ *     is likewise addressed by index).
+ *   - `contains`, and `equals` WITHOUT a `path` (whole-document containment),
+ *     throw `UnsupportedFeatureError` (E017) on PowDB: PowQL has no containment
+ *     operator.
+ */
 export interface JsonFilter {
-  /** Access nested path via #>> operator */
+  /**
+   * Access nested path via `#>>` operator (Postgres) / `->` path (PowDB). A
+   * digit-only segment (`'0'`) is treated as an array index on every engine.
+   */
   path?: string[];
-  /** Exact match: column @> value::jsonb (containment) */
+  /** Exact match: `column @> value::jsonb` (containment). On PowDB, requires `path` and compares the typed value (throws E017 without `path`). */
   equals?: unknown;
-  /** Containment check: column @> value::jsonb */
+  /** Containment check: `column @> value::jsonb`. Unsupported on PowDB (E017: PowQL has no containment operator). */
   contains?: unknown;
-  /** Key existence check: column ? key */
+  /** Key existence check: `column ? key`. */
   hasKey?: string;
   /**
    * Greater-than comparison of the value at `path` (required). Numbers cast
