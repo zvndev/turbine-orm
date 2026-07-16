@@ -419,6 +419,9 @@ export const sqliteDialect: Dialect = {
   supportsAdvisoryLock: false,
   // No FROM-clause LATERAL: the opt-in lateral pick plan is Postgres-only.
   supportsLateralJoin: false,
+  // SQLite explains a compiled query with `EXPLAIN QUERY PLAN` (four columns:
+  // id, parent, notused, detail), overriding the inherited Postgres `EXPLAIN`.
+  explainQuery: { prefix: 'EXPLAIN QUERY PLAN' },
   // json_group_array / json_object have no inline ORDER BY argument, so every
   // ordered to-many relation is forced through the inner-subquery rewrite.
   aggSupportsInlineOrderBy: false,

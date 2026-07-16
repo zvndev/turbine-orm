@@ -551,6 +551,11 @@ export const mssqlDialect: Dialect = {
   supportsLateralJoin: false,
   // sp_getapplock / sp_releaseapplock exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
+  // No in-band EXPLAIN: SQL Server's SHOWPLAN is a session toggle
+  // (SET SHOWPLAN_ALL ON), not a statement prefix, so a compiled query cannot
+  // be explained in one round-trip. Override the inherited Postgres `EXPLAIN`
+  // to absent → QueryInterface.explain() throws E017.
+  explainQuery: undefined,
   // FOR JSON over zero rows is NULL → coalesced in the relation override.
   aggSupportsInlineOrderBy: false,
   jsonPathSupport: 'limited',
