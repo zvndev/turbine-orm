@@ -466,9 +466,17 @@ describe('powdb: wrapPowdbError', () => {
 
   it('maps the remaining 0.14 spec families (timeout / cancel / bounded join / read-only open)', () => {
     // Per-query deadline → TimeoutError (message path, embedded has no .code).
-    assert.ok(
-      wrapPowdbError({ code: 'GenericFailure', message: 'query timeout after 5000ms' }) instanceof TimeoutError,
-    );
+    // The engine prose is preserved through the message override, not collapsed
+    // to the "timed out after 0ms" placeholder.
+    const timeout = wrapPowdbError({ code: 'GenericFailure', message: 'query timeout after 5000ms' });
+    assert.ok(timeout instanceof TimeoutError);
+    assert.match(timeout.message, /query timeout after 5000ms/);
+    assert.doesNotMatch(timeout.message, /timed out after 0ms/);
+    assert.ok((timeout as TimeoutError).cause, 'cause preserved');
+    // A closed embedded handle reaching a queued statement → ConnectionError E004.
+    const closed = wrapPowdbError({ code: 'GenericFailure', message: 'database is closed' });
+    assert.ok(closed instanceof ConnectionError);
+    assert.equal((closed as ConnectionError).code, TurbineErrorCode.CONNECTION);
     // Client-initiated cancellation → ConnectionError (final, never auto-retried).
     assert.ok(
       wrapPowdbError({ code: 'aborted', message: 'query cancelled by client disconnect' }) instanceof ConnectionError,
@@ -877,6 +885,28 @@ describe('powdb: PowdbEmbeddedPool param materialization', () => {
     await client.query('commit');
     client.release();
     assert.deepEqual(seen, ['begin', 'insert app_user { id := "x" }', 'commit']);
+  });
+
+  it('a begin queued past disconnect() rejects ConnectionError E004 (never runs against the closed handle)', async () => {
+    const { pool } = fakeEmbeddedDb({ kind: 'ok', affected: 0n });
+    const c1 = await pool.connect();
+    const c2 = await pool.connect();
+    // T1 opens a transaction, taking the single global write lock.
+    await c1.query('begin');
+    // T2's begin queues behind T1's still-open transaction (pending).
+    const queued = c2.query('begin');
+    // The pool is disconnected while T2 is still waiting for the gate.
+    await pool.end();
+    // Tearing down T1's connection fires a best-effort rollback and releases the
+    // gate, handing the slot to T2. T2 must re-check `closed` and refuse rather
+    // than run `begin` against the now-closed handle.
+    c1.release();
+    const err = await queued.then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    assert.ok(err instanceof ConnectionError, 'queued begin rejects ConnectionError');
+    assert.equal((err as ConnectionError).code, TurbineErrorCode.CONNECTION);
   });
 });
 

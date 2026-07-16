@@ -854,9 +854,10 @@ export function wrapPowdbError(err: unknown): Error {
     const m = /column ['"]?(\w+)['"]?/i.exec(msg);
     return new NotNullViolationError({ column: m?.[1], cause: err as Error });
   }
-  // Driver pool lifecycle errors (acquire after close, acquire timeout) carry
-  // no .code — classify by message so both transports surface E004.
-  if (/pool closed|pool acquire timeout/i.test(msg)) {
+  // Driver pool lifecycle errors (acquire after close, acquire timeout, or a
+  // statement reaching an already-closed embedded handle) carry no .code:
+  // classify by message so both transports surface E004.
+  if (/pool closed|pool acquire timeout|database is closed/i.test(msg)) {
     return new ConnectionError(`[turbine] PowDB connection unavailable: ${msg}`, { cause: err });
   }
   // Server-side transaction-gate wait bound (PowDB ≥ 0.10, default 5s): another
@@ -906,8 +907,11 @@ export function wrapPowdbError(err: unknown): Error {
   }
   // Per-query deadline → TimeoutError (E002). Message-path so it fires on the
   // embedded transport too (code is always 'GenericFailure' there); retryable.
+  // Pass the engine prose through the message override (same pattern as the
+  // transaction-gate timeout below) so the real "query timeout after <n>ms"
+  // survives instead of rendering the placeholder "timed out after 0ms".
   if (/query timeout after/i.test(msg)) {
-    return new TimeoutError(0, 'PowDB query', { cause: err });
+    return new TimeoutError(0, 'PowDB query', { message: `[turbine] PowDB ${msg}`, cause: err });
   }
   // Client-initiated cancellation → ConnectionError (E004). This is FINAL: the
   // issuing client disconnected, so the query was a clean early return, never
@@ -1815,6 +1819,17 @@ export class PowdbEmbeddedPool implements PgCompatPool {
       // transaction callback throws re-entrant E017 fast; independent
       // concurrent ones wait their FIFO turn.
       holdRef.hold = await this.txGate.acquire();
+      // The gate may have handed us the slot AFTER disconnect() closed the
+      // handle (a transaction queued behind an in-flight one, released as the
+      // pool shut down). Re-check before touching the now-closed engine, and
+      // release the slot we just took so the queue keeps draining.
+      if (this.closed) {
+        holdRef.hold.finish();
+        holdRef.hold = null;
+        throw new ConnectionError(
+          '[turbine] The PowDB embedded pool is closed: disconnect() was already called on this client.',
+        );
+      }
     }
     if ((ctl === 'commit' || ctl === 'rollback') && holdRef.hold === null) {
       // This context never acquired the gate — its `begin` never ran (the
@@ -1918,7 +1933,18 @@ export { PowqlInterface } from './powql.js';
 // ---------------------------------------------------------------------------
 
 /** Options for {@link turbinePowDB}. */
-export interface TurbinePowdbOptions extends Pick<TurbineConfig, 'logging' | 'defaultLimit' | 'warnOnUnlimited'> {
+export interface TurbinePowdbOptions
+  extends Pick<TurbineConfig, 'logging' | 'defaultLimit' | 'warnOnUnlimited' | 'relationLoadStrategy'> {
+  /**
+   * Client-level default `with`-relation load strategy. On PowDB the default is
+   * the batched N+1 loaders; setting `'join'` opts INTO native PowQL server-side
+   * joins for eligible top-level relations (ineligible ones, e.g. a paged parent
+   * or a nested `with`, fall back to the loaders per-relation and silently). A
+   * per-query `relationLoadStrategy` arg still overrides this. Requires an engine
+   * that advertises `serverJoins` (PowDB ≥ 0.13); a per-query `'join'` on an
+   * older engine throws E017, a client-level default silently falls back.
+   */
+  relationLoadStrategy?: TurbineConfig['relationLoadStrategy'];
   /** Max pooled connections (default 10). Networked transport only. */
   connectionLimit?: number;
   /**
@@ -2233,6 +2259,7 @@ export async function turbinePowDB(
       logging: options.logging,
       defaultLimit: options.defaultLimit,
       warnOnUnlimited: options.warnOnUnlimited,
+      relationLoadStrategy: options.relationLoadStrategy,
       queryInterfaceFactory,
     } as TurbineConfig & { queryInterfaceFactory: typeof queryInterfaceFactory },
     schema,

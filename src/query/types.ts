@@ -13,15 +13,19 @@ export type OrderDirection = 'asc' | 'desc';
 /**
  * How a query resolves its `with` relations.
  *
- *   - `'join'` (default) — one SQL statement with correlated
- *     `json_agg(json_build_object(...))` subqueries. One round-trip; an index
- *     seek per parent row when the child FK is indexed.
- *   - `'batched'` — run the base query, then ONE flat follow-up query per
+ *   - `'join'`: one SQL statement with correlated
+ *     `json_agg(json_build_object(...))` subqueries. One round-trip, an index
+ *     seek per parent row when the child FK is indexed. On PowDB, `'join'`
+ *     instead opts into native PowQL server-side joins where eligible.
+ *   - `'batched'`: run the base query, then ONE flat follow-up query per
  *     relation (`WHERE fk = ANY($1)`), stitching children client-side. D levels
  *     cost D extra round-trips, but each is a single key-set lookup and rows come
- *     back flat — a win when FK columns are unindexed or result sets are huge.
+ *     back flat (a win when FK columns are unindexed or result sets are huge).
  *
- * Precedence: per-query arg > client `relationLoadStrategy` config > `'join'`.
+ * Precedence: per-query arg > client `relationLoadStrategy` config > the engine
+ * default. On SQL engines the default is `'join'`; on PowDB the default is the
+ * batched loaders (an ineligible relation falls back to them per-relation and
+ * silently even when `'join'` is requested).
  */
 export type RelationLoadStrategy = 'join' | 'batched';
 

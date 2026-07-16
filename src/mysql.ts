@@ -436,9 +436,10 @@ export const mysqlDialect: Dialect = {
   supportsLateralJoin: false,
   // GET_LOCK / RELEASE_LOCK exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
-  // MySQL 8.0.16+ renders a readable tree plan with `EXPLAIN FORMAT=TREE`
-  // (one text column), overriding the inherited Postgres `EXPLAIN`.
-  explainQuery: { prefix: 'EXPLAIN FORMAT=TREE' },
+  // Plain `EXPLAIN` (one row of tabular plan columns) works on every supported
+  // MySQL 8.0.x; the readable `FORMAT=TREE` variant only exists from 8.0.16 and
+  // the engine floor here is 8.0.0. Plan text is a diagnostic, not a contract.
+  explainQuery: { prefix: 'EXPLAIN' },
   // JSON_ARRAYAGG has no inline ORDER BY argument → force the inner-subquery
   // rewrite for every ordered to-many relation.
   aggSupportsInlineOrderBy: false,

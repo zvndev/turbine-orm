@@ -237,8 +237,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * PowQL column reference for a field. Unqualified it is a dotted field
    * reference (`.snake_name`), which bypasses keyword lookup. When an `alias`
    * is supplied (the F2 join path) it is qualified (`alias.snake_name`) and the
-   * column name is backtick-quoted if it is a reserved word — a qualified
-   * `p.order` does NOT bypass keyword lookup, unlike the dotted `.order`.
+   * column name is backtick-quoted if it is a reserved word (a qualified
+   * `p.order` does NOT bypass keyword lookup, unlike the dotted `.order`).
    */
   private ref(field: string, alias?: string): string {
     return this.colRefName(this.column(field).name, alias);
@@ -325,7 +325,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * qualified with it (`.col` → `alias.col`, JSON path bases too); params bind
    * exactly as in the unqualified path. The caller only ever passes an alias for
    * an already-RESOLVED where (relation filters pre-resolved to literal in-lists
-   * by {@link resolveRelationFilters}) — the relation-key branch below still
+   * by {@link resolveRelationFilters}): the relation-key branch below still
    * throws, so an unresolved relation filter can never leak into a join.
    */
   private buildWhere(where: WhereClause<T> | undefined, params: unknown[], alias?: string): string {
@@ -857,10 +857,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   /** Build the E018 refusal for a write / `begin` on a read-only pool. */
   private readOnlyError(operation: string): ReadOnlyError {
-    return new ReadOnlyError(
-      `[turbine] ${operation} on "${this.table}" refused: this PowDB connection is read-only. ` +
-        `Route writes to a writable primary (a pool opened without \`readonly: true\`).`,
-    );
+    // Pass a clean detail: the ReadOnlyError constructor owns both the
+    // `[turbine] ` prefix and the "Route writes to a writable primary." hint,
+    // so adding either here would double them.
+    return new ReadOnlyError(`${operation} on "${this.table}" refused: this PowDB connection is read-only.`);
   }
 
   /**
@@ -1044,21 +1044,23 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    *
    * Runs as a READ (`explain <query>`), so it is safe on a read-only pool and
    * eligible for the stale-read replay. The line content is engine-owned and is
-   * NOT covered by semver — match plan node names / tree shape, never exact
-   * bytes (mirrors PowDB's own `explain` contract).
+   * NOT covered by semver (match plan node names / tree shape, never exact
+   * bytes; mirrors PowDB's own `explain` contract).
+   *
+   * Does NOT run through the middleware chain: plan text is a diagnostic, not
+   * entity rows, and `QueryInterface.explain` deliberately bypasses middleware
+   * too, so both engines agree.
    */
   async explain(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<string[]> {
-    return this.withMiddleware('explain', args as unknown as Record<string, unknown>, async () => {
-      const params: unknown[] = [];
-      const { powql } = await this.buildFind(args, params);
-      const { rows } = await this.exec(`explain ${powql}`, params, args.timeout, 'explain');
-      return rows
-        .map((r) => {
-          const line = r.plan ?? Object.values(r)[0];
-          return line == null ? '' : String(line);
-        })
-        .filter((line) => line.length > 0);
-    });
+    const params: unknown[] = [];
+    const { powql } = await this.buildFind(args, params);
+    const { rows } = await this.exec(`explain ${powql}`, params, args.timeout, 'explain');
+    return rows
+      .map((r) => {
+        const line = r.plan ?? Object.values(r)[0];
+        return line == null ? '' : String(line);
+      })
+      .filter((line) => line.length > 0);
   }
 
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
@@ -1104,8 +1106,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * resolved where). When the effective `relationLoadStrategy` resolves to an
    * explicit `'join'` and the pool advertises `serverJoins`, an eligible
    * top-level relation is loaded with a native PowQL join instead of the keyed
-   * loaders (F2); everything else — nested `with` levels, ineligible shapes, and
-   * the default `'batched'` strategy — keeps the loaders. Output is byte-equal
+   * loaders (F2); everything else (nested `with` levels, ineligible shapes, and
+   * the default `'batched'` strategy) keeps the loaders. Output is byte-equal
    * either way (the join reuses the same stitch / shape helpers).
    */
   private async loadRelations(
@@ -1119,14 +1121,28 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       throw new ValidationError(`[turbine] Nested 'with' on PowDB exceeded depth 10 (relation cycle?).`);
     }
     if (!parents.length) return;
-    const useJoins = this.joinsEnabled(parent);
+    // The resolved strategy is 'join' only for an EXPLICIT 'join' (per-query arg
+    // or a client config the user set). The serverJoins capability is consulted
+    // PER RELATION below, AFTER joinEligible, so a relation that would have
+    // fallen back to the loaders anyway (paged parent, nested `with`, composite
+    // key, …) never triggers the capability's E017.
+    const strategyIsJoin = parent ? this.resolveStrategy(parent.args) === 'join' : false;
     for (const [relName, opt] of Object.entries(withClause)) {
       if (!opt) continue;
       const rel = this.meta.relations[relName];
       if (!rel) throw new ValidationError(`[turbine] Unknown relation "${relName}" on "${this.table}".`);
-      if (useJoins && parent && this.joinEligible(rel, opt, parent.args, parents.length)) {
-        await this.loadRelationViaJoin(parents, rel, relName, opt, parent, timeout);
-        continue;
+      if (strategyIsJoin && parent && this.joinEligible(rel, opt, parent.args, parents.length)) {
+        if (this.capabilities.serverJoins) {
+          await this.loadRelationViaJoin(parents, rel, relName, opt, parent, timeout);
+          continue;
+        }
+        // An otherwise-eligible relation the engine cannot join: a PER-QUERY
+        // `relationLoadStrategy: 'join'` is an explicit request, so throw a typed
+        // E017; a CLIENT-LEVEL default silently falls back to the keyed loaders
+        // (so pointing an existing app at an older engine keeps working).
+        if (parent.args.relationLoadStrategy === 'join') {
+          requireCapability(this.capabilities, 'serverJoins', 'native PowQL relation joins');
+        }
       }
       if (rel.type === 'manyToMany') {
         await this.loadManyToMany(parents, rel, relName, opt, timeout);
@@ -1150,32 +1166,63 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const keys = [
         ...new Set(parents.map((p) => (p as Record<string, unknown>)[parentKeyField]).filter((k) => k != null)),
       ];
-      const childByKey = new Map<unknown, T[]>();
+      // The loader buckets children by their correlation column, so that column
+      // MUST be in the fetched projection even when the user's select/omit drops
+      // it. Force it into the fetch here and strip it back off the entities after
+      // stitching (the join path already gets this for free via `__tpk`).
+      const userSelect = options.select as Record<string, boolean> | undefined;
+      const userOmit = options.omit as Record<string, boolean> | undefined;
+      const fkProjected = userSelect ? Boolean(userSelect[childKeyField]) : userOmit ? !userOmit[childKeyField] : true;
+      let fetchOptions: FindManyArgs<object> = options;
+      if (!fkProjected) {
+        if (userSelect) {
+          fetchOptions = {
+            ...options,
+            select: { ...userSelect, [childKeyField]: true },
+          } as unknown as FindManyArgs<object>;
+        } else if (userOmit) {
+          const omitWithoutFk = { ...userOmit };
+          delete omitWithoutFk[childKeyField];
+          fetchOptions = { ...options, omit: omitWithoutFk } as unknown as FindManyArgs<object>;
+        }
+      }
       // Chunk the key set so a single `in (…)` never exceeds PowDB's
-      // per-statement param / row limits; merge each chunk's children.
+      // per-statement param / row limits; merge each chunk's children. Keys are
+      // normalized through joinKey (a Date maps to micros, matching the child
+      // cell) so a datetime correlation column stitches instead of silently
+      // returning [].
+      const childByKey = new Map<string, T[]>();
       for (let i = 0; i < keys.length; i += MAX_RELATION_KEYS) {
         const chunk = keys.slice(i, i + MAX_RELATION_KEYS);
         const childWhere = {
-          ...(options.where as Record<string, unknown> | undefined),
+          ...(fetchOptions.where as Record<string, unknown> | undefined),
           [childKeyField]: { in: chunk },
         } as WhereClause<object>;
         const children = (await targetQi.findMany({
-          ...options,
+          ...fetchOptions,
           where: childWhere,
           with: options.with,
           timeout: options.timeout ?? timeout,
         } as FindManyArgs<object>)) as T[];
         for (const child of children) {
-          const k = (child as Record<string, unknown>)[childKeyField];
+          const k = this.joinKey((child as Record<string, unknown>)[childKeyField]);
+          if (k == null) continue;
           const bucket = childByKey.get(k);
           if (bucket) bucket.push(child);
           else childByKey.set(k, [child]);
         }
       }
+      // Strip the forced correlation column back off if the user excluded it,
+      // so the emitted entities match their select/omit exactly.
+      if (!fkProjected) {
+        for (const bucket of childByKey.values()) {
+          for (const child of bucket) delete (child as Record<string, unknown>)[childKeyField];
+        }
+      }
       const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
       for (const parent of parents) {
-        const k = (parent as Record<string, unknown>)[parentKeyField];
-        const matches = childByKey.get(k) ?? [];
+        const k = this.joinKey((parent as Record<string, unknown>)[parentKeyField]);
+        const matches = (k == null ? undefined : childByKey.get(k)) ?? [];
         (parent as Record<string, unknown>)[relName] = single ? (matches[0] ?? null) : matches;
       }
     }
@@ -1282,15 +1329,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   // -------------------------------------------------------------------------
-  // Nested relations — native PowQL joins (F2, opt-in via relationLoadStrategy)
+  // Nested relations: native PowQL joins (F2, opt-in via relationLoadStrategy)
   // -------------------------------------------------------------------------
 
   /**
    * Resolve the effective relation-load strategy: the per-query arg wins, then
    * the client config, then the PowDB default of `'batched'` (the keyed
    * loaders). PowDB deliberately does NOT inherit the SQL-side implicit `'join'`
-   * default — that would silently flip every existing PowDB user onto brand-new
-   * join generation. Only a value the user actually set to `'join'` activates it.
+   * default (that would silently flip every existing PowDB user onto brand-new
+   * join generation). Only a value the user actually set to `'join'` activates it.
    */
   private resolveStrategy(args: FindManyArgs<T>): 'join' | 'batched' {
     const s = args.relationLoadStrategy ?? this.options.relationLoadStrategy ?? 'batched';
@@ -1298,29 +1345,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * Decide whether the top-level relations of THIS query use native joins:
-   * `true` only when the resolved strategy is an explicit `'join'` AND the pool
-   * advertises `serverJoins`. When the strategy is `'join'` but `serverJoins` is
-   * false the behavior splits by WHERE the `'join'` came from — a PER-QUERY
-   * `relationLoadStrategy: 'join'` is an explicit request, so it throws a typed
-   * E017 (via {@link requireCapability}); a CLIENT-LEVEL default silently falls
-   * back to the keyed loaders (so pointing an existing app at an older engine
-   * keeps working). Absent parent context (nested levels) never joins.
-   */
-  private joinsEnabled(parent?: PowqlParentContext<T>): boolean {
-    if (!parent) return false;
-    if (this.resolveStrategy(parent.args) !== 'join') return false;
-    if (this.capabilities.serverJoins) return true;
-    if (parent.args.relationLoadStrategy === 'join') {
-      requireCapability(this.capabilities, 'serverJoins', 'native PowQL relation joins');
-    }
-    return false; // client-level default only → silent loader fallback
-  }
-
-  /**
-   * Per-relation eligibility for the join path (checked after {@link joinsEnabled}).
-   * Any `false` here is a SILENT fallback to the keyed loaders — never an error —
-   * so an off-page or nested-`with` shape still returns correct rows:
+   * Per-relation eligibility for the join path (checked before the serverJoins
+   * capability). Any `false` here is a SILENT fallback to the keyed loaders (it
+   * is never an error), so an off-page or nested-`with` shape still returns
+   * correct rows:
    *   - the parent query must not be paged (`limit`/`offset`/`take`, including the
    *     configured `defaultLimit`): a parent-filter join under a page would scan
    *     children of off-page parents, where the loaders are strictly better;
@@ -1328,6 +1356,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    *     loaders this round) or a `distinct`;
    *   - single-column relation keys only (a composite key falls to the loader,
    *     which throws the same E017 as today);
+   *   - the PARENT-SIDE correlation column must be a single-column PK or unique
+   *     column, or the INNER join would re-emit one child copy per matching
+   *     parent row (a non-unique correlation key produces duplicate children the
+   *     loader never would). For hasMany/hasOne/m2m that column is the relation's
+   *     `referenceKey` on THIS (fetched) table; for belongsTo it is the
+   *     `referenceKey` on the TARGET table (the join's non-fetched side);
    *   - m2m keeps any `orderBy`/`limit`/`offset` on the loader (the junction-order
    *     stitch can't be reproduced by the 3-table join deterministically);
    *   - a to-one relation `limit`/`offset` (meaningless) stays on the loader, as
@@ -1352,9 +1386,21 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         return false;
       }
       if (options.orderBy || options.limit !== undefined || options.offset) return false;
+      // The parent joins on its referenceKey; a non-unique one duplicates.
+      if (!this.isSingleColumnUnique(this.meta, normalizeKeyColumns(rel.referenceKey)[0]!)) return false;
       return true;
     }
     if (normalizeKeyColumns(rel.foreignKey).length > 1 || normalizeKeyColumns(rel.referenceKey).length > 1) {
+      return false;
+    }
+    // Reject a non-unique correlation key: on belongsTo the fetched side joins on
+    // the target's referenceKey, otherwise the fetched side joins on its own.
+    if (rel.type === 'belongsTo') {
+      const targetMeta = this.schema.tables[rel.to];
+      if (!targetMeta || !this.isSingleColumnUnique(targetMeta, normalizeKeyColumns(rel.referenceKey)[0]!)) {
+        return false;
+      }
+    } else if (!this.isSingleColumnUnique(this.meta, normalizeKeyColumns(rel.referenceKey)[0]!)) {
       return false;
     }
     const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
@@ -1362,6 +1408,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       return false;
     }
     return true;
+  }
+
+  /**
+   * True when `col` is a single-column unique key of `tableMeta`: the sole
+   * primary-key column, a single-column entry in `uniqueColumns` (where a
+   * per-column `unique: true` and an introspected single-column unique constraint
+   * both land), or a single-column unique index. Used by {@link joinEligible} to
+   * keep the INNER-join path off relations whose parent-side correlation column
+   * can repeat (which would duplicate children).
+   */
+  private isSingleColumnUnique(tableMeta: TableMetadata, col: string): boolean {
+    if (tableMeta.primaryKey.length === 1 && tableMeta.primaryKey[0] === col) return true;
+    if (tableMeta.uniqueColumns.some((cols) => cols.length === 1 && cols[0] === col)) return true;
+    return tableMeta.indexes.some(
+      (idx) => idx.unique && !idx.docPath && idx.columns.length === 1 && idx.columns[0] === col,
+    );
   }
 
   /** Dispatch one eligible relation to the correct native-join loader. */
@@ -1383,7 +1445,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
     const fk = normalizeKeyColumns(rel.foreignKey);
     const rk = normalizeKeyColumns(rel.referenceKey);
-    // Correlation math is identical to the keyed loaders — only the transport
+    // Correlation math is identical to the keyed loaders, only the transport
     // (join vs in-list) changes. Always join the RELATION TARGET (alias `c`) to
     // the already-fetched side (alias `p`), correlating on the fetched side's key
     // and projecting `__tpk` from the fetched side's correlation column.
@@ -1409,7 +1471,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       `${targetQi.qt} as c join ${this.qt} as p ` +
       `on c.${quotePowqlIdent(childKeyCol)} = p.${quotePowqlIdent(parentKeyCol)}` +
       `${filter}${order}${limitClause}${offsetClause} ${proj}`;
-    // A READ — thread a read-shaped action through the exec seam.
+    // A READ: thread a read-shaped action through the exec seam.
     const { rows, native } = await targetQi.exec(powql, params, timeout, 'findMany');
 
     const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
@@ -1550,11 +1612,16 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   /**
    * Normalize a correlation key to a stable string map key so a parent's key
    * value (a shaped entity field) and a child row's `__tpk` cell match across
-   * wires (native int → bigint, legacy → string): both stringify identically.
+   * wires and column types. A `Date` maps to microseconds
+   * (`getTime()` ms times 1000), because a datetime correlation cell arrives as
+   * raw micros (bigint on the native wire, a micros string on the legacy wire),
+   * never as ms. bigint / number / string all stringify to the same digits, so
+   * an int key matches whether it came back typed or as text.
    */
   private joinKey(v: unknown): string | null {
     if (v == null) return null;
-    if (v instanceof Date) return String(v.getTime());
+    if (v instanceof Date) return (BigInt(v.getTime()) * 1000n).toString();
+    if (typeof v === 'bigint') return v.toString();
     return String(v);
   }
 
@@ -1782,6 +1849,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         this.schema,
         this.middlewares as unknown as never,
         this.options,
+        // Pass the PowDB pool so its read-only guard + capabilities carry into
+        // the transaction-scoped proxy pool (see createTxPool).
+        this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
       );
       const ctx: NestedWriteContext = { schema: this.schema, tx: tx as unknown as NestedWriteContext['tx'] };
       // Plant the single-writer re-entrancy marker for the implicit tx's

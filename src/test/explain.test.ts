@@ -109,12 +109,12 @@ describe('explain() - SQL prefix + param pass-through', () => {
     assert.deepEqual(calls[0]!.params, built.params);
   });
 
-  it('MySQL: prepends "EXPLAIN FORMAT=TREE "', async () => {
+  it('MySQL: prepends "EXPLAIN " (plain, works on the whole 8.0.x floor)', async () => {
     const args = { where: { role: 'admin' }, limit: 3 };
     const built = makeQuery('users', schema, { dialect: mysqlDialect }).buildFindMany(args);
     const { query, calls } = qi([], { dialect: mysqlDialect });
     await query.explain(args);
-    assert.equal(calls[0]!.sql, `EXPLAIN FORMAT=TREE ${built.sql}`);
+    assert.equal(calls[0]!.sql, `EXPLAIN ${built.sql}`);
     assert.deepEqual(calls[0]!.params, built.params);
   });
 

@@ -1,12 +1,12 @@
 /**
- * turbine-orm/powdb — F2 native-join + F4 explain + readonly-guard unit tests.
+ * turbine-orm/powdb: F2 native-join + F4 explain + readonly-guard unit tests.
  *
  * Build-only (no server): a fake pool records every PowQL string the
  * {@link PowqlInterface} emits and returns canned rows, so these assert the
  * exact join emission (aliases, `__tpk` projection, chained m2m joins, qualified
  * where), the eligibility fallbacks (parent paging / nested `with` / capability
  * gates keep the keyed loaders), the `explain` prefix + plan-line extraction,
- * and the read-only exec-seam guard — all without the addon or a socket.
+ * and the read-only exec-seam guard, all without the addon or a socket.
  */
 
 import assert from 'node:assert/strict';
@@ -102,6 +102,16 @@ const schema: SchemaMetadata = {
           foreignKey: 'author_id',
           referenceKey: 'id',
         },
+        // Correlates on `name`, which is NOT a unique column on app_user, so an
+        // INNER join would duplicate children, so joinEligible must fall back.
+        postsByName: {
+          type: 'hasMany',
+          name: 'postsByName',
+          from: 'app_user',
+          to: 'post',
+          foreignKey: 'author_id',
+          referenceKey: 'name',
+        },
       },
     ),
     post: table(
@@ -150,7 +160,7 @@ const schema: SchemaMetadata = {
 };
 
 // ---------------------------------------------------------------------------
-// Fake pool — records emitted PowQL, returns canned rows, feature-flag knobs.
+// Fake pool: records emitted PowQL, returns canned rows, feature-flag knobs.
 // ---------------------------------------------------------------------------
 
 interface MockOptions {
@@ -278,7 +288,7 @@ describe('powdb F2: alias-qualified where', () => {
     assert.match(call.powql, /filter p\.age > \$\d+/);
     // Relation JSON-path filter, alias-qualified with c (path segment + value bound).
     assert.match(call.powql, /and c\.data->\$\d+ = \$\d+/);
-    // Every value is a bound $N param — no inlined literals.
+    // Every value is a bound $N param, no inlined literals.
     assert.deepEqual(call.params, [18, 'k', 'v']);
   });
 
@@ -357,7 +367,7 @@ describe('powdb F2: eligibility', () => {
   it('a client-level join default on a serverJoins-false engine silently falls back to the loader', async () => {
     const caps = capabilitiesFromVersion('0.12.0');
     const mock = mockPool({ capabilities: caps });
-    // No per-query strategy — the client default is 'join', engine can't → loader.
+    // No per-query strategy: the client default is 'join', engine can't → loader.
     await qiClientJoin(mock).findMany({ with: { posts: true } });
     assert.equal(mock.joinCall(), undefined);
     assert.ok(mock.calls.some((c) => /post filter .*\bin \(/.test(c.powql)));
@@ -369,6 +379,32 @@ describe('powdb F2: eligibility', () => {
       () => qi(mock).findMany({ with: { bad: true }, relationLoadStrategy: 'join' }),
       (err: unknown) => err instanceof ValidationError && /__tpk/.test((err as Error).message),
     );
+  });
+
+  it('a non-unique parent correlation column falls back to the loader (would duplicate)', async () => {
+    // `postsByName` correlates on `name`, which is not unique on app_user: the
+    // INNER join would re-emit one child copy per matching parent, so the
+    // relation must silently use the keyed loader instead.
+    const mock = mockPool({ rows: [{ id: '1', name: 'Ada' }] });
+    await qi(mock).findMany({ with: { postsByName: true }, relationLoadStrategy: 'join' });
+    assert.equal(mock.joinCall(), undefined);
+    assert.ok(
+      mock.calls.some((c) => /post filter .*\bin \(/.test(c.powql)),
+      'the keyed loader in-list must be emitted',
+    );
+  });
+
+  it('a paged parent + per-query join on a serverJoins-false engine falls back (no E017)', async () => {
+    // Ordering fix: the capability check fires PER RELATION, only AFTER the other
+    // joinEligible conditions pass. A parent `limit` makes the relation
+    // ineligible, so an explicit per-query 'join' must NOT throw E017 here: it
+    // quietly uses the loader, exactly as it would on any engine.
+    const caps = capabilitiesFromVersion('0.12.0');
+    assert.equal(caps.serverJoins, false);
+    const mock = mockPool({ capabilities: caps });
+    await qi(mock).findMany({ limit: 10, with: { posts: true }, relationLoadStrategy: 'join' });
+    assert.equal(mock.joinCall(), undefined);
+    assert.ok(mock.calls.some((c) => /post filter .*\bin \(/.test(c.powql)));
   });
 });
 
@@ -390,6 +426,24 @@ describe('powdb F4: explain', () => {
     const mock = mockPool({ rows: [{ plan: 'SeqScan table=app_user' }, { plan: '' }] });
     const lines = await qi(mock).explain({});
     assert.deepEqual(lines, ['SeqScan table=app_user']);
+  });
+
+  it('does NOT run through the middleware chain (parity with QueryInterface.explain)', async () => {
+    const mock = mockPool({ rows: [{ plan: 'IndexScan table=app_user' }] });
+    const fired: string[] = [];
+    const middleware = (
+      p: { model: string; action: string; args: Record<string, unknown> },
+      next: (p: { model: string; action: string; args: Record<string, unknown> }) => Promise<unknown>,
+    ) => {
+      fired.push(p.action);
+      return next(p);
+    };
+    const iface = new PowqlInterface(mock.pool, 'app_user', schema, [middleware], { warnOnUnlimited: false });
+    await iface.explain({ where: { age: { gt: 1 } } });
+    assert.deepEqual(fired, [], 'explain must bypass middleware (plan text is not entity rows)');
+    // A read still fires middleware, proving the chain is otherwise wired up.
+    await iface.findMany({ limit: 1 });
+    assert.deepEqual(fired, ['findMany']);
   });
 });
 
@@ -426,6 +480,18 @@ describe('powdb: read-only guard', () => {
     const mock = mockPool({ readonly: true });
     await qi(mock).findMany({ limit: 1 });
     assert.equal(mock.calls.length, 1);
+  });
+
+  it('the E018 message is not doubled (single `[turbine]` prefix + single routing hint)', async () => {
+    const mock = mockPool({ readonly: true });
+    const err = await qi(mock)
+      .create({ data: { name: 'x' } })
+      .catch((e: unknown) => e as Error);
+    assert.ok(err instanceof ReadOnlyError);
+    // The ReadOnlyError constructor owns the prefix and the routing hint, so the
+    // guard's detail must not repeat either.
+    assert.equal(err.message.match(/\[turbine\]/g)?.length, 1, 'exactly one [turbine] prefix');
+    assert.equal(err.message.match(/Route writes to a writable primary/g)?.length, 1, 'exactly one routing hint');
   });
 
   it('a transaction-control begin (nested write) refuses with E018 before connect()', async () => {

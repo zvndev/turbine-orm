@@ -1,5 +1,5 @@
 /**
- * turbine-orm/powdb — F2 native-join LIVE integration tests through the REAL
+ * turbine-orm/powdb: F2 native-join LIVE integration tests through the REAL
  * in-process `@zvndev/powdb-embedded` napi addon (no server, no socket).
  *
  * The acceptance contract for native joins is deep-equality: for every relation
@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe } from 'node:test';
+import { ReadOnlyError, UnsupportedFeatureError } from '../errors.js';
 import { powqlSchemaDDL, turbinePowDB } from '../powdb.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
@@ -35,7 +36,7 @@ try {
 const { it } = skipGate(!embeddedAvailable, 'requires @zvndev/powdb-embedded (no prebuilt binary on this platform)');
 
 // ---------------------------------------------------------------------------
-// Schema fixture — auto-int PKs + a junction, hasMany / hasOne / belongsTo / m2m.
+// Schema fixture: auto-int PKs + a junction, hasMany / hasOne / belongsTo / m2m.
 // ---------------------------------------------------------------------------
 
 function col(
@@ -162,7 +163,7 @@ async function withSeeded(fn: (db: DB) => Promise<void>): Promise<void> {
     for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
     const ada = await db.table('member').create({ data: { name: 'Ada' } });
     const bob = await db.table('member').create({ data: { name: 'Bob' } });
-    // Cy is created but has no posts / profile / tags — the empty-stitch case.
+    // Cy is created but has no posts / profile / tags (the empty-stitch case).
     await db.table('member').create({ data: { name: 'Cy' } });
     await db.table('ppost').createMany({
       data: [
@@ -280,6 +281,22 @@ describe('powdb F2 integration: join vs loader parity (embedded)', () => {
     });
   });
 
+  it('relation select that omits the FK column returns the same children both ways', async () => {
+    await withSeeded(async (db) => {
+      // `select: { title: true }` drops the correlation column (member_id) from
+      // the projection. The join stitches via __tpk regardless; the loader must
+      // force-fetch member_id and strip it, so both return the same posts (never
+      // an empty list, and never leaking member_id).
+      await assertParity(db, { orderBy: { id: 'asc' }, with: { posts: { select: { title: true } } } });
+      const rows = await db
+        .table('member')
+        .findMany({ orderBy: { id: 'asc' }, with: { posts: { select: { title: true } } } });
+      const ada = rows.find((r: { name: string }) => r.name === 'Ada');
+      assert.equal(ada.posts.length, 3, 'Ada keeps her 3 posts even without the FK selected');
+      assert.deepEqual(Object.keys(ada.posts[0]).sort(), ['id', 'title'], 'only id + title, no leaked member_id');
+    });
+  });
+
   it('a member with no children stitches to [] / null, identically both ways', async () => {
     await withSeeded(async (db) => {
       // Cy has no posts, no profile, no tags.
@@ -294,5 +311,158 @@ describe('powdb F2 integration: join vs loader parity (embedded)', () => {
       assert.ok(lines.length > 0, 'explain must return plan lines');
       assert.match(lines.join('\n'), /Scan/, 'plan should name a scan node (Index/Seq/Range)');
     });
+  });
+});
+
+describe('powdb integration: client-level relationLoadStrategy activates joins (fix 8)', () => {
+  it('turbinePowDB({ relationLoadStrategy: "join" }) emits a native join without a per-query arg', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-clientjoin-'));
+    const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, schema, {
+      relationLoadStrategy: 'join',
+      warnOnUnlimited: false,
+    });
+    const emitted: string[] = [];
+    db.$on('query', (e: { sql: string }) => emitted.push(e.sql));
+    try {
+      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      const ada = await db.table('member').create({ data: { name: 'Ada' } });
+      await db.table('ppost').createMany({ data: [{ memberId: ada.id, title: 'a1', views: 1 }] });
+      emitted.length = 0; // ignore the seeding statements
+      const rows = await db.table('member').findMany({ orderBy: { id: 'asc' }, with: { posts: true } });
+      assert.ok(
+        emitted.some((s) => / join /.test(s)),
+        'the client-level join default must emit a native join statement (not the keyed loader)',
+      );
+      assert.equal(rows[0].posts.length, 1);
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Datetime correlation: the parent key is a Date (stored as int micros), so the
+// join's __tpk cell and the parent's shaped Date must normalize to the same
+// bucket key on BOTH strategies. A `at` column marked unique makes the relation
+// join-eligible (a non-unique correlation would fall back to the loader).
+// ---------------------------------------------------------------------------
+
+const dtSchema: SchemaMetadata = (() => {
+  const slot = makeTable(
+    'slot',
+    [
+      col('id', 'id', 'number', 'int8', { isGenerated: true, hasDefault: true }),
+      col('at', 'at', 'Date', 'timestamptz'),
+    ],
+    {
+      events: {
+        type: 'hasMany',
+        name: 'events',
+        from: 'slot',
+        to: 'sevent',
+        foreignKey: 'slot_at',
+        referenceKey: 'at',
+      },
+    },
+  );
+  // Mark the datetime correlation column unique so joinEligible activates the
+  // native join path (otherwise it silently falls back to the keyed loader).
+  slot.uniqueColumns = [['id'], ['at']];
+  return {
+    enums: {},
+    tables: {
+      slot,
+      sevent: makeTable('sevent', [
+        col('id', 'id', 'number', 'int8', { isGenerated: true, hasDefault: true }),
+        col('slot_at', 'slotAt', 'Date', 'timestamptz'),
+        col('label', 'label', 'string', 'text'),
+      ]),
+    },
+  };
+})();
+
+describe('powdb F2 integration: datetime correlation key (embedded)', () => {
+  it('hasMany correlated on a datetime column stitches identically under join and loader', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-dtjoin-'));
+    const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, dtSchema, { warnOnUnlimited: false });
+    try {
+      for (const stmt of powqlSchemaDDL(dtSchema)) await db.raw([stmt]);
+      const t0 = new Date('2024-01-01T00:00:00.000Z');
+      const t1 = new Date('2024-06-15T12:30:00.000Z');
+      const s0 = await db.table('slot').create({ data: { at: t0 } });
+      const s1 = await db.table('slot').create({ data: { at: t1 } });
+      await db.table('sevent').createMany({
+        data: [
+          { slotAt: s0.at, label: 'a' },
+          { slotAt: s0.at, label: 'b' },
+          { slotAt: s1.at, label: 'c' },
+        ],
+      });
+      const base = { orderBy: { id: 'asc' as const }, with: { events: true } };
+      const viaJoin = await db.table('slot').findMany({ ...base, relationLoadStrategy: 'join' });
+      const viaLoader = await db.table('slot').findMany({ ...base });
+      assert.deepEqual(viaJoin, viaLoader);
+      // Both strategies actually resolve the datetime-correlated children (the
+      // pre-fix join returned [] because getTime() ms never matched the micros
+      // cell, and the loader keyed by Date object identity).
+      assert.equal(viaJoin[0].events.length, 2);
+      assert.equal(viaJoin[1].events.length, 1);
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transaction proxy carries the PowDB pool's readonly + capabilities (fix 4).
+// ---------------------------------------------------------------------------
+
+describe('powdb integration: $transaction inherits pool readonly + capabilities (embedded)', () => {
+  it('a write inside $transaction on a readonly-marked client throws E018 before the wire', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-rotx-'));
+    // A writable engine handle marked read-only at the client level: the engine
+    // WOULD accept the write, so only the local guard (carried into the tx proxy
+    // pool) refuses it. Without the fix the tx proxy dropped `readonly` and the
+    // write succeeded.
+    const db: DB = await turbinePowDB({ embedded: dir }, schema, { readonly: true, warnOnUnlimited: false });
+    try {
+      await assert.rejects(
+        () =>
+          db.$transaction(async (tx: DB) => {
+            await tx.table('member').create({ data: { name: 'z' } });
+          }),
+        ReadOnlyError,
+      );
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a per-query join inside $transaction on a 0.12 engine throws typed E017 (not raw E003)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-captx-'));
+    // assumeEngineVersion 0.12.0 → serverJoins false. Without the fix the tx
+    // proxy fell back to ALL_POWDB_CAPABILITIES (serverJoins true) and emitted
+    // join PowQL a pre-0.13 engine would reject as a raw parse error.
+    const db: DB = await turbinePowDB({ embedded: dir }, schema, {
+      assumeEngineVersion: '0.12.0',
+      warnOnUnlimited: false,
+    });
+    try {
+      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      await db.table('member').create({ data: { name: 'Ada' } });
+      await assert.rejects(
+        () =>
+          db.$transaction(async (tx: DB) => {
+            await tx.table('member').findMany({ with: { posts: true }, relationLoadStrategy: 'join' });
+          }),
+        UnsupportedFeatureError,
+      );
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

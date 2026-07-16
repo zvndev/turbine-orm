@@ -1562,6 +1562,60 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
       },
     );
   });
+
+  liveIt('a datetime-correlated hasMany join deep-equals the loader over the native wire', async () => {
+    const suffix = `${Date.now().toString(36)}_${Math.floor(Math.random() * 1e4)}`;
+    const sName = `jslot_${suffix}`;
+    const eName = `jsevt_${suffix}`;
+    const slot = makeTable(
+      sName,
+      [
+        col('id', 'id', 'number', 'int8', { isGenerated: true, hasDefault: true }),
+        col('at', 'at', 'Date', 'timestamptz'),
+      ],
+      {
+        events: { type: 'hasMany', name: 'events', from: sName, to: eName, foreignKey: 'slot_at', referenceKey: 'at' },
+      },
+    );
+    // Mark the datetime correlation column unique so the native join activates.
+    slot.uniqueColumns = [['id'], ['at']];
+    const dtSchema: SchemaMetadata = {
+      enums: {},
+      tables: {
+        [sName]: slot,
+        [eName]: makeTable(eName, [
+          col('id', 'id', 'number', 'int8', { isGenerated: true, hasDefault: true }),
+          col('slot_at', 'slotAt', 'Date', 'timestamptz'),
+          col('label', 'label', 'string', 'text'),
+        ]),
+      },
+    };
+    const db: DB = await turbinePowDB(powdbUrl!, dtSchema, { warnOnUnlimited: false });
+    try {
+      await db.raw([`drop ${sName}`]).catch(() => {});
+      await db.raw([`drop ${eName}`]).catch(() => {});
+      for (const stmt of powqlSchemaDDL(dtSchema)) await db.raw([stmt]);
+      const s0 = await db.table(sName).create({ data: { at: new Date('2024-01-01T00:00:00.000Z') } });
+      const s1 = await db.table(sName).create({ data: { at: new Date('2024-06-15T12:30:00.000Z') } });
+      await db.table(eName).createMany({
+        data: [
+          { slotAt: s0.at, label: 'a' },
+          { slotAt: s0.at, label: 'b' },
+          { slotAt: s1.at, label: 'c' },
+        ],
+      });
+      const base = { orderBy: { id: 'asc' as const }, with: { events: true } };
+      const viaJoin = await db.table(sName).findMany({ ...base, relationLoadStrategy: 'join' });
+      const viaLoader = await db.table(sName).findMany({ ...base });
+      assert.deepEqual(viaJoin, viaLoader);
+      assert.equal(viaJoin[0].events.length, 2);
+      assert.equal(viaJoin[1].events.length, 1);
+    } finally {
+      await db.raw([`drop ${sName}`]).catch(() => {});
+      await db.raw([`drop ${eName}`]).catch(() => {});
+      await db.disconnect();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

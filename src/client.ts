@@ -234,13 +234,17 @@ export interface TurbineConfig {
    * Default strategy for resolving `with`-clause relations, applied to every
    * `findMany`/`findUnique`/`findFirst` unless overridden per query.
    *
-   *   - `'join'` (default) — one SQL statement using correlated
-   *     `json_agg(json_build_object(...))` subqueries.
-   *   - `'batched'` — run the base query, then one flat follow-up query per
+   *   - `'join'`: one SQL statement using correlated
+   *     `json_agg(json_build_object(...))` subqueries. On PowDB, `'join'` opts
+   *     into native server-side joins where eligible instead.
+   *   - `'batched'`: run the base query, then one flat follow-up query per
    *     relation (`WHERE fk = ANY($1)`), stitching children client-side. Wins
    *     when child FK columns are unindexed or result sets are large.
    *
-   * Precedence: per-query `relationLoadStrategy` arg > this config > `'join'`.
+   * Precedence: per-query `relationLoadStrategy` arg > this config > the engine
+   * default. On SQL engines the default is `'join'`; on PowDB the default is the
+   * batched loaders (an ineligible relation falls back to them silently even
+   * under `'join'`).
    */
   relationLoadStrategy?: RelationLoadStrategy;
   /**
@@ -462,6 +466,16 @@ export class TransactionClient {
     readonly schema: SchemaMetadata,
     private readonly middlewares: Middleware[],
     private readonly queryOptions?: QueryInterfaceOptions,
+    /**
+     * The parent pool this transaction runs on. Only its `readonly` and
+     * `capabilities` are read (both PowDB-only flags), so the transaction-scoped
+     * proxy pool built by {@link createTxPool} carries them through: without this
+     * a read-only client's `$transaction` writes bypass the E018 guard, and an
+     * older-engine client falls back to ALL_POWDB_CAPABILITIES inside the tx
+     * (emitting join PowQL a pre-0.13 engine rejects). Undefined / absent flags
+     * for a plain pg pool leave the proxy unchanged.
+     */
+    private readonly sourcePool?: { readonly readonly?: boolean; readonly capabilities?: unknown },
   ) {
     this.dialect = queryOptions?.dialect ?? postgresDialect;
     // Auto-create typed table accessors for all tables in the schema
@@ -547,7 +561,7 @@ export class TransactionClient {
     const client = this.client;
     // Return a minimal pool-compatible object that routes queries
     // through the transaction client
-    return {
+    const txPool: Record<string, unknown> = {
       query: async (textOrConfig: string | { name?: string; text: string; values?: unknown[] }, values?: unknown[]) => {
         try {
           if (typeof textOrConfig === 'string') {
@@ -562,7 +576,13 @@ export class TransactionClient {
         }
       },
       connect: () => Promise.resolve(client),
-    } as unknown as pg.Pool;
+    };
+    // Carry the parent pool's PowDB-only flags through so a transaction-scoped
+    // PowqlInterface reads the same read-only guard and capabilities it would
+    // outside the transaction (a plain pg pool has neither, so nothing changes).
+    if (this.sourcePool?.readonly !== undefined) txPool.readonly = this.sourcePool.readonly;
+    if (this.sourcePool?.capabilities !== undefined) txPool.capabilities = this.sourcePool.capabilities;
+    return txPool as unknown as pg.Pool;
   }
 }
 
@@ -1348,8 +1368,16 @@ export class TurbineClient {
         }
       }
 
-      // Create the transaction client with typed table accessors
-      const tx = new TransactionClient(client, this.schema, this.middlewares, this.queryOptions);
+      // Create the transaction client with typed table accessors. Pass the
+      // parent pool so its read-only guard + PowDB capabilities flow into the
+      // transaction-scoped proxy pool (see TransactionClient.createTxPool).
+      const tx = new TransactionClient(
+        client,
+        this.schema,
+        this.middlewares,
+        this.queryOptions,
+        this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
+      );
 
       // Dynamically attach table accessors to tx
       for (const tableName of Object.keys(this.schema.tables)) {

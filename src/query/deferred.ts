@@ -118,8 +118,12 @@ export interface QueryInterfaceOptions {
    */
   utcTimestamps?: boolean;
   /**
-   * Client-level default relation-loading strategy for `with` clauses. Per-query
-   * `relationLoadStrategy` args override this; both default to `'join'`.
+   * Client-level default relation-loading strategy for `with` clauses; a
+   * per-query `relationLoadStrategy` arg overrides it. On SQL engines the default
+   * is `'join'` (one single-statement `json_agg` query). On PowDB the default is
+   * the batched loaders, and `'join'` opts INTO native server-side joins where
+   * eligible (ineligible relations fall back to the loaders per-relation and
+   * silently; see the PowDB docs).
    */
   relationLoadStrategy?: RelationLoadStrategy;
   /**
