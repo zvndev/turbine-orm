@@ -30,6 +30,7 @@ import { describe } from 'node:test';
 import {
   ConnectionError,
   NotNullViolationError,
+  ReadOnlyError,
   TimeoutError,
   UniqueConstraintError,
   UnsupportedFeatureError,
@@ -907,23 +908,28 @@ describe('powdb integration (embedded): json document round-trip', () => {
       await insertDoc(db, 'jsonnull', new PowdbJsonParam(null));
       const rows = await db.table('doc').findMany({ orderBy: { id: 'asc' } });
       const byId = Object.fromEntries(rows.map((r: { id: string; data: unknown }) => [r.id, r.data]));
-      // Both collapse to null on the legacy string wire (fixed only on the
-      // native networked transport). If a future embedded native surface lands,
-      // THIS assertion flips loudly and forces the mapping to be revisited.
+      // Even on the native typed wire (addon >= 0.14) these read the same JS
+      // null: an absent value decodes from an `empty` cell, and a whole
+      // JSON-null document decodes from a `json` cell whose value is JSON null,
+      // Turbine's json decode maps both to JS null. (The raw cells DIFFER on the
+      // native wire; the residual is at Turbine's JS value surface, not the
+      // wire, and matches PowDB's scalarized-null contract.)
       assert.equal(byId.absent, null);
       assert.equal(byId.jsonnull, null);
     });
   });
 
-  it('DOCUMENTED WART: a nullable str holding "null" reads null on the embedded legacy wire', async () => {
+  it('FIXED WART (native >= 0.14): a nullable str holding "null" reads back as the STRING "null", distinct from SQL NULL', async () => {
     await withDocDb(async (db) => {
       await insertDoc(db, 's1', new PowdbJsonParam({}), 'null'); // s = the string "null"
       await insertDoc(db, 's2', new PowdbJsonParam({}), null); // s = SQL null
       const rows = await db.table('doc').findMany({ orderBy: { id: 'asc' } });
       const byId = Object.fromEntries(rows.map((r: { id: string; s: unknown }) => [r.id, r.s]));
-      // Legacy-wire wart: indistinguishable on embedded (both null). The native
-      // networked transport keeps "null" a string (covered by the pool unit test).
-      assert.equal(byId.s1, null);
+      // The legacy string wire collapsed both to null (the coerceValue wart);
+      // the native typed wire (F1) keeps the literal string "null" a string and
+      // an absent value null, so the two are distinguishable, matching the
+      // networked native transport.
+      assert.equal(byId.s1, 'null');
       assert.equal(byId.s2, null);
     });
   });
@@ -1555,5 +1561,170 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
         assert.ok(meta.tables[t]!.columns.some((c) => c.name === 'label'));
       },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1: embedded native typed transport (addon >= 0.14). With the pinned 0.14
+// addon the embedded pool auto-routes through queryWithParams (nativeRaw on),
+// so a full create/findMany round-trip must go over the native path, a genuine
+// str "null" survives as a string (distinct from SQL NULL), and groupBy keys
+// keep PG-text parity, mirroring the networked native-wire block above.
+// ---------------------------------------------------------------------------
+
+/** A table exercising every native cell type (str / int / float / bool / json / a nullable str). */
+const nativeSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    app_user: makeTable('app_user', [
+      col('id', 'id', 'string', 'text', { hasDefault: true }),
+      col('name', 'name', 'string', 'text', { nullable: true }),
+      col('age', 'age', 'number', 'int4', { nullable: true }),
+      col('score', 'score', 'number', 'float8', { nullable: true }),
+      col('active', 'active', 'boolean', 'bool', { nullable: true }),
+      col('s', 's', 'string', 'text', { nullable: true }),
+      col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+    ]),
+  },
+};
+
+async function withNativeDb(fn: (db: DB) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'powdb-native-it-'));
+  const db: DB = await turbinePowDB({ embedded: dir }, nativeSchema, { warnOnUnlimited: false });
+  try {
+    await db.raw(['drop app_user']).catch(() => {});
+    for (const stmt of powqlSchemaDDL(nativeSchema)) await db.raw([stmt]);
+    await fn(db);
+  } finally {
+    await db.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('powdb integration (embedded): F1 native typed transport', () => {
+  it('a create/findMany round-trip goes over the native path, typed values survive intact', async () => {
+    await withNativeDb(async (db) => {
+      const when = new Date('2026-01-02T03:04:05.000Z');
+      await db.table('app_user').create({
+        data: { id: 'u1', name: 'Ada', age: 30, score: 9.5, active: true, s: 'hello', data: { k: 1 } },
+      });
+      const [row] = await db.table('app_user').findMany({ where: { id: 'u1' } });
+      // Typed cells arrive pre-typed and coerce by column: int→number,
+      // float→number, bool→boolean, json→object.
+      assert.equal(row.name, 'Ada');
+      assert.equal(row.age, 30);
+      assert.equal(typeof row.age, 'number');
+      assert.equal(row.score, 9.5);
+      assert.equal(row.active, true);
+      assert.deepEqual(row.data, { k: 1 });
+      // A JSON.stringify of the result must not throw (no bigint leak).
+      assert.doesNotThrow(() => JSON.stringify(row));
+      // Reference `when` so the fixture stays honest about a Date column shape.
+      assert.ok(when instanceof Date);
+    });
+  });
+
+  it('a genuine str "null" survives as the STRING "null", distinct from SQL NULL (native fix)', async () => {
+    await withNativeDb(async (db) => {
+      await db.table('app_user').create({ data: { id: 'lit', s: 'null' } }); // the STRING "null"
+      await db.table('app_user').create({ data: { id: 'nul', s: null } }); // SQL NULL
+      const lit = await db.table('app_user').findUnique({ where: { id: 'lit' } });
+      const nul = await db.table('app_user').findUnique({ where: { id: 'nul' } });
+      assert.equal(lit.s, 'null'); // native wire keeps the literal string
+      assert.equal(nul.s, null); // absent stays null, distinguishable
+    });
+  });
+
+  it('a JSON-null document stays distinct from an ABSENT json cell in the SAME column at the doc level', async () => {
+    await withNativeDb(async (db) => {
+      await db.table('app_user').create({ data: { id: 'jn', data: { a: null } } });
+      await db.table('app_user').create({ data: { id: 'jm', data: {} } });
+      await db.table('app_user').create({ data: { id: 'js', data: { a: 'null' } } });
+      const rows = await db.table('app_user').findMany({ where: { id: { in: ['jn', 'jm', 'js'] } } });
+      // {a:null} vs {} vs {a:"null"} are three DISTINCT documents on the native wire.
+      const byId = Object.fromEntries(rows.map((r: { id: string; data: unknown }) => [r.id, r.data]));
+      assert.deepEqual(byId.jn, { a: null });
+      assert.deepEqual(byId.jm, {});
+      assert.deepEqual(byId.js, { a: 'null' });
+    });
+  });
+
+  it('groupBy keys keep PG-text parity on the native wire (no bigint / raw-micros leak)', async () => {
+    await withNativeDb(async (db) => {
+      await db.table('app_user').create({ data: { id: 'a', age: 1 } });
+      await db.table('app_user').create({ data: { id: 'b', age: 1 } });
+      await db.table('app_user').create({ data: { id: 'c', age: 2 } });
+      // Plain int group key: bigint→number, _count default-selected.
+      const groups = await db.table('app_user').groupBy({ by: ['age'] });
+      assert.ok(
+        groups.every((g: { age: unknown }) => typeof g.age === 'number'),
+        'int group key is a number, not bigint',
+      );
+      const byAge = new Map(groups.map((g: { age: number; _count: number }) => [g.age, g._count]));
+      assert.equal(byAge.get(1), 2);
+      assert.equal(byAge.get(2), 1);
+      assert.doesNotThrow(() => JSON.stringify(groups));
+
+      // JSON group key comes back as the extracted TEXT, matching the networked
+      // native transport and PG's #>> parity.
+      await db.table('app_user').create({ data: { id: 'd', data: { k: 7 } } });
+      await db.table('app_user').create({ data: { id: 'e', data: { k: 7 } } });
+      const jgroups = await db.table('app_user').groupBy({ by: [{ field: 'data', path: ['k'] }], _count: true });
+      const jByKey = new Map(jgroups.map((g: { k: unknown; _count: number }) => [g.k, g._count]));
+      assert.equal(jByKey.get('7'), 2);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3: read-only awareness (embedded openReadOnly). Seed a directory writable,
+// close it (flushing the WAL), reopen it read-only for snapshot serving: reads
+// work, writes are refused and map to ReadOnlyError (E018), both the ORM
+// create() path and a raw injected write that bypasses any client-side guard.
+// ---------------------------------------------------------------------------
+
+describe('powdb integration (embedded): F3 read-only target', () => {
+  it('opens a directory read-only: reads work, writes map to ReadOnlyError (E018)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-ro-it-'));
+    try {
+      // 1) Seed the directory with a writable handle, then close it so the WAL
+      //    is flushed (openReadOnly refuses a directory with a non-empty WAL).
+      const writable: DB = await turbinePowDB({ embedded: dir }, nativeSchema, { warnOnUnlimited: false });
+      for (const stmt of powqlSchemaDDL(nativeSchema)) await writable.raw([stmt]);
+      await writable.table('app_user').create({ data: { id: 'u1', name: 'Ada', age: 30 } });
+      await writable.disconnect();
+
+      // 2) Reopen the SAME directory read-only for snapshot serving.
+      const ro: DB = await turbinePowDB({ embedded: dir, readonly: true }, nativeSchema, { warnOnUnlimited: false });
+      try {
+        // Reads work over the read-only handle.
+        const rows = await ro.table('app_user').findMany({ where: { id: 'u1' } });
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].name, 'Ada');
+
+        // A create is refused and maps to ReadOnlyError (E018). (The client-side
+        // fail-fast guard lives in the PowQL exec seam; whether it short-circuits
+        // locally or the engine refuses, the caller sees the same typed E018.)
+        await assert.rejects(
+          () => ro.table('app_user').create({ data: { id: 'u2', name: 'Bob' } }),
+          (err: Error & { code?: string }) => err instanceof ReadOnlyError && err.code === 'TURBINE_E018',
+        );
+
+        // A raw injected write bypasses any client-side classification and hits
+        // the engine directly, its refusal still maps to ReadOnlyError (E018).
+        await assert.rejects(
+          () => ro.raw(['insert app_user { id := "u3", name := "Cy" } returning']),
+          (err: Error & { code?: string }) => err instanceof ReadOnlyError && err.code === 'TURBINE_E018',
+        );
+
+        // The directory is unchanged, the refused writes touched nothing.
+        const after = await ro.table('app_user').findMany({});
+        assert.equal(after.length, 1);
+      } finally {
+        await ro.disconnect();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

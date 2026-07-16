@@ -65,6 +65,7 @@ import { type Dialect, postgresDialect } from './dialect.js';
 import {
   ConnectionError,
   NotNullViolationError,
+  ReadOnlyError,
   TimeoutError,
   UniqueConstraintError,
   UnsupportedFeatureError,
@@ -311,18 +312,21 @@ export interface PowdbCapabilities {
   docFieldIndexes: boolean;
   /** ≥ 0.10: `schema` / `describe` introspection statements. */
   introspection: boolean;
+  /** ≥ 0.13: server-side joins, hash-accelerated and bounded. */
+  serverJoins: boolean;
   /** Networked only: server ≥ 0.13 AND the client exposes `queryNativeRaw`. */
   nativeRaw: boolean;
 }
 
 /** The feature-gate capability keys (everything except the version/nativeRaw metadata). */
-type PowdbFeatureKey = 'jsonDocs' | 'docFieldIndexes' | 'introspection';
+type PowdbFeatureKey = 'jsonDocs' | 'docFieldIndexes' | 'introspection' | 'serverJoins';
 
 /** Minimum engine version each gated feature needs, for the E017 hint text. */
 const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
   introspection: '0.10',
   jsonDocs: '0.12',
   docFieldIndexes: '0.13',
+  serverJoins: '0.13',
 };
 
 /**
@@ -338,6 +342,7 @@ export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   jsonDocs: true,
   docFieldIndexes: true,
   introspection: true,
+  serverJoins: true,
   nativeRaw: false,
 };
 
@@ -370,6 +375,7 @@ export function capabilitiesFromVersion(
       jsonDocs: false,
       docFieldIndexes: false,
       introspection: false,
+      serverJoins: false,
       nativeRaw: false,
     };
   }
@@ -378,6 +384,7 @@ export function capabilitiesFromVersion(
     introspection: atLeastVersion(sem, 0, 10),
     jsonDocs: atLeastVersion(sem, 0, 12),
     docFieldIndexes: atLeastVersion(sem, 0, 13),
+    serverJoins: atLeastVersion(sem, 0, 13),
     nativeRaw: Boolean(opts.hasNativeRaw) && atLeastVersion(sem, 0, 13),
   };
 }
@@ -873,6 +880,48 @@ export function wrapPowdbError(err: unknown): Error {
   ) {
     return new ConnectionError(`[turbine] PowDB connection is in an invalid state: ${msg}`, { cause: err });
   }
+  // Read-only refusal → ReadOnlyError (E018). Two engine shapes, both mapped by
+  // substring (the networked transport prefixes the message with `query failed:
+  // `, so never anchor on the start): an embedded database opened read-only for
+  // snapshot serving (`readonly mode: statement requires a writer …`), and a
+  // networked read-only role (`permission denied: role '<role>' cannot execute
+  // write statements`). These run BEFORE the generic validation regex below so a
+  // read-only write is surfaced as the routing signal E018, not a query defect.
+  if (/readonly mode: statement requires a writer/i.test(msg)) {
+    return new ReadOnlyError(`PowDB refused a write on a read-only database: ${msg}.`, { cause: err });
+  }
+  if (/permission denied: role/i.test(msg)) {
+    return new ReadOnlyError(`PowDB refused a write for a read-only role: ${msg}.`, { cause: err });
+  }
+  // Open-time read-only failure: a read-only handle over a directory whose WAL
+  // still has uncommitted frames is refused (`cannot open read-only: the WAL is
+  // not empty …`). It is a connection failure (E004), not a query defect, the
+  // fix is to recover the directory with a writable open first.
+  if (/cannot open read-only: the WAL is not empty/i.test(msg)) {
+    return new ConnectionError(
+      `[turbine] PowDB could not open the directory read-only: ${msg}. Open it once with a writable handle to ` +
+        'flush the WAL (recover the directory), then reopen it read-only for snapshot serving.',
+      { cause: err },
+    );
+  }
+  // Per-query deadline → TimeoutError (E002). Message-path so it fires on the
+  // embedded transport too (code is always 'GenericFailure' there); retryable.
+  if (/query timeout after/i.test(msg)) {
+    return new TimeoutError(0, 'PowDB query', { cause: err });
+  }
+  // Client-initiated cancellation → ConnectionError (E004). This is FINAL: the
+  // issuing client disconnected, so the query was a clean early return, never
+  // auto-retry it (the opt-in stale-read retry only replays stale-FRAME reads).
+  if (/query cancelled by client disconnect/i.test(msg)) {
+    return new ConnectionError(`[turbine] PowDB query cancelled by client disconnect: ${msg}`, { cause: err });
+  }
+  // Bounded join rejection → ValidationError (E003). The engine rejects a pure
+  // nested-loop join whose candidate-pair count (or result row count) exceeds
+  // the safety bound BEFORE executing, and names the fix in the message, keep
+  // that fix-hint intact so the caller knows how to make the join eligible.
+  if (/nested-loop join would evaluate|join result exceeds row limit/i.test(msg)) {
+    return new ValidationError(`[turbine] PowDB join rejected: ${msg}`);
+  }
   // Type mismatch / parse / execution / storage / unexpected(token) / row too
   // large → validation (E003). On the embedded transport these are the only
   // signal we get (code is always 'GenericFailure'); on the networked path they
@@ -1177,6 +1226,15 @@ export interface PowdbPoolOptions {
    * Default `false` (typed-error-only).
    */
   retryStaleReads?: boolean;
+  /**
+   * Mark this pool read-only: {@link PowqlInterface}'s exec seam then fails a
+   * write (or a tx-control `begin`) fast with a {@link ReadOnlyError} (E018)
+   * before it reaches the wire. An `{ embedded, readonly: true }` target forces
+   * this true; a networked pool bound to a read-only role can also set it so
+   * writes are rejected locally instead of round-tripping to the engine's
+   * refusal. Default `false`.
+   */
+  readonly?: boolean;
 }
 
 /**
@@ -1307,6 +1365,13 @@ export class PowdbPool implements PgCompatPool {
   readonly capabilities: PowdbCapabilities;
   /** Opt-in first-statement-read replay on a stale wire frame (read by {@link PowqlInterface}). */
   readonly retryStaleReads: boolean;
+  /**
+   * True when the caller marked this pool read-only (`readonly: true`). Read by
+   * {@link PowqlInterface}'s exec seam to fail writes fast with E018 before the
+   * wire; the engine's own read-only-role refusal (mapped by
+   * {@link wrapPowdbError}) is the backstop for raw / injected paths.
+   */
+  readonly readonly: boolean;
 
   constructor(
     readonly pool: PowdbClientPool,
@@ -1316,6 +1381,7 @@ export class PowdbPool implements PgCompatPool {
     this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
     this.capabilities = options.capabilities ?? ALL_POWDB_CAPABILITIES;
     this.retryStaleReads = options.retryStaleReads ?? false;
+    this.readonly = options.readonly ?? false;
   }
 
   /**
@@ -1522,6 +1588,15 @@ interface EmbeddedQueryResult {
   message?: string;
 }
 
+/**
+ * The embedded addon's native typed result (`@zvndev/powdb-embedded` ≥ 0.14).
+ * Mirrors {@link PowdbRawNativeResult}, the same tagged {@link PowdbWireValue}
+ * cells (embedded `bytes` arrive as a `Buffer`, which IS a `Uint8Array`, so the
+ * decode path is unchanged), including the `message` kind for DDL / status
+ * replies, which {@link adaptNativeResult}'s default branch handles at runtime.
+ */
+type EmbeddedNativeResult = PowdbRawNativeResult;
+
 /** A single in-process embedded database handle (`@zvndev/powdb-embedded`). */
 interface EmbeddedDatabase {
   query(powql: string): EmbeddedQueryResult;
@@ -1530,6 +1605,18 @@ interface EmbeddedDatabase {
   isPoisoned(): boolean;
   /** WAL durability selector — `@zvndev/powdb-embedded` ≥ 0.7.1. */
   setSyncMode?(mode: string): void;
+  /**
+   * Lossless typed native wire (`@zvndev/powdb-embedded` ≥ 0.14). All optional
+   * and feature-detected: an older addon omits them, so {@link PowdbEmbeddedPool}
+   * falls back to {@link materializePowql} + {@link query}. `queryWithParams`
+   * binds positional `$N` params as {@link PowdbParam} values (the NativeParam
+   * union) instead of materializing literals.
+   */
+  queryNative?(powql: string): EmbeddedNativeResult;
+  queryReadonlyNative?(powql: string): EmbeddedNativeResult;
+  queryWithParams?(powql: string, params: PowdbParam[]): EmbeddedNativeResult;
+  /** Checkpoint-flushing close (`@zvndev/powdb-embedded` ≥ 0.14). Optional (feature-detected). */
+  close?(): void;
 }
 
 interface EmbeddedModule {
@@ -1537,6 +1624,13 @@ interface EmbeddedModule {
     open(dir: string): EmbeddedDatabase;
     /** Open with a per-query memory budget — `@zvndev/powdb-embedded` ≥ 0.7.1. */
     openWithMemoryLimit?(dir: string, limitBytes: number): EmbeddedDatabase;
+    /**
+     * Open a read-only handle for snapshot serving (`@zvndev/powdb-embedded` ≥
+     * 0.14). Optional (feature-detected); a write through such a handle is
+     * refused with `readonly mode: statement requires a writer …` (→ E018).
+     */
+    openReadOnly?(dir: string): EmbeddedDatabase;
+    openReadOnlyWithMemoryLimit?(dir: string, limitBytes: number): EmbeddedDatabase;
   };
 }
 
@@ -1626,10 +1720,14 @@ export function materializePowql(powql: string, params: unknown[]): string {
 
 /**
  * A {@link PgCompatPool} backed by an in-process `@zvndev/powdb-embedded`
- * `Database`. The embedded addon takes **no params array** — its `query(powql)`
- * accepts only a string — so this pool materializes each positional `$N` into a
- * PowQL literal via {@link materializePowql} before handing the text to the
- * engine. One handle, single connection: transaction keywords (`begin`/`commit`/
+ * `Database`. On the addon's typed native wire (≥ 0.14, when
+ * `capabilities.nativeRaw` is set) this pool binds positional `$N` params via
+ * `queryWithParams` and decodes the typed cells, exactly like the networked
+ * transport. On an older addon (no `queryWithParams`) it falls back to the
+ * legacy string wire, which takes **no params array** (its `query(powql)`
+ * accepts only a string), so each positional `$N` is materialized into a PowQL
+ * literal via {@link materializePowql} before the text is handed to the engine.
+ * One handle, single connection: transaction keywords (`begin`/`commit`/
  * `rollback`) are issued serially as ordinary queries.
  */
 export class PowdbEmbeddedPool implements PgCompatPool {
@@ -1649,12 +1747,22 @@ export class PowdbEmbeddedPool implements PgCompatPool {
   private readonly poolHoldRef: { hold: PowdbTxHold | null } = { hold: null };
   /**
    * Feature capabilities of the embedded engine (resolved from the addon
-   * package version). `nativeRaw` is always false: the embedded addon exposes
-   * no native typed-wire surface (its rows are `string[][]`, the legacy wire).
+   * package version). `nativeRaw` is true when the addon is ≥ 0.14 and the
+   * opened handle exposes `queryWithParams` (the typed native wire); an older
+   * addon has no such method, so it stays false and the legacy string wire is
+   * used.
    */
   readonly capabilities: PowdbCapabilities;
   /** Carried for surface uniformity with {@link PowdbPool}; inert on embedded (no protocol_error frames). */
   readonly retryStaleReads: boolean;
+  /**
+   * True when this pool was opened read-only (an `{ embedded, readonly: true }`
+   * target, or a directly-constructed pool passed `readonly: true`). Read by
+   * {@link PowqlInterface}'s exec seam to fail writes fast with E018 before the
+   * wire; the engine's own refusal (mapped by {@link wrapPowdbError}) is the
+   * backstop for raw / injected paths.
+   */
+  readonly readonly: boolean;
 
   constructor(
     private readonly db: EmbeddedDatabase,
@@ -1663,10 +1771,24 @@ export class PowdbEmbeddedPool implements PgCompatPool {
     this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
     this.capabilities = options.capabilities ?? ALL_POWDB_CAPABILITIES;
     this.retryStaleReads = options.retryStaleReads ?? false;
+    this.readonly = options.readonly ?? false;
   }
 
-  /** Materialize `$N` params and hand the PowQL to the in-process engine. */
+  /** Run the PowQL on the in-process engine, choosing the native or legacy wire. */
   private exec(powql: string, params: unknown[]): PgCompatQueryResult {
+    // Native typed wire (addon ≥ 0.14): bind positional params with the SAME
+    // binder the networked transport uses ({@link toPowdbParam} yields exactly
+    // the NativeParam union null|bigint|number|boolean|string) and decode the
+    // typed cells: a genuine str "null" survives, a json-null document stays
+    // distinct from an absent value. Gated on the resolved capability AND a
+    // per-call feature-detect so a heterogeneous injected handle cannot crash.
+    if (this.capabilities.nativeRaw && typeof this.db.queryWithParams === 'function') {
+      const bound = params.map((v) => toPowdbParam(v));
+      return adaptNativeResult(this.db.queryWithParams(powql, bound));
+    }
+    // Legacy string wire (addon < 0.14): the engine takes no params array, so
+    // materialize each `$N` into a PowQL literal. Byte-for-byte unchanged, kept
+    // live and tested as the pre-0.14 fallback.
     const materialized = materializePowql(powql, params);
     return adaptResult(normalizeEmbeddedResult(this.db.query(materialized)));
   }
@@ -1767,13 +1889,15 @@ export class PowdbEmbeddedPool implements PgCompatPool {
 
   async end(): Promise<void> {
     if (this.closed) return;
-    // The addon exposes no explicit close — drop the reference and let GC /
-    // the engine's checkpoint flush. Marking the pool closed makes later
-    // queries fail with a typed ConnectionError instead of silently running
-    // against a handle the caller believes is gone. Caveat: durability is
-    // checkpoint-bound, so hold the process open long enough for the final
-    // WAL flush in short scripts.
     this.closed = true;
+    // Addon ≥ 0.14 exposes an explicit checkpoint-flushing close(): call it so
+    // the final WAL flush completes deterministically before the handle is
+    // dropped. An older addon has no close, dropping the reference and letting
+    // GC / the engine's checkpoint flush is the fallback (durability is then
+    // checkpoint-bound, so a short script must hold the process open long enough
+    // for the final flush). Marking the pool closed makes later queries fail
+    // with a typed ConnectionError instead of running against a gone handle.
+    this.db.close?.();
   }
 }
 
@@ -1832,12 +1956,32 @@ export interface TurbinePowdbOptions extends Pick<TurbineConfig, 'logging' | 'de
    */
   assumeEngineVersion?: string;
   /**
+   * Mark the client read-only: a write (or a transaction `begin`) fails fast
+   * locally with a {@link ReadOnlyError} (E018) before it reaches the wire,
+   * rather than round-tripping to the engine's refusal. Works on both
+   * transports (a networked pool bound to a read-only role, or an embedded
+   * handle). An `{ embedded, readonly: true }` target implies this. Default
+   * `false`.
+   *
+   * Ignored when you inject an already-constructed {@link PowdbPool} (it carries
+   * its own {@link PowdbPoolOptions}); set it on that pool's constructor instead.
+   */
+  readonly?: boolean;
+  /**
    * Driver-module injection for the networked target forms (URL / host+port):
    * bypasses the dynamic `import('@zvndev/powdb-client')` and uses this object
    * as the driver module instead. Intended for tests (a fake pool that counts
    * connections) and advanced embedding; everyday callers never set it.
    */
   powdbClientModule?: PowdbModule;
+  /**
+   * Driver-module injection for the **embedded** target form (`{ embedded }`):
+   * bypasses the dynamic `import('@zvndev/powdb-embedded')` and uses this object
+   * as the addon module instead. Intended for tests (a fake `Database` factory
+   * that records how the handle was opened) and advanced embedding; everyday
+   * callers never set it. The symmetric counterpart to {@link powdbClientModule}.
+   */
+  powdbEmbeddedModule?: EmbeddedModule;
 }
 
 /**
@@ -1864,6 +2008,16 @@ export interface TurbinePowdbEmbeddedTarget {
   syncMode?: 'full' | 'normal' | 'off';
   /** Per-query memory budget in bytes (requires `@zvndev/powdb-embedded` ≥ 0.7.1). */
   memoryLimit?: number;
+  /**
+   * Open the data directory read-only for snapshot serving (requires
+   * `@zvndev/powdb-embedded` ≥ 0.14: `openReadOnly` / `openReadOnlyWithMemoryLimit`).
+   * A write through a read-only handle is refused by the engine with
+   * `readonly mode: statement requires a writer …` (→ {@link ReadOnlyError}, E018),
+   * and Turbine additionally fails writes fast locally (this implies the pool's
+   * `readonly` flag). Meaningless together with `syncMode` (a read-only engine
+   * never writes), setting both throws a {@link ValidationError}.
+   */
+  readonly?: boolean;
 }
 
 /**
@@ -1935,12 +2089,39 @@ async function openEmbeddedPool(
   target: TurbinePowdbEmbeddedTarget,
   poolOptions: PowdbPoolOptions = {},
   assumeEngineVersion?: string,
+  injectedModule?: EmbeddedModule,
 ): Promise<PowdbEmbeddedPool> {
-  const mod = await loadPowdbEmbedded();
-  const { embedded: dir, syncMode, memoryLimit } = target;
+  const mod = injectedModule ?? (await loadPowdbEmbedded());
+  const { embedded: dir, syncMode, memoryLimit, readonly } = target;
+  // A read-only engine never writes, so a durability selector is meaningless
+  // there, reject the combination loudly rather than silently ignoring one.
+  if (readonly && syncMode !== undefined) {
+    throw new ValidationError(
+      '[turbine] embedded `syncMode` is meaningless with `readonly: true` (a read-only database never writes). Remove one.',
+    );
+  }
   let db: EmbeddedDatabase;
   try {
-    if (memoryLimit !== undefined) {
+    if (readonly) {
+      // Read-only snapshot serving (addon ≥ 0.14): route to the openReadOnly*
+      // constructors; feature-detect and fail with a clear version hint if the
+      // installed addon predates them.
+      if (memoryLimit !== undefined) {
+        if (typeof mod.Database.openReadOnlyWithMemoryLimit !== 'function') {
+          throw new ConnectionError(
+            '[turbine] embedded `readonly` + `memoryLimit` requires @zvndev/powdb-embedded >= 0.14 (openReadOnlyWithMemoryLimit).',
+          );
+        }
+        db = mod.Database.openReadOnlyWithMemoryLimit(dir, memoryLimit);
+      } else {
+        if (typeof mod.Database.openReadOnly !== 'function') {
+          throw new ConnectionError(
+            '[turbine] embedded `readonly: true` requires @zvndev/powdb-embedded >= 0.14 (the installed addon has no openReadOnly).',
+          );
+        }
+        db = mod.Database.openReadOnly(dir);
+      }
+    } else if (memoryLimit !== undefined) {
       if (typeof mod.Database.openWithMemoryLimit !== 'function') {
         throw new ConnectionError('[turbine] embedded `memoryLimit` requires @zvndev/powdb-embedded ≥ 0.7.1.');
       }
@@ -1960,11 +2141,19 @@ async function openEmbeddedPool(
     }
     db.setSyncMode(syncMode);
   }
-  // Embedded exposes no native typed-wire surface, so nativeRaw is always false.
+  // Native typed wire is feature-detected on the OPENED handle: an addon ≥ 0.14
+  // exposes `queryWithParams`, so nativeRaw turns on (server-gate ≥ 0.13 still
+  // applies via the version); an older addon has no such method → false.
   const capabilities = capabilitiesFromVersion(assumeEngineVersion ?? resolveEmbeddedVersion(), {
-    hasNativeRaw: false,
+    hasNativeRaw: typeof db.queryWithParams === 'function',
   });
-  return new PowdbEmbeddedPool(db, { ...poolOptions, capabilities });
+  // A read-only target forces the pool's readonly flag; otherwise honor whatever
+  // `poolOptions` (threaded from `options.readonly`) carried.
+  return new PowdbEmbeddedPool(db, {
+    ...poolOptions,
+    capabilities,
+    readonly: Boolean(readonly) || Boolean(poolOptions.readonly),
+  });
 }
 
 /**
@@ -1995,6 +2184,7 @@ export async function turbinePowDB(
   const poolOptions: PowdbPoolOptions = {
     transactionQueueTimeoutMs: options.transactionQueueTimeoutMs,
     retryStaleReads: options.retryStaleReads,
+    readonly: options.readonly,
   };
   const max = options.connectionLimit ?? 10;
 
@@ -2008,7 +2198,7 @@ export async function turbinePowDB(
     // An injected PowdbPool carries its own PowdbPoolOptions (incl. capabilities).
     pool = target;
   } else if (isEmbeddedTarget(target)) {
-    pool = await openEmbeddedPool(target, poolOptions, options.assumeEngineVersion);
+    pool = await openEmbeddedPool(target, poolOptions, options.assumeEngineVersion, options.powdbEmbeddedModule);
     owns = true;
   } else if (isPowdbClientPool(target)) {
     // Injected client pool: run the SAME probe as the URL / host+port paths so
