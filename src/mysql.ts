@@ -436,6 +436,9 @@ export const mysqlDialect: Dialect = {
   supportsLateralJoin: false,
   // GET_LOCK / RELEASE_LOCK exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
+  // MySQL 8.0.16+ renders a readable tree plan with `EXPLAIN FORMAT=TREE`
+  // (one text column), overriding the inherited Postgres `EXPLAIN`.
+  explainQuery: { prefix: 'EXPLAIN FORMAT=TREE' },
   // JSON_ARRAYAGG has no inline ORDER BY argument → force the inner-subquery
   // rewrite for every ordered to-many relation.
   aggSupportsInlineOrderBy: false,

@@ -335,6 +335,18 @@ export interface Dialect {
    */
   readonly supportsLateralJoin?: boolean;
 
+  /**
+   * How this dialect surfaces a query plan for a compiled SELECT. When present,
+   * `QueryInterface.explain()` prepends `prefix` (plus a single space) to the
+   * compiled findMany SQL and runs it as a read, returning the plan text lines.
+   * PostgreSQL / CockroachDB / YugabyteDB use `EXPLAIN`, SQLite
+   * `EXPLAIN QUERY PLAN`, MySQL `EXPLAIN FORMAT=TREE`. Absent means the engine
+   * cannot explain a compiled query in-band (SQL Server, whose SHOWPLAN needs a
+   * separate session toggle), so `QueryInterface.explain()` throws E017.
+   * Optional: dialects that predate this hook keep throwing E017.
+   */
+  readonly explainQuery?: { prefix: string };
+
   /** Build a dialect-specific RETURNING clause. Return an empty string when unsupported. */
   buildReturningClause(selection?: string): string;
 
@@ -563,6 +575,7 @@ export const postgresDialect: Dialect = {
   supportsRLS: true,
   supportsAdvisoryLock: true,
   supportsLateralJoin: true,
+  explainQuery: { prefix: 'EXPLAIN' },
 
   paramPlaceholder(index: number): string {
     return `$${index}`;

@@ -269,7 +269,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly warnOnUnlimited: boolean;
   private readonly utcTimestamps: boolean;
   private readonly preparedStatementsEnabled: boolean;
-  private readonly sqlCacheEnabled: boolean;
+  /**
+   * Whether the SQL template cache is active. Set once in the constructor.
+   * Mutable (not `readonly`) only so {@link withSqlCacheDisabled} can flip it
+   * off around a single synchronous compile (see {@link explain}).
+   */
+  private sqlCacheEnabled: boolean;
   private readonly dialect: Dialect;
   /** Client-level default relation-loading strategy ('join' unless configured). */
   private readonly relationLoadStrategy: RelationLoadStrategy;
@@ -1087,6 +1092,70 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
     }) as Promise<QueryResult<T, R, W, S, O>[]>;
+  }
+
+  /**
+   * Return the engine's query plan for a {@link findMany}-shaped query as plain
+   * text lines: a diagnostic surface for inspecting how the database will run a
+   * query (index usage, join strategy, scan type).
+   *
+   * The compiled SELECT is prefixed with the dialect's explain syntax
+   * (Postgres `EXPLAIN`, SQLite `EXPLAIN QUERY PLAN`, MySQL `EXPLAIN
+   * FORMAT=TREE`) and run as a read. The findMany args are compiled with the
+   * SQL template cache disabled, so an explain never reads or writes the shared
+   * cache. Middleware is NOT applied: the returned rows are plan text, not
+   * entity rows. Each result row is flattened to one line by joining its column
+   * values with a single space (Postgres returns one `QUERY PLAN` text column,
+   * SQLite's `EXPLAIN QUERY PLAN` returns four, MySQL's tree format one).
+   *
+   * Only `findMany` shapes are supported (where / orderBy / with / limit /
+   * pagination). Engines whose plan cannot be requested in-band from a compiled
+   * query (SQL Server, whose SHOWPLAN is a session toggle) throw
+   * {@link UnsupportedFeatureError} (E017).
+   *
+   * The plan text itself is engine-owned and NOT covered by semver: its content
+   * and formatting can change with the underlying database version.
+   */
+  async explain(args?: FindManyArgs<T, R>): Promise<string[]> {
+    const explainSyntax = this.dialect.explainQuery;
+    if (!explainSyntax) {
+      throw new UnsupportedFeatureError(
+        'explain()',
+        this.dialect.name,
+        'This engine cannot explain a compiled query in-band.',
+      );
+    }
+    // Compile the findMany SQL with the cache disabled: the prefixed EXPLAIN
+    // statement is a one-off diagnostic and must never read or write the shared
+    // query-template cache.
+    const deferred = this.withSqlCacheDisabled(() =>
+      this.buildFindMany(args as Parameters<QueryInterface<T, R>['buildFindMany']>[0]),
+    );
+    const sql = `${explainSyntax.prefix} ${deferred.sql}`;
+    this.currentAction = 'explain';
+    // No preparedName: keep the diagnostic statement out of the prepared path.
+    const result = await this.queryWithTimeout(sql, deferred.params, args?.timeout);
+    return result.rows.map((row) =>
+      Object.values(row)
+        .map((value) => (typeof value === 'string' ? value : String(value)))
+        .join(' '),
+    );
+  }
+
+  /**
+   * Run `fn` with the SQL template cache forced off, restoring the prior state
+   * afterward. Used by {@link explain}, whose one-off prefixed statement must
+   * neither read nor write the shared cache. `fn` is synchronous, so no query
+   * interleaves between the toggle and its restore.
+   */
+  private withSqlCacheDisabled<V>(fn: () => V): V {
+    const prev = this.sqlCacheEnabled;
+    this.sqlCacheEnabled = false;
+    try {
+      return fn();
+    } finally {
+      this.sqlCacheEnabled = prev;
+    }
   }
 
   /**
