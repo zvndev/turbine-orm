@@ -13,7 +13,9 @@ import { TurbineClient } from '../client.js';
 import {
   ConnectionError,
   NotNullViolationError,
+  ReadOnlyError,
   TimeoutError,
+  TurbineErrorCode,
   UniqueConstraintError,
   UnsupportedFeatureError,
   ValidationError,
@@ -420,6 +422,77 @@ describe('powdb: wrapPowdbError', () => {
     const wrapped = wrapPowdbError(raw) as NotNullViolationError;
     assert.equal((wrapped as { cause?: unknown }).cause, raw);
   });
+
+  it('maps a read-only refusal to ReadOnlyError (E018), both engine shapes, prefixed or not', () => {
+    // Embedded read-only handle (opened for snapshot serving): the engine text
+    // arrives GenericFailure with no prefix.
+    const snapshot = wrapPowdbError({
+      code: 'GenericFailure',
+      message: 'readonly mode: statement requires a writer (this database was opened read-only for snapshot serving)',
+    });
+    assert.ok(snapshot instanceof ReadOnlyError);
+    assert.equal(snapshot.code, TurbineErrorCode.READ_ONLY);
+    assert.match(snapshot.message, /Route writes to a writable primary/);
+
+    // Networked read-only role: the message is prefixed `query failed: `, the
+    // substring match must still classify it (not anchor on the start).
+    const role = wrapPowdbError({
+      code: 'query_failed',
+      message: `query failed: permission denied: role 'reader' cannot execute write statements`,
+    });
+    assert.ok(role instanceof ReadOnlyError);
+    assert.equal(role.code, TurbineErrorCode.READ_ONLY);
+
+    // The role form also covers schema-definition (DDL) refusals.
+    const ddl = wrapPowdbError({
+      code: 'query_failed',
+      message: `query failed: permission denied: role 'reader' cannot execute schema-definition statements`,
+    });
+    assert.ok(ddl instanceof ReadOnlyError);
+    // .cause is preserved for both shapes.
+    assert.equal((snapshot as { cause?: unknown }).cause !== undefined, true);
+  });
+
+  it('takes PRECEDENCE over the generic Execution/type-mismatch → E003 regex', () => {
+    // A read-only refusal wrapped in an Execution(...) envelope would otherwise
+    // match the generic ValidationError regex, the E018 checks run first.
+    const wrapped = wrapPowdbError({
+      code: 'GenericFailure',
+      message: `Execution("readonly mode: statement requires a writer")`,
+    });
+    assert.ok(wrapped instanceof ReadOnlyError, 'read-only wins over the E003 Execution match');
+    assert.ok(!(wrapped instanceof ValidationError));
+  });
+
+  it('maps the remaining 0.14 spec families (timeout / cancel / bounded join / read-only open)', () => {
+    // Per-query deadline → TimeoutError (message path, embedded has no .code).
+    assert.ok(
+      wrapPowdbError({ code: 'GenericFailure', message: 'query timeout after 5000ms' }) instanceof TimeoutError,
+    );
+    // Client-initiated cancellation → ConnectionError (final, never auto-retried).
+    assert.ok(
+      wrapPowdbError({ code: 'aborted', message: 'query cancelled by client disconnect' }) instanceof ConnectionError,
+    );
+    // Bounded join rejection → ValidationError, fix-hint preserved verbatim.
+    const join = wrapPowdbError({
+      code: 'query_failed',
+      message:
+        'query failed: nested-loop join would evaluate 4000000 candidate pairs, above the 1000000 pair limit; add an equi-key to ON',
+    });
+    assert.ok(join instanceof ValidationError);
+    assert.match(join.message, /add an equi-key to ON/);
+    assert.ok(
+      wrapPowdbError({ code: 'query_failed', message: 'query failed: join result exceeds row limit' }) instanceof
+        ValidationError,
+    );
+    // Open-time read-only failure (non-empty WAL) → ConnectionError, recover hint.
+    const wal = wrapPowdbError({
+      code: 'GenericFailure',
+      message: 'cannot open read-only: the WAL is not empty; recover the directory first',
+    });
+    assert.ok(wal instanceof ConnectionError);
+    assert.match(wal.message, /flush the WAL/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -804,6 +877,254 @@ describe('powdb: PowdbEmbeddedPool param materialization', () => {
     await client.query('commit');
     client.release();
     assert.deepEqual(seen, ['begin', 'insert app_user { id := "x" }', 'commit']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1: embedded native typed transport (addon >= 0.14)
+// ---------------------------------------------------------------------------
+
+/**
+ * A fake embedded Database exposing BOTH wires: `queryWithParams` (native typed
+ * wire, records the untouched PowQL + the bound params) and `query` (legacy
+ * string wire, records the materialized text). Which one a {@link
+ * PowdbEmbeddedPool} calls is decided by `capabilities.nativeRaw` + the per-call
+ * feature-detect, so the recorded arrays prove the routing.
+ */
+function fakeNativeDb() {
+  const nativeSeen: { powql: string; params: unknown[] }[] = [];
+  const legacySeen: string[] = [];
+  const db = {
+    query(powql: string) {
+      legacySeen.push(powql);
+      return { kind: 'ok', affected: 1n };
+    },
+    querySql: (sql: string) => ({ kind: 'message', message: sql }),
+    queryReadonly: (powql: string) => ({ kind: 'message', message: powql }),
+    isPoisoned: () => false,
+    queryWithParams(powql: string, params: unknown[]) {
+      nativeSeen.push({ powql, params });
+      // A str "null" cell to prove the native decode keeps it a string (no
+      // legacy collapse) at the pool layer.
+      return {
+        kind: 'rows',
+        columns: ['id', 's'],
+        rows: [
+          [
+            { type: 'str', value: 'u1' },
+            { type: 'str', value: 'null' },
+          ],
+        ],
+      };
+    },
+    close() {},
+  };
+  return { db, nativeSeen, legacySeen };
+}
+
+describe('powdb: PowdbEmbeddedPool native typed transport (F1)', () => {
+  it('routes to queryWithParams (params NOT materialized) when nativeRaw + queryWithParams present', async () => {
+    const { db, nativeSeen, legacySeen } = fakeNativeDb();
+    const pool = new PowdbEmbeddedPool(db as never, {
+      capabilities: capabilitiesFromVersion('0.14.0', { hasNativeRaw: true }),
+    });
+    const res = await pool.query('app_user filter .id = $1 { .id, .s }', ['u1']);
+    // Native path chosen: legacy string wire untouched.
+    assert.equal(legacySeen.length, 0);
+    assert.equal(nativeSeen.length, 1);
+    // The `$1` placeholder is NOT materialized into the text, it goes as a bound param.
+    assert.equal(nativeSeen[0]!.powql, 'app_user filter .id = $1 { .id, .s }');
+    assert.deepEqual(nativeSeen[0]!.params, ['u1']);
+    // Native decode keeps a genuine str "null" as the string "null" (no collapse).
+    assert.deepEqual(res.rows, [{ id: 'u1', s: 'null' }]);
+    assert.equal((res as { native?: boolean }).native, true);
+  });
+
+  it('falls back to the legacy materialized wire when nativeRaw is OFF (older server gate)', async () => {
+    const { db, nativeSeen, legacySeen } = fakeNativeDb();
+    // 0.13 without hasNativeRaw → nativeRaw false, even though the handle exposes queryWithParams.
+    const pool = new PowdbEmbeddedPool(db as never, { capabilities: capabilitiesFromVersion('0.13.0') });
+    await pool.query('insert app_user { id := $1 } returning', ['u1']);
+    assert.equal(nativeSeen.length, 0);
+    assert.deepEqual(legacySeen, ['insert app_user { id := "u1" } returning']);
+  });
+
+  it('falls back to the legacy wire when the handle lacks queryWithParams (per-call feature-detect)', async () => {
+    // nativeRaw is ON in caps, but the fake db (from fakeEmbeddedDb) has no
+    // queryWithParams, the defensive per-call detect must keep it on legacy.
+    const { pool, seen } = fakeEmbeddedDb(
+      { kind: 'ok', affected: 1n },
+      { capabilities: capabilitiesFromVersion('0.14.0', { hasNativeRaw: true }) },
+    );
+    await pool.query('insert app_user { id := $1 }', ['u1']);
+    assert.deepEqual(seen, ['insert app_user { id := "u1" }']);
+  });
+
+  it('binds params via toPowdbParam, every bound value is in the NativeParam union (null|bigint|number|boolean|string)', async () => {
+    const { db, nativeSeen } = fakeNativeDb();
+    const pool = new PowdbEmbeddedPool(db as never, {
+      capabilities: capabilitiesFromVersion('0.14.0', { hasNativeRaw: true }),
+    });
+    const when = new Date(1_700_000_000_000);
+    await pool.query('insert t { a := $1, b := $2, c := $3, d := $4, e := $5, f := $6, g := $7 } returning', [
+      when,
+      new PowdbFloatParam(42),
+      new PowdbJsonParam({ a: 1 }),
+      7n,
+      true,
+      'x',
+      null,
+    ]);
+    const bound = nativeSeen[0]!.params;
+    for (const p of bound) {
+      const t = typeof p;
+      assert.ok(
+        p === null || t === 'bigint' || t === 'number' || t === 'boolean' || t === 'string',
+        `bound param ${String(p)} (${t}) is not assignable to the NativeParam union`,
+      );
+    }
+    // Spot-check the coercions the binder applies.
+    assert.equal(bound[0], BigInt(when.getTime()) * 1000n); // Date → epoch micros bigint
+    assert.equal(bound[1], 42); // PowdbFloatParam → plain number
+    assert.equal(bound[2], JSON.stringify({ a: 1 })); // PowdbJsonParam → canonical JSON text
+    assert.equal(bound[3], 7n);
+    assert.equal(bound[4], true);
+    assert.equal(bound[5], 'x');
+    assert.equal(bound[6], null);
+  });
+
+  it('end() calls the addon close() (0.14 checkpoint flush) when present', async () => {
+    let closed = 0;
+    const { db } = fakeNativeDb();
+    (db as unknown as { close: () => void }).close = () => {
+      closed += 1;
+    };
+    const pool = new PowdbEmbeddedPool(db as never, {
+      capabilities: capabilitiesFromVersion('0.14.0', { hasNativeRaw: true }),
+    });
+    await pool.end();
+    assert.equal(closed, 1);
+    // Idempotent: a second end() does not double-close.
+    await pool.end();
+    assert.equal(closed, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3: read-only awareness: pool flag + embedded readonly target routing
+// ---------------------------------------------------------------------------
+
+/**
+ * A fake embedded MODULE recording how each handle was opened (open /
+ * openWithMemoryLimit / openReadOnly / openReadOnlyWithMemoryLimit). Injected
+ * into `turbinePowDB` via `powdbEmbeddedModule`, so `openEmbeddedPool`'s routing
+ * is unit-testable without the real napi addon.
+ */
+function fakeEmbeddedModule(calls: unknown[][], opts: { withReadOnly?: boolean } = {}) {
+  const db = {
+    query: () => ({ kind: 'ok', affected: 0n }),
+    querySql: () => ({ kind: 'message', message: '' }),
+    queryReadonly: () => ({ kind: 'message', message: '' }),
+    isPoisoned: () => false,
+    queryWithParams: () => ({ kind: 'ok', affected: 0n }),
+    setSyncMode: () => {},
+    close: () => {},
+  };
+  const withReadOnly = opts.withReadOnly ?? true;
+  const Database: Record<string, unknown> = {
+    open: (dir: string) => {
+      calls.push(['open', dir]);
+      return db;
+    },
+    openWithMemoryLimit: (dir: string, n: number) => {
+      calls.push(['openWithMemoryLimit', dir, n]);
+      return db;
+    },
+  };
+  if (withReadOnly) {
+    Database.openReadOnly = (dir: string) => {
+      calls.push(['openReadOnly', dir]);
+      return db;
+    };
+    Database.openReadOnlyWithMemoryLimit = (dir: string, n: number) => {
+      calls.push(['openReadOnlyWithMemoryLimit', dir, n]);
+      return db;
+    };
+  }
+  return { Database };
+}
+
+describe('powdb: readonly awareness (F3)', () => {
+  it('ReadOnlyError carries code E018 and the routing hint', () => {
+    const e = new ReadOnlyError('PowDB refused a write on a read-only database.');
+    assert.equal(e.code, TurbineErrorCode.READ_ONLY);
+    assert.equal(e.code, 'TURBINE_E018');
+    assert.equal(e.name, 'ReadOnlyError');
+    assert.match(e.message, /Route writes to a writable primary/);
+  });
+
+  it('a directly-constructed pool defaults readonly to false; the option flips it', () => {
+    assert.equal(new PowdbEmbeddedPool({} as never).readonly, false);
+    assert.equal(new PowdbEmbeddedPool({} as never, { readonly: true }).readonly, true);
+    assert.equal(new PowdbPool({} as never).readonly, false);
+    assert.equal(new PowdbPool({} as never, undefined, { readonly: true }).readonly, true);
+  });
+
+  it('embedded `readonly: true` routes to openReadOnly and forces the pool flag', async () => {
+    const calls: unknown[][] = [];
+    const db = await turbinePowDB({ embedded: '/tmp/snap', readonly: true }, schema, {
+      powdbEmbeddedModule: fakeEmbeddedModule(calls) as never,
+      assumeEngineVersion: '0.14.0',
+      warnOnUnlimited: false,
+    });
+    assert.deepEqual(calls, [['openReadOnly', '/tmp/snap']]);
+    await db.disconnect();
+  });
+
+  it('embedded `readonly` + `memoryLimit` routes to openReadOnlyWithMemoryLimit', async () => {
+    const calls: unknown[][] = [];
+    const db = await turbinePowDB({ embedded: '/tmp/snap', readonly: true, memoryLimit: 4096 }, schema, {
+      powdbEmbeddedModule: fakeEmbeddedModule(calls) as never,
+      assumeEngineVersion: '0.14.0',
+      warnOnUnlimited: false,
+    });
+    assert.deepEqual(calls, [['openReadOnlyWithMemoryLimit', '/tmp/snap', 4096]]);
+    await db.disconnect();
+  });
+
+  it('rejects readonly + syncMode with a ValidationError (a read-only engine never writes)', async () => {
+    await assert.rejects(
+      () =>
+        turbinePowDB({ embedded: '/tmp/snap', readonly: true, syncMode: 'normal' }, schema, {
+          powdbEmbeddedModule: fakeEmbeddedModule([]) as never,
+          assumeEngineVersion: '0.14.0',
+          warnOnUnlimited: false,
+        }),
+      ValidationError,
+    );
+  });
+
+  it('readonly on an addon WITHOUT openReadOnly throws a ConnectionError naming >= 0.14', async () => {
+    await assert.rejects(
+      () =>
+        turbinePowDB({ embedded: '/tmp/snap', readonly: true }, schema, {
+          powdbEmbeddedModule: fakeEmbeddedModule([], { withReadOnly: false }) as never,
+          assumeEngineVersion: '0.13.0',
+          warnOnUnlimited: false,
+        }),
+      (err: Error) => err instanceof ConnectionError && />= 0\.14/.test(err.message),
+    );
+  });
+
+  it('a non-readonly embedded target still routes to plain open (regression guard)', async () => {
+    const calls: unknown[][] = [];
+    const db = await turbinePowDB({ embedded: '/tmp/rw' }, schema, {
+      powdbEmbeddedModule: fakeEmbeddedModule(calls) as never,
+      assumeEngineVersion: '0.14.0',
+      warnOnUnlimited: false,
+    });
+    assert.deepEqual(calls, [['open', '/tmp/rw']]);
+    await db.disconnect();
   });
 });
 
@@ -1765,6 +2086,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       introspection: false,
       jsonDocs: false,
       docFieldIndexes: false,
+      serverJoins: false,
       nativeRaw: false,
     });
     // 0.10: introspection only.
@@ -1782,6 +2104,22 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
     assert.equal(capabilitiesFromVersion('0.12.9', { hasNativeRaw: true }).nativeRaw, false);
   });
 
+  it('gates serverJoins at >= 0.13 (0.12 false, 0.13 true)', () => {
+    // Server-side joins are hash-accelerated and bounded since 0.13.
+    assert.equal(capabilitiesFromVersion('0.12.9').serverJoins, false);
+    assert.equal(capabilitiesFromVersion('0.13.0').serverJoins, true);
+    assert.equal(capabilitiesFromVersion('0.14.2').serverJoins, true);
+    assert.equal(capabilitiesFromVersion('1.0.0').serverJoins, true);
+    // Unknown / non-semver version turns it off, like every other feature gate.
+    assert.equal(capabilitiesFromVersion('preview-build').serverJoins, false);
+    assert.equal(capabilitiesFromVersion(null).serverJoins, false);
+    // The E017 hint for a missing serverJoins names the 0.13 floor.
+    assert.throws(
+      () => requireCapability(capabilitiesFromVersion('0.12.0'), 'serverJoins', 'server-side joins'),
+      /server-side joins requires PowDB >= 0\.13/,
+    );
+  });
+
   it('turns every gate OFF for an unknown / non-semver version', () => {
     const caps = capabilitiesFromVersion('preview-build');
     assert.deepEqual(caps, {
@@ -1789,6 +2127,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       introspection: false,
       jsonDocs: false,
       docFieldIndexes: false,
+      serverJoins: false,
       nativeRaw: false,
     });
     assert.equal(capabilitiesFromVersion(null).engineVersion, null);
@@ -1831,6 +2170,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       jsonDocs: true,
       docFieldIndexes: true,
       introspection: true,
+      serverJoins: true,
       nativeRaw: false,
     });
     // A directly-constructed pool defaults to it.

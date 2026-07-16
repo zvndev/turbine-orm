@@ -87,6 +87,7 @@ export {
   OptimisticLockError,
   PipelineError,
   type PipelineResultSlot,
+  ReadOnlyError,
   RelationError,
   SerializationFailureError,
   setErrorMessageMode,

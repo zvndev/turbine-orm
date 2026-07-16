@@ -24,6 +24,7 @@ export const TurbineErrorCode = {
   OPTIMISTIC_LOCK: 'TURBINE_E015',
   EXCLUSION_VIOLATION: 'TURBINE_E016',
   UNSUPPORTED_FEATURE: 'TURBINE_E017',
+  READ_ONLY: 'TURBINE_E018',
 } as const;
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
@@ -603,6 +604,33 @@ export class UnsupportedFeatureError extends TurbineError {
     this.name = 'UnsupportedFeatureError';
     this.feature = feature;
     this.dialect = dialect;
+  }
+}
+
+/**
+ * Thrown when a write or DDL statement is refused because the target is
+ * read-only. Two shapes reach here, both on PowDB:
+ *   - an embedded database opened read-only for snapshot serving refuses a write
+ *     with `readonly mode: statement requires a writer …`;
+ *   - a networked read-only role refuses a write with `permission denied: role
+ *     '<role>' cannot execute write statements` (translated by `wrapPowdbError`).
+ * It is also raised locally, before the wire, when a write is issued on a pool
+ * the caller marked read-only (fail-fast). The message carries the engine text
+ * plus a hint to route writes to a writable primary.
+ *
+ * NOT retryable: the same write against the same read-only target fails
+ * identically; route it to a writable primary instead.
+ */
+export class ReadOnlyError extends TurbineError {
+  /**
+   * @param detail human-readable description of the refused write (the engine
+   *   message, or a local fail-fast description). A "route writes to a writable
+   *   primary" hint is always appended.
+   * @param options optional driver `cause` to preserve when wrapping a refusal.
+   */
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super(TurbineErrorCode.READ_ONLY, `[turbine] ${detail} Route writes to a writable primary.`, options);
+    this.name = 'ReadOnlyError';
   }
 }
 
