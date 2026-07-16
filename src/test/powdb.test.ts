@@ -433,6 +433,9 @@ describe('powdb: wrapPowdbError', () => {
     assert.ok(snapshot instanceof ReadOnlyError);
     assert.equal(snapshot.code, TurbineErrorCode.READ_ONLY);
     assert.match(snapshot.message, /Route writes to a writable primary/);
+    // The 0.15 driver spec distinguishes the two families: snapshot mode means
+    // nothing can write here, RBAC means this connection's role may not.
+    assert.equal(snapshot.reason, 'snapshot');
 
     // Networked read-only role: the message is prefixed `query failed: `, the
     // substring match must still classify it (not anchor on the start).
@@ -442,6 +445,7 @@ describe('powdb: wrapPowdbError', () => {
     });
     assert.ok(role instanceof ReadOnlyError);
     assert.equal(role.code, TurbineErrorCode.READ_ONLY);
+    assert.equal(role.reason, 'rbac');
 
     // The role form also covers schema-definition (DDL) refusals.
     const ddl = wrapPowdbError({

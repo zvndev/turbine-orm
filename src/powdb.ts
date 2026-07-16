@@ -888,11 +888,17 @@ export function wrapPowdbError(err: unknown): Error {
   // networked read-only role (`permission denied: role '<role>' cannot execute
   // write statements`). These run BEFORE the generic validation regex below so a
   // read-only write is surfaced as the routing signal E018, not a query defect.
+  // The driver spec (0.15) distinguishes them via `reason`: snapshot mode
+  // means "nothing can write here; route writes to the primary", RBAC means
+  // "this connection's role may not write here".
   if (/readonly mode: statement requires a writer/i.test(msg)) {
-    return new ReadOnlyError(`PowDB refused a write on a read-only database: ${msg}.`, { cause: err });
+    return new ReadOnlyError(`PowDB refused a write on a read-only database: ${msg}.`, {
+      cause: err,
+      reason: 'snapshot',
+    });
   }
   if (/permission denied: role/i.test(msg)) {
-    return new ReadOnlyError(`PowDB refused a write for a read-only role: ${msg}.`, { cause: err });
+    return new ReadOnlyError(`PowDB refused a write for a read-only role: ${msg}.`, { cause: err, reason: 'rbac' });
   }
   // Open-time read-only failure: a read-only handle over a directory whose WAL
   // still has uncommitted frames is refused (`cannot open read-only: the WAL is

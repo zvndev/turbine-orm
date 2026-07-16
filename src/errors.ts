@@ -623,14 +623,27 @@ export class UnsupportedFeatureError extends TurbineError {
  */
 export class ReadOnlyError extends TurbineError {
   /**
+   * Why the write was refused. `'snapshot'`: the database itself is read-only
+   * (snapshot serving, an embedded `readonly: true` open, or the client-level
+   * fail-fast flag), so NOTHING can write here and writes must route to the
+   * primary. `'rbac'`: the database is writable but THIS connection's role may
+   * not write (per-connection permission), so re-authenticating may suffice.
+   */
+  readonly reason: 'snapshot' | 'rbac';
+
+  /**
    * @param detail human-readable description of the refused write (the engine
    *   message, or a local fail-fast description). A "route writes to a writable
    *   primary" hint is always appended.
-   * @param options optional driver `cause` to preserve when wrapping a refusal.
+   * @param options optional driver `cause` to preserve when wrapping a refusal,
+   *   and the refusal `reason` (default `'snapshot'`).
    */
-  constructor(detail: string, options?: { cause?: unknown }) {
-    super(TurbineErrorCode.READ_ONLY, `[turbine] ${detail} Route writes to a writable primary.`, options);
+  constructor(detail: string, options?: { cause?: unknown; reason?: 'snapshot' | 'rbac' }) {
+    super(TurbineErrorCode.READ_ONLY, `[turbine] ${detail} Route writes to a writable primary.`, {
+      cause: options?.cause,
+    });
     this.name = 'ReadOnlyError';
+    this.reason = options?.reason ?? 'snapshot';
   }
 }
 
