@@ -24,6 +24,7 @@ export const TurbineErrorCode = {
   OPTIMISTIC_LOCK: 'TURBINE_E015',
   EXCLUSION_VIOLATION: 'TURBINE_E016',
   UNSUPPORTED_FEATURE: 'TURBINE_E017',
+  READ_ONLY: 'TURBINE_E018',
 } as const;
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
@@ -603,6 +604,19 @@ export class UnsupportedFeatureError extends TurbineError {
     this.name = 'UnsupportedFeatureError';
     this.feature = feature;
     this.dialect = dialect;
+  }
+}
+
+/**
+ * Thrown when a write (or a transaction-control `begin`) is attempted on a
+ * connection that is read-only — a PowDB pool opened read-only, or a read-only
+ * server role. The message carries the refused operation and hints that writes
+ * should be routed to a writable primary. Never retryable.
+ */
+export class ReadOnlyError extends TurbineError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(TurbineErrorCode.READ_ONLY, message, options);
+    this.name = 'ReadOnlyError';
   }
 }
 

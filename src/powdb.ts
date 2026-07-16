@@ -313,16 +313,19 @@ export interface PowdbCapabilities {
   introspection: boolean;
   /** Networked only: server ≥ 0.13 AND the client exposes `queryNativeRaw`. */
   nativeRaw: boolean;
+  /** ≥ 0.13: native PowQL joins (`A as a join B as b on …`) for relation loading. */
+  serverJoins: boolean;
 }
 
 /** The feature-gate capability keys (everything except the version/nativeRaw metadata). */
-type PowdbFeatureKey = 'jsonDocs' | 'docFieldIndexes' | 'introspection';
+type PowdbFeatureKey = 'jsonDocs' | 'docFieldIndexes' | 'introspection' | 'serverJoins';
 
 /** Minimum engine version each gated feature needs, for the E017 hint text. */
 const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
   introspection: '0.10',
   jsonDocs: '0.12',
   docFieldIndexes: '0.13',
+  serverJoins: '0.13',
 };
 
 /**
@@ -339,6 +342,7 @@ export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   docFieldIndexes: true,
   introspection: true,
   nativeRaw: false,
+  serverJoins: true,
 };
 
 /** Parse a PowDB semver prefix (`0.13.0`, `0.13`, `1.2.3-rc`) into components, or `null`. */
@@ -371,6 +375,7 @@ export function capabilitiesFromVersion(
       docFieldIndexes: false,
       introspection: false,
       nativeRaw: false,
+      serverJoins: false,
     };
   }
   return {
@@ -379,6 +384,7 @@ export function capabilitiesFromVersion(
     jsonDocs: atLeastVersion(sem, 0, 12),
     docFieldIndexes: atLeastVersion(sem, 0, 13),
     nativeRaw: Boolean(opts.hasNativeRaw) && atLeastVersion(sem, 0, 13),
+    serverJoins: atLeastVersion(sem, 0, 13),
   };
 }
 
@@ -1177,6 +1183,12 @@ export interface PowdbPoolOptions {
    * Default `false` (typed-error-only).
    */
   retryStaleReads?: boolean;
+  /**
+   * Marks this pool as read-only: {@link PowqlInterface}'s exec seam refuses
+   * write actions (and a transaction-control `begin`) locally with a
+   * {@link ReadOnlyError} (E018) before hitting the wire. Default `false`.
+   */
+  readonly?: boolean;
 }
 
 /**
@@ -1307,6 +1319,8 @@ export class PowdbPool implements PgCompatPool {
   readonly capabilities: PowdbCapabilities;
   /** Opt-in first-statement-read replay on a stale wire frame (read by {@link PowqlInterface}). */
   readonly retryStaleReads: boolean;
+  /** Read-only pool: writes/`begin` throw {@link ReadOnlyError} in {@link PowqlInterface} before the wire. */
+  readonly readonly: boolean;
 
   constructor(
     readonly pool: PowdbClientPool,
@@ -1316,6 +1330,7 @@ export class PowdbPool implements PgCompatPool {
     this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
     this.capabilities = options.capabilities ?? ALL_POWDB_CAPABILITIES;
     this.retryStaleReads = options.retryStaleReads ?? false;
+    this.readonly = options.readonly ?? false;
   }
 
   /**
@@ -1655,6 +1670,8 @@ export class PowdbEmbeddedPool implements PgCompatPool {
   readonly capabilities: PowdbCapabilities;
   /** Carried for surface uniformity with {@link PowdbPool}; inert on embedded (no protocol_error frames). */
   readonly retryStaleReads: boolean;
+  /** Read-only pool: writes/`begin` throw {@link ReadOnlyError} in {@link PowqlInterface} before the wire. */
+  readonly readonly: boolean;
 
   constructor(
     private readonly db: EmbeddedDatabase,
@@ -1663,6 +1680,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
     this.txGate = new PowdbTxGate(options.transactionQueueTimeoutMs ?? DEFAULT_TX_QUEUE_TIMEOUT_MS);
     this.capabilities = options.capabilities ?? ALL_POWDB_CAPABILITIES;
     this.retryStaleReads = options.retryStaleReads ?? false;
+    this.readonly = options.readonly ?? false;
   }
 
   /** Materialize `$N` params and hand the PowQL to the in-process engine. */
