@@ -762,6 +762,22 @@ const activeUsers = (where: WhereClause<User> = {}) =>
 const rows = await activeUsers({ orgId: 1 });
 ```
 
+## explain
+
+Every table accessor has `explain(args)` (since v0.35): it compiles the exact statement `findMany(args)` would run, executes it through the engine's plan explainer, and returns the plan as `string[]` lines. Use it to verify that the query the ORM actually emits hits the index you expect — no dropping to raw needed.
+
+```ts
+const plan = await db.posts.explain({
+  where: { orgId: 7, isPublished: true },
+  orderBy: { createdAt: 'desc' },
+});
+// PostgreSQL: ['Sort  (cost=…)', '  ->  Index Scan using posts_org_id_idx on posts …', …]
+```
+
+Engine mapping: PostgreSQL (and CockroachDB / YugabyteDB) use `EXPLAIN`, SQLite uses `EXPLAIN QUERY PLAN`, MySQL uses `EXPLAIN`, and PowDB uses its native `explain` (which since PowDB 0.14 shows the lowered, executed plan, with selectivity estimates on 0.15+). SQL Server has no in-band explain and throws a typed `UnsupportedFeatureError` (`TURBINE_E017`).
+
+Two caveats: plan **text** is engine-owned diagnostic output — match on node names if you must parse it, never on exact layout — and middleware does not run for `explain` (the rows are plan text, not entities).
+
 ## Raw SQL
 
 When you need something the query builder doesn't expose (window functions, `WITH RECURSIVE`, lateral joins, etc.):

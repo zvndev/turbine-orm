@@ -155,6 +155,7 @@ export {
   type QueryResult,
   type RelationDescriptor,
   type RelationFilter,
+  type RelationLoadStrategy,
   type RelationPickBy,
   type RelationPickOrderBy,
   type SelectResult,

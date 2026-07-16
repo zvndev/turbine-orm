@@ -64,6 +64,12 @@ const fresh = await db.$primary().orders.findUnique({ where: { id: created.id } 
 
 > **Note:** Turbine does not detect lag or "wait for" a replica to catch up. Route reads that must observe a recent write through `$primary()` (or run them inside the same `$transaction` as the write).
 
+## PowDB: snapshot serving as the replica
+
+The `replicas` config above is Postgres-only, but PowDB (≥ 0.14) has its own replica shape: **read-only snapshot serving**. A restored backup or checkpointed copy of the data directory is served strictly read-only — `powdb-server --readonly`, or in-process via `turbinePowDB({ embedded: dir, readonly: true }, schema)` — with any number of concurrent readers.
+
+The routing is manual but the errors do the work: any write against the snapshot throws a typed `ReadOnlyError` (`TURBINE_E018`) with `reason: 'snapshot'`, so applications can catch it and route the write to the primary. Passing `readonly: true` on the Turbine client makes the refusal local and immediate (no round-trip). Freshness is your snapshot cadence — this is snapshot serving, not streaming replication, so treat it like a cache tier that updates on your backup schedule. See [PowDB read-only snapshots](/engines#read-only-snapshots-and-replicas-powdb--014) and [`ReadOnlyError`](/errors#read-only-refusals).
+
 ## Interaction with global filters
 
 Read routing is orthogonal to [global filters](/global-filters). A filtered read routed to a replica carries the same compiled `WHERE` it would on the primary — soft-delete and tenancy filters apply identically wherever the query runs.

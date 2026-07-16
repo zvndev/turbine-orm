@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.35.0 (2026-07-16)
+
+PowDB 0.14/0.15 adoption: the embedded transport joins the native typed wire,
+relation loading can compile to native server-side joins, read-only snapshot
+serving is a first-class deployment mode with a typed routing error, and every
+engine gains `explain()`. Adversarially reviewed pre-release (19 findings
+confirmed and fixed, including three high-severity ones and two pre-existing
+loader bugs the new parity testing exposed).
+
+### Added
+
+- **Native PowQL joins for relation loading (PowDB >= 0.13).** Passing
+  `relationLoadStrategy: 'join'` (per query, or client-wide via the new
+  `TurbinePowdbOptions.relationLoadStrategy`) compiles eligible top-level
+  relations - hasMany, hasOne, belongsTo, and many-to-many through the
+  junction - to hash-accelerated server-side joins instead of keyed batch
+  lookups: no key lists, no 1,000-key chunking. Eligibility requires no parent
+  `limit`/`offset` and a unique (or primary-key) correlation column;
+  ineligible relations silently use the batched loaders, so results are
+  identical either way. PowDB's default remains the batched loaders.
+- **Embedded native typed transport (PowDB addon >= 0.14).** Embedded queries
+  now run through the engine's parameterized `queryWithParams` API: real
+  positional `$N` binding (token-level, injection-inert) and the same lossless
+  typed result cells as the networked wire, decoded by one shared path. A JSON
+  `null`, a missing field, and the string `"null"` are now distinguishable on
+  the embedded transport too. Older addons keep the literal-materialization
+  path unchanged. Embedded `disconnect()` now performs a real checkpoint-flush
+  `close()` on addon >= 0.14.
+- **Read-only snapshot serving (PowDB >= 0.14).** Open an embedded snapshot
+  with `turbinePowDB({ embedded: dir, readonly: true }, schema)`, or point at
+  a `powdb-server --readonly`. A new `ReadOnlyError` (`TURBINE_E018`) is the
+  routing signal: `reason: 'snapshot'` means nothing can write there (route
+  writes to the primary), `reason: 'rbac'` means this connection's role may
+  not write. A client-level `readonly: true` option fails writes fast locally,
+  before the wire, on both transports.
+- **`explain()` on every table accessor.** `db.posts.explain(args)` compiles
+  the exact statement `findMany(args)` would run and returns the engine's plan
+  as text lines: `EXPLAIN` on PostgreSQL/CockroachDB/YugabyteDB and MySQL,
+  `EXPLAIN QUERY PLAN` on SQLite, native `explain` on PowDB (lowered executed
+  plans since PowDB 0.14, selectivity estimates since 0.15). SQL Server throws
+  a typed E017. Plan text is diagnostic output, not a stable API, and
+  middleware does not run for it.
+- **Driver-spec error taxonomy.** PowDB error mapping now covers the full
+  quasi-stable family list from the upstream driver spec: query timeouts keep
+  the engine's message, client-disconnect cancellations map to
+  `ConnectionError`, bounded-join rejections map to `ValidationError` with the
+  engine's fix hint, and `database is closed` maps to `ConnectionError`.
+
+### Fixed
+
+- Two pre-existing PowDB relation-loader bugs, exposed by the new
+  join-vs-loader parity testing: a relation correlated on a datetime column
+  silently stitched to empty (Date object identity was used as a map key), and
+  a relation `select` that omitted the foreign key returned `[]` (the
+  correlation column is now fetched internally and stripped from the output).
+- `$transaction` on PowDB now carries the pool's `readonly` flag and
+  capability set into the transaction scope; previously the read-only
+  fail-fast guard and version gates did not apply inside transactions.
+- An embedded PowDB transaction queued behind the single-writer gate when
+  `disconnect()` ran no longer executes against the closed handle; it fails
+  with a typed `ConnectionError`.
+
+### Changed
+
+- Dev/test matrix pinned to PowDB 0.15 (client, embedded addon, server). 0.15
+  itself required no driver-surface changes: its per-index statistics and
+  cardinality-aware conjunction planning benefit Turbine-generated queries,
+  including the new native joins, with no code change.
+- The upstream PowDB driver spec (`docs/integrations/powql-for-drivers.md` in
+  the PowDB repository) is now the contract the driver is built against.
+
 ## 0.34.0 (2026-07-15)
 
 PowDB engine parity with PowDB 0.12/0.13: the JSON document API, the lossless

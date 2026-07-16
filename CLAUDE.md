@@ -231,7 +231,31 @@ src/
                       action is threaded per-call so a concurrent op can never turn a WRITE into a replayed
                       insert. **Error reclassification:** `protocol_error` (and the "received unexpected
                       frame" idle-socket shape) now maps to `ConnectionError` E004 (was E003), `.cause`
-                      preserved. See
+                      preserved. **0.14/0.15 round (v0.35):** the upstream driver spec
+                      (`docs/integrations/powql-for-drivers.md` in the PowDB repo) is the CONTRACT — spec
+                      gaps get filed upstream, never reverse-engineered around. Embedded joins the native
+                      typed wire: on addon ≥0.14 `PowdbEmbeddedPool.exec` routes `queryWithParams` (real
+                      $N binding + the same tagged WireValue decode as networked; `materializePowql`
+                      literal-encoding stays as the <0.14 fallback), `nativeRaw` is feature-detected on the
+                      opened handle, and `end()` does a real checkpoint-flush `close()`. **Native relation
+                      joins** (`serverJoins` capability ≥0.13): explicit `relationLoadStrategy: 'join'`
+                      (per-query or TurbinePowdbOptions) compiles eligible top-level relations to INNER
+                      PowQL joins (`Child as c join Parent as p on … { __tpk: p.pk, c.cols }`) with the
+                      parent where re-emitted alias-qualified; eligibility = no parent limit/offset +
+                      unique/PK correlation column + top-level, else silent loader fallback; PowDB's
+                      DEFAULT stays the batched loaders (never inherits the SQL 'join' default). Join and
+                      loader paths share one correlation-key normalizer (Date → micros; the old loader
+                      Date-identity Map bug and the select-omits-FK bug are fixed). **Readonly** (≥0.14):
+                      `{ embedded, readonly: true }` opens via `openReadOnly`; client-level
+                      `readonly: true` fails writes fast locally; both refusal shapes map to
+                      `ReadOnlyError` E018 with `reason: 'snapshot' | 'rbac'` (0.15 spec split). The
+                      tx-pool proxy in client.ts carries `readonly` + `capabilities` through
+                      `$transaction` (review-caught bypass). **explain()** on `PowqlInterface` (and
+                      `QueryInterface` via the `explainQuery` dialect hook: PG `EXPLAIN`, sqlite
+                      `EXPLAIN QUERY PLAN`, mysql `EXPLAIN`, mssql E017); plan text is diagnostic,
+                      middleware does NOT run for explain on any engine. 0.15 itself needed no driver
+                      surface (engine-side stats/planner; explain gains est_rows tokens that flow
+                      through). See
                       `docs/internal/strategy/powdb-parity-matrix.md` (local-only, untracked).
 
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code
@@ -364,6 +388,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E015 | `OptimisticLockError` | Version mismatch on `optimisticLock` update |
 | E016 | `ExclusionConstraintError` | pg 23P01 — via `wrapPgError()` |
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on an engine whose capability flag reports it unsupported — thrown directly, not via `wrapPgError()` |
+| E018 | `ReadOnlyError` | A write refused because the database is read-only — `reason: 'snapshot'` (PowDB snapshot serving / client-level `readonly: true` fail-fast) or `'rbac'` (read-only role). Thrown locally by the PowDB readonly guard and via `wrapPowdbError()` message families |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 

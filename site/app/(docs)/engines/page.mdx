@@ -216,7 +216,7 @@ Embedded keeps a real storage engine (indexes, WAL) *and* has a networked siblin
 
 PowDB is a younger, intentionally smaller engine, so Turbine's PowQL backend differs from the SQL path in a few honest ways:
 
-- **Nested `with` uses N+1 loaders, not a single query.** PowDB has no `json_agg`/link-navigation, so each relation level — including **many-to-many through a junction table** — is a separate batched lookup (keys chunked at 1,000). Correctness is identical; depth-D nesting costs D round-trips, not one.
+- **Nested `with` uses batched loaders by default, native joins on request.** PowDB has no `json_agg`/link-navigation, so by default each relation level — including **many-to-many through a junction table** — is a separate batched lookup (keys chunked at 1,000). As of v0.35, passing `relationLoadStrategy: 'join'` (per query or in `turbinePowDB` options) compiles eligible top-level relations to **native server-side PowQL joins** instead — see the joins section below. Output is identical either way.
 - **Primary keys can be server-assigned _or_ client-assigned.** Declare an `auto` int PK (`isGenerated`) and PowDB assigns a monotonic id on `create` (read back automatically); otherwise a defaulted string PK gets a client-generated UUID.
 - **Relation filters resolve to a literal list, not a subquery.** `where: { tags: { some } }` runs the inner predicate first and filters with `in (<keys>)` — one extra round-trip, but it sidesteps a PowDB engine quirk where a repeated `in (<subquery>)` of the same shape can return a stale cached result. Correct on every cardinality and nesting level.
 - **Nested writes run as one flat transaction.** `create`/`update` with relation ops (`create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert` on hasMany/hasOne/belongsTo) commit or roll back together. PowDB is single-writer with one global write lock, so top-level `$transaction` calls **queue FIFO** (as of v0.30) instead of failing — a second concurrent transaction waits for the first to finish rather than throwing. A **re-entrant / nested** `$transaction` still throws `UnsupportedFeatureError` immediately, since PowDB has no savepoints and waiting on the lock it already holds would deadlock. Cap the wait with `transactionQueueTimeoutMs` (default `30000`; `0` or `Infinity` waits forever) — on elapse the queued transaction rejects with `TimeoutError` (`TURBINE_E002`).
@@ -233,7 +233,42 @@ PowDB 0.12 added a native `json` document column type and 0.13 added path filter
 - **`JsonFilter` where-filters** — `where: { data: { path: ['ns', 'value'], gte: 5 } }` compiles to a PowQL path comparison with every segment and value bound as a typed parameter. A digit-only segment addresses an array index, matching the SQL engines. `equals: null` matches a JSON `null` **or** a missing key on PowDB. `contains` and pathless `equals` stay E017 (PowQL has no containment operator).
 - **JSON-path `orderBy` and `groupBy`** — path ordering (missing keys sort last in both directions, same as every other driver since v0.34) and JSON-path group keys / aggregate targets with the same alias and `orderBy` semantics as the SQL engines.
 - **Doc-field expression indexes** — declare them in `defineSchema` (`indexes: [{ docField: 'data', path: ['ns', 'value'] }]`) and `powqlSchemaDDL` emits the parenthesized `alter T add index (.data->"ns"->"value")` DDL (engine ≥ 0.13). Unique doc-field violations map to `UniqueConstraintError` (E008).
-- **Native typed wire** — on engine ≥ 0.13 the networked transport uses PowDB's lossless `queryNativeRaw` API, so a JSON `null`, a missing field, and the string `"null"` are all distinguishable end-to-end, and each result is coerced according to the wire that actually served it.
+- **Native typed wire on both transports** — on engine ≥ 0.13 the networked transport uses PowDB's lossless `queryNativeRaw` API, and as of v0.35 the **embedded** transport joins it: on addon ≥ 0.14 embedded queries run through `queryWithParams` (real positional parameter binding plus typed result cells), replacing the literal-materialization path older addons still use. On either transport a JSON `null`, a missing field, and the string `"null"` are all distinguishable end-to-end, and each result is coerced according to the wire that actually served it. Embedded `disconnect()` now performs a real checkpoint-flush close on addon ≥ 0.14.
+- **Equality is type-strict on JSON leaves.** PowQL's `=` never coerces across types: a JSON document holding `7.0` (float) does not match a filter binding the integer `7`, and strings never equal numbers. Turbine binds an integral JS number as an int and a fractional one as a float, so values written through Turbine round-trip correctly — but when filtering documents written by other tools, bind the type the document actually stores. (Stored scalar columns are softer: an int literal against a `float` column widens losslessly.)
+
+### Native relation joins (PowDB ≥ 0.13)
+
+By default PowDB relation loading runs the batched loaders described above. As of v0.35 you can opt eligible relations into **native server-side joins** instead — one hash-accelerated join statement per relation, no key lists, no 1,000-key chunking:
+
+```ts
+// Per query:
+const users = await db.users.findMany({ with: { posts: true }, relationLoadStrategy: 'join' });
+
+// Or as the client default:
+const db = await turbinePowDB(target, schema, { relationLoadStrategy: 'join' });
+```
+
+A relation is join-eligible when the parent query has no `limit`/`offset`, the relation is top-level (nested `with` levels keep the loaders), and the correlation key is the parent's primary key or a unique column. Ineligible relations silently fall back to the loaders, so results are always identical; only the transport changes. Requesting `relationLoadStrategy: 'join'` **per query** against an engine older than 0.13 throws a typed `UnsupportedFeatureError`; a client-level default falls back silently.
+
+One semantic note: the join re-evaluates the parent `where` in a second statement rather than pinning the fetched keys, so a row updated between the two statements can drop out of (or fail to join into) the relation set. The batched loaders pin fetched keys and have a narrower window. Neither runs in a transaction; if you need snapshot consistency across relation loads, wrap the read in `$transaction`.
+
+### Read-only snapshots and replicas (PowDB ≥ 0.14)
+
+PowDB 0.14 can serve a quiescent data directory **strictly read-only** — `powdb-server --readonly`, or embedded `Database.openReadOnly` — with any number of concurrent readers across processes. Turbine supports the pattern end to end:
+
+```ts
+// Embedded read-only snapshot (addon >= 0.14):
+const replica = await turbinePowDB({ embedded: './snapshot', readonly: true }, schema);
+
+// Networked against a powdb-server --readonly, failing writes fast locally:
+const replica = await turbinePowDB('powdb://replica-host:7070', schema, { readonly: true });
+```
+
+Reads work unchanged. Any write is refused with a typed `ReadOnlyError` (`TURBINE_E018`) whose `reason` field distinguishes `'snapshot'` (nothing can write here — route writes to the primary) from `'rbac'` (this connection's role may not write). With the client-level `readonly: true` flag the refusal happens locally, before the wire; without it, the engine's refusal maps to the same error. Freshness is the snapshot cadence — this is snapshot serving, not streaming replication. See [Read Replicas](/read-replicas) for the routing pattern.
+
+### explain() and index guidance
+
+Every Turbine table accessor has `explain(args)` as of v0.35 — it runs the exact query `findMany` would compile through the engine's plan explainer and returns the plan lines (see [Queries](/queries#explain)). On PowDB this matters more than elsewhere: the planner picks indexes greedily using per-index statistics (engine ≥ 0.15), so **index the most selective column of your common conjunctions** and verify with `explain` that the intended index drives the scan. Plan text is engine-owned diagnostic output, not a stable API.
 
 ### Unsupported features → `TURBINE_E017`
 

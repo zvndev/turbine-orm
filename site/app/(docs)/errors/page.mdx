@@ -30,6 +30,7 @@ Turbine throws typed errors you can catch with `instanceof`. Every error extends
 | `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update — the row was modified by another transaction |
 | `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01 — translated via `wrapPgError()` |
 | `TURBINE_E017` | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on a non-Postgres engine — exposes `feature` and `dialect` |
+| `TURBINE_E018` | `ReadOnlyError` | A write refused because the database is read-only — exposes `reason: 'snapshot' \| 'rbac'` (PowDB snapshot serving / read-only role) |
 
 ## Catching typed errors
 
@@ -196,6 +197,27 @@ try {
 ```
 
 On PostgreSQL these features never throw — `TURBINE_E017` only appears on the non-Postgres engines. See [Database Engines](/engines) for the full capability matrix.
+
+## Read-only refusals
+
+`ReadOnlyError` (`TURBINE_E018`, since v0.35) is the routing signal for writes that hit a read-only database. Its `reason` field tells you which kind:
+
+- **`'snapshot'`** — the database itself is read-only: a PowDB `--readonly` snapshot server, an embedded `{ readonly: true }` open, or Turbine's own client-level `readonly: true` fail-fast flag. Nothing can write here; route the write to your primary.
+- **`'rbac'`** — the database is writable but this connection's role may not write (`permission denied: role …`). Re-authenticating with a writer role may suffice.
+
+```ts
+import { ReadOnlyError } from 'turbine-orm';
+
+try {
+  await replica.orders.create({ data });
+} catch (err) {
+  if (err instanceof ReadOnlyError && err.reason === 'snapshot') {
+    await primary.orders.create({ data }); // route to the writer
+  }
+}
+```
+
+See [Read Replicas](/read-replicas) for the snapshot-serving pattern this supports.
 
 ## Safe error messages
 
