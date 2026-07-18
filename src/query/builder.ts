@@ -904,10 +904,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return writesMod.buildDeleteMany(this.ctx, args);
   }
 
-  private piiColumns(meta: TableMetadata): Set<string> {
-    return writesMod.piiColumns(this.ctx, meta);
-  }
-
   /**
    * Best-effort extraction of an auto-generated primary key from a write
    * result for `'reselect'` engines (e.g. mysql2's `insertId`). Returns
@@ -2127,10 +2123,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     whereMod.collectWhereParams(this.ctx, where, params);
   }
 
-  private buildWhere(where: WhereClause<T>): { sql: string; params: unknown[] } {
-    return whereMod.buildWhere(this.ctx, where);
-  }
-
   private resolveGlobalFilter(
     table: string,
     skip: SkipGlobalFilters | undefined = this.currentSkip,
@@ -2142,10 +2134,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return whereMod.mergeGlobalFilter(this.ctx, userWhere);
   }
 
-  private targetGlobalFilterAlias(targetTable: string, alias: string, params: unknown[]): string {
-    return whereMod.targetGlobalFilterAlias(this.ctx, targetTable, alias, params);
-  }
-
   private collectTargetGlobalFilterAlias(targetTable: string, params: unknown[]): void {
     whereMod.collectTargetGlobalFilterAlias(this.ctx, targetTable, params);
   }
@@ -2154,32 +2142,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return whereMod.globalFilterCacheSegment(this.ctx);
   }
 
-  private userPredicateIsEmpty(userWhere: Record<string, unknown>): boolean {
-    return whereMod.userPredicateIsEmpty(this.ctx, userWhere);
-  }
-
-  private assertMutationHasPredicate(
-    operation: 'update' | 'updateMany' | 'delete' | 'deleteMany',
-    whereSql: string,
-    allowFullTableScan: boolean | undefined,
-  ): void {
-    whereMod.assertMutationHasPredicate(this.ctx, operation, whereSql, allowFullTableScan);
-  }
-
   private buildWhereClause(where: Record<string, unknown>, params: unknown[]): string | null {
     return whereMod.buildWhereClause(this.ctx, where, params);
-  }
-
-  private pgTypeForColumn(meta: TableMetadata, column: string): string {
-    return whereMod.pgTypeForColumn(this.ctx, meta, column);
-  }
-
-  private enumTypeForColumn(column: string): string | null {
-    return whereMod.enumTypeForColumn(this.ctx, column);
-  }
-
-  private enumCastSuffix(column: string): string {
-    return whereMod.enumCastSuffix(this.ctx, column);
   }
 
   private buildAliasWhere(
@@ -2190,19 +2154,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     params: unknown[],
   ): string | null {
     return whereMod.buildAliasWhere(this.ctx, targetTable, targetMeta, alias, where, params);
-  }
-
-  private collectAliasWhereParams(
-    targetTable: string,
-    targetMeta: TableMetadata,
-    where: Record<string, unknown>,
-    params: unknown[],
-  ): void {
-    whereMod.collectAliasWhereParams(this.ctx, targetTable, targetMeta, where, params);
-  }
-
-  private fingerprintAliasWhere(where: Record<string, unknown>, targetTable?: string): string {
-    return whereMod.fingerprintAliasWhere(this.ctx, where, targetTable);
   }
 
   private vectorOperator(field: string, rawColumn: string, metric: string): string {
@@ -2227,14 +2178,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   private jsonPathParam(path: readonly (string | number)[], nativeForm?: unknown): unknown {
     return whereMod.jsonPathParam(this.ctx, path, nativeForm);
-  }
-
-  private castJsonNumeric(extract: string): string {
-    return whereMod.castJsonNumeric(this.ctx, extract);
-  }
-
-  private getColumnArrayType(column: string): string {
-    return whereMod.getColumnArrayType(this.ctx, column);
   }
 
   /**

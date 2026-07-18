@@ -439,6 +439,24 @@ describe('global filters — SQL cache', () => {
     assert.deepEqual(a.params, [1, 'x']);
     assert.deepEqual(b.params, [2, 'y']);
   });
+
+  it("another table's relation-filter shapes are fingerprinted with THAT table's host", () => {
+    // A function filter for `posts` whose shape varies inside a nested
+    // RELATION filter (`author` is a relation of posts, not of users). The
+    // root (users) host would classify `author` as an opaque scalar object,
+    // collapsing both shapes to one cache key while the built SQL differs:
+    // the classic poisoned-cache setup. The posts host must tell them apart.
+    let mode: 'byName' | 'byId' = 'byName';
+    const q = qi('users', {
+      posts: () => (mode === 'byName' ? { author: { is: { name: 'x' } } } : { author: { is: { id: 1 } } }),
+    });
+    const a = q.buildFindMany({ with: { posts: true } as unknown as WithClause });
+    mode = 'byId';
+    const b = q.buildFindMany({ with: { posts: true } as unknown as WithClause });
+    assert.notEqual(a.sql, b.sql, 'different nested relation-filter shapes must not share a cache entry');
+    assert.match(a.sql, /"name" = \$\d+/);
+    assert.match(b.sql, /"id" = \$\d+/);
+  });
 });
 
 // ---------------------------------------------------------------------------

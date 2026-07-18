@@ -591,7 +591,16 @@ export function globalFilterCacheSegment(qi: BuilderCtx): string {
       parts.push(`${table}:!`);
       continue;
     }
-    if (gf) parts.push(`${table}:${fingerprintWhere(qi, gf)}`);
+    if (gf) {
+      // Fingerprint with the FILTER's own table host, not the root table's:
+      // classifying another table's filter with the root host can mistake a
+      // relation filter for a scalar object and collide two shapes that
+      // compile to different SQL. Unknown meta falls back to the root host
+      // (same as scoped sub-wheres against an unknown target).
+      const meta = qi.schema.tables[table];
+      const host = meta && meta.name !== qi.tableMeta.name ? scopedWhereHost(qi, meta) : undefined;
+      parts.push(`${table}:${host ? fingerprintScopedWhere(qi, host, gf) : fingerprintWhere(qi, gf)}`);
+    }
   }
   return parts.length ? `|gf=${parts.join(';')}` : '';
 }
