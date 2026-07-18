@@ -1,5 +1,117 @@
 # Changelog
 
+## 0.36.0 (2026-07-17)
+
+The safety release: first-class PII field tagging with opt-in return semantics,
+an opt-in writable Studio (read-only stays the default), an honest and hardened
+migration story (destructive gate on `push`, declared indexes in DDL and diff,
+a sanctioned backfill recipe), and the where-clause cache paths unified onto a
+single canonical walk with a sampled production cross-check. Reviewed by five
+independent passes (product, strategy, security, code quality, UX) before
+release; every confirmed finding was fixed or explicitly documented below.
+
+### Added
+
+- **PII fields.** Tag a column `pii: true` in `defineSchema` (or `.pii()` on
+  the fluent builder) and Turbine excludes it from every default projection:
+  top-level rows, relation subqueries (`with`), the batched loader, positional
+  JSON encoding, PowDB loaders and native joins, and the row a write returns.
+  It comes back only when explicitly named in `select`, or via the new
+  `includePii: true` read option, which restores every PII column at the top
+  level and at every nested `with` level of that query. Filtering, ordering,
+  and grouping by a PII column stay allowed (naming the column is itself the
+  opt-in). Untagged schemas emit byte-identical SQL. The SQL cache key carries
+  the flag, so a cached no-PII statement can never serve an opt-in call. One
+  documented boundary: writes still use `RETURNING *`, so PII transits the
+  database connection before Turbine strips it from the returned object.
+- **Writable Studio (opt-in).** `turbine studio --write` enables single-row
+  insert/update/delete from the Data tab. Every write is addressed by the
+  row's full primary key (the predicate is rebuilt from the PK alone, so a
+  widened `where` cannot reach the database), compiled by the same validated
+  builders as the library, runs in its own transaction with the same
+  parameterized statement timeout and pinned `search_path`, and requires a
+  matching `Origin` header. Without the flag the write endpoints do not exist
+  (requests 404) and every transaction remains `BEGIN READ ONLY`. The UI shows
+  a persistent WRITE MODE banner and a delete confirmation.
+- **Studio PII redaction.** PII-tagged columns render as a redaction
+  placeholder in every tab, applied server-side before serialization (table
+  rows, builder rows, nested relation rows, and the echoed post-write row).
+  Redacted columns are also excluded from the Data-tab substring search and
+  from `orderBy`, so a redacted value cannot be probed or inferred through
+  sort position. `--show-pii` reveals values for a launch, with a loud
+  terminal warning and a persistent PII SHOWN banner in the browser.
+- **Destructive gate on `push`.** `turbine push` now scans the statements it
+  is about to apply with the same destructive-SQL scanner as `migrate up` and
+  refuses to run them without the two-step typed confirmation (the literal
+  phrase `destroy my data`, then `yes`) or an explicit `--allow-destructive`.
+- **Declared indexes in SQL DDL.** `defineSchema` table-level
+  `indexes: [{ columns, unique?, name? }]` now emit `CREATE [UNIQUE] INDEX`
+  from `schemaToSQL`/`push`, and `schemaDiff` adds declared indexes missing
+  from the live database (reverse: `DROP INDEX`). Matching is by name with a
+  definition check: a name that matches an existing index whose uniqueness,
+  column list, or partial-`WHERE` differs produces a warning, never a drop. A
+  declared index that resolves to the same name as an automatic FK index
+  supersedes it, so declaring a UNIQUE index on an FK column works. Undeclared
+  database indexes are surfaced as warnings and never dropped.
+- **Backfill migration recipe.** `turbine migrate create <name> --recipe
+  backfill` scaffolds the sanctioned two-phase pattern for changing a
+  populated column's type: nullable add, batched keyed `UPDATE` loop,
+  `SET NOT NULL` (with the `CHECK ... NOT VALID` + `VALIDATE` note for huge
+  tables), and an atomic rename swap, fully commented and reversible.
+- **Check constraints round-trip.** Table-level `checks` now survive
+  `generate`: the metadata emitter writes them into `metadata.ts`, and
+  `schemaDiff` diffs named checks (add missing, warn on expression drift).
+- **`TURBINE_CACHE_CHECK_SAMPLE`.** Opt-in sampled production re-verification
+  of the SQL template cache: set it to a rate in (0, 1] and that fraction of
+  cache hits rebuild the statement and compare byte-for-byte, logging once per
+  fingerprint and throwing on mismatch. The dev-mode always-on cross-check is
+  unchanged.
+
+### Changed
+
+- **The where-clause walk is unified.** `fingerprintWhere`,
+  `buildWhereClause`, and `collectWhereParams` (the three-way hand-synced
+  functions behind two previously shipped cache bugs) now consume one
+  canonical enumeration (`walkWhere` in `src/query/where-compile.ts`) with a
+  single column-aware scalar classifier, structurally eliminating the
+  top-level drift class. Relation sub-where compilation still has mirrored
+  walkers one level down; those are covered by the cross-check tripwire and
+  scheduled for the same treatment with the planned `builder.ts` split.
+- **Studio CSP hardened.** The inline UI script is authorized by a
+  per-request nonce (`script-src 'self' 'nonce-...'`); `unsafe-inline` is gone
+  from `script-src`. Mutating routes reject absent as well as mismatched
+  `Origin` headers.
+- **`redactUrl` redacts every credential.** Multi-URL strings (primary plus
+  replicas) have all userinfo passwords redacted, plus case-insensitive
+  `password=` query parameters.
+- **PowQL literal escaper version ceiling.** The embedded
+  literal-materialization fallback (pre-0.14 addons) now refuses to run
+  against an engine line newer than the escaping rules were verified on
+  (`POWQL_LEXER_TESTED_CEILING`), with a typed upgrade-pointing error, instead
+  of assuming a future lexer tokenizes escapes identically.
+- **Bundle-size claims are measured and gated.** `.size-limit.js` budgets are
+  re-baselined to measured brotli sizes (main 52.36 kB, edge 39.78 kB) and
+  `npm run size` now runs in `prepublishOnly`, so stale size marketing cannot
+  ship again.
+- **Docs honesty pass.** New "Migrations in Practice" page documenting exactly
+  what `migrate create --auto` cannot do (blind `USING` casts, rename
+  detection, `SET NOT NULL` backfill) and the sanctioned recipes; the
+  `schemaDiff` example now matches the real signature; the engines page states
+  up front that the CLI drives PostgreSQL only; `TURBINE_E018` added to the
+  README error table; every "read-only Studio" claim reconciled with the
+  opt-in write mode.
+
+### Fixed
+
+- `turbine push` could apply destructive statements without confirmation
+  (it bypassed the gate `migrate up` already had).
+- Declared-index emission could produce duplicate index names against the
+  automatic FK indexes (apply-time failure) or silently skip a declared
+  UNIQUE index whose name matched an existing plain index.
+- `--recipe` with a missing name now errors instead of silently creating a
+  plain migration.
+- `push --help` now documents `--allow-destructive`.
+
 ## 0.35.0 (2026-07-16)
 
 PowDB 0.14/0.15 adoption: the embedded transport joins the native typed wire,

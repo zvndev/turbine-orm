@@ -8,8 +8,8 @@ const nodePlatform = (config) => {
 };
 
 // Budgets re-baselined 2026-07-17 (v0.36.0). Measured at the final merged HEAD:
-// main 52.36 kB, serverless 39.78 kB, sqlite 42.31 kB, mysql 43.36 kB,
-// mssql 44.91 kB. Main headroom is deliberately tight (~0.6 kB): the next
+// main 52.59 kB, serverless 39.78 kB, sqlite 42.31 kB, mysql 43.36 kB,
+// mssql 44.91 kB. Main headroom is deliberately tight (~0.4 kB): the next
 // feature that grows the client graph must consciously re-baseline here.
 // Growth since the 0.28.0 baseline comes from the
 // safety-bundle work (typed capability errors, read-only guards, PII metadata)

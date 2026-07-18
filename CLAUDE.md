@@ -35,6 +35,19 @@ src/
                       isJsonFilter/isArrayFilter/isVectorFilter, sortedKeys/sortedEntries,
                       normalizeOrderBy). Kept out of builder.ts so the class stays about
                       SQL assembly rather than filter-shape bookkeeping.
+    where-compile.ts — The canonical where-clause enumeration (~300 LOC, added 0.36):
+                      walkWhere() is THE single key-ordering/branch authority that
+                      fingerprintWhere/buildWhereClause/collectWhereParams in builder.ts
+                      all consume (kills the 3-way hand-sync drift class behind the
+                      0.19.2/0.32.1 cache bugs), plus classifyScalarForSql (column-aware
+                      scalar-shape decision) and fingerprintScalarToken (deliberately
+                      column-blind for fingerprint byte-stability). Scope caveat: relation
+                      sub-wheres one level down are still hand-mirrored triples in
+                      builder.ts, covered by the cross-check tripwire; unify them when
+                      builder.ts gets its physical split. cacheCrossCheckMode() in
+                      builder.ts: 'dev' (always-on NODE_ENV guard) | 'sampled'
+                      (TURBINE_CACHE_CHECK_SAMPLE env, rate in (0,1], log-once-per-
+                      fingerprint then throw) | 'off'.
     deferred.ts     — DeferredQuery, QueryInterfaceOptions, middleware/event types.
     builder.ts      — QueryInterface class (~5.5K LOC): SQL generation for all operations
                       (findMany, findUnique, create, update, delete, aggregate, count,
@@ -272,11 +285,35 @@ src/
 
   schema.ts         — Postgres-to-TypeScript type mapping, SchemaMetadata/TableMetadata
                       interfaces, camelToSnake/snakeToCamel utilities, singularize helper.
+                      ColumnMetadata.pii (0.36): code-first-only PII tag (defineSchema
+                      `pii: true` / fluent `.pii()`; introspection NEVER auto-tags).
+                      Contract: PII columns are excluded from every default projection
+                      (top-level, `with` subqueries, batched loader, positional encoding,
+                      PowQL loaders + native joins, and write-returned rows via
+                      parseWriteRow — writes keep `RETURNING *`, so PII transits the wire
+                      but is stripped before the caller). Returned only via explicit
+                      `select` naming or the `includePii: true` read arg (reads only, not
+                      mutations); where/orderBy/groupBy on PII always allowed. The fm:/fu:
+                      SQL-cache keys carry a `|pii=0/1` segment (projection-invariant
+                      withFp made this mandatory). Untagged schemas emit byte-identical
+                      SQL (tested). TableMetadata.checks round-trips named check
+                      constraints through generate (emitted into metadata.ts).
 
   schema-builder.ts — defineSchema() API for code-first schema definitions. Produces
                       SchemaDef objects consumed by schema-sql.ts for DDL generation.
 
   schema-sql.ts     — DDL generation from SchemaDef. All identifiers quoted via quoteIdent().
+                      0.36 additions: schemaPush refuses destructive statements without
+                      `allowDestructive` (ValidationError listing offenders; scanner lives
+                      in cli/destructive.ts — a pure leaf, the one sanctioned lib→cli
+                      import); declared plain indexes (`indexes: [{ columns, unique?,
+                      name? }]`) emit CREATE [UNIQUE] INDEX (deterministic name
+                      idx_<table>_<cols>; a declared index that resolves to the auto
+                      FK-index name SUPERSEDES it — never emit duplicates); schemaDiff
+                      reads pg_indexes indexdef, ADDs missing declared indexes, and on a
+                      name match runs describeIndexDefMismatch (unique/columns/partial
+                      drift → warning, NEVER a drop; anchor column parsing on the USING
+                      clause so a partial index's WHERE parens aren't the column list).
                       Also provides schemaDiff() for auto-diff migrations.
 
   introspect.ts     — Reads information_schema + pg_catalog to produce SchemaMetadata.
@@ -398,9 +435,9 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.js` / `.json`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 
-**Migration system** (`cli/migrate.ts`): SQL-first migrations stored as timestamp-prefixed `.sql` files with `-- UP` and `-- DOWN` sections. Tracked in a `_turbine_migrations` table with SHA-256 checksums. Uses `pg_try_advisory_lock()` to prevent concurrent migration runs. Each migration runs in its own transaction. Checksum validation detects modified migration files.
+**Migration system** (`cli/migrate.ts`): SQL-first migrations stored as timestamp-prefixed `.sql` files with `-- UP` and `-- DOWN` sections. Tracked in a `_turbine_migrations` table with SHA-256 checksums. Uses `pg_try_advisory_lock()` to prevent concurrent migration runs. Each migration runs in its own transaction. Checksum validation detects modified migration files. Destructive statements (both `migrate up`/`down` and, since 0.36, `push`) require a two-step typed confirmation (`destroy my data` then `yes`) or `--allow-destructive`. `migrate create <name> --recipe backfill` (0.36) scaffolds the sanctioned two-phase type-change pattern from the MIGRATION_RECIPES registry (fully commented: nullable add → batched keyed UPDATE → SET NOT NULL → atomic rename swap); `--recipe` without a name errors.
 
-**Studio** (`cli/studio.ts`): Local read-only web UI served over Node's built-in `http` module — no new runtime deps. ORM-native since v0.19: there is NO raw-SQL surface. The Query tab (default) is a visual `findMany` builder; `POST /api/builder` validates every identifier (table/relation/field/orderBy) against the introspected schema and compiles the args with `QueryInterface.buildFindMany` (`sqlCache: false`, all values as `$N` params). Saved queries are builder-kind only — legacy raw-SQL entries are dropped on load with a console notice. Binds `127.0.0.1` by default (warns loudly on non-loopback hosts), authenticates via a random 24-byte hex token (constant-time check on every `/api/*` route), per-session rate limiting (100 req/60s), refuses cross-origin requests, and ships CSP + security headers (`X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`). Every DB query runs inside `BEGIN READ ONLY` with `SELECT set_config('statement_timeout', $1, true)` (NOT `SET LOCAL ... = $1`, which Postgres rejects — that was the 0.17.0 critical bug) and `set_config('search_path', $1, true)` pinned to the configured `--schema`. UI is an embedded single-file HTML/CSS/JS (`studio-ui.html`, prebuilt into `studio-ui.generated.ts` by `npm run gen:studio`) with Query / Data / Schema tabs matching the turbineorm.dev dark theme.
+**Studio** (`cli/studio.ts`): Local web UI served over Node's built-in `http` module — no new runtime deps, read-only by default. ORM-native since v0.19: there is NO raw-SQL surface. The Query tab (default) is a visual `findMany` builder; `POST /api/builder` validates every identifier (table/relation/field/orderBy) against the introspected schema and compiles the args with `QueryInterface.buildFindMany` (`sqlCache: false`, all values as `$N` params). Saved queries are builder-kind only — legacy raw-SQL entries are dropped on load with a console notice. Binds `127.0.0.1` by default (warns loudly on non-loopback hosts), authenticates via a random 24-byte hex token (constant-time check on every `/api/*` route), per-session rate limiting (100 req/60s), refuses cross-origin requests, and ships nonce-based CSP + security headers (`script-src 'self' 'nonce-...'` — no unsafe-inline in script-src since 0.36; style-src keeps it; `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`). Every read runs inside `BEGIN READ ONLY` with `SELECT set_config('statement_timeout', $1, true)` (NOT `SET LOCAL ... = $1`, which Postgres rejects — that was the 0.17.0 critical bug) and `set_config('search_path', $1, true)` pinned to the configured `--schema`. **Write mode (0.36, `--write`):** `/api/row/update|insert|delete` POST routes exist ONLY when writable (404 otherwise, deliberately not 403); each rebuilds the predicate from the FULL primary key alone via `extractPkWhere` (extra where keys dropped, operator objects refused — single-row by construction), validates table/columns against metadata, compiles via buildUpdate/buildCreate/buildDelete (`sqlCache: false`), runs in a plain BEGIN txn with the same parameterized timeout + search_path, and requires a matching `Origin` (absent OR mismatched → 403). Views and PK-less tables refused. Loud startup warning + persistent red WRITE MODE banner. **PII redaction:** PII-tagged cells are redacted SERVER-SIDE ("•• redacted ••") before serialization — table rows, builder rows, nested `with` rows (redactBuilderRows walks the tree against each relation's target table), and the post-write echo; redacted columns are also excluded from the Data-tab ILIKE search OR-set and orderBy (no substring/sort inference oracle). `--show-pii` reveals (terminal warning + persistent PII SHOWN banner). DB-less perimeter tests drive the exported `handleRequest` (src/test/studio-write.test.ts). UI is an embedded single-file HTML/CSS/JS (`studio-ui.html`, prebuilt into `studio-ui.generated.ts` by `npm run gen:studio`) with Query / Data / Schema tabs matching the turbineorm.dev dark theme.
 
 **UI module** (`cli/ui.ts`): Terminal formatting helpers — colors, spinners, tables, boxes. Imported throughout CLI but never by library code.
 
