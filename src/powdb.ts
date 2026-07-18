@@ -1697,6 +1697,27 @@ export function encodePowqlLiteral(value: unknown): string {
   throw new ValidationError(`[turbine] Value of type ${typeof value} cannot be encoded as a PowDB literal.`);
 }
 
+/**
+ * The newest PowDB engine LINE (major.minor) whose lexer escape handling
+ * {@link encodePowqlString} is VERIFIED against by reading
+ * `crates/query/src/lexer.rs`. The legacy materialize path
+ * ({@link materializePowql}) inlines encoded string literals directly into query
+ * text, so it is only injection-safe while the lexer recognizes exactly the
+ * escape set the escaper emits (`\"`, `\\`, `\n`, `\t`, everything else raw). If
+ * a future engine line teaches the lexer new escapes (e.g. `\u`, `\x`), a string
+ * that the escaper leaves raw could be re-interpreted by the lexer and break out
+ * of the literal, turning the fallback into an injection primitive.
+ *
+ * CONTRACT: bump this ceiling ONLY after re-verifying the escape handling in
+ * `crates/query/src/lexer.rs` for the newer line AND confirming
+ * {@link encodePowqlString} still escapes every breakout vector the lexer
+ * recognizes. The legacy path guards on this value (see
+ * {@link PowdbEmbeddedPool.exec}): an embedded addon whose engine line exceeds
+ * the ceiling yet still routes through the string wire is refused rather than
+ * materialized.
+ */
+export const POWQL_LEXER_TESTED_CEILING = '0.15';
+
 /** Escape a string into a PowQL `"…"` literal, matching the engine lexer's escape rules. */
 function encodePowqlString(s: string): string {
   let out = '"';
@@ -1799,6 +1820,30 @@ export class PowdbEmbeddedPool implements PgCompatPool {
     // Legacy string wire (addon < 0.14): the engine takes no params array, so
     // materialize each `$N` into a PowQL literal. Byte-for-byte unchanged, kept
     // live and tested as the pre-0.14 fallback.
+    //
+    // Safety assertion (see {@link POWQL_LEXER_TESTED_CEILING}): an addon whose
+    // engine line EXCEEDS the escaper's verified lexer ceiling must never be
+    // materialized — a newer lexer may recognize escapes the escaper leaves raw,
+    // making the inline path an injection primitive. Reachability: addons >= 0.14
+    // expose `queryWithParams` and take the native path above, so the ONLY way to
+    // reach this branch with a newer-than-ceiling engine is the anomalous
+    // newer-addon-without-native case (feature-detect failed). Refuse it rather
+    // than inline-encode against an unverified lexer.
+    const engineSem = parsePowdbSemver(this.capabilities.engineVersion);
+    const ceiling = parsePowdbSemver(POWQL_LEXER_TESTED_CEILING);
+    if (
+      engineSem &&
+      ceiling &&
+      (engineSem.major > ceiling.major || (engineSem.major === ceiling.major && engineSem.minor > ceiling.minor))
+    ) {
+      throw new ValidationError(
+        `[turbine] Refusing the PowDB legacy string wire: this embedded addon reports engine ` +
+          `${this.capabilities.engineVersion}, which is newer than the escaper's verified lexer range ` +
+          `(<= ${POWQL_LEXER_TESTED_CEILING}) AND such an addon exposes the parameterized native API — so ` +
+          `reaching the legacy materialize path means the queryWithParams feature-detect failed. Upgrade ` +
+          `turbine-orm so its PowQL escaper is verified against this engine line before running on it.`,
+      );
+    }
     const materialized = materializePowql(powql, params);
     return adaptResult(normalizeEmbeddedResult(this.db.query(materialized)));
   }

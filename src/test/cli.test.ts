@@ -654,6 +654,36 @@ describe('CLI UI utilities', () => {
     it('handles empty string', () => {
       assert.equal(redactUrl(''), '');
     });
+
+    it('redacts EVERY userinfo credential occurrence, not just the first (global)', () => {
+      // A string carrying two connection URLs (e.g. primary + replica) must have
+      // both passwords redacted — a non-global replace would leak the second.
+      const pair = 'primary=postgres://u1:secret1@a:5432/db replica=postgres://u2:secret2@b:5432/db';
+      const result = redactUrl(pair);
+      assert.ok(!result.includes('secret1'), 'first password redacted');
+      assert.ok(!result.includes('secret2'), 'second password redacted');
+      assert.equal(result, 'primary=postgres://u1:***@a:5432/db replica=postgres://u2:***@b:5432/db');
+    });
+
+    it('redacts query-string password params case-insensitively', () => {
+      const url = 'postgres://host:5432/db?sslmode=require&password=hunter2&application_name=app';
+      const result = redactUrl(url);
+      assert.ok(!result.includes('hunter2'), 'password param value redacted');
+      assert.equal(result, 'postgres://host:5432/db?sslmode=require&password=***&application_name=app');
+    });
+
+    it('redacts sslpassword and mixed-case password params', () => {
+      const url = 'postgres://host/db?SSLPassword=abc123&PassWord=def456';
+      const result = redactUrl(url);
+      assert.ok(!result.includes('abc123'));
+      assert.ok(!result.includes('def456'));
+      assert.equal(result, 'postgres://host/db?SSLPassword=***&PassWord=***');
+    });
+
+    it('leaves a normal URL without credentials unchanged in shape', () => {
+      const url = 'postgres://localhost:5432/mydb?sslmode=require';
+      assert.equal(redactUrl(url), url);
+    });
   });
 
   // -------------------------------------------------------------------------
