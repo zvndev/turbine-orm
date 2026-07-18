@@ -305,7 +305,13 @@ src/
                       `EXPLAIN QUERY PLAN`, mysql `EXPLAIN`, mssql E017); plan text is diagnostic,
                       middleware does NOT run for explain on any engine. 0.15 itself needed no driver
                       surface (engine-side stats/planner; explain gains est_rows tokens that flow
-                      through). See
+                      through). **0.16 (v0.36.1):** engine-internal NUL-safe index keys (on-disk
+                      index v3, auto-rebuilt on first writable open; a READ-ONLY open rebuilds in
+                      memory every open until a writable open persists it, documented on the
+                      engines page); driver spec byte-identical, lexer untouched (verified), so
+                      POWQL_LEXER_TESTED_CEILING bumped to '0.16' and deps to ^0.16.0; a live NUL
+                      regression test in powdb.integration.test.ts fails on the 0.15 addon and
+                      passes on 0.16. See
                       `docs/internal/strategy/powdb-parity-matrix.md` (local-only, untracked).
 
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code

@@ -3197,17 +3197,17 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
   it('the tested ceiling is the expected engine line', () => {
     // A canary: bumping the ceiling MUST be a deliberate, reviewed act (it
     // asserts the escaper was re-verified against a newer lexer).
-    assert.equal(POWQL_LEXER_TESTED_CEILING, '0.15');
+    assert.equal(POWQL_LEXER_TESTED_CEILING, '0.16');
   });
 
   it('refuses the legacy materialize path on an addon newer than the ceiling', async () => {
     // A legacy-only handle (no queryWithParams) whose capabilities claim engine
-    // 0.16.0, newer than the escaper's verified lexer range. Reaching the legacy
+    // 0.17.0, newer than the escaper's verified lexer range. Reaching the legacy
     // wire in this state is the dangerous "newer-addon-without-native" anomaly, so
     // exec() must refuse rather than inline-encode against an unverified lexer.
     const { pool, seen } = fakeEmbeddedDb(
       { kind: 'ok', affected: 1n },
-      { capabilities: capabilitiesFromVersion('0.16.0', { hasNativeRaw: true }) },
+      { capabilities: capabilitiesFromVersion('0.17.0', { hasNativeRaw: true }) },
     );
     const err = await pool.query('insert app_user { name := $1 }', ['Ada']).then(
       () => null,
@@ -3215,7 +3215,7 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
     );
     assert.ok(err instanceof ValidationError, 'refusal is a typed ValidationError');
     assert.equal((err as ValidationError).code, TurbineErrorCode.VALIDATION);
-    assert.match((err as Error).message, /0\.16\.0/, 'names the reported engine version');
+    assert.match((err as Error).message, /0\.17\.0/, 'names the reported engine version');
     assert.match((err as Error).message, new RegExp(POWQL_LEXER_TESTED_CEILING.replace('.', '\\.')));
     assert.match((err as Error).message, /queryWithParams/, 'explains the feature-detect anomaly');
     // Nothing was ever handed to the engine.

@@ -1782,3 +1782,78 @@ describe('powdb integration (embedded): F3 read-only target', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// PowDB 0.16: NUL-safe non-unique string index keys. The engine's composite
+// index keys previously NUL-terminated string values, so "A" and "A\u0000" could
+// interleave: indexed equality / prefix lookups / index-driven mutations could
+// return or touch a neighboring value's rows. 0.16 escape-encodes the keys
+// (index format v3). This locks the fix in through the ORM surface: an
+// indexed column with embedded NUL bytes must behave exactly like an
+// unindexed one.
+// ---------------------------------------------------------------------------
+
+const nulIdxSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    tagged: {
+      ...makeTable(
+        'tagged',
+        [
+          col('id', 'id', 'string', 'text', { hasDefault: true }),
+          col('tag', 'tag', 'string', 'text'),
+          col('n', 'n', 'number', 'int4'),
+        ],
+        {},
+      ),
+      indexes: [{ name: 'tagged_tag_idx', columns: ['tag'], unique: false, definition: '' }],
+    },
+  },
+};
+
+describe('powdb integration (embedded): NUL bytes in non-unique indexed strings (0.16)', () => {
+  it('indexed equality, prefix, and index-driven update stay exact around embedded NULs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-nul-it-'));
+    const db: DB = await turbinePowDB({ embedded: dir }, nulIdxSchema, { warnOnUnlimited: false });
+    try {
+      for (const stmt of powqlSchemaDDL(nulIdxSchema)) await db.raw([stmt]);
+
+      const tags = ['A', 'A\u0000', 'A\u0000B', 'B'];
+      for (const [i, tag] of tags.entries()) await db.tagged.create({ data: { tag, n: i } });
+
+      // Indexed equality returns EXACTLY the matching row for every neighbor.
+      for (const [i, tag] of tags.entries()) {
+        const rows = (await db.tagged.findMany({ where: { tag } })) as { tag: string; n: number }[];
+        assert.equal(rows.length, 1, `equality on ${JSON.stringify(tag)} must match exactly one row`);
+        assert.equal(rows[0]!.n, i);
+        assert.equal(rows[0]!.tag, tag, 'the NUL bytes round-trip losslessly');
+      }
+
+      // Prefix lookup: every A-prefixed tag, nothing else.
+      const prefixed = (await db.tagged.findMany({
+        where: { tag: { startsWith: 'A' } },
+        orderBy: { n: 'asc' },
+      })) as { n: number }[];
+      assert.deepEqual(
+        prefixed.map((r) => r.n),
+        [0, 1, 2],
+      );
+
+      // Index-driven mutation touches ONLY the addressed value's row.
+      await db.tagged.updateMany({ where: { tag: 'A\u0000' }, data: { n: 100 } });
+      const after = (await db.tagged.findMany({ orderBy: { n: 'asc' } })) as { tag: string; n: number }[];
+      assert.deepEqual(
+        after.map((r) => [r.tag, r.n]),
+        [
+          ['A', 0],
+          ['A\u0000B', 2],
+          ['B', 3],
+          ['A\u0000', 100],
+        ],
+      );
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.36.1 (2026-07-18)
+
+PowDB 0.16 support. The 0.16 driver contract is byte-identical to 0.15 (the
+release is an engine-internal index-correctness fix plus documentation), so
+this is a verification-and-pinning release, not a feature round.
+
+### Changed
+
+- **PowDB 0.16 verified and pinned.** The full live matrix (networked server +
+  embedded addon) runs green on 0.16; dev dependencies track `^0.16.0` (the
+  optional peer range `>=0.7.1 <1.0.0` already admits it). The PowQL
+  literal-escaper's tested lexer ceiling is bumped to `0.16` after verifying
+  the 0.16 lexer is untouched.
+- **NUL-byte regression coverage.** PowDB 0.16 fixed wrong rows from
+  non-unique string indexes on values with embedded NUL bytes (a new on-disk
+  index format, rebuilt automatically on first writable open). A live
+  integration test now locks the fix in through the ORM surface: indexed
+  equality, prefix lookups, and index-driven updates around `"A"` vs
+  `"A\0"` neighbors. The test fails on the 0.15 addon and passes on 0.16.
+- **Read-only snapshot note.** The engines page documents the 0.16 index
+  upgrade nuance for snapshot fleets: a read-only open rebuilds the affected
+  indexes in memory on every open until a writable open persists the new
+  format, so run snapshots through one writable open (or take them from a
+  0.16 primary).
+
 ## 0.36.0 (2026-07-18)
 
 The safety release: first-class PII field tagging with opt-in return semantics,

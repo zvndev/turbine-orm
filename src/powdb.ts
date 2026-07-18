@@ -1716,7 +1716,7 @@ export function encodePowqlLiteral(value: unknown): string {
  * the ceiling yet still routes through the string wire is refused rather than
  * materialized.
  */
-export const POWQL_LEXER_TESTED_CEILING = '0.15';
+export const POWQL_LEXER_TESTED_CEILING = '0.16';
 
 /** Escape a string into a PowQL `"…"` literal, matching the engine lexer's escape rules. */
 function encodePowqlString(s: string): string {
