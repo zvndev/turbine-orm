@@ -289,9 +289,15 @@ src/
                       `pii: true` / fluent `.pii()`; introspection NEVER auto-tags).
                       Contract: PII columns are excluded from every default projection
                       (top-level, `with` subqueries, batched loader, positional encoding,
-                      PowQL loaders + native joins, and write-returned rows via
-                      parseWriteRow — writes keep `RETURNING *`, so PII transits the wire
-                      but is stripped before the caller). Returned only via explicit
+                      PowQL loaders + native joins, and write returns). Writes on
+                      PII-tagged tables emit an explicit non-PII projection AT THE SQL
+                      LEVEL (writeReturningColumns: RETURNING list on PG/SQLite, projected
+                      reselect on MySQL, per-column OUTPUT INSERTED./DELETED. on MSSQL via
+                      mssqlOutput; a PII-tagged PK stays in the list so the row is
+                      addressable; untagged tables keep RETURNING * byte-for-byte).
+                      PowDB is the exception: its `returning` keyword takes no column list
+                      (driver spec), so stripWritePii removes PII client-side there.
+                      parseWriteRow's strip stays as defense-in-depth. Returned only via explicit
                       `select` naming or the `includePii: true` read arg (reads only, not
                       mutations); where/orderBy/groupBy on PII always allowed. The fm:/fu:
                       SQL-cache keys carry a `|pii=0/1` segment (projection-invariant
