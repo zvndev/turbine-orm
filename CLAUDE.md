@@ -52,12 +52,46 @@ src/
                       (TURBINE_CACHE_CHECK_SAMPLE env, rate in (0,1], log-once-per-
                       fingerprint then throw) | 'off'.
     deferred.ts     — DeferredQuery, QueryInterfaceOptions, middleware/event types.
-    builder.ts      — QueryInterface class (~5.5K LOC): SQL generation for all operations
-                      (findMany, findUnique, create, update, delete, aggregate, count,
-                      groupBy + HAVING). Builds WHERE clauses, json_agg nested relation
-                      subqueries (hasMany/belongsTo/hasOne + manyToMany through junction
-                      tables + self-relations), pgvector distance ops, and parameterized
-                      queries. Includes dev-only NODE_ENV validation guards.
+    builder.ts      - QueryInterface class + the execute FACADE (~2.4K LOC). Owns the
+                      constructor, connection/middleware/timeout execution, the SQL-template
+                      cache (acquireSql + crossCheckCache), findMany/findUnique/findFirst +
+                      streaming assembly, count, the async create/update/delete/upsert
+                      wrappers (incl. nested-write plumbing), and the shared primitives
+                      (q/p/castAgg/toColumn/toSqlColumn/pagination/parseRow, dev NODE_ENV
+                      guards). All WHERE / aggregate / write / relation SQL GENERATION now
+                      lives in the sibling modules below; builder.ts keeps only thin
+                      delegating methods for the cross-module + public + @internal entry
+                      points. The seam is a single `BuilderCtx` object literal (built once
+                      in the constructor, mirroring the `whereHost` precedent): a
+                      privacy-preserving view exposing exactly the class-resident primitives
+                      the modules need: live data fields, a `currentSkip` getter/setter, and
+                      bound method members. Each module's functions are `export function
+                      f(qi: BuilderCtx, …)` and import each other directly; the class holds a
+                      `private readonly ctx: BuilderCtx`.
+    where.ts        - The whole WHERE web (~1.8K LOC): the top-level and table-scoped
+                      build/collect/fingerprint trios, leaf JSON/array/vector/text-search
+                      clause builders, operator-clause + column-reference compilation, and
+                      the client-level global-filter helpers. Owns the `BuilderCtx`
+                      interface. Depends on nothing else in query/ (relation filters build
+                      EXISTS inline), so it is the base module the others build on.
+    aggregates.ts   - buildAggregate + buildGroupBy and helpers (~760 LOC): HAVING clauses,
+                      groupBy ordering, DISTINCT-ON sources, JSON-path aggregate targets.
+                      Reuses where.ts for WHERE compilation; shared orderBy / row-parse
+                      primitives stay class-resident via the ctx.
+    writes.ts       - Mutation SQL builders (~750 LOC): create / createMany / update /
+                      delete / upsert / updateMany / deleteMany plus the write-projection
+                      helpers (writeReturningColumns / writeReselectSelection / parseWriteRow,
+                      the PII column set, optimistic-lock + atomic-operator SET clauses,
+                      reselect-by-where). Reuses where.ts; the async execute wrappers stay in
+                      builder.ts.
+    relations.ts    - Relation + orderBy compilation (~2.1K LOC): the json_agg nested-relation
+                      machinery (buildSelectWithRelations, buildRelationSubquery,
+                      buildManyToManySubquery), the positional-encoding shapes + nested-row
+                      parser, the full orderBy surface (plain / JSON-path / vector KNN /
+                      relation _count / pick-row), relation _count expressions + their
+                      global-filter params, and the with-clause fingerprint + param
+                      collectors. Reuses where.ts (WHERE) and writes.ts (PII column set); the
+                      last and most connected module.
     batched-loader.ts — The `relationLoadStrategy: 'batched'` path. Instead of the default
                       single-statement `json_agg` join, runs the base query without relation
                       subqueries, then ONE flat follow-up per relation
@@ -380,7 +414,7 @@ This repo ships the library **and** its marketing/docs site. The site lives at `
 
 ## The json_agg Algorithm
 
-The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (query/builder.ts). For each relation in a `with` clause, it generates a correlated subquery that PostgreSQL evaluates per parent row.
+The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (query/relations.ts). For each relation in a `with` clause, it generates a correlated subquery that PostgreSQL evaluates per parent row.
 
 1. **Alias generation.** A shared `aliasCounter: { n: number }` is passed through all nesting levels. Each call allocates `t0`, `t1`, `t2`, etc. This prevents alias collisions in arbitrarily deep trees.
 
