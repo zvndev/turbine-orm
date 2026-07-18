@@ -135,8 +135,11 @@ function setPii(table: TableMetadata, columnName: string): void {
   col.pii = true;
 }
 
-function usersQuery(schema = piiSchema(), options?: Parameters<typeof makeQuery>[2]): QueryInterface {
-  return makeQuery('users', schema, options) as unknown as QueryInterface;
+function usersQuery(
+  schema = piiSchema(),
+  options?: Parameters<typeof makeQuery>[2],
+): QueryInterface<Record<string, unknown>> {
+  return makeQuery('users', schema, options) as unknown as QueryInterface<Record<string, unknown>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -401,18 +404,24 @@ describe('pii: includePii participates in the SQL-cache fingerprint', () => {
 
 describe('pii: untagged schemas emit byte-identical SQL', () => {
   it('untagged default findMany uses SELECT t.* (unchanged)', () => {
-    const { sql } = (makeQuery('users', untaggedSchema()) as unknown as QueryInterface).buildFindMany({});
+    const { sql } = (
+      makeQuery('users', untaggedSchema()) as unknown as QueryInterface<Record<string, unknown>>
+    ).buildFindMany({});
     assert.match(sql, /"users"\.\*/, 'no PII columns → the `*` fast path is preserved');
   });
 
   it('a tagged schema under includePii matches the untagged control SQL', () => {
     const tagged = usersQuery().buildFindMany({ includePii: true });
-    const control = (makeQuery('users', untaggedSchema()) as unknown as QueryInterface).buildFindMany({});
+    const control = (
+      makeQuery('users', untaggedSchema()) as unknown as QueryInterface<Record<string, unknown>>
+    ).buildFindMany({});
     assert.equal(tagged.sql, control.sql, 'includePii returns to the identical `*` projection');
   });
 
   it('untagged relation subquery is unchanged (secret present, no exclusion)', () => {
-    const { sql } = (makeQuery('users', untaggedSchema()) as unknown as QueryInterface).buildFindMany({
+    const { sql } = (
+      makeQuery('users', untaggedSchema()) as unknown as QueryInterface<Record<string, unknown>>
+    ).buildFindMany({
       with: { posts: true },
     });
     assert.match(sql, /'secret'/, 'untagged posts.secret is a normal column');
