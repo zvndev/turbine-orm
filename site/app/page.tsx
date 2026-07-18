@@ -45,21 +45,21 @@ const features = [
   {
     title: 'One dependency. No WASM.',
     description:
-      'Turbine ships pg and nothing else — no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. No adapter chain, no lockstep package upgrades. The main entry bundles to ~42 KB brotli, ~33 KB on the edge.',
+      'Turbine ships pg and nothing else — no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. No adapter chain, no lockstep package upgrades. The main entry bundles to ~50 KB brotli, ~39 KB on the edge.',
     stat: '1',
     statLabel: 'runtime dep',
   },
   {
     title: 'Read-only Studio your DBA will approve',
     description:
-      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, no raw-SQL surface at all, X-Frame-Options: DENY. No other TS ORM ships this.',
+      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, no raw-SQL surface at all, X-Frame-Options: DENY. No other TS ORM ships this. New in 0.36: opt-in writable mode via turbine studio --write for single-row edits through the same validated builder; read-only stays the default.',
     stat: '0',
-    statLabel: 'write paths',
+    statLabel: 'write paths by default',
   },
   {
-    title: 'PII-safe error messages',
+    title: 'PII-safe errors and field tagging',
     description:
-      'Turbine errors show WHERE keys, not values. A UniqueConstraintError says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.',
+      'Turbine errors show WHERE keys, not values. A UniqueConstraintError says which column violated the constraint, never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed. New in 0.36: tag a column pii: true in your schema and Turbine excludes it from default query results and redacts it in Studio.',
     stat: 'keys',
     statLabel: 'not values',
   },
@@ -74,7 +74,7 @@ const features = [
     title: 'Edge-native. One import swap.',
     description:
       'turbineHttp(pool, SCHEMA) — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step.',
-    stat: '~33 KB',
+    stat: '~39 KB',
     statLabel: 'edge bundle (brotli)',
   },
   {
@@ -391,11 +391,11 @@ export default async function Home() {
               {[
                 ['Engine / runtime', 'No engine binary (pg only)', 'Client + TS/WASM query compiler', 'No engine'],
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
-                ['Main bundle (brotli)', '~42 KB', '~1.6 MB client (TS/WASM compiler)', '~7 KB core'],
+                ['Main bundle (brotli)', '~50 KB', '~1.6 MB client (TS/WASM compiler)', '~7 KB core'],
                 ['Studio', 'Read-only, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, ~33 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
+                ['Edge runtime', 'One import swap, ~39 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 ['Nested relations', '1 query, deep type inference', '1 query, shallow inference', 'relations() re-declaration'],

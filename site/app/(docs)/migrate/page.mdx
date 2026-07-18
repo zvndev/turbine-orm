@@ -1,0 +1,130 @@
+export const metadata = {
+  title: 'Migrations in Practice',
+  description:
+    'The production migration workflow, what turbine migrate create --auto can and cannot do, and the sanctioned two-phase recipe for changing a populated column type in Turbine ORM.',
+  alternates: { canonical: '/migrate' },
+};
+
+# Migrations in Practice
+
+The [Schema & Migrations](/schema) page covers the basics: `.sql` files with `-- UP` and `-- DOWN` sections, tracked in `_turbine_migrations`. This page is the honest operational guide: the exact workflow, the real limits of auto-diffing, and the recipe for the one change that trips everyone up, altering a column's type when the table already has data.
+
+> **The migration CLI is Postgres-only.** `turbine migrate`, `turbine push`, and `turbine generate` drive PostgreSQL. The other engines (SQLite, MySQL, SQL Server, PowDB) are **code-first and programmatic**: define the schema with `defineSchema`, derive metadata with `schemaDefToMetadata`, and manage DDL yourself. The typed query API is identical across engines; only the migration tooling stays on Postgres today. See [Database Engines](/engines).
+
+## The workflow
+
+```bash
+# 1. Create a migration: blank, or auto-generated from the schema diff
+npx turbine migrate create add_users_table
+npx turbine migrate create add_email_index --auto
+
+# 2. Apply pending migrations locally (interactive; prompts on destructive ops)
+npx turbine migrate up
+
+# 3. Apply in CI / production (no prompts, applies files exactly as written)
+npx turbine migrate deploy
+
+# 4. Roll back the most recent migration (or the last N with --step)
+npx turbine migrate down
+npx turbine migrate down --step 2
+
+# 5. Inspect applied vs pending, and flag drift
+npx turbine migrate status
+```
+
+**`create --auto`** writes a starting-point migration from the diff between your `defineSchema` output and the live database. It is a draft; always read it before committing.
+
+**`up`** applies every pending migration in timestamp order. It is the interactive command: if any pending file contains a destructive statement, it stops and asks you to confirm before running anything (see [the destructive gate](#the-destructive-gate)).
+
+**`deploy`** is the production apply. It runs the same pending migrations as `up` but never prompts; it applies the files exactly as written. Use it in CI/CD and deployment hooks where there is no human to answer a prompt. Pair it with `--dry-run` in a pipeline step to preview.
+
+### What the runner guarantees
+
+- **Per-migration transactions.** Each migration runs inside its own `BEGIN` / `COMMIT`. If its SQL fails, that migration's transaction rolls back and nothing from it is recorded in `_turbine_migrations`.
+- **Stop on first error, partial apply.** When applying a batch of pending migrations, the runner processes them in order and **stops at the first failure**. Migrations that already succeeded stay applied and recorded; the failing one and everything after it do not run. So a failed `up` can leave you partway through the batch: fix the offending migration and re-run to continue from where it stopped.
+- **SHA-256 checksums.** Every applied migration's file is hashed. If an already-applied file changes on disk, `status` reports **drift** and `up` refuses to run until you reconcile (or pass `--allow-drift` when you are intentionally rewriting history).
+- **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent `migrate up` / `deploy` runs cannot race; the second exits cleanly instead of double-applying.
+
+## What `--auto` can and cannot do
+
+`create --auto` is a diff tool, not a schema-migration planner. It compares columns and types and emits the obvious DDL, but it has no notion of intent or history. Know its blind spots before you trust a generated file:
+
+- **Type changes get a blind cast.** A changed column type emits `ALTER COLUMN "col" TYPE <newtype> USING "col"::<newtype>`. That `USING` cast is unconditional, with no transformation hook. It works for widening casts (`int` to `bigint`, `text` to `varchar`) but **fails at apply time on data the cast cannot handle** (for example `text` to `integer` on non-numeric rows). For anything non-trivial, use the [two-phase recipe](#changing-a-column-type-with-existing-data) instead.
+- **Renames are not detected.** The differ has no way to know `full_name` was renamed from `name`. It sees one column gone and one added, so it produces an **add-new plus orphan-old**, and **the data does not move**. If you need a rename, write it by hand as `ALTER TABLE ... RENAME COLUMN`.
+- **`SET NOT NULL` has no backfill.** Making a nullable column `notNull` emits a bare `ALTER COLUMN "col" SET NOT NULL`. On a populated table with any `NULL` in that column, apply **fails**. Backfill the column first (see below).
+- **`varchar` length changes are not detected.** The differ compares the underlying type name, not the length, so `varchar(50)` to `varchar(100)` produces no statement. Change the length by hand if you need it enforced.
+- **Table and column drops are reported, never auto-emitted.** A table or column present in the database but absent from your schema is surfaced in the diff (and in `migrate status`) but is **never written into the executable SQL**; dropping data is always a manual, deliberate act. `schemaDiff()` returns these in `drop` / the `alter` plan; you write the `DROP` yourself.
+
+## Changing a column type with existing data
+
+When a type change needs a real transformation (or the blind `USING` cast would fail), do not edit the column in place. Use the two-phase expand/contract pattern: add a new column, backfill it in batches, verify, then swap. Every step is reversible until the final drop.
+
+**Phase 1, expand.** Add the new column as nullable so the write path keeps working, then backfill in bounded batches to avoid a long lock or a bloated transaction:
+
+```sql
+-- Migration A (UP): add the target column, nullable
+ALTER TABLE "orders" ADD COLUMN "total_cents" BIGINT;
+
+-- Backfill in batches (run outside a single giant transaction: one
+-- statement per batch, repeat until zero rows remain to convert).
+UPDATE "orders"
+SET "total_cents" = ("total" * 100)::BIGINT
+WHERE "id" IN (
+  SELECT "id" FROM "orders"
+  WHERE "total_cents" IS NULL
+  LIMIT 5000
+);
+```
+
+**Verify** before you tighten anything. Confirm every row converted and the values are what you expect:
+
+```sql
+SELECT count(*) FROM "orders" WHERE "total_cents" IS NULL;   -- expect 0
+SELECT "total", "total_cents" FROM "orders" LIMIT 20;        -- spot-check
+```
+
+**Phase 2, contract.** Once the new column is fully populated and verified, enforce `NOT NULL` and swap the names atomically in one transaction, so no reader ever sees a half-renamed table:
+
+```sql
+-- Migration B (UP): enforce, then swap in a single transaction
+ALTER TABLE "orders" ALTER COLUMN "total_cents" SET NOT NULL;
+
+BEGIN;
+ALTER TABLE "orders" RENAME COLUMN "total" TO "total_old";
+ALTER TABLE "orders" RENAME COLUMN "total_cents" TO "total";
+COMMIT;
+```
+
+**Drop the old column later**, in a separate migration deployed after the new column has been serving reads and writes long enough to be sure nothing depends on the old one:
+
+```sql
+-- Migration C (UP), shipped after B has been live for a while
+ALTER TABLE "orders" DROP COLUMN "total_old";
+```
+
+Keeping the drop in its own later migration means Phase 2 stays instantly reversible if you find a problem: you have not lost the original data until Migration C runs.
+
+### Scaffold it with `--recipe backfill`
+
+Writing that pattern by hand is error-prone, so 0.36 adds a scaffold:
+
+```bash
+npx turbine migrate create widen_order_total --recipe backfill
+```
+
+This generates a migration pre-filled with the expand/contract skeleton (the nullable add, a batched `UPDATE` backfill block, the `SET NOT NULL`, and commented swap/drop steps) with placeholders for you to fill in the table, columns, and conversion expression. It is a starting template, not a turnkey migration: review and adapt every placeholder before applying.
+
+## The destructive gate
+
+Turbine treats data-destroying DDL (`DROP TABLE`, `DROP COLUMN`, and similar) as opt-in, never automatic.
+
+- **`migrate up`** scans every pending migration for destructive statements. If it finds any, it stops, prints exactly which statements in which files are destructive, and asks for a typed confirmation (`yes`) before applying anything. Decline and nothing runs; no data is touched. You can skip the prompt with `--allow-destructive` when you know what you are doing.
+- **`migrate deploy`** applies files exactly as written, with no prompt; it is the non-interactive production path. Whatever destructive SQL is in the migration runs. That is by design: production apply is deterministic and unattended, so the review happens when the migration is authored and merged, not at deploy time.
+- **`push`**: as of 0.36, `turbine push` runs the same destructive scanner over the statements it is about to apply. Destructive operations require the same typed confirmation as `migrate up` (or `--allow-destructive`). `push` is still the fast **development** path that diffs `defineSchema` against the live database and applies the difference directly; for production, author real migrations and `deploy` them.
+
+## See also
+
+- **[Schema & Migrations](/schema)** for `defineSchema`, DDL generation, and `schemaDiff()`.
+- **[CLI](/cli)** for every migration command and flag.
+- **[Database Engines](/engines)** for why the migration CLI is Postgres-only today.
+- **[Typed Errors](/errors)** including `MigrationError` (TURBINE_E006).
