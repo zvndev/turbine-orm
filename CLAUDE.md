@@ -41,10 +41,13 @@ src/
                       all consume (kills the 3-way hand-sync drift class behind the
                       0.19.2/0.32.1 cache bugs), plus classifyScalarForSql (column-aware
                       scalar-shape decision) and fingerprintScalarToken (deliberately
-                      column-blind for fingerprint byte-stability). Scope caveat: relation
-                      sub-wheres one level down are still hand-mirrored triples in
-                      builder.ts, covered by the cross-check tripwire; unify them when
-                      builder.ts gets its physical split. cacheCrossCheckMode() in
+                      column-blind for fingerprint byte-stability). Relation sub-wheres one
+                      level down (the relation-filter EXISTS body AND the relation
+                      `with`-clause `where`) are ALSO consumers now: builder.ts binds a
+                      per-target-table WhereHost and drives ONE `buildScopedWhere` /
+                      `collectScopedWhereParams` / `fingerprintScopedWhere` trio (over a
+                      small `WhereScope` = column qualifier + meta + correlation parent), so
+                      no walker is hand-mirrored anymore. cacheCrossCheckMode() in
                       builder.ts: 'dev' (always-on NODE_ENV guard) | 'sampled'
                       (TURBINE_CACHE_CHECK_SAMPLE env, rate in (0,1], log-once-per-
                       fingerprint then throw) | 'off'.

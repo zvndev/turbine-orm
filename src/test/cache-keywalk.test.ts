@@ -51,13 +51,44 @@ function schema(): SchemaMetadata {
             foreignKey: 'author_id',
             referenceKey: 'id',
           },
+          // manyToMany through a junction — exercises the m2m relation-filter
+          // sub-where path under the shared scoped walk.
+          orgs: {
+            type: 'manyToMany',
+            name: 'orgs',
+            from: 'users',
+            to: 'orgs',
+            foreignKey: 'id',
+            referenceKey: 'id',
+            through: { table: 'user_orgs', sourceKey: 'user_id', targetKey: 'org_id' },
+          },
         },
       ),
-      posts: mockTable('posts', [
+      posts: mockTable(
+        'posts',
+        [
+          { name: 'id', field: 'id' },
+          { name: 'author_id', field: 'authorId' },
+          { name: 'published', field: 'published', pgType: 'bool' },
+          { name: 'views', field: 'views', pgType: 'int4' },
+        ],
+        {
+          // belongsTo back to users — exercises a NESTED relation filter
+          // (`posts.some.author.is`) inside a relation sub-where.
+          author: {
+            type: 'belongsTo',
+            name: 'author',
+            from: 'posts',
+            to: 'users',
+            foreignKey: 'author_id',
+            referenceKey: 'id',
+          },
+        },
+      ),
+      orgs: mockTable('orgs', [
         { name: 'id', field: 'id' },
-        { name: 'author_id', field: 'authorId' },
-        { name: 'published', field: 'published', pgType: 'bool' },
-        { name: 'views', field: 'views', pgType: 'int4' },
+        { name: 'name', field: 'name', pgType: 'text' },
+        { name: 'tier', field: 'tier', pgType: 'int4' },
       ]),
     },
   };
@@ -213,6 +244,77 @@ describe('key-walk: relation filters (some / none / every / is)', () => {
 
   it('every-filter with a non-trivial sub-where', () => {
     assertCacheStable({ posts: { every: { views: { gte: 5 } } } }, { posts: { every: { views: { gte: 50 } } } });
+  });
+});
+
+describe('key-walk: relation sub-wheres stay in lockstep under the shared scoped walk', () => {
+  // Since 0.36 the relation-filter EXISTS sub-where (buildSubWhereForRelation /
+  // collectRelFilterParams / fingerprintRelFilter) and the alias `with`-where
+  // (buildAliasWhere / collectAliasWhereParams / fingerprintAliasWhere) both
+  // consume the SAME canonical `walkWhere` the top level does. These cases warm
+  // the cache with a relation-filter clause, HIT it with a fingerprint-equal
+  // different-values clause, and assert the served (sql, params) equal a fresh
+  // cold build — the load-bearing invariant for the sub-where walkers.
+
+  it('some: permuted inner sub-where keys bind each its own value on a warm hit', () => {
+    const hot = assertCacheStable(
+      { posts: { some: { published: true, views: { gt: 1 } } } },
+      { posts: { some: { views: { gt: 999 }, published: false } } },
+    );
+    // The sub-where's `views > $N` binds the hit's value, and the scalar
+    // `published = $M` binds the hit's boolean.
+    assert.ok(hot.params.includes(999));
+    assert.ok(hot.params.includes(false));
+  });
+
+  it('none: sub-where with an operator + scalar stays aligned across a hit', () => {
+    assertCacheStable(
+      { posts: { none: { published: true, views: { lte: 5 } } }, age: 1 },
+      { age: 42, posts: { none: { views: { lte: 50 }, published: false } } },
+    );
+  });
+
+  it('every: non-trivial sub-where re-collects its params in lockstep', () => {
+    const hot = assertCacheStable(
+      { posts: { every: { views: { gte: 5 }, published: true } } },
+      { posts: { every: { published: false, views: { gte: 500 } } } },
+    );
+    assert.ok(hot.params.includes(500));
+  });
+
+  it('nested relation filter (posts.some.author.is) permutes correctly on a hit', () => {
+    const hot = assertCacheStable(
+      { posts: { some: { author: { is: { age: 1, name: 'a' } }, published: true } } },
+      { posts: { some: { published: false, author: { is: { name: 'z', age: 99 } } } } },
+    );
+    assert.ok(hot.params.includes(99));
+    assert.ok(hot.params.includes('z'));
+    assert.ok(hot.params.includes(false));
+  });
+
+  it('manyToMany relation filter re-collects its junction sub-where params', () => {
+    const hot = assertCacheStable(
+      { orgs: { some: { tier: { gte: 1 }, name: 'acme' } } },
+      { orgs: { some: { name: 'globex', tier: { gte: 3 } } } },
+    );
+    assert.ok(hot.params.includes(3));
+    assert.ok(hot.params.includes('globex'));
+  });
+
+  it('a relation-filter sub-where OR branch permutes without desyncing', () => {
+    assertCacheStable(
+      { posts: { some: { OR: [{ published: true }, { views: { gt: 1 } }] } } },
+      { posts: { some: { OR: [{ published: false }, { views: { gt: 100 } }] } } },
+    );
+  });
+
+  it('distinct relation sub-where shapes never collide on one fingerprint', () => {
+    // some vs none, and different inner operator sets, must be cache-distinct.
+    assert.notEqual(fp({ posts: { some: { views: { gt: 1 } } } }), fp({ posts: { some: { views: { lt: 1 } } } }));
+    assert.notEqual(
+      fp({ posts: { some: { author: { is: { age: 1 } } } } }),
+      fp({ posts: { some: { author: { is: { name: 'x' } } } } }),
+    );
   });
 });
 
