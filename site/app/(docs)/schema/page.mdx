@@ -179,7 +179,7 @@ npx turbine push
 
 ## SQL-first migrations
 
-Turbine migrations are plain `.sql` files with `-- UP` and `-- DOWN` sections. The runner tracks them in a `_turbine_migrations` table keyed on timestamp + SHA-256 checksum.
+Turbine migrations are plain `.sql` files with `-- UP` and `-- DOWN` sections. The runner tracks them in a `_turbine_migrations` table keyed on timestamp + SHA-256 checksum. For the full production workflow (deploy semantics, the destructive-op gate, what `--auto` can and cannot do, and the two-phase recipe for changing a populated column's type), see [Migrations in Practice](/migrate).
 
 ### Create a migration
 
@@ -227,19 +227,28 @@ Every migration's file is SHA-256 hashed and stored alongside the timestamp. If 
 
 ## Schema diffing
 
-`schemaDiff()` compares a `SchemaDef` against live database metadata and returns the DDL operations needed to close the gap. This powers `migrate create --auto`:
+`schemaDiff()` connects to a live Postgres database, compares it against a `SchemaDef`, and returns the DDL needed to close the gap. This powers `migrate create --auto`. Its signature is `schemaDiff(schema, connectionString)` and it returns a `Promise<DiffResult>`. Both `schemaDiff` and `introspect` are exported from the package root; there is no `turbine-orm/introspect` subpath:
 
 ```ts
 import { schemaDiff } from 'turbine-orm';
 import schema from './turbine/schema';
-import { introspect } from 'turbine-orm/introspect';
 
-const live = await introspect({ connectionString: DATABASE_URL });
-const ops = schemaDiff(live, schema);
-// ops: [{ kind: 'addColumn', table: 'users', ... }, ...]
+const diff = await schemaDiff(schema, process.env.DATABASE_URL!);
+
+// diff.statements: SQL to apply (UP direction), ready to run in order
+for (const sql of diff.statements) {
+  console.log(sql);
+}
+
+// diff.warnings: changes the diff detected but refuses to apply automatically
+for (const warning of diff.warnings ?? []) {
+  console.warn(warning);
+}
 ```
 
-The auto-generated migrations are a starting point — always review them before committing.
+`DiffResult` has the shape `{ create, alter, drop, statements, reverseStatements, warnings }`. `create` / `alter` / `drop` are the structured plan (tables to create, tables to alter, table names present in the DB but absent from the schema), `statements` is the flat SQL to apply and `reverseStatements` the DOWN direction. Anything destructive is deliberately left out of `statements`: table and column **drops are reported** (in `drop` and in the `alter` plan) **but never auto-emitted** into the executable SQL, so you apply those by hand. Enum value removals and reorders surface in `warnings` the same way.
+
+The auto-generated migrations are a starting point; always review them before committing. For the honest limits of `--auto` (blind type casts, undetected renames, `SET NOT NULL` without backfill) and the sanctioned recipe for changing a populated column's type, see [Migrations in Practice](/migrate).
 
 ## Introspection
 

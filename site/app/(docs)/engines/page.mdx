@@ -13,6 +13,8 @@ Multi-engine support is *additive*, not a pivot. You write the same `findMany` /
 
 Two of these engines run **in-process**, with no server to start: **SQLite** (always — there is no SQLite wire protocol) and **PowDB**, which uniquely offers *both* an in-process embedded mode *and* a networked client over the same data. The rest — PostgreSQL, MySQL, SQL Server — are networked.
 
+> **The `turbine` CLI drives PostgreSQL only.** `turbine generate`, `turbine push`, and `turbine migrate` are Postgres-only today. Every other engine (SQLite, MySQL, SQL Server, PowDB) is **code-first and programmatic**: define your schema with `defineSchema`, derive runtime metadata with `schemaDefToMetadata`, and construct the client through the engine's factory. The typed query API is identical across all engines; only the schema/migration *tooling* stays on Postgres for now. Each dialect already emits its own migration-tracking SQL, so a per-engine runner is a future adapter, not a rewrite.
+
 ## Honest by design
 
 Several of Turbine's flagship Postgres features have no portable equivalent. Rather than silently degrade, the non-Postgres engines throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) the moment you reach for one:
@@ -185,7 +187,7 @@ const db = await turbinePowDB('powdb://127.0.0.1:7070', schemaDefToMetadata(sche
 
 See [`schemaDefToMetadata`](/schema#runtime-metadata-without-a-database--schemadeftometadata) for the code-first metadata path in full.
 
-`turbinePowDB(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` is either an embedded descriptor (`{ embedded: dir, syncMode?, memoryLimit? }` or an open embedded handle) or a networked target (`powdb://host:port` string, a config object, or an existing PowDB pool — injection, so `disconnect()` becomes a no-op). The networked path probes the server version and requires **PowDB ≥ 0.7.1**; the optional peer range is `>=0.7.1 <1.0.0`. The ESM-only `@zvndev/powdb-client` ≥ 0.9 loads correctly even from a CommonJS build (Turbine reaches it through a dynamic-import shim).
+`turbinePowDB(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` is either an embedded descriptor (`{ embedded: dir, syncMode?, memoryLimit? }` or an open embedded handle) or a networked target (`powdb://host:port` string, a config object, or an existing PowDB pool — injection, so `disconnect()` becomes a no-op). The networked path probes the server version and requires **PowDB ≥ 0.7.0** at runtime; the declared optional peer range in `package.json` is `>=0.7.1 <1.0.0`. The ESM-only `@zvndev/powdb-client` ≥ 0.9 loads correctly even from a CommonJS build (Turbine reaches it through a dynamic-import shim).
 
 ### Embedded durability — `syncMode`
 

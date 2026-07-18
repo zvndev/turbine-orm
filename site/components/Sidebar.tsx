@@ -31,6 +31,7 @@ const sections: NavSection[] = [
       { href: '/vector', label: 'Vector Search' },
       { href: '/realtime', label: 'Realtime (LISTEN/NOTIFY)' },
       { href: '/schema', label: 'Schema & Migrations' },
+      { href: '/migrate', label: 'Migrations in Practice' },
       { href: '/seeding', label: 'Seeding' },
       { href: '/views', label: 'Views & Generated Columns' },
       { href: '/zod', label: 'Zod Schemas' },
