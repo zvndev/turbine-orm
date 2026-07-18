@@ -67,6 +67,28 @@ const users = await db.users.findMany({
 });
 ```
 
+### PII fields — `includePii`
+
+Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) are excluded from every default projection — the top-level rows, relation subqueries, batched loads, and a write's returned row. They come back in two ways: name the column explicitly in `select` (the explicit request IS the opt-in), or pass `includePii: true` to return every PII column at the top level **and** at every nested `with` level of that query.
+
+```ts
+// Default: email (pii) is absent
+const u = await db.users.findFirst({ where: { id: 1 } });
+u.email; // undefined
+
+// Explicit select returns exactly it
+const withEmail = await db.users.findFirst({ where: { id: 1 }, select: { email: true } });
+
+// includePii returns every PII column, including inside `with`
+const full = await db.users.findMany({
+  where: { active: true },
+  with: { posts: true },
+  includePii: true,
+});
+```
+
+`includePii` is only valid on reads (`findMany` / `findUnique` / `findFirst` and their `*OrThrow` forms, plus `findManyStream`); it is not a write option. Filtering or ordering by a PII column (`where`, `orderBy`, `groupBy`, aggregates) is always allowed regardless of the flag, since naming the column is itself explicit. Schemas with no PII-tagged columns are unaffected — the emitted SQL is byte-identical either way.
+
 ### Pagination — `limit` / `take`, `offset`, `cursor`
 
 Offset pagination uses `limit` + `offset`. `take` is a Prisma-compatible alias for `limit` — when both are passed, `take` wins (`take ?? limit`):
