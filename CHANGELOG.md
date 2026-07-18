@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.36.0 (2026-07-17)
+## 0.36.0 (2026-07-18)
 
 The safety release: first-class PII field tagging with opt-in return semantics,
 an opt-in writable Studio (read-only stays the default), an honest and hardened
@@ -21,9 +21,19 @@ release; every confirmed finding was fixed or explicitly documented below.
   level and at every nested `with` level of that query. Filtering, ordering,
   and grouping by a PII column stay allowed (naming the column is itself the
   opt-in). Untagged schemas emit byte-identical SQL. The SQL cache key carries
-  the flag, so a cached no-PII statement can never serve an opt-in call. One
-  documented boundary: writes still use `RETURNING *`, so PII transits the
-  database connection before Turbine strips it from the returned object.
+  the flag, so a cached no-PII statement can never serve an opt-in call.
+- **PII is enforced at the SQL level on writes.** A write against a table with
+  PII columns (`create`, `createMany`, `update`, `delete`, `upsert`, nested
+  writes) returns an explicit non-PII projection instead of `RETURNING *`:
+  `RETURNING "col", ...` on Postgres and SQLite, a projected follow-up
+  `SELECT` on MySQL, and per-column `OUTPUT INSERTED.` / `OUTPUT DELETED.` on
+  SQL Server. PII values are persisted normally; they simply never cross the
+  wire back unrequested. A PII-tagged primary key stays in the projection so
+  the returned row remains addressable. Tables with no PII columns keep
+  `RETURNING *` byte-for-byte. PowDB is the one exception (its `returning`
+  keyword takes no column list per the driver spec), so the returned row is
+  stripped client-side there; its upsert reselect already projects non-PII
+  columns.
 - **Writable Studio (opt-in).** `turbine studio --write` enables single-row
   insert/update/delete from the Data tab. Every write is addressed by the
   row's full primary key (the predicate is rebuilt from the PK alone, so a
@@ -40,10 +50,19 @@ release; every confirmed finding was fixed or explicitly documented below.
   from `orderBy`, so a redacted value cannot be probed or inferred through
   sort position. `--show-pii` reveals values for a launch, with a loud
   terminal warning and a persistent PII SHOWN banner in the browser.
+- **Studio row editor: explicit set-NULL.** Nullable non-PK columns get a
+  per-field NULL toggle (insert and edit) that sends an explicit `null`
+  parameter end-to-end; a blank field still means "unchanged" (edit) or "use
+  the default" (insert). A null-toggled PII field sends `null`, never the
+  redaction placeholder.
 - **Destructive gate on `push`.** `turbine push` now scans the statements it
   is about to apply with the same destructive-SQL scanner as `migrate up` and
   refuses to run them without the two-step typed confirmation (the literal
   phrase `destroy my data`, then `yes`) or an explicit `--allow-destructive`.
+  The diff is computed once and the confirmed statements are exactly the ones
+  applied (no re-diff between confirmation and apply), and the refusal is a
+  typed `DestructivePushRefusal` (exported, extends `ValidationError`,
+  carries the offending statements) rather than a message-text convention.
 - **Declared indexes in SQL DDL.** `defineSchema` table-level
   `indexes: [{ columns, unique?, name? }]` now emit `CREATE [UNIQUE] INDEX`
   from `schemaToSQL`/`push`, and `schemaDiff` adds declared indexes missing
@@ -111,6 +130,12 @@ release; every confirmed finding was fixed or explicitly documented below.
 - `--recipe` with a missing name now errors instead of silently creating a
   plain migration.
 - `push --help` now documents `--allow-destructive`.
+- `schemaDiff` undeclared-index warnings now fire whenever a table defines an
+  `indexes` array, including after the last declaration is removed (they were
+  previously silenced exactly when the operator most needed them).
+- A relation filter with a `null` value (`{ some: null }`) is now treated
+  identically by the SQL build and the cached-parameter collection paths
+  (latent asymmetry, unreachable through the public types).
 
 ## 0.35.0 (2026-07-16)
 
