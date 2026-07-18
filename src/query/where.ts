@@ -107,6 +107,12 @@ export interface BuilderCtx {
     build: (params: unknown[]) => string,
     collectedParams: unknown[],
   ): void;
+  // Shared primitives + state reached by the relation/orderBy module (relations.ts).
+  readonly jsonEncoding: 'object' | 'positional';
+  readonly camelDateFieldCache: Map<string, Set<string>>;
+  limitOneClause(): string;
+  buildPagination(limitPh: string | undefined, offsetPh: string | undefined, hasOrderBy: boolean): string;
+  paginationRef(value: unknown, params: unknown[]): string;
 }
 
 /**
