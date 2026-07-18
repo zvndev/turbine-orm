@@ -31,7 +31,7 @@ import { generate } from '../generate.js';
 import { findMissingRelationIndexes } from '../index-advisor.js';
 import { introspect } from '../introspect.js';
 import type { SchemaDef } from '../schema-builder.js';
-import { schemaDiff, schemaPush } from '../schema-sql.js';
+import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
 import type { CliOverrides, ResolvedConfig } from './config.js';
 import {
   configTemplate,
@@ -988,20 +988,25 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
   }
 
   // Execute (gated): schemaPush throws on destructive statements unless allowed.
+  // Pass the diff computed above as `precomputedDiff` so schemaPush applies the
+  // EXACT statements just displayed and confirmed, with no re-diff between confirm
+  // and apply (the TOCTOU window where a concurrent schema change could alter
+  // the applied set). Both the initial attempt and the post-confirmation retry
+  // reuse `diff`, so the confirmed plan and the applied plan are identical.
   const pushSpinner = new Spinner('Applying changes').start();
   let result: Awaited<ReturnType<typeof schemaPush>>;
   try {
-    result = await schemaPush(schemaDef, url, { allowDestructive: args.allowDestructive });
+    result = await schemaPush(schemaDef, url, { allowDestructive: args.allowDestructive, precomputedDiff: diff });
   } catch (err) {
-    if (!isDestructiveRefusal(err)) throw err;
+    if (!(err instanceof DestructivePushRefusal)) throw err;
     pushSpinner.stop();
-    if (!(await confirmDestructive((err as Error).message))) {
+    if (!(await confirmDestructive(err.message))) {
       error('Aborted: no changes were applied and no data was touched.');
       newline();
       process.exit(1);
     }
     pushSpinner.start();
-    result = await schemaPush(schemaDef, url, { allowDestructive: true });
+    result = await schemaPush(schemaDef, url, { allowDestructive: true, precomputedDiff: diff });
   }
   pushSpinner.succeed(`Applied ${bold(String(result.statementsExecuted))} statement(s)`);
 

@@ -17,18 +17,23 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { TurbineError, ValidationError } from '../errors.js';
 import { defineSchema } from '../schema-builder.js';
 import {
   buildAddForeignKeyStatement,
   type DbForeignKey,
+  DestructivePushRefusal,
+  type DiffResult,
   describeIndexDefMismatch,
   diffCheckConstraints,
   diffEnumValues,
   diffReferentialAction,
   findDestructivePushStatements,
   schemaDiff,
+  schemaPush,
   schemaToSQL,
   schemaToSQLString,
+  undeclaredIndexWarnings,
 } from '../schema-sql.js';
 import { skipGate } from './helpers.js';
 
@@ -1002,6 +1007,162 @@ describe('B1 - findDestructivePushStatements (pure)', () => {
       'CREATE INDEX "idx_users_email" ON "users"("email");',
     ];
     assert.deepEqual(findDestructivePushStatements(stmts), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I-2: DestructivePushRefusal is a typed marker (no more message sniffing)
+// ---------------------------------------------------------------------------
+
+describe('I-2 - DestructivePushRefusal (typed refusal)', () => {
+  const hits = findDestructivePushStatements([
+    'ALTER TABLE "users" ALTER COLUMN "id" TYPE INTEGER USING "id"::INTEGER;',
+  ]);
+
+  it('is a ValidationError subclass carrying the E003 code', () => {
+    const err = new DestructivePushRefusal(hits);
+    assert.ok(err instanceof DestructivePushRefusal);
+    assert.ok(err instanceof ValidationError);
+    assert.ok(err instanceof TurbineError);
+    assert.equal(err.code, 'TURBINE_E003');
+    assert.equal(err.name, 'DestructivePushRefusal');
+  });
+
+  it('carries the offending statements on .destructive', () => {
+    const err = new DestructivePushRefusal(hits);
+    assert.equal(err.destructive.length, 1);
+    assert.equal(err.destructive[0]!.kind, 'alter-column-type');
+    assert.equal(err.destructive[0]!.target, 'users.id');
+  });
+
+  it('keeps the message text (still lists DESTRUCTIVE) so callers need no sniff', () => {
+    const err = new DestructivePushRefusal(hits);
+    assert.ok(err.message.includes('DESTRUCTIVE'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I-1: schemaPush applies the precomputed (confirmed) diff verbatim
+// ---------------------------------------------------------------------------
+
+describe('I-1 - schemaPush precomputed diff (no TOCTOU re-diff)', () => {
+  const minimalSchema = defineSchema({ widgets: { id: { type: 'serial', primaryKey: true } } }, { enums: {} });
+  // A URL that would fail immediately on connect. If schemaPush re-diffed
+  // instead of honoring precomputedDiff, it would connect here and throw a
+  // connection error rather than exercising the precomputed path.
+  const unreachableUrl = 'postgres://127.0.0.1:1/does-not-exist';
+
+  const additiveDiff: DiffResult = {
+    create: [],
+    alter: [],
+    drop: [],
+    statements: ['ALTER TABLE "widgets" ADD COLUMN "label" TEXT;'],
+    reverseStatements: [],
+    warnings: [],
+  };
+
+  it('dry-run returns the exact precomputed statement array (identity), no DB touched', async () => {
+    const res = await schemaPush(minimalSchema, unreachableUrl, {
+      precomputedDiff: additiveDiff,
+      dryRun: true,
+    });
+    // Same array reference => the confirmed statements are what schemaPush operates on.
+    assert.equal(res.statements, additiveDiff.statements);
+    assert.equal(res.statementsExecuted, 0);
+  });
+
+  it('destructive gate scans the PRECOMPUTED statements and throws before connecting', async () => {
+    const destructiveDiff: DiffResult = {
+      create: [],
+      alter: [],
+      drop: [],
+      statements: [
+        'ALTER TABLE "widgets" ADD COLUMN "count" INTEGER;',
+        'ALTER TABLE "widgets" ALTER COLUMN "id" TYPE INTEGER USING "id"::INTEGER;',
+      ],
+      reverseStatements: [],
+      warnings: [],
+    };
+    await assert.rejects(
+      () => schemaPush(minimalSchema, unreachableUrl, { precomputedDiff: destructiveDiff }),
+      (err: unknown) => {
+        // A re-diff would have thrown a ConnectionError against unreachableUrl;
+        // getting the typed refusal proves the precomputed statements were used.
+        assert.ok(err instanceof DestructivePushRefusal);
+        assert.equal(err.destructive.length, 1);
+        assert.equal(err.destructive[0]!.kind, 'alter-column-type');
+        assert.equal(err.destructive[0]!.target, 'widgets.id');
+        return true;
+      },
+    );
+  });
+
+  it('allowDestructive with a precomputed destructive diff still reaches the executor (connect fails, not a refusal)', async () => {
+    // With allowDestructive the gate is skipped, so the ONLY thing that can
+    // fail on the unreachable URL is the connect: proves the gate no longer
+    // blocks and the precomputed statements would be the ones applied.
+    await assert.rejects(
+      () =>
+        schemaPush(minimalSchema, unreachableUrl, {
+          precomputedDiff: {
+            create: [],
+            alter: [],
+            drop: [],
+            statements: ['ALTER TABLE "widgets" ALTER COLUMN "id" TYPE INTEGER USING "id"::INTEGER;'],
+            reverseStatements: [],
+            warnings: [],
+          },
+          allowDestructive: true,
+        }),
+      (err: unknown) => {
+        assert.ok(!(err instanceof DestructivePushRefusal));
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I-3: undeclared-index warning scope (pure decision)
+// ---------------------------------------------------------------------------
+
+describe('I-3 - undeclaredIndexWarnings (scope decision)', () => {
+  it('returns [] when the table does not manage indexes (indexesDefined=false)', () => {
+    const out = undeclaredIndexWarnings({
+      tableName: 'users',
+      indexesDefined: false,
+      dbIndexNames: ['idx_users_stray'],
+      declaredNames: new Set(),
+      recognizedNames: new Set(),
+    });
+    assert.deepEqual(out, []);
+  });
+
+  it('warns even with ZERO declared indexes, as long as the table opts in (empty indexes array)', () => {
+    // The bug: deleting the last declared index (declaredNames empty) used to
+    // silence the whole pass. It must still warn about undeclared DB indexes.
+    const out = undeclaredIndexWarnings({
+      tableName: 'users',
+      indexesDefined: true,
+      dbIndexNames: ['idx_users_stray'],
+      declaredNames: new Set(),
+      recognizedNames: new Set(),
+    });
+    assert.equal(out.length, 1);
+    assert.ok(out[0]!.includes('idx_users_stray'));
+    assert.ok(out[0]!.includes('not declared in the schema'));
+  });
+
+  it('never flags declared, recognized, or *_pkey names', () => {
+    const out = undeclaredIndexWarnings({
+      tableName: 'users',
+      indexesDefined: true,
+      dbIndexNames: ['idx_users_email', 'users_pkey', 'idx_users_org_id', 'idx_users_stray'],
+      declaredNames: new Set(['idx_users_email']),
+      recognizedNames: new Set(['idx_users_org_id']),
+    });
+    assert.equal(out.length, 1);
+    assert.ok(out[0]!.includes('idx_users_stray'));
   });
 });
 

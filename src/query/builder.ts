@@ -4383,7 +4383,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     };
 
     // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
-    if (filterObj.some !== undefined) {
+    // A `null` branch is skipped (never reaches buildSubWhereForRelation, which
+    // would throw on Object.keys(null)), matching collectRelationFilterParams,
+    // which also skips null. Unreachable via normalization today, guarded anyway.
+    if (filterObj.some !== undefined && filterObj.some !== null) {
       const subWhere = filterObj.some as Record<string, unknown>;
       const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
       const filterAnd = filterClause ? ` AND ${filterClause}` : '';
@@ -4391,7 +4394,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
-    if (filterObj.none !== undefined) {
+    if (filterObj.none !== undefined && filterObj.none !== null) {
       const subWhere = filterObj.none as Record<string, unknown>;
       const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
       const filterAnd = filterClause ? ` AND ${filterClause}` : '';
@@ -4399,7 +4402,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND gf AND NOT (filter))
-    if (filterObj.every !== undefined) {
+    if (filterObj.every !== undefined && filterObj.every !== null) {
       const subWhere = filterObj.every as Record<string, unknown>;
       const filterClause = this.buildSubWhereForRelation(targetTable, subWhere, params);
       if (filterClause) {
