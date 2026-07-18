@@ -1,12 +1,12 @@
 /**
- * turbine-orm — WHERE-clause compilation (extracted from builder.ts)
+ * turbine-orm: WHERE-clause compilation (extracted from builder.ts)
  *
  * The whole WHERE web: the top-level build/collect/fingerprint trio, the
  * table-scoped trio for relation-filter EXISTS sub-wheres and relation
  * `with`-clause wheres, the leaf JSON/array/vector/text-search clause builders,
  * operator-clause + column-reference compilation, and the client-level
  * global-filter helpers. All functions take a {@link BuilderCtx} as their first
- * argument — the privacy-preserving view of the owning {@link QueryInterface}
+ * argument: the privacy-preserving view of the owning {@link QueryInterface}
  * instance (built once in its constructor) exposing exactly the class-resident
  * primitives this module needs. See builder.ts for the thin delegating methods.
  */

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — write compilation (extracted from builder.ts)
+ * turbine-orm: write compilation (extracted from builder.ts)
  *
  * SQL builders for the mutating operations (create / createMany / update /
  * delete / upsert / updateMany / deleteMany) plus the write-projection helpers
@@ -71,7 +71,7 @@ export function buildCreate<T extends object>(qi: BuilderCtx, args: CreateArgs<T
         throw new NotFoundError({
           table: qi.table,
           operation: 'create',
-          message: `[turbine] create on "${qi.table}" returned no row from RETURNING * — this should never happen.`,
+          message: `[turbine] create on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
         });
       }
       return parseWriteRow(qi, row) as T;
@@ -407,7 +407,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
           table: qi.table,
           where: args.where,
           operation: 'upsert',
-          message: `[turbine] upsert on "${qi.table}" returned no row from RETURNING * — this should never happen.`,
+          message: `[turbine] upsert on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
         });
       }
       return parseWriteRow(qi, row) as T;

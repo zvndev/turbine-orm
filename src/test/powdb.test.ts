@@ -662,7 +662,7 @@ describe('powdb: write generation', () => {
   });
 
   // PowDB spec limitation: PowQL `returning` is a bare keyword that hands back
-  // every column — the driver contract exposes NO column-list form. So (unlike
+  // every column (the driver contract exposes NO column-list form). So (unlike
   // the SQL engines, which emit an explicit non-PII RETURNING/OUTPUT projection)
   // the create/update/delete PowQL is UNCHANGED and PII must be stripped from the
   // returned row client-side (stripWritePii). The upsert path is different: it

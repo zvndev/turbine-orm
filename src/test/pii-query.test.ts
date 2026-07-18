@@ -408,7 +408,7 @@ describe('pii: untagged tables keep RETURNING * on writes (byte-identical)', () 
 
 // ---------------------------------------------------------------------------
 // A PII-tagged PRIMARY KEY is kept in the write projection (out of scope for
-// stripping — the returned row must stay addressable).
+// stripping; the returned row must stay addressable).
 // ---------------------------------------------------------------------------
 
 describe('pii: a PII-tagged primary key stays in the write RETURNING list', () => {

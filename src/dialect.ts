@@ -14,7 +14,7 @@ export type DialectName = 'postgresql' | 'mysql' | 'sqlite' | (string & {});
 
 /**
  * A write statement's returning/output selection. `'*'` returns every column
- * (the historical default — byte-identical SQL). A `string[]` is an explicit,
+ * (the historical default, byte-identical SQL). A `string[]` is an explicit,
  * SQL-ready quoted column list used to exclude PII-tagged columns from a
  * write's returned row at the SQL level, so PII never crosses the wire
  * unrequested. Each dialect renders it into its own returning surface

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — relation + orderBy compilation (extracted from builder.ts)
+ * turbine-orm: relation + orderBy compilation (extracted from builder.ts)
  *
  * The json_agg nested-relation machinery (buildSelectWithRelations,
  * buildRelationSubquery, buildManyToManySubquery), the positional-encoding

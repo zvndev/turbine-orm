@@ -531,7 +531,7 @@ function mssqlColumnType(type: string, maxLength?: number | null): string {
 /**
  * Render the SQL Server `OUTPUT` clause for a write's returning selection.
  * `'*'` → ` OUTPUT INSERTED.*` (byte-identical to the historical default); a
- * quoted column list → ` OUTPUT INSERTED.[c1], INSERTED.[c2]` — each column
+ * quoted column list → ` OUTPUT INSERTED.[c1], INSERTED.[c2]`; each column
  * carries its own `INSERTED.`/`DELETED.` prefix (a bare comma list is invalid
  * T-SQL). Used to exclude PII columns from a write's returned row. Empty
  * selection → no clause.

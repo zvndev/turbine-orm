@@ -1,5 +1,5 @@
 /**
- * turbine-orm — aggregate / groupBy compilation (extracted from builder.ts)
+ * turbine-orm: aggregate / groupBy compilation (extracted from builder.ts)
  *
  * buildAggregate + buildGroupBy and their helpers (HAVING clauses, groupBy
  * ordering, DISTINCT-ON sources, JSON-path aggregate targets). All functions
@@ -453,7 +453,7 @@ export function buildDistinctOnSource<T extends object>(
  * Build the SQL fragments for a {@link HavingClause}.
  *
  * Each aggregate expression (`COUNT(*)`, `SUM("col")`, etc.) is constructed
- * from a **schema-validated, quoted** column identifier — `qi.toColumn()`
+ * from a **schema-validated, quoted** column identifier: `qi.toColumn()`
  * throws {@link ValidationError} for unknown fields and `qi.q()` quotes via
  * the dialect, so no unvalidated identifier ever reaches the SQL string. Every
  * comparison value is pushed onto the shared `params` array and referenced by

@@ -789,7 +789,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    *
    * SPEC LIMITATION (PowQL): the driver contract
    * (`docs/integrations/powql-for-drivers.md`) exposes `returning` only as a
-   * bare keyword that hands back every column — it accepts NO column list, so
+   * bare keyword that hands back every column; it accepts NO column list, so
    * (unlike the SQL engines, which emit an explicit non-PII `RETURNING`/`OUTPUT`
    * projection) the create/update/delete `returning` paths cannot exclude PII at
    * the query-language level and must strip it here after the fact. This is the

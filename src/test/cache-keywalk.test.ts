@@ -51,7 +51,7 @@ function schema(): SchemaMetadata {
             foreignKey: 'author_id',
             referenceKey: 'id',
           },
-          // manyToMany through a junction — exercises the m2m relation-filter
+          // manyToMany through a junction: exercises the m2m relation-filter
           // sub-where path under the shared scoped walk.
           orgs: {
             type: 'manyToMany',
@@ -73,7 +73,7 @@ function schema(): SchemaMetadata {
           { name: 'views', field: 'views', pgType: 'int4' },
         ],
         {
-          // belongsTo back to users — exercises a NESTED relation filter
+          // belongsTo back to users: exercises a NESTED relation filter
           // (`posts.some.author.is`) inside a relation sub-where.
           author: {
             type: 'belongsTo',
@@ -254,7 +254,7 @@ describe('key-walk: relation sub-wheres stay in lockstep under the shared scoped
   // consume the SAME canonical `walkWhere` the top level does. These cases warm
   // the cache with a relation-filter clause, HIT it with a fingerprint-equal
   // different-values clause, and assert the served (sql, params) equal a fresh
-  // cold build — the load-bearing invariant for the sub-where walkers.
+  // cold build: the load-bearing invariant for the sub-where walkers.
 
   it('some: permuted inner sub-where keys bind each its own value on a warm hit', () => {
     const hot = assertCacheStable(
