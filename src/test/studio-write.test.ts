@@ -375,7 +375,8 @@ describe('Studio write: single-row round-trips', () => {
     assert.equal(r.status, 200, r.body);
     const write = firstDataQuery(calls);
     assert.match(write.text, /^INSERT INTO "users"/);
-    assert.match(write.text, /RETURNING \*/);
+    // users has a PII column, so the write returns the non-PII projection.
+    assert.match(write.text, /RETURNING "id", "name"/);
     // Both columns bound as params; the null is a real $N, never inlined.
     assert.deepEqual(write.values, [null, 'ada@x.com']);
   });
