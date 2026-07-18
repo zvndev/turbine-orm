@@ -11,6 +11,7 @@
  * primitives this module needs. See builder.ts for the thin delegating methods.
  */
 
+import type pg from 'pg';
 import type { Dialect } from '../dialect.js';
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
@@ -41,7 +42,7 @@ import type {
   WhereClause,
   WhereOperator,
 } from './types.js';
-import { escapeLike, OPERATOR_KEYS } from './utils.js';
+import { escapeLike, OPERATOR_KEYS, type SqlCacheEntry } from './utils.js';
 import {
   classifyScalarForSql,
   fingerprintScalarToken,
@@ -95,6 +96,17 @@ export interface BuilderCtx {
     prefix: string,
     params?: unknown[],
   ): string;
+  // Shared primitives reached by the write module (writes.ts).
+  toSqlColumn(field: string): string;
+  mutationInsertId(result: pg.QueryResult): unknown;
+  acquireSql(cacheKey: string, build: (params: unknown[]) => string): SqlCacheEntry;
+  crossCheckCache(
+    op: string,
+    cacheKey: string,
+    entry: SqlCacheEntry,
+    build: (params: unknown[]) => string,
+    collectedParams: unknown[],
+  ): void;
 }
 
 /**
