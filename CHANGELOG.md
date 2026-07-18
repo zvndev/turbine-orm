@@ -88,14 +88,16 @@ release; every confirmed finding was fixed or explicitly documented below.
 
 ### Changed
 
-- **The where-clause walk is unified.** `fingerprintWhere`,
+- **The where-clause walk is unified, at every level.** `fingerprintWhere`,
   `buildWhereClause`, and `collectWhereParams` (the three-way hand-synced
   functions behind two previously shipped cache bugs) now consume one
   canonical enumeration (`walkWhere` in `src/query/where-compile.ts`) with a
-  single column-aware scalar classifier, structurally eliminating the
-  top-level drift class. Relation sub-where compilation still has mirrored
-  walkers one level down; those are covered by the cross-check tripwire and
-  scheduled for the same treatment with the planned `builder.ts` split.
+  single column-aware scalar classifier. The relation sub-where walkers
+  (the relation-filter `EXISTS` body and the relation `with`-clause `where`)
+  are consumers of the same walk through one shared scoped trio, so no
+  hand-mirrored where walker remains anywhere in the query builder. The
+  dev-mode cross-check and the new sampled production cross-check stand as
+  tripwires on top.
 - **Studio CSP hardened.** The inline UI script is authorized by a
   per-request nonce (`script-src 'self' 'nonce-...'`); `unsafe-inline` is gone
   from `script-src`. Mutating routes reject absent as well as mismatched
