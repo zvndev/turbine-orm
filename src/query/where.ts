@@ -34,6 +34,7 @@ import type {
   ColumnRef,
   GlobalFilters,
   JsonFilter,
+  JsonPathOrderBy,
   SkipGlobalFilters,
   TextSearchFilter,
   VectorFilter,
@@ -68,13 +69,32 @@ export interface BuilderCtx {
   readonly columnPgTypeMap: Map<string, string>;
   readonly columnArrayTypeMap: Map<string, string>;
   readonly crossSchemaTypeColumns: Set<string>;
-  /** Live getter — the active query's `skipGlobalFilters` opt-out. */
-  readonly currentSkip: SkipGlobalFilters | undefined;
+  /**
+   * The active query's `skipGlobalFilters` opt-out. A live getter/setter over
+   * the owning instance's field: `build*` methods set it at their top, and the
+   * synchronous SQL-build + param-collect tree reads it deep inside
+   * `resolveGlobalFilter`.
+   */
+  currentSkip: SkipGlobalFilters | undefined;
   q(name: string): string;
   p(index: number): string;
   inParam(values: unknown): unknown;
   inClause(expr: string, paramRef: string, negated: boolean): string;
   toColumn(field: string): string;
+  // Shared primitives reached by the aggregate/groupBy module (aggregates.ts).
+  castAgg(expr: string, target: 'int' | 'float'): string;
+  parseRow(row: Record<string, unknown>, table: string): Record<string, unknown>;
+  nullsSuffix(nulls: 'first' | 'last' | undefined): string;
+  isRelationOrderByValue(value: unknown): boolean;
+  resolveOrderByColumn(table: string, meta: TableMetadata, key: string): string;
+  buildJsonPathOrderEntry(
+    table: string,
+    meta: TableMetadata,
+    field: string,
+    spec: JsonPathOrderBy,
+    prefix: string,
+    params?: unknown[],
+  ): string;
 }
 
 /**
