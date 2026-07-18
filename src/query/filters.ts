@@ -227,6 +227,18 @@ export const ARRAY_OPERATOR_KEYS = new Set<string>(['has', 'hasEvery', 'hasSome'
  */
 export const ARRAY_UNIQUE_KEYS = new Set<string>(['has', 'hasEvery', 'hasSome', 'isEmpty']);
 
+/**
+ * Value-invariant shape fingerprint for an {@link ArrayFilter} (the INNER part,
+ * without the `arr(...)` wrapper the where fingerprint adds). The boolean
+ * `isEmpty` operator changes the SQL shape (`= '{}'` vs `<> '{}'`), so its
+ * concrete value is part of the shape; the other operators are value-invariant.
+ */
+export function fingerprintArrayFilterShape(filter: ArrayFilter): string {
+  const keys = Object.keys(filter).sort();
+  const suffix = filter.isEmpty === undefined ? '' : `:empty=${filter.isEmpty ? 'true' : 'false'}`;
+  return `${keys.join(',')}${suffix}`;
+}
+
 /** Check if a value is an Array filter object */
 export function isArrayFilter(value: unknown): value is ArrayFilter {
   if (
