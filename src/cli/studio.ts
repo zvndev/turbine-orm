@@ -1,25 +1,38 @@
 /**
  * turbine-orm CLI — Studio
  *
- * A local, read-only web UI for browsing databases, exploring relations,
- * and composing queries visually. ORM-native since v0.19: there is no
- * raw-SQL input surface — the Query tab builds `findMany` args that are
- * validated against introspected metadata and compiled by QueryInterface
- * (`/api/builder`). Pure Node (built-in `http` module), no runtime
- * dependencies beyond `pg`. CLI defaults to 127.0.0.1 and refuses non-loopback
- * hosts unless `npx turbine studio --allow-remote` is set.
+ * A local web UI for browsing databases, exploring relations, and composing
+ * queries visually. ORM-native since v0.19: there is no raw-SQL input surface.
+ * The Query tab builds `findMany` args that are validated against introspected
+ * metadata and compiled by QueryInterface (`/api/builder`). Pure Node (built-in
+ * `http` module), no runtime dependencies beyond `pg`. CLI defaults to 127.0.0.1
+ * and refuses non-loopback hosts unless `npx turbine studio --allow-remote`.
+ *
+ * Read-only by default. `turbine studio --write` opts in to single-row writes
+ * (see the write model below); without the flag the write API routes do not
+ * exist (they 404) and the UI renders no write affordances.
  *
  * Security model:
  *   • Loopback by default; CLI refuses non-loopback without --allow-remote
  *   • Random auth token generated per process, required in Cookie header
- *   • No SQL input surface at all — every identifier in a builder request is
- *     validated against the introspected schema; all values are $N params
- *   • Every query runs in a READ ONLY transaction (belt-and-suspenders)
+ *   • No SQL input surface at all: every identifier in a builder or write
+ *     request is validated against the introspected schema; all values are
+ *     $N params compiled through the query builders
+ *   • Read routes run in a READ ONLY transaction (belt-and-suspenders)
+ *   • Write routes (only when `--write` is set) run in a plain BEGIN/COMMIT
+ *     transaction, require a matching Origin header (CSRF), and target exactly
+ *     one row by its full primary key
  *   • 30s statement timeout via parameterized set_config()
- *   • Per-session rate limiting, CSP + security headers, cross-origin refusal
+ *   • Per-session rate limiting, cross-origin refusal, security headers, and a
+ *     per-request CSP nonce for the inline script (no `unsafe-inline`)
  *
- * Not implemented (deliberately): row editing, DDL, destructive operations.
- * Studio is for inspection. Use the CLI, migrate, or raw SQL for writes.
+ * PII: columns tagged `pii` in code-first metadata are redacted server-side in
+ * every row-bearing response (the literal `•• redacted ••`) unless the server
+ * was started with `--show-pii`.
+ *
+ * Write model (opt-in): update/insert/delete a single row. DDL and multi-row or
+ * unconditional writes are deliberately unsupported. Use the CLI or migrate for
+ * schema changes and bulk operations.
  */
 
 import { spawn } from 'node:child_process';
@@ -30,7 +43,7 @@ import { platform } from 'node:os';
 import { dirname, resolve as pathResolve } from 'node:path';
 import pg from 'pg';
 import { introspect } from '../introspect.js';
-import type { FindManyArgs } from '../query/index.js';
+import type { CreateArgs, DeleteArgs, FindManyArgs, UpdateArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { STUDIO_HTML } from './studio-ui.generated.js';
@@ -51,6 +64,15 @@ export interface StudioOptions {
   stateDir?: string;
   /** Database adapter for dialect-specific behavior (e.g. statement timeout syntax). */
   adapter?: import('../adapters/index.js').DatabaseAdapter;
+  /**
+   * Opt in to single-row write routes (`/api/row/update|insert|delete`) and the
+   * write UI. Default `false`: read-only, with the write routes absent (404).
+   */
+  write?: boolean;
+  /**
+   * Reveal PII-tagged column values instead of redacting them. Default `false`.
+   */
+  showPii?: boolean;
 }
 
 export interface StudioHandle {
@@ -72,6 +94,13 @@ export interface StudioContext {
   statementTimeout: { sql: string; params: unknown[] };
   /** Rate limiter state — tracks requests per authenticated session. */
   rateLimiter: Map<string, { count: number; resetAt: number }>;
+  /**
+   * True when write mode is enabled (`--write`): the `/api/row/*` routes exist
+   * and the UI renders write affordances. Absent/false → read-only.
+   */
+  writable?: boolean;
+  /** True when PII redaction is disabled (`--show-pii`). Absent/false → redact. */
+  showPii?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +149,17 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     params: ['30s'],
   };
   const rateLimiter = new Map<string, { count: number; resetAt: number }>();
-  const ctx: StudioContext = { pool, metadata, options, authToken, stateDir, statementTimeout, rateLimiter };
+  const ctx: StudioContext = {
+    pool,
+    metadata,
+    options,
+    authToken,
+    stateDir,
+    statementTimeout,
+    rateLimiter,
+    writable: options.write === true,
+    showPii: options.showPii === true,
+  };
 
   const server = createServer((req, res) => {
     handleRequest(req, res, ctx).catch((err) => {
@@ -170,7 +209,7 @@ function originFor(host: string, port: number): string {
 // Request routing
 // ---------------------------------------------------------------------------
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
+export async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
   const expectedOrigin = originFor(ctx.options.host, ctx.options.port);
   // CORS: not needed — same-origin only. Explicitly refuse cross-origin.
   const origin = req.headers.origin;
@@ -200,7 +239,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Stu
       res.end();
       return;
     }
-    sendHtml(res, 200, STUDIO_HTML);
+    sendHtml(res, 200, STUDIO_HTML, cspNonce());
     return;
   }
 
@@ -251,6 +290,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: Stu
   if (pathname.startsWith('/api/saved-queries/') && req.method === 'DELETE') {
     const id = decodeURIComponent(pathname.slice('/api/saved-queries/'.length));
     return apiDeleteSavedQuery(res, ctx, id);
+  }
+
+  // Write routes: ONLY exist in write mode. In read-only mode they fall through
+  // to the 404 below (deliberately not 403: a read-only Studio has no such API).
+  if (ctx.writable && pathname.startsWith('/api/row/') && req.method === 'POST') {
+    // CSRF: a state-changing request MUST carry a same-origin Origin header. The
+    // top-of-handler check already rejects a MISMATCHED origin (403); this also
+    // rejects an ABSENT one, which read (GET) routes tolerate for curl ergonomics
+    // but a browser always sends on a cross-scheme/site POST. `fetch` from the
+    // Studio page always sets it for same-origin, so the real UI is unaffected.
+    if (origin !== expectedOrigin) {
+      sendJson(res, 403, { error: 'a matching Origin header is required for write requests' });
+      return;
+    }
+    const op = pathname.slice('/api/row/'.length);
+    if (op === 'update') return apiRowWrite(req, res, ctx, 'update');
+    if (op === 'insert') return apiRowWrite(req, res, ctx, 'insert');
+    if (op === 'delete') return apiRowWrite(req, res, ctx, 'delete');
   }
 
   sendJson(res, 404, { error: 'not found' });
@@ -339,6 +396,7 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
       nullable: col.nullable,
       hasDefault: col.hasDefault,
       isPrimaryKey: tbl.primaryKey.includes(col.name),
+      pii: col.pii === true,
     })),
     relations: Object.entries(tbl.relations).map(([name, rel]) => ({
       name,
@@ -369,6 +427,10 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
     schema: ctx.options.schema,
     tables: tables.map((t) => ({ ...t, estimatedRows: counts.get(t.name) ?? 0 })),
     enums: ctx.metadata.enums,
+    // Client-config flags the UI reads to gate write affordances / PII masking.
+    // Read-only Studio reports `writable: false` so the UI renders no write UI.
+    writable: ctx.writable === true,
+    showPii: ctx.showPii === true,
   });
 }
 
@@ -443,10 +505,11 @@ export async function apiTableRows(
     const countResult = await client.query<{ count: string }>(countSql, countValues);
     await client.query('COMMIT');
 
+    const piiKeys = ctx.showPii ? NO_PII_KEYS : piiKeysForTable(table);
     sendJson(res, 200, {
       table: table.name,
       columns: result.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID })),
-      rows: result.rows.map((r) => serializeRow(r)),
+      rows: result.rows.map((r) => serializeRow(redactFlatRow(r, piiKeys))),
       total: Number(countResult.rows[0]?.count ?? 0),
       limit,
       offset,
@@ -529,10 +592,12 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
     const elapsedMs = Date.now() - started;
     await client.query('COMMIT');
 
+    const rawRows = result.rows as Record<string, unknown>[];
+    const redactedRows = ctx.showPii ? rawRows : redactBuilderRows(rawRows, tableName, args.with, ctx.metadata);
     sendJson(res, 200, {
       sql: deferred.sql,
       columns: result.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID })),
-      rows: result.rows.map((r) => serializeRow(r as Record<string, unknown>)),
+      rows: redactedRows.map((r) => serializeRow(r)),
       rowCount: result.rowCount ?? result.rows.length,
       elapsedMs,
     });
@@ -546,6 +611,172 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
   } finally {
     client.release();
   }
+}
+
+// ---------------------------------------------------------------------------
+// API: /api/row/update | /api/row/insert | /api/row/delete (single-row writes)
+//
+// Write mode only (the routes do not exist otherwise). Every column identifier
+// is validated against the introspected metadata and the statement is compiled
+// through the query builders (`buildUpdate`/`buildCreate`/`buildDelete`) so all
+// values are $N params; there is no raw SQL. update/delete require the caller
+// to supply the FULL primary key in `where`; the effective predicate is rebuilt
+// from those PK values alone, so a write can only ever touch one row.
+// ---------------------------------------------------------------------------
+
+export async function apiRowWrite(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: StudioContext,
+  op: 'update' | 'insert' | 'delete',
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const tableName = typeof body?.table === 'string' ? body.table : '';
+  const table = ctx.metadata.tables[tableName];
+  if (!table) {
+    sendJson(res, 400, { error: unknownTableMessage(tableName, ctx) });
+    return;
+  }
+  if (table.isView) {
+    sendJson(res, 400, { error: `[turbine] "${tableName}" is a view; Studio cannot write to it.` });
+    return;
+  }
+
+  const data = (body?.data && typeof body.data === 'object' ? body.data : {}) as Record<string, unknown>;
+  const rawWhere = (body?.where && typeof body.where === 'object' ? body.where : {}) as Record<string, unknown>;
+
+  // Validate every column name up front for a clean typed 400 (the builders
+  // would also reject unknowns, but an explicit check keeps the message clear).
+  if (op === 'insert' || op === 'update') {
+    const badKey = firstUnknownColumn(table, data);
+    if (badKey) {
+      sendJson(res, 400, { error: `[turbine] unknown column "${badKey}" on table "${tableName}"` });
+      return;
+    }
+    if (!Object.keys(data).some((k) => data[k] !== undefined)) {
+      sendJson(res, 400, { error: '[turbine] `data` must include at least one column' });
+      return;
+    }
+  }
+
+  // update/delete: require the table to have a PK and the caller to cover it.
+  let effectiveWhere = rawWhere;
+  if (op === 'update' || op === 'delete') {
+    if (table.primaryKey.length === 0) {
+      sendJson(res, 400, {
+        error: `[turbine] "${tableName}" has no primary key; single-row writes require one.`,
+      });
+      return;
+    }
+    const pk = extractPkWhere(table, rawWhere);
+    if ('error' in pk) {
+      sendJson(res, 400, { error: `[turbine] ${pk.error}` });
+      return;
+    }
+    // Empty-where can never happen by construction (PK covered above); assert.
+    if (Object.keys(pk.where).length === 0) {
+      sendJson(res, 400, { error: '[turbine] refusing a write with an empty predicate' });
+      return;
+    }
+    effectiveWhere = pk.where;
+  }
+
+  let deferred: { sql: string; params: unknown[] };
+  try {
+    const qi = new QueryInterface<Record<string, unknown>>(ctx.pool, tableName, ctx.metadata, [], {
+      warnOnUnlimited: false,
+      sqlCache: false,
+      preparedStatements: false,
+    });
+    if (op === 'insert') {
+      deferred = qi.buildCreate({ data } as CreateArgs<Record<string, unknown>>);
+    } else if (op === 'update') {
+      deferred = qi.buildUpdate({ where: effectiveWhere, data } as UpdateArgs<Record<string, unknown>>);
+    } else {
+      deferred = qi.buildDelete({ where: effectiveWhere } as DeleteArgs<Record<string, unknown>>);
+    }
+  } catch (err) {
+    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+
+  const client = await ctx.pool.connect();
+  try {
+    // A real write transaction, NOT `READ ONLY`. Same parameterized
+    // statement-timeout + search_path pin as the read paths.
+    await client.query('BEGIN');
+    await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
+    await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
+    const result = await client.query(deferred.sql, deferred.params);
+    await client.query('COMMIT');
+
+    const row = result.rows[0] as Record<string, unknown> | undefined;
+    if (!row) {
+      const msg = op === 'insert' ? 'insert returned no row' : 'no row matched the primary key';
+      sendJson(res, 404, { error: `[turbine] ${msg}` });
+      return;
+    }
+    // The echoed row is redacted the same way as any read (unless --show-pii),
+    // even though a write to a pii column is allowed.
+    const piiKeys = ctx.showPii ? NO_PII_KEYS : piiKeysForTable(table);
+    sendJson(res, 200, {
+      operation: op,
+      row: serializeRow(redactFlatRow(row, piiKeys)),
+      rowCount: result.rowCount ?? 1,
+    });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Return the first key in `obj` that does not resolve to a real column on
+ * `table` (accepting either the camelCase field or snake_case column name), or
+ * `null` when every key is valid. Skips `undefined` values.
+ */
+function firstUnknownColumn(table: TableMetadata, obj: Record<string, unknown>): string | null {
+  for (const k of Object.keys(obj)) {
+    if (obj[k] === undefined) continue;
+    if (!resolveColumnName(table, k)) return k;
+  }
+  return null;
+}
+
+/**
+ * Build a primary-key-only `where` from the caller's `where`. Every PK column
+ * must be present (as its field or column name) with a scalar value; anything
+ * else is rejected so a write can only ever target one row. Keys are emitted as
+ * the camelCase field name (the query builder accepts field or column names).
+ */
+function extractPkWhere(
+  table: TableMetadata,
+  where: Record<string, unknown>,
+): { where: Record<string, unknown> } | { error: string } {
+  const resolved = new Map<string, unknown>();
+  for (const [k, v] of Object.entries(where)) {
+    const col = resolveColumnName(table, k);
+    if (col) resolved.set(col, v);
+  }
+  const pkWhere: Record<string, unknown> = {};
+  for (const pkCol of table.primaryKey) {
+    if (!resolved.has(pkCol)) {
+      return { error: `\`where\` must fully cover the primary key (missing "${pkCol}")` };
+    }
+    const v = resolved.get(pkCol);
+    if (v === undefined || v === null || typeof v === 'object') {
+      return { error: `primary key "${pkCol}" must be a scalar value in \`where\`` };
+    }
+    const field = table.reverseColumnMap[pkCol] ?? pkCol;
+    pkWhere[field] = v;
+  }
+  return { where: pkWhere };
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +897,101 @@ export function apiDeleteSavedQuery(res: ServerResponse, ctx: StudioContext, id:
 // Helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// PII redaction
+// ---------------------------------------------------------------------------
+
+/** The literal replacement value for a redacted PII cell. */
+export const PII_REDACTED = '•• redacted ••';
+
+/** Shared empty key set for the `--show-pii` fast path (no redaction). */
+const NO_PII_KEYS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * The set of keys (both snake_case column and camelCase field names) for the
+ * table's PII-tagged columns. Covering both spellings means the same set works
+ * for `SELECT *` rows (snake keys) and for json_build_object relation rows
+ * (camel keys).
+ */
+function piiKeysForTable(table: TableMetadata): ReadonlySet<string> {
+  const keys = new Set<string>();
+  for (const col of table.columns) {
+    if (col.pii === true) {
+      keys.add(col.name);
+      keys.add(col.field);
+    }
+  }
+  return keys;
+}
+
+/**
+ * Redact PII keys in a single flat row. Returns the row unchanged when there is
+ * nothing to redact (no allocation); otherwise a shallow copy with each present,
+ * non-null PII value replaced by {@link PII_REDACTED}. A null/undefined value
+ * carries no PII, so it is left as-is.
+ */
+function redactFlatRow(row: Record<string, unknown>, piiKeys: ReadonlySet<string>): Record<string, unknown> {
+  if (piiKeys.size === 0) return row;
+  let out: Record<string, unknown> | null = null;
+  for (const k of Object.keys(row)) {
+    if (piiKeys.has(k) && row[k] !== null && row[k] !== undefined) {
+      if (!out) out = { ...row };
+      out[k] = PII_REDACTED;
+    }
+  }
+  return out ?? row;
+}
+
+/**
+ * Redact PII in builder result rows, walking the `with` tree so nested relation
+ * rows are redacted against THEIR target table's PII columns (relation rows
+ * arrive as parsed json objects keyed by camelCase field names).
+ */
+function redactBuilderRows(
+  rows: Record<string, unknown>[],
+  tableName: string,
+  withClause: unknown,
+  metadata: SchemaMetadata,
+): Record<string, unknown>[] {
+  const table = metadata.tables[tableName];
+  if (!table) return rows;
+  const piiKeys = piiKeysForTable(table);
+  const relEntries =
+    withClause && typeof withClause === 'object'
+      ? Object.entries(withClause as Record<string, unknown>).filter(([, v]) => v)
+      : [];
+  // Nothing to do at this level or below → return as-is.
+  if (piiKeys.size === 0 && relEntries.length === 0) return rows;
+
+  return rows.map((row) => {
+    const out: Record<string, unknown> = { ...row };
+    for (const k of piiKeys) {
+      if (k in out && out[k] !== null && out[k] !== undefined) out[k] = PII_REDACTED;
+    }
+    for (const [relName, relVal] of relEntries) {
+      const rel = table.relations[relName];
+      if (!rel) continue;
+      const nestedWith = relVal && typeof relVal === 'object' ? (relVal as { with?: unknown }).with : undefined;
+      const child = out[relName];
+      if (Array.isArray(child)) {
+        out[relName] = redactBuilderRows(child as Record<string, unknown>[], rel.to, nestedWith, metadata);
+      } else if (child && typeof child === 'object') {
+        out[relName] = redactBuilderRows([child as Record<string, unknown>], rel.to, nestedWith, metadata)[0];
+      }
+    }
+    return out;
+  });
+}
+
+/**
+ * A fresh CSP nonce for one HTML response. Base64 of 16 random bytes; the value
+ * is stamped into both the `Content-Security-Policy` header and the inline
+ * `<script nonce="...">` tag(s) so `unsafe-inline` can be dropped from script-src.
+ */
+function cspNonce(): string {
+  return randomBytes(16).toString('base64');
+}
+
 function clampInt(value: string | null, fallback: number, min: number, max: number): number {
   if (value == null) return fallback;
   const n = Number.parseInt(value, 10);
@@ -716,8 +1042,10 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
+    // JSON responses render no document; no inline script is needed, so keep
+    // script-src to 'self' with no 'unsafe-inline'.
     'Content-Security-Policy':
-      "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'",
+      "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'",
   });
   res.end(payload);
 }
@@ -730,7 +1058,10 @@ function sendText(res: ServerResponse, status: number, body: string): void {
   res.end(body);
 }
 
-function sendHtml(res: ServerResponse, status: number, body: string): void {
+function sendHtml(res: ServerResponse, status: number, template: string, nonce: string): void {
+  // Stamp the per-request nonce into the inline <script nonce="__CSP_NONCE__">
+  // tag(s) so the CSP can use a nonce instead of 'unsafe-inline'.
+  const body = template.replaceAll('__CSP_NONCE__', nonce);
   res.writeHead(status, {
     'Content-Type': 'text/html; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
@@ -738,8 +1069,9 @@ function sendHtml(res: ServerResponse, status: number, body: string): void {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
-    'Content-Security-Policy':
-      "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'",
+    // style-src keeps 'unsafe-inline' (nonces don't cover style="" attributes,
+    // which the UI relies on); script-src moves to the per-request nonce.
+    'Content-Security-Policy': `default-src 'none'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'`,
   });
   res.end(body);
 }

@@ -118,6 +118,14 @@ export interface ColumnMetadata {
    * Present only when `isGeneratedStored` is true and the catalog exposed it.
    */
   generationExpression?: string;
+  /**
+   * Marks this column as containing personally identifiable information (PII).
+   * Code-first only (set via `defineSchema`'s column `pii: true` option); it is
+   * never auto-detected by introspection. Consumers that surface raw data (e.g.
+   * Studio) redact tagged values by default. Optional / defaults to `false` for
+   * back-compat.
+   */
+  pii?: boolean;
   /** Whether this is an array column */
   isArray: boolean;
   /** Dialect-specific array/bulk-insert type token when needed. */
