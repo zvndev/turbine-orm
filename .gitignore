@@ -21,3 +21,5 @@ studio-*.png
 docs/internal/
 AGENTS.md
 .private-terms
+.DS_Store
+test-app.ts
