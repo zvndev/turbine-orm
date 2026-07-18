@@ -26,7 +26,10 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { mssqlDialect } from '../mssql.js';
+import { mysqlDialect } from '../mysql.js';
 import { loadRelationsBatched, type RelationLoadContext } from '../query/batched-loader.js';
+import type { ReselectExecutor } from '../query/deferred.js';
 import type { QueryInterface } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -322,34 +325,191 @@ describe('pii: where / orderBy referencing a PII column are allowed (explicit re
 });
 
 // ---------------------------------------------------------------------------
-// Write read policy
+// Write RETURNING projection excludes PII at the SQL level
+//
+// PII must not leave the database on a write: a tagged table's write emits an
+// explicit non-PII RETURNING list instead of `RETURNING *`. The client-side
+// strip in parseWriteRow stays as defense-in-depth (it becomes a no-op once the
+// SQL already omits the column), so the transform still returns a PII-free row.
 // ---------------------------------------------------------------------------
 
-describe('pii: write RETURNING/reselect rows drop PII fields', () => {
-  it('create strips email from the returned entity (write still RETURNING *)', () => {
+/** The substring of a statement from `RETURNING`/`OUTPUT` onward (the projection). */
+function returnTail(sql: string): string {
+  const i = Math.min(
+    ...['RETURNING', 'OUTPUT'].map((k) => (sql.includes(k) ? sql.indexOf(k) : Number.POSITIVE_INFINITY)),
+  );
+  return Number.isFinite(i) ? sql.slice(i) : '';
+}
+
+describe('pii: write RETURNING excludes the PII column (Postgres)', () => {
+  it('create emits RETURNING "id", "name" with no email and no `*`', () => {
     const d = usersQuery().buildCreate({ data: { name: 'x', email: 'e@x' } as never });
-    assert.match(d.sql, /RETURNING \*/, 'the write SQL is unchanged, you may write PII freely');
-    const row = d.transform({ rows: [{ id: 1, name: 'x', email: 'e@x' }] } as never) as Record<string, unknown>;
+    assert.match(d.sql, /RETURNING "id", "name"/, 'explicit non-PII projection');
+    assert.doesNotMatch(d.sql, /RETURNING \*/, 'the `*` shortcut would leak PII on the wire');
+    assert.doesNotMatch(returnTail(d.sql), /"email"/, 'email must not appear in RETURNING');
+    // Defense-in-depth strip still returns a PII-free row.
+    const row = d.transform({ rows: [{ id: 1, name: 'x' }] } as never) as Record<string, unknown>;
     assert.equal(row.name, 'x');
-    assert.ok(!('email' in row), 'PII field is stripped from the create result');
+    assert.ok(!('email' in row));
   });
 
-  it('update strips email from the returned entity', () => {
+  it('update emits an explicit non-PII RETURNING list', () => {
     const d = usersQuery().buildUpdate({ where: { id: 1 }, data: { name: 'y' } as never });
-    const row = d.transform({ rows: [{ id: 1, name: 'y', email: 'e@x' }] } as never) as Record<string, unknown>;
+    assert.match(d.sql, /RETURNING "id", "name"/);
+    assert.doesNotMatch(returnTail(d.sql), /"email"/);
+    const row = d.transform({ rows: [{ id: 1, name: 'y' }] } as never) as Record<string, unknown>;
     assert.ok(!('email' in row));
   });
 
-  it('delete strips email from the returned entity', () => {
+  it('delete emits an explicit non-PII RETURNING list', () => {
     const d = usersQuery().buildDelete({ where: { id: 1 } });
-    const row = d.transform({ rows: [{ id: 1, name: 'z', email: 'e@x' }] } as never) as Record<string, unknown>;
+    assert.match(d.sql, /RETURNING "id", "name"/);
+    assert.doesNotMatch(returnTail(d.sql), /"email"/);
+    const row = d.transform({ rows: [{ id: 1, name: 'z' }] } as never) as Record<string, unknown>;
     assert.ok(!('email' in row));
   });
 
-  it('createMany strips email from every returned entity', () => {
+  it('createMany emits an explicit non-PII RETURNING list', () => {
     const d = usersQuery().buildCreateMany({ data: [{ name: 'a', email: 'e1' }] as never });
-    const rows = d.transform({ rows: [{ id: 1, name: 'a', email: 'e1' }] } as never) as Record<string, unknown>[];
+    assert.match(d.sql, /RETURNING "id", "name"/);
+    assert.doesNotMatch(returnTail(d.sql), /"email"/);
+    const rows = d.transform({ rows: [{ id: 1, name: 'a' }] } as never) as Record<string, unknown>[];
     assert.ok(!('email' in rows[0]!));
+  });
+
+  it('upsert emits an explicit non-PII RETURNING list', () => {
+    const d = usersQuery().buildUpsert({ where: { id: 1 }, create: { name: 'a' }, update: { name: 'b' } } as never);
+    assert.match(d.sql, /RETURNING "id", "name"/);
+    assert.doesNotMatch(returnTail(d.sql), /"email"/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Untagged control: writes keep `RETURNING *` byte-for-byte
+// ---------------------------------------------------------------------------
+
+describe('pii: untagged tables keep RETURNING * on writes (byte-identical)', () => {
+  function untaggedUsers(): QueryInterface<Record<string, unknown>> {
+    return makeQuery('users', untaggedSchema()) as unknown as QueryInterface<Record<string, unknown>>;
+  }
+
+  it('create on an untagged table still ends with RETURNING *', () => {
+    const d = untaggedUsers().buildCreate({ data: { name: 'x', email: 'e@x' } as never });
+    assert.match(d.sql, /RETURNING \*/, 'no PII column → the historical `*` is preserved');
+  });
+
+  it('update / delete on an untagged table still use RETURNING *', () => {
+    const u = untaggedUsers().buildUpdate({ where: { id: 1 }, data: { name: 'y' } as never });
+    const del = untaggedUsers().buildDelete({ where: { id: 1 } });
+    assert.match(u.sql, /RETURNING \*/);
+    assert.match(del.sql, /RETURNING \*/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A PII-tagged PRIMARY KEY is kept in the write projection (out of scope for
+// stripping — the returned row must stay addressable).
+// ---------------------------------------------------------------------------
+
+describe('pii: a PII-tagged primary key stays in the write RETURNING list', () => {
+  function peopleSchema(): SchemaMetadata {
+    const people = mockTable('people', [
+      { name: 'id', field: 'id' },
+      { name: 'name', field: 'name', pgType: 'text' },
+      { name: 'ssn', field: 'ssn', pgType: 'text' },
+    ]);
+    setPii(people, 'id'); // pathological: the PK itself tagged
+    setPii(people, 'ssn');
+    return { enums: {}, tables: { people } };
+  }
+
+  it('create keeps the PK column but drops the non-PK PII column', () => {
+    const d = (makeQuery('people', peopleSchema()) as unknown as QueryInterface<Record<string, unknown>>).buildCreate({
+      data: { name: 'x', ssn: '123' } as never,
+    });
+    assert.match(d.sql, /RETURNING "id", "name"/, 'PK kept even though tagged; row must stay addressable');
+    assert.doesNotMatch(returnTail(d.sql), /"ssn"/, 'the non-PK PII column is excluded');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SQL Server: OUTPUT INSERTED./DELETED. list excludes PII per column
+// ---------------------------------------------------------------------------
+
+describe('pii: SQL Server OUTPUT excludes the PII column (per-column prefix)', () => {
+  function mssqlUsers(schema = piiSchema()): QueryInterface<Record<string, unknown>> {
+    return makeQuery('users', schema, { dialect: mssqlDialect }) as unknown as QueryInterface<Record<string, unknown>>;
+  }
+
+  it('create emits OUTPUT INSERTED.[id], INSERTED.[name] with no email and no `*`', () => {
+    const d = mssqlUsers().buildCreate({ data: { name: 'x', email: 'e@x' } as never });
+    assert.match(d.sql, /OUTPUT INSERTED\.\[id\], INSERTED\.\[name\]/);
+    assert.doesNotMatch(d.sql, /INSERTED\.\*/);
+    assert.doesNotMatch(returnTail(d.sql), /\[email\]/);
+  });
+
+  it('update emits OUTPUT INSERTED. non-PII list', () => {
+    const d = mssqlUsers().buildUpdate({ where: { id: 1 }, data: { name: 'y' } as never });
+    assert.match(d.sql, /OUTPUT INSERTED\.\[id\], INSERTED\.\[name\]/);
+    assert.doesNotMatch(returnTail(d.sql), /\[email\]/);
+  });
+
+  it('delete emits OUTPUT DELETED. non-PII list', () => {
+    const d = mssqlUsers().buildDelete({ where: { id: 1 } });
+    assert.match(d.sql, /OUTPUT DELETED\.\[id\], DELETED\.\[name\]/);
+    assert.doesNotMatch(returnTail(d.sql), /\[email\]/);
+  });
+
+  it('untagged control keeps OUTPUT INSERTED.* (byte-identical)', () => {
+    const d = (
+      makeQuery('users', untaggedSchema(), { dialect: mssqlDialect }) as unknown as QueryInterface<
+        Record<string, unknown>
+      >
+    ).buildCreate({ data: { name: 'x' } as never });
+    assert.match(d.sql, /OUTPUT INSERTED\.\*/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MySQL (reselect): the follow-up SELECT projects the non-PII list
+// ---------------------------------------------------------------------------
+
+describe('pii: MySQL reselect SELECT projects the non-PII column list', () => {
+  function mysqlUsers(schema = piiSchema()): QueryInterface<Record<string, unknown>> {
+    return makeQuery('users', schema, { dialect: mysqlDialect }) as unknown as QueryInterface<Record<string, unknown>>;
+  }
+
+  /** Run a DeferredQuery's reselect plan, capturing every SQL string it issues. */
+  async function captureReselect(reselect: (exec: ReselectExecutor) => Promise<unknown>): Promise<string[]> {
+    const seen: string[] = [];
+    const exec: ReselectExecutor = async (sql) => {
+      seen.push(sql);
+      return { rows: [{ id: 1, name: 'y' }], rowCount: 1 } as never;
+    };
+    await reselect(exec);
+    return seen;
+  }
+
+  it('update reselect SELECT excludes the PII column', async () => {
+    const d = mysqlUsers().buildUpdate({ where: { id: 1 }, data: { name: 'y' } as never });
+    assert.ok(d.reselect, 'mysql attaches a reselect plan');
+    const issued = await captureReselect(d.reselect!);
+    const sel = issued.find((s) => /^SELECT/.test(s));
+    assert.ok(sel, 'a follow-up SELECT runs');
+    assert.match(sel!, /SELECT `id`, `name` FROM/);
+    assert.doesNotMatch(sel!, /SELECT \* FROM/);
+    assert.doesNotMatch(sel!, /`email`/);
+  });
+
+  it('untagged control reselect keeps SELECT *', async () => {
+    const d = (
+      makeQuery('users', untaggedSchema(), { dialect: mysqlDialect }) as unknown as QueryInterface<
+        Record<string, unknown>
+      >
+    ).buildUpdate({ where: { id: 1 }, data: { name: 'y' } as never });
+    const issued = await captureReselect(d.reselect!);
+    const sel = issued.find((s) => /^SELECT/.test(s));
+    assert.match(sel!, /SELECT \* FROM/);
   });
 });
 

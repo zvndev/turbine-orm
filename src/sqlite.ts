@@ -60,6 +60,7 @@ import {
   type InsertStatementInput,
   type IntrospectOptions,
   postgresDialect,
+  type ReturningSelection,
   type StreamableConnection,
   type UpsertStatementInput,
 } from './dialect.js';
@@ -481,8 +482,8 @@ export const sqliteDialect: Dialect = {
     return JSON.stringify(values ?? []);
   },
 
-  buildReturningClause(selection = '*'): string {
-    return ` RETURNING ${selection}`;
+  buildReturningClause(selection: ReturningSelection = '*'): string {
+    return ` RETURNING ${selection === '*' ? '*' : selection.join(', ')}`;
   },
 
   buildInsertStatement(input: InsertStatementInput): string {
