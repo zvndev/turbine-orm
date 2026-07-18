@@ -98,6 +98,12 @@ release; every confirmed finding was fixed or explicitly documented below.
   hand-mirrored where walker remains anywhere in the query builder. The
   dev-mode cross-check and the new sampled production cross-check stand as
   tripwires on top.
+- **The query builder is physically decomposed.** The 7,000-line
+  `query/builder.ts` is now a 2,300-line execution facade over four cohesive
+  modules (`query/where.ts`, `query/relations.ts`, `query/writes.ts`,
+  `query/aggregates.ts`). Pure refactor: the public `QueryInterface` API is
+  unchanged and the emitted SQL is byte-identical (the full suite's exact SQL
+  assertions pass with zero expectation edits).
 - **Studio CSP hardened.** The inline UI script is authorized by a
   per-request nonce (`script-src 'self' 'nonce-...'`); `unsafe-inline` is gone
   from `script-src`. Mutating routes reject absent as well as mismatched
@@ -138,6 +144,11 @@ release; every confirmed finding was fixed or explicitly documented below.
 - A relation filter with a `null` value (`{ some: null }`) is now treated
   identically by the SQL build and the cached-parameter collection paths
   (latent asymmetry, unreachable through the public types).
+- The SQL-cache segment for global filters now fingerprints another table's
+  filter with that table's own column/relation context. Previously, a
+  function global filter whose shape varied inside a nested relation filter
+  could collapse two different SQL texts onto one cache entry (an exotic
+  configuration; the dev-mode cross-check would have caught it).
 
 ## 0.35.0 (2026-07-16)
 
