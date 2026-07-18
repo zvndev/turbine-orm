@@ -559,7 +559,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * and unlimited-warnings silenced — a relation load must fetch every matching
    * child, and the per-relation `limit` is applied client-side by the loader.
    */
-  private batchedContext(timeout: number | undefined, skip: SkipGlobalFilters | undefined): RelationLoadContext {
+  private batchedContext(
+    timeout: number | undefined,
+    skip: SkipGlobalFilters | undefined,
+    includePii: boolean,
+  ): RelationLoadContext {
     const childOptions: QueryInterfaceOptions = {
       ...this.options,
       defaultLimit: undefined,
@@ -576,6 +580,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       inClauseParam: (values) => this.inParam(values),
       paramPlaceholder: (index) => this.p(index),
       skipGlobalFilters: skip,
+      // Query-level opt-in threaded onto every follow-up child `buildFindMany`,
+      // so a batched load excludes/includes PII exactly as the join strategy.
+      includePii,
       tableGlobalFilter: (table, alias, precedingParams) => {
         const gf = this.resolveGlobalFilter(table, skip);
         if (!gf) return null;
@@ -615,7 +622,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
     const entities = deferred.transform(result) as Record<string, unknown>[];
     if (entities.length > 0) {
-      await loadRelationsBatched(this.batchedContext(args.timeout, skip), entities, withClause, args.timeout);
+      await loadRelationsBatched(
+        this.batchedContext(args.timeout, skip, args.includePii === true),
+        entities,
+        withClause,
+        args.timeout,
+      );
     }
     stripFields(entities, strip);
     return entities as T[];
@@ -980,7 +992,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const entity = deferred.transform(result) as Record<string, unknown> | null;
     if (!entity) return null;
     await loadRelationsBatched(
-      this.batchedContext(args.timeout, args.skipGlobalFilters),
+      this.batchedContext(args.timeout, args.skipGlobalFilters, args.includePii === true),
       [entity],
       withClause,
       args.timeout,
@@ -994,7 +1006,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): DeferredQuery<T | null> {
     this.currentSkip = args.skipGlobalFilters;
-    const columnsList = this.resolveColumns(args.select, args.omit);
+    const includePii = args.includePii === true;
+    const columnsList = this.resolveColumns(args.select, args.omit, includePii);
     // A global filter turns the where into `{ AND: [...] }`, which the
     // `isSimpleWhere` test below rejects → the general (buildWhereClause) path
     // handles the merge and its params uniformly.
@@ -1002,7 +1015,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const colKey = columnsList ? columnsList.join(',') : '*';
     const whereFingerprint = this.fingerprintWhere(whereObj);
     const withFp = args.with ? this.withFingerprint(args.with as WithClause) : '';
-    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}${this.globalFilterCacheSegment()}`;
+    // See buildFindMany: `includePii` is its own cache-key segment so a no-PII
+    // statement can never serve an `includePii` call (relation projections that
+    // `withFp` does not capture also flip on it).
+    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}|pii=${includePii ? 1 : 0}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -1088,7 +1104,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const buildSql = (freshParams: unknown[]): string => {
       const clause = this.buildWhereClause(whereObj, freshParams);
       const whereSql = clause ? ` WHERE ${clause}` : '';
-      const selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, freshParams, columnsList);
+      const selectClause = this.buildSelectWithRelations(
+        this.table,
+        args.with as WithClause,
+        freshParams,
+        columnsList,
+        undefined,
+        undefined,
+        includePii,
+      );
       return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql}${this.limitOneClause()}`;
     };
     const entry = this.acquireSql(ck, buildSql);
@@ -1098,7 +1122,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.collectWithParams(args.with as WithClause, params);
     this.crossCheckCache('findUnique', ck, entry, buildSql, params);
 
-    const parseWith = this.makeNestedParser(args.with as WithClause);
+    const parseWith = this.makeNestedParser(args.with as WithClause, args.includePii === true);
 
     return {
       sql: entry.sql,
@@ -1282,7 +1306,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
     }
-    const columnsList = this.resolveColumns(args?.select, args?.omit);
+    const includePii = args?.includePii === true;
+    const columnsList = this.resolveColumns(args?.select, args?.omit, includePii);
     const colKey = columnsList ? columnsList.join(',') : '*';
     // AND-merge this table's global filter into the user where; `hasWhere` gates
     // the build/collect just like `args?.where` did (a merged filter can make
@@ -1320,7 +1345,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const limitFp = effectiveLimit !== undefined ? (inlinePagination ? `v${effectiveLimit}` : '1') : '0';
     const offsetFp = args?.offset !== undefined ? (inlinePagination ? `v${args.offset}` : '1') : '0';
 
-    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}${this.globalFilterCacheSegment()}`;
+    // `includePii` flips the projected column set at the top level (reflected in
+    // `colKey`) AND inside every relation subquery / batched follow-up (which
+    // `withFp` does NOT capture — it is projection-invariant). So it MUST be its
+    // own cache-key segment: a cached no-PII statement must never serve an
+    // `includePii` call, nor vice versa.
+    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -1344,7 +1374,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
       let selectClause: string;
       if (args?.with) {
-        selectClause = this.buildSelectWithRelations(this.table, args.with as WithClause, freshParams, columnsList);
+        selectClause = this.buildSelectWithRelations(
+          this.table,
+          args.with as WithClause,
+          freshParams,
+          columnsList,
+          undefined,
+          undefined,
+          includePii,
+        );
       } else if (columnsList) {
         selectClause = columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ');
       } else {
@@ -1459,7 +1497,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.crossCheckCache('findMany', ck, entry, buildSql, params);
 
     // Build the row parser once (positional shapes are computed here, not per row).
-    const parseWith = args?.with ? this.makeNestedParser(args.with as WithClause) : null;
+    const parseWith = args?.with ? this.makeNestedParser(args.with as WithClause, includePii) : null;
 
     return {
       sql: entry.sql,
@@ -1511,7 +1549,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
     const hasRelations = !!args?.with;
     // Build the positional-aware relation parser once for the whole stream.
-    const parseWith = hasRelations ? this.makeNestedParser(args!.with as WithClause) : null;
+    const parseWith = hasRelations ? this.makeNestedParser(args!.with as WithClause, args?.includePii === true) : null;
 
     // --- Speculative first fetch: try to satisfy the entire drain in one RTT ---
     const speculativeDeferred = this.buildFindMany({
@@ -1733,7 +1771,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             message: `[turbine] create on "${this.table}" returned no row from RETURNING * — this should never happen.`,
           });
         }
-        return this.parseRow(row, this.table) as T;
+        return this.parseWriteRow(row) as T;
       },
       tag: `${this.table}.create`,
       // Non-RETURNING engines: INSERT, then re-fetch the new row by primary key
@@ -1828,7 +1866,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return {
       sql: built.sql,
       params: built.params,
-      transform: (result) => result.rows.map((row) => this.parseRow(row, this.table) as T),
+      transform: (result) => result.rows.map((row) => this.parseWriteRow(row) as T),
       tag: `${this.table}.createMany`,
     };
   }
@@ -1936,7 +1974,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             operation: 'update',
           });
         }
-        return this.parseRow(row, this.table) as T;
+        return this.parseWriteRow(row) as T;
       },
       tag: `${this.table}.update`,
       preparedName,
@@ -2091,7 +2129,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             operation: 'delete',
           });
         }
-        return this.parseRow(row, this.table) as T;
+        return this.parseWriteRow(row) as T;
       },
       tag: `${this.table}.delete`,
       preparedName: entry.name,
@@ -2183,7 +2221,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             message: `[turbine] upsert on "${this.table}" returned no row from RETURNING * — this should never happen.`,
           });
         }
-        return this.parseRow(row, this.table) as T;
+        return this.parseWriteRow(row) as T;
       },
       tag: `${this.table}.upsert`,
       // Non-RETURNING engines: run the upsert, then re-fetch by the where keys.
@@ -3079,7 +3117,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Resolve select/omit options into a list of snake_case column names.
    * Returns null if neither is provided (meaning all columns).
    */
-  private resolveColumns(select?: Record<string, boolean>, omit?: Record<string, boolean>): string[] | null {
+  private resolveColumns(
+    select?: Record<string, boolean>,
+    omit?: Record<string, boolean>,
+    includePii?: boolean,
+  ): string[] | null {
     if (select) {
       // An array here means a caller wrote `select: ['id', 'name']` (Drizzle/SQL
       // style) instead of the object shape. Object.entries() would iterate the
@@ -3091,11 +3133,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
             `(e.g. { id: true, name: true }), not an array.`,
         );
       }
-      // Only include columns where value is true
+      // Only include columns where value is true. An explicit `select` naming a
+      // PII column IS the opt-in — it comes back regardless of `includePii`.
       return Object.entries(select)
         .filter(([, v]) => v)
         .map(([k]) => this.toColumn(k));
     }
+    // Default / omit-only projection: PII-tagged columns are excluded unless the
+    // caller passed `includePii: true`. An empty set (untagged schema) keeps the
+    // `null`/`*` fast path so the emitted SQL is byte-identical to before.
+    const piiCols = includePii ? undefined : this.piiColumns(this.tableMeta);
+    const hasPii = piiCols !== undefined && piiCols.size > 0;
     if (omit) {
       if (Array.isArray(omit)) {
         throw new ValidationError(
@@ -3103,15 +3151,62 @@ export class QueryInterface<T extends object, R extends object = {}> {
             `(e.g. { createdAt: true }), not an array.`,
         );
       }
-      // Include all columns except those where value is true
+      // Include all columns except those where value is true (and PII columns).
       const omitCols = new Set(
         Object.entries(omit)
           .filter(([, v]) => v)
           .map(([k]) => this.toColumn(k)),
       );
-      return this.tableMeta.allColumns.filter((col) => !omitCols.has(col));
+      return this.tableMeta.allColumns.filter((col) => !omitCols.has(col) && !(hasPii && piiCols!.has(col)));
+    }
+    if (hasPii) {
+      return this.tableMeta.allColumns.filter((col) => !piiCols!.has(col));
     }
     return null;
+  }
+
+  /**
+   * The snake_case names of a table's PII-tagged (`defineSchema` `pii: true`)
+   * columns. PII columns are excluded from default projections (findMany /
+   * findUnique / relation subqueries / batched loads) unless the query opts in
+   * via `includePii` or names the column explicitly in `select`. Returns an
+   * empty set for any table with no PII column, so untagged schemas keep their
+   * byte-identical SQL.
+   */
+  private piiColumns(meta: TableMetadata): Set<string> {
+    const out = new Set<string>();
+    for (const col of meta.columns) {
+      if (col.pii) out.add(col.name);
+    }
+    return out;
+  }
+
+  /**
+   * The camelCase field names of a table's PII-tagged columns — the read-side
+   * counterpart of {@link piiColumns} applied to already-parsed entities.
+   * Used to strip PII from a write's RETURNING/reselect row (writes accept no
+   * `includePii`/`select`, so their returned row always applies the default
+   * exclusion; you may still write PII fields freely).
+   */
+  private piiFields(meta: TableMetadata): string[] {
+    const out: string[] = [];
+    for (const col of meta.columns) {
+      if (col.pii) out.push(col.field);
+    }
+    return out;
+  }
+
+  /**
+   * Parse a write's returned row (create/update/upsert/delete), then strip the
+   * table's PII fields — the write-side read policy. Untagged tables incur only
+   * one `for` over a zero-length field list, so behavior is unchanged.
+   */
+  private parseWriteRow(row: Record<string, unknown>): Record<string, unknown> {
+    const parsed = this.parseRow(row, this.table);
+    for (const field of this.piiFields(this.tableMeta)) {
+      delete parsed[field];
+    }
+    return parsed;
   }
 
   /**
@@ -5973,20 +6068,29 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Shared by {@link buildRelationSubquery} (json order) and
    * {@link buildRelationShape} (decode key order) so they can never diverge.
    */
-  private resolveTargetColumns(spec: true | WithOptions, targetMeta: TableMetadata): string[] {
+  private resolveTargetColumns(spec: true | WithOptions, targetMeta: TableMetadata, includePii?: boolean): string[] {
     if (spec !== true && spec.select) {
+      // Explicit `select` names the columns — a PII column named here IS the
+      // opt-in and comes back regardless of the query's `includePii`.
       const selectedFields = Object.entries(spec.select)
         .filter(([, v]) => v)
         .map(([k]) => targetMeta.columnMap[k] ?? camelToSnake(k));
       return selectedFields.filter((col) => targetMeta.allColumns.includes(col));
     }
+    // Default / omit-only relation projection: PII columns are excluded unless
+    // the query opted in via `includePii`.
+    const piiCols = includePii ? undefined : this.piiColumns(targetMeta);
+    const hasPii = piiCols !== undefined && piiCols.size > 0;
     if (spec !== true && spec.omit) {
       const omittedFields = new Set(
         Object.entries(spec.omit)
           .filter(([, v]) => v)
           .map(([k]) => targetMeta.columnMap[k] ?? camelToSnake(k)),
       );
-      return targetMeta.allColumns.filter((col) => !omittedFields.has(col));
+      return targetMeta.allColumns.filter((col) => !omittedFields.has(col) && !(hasPii && piiCols!.has(col)));
+    }
+    if (hasPii) {
+      return targetMeta.allColumns.filter((col) => !piiCols!.has(col));
     }
     return targetMeta.allColumns;
   }
@@ -6012,14 +6116,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * {@link buildSelectWithRelations}: same relation iteration order, same
    * per-relation column resolution, same nested recursion.
    */
-  private buildRelationShapes(table: string, withClause: WithClause): Record<string, RelationShape> {
+  private buildRelationShapes(
+    table: string,
+    withClause: WithClause,
+    includePii?: boolean,
+  ): Record<string, RelationShape> {
     const meta = this.schema.tables[table];
     if (!meta) return {};
     const shapes: Record<string, RelationShape> = {};
     for (const [relName, relSpec] of sortedEntries(withClause)) {
       const relDef = meta.relations[relName];
       if (!relDef) continue; // buildSelectWithRelations already threw for this
-      shapes[relName] = this.buildRelationShape(relDef, relSpec, meta);
+      shapes[relName] = this.buildRelationShape(relDef, relSpec, meta, includePii);
     }
     return shapes;
   }
@@ -6030,11 +6138,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * {@link buildRelationSubquery} appends them), the nested sub-shapes, and the
    * cardinality (single object for belongsTo/hasOne, array for the rest).
    */
-  private buildRelationShape(relDef: RelationDef, spec: true | WithOptions, parentMeta: TableMetadata): RelationShape {
+  private buildRelationShape(
+    relDef: RelationDef,
+    spec: true | WithOptions,
+    parentMeta: TableMetadata,
+    includePii?: boolean,
+  ): RelationShape {
     void parentMeta;
     const targetMeta = this.schema.tables[relDef.to];
     if (!targetMeta) return { keys: [], nested: {}, cardinality: 'many' };
-    const targetColumns = this.resolveTargetColumns(spec, targetMeta);
+    const targetColumns = this.resolveTargetColumns(spec, targetMeta, includePii);
     const keys = targetColumns.map((col) => targetMeta.reverseColumnMap[col] ?? snakeToCamel(col));
     const nested: Record<string, RelationShape> = {};
     if (spec !== true && spec.with) {
@@ -6042,7 +6155,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const nestedRelDef = targetMeta.relations[nestedRelName];
         if (!nestedRelDef) continue;
         keys.push(nestedRelName);
-        nested[nestedRelName] = this.buildRelationShape(nestedRelDef, nestedSpec, targetMeta);
+        nested[nestedRelName] = this.buildRelationShape(nestedRelDef, nestedSpec, targetMeta, includePii);
       }
     }
     const cardinality: 'many' | 'one' = relDef.type === 'belongsTo' || relDef.type === 'hasOne' ? 'one' : 'many';
@@ -6055,11 +6168,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * positional arrays into the object form first (shapes built once, not per
    * row), then delegates to parseNestedRow for date/snake-camel coercion.
    */
-  private makeNestedParser(withClause: WithClause): (row: Record<string, unknown>) => Record<string, unknown> {
+  private makeNestedParser(
+    withClause: WithClause,
+    includePii?: boolean,
+  ): (row: Record<string, unknown>) => Record<string, unknown> {
     if (this.jsonEncoding !== 'positional') {
       return (row) => this.parseNestedRow(row, this.table);
     }
-    const shapes = this.buildRelationShapes(this.table, withClause);
+    const shapes = this.buildRelationShapes(this.table, withClause, includePii);
     return (row) => this.parseNestedRow(this.decodePositionalRelations(row, shapes), this.table);
   }
 
@@ -6165,6 +6281,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     columnsList?: string[] | null,
     depth?: number,
     path?: string[],
+    includePii?: boolean,
   ): string {
     const meta = this.schema.tables[table];
     if (!meta) throw new ValidationError(`[turbine] Unknown table "${table}"`);
@@ -6200,7 +6317,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
 
       // The main table is not aliased, so pass table name as parentRef
-      const subquery = this.buildRelationSubquery(relDef, relSpec, params, table, aliasCounter, depth, path);
+      const subquery = this.buildRelationSubquery(
+        relDef,
+        relSpec,
+        params,
+        table,
+        aliasCounter,
+        depth,
+        path,
+        includePii,
+      );
       relationSelects.push(`(${subquery}) AS ${this.q(relName)}`);
     }
 
@@ -6320,6 +6446,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     aliasCounter: { n: number },
     depth?: number,
     path?: string[],
+    includePii?: boolean,
   ): string {
     const currentDepth = depth ?? 0;
     const currentPath = path ?? [this.table];
@@ -6360,10 +6487,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Generate a unique alias: t0, t1, t2, ...
     const alias = `t${aliasCounter.n++}`;
 
-    // Resolve which columns to include based on select/omit. Shared with the
-    // positional-shape builder so the emitted json_build_array column order and
-    // the decode-side key order can never drift apart.
-    const targetColumns = this.resolveTargetColumns(spec, targetMeta);
+    // Resolve which columns to include based on select/omit (and the query-level
+    // `includePii` opt-in). Shared with the positional-shape builder so the
+    // emitted json_build_array column order and the decode-side key order can
+    // never drift apart.
+    const targetColumns = this.resolveTargetColumns(spec, targetMeta, includePii);
 
     // Engine override seam (additive): a dialect whose JSON-aggregation shape does
     // not map onto buildJsonObject/buildJsonArrayAgg (SQL Server FOR JSON PATH) owns
@@ -6390,7 +6518,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             ? this.buildAliasWhere(targetTable, targetMeta, whereAlias, spec.where as Record<string, unknown>, params)
             : '') ?? '',
         recurse: (nRelDef, nSpec, nParent, nDepth, nPath) =>
-          this.buildRelationSubquery(nRelDef, nSpec, params, nParent, aliasCounter, nDepth, nPath),
+          this.buildRelationSubquery(nRelDef, nSpec, params, nParent, aliasCounter, nDepth, nPath, includePii),
       });
     }
 
@@ -6426,6 +6554,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         alias,
         targetMeta,
         targetColumns,
+        includePii,
       );
     }
 
@@ -6448,6 +6577,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           aliasCounter,
           currentDepth + 1,
           [...currentPath, relDef.name],
+          includePii,
         );
         // Use '[]'::json for hasMany (empty array), NULL for belongsTo/hasOne (no object)
         const fallback =
@@ -6540,6 +6670,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
               aliasCounter,
               currentDepth + 1,
               [...currentPath, relDef.name],
+              includePii,
             );
             const fallback =
               nestedRelDef.type === 'hasMany' ? this.dialect.emptyJsonArrayLiteral : this.dialect.nullJsonLiteral;
@@ -6593,6 +6724,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     talias: string,
     targetMeta: TableMetadata,
     targetColumns: string[],
+    includePii?: boolean,
   ): string {
     if (!relDef.through) {
       throw new ValidationError(
@@ -6708,6 +6840,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             aliasCounter,
             currentDepth + 1,
             [...currentPath, relDef.name],
+            includePii,
           );
           const fallback =
             nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'
@@ -6743,6 +6876,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           aliasCounter,
           currentDepth + 1,
           [...currentPath, relDef.name],
+          includePii,
         );
         const fallback =
           nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'

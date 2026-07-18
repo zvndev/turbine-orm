@@ -728,10 +728,21 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   // Projection / order
   // -------------------------------------------------------------------------
 
-  /** Resolve the set of columns to project, honouring `select` / `omit`. */
-  private projectedColumns(select?: Record<string, boolean>, omit?: Record<string, boolean>): string[] {
+  /**
+   * Resolve the set of columns to project, honouring `select` / `omit` and the
+   * query-level `includePii` opt-in. PII-tagged (`defineSchema` `pii: true`)
+   * columns are EXCLUDED from a default (or omit-only) projection unless
+   * `includePii` is true; an explicit `select` naming a PII column IS the opt-in
+   * and returns it regardless. Untagged tables project exactly as before.
+   */
+  private projectedColumns(
+    select?: Record<string, boolean>,
+    omit?: Record<string, boolean>,
+    includePii?: boolean,
+  ): string[] {
     let cols = this.meta.columns.map((c) => c.name);
-    if (select && Object.keys(select).length) {
+    const hasSelect = select && Object.keys(select).length;
+    if (hasSelect) {
       const picked = new Set(
         Object.entries(select)
           .filter(([, v]) => v)
@@ -740,6 +751,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // Always keep the PK so reselect / relation stitching has a key to work with.
       for (const pk of this.meta.primaryKey) picked.add(pk);
       cols = cols.filter((c) => picked.has(c));
+    } else if (!includePii) {
+      // Default / omit-only projection: drop PII columns (kept above only when a
+      // caller names them in `select`). PK is never PII in practice; if one is
+      // tagged it is still dropped here, so tag sensitive data, not keys.
+      const pii = this.piiColumnNames();
+      if (pii.size) cols = cols.filter((c) => !pii.has(c));
     }
     if (omit && Object.keys(omit).length) {
       const dropped = new Set(
@@ -750,6 +767,32 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       cols = cols.filter((c) => !dropped.has(c));
     }
     return cols;
+  }
+
+  /**
+   * The snake_case names of this table's PII-tagged columns. Empty for a table
+   * with no `pii: true` column, so untagged tables keep their prior projection.
+   */
+  private piiColumnNames(): Set<string> {
+    const out = new Set<string>();
+    for (const col of this.meta.columns) {
+      if (col.pii) out.add(col.name);
+    }
+    return out;
+  }
+
+  /**
+   * The camelCase field names of this table's PII-tagged columns — the read
+   * policy applied to a write's returned row (create/update/upsert/delete accept
+   * no `includePii`/`select`, so their result always drops PII; you may still
+   * write PII fields freely).
+   */
+  private stripWritePii(entity: T | null): T | null {
+    if (!entity) return entity;
+    for (const col of this.meta.columns) {
+      if (col.pii) delete (entity as Record<string, unknown>)[col.field];
+    }
+    return entity;
   }
 
   /** `{ .c1, .c2, … }` projection clause. */
@@ -985,10 +1028,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const { rows, native, resolvedWhere } = await this.runFind(args, 'findMany');
       const entities = this.shape(rows, native);
       if (args.with) {
-        await this.loadRelations(entities, args.with as Record<string, unknown>, args.timeout, 0, {
-          args,
-          resolvedWhere,
-        });
+        await this.loadRelations(
+          entities,
+          args.with as Record<string, unknown>,
+          args.timeout,
+          0,
+          { args, resolvedWhere },
+          args.includePii === true,
+        );
       }
       return entities;
     });
@@ -1012,6 +1059,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const cols = this.projectedColumns(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
+      args.includePii === true,
     );
     const distinct = args.distinct?.length ? ' distinct' : '';
     const filter = where ? ` filter ${where}` : '';
@@ -1068,7 +1116,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const { rows, native } = await this.runFind({ ...args, limit: 1 } as FindManyArgs<T>, 'findUnique');
       if (!rows.length) return null;
       const entities = this.shape(rows, native);
-      if (args.with) await this.loadRelations(entities, args.with as Record<string, unknown>, args.timeout);
+      if (args.with)
+        await this.loadRelations(
+          entities,
+          args.with as Record<string, unknown>,
+          args.timeout,
+          0,
+          undefined,
+          args.includePii === true,
+        );
       return entities[0]!;
     });
   }
@@ -1078,7 +1134,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const { rows, native } = await this.runFind({ ...args, limit: 1 } as FindManyArgs<T>, 'findFirst');
       if (!rows.length) return null;
       const entities = this.shape(rows, native);
-      if (args.with) await this.loadRelations(entities, args.with as Record<string, unknown>, args.timeout);
+      if (args.with)
+        await this.loadRelations(
+          entities,
+          args.with as Record<string, unknown>,
+          args.timeout,
+          0,
+          undefined,
+          args.includePii === true,
+        );
       return entities[0]!;
     });
   }
@@ -1116,6 +1180,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     timeout?: number,
     depth = 0,
     parent?: PowqlParentContext<T>,
+    includePii = false,
   ): Promise<void> {
     if (depth >= 10) {
       throw new ValidationError(`[turbine] Nested 'with' on PowDB exceeded depth 10 (relation cycle?).`);
@@ -1133,7 +1198,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (!rel) throw new ValidationError(`[turbine] Unknown relation "${relName}" on "${this.table}".`);
       if (strategyIsJoin && parent && this.joinEligible(rel, opt, parent.args, parents.length)) {
         if (this.capabilities.serverJoins) {
-          await this.loadRelationViaJoin(parents, rel, relName, opt, parent, timeout);
+          await this.loadRelationViaJoin(parents, rel, relName, opt, parent, timeout, includePii);
           continue;
         }
         // An otherwise-eligible relation the engine cannot join: a PER-QUERY
@@ -1145,7 +1210,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         }
       }
       if (rel.type === 'manyToMany') {
-        await this.loadManyToMany(parents, rel, relName, opt, timeout);
+        await this.loadManyToMany(parents, rel, relName, opt, timeout, includePii);
         continue;
       }
       const fk = normalizeKeyColumns(rel.foreignKey);
@@ -1203,6 +1268,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           where: childWhere,
           with: options.with,
           timeout: options.timeout ?? timeout,
+          includePii,
         } as FindManyArgs<object>)) as T[];
         for (const child of children) {
           const k = this.joinKey((child as Record<string, unknown>)[childKeyField]);
@@ -1242,6 +1308,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     relName: string,
     opt: unknown,
     timeout?: number,
+    includePii = false,
   ): Promise<void> {
     const through = rel.through;
     if (!through)
@@ -1311,6 +1378,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         where,
         with: options.with,
         timeout: options.timeout ?? timeout,
+        includePii,
       } as FindManyArgs<object>)) as T[];
       for (const t of targets) targetByPk.set(String((t as Record<string, unknown>)[targetPkField]), t);
     }
@@ -1434,9 +1502,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     opt: unknown,
     parent: PowqlParentContext<T>,
     timeout?: number,
+    includePii = false,
   ): Promise<void> {
     if (rel.type === 'manyToMany') {
-      await this.loadManyToManyViaJoin(parents, rel, relName, opt, parent, timeout);
+      await this.loadManyToManyViaJoin(parents, rel, relName, opt, parent, timeout, includePii);
       return;
     }
     const options = (opt === true ? {} : opt) as FindManyArgs<object>;
@@ -1454,7 +1523,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const parentKeyField = this.meta.reverseColumnMap[parentKeyCol] ?? parentKeyCol;
 
     const params: unknown[] = [];
-    const childCols = this.joinChildCols(targetQi, options);
+    const childCols = this.joinChildCols(targetQi, options, includePii);
     const filter = await this.joinFilter(
       targetQi,
       parent.resolvedWhere,
@@ -1495,6 +1564,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     opt: unknown,
     parent: PowqlParentContext<T>,
     timeout?: number,
+    includePii = false,
   ): Promise<void> {
     const through = rel.through;
     if (!through)
@@ -1510,7 +1580,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const parentRefField = this.meta.reverseColumnMap[sourceRefCol] ?? sourceRefCol;
 
     const params: unknown[] = [];
-    const childCols = this.joinChildCols(targetQi, options);
+    const childCols = this.joinChildCols(targetQi, options, includePii);
     const filter = await this.joinFilter(
       targetQi,
       parent.resolvedWhere,
@@ -1539,10 +1609,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * with a loud guard: a real column named `__tpk` would collide with the
    * reserved correlation alias, so refuse rather than silently mis-stitch.
    */
-  private joinChildCols(targetQi: PowqlInterface<object>, options: FindManyArgs<object>): string[] {
+  private joinChildCols(targetQi: PowqlInterface<object>, options: FindManyArgs<object>, includePii = false): string[] {
     const cols = targetQi.projectedColumns(
       options.select as Record<string, boolean> | undefined,
       options.omit as Record<string, boolean> | undefined,
+      includePii,
     );
     if (cols.includes('__tpk')) {
       throw new ValidationError(
@@ -1696,7 +1767,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         args.timeout,
         'create',
       );
-      const row = rows.length ? this.shape(rows, native)[0]! : null;
+      const row = rows.length ? this.stripWritePii(this.shape(rows, native)[0]!) : null;
       if (!row) throw new NotFoundError({ table: this.table, where: data });
       return row;
     });
@@ -1718,7 +1789,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         args.timeout,
         'createMany',
       );
-      return this.shape(rows, native);
+      return this.shape(rows, native).map((r) => this.stripWritePii(r) as T);
     });
   }
 
@@ -1739,7 +1810,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         args.timeout,
         'update',
       );
-      const row = rows.length ? this.shape(rows, native)[0]! : null;
+      const row = rows.length ? this.stripWritePii(this.shape(rows, native)[0]!) : null;
       if (!row) throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
       return row;
     });
@@ -1903,7 +1974,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         args.timeout,
         'delete',
       );
-      const row = rows.length ? this.shape(rows, native)[0]! : null;
+      const row = rows.length ? this.stripWritePii(this.shape(rows, native)[0]!) : null;
       if (!row) throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
       return row;
     });

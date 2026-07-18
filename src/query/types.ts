@@ -445,6 +445,8 @@ export interface FindUniqueArgs<
   relationLoadStrategy?: RelationLoadStrategy;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
+  /** Include PII-tagged columns in the result. See {@link FindManyArgs.includePii}. */
+  includePii?: boolean;
 }
 
 export interface FindManyArgs<
@@ -481,6 +483,19 @@ export interface FindManyArgs<
    * force the warning even when it is disabled in config.
    */
   warnOnUnlimited?: boolean;
+  /**
+   * Include PII-tagged columns (`defineSchema` `pii: true`) in the result.
+   *
+   * PII columns are EXCLUDED from default projections: they come back only when
+   * explicitly named in `select`, or when this flag is `true`. Set it to `true`
+   * to return every PII column at the top level AND at every nested `with`
+   * level of this query. Default `false`. Schemas with no PII-tagged columns are
+   * unaffected (the emitted SQL is byte-identical either way).
+   *
+   * Referencing a PII column in `where` / `orderBy` / `groupBy` / aggregates is
+   * always allowed regardless of this flag (the reference is explicit).
+   */
+  includePii?: boolean;
 }
 
 export interface FindManyStreamArgs<

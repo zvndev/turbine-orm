@@ -114,6 +114,12 @@ export interface RelationLoadContext {
    */
   skipGlobalFilters?: SkipGlobalFilters;
   /**
+   * The query's `includePii` opt-in, threaded onto every child `buildFindMany`
+   * so a batched relation load excludes (or includes) PII-tagged columns exactly
+   * as the join strategy does at every nested level. Default `false`.
+   */
+  includePii?: boolean;
+  /**
    * Render `table`'s global filter against `alias` for a raw follow-up query
    * (the batched `_count`), numbering its `$n` placeholders AFTER
    * `precedingParams` already-bound params. Returns `null` when no filter
@@ -389,6 +395,7 @@ async function loadToOneOrMany(
         omit: proj.omit,
         orderBy: options.orderBy,
         skipGlobalFilters: ctx.skipGlobalFilters,
+        includePii: ctx.includePii,
       });
       const result = await ctx.exec(deferred.sql, deferred.params, deferred.preparedName);
       return deferred.transform(result) as Record<string, unknown>[];
@@ -514,6 +521,7 @@ async function loadManyToMany(
         omit: proj.omit,
         orderBy: options.orderBy,
         skipGlobalFilters: ctx.skipGlobalFilters,
+        includePii: ctx.includePii,
       });
       const result = await ctx.exec(deferred.sql, deferred.params, deferred.preparedName);
       return deferred.transform(result) as Record<string, unknown>[];
