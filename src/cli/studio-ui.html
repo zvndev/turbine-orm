@@ -155,6 +155,42 @@
     .row-editor-field input:disabled {
       opacity: 0.55;
     }
+    .row-editor-input-row {
+      display: flex;
+      align-items: stretch;
+      gap: 6px;
+    }
+    .row-editor-input-row input {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .row-editor-field input.null-set {
+      opacity: 0.5;
+      font-style: italic;
+      color: var(--text-dim);
+    }
+    .null-toggle {
+      flex: 0 0 auto;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      border-radius: var(--radius);
+      padding: 2px 10px;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      transition: var(--t);
+    }
+    .null-toggle:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+    .null-toggle.active {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
     .row-editor-error {
       margin-top: 12px;
       padding: 8px 10px;
@@ -3713,17 +3749,55 @@
           }
           if (RowEditor.mode === 'edit' && c.isPrimaryKey) input.disabled = true;
           field.appendChild(label);
-          field.appendChild(input);
+
+          const rec = { col: c, input, isNull: false };
+          // Nullable, non-PK columns get an explicit NULL toggle. Toggling it
+          // disables the text input and makes collect() emit an explicit null
+          // (which the write routes send as a $N param), rather than the
+          // blank-means-unchanged/default semantics of an empty input.
+          const nullable = c.nullable && !c.isPrimaryKey;
+          if (nullable) {
+            const basePlaceholder = input.placeholder;
+            const nullBtn = el('button', {
+              type: 'button',
+              class: 'null-toggle',
+              text: 'NULL',
+              title: 'Set this column to NULL',
+              'aria-pressed': 'false',
+            });
+            nullBtn.addEventListener('click', () => {
+              rec.isNull = !rec.isNull;
+              nullBtn.classList.toggle('active', rec.isNull);
+              nullBtn.setAttribute('aria-pressed', rec.isNull ? 'true' : 'false');
+              input.disabled = rec.isNull;
+              input.classList.toggle('null-set', rec.isNull);
+              input.placeholder = rec.isNull ? 'NULL' : basePlaceholder;
+            });
+            const inputRow = el('div', { class: 'row-editor-input-row' });
+            inputRow.appendChild(input);
+            inputRow.appendChild(nullBtn);
+            field.appendChild(inputRow);
+          } else {
+            field.appendChild(input);
+          }
+
           host.appendChild(field);
-          RowEditor.inputs.push({ col: c, input });
+          RowEditor.inputs.push(rec);
         }
       },
 
       collect() {
         const data = {};
-        for (const { col, input } of RowEditor.inputs) {
-          if (input.disabled) continue;
+        for (const rec of RowEditor.inputs) {
+          const { col, input } = rec;
           if (RowEditor.mode === 'edit' && col.isPrimaryKey) continue;
+          // An explicit NULL toggle wins over any typed value (including a
+          // redacted PII placeholder): send a real null, never the marker.
+          if (rec.isNull) {
+            data[col.name] = null;
+            continue;
+          }
+          if (input.disabled) continue;
           const raw = input.value;
           if (raw === '') continue;
           data[col.name] = coerceInput(col, raw);

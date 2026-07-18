@@ -148,6 +148,9 @@ function buildSchema(): SchemaMetadata {
     { posts: postsRel },
   );
   markPii(users, 'email');
+  // `name` is a nullable, non-PK column: it drives the explicit-null write path
+  // and the `nullable` schema-payload assertion.
+  markNullable(users, 'name');
 
   const posts = mockTable('posts', [
     { name: 'id', field: 'id' },
@@ -162,6 +165,11 @@ function buildSchema(): SchemaMetadata {
 function markPii(table: TableMetadata, columnName: string): void {
   const col = table.columns.find((c) => c.name === columnName);
   if (col) col.pii = true;
+}
+
+function markNullable(table: TableMetadata, columnName: string): void {
+  const col = table.columns.find((c) => c.name === columnName);
+  if (col) col.nullable = true;
 }
 
 const HOST = '127.0.0.1';
@@ -309,6 +317,61 @@ describe('Studio write: single-row round-trips', () => {
     assert.match(write.text, /VALUES \(\$1, \$2\)/);
     assert.match(write.text, /RETURNING \*/);
     assert.deepEqual(write.values, ['Ada', 'ada@x.com']);
+  });
+
+  it('update with an explicit null data value compiles SET "col" = $1 with a null param', async () => {
+    const { pool, calls } = makePool([
+      {},
+      {},
+      {},
+      { rows: [{ id: 1, name: null, email: 'bob@x.com' }], fields: [{ name: 'id' }] },
+      {},
+    ]);
+    const ctx = makeCtx(pool, { writable: true });
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/update',
+      headers: authHeaders(),
+      body: { table: 'users', where: { id: 1 }, data: { name: null } },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+
+    assert.equal(r.status, 200, r.body);
+    const write = firstDataQuery(calls);
+    assert.match(write.text, /^UPDATE "users"/);
+    assert.match(write.text, /SET "name" = \$1/);
+    assert.match(write.text, /WHERE "id" = \$2/);
+    // The null reaches the driver as a bound param, not inlined into SQL.
+    assert.deepEqual(write.values, [null, 1]);
+  });
+
+  it('insert with an explicit null data value reaches VALUES with a null param', async () => {
+    const { pool, calls } = makePool([
+      {},
+      {},
+      {},
+      { rows: [{ id: 7, name: null, email: 'ada@x.com' }], fields: [{ name: 'id' }] },
+      {},
+    ]);
+    const ctx = makeCtx(pool, { writable: true });
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/insert',
+      headers: authHeaders(),
+      body: { table: 'users', data: { name: null, email: 'ada@x.com' } },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+
+    assert.equal(r.status, 200, r.body);
+    const write = firstDataQuery(calls);
+    assert.match(write.text, /^INSERT INTO "users"/);
+    assert.match(write.text, /RETURNING \*/);
+    // Both columns bound as params; the null is a real $N, never inlined.
+    assert.deepEqual(write.values, [null, 'ada@x.com']);
   });
 
   it('delete compiles a parameterized DELETE with a PK-covering WHERE', async () => {
@@ -521,6 +584,22 @@ describe('Studio PII: redaction on the wire', () => {
     const name = users.columns.find((c) => c.name === 'name')!;
     assert.equal(email.pii, true);
     assert.equal(name.pii, false);
+  });
+
+  it('exposes per-column nullable in the schema payload (drives the NULL toggle)', async () => {
+    const { pool } = makePool([{ rows: [] }]);
+    const ctx = makeCtx(pool, {});
+    const req = makeReq({ method: 'GET', url: '/api/schema', headers: authHeaders() });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+    const tables = (r.json as { tables: Array<{ name: string; columns: Array<{ name: string; nullable: boolean }> }> })
+      .tables;
+    const users = tables.find((t) => t.name === 'users')!;
+    const name = users.columns.find((c) => c.name === 'name')!;
+    const id = users.columns.find((c) => c.name === 'id')!;
+    assert.equal(name.nullable, true, 'a nullable column advertises nullable:true');
+    assert.equal(id.nullable, false, 'the PK is not nullable');
   });
 });
 
