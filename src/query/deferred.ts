@@ -105,6 +105,13 @@ export interface QueryInterfaceOptions {
    * outside production, so it never touches the production hot path. Set the
    * env var `TURBINE_DISABLE_CACHE_CHECK=1` to opt out when dev traffic is
    * perf-sensitive.
+   *
+   * Production sampling: the check is off in production by default. Set
+   * `TURBINE_CACHE_CHECK_SAMPLE` to a float in `(0,1]` to re-verify that
+   * fraction of cache hits under real load (e.g. `0.001` for one in a
+   * thousand). A sampled mismatch logs `console.error` once per distinct
+   * fingerprint AND throws the same `ValidationError` (E003). `0`, unset, or an
+   * unparseable value keeps the check fully off.
    */
   sqlCache?: boolean;
   /** SQL dialect implementation. Defaults to PostgreSQL. */

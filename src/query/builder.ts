@@ -47,6 +47,7 @@ import {
   assertBindableEqualsOperand,
   findArrayUniqueKey,
   findJsonUniqueKey,
+  fingerprintArrayFilterShape,
   fingerprintJsonFilterShape,
   fingerprintOperatorShape,
   isArrayFilter,
@@ -55,9 +56,7 @@ import {
   isJsonPathOrderBy,
   isOrderBySpec,
   isRelationPickOrderBy,
-  isTextSearchFilter,
   isUnmatchedPlainObject,
-  isVectorFilter,
   isVectorOrderBy,
   isWhereOperator,
   JSON_RANGE_OPERATORS,
@@ -111,32 +110,60 @@ import type {
   WithOptions,
 } from './types.js';
 import { escapeLike, LRUCache, OPERATOR_KEYS, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
+import {
+  classifyScalarForSql,
+  fingerprintScalarToken,
+  type WhereHost,
+  type WhereRecord,
+  walkWhere,
+} from './where-compile.js';
 
 /** Relations already warned about missing FK indexes (once per process, dev only). */
 const unindexedRelationWarned = new Set<string>();
 
 /**
- * Dev-mode SQL-cache lockstep cross-check gate.
+ * SQL-cache lockstep cross-check gate.
  *
  * The SQL template cache requires three code paths to enumerate where-clause
  * keys identically: `fingerprintWhere` (builds the cache key),
  * `buildWhereClause` (builds SQL + `$N` params on a MISS), and
- * `collectWhereParams` (re-collects params on a HIT without rebuilding). They
- * are synchronized only by convention, and drift has shipped silent
- * wrong-results bugs before (permuted where-key order; an orderBy fingerprint
- * collision). This check catches such drift loudly the moment a cache HIT
- * happens by rebuilding the SQL + params fresh and comparing them against what
- * the cache-hit path produced.
+ * `collectWhereParams` (re-collects params on a HIT without rebuilding). Since
+ * 0.36 all three consume ONE shared where-key walk (see `where-compile.ts`), so
+ * enumeration drift is structurally eliminated; this check remains as a
+ * tripwire in case a future leaf builder or its collect mirror falls out of
+ * step. It rebuilds the SQL + params fresh on a cache HIT and compares them
+ * against what the cache-hit path produced.
  *
- * Enabled only when `NODE_ENV !== 'production'` (same convention as the other
- * dev-only guards in this file) AND `TURBINE_DISABLE_CACHE_CHECK !== '1'`. The
- * env vars are read inline (not captured once) so tests and perf-sensitive dev
- * traffic can toggle them per process. In production the check never runs, so
- * the hot path is unchanged.
+ * Modes (decided per HIT; env read inline, not captured once, so tests and
+ * perf-sensitive traffic can toggle per process):
+ * - `'dev'`: `NODE_ENV !== 'production'` and `TURBINE_DISABLE_CACHE_CHECK !== '1'`
+ *   — always check (the historical default; the whole unit suite runs under it).
+ * - `'off'`: dev with `TURBINE_DISABLE_CACHE_CHECK=1`, OR production with no
+ *   sampling configured — the hot path is untouched.
+ * - `'sampled'`: production with `TURBINE_CACHE_CHECK_SAMPLE` set to a float in
+ *   `(0,1]` — re-verify that fraction of cache hits (per-hit `Math.random()`;
+ *   `>= 1` checks every hit). A mismatch logs once per distinct fingerprint AND
+ *   throws, same as dev. `0`, unset, or an unparseable value means never check.
  */
-function cacheCrossCheckEnabled(): boolean {
-  return process.env.NODE_ENV !== 'production' && process.env.TURBINE_DISABLE_CACHE_CHECK !== '1';
+function cacheCrossCheckMode(): 'dev' | 'sampled' | 'off' {
+  if (process.env.NODE_ENV !== 'production') {
+    return process.env.TURBINE_DISABLE_CACHE_CHECK === '1' ? 'off' : 'dev';
+  }
+  const raw = process.env.TURBINE_CACHE_CHECK_SAMPLE;
+  if (raw === undefined) return 'off';
+  const rate = Number.parseFloat(raw);
+  if (!Number.isFinite(rate) || rate <= 0) return 'off';
+  if (rate >= 1) return 'sampled';
+  return Math.random() < rate ? 'sampled' : 'off';
 }
+
+/**
+ * Distinct cache-mismatch fingerprints already logged by the sampled production
+ * cross-check, so a hot mismatch logs `console.error` exactly once per shape
+ * instead of flooding the log. Dev mode does not log (it throws immediately),
+ * so this set is only ever touched on the `'sampled'` path.
+ */
+const loggedCacheMismatchFingerprints = new Set<string>();
 
 /**
  * Strict structural equality for a single SQL parameter value. Handles the
@@ -342,6 +369,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private currentSkip: SkipGlobalFilters | undefined;
 
+  /**
+   * The bound view of this instance passed to the shared WHERE walk
+   * (`where-compile.ts`). Built once in the constructor so `fingerprintWhere` /
+   * `buildWhereClause` / `collectWhereParams` all drive ONE enumeration + ONE
+   * scalar classifier without widening the class's public surface or allocating
+   * per call. See {@link WhereHost}.
+   */
+  private readonly whereHost: WhereHost;
+
   constructor(
     private readonly pool: pg.Pool,
     private readonly table: string,
@@ -394,6 +430,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       this.columnArrayTypeMap.set(col.name, col.arrayType ?? col.pgArrayType);
       if (col.pgTypeSchema !== undefined) this.crossSchemaTypeColumns.add(col.name);
     }
+
+    // Bind the shared WHERE-walk view once. `tableMeta` is immutable after this
+    // point; the method wrappers forward to the (private) instance methods so
+    // the walk needs no public accessors on the class.
+    this.whereHost = {
+      tableMeta: this.tableMeta,
+      normalizeRelationFilter: (relDef, filterObj) => this.normalizeRelationFilter(relDef, filterObj),
+      getColumnPgType: (column) => this.getColumnPgType(column),
+      isJsonColumnType: (colType) => this.isJsonColumnType(colType),
+    };
   }
 
   /** Quote an identifier through the active SQL dialect. */
@@ -684,7 +730,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     collectedParams: unknown[],
   ): void {
     if (!this.lastCacheHit) return;
-    if (!cacheCrossCheckEnabled()) return;
+    const mode = cacheCrossCheckMode();
+    if (mode === 'off') return;
 
     const freshParams: unknown[] = [];
     const freshSql = build(freshParams);
@@ -704,12 +751,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
         `cache-hit params and freshly-built params diverge (collected ${collectedParams.length}, built ${freshParams.length})`,
       );
     }
-    throw new ValidationError(
+    const message =
       `[turbine] SQL cache lockstep violation on ${op} (fingerprint "${cacheKey}"). ` +
-        `This is a Turbine internal invariant violation, please report it at ` +
-        `https://github.com/zvndev/turbine-orm/issues. The fingerprint, SQL-build, and ` +
-        `param-collect paths must enumerate where-clause keys identically.\n${details.join('\n')}`,
-    );
+      `This is a Turbine internal invariant violation, please report it at ` +
+      `https://github.com/zvndev/turbine-orm/issues. The fingerprint, SQL-build, and ` +
+      `param-collect paths must enumerate where-clause keys identically.\n${details.join('\n')}`;
+    // Sampled production path: log once per distinct fingerprint so the failure
+    // is durably recorded in the server log before the throw unwinds the query.
+    // (Dev mode throws straight away — its behavior is unchanged.)
+    if (mode === 'sampled' && !loggedCacheMismatchFingerprints.has(cacheKey)) {
+      loggedCacheMismatchFingerprints.add(cacheKey);
+      console.error(message);
+    }
+    throw new ValidationError(message);
   }
 
   /**
@@ -3210,145 +3264,72 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * @internal Exposed as package-private for testing via class access.
    */
   fingerprintWhere(where: Record<string, unknown>): string {
-    const keys = Object.keys(where)
-      .filter((k) => where[k] !== undefined)
-      .sort();
-    if (keys.length === 0) return '';
-
     const parts: string[] = [];
-    for (const key of keys) {
-      const value = where[key];
-      if (value === undefined) continue;
-
-      if (key === 'OR') {
-        const orArr = value as Record<string, unknown>[];
-        if (!Array.isArray(orArr) || orArr.length === 0) continue;
-        const orParts = orArr.map((cond) => this.fingerprintWhere(cond));
-        parts.push(`OR[${orParts.join(',')}]`);
-        continue;
+    for (const event of walkWhere(this.whereHost, where)) {
+      switch (event.kind) {
+        case 'or':
+          parts.push(`OR[${event.conditions.map((cond) => this.fingerprintWhere(cond)).join(',')}]`);
+          break;
+        case 'and':
+          parts.push(`AND[${event.conditions.map((cond) => this.fingerprintWhere(cond)).join(',')}]`);
+          break;
+        case 'not':
+          parts.push(`NOT(${this.fingerprintWhere(event.condition)})`);
+          break;
+        case 'relation':
+          // { posts: { some: { published: true } } } → `posts:{some(...)}`
+          parts.push(`${event.key}:{${this.fingerprintRelationParts(event.relDef, event.filterObj).join(',')}}`);
+          break;
+        case 'scalar':
+          // Column-blind scalar token (see fingerprintScalarToken): the value's
+          // shape alone distinguishes the SQL, so no column lookup is needed.
+          parts.push(`${event.key}:${fingerprintScalarToken(event.value)}`);
+          break;
       }
-      if (key === 'AND') {
-        const andArr = value as Record<string, unknown>[];
-        if (!Array.isArray(andArr) || andArr.length === 0) continue;
-        const andParts = andArr.map((cond) => this.fingerprintWhere(cond));
-        parts.push(`AND[${andParts.join(',')}]`);
-        continue;
-      }
-      if (key === 'NOT') {
-        const notCond = value as Record<string, unknown>;
-        parts.push(`NOT(${this.fingerprintWhere(notCond)})`);
-        continue;
-      }
-
-      // Relation filters: { posts: { some: { published: true } } }
-      const relDef = this.tableMeta.relations[key];
-      if (relDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        const filterObj = this.normalizeRelationFilter(relDef, value as Record<string, unknown>);
-        if (
-          'some' in filterObj ||
-          'every' in filterObj ||
-          'none' in filterObj ||
-          'is' in filterObj ||
-          'isNot' in filterObj
-        ) {
-          const relParts: string[] = [];
-          if (filterObj.some !== undefined)
-            relParts.push(
-              filterObj.some === null
-                ? 'some(null)'
-                : `some(${this.fingerprintRelFilter(relDef.to, filterObj.some as Record<string, unknown>)})`,
-            );
-          if (filterObj.every !== undefined)
-            relParts.push(
-              filterObj.every === null
-                ? 'every(null)'
-                : `every(${this.fingerprintRelFilter(relDef.to, filterObj.every as Record<string, unknown>)})`,
-            );
-          if (filterObj.none !== undefined)
-            relParts.push(
-              filterObj.none === null
-                ? 'none(null)'
-                : `none(${this.fingerprintRelFilter(relDef.to, filterObj.none as Record<string, unknown>)})`,
-            );
-          if (filterObj.is !== undefined)
-            relParts.push(
-              filterObj.is === null
-                ? 'is(null)'
-                : `is(${this.fingerprintRelFilter(relDef.to, filterObj.is as Record<string, unknown>)})`,
-            );
-          if (filterObj.isNot !== undefined)
-            relParts.push(
-              filterObj.isNot === null
-                ? 'isNot(null)'
-                : `isNot(${this.fingerprintRelFilter(relDef.to, filterObj.isNot as Record<string, unknown>)})`,
-            );
-          parts.push(`${key}:{${relParts.join(',')}}`);
-          continue;
-        }
-      }
-
-      // null → distinct from value
-      if (value === null) {
-        parts.push(`${key}:null`);
-        continue;
-      }
-
-      // Operator objects
-      if (isWhereOperator(value)) {
-        parts.push(`${key}:${fingerprintOperatorShape(value)}`);
-        continue;
-      }
-
-      // Vector distance filter — metric (operator) and present comparators
-      // change the SQL shape, so both go in the fingerprint.
-      if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
-        const dist = (value as VectorFilter).distance;
-        const cmps = Object.keys(VECTOR_DISTANCE_COMPARATORS)
-          .filter((c) => (dist as unknown as Record<string, unknown>)[c] !== undefined)
-          .sort()
-          .join('|');
-        parts.push(`${key}:vec(${dist.metric},${cmps})`);
-        continue;
-      }
-
-      // JSON filter — range ops carry a numeric/string annotation because the
-      // numeric compile emits a cast (different SQL shape).
-      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
-        parts.push(`${key}:${fingerprintJsonFilterShape(value as JsonFilter)}`);
-        continue;
-      }
-
-      // Array filter
-      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value as ArrayFilter)) {
-        parts.push(`${key}:arr(${this.fingerprintArrayFilter(value as ArrayFilter)})`);
-        continue;
-      }
-
-      // Text search filter
-      if (typeof value === 'object' && !Array.isArray(value) && isTextSearchFilter(value as TextSearchFilter)) {
-        const cfg = (value as TextSearchFilter).config ?? 'english';
-        parts.push(`${key}:fts(${cfg})`);
-        continue;
-      }
-
-      // Plain object literal that matched no filter shape — give it a
-      // fingerprint distinct from real equality. The build path throws for
-      // these on non-JSON columns; sharing `key:eq` would let a cache entry
-      // warmed by genuine equality serve the bad filter silently.
-      if (isUnmatchedPlainObject(value)) {
-        parts.push(
-          `${key}:obj(${Object.keys(value as object)
-            .sort()
-            .join(',')})`,
-        );
-        continue;
-      }
-
-      // Plain equality
-      parts.push(`${key}:eq`);
     }
-
     return parts.join('&');
+  }
+
+  /**
+   * Fingerprint the present branches of a normalized relation filter, in the
+   * fixed order some→every→none→is→isNot. A `null` branch tokenizes as
+   * `<branch>(null)`; a present branch recurses through
+   * {@link fingerprintRelFilter} so the FULL inner shape is captured (two
+   * different sub-wheres must never collide on one cached SQL text).
+   */
+  private fingerprintRelationParts(relDef: RelationDef, filterObj: WhereRecord): string[] {
+    const relParts: string[] = [];
+    if (filterObj.some !== undefined)
+      relParts.push(
+        filterObj.some === null
+          ? 'some(null)'
+          : `some(${this.fingerprintRelFilter(relDef.to, filterObj.some as Record<string, unknown>)})`,
+      );
+    if (filterObj.every !== undefined)
+      relParts.push(
+        filterObj.every === null
+          ? 'every(null)'
+          : `every(${this.fingerprintRelFilter(relDef.to, filterObj.every as Record<string, unknown>)})`,
+      );
+    if (filterObj.none !== undefined)
+      relParts.push(
+        filterObj.none === null
+          ? 'none(null)'
+          : `none(${this.fingerprintRelFilter(relDef.to, filterObj.none as Record<string, unknown>)})`,
+      );
+    if (filterObj.is !== undefined)
+      relParts.push(
+        filterObj.is === null
+          ? 'is(null)'
+          : `is(${this.fingerprintRelFilter(relDef.to, filterObj.is as Record<string, unknown>)})`,
+      );
+    if (filterObj.isNot !== undefined)
+      relParts.push(
+        filterObj.isNot === null
+          ? 'isNot(null)'
+          : `isNot(${this.fingerprintRelFilter(relDef.to, filterObj.isNot as Record<string, unknown>)})`,
+      );
+    return relParts;
   }
 
   /**
@@ -3356,9 +3337,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * parameterless boolean operators that change SQL shape.
    */
   private fingerprintArrayFilter(filter: ArrayFilter): string {
-    const keys = Object.keys(filter).sort();
-    const suffix = filter.isEmpty === undefined ? '' : `:empty=${filter.isEmpty ? 'true' : 'false'}`;
-    return `${keys.join(',')}${suffix}`;
+    return fingerprintArrayFilterShape(filter);
   }
 
   /**
@@ -3434,105 +3413,72 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * @internal Exposed as package-private for testing.
    */
   collectWhereParams(where: Record<string, unknown>, params: unknown[]): void {
-    // Sorted (canonical) order — MUST match fingerprintWhere and buildWhereClause.
-    const keys = sortedKeys(where);
-
-    for (const key of keys) {
-      const value = where[key];
-      if (value === undefined) continue;
-
-      if (key === 'OR') {
-        const orConditions = value as Record<string, unknown>[];
-        if (!Array.isArray(orConditions) || orConditions.length === 0) continue;
-        for (const orCond of orConditions) {
-          this.collectWhereParams(orCond, params);
-        }
-        continue;
+    // ONE canonical walk (shared with fingerprintWhere + buildWhereClause), so
+    // the key order + combinator structure cannot drift out of lockstep.
+    for (const event of walkWhere(this.whereHost, where)) {
+      switch (event.kind) {
+        case 'or':
+        case 'and':
+          for (const cond of event.conditions) this.collectWhereParams(cond, params);
+          break;
+        case 'not':
+          this.collectWhereParams(event.condition, params);
+          break;
+        case 'relation':
+          this.collectRelationFilterParams(event.relDef, event.filterObj, params);
+          break;
+        case 'scalar':
+          this.collectScalarParams(event.key, event.value, params);
+          break;
       }
+    }
+  }
 
-      if (key === 'AND') {
-        const andConditions = value as Record<string, unknown>[];
-        if (!Array.isArray(andConditions) || andConditions.length === 0) continue;
-        for (const andCond of andConditions) {
-          this.collectWhereParams(andCond, params);
-        }
-        continue;
-      }
-
-      if (key === 'NOT') {
-        const notCond = value as Record<string, unknown>;
-        this.collectWhereParams(notCond, params);
-        continue;
-      }
-
-      // Relation filters
-      const relationDef = this.tableMeta.relations[key];
-      if (relationDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        const filterObj = this.normalizeRelationFilter(relationDef, value as Record<string, unknown>);
-        if (
-          'some' in filterObj ||
-          'every' in filterObj ||
-          'none' in filterObj ||
-          'is' in filterObj ||
-          'isNot' in filterObj
-        ) {
-          this.collectRelationFilterParams(relationDef, filterObj, params);
-          continue;
-        }
-      }
-
-      // null → no param pushed (IS NULL is parameterless)
-      if (value === null) continue;
-
-      const rawColumn = this.toColumn(key);
-
-      // Vector distance filter — mirrors buildVectorFilterClauses push order.
-      if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
+  /**
+   * Push a scalar WHERE value's params, mirroring {@link buildScalarClause}'s
+   * emissions exactly. Both resolve the value's shape via the shared
+   * {@link classifyScalarForSql}, so a cache HIT binds each `$N` to the value
+   * the cached SQL expects. A JSON/array-shaped value on a non-JSON/array column
+   * (`jsonThrow`/`arrayThrow`) falls through to the equality path here — the
+   * same fall-through the collect path has always taken (the build path's typed
+   * error there is only reachable on a MISS, before anything is cached).
+   */
+  private collectScalarParams(key: string, value: unknown, params: unknown[]): void {
+    const rawColumn = this.toColumn(key);
+    const cls = classifyScalarForSql(this.whereHost, rawColumn, value);
+    switch (cls.kind) {
+      case 'null':
+        // IS NULL is parameterless.
+        return;
+      case 'vector':
         // Validate the same way the build path does so the collect path never
         // diverges (it would throw before any param was pushed).
-        this.vectorOperator(key, rawColumn, value.distance.metric);
-        this.collectVectorFilterParams(key, rawColumn, value, params);
-        continue;
-      }
-
-      // JSONB filter
-      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
-        const colType = this.getColumnPgType(rawColumn);
-        if (this.isJsonColumnType(colType)) {
-          this.collectJsonFilterParams(value, params, this.q(rawColumn));
-          continue;
-        }
-      }
-
-      // Array filter
-      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
-        const colType = this.getColumnPgType(rawColumn);
-        if (colType.startsWith('_')) {
-          this.collectArrayFilterParams(value, params);
-          continue;
-        }
-      }
-
-      // Text search filter
-      if (typeof value === 'object' && !Array.isArray(value) && isTextSearchFilter(value)) {
-        params.push(value.search);
-        continue;
-      }
-
-      // Operator objects
-      if (isWhereOperator(value)) {
-        this.collectOperatorParams(rawColumn, value, params, {
+        this.vectorOperator(key, rawColumn, (value as VectorFilter).distance.metric);
+        this.collectVectorFilterParams(key, rawColumn, value as VectorFilter, params);
+        return;
+      case 'json':
+        this.collectJsonFilterParams(value as JsonFilter, params, this.q(rawColumn));
+        return;
+      case 'array':
+        this.collectArrayFilterParams(value as ArrayFilter, params);
+        return;
+      case 'textsearch':
+        params.push((value as TextSearchFilter).search);
+        return;
+      case 'operator':
+        this.collectOperatorParams(rawColumn, value as WhereOperator, params, {
           meta: this.tableMeta,
           table: this.table,
           prefix: '',
         });
-        continue;
-      }
-
-      // Plain equality — same strict validation as the build path, so a
-      // cache hit can never silently bind a misspelled-operator object.
-      this.assertBindableEqualityValue(rawColumn, value, this.getColumnPgType(rawColumn), this.table);
-      params.push(value);
+        return;
+      default:
+        // 'equality' | 'jsonThrow' | 'arrayThrow' — same strict validation as
+        // the build path, so a cache hit can never silently bind a
+        // misspelled-operator object.
+        this.assertBindableEqualityValue(rawColumn, value, this.getColumnPgType(rawColumn), this.table);
+        params.push(value);
+        return;
     }
   }
 
@@ -4199,157 +4145,105 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Supports: equality, operators, NULL, OR, AND, NOT, relation filters (some/every/none).
    */
   private buildWhereClause(where: Record<string, unknown>, params: unknown[]): string | null {
-    // Sorted (canonical) order — MUST match fingerprintWhere and collectWhereParams.
-    const keys = sortedKeys(where);
-    if (keys.length === 0) return null;
-
     const andClauses: string[] = [];
 
-    for (const key of keys) {
-      const value = where[key];
-      if (value === undefined) continue;
-
-      // Handle OR special key
-      if (key === 'OR') {
-        const orConditions = value as Record<string, unknown>[];
-        if (!Array.isArray(orConditions) || orConditions.length === 0) continue;
-        const orClauses: string[] = [];
-        for (const orCond of orConditions) {
-          const sub = this.buildWhereClause(orCond, params);
-          if (sub) orClauses.push(sub);
+    // ONE canonical walk (shared with fingerprintWhere + collectWhereParams).
+    for (const event of walkWhere(this.whereHost, where)) {
+      switch (event.kind) {
+        case 'or': {
+          const orClauses: string[] = [];
+          for (const orCond of event.conditions) {
+            const sub = this.buildWhereClause(orCond, params);
+            if (sub) orClauses.push(sub);
+          }
+          if (orClauses.length > 0) andClauses.push(`(${orClauses.join(' OR ')})`);
+          break;
         }
-        if (orClauses.length > 0) {
-          andClauses.push(`(${orClauses.join(' OR ')})`);
+        case 'and':
+          for (const andCond of event.conditions) {
+            const sub = this.buildWhereClause(andCond, params);
+            if (sub) andClauses.push(sub);
+          }
+          break;
+        case 'not': {
+          const sub = this.buildWhereClause(event.condition, params);
+          if (sub) andClauses.push(`NOT (${sub})`);
+          break;
         }
-        continue;
-      }
-
-      // Handle AND special key
-      if (key === 'AND') {
-        const andConditions = value as Record<string, unknown>[];
-        if (!Array.isArray(andConditions) || andConditions.length === 0) continue;
-        for (const andCond of andConditions) {
-          const sub = this.buildWhereClause(andCond, params);
-          if (sub) andClauses.push(sub);
-        }
-        continue;
-      }
-
-      // Handle NOT special key
-      if (key === 'NOT') {
-        const notCond = value as Record<string, unknown>;
-        const sub = this.buildWhereClause(notCond, params);
-        if (sub) andClauses.push(`NOT (${sub})`);
-        continue;
-      }
-
-      // Handle relation filters: { posts: { some: { published: true } } }
-      const relationDef = this.tableMeta.relations[key];
-      if (relationDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        const filterObj = this.normalizeRelationFilter(relationDef, value as Record<string, unknown>);
-        // Check if this is a relation filter (has some/every/none keys)
-        if (
-          'some' in filterObj ||
-          'every' in filterObj ||
-          'none' in filterObj ||
-          'is' in filterObj ||
-          'isNot' in filterObj
-        ) {
-          const relClause = this.buildRelationFilter(key, relationDef, filterObj, params);
+        case 'relation': {
+          // { posts: { some: { published: true } } } → EXISTS / NOT EXISTS
+          const relClause = this.buildRelationFilter(event.key, event.relDef, event.filterObj, params);
           if (relClause) andClauses.push(relClause);
-          continue;
+          break;
         }
+        case 'scalar':
+          this.buildScalarClause(event.key, event.value, params, andClauses);
+          break;
       }
-
-      const rawColumn = this.toColumn(key);
-      const column = this.q(rawColumn);
-
-      // Handle null → IS NULL
-      if (value === null) {
-        andClauses.push(`${column} IS NULL`);
-        continue;
-      }
-
-      // Handle vector distance filter (pgvector): `{ distance: { to, metric, lt } }`
-      if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
-        const vecClauses = this.buildVectorFilterClauses(key, rawColumn, value, params);
-        andClauses.push(...vecClauses);
-        continue;
-      }
-
-      // Handle JSONB filter operators (for json/jsonb columns)
-      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
-        const colType = this.getColumnPgType(rawColumn);
-        if (this.isJsonColumnType(colType)) {
-          const jsonClauses = this.buildJsonFilterClauses(column, value, params);
-          andClauses.push(...jsonClauses);
-          continue;
-        }
-        // Strict validation: a JSON-only operator on a non-JSON column was almost
-        // certainly a typo or schema mismatch. Silently falling through to plain
-        // equality (the previous behaviour) wasted hours of debugging time. Only
-        // throw when the operator is unambiguously JSON-specific — `contains` is
-        // shared with WhereOperator's LIKE so it must continue to fall through.
-        const jsonKey = findJsonUniqueKey(value);
-        if (jsonKey) {
-          throw new ValidationError(
-            `[turbine] Column "${rawColumn}" on table "${this.table}" is not a JSON column ` +
-              `(actual type: ${colType}); cannot apply JSON operator '${jsonKey}'.`,
-          );
-        }
-      }
-
-      // Handle Array filter operators (for array columns)
-      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
-        const colType = this.getColumnPgType(rawColumn);
-        if (colType.startsWith('_')) {
-          const arrayClauses = this.buildArrayFilterClauses(column, value, params, colType);
-          andClauses.push(...arrayClauses);
-          continue;
-        }
-        // Strict validation: array operators (`has`, `hasEvery`, ...) on a
-        // non-array column always indicate a mistake. None of these keys
-        // overlap with other filter shapes so we can throw unconditionally.
-        const arrayKey = findArrayUniqueKey(value);
-        if (arrayKey) {
-          throw new ValidationError(
-            `[turbine] Column "${rawColumn}" on table "${this.table}" is not an array column ` +
-              `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
-          );
-        }
-      }
-
-      // Handle full-text search filter
-      if (typeof value === 'object' && !Array.isArray(value) && isTextSearchFilter(value)) {
-        const tsClause = this.buildTextSearchClause(column, value, params);
-        andClauses.push(tsClause);
-        continue;
-      }
-
-      // Handle operator objects
-      if (isWhereOperator(value)) {
-        const opClauses = this.buildOperatorClauses(column, value, params, {
-          meta: this.tableMeta,
-          table: this.table,
-          prefix: '',
-        });
-        andClauses.push(...opClauses);
-        continue;
-      }
-
-      // Strict validation: a plain object literal that matched no known filter
-      // shape is almost always a misspelled operator (`startWith` for
-      // `startsWith`). The guard also runs on the cache-hit param-collect path
-      // (collectWhereParams) so a warmed SQL cache can never skip it.
-      this.assertBindableEqualityValue(rawColumn, value, this.getColumnPgType(rawColumn), this.table);
-
-      // Plain equality
-      params.push(value);
-      andClauses.push(`${column} = ${this.p(params.length)}`);
     }
 
     if (andClauses.length === 0) return null;
     return andClauses.join(' AND ');
+  }
+
+  /**
+   * Emit the SQL clause(s) for one scalar WHERE key onto `andClauses`, pushing
+   * any params. The shape decision comes from the shared
+   * {@link classifyScalarForSql} so {@link collectScalarParams} pushes an
+   * identical param list on a cache hit. The `*Throw` branches preserve the
+   * strict-validation errors for a JSON/array operator on the wrong column type.
+   */
+  private buildScalarClause(key: string, value: unknown, params: unknown[], andClauses: string[]): void {
+    const rawColumn = this.toColumn(key);
+    const column = this.q(rawColumn);
+    const cls = classifyScalarForSql(this.whereHost, rawColumn, value);
+    switch (cls.kind) {
+      case 'null':
+        andClauses.push(`${column} IS NULL`);
+        return;
+      case 'vector':
+        andClauses.push(...this.buildVectorFilterClauses(key, rawColumn, value as VectorFilter, params));
+        return;
+      case 'json':
+        andClauses.push(...this.buildJsonFilterClauses(column, value as JsonFilter, params));
+        return;
+      case 'jsonThrow':
+        // A JSON-only operator on a non-JSON column was almost certainly a typo
+        // or schema mismatch. `contains`/`equals` are shared with WhereOperator
+        // (LIKE / equality), so only shape-unique keys reach here.
+        throw new ValidationError(
+          `[turbine] Column "${rawColumn}" on table "${this.table}" is not a JSON column ` +
+            `(actual type: ${this.getColumnPgType(rawColumn)}); cannot apply JSON operator '${cls.jsonKey}'.`,
+        );
+      case 'array':
+        andClauses.push(...this.buildArrayFilterClauses(column, value as ArrayFilter, params, cls.colType));
+        return;
+      case 'arrayThrow':
+        throw new ValidationError(
+          `[turbine] Column "${rawColumn}" on table "${this.table}" is not an array column ` +
+            `(actual type: ${this.getColumnPgType(rawColumn)}); cannot apply array operator '${cls.arrayKey}'.`,
+        );
+      case 'textsearch':
+        andClauses.push(this.buildTextSearchClause(column, value as TextSearchFilter, params));
+        return;
+      case 'operator':
+        andClauses.push(
+          ...this.buildOperatorClauses(column, value as WhereOperator, params, {
+            meta: this.tableMeta,
+            table: this.table,
+            prefix: '',
+          }),
+        );
+        return;
+      default:
+        // 'equality' — a plain object literal that matched no known filter shape
+        // is almost always a misspelled operator (`startWith` for `startsWith`);
+        // the guard also runs on the cache-hit param-collect path.
+        this.assertBindableEqualityValue(rawColumn, value, this.getColumnPgType(rawColumn), this.table);
+        params.push(value);
+        andClauses.push(`${column} = ${this.p(params.length)}`);
+        return;
+    }
   }
 
   /**
