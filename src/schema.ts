@@ -118,6 +118,15 @@ export interface ColumnMetadata {
    * Present only when `isGeneratedStored` is true and the catalog exposed it.
    */
   generationExpression?: string;
+  /**
+   * True when this column holds personally identifiable information (PII).
+   * Tagged in `defineSchema` (`pii: true`) and carried through generated
+   * metadata. A PII column is EXCLUDED from default projections: it comes back
+   * only when explicitly named in `select` or when the query passes
+   * `includePii: true` (full opt-in). Studio redacts PII cells by default.
+   * Optional / defaults to `false`; untagged schemas behave exactly as before.
+   */
+  pii?: boolean;
   /** Whether this is an array column */
   isArray: boolean;
   /** Dialect-specific array/bulk-insert type token when needed. */
