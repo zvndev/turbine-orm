@@ -65,7 +65,6 @@ import type {
   UpdateArgs,
   UpdateManyArgs,
   UpsertArgs,
-  WhereClause,
   WithClause,
 } from './types.js';
 import { LRUCache, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
