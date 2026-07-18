@@ -1,29 +1,31 @@
 export const metadata = {
   title: 'Studio',
   description:
-    'Turbine Studio — a local, read-only database UI with a visual findMany builder, no raw-SQL surface, loopback binding, token auth, and BEGIN READ ONLY enforcement.',
+    'Turbine Studio: a local database UI with a visual findMany builder, no raw-SQL surface, loopback binding, token auth, BEGIN READ ONLY by default, opt-in write mode, and PII redaction.',
   alternates: { canonical: '/studio' },
 };
 
 # Studio
 
-`npx turbine studio` launches a local web UI for browsing your database and composing queries visually. It is **read-only by design** — there is no row editing, no DDL, no raw-SQL input surface, and every query executes inside a `BEGIN READ ONLY` transaction. It's the database UI you can run against production data without a change-control conversation.
+`npx turbine studio` launches a local web UI for browsing your database and composing queries visually. It is **read-only by default**: no row editing, no DDL, no raw-SQL input surface, and every query executes inside a `BEGIN READ ONLY` transaction. It's the database UI you can run against production data without a change-control conversation. Since v0.36, `--write` opts a launch in to single-row edits through the same validated builder; without the flag, the write endpoints do not exist.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
 ```
 
-Studio introspects the schema, starts an HTTP server on `127.0.0.1:4983` (Node's built-in `http` module — no extra dependencies), and opens your browser with a per-process session token in the URL.
+Studio introspects the schema, starts an HTTP server on `127.0.0.1:4983` (Node's built-in `http` module, no extra dependencies), and opens your browser with a per-process session token in the URL.
 
 ## Launching
 
 ```bash
-npx turbine studio                          # default: 127.0.0.1:4983, opens browser
+npx turbine studio                          # default: 127.0.0.1:4983, opens browser, read-only
 npx turbine studio --port 5173              # custom port
 npx turbine studio --no-open                # don't auto-open the browser
 npx turbine studio --schema inventory       # non-public Postgres schema
 npx turbine studio --include users,posts    # only these tables
 npx turbine studio --exclude _migrations    # hide tables
+npx turbine studio --write                  # opt in to single-row writes (loud warning)
+npx turbine studio --show-pii               # reveal PII-tagged values (loud warning)
 npx turbine studio --host 0.0.0.0 --allow-remote  # non-loopback requires explicit opt-in
 ```
 
@@ -34,6 +36,8 @@ The connection string resolves the same way as every other CLI command: `--url` 
 | `--port <n>` | HTTP port (default: `4983`). |
 | `--host <addr>` | Bind address (default: `127.0.0.1`). Non-loopback values are **refused** unless you also pass `--allow-remote`. |
 | `--allow-remote` | Opt in to binding on a non-loopback `--host`. Emits a loud warning and proceeds. Without this flag, Studio exits with code 1. |
+| `--write` | Enable single-row insert/update/delete from the Data tab. Read-only stays the default on every launch; the flag emits a loud startup warning and the UI shows a persistent WRITE MODE banner. |
+| `--show-pii` | Show PII-tagged column values instead of the redaction placeholder. Emits a loud startup warning. |
 | `--no-open` | Don't open the browser automatically. |
 | `--include <a,b>` / `--exclude <a,b>` | Limit which tables Studio sees. |
 | `--schema <name>` | Postgres schema (default: `public`). Pinned via `set_config('search_path', ...)` on every query. |
@@ -53,10 +57,25 @@ Because the builder speaks ORM args instead of SQL, the server can validate ever
 
 ## Data and Schema tabs
 
-- **Data** — browse table rows with column sorting, search across every text column, and a modal viewer for JSON/JSONB cells.
-- **Schema** — inspect tables, columns, types, indexes, and relations as introspected.
+- **Data** — browse table rows with column sorting, search across every text column, and a modal viewer for JSON/JSONB cells. In write mode, this tab also hosts the row editor (below).
+- **Schema** — inspect tables, columns, types, indexes, and relations as introspected. Columns tagged `pii: true` carry a **pii** badge.
 
-Both tabs go through the same read-only, parameterized query path as the builder.
+Both tabs go through the same parameterized query path as the builder; reads stay inside `BEGIN READ ONLY` even in write mode.
+
+## Write mode (`--write`)
+
+By default there is nothing to opt out of: the write endpoints are not registered, requests to them 404, and every transaction is read-only at the database level. Passing `--write` changes that for a single launch:
+
+- The Data tab gains **Insert row**, **Edit**, and **Delete** actions, and the UI shows a persistent red WRITE MODE banner.
+- Every write targets **one row, addressed by its full primary key**. There is no bulk update, no DDL, and still no SQL input surface: writes compile through the same validated `buildUpdate` / `buildCreate` / `buildDelete` builders as the library, identifiers checked against the introspected schema, values bound as `$N` parameters.
+- Each write runs in its own transaction with the same parameterized `statement_timeout` and pinned `search_path` as reads.
+- Write requests additionally require a matching `Origin` header; absent or mismatched origins are rejected.
+
+Write mode is for the "fix one bad row without opening psql" moment, not for data entry. Tables without a primary key (and views) are not editable.
+
+## PII redaction
+
+Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) render as a redaction placeholder in every tab — table rows, builder results, nested relation rows, and the echoed row after a write. Redaction happens **server-side**, before the value is serialized into the API response, so the browser never receives the value. `--show-pii` turns redaction off for a launch, with a loud startup warning. See [PII fields](/queries#pii-fields-includepii) for how the same tags behave in application queries.
 
 ## Saved queries and the command palette
 
@@ -70,15 +89,16 @@ Studio's hardening is the point. Every layer assumes the layer above it failed:
 
 1. **Loopback binding.** Binds `127.0.0.1` by default and **refuses** non-loopback `--host` values unless you pass `--allow-remote` (which still emits a loud warning). Studio is a single-user local tool, not a deployable service.
 2. **Per-process token auth.** A random 24-byte (192-bit) hex token is generated at startup and required on every `/api/*` request, compared in constant time. The token lives in the launch URL and a `SameSite=Strict`, `HttpOnly` cookie.
-3. **No raw-SQL surface.** Since v0.19 there is no endpoint that accepts SQL text. Builder requests are ORM args, validated identifier-by-identifier against the introspected schema; all values are `$N` parameters.
-4. **`BEGIN READ ONLY` on every query.** Even if every check above were bypassed, Postgres itself rejects writes — the transaction is read-only at the database level. Belt and suspenders.
-5. **Statement timeout.** A 30-second transaction-local `statement_timeout` (parameterized `set_config`, never interpolated) bounds runaway queries, and `search_path` is pinned to the configured schema the same way.
-6. **Request hygiene.** Per-session rate limiting (100 requests / 60 s), cross-origin requests refused, and security headers on every response: CSP, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
+3. **No raw-SQL surface.** Since v0.19 there is no endpoint that accepts SQL text. Builder and write requests are ORM args, validated identifier-by-identifier against the introspected schema; all values are `$N` parameters.
+4. **`BEGIN READ ONLY` on every read.** Even if every check above were bypassed, Postgres itself rejects writes on the read path — the transaction is read-only at the database level. Without `--write`, this covers every request Studio can make.
+5. **Write-mode gates.** With `--write`: full-primary-key addressing on every mutation, per-write transactions with the same timeout and schema pinning, and `Origin` checks that reject absent or mismatched origins.
+6. **Statement timeout.** A 30-second transaction-local `statement_timeout` (parameterized `set_config`, never interpolated) bounds runaway queries, and `search_path` is pinned to the configured schema the same way.
+7. **Request hygiene.** Per-session rate limiting (100 requests / 60 s), cross-origin requests refused, and security headers on every response: a nonce-based CSP (`script-src 'self' 'nonce-...'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
 
-Deliberately not implemented: row editing, DDL, destructive operations of any kind. Studio is for inspection — use the CLI, migrations, or your own code for writes.
+Deliberately not implemented, in any mode: raw SQL, DDL, bulk mutations, and multi-row writes. Studio is for inspection and the occasional single-row fix — use the CLI, migrations, or your own code for everything else.
 
 ## See also
 
 - **[CLI](/cli)** — every command, flag, and the config resolution order.
-- **[API Reference](/queries)** — the `findMany` surface the builder compiles to.
+- **[API Reference](/queries)** — the `findMany` surface the builder compiles to, and the `includePii` read option.
 - **[Observability](/observability)** — `npx turbine observe`, the metrics dashboard with the same security model.

@@ -201,6 +201,10 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         result.allowDestructive = true;
         break;
       case '--recipe':
+        if (next === undefined || next.startsWith('-')) {
+          console.error('--recipe requires a name (e.g. --recipe backfill)');
+          process.exit(1);
+        }
         result.recipe = next;
         i++;
         break;
@@ -2087,6 +2091,9 @@ function showPushHelp(): void {
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
   console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
+  console.log(
+    `    ${cyan('--allow-destructive')} Skip the interactive confirmation for data-destroying statements ${dim('(CI)')}`,
+  );
   console.log(`    ${cyan('--verbose, -v')}      Show detailed output`);
   newline();
 }

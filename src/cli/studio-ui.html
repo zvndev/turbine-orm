@@ -69,6 +69,24 @@
       background: var(--red);
       box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.2);
     }
+    .pii-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      background: rgba(250, 204, 21, 0.12);
+      border-bottom: 1px solid rgba(250, 204, 21, 0.5);
+      color: var(--yellow);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      flex: 0 0 auto;
+    }
+    .pii-banner strong {
+      font-weight: 700;
+    }
+    .pii-banner span:last-child {
+      color: var(--text-dim);
+    }
     .badge.pii {
       background: rgba(250, 204, 21, 0.14);
       color: var(--yellow);
@@ -1589,6 +1607,11 @@
       <span class="write-banner-dot" aria-hidden="true"></span>
       <strong>WRITE MODE</strong>
       <span>changes are committed directly to your database</span>
+    </div>
+    <!-- PII banner (shown only when the server runs with --show-pii) -->
+    <div class="pii-banner" id="piiBanner" role="alert" hidden>
+      <strong>PII SHOWN</strong>
+      <span>PII-tagged column values are displayed unredacted (--show-pii)</span>
     </div>
     <!-- Header -->
     <header class="header">
@@ -3685,6 +3708,8 @@
           const v = row[c.name];
           if (RowEditor.mode === 'edit' && v !== undefined && v !== null && v !== REDACTED_MARKER) {
             input.value = typeof v === 'object' ? JSON.stringify(v) : String(v);
+          } else if (RowEditor.mode === 'edit' && v === REDACTED_MARKER) {
+            input.placeholder = 'redacted · leave blank to keep the existing value';
           }
           if (RowEditor.mode === 'edit' && c.isPrimaryKey) input.disabled = true;
           field.appendChild(label);
@@ -3944,6 +3969,8 @@
         // Persistent write-mode affordances (only when the server allows writes).
         $('#writeBanner').hidden = !State.writable;
         $('#dataInsert').hidden = !State.writable;
+        // Persistent unredacted-PII indicator (only under --show-pii).
+        $('#piiBanner').hidden = !State.showPii;
         $('#connDot').classList.add('ok');
         $('#connLabel').textContent = 'connected';
         const meta =

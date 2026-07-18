@@ -401,11 +401,16 @@ function normalizeDefault(val: string): string {
  */
 function generateForeignKeyIndexes(table: TableDef, dialect: Dialect = postgresDialect): string[] {
   const indexes: string[] = [];
+  // A declared index whose deterministic name matches the auto FK-index name
+  // takes precedence (it may be UNIQUE); emitting both would fail at apply time
+  // with "relation already exists".
+  const declared = declaredPlainIndexNames(table);
 
   for (const [fieldName, config] of Object.entries(table.columns)) {
     if (config.referencesTarget) {
       const snakeName = camelToSnake(fieldName);
       const indexName = `idx_${table.name}_${snakeName}`;
+      if (declared.has(indexName)) continue;
       indexes.push(
         dialect.buildCreateIndexStatement({
           name: dialect.quoteIdentifier(indexName),
@@ -428,6 +433,52 @@ function declaredIndexName(tableName: string, idx: ColumnIndexDef): string {
   if (idx.name) return idx.name;
   const cols = idx.columns.map(camelToSnake);
   return `idx_${tableName}_${cols.join('_')}`;
+}
+
+/**
+ * Compare a declared plain index against a pg_indexes `indexdef` string.
+ * Returns a human-readable description of the first mismatch (uniqueness or
+ * column list), or null when the definitions agree. Expression/partial indexes
+ * in the DB never structurally match a plain column list, which is the
+ * intended outcome: the operator gets a warning rather than a silent skip.
+ */
+export function describeIndexDefMismatch(idx: ColumnIndexDef, indexdef: string): string | null {
+  const dbUnique = /^\s*CREATE\s+UNIQUE\s+INDEX\b/i.test(indexdef);
+  const wantUnique = idx.unique === true;
+  if (dbUnique !== wantUnique) {
+    return wantUnique
+      ? 'declared UNIQUE, existing index is not unique'
+      : 'existing index is UNIQUE, declaration is not';
+  }
+  // pg_indexes.indexdef always reads `CREATE [UNIQUE] INDEX name ON tbl
+  // USING method (col, ...) [WHERE ...]`; anchor on the USING clause so a
+  // partial index's WHERE parentheses are never mistaken for the column list.
+  const parenMatch = indexdef.match(/USING\s+\w+\s*\(([^)]*)\)/i) ?? indexdef.match(/\(([^)]*)\)/);
+  const dbCols = parenMatch
+    ? parenMatch[1]!.split(',').map((c) =>
+        c
+          .trim()
+          .replace(/\s+(ASC|DESC|NULLS\s+(FIRST|LAST))\b/gi, '')
+          .replace(/^"(.*)"$/, '$1')
+          .trim(),
+      )
+    : [];
+  const wantCols = idx.columns.map(camelToSnake);
+  if (dbCols.length !== wantCols.length || dbCols.some((c, i) => c !== wantCols[i])) {
+    return `declared columns (${wantCols.join(', ')}) differ from existing (${dbCols.join(', ') || 'unparsed'})`;
+  }
+  if (/\bWHERE\b/i.test(indexdef)) return 'existing index is partial (has a WHERE clause)';
+  return null;
+}
+
+/** The deterministic SQL names of every declared plain index on a table. */
+function declaredPlainIndexNames(table: TableDef): Set<string> {
+  const names = new Set<string>();
+  for (const idx of table.indexes ?? []) {
+    if (isDocFieldIndexDef(idx) || idx.columns.length === 0) continue;
+    names.add(declaredIndexName(table.name, idx));
+  }
+  return names;
 }
 
 /**
@@ -820,13 +871,13 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
     // Existing index NAMES per table (for the declared-index diff). Covers PK,
     // unique-constraint, FK, and user indexes alike; the diff only ADDs declared
     // indexes whose name is missing and never auto-drops any (see below).
-    const indexResult = await client.query<{ tablename: string; indexname: string }>(
-      `SELECT tablename, indexname FROM pg_indexes WHERE schemaname = 'public'`,
+    const indexResult = await client.query<{ tablename: string; indexname: string; indexdef: string }>(
+      `SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'`,
     );
-    const dbIndexes: Record<string, Set<string>> = {};
+    const dbIndexes: Record<string, Map<string, string>> = {};
     for (const row of indexResult.rows) {
-      if (!dbIndexes[row.tablename]) dbIndexes[row.tablename] = new Set();
-      dbIndexes[row.tablename]!.add(row.indexname);
+      if (!dbIndexes[row.tablename]) dbIndexes[row.tablename] = new Map();
+      dbIndexes[row.tablename]!.set(row.indexname, row.indexdef);
     }
 
     // Build a set of DDL-facing snake_case table names that the schema defines.
@@ -1073,17 +1124,33 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       // constraint, or FK-column index names, which the schema never declares.
       const declaredPlain = (tableDef.indexes ?? []).filter((i): i is ColumnIndexDef => !isDocFieldIndexDef(i));
       if (declaredPlain.length > 0) {
-        const dbIdxNames = dbIndexes[tableName] ?? new Set<string>();
+        const dbIdx = dbIndexes[tableName] ?? new Map<string, string>();
+        const dbIdxNames = new Set(dbIdx.keys());
         const declaredNames = new Set<string>();
         for (const idx of declaredPlain) {
           if (idx.columns.length === 0) continue;
           const name = declaredIndexName(tableName, idx);
           declaredNames.add(name);
-          if (!dbIdxNames.has(name)) {
+          const existingDef = dbIdx.get(name);
+          if (existingDef === undefined) {
             const stmt = buildDeclaredIndexStatement(tableName, idx, dialect);
             if (!stmt) continue;
             result.statements.push(stmt);
             result.reverseStatements.unshift(`DROP INDEX IF EXISTS ${dialect.quoteIdentifier(name)};`);
+          } else {
+            // Name matches an existing index: verify the definition agrees.
+            // Matching is by name, so a definition drift (a declared UNIQUE
+            // index colliding with the plain auto FK index, or a changed
+            // column list) would otherwise be silently skipped, leaving the
+            // declared guarantee unenforced. Warn, never drop.
+            const mismatch = describeIndexDefMismatch(idx, existingDef);
+            if (mismatch) {
+              result.warnings!.push(
+                `index "${name}" on "${tableName}": the declared definition does not match the existing ` +
+                  `database index (${mismatch}). Turbine matches indexes by name and never drops them ` +
+                  `automatically; drop and recreate it in a manual migration to apply the declared definition.`,
+              );
+            }
           }
         }
         // Recognized (never-declared) index names: unique-constraint + FK-column.
@@ -1091,10 +1158,10 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         for (const [fieldName, config] of Object.entries(tableDef.columns)) {
           if (config.referencesTarget) recognized.add(`idx_${tableName}_${camelToSnake(fieldName)}`);
         }
-        for (const dbIdx of dbIdxNames) {
-          if (declaredNames.has(dbIdx) || recognized.has(dbIdx) || dbIdx.endsWith('_pkey')) continue;
+        for (const dbIdxName of dbIdxNames) {
+          if (declaredNames.has(dbIdxName) || recognized.has(dbIdxName) || dbIdxName.endsWith('_pkey')) continue;
           result.warnings!.push(
-            `index "${dbIdx}" on "${tableName}" exists in the database but is not declared in the schema. ` +
+            `index "${dbIdxName}" on "${tableName}" exists in the database but is not declared in the schema. ` +
               `Turbine does not drop indexes automatically; drop it in a manual migration if it is no longer needed.`,
           );
         }

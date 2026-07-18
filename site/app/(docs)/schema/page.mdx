@@ -144,6 +144,25 @@ products: {
 
 A table-level check without a `name` emits a bare `CHECK (expr)`. Introspection reads check constraints back, so they survive a `pull`. A violated check throws `CheckConstraintError` (TURBINE_E011) at write time.
 
+### Declared indexes
+
+Declare plain column-list indexes at the table level with `indexes`. Each entry names its camelCase columns, optionally `unique: true`, and optionally an explicit `name` (auto-derived as `idx_<table>_<col1>_<col2>` when omitted):
+
+```ts
+users: {
+  id: { type: 'serial', primaryKey: true },
+  email: { type: 'text', notNull: true },
+  orgId: { type: 'integer', references: 'orgs.id' },
+  indexes: [
+    { columns: ['email'], unique: true },          // CREATE UNIQUE INDEX "idx_users_email"
+    { columns: ['orgId', 'email'] },               // CREATE INDEX "idx_users_org_id_email"
+    { columns: ['email'], name: 'users_email_ci' } // explicit name
+  ],
+}
+```
+
+`schemaToSQL` (and therefore `push`) emits these as `CREATE [UNIQUE] INDEX` after the table DDL. Foreign-key columns still get an automatic index; a declared index that resolves to the same name takes precedence, so declaring `{ columns: ['orgId'], unique: true }` replaces the plain auto FK index rather than colliding with it. `schemaDiff` adds declared indexes missing from the live database, warns when a name matches an existing index whose definition differs (uniqueness, column list, or a partial-index `WHERE`), and never drops an index automatically. PowDB doc-field expression indexes (`{ docField, path }`) are documented on the [engines page](/engines) and have no SQL emission.
+
 ### PII fields
 
 Tag a column with `pii: true` to mark it as personally identifiable information:

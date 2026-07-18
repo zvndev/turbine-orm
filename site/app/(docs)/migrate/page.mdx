@@ -118,7 +118,7 @@ This generates a migration pre-filled with the expand/contract skeleton (the nul
 
 Turbine treats data-destroying DDL (`DROP TABLE`, `DROP COLUMN`, and similar) as opt-in, never automatic.
 
-- **`migrate up`** scans every pending migration for destructive statements. If it finds any, it stops, prints exactly which statements in which files are destructive, and asks for a typed confirmation (`yes`) before applying anything. Decline and nothing runs; no data is touched. You can skip the prompt with `--allow-destructive` when you know what you are doing.
+- **`migrate up`** scans every pending migration for destructive statements. If it finds any, it stops, prints exactly which statements in which files are destructive, and asks for a two-step typed confirmation (the literal phrase `destroy my data`, then `yes`) before applying anything. Decline and nothing runs; no data is touched. You can skip the prompt with `--allow-destructive` when you know what you are doing.
 - **`migrate deploy`** applies files exactly as written, with no prompt; it is the non-interactive production path. Whatever destructive SQL is in the migration runs. That is by design: production apply is deterministic and unattended, so the review happens when the migration is authored and merged, not at deploy time.
 - **`push`**: as of 0.36, `turbine push` runs the same destructive scanner over the statements it is about to apply. Destructive operations require the same typed confirmation as `migrate up` (or `--allow-destructive`). `push` is still the fast **development** path that diffs `defineSchema` against the live database and applies the difference directly; for production, author real migrations and `deploy` them.
 

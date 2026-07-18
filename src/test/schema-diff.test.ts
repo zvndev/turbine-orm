@@ -21,6 +21,7 @@ import { defineSchema } from '../schema-builder.js';
 import {
   buildAddForeignKeyStatement,
   type DbForeignKey,
+  describeIndexDefMismatch,
   diffCheckConstraints,
   diffEnumValues,
   diffReferentialAction,
@@ -891,6 +892,90 @@ describe('B2 - declared index DDL (schemaToSQL)', () => {
     // Nothing referencing the json path should reach SQL DDL.
     assert.ok(!sql.some((s) => /owner/.test(s)), `doc-field index leaked into SQL:\n${sql.join('\n')}`);
     assert.ok(!sql.some((s) => /CREATE\s+(UNIQUE\s+)?INDEX\s+"[^"]*payload/.test(s)));
+  });
+
+  it('a declared index on an FK column supersedes the auto FK index (no duplicate name)', () => {
+    const schema = defineSchema({
+      teams: {
+        id: { type: 'serial', primaryKey: true },
+      },
+      players: {
+        id: { type: 'serial', primaryKey: true },
+        teamId: { type: 'bigint', notNull: true, references: 'teams.id' },
+        indexes: [{ columns: ['teamId'], unique: true }],
+      },
+    });
+    const sql = schemaToSQL(schema);
+    const withName = sql.filter((s) => s.includes('"idx_players_team_id"'));
+    assert.equal(withName.length, 1, `expected exactly one idx_players_team_id, got:\n${sql.join('\n')}`);
+    assert.match(
+      withName[0]!,
+      /^CREATE UNIQUE INDEX/,
+      'the declared UNIQUE index must win over the plain auto FK index',
+    );
+  });
+
+  it('an explicitly named declared index leaves the auto FK index alone', () => {
+    const schema = defineSchema({
+      teams: {
+        id: { type: 'serial', primaryKey: true },
+      },
+      players: {
+        id: { type: 'serial', primaryKey: true },
+        teamId: { type: 'bigint', notNull: true, references: 'teams.id' },
+        indexes: [{ columns: ['teamId'], unique: true, name: 'players_team_unique' }],
+      },
+    });
+    const sql = schemaToSQL(schema);
+    assert.ok(
+      sql.some((s) => s.includes('"idx_players_team_id"')),
+      'auto FK index still emitted',
+    );
+    assert.ok(sql.some((s) => s.startsWith('CREATE UNIQUE INDEX "players_team_unique"')));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Declared-index definition matching against pg_indexes indexdef (pure)
+// ---------------------------------------------------------------------------
+
+describe('describeIndexDefMismatch', () => {
+  const plain = 'CREATE INDEX idx_users_email ON public.users USING btree (email)';
+  const unique = 'CREATE UNIQUE INDEX idx_users_email ON public.users USING btree (email)';
+
+  it('returns null when a plain declaration matches a plain index', () => {
+    assert.equal(describeIndexDefMismatch({ columns: ['email'] }, plain), null);
+  });
+
+  it('returns null when a unique declaration matches a unique index', () => {
+    assert.equal(describeIndexDefMismatch({ columns: ['email'], unique: true }, unique), null);
+  });
+
+  it('flags declared UNIQUE over an existing plain index (the FK-collision case)', () => {
+    const msg = describeIndexDefMismatch({ columns: ['email'], unique: true }, plain);
+    assert.match(msg ?? '', /declared UNIQUE, existing index is not unique/);
+  });
+
+  it('flags an existing UNIQUE index against a plain declaration', () => {
+    const msg = describeIndexDefMismatch({ columns: ['email'] }, unique);
+    assert.match(msg ?? '', /existing index is UNIQUE/);
+  });
+
+  it('flags a changed column list', () => {
+    const db = 'CREATE INDEX idx_events_x ON public.events USING btree (user_id)';
+    const msg = describeIndexDefMismatch({ columns: ['userId', 'createdAt'], name: 'idx_events_x' }, db);
+    assert.match(msg ?? '', /declared columns \(user_id, created_at\) differ from existing \(user_id\)/);
+  });
+
+  it('handles quoted and direction-annotated columns', () => {
+    const db = 'CREATE INDEX i ON public.t USING btree ("user_id" DESC, created_at ASC)';
+    assert.equal(describeIndexDefMismatch({ columns: ['userId', 'createdAt'] }, db), null);
+  });
+
+  it('flags a partial index (WHERE clause) even when columns match', () => {
+    const db = 'CREATE INDEX i ON public.t USING btree (email) WHERE (deleted_at IS NULL)';
+    const msg = describeIndexDefMismatch({ columns: ['email'] }, db);
+    assert.match(msg ?? '', /partial/);
   });
 });
 

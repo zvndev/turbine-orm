@@ -1,6 +1,6 @@
 # turbine-orm
 
-The Postgres ORM your DBA will sign off on. A read-only Studio that can't touch prod, errors that never leak PII, one dependency, and checksummed migrations.
+The Postgres ORM your DBA will sign off on. A read-only-by-default Studio, PII-tagged columns that stay out of results until asked for, errors that never leak data, one dependency, and checksummed migrations.
 
 ```
 npm install turbine-orm
@@ -12,14 +12,14 @@ npm install turbine-orm
 
 Every TS ORM now resolves nested relations in a single `json_agg` query — Prisma 7 and Drizzle both ship it, and so does Turbine. That part is table stakes. The reason to reach for Turbine is the **safety bundle**: the boxes a DBA ticks before a query layer goes anywhere near production. It's the only TypeScript ORM that ships all six of these together:
 
-1. **Read-only Studio your DBA will approve.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and — since v0.19 — no raw-SQL surface at all: queries are composed in the ORM's own validated builder. The only TS ORM Studio that physically cannot mutate your database.
+1. **Read-only-by-default Studio your DBA will approve.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and (since v0.19) no raw-SQL surface at all: queries are composed in the ORM's own validated builder. In the default mode the write endpoints do not exist and every transaction is read-only at the database level; single-row edits require an explicit `--write` opt-in per launch.
 2. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
-3. **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages to keep in lockstep. The main entry's **import graph** is ~50 kB brotli (edge ~39 kB) with `pg` external (that is the client footprint your bundler sees, not the dual ESM+CJS install size on disk, ~3 MB). Prisma 7 dropped its Rust query engine, but its client still ships a TypeScript/WASM query compiler: a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
+3. **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages to keep in lockstep. The main entry's **import graph** is ~52 kB brotli (edge ~40 kB) with `pg` external (that is the client footprint your bundler sees, not the dual ESM+CJS install size on disk, ~3 MB). Prisma 7 dropped its Rust query engine, but its client still ships a TypeScript/WASM query compiler: a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
 5. **Edge-native — one import swap.** `turbineHttp(pool, SCHEMA)` — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle, no adapter package, no separate serverless build.
 6. **Pipeline batching via wire protocol.** Real Parse/Bind/Execute pipeline — not queries wrapped in a transaction. N independent queries in one round-trip.
 
-See [How It Works](#how-it-works) for the `json_agg` query strategy itself — but the query strategy isn't why you'd pick Turbine. The safety bundle above is: a Studio that can't mutate prod, errors that never leak PII, one dependency, and checksummed migrations.
+See [How It Works](#how-it-works) for the `json_agg` query strategy itself, but the query strategy isn't why you'd pick Turbine. The safety bundle above is: a Studio that is read-only unless you explicitly opt in to writes, PII columns that stay out of results until asked for, errors that never leak data, one dependency, and checksummed migrations.
 
 **New in 0.28.0:** [global filters](https://turbineorm.dev/global-filters) for soft-delete and multi-tenancy · [read replicas](https://turbineorm.dev/read-replicas) with a `$primary()` escape hatch · a read-only [MCP server](https://turbineorm.dev/mcp) for AI agents · [seed-as-code](https://turbineorm.dev/seeding) and a non-interactive `migrate deploy` for CI · [Zod generation](https://turbineorm.dev/zod) · read-only [views & generated columns](https://turbineorm.dev/views) · `NULLS FIRST/LAST` ordering, relation `_count`, and ordering by a relation · schema referential actions, enums, array, `vector`, and check constraints.
 
@@ -46,7 +46,7 @@ Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizz
 - **Drizzle leads nested reads (L2), streaming, and atomic increment.** Its relational query builder emits tighter SQL for the posts/comments joins, and its keyset pagination drains 50K rows fastest. Turbine's `json_agg` nesting is close behind and still 1.9x to 3.3x ahead of Prisma on the same L2/L3 shapes. L3 is a genuine Turbine/Drizzle near-tie that flips between runs.
 - **Prisma trails on every scenario here.** Its engine-less client's per-query work is no longer masked by network latency; on a pooled remote database (the regime we measured previously) these same deltas compress back into the noise floor.
 
-Net: on a local socket Turbine wins 6 of 10 scenarios, loses L2 / streaming / atomic increment to Drizzle, and trades the L3 lead run-to-run. It is competitive-to-ahead across the board rather than a clean sweep, and the honest takeaway is unchanged: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
+Net: on a local socket Turbine wins 6 of 10 scenarios, loses L2 / streaming / atomic increment to Drizzle, and trades the L3 lead run-to-run. It is competitive-to-ahead across the board rather than a clean sweep, and the honest takeaway is unchanged: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only-by-default Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
 
 > Full analysis with p50/p95/p99 and methodology notes: [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench.ts`
@@ -614,7 +614,7 @@ Commands:
   seed                         Run seed file
   status                       Show database schema summary
   doctor                       Check relations for missing FK indexes (--fix emits migration)
-  studio                       Launch local read-only Studio web UI
+  studio                       Launch local Studio web UI (read-only; --write opts in to single-row writes)
   mcp                          Start read-only MCP server over JSON-RPC stdio
   observe                      Launch local metrics dashboard (requires TURBINE_OBSERVE_URL)
 
@@ -680,7 +680,7 @@ then `yes`; in CI you must pass `--allow-destructive`. A refused batch applies n
 
 ## Studio
 
-The only Postgres ORM with a Studio your DBA will approve. `turbine studio` launches a local, read-only web UI for exploring your database — no mutations, no writes, and since v0.19 **no raw-SQL surface at all**: every query is composed visually in the ORM and compiled by the same validated query builder your application uses.
+The only Postgres ORM with a Studio your DBA will approve. `turbine studio` launches a local web UI for exploring your database. It is **read-only by default** (no mutations, no writes, every transaction `BEGIN READ ONLY`) and since v0.19 has **no raw-SQL surface at all**: every query is composed visually in the ORM and compiled by the same validated query builder your application uses. Since v0.36, `--write` opts a launch in to single-row insert/update/delete through that same validated builder; without the flag the write endpoints do not exist.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
@@ -695,14 +695,16 @@ npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 - **Saved queries.** Named builder queries persisted to `.turbine/studio-queries.json` — share them across runs without committing them.
 - **Cmd+K command palette.** Jump to any table, tab, or saved query in one keystroke.
 - **Full-text search across rows.** The Data tab supports substring search across every text column of the current table.
+- **PII redaction.** Columns tagged `pii: true` in the schema render as a redaction placeholder in every tab. `--show-pii` reveals them, with a loud startup warning.
+- **Opt-in write mode.** `--write` enables single-row insert/update/delete from the Data tab, gated per row by the full primary key, compiled by the same validated builders, and flagged with a persistent WRITE MODE banner. Read-only stays the default on every launch.
 
-**Security posture (read-only by design)**
+**Security posture (read-only by default)**
 
-- **No SQL input surface.** There is nothing to inject into — builder requests are validated identifier-by-identifier against the introspected schema, and every value is bound as a `$N` parameter.
+- **No SQL input surface.** There is nothing to inject into: builder requests are validated identifier-by-identifier against the introspected schema, and every value is bound as a `$N` parameter.
 - **Loopback by default** (`127.0.0.1`). Non-loopback `--host` is **refused** unless you pass `--allow-remote` (loud warning when you opt in).
-- **Per-process auth token** — 24 random bytes of hex, stored in a `SameSite=Strict` `HttpOnly` cookie.
-- **Every query runs inside `BEGIN READ ONLY`** with a 30s transaction-local statement timeout (parameterized `set_config`). Writes are physically impossible at the transaction level.
-- **Security headers on every response** — CSP, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` — plus per-session rate limiting and cross-origin refusal.
+- **Per-process auth token**: 24 random bytes of hex, stored in a `SameSite=Strict` `HttpOnly` cookie.
+- **Every read query runs inside `BEGIN READ ONLY`** with a 30s transaction-local statement timeout (parameterized `set_config`). Without `--write`, the write endpoints do not exist (they 404) and writes are impossible at the transaction level; with it, each write runs in its own transaction with the same timeout and schema pinning, requires the row's full primary key, and rejects absent or mismatched `Origin` headers.
+- **Security headers on every response**: nonce-based CSP, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, plus per-session rate limiting and cross-origin refusal.
 
 ## Observability
 
@@ -944,11 +946,11 @@ Turbine maps Postgres types to TypeScript:
 |---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
-| **Main bundle (brotli)** | ~50 kB | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
+| **Main bundle (brotli)** | ~52 kB | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
 | **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Free; hosted Gateway paid | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, ~39 kB brotli | Driver adapter + WASM compiler | Native | Native |
+| **Edge runtime** | One import swap, ~40 kB brotli | Driver adapter + WASM compiler | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query, shallow inference | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |

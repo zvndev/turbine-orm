@@ -313,9 +313,12 @@ export interface DocFieldIndexDef {
  * ({@link ColumnIndexDef}) or a doc-field expression index into a json column
  * ({@link DocFieldIndexDef}).
  *
- * Consumed today by the PowDB DDL generator (`powqlSchemaDDL`) and carried onto
- * {@link import('./schema.js').IndexMetadata} by `schemaDefToMetadata`. The SQL
- * DDL generators (`schema-sql.ts` / `schemaDiff`) do NOT consume these yet.
+ * Consumed by the PowDB DDL generator (`powqlSchemaDDL`), carried onto
+ * {@link import('./schema.js').IndexMetadata} by `schemaDefToMetadata`, and
+ * since 0.36 emitted as `CREATE [UNIQUE] INDEX` by the SQL DDL generators:
+ * `schemaToSQL` emits plain column-list indexes, and `schemaDiff` adds ones
+ * missing from the live database (matching by name; it warns on definition
+ * mismatches and never drops). Doc-field indexes stay PowDB-only.
  */
 export type SchemaIndexDef = ColumnIndexDef | DocFieldIndexDef;
 

@@ -558,3 +558,142 @@ describe('Studio hardening: CSP nonce on the HTML shell', () => {
     assert.notEqual(a, b, 'each response should carry a fresh nonce');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Write predicate: extra non-PK where keys are stripped (regression lock)
+// ---------------------------------------------------------------------------
+
+describe('Studio write: the effective WHERE is rebuilt from the PK alone', () => {
+  it('drops extra non-PK keys (including operator objects) from an update where', async () => {
+    const { pool, calls } = makePool([
+      {},
+      {},
+      {},
+      { rows: [{ id: 1, name: 'Bob', email: 'b@x.com' }], fields: [{ name: 'id' }] },
+      {},
+    ]);
+    const ctx = makeCtx(pool, { writable: true });
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/update',
+      headers: authHeaders(),
+      // A widened predicate: the PK plus a scalar and an operator object.
+      body: { table: 'users', where: { id: 1, name: 'Bob', email: { not: null } }, data: { name: 'Bobby' } },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+
+    assert.equal(r.status, 200, r.body);
+    const write = firstDataQuery(calls);
+    assert.match(write.text, /WHERE "id" = \$2\s*(RETURNING|$)/, 'WHERE must contain the PK predicate only');
+    assert.ok(
+      !/("name"|"email")\s*(=|IS)/.test(write.text.split('WHERE')[1] ?? ''),
+      'non-PK keys must not reach the WHERE',
+    );
+    assert.deepEqual(write.values, ['Bobby', 1]);
+  });
+
+  it('drops extra non-PK keys from a delete where', async () => {
+    const { pool, calls } = makePool([
+      {},
+      {},
+      {},
+      { rows: [{ id: 3, name: 'Gone', email: 'g@x.com' }], fields: [{ name: 'id' }] },
+      {},
+    ]);
+    const ctx = makeCtx(pool, { writable: true });
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/delete',
+      headers: authHeaders(),
+      body: { table: 'users', where: { id: 3, name: 'Widened' } },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+
+    assert.equal(r.status, 200, r.body);
+    const write = firstDataQuery(calls);
+    assert.match(write.text, /^DELETE FROM "users"/);
+    assert.ok(!/"name"/.test(write.text), 'non-PK key must not reach the DELETE');
+    assert.deepEqual(write.values, [3]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PII inference hardening: redacted columns are not search/orderBy oracles
+// ---------------------------------------------------------------------------
+
+describe('Studio PII: redacted columns are excluded from search and orderBy', () => {
+  it('search ILIKE OR-set omits PII columns when redaction is on', async () => {
+    const { pool, calls } = makePool([{}, {}, { rows: [] }, { rows: [{ count: '0' }] }, {}]);
+    const ctx = makeCtx(pool, {});
+    const req = makeReq({
+      method: 'GET',
+      url: '/api/tables/users?search=probe',
+      headers: authHeaders(),
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+
+    assert.equal(r.status, 200, r.body);
+    const main = calls.find((c) => /^SELECT \* FROM/.test(c.text.trim()));
+    assert.ok(main, 'main rows query recorded');
+    assert.match(main!.text, /"name" ILIKE/);
+    assert.ok(!/"email" ILIKE/.test(main!.text), 'a redacted PII column must not be substring-probeable');
+  });
+
+  it('search includes PII columns again under --show-pii', async () => {
+    const { pool, calls } = makePool([{}, {}, { rows: [] }, { rows: [{ count: '0' }] }, {}]);
+    const ctx = makeCtx(pool, { showPii: true });
+    const req = makeReq({
+      method: 'GET',
+      url: '/api/tables/users?search=probe',
+      headers: authHeaders(),
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    await done;
+
+    const main = calls.find((c) => /^SELECT \* FROM/.test(c.text.trim()));
+    assert.ok(main, 'main rows query recorded');
+    assert.match(main!.text, /"email" ILIKE/, 'with --show-pii the column is fair game');
+  });
+
+  it('orderBy on a redacted PII column falls back to the PK ordering', async () => {
+    const { pool, calls } = makePool([{}, {}, { rows: [] }, { rows: [{ count: '0' }] }, {}]);
+    const ctx = makeCtx(pool, {});
+    const req = makeReq({
+      method: 'GET',
+      url: '/api/tables/users?orderBy=email&dir=asc',
+      headers: authHeaders(),
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    await done;
+
+    const main = calls.find((c) => /^SELECT \* FROM/.test(c.text.trim()));
+    assert.ok(main, 'main rows query recorded');
+    assert.ok(!/ORDER BY "email"/.test(main!.text), 'sort position must not leak a redacted value');
+    assert.match(main!.text, /ORDER BY "id"/, 'falls back to PK ordering');
+  });
+
+  it('orderBy on a PII column works under --show-pii', async () => {
+    const { pool, calls } = makePool([{}, {}, { rows: [] }, { rows: [{ count: '0' }] }, {}]);
+    const ctx = makeCtx(pool, { showPii: true });
+    const req = makeReq({
+      method: 'GET',
+      url: '/api/tables/users?orderBy=email&dir=asc',
+      headers: authHeaders(),
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    await done;
+
+    const main = calls.find((c) => /^SELECT \* FROM/.test(c.text.trim()));
+    assert.ok(main, 'main rows query recorded');
+    assert.match(main!.text, /ORDER BY "email" ASC/);
+  });
+});

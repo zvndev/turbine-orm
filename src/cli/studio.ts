@@ -458,10 +458,15 @@ export async function apiTableRows(
 
   // orderBy — accept either the Postgres column name (snake) or the TS field
   // name (camel). Always emit the Postgres column in the SQL.
+  // When redaction is on, PII columns are excluded from orderBy (and from the
+  // search OR-set below): a redacted value must not be inferable through sort
+  // position or substring probing.
+  const redactedPii = ctx.showPii ? NO_PII_KEYS : piiKeysForTable(table);
+
   let orderByClause = '';
   if (orderByRaw) {
     const col = resolveColumnName(table, orderByRaw);
-    if (col) orderByClause = `ORDER BY ${quoteIdent(col)} ${dir}`;
+    if (col && !redactedPii.has(col)) orderByClause = `ORDER BY ${quoteIdent(col)} ${dir}`;
   }
   if (!orderByClause && table.primaryKey.length > 0 && table.primaryKey[0]) {
     orderByClause = `ORDER BY ${quoteIdent(table.primaryKey[0])} ${dir}`;
@@ -471,7 +476,9 @@ export async function apiTableRows(
   // parameterized so injection is impossible. Each query gets its own
   // WHERE clause with parameter indices matching that query's param array.
   const search = params.get('search')?.trim() ?? '';
-  const textColumns = table.columns.filter((c) => isTextishType(c.pgType)).map((c) => c.name);
+  const textColumns = table.columns
+    .filter((c) => isTextishType(c.pgType) && !redactedPii.has(c.name))
+    .map((c) => c.name);
   const hasSearch = search.length > 0 && textColumns.length > 0;
   const pattern = hasSearch ? `%${escapeLikePattern(search)}%` : null;
 
@@ -505,11 +512,10 @@ export async function apiTableRows(
     const countResult = await client.query<{ count: string }>(countSql, countValues);
     await client.query('COMMIT');
 
-    const piiKeys = ctx.showPii ? NO_PII_KEYS : piiKeysForTable(table);
     sendJson(res, 200, {
       table: table.name,
       columns: result.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID })),
-      rows: result.rows.map((r) => serializeRow(redactFlatRow(r, piiKeys))),
+      rows: result.rows.map((r) => serializeRow(redactFlatRow(r, redactedPii))),
       total: Number(countResult.rows[0]?.count ?? 0),
       limit,
       offset,

@@ -241,6 +241,9 @@ function buildBackfillRecipe(): { up: string; down: string } {
 --    );
 --
 -- Phase 3: once every row is populated, enforce NOT NULL.
+-- Note: SET NOT NULL takes an exclusive lock and scans the table. On huge
+-- tables, first ADD CONSTRAINT ... CHECK ("new_col" IS NOT NULL) NOT VALID,
+-- then VALIDATE CONSTRAINT (PG 12+ uses the validated check to skip the scan).
 -- ALTER TABLE "my_table" ALTER COLUMN "new_col" SET NOT NULL;
 --
 -- Phase 4 (optional atomic swap): retire the old column and rename the new one

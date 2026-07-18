@@ -7,7 +7,7 @@ import { TURBINE_MINOR } from '../lib/version';
 export const metadata: Metadata = {
   title: 'Turbine ORM — the Postgres ORM your DBA will sign off on.',
   description:
-    'A read-only Studio that physically cannot mutate prod, errors that never leak PII, one dependency (pg, no WASM engine), and SQL-first migrations with SHA-256 drift detection. Postgres-maximalist underneath: typed pgvector, RLS sessions, LISTEN/NOTIFY, full-text.',
+    'A read-only-by-default Studio (writes are an explicit opt-in), errors that never leak PII, one dependency (pg, no WASM engine), and SQL-first migrations with SHA-256 drift detection. Postgres-maximalist underneath: typed pgvector, RLS sessions, LISTEN/NOTIFY, full-text.',
 };
 
 const heroCode = `const docs = await db.documents.findMany({
@@ -45,7 +45,7 @@ const features = [
   {
     title: 'One dependency. No WASM.',
     description:
-      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. No adapter chain, no lockstep package upgrades. The main entry bundles to ~50 KB brotli, ~39 KB on the edge.',
+      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. No adapter chain, no lockstep package upgrades. The main entry bundles to ~52 KB brotli, ~40 KB on the edge.',
     stat: '1',
     statLabel: 'runtime dep',
   },
@@ -74,7 +74,7 @@ const features = [
     title: 'Edge-native. One import swap.',
     description:
       'turbineHttp(pool, SCHEMA) — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step.',
-    stat: '~39 KB',
+    stat: '~40 KB',
     statLabel: 'edge bundle (brotli)',
   },
   {
@@ -142,7 +142,7 @@ export default async function Home() {
     '@type': 'SoftwareApplication',
     name: 'Turbine ORM',
     description:
-      'The Postgres ORM your DBA will sign off on: a read-only Studio that physically cannot mutate prod, PII-safe error messages, one runtime dependency with no WASM engine, and SQL-first migrations with SHA-256 drift detection. Postgres-maximalist underneath — pgvector search, RLS session context, LISTEN/NOTIFY, and full-text as typed first-class API.',
+      'The Postgres ORM your DBA will sign off on: a read-only-by-default Studio (writes are an explicit --write opt-in), PII-safe error messages, one runtime dependency with no WASM engine, and SQL-first migrations with SHA-256 drift detection. Postgres-maximalist underneath: pgvector search, RLS session context, LISTEN/NOTIFY, and full-text as typed first-class API.',
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Any',
     url: 'https://turbineorm.dev',
@@ -181,11 +181,11 @@ export default async function Home() {
           </h1>
 
           <p className="hero-subtitle animate-fade-in-up delay-2">
-            A Studio that physically cannot mutate prod, error messages that
-            never leak PII, one dependency (<code>pg</code>, no WASM engine),
-            and SQL-first migrations with checksum drift detection. Underneath
-            it&apos;s Postgres-maximalist — typed pgvector, RLS sessions, and
-            realtime are all first-class. The rest is below.
+            A Studio that is read-only unless you say otherwise, error messages
+            that never leak PII, one dependency (<code>pg</code>, no WASM
+            engine), and SQL-first migrations with checksum drift detection.
+            Underneath it&apos;s Postgres-maximalist: typed pgvector, RLS
+            sessions, and realtime are all first-class. The rest is below.
           </p>
 
           <div className="animate-fade-in-up delay-3">
@@ -283,7 +283,7 @@ export default async function Home() {
                 the same <code>json_agg</code> approach as Prisma 7 and
                 Drizzle. The difference isn&apos;t the query strategy &mdash; it&apos;s
                 everything around it: the one-dependency, no-WASM footprint, the
-                read-only Studio, and the error messages that never expose user data.
+                read-only-by-default Studio, and the error messages that never expose user data.
               </p>
 
               <ul className="showcase-list">
@@ -391,11 +391,11 @@ export default async function Home() {
               {[
                 ['Engine / runtime', 'No engine binary (pg only)', 'Client + TS/WASM query compiler', 'No engine'],
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
-                ['Main bundle (brotli)', '~50 KB', '~1.6 MB client (TS/WASM compiler)', '~7 KB core'],
-                ['Studio', 'Read-only, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
+                ['Main bundle (brotli)', '~52 KB', '~1.6 MB client (TS/WASM compiler)', '~7 KB core'],
+                ['Studio', 'Read-only by default, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, ~39 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
+                ['Edge runtime', 'One import swap, ~40 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 ['Nested relations', '1 query, deep type inference', '1 query, shallow inference', 'relations() re-declaration'],
