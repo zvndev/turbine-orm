@@ -260,5 +260,13 @@ export function stripAnsi(s: string): string {
 // ---------------------------------------------------------------------------
 
 export function redactUrl(url: string): string {
-  return url.replace(/:([^@/:]+)@/, ':***@');
+  return (
+    url
+      // Userinfo credentials: `:secret@` in any authority (global — a string may
+      // carry more than one URL, e.g. a primary + replica connection pair).
+      .replace(/:([^@/:]+)@/g, ':***@')
+      // Query-string password params: `password=`, `sslpassword=`, and similar,
+      // case-insensitive. Value runs up to the next `&`, `#`, or end of string.
+      .replace(/([?&][^=&#]*password)=([^&#]*)/gi, '$1=***')
+  );
 }

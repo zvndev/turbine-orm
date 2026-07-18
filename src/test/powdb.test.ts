@@ -30,6 +30,7 @@ import {
   isJsonColumn,
   isStaleFramePowdbError,
   materializePowql,
+  POWQL_LEXER_TESTED_CEILING,
   type PowdbCapabilities,
   PowdbEmbeddedPool,
   PowdbFloatParam,
@@ -3125,5 +3126,52 @@ describe('powdb hook: retryStaleReads replays a READ once, never a write, never 
       'the write rejects with the typed ConnectionError (E004)',
     );
     assert.equal(inserts, 1, 'the insert executed EXACTLY once: the write was never replayed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E1: legacy string-wire lexer-ceiling assertion (MED-1)
+// ---------------------------------------------------------------------------
+
+describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
+  it('the tested ceiling is the expected engine line', () => {
+    // A canary: bumping the ceiling MUST be a deliberate, reviewed act (it
+    // asserts the escaper was re-verified against a newer lexer).
+    assert.equal(POWQL_LEXER_TESTED_CEILING, '0.15');
+  });
+
+  it('refuses the legacy materialize path on an addon newer than the ceiling', async () => {
+    // A legacy-only handle (no queryWithParams) whose capabilities claim engine
+    // 0.16.0 — newer than the escaper's verified lexer range. Reaching the legacy
+    // wire in this state is the dangerous "newer-addon-without-native" anomaly, so
+    // exec() must refuse rather than inline-encode against an unverified lexer.
+    const { pool, seen } = fakeEmbeddedDb(
+      { kind: 'ok', affected: 1n },
+      { capabilities: capabilitiesFromVersion('0.16.0', { hasNativeRaw: true }) },
+    );
+    const err = await pool.query('insert app_user { name := $1 }', ['Ada']).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    assert.ok(err instanceof ValidationError, 'refusal is a typed ValidationError');
+    assert.equal((err as ValidationError).code, TurbineErrorCode.VALIDATION);
+    assert.match((err as Error).message, /0\.16\.0/, 'names the reported engine version');
+    assert.match((err as Error).message, new RegExp(POWQL_LEXER_TESTED_CEILING.replace('.', '\\.')));
+    assert.match((err as Error).message, /queryWithParams/, 'explains the feature-detect anomaly');
+    // Nothing was ever handed to the engine.
+    assert.equal(seen.length, 0, 'the query never reached the addon');
+  });
+
+  it('still materializes literals on a pre-0.14 legacy addon (happy path untouched)', async () => {
+    // 0.13.0 is within the verified lexer range and legitimately has no native
+    // wire, so the legacy materialize path stays live and byte-for-byte unchanged.
+    const { pool, seen } = fakeEmbeddedDb(
+      { kind: 'rows', columns: ['id', 'name'], rows: [['u1', 'Ada']] },
+      { capabilities: capabilitiesFromVersion('0.13.0') },
+    );
+    const res = await pool.query('insert app_user { id := $1, name := $2 } returning', ['u1', 'Ada']);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], 'insert app_user { id := "u1", name := "Ada" } returning');
+    assert.deepEqual(res.rows, [{ id: 'u1', name: 'Ada' }]);
   });
 });
