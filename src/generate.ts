@@ -624,6 +624,18 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
     }
     lines.push('      ],');
 
+    // checks: introspected named CHECK constraints. Emitted only when present
+    // (byte-stable for check-less tables) and sorted by name so `--no-timestamp`
+    // output is deterministic regardless of catalog row order.
+    if (table.checks && table.checks.length > 0) {
+      const sortedChecks = [...table.checks].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      lines.push('      checks: [');
+      for (const chk of sortedChecks) {
+        lines.push(`        { name: '${escSQ(chk.name)}', expression: ${JSON.stringify(chk.expression)} },`);
+      }
+      lines.push('      ],');
+    }
+
     // isView — read-only marker; the runtime write guard reads it.
     if (table.isView) lines.push('      isView: true,');
 
@@ -839,6 +851,10 @@ function serializeColumn(col: ColumnMetadata): string {
   if (col.generationExpression !== undefined) {
     parts.push(`generationExpression: '${escSQ(col.generationExpression)}'`);
   }
+  // PII marker: emitted only when set, so untagged schemas stay byte-identical.
+  // Introspection never sets this (code-first declaration), but a metadata
+  // object built from `defineSchema` (pii: true) carries it through codegen.
+  if (col.pii) parts.push(`pii: true`);
   if (col.maxLength !== undefined) parts.push(`maxLength: ${col.maxLength}`);
   return `{ ${parts.join(', ')} }`;
 }

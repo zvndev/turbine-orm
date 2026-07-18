@@ -412,6 +412,10 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
         arrayType: pgArrayType(base),
         pgArrayType: pgArrayType(base),
         ...(serial ? { isGenerated: true } : {}),
+        // PII is a code-first declaration; carry it through so query-layer
+        // default-projection exclusion and Studio redaction can honor it.
+        // Only set when true, keeping output byte-stable for untagged schemas.
+        ...(config.pii ? { pii: true } : {}),
         ...(config.maxLength != null ? { maxLength: config.maxLength } : {}),
       };
       columns.push(col);

@@ -24,6 +24,7 @@ import {
   diffCheckConstraints,
   diffEnumValues,
   diffReferentialAction,
+  findDestructivePushStatements,
   schemaDiff,
   schemaToSQL,
   schemaToSQLString,
@@ -812,6 +813,110 @@ describe('schemaDiff reverse statement patterns — comprehensive', () => {
     // Last operation's reverse comes first
     assert.match(reverseStatements[0]!, /ALTER TABLE "b"/);
     assert.match(reverseStatements[1]!, /ALTER TABLE "a"/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B2 - user-declared indexes in schemaToSQL (pure, no DB)
+// ---------------------------------------------------------------------------
+
+describe('B2 - declared index DDL (schemaToSQL)', () => {
+  it('emits CREATE INDEX for a single-column declared index', () => {
+    const schema = defineSchema({
+      users: {
+        id: { type: 'serial', primaryKey: true },
+        email: { type: 'text', notNull: true },
+        indexes: [{ columns: ['email'] }],
+      },
+    });
+    const sql = schemaToSQL(schema);
+    assert.ok(
+      sql.some((s) => s === 'CREATE INDEX "idx_users_email" ON "users"("email");'),
+      `expected single-column index, got:\n${sql.join('\n')}`,
+    );
+  });
+
+  it('emits a composite CREATE INDEX in column order', () => {
+    const schema = defineSchema({
+      events: {
+        id: { type: 'serial', primaryKey: true },
+        userId: { type: 'integer', notNull: true },
+        createdAt: { type: 'timestamptz', notNull: true },
+        indexes: [{ columns: ['userId', 'createdAt'] }],
+      },
+    });
+    const sql = schemaToSQL(schema);
+    assert.ok(
+      sql.some((s) => s === 'CREATE INDEX "idx_events_user_id_created_at" ON "events"("user_id", "created_at");'),
+      `expected composite index, got:\n${sql.join('\n')}`,
+    );
+  });
+
+  it('emits CREATE UNIQUE INDEX when unique: true', () => {
+    const schema = defineSchema({
+      accounts: {
+        id: { type: 'serial', primaryKey: true },
+        slug: { type: 'text', notNull: true },
+        indexes: [{ columns: ['slug'], unique: true }],
+      },
+    });
+    const sql = schemaToSQL(schema);
+    assert.ok(
+      sql.some((s) => s === 'CREATE UNIQUE INDEX "idx_accounts_slug" ON "accounts"("slug");'),
+      `expected unique index, got:\n${sql.join('\n')}`,
+    );
+  });
+
+  it('honors an explicit index name', () => {
+    const schema = defineSchema({
+      users: {
+        id: { type: 'serial', primaryKey: true },
+        email: { type: 'text', notNull: true },
+        indexes: [{ columns: ['email'], name: 'users_email_lookup' }],
+      },
+    });
+    const sql = schemaToSQL(schema);
+    assert.ok(sql.some((s) => s === 'CREATE INDEX "users_email_lookup" ON "users"("email");'));
+  });
+
+  it('skips PowDB doc-field expression indexes (no SQL emission)', () => {
+    const schema = defineSchema({
+      docs: {
+        id: { type: 'serial', primaryKey: true },
+        payload: { type: 'jsonb', notNull: true },
+        indexes: [{ docField: 'payload', path: ['owner', 'id'] }],
+      },
+    });
+    const sql = schemaToSQL(schema);
+    // Nothing referencing the json path should reach SQL DDL.
+    assert.ok(!sql.some((s) => /owner/.test(s)), `doc-field index leaked into SQL:\n${sql.join('\n')}`);
+    assert.ok(!sql.some((s) => /CREATE\s+(UNIQUE\s+)?INDEX\s+"[^"]*payload/.test(s)));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B1 - push destructive gate (pure scan over diff statements)
+// ---------------------------------------------------------------------------
+
+describe('B1 - findDestructivePushStatements (pure)', () => {
+  it('flags a lossy ALTER COLUMN ... TYPE cast', () => {
+    const stmts = [
+      'ALTER TABLE "users" ADD COLUMN "age" INTEGER;',
+      'ALTER TABLE "users" ALTER COLUMN "id" TYPE INTEGER USING "id"::INTEGER;',
+    ];
+    const hits = findDestructivePushStatements(stmts);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0]!.kind, 'alter-column-type');
+    assert.equal(hits[0]!.target, 'users.id');
+  });
+
+  it('returns [] for purely additive diffs', () => {
+    const stmts = [
+      'CREATE TABLE "users" ("id" SERIAL PRIMARY KEY);',
+      'ALTER TABLE "users" ADD COLUMN "email" TEXT;',
+      'CREATE INDEX "idx_users_email" ON "users"("email");',
+    ];
+    assert.deepEqual(findDestructivePushStatements(stmts), []);
   });
 });
 
