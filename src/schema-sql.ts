@@ -471,6 +471,38 @@ export function describeIndexDefMismatch(idx: ColumnIndexDef, indexdef: string):
   return null;
 }
 
+/**
+ * Pure decision for the "index exists in the DB but is not declared" warning
+ * pass. Extracted so the scope rule is unit-testable without a live database.
+ *
+ * The pass runs only when the table opts into index management by DEFINING an
+ * `indexes` array (`indexesDefined: true`), even when that array is empty or
+ * all-doc-field: deleting the last declared index must NOT silence the pass.
+ * Tables with no `indexes` key stay silent (the user is not managing indexes
+ * there). Recognized names (declared, unique-constraint / FK-column, `*_pkey`)
+ * are never flagged; everything else in the DB yields one warning.
+ */
+export function undeclaredIndexWarnings(opts: {
+  tableName: string;
+  indexesDefined: boolean;
+  dbIndexNames: Iterable<string>;
+  declaredNames: ReadonlySet<string>;
+  recognizedNames: ReadonlySet<string>;
+}): string[] {
+  if (!opts.indexesDefined) return [];
+  const out: string[] = [];
+  for (const dbIdxName of opts.dbIndexNames) {
+    if (opts.declaredNames.has(dbIdxName) || opts.recognizedNames.has(dbIdxName) || dbIdxName.endsWith('_pkey')) {
+      continue;
+    }
+    out.push(
+      `index "${dbIdxName}" on "${opts.tableName}" exists in the database but is not declared in the schema. ` +
+        `Turbine does not drop indexes automatically; drop it in a manual migration if it is no longer needed.`,
+    );
+  }
+  return out;
+}
+
 /** The deterministic SQL names of every declared plain index on a table. */
 function declaredPlainIndexNames(table: TableDef): Set<string> {
   const names = new Set<string>();
@@ -1122,8 +1154,13 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       // indexes here), unrecognized extra DB indexes are surfaced as warnings so
       // the operator can drop them by hand if intended. Recognized = PK, unique
       // constraint, or FK-column index names, which the schema never declares.
+      // Run the whole index-management pass whenever the table DEFINES an
+      // `indexes` array (even empty or all-doc-field): a table with an `indexes`
+      // key is one the user is actively managing, so undeclared DB indexes stay
+      // worth surfacing. Deleting the last declared index must NOT silence the
+      // warning pass. Tables with no `indexes` key stay silent (not managed).
       const declaredPlain = (tableDef.indexes ?? []).filter((i): i is ColumnIndexDef => !isDocFieldIndexDef(i));
-      if (declaredPlain.length > 0) {
+      if (tableDef.indexes !== undefined) {
         const dbIdx = dbIndexes[tableName] ?? new Map<string, string>();
         const dbIdxNames = new Set(dbIdx.keys());
         const declaredNames = new Set<string>();
@@ -1158,12 +1195,14 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         for (const [fieldName, config] of Object.entries(tableDef.columns)) {
           if (config.referencesTarget) recognized.add(`idx_${tableName}_${camelToSnake(fieldName)}`);
         }
-        for (const dbIdxName of dbIdxNames) {
-          if (declaredNames.has(dbIdxName) || recognized.has(dbIdxName) || dbIdxName.endsWith('_pkey')) continue;
-          result.warnings!.push(
-            `index "${dbIdxName}" on "${tableName}" exists in the database but is not declared in the schema. ` +
-              `Turbine does not drop indexes automatically; drop it in a manual migration if it is no longer needed.`,
-          );
+        for (const w of undeclaredIndexWarnings({
+          tableName,
+          indexesDefined: tableDef.indexes !== undefined,
+          dbIndexNames: dbIdxNames,
+          declaredNames,
+          recognizedNames: recognized,
+        })) {
+          result.warnings!.push(w);
         }
       }
     }
@@ -1300,23 +1339,47 @@ export interface PushResult {
 }
 
 /**
+ * Thrown by {@link schemaPush} when the diff contains data-destroying statements
+ * and `allowDestructive` was not set. A typed subclass of {@link ValidationError}
+ * (same `TURBINE_E003` code, no new taxonomy entry) so callers can branch on
+ * `instanceof DestructivePushRefusal` instead of sniffing the message text. The
+ * offending statements are carried on `.destructive` for programmatic display.
+ */
+export class DestructivePushRefusal extends ValidationError {
+  /** The destructive statements the push refused to apply. */
+  readonly destructive: DestructiveStatement[];
+
+  constructor(destructive: DestructiveStatement[]) {
+    super(formatDestructivePushError(destructive));
+    this.name = 'DestructivePushRefusal';
+    this.destructive = destructive;
+  }
+}
+
+/**
  * Push a schema definition to a live database.
  *
  * Computes the diff, then executes the resulting DDL statements in a
  * single transaction. It will NOT drop tables or columns.
  *
  * Data-loss gate: if the diff contains a destructive statement (e.g. a lossy
- * `ALTER COLUMN ... TYPE` cast), `schemaPush` throws a {@link ValidationError}
- * listing the statements UNLESS `allowDestructive: true` is passed. The CLI
- * (`turbine push`) catches this and prompts for the same typed confirmation as
- * `migrate up`; programmatic callers must opt in explicitly.
+ * `ALTER COLUMN ... TYPE` cast), `schemaPush` throws a
+ * {@link DestructivePushRefusal} (a {@link ValidationError} subclass carrying
+ * the offending statements on `.destructive`) listing the statements UNLESS
+ * `allowDestructive: true` is passed. The CLI (`turbine push`) catches this and
+ * prompts for the same typed confirmation as `migrate up`; programmatic callers
+ * must opt in explicitly.
  */
 export async function schemaPush(
   schema: SchemaDef,
   connectionString: string,
-  options: { dryRun?: boolean; allowDestructive?: boolean } = {},
+  options: { dryRun?: boolean; allowDestructive?: boolean; precomputedDiff?: DiffResult } = {},
 ): Promise<PushResult> {
-  const diff = await schemaDiff(schema, connectionString);
+  // Accept a precomputed diff so a caller (the CLI) can diff ONCE, show the
+  // plan, confirm, and apply the EXACT statements it displayed. Without this,
+  // schemaPush would re-diff on the post-confirmation retry, so a concurrent
+  // schema change between confirm and apply could alter the applied set (TOCTOU).
+  const diff = options.precomputedDiff ?? (await schemaDiff(schema, connectionString));
 
   const result: PushResult = {
     statementsExecuted: 0,
@@ -1333,7 +1396,7 @@ export async function schemaPush(
   if (!options.allowDestructive) {
     const destructive = findDestructivePushStatements(diff.statements);
     if (destructive.length > 0) {
-      throw new ValidationError(formatDestructivePushError(destructive));
+      throw new DestructivePushRefusal(destructive);
     }
   }
 

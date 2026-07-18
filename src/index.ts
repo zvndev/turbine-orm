@@ -232,6 +232,7 @@ export { schemaDefToMetadata } from './schema-metadata.js';
 export {
   type AlterColumnDef,
   type AlterDef,
+  DestructivePushRefusal,
   type DiffResult,
   type PushResult,
   type SchemaSqlOptions,
