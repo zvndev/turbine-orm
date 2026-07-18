@@ -45,7 +45,7 @@ const features = [
   {
     title: 'One dependency. No WASM.',
     description:
-      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. No adapter chain, no lockstep package upgrades. The main entry bundles to ~52 KB brotli, ~40 KB on the edge.',
+      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. No adapter chain, no lockstep package upgrades. The main entry bundles to ~53 KB brotli, ~40 KB on the edge.',
     stat: '1',
     statLabel: 'runtime dep',
   },
@@ -391,7 +391,7 @@ export default async function Home() {
               {[
                 ['Engine / runtime', 'No engine binary (pg only)', 'Client + TS/WASM query compiler', 'No engine'],
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
-                ['Main bundle (brotli)', '~52 KB', '~1.6 MB client (TS/WASM compiler)', '~7 KB core'],
+                ['Main bundle (brotli)', '~53 KB', '~1.6 MB client (TS/WASM compiler)', '~7 KB core'],
                 ['Studio', 'Read-only by default, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],

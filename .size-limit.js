@@ -8,17 +8,18 @@ const nodePlatform = (config) => {
 };
 
 // Budgets re-baselined 2026-07-17 (v0.36.0). Measured at the final merged HEAD:
-// main 52.59 kB, serverless 39.78 kB, sqlite 42.31 kB, mysql 43.36 kB,
-// mssql 44.91 kB. Main headroom is deliberately tight (~0.4 kB): the next
-// feature that grows the client graph must consciously re-baseline here.
-// Growth since the 0.28.0 baseline comes from the
-// safety-bundle work (typed capability errors, read-only guards, PII metadata)
-// riding the shared client/query graph. Re-measure and re-baseline on each bump.
+// main 52.96 kB, serverless 39.78 kB, sqlite 42.31 kB, mysql 43.36 kB,
+// mssql 44.91 kB. The main budget moved 53 -> 55 kB after the 0.36 PII
+// write-projection work grew the client graph; a feature that trips a budget
+// must consciously re-baseline here, never bump blindly. Growth since the
+// 0.28.0 baseline comes from the safety-bundle work (typed capability errors,
+// read-only guards, PII metadata) riding the shared client/query graph.
+// Re-measure and re-baseline on each bump.
 export default [
   {
     name: "main entry — import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
-    limit: '53 kB',
+    limit: '55 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
