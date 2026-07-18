@@ -10,7 +10,7 @@
  *
  * The load-bearing property is: whenever two WHERE clauses share a fingerprint,
  * they MUST compile to byte-identical SQL and their params, collected via the
- * warm-cache HIT path, must equal the params a fresh build produces — and each
+ * warm-cache HIT path, must equal the params a fresh build produces, and each
  * column's `$N` placeholder must bind that column's own value. This is verified
  * by DOUBLE-COMPILE comparison: warm the cache with clause A, HIT it with a
  * fingerprint-equal clause B, and compare the HIT's (sql, params) against a
@@ -66,7 +66,7 @@ function schema(): SchemaMetadata {
 type Where = Record<string, unknown>;
 type Args = Record<string, unknown>;
 
-/** Fresh (cache-disabled) compile — the byte-stability oracle for one clause. */
+/** Fresh (cache-disabled) compile: the byte-stability oracle for one clause. */
 function fresh(args: Args): { sql: string; params: unknown[] } {
   const q = makeQuery('users', schema(), { sqlCache: false });
   const d = q.buildFindMany(args as never);
@@ -75,7 +75,7 @@ function fresh(args: Args): { sql: string; params: unknown[] } {
 
 /**
  * Warm the cache with `warm`, then HIT it with `hit` (which must be
- * fingerprint-equal to `warm`). Returns the HIT's compiled (sql, params) — the
+ * fingerprint-equal to `warm`). Returns the HIT's compiled (sql, params): the
  * SQL comes from the cache entry warmed by `warm`, the params from the
  * cache-hit collect path over `hit`. Runs under the live dev cross-check.
  */
@@ -193,7 +193,7 @@ describe('key-walk: operator, json, array, vector, text-search shapes', () => {
   });
 
   it('a bare equals/contains keeps its operator meaning on a non-json column', () => {
-    // `name` is text, so `{ contains }` is a LIKE operator, not a JSON filter —
+    // `name` is text, so `{ contains }` is a LIKE operator, not a JSON filter;
     // the fingerprint tokenizes it as an operator and the compile matches.
     assertCacheStable({ name: { contains: 'ab' } }, { name: { contains: 'cd' } });
   });

@@ -657,7 +657,7 @@ describe('CLI UI utilities', () => {
 
     it('redacts EVERY userinfo credential occurrence, not just the first (global)', () => {
       // A string carrying two connection URLs (e.g. primary + replica) must have
-      // both passwords redacted — a non-global replace would leak the second.
+      // both passwords redacted; a non-global replace would leak the second.
       const pair = 'primary=postgres://u1:secret1@a:5432/db replica=postgres://u2:secret2@b:5432/db';
       const result = redactUrl(pair);
       assert.ok(!result.includes('secret1'), 'first password redacted');

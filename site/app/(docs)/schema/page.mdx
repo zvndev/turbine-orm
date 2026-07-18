@@ -157,9 +157,9 @@ users: {
 }
 ```
 
-A PII column is **excluded from default projections**. It comes back only when you name it explicitly in `select`, or pass `includePii: true` to the query — see [includePii on reads](/queries#pii-fields-includepii). Writes are unaffected: you may write PII fields freely, but a write's returned row applies the same read policy (the value is persisted; it is just absent from the returned object unless you re-read with an opt-in). Referencing a PII column in `where`, `orderBy`, `groupBy`, or an aggregate is always allowed, because the reference is explicit.
+A PII column is **excluded from default projections**. It comes back only when you name it explicitly in `select`, or pass `includePii: true` to the query; see [includePii on reads](/queries#pii-fields-includepii). Writes are unaffected: you may write PII fields freely, but a write's returned row applies the same read policy (the value is persisted; it is just absent from the returned object unless you re-read with an opt-in). Referencing a PII column in `where`, `orderBy`, `groupBy`, or an aggregate is always allowed, because the reference is explicit.
 
-The tag flows through the whole stack: [`turbine studio`](/studio) redacts PII cells in its Data and Query views by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type so it tells the truth about default absence. The tag is a **code-first declaration only** — introspection never auto-tags a column as PII, so tagging is always a deliberate choice you make in `defineSchema`.
+The tag flows through the whole stack: [`turbine studio`](/studio) redacts PII cells in its Data and Query views by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type so it tells the truth about default absence. The tag is a **code-first declaration only**: introspection never auto-tags a column as PII, so tagging is always a deliberate choice you make in `defineSchema`.
 
 ### Runtime metadata without a database — `schemaDefToMetadata`
 

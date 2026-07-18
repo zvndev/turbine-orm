@@ -1823,7 +1823,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
     //
     // Safety assertion (see {@link POWQL_LEXER_TESTED_CEILING}): an addon whose
     // engine line EXCEEDS the escaper's verified lexer ceiling must never be
-    // materialized — a newer lexer may recognize escapes the escaper leaves raw,
+    // materialized: a newer lexer may recognize escapes the escaper leaves raw,
     // making the inline path an injection primitive. Reachability: addons >= 0.14
     // expose `queryWithParams` and take the native path above, so the ONLY way to
     // reach this branch with a newer-than-ceiling engine is the anomalous
@@ -1839,7 +1839,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
       throw new ValidationError(
         `[turbine] Refusing the PowDB legacy string wire: this embedded addon reports engine ` +
           `${this.capabilities.engineVersion}, which is newer than the escaper's verified lexer range ` +
-          `(<= ${POWQL_LEXER_TESTED_CEILING}) AND such an addon exposes the parameterized native API — so ` +
+          `(<= ${POWQL_LEXER_TESTED_CEILING}) AND such an addon exposes the parameterized native API, so ` +
           `reaching the legacy materialize path means the queryWithParams feature-detect failed. Upgrade ` +
           `turbine-orm so its PowQL escaper is verified against this engine line before running on it.`,
       );

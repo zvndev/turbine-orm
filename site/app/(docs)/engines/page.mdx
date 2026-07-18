@@ -187,7 +187,7 @@ const db = await turbinePowDB('powdb://127.0.0.1:7070', schemaDefToMetadata(sche
 
 See [`schemaDefToMetadata`](/schema#runtime-metadata-without-a-database--schemadeftometadata) for the code-first metadata path in full.
 
-`turbinePowDB(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` is either an embedded descriptor (`{ embedded: dir, syncMode?, memoryLimit? }` or an open embedded handle) or a networked target (`powdb://host:port` string, a config object, or an existing PowDB pool — injection, so `disconnect()` becomes a no-op). The networked path probes the server version and requires **PowDB ≥ 0.7.0** at runtime; the declared optional peer range in `package.json` is `>=0.7.1 <1.0.0`. The ESM-only `@zvndev/powdb-client` ≥ 0.9 loads correctly even from a CommonJS build (Turbine reaches it through a dynamic-import shim).
+`turbinePowDB(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` is either an embedded descriptor (`{ embedded: dir, syncMode?, memoryLimit? }` or an open embedded handle) or a networked target (`powdb://host:port` string, a config object, or an existing PowDB pool, injection, so `disconnect()` becomes a no-op). The networked path probes the server version and requires **PowDB ≥ 0.7.0** at runtime; the declared optional peer range in `package.json` is `>=0.7.1 <1.0.0`. The ESM-only `@zvndev/powdb-client` ≥ 0.9 loads correctly even from a CommonJS build (Turbine reaches it through a dynamic-import shim).
 
 ### Embedded durability — `syncMode`
 

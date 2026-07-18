@@ -1,5 +1,5 @@
 /**
- * turbine-orm — PII query semantics (Track F, build-only / no DB)
+ * turbine-orm: PII query semantics (Track F, build-only / no DB)
  *
  * The contract (from `ColumnMetadata.pii`'s JSDoc, which is normative): a
  * PII-tagged column is EXCLUDED from default projections. It comes back only
@@ -100,7 +100,7 @@ function piiSchema(): SchemaMetadata {
   return { enums: {}, tables: { users, posts, tags } };
 }
 
-/** Same shape as piiSchema() but with NO pii tags — the byte-identical control. */
+/** Same shape as piiSchema() but with NO pii tags: the byte-identical control. */
 function untaggedSchema(): SchemaMetadata {
   const users = mockTable(
     'users',
@@ -227,7 +227,7 @@ describe('pii: relation subqueries exclude the child PII column by default', () 
 
   it('nested with (posts → author) excludes the parent-side PII column at depth', () => {
     const { sql } = usersQuery().buildFindMany({ with: { posts: { with: { author: true } } } });
-    // author is a users row nested under posts — its email must stay excluded.
+    // author is a users row nested under posts: its email must stay excluded.
     assert.doesNotMatch(sql, /'email'/, 'PII excluded at every nested level');
     const opted = usersQuery().buildFindMany({
       with: { posts: { with: { author: true } } },
@@ -284,7 +284,7 @@ function makeCtx(schema: SchemaMetadata, captured: string[], includePii: boolean
 }
 
 // ---------------------------------------------------------------------------
-// Lateral pick ordering — allowed, never widens the projection
+// Lateral pick ordering: allowed, never widens the projection
 // ---------------------------------------------------------------------------
 
 describe('pii: a lateral pick ORDER BY over a PII column stays allowed', () => {
@@ -302,7 +302,7 @@ describe('pii: a lateral pick ORDER BY over a PII column stays allowed', () => {
 });
 
 // ---------------------------------------------------------------------------
-// where / orderBy referencing a PII column — explicit, so allowed
+// where / orderBy referencing a PII column: explicit, so allowed
 // ---------------------------------------------------------------------------
 
 describe('pii: where / orderBy referencing a PII column are allowed (explicit reference)', () => {
@@ -328,7 +328,7 @@ describe('pii: where / orderBy referencing a PII column are allowed (explicit re
 describe('pii: write RETURNING/reselect rows drop PII fields', () => {
   it('create strips email from the returned entity (write still RETURNING *)', () => {
     const d = usersQuery().buildCreate({ data: { name: 'x', email: 'e@x' } as never });
-    assert.match(d.sql, /RETURNING \*/, 'the write SQL is unchanged — you may write PII freely');
+    assert.match(d.sql, /RETURNING \*/, 'the write SQL is unchanged, you may write PII freely');
     const row = d.transform({ rows: [{ id: 1, name: 'x', email: 'e@x' }] } as never) as Record<string, unknown>;
     assert.equal(row.name, 'x');
     assert.ok(!('email' in row), 'PII field is stripped from the create result');
@@ -354,7 +354,7 @@ describe('pii: write RETURNING/reselect rows drop PII fields', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Cache fingerprint — includePii must not collide
+// Cache fingerprint: includePii must not collide
 // ---------------------------------------------------------------------------
 
 describe('pii: includePii participates in the SQL-cache fingerprint', () => {
@@ -370,7 +370,7 @@ describe('pii: includePii participates in the SQL-cache fingerprint', () => {
     assert.match(on, /'secret'/);
   });
 
-  it('warm cache with includePii=false, then hit includePii=true — no cross-serve', () => {
+  it('warm cache with includePii=false, then hit includePii=true: no cross-serve', () => {
     const q = makeQuery('users', piiSchema());
     // Warm the no-PII entry, then request the includePii variant on the same
     // interface: it must NOT be served the cached no-PII SQL.
@@ -381,7 +381,7 @@ describe('pii: includePii participates in the SQL-cache fingerprint', () => {
     assert.equal(hot.sql, fresh({ with: { posts: true }, includePii: true }));
   });
 
-  it('warm cache with includePii=true, then hit again — warm-hit stays correct', () => {
+  it('warm cache with includePii=true, then hit again: warm-hit stays correct', () => {
     const q = makeQuery('users', piiSchema());
     const first = q.buildFindMany({ includePii: true } as never) as { sql: string };
     const second = q.buildFindMany({ includePii: true } as never) as { sql: string };
@@ -389,7 +389,7 @@ describe('pii: includePii participates in the SQL-cache fingerprint', () => {
     assert.match(second.sql, /"users"\.\*/);
   });
 
-  it('warm cache with includePii=false twice — warm-hit stays PII-excluded', () => {
+  it('warm cache with includePii=false twice: warm-hit stays PII-excluded', () => {
     const q = makeQuery('users', piiSchema());
     const first = q.buildFindMany({} as never) as { sql: string };
     const second = q.buildFindMany({} as never) as { sql: string };

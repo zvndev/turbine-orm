@@ -43,7 +43,7 @@ function buildSchema(): SchemaMetadata {
 /**
  * Reach the NEWEST private SQL cache entry object so a test can corrupt it in
  * place. Newest (not first) so a test that warms several distinct shapes can
- * corrupt the one it just added — Map insertion order puts it last.
+ * corrupt the one it just added; Map insertion order puts it last.
  */
 function newestCacheEntry(q: QueryInterface<Record<string, unknown>>): { sql: string; name: string } {
   const cache = (q as unknown as { sqlTemplateCache: { cache: Map<string, { sql: string; name: string }> } })

@@ -137,11 +137,11 @@ const unindexedRelationWarned = new Set<string>();
  * Modes (decided per HIT; env read inline, not captured once, so tests and
  * perf-sensitive traffic can toggle per process):
  * - `'dev'`: `NODE_ENV !== 'production'` and `TURBINE_DISABLE_CACHE_CHECK !== '1'`
- *   — always check (the historical default; the whole unit suite runs under it).
+ *   (always checks; the historical default, the whole unit suite runs under it).
  * - `'off'`: dev with `TURBINE_DISABLE_CACHE_CHECK=1`, OR production with no
- *   sampling configured — the hot path is untouched.
+ *   sampling configured (the hot path is untouched).
  * - `'sampled'`: production with `TURBINE_CACHE_CHECK_SAMPLE` set to a float in
- *   `(0,1]` — re-verify that fraction of cache hits (per-hit `Math.random()`;
+ *   `(0,1]`, re-verify that fraction of cache hits (per-hit `Math.random()`;
  *   `>= 1` checks every hit). A mismatch logs once per distinct fingerprint AND
  *   throws, same as dev. `0`, unset, or an unparseable value means never check.
  */
@@ -770,7 +770,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       `param-collect paths must enumerate where-clause keys identically.\n${details.join('\n')}`;
     // Sampled production path: log once per distinct fingerprint so the failure
     // is durably recorded in the server log before the throw unwinds the query.
-    // (Dev mode throws straight away — its behavior is unchanged.)
+    // (Dev mode throws straight away; its behavior is unchanged.)
     if (mode === 'sampled' && !loggedCacheMismatchFingerprints.has(cacheKey)) {
       loggedCacheMismatchFingerprints.add(cacheKey);
       console.error(message);
@@ -1347,7 +1347,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
     // `includePii` flips the projected column set at the top level (reflected in
     // `colKey`) AND inside every relation subquery / batched follow-up (which
-    // `withFp` does NOT capture — it is projection-invariant). So it MUST be its
+    // `withFp` does NOT capture; it is projection-invariant). So it MUST be its
     // own cache-key segment: a cached no-PII statement must never serve an
     // `includePii` call, nor vice versa.
     const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${this.globalFilterCacheSegment()}`;
@@ -3134,7 +3134,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         );
       }
       // Only include columns where value is true. An explicit `select` naming a
-      // PII column IS the opt-in — it comes back regardless of `includePii`.
+      // PII column IS the opt-in: it comes back regardless of `includePii`.
       return Object.entries(select)
         .filter(([, v]) => v)
         .map(([k]) => this.toColumn(k));
@@ -3182,7 +3182,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * The camelCase field names of a table's PII-tagged columns — the read-side
+   * The camelCase field names of a table's PII-tagged columns: the read-side
    * counterpart of {@link piiColumns} applied to already-parsed entities.
    * Used to strip PII from a write's RETURNING/reselect row (writes accept no
    * `includePii`/`select`, so their returned row always applies the default
@@ -3198,7 +3198,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /**
    * Parse a write's returned row (create/update/upsert/delete), then strip the
-   * table's PII fields — the write-side read policy. Untagged tables incur only
+   * table's PII fields: the write-side read policy. Untagged tables incur only
    * one `for` over a zero-length field list, so behavior is unchanged.
    */
   private parseWriteRow(row: Record<string, unknown>): Record<string, unknown> {
@@ -3534,7 +3534,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * emissions exactly. Both resolve the value's shape via the shared
    * {@link classifyScalarForSql}, so a cache HIT binds each `$N` to the value
    * the cached SQL expects. A JSON/array-shaped value on a non-JSON/array column
-   * (`jsonThrow`/`arrayThrow`) falls through to the equality path here — the
+   * (`jsonThrow`/`arrayThrow`) falls through to the equality path here, the
    * same fall-through the collect path has always taken (the build path's typed
    * error there is only reachable on a MISS, before anything is cached).
    */
@@ -3568,7 +3568,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         });
         return;
       default:
-        // 'equality' | 'jsonThrow' | 'arrayThrow' — same strict validation as
+        // 'equality' | 'jsonThrow' | 'arrayThrow': same strict validation as
         // the build path, so a cache hit can never silently bind a
         // misspelled-operator object.
         this.assertBindableEqualityValue(rawColumn, value, this.getColumnPgType(rawColumn), this.table);
@@ -4331,7 +4331,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         );
         return;
       default:
-        // 'equality' — a plain object literal that matched no known filter shape
+        // 'equality': a plain object literal that matched no known filter shape
         // is almost always a misspelled operator (`startWith` for `startsWith`);
         // the guard also runs on the cache-hit param-collect path.
         this.assertBindableEqualityValue(rawColumn, value, this.getColumnPgType(rawColumn), this.table);
@@ -6070,7 +6070,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private resolveTargetColumns(spec: true | WithOptions, targetMeta: TableMetadata, includePii?: boolean): string[] {
     if (spec !== true && spec.select) {
-      // Explicit `select` names the columns — a PII column named here IS the
+      // Explicit `select` names the columns: a PII column named here IS the
       // opt-in and comes back regardless of the query's `includePii`.
       const selectedFields = Object.entries(spec.select)
         .filter(([, v]) => v)

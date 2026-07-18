@@ -782,7 +782,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * The camelCase field names of this table's PII-tagged columns — the read
+   * The camelCase field names of this table's PII-tagged columns: the read
    * policy applied to a write's returned row (create/update/upsert/delete accept
    * no `includePii`/`select`, so their result always drops PII; you may still
    * write PII fields freely).

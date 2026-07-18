@@ -1,15 +1,15 @@
 /**
- * turbine-orm — Shared WHERE-clause walk
+ * turbine-orm: Shared WHERE-clause walk
  *
  * The SQL template cache requires three code paths over a table-scoped WHERE
  * object to stay in perfect lockstep:
- *   - `fingerprintWhere`   — the value-invariant cache KEY,
- *   - `buildWhereClause`   — the SQL text + `$N` params on a cache MISS,
- *   - `collectWhereParams` — the params ONLY on a cache HIT (no SQL rebuild).
+ *   - `fingerprintWhere`   : the value-invariant cache KEY,
+ *   - `buildWhereClause`   : the SQL text + `$N` params on a cache MISS,
+ *   - `collectWhereParams` : the params ONLY on a cache HIT (no SQL rebuild).
  *
  * If any two of them enumerate the WHERE keys in a different order, or classify
  * a key's value into a different filter shape, the cached SQL's `$N`
- * placeholders bind the wrong values — a silent cross-value (and, with tenant
+ * placeholders bind the wrong values: a silent cross-value (and, with tenant
  * columns, cross-tenant) leak. That drift shipped twice historically (permuted
  * where-key order; an orderBy fingerprint collision).
  *
@@ -25,7 +25,7 @@
  *     therefore push params in the same order.
  *   - {@link fingerprintScalarToken} is the fingerprint's own (deliberately
  *     column-blind) scalar token. It over-distinguishes relative to the SQL
- *     classifier — which is always safe — so a fingerprint match still implies
+ *     classifier (which is always safe), so a fingerprint match still implies
  *     an identical SQL shape.
  *
  * The dev-mode / sampled-production cross-check in `builder.ts` stays as the
@@ -75,7 +75,7 @@ export interface WhereHost {
  * The SQL-relevant classification of a scalar WHERE value, decided column-aware
  * in the SAME linear fall-through order the SQL builder has always used
  * (null → vector → json → array → text-search → operator → equality). Shared by
- * the build and collect paths so their branch choice — and thus param order —
+ * the build and collect paths so their branch choice (and thus param order)
  * is identical by construction. The `*Throw` variants preserve the build path's
  * strict-validation errors for a JSON/array operator on a non-JSON/array column.
  */
@@ -114,7 +114,7 @@ function isRelationFilterObj(filterObj: WhereRecord): boolean {
 /**
  * THE canonical WHERE enumeration. Yields events in sorted-key order (skipping
  * `undefined`), dispatching combinators and relation filters, so every consumer
- * — fingerprint, SQL build, param collect — walks identically.
+ * (fingerprint, SQL build, param collect) walks identically.
  *
  * Combinator SKIP rules match the historical code exactly: an `OR`/`AND` whose
  * value is a non-array or an empty array is skipped entirely (it contributes
@@ -179,7 +179,7 @@ export function classifyScalarForSql(host: WhereHost, rawColumn: string, value: 
     if (host.isJsonColumnType(colType)) return { kind: 'json' };
     const jsonKey = findJsonUniqueKey(value);
     if (jsonKey) return { kind: 'jsonThrow', jsonKey };
-    // else: fall through — `equals`/`contains` on a non-JSON column keep their
+    // else: fall through, `equals`/`contains` on a non-JSON column keep their
     // WhereOperator meaning (matches builder.ts: no `continue`).
   }
 
@@ -201,7 +201,7 @@ export function classifyScalarForSql(host: WhereHost, rawColumn: string, value: 
 }
 
 /**
- * The fingerprint's scalar token — deliberately COLUMN-BLIND and in the
+ * The fingerprint's scalar token: deliberately COLUMN-BLIND and in the
  * historical fingerprint precedence (operator before vector/json/array), so a
  * value that both looks like an operator and a JSON filter (`equals`/`contains`
  * overlap) tokenizes as an operator exactly as it did before. Column-blindness
@@ -212,10 +212,10 @@ export function fingerprintScalarToken(value: unknown): string {
   // null → distinct from any value token.
   if (value === null) return 'null';
 
-  // Operator objects — checked first (column-blind precedence).
+  // Operator objects, checked first (column-blind precedence).
   if (isWhereOperator(value)) return fingerprintOperatorShape(value);
 
-  // Vector distance filter — metric (operator) and present comparators change
+  // Vector distance filter: metric (operator) and present comparators change
   // the SQL shape, so both go in the token.
   if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
     const dist = (value as VectorFilter).distance;
@@ -226,7 +226,7 @@ export function fingerprintScalarToken(value: unknown): string {
     return `vec(${dist.metric},${cmps})`;
   }
 
-  // JSON filter — range ops carry a numeric/string annotation (different cast).
+  // JSON filter: range ops carry a numeric/string annotation (different cast).
   if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
     return fingerprintJsonFilterShape(value as JsonFilter);
   }
@@ -242,7 +242,7 @@ export function fingerprintScalarToken(value: unknown): string {
     return `fts(${cfg})`;
   }
 
-  // Plain object literal that matched no filter shape — a token distinct from
+  // Plain object literal that matched no filter shape: a token distinct from
   // real equality so a cache entry warmed by genuine equality can't serve it.
   if (isUnmatchedPlainObject(value)) {
     return `obj(${Object.keys(value as object)

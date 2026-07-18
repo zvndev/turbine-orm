@@ -3142,7 +3142,7 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
 
   it('refuses the legacy materialize path on an addon newer than the ceiling', async () => {
     // A legacy-only handle (no queryWithParams) whose capabilities claim engine
-    // 0.16.0 — newer than the escaper's verified lexer range. Reaching the legacy
+    // 0.16.0, newer than the escaper's verified lexer range. Reaching the legacy
     // wire in this state is the dangerous "newer-addon-without-native" anomaly, so
     // exec() must refuse rather than inline-encode against an unverified lexer.
     const { pool, seen } = fakeEmbeddedDb(

@@ -262,7 +262,7 @@ export function stripAnsi(s: string): string {
 export function redactUrl(url: string): string {
   return (
     url
-      // Userinfo credentials: `:secret@` in any authority (global — a string may
+      // Userinfo credentials: `:secret@` in any authority (global: a string may
       // carry more than one URL, e.g. a primary + replica connection pair).
       .replace(/:([^@/:]+)@/g, ':***@')
       // Query-string password params: `password=`, `sslpassword=`, and similar,

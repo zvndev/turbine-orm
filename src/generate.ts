@@ -228,9 +228,9 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       // PII columns are excluded from default projections, so the field is
       // absent unless the query names it in `select` or passes `includePii`.
       // The emitted type marks it optional so it tells the truth about absence.
-      const piiNote = col.pii ? ' — PII: absent unless selected or includePii' : '';
+      const piiNote = col.pii ? ' (PII: absent unless selected or includePii)' : '';
       const optional = col.pii ? '?' : '';
-      lines.push(`  /** Column: ${col.name} — ${col.pgType}${pkNote}${nullNote}${piiNote} */`);
+      lines.push(`  /** Column: ${col.name}, ${col.pgType}${pkNote}${nullNote}${piiNote} */`);
       lines.push(`  ${col.field}${optional}: ${columnTsType(col, schema.enums)};`);
     }
     lines.push('}');

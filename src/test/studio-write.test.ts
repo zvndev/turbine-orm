@@ -1,5 +1,5 @@
 /**
- * Studio — write mode, PII redaction, and origin/nonce hardening.
+ * Studio: write mode, PII redaction, and origin/nonce hardening.
  *
  * These tests drive the real dispatch function `handleRequest` DB-less: a mock
  * pg.Pool records every statement, and a fake IncomingMessage/ServerResponse
@@ -210,7 +210,7 @@ function authHeaders(extra: Record<string, string> = {}): Record<string, string>
 // Write-route gating: routes 404 in read-only mode
 // ---------------------------------------------------------------------------
 
-describe('Studio write — route gating (read-only mode)', () => {
+describe('Studio write: route gating (read-only mode)', () => {
   for (const op of ['update', 'insert', 'delete']) {
     it(`returns 404 for /api/row/${op} when write mode is off`, async () => {
       const { pool } = makePool();
@@ -245,7 +245,7 @@ describe('Studio write — route gating (read-only mode)', () => {
 // Write-route round-trips (write mode + valid token + Origin)
 // ---------------------------------------------------------------------------
 
-describe('Studio write — single-row round-trips', () => {
+describe('Studio write: single-row round-trips', () => {
   it('update compiles a parameterized UPDATE with a PK-covering WHERE in a plain txn', async () => {
     const { pool, calls } = makePool([
       {}, // BEGIN
@@ -374,7 +374,7 @@ describe('Studio write — single-row round-trips', () => {
 // CSRF + auth on write routes
 // ---------------------------------------------------------------------------
 
-describe('Studio write — auth + CSRF perimeter', () => {
+describe('Studio write: auth + CSRF perimeter', () => {
   it('rejects a mutation with an ABSENT Origin header (403)', async () => {
     const { pool } = makePool();
     const ctx = makeCtx(pool, { writable: true });
@@ -411,7 +411,7 @@ describe('Studio write — auth + CSRF perimeter', () => {
 // PII redaction
 // ---------------------------------------------------------------------------
 
-describe('Studio PII — redaction on the wire', () => {
+describe('Studio PII: redaction on the wire', () => {
   it('redacts PII columns in table rows by default', async () => {
     const { pool } = makePool([
       {}, // BEGIN READ ONLY
@@ -528,7 +528,7 @@ describe('Studio PII — redaction on the wire', () => {
 // CSP nonce hardening
 // ---------------------------------------------------------------------------
 
-describe('Studio hardening — CSP nonce on the HTML shell', () => {
+describe('Studio hardening: CSP nonce on the HTML shell', () => {
   it('serves a per-request nonce and drops unsafe-inline from script-src', async () => {
     const { pool } = makePool();
     const ctx = makeCtx(pool, {});

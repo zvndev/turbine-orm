@@ -1,12 +1,12 @@
 /**
- * turbine-orm — PII query semantics LIVE integration (Track F)
+ * turbine-orm: PII query semantics LIVE integration (Track F)
  *
  * Runs the real round-trip on two backends:
- *   1. `@zvndev/powdb-embedded` (in-process napi addon, no server) — gated on the
+ *   1. `@zvndev/powdb-embedded` (in-process napi addon, no server), gated on the
  *      prebuilt binary loading, exactly like the other powdb integration suites.
  *      Exercises the keyed loaders AND the native-join strategy, plus a `str`
  *      and a `json` PII column.
- *   2. PostgreSQL — gated on `DATABASE_URL`. Same shapes over a real Postgres.
+ *   2. PostgreSQL: gated on `DATABASE_URL`. Same shapes over a real Postgres.
  *
  * The load-bearing property: a PII-tagged column is default-EXCLUDED from every
  * read (top-level, relation, both loader + join strategies), comes back only via
@@ -29,7 +29,7 @@ import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from 
 import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// Shared schema fixture — a str PII column, a json PII column, and a relation.
+// Shared schema fixture: a str PII column, a json PII column, and a relation.
 // ---------------------------------------------------------------------------
 
 function col(
@@ -137,7 +137,7 @@ async function assertPiiSemantics(db: DB, authorId: unknown): Promise<void> {
   assert.ok(!('name' in sel), 'select projects only the named column (+ PK)');
 
   // (3) includePii returns everything, including the json PII column. (The exact
-  // decoded json shape is a backend detail — assert presence, not bytes.)
+  // decoded json shape is a backend detail: assert presence, not bytes.)
   const all = await db.table('app_user').findUnique({ where: { id: authorId }, includePii: true });
   assert.equal(all.email, 'ada@x.test');
   assert.ok('profile' in all && all.profile != null, 'includePii returns the json PII column');
@@ -169,7 +169,7 @@ async function assertPiiSemantics(db: DB, authorId: unknown): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// PowDB (embedded) — keyed loaders AND native joins.
+// PowDB (embedded): keyed loaders AND native joins.
 // ---------------------------------------------------------------------------
 
 let embeddedAvailable = false;
@@ -210,7 +210,7 @@ describe('pii integration (powdb embedded)', () => {
   powdb.it('keyed loaders: default exclusion, select opt-in, includePii, str + json PII', async () => {
     await withPowdb(async (db, authorId) => {
       await assertPiiSemantics(db, authorId);
-      // The PII value really persisted (write unaffected) — proven by (3) above,
+      // The PII value really persisted (write unaffected), proven by (3) above,
       // and the DB row still carries it for the includePii read.
     });
   });
@@ -252,7 +252,7 @@ describe('pii integration (powdb embedded)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// PostgreSQL — DATABASE_URL gated.
+// PostgreSQL: DATABASE_URL gated.
 // ---------------------------------------------------------------------------
 
 const DATABASE_URL = process.env.DATABASE_URL;
