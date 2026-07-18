@@ -12,7 +12,7 @@
  */
 
 import type pg from 'pg';
-import type { Dialect } from '../dialect.js';
+import type { Dialect, ReturningSelection } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
 import {
   CircularRelationError,
@@ -900,7 +900,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const params: unknown[] = [];
     const clause = this.buildWhereClause(whereObj, params);
     const where = clause ? ` WHERE ${clause}` : '';
-    return { sql: `SELECT * FROM ${this.q(this.table)}${where}`, params };
+    return { sql: `SELECT ${this.writeReselectSelection()} FROM ${this.q(this.table)}${where}`, params };
   }
 
   /**
@@ -1756,7 +1756,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       table: this.q(this.table),
       columns,
       valuePlaceholders: placeholders,
-      returning: '*',
+      returning: this.writeReturningColumns(),
     });
 
     return {
@@ -1804,7 +1804,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         conds.push(`${this.q(pk)} = ${this.p(idx++)}`);
       }
       const where = conds.length > 0 ? ` WHERE ${conds.join(' AND ')}` : '';
-      return exec(`SELECT * FROM ${this.q(this.table)}${where}`, selParams);
+      return exec(`SELECT ${this.writeReselectSelection()} FROM ${this.q(this.table)}${where}`, selParams);
     };
   }
 
@@ -1860,7 +1860,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       rowValues,
       columnArrayTypes: typeCasts,
       skipDuplicates: args.skipDuplicates,
-      returning: '*',
+      returning: this.writeReturningColumns(),
     });
 
     return {
@@ -1927,9 +1927,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Engines that inject their returning shape MID-statement (SQL Server
       // `OUTPUT INSERTED.*` between SET and WHERE) override buildUpdateStatement;
       // absent → the trailing-clause PG/SQLite/MySQL form (byte-identical).
+      // `returning` excludes PII columns on tagged tables (else '*').
+      const returning = this.writeReturningColumns();
       return this.dialect.buildUpdateStatement
-        ? this.dialect.buildUpdateStatement({ table: this.q(this.table), setClauses, whereSql, returning: '*' })
-        : `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}${this.dialect.buildReturningClause('*')}`;
+        ? this.dialect.buildUpdateStatement({ table: this.q(this.table), setClauses, whereSql, returning })
+        : `UPDATE ${this.q(this.table)} SET ${setClauses.join(', ')}${whereSql}${this.dialect.buildReturningClause(returning)}`;
     };
 
     let sql: string;
@@ -2108,9 +2110,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const whereSql = clause ? ` WHERE ${clause}` : '';
       // SQL Server injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and WHERE;
       // absent override → the trailing-clause PG/SQLite/MySQL form (byte-identical).
+      // `returning` excludes PII columns on tagged tables (else '*').
+      const returning = this.writeReturningColumns();
       return this.dialect.buildDeleteStatement
-        ? this.dialect.buildDeleteStatement({ table: this.q(this.table), whereSql, returning: '*' })
-        : `DELETE FROM ${this.q(this.table)}${whereSql}${this.dialect.buildReturningClause('*')}`;
+        ? this.dialect.buildDeleteStatement({ table: this.q(this.table), whereSql, returning })
+        : `DELETE FROM ${this.q(this.table)}${whereSql}${this.dialect.buildReturningClause(returning)}`;
     };
     const entry = this.acquireSql(ck, buildSql);
 
@@ -2205,7 +2209,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       conflictColumns,
       updateSetClauses: setClauses,
       updateWhere,
-      returning: '*',
+      returning: this.writeReturningColumns(),
     });
 
     return {
@@ -3197,9 +3201,42 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * The `RETURNING` / `OUTPUT` selection for a write on this table. A table with
+   * no PII column returns `'*'` (every column — byte-identical SQL to before);
+   * a table WITH PII columns returns an explicit quoted list of every non-PII
+   * column so the PII values never leave the database on a write. A PII-tagged
+   * PRIMARY KEY column is kept in the projection regardless (the returned row
+   * must stay addressable): tag sensitive data, not keys — a PII PK is
+   * documented out of scope for stripping. Writes accept no `select`/`includePii`
+   * (unlike reads), so this is the whole write-return policy at the SQL level;
+   * {@link parseWriteRow} remains as a defense-in-depth strip (a no-op once the
+   * SQL already excludes the columns). Derived purely from static per-table
+   * schema metadata, so the write SQL cache needs no extra key segment.
+   */
+  private writeReturningColumns(): ReturningSelection {
+    const piiCols = this.piiColumns(this.tableMeta);
+    if (piiCols.size === 0) return '*';
+    const pk = new Set(this.tableMeta.primaryKey);
+    return this.tableMeta.allColumns.filter((col) => !piiCols.has(col) || pk.has(col)).map((col) => this.q(col));
+  }
+
+  /**
+   * String form of {@link writeReturningColumns} for a `SELECT` list (the
+   * `'reselect'` result strategy re-fetches via a SELECT, not RETURNING).
+   * `'*'` when there is no PII column; otherwise the comma-joined quoted list.
+   */
+  private writeReselectSelection(): string {
+    const cols = this.writeReturningColumns();
+    return cols === '*' ? '*' : cols.join(', ');
+  }
+
+  /**
    * Parse a write's returned row (create/update/upsert/delete), then strip the
-   * table's PII fields: the write-side read policy. Untagged tables incur only
-   * one `for` over a zero-length field list, so behavior is unchanged.
+   * table's PII fields: the write-side read policy. On PII-tagged tables the
+   * statement's RETURNING/OUTPUT already omits these columns (see
+   * {@link writeReturningColumns}), so this strip is defense-in-depth and a
+   * no-op. Untagged tables incur only one `for` over a zero-length field list,
+   * so behavior is unchanged.
    */
   private parseWriteRow(row: Record<string, unknown>): Record<string, unknown> {
     const parsed = this.parseRow(row, this.table);

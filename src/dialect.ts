@@ -12,6 +12,16 @@ import { pgArrayType, pgTypeToTs, type RelationDef, type SchemaMetadata, type Ta
 
 export type DialectName = 'postgresql' | 'mysql' | 'sqlite' | (string & {});
 
+/**
+ * A write statement's returning/output selection. `'*'` returns every column
+ * (the historical default — byte-identical SQL). A `string[]` is an explicit,
+ * SQL-ready quoted column list used to exclude PII-tagged columns from a
+ * write's returned row at the SQL level, so PII never crosses the wire
+ * unrequested. Each dialect renders it into its own returning surface
+ * (`RETURNING …`, `OUTPUT INSERTED.…`).
+ */
+export type ReturningSelection = '*' | readonly string[];
+
 export interface InsertStatementInput {
   /** SQL-ready quoted table name. */
   table: string;
@@ -20,7 +30,7 @@ export interface InsertStatementInput {
   /** SQL-ready parameter placeholders/expressions for VALUES. */
   valuePlaceholders: string[];
   /** Optional SQL-ready RETURNING selection. */
-  returning?: string;
+  returning?: ReturningSelection;
 }
 
 export interface BulkInsertStatementInput {
@@ -35,7 +45,7 @@ export interface BulkInsertStatementInput {
   /** Skip duplicate rows when supported by the dialect. */
   skipDuplicates?: boolean;
   /** Optional SQL-ready RETURNING selection. */
-  returning?: string;
+  returning?: ReturningSelection;
 }
 
 export interface BuiltStatement {
@@ -63,7 +73,7 @@ export interface UpsertStatementInput {
    */
   updateWhere?: string;
   /** Optional SQL-ready RETURNING selection. */
-  returning?: string;
+  returning?: ReturningSelection;
 }
 
 export interface ColumnTypeInput {
@@ -145,7 +155,7 @@ export interface UpdateStatementInput {
   /** SQL-ready WHERE fragment INCLUDING the leading ` WHERE ` (or '' for none). */
   whereSql: string;
   /** SQL-ready returning selection (default `*`). */
-  returning?: string;
+  returning?: ReturningSelection;
 }
 
 /**
@@ -158,7 +168,7 @@ export interface DeleteStatementInput {
   /** SQL-ready WHERE fragment INCLUDING the leading ` WHERE ` (or '' for none). */
   whereSql: string;
   /** SQL-ready returning selection (default `*`). */
-  returning?: string;
+  returning?: ReturningSelection;
 }
 
 /**
@@ -348,7 +358,7 @@ export interface Dialect {
   readonly explainQuery?: { prefix: string };
 
   /** Build a dialect-specific RETURNING clause. Return an empty string when unsupported. */
-  buildReturningClause(selection?: string): string;
+  buildReturningClause(selection?: ReturningSelection): string;
 
   /** Build a single-row INSERT statement. Inputs are SQL-ready quoted fragments. */
   buildInsertStatement(input: InsertStatementInput): string;
@@ -628,8 +638,8 @@ export const postgresDialect: Dialect = {
     return `COALESCE((${subquery}), ${fallback})`;
   },
 
-  buildReturningClause(selection = '*'): string {
-    return ` RETURNING ${selection}`;
+  buildReturningClause(selection: ReturningSelection = '*'): string {
+    return ` RETURNING ${selection === '*' ? '*' : selection.join(', ')}`;
   },
 
   buildInsertStatement(input: InsertStatementInput): string {

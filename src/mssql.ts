@@ -105,6 +105,7 @@ import {
   type LimitOffsetInput,
   postgresDialect,
   type RelationSubqueryContext,
+  type ReturningSelection,
   type StreamableConnection,
   type UpdateStatementInput,
   type UpsertStatementInput,
@@ -528,6 +529,21 @@ function mssqlColumnType(type: string, maxLength?: number | null): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Render the SQL Server `OUTPUT` clause for a write's returning selection.
+ * `'*'` → ` OUTPUT INSERTED.*` (byte-identical to the historical default); a
+ * quoted column list → ` OUTPUT INSERTED.[c1], INSERTED.[c2]` — each column
+ * carries its own `INSERTED.`/`DELETED.` prefix (a bare comma list is invalid
+ * T-SQL). Used to exclude PII columns from a write's returned row. Empty
+ * selection → no clause.
+ */
+function mssqlOutput(returning: ReturningSelection | undefined, alias: 'INSERTED' | 'DELETED'): string {
+  if (!returning) return '';
+  if (returning === '*') return ` OUTPUT ${alias}.*`;
+  if (returning.length === 0) return '';
+  return ` OUTPUT ${returning.map((col) => `${alias}.${col}`).join(', ')}`;
+}
+
+/**
  * SQL Server 2016+ implementation of the {@link Dialect} contract. Bracket
  * identifier quoting (`[…]`), named `@pN` placeholders, the `FOR JSON PATH`
  * nested-relation override (no `json_agg`), no `RETURNING`
@@ -597,7 +613,7 @@ export const mssqlDialect: Dialect = {
   },
 
   buildInsertStatement(input: InsertStatementInput): string {
-    const out = input.returning ? ` OUTPUT INSERTED.${input.returning}` : '';
+    const out = mssqlOutput(input.returning, 'INSERTED');
     return `INSERT INTO ${input.table} (${input.columns.join(', ')})${out} VALUES (${input.valuePlaceholders.join(', ')})`;
   },
 
@@ -622,7 +638,7 @@ export const mssqlDialect: Dialect = {
     const placeholders = input.rowValues
       .map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`)
       .join(', ');
-    const out = input.returning ? ` OUTPUT INSERTED.${input.returning}` : '';
+    const out = mssqlOutput(input.returning, 'INSERTED');
     // skipDuplicates has no single-statement equivalent here; ignored (documented).
     return {
       sql: `INSERT INTO ${input.table} (${input.columns.join(', ')})${out} VALUES ${placeholders}`,
@@ -638,7 +654,7 @@ export const mssqlDialect: Dialect = {
     const on = input.conflictColumns.map((c) => `T.${c} = S.${c}`).join(' AND ');
     const insertCols = input.insertColumns.join(', ');
     const sourceVals = input.insertColumns.map((c) => `S.${c}`).join(', ');
-    const out = input.returning ? ` OUTPUT INSERTED.${input.returning}` : '';
+    const out = mssqlOutput(input.returning, 'INSERTED');
     return (
       `MERGE INTO ${input.table} AS T ` +
       `USING (VALUES (${input.valuePlaceholders.join(', ')})) AS S (${insertCols}) ` +
@@ -652,12 +668,12 @@ export const mssqlDialect: Dialect = {
   // UPDATE/DELETE inject OUTPUT mid-statement (between SET and WHERE / FROM and
   // WHERE) — a trailing clause would be invalid T-SQL.
   buildUpdateStatement(input: UpdateStatementInput): string {
-    const out = input.returning ? ` OUTPUT INSERTED.${input.returning}` : '';
+    const out = mssqlOutput(input.returning, 'INSERTED');
     return `UPDATE ${input.table} SET ${input.setClauses.join(', ')}${out}${input.whereSql}`;
   },
 
   buildDeleteStatement(input: DeleteStatementInput): string {
-    const out = input.returning ? ` OUTPUT DELETED.${input.returning}` : '';
+    const out = mssqlOutput(input.returning, 'DELETED');
     return `DELETE FROM ${input.table}${out}${input.whereSql}`;
   },
 

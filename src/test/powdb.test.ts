@@ -661,6 +661,66 @@ describe('powdb: write generation', () => {
     assert.ok(m.calls.some((c) => /^app_user filter \.id = \$1/.test(c.powql.trimStart())));
   });
 
+  // PowDB spec limitation: PowQL `returning` is a bare keyword that hands back
+  // every column — the driver contract exposes NO column-list form. So (unlike
+  // the SQL engines, which emit an explicit non-PII RETURNING/OUTPUT projection)
+  // the create/update/delete PowQL is UNCHANGED and PII must be stripped from the
+  // returned row client-side (stripWritePii). The upsert path is different: it
+  // reselects by PK through the read projection, which already omits PII, so PII
+  // never crosses the wire there.
+  describe('PII on writes (spec-limited: bare `returning` + client strip)', () => {
+    const piiSchema: SchemaMetadata = {
+      enums: {},
+      tables: {
+        app_user: table('app_user', [
+          col('id', 'id', 'string', 'text', { hasDefault: true }),
+          col('name', 'name', 'string', 'text'),
+          col('email', 'email', 'string', 'text', { pii: true }),
+        ]),
+      },
+    };
+    const piiQi = (m: ReturnType<typeof mockPool>) => new PowqlInterface(m.pool, 'app_user', piiSchema);
+
+    it('create still emits the bare `returning` keyword (no column list) and strips PII from the row', async () => {
+      const m = mockPool();
+      m.setRows([{ id: 'u1', name: 'Ada', email: 'ada@x.test' }]);
+      const row = await piiQi(m).create({ data: { name: 'Ada', email: 'ada@x.test' } });
+      const insert = m.calls.find((c) => c.powql.startsWith('insert'))!;
+      // Unchanged: trailing bare `returning`, never a `returning { .id, .name }` list.
+      assert.match(insert.powql, /\}\s*returning$/);
+      assert.doesNotMatch(insert.powql, /returning\s*\{/);
+      // The persisted value is still written (email is bound as a param)...
+      assert.ok(insert.params.includes('ada@x.test'), 'PII is written freely');
+      // ...but stripped from the returned entity (client-side, defense of last resort).
+      assert.equal((row as { name: string }).name, 'Ada');
+      assert.ok(!('email' in (row as Record<string, unknown>)), 'PII stripped from the write result');
+    });
+
+    it('update and delete keep the bare `returning` keyword and strip PII', async () => {
+      const mu = mockPool();
+      mu.setRows([{ id: 'u1', name: 'Zed', email: 'z@x.test' }]);
+      const uRow = await piiQi(mu).update({ where: { id: 'u1' }, data: { name: 'Zed' } });
+      assert.match(mu.last().powql, /\}\s*returning$/);
+      assert.ok(!('email' in (uRow as Record<string, unknown>)));
+
+      const md = mockPool();
+      md.setRows([{ id: 'u1', name: 'Gone', email: 'g@x.test' }]);
+      const dRow = await piiQi(md).delete({ where: { id: 'u1' } });
+      assert.match(md.last().powql, /delete returning$/);
+      assert.ok(!('email' in (dRow as Record<string, unknown>)));
+    });
+
+    it('upsert reselect-by-PK projects the non-PII column list (email excluded)', async () => {
+      const m = mockPool();
+      m.setRows([{ id: 'u1', name: 'X' }]);
+      await piiQi(m).upsert({ where: { id: 'u1' }, create: { id: 'u1', name: 'X' }, update: { name: 'Y' } });
+      const reselect = m.calls.find((c) => /^app_user filter \.id = \$1/.test(c.powql.trimStart()))!;
+      assert.ok(reselect, 'upsert reselects by PK');
+      assert.match(reselect.powql, /\{ \.id, \.name \}/, 'reselect projects the non-PII columns');
+      assert.doesNotMatch(reselect.powql, /\.email/, 'PII column excluded from the reselect projection');
+    });
+  });
+
   it('empty-where guard blocks unscoped updateMany/deleteMany', async () => {
     const m = mockPool();
     await assert.rejects(() => qi(m).updateMany({ where: {}, data: { age: 0 } }), ValidationError);

@@ -89,7 +89,7 @@ const full = await db.users.findMany({
 
 `includePii` is only valid on reads (`findMany` / `findUnique` / `findFirst` and their `*OrThrow` forms, plus `findManyStream`); it is not a write option. Filtering or ordering by a PII column (`where`, `orderBy`, `groupBy`, aggregates) is always allowed regardless of the flag, since naming the column is itself explicit. Schemas with no PII-tagged columns are unaffected: the emitted SQL is byte-identical either way.
 
-One boundary worth knowing: writes still use `RETURNING *`, so PII values in the affected row do transit the database connection before Turbine strips them from the returned object. The guarantee is that PII never reaches your application code unrequested, not that it never crosses the wire.
+Writes enforce the same boundary at the SQL level. A write against a table with PII columns (`create`, `createMany`, `update`, `delete`, `upsert`, and nested writes) returns an explicit non-PII projection instead of `RETURNING *`: `RETURNING "id", "name", ...` on Postgres and SQLite, the follow-up `SELECT` on MySQL, and `OUTPUT INSERTED.…` / `OUTPUT DELETED.…` on SQL Server all list only the non-PII columns. You may still write PII values freely (they are persisted); they simply never cross the wire back to your application unrequested. A PII-tagged primary key is kept in the projection anyway, so the returned row stays addressable. Tables with no PII columns keep `RETURNING *` byte-for-byte. (PowDB is the one exception: its `returning` keyword accepts no column list, so PII is stripped client-side from the returned row there; the upsert path reselects by PK through the non-PII read projection.)
 
 ### Pagination — `limit` / `take`, `offset`, `cursor`
 

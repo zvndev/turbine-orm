@@ -283,6 +283,12 @@ describe('pii integration (postgres)', () => {
       assert.ok(!('email' in created), 'write result drops the str PII column');
       assert.ok(!('profile' in created), 'write result drops the json PII column');
 
+      // Live proof of the boundary: the value was WRITTEN (persisted) even though
+      // the create() result omitted it — the write's RETURNING excludes PII at the
+      // SQL level, it is not merely stripped client-side. Read it back with raw SQL.
+      const persisted = await db.raw(["SELECT email FROM app_user WHERE name = 'Ada'"]);
+      assert.equal(persisted[0]?.email, 'ada@x.test', 'PII persisted despite being excluded from the write return');
+
       const ada = await db.table('app_user').findFirst({ where: { name: 'Ada' } });
       await db.table('post').createMany({
         data: [

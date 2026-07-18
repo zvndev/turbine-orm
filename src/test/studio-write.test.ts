@@ -251,7 +251,7 @@ describe('Studio write: single-row round-trips', () => {
       {}, // BEGIN
       {}, // set_config statement_timeout
       {}, // set_config search_path
-      { rows: [{ id: 1, name: 'Bob', email: 'bob@x.com' }], fields: [{ name: 'id' }] }, // UPDATE ... RETURNING *
+      { rows: [{ id: 1, name: 'Bob' }], fields: [{ name: 'id' }] }, // UPDATE ... RETURNING non-PII list
       {}, // COMMIT
     ]);
     const ctx = makeCtx(pool, { writable: true });
@@ -275,7 +275,10 @@ describe('Studio write: single-row round-trips', () => {
     assert.match(write.text, /^UPDATE "users"/);
     assert.match(write.text, /SET "name" = \$1/);
     assert.match(write.text, /WHERE "id" = \$2/);
-    assert.match(write.text, /RETURNING \*/);
+    // email is PII on this fixture: the write returns an explicit non-PII list,
+    // never `RETURNING *`, so PII never leaves the database on a write.
+    assert.match(write.text, /RETURNING "id", "name"/);
+    assert.ok(!/RETURNING[^;]*"email"/.test(write.text), 'PII column excluded from RETURNING');
     assert.deepEqual(write.values, ['Bob', 1]);
 
     const json = r.json as { operation: string; row: Record<string, unknown> };
@@ -283,7 +286,7 @@ describe('Studio write: single-row round-trips', () => {
     assert.equal(json.row.id, 1);
   });
 
-  it('insert compiles a parameterized INSERT ... RETURNING *', async () => {
+  it('insert compiles a parameterized INSERT with a non-PII RETURNING list', async () => {
     const { pool, calls } = makePool([
       {},
       {},
@@ -307,7 +310,10 @@ describe('Studio write: single-row round-trips', () => {
     const write = firstDataQuery(calls);
     assert.match(write.text, /^INSERT INTO "users"/);
     assert.match(write.text, /VALUES \(\$1, \$2\)/);
-    assert.match(write.text, /RETURNING \*/);
+    // email is PII: written freely (it is in the VALUES list) but excluded from
+    // the RETURNING projection, so it never crosses the wire back to the client.
+    assert.match(write.text, /RETURNING "id", "name"/);
+    assert.ok(!/RETURNING[^;]*"email"/.test(write.text), 'PII column excluded from RETURNING');
     assert.deepEqual(write.values, ['Ada', 'ada@x.com']);
   });
 
@@ -616,7 +622,11 @@ describe('Studio write: the effective WHERE is rebuilt from the PK alone', () =>
     assert.equal(r.status, 200, r.body);
     const write = firstDataQuery(calls);
     assert.match(write.text, /^DELETE FROM "users"/);
-    assert.ok(!/"name"/.test(write.text), 'non-PK key must not reach the DELETE');
+    // Scope the check to the statement BEFORE the RETURNING projection: "name"
+    // legitimately appears in the non-PII RETURNING list, but the widened
+    // non-PK where key must not reach the DELETE's WHERE clause.
+    const beforeReturning = write.text.split('RETURNING')[0]!;
+    assert.ok(!/"name"/.test(beforeReturning), 'non-PK key must not reach the DELETE WHERE');
     assert.deepEqual(write.values, [3]);
   });
 });
