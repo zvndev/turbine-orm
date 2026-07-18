@@ -205,17 +205,90 @@ function isLegacyChecksum(hash: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Migration recipes: scaffolds for sanctioned multi-step patterns
+// ---------------------------------------------------------------------------
+
+/**
+ * A named migration scaffold. `build()` returns the commented-SQL UP/DOWN body
+ * for the recipe; `createMigration({ recipe })` wraps it in the file header.
+ */
+export interface MigrationRecipe {
+  /** One-line description shown in CLI help. */
+  description: string;
+  /** Build the UP/DOWN body (commented scaffold with placeholders). */
+  build(name: string): { up: string; down: string };
+}
+
+/** The sanctioned two-phase (add nullable, batched backfill, swap) recipe. */
+function buildBackfillRecipe(): { up: string; down: string } {
+  const up = `-- Two-phase backfill scaffold. Every statement below is COMMENTED OUT: fill in
+-- your table, the new column, the old column, and the transform, then uncomment
+-- the phases you need and review before running \`npx turbine migrate up\`.
+--
+-- Phase 1: add the new column as NULLABLE. This is a fast, non-blocking change
+-- (no table rewrite, no long lock), so it is safe to ship ahead of the backfill.
+-- ALTER TABLE "my_table" ADD COLUMN "new_col" text;
+--
+-- Phase 2: backfill in bounded batches. Repeat this UPDATE until it reports
+-- 0 rows affected. \`turbine migrate\` runs each file exactly once, so for large
+-- tables drive the loop from psql or your app rather than inlining it here.
+-- Tune the LIMIT (batch size) to your row width and lock tolerance.
+-- UPDATE "my_table"
+--    SET "new_col" = transform("old_col")
+--  WHERE "new_col" IS NULL
+--    AND "id" IN (
+--      SELECT "id" FROM "my_table" WHERE "new_col" IS NULL LIMIT 5000
+--    );
+--
+-- Phase 3: once every row is populated, enforce NOT NULL.
+-- ALTER TABLE "my_table" ALTER COLUMN "new_col" SET NOT NULL;
+--
+-- Phase 4 (optional atomic swap): retire the old column and rename the new one
+-- into its place, in one transaction so readers never see a missing column.
+-- BEGIN;
+--   ALTER TABLE "my_table" RENAME COLUMN "old_col" TO "old_col_retired";
+--   ALTER TABLE "my_table" RENAME COLUMN "new_col" TO "old_col";
+-- COMMIT;`;
+
+  const down = `-- Reverse the Phase 4 atomic swap (only if you ran it).
+-- BEGIN;
+--   ALTER TABLE "my_table" RENAME COLUMN "old_col" TO "new_col";
+--   ALTER TABLE "my_table" RENAME COLUMN "old_col_retired" TO "old_col";
+-- COMMIT;
+--
+-- If you stopped after phases 1 to 3, drop the added column instead:
+-- ALTER TABLE "my_table" DROP COLUMN "new_col";`;
+
+  return { up, down };
+}
+
+/**
+ * Registry of migration recipes, keyed by `--recipe <name>`. New recipes slot
+ * in here without touching {@link createMigration} or the CLI handler.
+ */
+export const MIGRATION_RECIPES: Record<string, MigrationRecipe> = {
+  backfill: {
+    description: 'Two-phase column backfill (add nullable, batched UPDATE, SET NOT NULL, rename swap)',
+    build: buildBackfillRecipe,
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
 /**
  * Create a new migration file.
- * If `autoContent` is provided, the UP/DOWN sections are pre-populated with the given SQL.
+ *
+ * - `autoContent`: pre-populate UP/DOWN from a schema diff.
+ * - `options.recipe`: scaffold a named recipe (see {@link MIGRATION_RECIPES}).
+ *   Mutually exclusive with `autoContent`; an unknown recipe throws.
  */
 export function createMigration(
   migrationsDir: string,
   name: string,
   autoContent?: { up: string; down: string },
+  options?: { recipe?: string },
 ): MigrationFile {
   mkdirSync(migrationsDir, { recursive: true });
 
@@ -227,7 +300,24 @@ export function createMigration(
   const filePath = join(migrationsDir, filename);
 
   let template: string;
-  if (autoContent) {
+  if (options?.recipe) {
+    const recipe = MIGRATION_RECIPES[options.recipe];
+    if (!recipe) {
+      const known = Object.keys(MIGRATION_RECIPES).join(', ') || '(none)';
+      throw new MigrationError(`[turbine] Unknown migration recipe "${options.recipe}". Available recipes: ${known}`);
+    }
+    const body = recipe.build(name);
+    template = `-- Migration: ${name} (${options.recipe} recipe scaffold)
+-- Created: ${now.toISOString()}
+-- Fill in the placeholders and review before running: npx turbine migrate up
+
+-- UP
+${body.up}
+
+-- DOWN
+${body.down}
+`;
+  } else if (autoContent) {
     template = `-- Migration: ${name} (auto-generated from schema diff)
 -- Created: ${now.toISOString()}
 -- Review this file before running: npx turbine migrate up

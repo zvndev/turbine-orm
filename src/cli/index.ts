@@ -5,8 +5,8 @@
  * Commands:
  *   turbine init                  — Initialize a Turbine project
  *   turbine generate | pull       — Introspect database and generate TypeScript types
- *   turbine push                  — Apply schema-builder definitions to database
- *   turbine migrate create <name> — Create a new SQL migration file
+ *   turbine push                  - Apply schema-builder definitions to database (destructive ops gated)
+ *   turbine migrate create <name> - Create a new SQL migration file (--auto | --recipe <name>)
  *   turbine migrate up            — Apply pending migrations
  *   turbine migrate deploy        — Apply pending migrations without prompts
  *   turbine migrate down          — Rollback last migration
@@ -48,6 +48,7 @@ import {
   createMigration,
   inspectMigrationDeploy,
   listMigrationFiles,
+  MIGRATION_RECIPES,
   migrateDeploy,
   migrateDown,
   migrateStatus,
@@ -104,6 +105,8 @@ export interface CliArgs {
   allowDrift?: boolean;
   allowEmpty?: boolean;
   allowDestructive?: boolean;
+  /** `migrate create --recipe <name>` scaffold selector. */
+  recipe?: string;
   fix?: boolean;
   // generate flags
   zod?: boolean;
@@ -192,6 +195,10 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--allow-destructive':
         result.allowDestructive = true;
+        break;
+      case '--recipe':
+        result.recipe = next;
+        i++;
         break;
       case '--force':
       case '-f':
@@ -948,15 +955,40 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
     newline();
   }
 
+  // Surface any non-fatal diff warnings (e.g. undeclared DB indexes, enum
+  // removals) the diff refuses to apply automatically.
+  if (diff.warnings && diff.warnings.length > 0) {
+    for (const w of diff.warnings) warn(w);
+    newline();
+  }
+
   if (args.dryRun) {
     info('Dry run — no changes applied.');
     newline();
     return;
   }
 
-  // Execute
+  if (args.allowDestructive) {
+    warn('--allow-destructive is set: data-destroying schema changes WILL run.');
+    newline();
+  }
+
+  // Execute (gated): schemaPush throws on destructive statements unless allowed.
   const pushSpinner = new Spinner('Applying changes').start();
-  const result = await schemaPush(schemaDef, url);
+  let result: Awaited<ReturnType<typeof schemaPush>>;
+  try {
+    result = await schemaPush(schemaDef, url, { allowDestructive: args.allowDestructive });
+  } catch (err) {
+    if (!isDestructiveRefusal(err)) throw err;
+    pushSpinner.stop();
+    if (!(await confirmDestructive((err as Error).message))) {
+      error('Aborted: no changes were applied and no data was touched.');
+      newline();
+      process.exit(1);
+    }
+    pushSpinner.start();
+    result = await schemaPush(schemaDef, url, { allowDestructive: true });
+  }
   pushSpinner.succeed(`Applied ${bold(String(result.statementsExecuted))} statement(s)`);
 
   if (result.tablesCreated.length > 0) {
@@ -983,24 +1015,32 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`  ${bold('turbine migrate')} ${dim('— SQL-first migration system')}`);
     newline();
     console.log(`  ${bold('Commands:')}`);
-    console.log(`    ${cyan('create <name>')}         Create a new migration file`);
-    console.log(`    ${cyan('create <name> --auto')}  Auto-generate from schema diff`);
-    console.log(`    ${cyan('up')}                    Apply pending migrations`);
-    console.log(`    ${cyan('deploy')}                Apply pending migrations without prompts`);
-    console.log(`    ${cyan('down')}                  Rollback last migration`);
-    console.log(`    ${cyan('status')}                Show migration status`);
+    console.log(`    ${cyan('create <name>')}            Create a new migration file`);
+    console.log(`    ${cyan('create <name> --auto')}     Auto-generate from schema diff`);
+    console.log(`    ${cyan('create <name> --recipe')}   Scaffold a named recipe (e.g. backfill)`);
+    console.log(`    ${cyan('up')}                       Apply pending migrations`);
+    console.log(`    ${cyan('deploy')}                   Apply pending migrations without prompts`);
+    console.log(`    ${cyan('down')}                     Rollback last migration`);
+    console.log(`    ${cyan('status')}                   Show migration status`);
     newline();
     console.log(`  ${bold('Options:')}`);
-    console.log(`    ${cyan('--auto')}           Auto-generate UP/DOWN SQL from schema diff`);
-    console.log(`    ${cyan('--step, -n')}       Number of migrations to apply/rollback`);
-    console.log(`    ${cyan('--dry-run')}        Show SQL without executing`);
+    console.log(`    ${cyan('--auto')}             Auto-generate UP/DOWN SQL from schema diff`);
+    console.log(`    ${cyan('--recipe <name>')}    Scaffold a sanctioned migration pattern`);
+    console.log(`    ${cyan('--step, -n')}         Number of migrations to apply/rollback`);
+    console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
     console.log(
-      `    ${cyan('--allow-drift')}    Bypass checksum validation on ${cyan('migrate up')} ${dim('(advanced)')}`,
+      `    ${cyan('--allow-drift')}      Bypass checksum validation on ${cyan('migrate up')} ${dim('(advanced)')}`,
     );
+    newline();
+    console.log(`  ${bold('Recipes')} ${dim('(--recipe):')}`);
+    for (const [key, recipe] of Object.entries(MIGRATION_RECIPES)) {
+      console.log(`    ${cyan(key)}  ${dim(recipe.description)}`);
+    }
     newline();
     console.log(`  ${bold('Examples:')}`);
     console.log(`    ${dim('npx turbine migrate create add_users_table')}`);
     console.log(`    ${dim('npx turbine migrate create add_email_index --auto')}`);
+    console.log(`    ${dim('npx turbine migrate create backfill_full_name --recipe backfill')}`);
     console.log(`    ${dim('npx turbine migrate up')}`);
     console.log(`    ${dim('npx turbine migrate deploy --dry-run')}`);
     console.log(`    ${dim('npx turbine migrate down --step 2')}`);
@@ -1102,6 +1142,30 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     newline();
 
     console.log(`  ${dim('Review the migration, then run:')}`);
+    console.log(`  ${cyan('npx turbine migrate up')}`);
+    newline();
+    return;
+  }
+
+  if (args.recipe) {
+    if (!MIGRATION_RECIPES[args.recipe]) {
+      error(`Unknown migration recipe: ${args.recipe}`);
+      newline();
+      console.log(`  ${dim('Available recipes:')}`);
+      for (const [key, recipe] of Object.entries(MIGRATION_RECIPES)) {
+        console.log(`    ${cyan(key)}  ${dim(recipe.description)}`);
+      }
+      newline();
+      process.exit(1);
+    }
+    const file = createMigration(config.migrationsDir, name, undefined, { recipe: args.recipe });
+    const relPath = relative(process.cwd(), file.path);
+
+    success(`Created ${args.recipe} migration: ${bold(file.filename)}`);
+    newline();
+    console.log(`  ${dim('File:')} ${cyan(relPath)}`);
+    newline();
+    console.log(`  ${dim('Fill in the commented placeholders, then run:')}`);
     console.log(`  ${cyan('npx turbine migrate up')}`);
     newline();
     return;
@@ -2016,6 +2080,9 @@ function showMigrateHelp(): void {
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
   console.log(`    ${cyan('--auto')}            Auto-generate UP/DOWN SQL from schema diff ${dim('(create only)')}`);
+  console.log(
+    `    ${cyan('--recipe')} ${dim('<name>')}   Scaffold a sanctioned migration pattern ${dim('(create only, e.g. backfill)')}`,
+  );
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
   console.log(`    ${cyan('--dry-run')}         Show SQL without executing`);
   console.log(`    ${cyan('--allow-drift')}     Bypass checksum validation ${dim('(migrate up only — advanced)')}`);
@@ -2027,6 +2094,7 @@ function showMigrateHelp(): void {
   console.log(`  ${bold('Examples:')}`);
   console.log(`    ${dim('$')} npx turbine migrate create add_users_table`);
   console.log(`    ${dim('$')} npx turbine migrate create add_email_index --auto`);
+  console.log(`    ${dim('$')} npx turbine migrate create backfill_full_name --recipe backfill`);
   console.log(`    ${dim('$')} npx turbine migrate up`);
   console.log(`    ${dim('$')} npx turbine migrate deploy --dry-run`);
   console.log(`    ${dim('$')} npx turbine migrate down --step 2`);

@@ -6,11 +6,18 @@
  */
 
 import pg from 'pg';
+import { DESTRUCTIVE_KIND_LABEL, type DestructiveStatement, scanDestructiveSql } from './cli/destructive.js';
 import { type Dialect, postgresDialect } from './dialect.js';
-import { UnsupportedFeatureError } from './errors.js';
+import { UnsupportedFeatureError, ValidationError } from './errors.js';
 import { pgConfActionToReferential, stripCheckWrapper } from './introspect.js';
 import { camelToSnake, type ReferentialAction } from './schema.js';
-import type { ColumnConfig, SchemaDef, TableDef } from './schema-builder.js';
+import {
+  type ColumnConfig,
+  type ColumnIndexDef,
+  isDocFieldIndexDef,
+  type SchemaDef,
+  type TableDef,
+} from './schema-builder.js';
 
 export interface SchemaSqlOptions {
   /** SQL dialect used for DDL generation. Defaults to PostgreSQL. */
@@ -135,6 +142,12 @@ export function schemaToSQL(schema: SchemaDef, options?: SchemaSqlOptions): stri
     const table = schema.tables[tableName]!;
     const indexes = generateForeignKeyIndexes(table, dialect);
     statements.push(...indexes);
+  }
+
+  // Generate CREATE INDEX / CREATE UNIQUE INDEX for user-declared indexes.
+  for (const tableName of sorted) {
+    const table = schema.tables[tableName]!;
+    statements.push(...generateDeclaredIndexes(table, dialect));
   }
 
   return statements;
@@ -404,6 +417,47 @@ function generateForeignKeyIndexes(table: TableDef, dialect: Dialect = postgresD
   }
 
   return indexes;
+}
+
+/**
+ * The deterministic SQL index name for a declared plain (column-list) index:
+ * the user-supplied `name`, else `idx_<table>_<col1>_<col2>...`, mirroring the
+ * FK-index convention in {@link generateForeignKeyIndexes}.
+ */
+function declaredIndexName(tableName: string, idx: ColumnIndexDef): string {
+  if (idx.name) return idx.name;
+  const cols = idx.columns.map(camelToSnake);
+  return `idx_${tableName}_${cols.join('_')}`;
+}
+
+/**
+ * Build the `CREATE [UNIQUE] INDEX` statement for a declared plain index.
+ * `buildCreateIndexStatement` has no `unique` hook, so unique indexes are
+ * emitted directly here (still fully identifier-quoted via the dialect).
+ */
+function buildDeclaredIndexStatement(tableName: string, idx: ColumnIndexDef, dialect: Dialect): string | null {
+  const cols = idx.columns.map(camelToSnake);
+  if (cols.length === 0) return null;
+  const name = declaredIndexName(tableName, idx);
+  const quotedCols = cols.map((c) => dialect.quoteIdentifier(c)).join(', ');
+  const unique = idx.unique ? 'UNIQUE ' : '';
+  return `CREATE ${unique}INDEX ${dialect.quoteIdentifier(name)} ON ${dialect.quoteIdentifier(tableName)}(${quotedCols});`;
+}
+
+/**
+ * Generate `CREATE INDEX` / `CREATE UNIQUE INDEX` for a table's user-declared
+ * plain-column indexes. PowDB doc-field expression indexes ({@link DocFieldIndexDef})
+ * are skipped here (those stay PowDB-only, emitted by `powqlSchemaDDL`) and have
+ * no SQL equivalent.
+ */
+function generateDeclaredIndexes(table: TableDef, dialect: Dialect = postgresDialect): string[] {
+  const out: string[] = [];
+  for (const idx of table.indexes ?? []) {
+    if (isDocFieldIndexDef(idx)) continue; // PowDB-only, no SQL emission
+    const stmt = buildDeclaredIndexStatement(table.name, idx, dialect);
+    if (stmt) out.push(stmt);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +817,18 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       dbChecks[row.table_name]!.push({ name: row.conname, expression: stripCheckWrapper(row.definition) });
     }
 
+    // Existing index NAMES per table (for the declared-index diff). Covers PK,
+    // unique-constraint, FK, and user indexes alike; the diff only ADDs declared
+    // indexes whose name is missing and never auto-drops any (see below).
+    const indexResult = await client.query<{ tablename: string; indexname: string }>(
+      `SELECT tablename, indexname FROM pg_indexes WHERE schemaname = 'public'`,
+    );
+    const dbIndexes: Record<string, Set<string>> = {};
+    for (const row of indexResult.rows) {
+      if (!dbIndexes[row.tablename]) dbIndexes[row.tablename] = new Set();
+      dbIndexes[row.tablename]!.add(row.indexname);
+    }
+
     // Build a set of DDL-facing snake_case table names that the schema defines.
     const schemaDdlNames = new Set<string>();
     for (const def of Object.values(schema.tables)) schemaDdlNames.add(def.name);
@@ -795,6 +861,8 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         result.statements.push(generateCreateTable(tableDef, resolveRef, dialect));
         const fkIndexes = generateForeignKeyIndexes(tableDef, dialect);
         result.statements.push(...fkIndexes);
+        // User-declared indexes on a brand-new table (reversed by the DROP TABLE).
+        result.statements.push(...generateDeclaredIndexes(tableDef, dialect));
         // Reverse: DROP TABLE (with indexes — they drop automatically)
         result.reverseStatements.unshift(`DROP TABLE IF EXISTS ${dialect.quoteIdentifier(ddlName)} CASCADE;`);
       }
@@ -994,6 +1062,43 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
           );
         }
       }
+
+      // --- User-declared indexes (TableDef.indexes) ---
+      // ADD any declared plain index whose NAME is missing from the DB (reverse:
+      // DROP INDEX). Doc-field indexes are PowDB-only and skipped. We never
+      // auto-drop DB indexes not in the schema, matching the column-drop posture.
+      // When the table declares at least one index (the user is actively managing
+      // indexes here), unrecognized extra DB indexes are surfaced as warnings so
+      // the operator can drop them by hand if intended. Recognized = PK, unique
+      // constraint, or FK-column index names, which the schema never declares.
+      const declaredPlain = (tableDef.indexes ?? []).filter((i): i is ColumnIndexDef => !isDocFieldIndexDef(i));
+      if (declaredPlain.length > 0) {
+        const dbIdxNames = dbIndexes[tableName] ?? new Set<string>();
+        const declaredNames = new Set<string>();
+        for (const idx of declaredPlain) {
+          if (idx.columns.length === 0) continue;
+          const name = declaredIndexName(tableName, idx);
+          declaredNames.add(name);
+          if (!dbIdxNames.has(name)) {
+            const stmt = buildDeclaredIndexStatement(tableName, idx, dialect);
+            if (!stmt) continue;
+            result.statements.push(stmt);
+            result.reverseStatements.unshift(`DROP INDEX IF EXISTS ${dialect.quoteIdentifier(name)};`);
+          }
+        }
+        // Recognized (never-declared) index names: unique-constraint + FK-column.
+        const recognized = new Set<string>(Object.values(dbUniques[tableName] ?? {}));
+        for (const [fieldName, config] of Object.entries(tableDef.columns)) {
+          if (config.referencesTarget) recognized.add(`idx_${tableName}_${camelToSnake(fieldName)}`);
+        }
+        for (const dbIdx of dbIdxNames) {
+          if (declaredNames.has(dbIdx) || recognized.has(dbIdx) || dbIdx.endsWith('_pkey')) continue;
+          result.warnings!.push(
+            `index "${dbIdx}" on "${tableName}" exists in the database but is not declared in the schema. ` +
+              `Turbine does not drop indexes automatically; drop it in a manual migration if it is no longer needed.`,
+          );
+        }
+      }
     }
 
     return result;
@@ -1091,6 +1196,31 @@ function defaultsMatch(schemaDefault: string, dbDefault: string): boolean {
 // Schema Push — execute the diff against a live database
 // ---------------------------------------------------------------------------
 
+/**
+ * Scan a set of diff statements for data-destroying operations, using the same
+ * conservative scanner (`scanDestructiveSql`) that gates `migrate up`/`down`.
+ * Push mostly emits additive DDL, but a type change surfaces as a lossy
+ * `ALTER COLUMN ... TYPE` cast, exactly the kind of silent data loss `push`
+ * must never apply without an explicit opt-in.
+ */
+export function findDestructivePushStatements(statements: readonly string[]): DestructiveStatement[] {
+  const hits: DestructiveStatement[] = [];
+  for (const stmt of statements) hits.push(...scanDestructiveSql(stmt));
+  return hits;
+}
+
+/** Format the destructive-push refusal message (mirrors the migrate gate copy). */
+function formatDestructivePushError(hits: readonly DestructiveStatement[]): string {
+  const lines = ['[turbine] Refusing to apply schema changes containing DESTRUCTIVE statements:', ''];
+  for (const h of hits) {
+    lines.push(`  - [${h.kind}] ${h.target}: ${DESTRUCTIVE_KIND_LABEL[h.kind]}`);
+  }
+  lines.push('');
+  lines.push('Review the statements above. To proceed: run `npx turbine push` interactively');
+  lines.push('and confirm, pass --allow-destructive, or set allowDestructive: true programmatically.');
+  return lines.join('\n');
+}
+
 export interface PushResult {
   /** Number of statements executed */
   statementsExecuted: number;
@@ -1106,13 +1236,18 @@ export interface PushResult {
  * Push a schema definition to a live database.
  *
  * Computes the diff, then executes the resulting DDL statements in a
- * single transaction. This is a destructive operation for ADD/ALTER —
- * it will NOT drop tables or columns unless explicitly configured.
+ * single transaction. It will NOT drop tables or columns.
+ *
+ * Data-loss gate: if the diff contains a destructive statement (e.g. a lossy
+ * `ALTER COLUMN ... TYPE` cast), `schemaPush` throws a {@link ValidationError}
+ * listing the statements UNLESS `allowDestructive: true` is passed. The CLI
+ * (`turbine push`) catches this and prompts for the same typed confirmation as
+ * `migrate up`; programmatic callers must opt in explicitly.
  */
 export async function schemaPush(
   schema: SchemaDef,
   connectionString: string,
-  options: { dryRun?: boolean } = {},
+  options: { dryRun?: boolean; allowDestructive?: boolean } = {},
 ): Promise<PushResult> {
   const diff = await schemaDiff(schema, connectionString);
 
@@ -1125,6 +1260,14 @@ export async function schemaPush(
 
   if (options.dryRun || diff.statements.length === 0) {
     return result;
+  }
+
+  // Destructive-statement gate: refuse silent data loss unless opted in.
+  if (!options.allowDestructive) {
+    const destructive = findDestructivePushStatements(diff.statements);
+    if (destructive.length > 0) {
+      throw new ValidationError(formatDestructivePushError(destructive));
+    }
   }
 
   // Execute all statements in a transaction

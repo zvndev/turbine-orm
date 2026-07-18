@@ -125,6 +125,7 @@ export interface ColumnMetadata {
    * only when explicitly named in `select` or when the query passes
    * `includePii: true` (full opt-in). Studio redacts PII cells by default.
    * Optional / defaults to `false`; untagged schemas behave exactly as before.
+   * Introspection never auto-tags PII (it is a code-first declaration).
    */
   pii?: boolean;
   /** Whether this is an array column */

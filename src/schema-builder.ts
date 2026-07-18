@@ -135,6 +135,15 @@ export interface ColumnDef {
   array?: boolean;
   /** Column-level `CHECK` expression (raw SQL, e.g. `price >= 0`). */
   check?: string;
+  /**
+   * Marks this column as personally identifiable information (PII). Purely a
+   * code-first declaration: it carries onto {@link ColumnConfig.pii} and, via
+   * `schemaDefToMetadata` / codegen, onto
+   * {@link import('./schema.js').ColumnMetadata.pii}. A PII column is excluded
+   * from default projections (read back only via an explicit `select` or
+   * `includePii: true`) and redacted by Studio. Introspection never auto-tags PII.
+   */
+  pii?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +192,8 @@ export interface ColumnConfig {
   isArray: boolean;
   /** Column-level `CHECK` expression, or null. */
   check: string | null;
+  /** Whether this column is tagged as PII (personally identifiable information). */
+  pii: boolean;
 }
 
 /** Convert a user-facing ColumnDef to the internal ColumnConfig */
@@ -224,6 +235,7 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
     vectorDimensions: def.dimensions ?? null,
     isArray: def.array ?? false,
     check: def.check ?? null,
+    pii: def.pii ?? false,
   };
 }
 
@@ -567,6 +579,7 @@ export class ColumnBuilder {
       vectorDimensions: null,
       isArray: false,
       check: null,
+      pii: false,
     };
   }
 
@@ -673,6 +686,10 @@ export class ColumnBuilder {
   }
   check(expression: string): this {
     this._config.check = expression;
+    return this;
+  }
+  pii(): this {
+    this._config.pii = true;
     return this;
   }
   array(): this {
