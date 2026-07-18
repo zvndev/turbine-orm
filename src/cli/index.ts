@@ -119,6 +119,10 @@ export interface CliArgs {
   noOpen?: boolean;
   /** Opt-in to bind Studio/Observe on a non-loopback host. */
   allowRemote?: boolean;
+  /** Opt-in to Studio single-row write mode (`studio --write`). */
+  write?: boolean;
+  /** Reveal PII-tagged column values in Studio instead of redacting (`--show-pii`). */
+  showPii?: boolean;
 }
 
 export function parseArgs(argv = process.argv.slice(2)): CliArgs {
@@ -225,6 +229,12 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--allow-remote':
         result.allowRemote = true;
+        break;
+      case '--write':
+        result.write = true;
+        break;
+      case '--show-pii':
+        result.showPii = true;
         break;
       default:
         if (!arg.startsWith('-')) {
@@ -1832,6 +1842,8 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
       openBrowser,
       include: config.include.length ? config.include : undefined,
       exclude: config.exclude.length ? config.exclude : undefined,
+      write: args.write === true,
+      showPii: args.showPii === true,
     });
     spinner.succeed(`Studio is running`);
   } catch (err) {
@@ -1839,15 +1851,31 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
     process.exit(1);
   }
 
+  // Loud startup warnings for the opt-in modes that widen Studio's surface.
+  if (args.write) {
+    newline();
+    console.log(
+      warn(
+        'WRITE MODE is ON. Studio can update, insert, and delete single rows in ' +
+          `${redactUrl(url)}. Every change is committed directly to your database.`,
+      ),
+    );
+  }
+  if (args.showPii) {
+    newline();
+    console.log(warn('--show-pii is ON. PII-tagged column values are shown UNREDACTED in Studio.'));
+  }
+
   newline();
   console.log(
     box(
       [
-        `${bold('Turbine Studio')}  ${dim('— local read-only UI')}`,
+        `${bold('Turbine Studio')}  ${dim(args.write ? 'local UI (WRITE MODE)' : 'local read-only UI')}`,
         '',
         `  ${cyan('URL:')}    ${bold(studio.url)}`,
         `  ${cyan('Schema:')} ${config.schema}`,
         `  ${cyan('DB:')}     ${redactUrl(url)}`,
+        `  ${cyan('Mode:')}   ${args.write ? red('read-write (single-row)') : 'read-only'}`,
         '',
         dim('Open the URL above in your browser. It includes a one-time session'),
         dim('token that gets set as an HttpOnly cookie on first load.'),
@@ -2181,7 +2209,9 @@ function showHelp(): void {
   console.log(
     `    ${cyan('doctor')}             Check relations for missing FK indexes ${dim('(--fix emits migration)')}`,
   );
-  console.log(`    ${cyan('studio')}             Launch local read-only web UI`);
+  console.log(
+    `    ${cyan('studio')}             Launch local read-only web UI ${dim('(--write opts in to single-row writes)')}`,
+  );
   console.log(`    ${cyan('mcp')}                Start read-only MCP server over stdio`);
   console.log(`    ${cyan('observe')}            Launch metrics dashboard ${dim('(requires TURBINE_OBSERVE_URL)')}`);
   newline();
@@ -2212,6 +2242,12 @@ function showHelp(): void {
   console.log(`    ${cyan('--host')} ${dim('<addr>')}        Bind address ${dim('(default: 127.0.0.1)')}`);
   console.log(`    ${cyan('--no-open')}            Don't auto-open the browser`);
   console.log(`    ${cyan('--allow-remote')}       Allow non-loopback --host ${dim('(refused without this flag)')}`);
+  console.log(
+    `    ${cyan('--write')}              Studio: enable single-row update/insert/delete ${dim('(read-only by default)')}`,
+  );
+  console.log(
+    `    ${cyan('--show-pii')}           Studio: show PII-tagged values unredacted ${dim('(redacted by default)')}`,
+  );
   newline();
 
   console.log(`  ${bold('Config file:')}`);

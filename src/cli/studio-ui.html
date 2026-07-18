@@ -42,6 +42,113 @@
     }
 
     /* =====================================================================
+       Write mode (opt-in) + PII
+       ===================================================================== */
+    .write-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      background: rgba(248, 113, 113, 0.14);
+      border-bottom: 1px solid var(--red);
+      color: var(--red);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      flex: 0 0 auto;
+    }
+    .write-banner strong {
+      font-weight: 700;
+    }
+    .write-banner span:last-child {
+      color: var(--text-dim);
+    }
+    .write-banner-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--red);
+      box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.2);
+    }
+    .badge.pii {
+      background: rgba(250, 204, 21, 0.14);
+      color: var(--yellow);
+      border: 1px solid rgba(250, 204, 21, 0.3);
+    }
+    .row-actions {
+      display: flex;
+      gap: 4px;
+      white-space: nowrap;
+    }
+    .row-action-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      border-radius: var(--radius);
+      padding: 2px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: var(--t);
+    }
+    .row-action-btn:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+    .row-action-btn.danger:hover {
+      border-color: var(--red);
+      color: var(--red);
+    }
+    .row-editor-hint {
+      color: var(--text-dim);
+      font-size: 12px;
+      margin-bottom: 12px;
+    }
+    .row-editor-fields {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 52vh;
+      overflow-y: auto;
+    }
+    .row-editor-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .row-editor-field label {
+      font-size: 11px;
+      color: var(--text-dim);
+      font-family: var(--mono);
+    }
+    .row-editor-field label .pkflag {
+      color: var(--accent);
+    }
+    .row-editor-field label .piiflag {
+      color: var(--yellow);
+    }
+    .row-editor-field input {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      padding: 6px 8px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .row-editor-field input:disabled {
+      opacity: 0.55;
+    }
+    .row-editor-error {
+      margin-top: 12px;
+      padding: 8px 10px;
+      background: rgba(248, 113, 113, 0.1);
+      border: 1px solid var(--red);
+      border-radius: var(--radius);
+      color: var(--red);
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+
+    /* =====================================================================
        Reset + base
        ===================================================================== */
     *,
@@ -1477,6 +1584,12 @@
 </head>
 <body>
   <div class="app" id="app">
+    <!-- Write-mode banner (shown only when the server runs with --write) -->
+    <div class="write-banner" id="writeBanner" role="alert" hidden>
+      <span class="write-banner-dot" aria-hidden="true"></span>
+      <strong>WRITE MODE</strong>
+      <span>changes are committed directly to your database</span>
+    </div>
     <!-- Header -->
     <header class="header">
       <div class="brand">
@@ -1597,6 +1710,12 @@
                 </svg>
                 Refresh
               </button>
+              <button class="btn btn-primary btn-sm" id="dataInsert" aria-label="Insert row" hidden>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+                Insert row
+              </button>
             </div>
           </div>
           <div class="data-wrap">
@@ -1707,9 +1826,28 @@
     </div>
   </div>
 
+  <!-- Row editor (write mode only): insert / edit a single row -->
+  <div class="modal-backdrop" id="rowEditorBackdrop" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="rowEditorTitle" style="width: 560px">
+      <div class="modal-header">
+        <div class="modal-title" id="rowEditorTitle">Edit row</div>
+        <button class="icon-btn" data-close-modal="rowEditorBackdrop" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="row-editor-hint" id="rowEditorHint"></div>
+        <div class="row-editor-fields" id="rowEditorFields"></div>
+        <div class="row-editor-error" id="rowEditorError" hidden></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" data-close-modal="rowEditorBackdrop">Cancel</button>
+        <button class="btn btn-primary" id="rowEditorConfirm">Save</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast-wrap" id="toastWrap" aria-live="polite"></div>
 
-  <script>
+  <script nonce="__CSP_NONCE__">
     // =====================================================================
     // State
     // =====================================================================
@@ -1721,6 +1859,9 @@
       currentTable: null,
       currentTab: 'data',
       connOk: false,
+      // write mode / PII (from /api/schema)
+      writable: false,
+      showPii: false,
       // data pane
       data: {
         rows: [],
@@ -1834,6 +1975,26 @@
         return Api._fetch('/api/builder', {
           method: 'POST',
           body: JSON.stringify({ table, args }),
+        });
+      },
+      // Write mode only (the routes 404 in read-only mode). `fetch` sets a
+      // same-origin Origin header on POST, which the server requires (CSRF).
+      rowInsert(table, data) {
+        return Api._fetch('/api/row/insert', {
+          method: 'POST',
+          body: JSON.stringify({ table, data }),
+        });
+      },
+      rowUpdate(table, where, data) {
+        return Api._fetch('/api/row/update', {
+          method: 'POST',
+          body: JSON.stringify({ table, where, data }),
+        });
+      },
+      rowDelete(table, where) {
+        return Api._fetch('/api/row/delete', {
+          method: 'POST',
+          body: JSON.stringify({ table, where }),
         });
       },
       savedQueries(table) {
@@ -2252,6 +2413,7 @@
           sortable: true,
           orderBy: State.data.orderBy,
           dir: State.data.dir,
+          actions: State.writable ? (row) => DataPane.rowActions(row) : null,
           onSort: (col) => {
             if (State.data.orderBy === col) {
               State.data.dir = State.data.dir === 'asc' ? 'desc' : 'asc';
@@ -2272,6 +2434,53 @@
         $('#pageIndicator').textContent = 'Page ' + page + ' / ' + pages;
         $('#pagePrev').disabled = State.data.offset === 0;
         $('#pageNext').disabled = State.data.offset + State.data.limit >= State.data.total;
+      },
+
+      // Per-row edit/delete controls (write mode only).
+      rowActions(row) {
+        const wrap = el('div', { class: 'row-actions' });
+        wrap.appendChild(
+          el('button', {
+            class: 'row-action-btn',
+            text: 'Edit',
+            onclick: (e) => {
+              e.stopPropagation();
+              RowEditor.openEdit(row);
+            },
+          })
+        );
+        wrap.appendChild(
+          el('button', {
+            class: 'row-action-btn danger',
+            text: 'Delete',
+            onclick: (e) => {
+              e.stopPropagation();
+              DataPane.deleteRow(row);
+            },
+          })
+        );
+        return wrap;
+      },
+
+      async deleteRow(row) {
+        const t = State.currentTable;
+        if (!t || !State.writable) return;
+        const pks = t.primaryKey || [];
+        if (!pks.length) {
+          toast('Table has no primary key; cannot delete a single row', 'err');
+          return;
+        }
+        const where = {};
+        for (const pk of pks) where[pk] = row[pk];
+        const label = pks.map((k) => k + '=' + row[k]).join(', ');
+        if (!window.confirm('Delete row where ' + label + '? This cannot be undone.')) return;
+        try {
+          await Api.rowDelete(t.name, where);
+          toast('Row deleted', 'ok');
+          DataPane.loadAndRender();
+        } catch (err) {
+          toast('Delete failed: ' + (err && err.message ? err.message : 'unknown'), 'err');
+        }
       },
 
       async loadAndRender() {
@@ -2312,6 +2521,7 @@
           }, 240)
         );
         $('#dataRefresh').addEventListener('click', () => DataPane.loadAndRender());
+        $('#dataInsert').addEventListener('click', () => RowEditor.openInsert());
         $('#pagePrev').addEventListener('click', () => {
           if (State.data.offset === 0) return;
           State.data.offset = Math.max(0, State.data.offset - State.data.limit);
@@ -2348,6 +2558,9 @@
           }
           headRow.appendChild(th);
         }
+        if (opts.actions) {
+          headRow.appendChild(el('th', { scope: 'col', text: '' }));
+        }
         thead.appendChild(headRow);
         table.appendChild(thead);
 
@@ -2357,6 +2570,11 @@
           for (const c of cols) {
             const val = row[c];
             tr.appendChild(Table.renderCell(val));
+          }
+          if (opts.actions) {
+            const td = el('td');
+            td.appendChild(opts.actions(row));
+            tr.appendChild(td);
           }
           tbody.appendChild(tr);
         }
@@ -2453,6 +2671,7 @@
           if (!c.nullable) attrs.appendChild(el('span', { class: 'badge nn', text: 'NOT NULL' }));
           else attrs.appendChild(el('span', { class: 'badge nullable', text: 'nullable' }));
           if (c.hasDefault) attrs.appendChild(el('span', { class: 'badge def', text: 'default' }));
+          if (c.pii) attrs.appendChild(el('span', { class: 'badge pii', text: 'PII' }));
           tr.appendChild(attrs);
           colBody.appendChild(tr);
         }
@@ -3392,6 +3611,140 @@
       },
     };
 
+    // =====================================================================
+    // Row editor (write mode): single-row insert / edit
+    // =====================================================================
+    // Matches the server's redaction marker so a redacted PII cell is never
+    // written back verbatim when editing a row.
+    const REDACTED_MARKER = '•• redacted ••';
+
+    function coerceInput(col, raw) {
+      const ts = col.tsType || '';
+      if (ts === 'number' || ts === 'bigint') {
+        const n = Number(raw);
+        return Number.isNaN(n) ? raw : n;
+      }
+      if (ts === 'boolean') return raw === 'true' || raw === '1' || raw === 't';
+      return raw;
+    }
+
+    const RowEditor = {
+      mode: 'insert',
+      table: null,
+      pkWhere: null,
+      inputs: [],
+
+      openInsert() {
+        const t = State.currentTable;
+        if (!t) {
+          toast('Select a table first', 'err');
+          return;
+        }
+        RowEditor.mode = 'insert';
+        RowEditor.table = t;
+        RowEditor.pkWhere = null;
+        $('#rowEditorTitle').textContent = 'Insert into ' + t.name;
+        $('#rowEditorHint').textContent = 'Leave a field blank to use its database default.';
+        RowEditor.buildFields(t, {});
+        RowEditor.showError(null);
+        Modal.open('rowEditorBackdrop');
+      },
+
+      openEdit(row) {
+        const t = State.currentTable;
+        if (!t) return;
+        const pks = t.primaryKey || [];
+        if (!pks.length) {
+          toast('Table has no primary key; cannot edit a single row', 'err');
+          return;
+        }
+        RowEditor.mode = 'edit';
+        RowEditor.table = t;
+        const where = {};
+        for (const pk of pks) where[pk] = row[pk];
+        RowEditor.pkWhere = where;
+        $('#rowEditorTitle').textContent = 'Edit row in ' + t.name;
+        $('#rowEditorHint').textContent = 'Primary key columns are read-only. Cleared fields are left unchanged.';
+        RowEditor.buildFields(t, row);
+        RowEditor.showError(null);
+        Modal.open('rowEditorBackdrop');
+      },
+
+      buildFields(t, row) {
+        const host = $('#rowEditorFields');
+        host.innerHTML = '';
+        RowEditor.inputs = [];
+        for (const c of t.columns) {
+          const field = el('div', { class: 'row-editor-field' });
+          const label = el('label');
+          label.appendChild(document.createTextNode(c.name + ' '));
+          label.appendChild(el('span', { class: 'col-pg', text: c.pgType || '' }));
+          if (c.isPrimaryKey) label.appendChild(el('span', { class: 'pkflag', text: ' · PK' }));
+          if (c.pii) label.appendChild(el('span', { class: 'piiflag', text: ' · PII' }));
+          const input = el('input', { type: 'text' });
+          const v = row[c.name];
+          if (RowEditor.mode === 'edit' && v !== undefined && v !== null && v !== REDACTED_MARKER) {
+            input.value = typeof v === 'object' ? JSON.stringify(v) : String(v);
+          }
+          if (RowEditor.mode === 'edit' && c.isPrimaryKey) input.disabled = true;
+          field.appendChild(label);
+          field.appendChild(input);
+          host.appendChild(field);
+          RowEditor.inputs.push({ col: c, input });
+        }
+      },
+
+      collect() {
+        const data = {};
+        for (const { col, input } of RowEditor.inputs) {
+          if (input.disabled) continue;
+          if (RowEditor.mode === 'edit' && col.isPrimaryKey) continue;
+          const raw = input.value;
+          if (raw === '') continue;
+          data[col.name] = coerceInput(col, raw);
+        }
+        return data;
+      },
+
+      async confirm() {
+        const t = RowEditor.table;
+        if (!t) return;
+        const data = RowEditor.collect();
+        if (!Object.keys(data).length) {
+          RowEditor.showError(RowEditor.mode === 'insert' ? 'Enter at least one value.' : 'No changes to save.');
+          return;
+        }
+        try {
+          if (RowEditor.mode === 'insert') {
+            await Api.rowInsert(t.name, data);
+            toast('Row inserted', 'ok');
+          } else {
+            await Api.rowUpdate(t.name, RowEditor.pkWhere, data);
+            toast('Row updated', 'ok');
+          }
+          Modal.close('rowEditorBackdrop');
+          DataPane.loadAndRender();
+        } catch (err) {
+          RowEditor.showError(err && err.message ? err.message : 'Write failed');
+        }
+      },
+
+      showError(msg) {
+        const box = $('#rowEditorError');
+        if (!msg) {
+          box.hidden = true;
+          box.textContent = '';
+          return;
+        }
+        box.hidden = false;
+        box.textContent = msg;
+      },
+
+      bind() {
+        $('#rowEditorConfirm').addEventListener('click', () => RowEditor.confirm());
+      },
+    };
+
     const SavePrompt = {
       fillTables(preferred) {
         const sel = $('#savePromptTable');
@@ -3559,7 +3912,7 @@
           return;
         }
         if (e.key === 'Escape') {
-          ['savePromptBackdrop', 'jsonModalBackdrop', 'paletteBackdrop'].forEach((id) =>
+          ['savePromptBackdrop', 'jsonModalBackdrop', 'paletteBackdrop', 'rowEditorBackdrop'].forEach((id) =>
             Modal.close(id)
           );
           return;
@@ -3585,7 +3938,12 @@
         State.tables = schema.tables || [];
         State.tablesByName = new Map(State.tables.map((t) => [t.name, t]));
         State.enums = schema.enums || {};
+        State.writable = schema.writable === true;
+        State.showPii = schema.showPii === true;
         State.connOk = true;
+        // Persistent write-mode affordances (only when the server allows writes).
+        $('#writeBanner').hidden = !State.writable;
+        $('#dataInsert').hidden = !State.writable;
         $('#connDot').classList.add('ok');
         $('#connLabel').textContent = 'connected';
         const meta =
@@ -3637,6 +3995,7 @@
       BuilderPane.bind();
       Modal.bind();
       SavePrompt.bind();
+      RowEditor.bind();
       Palette.bind();
       bindKeys();
       boot();
