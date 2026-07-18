@@ -47,9 +47,6 @@ import {
   assertBindableEqualsOperand,
   findArrayUniqueKey,
   findJsonUniqueKey,
-  fingerprintArrayFilterShape,
-  fingerprintJsonFilterShape,
-  fingerprintOperatorShape,
   isArrayFilter,
   isColumnRef,
   isJsonFilter,
@@ -62,7 +59,6 @@ import {
   JSON_RANGE_OPERATORS,
   normalizeOrderBy,
   sortedEntries,
-  sortedKeys,
   UPDATE_OPERATOR_KEYS,
   VECTOR_DISTANCE_COMPARATORS,
   VECTOR_METRIC_OPERATORS,
@@ -244,6 +240,32 @@ interface ColumnRefContext {
   prefix: string;
 }
 
+/**
+ * A table-scoped WHERE compilation context for a sub-where that is NOT the
+ * top-level `this.tableMeta` clause. Both relation-filter `EXISTS` sub-wheres
+ * (correlated against the bare target table, `"target".col`) and relation
+ * `with`-clause `where` filters (against a per-subquery alias, `t0.col`) compile
+ * an arbitrary target table's where against a column qualifier. They differ ONLY
+ * in that qualifier, the correlation parent handed to `buildRelationFilter`, and
+ * the unknown-column error wording — so a single scoped build/collect/fingerprint
+ * trio, driven by the SAME canonical {@link walkWhere} the top level uses, serves
+ * both. See `buildScopedWhere` / `collectScopedWhereParams` / `fingerprintScopedWhere`.
+ */
+interface WhereScope {
+  /** The target table's metadata (column map, relations, types). */
+  meta: TableMetadata;
+  /** The target table name (used for host binding + error messages). */
+  table: string;
+  /** SQL prefix before `q(col)` — `"target".` for EXISTS sub-wheres, `t0.` for aliases. */
+  qualifier: string;
+  /** The `parentTable` correlation argument for nested `buildRelationFilter` calls. */
+  relationParent: string;
+  /** {@link WhereHost} bound to `meta`, so {@link walkWhere} enumerates this scope's keys. */
+  host: WhereHost;
+  /** Typed error for an unknown column reference (wording differs per scope). */
+  unknownColumn: (field: string) => ValidationError;
+}
+
 // ---------------------------------------------------------------------------
 // Deferred query + option types (see deferred.ts)
 // ---------------------------------------------------------------------------
@@ -377,6 +399,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * per call. See {@link WhereHost}.
    */
   private readonly whereHost: WhereHost;
+
+  /**
+   * Per-target-table {@link WhereHost} memo for scoped sub-wheres (relation
+   * `EXISTS` filters + relation `with`-clause `where`s). Keyed by table name;
+   * the host depends only on the target table's metadata, so it is shared across
+   * every alias/qualifier for that table. Lazily filled by {@link scopedWhereHost}.
+   */
+  private readonly scopedHostCache = new Map<string, WhereHost>();
 
   constructor(
     private readonly pool: pg.Pool,
@@ -3465,76 +3495,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * Produce a value-invariant fingerprint for array filters while preserving
-   * parameterless boolean operators that change SQL shape.
-   */
-  private fingerprintArrayFilter(filter: ArrayFilter): string {
-    return fingerprintArrayFilterShape(filter);
-  }
-
-  /**
-   * Fingerprint a relation filter sub-where for some/every/none.
+   * Fingerprint a relation filter sub-where for some/every/none. Thin wrapper
+   * over the unified {@link fingerprintScopedWhere}. When the target table is
+   * unknown, an empty-relations host makes every key scalar (matching the old
+   * `meta?.relations` short-circuit).
    */
   private fingerprintRelFilter(targetTable: string, subWhere: Record<string, unknown>): string {
     const meta = this.schema.tables[targetTable];
-    const keys = Object.keys(subWhere)
-      .filter((k) => subWhere[k] !== undefined)
-      .sort();
-    if (keys.length === 0) return '';
-    const parts: string[] = [];
-    for (const key of keys) {
-      const value = subWhere[key];
-      if (value === undefined) continue;
-      if (key === 'OR' || key === 'AND') {
-        const arr = Array.isArray(value) ? (value as Record<string, unknown>[]) : [];
-        parts.push(`${key}[${arr.map((b) => `(${this.fingerprintRelFilter(targetTable, b)})`).join(',')}]`);
-        continue;
-      }
-      if (key === 'NOT') {
-        parts.push(`NOT(${this.fingerprintRelFilter(targetTable, value as Record<string, unknown>)})`);
-        continue;
-      }
-      // Nested relation filter — must fingerprint the FULL inner shape, or two
-      // different nested filters would collide on one cached SQL text.
-      const nestedRel = meta?.relations?.[key];
-      if (nestedRel && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        const norm = this.normalizeRelationFilter(nestedRel, value as Record<string, unknown>);
-        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          const inner: string[] = [];
-          for (const op of ['some', 'none', 'every', 'is', 'isNot'] as const) {
-            if (norm[op] === undefined) continue;
-            inner.push(
-              norm[op] === null
-                ? `${op}(null)`
-                : `${op}(${this.fingerprintRelFilter(nestedRel.to, norm[op] as Record<string, unknown>)})`,
-            );
-          }
-          parts.push(`${key}:rel[${inner.join(',')}]`);
-          continue;
-        }
-      }
-      if (value === null) {
-        parts.push(`${key}:null`);
-      } else if (isWhereOperator(value)) {
-        parts.push(`${key}:${fingerprintOperatorShape(value)}`);
-      } else if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
-        // Mirrors fingerprintWhere: JSON filters inside relation sub-wheres
-        // build real JSON clauses (buildSubWhereForRelation), so their shape
-        // must be cache-distinct from plain equality.
-        parts.push(`${key}:${fingerprintJsonFilterShape(value as JsonFilter)}`);
-      } else if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value as ArrayFilter)) {
-        parts.push(`${key}:arr(${this.fingerprintArrayFilter(value as ArrayFilter)})`);
-      } else if (isUnmatchedPlainObject(value)) {
-        parts.push(
-          `${key}:obj(${Object.keys(value as object)
-            .sort()
-            .join(',')})`,
-        );
-      } else {
-        parts.push(`${key}:eq`);
-      }
-    }
-    return parts.join('&');
+    const host = meta ? this.scopedWhereHost(meta) : this.emptyRelationsHost(targetTable);
+    return this.fingerprintScopedWhere(host, subWhere);
   }
 
   /**
@@ -3660,61 +3629,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private collectRelFilterParams(targetTable: string, subWhere: Record<string, unknown>, params: unknown[]): void {
     const meta = this.schema.tables[targetTable];
     if (!meta) return;
-
-    // Sorted (canonical) order — MUST match fingerprintRelFilter and buildSubWhereForRelation.
-    for (const field of sortedKeys(subWhere)) {
-      const value = subWhere[field];
-      if (value === undefined) continue;
-      if (value === null) continue;
-      if (field === 'OR' || field === 'AND') {
-        const arr = value as Record<string, unknown>[];
-        if (!Array.isArray(arr)) continue;
-        for (const branch of arr) this.collectRelFilterParams(targetTable, branch, params);
-        continue;
-      }
-      if (field === 'NOT') {
-        this.collectRelFilterParams(targetTable, value as Record<string, unknown>, params);
-        continue;
-      }
-      const nestedRel = meta.relations?.[field];
-      if (nestedRel && typeof value === 'object' && !Array.isArray(value)) {
-        const norm = this.normalizeRelationFilter(nestedRel, value as Record<string, unknown>);
-        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          // Mirrors buildRelationFilter (some→none→every→is→isNot, each: sub-where
-          // params then target global-filter params).
-          this.collectRelationFilterParams(nestedRel, norm, params);
-          continue;
-        }
-      }
-      const col = meta.columnMap[field] ?? camelToSnake(field);
-
-      // JSONB filter — mirrors buildSubWhereForRelation (which mirrors the
-      // top-level buildWhereClause): route to the JSON param collector when
-      // the target column is json/jsonb.
-      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
-        const colType = this.pgTypeForColumn(meta, col);
-        if (this.isJsonColumnType(colType)) {
-          this.collectJsonFilterParams(value, params, `${this.q(targetTable)}.${this.q(col)}`);
-          continue;
-        }
-      }
-
-      // Array filter — mirrors buildSubWhereForRelation.
-      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
-        const colType = this.pgTypeForColumn(meta, col);
-        if (colType.startsWith('_')) {
-          this.collectArrayFilterParams(value, params);
-          continue;
-        }
-      }
-
-      if (isWhereOperator(value)) {
-        this.collectOperatorParams(col, value, params, { meta, table: targetTable, prefix: '' });
-        continue;
-      }
-      this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(meta, col), targetTable);
-      params.push(value);
-    }
+    this.collectScopedWhereParams(this.relationWhereScope(targetTable, meta), subWhere, params);
   }
 
   /**
@@ -4378,6 +4293,280 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Scoped (non-top-level) WHERE compilation — relation EXISTS sub-wheres and
+  // relation `with`-clause `where`s. All three consumers below drive the SAME
+  // canonical `walkWhere` the top level uses (bound to the SCOPE's target
+  // table), so their key order + combinator structure + relation detection can
+  // never drift from each other or from the top-level trio. Only the per-event
+  // rendering (column qualifier, correlation parent, unknown-column wording)
+  // differs, and that is carried by the `WhereScope`.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The {@link WhereHost} for a scoped sub-where over `meta`'s table. Memoized
+   * per table (see {@link scopedHostCache}); the host depends only on the target
+   * metadata, not on the caller's alias/qualifier.
+   */
+  /**
+   * A {@link WhereHost} with no relations — used to fingerprint a sub-where
+   * whose target table is unknown (`schema.tables[t]` miss). `walkWhere` reads
+   * only `tableMeta.relations`, so every key falls to the scalar path, matching
+   * the pre-unification `meta?.relations` short-circuit.
+   */
+  private emptyRelationsHost(table: string): WhereHost {
+    return {
+      tableMeta: { name: table, relations: {} } as TableMetadata,
+      normalizeRelationFilter: (relDef, filterObj) => this.normalizeRelationFilter(relDef, filterObj),
+      getColumnPgType: () => 'text',
+      isJsonColumnType: (colType) => this.isJsonColumnType(colType),
+    };
+  }
+
+  private scopedWhereHost(meta: TableMetadata): WhereHost {
+    let host = this.scopedHostCache.get(meta.name);
+    if (!host) {
+      host = {
+        tableMeta: meta,
+        normalizeRelationFilter: (relDef, filterObj) => this.normalizeRelationFilter(relDef, filterObj),
+        getColumnPgType: (column) => this.pgTypeForColumn(meta, column),
+        isJsonColumnType: (colType) => this.isJsonColumnType(colType),
+      };
+      this.scopedHostCache.set(meta.name, host);
+    }
+    return host;
+  }
+
+  /** Build the scope for a relation-filter EXISTS sub-where over the bare target table. */
+  private relationWhereScope(targetTable: string, meta: TableMetadata): WhereScope {
+    return {
+      meta,
+      table: targetTable,
+      qualifier: `${this.q(targetTable)}.`,
+      relationParent: targetTable,
+      host: this.scopedWhereHost(meta),
+      unknownColumn: (field) =>
+        new ValidationError(
+          `[turbine] Unknown field "${field}" in relation filter for table "${targetTable}". ` +
+            `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
+        ),
+    };
+  }
+
+  /** Build the scope for a relation `with`-clause `where` compiled against `alias`. */
+  private aliasWhereScope(targetTable: string, meta: TableMetadata, alias: string): WhereScope {
+    return {
+      meta,
+      table: targetTable,
+      qualifier: `${alias}.`,
+      relationParent: alias,
+      host: this.scopedWhereHost(meta),
+      unknownColumn: (field) =>
+        new ValidationError(`[turbine] Unknown column "${field}" in where for table "${targetTable}"`),
+    };
+  }
+
+  /**
+   * Compile a scoped sub-where to SQL. Serves BOTH the relation-filter EXISTS
+   * body ({@link buildSubWhereForRelation}) and the relation `with`-clause
+   * `where` ({@link buildAliasWhere}) — the emitted SQL is byte-identical to the
+   * former hand-mirrored walkers, since it renders the same clauses in the same
+   * ({@link walkWhere}-canonical) key order.
+   */
+  private buildScopedWhere(scope: WhereScope, where: Record<string, unknown>, params: unknown[]): string | null {
+    const clauses: string[] = [];
+    for (const event of walkWhere(scope.host, where)) {
+      switch (event.kind) {
+        case 'or':
+        case 'and': {
+          const parts = event.conditions
+            .map((cond) => this.buildScopedWhere(scope, cond, params))
+            .filter((s): s is string => s !== null)
+            .map((s) => `(${s})`);
+          if (parts.length > 0) clauses.push(`(${parts.join(event.kind === 'or' ? ' OR ' : ' AND ')})`);
+          break;
+        }
+        case 'not': {
+          const sub = this.buildScopedWhere(scope, event.condition, params);
+          if (sub) clauses.push(`NOT (${sub})`);
+          break;
+        }
+        case 'relation': {
+          const c = this.buildRelationFilter(event.key, event.relDef, event.filterObj, params, scope.relationParent);
+          if (c) clauses.push(c);
+          break;
+        }
+        case 'scalar':
+          this.buildScopedScalarClause(scope, event.key, event.value, params, clauses);
+          break;
+      }
+    }
+    return clauses.length > 0 ? clauses.join(' AND ') : null;
+  }
+
+  /**
+   * Emit the SQL clause(s) for one scalar key of a scoped sub-where. Reproduces
+   * the null / JSON / array / operator / equality fall-through both former
+   * walkers shared (relation sub-wheres and alias wheres carry no vector or
+   * text-search scalar surface, so — unlike the top-level {@link buildScalarClause}
+   * — those shapes are not special-cased here and keep their historical
+   * equality-guard behavior).
+   */
+  private buildScopedScalarClause(
+    scope: WhereScope,
+    field: string,
+    value: unknown,
+    params: unknown[],
+    clauses: string[],
+  ): void {
+    const meta = scope.meta;
+    const col = meta.columnMap[field] ?? camelToSnake(field);
+    if (!meta.allColumns.includes(col)) throw scope.unknownColumn(field);
+    const qCol = `${scope.qualifier}${this.q(col)}`;
+
+    if (value === null) {
+      clauses.push(`${qCol} IS NULL`);
+      return;
+    }
+
+    if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
+      const colType = this.pgTypeForColumn(meta, col);
+      if (this.isJsonColumnType(colType)) {
+        clauses.push(...this.buildJsonFilterClauses(qCol, value, params));
+        return;
+      }
+      const jsonKey = findJsonUniqueKey(value);
+      if (jsonKey) {
+        throw new ValidationError(
+          `[turbine] Column "${col}" on table "${scope.table}" is not a JSON column ` +
+            `(actual type: ${colType}); cannot apply JSON operator '${jsonKey}'.`,
+        );
+      }
+    }
+
+    if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
+      const colType = this.pgTypeForColumn(meta, col);
+      if (colType.startsWith('_')) {
+        clauses.push(...this.buildArrayFilterClauses(qCol, value, params, colType));
+        return;
+      }
+      const arrayKey = findArrayUniqueKey(value);
+      if (arrayKey) {
+        throw new ValidationError(
+          `[turbine] Column "${col}" on table "${scope.table}" is not an array column ` +
+            `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
+        );
+      }
+    }
+
+    if (isWhereOperator(value)) {
+      clauses.push(
+        ...this.buildOperatorClauses(qCol, value, params, {
+          meta,
+          table: scope.table,
+          prefix: scope.qualifier,
+        }),
+      );
+      return;
+    }
+
+    this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(meta, col), scope.table);
+    params.push(value);
+    clauses.push(`${qCol} = ${this.p(params.length)}`);
+  }
+
+  /**
+   * Cache-hit param-collect mirror of {@link buildScopedWhere}: pushes the exact
+   * same params in the exact same order (driven by the same {@link walkWhere}),
+   * without rebuilding SQL. Serves both {@link collectRelFilterParams} and
+   * {@link collectAliasWhereParams}.
+   */
+  private collectScopedWhereParams(scope: WhereScope, where: Record<string, unknown>, params: unknown[]): void {
+    for (const event of walkWhere(scope.host, where)) {
+      switch (event.kind) {
+        case 'or':
+        case 'and':
+          for (const cond of event.conditions) this.collectScopedWhereParams(scope, cond, params);
+          break;
+        case 'not':
+          this.collectScopedWhereParams(scope, event.condition, params);
+          break;
+        case 'relation':
+          // Same some→none→every→is→isNot (each: sub-where params then target
+          // global-filter params) as buildRelationFilter emits.
+          this.collectRelationFilterParams(event.relDef, event.filterObj, params);
+          break;
+        case 'scalar':
+          this.collectScopedScalarParams(scope, event.key, event.value, params);
+          break;
+      }
+    }
+  }
+
+  /** Param-collect mirror of {@link buildScopedScalarClause}. */
+  private collectScopedScalarParams(scope: WhereScope, field: string, value: unknown, params: unknown[]): void {
+    if (value === null) return;
+    const meta = scope.meta;
+    const col = meta.columnMap[field] ?? camelToSnake(field);
+
+    if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
+      const colType = this.pgTypeForColumn(meta, col);
+      if (this.isJsonColumnType(colType)) {
+        this.collectJsonFilterParams(value, params, `${this.q(scope.table)}.${this.q(col)}`);
+        return;
+      }
+    }
+
+    if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
+      const colType = this.pgTypeForColumn(meta, col);
+      if (colType.startsWith('_')) {
+        this.collectArrayFilterParams(value, params);
+        return;
+      }
+    }
+
+    if (isWhereOperator(value)) {
+      this.collectOperatorParams(col, value, params, { meta, table: scope.table, prefix: '' });
+      return;
+    }
+
+    this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(meta, col), scope.table);
+    params.push(value);
+  }
+
+  /**
+   * Value-invariant fingerprint of a scoped sub-where. Same canonical
+   * {@link walkWhere} as {@link fingerprintWhere}, so two shapes that compile to
+   * different SQL never collide on one cached SQL string. Serves both
+   * {@link fingerprintRelFilter} and {@link fingerprintAliasWhere}. Fingerprint
+   * bytes are process-local cache keys (never persisted), so their exact text
+   * may differ from the pre-unification walkers as long as collisions stay
+   * impossible.
+   */
+  private fingerprintScopedWhere(host: WhereHost, where: Record<string, unknown>): string {
+    const parts: string[] = [];
+    for (const event of walkWhere(host, where)) {
+      switch (event.kind) {
+        case 'or':
+          parts.push(`OR[${event.conditions.map((c) => this.fingerprintScopedWhere(host, c)).join(',')}]`);
+          break;
+        case 'and':
+          parts.push(`AND[${event.conditions.map((c) => this.fingerprintScopedWhere(host, c)).join(',')}]`);
+          break;
+        case 'not':
+          parts.push(`NOT(${this.fingerprintScopedWhere(host, event.condition)})`);
+          break;
+        case 'relation':
+          parts.push(`${event.key}:{${this.fingerprintRelationParts(event.relDef, event.filterObj).join(',')}}`);
+          break;
+        case 'scalar':
+          parts.push(`${event.key}:${fingerprintScalarToken(event.value)}`);
+          break;
+      }
+    }
+    return parts.join('&');
+  }
+
   /**
    * Build relation filter SQL: WHERE EXISTS / NOT EXISTS subquery
    * Supports: some (EXISTS), every (NOT EXISTS ... NOT), none (NOT EXISTS)
@@ -4492,110 +4681,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): string | null {
     const meta = this.schema.tables[targetTable];
     if (!meta) return null;
-
-    const qt = this.q(targetTable);
-    const conditions: string[] = [];
-
-    // Sorted (canonical) order — MUST match fingerprintRelFilter and collectRelFilterParams.
-    for (const field of sortedKeys(subWhere)) {
-      const value = subWhere[field];
-      if (value === undefined) continue;
-
-      // OR / AND / NOT combinators inside a relation sub-where
-      if (field === 'OR' || field === 'AND') {
-        const arr = value as Record<string, unknown>[];
-        if (!Array.isArray(arr) || arr.length === 0) continue;
-        const parts: string[] = [];
-        for (const branch of arr) {
-          const c = this.buildSubWhereForRelation(targetTable, branch, params);
-          if (c) parts.push(`(${c})`);
-        }
-        if (parts.length) conditions.push(`(${parts.join(field === 'OR' ? ' OR ' : ' AND ')})`);
-        continue;
-      }
-      if (field === 'NOT') {
-        const c = this.buildSubWhereForRelation(targetTable, value as Record<string, unknown>, params);
-        if (c) conditions.push(`NOT (${c})`);
-        continue;
-      }
-
-      // Nested relation filter (relation of the relation target) — recurse
-      // with the TARGET table as the correlation parent.
-      const nestedRel = meta.relations?.[field];
-      if (nestedRel && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        const norm = this.normalizeRelationFilter(nestedRel, value as Record<string, unknown>);
-        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          const c = this.buildRelationFilter(field, nestedRel, norm, params, targetTable);
-          if (c) conditions.push(c);
-          continue;
-        }
-      }
-
-      const col = meta.columnMap[field] ?? camelToSnake(field);
-      if (!meta.allColumns.includes(col)) {
-        throw new ValidationError(
-          `[turbine] Unknown field "${field}" in relation filter for table "${targetTable}". ` +
-            `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
-        );
-      }
-      const qCol = `${qt}.${this.q(col)}`;
-
-      if (value === null) {
-        conditions.push(`${qCol} IS NULL`);
-        continue;
-      }
-
-      // JSONB filter on a json/jsonb column of the relation target — mirrors
-      // the top-level WHERE path (buildWhereClause). Without this branch the
-      // filter object used to fall through to plain equality and bind as a
-      // jsonb value, silently matching nothing.
-      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
-        const colType = this.pgTypeForColumn(meta, col);
-        if (this.isJsonColumnType(colType)) {
-          conditions.push(...this.buildJsonFilterClauses(qCol, value, params));
-          continue;
-        }
-        const jsonKey = findJsonUniqueKey(value);
-        if (jsonKey) {
-          throw new ValidationError(
-            `[turbine] Column "${col}" on table "${targetTable}" is not a JSON column ` +
-              `(actual type: ${colType}); cannot apply JSON operator '${jsonKey}'.`,
-          );
-        }
-      }
-
-      // Array filter on an array column of the relation target — same mirror.
-      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
-        const colType = this.pgTypeForColumn(meta, col);
-        if (colType.startsWith('_')) {
-          conditions.push(...this.buildArrayFilterClauses(qCol, value, params, colType));
-          continue;
-        }
-        const arrayKey = findArrayUniqueKey(value);
-        if (arrayKey) {
-          throw new ValidationError(
-            `[turbine] Column "${col}" on table "${targetTable}" is not an array column ` +
-              `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
-          );
-        }
-      }
-
-      if (isWhereOperator(value)) {
-        const opClauses = this.buildOperatorClauses(qCol, value, params, {
-          meta,
-          table: targetTable,
-          prefix: `${qt}.`,
-        });
-        conditions.push(...opClauses);
-        continue;
-      }
-
-      this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(meta, col), targetTable);
-      params.push(value);
-      conditions.push(`${qCol} = ${this.p(params.length)}`);
-    }
-
-    return conditions.length > 0 ? conditions.join(' AND ') : null;
+    return this.buildScopedWhere(this.relationWhereScope(targetTable, meta), subWhere, params);
   }
 
   /**
@@ -4687,104 +4773,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     where: Record<string, unknown>,
     params: unknown[],
   ): string | null {
-    const clauses: string[] = [];
-
-    // Sorted (canonical) order — MUST match fingerprintAliasWhere and collectAliasWhereParams.
-    for (const key of sortedKeys(where)) {
-      const value = where[key];
-      if (value === undefined) continue;
-
-      if (key === 'OR' || key === 'AND') {
-        const arr = value as Record<string, unknown>[];
-        if (!Array.isArray(arr) || arr.length === 0) continue;
-        const subs = arr
-          .map((cond) => this.buildAliasWhere(targetTable, targetMeta, alias, cond, params))
-          .filter((s): s is string => s !== null)
-          .map((s) => `(${s})`);
-        if (subs.length > 0) clauses.push(`(${subs.join(key === 'OR' ? ' OR ' : ' AND ')})`);
-        continue;
-      }
-
-      if (key === 'NOT') {
-        const sub = this.buildAliasWhere(targetTable, targetMeta, alias, value as Record<string, unknown>, params);
-        if (sub) clauses.push(`NOT (${sub})`);
-        continue;
-      }
-
-      // Relation filter inside a with-clause where — EXISTS correlated to the
-      // relation alias (some/every/none/is/isNot + bare to-one implicit `is`).
-      const aliasRel = targetMeta.relations?.[key];
-      if (aliasRel && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        const norm = this.normalizeRelationFilter(aliasRel, value as Record<string, unknown>);
-        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          const c = this.buildRelationFilter(key, aliasRel, norm, params, alias);
-          if (c) clauses.push(c);
-          continue;
-        }
-      }
-
-      const col = targetMeta.columnMap[key] ?? camelToSnake(key);
-      if (!targetMeta.allColumns.includes(col)) {
-        throw new ValidationError(`[turbine] Unknown column "${key}" in where for table "${targetTable}"`);
-      }
-      const qCol = `${alias}.${this.q(col)}`;
-
-      if (value === null) {
-        clauses.push(`${qCol} IS NULL`);
-        continue;
-      }
-
-      // JSONB filter on a json/jsonb column — mirrors the top-level WHERE path
-      // (buildWhereClause) so a `with.where` JSON filter is never silently
-      // bound as a plain equality value.
-      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
-        const colType = this.pgTypeForColumn(targetMeta, col);
-        if (this.isJsonColumnType(colType)) {
-          clauses.push(...this.buildJsonFilterClauses(qCol, value, params));
-          continue;
-        }
-        const jsonKey = findJsonUniqueKey(value);
-        if (jsonKey) {
-          throw new ValidationError(
-            `[turbine] Column "${col}" on table "${targetTable}" is not a JSON column ` +
-              `(actual type: ${colType}); cannot apply JSON operator '${jsonKey}'.`,
-          );
-        }
-      }
-
-      // Array filter on an array column — same mirror.
-      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
-        const colType = this.pgTypeForColumn(targetMeta, col);
-        if (colType.startsWith('_')) {
-          clauses.push(...this.buildArrayFilterClauses(qCol, value, params, colType));
-          continue;
-        }
-        const arrayKey = findArrayUniqueKey(value);
-        if (arrayKey) {
-          throw new ValidationError(
-            `[turbine] Column "${col}" on table "${targetTable}" is not an array column ` +
-              `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
-          );
-        }
-      }
-
-      if (isWhereOperator(value)) {
-        clauses.push(
-          ...this.buildOperatorClauses(qCol, value, params, {
-            meta: targetMeta,
-            table: targetTable,
-            prefix: `${alias}.`,
-          }),
-        );
-        continue;
-      }
-
-      this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(targetMeta, col), targetTable);
-      params.push(value);
-      clauses.push(`${qCol} = ${this.p(params.length)}`);
-    }
-
-    return clauses.length > 0 ? clauses.join(' AND ') : null;
+    return this.buildScopedWhere(this.aliasWhereScope(targetTable, targetMeta, alias), where, params);
   }
 
   /** Mirrors {@link buildAliasWhere} param-push order for the cache-hit collect path. */
@@ -4794,66 +4783,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     where: Record<string, unknown>,
     params: unknown[],
   ): void {
-    // Sorted (canonical) order — MUST match fingerprintAliasWhere and buildAliasWhere.
-    for (const key of sortedKeys(where)) {
-      const value = where[key];
-      if (value === undefined) continue;
-
-      if (key === 'OR' || key === 'AND') {
-        const arr = value as Record<string, unknown>[];
-        if (!Array.isArray(arr) || arr.length === 0) continue;
-        for (const cond of arr) {
-          this.collectAliasWhereParams(targetTable, targetMeta, cond, params);
-        }
-        continue;
-      }
-
-      if (key === 'NOT') {
-        this.collectAliasWhereParams(targetTable, targetMeta, value as Record<string, unknown>, params);
-        continue;
-      }
-
-      if (value === null) continue;
-
-      const aliasRel = targetMeta.relations?.[key];
-      if (aliasRel && typeof value === 'object' && !Array.isArray(value)) {
-        const norm = this.normalizeRelationFilter(aliasRel, value as Record<string, unknown>);
-        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          // Mirrors buildRelationFilter (some→none→every→is→isNot, each: sub-where
-          // params then target global-filter params).
-          this.collectRelationFilterParams(aliasRel, norm, params);
-          continue;
-        }
-      }
-
-      const col = targetMeta.columnMap[key] ?? camelToSnake(key);
-
-      // JSONB filter — mirrors buildAliasWhere.
-      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
-        const colType = this.pgTypeForColumn(targetMeta, col);
-        if (this.isJsonColumnType(colType)) {
-          this.collectJsonFilterParams(value, params, this.q(col));
-          continue;
-        }
-      }
-
-      // Array filter — mirrors buildAliasWhere.
-      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
-        const colType = this.pgTypeForColumn(targetMeta, col);
-        if (colType.startsWith('_')) {
-          this.collectArrayFilterParams(value, params);
-          continue;
-        }
-      }
-
-      if (isWhereOperator(value)) {
-        this.collectOperatorParams(col, value, params, { meta: targetMeta, table: targetTable, prefix: '' });
-        continue;
-      }
-
-      this.assertBindableEqualityValue(col, value, this.pgTypeForColumn(targetMeta, col), targetTable);
-      params.push(value);
-    }
+    // The alias identifier is irrelevant to param collection (it only shapes SQL
+    // text), so reuse the relation scope's host binding for `targetMeta`.
+    this.collectScopedWhereParams(this.aliasWhereScope(targetTable, targetMeta, ''), where, params);
   }
 
   /**
@@ -4863,73 +4795,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * differently-shaped wheres would share one cached SQL string.
    */
   private fingerprintAliasWhere(where: Record<string, unknown>, targetTable?: string): string {
-    const keys = Object.keys(where)
-      .filter((k) => where[k] !== undefined)
-      .sort();
-    const parts: string[] = [];
     const meta = targetTable ? this.schema.tables[targetTable] : undefined;
-
-    for (const key of keys) {
-      const value = where[key];
-
-      if (key === 'OR' || key === 'AND') {
-        const arr = value as Record<string, unknown>[];
-        if (!Array.isArray(arr) || arr.length === 0) continue;
-        parts.push(`${key}[${arr.map((c) => this.fingerprintAliasWhere(c, targetTable)).join(',')}]`);
-        continue;
-      }
-      if (key === 'NOT') {
-        parts.push(`NOT(${this.fingerprintAliasWhere(value as Record<string, unknown>, targetTable)})`);
-        continue;
-      }
-      if (value === null) {
-        parts.push(`${key}:null`);
-        continue;
-      }
-      // Relation filter shapes must be fully fingerprinted (cache-key safety).
-      const fpRel = meta?.relations?.[key];
-      if (fpRel && typeof value === 'object' && !Array.isArray(value)) {
-        const norm = this.normalizeRelationFilter(fpRel, value as Record<string, unknown>);
-        if ('some' in norm || 'every' in norm || 'none' in norm || 'is' in norm || 'isNot' in norm) {
-          const inner: string[] = [];
-          for (const op of ['some', 'none', 'every', 'is', 'isNot'] as const) {
-            if (norm[op] === undefined) continue;
-            inner.push(
-              norm[op] === null
-                ? `${op}(null)`
-                : `${op}(${this.fingerprintRelFilter(fpRel.to, norm[op] as Record<string, unknown>)})`,
-            );
-          }
-          parts.push(`${key}:rel[${inner.join(',')}]`);
-          continue;
-        }
-      }
-      if (isWhereOperator(value)) {
-        parts.push(`${key}:${fingerprintOperatorShape(value)}`);
-        continue;
-      }
-      // JSON / array filters build real clauses in buildAliasWhere, so their
-      // shape must be cache-distinct from plain equality (mirrors fingerprintWhere).
-      if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value as JsonFilter)) {
-        parts.push(`${key}:${fingerprintJsonFilterShape(value as JsonFilter)}`);
-        continue;
-      }
-      if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value as ArrayFilter)) {
-        parts.push(`${key}:arr(${this.fingerprintArrayFilter(value as ArrayFilter)})`);
-        continue;
-      }
-      if (isUnmatchedPlainObject(value)) {
-        parts.push(
-          `${key}:obj(${Object.keys(value as object)
-            .sort()
-            .join(',')})`,
-        );
-        continue;
-      }
-      parts.push(`${key}:eq`);
-    }
-
-    return parts.join('&');
+    const host = meta ? this.scopedWhereHost(meta) : this.emptyRelationsHost(targetTable ?? '');
+    return this.fingerprintScopedWhere(host, where);
   }
 
   /**
@@ -4960,7 +4828,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /**
    * Compile a `{ col }` reference to its quoted, prefix-matched SQL identifier.
    * NO param is bound: the referenced column is part of the SQL text (and of
-   * the where fingerprint, see {@link fingerprintOperatorShape}).
+   * the where fingerprint, via `fingerprintOperatorShape` in `filters.ts`).
    */
   private columnRefSql(ref: ColumnRef, ctx: ColumnRefContext | undefined, mode?: 'default' | 'insensitive'): string {
     if (!ctx) {
