@@ -42,10 +42,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { platform } from 'node:os';
 import { dirname, resolve as pathResolve } from 'node:path';
 import pg from 'pg';
+import type { PgCompatPool } from '../client.js';
+import type { Dialect } from '../dialect.js';
 import { introspect } from '../introspect.js';
 import type { CreateArgs, DeleteArgs, FindManyArgs, UpdateArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
+import { createDemoContext } from './studio-demo.js';
 import { STUDIO_HTML } from './studio-ui.generated.js';
 
 // ---------------------------------------------------------------------------
@@ -73,6 +76,13 @@ export interface StudioOptions {
    * Reveal PII-tagged column values instead of redacting them. Default `false`.
    */
   showPii?: boolean;
+  /**
+   * Boot with a seeded, in-memory sample database instead of connecting to a
+   * real one (no DATABASE_URL required). Backed by Turbine's own SQLite engine
+   * over `node:sqlite` `:memory:`; nothing is ever persisted. Enables the live
+   * three-mode switcher (`/api/demo/mode`). Default `false`.
+   */
+  demo?: boolean;
 }
 
 export interface StudioHandle {
@@ -85,7 +95,14 @@ export interface StudioHandle {
 }
 
 export interface StudioContext {
-  pool: pg.Pool;
+  /**
+   * The pg-compatible pool. A real `pg.Pool` in normal mode, a `SqlitePool`
+   * over an in-memory database in demo mode. Typed as the minimal
+   * `PgCompatPool` contract so both shapes work through one code path (pg.Pool
+   * satisfies it; the query builders take `pg.Pool` via a cast, matching the
+   * external-pool seam in client.ts).
+   */
+  pool: PgCompatPool;
   metadata: SchemaMetadata;
   options: StudioOptions;
   authToken: string;
@@ -96,11 +113,23 @@ export interface StudioContext {
   rateLimiter: Map<string, { count: number; resetAt: number }>;
   /**
    * True when write mode is enabled (`--write`): the `/api/row/*` routes exist
-   * and the UI renders write affordances. Absent/false → read-only.
+   * and the UI renders write affordances. Absent/false → read-only. In demo
+   * mode this is toggled live by the `/api/demo/mode` switcher.
    */
   writable?: boolean;
   /** True when PII redaction is disabled (`--show-pii`). Absent/false → redact. */
   showPii?: boolean;
+  /**
+   * True when Studio is running against the seeded in-memory demo store
+   * (`--demo`). Branches the handful of Postgres-specific statements onto their
+   * SQLite equivalents and enables the `/api/demo/mode` live switcher.
+   */
+  demo?: boolean;
+  /**
+   * SQL dialect the builder/write handlers compile against. Absent → Postgres
+   * (the default). Set to the SQLite dialect in demo mode.
+   */
+  dialect?: Dialect;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,37 +146,59 @@ export interface StudioContext {
  *   process.on('SIGINT', () => studio.dispose().then(() => process.exit(0)));
  */
 export async function startStudio(options: StudioOptions): Promise<StudioHandle> {
-  const pool = new pg.Pool({
-    connectionString: options.url,
-    max: 4, // small pool — single-user tool
-    idleTimeoutMillis: 10_000,
-  });
+  const demo = options.demo === true;
 
-  // Verify connectivity before starting the server — fail fast.
-  const probe = await pool.connect();
-  try {
-    await probe.query('SELECT 1');
-  } finally {
-    probe.release();
+  let pool: PgCompatPool;
+  let metadata: SchemaMetadata;
+  let dialect: Dialect | undefined;
+  let statementTimeout: { sql: string; params: unknown[] };
+
+  if (demo) {
+    // Seeded in-memory SQLite store: no DATABASE_URL, no network. Each launch
+    // starts pristine and nothing is ever persisted.
+    const demoCtx = createDemoContext();
+    pool = demoCtx.pool;
+    metadata = demoCtx.metadata;
+    dialect = demoCtx.dialect;
+    // SQLite has no set_config / statement_timeout GUC; a harmless no-op keeps
+    // the shared execution path (which issues this before each query) uniform.
+    statementTimeout = { sql: 'SELECT 1', params: [] };
+  } else {
+    // pg.Pool satisfies the PgCompatPool contract (same as the external-pool
+    // seam in client.ts); the cast keeps one typed pool field for both modes.
+    pool = new pg.Pool({
+      connectionString: options.url,
+      max: 4, // small pool — single-user tool
+      idleTimeoutMillis: 10_000,
+    }) as unknown as PgCompatPool;
+
+    // Verify connectivity before starting the server — fail fast.
+    const probe = await pool.connect();
+    try {
+      await probe.query('SELECT 1');
+    } finally {
+      probe.release();
+    }
+
+    metadata = await introspect({
+      connectionString: options.url,
+      schema: options.schema,
+      include: options.include,
+      exclude: options.exclude,
+    });
+
+    statementTimeout = options.adapter?.statementTimeout?.(30) ?? {
+      // Postgres rejects parameters in `SET LOCAL` (`SET LOCAL ... = $1` is a
+      // syntax error). `set_config(name, value, is_local=true)` is the
+      // parameterizable, transaction-local equivalent and works on every
+      // Postgres-compatible engine.
+      sql: `SELECT set_config('statement_timeout', $1, true)`,
+      params: ['30s'],
+    };
   }
-
-  const metadata = await introspect({
-    connectionString: options.url,
-    schema: options.schema,
-    include: options.include,
-    exclude: options.exclude,
-  });
 
   const authToken = randomBytes(24).toString('hex');
   const stateDir = pathResolve(options.stateDir ?? '.turbine');
-  const statementTimeout = options.adapter?.statementTimeout?.(30) ?? {
-    // Postgres rejects parameters in `SET LOCAL` (`SET LOCAL ... = $1` is a
-    // syntax error). `set_config(name, value, is_local=true)` is the
-    // parameterizable, transaction-local equivalent and works on every
-    // Postgres-compatible engine.
-    sql: `SELECT set_config('statement_timeout', $1, true)`,
-    params: ['30s'],
-  };
   const rateLimiter = new Map<string, { count: number; resetAt: number }>();
   const ctx: StudioContext = {
     pool,
@@ -157,8 +208,12 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     stateDir,
     statementTimeout,
     rateLimiter,
-    writable: options.write === true,
-    showPii: options.showPii === true,
+    // Demo always boots read-only + PII redacted; the in-UI switcher flips these
+    // live. Non-demo honors the CLI flags.
+    writable: demo ? false : options.write === true,
+    showPii: demo ? false : options.showPii === true,
+    demo,
+    dialect,
   };
 
   const server = createServer((req, res) => {
@@ -310,7 +365,39 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse, c
     if (op === 'delete') return apiRowWrite(req, res, ctx, 'delete');
   }
 
+  // Demo mode switcher: ONLY exists in demo mode (404 otherwise). Flips the live
+  // read-only / PII / write toggles on the in-memory store. State-changing, so it
+  // requires a matching Origin like the write routes.
+  if (ctx.demo && pathname === '/api/demo/mode' && req.method === 'POST') {
+    if (origin !== expectedOrigin) {
+      sendJson(res, 403, { error: 'a matching Origin header is required for mode changes' });
+      return;
+    }
+    return apiDemoMode(req, res, ctx);
+  }
+
   sendJson(res, 404, { error: 'not found' });
+}
+
+// ---------------------------------------------------------------------------
+// API: /api/demo/mode: live mode switcher (demo mode only)
+//
+// Mutates the shared StudioContext so the change applies to every subsequent
+// request: `writable` gates the (already-registered) `/api/row/*` routes and the
+// UI's write affordances; `showPii` toggles server-side PII redaction. The two
+// are independent toggles. The UI re-fetches `/api/schema` afterwards to re-read
+// the effective state.
+// ---------------------------------------------------------------------------
+
+export async function apiDemoMode(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
+  const body = await readJsonBody(req);
+  if (typeof body.writable === 'boolean') ctx.writable = body.writable;
+  if (typeof body.showPii === 'boolean') ctx.showPii = body.showPii;
+  sendJson(res, 200, {
+    demo: true,
+    writable: ctx.writable === true,
+    showPii: ctx.showPii === true,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -407,20 +494,30 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
     })),
   }));
 
-  // Row counts — cheap enough to fetch inline. Use pg_class reltuples as
-  // a fast estimate so we don't hammer big tables with SELECT COUNT(*).
-  const countsResult = await ctx.pool.query<{ relname: string; reltuples: string }>(
-    `SELECT c.relname, c.reltuples::bigint::text AS reltuples
-     FROM pg_class c
-     JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = $1 AND c.relkind = 'r'`,
-    [ctx.options.schema],
-  );
+  // Row counts (cheap enough to fetch inline).
   const counts = new Map<string, number>();
-  for (const row of countsResult.rows) {
-    // pg_class.reltuples is -1 on PG14+ until a table is ANALYZEd; clamp so the
-    // sidebar never shows a negative estimate.
-    counts.set(row.relname, Math.max(0, Number(row.reltuples)));
+  if (ctx.demo) {
+    // The demo dataset is tiny and in-memory: an exact per-table COUNT(*) is
+    // instant, and SQLite has no pg_class estimate to read.
+    for (const t of tables) {
+      const r = await ctx.pool.query<{ count: number | string }>(`SELECT COUNT(*) AS count FROM ${quoteIdent(t.name)}`);
+      counts.set(t.name, Number(r.rows[0]?.count ?? 0));
+    }
+  } else {
+    // Use pg_class reltuples as a fast estimate so we don't hammer big tables
+    // with SELECT COUNT(*).
+    const countsResult = await ctx.pool.query<{ relname: string; reltuples: string }>(
+      `SELECT c.relname, c.reltuples::bigint::text AS reltuples
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1 AND c.relkind = 'r'`,
+      [ctx.options.schema],
+    );
+    for (const row of countsResult.rows) {
+      // pg_class.reltuples is -1 on PG14+ until a table is ANALYZEd; clamp so the
+      // sidebar never shows a negative estimate.
+      counts.set(row.relname, Math.max(0, Number(row.reltuples)));
+    }
   }
 
   sendJson(res, 200, {
@@ -431,6 +528,8 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
     // Read-only Studio reports `writable: false` so the UI renders no write UI.
     writable: ctx.writable === true,
     showPii: ctx.showPii === true,
+    // Demo flag drives the in-UI mode switcher + persistent demo banner.
+    demo: ctx.demo === true,
   });
 }
 
@@ -482,12 +581,23 @@ export async function apiTableRows(
   const hasSearch = search.length > 0 && textColumns.length > 0;
   const pattern = hasSearch ? `%${escapeLikePattern(search)}%` : null;
 
+  // Parameter placeholder + case-insensitive LIKE condition differ by engine.
+  // Postgres: numbered `$N` + `ILIKE`. Demo (SQLite): named `:pN` (bound by
+  // name from the positional value array, matching Turbine's own SQLite path)
+  // + `LOWER(col) LIKE LOWER(:pN)` (explicit case-fold, ASCII). The escape char
+  // (`\`) is identical. When demo is off these produce byte-identical SQL.
+  const ph = (n: number) => (ctx.demo ? `:p${n}` : `$${n}`);
+  const likeCond = (col: string, n: number) =>
+    ctx.demo
+      ? `LOWER(${quoteIdent(col)}) LIKE LOWER(${ph(n)}) ESCAPE '\\'`
+      : `${quoteIdent(col)} ILIKE ${ph(n)} ESCAPE '\\'`;
+
   // Main query: $1 = limit, $2 = offset, $3 = pattern (if search)
   const mainValues: unknown[] = [limit, offset];
   let mainWhere = '';
   if (hasSearch && pattern !== null) {
     mainValues.push(pattern);
-    const conds = textColumns.map((c) => `${quoteIdent(c)} ILIKE $3 ESCAPE '\\'`);
+    const conds = textColumns.map((c) => likeCond(c, 3));
     mainWhere = `WHERE (${conds.join(' OR ')})`;
   }
 
@@ -496,25 +606,37 @@ export async function apiTableRows(
   let countWhere = '';
   if (hasSearch && pattern !== null) {
     countValues.push(pattern);
-    const conds = textColumns.map((c) => `${quoteIdent(c)} ILIKE $1 ESCAPE '\\'`);
+    const conds = textColumns.map((c) => likeCond(c, 1));
     countWhere = `WHERE (${conds.join(' OR ')})`;
   }
 
-  const qualifiedTable = `${quoteIdent(ctx.options.schema)}.${quoteIdent(table.name)}`;
-  const sql = `SELECT * FROM ${qualifiedTable} ${mainWhere} ${orderByClause} LIMIT $1 OFFSET $2`;
-  const countSql = `SELECT COUNT(*)::text AS count FROM ${qualifiedTable} ${countWhere}`;
+  // Demo runs against an unqualified in-memory SQLite table (no schemas);
+  // Postgres qualifies with the configured `--schema`.
+  const qualifiedTable = ctx.demo
+    ? quoteIdent(table.name)
+    : `${quoteIdent(ctx.options.schema)}.${quoteIdent(table.name)}`;
+  const sql = `SELECT * FROM ${qualifiedTable} ${mainWhere} ${orderByClause} LIMIT ${ph(1)} OFFSET ${ph(2)}`;
+  // Postgres casts the bigint COUNT to text to avoid int8 precision loss on the
+  // wire; SQLite returns a safe integer directly, so no cast.
+  const countSql = `SELECT COUNT(*)${ctx.demo ? '' : '::text'} AS count FROM ${qualifiedTable} ${countWhere}`;
 
   const client = await ctx.pool.connect();
   try {
-    await client.query('BEGIN READ ONLY');
-    await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
+    // Demo: the in-memory SQLite handle is a single synchronous connection with
+    // no READ ONLY txn mode or statement_timeout GUC, so we skip the read
+    // transaction wrapper entirely. Postgres keeps its belt-and-suspenders
+    // READ ONLY transaction + timeout.
+    if (!ctx.demo) {
+      await client.query('BEGIN READ ONLY');
+      await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
+    }
     const result = await client.query(sql, mainValues);
-    const countResult = await client.query<{ count: string }>(countSql, countValues);
-    await client.query('COMMIT');
+    const countResult = await client.query<{ count: string | number }>(countSql, countValues);
+    if (!ctx.demo) await client.query('COMMIT');
 
     sendJson(res, 200, {
       table: table.name,
-      columns: result.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID })),
+      columns: resultColumns(result, result.rows),
       rows: result.rows.map((r) => serializeRow(redactFlatRow(r, redactedPii))),
       total: Number(countResult.rows[0]?.count ?? 0),
       limit,
@@ -522,10 +644,12 @@ export async function apiTableRows(
       search,
     });
   } catch (err) {
-    try {
-      await client.query('ROLLBACK');
-    } catch {
-      /* ignore */
+    if (!ctx.demo) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
     }
     throw err;
   } finally {
@@ -573,11 +697,20 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
 
   let deferred: ReturnType<QueryInterface<Record<string, unknown>>['buildFindMany']>;
   try {
-    const qi = new QueryInterface<Record<string, unknown>>(ctx.pool, tableName, ctx.metadata, [], {
-      warnOnUnlimited: false,
-      sqlCache: false,
-      preparedStatements: false,
-    });
+    const qi = new QueryInterface<Record<string, unknown>>(
+      ctx.pool as unknown as pg.Pool,
+      tableName,
+      ctx.metadata,
+      [],
+      {
+        warnOnUnlimited: false,
+        sqlCache: false,
+        preparedStatements: false,
+        // Demo compiles SQLite SQL (`:pN`, json_group_array, …); Postgres default
+        // when unset.
+        dialect: ctx.dialect,
+      },
+    );
     deferred = qi.buildFindMany(args);
   } catch (err) {
     sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -586,32 +719,42 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
 
   const client = await ctx.pool.connect();
   try {
-    await client.query('BEGIN READ ONLY');
-    await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
-    // QueryInterface emits unqualified table identifiers, which resolve via
-    // the connection's search_path. Pin it to the configured --schema so the
-    // Query tab reads the same schema as the Data tab (set_config is
-    // transaction-local and fully parameterized).
-    await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
+    if (!ctx.demo) {
+      await client.query('BEGIN READ ONLY');
+      await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
+      // QueryInterface emits unqualified table identifiers, which resolve via
+      // the connection's search_path. Pin it to the configured --schema so the
+      // Query tab reads the same schema as the Data tab (set_config is
+      // transaction-local and fully parameterized). Demo has no schemas.
+      await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
+    }
     const started = Date.now();
     const result = await client.query(deferred.sql, deferred.params);
     const elapsedMs = Date.now() - started;
-    await client.query('COMMIT');
+    if (!ctx.demo) await client.query('COMMIT');
 
-    const rawRows = result.rows as Record<string, unknown>[];
+    // Postgres auto-parses json/jsonb relation columns into JS values via its
+    // type parsers; the SQLite demo driver returns them as raw JSON strings. So
+    // in demo mode, parse relation columns back into arrays/objects (walking the
+    // `with` tree) to match the Postgres shape before redaction + serialization.
+    const rawRows = ctx.demo
+      ? parseDemoRelationRows(result.rows as Record<string, unknown>[], tableName, args.with, ctx.metadata)
+      : (result.rows as Record<string, unknown>[]);
     const redactedRows = ctx.showPii ? rawRows : redactBuilderRows(rawRows, tableName, args.with, ctx.metadata);
     sendJson(res, 200, {
       sql: deferred.sql,
-      columns: result.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID })),
+      columns: resultColumns(result, result.rows as Record<string, unknown>[]),
       rows: redactedRows.map((r) => serializeRow(r)),
       rowCount: result.rowCount ?? result.rows.length,
       elapsedMs,
     });
   } catch (err) {
-    try {
-      await client.query('ROLLBACK');
-    } catch {
-      /* ignore */
+    if (!ctx.demo) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
     }
     sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
   } finally {
@@ -689,11 +832,18 @@ export async function apiRowWrite(
 
   let deferred: { sql: string; params: unknown[] };
   try {
-    const qi = new QueryInterface<Record<string, unknown>>(ctx.pool, tableName, ctx.metadata, [], {
-      warnOnUnlimited: false,
-      sqlCache: false,
-      preparedStatements: false,
-    });
+    const qi = new QueryInterface<Record<string, unknown>>(
+      ctx.pool as unknown as pg.Pool,
+      tableName,
+      ctx.metadata,
+      [],
+      {
+        warnOnUnlimited: false,
+        sqlCache: false,
+        preparedStatements: false,
+        dialect: ctx.dialect,
+      },
+    );
     if (op === 'insert') {
       deferred = qi.buildCreate({ data } as CreateArgs<Record<string, unknown>>);
     } else if (op === 'update') {
@@ -708,11 +858,15 @@ export async function apiRowWrite(
 
   const client = await ctx.pool.connect();
   try {
-    // A real write transaction, NOT `READ ONLY`. Same parameterized
-    // statement-timeout + search_path pin as the read paths.
+    // A real write transaction, NOT `READ ONLY`. Postgres also pins the
+    // parameterized statement-timeout + search_path; demo (SQLite) has neither
+    // GUC, so those are skipped, but the BEGIN/COMMIT is kept (SqlitePool
+    // supports it) so an in-memory write still applies atomically.
     await client.query('BEGIN');
-    await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
-    await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
+    if (!ctx.demo) {
+      await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
+      await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
+    }
     const result = await client.query(deferred.sql, deferred.params);
     await client.query('COMMIT');
 
@@ -990,6 +1144,54 @@ function redactBuilderRows(
 }
 
 /**
+ * Demo-only: parse relation columns that arrive as raw JSON strings from the
+ * SQLite driver back into arrays/objects, walking the `with` tree so nested
+ * relations are parsed at every level. This mirrors what Postgres' json/jsonb
+ * type parsers do automatically, so the builder response shape (and downstream
+ * redaction) is identical across engines. Rows without the named relation, or
+ * whose value is already a parsed object/array, pass through unchanged.
+ */
+function parseDemoRelationRows(
+  rows: Record<string, unknown>[],
+  tableName: string,
+  withClause: unknown,
+  metadata: SchemaMetadata,
+): Record<string, unknown>[] {
+  const table = metadata.tables[tableName];
+  if (!table) return rows;
+  const relEntries =
+    withClause && typeof withClause === 'object'
+      ? Object.entries(withClause as Record<string, unknown>).filter(([, v]) => v)
+      : [];
+  if (relEntries.length === 0) return rows;
+
+  return rows.map((row) => {
+    const out: Record<string, unknown> = { ...row };
+    for (const [relName, relVal] of relEntries) {
+      const rel = table.relations[relName];
+      if (!rel) continue;
+      let child = out[relName];
+      if (typeof child === 'string') {
+        try {
+          child = JSON.parse(child);
+        } catch {
+          continue;
+        }
+      }
+      const nestedWith = relVal && typeof relVal === 'object' ? (relVal as { with?: unknown }).with : undefined;
+      if (Array.isArray(child)) {
+        out[relName] = parseDemoRelationRows(child as Record<string, unknown>[], rel.to, nestedWith, metadata);
+      } else if (child && typeof child === 'object') {
+        out[relName] = parseDemoRelationRows([child as Record<string, unknown>], rel.to, nestedWith, metadata)[0];
+      } else {
+        out[relName] = child;
+      }
+    }
+    return out;
+  });
+}
+
+/**
  * A fresh CSP nonce for one HTML response. Base64 of 16 random bytes; the value
  * is stamped into both the `Content-Security-Policy` header and the inline
  * `<script nonce="...">` tag(s) so `unsafe-inline` can be dropped from script-src.
@@ -1003,6 +1205,24 @@ function clampInt(value: string | null, fallback: number, min: number, max: numb
   const n = Number.parseInt(value, 10);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(Math.max(n, min), max);
+}
+
+/**
+ * Column descriptors for a result payload. Postgres results carry a `fields`
+ * array (name + OID); the SQLite demo driver does not, so we fall back to the
+ * keys of the first returned row (dataTypeID 0 = "unknown", which the UI treats
+ * generically). When `fields` is present this is byte-identical to the previous
+ * inline `result.fields.map(...)`.
+ */
+function resultColumns(
+  result: { fields?: Array<{ name: string; dataTypeID: number }> },
+  rows: Record<string, unknown>[],
+): Array<{ name: string; dataTypeID: number }> {
+  if (result.fields) {
+    return result.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID }));
+  }
+  const first = rows[0];
+  return first ? Object.keys(first).map((name) => ({ name, dataTypeID: 0 })) : [];
 }
 
 function serializeRow(row: Record<string, unknown>): Record<string, unknown> {
