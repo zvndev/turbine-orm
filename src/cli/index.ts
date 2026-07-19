@@ -14,7 +14,7 @@
  *   turbine seed                  — Run seed file
  *   turbine status                — Show schema summary
  *   turbine doctor                — Check relations for missing FK indexes (--fix emits migration)
- *   turbine studio                — Launch local read-only web UI (--demo for a seeded sample DB)
+ *   turbine studio                : Launch local read-only web UI (--demo for a seeded sample DB)
  *   turbine mcp                   — Start read-only MCP server over JSON-RPC stdio
  *   turbine observe               — Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
  *

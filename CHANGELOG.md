@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.37.0 (2026-07-18)
+
+### Added
+
+- **Studio demo mode.** `npx turbine studio --demo` boots Studio with no
+  database and no `DATABASE_URL`: a seeded in-memory sample dataset (users
+  with PII-tagged emails and phones, posts, comments, orgs, relations wired)
+  served by Turbine's own SQLite engine over the Node built-in `node:sqlite`
+  `:memory:` (Node 22.5+). A demo banner carries two live toggles, PII
+  (hidden/shown) and Writes (off/on), so the three Studio modes can be
+  experienced in one session: read-only and redacted on boot, flip to see
+  real-looking PII reveal warnings, flip again to insert/edit/delete rows.
+  Writes genuinely apply to the in-memory store (edits stick, refresh shows
+  them) but nothing is ever saved anywhere: the store dies with the process
+  and every launch starts pristine. The full security model applies (token
+  auth, Origin checks on mutating routes, rate limiting, nonce CSP), the
+  mode switcher route exists only in demo mode, and the Postgres path is
+  byte-identical when the flag is off.
+
 ## 0.36.1 (2026-07-18)
 
 PowDB 0.16 support. The 0.16 driver contract is byte-identical to 0.15 (the
