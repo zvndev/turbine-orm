@@ -52,7 +52,7 @@ const features = [
   {
     title: 'Read-only Studio your DBA will approve',
     description:
-      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, no raw-SQL surface at all, X-Frame-Options: DENY. No other TS ORM ships this. New in 0.36: opt-in writable mode via turbine studio --write for single-row edits through the same validated builder; read-only stays the default.',
+      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, no raw-SQL surface at all, X-Frame-Options: DENY. No other TS ORM ships this. Try it with zero setup: npx turbine-orm@latest studio --demo boots a seeded in-memory sample DB (no DATABASE_URL) with a live Read-only / Show PII / Write switcher. New in 0.36: opt-in writable mode via turbine studio --write for single-row edits through the same validated builder; read-only stays the default.',
     stat: '0',
     statLabel: 'write paths by default',
   },

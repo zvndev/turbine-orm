@@ -87,6 +87,68 @@
     .pii-banner span:last-child {
       color: var(--text-dim);
     }
+    /* Demo banner + live mode switcher (shown only in --demo mode). Distinct
+       blue accent, separate from the red write and yellow PII banners. */
+    .demo-banner {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 6px 14px;
+      background: rgba(96, 165, 250, 0.12);
+      border-bottom: 1px solid rgba(96, 165, 250, 0.5);
+      color: var(--accent);
+      font-size: 12px;
+      letter-spacing: 0.02em;
+      flex: 0 0 auto;
+    }
+    .demo-banner strong {
+      font-weight: 700;
+    }
+    .demo-banner .demo-msg {
+      color: var(--text-dim);
+    }
+    .demo-switcher {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-left: auto;
+    }
+    .demo-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg-hover);
+      border: 1px solid var(--border-strong);
+      color: var(--text-dim);
+      border-radius: 999px;
+      padding: 3px 12px;
+      font-size: 11px;
+      letter-spacing: 0.03em;
+      cursor: pointer;
+      transition: var(--t);
+      white-space: nowrap;
+    }
+    .demo-toggle:hover {
+      color: var(--text);
+      border-color: var(--accent);
+    }
+    .demo-toggle-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      transition: var(--t);
+    }
+    .demo-toggle[aria-pressed="true"] {
+      color: var(--accent);
+      border-color: var(--accent);
+      background: var(--accent-dim);
+    }
+    .demo-toggle[aria-pressed="true"] .demo-toggle-dot {
+      background: var(--accent);
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.2);
+    }
     .badge.pii {
       background: rgba(250, 204, 21, 0.14);
       color: var(--yellow);
@@ -1649,6 +1711,21 @@
       <strong>PII SHOWN</strong>
       <span>PII-tagged column values are displayed unredacted (--show-pii)</span>
     </div>
+    <!-- Demo banner + live mode switcher (shown only in --demo mode) -->
+    <div class="demo-banner" id="demoBanner" role="note" hidden>
+      <strong>DEMO</strong>
+      <span class="demo-msg">Seeded sample data. Nothing you do here is saved anywhere; every launch starts fresh.</span>
+      <div class="demo-switcher" role="group" aria-label="Demo mode switcher">
+        <button class="demo-toggle" id="demoTogglePii" type="button" aria-pressed="false">
+          <span class="demo-toggle-dot" aria-hidden="true"></span>
+          <span id="demoTogglePiiLabel">PII: hidden</span>
+        </button>
+        <button class="demo-toggle" id="demoToggleWrite" type="button" aria-pressed="false">
+          <span class="demo-toggle-dot" aria-hidden="true"></span>
+          <span id="demoToggleWriteLabel">Writes: off</span>
+        </button>
+      </div>
+    </div>
     <!-- Header -->
     <header class="header">
       <div class="brand">
@@ -1918,9 +1995,10 @@
       currentTable: null,
       currentTab: 'data',
       connOk: false,
-      // write mode / PII (from /api/schema)
+      // write mode / PII / demo (from /api/schema)
       writable: false,
       showPii: false,
+      demo: false,
       // data pane
       data: {
         rows: [],
@@ -2054,6 +2132,14 @@
         return Api._fetch('/api/row/delete', {
           method: 'POST',
           body: JSON.stringify({ table, where }),
+        });
+      },
+      // Demo mode only (404 otherwise). Flips the live read-only / PII / write
+      // toggles on the in-memory store; independent booleans.
+      demoMode(patch) {
+        return Api._fetch('/api/demo/mode', {
+          method: 'POST',
+          body: JSON.stringify(patch),
         });
       },
       savedQueries(table) {
@@ -4028,6 +4114,41 @@
     }
 
     // =====================================================================
+    // Demo mode switcher (only rendered in --demo mode)
+    // =====================================================================
+    const DemoSwitcher = {
+      bind() {
+        const piiBtn = $('#demoTogglePii');
+        const writeBtn = $('#demoToggleWrite');
+        if (piiBtn) piiBtn.addEventListener('click', () => DemoSwitcher.toggle({ showPii: !State.showPii }));
+        if (writeBtn) writeBtn.addEventListener('click', () => DemoSwitcher.toggle({ writable: !State.writable }));
+      },
+      // Reflect the current server-side state on the two toggle pills.
+      sync() {
+        const piiBtn = $('#demoTogglePii');
+        const writeBtn = $('#demoToggleWrite');
+        if (piiBtn) {
+          piiBtn.setAttribute('aria-pressed', State.showPii ? 'true' : 'false');
+          $('#demoTogglePiiLabel').textContent = 'PII: ' + (State.showPii ? 'shown' : 'hidden');
+        }
+        if (writeBtn) {
+          writeBtn.setAttribute('aria-pressed', State.writable ? 'true' : 'false');
+          $('#demoToggleWriteLabel').textContent = 'Writes: ' + (State.writable ? 'on' : 'off');
+        }
+      },
+      // POST the toggle, then re-boot so redaction / write affordances / banners
+      // and the current view all reflect the new server-side state.
+      async toggle(patch) {
+        try {
+          await Api.demoMode(patch);
+          await boot(true);
+        } catch (err) {
+          toast('Failed to switch mode: ' + (err && err.message ? err.message : 'unknown'), 'err');
+        }
+      },
+    };
+
+    // =====================================================================
     // Init / boot
     // =====================================================================
     async function boot(reloadOnly) {
@@ -4039,12 +4160,18 @@
         State.enums = schema.enums || {};
         State.writable = schema.writable === true;
         State.showPii = schema.showPii === true;
+        State.demo = schema.demo === true;
         State.connOk = true;
         // Persistent write-mode affordances (only when the server allows writes).
         $('#writeBanner').hidden = !State.writable;
         $('#dataInsert').hidden = !State.writable;
         // Persistent unredacted-PII indicator (only under --show-pii).
         $('#piiBanner').hidden = !State.showPii;
+        // Demo banner + live switcher (only in --demo mode). Its two toggle
+        // pills reflect the current server state (which the write/PII banners
+        // above also mirror).
+        $('#demoBanner').hidden = !State.demo;
+        if (State.demo) DemoSwitcher.sync();
         $('#connDot').classList.add('ok');
         $('#connLabel').textContent = 'connected';
         const meta =
@@ -4098,6 +4225,7 @@
       SavePrompt.bind();
       RowEditor.bind();
       Palette.bind();
+      DemoSwitcher.bind();
       bindKeys();
       boot();
     }

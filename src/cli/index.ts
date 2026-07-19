@@ -14,7 +14,7 @@
  *   turbine seed                  — Run seed file
  *   turbine status                — Show schema summary
  *   turbine doctor                — Check relations for missing FK indexes (--fix emits migration)
- *   turbine studio                — Launch local read-only web UI
+ *   turbine studio                — Launch local read-only web UI (--demo for a seeded sample DB)
  *   turbine mcp                   — Start read-only MCP server over JSON-RPC stdio
  *   turbine observe               — Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
  *
@@ -123,6 +123,8 @@ export interface CliArgs {
   write?: boolean;
   /** Reveal PII-tagged column values in Studio instead of redacting (`--show-pii`). */
   showPii?: boolean;
+  /** Launch Studio with a seeded in-memory sample database (`studio --demo`). */
+  demo?: boolean;
 }
 
 export function parseArgs(argv = process.argv.slice(2)): CliArgs {
@@ -239,6 +241,9 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--show-pii':
         result.showPii = true;
+        break;
+      case '--demo':
+        result.demo = true;
         break;
       default:
         if (!arg.startsWith('-')) {
@@ -1809,7 +1814,10 @@ export function isLoopbackHost(host: string): boolean {
 
 async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
-  const url = requireUrl(config);
+  const demo = args.demo === true;
+  // Demo mode is self-contained (seeded in-memory database), so it never needs
+  // a DATABASE_URL. The placeholder is only used for display.
+  const url = demo ? 'demo://in-memory' : requireUrl(config);
 
   const port = args.port ?? 4983;
   const host = args.host ?? '127.0.0.1';
@@ -1840,7 +1848,7 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
     );
   }
 
-  const spinner = new Spinner('Introspecting database').start();
+  const spinner = new Spinner(demo ? 'Seeding demo dataset' : 'Introspecting database').start();
   let studio: { dispose: () => Promise<void>; authToken: string; url: string };
   try {
     studio = await startStudio({
@@ -1851,49 +1859,74 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
       openBrowser,
       include: config.include.length ? config.include : undefined,
       exclude: config.exclude.length ? config.exclude : undefined,
+      // Demo boots read-only + PII redacted; the flags are ignored in demo mode
+      // (the in-UI switcher controls modes live).
       write: args.write === true,
       showPii: args.showPii === true,
+      demo,
     });
-    spinner.succeed(`Studio is running`);
+    spinner.succeed(demo ? 'Demo Studio is running' : 'Studio is running');
   } catch (err) {
     spinner.fail(`Failed to start Studio: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
   }
 
-  // Loud startup warnings for the opt-in modes that widen Studio's surface.
-  if (args.write) {
+  if (demo) {
     newline();
     console.log(
-      warn(
-        'WRITE MODE is ON. Studio can update, insert, and delete single rows in ' +
-          `${redactUrl(url)}. Every change is committed directly to your database.`,
+      box(
+        [
+          `${bold('Turbine Studio')}  ${dim('DEMO MODE (seeded in-memory sample database)')}`,
+          '',
+          `  ${cyan('URL:')}    ${bold(studio.url)}`,
+          `  ${cyan('Data:')}   seeded sample dataset (users, posts, comments, orgs)`,
+          `  ${cyan('Modes:')}  switch Read-only / Show PII / Write live from inside the UI`,
+          '',
+          dim('Nothing you do here is saved anywhere. The database lives only in'),
+          dim('memory: every launch starts fresh and restarts reset all edits.'),
+          dim('Open the URL above (it carries a one-time session token).'),
+          dim('Press Ctrl+C to stop.'),
+        ].join('\n'),
+        { title: bold(cyan('Studio · demo')), padding: 1 },
       ),
     );
-  }
-  if (args.showPii) {
     newline();
-    console.log(warn('--show-pii is ON. PII-tagged column values are shown UNREDACTED in Studio.'));
-  }
+  } else {
+    // Loud startup warnings for the opt-in modes that widen Studio's surface.
+    if (args.write) {
+      newline();
+      console.log(
+        warn(
+          'WRITE MODE is ON. Studio can update, insert, and delete single rows in ' +
+            `${redactUrl(url)}. Every change is committed directly to your database.`,
+        ),
+      );
+    }
+    if (args.showPii) {
+      newline();
+      console.log(warn('--show-pii is ON. PII-tagged column values are shown UNREDACTED in Studio.'));
+    }
 
-  newline();
-  console.log(
-    box(
-      [
-        `${bold('Turbine Studio')}  ${dim(args.write ? 'local UI (WRITE MODE)' : 'local read-only UI')}`,
-        '',
-        `  ${cyan('URL:')}    ${bold(studio.url)}`,
-        `  ${cyan('Schema:')} ${config.schema}`,
-        `  ${cyan('DB:')}     ${redactUrl(url)}`,
-        `  ${cyan('Mode:')}   ${args.write ? red('read-write (single-row)') : 'read-only'}`,
-        '',
-        dim('Open the URL above in your browser. It includes a one-time session'),
-        dim('token that gets set as an HttpOnly cookie on first load.'),
-        dim('Press Ctrl+C to stop.'),
-      ].join('\n'),
-      { title: bold(cyan('Studio')), padding: 1 },
-    ),
-  );
-  newline();
+    newline();
+    console.log(
+      box(
+        [
+          `${bold('Turbine Studio')}  ${dim(args.write ? 'local UI (WRITE MODE)' : 'local read-only UI')}`,
+          '',
+          `  ${cyan('URL:')}    ${bold(studio.url)}`,
+          `  ${cyan('Schema:')} ${config.schema}`,
+          `  ${cyan('DB:')}     ${redactUrl(url)}`,
+          `  ${cyan('Mode:')}   ${args.write ? red('read-write (single-row)') : 'read-only'}`,
+          '',
+          dim('Open the URL above in your browser. It includes a one-time session'),
+          dim('token that gets set as an HttpOnly cookie on first load.'),
+          dim('Press Ctrl+C to stop.'),
+        ].join('\n'),
+        { title: bold(cyan('Studio')), padding: 1 },
+      ),
+    );
+    newline();
+  }
 
   // Wait forever until SIGINT/SIGTERM, then dispose cleanly.
   await new Promise<void>((resolve) => {
@@ -2222,7 +2255,7 @@ function showHelp(): void {
     `    ${cyan('doctor')}             Check relations for missing FK indexes ${dim('(--fix emits migration)')}`,
   );
   console.log(
-    `    ${cyan('studio')}             Launch local read-only web UI ${dim('(--write opts in to single-row writes)')}`,
+    `    ${cyan('studio')}             Launch local read-only web UI ${dim('(--write for writes, --demo for a sample DB)')}`,
   );
   console.log(`    ${cyan('mcp')}                Start read-only MCP server over stdio`);
   console.log(`    ${cyan('observe')}            Launch metrics dashboard ${dim('(requires TURBINE_OBSERVE_URL)')}`);
@@ -2259,6 +2292,9 @@ function showHelp(): void {
   );
   console.log(
     `    ${cyan('--show-pii')}           Studio: show PII-tagged values unredacted ${dim('(redacted by default)')}`,
+  );
+  console.log(
+    `    ${cyan('--demo')}               Studio: launch with a seeded in-memory sample database ${dim('(no DATABASE_URL needed; nothing is saved)')}`,
   );
   newline();
 

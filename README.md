@@ -614,7 +614,7 @@ Commands:
   seed                         Run seed file
   status                       Show database schema summary
   doctor                       Check relations for missing FK indexes (--fix emits migration)
-  studio                       Launch local Studio web UI (read-only; --write opts in to single-row writes)
+  studio                       Launch local Studio web UI (read-only; --write for writes, --demo for a sample DB)
   mcp                          Start read-only MCP server over JSON-RPC stdio
   observe                      Launch local metrics dashboard (requires TURBINE_OBSERVE_URL)
 
@@ -687,6 +687,8 @@ DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
 # With flags
 npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 ```
+
+**Try it without a database.** `npx turbine-orm@latest studio --demo` boots Studio against a seeded, in-memory sample database (users, posts, comments, orgs) with no `DATABASE_URL` and no extra dependency, backed by Turbine's own SQLite engine over `node:sqlite` (Node 22.5+). An in-UI switcher flips the three modes live (Read-only / Show PII / Write), so you can feel PII redaction and the write flow back to back. Writes genuinely apply to the in-memory store but nothing is ever saved: every launch starts fresh.
 
 **Features**
 

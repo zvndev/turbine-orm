@@ -15,6 +15,20 @@ DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
 
 Studio introspects the schema, starts an HTTP server on `127.0.0.1:4983` (Node's built-in `http` module, no extra dependencies), and opens your browser with a per-process session token in the URL.
 
+## Try it without a database
+
+No connection string, no setup: `--demo` boots Studio against a seeded, in-memory sample database so you can feel the product in ten seconds.
+
+```bash
+npx turbine-orm@latest studio --demo
+```
+
+The sample dataset (users, posts, comments, orgs, with realistic relations and two PII-tagged columns) is served from Turbine's own SQLite engine over `node:sqlite`'s `:memory:` database, so it needs no `DATABASE_URL` and adds no dependency. It requires Node 22.5+ (the built-in `node:sqlite`).
+
+From inside the UI you can flip between the three Studio modes live: a **Read-only / Show PII / Write** switcher in the demo banner toggles PII redaction and single-row writes independently, so you can try the redaction behavior and the write flow back to back without restarting. Every launch boots read-only with PII redacted.
+
+Writes genuinely apply to the in-memory store (your edits stick, a refresh shows them), but **nothing is ever saved anywhere**: the database lives only in memory, so the store dies with the process and every launch starts pristine.
+
 ## Launching
 
 ```bash
@@ -26,6 +40,7 @@ npx turbine studio --include users,posts    # only these tables
 npx turbine studio --exclude _migrations    # hide tables
 npx turbine studio --write                  # opt in to single-row writes (loud warning)
 npx turbine studio --show-pii               # reveal PII-tagged values (loud warning)
+npx turbine studio --demo                    # seeded in-memory sample DB (no DATABASE_URL)
 npx turbine studio --host 0.0.0.0 --allow-remote  # non-loopback requires explicit opt-in
 ```
 
@@ -38,6 +53,7 @@ The connection string resolves the same way as every other CLI command: `--url` 
 | `--allow-remote` | Opt in to binding on a non-loopback `--host`. Emits a loud warning and proceeds. Without this flag, Studio exits with code 1. |
 | `--write` | Enable single-row insert/update/delete from the Data tab. Read-only stays the default on every launch; the flag emits a loud startup warning and the UI shows a persistent WRITE MODE banner. |
 | `--show-pii` | Show PII-tagged column values instead of the redaction placeholder. Emits a loud startup warning. |
+| `--demo` | Launch with a seeded in-memory sample database (no `DATABASE_URL` needed; nothing is saved). Enables the in-UI Read-only / Show PII / Write switcher. Requires Node 22.5+. |
 | `--no-open` | Don't open the browser automatically. |
 | `--include <a,b>` / `--exclude <a,b>` | Limit which tables Studio sees. |
 | `--schema <name>` | Postgres schema (default: `public`). Pinned via `set_config('search_path', ...)` on every query. |
