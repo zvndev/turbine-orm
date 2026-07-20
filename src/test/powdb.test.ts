@@ -381,6 +381,73 @@ describe('powdb: wrapPowdbError', () => {
     assert.ok(wrapPowdbError({ code: 'query_failed', message: 'x' }) instanceof ValidationError);
   });
 
+  it('classifies by the typed wire error class (server >= 0.17) even when the message is sanitized', () => {
+    // The server replaces non-allowlisted messages with the generic "query
+    // execution error" text, but the class byte is derived from the typed error,
+    // so it stays accurate. Pre-0.17 behavior would have misread several of
+    // these from the message alone.
+    const sanitized = 'query execution error';
+    const timeout = wrapPowdbError({ code: 'timeout', message: sanitized, wireErrorClass: 3 });
+    assert.ok(timeout instanceof TimeoutError);
+    const limit = wrapPowdbError({ code: 'size_exceeded', message: sanitized, wireErrorClass: 4 });
+    assert.ok(limit instanceof ValidationError);
+    assert.match((limit as Error).message, /resource limit/);
+    // readonly_refused with a sanitized message: the message families cannot see
+    // "readonly mode: ..." so only the class carries the E018 routing signal.
+    const ro = wrapPowdbError({ code: 'query_failed', message: sanitized, wireErrorClass: 5 });
+    assert.ok(ro instanceof ReadOnlyError);
+    assert.equal((ro as ReadOnlyError).reason, 'snapshot');
+    const auth = wrapPowdbError({ code: 'auth_failed', message: sanitized, wireErrorClass: 6 });
+    assert.ok(auth instanceof ConnectionError);
+    const rate = wrapPowdbError({ code: 'auth_failed', message: sanitized, wireErrorClass: 7 });
+    assert.ok(rate instanceof ConnectionError);
+    assert.match((rate as Error).message, /rate-limited/);
+    const constraint = wrapPowdbError({ code: 'query_failed', message: sanitized, wireErrorClass: 8 });
+    assert.ok(constraint instanceof UniqueConstraintError);
+    const cancelled = wrapPowdbError({ code: 'query_failed', message: sanitized, wireErrorClass: 9 });
+    assert.ok(cancelled instanceof ConnectionError);
+    const parse = wrapPowdbError({ code: 'query_failed', message: sanitized, wireErrorClass: 1 });
+    assert.ok(parse instanceof ValidationError);
+  });
+
+  it('wire class 8 still extracts the constraint name when the message passed sanitization', () => {
+    const e = wrapPowdbError({
+      code: 'query_failed',
+      message: 'unique constraint violation on app_user.email',
+      wireErrorClass: 8,
+    });
+    assert.ok(e instanceof UniqueConstraintError);
+    assert.equal((e as UniqueConstraintError).constraint, 'email');
+  });
+
+  it('specific message families keep precedence over the class byte (detail extraction)', () => {
+    // A required-column violation is execution-class (2) on the wire; the
+    // message family must still win so the caller gets E010 with the column
+    // name, not a generic E003.
+    const notNull = wrapPowdbError({
+      code: 'query_failed',
+      message: "column 'email' is required but no value was provided",
+      wireErrorClass: 2,
+    });
+    assert.ok(notNull instanceof NotNullViolationError);
+    // RBAC read-only refusal is not class 5 (that is snapshot serving); the
+    // message family maps it to E018 reason rbac before the class-2 fallthrough.
+    const rbac = wrapPowdbError({
+      code: 'query_failed',
+      message: `permission denied: role 'reader' cannot execute write statements`,
+      wireErrorClass: 2,
+    });
+    assert.ok(rbac instanceof ReadOnlyError);
+    assert.equal((rbac as ReadOnlyError).reason, 'rbac');
+  });
+
+  it('class 0 (internal) and unknown future classes fall through to pre-0.17 behavior', () => {
+    const internal = wrapPowdbError({ code: 'query_failed', message: 'query execution error', wireErrorClass: 0 });
+    assert.ok(internal instanceof ValidationError); // the .code switch, as before
+    const future = wrapPowdbError({ code: 'timeout', message: 'x', wireErrorClass: 250 });
+    assert.ok(future instanceof TimeoutError); // unknown class ignored, .code wins
+  });
+
   it('maps EMBEDDED napi errors (code:GenericFailure) by message shape', () => {
     // The embedded addon tags EVERY error code:'GenericFailure' — the class can
     // only be recovered from the message. These are real engine message shapes.
@@ -2182,6 +2249,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       jsonDocs: false,
       docFieldIndexes: false,
       serverJoins: false,
+      nestedProjections: false,
       nativeRaw: false,
     });
     // 0.10: introspection only.
@@ -2215,6 +2283,16 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
     );
   });
 
+  it('gates nestedProjections at >= 0.18 (0.17 false, 0.18 true)', () => {
+    assert.equal(capabilitiesFromVersion('0.17.0').nestedProjections, false);
+    assert.equal(capabilitiesFromVersion('0.18.0').nestedProjections, true);
+    assert.equal(capabilitiesFromVersion('1.0.0').nestedProjections, true);
+    assert.throws(
+      () => requireCapability(capabilitiesFromVersion('0.17.0'), 'nestedProjections', 'nested projections'),
+      /nested projections requires PowDB >= 0\.18/,
+    );
+  });
+
   it('turns every gate OFF for an unknown / non-semver version', () => {
     const caps = capabilitiesFromVersion('preview-build');
     assert.deepEqual(caps, {
@@ -2223,6 +2301,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       jsonDocs: false,
       docFieldIndexes: false,
       serverJoins: false,
+      nestedProjections: false,
       nativeRaw: false,
     });
     assert.equal(capabilitiesFromVersion(null).engineVersion, null);
@@ -2266,6 +2345,10 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       docFieldIndexes: true,
       introspection: true,
       serverJoins: true,
+      // OFF like nativeRaw: both flip real query generation / wire paths and
+      // must only be enabled by an actual version probe (>= 0.18), never
+      // assumed for a bare-constructed pool.
+      nestedProjections: false,
       nativeRaw: false,
     });
     // A directly-constructed pool defaults to it.
@@ -3197,17 +3280,17 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
   it('the tested ceiling is the expected engine line', () => {
     // A canary: bumping the ceiling MUST be a deliberate, reviewed act (it
     // asserts the escaper was re-verified against a newer lexer).
-    assert.equal(POWQL_LEXER_TESTED_CEILING, '0.16');
+    assert.equal(POWQL_LEXER_TESTED_CEILING, '0.18');
   });
 
   it('refuses the legacy materialize path on an addon newer than the ceiling', async () => {
     // A legacy-only handle (no queryWithParams) whose capabilities claim engine
-    // 0.17.0, newer than the escaper's verified lexer range. Reaching the legacy
+    // 0.19.0, newer than the escaper's verified lexer range. Reaching the legacy
     // wire in this state is the dangerous "newer-addon-without-native" anomaly, so
     // exec() must refuse rather than inline-encode against an unverified lexer.
     const { pool, seen } = fakeEmbeddedDb(
       { kind: 'ok', affected: 1n },
-      { capabilities: capabilitiesFromVersion('0.17.0', { hasNativeRaw: true }) },
+      { capabilities: capabilitiesFromVersion('0.19.0', { hasNativeRaw: true }) },
     );
     const err = await pool.query('insert app_user { name := $1 }', ['Ada']).then(
       () => null,
@@ -3215,7 +3298,7 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
     );
     assert.ok(err instanceof ValidationError, 'refusal is a typed ValidationError');
     assert.equal((err as ValidationError).code, TurbineErrorCode.VALIDATION);
-    assert.match((err as Error).message, /0\.17\.0/, 'names the reported engine version');
+    assert.match((err as Error).message, /0\.19\.0/, 'names the reported engine version');
     assert.match((err as Error).message, new RegExp(POWQL_LEXER_TESTED_CEILING.replace('.', '\\.')));
     assert.match((err as Error).message, /queryWithParams/, 'explains the feature-detect anomaly');
     // Nothing was ever handed to the engine.

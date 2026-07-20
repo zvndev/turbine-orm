@@ -145,6 +145,29 @@ interface PowqlParentContext<T> {
   resolvedWhere: WhereClause<T> | undefined;
 }
 
+/**
+ * One planned nested-projection relation (PowDB >= 0.18 shaped results): the
+ * compile-side inputs for its `name: Target as tN filter … { … }` block plus
+ * everything the post-execution attach pass needs to shape the JSON children
+ * back into typed entities. Built by {@link PowqlInterface.planNestedRelation}
+ * (which returns `null` for any ineligible shape — a silent loader fallback,
+ * never an error) and consumed by {@link PowqlInterface.buildNestedBlock} /
+ * {@link PowqlInterface.attachNestedRows}.
+ */
+interface NestedRelationPlan {
+  relName: string;
+  rel: RelationDef;
+  options: FindManyArgs<object> & { with?: Record<string, unknown> };
+  /** A fresh interface over the relation target (compile + coercion metadata). */
+  targetQi: PowqlInterface<object>;
+  /** to-one (belongsTo / hasOne): emit `limit 1` and unwrap `[0] ?? null`. */
+  single: boolean;
+  /** Projected child columns (snake names, select/omit/PII already applied). */
+  cols: string[];
+  /** Sub-plans for the relation's own `with` (every level proved eligible). */
+  children: NestedRelationPlan[];
+}
+
 /** Operator keys recognised inside a `WhereOperator` object. */
 const OPERATOR_KEYS = new Set([
   'equals',
@@ -1039,12 +1062,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     return this.withMiddleware('findMany', args as unknown as Record<string, unknown>, async () => {
-      const { rows, native, resolvedWhere } = await this.runFind(args, 'findMany');
+      const { rows, native, resolvedWhere, nestedPlans, residualWith } = await this.runFind(args, 'findMany');
       const entities = this.shape(rows, native);
-      if (args.with) {
+      if (nestedPlans.length) this.attachNestedRows(entities, nestedPlans);
+      if (residualWith) {
         await this.loadRelations(
           entities,
-          args.with as Record<string, unknown>,
+          residualWith,
           args.timeout,
           0,
           { args, resolvedWhere },
@@ -1056,28 +1080,64 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * Compile the flat findMany select into PowQL (no execution), pushing values
-   * into `params`. Returns the query plus the RESOLVED where (relation filters
+   * Compile the findMany select into PowQL (no execution), pushing values into
+   * `params`. Returns the query plus the RESOLVED where (relation filters
    * already collapsed to literal in-lists) so the F2 join path can re-emit the
    * exact parent predicate alias-qualified, and so {@link explain} can wrap it.
+   *
+   * When the engine supports nested projections (>= 0.18) and the strategy
+   * does not opt out, eligible `with` relations compile INTO this statement as
+   * nested-projection blocks (`nestedPlans`) — one round-trip for the whole
+   * shape — and only the ineligible remainder (`residualWith`) goes to the
+   * post-execution loaders. Without nesting the emitted PowQL is byte-identical
+   * to the pre-0.18 output (no alias, `.col` refs).
    */
   private async buildFind(
     args: FindManyArgs<T>,
     params: unknown[],
-  ): Promise<{ powql: string; resolvedWhere: WhereClause<T> | undefined }> {
+  ): Promise<{
+    powql: string;
+    resolvedWhere: WhereClause<T> | undefined;
+    nestedPlans: NestedRelationPlan[];
+    residualWith: Record<string, unknown> | undefined;
+  }> {
     if ((args as { cursor?: unknown }).cursor) {
       throw new UnsupportedFeatureError('cursor pagination', 'PowDB', 'use limit/offset instead');
     }
     const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
-    const where = this.buildWhere(resolvedWhere, params);
     const cols = this.projectedColumns(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       args.includePii === true,
     );
+
+    // Partition the `with` clause: nested-projection blocks vs loader residue.
+    // A parent `distinct` never nests (distinct over a row containing a JSON
+    // array is not a defined comparison), and a relation whose field name
+    // collides with a projected parent column stays on the loaders (its block
+    // key would duplicate the column's).
+    const withClause = args.with as Record<string, unknown> | undefined;
+    const nestedPlans: NestedRelationPlan[] = [];
+    let residualWith = withClause;
+    if (withClause && !args.distinct?.length && this.nestedProjectionsPreferred(args)) {
+      const residue: Record<string, unknown> = {};
+      for (const [relName, opt] of Object.entries(withClause)) {
+        if (!opt) continue;
+        const rel = this.meta.relations[relName];
+        const plan =
+          rel && !cols.includes(relName) ? this.planNestedRelation(relName, rel, opt, args.includePii === true) : null;
+        if (plan) nestedPlans.push(plan);
+        else residue[relName] = opt; // unknown relation: the loader raises its E003
+      }
+      residualWith = Object.keys(residue).length ? residue : undefined;
+    }
+
+    const nest = nestedPlans.length > 0;
+    const alias = nest ? 't0' : undefined;
+    const where = this.buildWhere(resolvedWhere, params, alias);
     const distinct = args.distinct?.length ? ' distinct' : '';
     const filter = where ? ` filter ${where}` : '';
-    const order = this.buildOrder(args.orderBy, params);
+    const order = this.buildOrder(args.orderBy, params, alias);
     const limit = args.limit ?? (args as { take?: number }).take ?? this.defaultLimit;
     if (limit === undefined && this.warnOnUnlimited && !this.warnedUnlimited) {
       this.warnedUnlimited = true;
@@ -1085,19 +1145,38 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
     const limitClause = limit !== undefined ? ` limit ${this.param(limit, params)}` : '';
     const offsetClause = args.offset ? ` offset ${this.param(args.offset, params)}` : '';
-    const powql = `${this.qt}${distinct}${filter}${order}${limitClause}${offsetClause} ${this.projection(cols)}`;
-    return { powql, resolvedWhere };
+    let projection: string;
+    if (nest) {
+      // Aliased scan: every parent column keys itself (`col: t0.col`) so the
+      // result columns keep their bare snake names, then the nested blocks.
+      const aliasCtr = { n: 1 };
+      const parts = cols.map((c) => `${quotePowqlIdent(c)}: t0.${quotePowqlIdent(c)}`);
+      for (const plan of nestedPlans) {
+        parts.push(await this.buildNestedBlock(plan, 't0', aliasCtr, params, args.timeout));
+      }
+      projection = `{ ${parts.join(', ')} }`;
+    } else {
+      projection = this.projection(cols);
+    }
+    const powql = `${this.qt}${nest ? ' as t0' : ''}${distinct}${filter}${order}${limitClause}${offsetClause} ${projection}`;
+    return { powql, resolvedWhere, nestedPlans, residualWith };
   }
 
-  /** Build + run the flat findMany select; returns raw rows, the serving wire, and the resolved where. */
+  /** Build + run the findMany select; returns raw rows, the serving wire, the resolved where, and the `with` partition. */
   private async runFind(
     args: FindManyArgs<T>,
     action = 'findMany',
-  ): Promise<{ rows: Record<string, unknown>[]; native: boolean; resolvedWhere: WhereClause<T> | undefined }> {
+  ): Promise<{
+    rows: Record<string, unknown>[];
+    native: boolean;
+    resolvedWhere: WhereClause<T> | undefined;
+    nestedPlans: NestedRelationPlan[];
+    residualWith: Record<string, unknown> | undefined;
+  }> {
     const params: unknown[] = [];
-    const { powql, resolvedWhere } = await this.buildFind(args, params);
+    const { powql, resolvedWhere, nestedPlans, residualWith } = await this.buildFind(args, params);
     const { rows, native } = await this.exec(powql, params, args.timeout, action);
-    return { rows, native, resolvedWhere };
+    return { rows, native, resolvedWhere, nestedPlans, residualWith };
   }
 
   /**
@@ -1127,36 +1206,30 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
     return this.withMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
-      const { rows, native } = await this.runFind({ ...args, limit: 1 } as FindManyArgs<T>, 'findUnique');
+      const { rows, native, nestedPlans, residualWith } = await this.runFind(
+        { ...args, limit: 1 } as FindManyArgs<T>,
+        'findUnique',
+      );
       if (!rows.length) return null;
       const entities = this.shape(rows, native);
-      if (args.with)
-        await this.loadRelations(
-          entities,
-          args.with as Record<string, unknown>,
-          args.timeout,
-          0,
-          undefined,
-          args.includePii === true,
-        );
+      if (nestedPlans.length) this.attachNestedRows(entities, nestedPlans);
+      if (residualWith)
+        await this.loadRelations(entities, residualWith, args.timeout, 0, undefined, args.includePii === true);
       return entities[0]!;
     });
   }
 
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
     return this.withMiddleware('findFirst', args as unknown as Record<string, unknown>, async () => {
-      const { rows, native } = await this.runFind({ ...args, limit: 1 } as FindManyArgs<T>, 'findFirst');
+      const { rows, native, nestedPlans, residualWith } = await this.runFind(
+        { ...args, limit: 1 } as FindManyArgs<T>,
+        'findFirst',
+      );
       if (!rows.length) return null;
       const entities = this.shape(rows, native);
-      if (args.with)
-        await this.loadRelations(
-          entities,
-          args.with as Record<string, unknown>,
-          args.timeout,
-          0,
-          undefined,
-          args.includePii === true,
-        );
+      if (nestedPlans.length) this.attachNestedRows(entities, nestedPlans);
+      if (residualWith)
+        await this.loadRelations(entities, residualWith, args.timeout, 0, undefined, args.includePii === true);
       return entities[0]!;
     });
   }
@@ -1708,6 +1781,170 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if (v instanceof Date) return (BigInt(v.getTime()) * 1000n).toString();
     if (typeof v === 'bigint') return v.toString();
     return String(v);
+  }
+
+  // -------------------------------------------------------------------------
+  // Nested relations: nested projections / shaped results (PowDB >= 0.18)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Should this query's `with` compile to nested-projection blocks? Requires
+   * the engine capability (>= 0.18), and an EXPLICIT `relationLoadStrategy:
+   * 'batched'` (per-query or client-level) opts back out to the keyed loaders.
+   * The default and `'join'` both prefer nesting: unlike the F2 INNER join it
+   * has no fan-out, keeps childless parents, works under parent paging, and
+   * applies per-parent `order`/`limit`/`offset` natively, so it is the
+   * strictly-better single-statement path wherever it is eligible. Ineligible
+   * relations fall through to the existing strategy resolution untouched.
+   */
+  private nestedProjectionsPreferred(args: FindManyArgs<T>): boolean {
+    if (!this.capabilities.nestedProjections) return false;
+    const explicit = args.relationLoadStrategy ?? this.options.relationLoadStrategy;
+    return explicit !== 'batched';
+  }
+
+  /**
+   * Plan one `with` relation as a nested-projection block, or return `null`
+   * when the shape must stay on the loaders (ALWAYS a silent fallback with
+   * identical output, never an error):
+   *   - m2m (the block takes exactly one child table; the junction-order
+   *     stitch has no nested equivalent), and composite relation keys;
+   *   - a to-one relation carrying `limit`/`offset` (the loaders' semantics);
+   *   - `distinct` inside the relation options (no nested grammar for it);
+   *   - a projected child column whose tsType is `bigint` or `Uint8Array`
+   *     (values ride a JSON array, which cannot carry them losslessly);
+   *   - a projection key collision (a child column named like a sub-relation);
+   *   - depth >= 10 (the loader path enforces the same cap by throwing, so the
+   *     fallback surfaces the identical E003 today's users get);
+   *   - any ineligible descendant (the WHOLE relation falls back, so one
+   *     statement never mixes nested and loader semantics mid-subtree).
+   */
+  private planNestedRelation(
+    relName: string,
+    rel: RelationDef,
+    opt: unknown,
+    includePii: boolean,
+    depth = 0,
+  ): NestedRelationPlan | null {
+    if (depth >= 10) return null;
+    if (rel.type === 'manyToMany') return null;
+    if (normalizeKeyColumns(rel.foreignKey).length > 1 || normalizeKeyColumns(rel.referenceKey).length > 1) {
+      return null;
+    }
+    if (!this.schema.tables[rel.to]) return null; // the loader raises its own error
+    const options = (opt === true ? {} : opt) as FindManyArgs<object> & { with?: Record<string, unknown> };
+    if (options.distinct?.length) return null;
+    const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
+    if (single && (options.limit !== undefined || options.offset)) return null;
+    const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
+    const cols = targetQi.projectedColumns(
+      options.select as Record<string, boolean> | undefined,
+      options.omit as Record<string, boolean> | undefined,
+      includePii,
+    );
+    const byName = new Map(targetQi.meta.columns.map((c) => [c.name, c]));
+    for (const c of cols) {
+      const ts = (byName.get(c)?.tsType ?? '').replace(/\s*\|\s*null$/i, '').trim();
+      if (ts === 'bigint' || ts === 'Uint8Array') return null;
+    }
+    const children: NestedRelationPlan[] = [];
+    if (options.with) {
+      for (const [subName, subOpt] of Object.entries(options.with)) {
+        if (!subOpt) continue;
+        const subRel = targetQi.meta.relations[subName];
+        if (!subRel) return null; // let the loader raise its unknown-relation error
+        const child = targetQi.planNestedRelation(subName, subRel, subOpt, includePii, depth + 1);
+        if (!child) return null;
+        children.push(child);
+      }
+    }
+    // The block's object keys are the projected snake column names plus the
+    // sub-relation field names; a duplicate key would mis-shape the JSON.
+    const keys = new Set(cols);
+    for (const child of children) {
+      if (keys.has(child.relName)) return null;
+      keys.add(child.relName);
+    }
+    return { relName, rel, options, targetQi, single, cols, children };
+  }
+
+  /**
+   * Compile one {@link NestedRelationPlan} into its projection-field block:
+   * `name: Target as tN filter <correlation> [and (<child where>)] [order …]
+   * [limit …] [offset …] { col: tN.col, …, <sub-blocks> }`. Params bind in
+   * emission order (the projection is the statement's final clause, so nested
+   * params always follow the parent's filter/order/limit/offset params).
+   * Aliases share the parent statement's counter, so arbitrarily deep and
+   * self-referential trees stay collision-free (the same discipline as the SQL
+   * engine's json_agg subqueries).
+   */
+  private async buildNestedBlock(
+    plan: NestedRelationPlan,
+    parentAlias: string,
+    aliasCtr: { n: number },
+    params: unknown[],
+    timeout?: number,
+  ): Promise<string> {
+    const { rel, relName, targetQi, options, single } = plan;
+    const alias = `t${aliasCtr.n++}`;
+    const fk = normalizeKeyColumns(rel.foreignKey)[0]!;
+    const rk = normalizeKeyColumns(rel.referenceKey)[0]!;
+    const parentKeyCol = rel.type === 'belongsTo' ? fk : rk;
+    const childKeyCol = rel.type === 'belongsTo' ? rk : fk;
+    // Exactly one equi-correlation predicate (the 0.18 correlation rule); the
+    // child where chains behind it as a parenthesized `and` group, which the
+    // grammar accepts even when the group itself contains `or`.
+    const correlation = `${alias}.${quotePowqlIdent(childKeyCol)} = ${parentAlias}.${quotePowqlIdent(parentKeyCol)}`;
+    const resolved = await targetQi.resolveRelationFilters(options.where as WhereClause<object>, timeout);
+    const childWhere = targetQi.buildWhere(resolved, params, alias);
+    const filter = childWhere ? `${correlation} and (${childWhere})` : correlation;
+    const order = targetQi.buildOrder(options.orderBy, params, alias);
+    const limitClause = single
+      ? ' limit 1'
+      : options.limit !== undefined
+        ? ` limit ${this.param(options.limit, params)}`
+        : '';
+    const offsetClause = !single && options.offset ? ` offset ${this.param(options.offset, params)}` : '';
+    const parts = plan.cols.map((c) => `${quotePowqlIdent(c)}: ${alias}.${quotePowqlIdent(c)}`);
+    for (const child of plan.children) {
+      parts.push(await targetQi.buildNestedBlock(child, alias, aliasCtr, params, timeout));
+    }
+    return (
+      `${quotePowqlIdent(relName)}: ${targetQi.qt} as ${alias} ` +
+      `filter ${filter}${order}${limitClause}${offsetClause} { ${parts.join(', ')} }`
+    );
+  }
+
+  /**
+   * Shape the nested JSON children back into typed entities on every parent
+   * row. The nested field arrives as a decoded JSON array on the native wire
+   * (or JSON text on the legacy wire — parsed here); its values are real JSON
+   * types, so each child object goes through the NATIVE coercion policy
+   * (`rowToEntity(…, true)`: a date column's micros number becomes a `Date`, a
+   * json column's document passes through, a str `"null"` stays a string).
+   * to-one relations unwrap to `[0] ?? null`, matching the loaders exactly.
+   */
+  private attachNestedRows(entities: T[], plans: NestedRelationPlan[]): void {
+    for (const entity of entities) {
+      for (const plan of plans) this.attachOneNested(entity as Record<string, unknown>, plan);
+    }
+  }
+
+  private attachOneNested(row: Record<string, unknown>, plan: NestedRelationPlan): void {
+    let value = row[plan.relName];
+    if (typeof value === 'string') {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = [];
+      }
+    }
+    const items = Array.isArray(value) ? value : [];
+    const shaped = items.map((o) => rowToEntity(o as Record<string, unknown>, plan.targetQi.meta, true));
+    for (const child of shaped) {
+      for (const sub of plan.children) plan.targetQi.attachOneNested(child, sub);
+    }
+    row[plan.relName] = plan.single ? (shaped[0] ?? null) : shaped;
   }
 
   // -------------------------------------------------------------------------

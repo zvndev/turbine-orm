@@ -23,7 +23,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe } from 'node:test';
@@ -36,7 +37,13 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from '../errors.js';
-import { introspectPowdbDatabase, PowdbJsonParam, powqlSchemaDDL, turbinePowDB } from '../powdb.js';
+import {
+  capabilitiesFromVersion,
+  introspectPowdbDatabase,
+  PowdbJsonParam,
+  powqlSchemaDDL,
+  turbinePowDB,
+} from '../powdb.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
 
@@ -1855,5 +1862,186 @@ describe('powdb integration (embedded): NUL bytes in non-unique indexed strings 
       await db.disconnect();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Nested projections (shaped results, PowDB >= 0.18) — live through the addon.
+// Gated separately: CI on a 0.17 addon skips these cleanly (the capability is
+// version-derived), a >= 0.18 addon runs them against the real engine.
+// ---------------------------------------------------------------------------
+
+let embeddedNestedProjections = false;
+try {
+  const req = createRequire(import.meta.url);
+  const pkg = JSON.parse(readFileSync(req.resolve('@zvndev/powdb-embedded/package.json'), 'utf8')) as {
+    version?: string;
+  };
+  embeddedNestedProjections = embeddedAvailable && capabilitiesFromVersion(pkg.version).nestedProjections;
+} catch {
+  embeddedNestedProjections = false;
+}
+const { it: nestedIt } = skipGate(
+  !embeddedNestedProjections,
+  'requires @zvndev/powdb-embedded >= 0.18 (nested projections)',
+);
+
+const nestedSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    n_user: makeTable(
+      'n_user',
+      [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('name', 'name', 'string', 'text'),
+        col('joined_at', 'joinedAt', 'Date', 'timestamptz', { nullable: true }),
+      ],
+      {
+        posts: {
+          type: 'hasMany',
+          name: 'posts',
+          from: 'n_user',
+          to: 'n_post',
+          foreignKey: 'author_id',
+          referenceKey: 'id',
+        },
+        profile: {
+          type: 'hasOne',
+          name: 'profile',
+          from: 'n_user',
+          to: 'n_profile',
+          foreignKey: 'user_id',
+          referenceKey: 'id',
+        },
+      },
+    ),
+    n_post: makeTable(
+      'n_post',
+      [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('author_id', 'authorId', 'string', 'text'),
+        col('title', 'title', 'string', 'text'),
+        col('views', 'views', 'number', 'int4', { nullable: true }),
+        col('draft_notes', 'draftNotes', 'string', 'text', { nullable: true, pii: true }),
+      ],
+      {
+        author: {
+          type: 'belongsTo',
+          name: 'author',
+          from: 'n_post',
+          to: 'n_user',
+          foreignKey: 'author_id',
+          referenceKey: 'id',
+        },
+      },
+    ),
+    n_profile: makeTable('n_profile', [
+      col('id', 'id', 'string', 'text', { hasDefault: true }),
+      col('user_id', 'userId', 'string', 'text'),
+      col('bio', 'bio', 'string', 'text', { nullable: true }),
+    ]),
+  },
+};
+
+async function withNestedDb(fn: (db: DB, sqls: string[]) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'powdb-nested-it-'));
+  const db: DB = await turbinePowDB({ embedded: dir }, nestedSchema, { warnOnUnlimited: false });
+  const sqls: string[] = [];
+  db.$on('query', (e: { sql: string }) => sqls.push(e.sql));
+  try {
+    for (const stmt of powqlSchemaDDL(nestedSchema)) await db.raw([stmt]);
+    // Ada: three posts + a profile; Bob: none of either.
+    await db.nUser.create({ data: { id: 'u1', name: 'Ada', joinedAt: new Date('2026-01-02T03:04:05Z') } });
+    await db.nUser.create({ data: { id: 'u2', name: 'Bob' } });
+    await db.nProfile.create({ data: { id: 'pr1', userId: 'u1', bio: 'pioneer' } });
+    await db.nPost.create({ data: { id: 'p1', authorId: 'u1', title: 'Alpha', views: 5, draftNotes: 'secret-a' } });
+    await db.nPost.create({ data: { id: 'p2', authorId: 'u1', title: 'Beta', views: 50, draftNotes: 'secret-b' } });
+    await db.nPost.create({ data: { id: 'p3', authorId: 'u1', title: 'Gamma', views: 20 } });
+    sqls.length = 0;
+    await fn(db, sqls);
+  } finally {
+    await db.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('powdb integration (embedded): nested projections (0.18 shaped results)', () => {
+  nestedIt('loads an eligible with in ONE statement, per-parent order/limit, childless kept', async () => {
+    await withNestedDb(async (db, sqls) => {
+      const users = await db.nUser.findMany({
+        orderBy: { id: 'asc' },
+        with: {
+          posts: { where: { views: { gt: 10 } }, orderBy: { views: 'desc' }, limit: 1 },
+          profile: true,
+        },
+      });
+      assert.equal(sqls.length, 1, `expected one statement, saw: ${sqls.join(' | ')}`);
+      assert.match(sqls[0]!, / as t0/);
+      assert.equal(users.length, 2);
+      // Ada: top post by views above 10, profile object.
+      assert.deepEqual(
+        users[0].posts.map((p: { title: string }) => p.title),
+        ['Beta'],
+      );
+      assert.equal(users[0].profile.bio, 'pioneer');
+      // Bob: childless keeps [] and null, the row is never dropped.
+      assert.deepEqual(users[1].posts, []);
+      assert.equal(users[1].profile, null);
+    });
+  });
+
+  nestedIt('matches the batched loaders exactly (deepEqual, dates included)', async () => {
+    await withNestedDb(async (db, sqls) => {
+      const args = {
+        orderBy: { id: 'asc' },
+        with: {
+          posts: { orderBy: { views: 'asc' }, with: { author: true } },
+          profile: true,
+        },
+      };
+      const nested = await db.nUser.findMany(args);
+      assert.equal(sqls.length, 1, 'nested path is a single statement');
+      sqls.length = 0;
+      const batched = await db.nUser.findMany({ ...args, relationLoadStrategy: 'batched' });
+      assert.ok(sqls.length > 1, 'batched path issues loader statements');
+      assert.deepEqual(nested, batched);
+      // The multi-level author round-trips its Date through the nested JSON.
+      assert.ok(nested[0].posts[0].author.joinedAt instanceof Date);
+      assert.equal(nested[0].posts[0].author.joinedAt.getTime(), Date.parse('2026-01-02T03:04:05Z'));
+    });
+  });
+
+  nestedIt('PII-tagged child columns stay out of the nested projection', async () => {
+    await withNestedDb(async (db) => {
+      const users = await db.nUser.findMany({ where: { id: 'u1' }, with: { posts: { orderBy: { views: 'asc' } } } });
+      for (const p of users[0].posts) assert.ok(!('draftNotes' in p), 'pii column excluded by default');
+      const revealed = await db.nUser.findMany({
+        where: { id: 'u1' },
+        with: { posts: { orderBy: { views: 'asc' } } },
+        includePii: true,
+      });
+      assert.equal(revealed[0].posts[0].draftNotes, 'secret-a');
+    });
+  });
+
+  nestedIt('findUnique + relation select/omit shapes match the loaders', async () => {
+    await withNestedDb(async (db, sqls) => {
+      const u = await db.nUser.findUnique({
+        where: { id: 'u1' },
+        with: { posts: { select: { title: true }, orderBy: { title: 'asc' } } },
+      });
+      assert.equal(sqls.length, 1);
+      assert.deepEqual(u.posts, [
+        { id: 'p1', title: 'Alpha' },
+        { id: 'p2', title: 'Beta' },
+        { id: 'p3', title: 'Gamma' },
+      ]);
+      const viaLoader = await db.nUser.findUnique({
+        where: { id: 'u1' },
+        with: { posts: { select: { title: true }, orderBy: { title: 'asc' } } },
+        relationLoadStrategy: 'batched',
+      });
+      assert.deepEqual(u.posts, viaLoader.posts);
+    });
   });
 });

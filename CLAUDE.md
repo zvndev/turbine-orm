@@ -309,9 +309,30 @@ src/
                       index v3, auto-rebuilt on first writable open; a READ-ONLY open rebuilds in
                       memory every open until a writable open persists it, documented on the
                       engines page); driver spec byte-identical, lexer untouched (verified), so
-                      POWQL_LEXER_TESTED_CEILING bumped to '0.16' and deps to ^0.16.0; a live NUL
+                      a live NUL
                       regression test in powdb.integration.test.ts fails on the 0.15 addon and
-                      passes on 0.16. See
+                      passes on 0.16. **0.17/0.18 round (v0.39):** wrapPowdbError classifies by the
+                      0.17 typed wire error class (`err.wireErrorClass`, networked) BEFORE the
+                      generic message regexes but AFTER the detail-extracting message families
+                      (class 3→E002, 4→E003, 5→E018 snapshot, 6/7→E004, 8→E008, 9→E004 final,
+                      1/2→E003; 0/unknown falls through), so sanitized messages still classify
+                      right. **Nested projections (0.18, `nestedProjections` capability):**
+                      eligible `with` clauses compile INTO the parent statement as correlated
+                      nested-projection blocks (buildFind partitions with → nestedPlans +
+                      residualWith; planNestedRelation / buildNestedBlock / attachNestedRows in
+                      powql.ts) — per-parent order/limit/offset native, childless parents keep
+                      []/null, recursion shares one alias counter (t0/t1/…), child JSON re-coerced
+                      per column (rowToEntity native policy; date micros→Date). DEFAULT on >=0.18
+                      (explicit 'batched' opts out; 'join' also prefers nesting); silent loader
+                      fallback for m2m, bigint/bytes child columns, to-one paging, parent
+                      distinct, projection-key collisions, ineligible descendants (whole relation
+                      falls back), depth >= 10. `nestedProjections` stays OFF in
+                      ALL_POWDB_CAPABILITIES (like nativeRaw: it flips real query generation, so
+                      only a genuine version probe enables it). Ceiling: lexer verified
+                      byte-identical 0.16→0.18, POWQL_LEXER_TESTED_CEILING '0.18', deps ^0.17.0
+                      (0.18 npm publish pending upstream; feature lights up via the version
+                      probe). Unit tests src/test/powdb-nested.test.ts; live 0.18 coverage in
+                      powdb.integration.test.ts skip-gates on the addon version. See
                       `docs/internal/strategy/powdb-parity-matrix.md` (local-only, untracked).
 
   errors.ts         — Error hierarchy rooted at TurbineError. Each error has a code

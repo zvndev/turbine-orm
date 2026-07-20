@@ -314,12 +314,19 @@ export interface PowdbCapabilities {
   introspection: boolean;
   /** ≥ 0.13: server-side joins, hash-accelerated and bounded. */
   serverJoins: boolean;
+  /**
+   * ≥ 0.18: nested projections (shaped results) — a projection field may be a
+   * whole correlated child query returning a per-parent JSON array. When set,
+   * eligible `with` clauses compile into the parent statement instead of the
+   * batched loaders.
+   */
+  nestedProjections: boolean;
   /** Networked only: server ≥ 0.13 AND the client exposes `queryNativeRaw`. */
   nativeRaw: boolean;
 }
 
 /** The feature-gate capability keys (everything except the version/nativeRaw metadata). */
-type PowdbFeatureKey = 'jsonDocs' | 'docFieldIndexes' | 'introspection' | 'serverJoins';
+type PowdbFeatureKey = 'jsonDocs' | 'docFieldIndexes' | 'introspection' | 'serverJoins' | 'nestedProjections';
 
 /** Minimum engine version each gated feature needs, for the E017 hint text. */
 const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
@@ -327,6 +334,7 @@ const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
   jsonDocs: '0.12',
   docFieldIndexes: '0.13',
   serverJoins: '0.13',
+  nestedProjections: '0.18',
 };
 
 /**
@@ -335,7 +343,9 @@ const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
  * did not go through {@link turbinePowDB}'s version probe (e.g. an injected
  * pool, or a unit-test pool). `nativeRaw` stays OFF here because it flips the
  * actual wire path and must only be enabled after a real server-version probe,
- * never inferred from a bare construction.
+ * never inferred from a bare construction. `nestedProjections` stays OFF for
+ * the same reason: it changes the generated PowQL for every `with` query, and
+ * an unprobed engine below 0.18 would reject the syntax outright.
  */
 export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   engineVersion: null,
@@ -343,6 +353,7 @@ export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   docFieldIndexes: true,
   introspection: true,
   serverJoins: true,
+  nestedProjections: false,
   nativeRaw: false,
 };
 
@@ -376,6 +387,7 @@ export function capabilitiesFromVersion(
       docFieldIndexes: false,
       introspection: false,
       serverJoins: false,
+      nestedProjections: false,
       nativeRaw: false,
     };
   }
@@ -385,6 +397,7 @@ export function capabilitiesFromVersion(
     jsonDocs: atLeastVersion(sem, 0, 12),
     docFieldIndexes: atLeastVersion(sem, 0, 13),
     serverJoins: atLeastVersion(sem, 0, 13),
+    nestedProjections: atLeastVersion(sem, 0, 18),
     nativeRaw: Boolean(opts.hasNativeRaw) && atLeastVersion(sem, 0, 13),
   };
 }
@@ -836,7 +849,10 @@ export function rowToEntity(
  *     `Execution("type mismatch …")`, `Parse(…)`, `StorageError(…)`).
  *
  * So we always run the unique-constraint and message-shape checks first (they
- * fire for both transports), then fall through to the networked `.code` switch.
+ * fire for both transports and extract detail like constraint / column names),
+ * then classify by the typed wire error class (`.wireErrorClass`, networked
+ * server >= 0.17 — accurate even when the server sanitized the message text),
+ * then fall through to the networked `.code` switch.
  */
 export function wrapPowdbError(err: unknown): Error {
   if (!err || typeof err !== 'object') return new ConnectionError(`[turbine] PowDB error: ${String(err)}`);
@@ -931,6 +947,53 @@ export function wrapPowdbError(err: unknown): Error {
   // that fix-hint intact so the caller knows how to make the join eligible.
   if (/nested-loop join would evaluate|join result exceeds row limit/i.test(msg)) {
     return new ValidationError(`[turbine] PowDB join rejected: ${msg}`);
+  }
+
+  // Typed wire error class (networked, server >= 0.17): the client surfaces the
+  // stable one-byte class from the error frame as `.wireErrorClass`. Classify by
+  // it BEFORE the generic message regexes: the server sanitizes non-allowlisted
+  // messages to the generic "query execution error" text, but the class is
+  // derived from the typed error at response-build time, so it stays accurate
+  // when the message no longer is. The specific message families above still run
+  // first because they extract richer detail (constraint / column names) that
+  // the class byte cannot carry. Class values are append-only wire contract
+  // (docs/errors.md upstream); unknown / absent classes fall through to the
+  // pre-0.17 message + `.code` behavior.
+  const wireClass = (err as { wireErrorClass?: unknown }).wireErrorClass;
+  if (typeof wireClass === 'number') {
+    switch (wireClass) {
+      case 3: // timeout (per-query budget, gate wait, idle timeout) — retryable
+        return new TimeoutError(0, 'PowDB query', { message: `[turbine] PowDB ${msg}`, cause: err });
+      case 4: // limit_exceeded (memory / size budget) — a query-shape defect
+        return new ValidationError(`[turbine] PowDB resource limit exceeded: ${msg}`);
+      case 5: // readonly_refused — the snapshot-serving routing signal
+        return new ReadOnlyError(`PowDB refused a write on a read-only database: ${msg}.`, {
+          cause: err,
+          reason: 'snapshot',
+        });
+      case 6: // auth_failed at CONNECT
+        return new ConnectionError(
+          `[turbine] PowDB authentication failed: ${msg} (check the user / password / dbName for this connection).`,
+          { cause: err },
+        );
+      case 7: // rate_limited (repeated bad auth) — connection-establishment class
+        return new ConnectionError(
+          `[turbine] PowDB rate-limited this address after repeated failed authentication: ${msg}. Wait before retrying.`,
+          { cause: err },
+        );
+      case 8: {
+        // constraint_violation — today that is always a unique index
+        const m = /on\s+\S+\.(\w+)/i.exec(msg);
+        return new UniqueConstraintError({ constraint: m?.[1], cause: err as Error });
+      }
+      case 9: // cancelled (issuing client disconnected) — final, never retry
+        return new ConnectionError(`[turbine] PowDB query cancelled by client disconnect: ${msg}`, { cause: err });
+      case 1: // parse
+      case 2: // execution
+        return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
+      default: // internal (0) or an unknown future class: fall through
+        break;
+    }
   }
   // Type mismatch / parse / execution / storage / unexpected(token) / row too
   // large → validation (E003). On the embedded transport these are the only
@@ -1716,7 +1779,7 @@ export function encodePowqlLiteral(value: unknown): string {
  * the ceiling yet still routes through the string wire is refused rather than
  * materialized.
  */
-export const POWQL_LEXER_TESTED_CEILING = '0.16';
+export const POWQL_LEXER_TESTED_CEILING = '0.18';
 
 /** Escape a string into a PowQL `"…"` literal, matching the engine lexer's escape rules. */
 function encodePowqlString(s: string): string {

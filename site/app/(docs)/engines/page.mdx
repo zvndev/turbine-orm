@@ -218,7 +218,7 @@ Embedded keeps a real storage engine (indexes, WAL) *and* has a networked siblin
 
 PowDB is a younger, intentionally smaller engine, so Turbine's PowQL backend differs from the SQL path in a few honest ways:
 
-- **Nested `with` uses batched loaders by default, native joins on request.** PowDB has no `json_agg`/link-navigation, so by default each relation level — including **many-to-many through a junction table** — is a separate batched lookup (keys chunked at 1,000). As of v0.35, passing `relationLoadStrategy: 'join'` (per query or in `turbinePowDB` options) compiles eligible top-level relations to **native server-side PowQL joins** instead — see the joins section below. Output is identical either way.
+- **Nested `with` runs as one statement on engine 0.18+.** PowDB 0.18's **nested projections** let a PowQL projection field be a whole correlated child query, so Turbine compiles eligible `with` clauses straight into the parent statement — the same single-query shape its `json_agg` strategy gives Postgres — with per-parent `orderBy`/`limit` applied natively and childless parents kept. See the nested projections section below. On older engines (and for ineligible shapes such as **many-to-many through a junction table**) each relation level is a separate batched lookup (keys chunked at 1,000), and as of v0.35 `relationLoadStrategy: 'join'` can compile eligible top-level relations to native server-side PowQL joins. Output is identical on every path.
 - **Primary keys can be server-assigned _or_ client-assigned.** Declare an `auto` int PK (`isGenerated`) and PowDB assigns a monotonic id on `create` (read back automatically); otherwise a defaulted string PK gets a client-generated UUID.
 - **Relation filters resolve to a literal list, not a subquery.** `where: { tags: { some } }` runs the inner predicate first and filters with `in (<keys>)` — one extra round-trip, but it sidesteps a PowDB engine quirk where a repeated `in (<subquery>)` of the same shape can return a stale cached result. Correct on every cardinality and nesting level.
 - **Nested writes run as one flat transaction.** `create`/`update` with relation ops (`create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert` on hasMany/hasOne/belongsTo) commit or roll back together. PowDB is single-writer with one global write lock, so top-level `$transaction` calls **queue FIFO** (as of v0.30) instead of failing — a second concurrent transaction waits for the first to finish rather than throwing. A **re-entrant / nested** `$transaction` still throws `UnsupportedFeatureError` immediately, since PowDB has no savepoints and waiting on the lock it already holds would deadlock. Cap the wait with `transactionQueueTimeoutMs` (default `30000`; `0` or `Infinity` waits forever) — on elapse the queued transaction rejects with `TimeoutError` (`TURBINE_E002`).
@@ -238,9 +238,28 @@ PowDB 0.12 added a native `json` document column type and 0.13 added path filter
 - **Native typed wire on both transports** — on engine ≥ 0.13 the networked transport uses PowDB's lossless `queryNativeRaw` API, and as of v0.35 the **embedded** transport joins it: on addon ≥ 0.14 embedded queries run through `queryWithParams` (real positional parameter binding plus typed result cells), replacing the literal-materialization path older addons still use. On either transport a JSON `null`, a missing field, and the string `"null"` are all distinguishable end-to-end, and each result is coerced according to the wire that actually served it. Embedded `disconnect()` now performs a real checkpoint-flush close on addon ≥ 0.14.
 - **Equality is type-strict on JSON leaves.** PowQL's `=` never coerces across types: a JSON document holding `7.0` (float) does not match a filter binding the integer `7`, and strings never equal numbers. Turbine binds an integral JS number as an int and a fractional one as a float, so values written through Turbine round-trip correctly — but when filtering documents written by other tools, bind the type the document actually stores. (Stored scalar columns are softer: an int literal against a `float` column widens losslessly.)
 
+### Nested projections: one-statement `with` (PowDB ≥ 0.18)
+
+PowDB 0.18 added **nested projections** (shaped results) to PowQL: a projection field can be a whole correlated child query, returning one row per parent with the matching children assembled into a native JSON array — no join fan-out, no client-side regrouping. On a ≥ 0.18 engine Turbine compiles eligible `with` clauses straight into the parent statement, making this the **default** relation path (it supersedes the batched loaders automatically; nothing to configure):
+
+```ts
+// ONE PowQL statement: per-parent ordering and limit applied by the engine,
+// childless users keep posts: [] and profile: null, arbitrary nesting depth.
+const users = await db.users.findMany({
+  with: {
+    posts: { orderBy: { views: 'desc' }, limit: 3, with: { comments: true } },
+    profile: true,
+  },
+});
+```
+
+Per-relation `where` / `orderBy` / `limit` apply **per parent** (top-N per parent, exactly like the SQL engines' `json_agg` subqueries), `select`/`omit`/PII rules shape the child projection at the query level, and child values are re-coerced by column type (datetime microseconds come back as `Date`). `explain()` shows the engine's nested plan.
+
+Ineligible shapes **silently fall back** to the batched loaders with identical output: many-to-many (the junction-order stitch has no nested equivalent), a `bigint`-typed child column (values ride a JSON array, which cannot carry int64 losslessly), a to-one relation with `limit`/`offset`, parent `distinct`, and a relation named like a projected parent column. An explicit `relationLoadStrategy: 'batched'` (per query or client-level) opts back out entirely; `relationLoadStrategy: 'join'` also prefers nesting on a ≥ 0.18 engine, since it is the strictly better server-side path (no fan-out, works under parent paging, keeps childless parents). Engines below 0.18 keep the loaders byte-for-byte.
+
 ### Native relation joins (PowDB ≥ 0.13)
 
-By default PowDB relation loading runs the batched loaders described above. As of v0.35 you can opt eligible relations into **native server-side joins** instead — one hash-accelerated join statement per relation, no key lists, no 1,000-key chunking:
+On engines below 0.18 (or with nesting opted out) PowDB relation loading runs the batched loaders described above. As of v0.35 you can opt eligible relations into **native server-side joins** instead — one hash-accelerated join statement per relation, no key lists, no 1,000-key chunking:
 
 ```ts
 // Per query:
@@ -269,6 +288,8 @@ const replica = await turbinePowDB('powdb://replica-host:7070', schema, { readon
 Reads work unchanged. Any write is refused with a typed `ReadOnlyError` (`TURBINE_E018`) whose `reason` field distinguishes `'snapshot'` (nothing can write here — route writes to the primary) from `'rbac'` (this connection's role may not write). With the client-level `readonly: true` flag the refusal happens locally, before the wire; without it, the engine's refusal maps to the same error. Freshness is the snapshot cadence — this is snapshot serving, not streaming replication. See [Read Replicas](/read-replicas) for the routing pattern.
 
 One operational note on engine 0.16: PowDB 0.16 fixed a correctness bug in non-unique string indexes (values with embedded NUL bytes could interleave) with a new on-disk index format. A data directory written by an older engine upgrades automatically on its first **writable** open; a read-only open rebuilds the affected indexes in memory on every open until a writable open persists the upgrade. For snapshot fleets, run the snapshot through one writable open (or take snapshots from a 0.16 primary) so replicas skip the per-open rebuild. Turbine supports 0.16 as of v0.36.1; no query or API changes are involved.
+
+PowDB 0.17 added a stable one-byte **error class** to every server error frame. As of Turbine v0.39, `wrapPowdbError` classifies by it before falling back to message matching, so even a server-sanitized message ("query execution error") maps to the right typed error: timeouts to `TimeoutError`, read-only refusals to `ReadOnlyError` (`reason: 'snapshot'`), constraint violations to `UniqueConstraintError`, auth failures and rate limiting to `ConnectionError`. Older servers send no class byte and keep the exact previous behavior.
 
 ### explain() and index guidance
 

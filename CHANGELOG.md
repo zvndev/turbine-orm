@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.39.0 (2026-07-20)
+
+### Added
+
+- **PowDB nested projections: `with` runs as one statement.** PowDB 0.18 adds
+  nested projections (shaped results) to PowQL: a projection field can be a
+  whole correlated child query returning a per-parent JSON array. Turbine now
+  compiles eligible `with` clauses straight into the parent statement, so
+  `db.users.findMany({ with: { posts: { orderBy: { views: 'desc' }, limit: 3 } } })`
+  runs as ONE PowQL statement, with per-parent ordering, limits, and offsets
+  applied natively by the engine, childless parents kept (`[]` for hasMany,
+  `null` for to-one), and arbitrary nesting depth sharing one alias counter,
+  the same single-query shape Turbine's `json_agg` strategy gives Postgres.
+  On an engine >= 0.18 this replaces the batched N+1 loaders as the default
+  relation path; an explicit `relationLoadStrategy: 'batched'` opts back out,
+  and `'join'` also prefers nesting (it is the strictly better server-side
+  path: no fan-out, survives parent paging, keeps childless parents).
+  Ineligible shapes silently fall back to the loaders with identical output:
+  many-to-many (the junction-order stitch has no nested equivalent),
+  bigint-typed child columns (JSON cannot carry them losslessly), a to-one
+  relation with paging, parent `distinct`, and projection-key collisions.
+  PII-tagged child columns stay excluded at the query level; `select` /
+  `omit` / `includePii` are honored; child JSON values are re-coerced per
+  column type (datetime micros come back as `Date`). `explain()` shows the
+  engine's nested plan. Everything is capability-gated on the probed engine
+  version: older engines keep the loaders byte-for-byte, and the feature
+  lights up automatically once the 0.18 driver packages are on npm.
+- **PowDB typed wire error classes (engine >= 0.17).** PowDB 0.17 error frames
+  carry a stable one-byte error class, and `wrapPowdbError` now classifies by
+  it before the message-substring families, so a server-sanitized message
+  ("query execution error") still maps to the right typed error: timeout →
+  `TimeoutError` (E002), memory/size limit → `ValidationError` (E003),
+  read-only refusal → `ReadOnlyError` (E018, `reason: 'snapshot'`),
+  auth failure / rate limiting → `ConnectionError` (E004), constraint
+  violation → `UniqueConstraintError` (E008), cooperative cancellation →
+  `ConnectionError` (E004, final). The specific message families keep
+  precedence where they extract richer detail (constraint and column names,
+  RBAC-vs-snapshot read-only reasons); classless errors from older servers
+  keep the exact pre-0.17 behavior.
+
+### Changed
+
+- PowDB driver dev/test baseline bumped to `@zvndev/powdb-client` /
+  `@zvndev/powdb-embedded` `^0.17.0` (the peer range is unchanged and already
+  admits 0.18). The PowQL lexer escape set was re-verified byte-identical
+  through the 0.18 engine line, so `POWQL_LEXER_TESTED_CEILING` is now
+  `'0.18'`.
+
 ## 0.38.1 (2026-07-19)
 
 ### Fixed
