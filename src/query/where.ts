@@ -1794,8 +1794,15 @@ export function getColumnArrayType(qi: BuilderCtx, column: string): string {
   const arrayType = qi.columnArrayTypeMap.get(column);
   if (arrayType) return arrayType;
 
-  // Fallback heuristic for unknown columns, routed through the active dialect
-  // so non-Postgres packages can supply their own bulk-insert cast shape.
+  // The column's DECLARED type always beats any name-based guess: a text/uuid
+  // "author_id" must never be cast bigint[] just because of its suffix (that
+  // produced real 22P02 failures on createMany against uuid-keyed tables).
+  const declared = Object.hasOwn(qi.tableMeta.pgTypes, column) ? qi.tableMeta.pgTypes[column] : undefined;
+  if (declared) return qi.dialect.arrayType?.(declared) ?? 'text[]';
+
+  // Last-resort heuristic for columns absent from the metadata entirely,
+  // routed through the active dialect so non-Postgres packages can supply
+  // their own bulk-insert cast shape.
   if (column === 'id' || column.endsWith('_id')) return qi.dialect.arrayType?.('int8') ?? 'text[]';
   if (column.endsWith('_at')) return qi.dialect.arrayType?.('timestamptz') ?? 'text[]';
   return qi.dialect.arrayType?.('text') ?? 'text[]';

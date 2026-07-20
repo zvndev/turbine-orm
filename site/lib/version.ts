@@ -7,7 +7,7 @@
  * sidebar); it can never drift from the published package because every build
  * regenerates it. To change it, bump the root package.json and rebuild.
  */
-export const TURBINE_VERSION = '0.38.0';
+export const TURBINE_VERSION = '0.38.1';
 
 /** Marketing minor line, e.g. "v0.23" for the hero badge. */
 export const TURBINE_MINOR = `v${TURBINE_VERSION.split('.').slice(0, 2).join('.')}`;

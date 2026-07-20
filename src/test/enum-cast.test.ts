@@ -200,3 +200,53 @@ describe('Postgres enum write casts — cross-schema guard (N-5)', () => {
     assert.equal(out.match(/pgTypeSchema/g)?.length, 1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// createMany UNNEST casts: the column's DECLARED type must beat the name-based
+// heuristic. Regression for a live 22P02: metadata without pgArrayType (e.g.
+// hand-built or defineSchema-era) on a TEXT "author_id" column compiled
+// `UNNEST($1::bigint[])`, so uuid/text foreign keys failed every createMany
+// with `invalid input syntax for type bigint`.
+// ---------------------------------------------------------------------------
+
+describe('createMany UNNEST casts: declared type beats the _id/_at name heuristic', () => {
+  function textIdSchema(): SchemaMetadata {
+    const tables: Record<string, TableMetadata> = {};
+    const t = mockTable('post', [
+      { name: 'id', field: 'id', pgType: 'text' },
+      { name: 'author_id', field: 'authorId', pgType: 'text' },
+      { name: 'created_at', field: 'createdAt', pgType: 'text' },
+      { name: 'title', field: 'title', pgType: 'text' },
+    ]);
+    // Strip the array-type hints: this is the shape hand-built / non-introspected
+    // metadata arrives in, which is exactly where the heuristic used to fire.
+    t.columns = t.columns.map((c) => ({ ...c, pgArrayType: '' }));
+    tables.post = t;
+    return { tables, enums: {} };
+  }
+
+  it('text author_id / created_at cast to text[], never bigint[]/timestamptz[]', () => {
+    const q = makeQuery('post', textIdSchema());
+    const d = q.buildCreateMany({
+      data: [
+        { authorId: 'a-uuid', createdAt: '2026-01-01', title: 'p1' },
+        { authorId: 'a-uuid', createdAt: '2026-01-02', title: 'p2' },
+      ] as never,
+    });
+    assert.match(d.sql, /UNNEST\(\$1::text\[\], \$2::text\[\], \$3::text\[\]\)/);
+    assert.ok(!d.sql.includes('bigint[]'), 'no bigint[] cast on a text column');
+    assert.ok(!d.sql.includes('timestamptz[]'), 'no timestamptz[] cast on a text column');
+  });
+
+  it('the heuristic still applies when the column has no declared type at all', () => {
+    const s = textIdSchema();
+    const t = s.tables.post as TableMetadata;
+    // Simulate a column entirely unknown to pgTypes (last-resort path).
+    delete (t.pgTypes as Record<string, string>).author_id;
+    const q = makeQuery('post', s);
+    const d = q.buildCreateMany({
+      data: [{ authorId: 1, title: 'p1' }] as never,
+    });
+    assert.match(d.sql, /UNNEST\(\$1::bigint\[\]/, 'name heuristic is the fallback of last resort');
+  });
+});

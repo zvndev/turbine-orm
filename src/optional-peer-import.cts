@@ -104,7 +104,13 @@ namespace importOptionalPeer {
    */
   export function peerPackageVersion(specifier: string): string | null {
     try {
-      const pkg = require(`${specifier}/package.json`) as { version?: string };
+      // Resolve the path with `require.resolve`, then read + parse the file
+      // directly instead of `require`ing the JSON module: some loader hooks
+      // (tsx's CJS hook on Node 20) fail on requiring a .json file even though
+      // resolution succeeds, and a plain fs read is loader-independent.
+      const path = require.resolve(`${specifier}/package.json`);
+      const raw = (require('node:fs') as typeof import('node:fs')).readFileSync(path, 'utf8');
+      const pkg = JSON.parse(raw) as { version?: string };
       return typeof pkg.version === 'string' ? pkg.version : null;
     } catch {
       return null;

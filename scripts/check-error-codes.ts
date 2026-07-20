@@ -30,6 +30,11 @@ const KNOWN_ERRORS = new Set([
   'OptimisticLockError',
   'ExclusionConstraintError',
   'UnsupportedFeatureError',
+  'ReadOnlyError',
+  // Typed subclasses of the above defined outside errors.ts:
+  // DestructivePushRefusal (schema-sql.ts) extends ValidationError so callers
+  // can `instanceof` the refusal instead of sniffing message text.
+  'DestructivePushRefusal',
 ]);
 
 // Also allow standard Error in test files and CLI UI code

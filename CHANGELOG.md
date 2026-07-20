@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.38.1 (2026-07-19)
+
+### Fixed
+
+- **createMany respects declared column types in its UNNEST casts.** The
+  bulk-insert cast picker fell back to a name-based heuristic (`*_id` implies
+  `bigint[]`, `*_at` implies `timestamptz[]`) whenever the metadata carried no
+  precomputed array type, so a `createMany` against a text or uuid foreign key
+  (for example `author_id text`) failed with `invalid input syntax for type
+  bigint`. The column's declared type in `pgTypes` now always wins; the
+  heuristic survives only for columns entirely absent from the metadata.
+  Build-only regression tests pin both behaviors.
+- **PowDB embedded version detection under tsx on Node 20.** The optional-peer
+  helper resolved the addon's version with `require('<pkg>/package.json')`,
+  which tsx's CommonJS hook on Node 20 fails to load even though resolution
+  succeeds, so every version-gated capability threw E017 ("could not report a
+  version") on that lane. The helper now resolves the path and reads the file
+  directly, which is loader-independent.
+- **Error-code enforcement script recognizes typed subclasses.** The CI check
+  now knows `ReadOnlyError` (E018) and `DestructivePushRefusal` (the
+  `ValidationError` subclass thrown by `schemaPush`), which it previously
+  flagged as untracked, keeping the error-codes gate red.
+
+These three were the standing CI failures on main; the branch is fully green
+again, and the hardened tag-publish gate introduced in 0.38.0 (which correctly
+refused to publish over the red integration lane) now passes end to end.
+
 ## 0.38.0 (2026-07-19)
 
 ### Added
