@@ -12,7 +12,7 @@ npm install turbine-orm
 
 Every TS ORM now resolves nested relations in a single `json_agg` query — Prisma 7 and Drizzle both ship it, and so does Turbine. That part is table stakes. The reason to reach for Turbine is the **safety bundle**: the boxes a DBA ticks before a query layer goes anywhere near production. It's the only TypeScript ORM that ships all six of these together:
 
-1. **Read-only-by-default Studio your DBA will approve.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and (since v0.19) no raw-SQL surface at all: queries are composed in the ORM's own validated builder. In the default mode the write endpoints do not exist and every transaction is read-only at the database level; single-row edits require an explicit `--write` opt-in per launch.
+1. **Read-only-by-default Studio your DBA will approve.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and (since v0.19) no raw-SQL surface at all: queries are composed in the ORM's own validated builder. In the default mode the write endpoints do not exist and every transaction is read-only at the database level; edits require an explicit `--write` opt-in per launch, and every edit is addressed by its full primary key (never a predicate).
 2. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
 3. **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages to keep in lockstep. The main entry's **import graph** is ~53 kB brotli (edge ~40 kB) with `pg` external (that is the client footprint your bundler sees, not the dual ESM+CJS install size on disk, ~3 MB). Prisma 7 dropped its Rust query engine, but its client still ships a TypeScript/WASM query compiler: a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
@@ -680,7 +680,7 @@ then `yes`; in CI you must pass `--allow-destructive`. A refused batch applies n
 
 ## Studio
 
-The only Postgres ORM with a Studio your DBA will approve. `turbine studio` launches a local web UI for exploring your database. It is **read-only by default** (no mutations, no writes, every transaction `BEGIN READ ONLY`) and since v0.19 has **no raw-SQL surface at all**: every query is composed visually in the ORM and compiled by the same validated query builder your application uses. Since v0.36, `--write` opts a launch in to single-row insert/update/delete through that same validated builder; without the flag the write endpoints do not exist.
+The only Postgres ORM with a Studio your DBA will approve. `turbine studio` launches a local web UI for exploring your database. It is **read-only by default** (no mutations, no writes, every transaction `BEGIN READ ONLY`) and since v0.19 has **no raw-SQL surface at all**: every query is composed visually in the ORM and compiled by the same validated query builder your application uses. Since v0.36, `--write` opts a launch in to primary-key-addressed insert/update/delete through that same validated builder (single rows, or a capped multi-select batch run in one all-or-nothing transaction since v0.38); without the flag the write endpoints do not exist.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
@@ -698,7 +698,7 @@ npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 - **Cmd+K command palette.** Jump to any table, tab, or saved query in one keystroke.
 - **Full-text search across rows.** The Data tab supports substring search across every text column of the current table.
 - **PII redaction.** Columns tagged `pii: true` in the schema render as a redaction placeholder in every tab. `--show-pii` reveals them, with a loud startup warning.
-- **Opt-in write mode.** `--write` enables single-row insert/update/delete from the Data tab, gated per row by the full primary key, compiled by the same validated builders, and flagged with a persistent WRITE MODE banner. Read-only stays the default on every launch.
+- **Opt-in write mode.** `--write` enables insert/update/delete from the Data tab (single rows, multi-select delete, and paste-to-insert batches), gated per row by the full primary key, compiled by the same validated builders, and flagged with a persistent WRITE MODE banner. Read-only stays the default on every launch.
 
 **Security posture (read-only by default)**
 

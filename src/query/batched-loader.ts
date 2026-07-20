@@ -53,6 +53,7 @@ import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableM
 import type { ReselectExecutor } from './builder.js';
 import { isRelationPickOrderBy } from './filters.js';
 import type { SkipGlobalFilters, WithClause, WithCount, WithOptions } from './types.js';
+import { ownLookup } from './utils.js';
 
 /**
  * Max parent keys per follow-up query. On Postgres the whole key set travels as
@@ -198,7 +199,7 @@ export function neededParentKeyFields(parentMeta: TableMetadata, withClause: Wit
       }
       continue;
     }
-    const rel = parentMeta.relations[relName];
+    const rel = ownLookup(parentMeta.relations, relName);
     if (!rel) continue; // unknown relation — the join path throws; let the loader surface it
     for (const col of localKeyColumns(rel)) {
       fields.add(parentMeta.reverseColumnMap[col] ?? col);
@@ -235,7 +236,7 @@ export function resolveCountRelations(parentMeta: TableMetadata, countSpec: With
   const out: RelationDef[] = [];
   for (const [relName, enabled] of Object.entries(countSpec)) {
     if (!enabled) continue;
-    const rel = parentMeta.relations[relName];
+    const rel = ownLookup(parentMeta.relations, relName);
     if (!rel) {
       throw new RelationError(
         `[turbine] Unknown relation "${relName}" in _count on table "${parentMeta.name}". ` +
@@ -317,7 +318,7 @@ export async function loadRelationsBatched(
       loads.push(loadCounts(ctx, parents, spec as unknown as WithCount));
       continue;
     }
-    const rel = ctx.parentMeta.relations[relName];
+    const rel = ownLookup(ctx.parentMeta.relations, relName);
     if (!rel) {
       throw new ValidationError(
         `[turbine] Unknown relation "${relName}" on table "${ctx.parentMeta.name}". ` +

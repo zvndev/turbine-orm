@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.38.0 (2026-07-19)
+
+### Added
+
+- **Studio data-tab power pass.** The Data tab grows the tools a real
+  inspection session needs. Per-column filters (equals, not, contains,
+  comparisons, IS NULL / IS NOT NULL) stack with the text search, compile to
+  fully parameterized SQL on the server (validated column and operator
+  whitelists, capped at 10), and are refused outright on redacted PII columns,
+  including null checks, so a hidden value cannot be probed. Rows are
+  selectable (checkbox column with select-all) with a selection bar for Copy
+  JSON / Copy CSV / Delete selected / Clear; an Export modal copies or
+  downloads the current page or selection as JSON or CSV; double-clicking any
+  cell copies its raw value; and the page size is adjustable from 25 to 500
+  rows (persisted).
+- **Studio bulk writes, still PK-addressed.** In `--write` mode,
+  `/api/row/insert` and `/api/row/delete` accept a `rows` array (capped at
+  500): each entry passes the same per-row validation as a single write
+  (full-primary-key addressing, column checks against introspected metadata),
+  compiles to its own single-row statement, and the batch runs in one
+  all-or-nothing transaction; a delete whose primary key matches nothing rolls
+  the whole batch back. This powers multi-select delete and the new Paste
+  rows flow (bulk insert from pasted TSV/CSV with a header row, or a JSON
+  array, with live parse preview and per-row errors). Predicate-based
+  mutations and bulk update remain deliberately unsupported.
+- **Studio query-tab visibility.** After a run, View SQL / Copy SQL expose the
+  single statement the builder compiled to. Builder validation messages now
+  render (a disabled Run button explains which clause is incomplete instead
+  of graying out silently), and the where builder gains IS NULL / IS NOT NULL
+  operators. Loading a saved query now restores NOT combinators and null-check
+  clauses correctly, the save dialog locks the target table to the builder's
+  table, and deleting a saved query asks for confirmation.
+- **Studio keyboard shortcuts, for real.** The shortcuts the command palette
+  advertised now work: Cmd+Enter runs, Cmd+S saves (instead of the browser
+  save dialog), G then Q / D / S switches tabs, R refreshes data, Shift+R
+  reloads the schema. Tab buttons keep `aria-selected` in sync.
+- **Typed row editor.** Enum and boolean columns get dropdowns, JSON columns
+  validate before submit with the parse error shown inline, and timestamp
+  fields carry ISO 8601 placeholders.
+
+### Fixed
+
+- **Nested-write errors no longer embed user-supplied values.** The
+  connect/update miss messages in the nested-write engine interpolated the
+  full `where`/`connect` object (including values such as email addresses)
+  into the exception text even in safe error mode, contradicting the PII-safe
+  errors contract. They now follow the same safe/verbose convention as
+  `NotFoundError`: key names only in safe mode, full detail under verbose.
+- **Demo mode now honors its "nothing is saved" promise for saved queries.**
+  Saving a query in `turbine studio --demo` wrote `.turbine/studio-queries.json`
+  into the working directory, and demo sessions displayed the project's real
+  saved queries. Demo saved queries now live in memory only, die with the
+  process, and the real file is never read or written.
+- **Prototype-safe field validation.** Field names that collide with
+  `Object.prototype` members (`constructor`, `toString`, `__proto__`, ...) in
+  `where` / `orderBy` / `select` / nested-write `data` previously bypassed the
+  unknown-column check via inherited lookups and crashed with a `TypeError`.
+  All user-keyed metadata lookups are now `Object.hasOwn`-guarded and throw
+  the normal typed `ValidationError` (E003).
+- **Studio boot failures are visible.** A schema-load error now renders an
+  error box with a Retry button on every tab instead of leaving the default
+  Query tab on an eternal "Loading schema...". Live demo-mode toggles no
+  longer reset the composed builder query, current table, filters, or
+  selection; builder results re-run after a toggle so redaction on screen
+  always reflects the server state.
+- **Studio data-grid honesty.** Column headers render verbatim
+  (`created_at`, not `CREATED_AT`), redacted PII columns show a
+  sorting-disabled tooltip instead of a lying sort arrow, rate-limit (429)
+  responses surface a retry hint, and nullable-typed columns
+  (`number | null`) are classified correctly by the value editors.
+
+### Changed
+
+- **Release gate hardened.** The tag-triggered publish workflow now requires a
+  live Postgres integration run (seeded fixture) and the packed-tarball smoke
+  job before `npm publish`, matching the PR gate instead of trusting
+  unit tests alone.
+- **Site.** The hero version badge derives its tagline from the changelog at
+  build time (it can no longer go stale), a full changelog page ships at
+  /changelog, the landing page gains cards for `turbine doctor`, multi-engine
+  support, `explain()`, and the MCP server, and the comparison table is dated
+  with Prisma's `relationJoins` marked as Preview.
+
 ## 0.37.0 (2026-07-18)
 
 ### Added

@@ -42,7 +42,7 @@ import type {
   WhereClause,
   WhereOperator,
 } from './types.js';
-import { escapeLike, OPERATOR_KEYS, type SqlCacheEntry } from './utils.js';
+import { escapeLike, OPERATOR_KEYS, ownLookup, type SqlCacheEntry } from './utils.js';
 import {
   classifyScalarForSql,
   fingerprintScalarToken,
@@ -863,7 +863,7 @@ export function buildScopedScalarClause(
   clauses: string[],
 ): void {
   const meta = scope.meta;
-  const col = meta.columnMap[field] ?? camelToSnake(field);
+  const col = ownLookup(meta.columnMap, field) ?? camelToSnake(field);
   if (!meta.allColumns.includes(col)) throw scope.unknownColumn(field);
   const qCol = `${scope.qualifier}${qi.q(col)}`;
 
@@ -961,7 +961,7 @@ export function collectScopedScalarParams(
 ): void {
   if (value === null) return;
   const meta = scope.meta;
-  const col = meta.columnMap[field] ?? camelToSnake(field);
+  const col = ownLookup(meta.columnMap, field) ?? camelToSnake(field);
 
   if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
     const colType = pgTypeForColumn(qi, meta, col);
@@ -1284,7 +1284,7 @@ export function resolveColumnRef(
         `for lower(a) = lower(b).`,
     );
   }
-  const col = ctx.meta.columnMap[ref.col] ?? camelToSnake(ref.col);
+  const col = ownLookup(ctx.meta.columnMap, ref.col) ?? camelToSnake(ref.col);
   if (!ctx.meta.allColumns.includes(col)) {
     throw new ValidationError(
       `[turbine] Unknown field "${ref.col}" referenced by { col } in where on table "${ctx.table}". ` +

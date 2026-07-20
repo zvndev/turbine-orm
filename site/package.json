@@ -4,9 +4,9 @@
   "private": true,
   "description": "Documentation site for turbine-orm (turbineorm.dev)",
   "scripts": {
-    "predev": "node scripts/gen-version.mjs",
+    "predev": "node scripts/gen-version.mjs && node scripts/gen-changelog.mjs",
     "dev": "next dev",
-    "prebuild": "node scripts/gen-version.mjs",
+    "prebuild": "node scripts/gen-version.mjs && node scripts/gen-changelog.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"

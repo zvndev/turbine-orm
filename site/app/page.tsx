@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { codeToHtml } from 'shiki';
 import { CopyButton } from '../components/CopyButton';
+import { LATEST_TAGLINE } from '../lib/changelog.generated';
 import { TURBINE_MINOR } from '../lib/version';
 
 export const metadata: Metadata = {
@@ -52,14 +53,14 @@ const features = [
   {
     title: 'Read-only Studio your DBA will approve',
     description:
-      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, no raw-SQL surface at all, X-Frame-Options: DENY. No other TS ORM ships this. Try it with zero setup: npx turbine-orm@latest studio --demo boots a seeded in-memory sample DB (no DATABASE_URL) with a live Read-only / Show PII / Write switcher. New in 0.36: opt-in writable mode via turbine studio --write for single-row edits through the same validated builder; read-only stays the default.',
+      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, no raw-SQL surface at all, X-Frame-Options: DENY. No other TS ORM ships this. Try it with zero setup: npx turbine-orm@latest studio --demo boots a seeded in-memory sample DB (no DATABASE_URL) with a live Read-only / Show PII / Write switcher. Opt-in writable mode via turbine studio --write allows PK-addressed edits through the same validated builder; read-only stays the default.',
     stat: '0',
     statLabel: 'write paths by default',
   },
   {
     title: 'PII-safe errors and field tagging',
     description:
-      'Turbine errors show WHERE keys, not values. A UniqueConstraintError says which column violated the constraint, never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed. New in 0.36: tag a column pii: true in your schema and Turbine excludes it from default query results and redacts it in Studio.',
+      'Turbine errors show WHERE keys, not values. A UniqueConstraintError says which column violated the constraint, never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed. Tag a column pii: true in your schema and Turbine excludes it from default query results and redacts it in Studio.',
     stat: 'keys',
     statLabel: 'not values',
   },
@@ -131,6 +132,37 @@ const postgresFeatures = [
   },
 ];
 
+const capabilities = [
+  {
+    title: 'turbine doctor: the missing-index advisor',
+    description:
+      "Turbine loads relations as correlated subqueries, so an unindexed foreign key becomes a full scan per parent row. npx turbine doctor finds every missing FK index before it hits production, and turbine doctor --fix writes the add-index migration for you. In dev, the first query over an unindexed FK also logs the exact CREATE INDEX. The check your DBA would have asked for, run for you.",
+    href: '/cli#turbine-doctor',
+    cta: 'Doctor docs',
+  },
+  {
+    title: 'Multi-engine, one typed API',
+    description:
+      'Postgres is the default and the primary target, but the same findMany / with / where surface runs on SQLite, MySQL 8, SQL Server, and PowDB through subpath exports (turbine-orm/sqlite, /mysql, /mssql, /powdb). npm install turbine-orm still pulls exactly one runtime dependency; each engine driver is an optional peer you install only if you use it.',
+    href: '/engines',
+    cta: 'Engines docs',
+  },
+  {
+    title: 'explain() without dropping to raw',
+    description:
+      'Every table accessor has explain(args): it compiles the exact statement findMany(args) would run and returns the engine plan as string[] lines. Verify the query the ORM actually emits hits the index you expect, mapped to EXPLAIN / EXPLAIN QUERY PLAN per engine.',
+    href: '/queries#explain',
+    cta: 'explain() docs',
+  },
+  {
+    title: 'MCP server for AI agents',
+    description:
+      'turbine mcp exposes your database to Claude Code, Cursor, or any MCP client over JSON-RPC stdio. Read-only tools only, no free-form SQL: schema overview, table detail, migrate status, doctor report, EXPLAIN, and sample rows, all inside BEGIN READ ONLY. The same safety stance as Studio.',
+    href: '/mcp',
+    cta: 'MCP docs',
+  },
+];
+
 export default async function Home() {
   const [heroHtml, sqlHtml] = await Promise.all([
     codeToHtml(heroCode, { lang: 'typescript', theme: 'github-dark-dimmed' }),
@@ -167,12 +199,12 @@ export default async function Home() {
       {/* ========== HERO ========== */}
       <section className="landing-hero">
         <div className="relative z-10 flex flex-col items-center w-full max-w-landing mx-auto">
-          <div className="hero-badge animate-fade-in">
+          <Link href="/changelog" className="hero-badge animate-fade-in" style={{ textDecoration: 'none' }}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            {TURBINE_MINOR} — PowDB engine support &amp; the BataDB guide
-          </div>
+            {TURBINE_MINOR} &middot; {LATEST_TAGLINE}
+          </Link>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
             <span className="text-white">The Postgres ORM your DBA will sign off on.</span>
@@ -263,6 +295,36 @@ export default async function Home() {
               <h3>{f.title}</h3>
               <p>{f.description}</p>
             </div>
+          ))}
+        </div>
+      </section>
+
+      {/* ========== OPERATIONS / REACH ========== */}
+      <section className="features-section">
+        <div className="animate-fade-in-up">
+          <p className="section-label">Ship it and sleep</p>
+          <h2 className="section-title">
+            Tooling your DBA will thank you for.
+          </h2>
+        </div>
+
+        <div className="feature-grid">
+          {capabilities.map((f, i) => (
+            <Link
+              key={f.title}
+              href={f.href}
+              className={`feature-card animate-fade-in-up delay-${i + 1}`}
+              style={{ textDecoration: 'none', display: 'block' }}
+            >
+              <h3>{f.title}</h3>
+              <p>{f.description}</p>
+              <span
+                className="font-mono"
+                style={{ color: 'var(--accent)', fontSize: '0.8rem' }}
+              >
+                {f.cta} &rarr;
+              </span>
+            </Link>
           ))}
         </div>
       </section>
@@ -398,7 +460,7 @@ export default async function Home() {
                 ['Edge runtime', 'One import swap, ~40 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
-                ['Nested relations', '1 query, deep type inference', '1 query, shallow inference', 'relations() re-declaration'],
+                ['Nested relations', '1 query, deep type inference', '1 query (relationJoins, Preview), shallow inference', 'relations() re-declaration'],
                 ['Many-to-many', 'Auto-detected from junctions', 'Implicit/explicit', 'Explicit relations()'],
                 ['Vector search', 'Built-in distance / KNN', 'Preview / raw', 'Extension API'],
                 ['LISTEN/NOTIFY', '$listen / $notify', 'None', 'None'],
@@ -448,6 +510,25 @@ export default async function Home() {
             </tbody>
           </table>
         </div>
+
+        <p
+          style={{
+            marginTop: '1rem',
+            maxWidth: '48rem',
+            color: 'var(--text-muted)',
+            fontSize: '0.8rem',
+            lineHeight: 1.7,
+          }}
+        >
+          Comparison as of July 2026, against Prisma 7 and Drizzle 0.45.
+          Competitor features marked Preview or beta may change, and bundle
+          sizes move release to release. Turbine&apos;s bundle-size and
+          performance claims are measured on the{' '}
+          <Link href="/benchmarks" style={{ color: 'var(--accent)' }}>
+            benchmarks page
+          </Link>
+          .
+        </p>
 
         <p
           style={{

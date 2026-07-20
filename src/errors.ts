@@ -87,6 +87,32 @@ export function getErrorMessageMode(): ErrorMessageMode {
 }
 
 /**
+ * Render a user-supplied `where` / `connect` target for a "no row found" error
+ * message, honoring the global {@link ErrorMessageMode}. In 'safe' mode (the
+ * default) only the key names are shown (`keys [email, id]`) so that PII values
+ * never leak into logs; in 'verbose' mode the full JSON serialization is used.
+ *
+ * This mirrors {@link NotFoundError}'s redaction so that every "no row found"
+ * message in the library follows one convention, including the nested-write
+ * connect/update failures which historically embedded the raw values.
+ */
+export function describeTargetForMessage(target: unknown): string {
+  if (errorMessageMode === 'verbose') {
+    try {
+      return JSON.stringify(target);
+    } catch {
+      return '[unserializable]';
+    }
+  }
+  // safe mode: key names only
+  if (target === null || target === undefined || typeof target !== 'object') {
+    return 'keys []';
+  }
+  const keys = Object.keys(target as Record<string, unknown>);
+  return `keys [${keys.join(', ')}]`;
+}
+
+/**
  * Render a `where` clause for error messages. In 'safe' mode (the default),
  * only the keys are shown; values are stripped to avoid leaking PII into logs.
  * Nested AND/OR/NOT combinators are recursively rendered.

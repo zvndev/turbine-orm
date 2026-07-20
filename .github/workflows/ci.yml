@@ -120,8 +120,6 @@ jobs:
   # mock). It runs studio-timeout-integration.test.ts with
   # TURBINE_TEST_ENGINE=cockroachdb so the CRDB-specific adapter SQL is the SQL
   # actually sent over the wire. Hard gate — engine integration regressions fail the PR.
-  # in CI a few times — it exercises a real engine but the container topology
-  # hasn't been proven on GitHub runners yet; promote to a hard gate once it has.
   cockroachdb-integration:
     name: cockroachdb-integration
     runs-on: ubuntu-latest
@@ -187,8 +185,6 @@ jobs:
   # Without MYSQL_URL (locally + the unit-tests job) those tests skip cleanly while
   # the build-only + mock-driver tests still run. mysql2 is a devDep, so `npm ci`
   # installs it. Hard gate — engine integration regressions fail the PR.
-  # on GitHub runners a few times (same posture as cockroachdb-integration); promote
-  # to a hard gate once proven.
   mysql-integration:
     name: mysql-integration
     runs-on: ubuntu-latest
@@ -228,8 +224,6 @@ jobs:
   # errors. Without MSSQL_URL (locally + the unit-tests job) those tests skip cleanly while
   # the build-only + mock-driver tests still run. mssql is a devDep, so `npm ci` installs
   # it. Hard gate — engine integration regressions fail the PR.
-  # runners a few times (same posture as mysql/cockroachdb); promote to a hard gate once
-  # proven.
   mssql-integration:
     name: mssql-integration
     runs-on: ubuntu-latest

@@ -51,6 +51,7 @@ import {
   VECTOR_DISTANCE_COMPARATORS,
 } from './filters.js';
 import type { ArrayFilter, JsonFilter, TextSearchFilter, VectorFilter } from './types.js';
+import { ownLookup } from './utils.js';
 
 /** A table-scoped WHERE object (or an `OR`/`AND`/`NOT` branch of one). */
 export type WhereRecord = Record<string, unknown>;
@@ -145,7 +146,7 @@ export function walkWhere(host: WhereHost, where: WhereRecord): WhereEvent[] {
       continue;
     }
 
-    const relDef = host.tableMeta.relations[key];
+    const relDef = ownLookup(host.tableMeta.relations, key);
     if (relDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
       const filterObj = host.normalizeRelationFilter(relDef, value as WhereRecord);
       if (isRelationFilterObj(filterObj)) {

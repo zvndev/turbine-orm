@@ -52,7 +52,10 @@ const sections: NavSection[] = [
   },
   {
     title: 'Reference',
-    items: [{ href: '/benchmarks', label: 'Benchmarks' }],
+    items: [
+      { href: '/benchmarks', label: 'Benchmarks' },
+      { href: '/changelog', label: 'Changelog' },
+    ],
   },
 ];
 

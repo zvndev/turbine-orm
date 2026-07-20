@@ -205,7 +205,8 @@
     .row-editor-field label .piiflag {
       color: var(--yellow);
     }
-    .row-editor-field input {
+    .row-editor-field input,
+    .row-editor-field select {
       background: var(--bg);
       border: 1px solid var(--border);
       border-radius: var(--radius);
@@ -214,7 +215,8 @@
       font-family: var(--mono);
       font-size: 12px;
     }
-    .row-editor-field input:disabled {
+    .row-editor-field input:disabled,
+    .row-editor-field select:disabled {
       opacity: 0.55;
     }
     .row-editor-input-row {
@@ -222,11 +224,13 @@
       align-items: stretch;
       gap: 6px;
     }
-    .row-editor-input-row input {
+    .row-editor-input-row input,
+    .row-editor-input-row select {
       flex: 1 1 auto;
       min-width: 0;
     }
-    .row-editor-field input.null-set {
+    .row-editor-field input.null-set,
+    .row-editor-field select.null-set {
       opacity: 0.5;
       font-style: italic;
       color: var(--text-dim);
@@ -907,8 +911,9 @@
       font-weight: 500;
       color: var(--text-dim);
       font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
+      /* Column names render verbatim (created_at, not CREATED_AT) — casing is
+         schema information, never cosmetic. */
+      letter-spacing: 0.03em;
       white-space: nowrap;
       z-index: 2;
       user-select: none;
@@ -1670,6 +1675,184 @@
       }
     }
 
+    /* =====================================================================
+       Data-tab filter bar
+       ===================================================================== */
+    .filter-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-elev);
+      flex-shrink: 0;
+    }
+    .filter-row {
+      display: grid;
+      grid-template-columns: minmax(120px, 1fr) minmax(100px, 0.8fr) minmax(140px, 1.4fr) auto;
+      gap: 6px;
+      align-items: center;
+    }
+    .filter-row .builder-select,
+    .filter-row .builder-input {
+      padding: 5px 8px;
+      font-size: 11.5px;
+    }
+    .filter-row .icon-btn {
+      width: 24px;
+      height: 24px;
+    }
+
+    /* =====================================================================
+       Row selection + bulk actions
+       ===================================================================== */
+    table.data th.sel-col,
+    table.data td.sel-col {
+      width: 34px;
+      max-width: 34px;
+      padding: 0 0 0 14px;
+      text-align: left;
+    }
+    table.data input[type="checkbox"] {
+      accent-color: var(--accent);
+      cursor: pointer;
+      width: 13px;
+      height: 13px;
+      vertical-align: middle;
+    }
+    table.data tbody tr.selected {
+      background: var(--accent-dim);
+    }
+    table.data thead th.no-sort {
+      cursor: default;
+    }
+    table.data thead th.no-sort:hover {
+      color: var(--text-dim);
+      background: var(--bg-elev);
+    }
+    .selection-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--accent-dim);
+      font-size: 12px;
+      color: var(--text);
+      flex-shrink: 0;
+      font-family: var(--mono);
+    }
+    .selection-bar .btn {
+      padding: 3px 9px;
+      font-size: 11px;
+    }
+    .selection-count {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    /* =====================================================================
+       Builder SQL panel + validation
+       ===================================================================== */
+    .builder-validation {
+      padding: 8px 22px;
+      border-bottom: 1px solid rgba(248, 113, 113, 0.35);
+      background: rgba(248, 113, 113, 0.06);
+      color: var(--red);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .builder-results-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .builder-results-header .spacer {
+      flex: 1;
+    }
+    .builder-results-header .btn {
+      padding: 2px 8px;
+      font-size: 10.5px;
+      text-transform: none;
+      letter-spacing: normal;
+    }
+    .builder-sql {
+      margin: 0;
+      padding: 12px 22px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      line-height: 1.6;
+      color: var(--green);
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 180px;
+      overflow: auto;
+      flex-shrink: 0;
+    }
+
+    /* =====================================================================
+       Paste-rows modal (write mode)
+       ===================================================================== */
+    .paste-area {
+      width: 100%;
+      min-height: 180px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 10px;
+      resize: vertical;
+    }
+    .paste-area:focus {
+      outline: none;
+      border-color: var(--border-strong);
+    }
+    .paste-hint {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-bottom: 8px;
+      line-height: 1.6;
+    }
+    .paste-hint code {
+      font-family: var(--mono);
+      color: var(--accent);
+    }
+    .paste-preview {
+      margin-top: 10px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--text-dim);
+      white-space: pre-wrap;
+    }
+    .paste-preview.err {
+      color: var(--red);
+    }
+
+    /* Page-size picker */
+    .page-size {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-right: 14px;
+    }
+    .page-size select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 3px 6px;
+    }
+
     .toast-wrap {
       position: fixed;
       bottom: 24px;
@@ -1839,12 +2022,32 @@
                 </svg>
                 <input id="dataSearch" type="text" placeholder="Search all text columns…" aria-label="Full text search" />
               </div>
+              <button class="btn btn-sm" id="dataFilterAdd" aria-label="Add column filter">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M4 5h16M7 12h10M10 19h4" />
+                </svg>
+                Filter
+              </button>
+              <button class="btn btn-ghost btn-sm" id="dataExport" aria-label="Export rows">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 3v12M6 9l6 6 6-6" />
+                  <path d="M4 21h16" />
+                </svg>
+                Export
+              </button>
               <button class="btn btn-ghost btn-sm" id="dataRefresh" aria-label="Refresh">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M21 12a9 9 0 1 1-3-6.7L21 8" />
                   <path d="M21 3v5h-5" />
                 </svg>
                 Refresh
+              </button>
+              <button class="btn btn-sm" id="dataPaste" aria-label="Paste rows to insert" hidden>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="7" y="4" width="10" height="4" rx="1" />
+                  <path d="M9 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-3" />
+                </svg>
+                Paste rows
               </button>
               <button class="btn btn-primary btn-sm" id="dataInsert" aria-label="Insert row" hidden>
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1854,11 +2057,29 @@
               </button>
             </div>
           </div>
+          <div class="filter-bar" id="dataFilterBar" hidden></div>
+          <div class="selection-bar" id="dataSelectionBar" hidden>
+            <span class="selection-count" id="selectionCount">0 selected</span>
+            <button class="btn" id="selCopyJson">Copy JSON</button>
+            <button class="btn" id="selCopyCsv">Copy CSV</button>
+            <button class="btn" id="selDelete" hidden>Delete selected</button>
+            <button class="btn btn-ghost" id="selClear">Clear</button>
+          </div>
           <div class="data-wrap">
             <div class="data-scroll" id="dataScroll"></div>
             <div class="data-footer">
               <span id="dataRange">—</span>
               <div class="pagination">
+                <span class="page-size">
+                  <label for="pageSize">Rows</label>
+                  <select id="pageSize" aria-label="Rows per page">
+                    <option value="25">25</option>
+                    <option value="50" selected>50</option>
+                    <option value="100">100</option>
+                    <option value="250">250</option>
+                    <option value="500">500</option>
+                  </select>
+                </span>
                 <button class="btn btn-sm" id="pagePrev">← Prev</button>
                 <span id="pageIndicator">—</span>
                 <button class="btn btn-sm" id="pageNext">Next →</button>
@@ -1902,8 +2123,15 @@
             <div class="builder-left" id="builderLeft"></div>
             <div class="builder-right">
               <div class="builder-preview" id="builderPreview"></div>
+              <div class="builder-validation" id="builderValidation" hidden></div>
               <div class="builder-results">
-                <div class="builder-results-header" id="builderResultsHeader">Results</div>
+                <div class="builder-results-header">
+                  <span id="builderResultsHeader">Results</span>
+                  <span class="spacer"></span>
+                  <button class="btn" id="builderSqlToggle" hidden>View SQL</button>
+                  <button class="btn" id="builderSqlCopy" hidden>Copy SQL</button>
+                </div>
+                <pre class="builder-sql" id="builderSql" hidden></pre>
                 <div class="data-scroll" id="builderResults" style="flex:1"></div>
               </div>
             </div>
@@ -1927,7 +2155,9 @@
         </div>
         <div class="modal-field">
           <label for="savePromptTable">Target table</label>
-          <select id="savePromptTable"></select>
+          <!-- Locked: the composed args belong to the builder's current table;
+               saving them under another table would produce a broken query. -->
+          <select id="savePromptTable" disabled aria-disabled="true"></select>
         </div>
       </div>
       <div class="modal-footer">
@@ -1981,6 +2211,44 @@
     </div>
   </div>
 
+  <!-- Paste rows (write mode only): bulk insert from TSV/CSV/JSON -->
+  <div class="modal-backdrop" id="pasteBackdrop" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pasteTitle" style="width: 640px">
+      <div class="modal-header">
+        <div class="modal-title" id="pasteTitle">Paste rows</div>
+        <button class="icon-btn" data-close-modal="pasteBackdrop" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="paste-hint" id="pasteHint"></div>
+        <textarea class="paste-area" id="pasteArea" spellcheck="false" placeholder="Paste TSV/CSV (with a header row) or a JSON array of objects…"></textarea>
+        <div class="paste-preview" id="pastePreview" hidden></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" data-close-modal="pasteBackdrop">Cancel</button>
+        <button class="btn btn-primary" id="pasteConfirm" disabled>Insert 0 rows</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export current page / selection -->
+  <div class="modal-backdrop" id="exportBackdrop" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="exportTitle" style="width: 420px">
+      <div class="modal-header">
+        <div class="modal-title" id="exportTitle">Export rows</div>
+        <button class="icon-btn" data-close-modal="exportBackdrop" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="paste-hint" id="exportHint"></div>
+        <div style="display: flex; flex-direction: column; gap: 8px">
+          <button class="btn" id="exportCopyJson">Copy JSON</button>
+          <button class="btn" id="exportCopyCsv">Copy CSV</button>
+          <button class="btn" id="exportDownloadJson">Download JSON</button>
+          <button class="btn" id="exportDownloadCsv">Download CSV</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="toast-wrap" id="toastWrap" aria-live="polite"></div>
 
   <script nonce="__CSP_NONCE__">
@@ -2009,6 +2277,10 @@
         orderBy: null,
         dir: 'asc',
         search: '',
+        // per-column filters composed by the filter bar: { column, op, value }
+        filters: [],
+        // selected rows keyed by PK signature (Map key -> row object)
+        selected: new Map(),
         loading: false,
         error: null,
       },
@@ -2020,6 +2292,8 @@
         error: null,
         running: false,
         validation: {},
+        // persisted preference: show the generated SQL under the results header
+        showSql: false,
       },
       savedQueries: [],
       sidebarFilter: '',
@@ -2089,7 +2363,12 @@
           /* non-JSON response */
         }
         if (!res.ok) {
-          const err = new Error((body && body.error) || res.statusText || 'Request failed');
+          let msg = (body && body.error) || res.statusText || 'Request failed';
+          if (res.status === 429) {
+            const after = (body && body.retryAfter) || res.headers.get('Retry-After');
+            msg = 'Rate limited — retry in ' + (after ? after + 's' : 'a moment');
+          }
+          const err = new Error(msg);
           err.status = res.status;
           throw err;
         }
@@ -2134,6 +2413,20 @@
           body: JSON.stringify({ table, where }),
         });
       },
+      // Bulk forms: `rows` is an array of data objects (insert) or PK-where
+      // objects (delete). The server runs them in one all-or-nothing txn.
+      rowInsertBulk(table, rows) {
+        return Api._fetch('/api/row/insert', {
+          method: 'POST',
+          body: JSON.stringify({ table, rows }),
+        });
+      },
+      rowDeleteBulk(table, rows) {
+        return Api._fetch('/api/row/delete', {
+          method: 'POST',
+          body: JSON.stringify({ table, rows }),
+        });
+      },
       // Demo mode only (404 otherwise). Flips the live read-only / PII / write
       // toggles on the in-memory store; independent booleans.
       demoMode(patch) {
@@ -2165,10 +2458,20 @@
     const $ = (sel, root) => (root || document).querySelector(sel);
     const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
+    // SVG elements need the SVG namespace — document.createElement('svg')
+    // yields an inert HTMLUnknownElement that never renders.
+    const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'ellipse', 'line', 'polyline', 'polygon', 'g']);
+
     function el(tag, attrs = {}, children = []) {
-      const node = document.createElement(tag);
+      const isSvg = SVG_TAGS.has(tag);
+      const node = isSvg
+        ? document.createElementNS('http://www.w3.org/2000/svg', tag)
+        : document.createElement(tag);
       for (const [k, v] of Object.entries(attrs)) {
-        if (k === 'class') node.className = v;
+        if (k === 'class') {
+          if (isSvg) node.setAttribute('class', v);
+          else node.className = v;
+        }
         else if (k === 'text') node.textContent = v;
         else if (k === 'html') node.innerHTML = v;
         else if (k.startsWith('on') && typeof v === 'function') {
@@ -2268,24 +2571,33 @@
       }
     }
 
+    // Prefix matches: nullable columns arrive as e.g. 'number | null'.
     function isStringType(ts) {
-      return ts === 'string';
+      return typeof ts === 'string' && ts.indexOf('string') === 0;
     }
     function isNumericType(ts) {
-      return ts === 'number' || ts === 'bigint';
+      return typeof ts === 'string' && (ts.indexOf('number') === 0 || ts.indexOf('bigint') === 0);
     }
     function isBoolType(ts) {
-      return ts === 'boolean';
+      return typeof ts === 'string' && ts.indexOf('boolean') === 0;
     }
     function isDateType(ts) {
-      return ts === 'Date';
+      return typeof ts === 'string' && ts.indexOf('Date') === 0;
     }
+
+    // `isNull` / `isNotNull` compile to `{ col: null }` / `{ col: { not: null } }`
+    // and take no value input.
+    const NULL_OPS = ['isNull', 'isNotNull'];
 
     function operatorsForType(ts) {
       const base = ['equals', 'not', 'in', 'notIn'];
-      if (isStringType(ts)) return base.concat(['contains', 'startsWith', 'endsWith']);
-      if (isNumericType(ts) || isDateType(ts)) return base.concat(['lt', 'lte', 'gt', 'gte']);
-      return base;
+      if (isStringType(ts)) return base.concat(['contains', 'startsWith', 'endsWith'], NULL_OPS);
+      if (isNumericType(ts) || isDateType(ts)) return base.concat(['lt', 'lte', 'gt', 'gte'], NULL_OPS);
+      return base.concat(NULL_OPS);
+    }
+
+    function isNullOp(op) {
+      return op === 'isNull' || op === 'isNotNull';
     }
 
     // =====================================================================
@@ -2442,9 +2754,11 @@
       selectTab(tab) {
         State.currentTab = tab;
         Storage.set('tab', tab);
-        $$('.tab').forEach((b) =>
-          b.classList.toggle('active', b.dataset.tab === tab)
-        );
+        $$('.tab').forEach((b) => {
+          const active = b.dataset.tab === tab;
+          b.classList.toggle('active', active);
+          b.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
         $$('.pane').forEach((p) =>
           p.classList.toggle('active', p.id === 'pane-' + tab)
         );
@@ -2461,6 +2775,10 @@
         State.data.orderBy = (t.primaryKey && t.primaryKey[0]) || (t.columns[0] && t.columns[0].name);
         State.data.dir = 'asc';
         State.data.search = '';
+        $('#dataSearch').value = '';
+        State.data.filters = [];
+        State.data.selected.clear();
+        FilterBar.render();
         Storage.set('currentTable', name);
         Sidebar.render();
         if (State.currentTab === 'data') DataPane.loadAndRender();
@@ -2495,6 +2813,7 @@
         }
         $('#dataTitle').textContent = t.name;
         $('#dataTotal').textContent = State.data.loading ? 'loading…' : formatNumber(State.data.total) + ' rows';
+        DataPane.renderSelectionBar();
 
         const host = $('#dataScroll');
 
@@ -2538,10 +2857,12 @@
                   stroke: 'currentColor',
                   'stroke-width': '2',
                 },
-                []
+                [el('path', { d: 'M22 12h-6l-2 3h-4l-2-3H2' }), el('path', { d: 'M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1' })]
               ),
               document.createTextNode(
-                State.data.search ? 'No rows match your search.' : 'No rows.'
+                State.data.search || State.data.filters.length
+                  ? 'No rows match your search or filters.'
+                  : 'No rows.'
               ),
             ])
           );
@@ -2554,11 +2875,30 @@
         const cols = State.data.columns.length
           ? State.data.columns.map((c) => c.name)
           : Object.keys(State.data.rows[0] || {});
+        const piiRedacted = DataPane.redactedPiiSet();
         host.appendChild(Table.render(cols, State.data.rows, {
           sortable: true,
+          sortableFor: (col) => !piiRedacted.has(col),
           orderBy: State.data.orderBy,
           dir: State.data.dir,
           actions: State.writable ? (row) => DataPane.rowActions(row) : null,
+          selectable: {
+            isSelected: (row) => State.data.selected.has(DataPane.rowKey(row)),
+            onToggle: (row, checked) => {
+              const key = DataPane.rowKey(row);
+              if (checked) State.data.selected.set(key, row);
+              else State.data.selected.delete(key);
+              DataPane.render();
+            },
+            onToggleAll: (checked) => {
+              for (const row of State.data.rows) {
+                const key = DataPane.rowKey(row);
+                if (checked) State.data.selected.set(key, row);
+                else State.data.selected.delete(key);
+              }
+              DataPane.render();
+            },
+          },
           onSort: (col) => {
             if (State.data.orderBy === col) {
               State.data.dir = State.data.dir === 'asc' ? 'desc' : 'asc';
@@ -2570,6 +2910,7 @@
             DataPane.loadAndRender();
           },
         }));
+        DataPane.renderSelectionBar();
 
         const start = State.data.total ? State.data.offset + 1 : 0;
         const end = Math.min(State.data.offset + State.data.limit, State.data.total);
@@ -2579,6 +2920,70 @@
         $('#pageIndicator').textContent = 'Page ' + page + ' / ' + pages;
         $('#pagePrev').disabled = State.data.offset === 0;
         $('#pageNext').disabled = State.data.offset + State.data.limit >= State.data.total;
+      },
+
+      // Columns whose values are PII-redacted right now (empty when --show-pii).
+      redactedPiiSet() {
+        const t = State.currentTable;
+        if (!t || State.showPii) return new Set();
+        return new Set(t.columns.filter((c) => c.pii).map((c) => c.name));
+      },
+
+      // Stable identity for row selection: the PK signature when the table has
+      // one, else the whole serialized row (copy still works; delete is
+      // PK-only and stays disabled without one).
+      rowKey(row) {
+        const t = State.currentTable;
+        const pks = (t && t.primaryKey) || [];
+        if (pks.length) return pks.map((k) => String(row[k])).join(' ');
+        return JSON.stringify(row);
+      },
+
+      renderSelectionBar() {
+        const bar = $('#dataSelectionBar');
+        const n = State.data.selected.size;
+        bar.hidden = n === 0;
+        if (n === 0) return;
+        $('#selectionCount').textContent = n + ' selected';
+        const t = State.currentTable;
+        const canDelete = State.writable && t && (t.primaryKey || []).length > 0;
+        $('#selDelete').hidden = !canDelete;
+      },
+
+      selectedRows() {
+        return Array.from(State.data.selected.values());
+      },
+
+      clearSelection() {
+        State.data.selected.clear();
+        DataPane.render();
+      },
+
+      async deleteSelected() {
+        const t = State.currentTable;
+        if (!t || !State.writable) return;
+        const pks = t.primaryKey || [];
+        if (!pks.length) return;
+        const rows = DataPane.selectedRows();
+        if (!rows.length) return;
+        const targets = rows.map((row) => {
+          const where = {};
+          for (const pk of pks) where[pk] = row[pk];
+          return where;
+        });
+        const msg =
+          rows.length === 1
+            ? 'Delete 1 selected row? This cannot be undone.'
+            : 'Delete ' + rows.length + ' selected rows in one transaction? This cannot be undone.';
+        if (!window.confirm(msg)) return;
+        try {
+          const res = await Api.rowDeleteBulk(t.name, targets);
+          State.data.selected.clear();
+          toast('Deleted ' + (res.rowCount || targets.length) + ' rows', 'ok');
+          DataPane.loadAndRender();
+        } catch (err) {
+          toast('Delete failed: ' + (err && err.message ? err.message : 'unknown'), 'err');
+        }
       },
 
       // Per-row edit/delete controls (write mode only).
@@ -2635,12 +3040,14 @@
         State.data.error = null;
         DataPane.render();
         try {
+          const activeFilters = FilterBar.activeFilters();
           const params = {
             limit: State.data.limit,
             offset: State.data.offset,
             orderBy: State.data.orderBy,
             dir: State.data.dir,
             search: State.data.search,
+            filters: activeFilters.length ? JSON.stringify(activeFilters) : '',
           };
           const res = await Api.rows(t.name, params);
           State.data.rows = res.rows || [];
@@ -2667,6 +3074,25 @@
         );
         $('#dataRefresh').addEventListener('click', () => DataPane.loadAndRender());
         $('#dataInsert').addEventListener('click', () => RowEditor.openInsert());
+        $('#dataPaste').addEventListener('click', () => PasteRows.open());
+        $('#dataExport').addEventListener('click', () => Exporter.open());
+        $('#dataFilterAdd').addEventListener('click', () => FilterBar.add());
+        $('#selCopyJson').addEventListener('click', () =>
+          copyToClipboard(JSON.stringify(DataPane.selectedRows(), null, 2), 'Selection JSON copied')
+        );
+        $('#selCopyCsv').addEventListener('click', () =>
+          copyToClipboard(toCsv(DataPane.selectedRows()), 'Selection CSV copied')
+        );
+        $('#selDelete').addEventListener('click', () => DataPane.deleteSelected());
+        $('#selClear').addEventListener('click', () => DataPane.clearSelection());
+        const pageSize = $('#pageSize');
+        pageSize.value = String(State.data.limit);
+        pageSize.addEventListener('change', () => {
+          State.data.limit = parseInt(pageSize.value, 10) || 50;
+          State.data.offset = 0;
+          Storage.set('pageSize', State.data.limit);
+          DataPane.loadAndRender();
+        });
         $('#pagePrev').addEventListener('click', () => {
           if (State.data.offset === 0) return;
           State.data.offset = Math.max(0, State.data.offset - State.data.limit);
@@ -2681,6 +3107,428 @@
     };
 
     // =====================================================================
+    // CSV serialization (RFC 4180-ish: quote when needed, double inner quotes)
+    // =====================================================================
+    function toCsv(rows, cols) {
+      if (!rows || !rows.length) return '';
+      const columns = cols && cols.length ? cols : Object.keys(rows[0]);
+      const cell = (v) => {
+        if (v === null || v === undefined) return '';
+        const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+        return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      };
+      const lines = [columns.map(cell).join(',')];
+      for (const row of rows) {
+        lines.push(columns.map((c) => cell(row[c])).join(','));
+      }
+      return lines.join('\r\n');
+    }
+
+    function downloadFile(name, mime, text) {
+      const blob = new Blob([text], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+
+    // =====================================================================
+    // Data-tab per-column filter bar
+    // =====================================================================
+    const FilterBar = {
+      // Columns eligible for filtering (redacted PII columns are excluded —
+      // the server refuses them, so don't offer them).
+      columns() {
+        const t = State.currentTable;
+        if (!t) return [];
+        const redacted = DataPane.redactedPiiSet();
+        return t.columns.filter((c) => !redacted.has(c.name));
+      },
+
+      opsFor(col) {
+        const nullOps = col.nullable ? ['isNull', 'notNull'] : [];
+        if (isBoolType(col.tsType)) return ['equals', 'not'].concat(nullOps);
+        if (isNumericType(col.tsType) || isDateType(col.tsType)) {
+          return ['equals', 'not', 'gt', 'gte', 'lt', 'lte'].concat(nullOps);
+        }
+        return ['contains', 'equals', 'not', 'gt', 'gte', 'lt', 'lte'].concat(nullOps);
+      },
+
+      add() {
+        const cols = FilterBar.columns();
+        if (!cols.length) {
+          toast('No filterable columns on this table', 'err');
+          return;
+        }
+        State.data.filters.push({ column: cols[0].name, op: FilterBar.opsFor(cols[0])[0], value: '' });
+        FilterBar.render();
+      },
+
+      remove(idx) {
+        State.data.filters.splice(idx, 1);
+        FilterBar.render();
+        FilterBar.apply();
+      },
+
+      // The filters that are complete enough to send (value present unless a
+      // null-check op), with values coerced to the column's type.
+      activeFilters() {
+        const t = State.currentTable;
+        if (!t) return [];
+        const out = [];
+        for (const f of State.data.filters) {
+          const col = t.columns.find((c) => c.name === f.column);
+          if (!col) continue;
+          if (f.op === 'isNull' || f.op === 'notNull') {
+            out.push({ column: f.column, op: f.op });
+            continue;
+          }
+          if (f.value === '' || f.value == null) continue;
+          let value = f.value;
+          if (isNumericType(col.tsType)) {
+            const n = Number(value);
+            if (!Number.isFinite(n)) continue;
+            value = n;
+          } else if (isBoolType(col.tsType)) {
+            value = value === 'true' || value === true;
+          } else {
+            value = String(value);
+          }
+          out.push({ column: f.column, op: f.op, value });
+        }
+        return out;
+      },
+
+      apply: null, // assigned below (debounced)
+
+      render() {
+        const bar = $('#dataFilterBar');
+        bar.innerHTML = '';
+        const filters = State.data.filters;
+        bar.hidden = filters.length === 0;
+        if (!filters.length) return;
+        const t = State.currentTable;
+        if (!t) return;
+        const cols = FilterBar.columns();
+        filters.forEach((f, idx) => {
+          const row = el('div', { class: 'filter-row' });
+
+          const colSel = el('select', { class: 'builder-select', 'aria-label': 'Filter column' });
+          for (const c of cols) {
+            const opt = el('option', { value: c.name, text: c.name });
+            if (c.name === f.column) opt.selected = true;
+            colSel.appendChild(opt);
+          }
+          colSel.addEventListener('change', () => {
+            f.column = colSel.value;
+            const col = cols.find((c) => c.name === f.column);
+            const ops = col ? FilterBar.opsFor(col) : ['equals'];
+            if (!ops.includes(f.op)) f.op = ops[0];
+            FilterBar.render();
+            FilterBar.apply();
+          });
+          row.appendChild(colSel);
+
+          const col = cols.find((c) => c.name === f.column) || cols[0];
+          const ops = FilterBar.opsFor(col);
+          const opSel = el('select', { class: 'builder-select', 'aria-label': 'Filter operator' });
+          for (const op of ops) {
+            const opt = el('option', { value: op, text: op });
+            if (op === f.op) opt.selected = true;
+            opSel.appendChild(opt);
+          }
+          opSel.addEventListener('change', () => {
+            f.op = opSel.value;
+            FilterBar.render();
+            FilterBar.apply();
+          });
+          row.appendChild(opSel);
+
+          const isNullOp = f.op === 'isNull' || f.op === 'notNull';
+          if (isNullOp) {
+            row.appendChild(el('span', {
+              style: { fontFamily: 'var(--mono)', fontSize: '11px', color: 'var(--text-muted)' },
+              text: 'no value needed',
+            }));
+          } else if (isBoolType(col.tsType)) {
+            const valSel = el('select', { class: 'builder-select', 'aria-label': 'Filter value' });
+            for (const v of ['true', 'false']) {
+              const opt = el('option', { value: v, text: v });
+              if (String(f.value) === v) opt.selected = true;
+              valSel.appendChild(opt);
+            }
+            if (f.value === '' || f.value == null) f.value = 'true';
+            valSel.addEventListener('change', () => {
+              f.value = valSel.value;
+              FilterBar.apply();
+            });
+            row.appendChild(valSel);
+          } else {
+            const valInput = el('input', {
+              class: 'builder-input',
+              type: isNumericType(col.tsType) ? 'number' : 'text',
+              placeholder: isDateType(col.tsType) ? 'e.g. 2026-01-01' : 'value',
+              value: f.value != null ? String(f.value) : '',
+              'aria-label': 'Filter value',
+            });
+            valInput.addEventListener('input', () => {
+              f.value = valInput.value;
+              FilterBar.apply();
+            });
+            row.appendChild(valInput);
+          }
+
+          row.appendChild(
+            el('button', {
+              class: 'icon-btn',
+              'aria-label': 'Remove filter',
+              text: '×',
+              onclick: () => FilterBar.remove(idx),
+            })
+          );
+          bar.appendChild(row);
+        });
+      },
+    };
+    FilterBar.apply = debounce(() => {
+      State.data.offset = 0;
+      DataPane.loadAndRender();
+    }, 260);
+
+    // =====================================================================
+    // Export (current page or selection) — JSON / CSV, copy or download
+    // =====================================================================
+    const Exporter = {
+      scope() {
+        const sel = DataPane.selectedRows();
+        if (sel.length) return { rows: sel, label: sel.length + ' selected rows' };
+        return { rows: State.data.rows, label: 'current page (' + State.data.rows.length + ' rows)' };
+      },
+      open() {
+        const t = State.currentTable;
+        if (!t || State.currentTab !== 'data') {
+          toast('Open a table in the Data tab first', 'err');
+          return;
+        }
+        if (!State.data.rows.length && !State.data.selected.size) {
+          toast('Nothing to export', 'err');
+          return;
+        }
+        $('#exportHint').textContent = 'Exports ' + Exporter.scope().label + ' of ' + t.name + '. Select rows to export a subset.';
+        Modal.open('exportBackdrop');
+      },
+      cols() {
+        return State.data.columns.length
+          ? State.data.columns.map((c) => c.name)
+          : Object.keys(State.data.rows[0] || {});
+      },
+      bind() {
+        const table = () => (State.currentTable ? State.currentTable.name : 'rows');
+        $('#exportCopyJson').addEventListener('click', () => {
+          copyToClipboard(JSON.stringify(Exporter.scope().rows, null, 2), 'JSON copied');
+          Modal.close('exportBackdrop');
+        });
+        $('#exportCopyCsv').addEventListener('click', () => {
+          copyToClipboard(toCsv(Exporter.scope().rows, Exporter.cols()), 'CSV copied');
+          Modal.close('exportBackdrop');
+        });
+        $('#exportDownloadJson').addEventListener('click', () => {
+          downloadFile(table() + '.json', 'application/json', JSON.stringify(Exporter.scope().rows, null, 2));
+          Modal.close('exportBackdrop');
+        });
+        $('#exportDownloadCsv').addEventListener('click', () => {
+          downloadFile(table() + '.csv', 'text/csv', toCsv(Exporter.scope().rows, Exporter.cols()));
+          Modal.close('exportBackdrop');
+        });
+      },
+    };
+
+    // =====================================================================
+    // Paste rows (write mode): bulk insert from TSV/CSV (header row) or JSON
+    // =====================================================================
+    const PasteRows = {
+      parsed: null,
+
+      open() {
+        const t = State.currentTable;
+        if (!t) {
+          toast('Select a table first', 'err');
+          return;
+        }
+        if (!State.writable) return;
+        PasteRows.parsed = null;
+        const cols = t.columns.map((c) => c.name).join(', ');
+        $('#pasteTitle').textContent = 'Paste rows into ' + t.name;
+        $('#pasteHint').innerHTML =
+          'Paste tab- or comma-separated rows with a <code>header row</code> of column names, ' +
+          'or a JSON array of objects. Empty cells use the column default. Columns: <code>' +
+          escapeHtml(cols) + '</code>';
+        $('#pasteArea').value = '';
+        $('#pastePreview').hidden = true;
+        PasteRows.updatePreview();
+        Modal.open('pasteBackdrop');
+      },
+
+      // Parse the textarea into row objects, or an error string.
+      parse(text, t) {
+        const trimmed = text.trim();
+        if (!trimmed) return { rows: [] };
+        const byName = new Map();
+        for (const c of t.columns) {
+          byName.set(c.name.toLowerCase(), c);
+          byName.set(c.field.toLowerCase(), c);
+        }
+        const coerce = (col, raw) => {
+          if (raw === '' || raw == null) return undefined;
+          if (typeof raw !== 'string') return raw; // JSON path: already typed
+          if (raw.toLowerCase() === 'null') return null;
+          return coerceInput(col, raw);
+        };
+
+        if (trimmed.startsWith('[')) {
+          let arr;
+          try {
+            arr = JSON.parse(trimmed);
+          } catch (err) {
+            return { error: 'Invalid JSON: ' + err.message };
+          }
+          if (!Array.isArray(arr)) return { error: 'JSON must be an array of objects' };
+          const rows = [];
+          for (let i = 0; i < arr.length; i++) {
+            const item = arr[i];
+            if (!item || typeof item !== 'object' || Array.isArray(item)) {
+              return { error: 'Row ' + (i + 1) + ' is not an object' };
+            }
+            const row = {};
+            for (const [k, v] of Object.entries(item)) {
+              const col = byName.get(String(k).toLowerCase());
+              if (!col) return { error: 'Row ' + (i + 1) + ': unknown column "' + k + '"' };
+              if (v !== undefined) row[col.name] = v;
+            }
+            if (!Object.keys(row).length) return { error: 'Row ' + (i + 1) + ' has no values' };
+            rows.push(row);
+          }
+          return { rows };
+        }
+
+        // Delimited text: tab wins if present (spreadsheet paste), else comma.
+        const lines = trimmed.split(/\r?\n/).filter((l) => l.length > 0);
+        if (lines.length < 2) {
+          return { error: 'Need a header row plus at least one data row (or paste a JSON array)' };
+        }
+        const delim = lines[0].includes('\t') ? '\t' : ',';
+        const split = (line) => PasteRows.splitDelimited(line, delim);
+        const header = split(lines[0]).map((h) => h.trim());
+        const colsForHeader = [];
+        for (const h of header) {
+          const col = byName.get(h.toLowerCase());
+          if (!col) return { error: 'Unknown column "' + h + '" in header row' };
+          colsForHeader.push(col);
+        }
+        const rows = [];
+        for (let i = 1; i < lines.length; i++) {
+          const cells = split(lines[i]);
+          if (cells.length > colsForHeader.length) {
+            return { error: 'Row ' + i + ' has ' + cells.length + ' cells but the header has ' + colsForHeader.length };
+          }
+          const row = {};
+          try {
+            for (let cIdx = 0; cIdx < cells.length; cIdx++) {
+              const v = coerce(colsForHeader[cIdx], cells[cIdx].trim());
+              if (v !== undefined) row[colsForHeader[cIdx].name] = v;
+            }
+          } catch (err) {
+            return { error: 'Row ' + i + ': ' + (err && err.message ? err.message : 'invalid value') };
+          }
+          if (!Object.keys(row).length) return { error: 'Row ' + i + ' has no values' };
+          rows.push(row);
+        }
+        return { rows };
+      },
+
+      // Minimal delimited-line splitter with double-quote support.
+      splitDelimited(line, delim) {
+        const out = [];
+        let cur = '';
+        let inQ = false;
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i];
+          if (inQ) {
+            if (ch === '"' && line[i + 1] === '"') {
+              cur += '"';
+              i++;
+            } else if (ch === '"') {
+              inQ = false;
+            } else {
+              cur += ch;
+            }
+          } else if (ch === '"' && cur === '') {
+            inQ = true;
+          } else if (ch === delim) {
+            out.push(cur);
+            cur = '';
+          } else {
+            cur += ch;
+          }
+        }
+        out.push(cur);
+        return out;
+      },
+
+      updatePreview() {
+        const t = State.currentTable;
+        const preview = $('#pastePreview');
+        const confirm = $('#pasteConfirm');
+        if (!t) return;
+        const result = PasteRows.parse($('#pasteArea').value, t);
+        PasteRows.parsed = result.rows || null;
+        if (result.error) {
+          preview.hidden = false;
+          preview.className = 'paste-preview err';
+          preview.textContent = result.error;
+          confirm.disabled = true;
+          confirm.textContent = 'Insert 0 rows';
+          return;
+        }
+        const n = result.rows.length;
+        preview.hidden = n === 0;
+        preview.className = 'paste-preview';
+        if (n > 0) {
+          const shown = result.rows.slice(0, 3).map((r) => JSON.stringify(r)).join('\n');
+          preview.textContent = n + ' rows parsed:\n' + shown + (n > 3 ? '\n…' : '');
+        }
+        confirm.disabled = n === 0 || n > 500;
+        confirm.textContent = n > 500 ? 'Too many rows (max 500)' : 'Insert ' + n + ' row' + (n === 1 ? '' : 's');
+      },
+
+      async confirm() {
+        const t = State.currentTable;
+        const rows = PasteRows.parsed;
+        if (!t || !rows || !rows.length) return;
+        try {
+          const res = await Api.rowInsertBulk(t.name, rows);
+          Modal.close('pasteBackdrop');
+          toast('Inserted ' + (res.rowCount || rows.length) + ' rows', 'ok');
+          DataPane.loadAndRender();
+        } catch (err) {
+          const preview = $('#pastePreview');
+          preview.hidden = false;
+          preview.className = 'paste-preview err';
+          preview.textContent = 'Insert failed (nothing was written): ' + (err && err.message ? err.message : 'unknown');
+        }
+      },
+
+      bind() {
+        $('#pasteArea').addEventListener('input', debounce(() => PasteRows.updatePreview(), 180));
+        $('#pasteConfirm').addEventListener('click', () => PasteRows.confirm());
+      },
+    };
+
+    // =====================================================================
     // Shared data table renderer
     // =====================================================================
     const Table = {
@@ -2688,18 +3536,36 @@
         const table = el('table', { class: 'data' });
         const thead = el('thead');
         const headRow = el('tr');
+
+        // Selection column (checkbox per row + select-all header).
+        if (opts.selectable) {
+          const allTh = el('th', { class: 'sel-col no-sort', scope: 'col' });
+          const allCb = el('input', {
+            type: 'checkbox',
+            'aria-label': 'Select all rows on this page',
+          });
+          allCb.checked = rows.length > 0 && rows.every((r) => opts.selectable.isSelected(r));
+          allCb.addEventListener('change', () => opts.selectable.onToggleAll(allCb.checked));
+          allTh.appendChild(allCb);
+          headRow.appendChild(allTh);
+        }
+
         for (const c of cols) {
+          const canSort = opts.sortable && (!opts.sortableFor || opts.sortableFor(c));
           const attrs = {
-            class: opts.sortable ? 'sortable' : '',
+            class: opts.sortable ? (canSort ? 'sortable' : 'no-sort') : '',
             scope: 'col',
           };
-          if (opts.sortable) {
+          if (canSort) {
             attrs.onclick = () => opts.onSort && opts.onSort(c);
+          } else if (opts.sortable) {
+            attrs.title = 'Sorting disabled while this PII column is redacted';
           }
           const th = el('th', attrs);
           th.appendChild(document.createTextNode(c));
-          if (opts.sortable && opts.orderBy === c) {
+          if (canSort && opts.orderBy === c) {
             th.appendChild(el('span', { class: 'sort-ind', text: opts.dir === 'asc' ? '▲' : '▼' }));
+            th.setAttribute('aria-sort', opts.dir === 'asc' ? 'ascending' : 'descending');
           }
           headRow.appendChild(th);
         }
@@ -2712,6 +3578,15 @@
         const tbody = el('tbody');
         for (const row of rows) {
           const tr = el('tr');
+          if (opts.selectable && opts.selectable.isSelected(row)) tr.classList.add('selected');
+          if (opts.selectable) {
+            const td = el('td', { class: 'sel-col' });
+            const cb = el('input', { type: 'checkbox', 'aria-label': 'Select row' });
+            cb.checked = opts.selectable.isSelected(row);
+            cb.addEventListener('change', () => opts.selectable.onToggle(row, cb.checked));
+            td.appendChild(cb);
+            tr.appendChild(td);
+          }
           for (const c of cols) {
             const val = row[c];
             tr.appendChild(Table.renderCell(val));
@@ -2733,18 +3608,21 @@
           td.className = 'cell-null';
           td.textContent = 'null';
           td.title = 'null';
+          td.dataset.raw = 'null';
           return td;
         }
         if (typeof val === 'number') {
           td.className = 'cell-number';
           td.textContent = String(val);
           td.title = String(val);
+          td.dataset.raw = String(val);
           return td;
         }
         if (typeof val === 'boolean') {
           td.className = 'cell-bool';
           td.textContent = String(val);
           td.title = String(val);
+          td.dataset.raw = String(val);
           return td;
         }
         if (val && typeof val === 'object') {
@@ -2752,7 +3630,8 @@
           const str = JSON.stringify(val);
           const preview = str.length > 48 ? str.slice(0, 45) + '…' : str;
           td.textContent = preview;
-          td.title = 'JSON (click to expand)';
+          td.title = 'JSON (double-click to copy, expand to view)';
+          td.dataset.raw = str;
           const btn = el('button', {
             class: 'expand-btn',
             text: 'expand',
@@ -2767,9 +3646,20 @@
         const s = String(val);
         td.textContent = s;
         td.title = s;
+        td.dataset.raw = s;
         return td;
       },
     };
+
+    // Double-click any data cell to copy its raw value (delegated once so the
+    // handler survives every re-render).
+    document.addEventListener('dblclick', (e) => {
+      const td = e.target && e.target.closest ? e.target.closest('table.data td') : null;
+      if (!td || td.classList.contains('sel-col')) return;
+      if (e.target.closest('button, input, a')) return;
+      const text = td.dataset.raw != null ? td.dataset.raw : td.textContent;
+      copyToClipboard(text, 'Cell value copied');
+    });
 
     // =====================================================================
     // Schema pane
@@ -3042,19 +3932,28 @@
         });
         row.appendChild(opSel);
 
-        // value input
-        const valInput = el('input', {
-          class: 'builder-input',
-          type: col && isNumericType(col.tsType) ? 'number' : 'text',
-          placeholder: 'value',
-          value: clause.value != null ? String(clause.value) : '',
-        });
-        valInput.addEventListener('input', () => {
-          clause.value = valInput.value;
-          BuilderPane.updatePreview();
-          BuilderPane.updateRunButton();
-        });
-        row.appendChild(valInput);
+        // value input (null-check ops take no value)
+        if (isNullOp(clause.op)) {
+          row.appendChild(
+            el('span', {
+              style: { fontFamily: 'var(--mono)', fontSize: '11px', color: 'var(--text-muted)' },
+              text: 'no value needed',
+            })
+          );
+        } else {
+          const valInput = el('input', {
+            class: 'builder-input',
+            type: col && isNumericType(col.tsType) ? 'number' : 'text',
+            placeholder: 'value',
+            value: clause.value != null ? String(clause.value) : '',
+          });
+          valInput.addEventListener('input', () => {
+            clause.value = valInput.value;
+            BuilderPane.updatePreview();
+            BuilderPane.updateRunButton();
+          });
+          row.appendChild(valInput);
+        }
 
         // remove
         const rm = el('button', {
@@ -3332,6 +4231,10 @@
         for (const c of localArgs.where) {
           const col = tableMeta.columns.find((cc) => cc.name === c.column);
           if (!col) continue;
+          if (isNullOp(c.op)) {
+            clauses.push({ [c.column]: c.op === 'isNull' ? null : { not: null } });
+            continue;
+          }
           const parsed = BuilderPane.coerceValue(c.value, col.tsType, c.op);
           if (parsed === undefined) continue;
           const inner =
@@ -3371,14 +4274,18 @@
 
       validate() {
         const errs = {};
-        if (!State.builder.table) errs.table = 'Pick a table';
+        if (!State.builder.table) errs.table = 'Pick a table.';
         if (State.builder.args.limit != null && State.builder.args.limit < 1) {
-          errs.limit = 'Limit must be ≥ 1';
+          errs.limit = 'Limit must be at least 1.';
         }
-        for (const c of State.builder.args.where) {
-          if (!c.column) errs.where = 'Clause missing column';
-          if (c.value === '' || c.value == null) errs.where = 'Clause missing value';
-        }
+        State.builder.args.where.forEach((c, i) => {
+          if (!c.column) {
+            errs['where' + i] = 'where clause ' + (i + 1) + ': pick a column.';
+          } else if (!isNullOp(c.op) && (c.value === '' || c.value == null)) {
+            errs['where' + i] =
+              'where clause ' + (i + 1) + ' (' + c.column + ' ' + c.op + '): enter a value, or remove the clause.';
+          }
+        });
         State.builder.validation = errs;
         return Object.keys(errs).length === 0;
       },
@@ -3386,6 +4293,13 @@
       updateRunButton() {
         const ok = BuilderPane.validate();
         $('#builderRun').disabled = !ok;
+        // Surface WHY Run is disabled — a grayed-out button with no explanation
+        // is a dead end.
+        const box = $('#builderValidation');
+        const msgs = Object.values(State.builder.validation);
+        box.hidden = msgs.length === 0;
+        box.innerHTML = '';
+        for (const m of msgs) box.appendChild(el('div', { text: m }));
       },
 
       updatePreview() {
@@ -3434,9 +4348,29 @@
         }
       },
 
+      // Show/hide the generated-SQL affordances. The whole point of the single
+      // query strategy is that you can SEE the single query.
+      syncSqlPanel() {
+        const r = State.builder.result;
+        const hasSql = !!(r && r.sql);
+        const toggle = $('#builderSqlToggle');
+        const copy = $('#builderSqlCopy');
+        const pre = $('#builderSql');
+        toggle.hidden = !hasSql;
+        copy.hidden = !hasSql;
+        if (!hasSql) {
+          pre.hidden = true;
+          return;
+        }
+        pre.textContent = r.sql;
+        pre.hidden = !State.builder.showSql;
+        toggle.textContent = State.builder.showSql ? 'Hide SQL' : 'View SQL';
+      },
+
       renderResults() {
         const host = $('#builderResults');
         const header = $('#builderResultsHeader');
+        BuilderPane.syncSqlPanel();
         if (State.builder.running) {
           header.textContent = 'Results · running…';
           host.innerHTML = '';
@@ -3493,6 +4427,15 @@
         $('#builderCopy').addEventListener('click', () => {
           const code = $('#builderPreview').dataset.rawCode || '';
           copyToClipboard(code, 'TypeScript copied');
+        });
+        $('#builderSqlToggle').addEventListener('click', () => {
+          State.builder.showSql = !State.builder.showSql;
+          Storage.set('showSql', State.builder.showSql);
+          BuilderPane.syncSqlPanel();
+        });
+        $('#builderSqlCopy').addEventListener('click', () => {
+          const r = State.builder.result;
+          copyToClipboard(r && r.sql ? r.sql : '', 'SQL copied');
         });
         $('#builderReset').addEventListener('click', () => {
           if (State.builder.table) BuilderPane.resetForTable(State.builder.table);
@@ -3656,17 +4599,25 @@
         }
         if (argsObj.where) {
           const w = argsObj.where;
-          const collectInto = (obj, combinator) => {
+          const collectInto = (obj) => {
             for (const [col, val] of Object.entries(obj)) {
               if (col === 'AND' || col === 'OR' || col === 'NOT') continue;
-              if (val && typeof val === 'object' && !Array.isArray(val)) {
+              if (val === null) {
+                // { col: null } is IS NULL
+                out.where.push({ column: col, op: 'isNull', value: '', insensitive: false });
+              } else if (val && typeof val === 'object' && !Array.isArray(val)) {
                 const op = Object.keys(val).find((k) => k !== 'mode') || 'equals';
-                out.where.push({
-                  column: col,
-                  op,
-                  value: val[op],
-                  insensitive: val.mode === 'insensitive',
-                });
+                if (op === 'not' && val[op] === null) {
+                  // { col: { not: null } } is IS NOT NULL
+                  out.where.push({ column: col, op: 'isNotNull', value: '', insensitive: false });
+                } else {
+                  out.where.push({
+                    column: col,
+                    op,
+                    value: val[op],
+                    insensitive: val.mode === 'insensitive',
+                  });
+                }
               } else {
                 out.where.push({ column: col, op: 'equals', value: val, insensitive: false });
               }
@@ -3674,11 +4625,19 @@
           };
           if (w.OR) {
             out.combinator = 'OR';
-            for (const c of w.OR) collectInto(c, 'OR');
+            for (const c of w.OR) collectInto(c);
+          } else if (w.NOT) {
+            out.combinator = 'NOT';
+            const inner = w.NOT;
+            if (inner && typeof inner === 'object' && Array.isArray(inner.AND)) {
+              for (const c of inner.AND) collectInto(c);
+            } else if (inner && typeof inner === 'object') {
+              collectInto(inner);
+            }
           } else if (w.AND) {
-            for (const c of w.AND) collectInto(c, 'AND');
+            for (const c of w.AND) collectInto(c);
           } else {
-            collectInto(w, 'AND');
+            collectInto(w);
           }
         }
         if (argsObj.select) out.select = Object.keys(argsObj.select);
@@ -3695,6 +4654,9 @@
       },
 
       async remove(id) {
+        const q = State.savedQueries.find((x) => x.id === id);
+        const label = q ? '"' + q.name + '"' : 'this saved query';
+        if (!window.confirm('Delete ' + label + '? This cannot be undone.')) return;
         try {
           await Api.deleteSaved(id);
           State.savedQueries = State.savedQueries.filter((q) => q.id !== id);
@@ -3765,11 +4727,18 @@
 
     function coerceInput(col, raw) {
       const ts = col.tsType || '';
-      if (ts === 'number' || ts === 'bigint') {
+      if (/json/i.test(col.pgType || '')) {
+        try {
+          return JSON.parse(raw);
+        } catch (err) {
+          throw new Error('Column "' + col.name + '": invalid JSON — ' + err.message);
+        }
+      }
+      if (isNumericType(ts)) {
         const n = Number(raw);
         return Number.isNaN(n) ? raw : n;
       }
-      if (ts === 'boolean') return raw === 'true' || raw === '1' || raw === 't';
+      if (isBoolType(ts)) return raw === 'true' || raw === '1' || raw === 't';
       return raw;
     }
 
@@ -3826,11 +4795,32 @@
           label.appendChild(el('span', { class: 'col-pg', text: c.pgType || '' }));
           if (c.isPrimaryKey) label.appendChild(el('span', { class: 'pkflag', text: ' · PK' }));
           if (c.pii) label.appendChild(el('span', { class: 'piiflag', text: ' · PII' }));
-          const input = el('input', { type: 'text' });
+          // Typed controls: enums and booleans get a select (no more hand-typed
+          // 'true'/'t'); JSON and timestamps get format placeholders + validation.
+          const ts = c.tsType || '';
+          const enumValues = (State.enums && State.enums[c.pgType]) || null;
+          let input;
+          if (enumValues && enumValues.length) {
+            input = el('select', {});
+            input.appendChild(el('option', { value: '', text: '— unset —' }));
+            for (const ev of enumValues) input.appendChild(el('option', { value: ev, text: ev }));
+          } else if (ts.indexOf('boolean') === 0) {
+            input = el('select', {});
+            input.appendChild(el('option', { value: '', text: '— unset —' }));
+            input.appendChild(el('option', { value: 'true', text: 'true' }));
+            input.appendChild(el('option', { value: 'false', text: 'false' }));
+          } else {
+            input = el('input', { type: 'text' });
+            if (/json/i.test(c.pgType || '')) {
+              input.placeholder = 'JSON, e.g. {"key": "value"}';
+            } else if (ts.indexOf('Date') === 0) {
+              input.placeholder = 'ISO 8601, e.g. 2026-01-01T00:00:00Z';
+            }
+          }
           const v = row[c.name];
           if (RowEditor.mode === 'edit' && v !== undefined && v !== null && v !== REDACTED_MARKER) {
             input.value = typeof v === 'object' ? JSON.stringify(v) : String(v);
-          } else if (RowEditor.mode === 'edit' && v === REDACTED_MARKER) {
+          } else if (RowEditor.mode === 'edit' && v === REDACTED_MARKER && input.tagName === 'INPUT') {
             input.placeholder = 'redacted · leave blank to keep the existing value';
           }
           if (RowEditor.mode === 'edit' && c.isPrimaryKey) input.disabled = true;
@@ -3894,7 +4884,13 @@
       async confirm() {
         const t = RowEditor.table;
         if (!t) return;
-        const data = RowEditor.collect();
+        let data;
+        try {
+          data = RowEditor.collect();
+        } catch (err) {
+          RowEditor.showError(err && err.message ? err.message : 'Invalid value');
+          return;
+        }
         if (!Object.keys(data).length) {
           RowEditor.showError(RowEditor.mode === 'insert' ? 'Enter at least one value.' : 'No changes to save.');
           return;
@@ -3947,7 +4943,9 @@
       bind() {
         $('#savePromptConfirm').addEventListener('click', async () => {
           const name = $('#savePromptName').value.trim();
-          const table = $('#savePromptTable').value;
+          // The table is locked to the builder's table — the composed args only
+          // make sense against it.
+          const table = State.savePrompt.fixedTable || $('#savePromptTable').value;
           if (!name || !table) {
             toast('Name and table required', 'err');
             return;
@@ -4070,7 +5068,7 @@
                 stroke: 'currentColor',
                 'stroke-width': '2',
               },
-              []
+              [el('path', { d: 'M9 18l6-6-6-6' })]
             ),
             el('span', { text: name }),
           ]),
@@ -4088,6 +5086,8 @@
     // Keyboard shortcuts
     // =====================================================================
     function bindKeys() {
+      // 'g' chord state for G Q / G D / G S tab navigation.
+      let chordAt = 0;
       document.addEventListener('keydown', (e) => {
         const cmd = e.metaKey || e.ctrlKey;
         // Cmd+K opens palette
@@ -4096,13 +5096,51 @@
           Palette.open();
           return;
         }
+        // Cmd+Enter runs the builder query (works from inside inputs too — the
+        // most common flow is typing a value and hitting Run).
+        if (cmd && e.key === 'Enter') {
+          e.preventDefault();
+          if (State.currentTab !== 'builder') Router.selectTab('builder');
+          BuilderPane.run();
+          return;
+        }
+        // Cmd+S saves the current builder query (never the browser dialog).
+        if (cmd && (e.key === 's' || e.key === 'S')) {
+          e.preventDefault();
+          if (State.currentTab !== 'builder') Router.selectTab('builder');
+          BuilderPane.openSave();
+          return;
+        }
         if (e.key === 'Escape') {
-          ['savePromptBackdrop', 'jsonModalBackdrop', 'paletteBackdrop', 'rowEditorBackdrop'].forEach((id) =>
+          ['savePromptBackdrop', 'jsonModalBackdrop', 'paletteBackdrop', 'rowEditorBackdrop', 'pasteBackdrop', 'exportBackdrop'].forEach((id) =>
             Modal.close(id)
           );
           return;
         }
         if (isTypingInInput()) return;
+        // G-chords: g then q/d/s within 800ms switches tabs.
+        if (e.key === 'g' || e.key === 'G') {
+          chordAt = Date.now();
+          return;
+        }
+        if (chordAt && Date.now() - chordAt < 800) {
+          const k = e.key.toLowerCase();
+          const target = k === 'q' ? 'builder' : k === 'd' ? 'data' : k === 's' ? 'schema' : null;
+          chordAt = 0;
+          if (target) {
+            e.preventDefault();
+            Router.selectTab(target);
+            return;
+          }
+        }
+        if (e.key === 'R' && e.shiftKey) {
+          boot(true);
+          return;
+        }
+        if (e.key === 'r') {
+          if (State.currentTab === 'data') DataPane.loadAndRender();
+          return;
+        }
         if (e.key === '/') {
           e.preventDefault();
           $('#sidebarSearch').focus();
@@ -4165,6 +5203,7 @@
         // Persistent write-mode affordances (only when the server allows writes).
         $('#writeBanner').hidden = !State.writable;
         $('#dataInsert').hidden = !State.writable;
+        $('#dataPaste').hidden = !State.writable;
         // Persistent unredacted-PII indicator (only under --show-pii).
         $('#piiBanner').hidden = !State.showPii;
         // Demo banner + live switcher (only in --demo mode). Its two toggle
@@ -4172,6 +5211,7 @@
         // above also mirror).
         $('#demoBanner').hidden = !State.demo;
         if (State.demo) DemoSwitcher.sync();
+        $('#connDot').classList.remove('err');
         $('#connDot').classList.add('ok');
         $('#connLabel').textContent = 'connected';
         const meta =
@@ -4179,7 +5219,29 @@
         $('#headerMeta').textContent = meta;
         $('#sidebarMeta').textContent = meta;
 
-        // Restore
+        if (reloadOnly) {
+          // A live reload (demo mode toggle, Shift+R): keep the user's place —
+          // current tab, table, composed builder query, filters, selection.
+          // Re-point currentTable at the fresh metadata object and re-render;
+          // re-fetch whatever the active tab is showing so redaction/write
+          // affordances reflect the new server state.
+          if (State.currentTable) {
+            State.currentTable = State.tablesByName.get(State.currentTable.name) || null;
+          }
+          Sidebar.render();
+          FilterBar.render();
+          Router.selectTab(State.currentTab);
+          if (State.currentTab === 'data' && State.currentTable) DataPane.loadAndRender();
+          if (State.currentTab === 'builder' && State.builder.result) {
+            // Results were fetched under the previous mode (e.g. different PII
+            // redaction) — re-run so what's on screen is always truthful.
+            BuilderPane.run();
+          }
+          SavedQueries.refresh();
+          return;
+        }
+
+        // First boot: restore persisted layout + location.
         const savedW = Storage.get('sidebarW');
         if (savedW) document.documentElement.style.setProperty('--sidebar-w', savedW);
         const savedTab = Storage.get('tab', 'builder');
@@ -4207,16 +5269,31 @@
         $('#connLabel').textContent = 'offline';
         $('#headerMeta').textContent = 'connection failed';
         $('#sidebarMeta').textContent = '—';
-        const mainErr = el('div', { class: 'error-box' }, [
-          el('div', { class: 'error-box-title', text: 'Cannot reach /api/schema' }),
-          document.createTextNode(err.message),
-        ]);
-        $('#dataScroll').innerHTML = '';
-        $('#dataScroll').appendChild(mainErr);
+        // Surface the failure on EVERY pane (whichever tab is active) with a
+        // retry affordance — a schema-load failure must never strand the UI on
+        // an eternal "Loading schema…".
+        const renderBootError = (host) => {
+          host.innerHTML = '';
+          host.appendChild(
+            el('div', { class: 'error-box' }, [
+              el('div', { class: 'error-box-title', text: 'Cannot reach /api/schema' }),
+              document.createTextNode(err.message),
+              el('div', { style: { marginTop: '10px' } }, [
+                el('button', { class: 'btn btn-sm', text: 'Retry', onclick: () => boot(reloadOnly) }),
+              ]),
+            ])
+          );
+        };
+        renderBootError($('#dataScroll'));
+        renderBootError($('#builderLeft'));
+        renderBootError($('#schemaScroll'));
       }
     }
 
     function init() {
+      // Restore persisted preferences before the binds read them.
+      State.data.limit = Storage.get('pageSize', 50);
+      State.builder.showSql = Storage.get('showSql', false) === true;
       Sidebar.bind();
       Router.bind();
       DataPane.bind();
@@ -4226,6 +5303,8 @@
       RowEditor.bind();
       Palette.bind();
       DemoSwitcher.bind();
+      Exporter.bind();
+      PasteRows.bind();
       bindKeys();
       boot();
     }

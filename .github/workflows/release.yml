@@ -12,14 +12,17 @@ name: Release
 #   npm version patch   # or minor / major — bumps package.json and creates a git tag
 #   git push --follow-tags
 #
-# The workflow runs lint → typecheck → unit tests → build, verifies that
-# package.json version matches the tag, and publishes with `--provenance`
-# so the npm registry can attest the build to this repo.
+# The workflow runs lint → typecheck → unit tests → build, then two release
+# gates that mirror ci.yml — a real Postgres integration run (seeded fixture)
+# and the packed-tarball smoke test — before it verifies that package.json
+# version matches the tag and publishes with `--provenance` so the npm registry
+# can attest the build to this repo.
 #
-# Note: integration tests are intentionally NOT run here. They require a
-# seeded Postgres database and are covered separately by ci.yml on push.
-# The unit test gate alone covers all SQL generation, schema/migration
-# logic, error handling, and the edge-driver adapter.
+# A publish requires ALL of: test (lint/typecheck/unit/build/size),
+# integration-postgres (real DB), and pack-smoke (published package surface).
+# The full multi-version / multi-engine matrix still lives in ci.yml on push;
+# the release gate runs one representative Postgres and the pack smoke so a tag
+# can never publish SQL a real Postgres rejects or a broken package surface.
 
 on:
   push:
@@ -70,8 +73,113 @@ jobs:
       - name: Verify bundle sizes
         run: npx size-limit
 
+  # Postgres integration gate — mirrors ci.yml's integration-tests but pinned to
+  # a single representative major (16). Seeds src/test/fixtures/seed.sql, then
+  # runs the full DB-backed suite so a tag can never publish SQL that a real
+  # Postgres rejects. The 14/15/16/17 matrix stays in ci.yml on push.
+  integration-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: turbine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Seed test database
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f src/test/fixtures/seed.sql
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+          PGPASSWORD: test
+      - run: npm test
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+
+  # Packed-tarball smoke gate — mirrors ci.yml's pack-smoke. Installs the real
+  # `npm pack` output into a clean temp project and verifies the published
+  # package surface (ESM import, CJS require, CLI bin, and every subpath export)
+  # so a tag can never publish a broken exports map or missing dist file.
+  pack-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Pack tarball
+        run: |
+          TARBALL=$(npm pack --silent | tail -1)
+          echo "TARBALL=$GITHUB_WORKSPACE/$TARBALL" >> "$GITHUB_ENV"
+          echo "EXPECTED_VERSION=$(jq -r .version package.json)" >> "$GITHUB_ENV"
+      - name: Verify packed manifest has no install scripts
+        # The published tarball must not ship prepare/preinstall/install/postinstall.
+        run: |
+          MANIFEST=$(tar -xzOf "$TARBALL" package/package.json)
+          BANNED=$(echo "$MANIFEST" | jq -r '
+            (.scripts // {}) | keys[]
+            | select(. == "prepare" or . == "preinstall" or . == "install" or . == "postinstall")
+          ')
+          if [ -n "$BANNED" ]; then
+            echo "Published manifest must not contain install scripts, found:"
+            echo "$BANNED"
+            echo "$MANIFEST" | jq '.scripts'
+            exit 1
+          fi
+          echo "Packed manifest has no install scripts OK"
+      - name: Install tarball in temp project
+        run: |
+          SMOKE_DIR=$(mktemp -d)
+          echo "SMOKE_DIR=$SMOKE_DIR" >> "$GITHUB_ENV"
+          cd "$SMOKE_DIR"
+          npm init -y > /dev/null
+          npm install "$TARBALL" --no-audit --no-fund
+      - name: Verify ESM import
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm'); if (!m.TurbineClient) { console.error('ESM import missing TurbineClient'); process.exit(1); } console.log('ESM import OK');"
+      - name: Verify CJS require
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node -e "const m = require('turbine-orm'); if (!m.TurbineClient) { console.error('CJS require missing TurbineClient'); process.exit(1); } console.log('CJS require OK');"
+      - name: Verify CLI bin prints version
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          npx turbine --version
+          npx turbine --version | grep -F "$EXPECTED_VERSION"
+      - name: Verify serverless subpath import
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/serverless'); if (typeof m.turbineHttp !== 'function') { console.error('serverless subpath missing turbineHttp'); process.exit(1); } console.log('serverless subpath OK');"
+      - name: Verify sqlite subpath import
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/sqlite'); if (m.sqliteDialect?.name !== 'sqlite' || typeof m.turbineSqlite !== 'function') { console.error('sqlite subpath broken'); process.exit(1); } console.log('sqlite subpath OK');"
+      - name: Verify adapters subpath import
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/adapters'); if (!m.cockroachdb || !m.yugabytedb || !m.postgresql) { console.error('adapters subpath broken'); process.exit(1); } console.log('adapters subpath OK', Object.keys(m).slice(0,8).join(','));"
+
   publish:
-    needs: [test]
+    needs: [test, integration-postgres, pack-smoke]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

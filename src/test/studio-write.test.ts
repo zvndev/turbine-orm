@@ -441,6 +441,200 @@ describe('Studio write: single-row round-trips', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Bulk writes: `rows` array on insert/delete — one txn, all-or-nothing,
+// every row still PK-addressed / column-validated.
+// ---------------------------------------------------------------------------
+
+describe('Studio write: bulk rows', () => {
+  it('bulk insert compiles one INSERT per row inside a single txn', async () => {
+    const { pool, calls } = makePool([
+      {}, // BEGIN
+      {}, // set_config statement_timeout
+      {}, // set_config search_path
+      { rows: [{ id: 1, name: 'A', email: 'a@x.com' }], fields: [{ name: 'id' }] },
+      { rows: [{ id: 2, name: 'B', email: 'b@x.com' }], fields: [{ name: 'id' }] },
+      {}, // COMMIT
+    ]);
+    const ctx = makeCtx(pool, { writable: true });
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/insert',
+      headers: authHeaders(),
+      body: {
+        table: 'users',
+        rows: [
+          { name: 'A', email: 'a@x.com' },
+          { name: 'B', email: 'b@x.com' },
+        ],
+      },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+
+    assert.equal(r.status, 200, r.body);
+    const inserts = calls.filter((c) => /^INSERT INTO "users"/.test(c.text));
+    assert.equal(inserts.length, 2, 'one INSERT per row');
+    assert.equal(calls.filter((c) => c.text.trim() === 'BEGIN').length, 1, 'exactly one txn');
+    assert.equal(calls.filter((c) => c.text.trim() === 'COMMIT').length, 1);
+
+    const json = r.json as { operation: string; rows: Array<Record<string, unknown>>; rowCount: number };
+    assert.equal(json.operation, 'insert');
+    assert.equal(json.rowCount, 2);
+    assert.equal(json.rows.length, 2);
+    // The echoed rows are redacted like any read.
+    for (const row of json.rows) {
+      if (row.email != null) assert.equal(row.email, PII_REDACTED, 'bulk echo redacts PII');
+    }
+  });
+
+  it('bulk delete compiles one PK-addressed DELETE per row', async () => {
+    const { pool, calls } = makePool([
+      {},
+      {},
+      {},
+      { rows: [{ id: 1 }], fields: [{ name: 'id' }] },
+      { rows: [{ id: 2 }], fields: [{ name: 'id' }] },
+      {},
+    ]);
+    const ctx = makeCtx(pool, { writable: true });
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/delete',
+      headers: authHeaders(),
+      body: { table: 'users', rows: [{ id: 1 }, { id: 2 }] },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+
+    assert.equal(r.status, 200, r.body);
+    const deletes = calls.filter((c) => /^DELETE FROM "users"/.test(c.text));
+    assert.equal(deletes.length, 2);
+    for (const d of deletes) {
+      assert.match(d.text, /WHERE "id" = \$1/, 'each delete is PK-addressed');
+    }
+    assert.deepEqual(
+      deletes.map((d) => d.values),
+      [[1], [2]],
+    );
+    assert.equal((r.json as { rowCount: number }).rowCount, 2);
+  });
+
+  it('rolls back the WHOLE bulk delete when any row matches nothing (404, no COMMIT)', async () => {
+    const { pool, calls } = makePool([
+      {},
+      {},
+      {},
+      { rows: [{ id: 1 }], fields: [{ name: 'id' }] }, // first delete hits
+      { rows: [] }, // second delete matches nothing
+      {}, // ROLLBACK
+    ]);
+    const ctx = makeCtx(pool, { writable: true });
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/delete',
+      headers: authHeaders(),
+      body: { table: 'users', rows: [{ id: 1 }, { id: 999 }] },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+
+    assert.equal(r.status, 404, r.body);
+    assert.ok(
+      calls.some((c) => c.text.trim() === 'ROLLBACK'),
+      'txn rolled back',
+    );
+    assert.ok(!calls.some((c) => c.text.trim() === 'COMMIT'), 'nothing committed');
+  });
+
+  it('rejects bulk update (400)', async () => {
+    const { pool, calls } = makePool();
+    const ctx = makeCtx(pool, { writable: true });
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/update',
+      headers: authHeaders(),
+      body: { table: 'users', rows: [{ id: 1 }], data: { name: 'x' } },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+    assert.equal(r.status, 400);
+    assert.match((r.json as { error: string }).error, /bulk update is not supported/i);
+    assert.equal(calls.length, 0, 'no statement ran');
+  });
+
+  it('caps bulk requests at 500 rows (400, nothing runs)', async () => {
+    const { pool, calls } = makePool();
+    const ctx = makeCtx(pool, { writable: true });
+    const rows = Array.from({ length: 501 }, (_, i) => ({ id: i + 1 }));
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/delete',
+      headers: authHeaders(),
+      body: { table: 'users', rows },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+    assert.equal(r.status, 400);
+    assert.match((r.json as { error: string }).error, /too many rows/i);
+    assert.equal(calls.length, 0, 'no statement ran');
+  });
+
+  it('rejects an empty rows array (400)', async () => {
+    const { pool } = makePool();
+    const ctx = makeCtx(pool, { writable: true });
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/row/insert',
+      headers: authHeaders(),
+      body: { table: 'users', rows: [] },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+    assert.equal(r.status, 400);
+    assert.match((r.json as { error: string }).error, /at least one entry/i);
+  });
+
+  it('names the offending row on a per-row validation failure (400, nothing runs)', async () => {
+    const { pool, calls } = makePool();
+    const ctx = makeCtx(pool, { writable: true });
+
+    // insert: unknown column in the second row
+    const badInsert = makeReq({
+      method: 'POST',
+      url: '/api/row/insert',
+      headers: authHeaders(),
+      body: { table: 'users', rows: [{ name: 'ok' }, { nope: 'x' }] },
+    });
+    const a = makeRes();
+    await handleRequest(badInsert, a.res, ctx);
+    const ra = await a.done;
+    assert.equal(ra.status, 400);
+    assert.match((ra.json as { error: string }).error, /unknown column "nope"[\s\S]*rows\[1\]/);
+
+    // delete: second row missing the PK
+    const badDelete = makeReq({
+      method: 'POST',
+      url: '/api/row/delete',
+      headers: authHeaders(),
+      body: { table: 'users', rows: [{ id: 1 }, { name: 'no pk' }] },
+    });
+    const b = makeRes();
+    await handleRequest(badDelete, b.res, ctx);
+    const rb = await b.done;
+    assert.equal(rb.status, 400);
+    assert.match((rb.json as { error: string }).error, /primary key[\s\S]*rows\[1\]/);
+
+    assert.equal(calls.length, 0, 'validation happens before any statement');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CSRF + auth on write routes
 // ---------------------------------------------------------------------------
 

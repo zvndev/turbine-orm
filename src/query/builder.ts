@@ -67,7 +67,7 @@ import type {
   UpsertArgs,
   WithClause,
 } from './types.js';
-import { LRUCache, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
+import { LRUCache, ownLookup, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 import type { WhereHost } from './where-compile.js';
@@ -1034,7 +1034,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       !whereObj.NOT &&
       whereKeys.every((k) => {
         const v = whereObj[k];
-        return v !== null && !isWhereOperator(v) && !this.tableMeta.relations[k];
+        return v !== null && !isWhereOperator(v) && !ownLookup(this.tableMeta.relations, k);
       });
 
     // Simple path: plain equality, no operators/null/OR
@@ -1321,7 +1321,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
     const orderFp = args?.orderBy
       ? Object.entries(args.orderBy)
-          .map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d, this.tableMeta.relations[k]?.to)}`)
+          .map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d, ownLookup(this.tableMeta.relations, k)?.to)}`)
           .join(',')
       : '';
     const cursorFp = args?.cursor
@@ -2075,7 +2075,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /** Convert camelCase field name to snake_case column name (unquoted, for non-SQL uses) */
   private toColumn(field: string): string {
-    const mapped = this.tableMeta.columnMap[field];
+    // Prototype-safe lookup: a plain-object `columnMap` would otherwise return
+    // an inherited member (e.g. Object.prototype.constructor) for a field named
+    // "constructor" / "toString" / "__proto__", bypassing the unknown-field
+    // check below and returning a non-string as the column name.
+    const mapped = ownLookup(this.tableMeta.columnMap, field);
     if (mapped) return mapped;
     // Fall back to camelToSnake ONLY if that snake_cased name also exists as a
     // real column on the table. This preserves the convenience of writing
@@ -2084,7 +2088,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // SQL injection and catching typos like `where: { emial: 'x' }` with a
     // clear error instead of a cryptic Postgres "column does not exist".
     const snake = camelToSnake(field);
-    if (this.tableMeta.reverseColumnMap?.[snake]) {
+    if (this.tableMeta.reverseColumnMap && ownLookup(this.tableMeta.reverseColumnMap, snake)) {
       return snake;
     }
     if (this.tableMeta.allColumns?.includes(snake)) {
@@ -2208,7 +2212,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // pick.where / pick.orderBy paths). To-one relation orderBy carries the
       // target's global filter once per ordered column.
       if (this.isRelationOrderByValue(dir)) {
-        const relDef = this.tableMeta.relations[key];
+        const relDef = ownLookup(this.tableMeta.relations, key);
         if (relDef && isRelationPickOrderBy(dir)) {
           this.collectRelationPickOrderParams(key, relDef, dir, params);
         } else if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {

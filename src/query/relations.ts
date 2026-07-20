@@ -36,6 +36,7 @@ import type {
   WithCount,
   WithOptions,
 } from './types.js';
+import { ownLookup } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 import * as writesMod from './writes.js';
@@ -402,9 +403,9 @@ export function buildOrderBy(
   // are validated in the relation branch below, so skip them here.
   if (process.env.NODE_ENV !== 'production') {
     for (const [key, value] of Object.entries(orderBy)) {
-      if (isRelationOrderByValue(qi, value) && qi.tableMeta.relations[key]) continue;
+      if (isRelationOrderByValue(qi, value) && ownLookup(qi.tableMeta.relations, key)) continue;
       const snakeKey = camelToSnake(key);
-      if (!qi.tableMeta.columns.some((c) => c.name === snakeKey) && !(key in qi.tableMeta.columnMap)) {
+      if (!qi.tableMeta.columns.some((c) => c.name === snakeKey) && !Object.hasOwn(qi.tableMeta.columnMap, key)) {
         console.warn(
           `[turbine] Unknown orderBy field "${key}" for table "${qi.tableMeta.name}". ` +
             'This will cause a runtime error.',
@@ -514,7 +515,7 @@ export function nullsSuffix(qi: BuilderCtx, nulls: 'first' | 'last' | undefined)
  * camelCase-named DB columns like "sortOrder").
  */
 export function resolveOrderByColumn(_qi: BuilderCtx, table: string, meta: TableMetadata, key: string): string {
-  const col = meta.columnMap[key] ?? camelToSnake(key);
+  const col = ownLookup(meta.columnMap, key) ?? camelToSnake(key);
   if (!meta.allColumns.includes(col)) {
     throw new ValidationError(
       `[turbine] Unknown field "${key}" in orderBy on table "${table}". ` +
@@ -673,7 +674,7 @@ export function buildRelationOrderBy(
     .map(([col, dirValue]) => {
       // columnMap-first resolution (camelToSnake fallback): mirrors the
       // scalar orderBy path so camelCase-named DB columns resolve here too.
-      const snakeCol = targetMeta.columnMap[col] ?? camelToSnake(col);
+      const snakeCol = ownLookup(targetMeta.columnMap, col) ?? camelToSnake(col);
       if (!targetMeta.allColumns.includes(snakeCol)) {
         throw new ValidationError(
           `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").`,
@@ -1257,7 +1258,7 @@ export function resolveTargetColumns(
     // opt-in and comes back regardless of the query's `includePii`.
     const selectedFields = Object.entries(spec.select)
       .filter(([, v]) => v)
-      .map(([k]) => targetMeta.columnMap[k] ?? camelToSnake(k));
+      .map(([k]) => ownLookup(targetMeta.columnMap, k) ?? camelToSnake(k));
     return selectedFields.filter((col) => targetMeta.allColumns.includes(col));
   }
   // Default / omit-only relation projection: PII columns are excluded unless
@@ -1268,7 +1269,7 @@ export function resolveTargetColumns(
     const omittedFields = new Set(
       Object.entries(spec.omit)
         .filter(([, v]) => v)
-        .map(([k]) => targetMeta.columnMap[k] ?? camelToSnake(k)),
+        .map(([k]) => ownLookup(targetMeta.columnMap, k) ?? camelToSnake(k)),
     );
     return targetMeta.allColumns.filter((col) => !omittedFields.has(col) && !(hasPii && piiCols!.has(col)));
   }

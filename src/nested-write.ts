@@ -12,7 +12,7 @@
  * `NestedWriteContext`.
  */
 
-import { CircularRelationError, RelationError, ValidationError } from './errors.js';
+import { CircularRelationError, describeTargetForMessage, RelationError, ValidationError } from './errors.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { normalizeKeyColumns } from './schema.js';
 
@@ -75,7 +75,7 @@ export function extractRelationFields(data: Record<string, unknown>, tableMeta: 
 
   for (const [key, value] of Object.entries(data)) {
     if (
-      key in tableMeta.relations &&
+      Object.hasOwn(tableMeta.relations, key) &&
       value !== null &&
       typeof value === 'object' &&
       !Array.isArray(value) &&
@@ -97,7 +97,7 @@ export function extractRelationFields(data: Record<string, unknown>, tableMeta: 
  */
 export function hasRelationFields(data: Record<string, unknown>, tableMeta: TableMetadata): boolean {
   for (const key of Object.keys(data)) {
-    if (key in tableMeta.relations) {
+    if (Object.hasOwn(tableMeta.relations, key)) {
       const val = data[key];
       if (val !== null && typeof val === 'object' && !Array.isArray(val) && !(val instanceof Date)) {
         return true;
@@ -301,7 +301,9 @@ export async function executeNestedUpdate(
   } else {
     parentRow = (await ctx.tx.table(tableName).findUnique({ where })) as Record<string, unknown>;
     if (!parentRow) {
-      throw new ValidationError(`[turbine] update: no ${tableName} row found matching ${JSON.stringify(where)}.`);
+      throw new ValidationError(
+        `[turbine] update: no ${tableName} row found matching ${describeTargetForMessage(where)}.`,
+      );
     }
   }
 
@@ -409,7 +411,7 @@ async function processHasManyCreate(
       // Check if any items have nested relations (need per-row recursion)
       const childTable = ctx.schema.tables[rel.to];
       const hasNested =
-        childTable && items.some((item) => Object.keys(item).some((k) => k in (childTable.relations ?? {})));
+        childTable && items.some((item) => Object.keys(item).some((k) => Object.hasOwn(childTable.relations ?? {}, k)));
 
       if (hasNested) {
         // Per-row recursive create for items with nested relations
@@ -486,7 +488,7 @@ async function resolveBelongsToForCreate(
       relatedRow = (await ctx.tx.table(rel.to).findUnique({ where: target })) as Record<string, unknown> | null;
       if (!relatedRow) {
         throw new ValidationError(
-          `[turbine] connect on "${relName}": no ${rel.to} row found matching ${JSON.stringify(target)}.`,
+          `[turbine] connect on "${relName}": no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
         );
       }
     }
@@ -558,7 +560,7 @@ async function processBelongsToCreate(
       const existing = await ctx.tx.table(rel.to).findUnique({ where: target });
       if (!existing) {
         throw new ValidationError(
-          `[turbine] connect on "${relName}": no ${rel.to} row found matching ${JSON.stringify(target)}.`,
+          `[turbine] connect on "${relName}": no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
         );
       }
       const updateData: Record<string, unknown> = {};
@@ -597,7 +599,9 @@ async function batchConnect(
   for (const target of items) {
     const existing = await ctx.tx.table(rel.to).findUnique({ where: target });
     if (!existing) {
-      throw new ValidationError(`[turbine] connect: no ${rel.to} row found matching ${JSON.stringify(target)}.`);
+      throw new ValidationError(
+        `[turbine] connect: no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
+      );
     }
   }
 

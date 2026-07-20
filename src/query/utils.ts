@@ -22,6 +22,19 @@ export function quoteIdent(name: string): string {
 }
 
 /**
+ * Prototype-safe own-property read for the plain metadata maps (columnMap,
+ * relations, reverseColumnMap). These are constructed as plain objects, so a
+ * bare `map[key]` for a user-supplied field name like "constructor",
+ * "toString", or "__proto__" returns an inherited member from
+ * `Object.prototype` — a truthy value that slips past validation and produces a
+ * cryptic `TypeError` instead of a clean `ValidationError`. Returns `undefined`
+ * unless `key` is an OWN enumerable/non-enumerable property.
+ */
+export function ownLookup<T>(map: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(map, key) ? map[key] : undefined;
+}
+
+/**
  * Escape single quotes for use as string keys in json_build_object().
  * Doubles single quotes per SQL quoting rules.
  */

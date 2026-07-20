@@ -20,8 +20,9 @@
  *     $N params compiled through the query builders
  *   • Read routes run in a READ ONLY transaction (belt-and-suspenders)
  *   • Write routes (only when `--write` is set) run in a plain BEGIN/COMMIT
- *     transaction, require a matching Origin header (CSRF), and target exactly
- *     one row by its full primary key
+ *     transaction, require a matching Origin header (CSRF), and address every
+ *     row by its full primary key (single row, or a capped `rows` array of
+ *     PK-addressed statements run atomically)
  *   • 30s statement timeout via parameterized set_config()
  *   • Per-session rate limiting, cross-origin refusal, security headers, and a
  *     per-request CSP nonce for the inline script (no `unsafe-inline`)
@@ -30,9 +31,10 @@
  * every row-bearing response (the literal `•• redacted ••`) unless the server
  * was started with `--show-pii`.
  *
- * Write model (opt-in): update/insert/delete a single row. DDL and multi-row or
- * unconditional writes are deliberately unsupported. Use the CLI or migrate for
- * schema changes and bulk operations.
+ * Write model (opt-in): update a single row; insert/delete one row or a capped
+ * list of PK-addressed rows in one all-or-nothing transaction. DDL and
+ * predicate-based (unconditional) writes are deliberately unsupported. Use the
+ * CLI or migrate for schema changes and true bulk operations.
  */
 
 import { spawn } from 'node:child_process';
@@ -130,6 +132,12 @@ export interface StudioContext {
    * (the default). Set to the SQLite dialect in demo mode.
    */
   dialect?: Dialect;
+  /**
+   * Demo mode only: saved queries live here instead of on disk, honoring the
+   * "nothing you do here is saved anywhere" promise. Absent in normal mode
+   * (saved queries persist to `<stateDir>/studio-queries.json`).
+   */
+  memorySavedQueries?: SavedQueriesFile;
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +222,9 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     showPii: demo ? false : options.showPii === true,
     demo,
     dialect,
+    // Demo never touches disk: saved queries live (and die) with the process,
+    // and the user's real .turbine/studio-queries.json is never read.
+    memorySavedQueries: demo ? { version: 1, queries: [] } : undefined,
   };
 
   const server = createServer((req, res) => {
@@ -581,6 +592,18 @@ export async function apiTableRows(
   const hasSearch = search.length > 0 && textColumns.length > 0;
   const pattern = hasSearch ? `%${escapeLikePattern(search)}%` : null;
 
+  // Per-column filters: `filters` is a JSON array of { column, op, value }
+  // composed by the Data tab's filter bar. Every column is validated against
+  // the metadata, every op against a fixed whitelist, and every value is a
+  // parameter — same discipline as the builder route.
+  let filters: TableFilter[];
+  try {
+    filters = parseTableFilters(params.get('filters'), table, redactedPii);
+  } catch (err) {
+    sendJson(res, 400, { error: `[turbine] ${err instanceof Error ? err.message : String(err)}` });
+    return;
+  }
+
   // Parameter placeholder + case-insensitive LIKE condition differ by engine.
   // Postgres: numbered `$N` + `ILIKE`. Demo (SQLite): named `:pN` (bound by
   // name from the positional value array, matching Turbine's own SQLite path)
@@ -592,23 +615,45 @@ export async function apiTableRows(
       ? `LOWER(${quoteIdent(col)}) LIKE LOWER(${ph(n)}) ESCAPE '\\'`
       : `${quoteIdent(col)} ILIKE ${ph(n)} ESCAPE '\\'`;
 
-  // Main query: $1 = limit, $2 = offset, $3 = pattern (if search)
-  const mainValues: unknown[] = [limit, offset];
-  let mainWhere = '';
-  if (hasSearch && pattern !== null) {
-    mainValues.push(pattern);
-    const conds = textColumns.map((c) => likeCond(c, 3));
-    mainWhere = `WHERE (${conds.join(' OR ')})`;
-  }
+  // Build the WHERE conditions (search OR-set + per-column filters) once per
+  // query, numbering parameters from `startIndex` so the main query (params
+  // begin after limit/offset) and the count query (params begin at 1) each get
+  // indices matching their own value arrays.
+  const buildWhere = (startIndex: number): { where: string; values: unknown[] } => {
+    let n = startIndex;
+    const conds: string[] = [];
+    const values: unknown[] = [];
+    if (hasSearch && pattern !== null) {
+      values.push(pattern);
+      const idx = n++;
+      conds.push(`(${textColumns.map((c) => likeCond(c, idx)).join(' OR ')})`);
+    }
+    for (const f of filters) {
+      if (f.op === 'isNull') {
+        conds.push(`${quoteIdent(f.column)} IS NULL`);
+      } else if (f.op === 'notNull') {
+        conds.push(`${quoteIdent(f.column)} IS NOT NULL`);
+      } else if (f.op === 'contains') {
+        values.push(`%${escapeLikePattern(String(f.value))}%`);
+        conds.push(likeCond(f.column, n++));
+      } else {
+        const sqlOp = FILTER_OPS[f.op];
+        values.push(f.value);
+        conds.push(`${quoteIdent(f.column)} ${sqlOp} ${ph(n++)}`);
+      }
+    }
+    return { where: conds.length ? `WHERE ${conds.join(' AND ')}` : '', values };
+  };
 
-  // Count query: $1 = pattern (if search)
-  const countValues: unknown[] = [];
-  let countWhere = '';
-  if (hasSearch && pattern !== null) {
-    countValues.push(pattern);
-    const conds = textColumns.map((c) => likeCond(c, 1));
-    countWhere = `WHERE (${conds.join(' OR ')})`;
-  }
+  // Main query: $1 = limit, $2 = offset, then search/filter params.
+  const mainW = buildWhere(3);
+  const mainValues: unknown[] = [limit, offset, ...mainW.values];
+  const mainWhere = mainW.where;
+
+  // Count query: params start at $1.
+  const countW = buildWhere(1);
+  const countValues: unknown[] = countW.values;
+  const countWhere = countW.where;
 
   // Demo runs against an unqualified in-memory SQLite table (no schemas);
   // Postgres qualifies with the configured `--schema`.
@@ -679,6 +724,87 @@ export function isTextishType(pgType: string): boolean {
 export function escapeLikePattern(s: string): string {
   // Escape the LIKE wildcards so user input is treated literally.
   return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+// ---------------------------------------------------------------------------
+// Data-tab per-column filters
+// ---------------------------------------------------------------------------
+
+/** Scalar comparison ops → SQL operator. `contains`/`isNull`/`notNull` compile separately. */
+const FILTER_OPS: Record<string, string> = {
+  equals: '=',
+  not: '<>',
+  gt: '>',
+  gte: '>=',
+  lt: '<',
+  lte: '<=',
+};
+
+const FILTER_OP_NAMES = new Set([...Object.keys(FILTER_OPS), 'contains', 'isNull', 'notNull']);
+
+/** Hard cap on filter clauses per request — the UI never composes more. */
+const MAX_TABLE_FILTERS = 10;
+
+interface TableFilter {
+  /** Resolved Postgres column name (validated against metadata). */
+  column: string;
+  op: string;
+  value?: unknown;
+}
+
+/**
+ * Parse + validate the Data tab's `filters` query param. Throws with a clear
+ * message on any invalid shape; the caller turns that into a 400. Filters on
+ * redacted PII columns are refused outright (a filter is a value-probing
+ * oracle, same reason redacted columns are excluded from search and orderBy).
+ */
+function parseTableFilters(raw: string | null, table: TableMetadata, redactedPii: ReadonlySet<string>): TableFilter[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('`filters` must be a JSON array');
+  }
+  if (!Array.isArray(parsed)) throw new Error('`filters` must be a JSON array');
+  if (parsed.length > MAX_TABLE_FILTERS) {
+    throw new Error(`too many filters (max ${MAX_TABLE_FILTERS})`);
+  }
+  const out: TableFilter[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error('each filter must be an object { column, op, value }');
+    }
+    const f = item as Record<string, unknown>;
+    const col = typeof f.column === 'string' ? resolveColumnName(table, f.column) : null;
+    if (!col) {
+      throw new Error(`unknown filter column "${String(f.column)}" on table "${table.name}"`);
+    }
+    if (redactedPii.has(col)) {
+      throw new Error(`column "${col}" is PII-redacted; filtering on it is disabled (run with --show-pii to enable)`);
+    }
+    const op = typeof f.op === 'string' ? f.op : '';
+    if (!FILTER_OP_NAMES.has(op)) {
+      throw new Error(`unknown filter op "${op}" (expected one of: ${[...FILTER_OP_NAMES].join(', ')})`);
+    }
+    if (op === 'isNull' || op === 'notNull') {
+      out.push({ column: col, op });
+      continue;
+    }
+    const value = f.value;
+    const t = typeof value;
+    if (value === null || value === undefined || (t !== 'string' && t !== 'number' && t !== 'boolean')) {
+      throw new Error(`filter on "${col}" needs a scalar value (use isNull/notNull for null checks)`);
+    }
+    if (op === 'contains') {
+      const colMeta = table.columns.find((c) => c.name === col);
+      if (!colMeta || !isTextishType(colMeta.pgType)) {
+        throw new Error(`contains only applies to text columns ("${col}" is ${colMeta?.pgType ?? 'unknown'})`);
+      }
+    }
+    out.push({ column: col, op, value });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -763,15 +889,25 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
 }
 
 // ---------------------------------------------------------------------------
-// API: /api/row/update | /api/row/insert | /api/row/delete (single-row writes)
+// API: /api/row/update | /api/row/insert | /api/row/delete (PK-addressed writes)
 //
 // Write mode only (the routes do not exist otherwise). Every column identifier
 // is validated against the introspected metadata and the statement is compiled
 // through the query builders (`buildUpdate`/`buildCreate`/`buildDelete`) so all
 // values are $N params; there is no raw SQL. update/delete require the caller
 // to supply the FULL primary key in `where`; the effective predicate is rebuilt
-// from those PK values alone, so a write can only ever touch one row.
+// from those PK values alone, so a statement can only ever touch one row.
+//
+// Bulk form (insert/delete only): pass `rows: [...]` instead of `data`/`where`
+// — an array of data objects (insert) or PK-where objects (delete). Each entry
+// goes through the exact same per-row validation and compiles to its own
+// single-row statement; all statements run in ONE transaction (all-or-nothing,
+// capped at MAX_BULK_ROWS). Predicate-based bulk writes stay deliberately
+// unsupported — every row is still addressed by its full primary key.
 // ---------------------------------------------------------------------------
+
+/** Hard cap on rows per bulk insert/delete request (matches the max page size). */
+const MAX_BULK_ROWS = 500;
 
 export async function apiRowWrite(
   req: IncomingMessage,
@@ -791,12 +927,85 @@ export async function apiRowWrite(
     return;
   }
 
+  // Bulk form: `rows` replaces `data` (insert) / `where` (delete).
+  const bulkRows = Array.isArray(body?.rows) ? (body.rows as unknown[]) : null;
+  if (bulkRows) {
+    if (op === 'update') {
+      sendJson(res, 400, { error: '[turbine] bulk update is not supported; update rows one at a time' });
+      return;
+    }
+    if (bulkRows.length === 0) {
+      sendJson(res, 400, { error: '[turbine] `rows` must include at least one entry' });
+      return;
+    }
+    if (bulkRows.length > MAX_BULK_ROWS) {
+      sendJson(res, 400, { error: `[turbine] too many rows (max ${MAX_BULK_ROWS} per request)` });
+      return;
+    }
+  }
+
   const data = (body?.data && typeof body.data === 'object' ? body.data : {}) as Record<string, unknown>;
   const rawWhere = (body?.where && typeof body.where === 'object' ? body.where : {}) as Record<string, unknown>;
 
-  // Validate every column name up front for a clean typed 400 (the builders
-  // would also reject unknowns, but an explicit check keeps the message clear).
-  if (op === 'insert' || op === 'update') {
+  // Per-statement inputs, validated up front for a clean typed 400 (the
+  // builders would also reject unknowns, but explicit checks keep messages
+  // clear and stop before any statement has run).
+  const inserts: Record<string, unknown>[] = [];
+  const wheres: Record<string, unknown>[] = [];
+
+  if (op === 'insert') {
+    const candidates = bulkRows ?? [data];
+    for (let i = 0; i < candidates.length; i++) {
+      const rowLabel = bulkRows ? ` (rows[${i}])` : '';
+      const rowData = candidates[i];
+      if (!rowData || typeof rowData !== 'object' || Array.isArray(rowData)) {
+        sendJson(res, 400, { error: `[turbine] each insert row must be an object${rowLabel}` });
+        return;
+      }
+      const rec = rowData as Record<string, unknown>;
+      const badKey = firstUnknownColumn(table, rec);
+      if (badKey) {
+        sendJson(res, 400, { error: `[turbine] unknown column "${badKey}" on table "${tableName}"${rowLabel}` });
+        return;
+      }
+      if (!Object.keys(rec).some((k) => rec[k] !== undefined)) {
+        sendJson(res, 400, { error: `[turbine] \`data\` must include at least one column${rowLabel}` });
+        return;
+      }
+      inserts.push(rec);
+    }
+  }
+
+  if (op === 'update' || op === 'delete') {
+    if (table.primaryKey.length === 0) {
+      sendJson(res, 400, {
+        error: `[turbine] "${tableName}" has no primary key; single-row writes require one.`,
+      });
+      return;
+    }
+    const candidates = op === 'delete' && bulkRows ? bulkRows : [rawWhere];
+    for (let i = 0; i < candidates.length; i++) {
+      const rowLabel = bulkRows ? ` (rows[${i}])` : '';
+      const rowWhere = candidates[i];
+      if (!rowWhere || typeof rowWhere !== 'object' || Array.isArray(rowWhere)) {
+        sendJson(res, 400, { error: `[turbine] each delete target must be a where object${rowLabel}` });
+        return;
+      }
+      const pk = extractPkWhere(table, rowWhere as Record<string, unknown>);
+      if ('error' in pk) {
+        sendJson(res, 400, { error: `[turbine] ${pk.error}${rowLabel}` });
+        return;
+      }
+      // Empty-where can never happen by construction (PK covered above); assert.
+      if (Object.keys(pk.where).length === 0) {
+        sendJson(res, 400, { error: '[turbine] refusing a write with an empty predicate' });
+        return;
+      }
+      wheres.push(pk.where);
+    }
+  }
+
+  if (op === 'update') {
     const badKey = firstUnknownColumn(table, data);
     if (badKey) {
       sendJson(res, 400, { error: `[turbine] unknown column "${badKey}" on table "${tableName}"` });
@@ -808,29 +1017,7 @@ export async function apiRowWrite(
     }
   }
 
-  // update/delete: require the table to have a PK and the caller to cover it.
-  let effectiveWhere = rawWhere;
-  if (op === 'update' || op === 'delete') {
-    if (table.primaryKey.length === 0) {
-      sendJson(res, 400, {
-        error: `[turbine] "${tableName}" has no primary key; single-row writes require one.`,
-      });
-      return;
-    }
-    const pk = extractPkWhere(table, rawWhere);
-    if ('error' in pk) {
-      sendJson(res, 400, { error: `[turbine] ${pk.error}` });
-      return;
-    }
-    // Empty-where can never happen by construction (PK covered above); assert.
-    if (Object.keys(pk.where).length === 0) {
-      sendJson(res, 400, { error: '[turbine] refusing a write with an empty predicate' });
-      return;
-    }
-    effectiveWhere = pk.where;
-  }
-
-  let deferred: { sql: string; params: unknown[] };
+  let deferreds: { sql: string; params: unknown[] }[];
   try {
     const qi = new QueryInterface<Record<string, unknown>>(
       ctx.pool as unknown as pg.Pool,
@@ -845,11 +1032,12 @@ export async function apiRowWrite(
       },
     );
     if (op === 'insert') {
-      deferred = qi.buildCreate({ data } as CreateArgs<Record<string, unknown>>);
+      deferreds = inserts.map((rec) => qi.buildCreate({ data: rec } as CreateArgs<Record<string, unknown>>));
     } else if (op === 'update') {
-      deferred = qi.buildUpdate({ where: effectiveWhere, data } as UpdateArgs<Record<string, unknown>>);
+      const where = wheres[0] as Record<string, unknown>;
+      deferreds = [qi.buildUpdate({ where, data } as UpdateArgs<Record<string, unknown>>)];
     } else {
-      deferred = qi.buildDelete({ where: effectiveWhere } as DeleteArgs<Record<string, unknown>>);
+      deferreds = wheres.map((where) => qi.buildDelete({ where } as DeleteArgs<Record<string, unknown>>));
     }
   } catch (err) {
     sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -861,29 +1049,48 @@ export async function apiRowWrite(
     // A real write transaction, NOT `READ ONLY`. Postgres also pins the
     // parameterized statement-timeout + search_path; demo (SQLite) has neither
     // GUC, so those are skipped, but the BEGIN/COMMIT is kept (SqlitePool
-    // supports it) so an in-memory write still applies atomically.
+    // supports it) so an in-memory write still applies atomically. Bulk
+    // requests are all-or-nothing: any per-row failure rolls back every row.
     await client.query('BEGIN');
     if (!ctx.demo) {
       await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
       await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
     }
-    const result = await client.query(deferred.sql, deferred.params);
+    const returnedRows: Record<string, unknown>[] = [];
+    let rowCount = 0;
+    for (const deferred of deferreds) {
+      const result = await client.query(deferred.sql, deferred.params);
+      const row = result.rows[0] as Record<string, unknown> | undefined;
+      if (!row) {
+        // A statement that touched nothing (stale PK, vanished row) aborts the
+        // whole request so a bulk delete can never half-apply.
+        await client.query('ROLLBACK');
+        const msg = op === 'insert' ? 'insert returned no row' : 'no row matched the primary key';
+        sendJson(res, 404, { error: `[turbine] ${msg}` });
+        return;
+      }
+      returnedRows.push(row);
+      rowCount += result.rowCount ?? 1;
+    }
     await client.query('COMMIT');
 
-    const row = result.rows[0] as Record<string, unknown> | undefined;
-    if (!row) {
-      const msg = op === 'insert' ? 'insert returned no row' : 'no row matched the primary key';
-      sendJson(res, 404, { error: `[turbine] ${msg}` });
-      return;
-    }
-    // The echoed row is redacted the same way as any read (unless --show-pii),
+    // The echoed rows are redacted the same way as any read (unless --show-pii),
     // even though a write to a pii column is allowed.
     const piiKeys = ctx.showPii ? NO_PII_KEYS : piiKeysForTable(table);
-    sendJson(res, 200, {
-      operation: op,
-      row: serializeRow(redactFlatRow(row, piiKeys)),
-      rowCount: result.rowCount ?? 1,
-    });
+    if (bulkRows) {
+      sendJson(res, 200, {
+        operation: op,
+        rows: returnedRows.map((row) => serializeRow(redactFlatRow(row, piiKeys))),
+        rowCount,
+      });
+    } else {
+      const first = returnedRows[0] as Record<string, unknown>;
+      sendJson(res, 200, {
+        operation: op,
+        row: serializeRow(redactFlatRow(first, piiKeys)),
+        rowCount,
+      });
+    }
   } catch (err) {
     try {
       await client.query('ROLLBACK');
@@ -966,6 +1173,11 @@ function savedQueriesPath(ctx: StudioContext): string {
 let legacyDropNoticeShown = false;
 
 function loadSavedQueries(ctx: StudioContext): SavedQueriesFile {
+  // Demo mode: in-memory only — never read the user's real saved-query file.
+  if (ctx.demo) {
+    if (!ctx.memorySavedQueries) ctx.memorySavedQueries = { version: 1, queries: [] };
+    return ctx.memorySavedQueries;
+  }
   const file = savedQueriesPath(ctx);
   if (!existsSync(file)) return { version: 1, queries: [] };
   try {
@@ -991,6 +1203,11 @@ function loadSavedQueries(ctx: StudioContext): SavedQueriesFile {
 }
 
 function writeSavedQueries(ctx: StudioContext, data: SavedQueriesFile): void {
+  // Demo mode: in-memory only — nothing is ever written to disk.
+  if (ctx.demo) {
+    ctx.memorySavedQueries = data;
+    return;
+  }
   const file = savedQueriesPath(ctx);
   const dir = dirname(file);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
