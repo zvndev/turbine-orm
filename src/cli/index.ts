@@ -6,7 +6,7 @@
  *   turbine init                  — Initialize a Turbine project
  *   turbine generate | pull       — Introspect database and generate TypeScript types
  *   turbine push                  - Apply schema-builder definitions to database (destructive ops gated)
- *   turbine migrate create <name> - Create a new SQL migration file (--auto | --recipe <name>)
+ *   turbine migrate create <name> - Create a new SQL migration file (--auto | --from-diff | --recipe <name>)
  *   turbine migrate up            — Apply pending migrations
  *   turbine migrate deploy        — Apply pending migrations without prompts
  *   turbine migrate down          — Rollback last migration
@@ -45,6 +45,7 @@ import {
 import { canResolveTsx, getTsLoaderError, needsTsLoader, registerTsLoader } from './loader.js';
 import { runMcpServer } from './mcp.js';
 import {
+  buildDiffMigrationBody,
   createMigration,
   inspectMigrationDeploy,
   listMigrationFiles,
@@ -102,12 +103,25 @@ export interface CliArgs {
   verbose?: boolean;
   help?: boolean;
   auto?: boolean;
+  /** `migrate create --from-diff`: scaffold UP/DOWN from the schema diff, destructive statements flagged. */
+  fromDiff?: boolean;
   allowDrift?: boolean;
   allowEmpty?: boolean;
   allowDestructive?: boolean;
   /** `migrate create --recipe <name>` scaffold selector. */
   recipe?: string;
   fix?: boolean;
+  // init flags
+  /** `init --yes`/`-y`: accept every step's default non-interactively. */
+  yes?: boolean;
+  /** `init --skip-schema`: don't scaffold the schema file. */
+  skipSchema?: boolean;
+  /** `init --skip-seed`: don't scaffold the seed file or offer to run it. */
+  skipSeed?: boolean;
+  /** `init --skip-push`: don't offer to push the schema to the database. */
+  skipPush?: boolean;
+  /** `init --skip-generate`: don't offer to generate the typed client. */
+  skipGenerate?: boolean;
   // generate flags
   zod?: boolean;
   includeViews?: boolean;
@@ -180,6 +194,25 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--auto':
         result.auto = true;
+        break;
+      case '--from-diff':
+        result.fromDiff = true;
+        break;
+      case '--yes':
+      case '-y':
+        result.yes = true;
+        break;
+      case '--skip-schema':
+        result.skipSchema = true;
+        break;
+      case '--skip-seed':
+        result.skipSeed = true;
+        break;
+      case '--skip-push':
+        result.skipPush = true;
+        break;
+      case '--skip-generate':
+        result.skipGenerate = true;
         break;
       case '--allow-drift':
         result.allowDrift = true;
@@ -533,8 +566,374 @@ export function detectConsumerModuleType(cwd = process.cwd()): 'module' | 'commo
 }
 
 // ---------------------------------------------------------------------------
-// Command: init
+// Command: init — sequenced, interactive project bootstrap
 // ---------------------------------------------------------------------------
+
+/** A single step in the `turbine init` flow. */
+export type InitStepId = 'config' | 'schema' | 'seed-file' | 'push' | 'generate' | 'seed-run';
+
+/** What the planner decided to do with a step. */
+export type InitStepAction = 'run' | 'prompt' | 'skip';
+
+/** Why a step was skipped (only set when `action` is `skip`). */
+export type InitStepSkipReason =
+  | 'exists'
+  | 'flag'
+  | 'no-url'
+  | 'unreachable'
+  | 'no-seed-file'
+  | 'non-interactive'
+  | 'default-no';
+
+export interface InitPlanStep {
+  id: InitStepId;
+  action: InitStepAction;
+  /** Prompt default; also the value used to decide auto-run under `--yes`. */
+  defaultYes: boolean;
+  skipReason?: InitStepSkipReason;
+}
+
+/** Detected project state (all IO done by the caller). */
+export interface InitPlanState {
+  configExists: boolean;
+  schemaExists: boolean;
+  seedFileExists: boolean;
+  hasUrl: boolean;
+  dbReachable: boolean;
+}
+
+/** Effective flags for the planner. */
+export interface InitPlanFlags {
+  yes: boolean;
+  force: boolean;
+  interactive: boolean;
+  skipSchema: boolean;
+  skipSeed: boolean;
+  skipPush: boolean;
+  skipGenerate: boolean;
+}
+
+/**
+ * Pure step planner for `turbine init`. Given the detected project state and the
+ * effective flags, decide for each step whether to run it, prompt for it, or
+ * skip it (and why). No IO — every input is precomputed by the caller — so the
+ * whole decision matrix is unit-testable without a TTY or a database.
+ *
+ * Three modes:
+ *  - `prompt`      (interactive TTY, no `--yes`): scaffold + DB steps are prompted.
+ *  - `auto-yes`    (`--yes`): accept each step's default; the yes-defaults run.
+ *  - `auto-legacy` (non-TTY, no `--yes`): reproduce the pre-existing init
+ *    behavior. Scaffold files + generate run; push + seed-run do not.
+ *
+ * Steps that create files (config, schema, seed) are skipped when the file
+ * already exists, so re-runs are safe. DB steps (push, generate, seed-run) are
+ * skipped when there is no URL or the database is unreachable.
+ */
+export function planInitSteps(state: InitPlanState, flags: InitPlanFlags): InitPlanStep[] {
+  const mode: 'prompt' | 'auto-yes' | 'auto-legacy' =
+    flags.interactive && !flags.yes ? 'prompt' : flags.yes ? 'auto-yes' : 'auto-legacy';
+
+  const steps: InitPlanStep[] = [];
+
+  // config — core scaffold, never prompted.
+  steps.push(
+    state.configExists && !flags.force
+      ? { id: 'config', action: 'skip', defaultYes: true, skipReason: 'exists' }
+      : { id: 'config', action: 'run', defaultYes: true },
+  );
+
+  // Scaffold files (schema, seed) — created by default; prompted interactively.
+  const scaffold = (id: InitStepId, exists: boolean, skipFlag: boolean): InitPlanStep => {
+    if (skipFlag) return { id, action: 'skip', defaultYes: true, skipReason: 'flag' };
+    if (exists) return { id, action: 'skip', defaultYes: true, skipReason: 'exists' };
+    return { id, action: mode === 'prompt' ? 'prompt' : 'run', defaultYes: true };
+  };
+  steps.push(scaffold('schema', state.schemaExists, flags.skipSchema));
+  steps.push(scaffold('seed-file', state.seedFileExists, flags.skipSeed));
+
+  // seed-run needs a seed file — either one that already exists, or one this run
+  // is about to create.
+  const seedWillExist = state.seedFileExists || steps.find((s) => s.id === 'seed-file')?.action !== 'skip';
+
+  // DB steps — need a reachable database.
+  const dbStep = (
+    id: InitStepId,
+    skipFlag: boolean,
+    opts: { legacyRun: boolean; defaultYes: boolean; extraSkip?: InitStepSkipReason },
+  ): InitPlanStep => {
+    const { defaultYes } = opts;
+    if (skipFlag) return { id, action: 'skip', defaultYes, skipReason: 'flag' };
+    if (!state.hasUrl) return { id, action: 'skip', defaultYes, skipReason: 'no-url' };
+    if (!state.dbReachable) return { id, action: 'skip', defaultYes, skipReason: 'unreachable' };
+    if (opts.extraSkip) return { id, action: 'skip', defaultYes, skipReason: opts.extraSkip };
+    if (mode === 'prompt') return { id, action: 'prompt', defaultYes };
+    if (mode === 'auto-yes') {
+      return defaultYes
+        ? { id, action: 'run', defaultYes }
+        : { id, action: 'skip', defaultYes, skipReason: 'default-no' };
+    }
+    // auto-legacy
+    return opts.legacyRun
+      ? { id, action: 'run', defaultYes }
+      : { id, action: 'skip', defaultYes, skipReason: 'non-interactive' };
+  };
+
+  steps.push(dbStep('push', flags.skipPush, { legacyRun: false, defaultYes: true }));
+  steps.push(dbStep('generate', flags.skipGenerate, { legacyRun: true, defaultYes: true }));
+  steps.push(
+    dbStep('seed-run', flags.skipSeed, {
+      legacyRun: false,
+      defaultYes: false,
+      extraSkip: seedWillExist ? undefined : 'no-seed-file',
+    }),
+  );
+
+  return steps;
+}
+
+/** Prompt for a yes/no answer on an interactive TTY. */
+async function promptYesNo(question: string, defaultYes: boolean): Promise<boolean> {
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const suffix = defaultYes ? '[Y/n]' : '[y/N]';
+    const raw = (await rl.question(`  ${question} ${dim(suffix)} `)).trim().toLowerCase();
+    if (raw === '') return defaultYes;
+    return raw === 'y' || raw === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+/** Probe database reachability with a short-lived connection. Never throws. */
+async function probeDatabase(url: string): Promise<boolean> {
+  try {
+    const { default: pg } = await import('pg');
+    const client = new pg.Client({ connectionString: url });
+    await client.connect();
+    await client.end();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const INIT_SEED_TEMPLATE = `/**
+ * Turbine seed file
+ *
+ * Run with: npx turbine seed
+ */
+
+import { defineSeed } from 'turbine-orm';
+
+export default defineSeed(async (db) => {
+  console.log('Seeding database...');
+
+  // Add your seed data here:
+  // await db.raw\`INSERT INTO users (email, name) VALUES (\${'admin@example.com'}, \${'Admin'})\`;
+
+  console.log('Done!');
+});
+`;
+
+const INIT_SCHEMA_TEMPLATE = `/**
+ * Turbine schema definition
+ *
+ * Define your database schema in TypeScript.
+ * Use \`npx turbine push\` to sync it to your database.
+ *
+ * @see https://turbineorm.dev
+ */
+
+import { defineSchema } from 'turbine-orm';
+
+export default defineSchema({
+  // Example:
+  // users: {
+  //   id: { type: 'serial', primaryKey: true },
+  //   email: { type: 'text', notNull: true, unique: true },
+  //   name: { type: 'text', notNull: true },
+  //   created_at: { type: 'timestamp', default: 'NOW()' },
+  // },
+});
+`;
+
+/** Create supporting directories + .gitignore entries (unconditional, unprompted). */
+function ensureInitScaffoldDirs(config: ResolvedConfig): void {
+  const migrDir = config.migrationsDir;
+  if (!existsSync(migrDir)) {
+    mkdirSync(migrDir, { recursive: true });
+    writeFileSync(`${migrDir}/.gitkeep`, '', 'utf-8');
+    success(`Created ${cyan(`${migrDir}/`)}`);
+  }
+
+  if (!existsSync(config.out)) {
+    mkdirSync(config.out, { recursive: true });
+    success(`Created ${cyan(`${config.out}/`)}`);
+  }
+
+  const gitignorePath = '.gitignore';
+  if (existsSync(gitignorePath)) {
+    const gitignoreContent = readFileSync(gitignorePath, 'utf-8');
+    const additions: string[] = [];
+    if (!gitignoreContent.includes('generated/turbine')) additions.push('generated/turbine/');
+    if (!gitignoreContent.includes('turbine.config.ts')) additions.push('turbine.config.ts');
+    if (additions.length > 0) {
+      appendFileSync(gitignorePath, `\n# Turbine generated client & config\n${additions.join('\n')}\n`);
+      success(`Added ${cyan(additions.join(', '))} to ${cyan('.gitignore')}`);
+    }
+  }
+}
+
+function writeInitSchemaTemplate(config: ResolvedConfig): void {
+  const schemaDir = dirname(config.schemaFile);
+  if (schemaDir && !existsSync(schemaDir)) mkdirSync(schemaDir, { recursive: true });
+  writeFileSync(config.schemaFile, INIT_SCHEMA_TEMPLATE, 'utf-8');
+  success(`Created ${cyan(config.schemaFile)}`);
+}
+
+function writeInitSeedTemplate(seedFilePath: string): void {
+  const seedDir = dirname(seedFilePath);
+  if (seedDir && !existsSync(seedDir)) mkdirSync(seedDir, { recursive: true });
+  writeFileSync(seedFilePath, INIT_SEED_TEMPLATE, 'utf-8');
+  success(`Created ${cyan(seedFilePath)}`);
+}
+
+/** Push the code-first schema to the database, preserving the destructive typed confirm. */
+async function runInitPush(config: ResolvedConfig, url: string): Promise<void> {
+  if (!existsSync(config.schemaFile)) {
+    warn(`No schema file at ${cyan(config.schemaFile)} — skipping push.`);
+    return;
+  }
+  const schemaDef = await loadSchemaFile(config.schemaFile);
+  const spinner = new Spinner('Computing schema diff').start();
+  const diff = await schemaDiff(schemaDef, url);
+  if (diff.statements.length === 0) {
+    spinner.succeed('Database already in sync — nothing to push');
+    return;
+  }
+  spinner.succeed(`Found ${bold(String(diff.statements.length))} change(s) to apply`);
+
+  const pushSpinner = new Spinner('Applying schema').start();
+  try {
+    const result = await schemaPush(schemaDef, url, { precomputedDiff: diff });
+    pushSpinner.succeed(`Applied ${bold(String(result.statementsExecuted))} statement(s)`);
+  } catch (err) {
+    if (!(err instanceof DestructivePushRefusal)) throw err;
+    pushSpinner.stop();
+    if (!(await confirmDestructive(err.message))) {
+      warn('Push aborted — no schema changes were applied.');
+      return;
+    }
+    const result = await schemaPush(schemaDef, url, { allowDestructive: true, precomputedDiff: diff });
+    success(`Applied ${bold(String(result.statementsExecuted))} statement(s)`);
+  }
+}
+
+/** Introspect the database and generate the typed client. */
+async function runInitGenerate(config: ResolvedConfig, url: string): Promise<void> {
+  const spinner = new Spinner('Introspecting database').start();
+  try {
+    const schema = await introspect({
+      connectionString: url,
+      schema: config.schema,
+      include: config.include.length ? config.include : undefined,
+      exclude: config.exclude.length ? config.exclude : undefined,
+    });
+    spinner.succeed(`Found ${bold(String(Object.keys(schema.tables).length))} tables`);
+
+    const genSpinner = new Spinner('Generating TypeScript client').start();
+    const result = generate({ schema, outDir: config.out, connectionString: url });
+    genSpinner.succeed(`Generated ${bold(String(result.files.length))} files to ${cyan(`${config.out}/`)}`);
+  } catch (err) {
+    spinner.fail('Could not generate client');
+    if (err instanceof Error) console.log(`  ${dim(redactUrl(err.message))}`);
+    info(`Run generation later with: ${cyan('npx turbine generate')}`);
+  }
+}
+
+/** Run the seed file. */
+async function runInitSeed(config: ResolvedConfig): Promise<void> {
+  const seedFile = resolveSeedFile(config);
+  if (!seedFile || !existsSync(seedFile)) {
+    warn('No seed file found — skipping seed run.');
+    return;
+  }
+  const spinner = new Spinner('Running seed file').start();
+  try {
+    await runSeedPlan(getSeedExecutionPlan(seedFile), config);
+    spinner.succeed('Seed completed');
+  } catch (err) {
+    spinner.fail('Seed failed');
+    if (err instanceof Error) console.log(`  ${dim(redactUrl(err.message))}`);
+  }
+}
+
+/** Human label for a step, used in prompts and skip messages. */
+function initStepLabel(id: InitStepId): string {
+  switch (id) {
+    case 'config':
+      return 'config file';
+    case 'schema':
+      return 'schema file';
+    case 'seed-file':
+      return 'seed file';
+    case 'push':
+      return 'schema push';
+    case 'generate':
+      return 'client generation';
+    case 'seed-run':
+      return 'seed run';
+  }
+}
+
+/** Report a skipped step with its reason. Existence skips are the quiet common case. */
+function reportInitSkip(step: InitPlanStep): void {
+  const label = initStepLabel(step.id);
+  switch (step.skipReason) {
+    case 'exists':
+      info(`${label} already exists ${dim('— skipped')}`);
+      break;
+    case 'flag':
+      console.log(`  ${dim(`${symbols.dot} ${label} skipped (flag)`)}`);
+      break;
+    case 'no-url':
+      console.log(`  ${dim(`${symbols.dot} ${label} skipped (no database URL)`)}`);
+      break;
+    case 'unreachable':
+      console.log(`  ${dim(`${symbols.dot} ${label} skipped (database unreachable)`)}`);
+      break;
+    case 'no-seed-file':
+      console.log(`  ${dim(`${symbols.dot} ${label} skipped (no seed file)`)}`);
+      break;
+    case 'non-interactive':
+      console.log(`  ${dim(`${symbols.dot} ${label} skipped (non-interactive — pass --yes to run it)`)}`);
+      break;
+    case 'default-no':
+      console.log(`  ${dim(`${symbols.dot} ${label} skipped (default no)`)}`);
+      break;
+    default:
+      console.log(`  ${dim(`${symbols.dot} ${label} skipped`)}`);
+  }
+}
+
+/** The interactive prompt question for a promptable step. */
+function initPromptQuestion(step: InitPlanStep, config: ResolvedConfig, seedFilePath: string): string {
+  switch (step.id) {
+    case 'schema':
+      return `Create a starter schema file (${config.schemaFile})?`;
+    case 'seed-file':
+      return `Create a starter seed file (${seedFilePath})?`;
+    case 'push':
+      return 'Push your schema to the database now?';
+    case 'generate':
+      return 'Generate the typed client from the database now?';
+    case 'seed-run':
+      return 'Run the seed file now?';
+    default:
+      return `Run ${initStepLabel(step.id)}?`;
+  }
+}
 
 async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
@@ -580,152 +979,90 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
     newline();
   }
 
+  // Resolve the effective URL and detect current project state.
+  const url = args.url ?? envUrl ?? config.url;
+  const hasUrl = Boolean(url);
+  const interactive = Boolean(process.stdin.isTTY);
+  const yes = args.yes === true;
+  const seedFilePath = config.seedFile ?? './seed.ts';
   const configPath = findConfigFile();
 
-  // Create config file
-  if (configPath && !args.force) {
-    warn(`Config file already exists: ${dim(configPath)}`);
-    console.log(`  ${dim('Run with')} ${cyan('--force')} ${dim('to overwrite')}`);
-  } else {
-    const urlForConfig = args.url ?? undefined;
-    const configContent = configTemplate(urlForConfig);
-    writeFileSync('turbine.config.ts', configContent, 'utf-8');
-    if (configPath) {
-      success(`Overwrote ${cyan('turbine.config.ts')}`);
-    } else {
-      success(`Created ${cyan('turbine.config.ts')}`);
+  const state: InitPlanState = {
+    configExists: Boolean(configPath),
+    schemaExists: existsSync(config.schemaFile),
+    seedFileExists: existsSync(seedFilePath),
+    hasUrl,
+    dbReachable: false,
+  };
+
+  // Probe the database once, up front, so the planner can decide the DB steps.
+  // Skip the probe entirely when every DB step is already flag-skipped.
+  const anyDbStepPossible = !(args.skipPush && args.skipGenerate && args.skipSeed);
+  if (hasUrl && anyDbStepPossible) {
+    const probe = new Spinner('Checking database connection').start();
+    state.dbReachable = await probeDatabase(url);
+    if (state.dbReachable) probe.succeed('Database is reachable');
+    else probe.info('Database not reachable — push / generate / seed steps will be skipped');
+  }
+
+  const flags: InitPlanFlags = {
+    yes,
+    force: args.force === true,
+    interactive,
+    skipSchema: args.skipSchema === true,
+    skipSeed: args.skipSeed === true,
+    skipPush: args.skipPush === true,
+    skipGenerate: args.skipGenerate === true,
+  };
+  const plan = planInitSteps(state, flags);
+  const degraded = !interactive && !yes;
+
+  // Supporting dirs + .gitignore, regardless of prompts (unchanged behavior).
+  ensureInitScaffoldDirs(config);
+  newline();
+
+  // Execute the plan in order. `run` proceeds; `prompt` asks; `skip` reports.
+  for (const step of plan) {
+    if (step.action === 'skip') {
+      reportInitSkip(step);
+      continue;
+    }
+    const shouldRun =
+      step.action === 'run' ? true : await promptYesNo(initPromptQuestion(step, config, seedFilePath), step.defaultYes);
+    if (!shouldRun) {
+      info(`Skipped ${initStepLabel(step.id)}`);
+      continue;
+    }
+
+    switch (step.id) {
+      case 'config':
+        writeFileSync('turbine.config.ts', configTemplate(args.url ?? undefined), 'utf-8');
+        success(state.configExists ? `Overwrote ${cyan('turbine.config.ts')}` : `Created ${cyan('turbine.config.ts')}`);
+        break;
+      case 'schema':
+        writeInitSchemaTemplate(config);
+        break;
+      case 'seed-file':
+        writeInitSeedTemplate(seedFilePath);
+        break;
+      case 'push':
+        await runInitPush(config, url);
+        break;
+      case 'generate':
+        await runInitGenerate(config, url);
+        break;
+      case 'seed-run':
+        await runInitSeed(config);
+        break;
     }
   }
 
-  // Create migrations directory
-  const migrDir = config.migrationsDir;
-  if (!existsSync(migrDir)) {
-    mkdirSync(migrDir, { recursive: true });
-    // Create .gitkeep
-    writeFileSync(`${migrDir}/.gitkeep`, '', 'utf-8');
-    success(`Created ${cyan(`${migrDir}/`)}`);
-  } else {
-    info(`Migrations dir already exists: ${dim(migrDir)}`);
-  }
-
-  // Create output directory
-  if (!existsSync(config.out)) {
-    mkdirSync(config.out, { recursive: true });
-    success(`Created ${cyan(`${config.out}/`)}`);
-  }
-
-  // Create seed file template
-  const initSeedFile = config.seedFile ?? './seed.ts';
-  const seedDir = dirname(initSeedFile);
-  if (!existsSync(initSeedFile)) {
-    if (!existsSync(seedDir)) {
-      mkdirSync(seedDir, { recursive: true });
-    }
-    writeFileSync(
-      initSeedFile,
-      `/**
- * Turbine seed file
- *
- * Run with: npx turbine seed
- */
-
-import { defineSeed } from 'turbine-orm';
-
-export default defineSeed(async (db) => {
-  console.log('Seeding database...');
-
-  // Add your seed data here:
-  // await db.raw\`INSERT INTO users (email, name) VALUES (\${'admin@example.com'}, \${'Admin'})\`;
-
-  console.log('Done!');
-});
-`,
-      'utf-8',
-    );
-    success(`Created ${cyan(initSeedFile)}`);
-  }
-
-  // Create schema builder template
-  if (!existsSync(config.schemaFile)) {
-    const schemaDir = config.schemaFile.substring(0, config.schemaFile.lastIndexOf('/'));
-    if (!existsSync(schemaDir)) {
-      mkdirSync(schemaDir, { recursive: true });
-    }
-    writeFileSync(
-      config.schemaFile,
-      `/**
- * Turbine schema definition
- *
- * Define your database schema in TypeScript.
- * Use \`npx turbine push\` to sync it to your database.
- *
- * @see https://turbineorm.dev
- */
-
-import { defineSchema } from 'turbine-orm';
-
-export default defineSchema({
-  // Example:
-  // users: {
-  //   id: { type: 'serial', primaryKey: true },
-  //   email: { type: 'text', notNull: true, unique: true },
-  //   name: { type: 'text', notNull: true },
-  //   created_at: { type: 'timestamp', default: 'NOW()' },
-  // },
-});
-`,
-      'utf-8',
-    );
-    success(`Created ${cyan(config.schemaFile)}`);
-  }
-
-  // Add .gitignore entries for generated output and config (may contain connection strings)
-  const gitignorePath = '.gitignore';
-  if (existsSync(gitignorePath)) {
-    const gitignoreContent = readFileSync(gitignorePath, 'utf-8');
-    const additions: string[] = [];
-    if (!gitignoreContent.includes('generated/turbine')) {
-      additions.push('generated/turbine/');
-    }
-    if (!gitignoreContent.includes('turbine.config.ts')) {
-      additions.push('turbine.config.ts');
-    }
-    if (additions.length > 0) {
-      appendFileSync(gitignorePath, `\n# Turbine generated client & config\n${additions.join('\n')}\n`);
-      success(`Added ${cyan(additions.join(', '))} to ${cyan('.gitignore')}`);
-    }
-  }
-
-  // If we have a URL, run initial generate
-  const url = args.url ?? envUrl ?? config.url;
-  if (url) {
+  if (degraded) {
     newline();
-    divider();
-    newline();
-
-    const spinner = new Spinner('Introspecting database').start();
-    try {
-      const schema = await introspect({
-        connectionString: url,
-        schema: config.schema,
-        include: config.include.length ? config.include : undefined,
-        exclude: config.exclude.length ? config.exclude : undefined,
-      });
-
-      const tableCount = Object.keys(schema.tables).length;
-      spinner.succeed(`Found ${bold(String(tableCount))} tables`);
-
-      const genSpinner = new Spinner('Generating TypeScript client').start();
-      const result = generate({ schema, outDir: config.out, connectionString: url });
-      genSpinner.succeed(`Generated ${bold(String(result.files.length))} files to ${cyan(`${config.out}/`)}`);
-    } catch (err) {
-      spinner.fail('Could not connect to database');
-      if (err instanceof Error) {
-        console.log(`  ${dim(redactUrl(err.message))}`);
-      }
-      newline();
-      info(`You can run generation later with: ${cyan('npx turbine generate')}`);
-    }
+    info('Non-interactive shell: interactive prompts were skipped.');
+    console.log(
+      `  ${dim('Re-run in a terminal, pass')} ${cyan('--yes')} ${dim('to accept defaults, or use')} ${cyan('--skip-*')} ${dim('flags to control each step.')}`,
+    );
   }
 
   // Next steps
@@ -1039,9 +1376,10 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`  ${bold('turbine migrate')} ${dim('— SQL-first migration system')}`);
     newline();
     console.log(`  ${bold('Commands:')}`);
-    console.log(`    ${cyan('create <name>')}            Create a new migration file`);
-    console.log(`    ${cyan('create <name> --auto')}     Auto-generate from schema diff`);
-    console.log(`    ${cyan('create <name> --recipe')}   Scaffold a named recipe (e.g. backfill)`);
+    console.log(`    ${cyan('create <name>')}             Create a new migration file`);
+    console.log(`    ${cyan('create <name> --auto')}      Auto-generate from schema diff`);
+    console.log(`    ${cyan('create <name> --from-diff')} Generate from schema diff, destructive statements flagged`);
+    console.log(`    ${cyan('create <name> --recipe')}    Scaffold a named recipe (e.g. backfill)`);
     console.log(`    ${cyan('up')}                       Apply pending migrations`);
     console.log(`    ${cyan('deploy')}                   Apply pending migrations without prompts`);
     console.log(`    ${cyan('down')}                     Rollback last migration`);
@@ -1049,6 +1387,7 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     newline();
     console.log(`  ${bold('Options:')}`);
     console.log(`    ${cyan('--auto')}             Auto-generate UP/DOWN SQL from schema diff`);
+    console.log(`    ${cyan('--from-diff')}        Like --auto, but flags destructive statements in the file`);
     console.log(`    ${cyan('--recipe <name>')}    Scaffold a sanctioned migration pattern`);
     console.log(`    ${cyan('--step, -n')}         Number of migrations to apply/rollback`);
     console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
@@ -1064,6 +1403,7 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`  ${bold('Examples:')}`);
     console.log(`    ${dim('npx turbine migrate create add_users_table')}`);
     console.log(`    ${dim('npx turbine migrate create add_email_index --auto')}`);
+    console.log(`    ${dim('npx turbine migrate create sync_schema --from-diff')}`);
     console.log(`    ${dim('npx turbine migrate create backfill_full_name --recipe backfill')}`);
     console.log(`    ${dim('npx turbine migrate up')}`);
     console.log(`    ${dim('npx turbine migrate deploy --dry-run')}`);
@@ -1105,6 +1445,21 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     console.log(`  ${dim('Usage:')} ${cyan('npx turbine migrate create <name>')}`);
     console.log(`  ${dim('Example:')} ${cyan('npx turbine migrate create add_users_table')}`);
     console.log(`  ${dim('Auto:')}    ${cyan('npx turbine migrate create my_change --auto')}`);
+    newline();
+    process.exit(1);
+  }
+
+  // The scaffold strategies each own the file body, so combining them is
+  // ambiguous. Refuse up front (before any of the strategy blocks run).
+  if (args.fromDiff && args.recipe) {
+    error('--from-diff cannot be combined with --recipe.');
+    console.log(`  ${dim('Pick one: --from-diff generates from the schema diff, --recipe scaffolds a pattern.')}`);
+    newline();
+    process.exit(1);
+  }
+  if (args.fromDiff && args.auto) {
+    error('--from-diff cannot be combined with --auto.');
+    console.log(`  ${dim('Both generate from the schema diff; --from-diff also flags destructive statements.')}`);
     newline();
     process.exit(1);
   }
@@ -1164,6 +1519,93 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
       }
     }
     newline();
+
+    console.log(`  ${dim('Review the migration, then run:')}`);
+    console.log(`  ${cyan('npx turbine migrate up')}`);
+    newline();
+    return;
+  }
+
+  if (args.fromDiff) {
+    // Load the code-first schema (same file `push` uses). loadSchemaFile exits
+    // with a clear message when the project has no schema-builder file.
+    const url = requireUrl(config);
+    label('Database', redactUrl(url));
+    label('Schema file', config.schemaFile);
+    newline();
+
+    const schemaDef = await loadSchemaFile(config.schemaFile);
+
+    const diffSpinner = new Spinner('Computing schema diff').start();
+    const diff = await schemaDiff(schemaDef, url);
+
+    if (diff.statements.length === 0) {
+      diffSpinner.succeed('Database is already in sync — nothing to migrate');
+      newline();
+      return;
+    }
+
+    diffSpinner.succeed(`Found ${bold(String(diff.statements.length))} change(s)`);
+    newline();
+
+    const body = buildDiffMigrationBody(diff);
+    const file = createMigration(config.migrationsDir, name, { up: body.up, down: body.down });
+    const relPath = relative(process.cwd(), file.path);
+
+    success(`Created diff migration: ${bold(file.filename)}`);
+    newline();
+    console.log(`  ${dim('File:')} ${cyan(relPath)}`);
+    newline();
+
+    // Summarize the changes, mirroring --auto's output.
+    if (diff.create.length > 0) {
+      console.log(
+        `  ${green('+ Create')} ${diff.create.length} table(s): ${diff.create.map((t) => t.name).join(', ')}`,
+      );
+    }
+    if (diff.alter.length > 0) {
+      console.log(`  ${yellow('~ Alter')} ${diff.alter.length} table(s):`);
+      for (const a of diff.alter) {
+        for (const col of a.columns) {
+          const actionLabel =
+            col.action === 'add'
+              ? green('+ add')
+              : col.action === 'drop'
+                ? red('- drop')
+                : col.action === 'add_unique'
+                  ? green('+ unique')
+                  : col.action === 'drop_unique'
+                    ? red('- unique')
+                    : yellow(`~ ${col.action.replace(/_/g, ' ')}`);
+          console.log(`    ${actionLabel} ${a.table}.${col.column}`);
+        }
+      }
+    }
+    newline();
+
+    // Loudly flag destructive statements written into the file. They stay in the
+    // migration (so `migrate up`'s gate still refuses them by default) but the
+    // operator must know they are there before running.
+    const destructiveCount = body.destructiveUp.length + body.destructiveDown.length;
+    if (destructiveCount > 0) {
+      warn(`This migration contains ${bold(String(destructiveCount))} DESTRUCTIVE statement(s), flagged in the file.`);
+      for (const h of body.destructiveUp) {
+        console.log(`    ${red(symbols.warning)} ${dim('UP')}   [${h.kind}] ${h.target}`);
+      }
+      for (const h of body.destructiveDown) {
+        console.log(`    ${red(symbols.warning)} ${dim('DOWN')} [${h.kind}] ${h.target}`);
+      }
+      newline();
+      console.log(
+        `  ${dim('`migrate up` refuses destructive statements by default — confirm interactively or pass')} ${cyan('--allow-destructive')}${dim('.')}`,
+      );
+      newline();
+    }
+
+    if (diff.warnings && diff.warnings.length > 0) {
+      for (const w of diff.warnings) warn(w);
+      newline();
+    }
 
     console.log(`  ${dim('Review the migration, then run:')}`);
     console.log(`  ${cyan('npx turbine migrate up')}`);
@@ -2075,12 +2517,22 @@ function showInitHelp(): void {
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine init ${dim('[options]')}`);
   newline();
-  console.log(`  Creates ${cyan('turbine.config.ts')}, migrations directory, seed file template,`);
-  console.log(`  and schema file template.`);
+  console.log(`  Sequenced, interactive bootstrap. Detects project state and runs only`);
+  console.log(`  the needed steps: writes ${cyan('turbine.config.ts')}, offers a starter schema +`);
+  console.log(`  seed file, and (when a reachable database is configured) offers to push`);
+  console.log(`  the schema, generate the typed client, and run the seed file.`);
+  newline();
+  console.log(`  ${dim('Re-runs skip completed steps. A non-interactive shell runs the safe')}`);
+  console.log(`  ${dim('scaffold + generate steps only; pass --yes to accept every default.')}`);
   newline();
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string to embed in config`);
   console.log(`    ${cyan('--force, -f')}        Overwrite existing config file`);
+  console.log(`    ${cyan('--yes, -y')}          Accept every step's default (non-interactive)`);
+  console.log(`    ${cyan('--skip-schema')}      Don't create the starter schema file`);
+  console.log(`    ${cyan('--skip-seed')}        Don't create the seed file or run the seed`);
+  console.log(`    ${cyan('--skip-push')}        Don't push the schema to the database`);
+  console.log(`    ${cyan('--skip-generate')}    Don't generate the typed client`);
   newline();
 }
 
@@ -2154,6 +2606,9 @@ function showMigrateHelp(): void {
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
   console.log(`    ${cyan('--auto')}            Auto-generate UP/DOWN SQL from schema diff ${dim('(create only)')}`);
   console.log(
+    `    ${cyan('--from-diff')}       Generate from schema diff, flagging destructive statements ${dim('(create only)')}`,
+  );
+  console.log(
     `    ${cyan('--recipe')} ${dim('<name>')}   Scaffold a sanctioned migration pattern ${dim('(create only, e.g. backfill)')}`,
   );
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
@@ -2167,6 +2622,7 @@ function showMigrateHelp(): void {
   console.log(`  ${bold('Examples:')}`);
   console.log(`    ${dim('$')} npx turbine migrate create add_users_table`);
   console.log(`    ${dim('$')} npx turbine migrate create add_email_index --auto`);
+  console.log(`    ${dim('$')} npx turbine migrate create sync_schema --from-diff`);
   console.log(`    ${dim('$')} npx turbine migrate create backfill_full_name --recipe backfill`);
   console.log(`    ${dim('$')} npx turbine migrate up`);
   console.log(`    ${dim('$')} npx turbine migrate deploy --dry-run`);

@@ -55,6 +55,13 @@ describe('CLI flag regression guard', () => {
     }
   });
 
+  it('migrate create --from-diff and init step flags are wired up', () => {
+    const source = readFileSync(CLI_INDEX, 'utf-8');
+    for (const flag of ['--from-diff', '--yes', '--skip-schema', '--skip-seed', '--skip-push', '--skip-generate']) {
+      assert.ok(source.includes(`'${flag}'`), `parseArgs() must handle ${flag}`);
+    }
+  });
+
   it('help text documents --allow-remote', () => {
     const source = readFileSync(CLI_INDEX, 'utf-8');
     assert.ok(source.includes('--allow-remote'), 'help / parseArgs must mention --allow-remote');
