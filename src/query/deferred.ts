@@ -114,6 +114,17 @@ export interface QueryInterfaceOptions {
    * unparseable value keeps the check fully off.
    */
   sqlCache?: boolean;
+  /**
+   * Maximum number of distinct SQL templates the per-table LRU cache retains.
+   *
+   * Default: `1000`. Raise it for apps with a very large number of distinct
+   * query SHAPES (not values, since values are parameterized and never fragment the
+   * cache) to lift the hit rate at the cost of memory; lower it to cap memory.
+   * `0` disables the cache entirely, exactly like `sqlCache: false`. A negative
+   * value is ignored (treated as the default). Applied per QueryInterface (one
+   * per table).
+   */
+  sqlCacheSize?: number;
   /** SQL dialect implementation. Defaults to PostgreSQL. */
   dialect?: Dialect;
   /**

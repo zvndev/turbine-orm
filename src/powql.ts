@@ -57,7 +57,7 @@ import {
   requireCapability,
   rowToEntity,
 } from './powdb.js';
-import { isJsonFilter, isRelationPickOrderBy } from './query/filters.js';
+import { isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
 import type {
   AggregateArgs,
@@ -852,7 +852,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    */
   private buildOrder(orderBy: OrderByClause | undefined, params: unknown[], alias?: string): string {
     if (!orderBy) return '';
-    const keys = Object.entries(orderBy).filter(([, dir]) => dir !== undefined);
+    const keys = orderByEntries(orderBy).filter(([, dir]) => dir !== undefined);
     if (!keys.length) return '';
     const parts = keys.map(([field, dir]) => {
       if (dir && typeof dir === 'object') {
@@ -2511,7 +2511,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
       const having = this.buildHaving(args.having, params, aggInner);
       const order = this.buildGroupOrder(args.orderBy, byOrderExprs, aggOrderExprs);
-      const powql = `${this.qt}${filter} group ${groupExprs.join(', ')}${having}${order} { ${proj.join(', ')} }`;
+      // LIMIT / OFFSET over the result groups, applied after ORDER BY (mirrors
+      // the SQL groupBy). offset 0 is a no-op, matching findMany.
+      const limitClause = args.limit !== undefined ? ` limit ${this.param(args.limit, params)}` : '';
+      const offsetClause = args.offset ? ` offset ${this.param(args.offset, params)}` : '';
+      const powql = `${this.qt}${filter} group ${groupExprs.join(', ')}${having}${order}${limitClause}${offsetClause} { ${proj.join(', ')} }`;
       const { rows, native: resultNative } = await this.exec(powql, params, args.timeout, 'groupBy');
 
       // Reshape: group keys → user fields (coerced / null-disambiguated),
@@ -2608,7 +2612,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * keys. `nulls: 'first'` stays E017 (PowDB has no NULLS placement grammar).
    */
   private buildGroupOrder(
-    orderBy: GroupByOrderBy | undefined,
+    orderBy: GroupByOrderBy | GroupByOrderBy[] | undefined,
     byOrderExprs: Map<string, string>,
     aggOrderExprs: Map<string, string>,
   ): string {
@@ -2620,7 +2624,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       return keys.join(', ') || '(none)';
     };
     const parts: string[] = [];
-    for (const [key, value] of Object.entries(orderBy)) {
+    for (const [key, value] of orderByEntries(orderBy)) {
       if (value === undefined) continue;
       if (aggBlocks.has(key)) {
         if (key === '_count') {

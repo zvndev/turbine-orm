@@ -39,6 +39,7 @@ import {
   isRelationPickOrderBy,
   isVectorOrderBy,
   isWhereOperator,
+  orderByEntries,
   sortedEntries,
 } from './filters.js';
 import * as relationsMod from './relations.js';
@@ -55,6 +56,7 @@ import type {
   FindUniqueArgs,
   GlobalFilters,
   GroupByArgs,
+  GroupByResult,
   JsonPathOrderBy,
   OrderByClause,
   QueryResult,
@@ -200,8 +202,12 @@ import type { DeferredQuery, MiddlewareFn, QueryInterfaceOptions, ReselectExecut
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional for untyped table access
 export class QueryInterface<T extends object, R extends object = {}> {
   private readonly tableMeta: TableMetadata;
-  /** SQL template cache: cacheKey → SqlCacheEntry (sql + prepared statement name) */
-  private readonly sqlTemplateCache = new LRUCache<string, SqlCacheEntry>(1000);
+  /**
+   * SQL template cache: cacheKey → SqlCacheEntry (sql + prepared statement name).
+   * Capacity is set once in the constructor from `options.sqlCacheSize`
+   * (default 1000). See {@link QueryInterfaceOptions.sqlCacheSize}.
+   */
+  private readonly sqlTemplateCache: LRUCache<string, SqlCacheEntry>;
   /**
    * Whether the most recent {@link acquireSql} call was a cache HIT. Read by
    * {@link crossCheckCache} to decide whether to run the dev-mode lockstep
@@ -346,7 +352,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
         : warnOpt !== false;
     this.utcTimestamps = options?.utcTimestamps !== false;
     this.preparedStatementsEnabled = options?.preparedStatements ?? true;
-    this.sqlCacheEnabled = options?.sqlCache !== false;
+    // SQL template cache capacity. `sqlCacheSize: 0` disables caching entirely
+    // (mirrors `sqlCache: false`); any positive integer sets the LRU bound;
+    // undefined keeps the historical 1000-entry default. A negative value is
+    // treated as the default rather than throwing.
+    const sqlCacheSize = options?.sqlCacheSize;
+    this.sqlCacheEnabled = options?.sqlCache !== false && sqlCacheSize !== 0;
+    this.sqlTemplateCache = new LRUCache<string, SqlCacheEntry>(
+      sqlCacheSize !== undefined && sqlCacheSize > 0 ? Math.floor(sqlCacheSize) : 1000,
+    );
     this.dialect = options?.dialect ?? postgresDialect;
     this.relationLoadStrategy = options?.relationLoadStrategy ?? 'join';
     this.jsonEncoding = options?.jsonEncoding ?? 'object';
@@ -1297,7 +1311,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Checked BEFORE the SQL cache so build and warm-cache paths throw
     // identically (same rule as the vector guard inside the distinct branch).
     if (args?.distinct && args.distinct.length > 0 && args.orderBy) {
-      for (const d of Object.values(args.orderBy)) {
+      for (const [, d] of orderByEntries(args.orderBy)) {
         if (this.isRelationOrderByValue(d)) {
           throw new ValidationError(
             '[turbine] `distinct` cannot be combined with relation orderBy (pick-row, `_count`, or ' +
@@ -1319,8 +1333,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Build fingerprint for cache lookup
     const whereFp = hasWhere ? this.fingerprintWhere(whereObj) : '';
     const withFp = args?.with ? this.withFingerprint(args.with as WithClause) : '';
+    // Flatten via orderByEntries so the object form (`{ a, b }`) and the
+    // Prisma-style array form (`[{ a }, { b }]`) fingerprint from the SAME
+    // ordered entry list the build/collect paths consume. An array's element
+    // order is authoritative and preserved here, so a permuted array is a
+    // distinct key (correct, it emits a different ORDER BY).
     const orderFp = args?.orderBy
-      ? Object.entries(args.orderBy)
+      ? orderByEntries(args.orderBy)
           .map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d, ownLookup(this.tableMeta.relations, k)?.to)}`)
           .join(',')
       : '';
@@ -1403,11 +1422,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // Sorted (canonical) order — MUST match cursorFp and the cache-hit collect below.
         const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
         if (cursorEntries.length > 0) {
+          // Resolve the seek direction per cursor field from the flattened
+          // orderBy entries (last wins, matching object-key semantics), so both
+          // the object and array orderBy forms drive the cursor comparison.
+          const orderDirByKey = new Map(orderByEntries(args.orderBy));
           const cursorConditions = cursorEntries.map(([k, v]) => {
             const col = this.toSqlColumn(k);
             // orderBy values can be the { sort, nulls } spec form: normalize
             // before comparing, or a desc spec would seek the ascending side.
-            const dir = args.orderBy?.[k];
+            const dir = orderDirByKey.get(k);
             const desc = isOrderBySpec(dir) ? dir.sort === 'desc' : dir === 'desc';
             const op = desc ? '<' : '>';
             freshParams.push(v);
@@ -1429,7 +1452,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // need two levels: inner DISTINCT ON ordered by the distinct columns then
         // the user's order (picks the right representative row), outer re-ordered
         // by the user's order alone.
-        if (Object.values(args.orderBy).some((d) => isVectorOrderBy(d))) {
+        if (orderByEntries(args.orderBy).some(([, d]) => isVectorOrderBy(d))) {
           throw new ValidationError('[turbine] `distinct` cannot be combined with vector distance ordering.');
         }
         const userOrder = this.buildOrderBy(args.orderBy, freshParams);
@@ -1937,11 +1960,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // groupBy (with aggregate functions)
   // -------------------------------------------------------------------------
 
-  async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
+  /**
+   * Group rows and compute per-group aggregates (Prisma-style). The result row
+   * type is INFERRED from the args: each `by` field carries its entity field
+   * type, `_count` is always a number, and each requested `_sum` / `_avg` /
+   * `_min` / `_max` block maps its fields to properly typed values (see
+   * {@link GroupByResult}). Grouping by a JSON-path key yields a runtime alias
+   * that cannot be typed, so those columns are not projected onto the row type.
+   */
+  async groupBy<A extends GroupByArgs<T>>(args: A): Promise<GroupByResult<T, A>[]> {
     return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildGroupBy(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
-      return deferred.transform(result);
+      return deferred.transform(result) as GroupByResult<T, A>[];
     });
   }
 
@@ -2190,7 +2221,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * order exactly so the cached-SQL param re-collection stays in lockstep.
    */
   private collectOrderByParams(orderBy: OrderByClause, params: unknown[]): void {
-    for (const [key, dir] of Object.entries(orderBy)) {
+    for (const [key, dir] of orderByEntries(orderBy)) {
       if (isVectorOrderBy(dir)) {
         const rawColumn = this.toColumn(key);
         // Re-run the same validation as buildOrderBy so the collect path can

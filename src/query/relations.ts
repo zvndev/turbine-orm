@@ -24,6 +24,7 @@ import {
   isRelationPickOrderBy,
   isVectorOrderBy,
   normalizeOrderBy,
+  orderByEntries,
   sortedEntries,
 } from './filters.js';
 import type {
@@ -188,7 +189,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
     // orderBy shape (OrderBySpec nulls placement changes the SQL, so fingerprint it)
     if (opts.orderBy) {
       const targetRels = qi.schema.tables[relDef.to]?.relations;
-      const oEntries = Object.entries(opts.orderBy).map(
+      const oEntries = orderByEntries(opts.orderBy).map(
         ([k, d]) => `${k}:${orderByEntryFingerprint(qi, d, targetRels?.[k]?.to)}`,
       );
       subParts.push(`o=${oEntries.join(',')}`);
@@ -265,7 +266,7 @@ export function collectRelationSubqueryParams(
   //   orderBy params → where params → limit param → nested-with params
   //   (always, both paths).
   if (relDef.type === 'manyToMany') {
-    const m2mOrderEntries = spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+    const m2mOrderEntries = spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
     if (nativeOrderPath && m2mOrderEntries.length > 0) {
       collectRelationOrderParams(qi, targetTable, targetMeta, m2mOrderEntries, params);
     }
@@ -287,7 +288,7 @@ export function collectRelationSubqueryParams(
   }
 
   // Mirrors buildRelationSubquery's willWrap: `orderBy: {}` is treated as absent.
-  const relOrderEntries = spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+  const relOrderEntries = spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
   const hasOrder = relOrderEntries.length > 0;
   const willWrap = relDef.type === 'hasMany' && (spec.limit !== undefined || hasOrder);
 
@@ -402,7 +403,7 @@ export function buildOrderBy(
   // orderBy keys (object values that are neither a vector nor an OrderBySpec)
   // are validated in the relation branch below, so skip them here.
   if (process.env.NODE_ENV !== 'production') {
-    for (const [key, value] of Object.entries(orderBy)) {
+    for (const [key, value] of orderByEntries(orderBy)) {
       if (isRelationOrderByValue(qi, value) && ownLookup(qi.tableMeta.relations, key)) continue;
       const snakeKey = camelToSnake(key);
       if (!qi.tableMeta.columns.some((c) => c.name === snakeKey) && !Object.hasOwn(qi.tableMeta.columnMap, key)) {
@@ -416,7 +417,7 @@ export function buildOrderBy(
 
   const meta = qi.schema.tables[qi.table];
   let relOrdCounter = 0;
-  return Object.entries(orderBy)
+  return orderByEntries(orderBy)
     .map(([key, value]) => {
       // Vector KNN ordering: { distance: { to, metric, direction? } }
       if (isVectorOrderBy(value)) {
@@ -1721,7 +1722,7 @@ export function buildRelationSubquery(
   // it must neither trigger the wrap (dropping nested relations) nor render a
   // dangling `ORDER BY `. `limit: 0` is meaningful (LIMIT 0) and DOES wrap.
   const relOrderEntries =
-    spec !== true && spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+    spec !== true && spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
   const willWrap =
     relDef.type === 'hasMany' && spec !== true && (spec.limit !== undefined || relOrderEntries.length > 0);
 
@@ -1973,7 +1974,7 @@ export function buildManyToManySubquery(
   // render a dangling `ORDER BY `. Param pushes here land BEFORE the
   // spec.where params, mirrored by collectRelationSubqueryParams' m2m branch.
   const relOrderEntries =
-    spec !== true && spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+    spec !== true && spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
   let orderClause = '';
   if (relOrderEntries.length > 0) {
     orderClause = buildRelationOrderClause(qi, targetTable, targetMeta, talias, relOrderEntries, params);

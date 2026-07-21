@@ -12,7 +12,7 @@
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { snakeToCamel } from '../schema.js';
 import type { DeferredQuery } from './deferred.js';
-import { isJsonPathOrderBy, isVectorOrderBy, normalizeOrderBy } from './filters.js';
+import { isJsonPathOrderBy, isVectorOrderBy, normalizeOrderBy, orderByEntries } from './filters.js';
 import type {
   AggregateArgs,
   AggregateResult,
@@ -199,6 +199,17 @@ export function buildGroupBy<T extends object>(
     if (orderSql) sql += ` ORDER BY ${orderSql}`;
   }
 
+  // LIMIT / OFFSET over the result groups, applied AFTER ORDER BY. Routed
+  // through the dialect pagination hook (parameterized on PG/SQLite/SQL Server,
+  // inlined on MySQL); params append after the WHERE/HAVING/ORDER BY params, so
+  // no `$n` renumbering. `offset` without a deterministic `orderBy` yields an
+  // arbitrary window (same caveat as findMany).
+  if (args.limit !== undefined || args.offset !== undefined) {
+    const limitPh = args.limit !== undefined ? qi.paginationRef(args.limit, params) : undefined;
+    const offsetPh = args.offset !== undefined ? qi.paginationRef(args.offset, params) : undefined;
+    sql += qi.buildPagination(limitPh, offsetPh, args.orderBy !== undefined);
+  }
+
   return {
     sql,
     params,
@@ -282,7 +293,7 @@ export function buildGroupBy<T extends object>(
  */
 export function buildGroupByOrderBy(
   qi: BuilderCtx,
-  orderBy: GroupByOrderBy,
+  orderBy: GroupByOrderBy | GroupByOrderBy[],
   byOrderExprs: Map<string, string>,
   aggOrderExprs: Map<string, string>,
 ): string {
@@ -297,7 +308,7 @@ export function buildGroupByOrderBy(
   };
 
   const parts: string[] = [];
-  for (const [key, value] of Object.entries(orderBy)) {
+  for (const [key, value] of orderByEntries(orderBy)) {
     if (value === undefined) continue;
 
     // Aggregate ordering blocks.

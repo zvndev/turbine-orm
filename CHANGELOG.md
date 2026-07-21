@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Typed `groupBy` results.** `groupBy` no longer returns
+  `Record<string, unknown>[]`: its result-row type is now inferred from the
+  args, matching Prisma and Drizzle. Each `by` field carries its entity field
+  type, `_count` is a `number`, `_sum` / `_avg` fields are `number | null`, and
+  `_min` / `_max` fields carry the field's own type. No `as const` needed at the
+  call site. Grouping by a JSON-path key still yields a runtime alias that can't
+  be typed, so those columns are left off the row type (cast when grouping by a
+  JSON path). Compile-time assertions guard the inference in the typecheck job.
+- **`groupBy` `limit` and `offset`.** `groupBy` accepts optional `limit` and
+  `offset`, compiled to `LIMIT` / `OFFSET` after `ORDER BY` (parameterized on
+  PostgreSQL / SQLite / SQL Server, inlined on MySQL, native on PowDB). Useful
+  for "top N groups" and paginated grouped results; pair with a deterministic
+  `orderBy`.
+- **Array `orderBy` (Prisma-style).** Everywhere an `orderBy` is accepted
+  (`findMany`, a `with` relation, and `groupBy`) you can now pass an array of
+  objects, e.g. `orderBy: [{ createdAt: 'desc' }, { id: 'asc' }]`. The array's
+  element order is the authoritative multi-key sort precedence, so multi-key
+  ordering no longer depends on JS object key iteration order. The single-object
+  form is unchanged and byte-identical. Both forms flatten through one shared
+  helper, so the SQL-template cache fingerprint, SQL build, and param-collect
+  paths stay in lockstep (a permuted array is correctly a distinct cache key).
+  Supported on every engine, including PowDB.
+- **Configurable SQL-template cache size.** A new `sqlCacheSize` option on the
+  client config (and `QueryInterfaceOptions`) bounds the per-table LRU SQL
+  template cache. Default stays `1000`. Values are parameterized and never
+  fragment the cache, so this bounds distinct query *shapes*: raise it for apps
+  with a very large query surface to lift the hit rate, lower it to cap memory.
+  `sqlCacheSize: 0` disables caching entirely (identical to `sqlCache: false`).
+
 ## 0.39.0 (2026-07-20)
 
 ### Added

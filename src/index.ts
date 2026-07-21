@@ -136,6 +136,7 @@ export {
   type GroupByAggregateSpec,
   type GroupByArgs,
   type GroupByDistinctOn,
+  type GroupByResult,
   type HavingClause,
   type JsonFilter,
   type JsonPathAggregateTarget,
@@ -148,6 +149,7 @@ export {
   type NestedUpsertOpItem,
   type OmitResult,
   type OrderByClause,
+  type OrderByObject,
   type OrderDirection,
   type QueryEvent,
   type QueryEventListener,
@@ -178,6 +180,7 @@ export {
   type WhereValue,
   type WithClause,
   type WithOptions,
+  type WithOrderByObject,
   type WithResult,
 } from './query/index.js';
 // Realtime — LISTEN/NOTIFY pub/sub

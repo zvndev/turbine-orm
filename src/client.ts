@@ -294,6 +294,16 @@ export interface TurbineConfig {
    * Default: `true`. Set to `false` as a nuclear kill switch.
    */
   sqlCache?: boolean;
+  /**
+   * Maximum number of distinct SQL templates each per-table LRU cache retains.
+   *
+   * Default: `1000`. Values are parameterized (`$1, $2, …`) and never fragment
+   * the cache, so this bounds distinct query SHAPES. Raise it for apps with a
+   * very large surface of query shapes to lift the hit rate at the cost of
+   * memory; lower it to cap memory. `0` disables caching entirely (identical to
+   * `sqlCache: false`); a negative value is ignored (treated as the default).
+   */
+  sqlCacheSize?: number;
   /** SQL dialect implementation. Defaults to PostgreSQL. Internal Phase-1 seam for dialect packages. */
   dialect?: Dialect;
   /**
@@ -731,6 +741,7 @@ export class TurbineClient {
       globalFilters: config.globalFilters,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
       sqlCache: config.sqlCache ?? true,
+      sqlCacheSize: config.sqlCacheSize,
       dialect: config.dialect,
       // Non-SQL backends (PowDB) inject a factory that builds their own query
       // interface (PowqlInterface) instead of the SQL QueryInterface. SQL engines
