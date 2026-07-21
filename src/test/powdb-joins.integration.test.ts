@@ -314,8 +314,8 @@ describe('powdb F2 integration: join vs loader parity (embedded)', () => {
   });
 });
 
-describe('powdb integration: client-level relationLoadStrategy activates joins (fix 8)', () => {
-  it('turbinePowDB({ relationLoadStrategy: "join" }) emits a native join without a per-query arg', async () => {
+describe('powdb integration: client-level relationLoadStrategy activates single-statement loads (fix 8)', () => {
+  it('turbinePowDB({ relationLoadStrategy: "join" }) emits ONE non-loader statement without a per-query arg', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'powdb-clientjoin-'));
     const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, schema, {
       relationLoadStrategy: 'join',
@@ -329,9 +329,20 @@ describe('powdb integration: client-level relationLoadStrategy activates joins (
       await db.table('ppost').createMany({ data: [{ memberId: ada.id, title: 'a1', views: 1 }] });
       emitted.length = 0; // ignore the seeding statements
       const rows = await db.table('member').findMany({ orderBy: { id: 'asc' }, with: { posts: true } });
-      assert.ok(
-        emitted.some((s) => / join /.test(s)),
-        'the client-level join default must emit a native join statement (not the keyed loader)',
+      // The client-level strategy must reach the query and take a single-statement
+      // path, never the N+1 keyed loaders (which would emit the base scan plus one
+      // loader per relation). On a >= 0.18 engine 'join' prefers a nested
+      // projection (` as t0`); on an older engine it emits a native ` join `.
+      // Either way it is exactly one statement, and never the keyed loader.
+      assert.equal(
+        emitted.length,
+        1,
+        `client-level strategy must emit one statement (not N+1 loaders), saw: ${emitted.join(' | ')}`,
+      );
+      assert.match(
+        emitted[0]!,
+        / join | as t0/,
+        'the single statement is a native join (< 0.18) or a nested projection (>= 0.18)',
       );
       assert.equal(rows[0].posts.length, 1);
     } finally {

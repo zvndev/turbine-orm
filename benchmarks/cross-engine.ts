@@ -34,6 +34,15 @@ import { turbineMssql } from '../src/mssql.js';
 
 const require = createRequire(import.meta.url);
 
+/** Installed @zvndev/powdb-embedded version, read at runtime for the engine label. */
+function powdbEmbeddedVersion(): string {
+  try {
+    return (require('@zvndev/powdb-embedded/package.json') as { version?: string }).version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -427,7 +436,7 @@ const engines: Record<string, Engine> = {
     // second Database.open on the same dir, which has no lock and would corrupt).
     // syncMode:'normal' (0.7.1) moves fsync off the commit path — the knob that
     // closes the embedded-write gap.
-    name: 'PowDB 0.7.1 (embed·norm)',
+    name: `PowDB ${powdbEmbeddedVersion()} (embed·norm)`,
     async setup() {
       const dir = POWDB_EMB_DIR ?? mkdtempSync(join(tmpdir(), 'powdb-emb-bench-'));
       powdbEmbDir = dir;

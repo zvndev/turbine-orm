@@ -58,6 +58,16 @@
   fragment the cache, so this bounds distinct query *shapes*: raise it for apps
   with a very large query surface to lift the hit rate, lower it to cap memory.
   `sqlCacheSize: 0` disables caching entirely (identical to `sqlCache: false`).
+### Changed
+
+- **PowDB 0.18.1 driver packages adopted.** The optional PowDB peers
+  (`@zvndev/powdb-client`, `@zvndev/powdb-embedded`) now resolve to the
+  published `0.18.1` line, so the nested-projection relation path shipped in
+  0.39.0 lights up automatically on install via the engine version probe
+  (previously it activated only against a locally built 0.18 engine). The
+  supported peer range is unchanged. Storage-raised unique-constraint
+  violations now arrive with the typed wire error class already mapped to
+  `UniqueConstraintError` (E008); no behavior change for consumers.
 
 ## 0.39.0 (2026-07-20)
 
