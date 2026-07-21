@@ -277,6 +277,114 @@ export const MIGRATION_RECIPES: Record<string, MigrationRecipe> = {
 };
 
 // ---------------------------------------------------------------------------
+// Diff-based migration body (`migrate create --from-diff`)
+// ---------------------------------------------------------------------------
+
+/**
+ * The UP/DOWN body produced by {@link buildDiffMigrationBody}, plus the
+ * destructive statements found in each direction so the CLI can warn loudly.
+ */
+export interface DiffMigrationBody {
+  /** Annotated UP SQL (destructive statements flagged with loud comments). */
+  up: string;
+  /** Annotated DOWN SQL, or an irreversible placeholder when none is derivable. */
+  down: string;
+  /** Destructive statements detected in the UP direction. */
+  destructiveUp: DestructiveStatement[];
+  /** Destructive statements detected in the DOWN direction. */
+  destructiveDown: DestructiveStatement[];
+}
+
+/** Loud file-level banner prepended when a diff migration contains destructive statements. */
+const DESTRUCTIVE_MIGRATION_BANNER = [
+  '-- ============================================================',
+  '-- WARNING: this migration contains DESTRUCTIVE statement(s).',
+  '-- Each one is flagged inline below. `turbine migrate up` refuses',
+  '-- destructive statements by default: it asks you to confirm',
+  '-- interactively, or you must pass --allow-destructive. Review',
+  '-- every flagged statement carefully before running.',
+  '-- ============================================================',
+];
+
+/**
+ * Annotate a list of SQL statements: scan each for data-destroying operations
+ * (via {@link scanDestructiveSql}) and prefix any offender with loud, commented
+ * warnings. Statements are left intact so the existing `migrate up` gate still
+ * refuses them by default; the comments just make the danger visible on review.
+ */
+function annotateDiffStatements(statements: string[]): { text: string; destructive: DestructiveStatement[] } {
+  const destructive: DestructiveStatement[] = [];
+  const out: string[] = [];
+
+  for (const raw of statements) {
+    const stmt = raw.trim();
+    if (!stmt) continue;
+
+    const hits = scanDestructiveSql(stmt);
+    if (hits.length > 0) {
+      destructive.push(...hits);
+      for (const h of hits) {
+        out.push(`-- !! DESTRUCTIVE [${h.kind}] ${h.target}: ${DESTRUCTIVE_KIND_LABEL[h.kind]}`);
+      }
+      out.push('-- !! Refused by default. Confirm interactively or pass --allow-destructive to run it.');
+    }
+    out.push(stmt.endsWith(';') ? stmt : `${stmt};`);
+  }
+
+  return { text: out.join('\n'), destructive };
+}
+
+/**
+ * Build a migration UP/DOWN body from a `schemaDiff()` result.
+ *
+ * - UP is the diff's forward statements. DOWN is the diff's reverse statements
+ *   when derivable, otherwise a clearly-commented "irreversible" placeholder.
+ * - Destructive statements in EITHER direction (a lossy `ALTER COLUMN ... TYPE`
+ *   in UP, a `DROP TABLE`/`DROP COLUMN` reverse in DOWN) are flagged inline and,
+ *   when any exist, a loud file-level banner is prepended to UP.
+ * - Any diff `warnings` (changes the diff refuses to apply automatically, e.g.
+ *   enum value removals) are surfaced as `-- NOTE:` comments in UP.
+ *
+ * Pure and DB-free, so it is unit-testable from a synthesized diff.
+ */
+export function buildDiffMigrationBody(diff: {
+  statements: string[];
+  reverseStatements: string[];
+  warnings?: string[];
+}): DiffMigrationBody {
+  const up = annotateDiffStatements(diff.statements);
+  const hasReverse = diff.reverseStatements.length > 0;
+  const down = hasReverse
+    ? annotateDiffStatements(diff.reverseStatements)
+    : { text: '', destructive: [] as DestructiveStatement[] };
+
+  const upParts: string[] = [];
+  if (up.destructive.length > 0 || down.destructive.length > 0) {
+    upParts.push(...DESTRUCTIVE_MIGRATION_BANNER, '');
+  }
+  if (diff.warnings && diff.warnings.length > 0) {
+    for (const w of diff.warnings) upParts.push(`-- NOTE: ${w}`);
+    upParts.push('');
+  }
+  upParts.push(up.text || '-- (no statements: schema already matches the database)');
+
+  const downText = hasReverse
+    ? down.text
+    : [
+        '-- irreversible, write manually',
+        '-- The diff produced no reversible statements for this change. Write the',
+        '-- rollback SQL by hand, or leave this section empty for a one-way migration.',
+      ].join('\n');
+
+  return {
+    up: upParts.join('\n'),
+    down: downText,
+    destructiveUp: up.destructive,
+    destructiveDown: down.destructive,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 

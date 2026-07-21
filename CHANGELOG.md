@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`turbine migrate create <name> --from-diff`.** Scaffold a migration from the
+  live schema diff. Loads your code-first schema (the same file `push` uses),
+  introspects the database, runs the diff, and writes the forward statements
+  into the migration's `-- UP` section and the reverse statements into `-- DOWN`
+  (a clearly commented "irreversible, write manually" placeholder is written
+  when no reverse is derivable). Any data-destroying statement in either
+  direction (a lossy `ALTER COLUMN ... TYPE` in UP, a `DROP TABLE` / `DROP
+  COLUMN` reverse in DOWN) is flagged inline with loud comments and a file-level
+  banner, and the statement is left intact so `migrate up` still refuses it by
+  default unless you confirm interactively or pass `--allow-destructive`. Diff
+  warnings (e.g. enum value removals the diff will not apply automatically) are
+  surfaced as `-- NOTE:` comments. `--from-diff` cannot be combined with
+  `--auto` or `--recipe`. This complements the existing `--auto` flag, which
+  writes the raw diff without the destructive annotations.
+- **Richer interactive `turbine init`.** `init` is now a sequenced bootstrap
+  that detects project state and runs only the needed steps: write
+  `turbine.config.ts` if missing, offer to create a starter schema file and seed
+  file, and (when a reachable database is configured) offer to push the schema,
+  generate the typed client, and run the seed file. Re-runs skip completed steps
+  (existing files are detected), so `init` is safe to run repeatedly. New flags:
+  `--yes` / `-y` accepts every step's default non-interactively, and
+  `--skip-schema`, `--skip-seed`, `--skip-push`, `--skip-generate` skip
+  individual steps. A destructive push keeps the existing typed confirmation. A
+  bare non-interactive invocation behaves as before (scaffold files + generate
+  run; push and seed do not) and prints a note pointing at `--yes` and the
+  `--skip-*` flags.
+
 ## 0.39.0 (2026-07-20)
 
 ### Added
