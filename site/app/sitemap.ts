@@ -5,7 +5,7 @@ const SITE = 'https://turbineorm.dev';
 // A stable, build-time constant so we don't stamp every page as "modified"
 // on every deploy (which `new Date()` did). Bump this when docs content
 // meaningfully changes.
-const LAST_MODIFIED = '2026-07-19';
+const LAST_MODIFIED = '2026-07-21';
 
 const ROUTES = [
   '',
@@ -34,6 +34,7 @@ const ROUTES = [
   '/cli',
   '/studio',
   '/mcp',
+  '/ai-agents',
   '/observability',
   '/errors',
   '/recipes',
