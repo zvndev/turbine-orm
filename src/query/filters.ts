@@ -377,6 +377,38 @@ export function isRelationPickOrderBy(value: unknown): value is RelationPickOrde
 }
 
 /**
+ * Flatten an orderBy input into an ordered list of `[field, value]` entries.
+ *
+ * Accepts BOTH the classic single-object form (`{ a: 'asc', b: 'desc' }`,
+ * whose insertion order is authoritative) and the Prisma-style array form
+ * (`[{ a: 'asc' }, { b: 'desc' }]`, whose array order is authoritative). The
+ * array form removes the reliance on JS object key iteration order for
+ * multi-key sorts. Each array element may carry one or more keys; they expand
+ * left-to-right. `undefined`/non-object elements are skipped.
+ *
+ * Undefined-VALUED entries are preserved (mirroring `Object.entries`) so each
+ * consumer keeps its own `dir !== undefined` filtering exactly as before. This
+ * is THE single flattening authority: every ORDER BY compile / collect /
+ * fingerprint path routes through it so the array and object forms stay in
+ * lockstep across build, param-collect, and cache-key fingerprint.
+ */
+export function orderByEntries(orderBy: unknown): [string, unknown][] {
+  if (Array.isArray(orderBy)) {
+    const entries: [string, unknown][] = [];
+    for (const element of orderBy) {
+      if (element !== null && typeof element === 'object' && !Array.isArray(element)) {
+        for (const kv of Object.entries(element as Record<string, unknown>)) entries.push(kv);
+      }
+    }
+    return entries;
+  }
+  if (orderBy !== null && typeof orderBy === 'object') {
+    return Object.entries(orderBy as Record<string, unknown>);
+  }
+  return [];
+}
+
+/**
  * Normalize an orderBy value into `{ direction, nulls }`. Accepts a plain
  * direction string or an {@link OrderBySpec}. Used by every ORDER BY compile
  * path (findMany, groupBy, relation inner subqueries).

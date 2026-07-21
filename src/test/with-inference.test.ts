@@ -411,6 +411,62 @@ async function countCallSite() {
 void countCallSite;
 
 // ---------------------------------------------------------------------------
+// 13. Typed groupBy results (GroupByResult)
+//
+//     The result-row type is inferred from the args literal: `by` fields carry
+//     their entity type, `_count` is always a number, and each requested
+//     aggregate block maps its fields to properly typed values. Parity with
+//     Prisma / Drizzle.
+// ---------------------------------------------------------------------------
+
+import type { GroupByResult } from '../query/index.js';
+
+interface Sale {
+  id: number;
+  region: string;
+  amount: number;
+  createdAt: Date;
+}
+
+// --- by field + default _count ---
+type GbByCount = GroupByResult<Sale, { by: ['region'] }>;
+assertTrue<Equals<GbByCount['region'], string>>();
+assertTrue<Equals<GbByCount['_count'], number>>();
+
+// --- _sum / _avg map their fields to number | null ---
+type GbSumAvg = GroupByResult<Sale, { by: ['region']; _sum: { amount: true }; _avg: { amount: true } }>;
+assertTrue<Equals<GbSumAvg['_sum'], { amount: number | null }>>();
+assertTrue<Equals<GbSumAvg['_avg'], { amount: number | null }>>();
+
+// --- _min / _max carry the entity field's own type ---
+type GbMinMax = GroupByResult<Sale, { by: ['region']; _min: { createdAt: true }; _max: { amount: true } }>;
+assertTrue<Equals<GbMinMax['_min'], { createdAt: Date }>>();
+assertTrue<Equals<GbMinMax['_max'], { amount: number }>>();
+
+// --- multiple by fields each carry their entity type ---
+type GbMultiBy = GroupByResult<Sale, { by: ['region', 'amount'] }>;
+assertTrue<Equals<GbMultiBy['region'], string>>();
+assertTrue<Equals<GbMultiBy['amount'], number>>();
+
+// --- a groupBy with no aggregate blocks has NO _sum key ---
+type GbNoSum = GroupByResult<Sale, { by: ['region'] }>;
+type GbNoSumHasSum = '_sum' extends keyof GbNoSum ? true : false;
+assertTrue<Equals<GbNoSumHasSum, false>>();
+
+// --- Call-site inference: db.sales.groupBy({ ... }) infers the row type ---
+declare const sales: QueryInterface<Sale, NoRelations>;
+async function groupByCallSite() {
+  if (false as boolean) {
+    const rows = await sales.groupBy({ by: ['region'], _sum: { amount: true } });
+    type Row = (typeof rows)[number];
+    assertTrue<Equals<Row['region'], string>>();
+    assertTrue<Equals<Row['_count'], number>>();
+    assertTrue<Equals<Row['_sum'], { amount: number | null }>>();
+  }
+}
+void groupByCallSite;
+
+// ---------------------------------------------------------------------------
 // node:test stub so the runner picks up the file
 // ---------------------------------------------------------------------------
 

@@ -30,6 +30,7 @@ export type {
   GroupByAggregateSpec,
   GroupByArgs,
   GroupByDistinctOn,
+  GroupByResult,
   HavingClause,
   JsonFilter,
   JsonPathAggregateTarget,
@@ -41,6 +42,7 @@ export type {
   NestedUpsertOpItem,
   OmitResult,
   OrderByClause,
+  OrderByObject,
   OrderDirection,
   QueryResult,
   RelationDescriptor,
@@ -68,6 +70,7 @@ export type {
   WhereValue,
   WithClause,
   WithOptions,
+  WithOrderByObject,
   WithResult,
 } from './types.js';
 

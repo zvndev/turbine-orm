@@ -210,11 +210,23 @@ export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
  * `{}` (no relation suggestions) for callers that use the unparameterized
  * {@link WithClause}.
  */
+/**
+ * A single relation-`with` orderBy object: field → direction / sort spec /
+ * JSON-path ordering / relation ordering. The Prisma-style array form on
+ * {@link WithOptions.orderBy} is `WithOrderByObject[]`.
+ */
+export type WithOrderByObject = Record<string, OrderDirection | OrderBySpec | JsonPathOrderBy | RelationOrderBy>;
+
 // biome-ignore lint/complexity/noBannedTypes: {} means "no nested relations" — using object would break WithResult inference
 export interface WithOptions<NestedR extends object = {}> {
   with?: TypedWithClause<NestedR>;
   where?: Record<string, unknown>;
-  orderBy?: Record<string, OrderDirection | OrderBySpec | JsonPathOrderBy | RelationOrderBy>;
+  /**
+   * Order the related rows. Accepts a single object (`{ a: 'asc', b: 'desc' }`)
+   * or a Prisma-style array of objects (`[{ a: 'asc' }, { b: 'desc' }]`, whose
+   * element order is the authoritative multi-key sort precedence).
+   */
+  orderBy?: WithOrderByObject | WithOrderByObject[];
   limit?: number;
   /** Only include these fields from the relation */
   select?: Record<string, boolean>;
@@ -938,13 +950,80 @@ export interface GroupByArgs<T> {
    * (`_count`, or `_sum`/`_avg`/`_min`/`_max` mapping a requested field/alias to
    * its direction). Every value supports {@link OrderBySpec} for NULLS
    * placement. See {@link GroupByOrderBy}.
+   *
+   * Accepts a single object or a Prisma-style array of objects
+   * (`[{ region: 'asc' }, { _count: 'desc' }]`, array order authoritative).
    */
-  orderBy?: GroupByOrderBy;
+  orderBy?: GroupByOrderBy | GroupByOrderBy[];
+  /**
+   * Cap the number of result groups (`LIMIT`, applied after `ORDER BY`). Useful
+   * for "top N groups" queries; pair with `orderBy` for a deterministic set.
+   */
+  limit?: number;
+  /**
+   * Skip this many result groups (`OFFSET`, applied after `ORDER BY`). Paginates
+   * grouped results; combine with `limit` and a deterministic `orderBy`.
+   */
+  offset?: number;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
 }
+
+// ---------------------------------------------------------------------------
+// GroupByResult: compute the typed result-row shape from the groupBy args
+// ---------------------------------------------------------------------------
+
+/** The by-key union of a groupBy args type (array element type of `by`). */
+type GroupByKeys<A> = A extends { by: infer BY } ? (BY extends readonly unknown[] ? BY[number] : never) : never;
+
+/** The subset of `by` keys that are plain string field names on the entity `T`. */
+type GroupByFieldKeys<T, A> = Extract<GroupByKeys<A>, keyof T & string>;
+
+/**
+ * `_sum` / `_avg` result block: every requested key maps to `number | null`
+ * (an aggregate over zero matching rows is null). Present only when the args
+ * actually requested the block. A JSON-path aggregate target keys by its arg
+ * key (the alias), so `keyof S` covers both plain columns and JSON aliases.
+ */
+type GroupBySumAvgPart<A, Key extends '_sum' | '_avg'> = A extends { [P in Key]: infer S }
+  ? [S] extends [object]
+    ? { [P in Key]: { [K in keyof S & string]: number | null } }
+    : unknown
+  : unknown;
+
+/**
+ * `_min` / `_max` result block: a requested key that is a real entity field
+ * carries that field's own type; a JSON-path alias (or unknown key) carries
+ * `unknown`.
+ */
+type GroupByMinMaxPart<T, A, Key extends '_min' | '_max'> = A extends { [P in Key]: infer S }
+  ? [S] extends [object]
+    ? { [P in Key]: { [K in keyof S & string]: K extends keyof T ? T[K] : unknown } }
+    : unknown
+  : unknown;
+
+/**
+ * The typed result-row shape of a `groupBy(args)` call, computed from the args
+ * literal `A` (Prisma / Drizzle parity). Each `by` field carries the entity's
+ * field type; `_count` is always present (a group always has a row count); and
+ * each requested `_sum` / `_avg` / `_min` / `_max` block maps its selected
+ * fields to properly typed values.
+ *
+ * JSON-path group keys (objects in `by`) resolve to a runtime alias that is not
+ * knowable at the type level, so they are not projected onto the row type: cast
+ * the result when grouping by a JSON path. Intersections with `unknown` (an
+ * absent aggregate block) collapse away, so an args literal with no aggregates
+ * yields exactly `{ [byField]: T[field] } & { _count: number }`.
+ */
+export type GroupByResult<T, A> = { [K in GroupByFieldKeys<T, A>]: T[K] } & { _count: number } & GroupBySumAvgPart<
+    A,
+    '_sum'
+  > &
+  GroupBySumAvgPart<A, '_avg'> &
+  GroupByMinMaxPart<T, A, '_min'> &
+  GroupByMinMaxPart<T, A, '_max'>;
 
 /** Arguments for the standalone aggregate method */
 export interface AggregateArgs<T> {
@@ -1263,7 +1342,7 @@ export interface RelationPickOrderBy {
 }
 
 /**
- * An orderBy clause maps each key to one of:
+ * A single orderBy object: maps each key to one of:
  *  - a plain direction (`'asc'` / `'desc'`),
  *  - an {@link OrderBySpec} (`{ sort, nulls }`) for NULLS placement,
  *  - for json/jsonb columns, a JSON-path ordering ({@link JsonPathOrderBy}),
@@ -1272,7 +1351,17 @@ export interface RelationPickOrderBy {
  *    target column for to-one) or a pick-row ordering
  *    ({@link RelationPickOrderBy}, hasMany only).
  */
-export type OrderByClause = Record<
+export type OrderByObject = Record<
   string,
   OrderDirection | OrderBySpec | JsonPathOrderBy | VectorOrderBy | RelationOrderBy | RelationPickOrderBy
 >;
+
+/**
+ * An orderBy clause. Either a single {@link OrderByObject}
+ * (`{ a: 'asc', b: 'desc' }`, insertion order authoritative) or a Prisma-style
+ * array of them (`[{ a: 'asc' }, { b: 'desc' }]`, array order authoritative).
+ * The array form makes multi-key ordering independent of JS object key
+ * iteration order. Both forms flatten through `orderByEntries` so build,
+ * param-collect, and cache-fingerprint paths stay in lockstep.
+ */
+export type OrderByClause = OrderByObject | OrderByObject[];
