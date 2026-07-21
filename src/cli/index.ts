@@ -566,7 +566,7 @@ export function detectConsumerModuleType(cwd = process.cwd()): 'module' | 'commo
 }
 
 // ---------------------------------------------------------------------------
-// Command: init — sequenced, interactive project bootstrap
+// Command: init: sequenced, interactive project bootstrap
 // ---------------------------------------------------------------------------
 
 /** A single step in the `turbine init` flow. */
@@ -616,7 +616,7 @@ export interface InitPlanFlags {
 /**
  * Pure step planner for `turbine init`. Given the detected project state and the
  * effective flags, decide for each step whether to run it, prompt for it, or
- * skip it (and why). No IO — every input is precomputed by the caller — so the
+ * skip it (and why). No IO: every input is precomputed by the caller: so the
  * whole decision matrix is unit-testable without a TTY or a database.
  *
  * Three modes:
@@ -635,14 +635,14 @@ export function planInitSteps(state: InitPlanState, flags: InitPlanFlags): InitP
 
   const steps: InitPlanStep[] = [];
 
-  // config — core scaffold, never prompted.
+  // config: core scaffold, never prompted.
   steps.push(
     state.configExists && !flags.force
       ? { id: 'config', action: 'skip', defaultYes: true, skipReason: 'exists' }
       : { id: 'config', action: 'run', defaultYes: true },
   );
 
-  // Scaffold files (schema, seed) — created by default; prompted interactively.
+  // Scaffold files (schema, seed): created by default; prompted interactively.
   const scaffold = (id: InitStepId, exists: boolean, skipFlag: boolean): InitPlanStep => {
     if (skipFlag) return { id, action: 'skip', defaultYes: true, skipReason: 'flag' };
     if (exists) return { id, action: 'skip', defaultYes: true, skipReason: 'exists' };
@@ -651,11 +651,11 @@ export function planInitSteps(state: InitPlanState, flags: InitPlanFlags): InitP
   steps.push(scaffold('schema', state.schemaExists, flags.skipSchema));
   steps.push(scaffold('seed-file', state.seedFileExists, flags.skipSeed));
 
-  // seed-run needs a seed file — either one that already exists, or one this run
+  // seed-run needs a seed file: either one that already exists, or one this run
   // is about to create.
   const seedWillExist = state.seedFileExists || steps.find((s) => s.id === 'seed-file')?.action !== 'skip';
 
-  // DB steps — need a reachable database.
+  // DB steps: need a reachable database.
   const dbStep = (
     id: InitStepId,
     skipFlag: boolean,
@@ -802,14 +802,14 @@ function writeInitSeedTemplate(seedFilePath: string): void {
 /** Push the code-first schema to the database, preserving the destructive typed confirm. */
 async function runInitPush(config: ResolvedConfig, url: string): Promise<void> {
   if (!existsSync(config.schemaFile)) {
-    warn(`No schema file at ${cyan(config.schemaFile)} — skipping push.`);
+    warn(`No schema file at ${cyan(config.schemaFile)}: skipping push.`);
     return;
   }
   const schemaDef = await loadSchemaFile(config.schemaFile);
   const spinner = new Spinner('Computing schema diff').start();
   const diff = await schemaDiff(schemaDef, url);
   if (diff.statements.length === 0) {
-    spinner.succeed('Database already in sync — nothing to push');
+    spinner.succeed('Database already in sync: nothing to push');
     return;
   }
   spinner.succeed(`Found ${bold(String(diff.statements.length))} change(s) to apply`);
@@ -822,7 +822,7 @@ async function runInitPush(config: ResolvedConfig, url: string): Promise<void> {
     if (!(err instanceof DestructivePushRefusal)) throw err;
     pushSpinner.stop();
     if (!(await confirmDestructive(err.message))) {
-      warn('Push aborted — no schema changes were applied.');
+      warn('Push aborted: no schema changes were applied.');
       return;
     }
     const result = await schemaPush(schemaDef, url, { allowDestructive: true, precomputedDiff: diff });
@@ -856,7 +856,7 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<voi
 async function runInitSeed(config: ResolvedConfig): Promise<void> {
   const seedFile = resolveSeedFile(config);
   if (!seedFile || !existsSync(seedFile)) {
-    warn('No seed file found — skipping seed run.');
+    warn('No seed file found: skipping seed run.');
     return;
   }
   const spinner = new Spinner('Running seed file').start();
@@ -892,7 +892,7 @@ function reportInitSkip(step: InitPlanStep): void {
   const label = initStepLabel(step.id);
   switch (step.skipReason) {
     case 'exists':
-      info(`${label} already exists ${dim('— skipped')}`);
+      info(`${label} already exists ${dim('- skipped')}`);
       break;
     case 'flag':
       console.log(`  ${dim(`${symbols.dot} ${label} skipped (flag)`)}`);
@@ -907,7 +907,7 @@ function reportInitSkip(step: InitPlanStep): void {
       console.log(`  ${dim(`${symbols.dot} ${label} skipped (no seed file)`)}`);
       break;
     case 'non-interactive':
-      console.log(`  ${dim(`${symbols.dot} ${label} skipped (non-interactive — pass --yes to run it)`)}`);
+      console.log(`  ${dim(`${symbols.dot} ${label} skipped (non-interactive: pass --yes to run it)`)}`);
       break;
     case 'default-no':
       console.log(`  ${dim(`${symbols.dot} ${label} skipped (default no)`)}`);
@@ -1002,7 +1002,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
     const probe = new Spinner('Checking database connection').start();
     state.dbReachable = await probeDatabase(url);
     if (state.dbReachable) probe.succeed('Database is reachable');
-    else probe.info('Database not reachable — push / generate / seed steps will be skipped');
+    else probe.info('Database not reachable: push / generate / seed steps will be skipped');
   }
 
   const flags: InitPlanFlags = {
@@ -1476,7 +1476,7 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     const diff = await schemaDiff(schemaDef, url);
 
     if (diff.statements.length === 0) {
-      diffSpinner.succeed('Database is already in sync — nothing to migrate');
+      diffSpinner.succeed('Database is already in sync: nothing to migrate');
       newline();
       return;
     }
@@ -1540,7 +1540,7 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     const diff = await schemaDiff(schemaDef, url);
 
     if (diff.statements.length === 0) {
-      diffSpinner.succeed('Database is already in sync — nothing to migrate');
+      diffSpinner.succeed('Database is already in sync: nothing to migrate');
       newline();
       return;
     }
@@ -1597,7 +1597,7 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
       }
       newline();
       console.log(
-        `  ${dim('`migrate up` refuses destructive statements by default — confirm interactively or pass')} ${cyan('--allow-destructive')}${dim('.')}`,
+        `  ${dim('`migrate up` refuses destructive statements by default: confirm interactively or pass')} ${cyan('--allow-destructive')}${dim('.')}`,
       );
       newline();
     }
