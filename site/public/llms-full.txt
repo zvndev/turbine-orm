@@ -1,0 +1,199 @@
+# Turbine ORM, full reference for LLMs
+
+> Turbine is a Postgres-first TypeScript ORM with a Prisma-like API. Nested relations compile to a single SQL statement via PostgreSQL json_agg. The client is fully typed and generated from your live schema. One runtime dependency (pg). Optional SQLite / MySQL / SQL Server / PowDB engines share the same typed API behind subpath exports.
+
+This file is a condensed API reference for coding agents. It is accurate to the documented API; when in doubt, prefer the full docs at https://turbineorm.dev. Everything below is real, current API, do not invent methods, operators, or options that are not listed here.
+
+## Setup and codegen flow
+
+The flow is deterministic and agent-friendly: introspect the database, generate a typed client, query through it.
+
+```bash
+npm install turbine-orm
+npm install --save-dev tsx        # CLI loads .ts config/schema/seeds via tsx
+npx turbine init                  # writes turbine.config.ts + turbine/
+npx turbine generate              # introspect an existing DB -> typed client
+# or, code-first: edit turbine/schema.ts, then:
+npx turbine push                  # apply defineSchema to the DB (fast local path)
+npx turbine generate              # emit the typed client from the live schema
+```
+
+`generate` writes three files to `./generated/turbine/` (or the config `out`):
+- `types.ts`, entity interfaces plus `*Create` / `*Update` input types
+- `metadata.ts`, runtime schema metadata
+- `index.ts`, a typed `TurbineClient` subclass with `db.<table>` accessors and a `turbine()` factory
+
+Requirements: Node.js >= 20 (SQLite engine needs Node >= 22.5), PostgreSQL 14+ for the default path. ESM-first; `"type": "module"` recommended. The library never reads `.env`, populate `process.env.DATABASE_URL` yourself (e.g. `node --env-file=.env app.js`); the CLI auto-loads `.env`.
+
+```ts
+import { turbine } from './generated/turbine';
+
+const db = turbine();   // reads DATABASE_URL; or turbine({ connectionString })
+
+const users = await db.users.findMany({
+  where: { role: 'admin' },
+  orderBy: { createdAt: 'desc' },
+  limit: 10,
+});
+
+await db.disconnect();
+```
+
+## Reads
+
+### findMany(args)
+Returns an array. Supports `where`, `with`, `orderBy`, `limit`/`take`, `offset`, `cursor`, `distinct`, `select`, `omit`.
+
+```ts
+const users = await db.users.findMany({
+  where: { orgId: 1 },
+  with: { posts: { where: { published: true }, orderBy: { createdAt: 'desc' }, limit: 5, with: { comments: true } } },
+});
+// the whole graph resolves in ONE SQL statement; users[0].posts[0].comments[0] is fully typed
+```
+
+- `select` / `omit`, pick or drop columns (one or the other, not both): `select: { id: true, email: true }`.
+- Pagination: `limit`/`take` + `offset`, or keyset `cursor` (pass the last row's ordered column values; the cursor row is excluded). `take` is a Prisma-compatible alias for `limit`; when both are present `take` wins.
+- `distinct: ['userId']`, DISTINCT ON; which row survives per group is governed by `orderBy`.
+- `orderBy`, `{ field: 'asc' | 'desc' }`, or a spec `{ field: { sort: 'desc', nulls: 'last' } }`. Order by a to-many relation's `_count` (`orderBy: { posts: { _count: 'desc' } }`) or a to-one relation's column (`orderBy: { author: { name: 'asc' } }`).
+- `warnOnUnlimited: false` silences the unlimited-query warning per call.
+
+### findUnique / findUniqueOrThrow
+Look up by primary key or any unique column. `findUnique` returns `T | null`; the `OrThrow` form throws `NotFoundError` (E001). Composite PKs pass all key columns: `where: { userId: 1, orgId: 2 }`.
+
+### findFirst / findFirstOrThrow
+First matching row by `where` + `orderBy` (non-unique lookups).
+
+### findManyStream(args)
+Async iterable backed by a server-side cursor. Constant memory, supports nested `with`, safe to `break` early (cursor + connection cleaned up deterministically). `batchSize` defaults to 1000.
+
+### count / aggregate / groupBy
+```ts
+await db.users.count({ where: { role: 'admin' } });
+await db.posts.aggregate({ where: { orgId: 1 }, _sum: { viewCount: true }, _avg: { score: true }, _count: true });
+await db.posts.groupBy({ by: ['userId'], _count: true, _sum: { viewCount: true }, having: { _count: { gt: 1 } } });
+```
+Aggregate functions: `_count`, `_sum`, `_avg`, `_min`, `_max`. `groupBy` also supports `where` (filter rows before grouping), `having` (filter groups; operators gt/gte/lt/lte/in/notIn), `orderBy`, JSON-path group keys/targets, and Postgres-only `distinctOn`.
+
+### explain(args)
+Compiles the exact statement `findMany(args)` would run and returns the engine plan as `string[]`. Use it to confirm the emitted query hits the index you expect.
+
+## WHERE operators
+
+Equality: bare literal (`{ email: 'a@b.com' }`), `equals`, `not` (also `not: null` for IS NOT NULL).
+Sets: `in`, `notIn`.
+Comparison: `gt`, `gte`, `lt`, `lte`.
+String: `contains`, `startsWith`, `endsWith`, and `mode: 'insensitive'` (switches to ILIKE). Wildcards in input are escaped.
+Array columns: `has`, `hasEvery`, `hasSome`.
+Full-text: `search` (with optional `config`, default 'english').
+JSON (`json`/`jsonb`): `path` (drill into keys), `equals`, `contains` (containment @>), `hasKey`, and `gt`/`gte`/`lt`/`lte` (require `path`).
+Column-to-column: `{ col: 'otherField' }` inside `equals`/`not`/`gt`/`gte`/`lt`/`lte`.
+Relation filters: `some`, `every`, `none` (any operator composes inside them).
+Combinators: `AND`, `OR`, `NOT`.
+
+```ts
+where: {
+  AND: [{ orgId: 1 }, { role: 'admin' }],
+  OR: [{ role: 'owner' }, { role: 'admin' }],
+  NOT: { deletedAt: { not: null } },
+}
+```
+
+## Writes
+
+```ts
+await db.users.create({ data: { email: 'a@b.com', name: 'Alice', orgId: 1 } });   // returns the full row
+await db.users.createMany({ data: [ /* ... */ ] });                                // single INSERT ... UNNEST
+await db.users.update({ where: { id: 42 }, data: { name: 'Alice Updated' } });
+await db.users.updateMany({ where: { role: 'guest' }, data: { role: 'member' } });
+await db.users.delete({ where: { id: 42 } });
+await db.users.deleteMany({ where: { createdAt: { lt: cutoff } } });
+await db.users.upsert({ where: { email: 'a@b.com' }, create: { /* ... */ }, update: { /* ... */ } });
+```
+
+Atomic update operators on numeric columns (race-safe `col = col + $n`): `set`, `increment`, `decrement`, `multiply`, `divide`.
+```ts
+await db.posts.update({ where: { id: 1 }, data: { viewCount: { increment: 1 } } });
+```
+
+Safety: `update`/`delete` with an empty `where` (`{}` or all-undefined) throws `ValidationError` (E003). Pass `{ allowFullTableScan: true }` to override.
+
+Nested writes: relation fields in `create`/`update` `data` support `create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert`, resolved in one transaction (depth-capped at 10).
+
+## Transactions, pipeline, raw SQL
+
+```ts
+await db.$transaction(async (tx) => {
+  const user = await tx.users.create({ data: { /* ... */ } });
+  await tx.posts.create({ data: { userId: user.id, /* ... */ } });
+}, { isolationLevel: 'Serializable', timeout: 5000 });
+```
+`tx` has the same typed accessors as `db`. Nested `$transaction` calls become SAVEPOINTs. Isolation levels: `ReadCommitted`, `RepeatableRead`, `Serializable`.
+
+Pipeline, N independent queries in one round-trip via the Postgres extended-query pipeline protocol:
+```ts
+const [user, postCount, recent] = await db.pipeline([
+  db.users.buildFindUnique({ where: { id: 1 } }),
+  db.posts.buildCount({ where: { orgId: 1 } }),
+  db.posts.buildFindMany({ where: { userId: 1 }, limit: 5 }),
+]);
+```
+`build*` methods return DeferredQuery objects (sql + params + transform) without executing. Pipelines run in a transaction by default; `{ transactional: false }` isolates errors (inspect `PipelineError`). HTTP/serverless pools fall back to sequential; probe with `db.pipelineSupported()`.
+
+Raw SQL, every `${value}` becomes a bound `$N` parameter (injection impossible):
+```ts
+const rows = await db.raw<{ day: Date; count: number }>`SELECT ... WHERE org_id = ${orgId}`;
+const users = await db.sql<{ id: number; name: string }>`SELECT id, name FROM users WHERE id = ${42}`; // .one(), .scalar()
+```
+
+Middleware, `db.$use(fn)` runs after SQL generation: observe params/timing and transform results, but it cannot rewrite the query.
+
+## Typed errors
+
+Every error extends `TurbineError` and carries a `code`. Branch on the class/code, never on the message.
+
+- E001 NotFoundError, OrThrow lookups
+- E002 TimeoutError
+- E003 ValidationError, unknown column, invalid operator, empty-where guard
+- E004 ConnectionError
+- E005 RelationError, unknown relation in `with`
+- E006 MigrationError
+- E007 CircularRelationError, `with` nesting depth > 10
+- E008 UniqueConstraintError (pg 23505)
+- E009 ForeignKeyError (23503)
+- E010 NotNullViolationError (23502)
+- E011 CheckConstraintError (23514)
+- E012 DeadlockError (40P01), `isRetryable = true`
+- E013 SerializationFailureError (40001), `isRetryable = true`
+- E014 PipelineError
+- E015 OptimisticLockError
+- E016 ExclusionConstraintError (23P01)
+- E017 UnsupportedFeatureError, a Postgres-only feature invoked on an engine that lacks it
+- E018 ReadOnlyError, a write refused on a read-only database
+
+```ts
+import { SerializationFailureError } from 'turbine-orm';
+try { await doWork(); }
+catch (err) {
+  if (err instanceof SerializationFailureError && err.isRetryable) { /* retry */ }
+}
+```
+
+## Migrations
+
+SQL-first migration files (timestamp-prefixed, `-- UP` / `-- DOWN` sections) tracked in `_turbine_migrations` with SHA-256 checksums and a `pg_try_advisory_lock()`. Each runs in its own transaction; modified files are detected by checksum. Destructive statements need a typed confirmation or `--allow-destructive`. For fast local iteration use `turbine push` (applies `defineSchema` directly); prefer SQL migrations for production.
+
+## Engines
+
+Default is PostgreSQL. Optional engines share the same typed API via subpath exports and load their drivers lazily (Postgres users still pull only `pg`):
+- `turbine-orm/sqlite`, `turbineSqlite(...)`, uses Node's built-in `node:sqlite` (Node >= 22.5)
+- `turbine-orm/mysql`, `await turbineMysql(...)` (optional peer `mysql2`)
+- `turbine-orm/mssql`, `await turbineMssql(...)` (optional peer `mssql`)
+- `turbine-orm/powdb`, `await turbinePowDB(...)` (PowDB, its own query language under the same API)
+
+Several flagship features stay Postgres-only (pgvector, LISTEN/NOTIFY, RLS session context); calling them on an engine that lacks the capability throws `UnsupportedFeatureError` (E017) instead of emitting broken SQL. See https://turbineorm.dev/engines for the capability matrix.
+
+## Agent integration point
+
+The canonical way to teach an agent about Turbine is to point it at https://turbineorm.dev/llms.txt (index) and this file (full reference), and to add a short instruction block to the project's CLAUDE.md / AGENTS.md, see https://turbineorm.dev/ai-agents for a copy-pasteable snippet. Turbine also ships a read-only MCP server (`npx turbine mcp`) that exposes schema, migrations, doctor, EXPLAIN, and sample rows to MCP clients like Claude Code and Cursor.
+</content>

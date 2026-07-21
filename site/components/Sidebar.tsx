@@ -42,6 +42,7 @@ const sections: NavSection[] = [
       { href: '/cli', label: 'CLI' },
       { href: '/studio', label: 'Studio' },
       { href: '/mcp', label: 'MCP Server' },
+      { href: '/ai-agents', label: 'Turbine for AI agents' },
       { href: '/observability', label: 'Observability' },
       { href: '/errors', label: 'Typed Errors' },
     ],

@@ -1,0 +1,131 @@
+export const metadata = {
+  title: 'Turbine for AI agents',
+  description:
+    'How to point a coding agent at Turbine ORM: the llms.txt integration point, the deterministic introspect-generate-typed-client flow, why typed query args and coded errors suit agents, and a drop-in agent-instructions snippet.',
+  alternates: { canonical: '/ai-agents' },
+};
+
+# Turbine for AI agents
+
+Turbine is built to be legible to AI coding agents, not just to people. Three properties do most of the work: a **deterministic codegen flow** an agent can run and re-run, **fully typed query arguments** that turn an invalid query into a compile error the agent can read, and a **stable coded error system** the agent can branch on instead of parsing prose. This page shows how to point an agent at Turbine and gives you a snippet to drop into your project so the agent uses it correctly.
+
+There is nothing to install for this. The integration point is a plain text file the agent reads, no plugin, no skill catalog, no runtime coupling.
+
+## Point an agent at Turbine: `llms.txt`
+
+Turbine publishes an [llms.txt](https://turbineorm.dev/llms.txt) at the site root, following the [llms.txt convention](https://llmstxt.org): a concise description of the library, the key facts, and links to every docs page with a one-line summary. There is also a fuller [llms-full.txt](https://turbineorm.dev/llms-full.txt) with a condensed API reference distilled from these docs.
+
+| File | URL | What it is |
+|---|---|---|
+| `llms.txt` | [turbineorm.dev/llms.txt](https://turbineorm.dev/llms.txt) | Short index: description, key facts, and links to each docs page. |
+| `llms-full.txt` | [turbineorm.dev/llms-full.txt](https://turbineorm.dev/llms-full.txt) | Condensed API reference: reads, writes, WHERE operators, transactions, errors, engines. |
+
+To ground an agent, hand it one or both URLs, or paste them into your project's agent-instructions file (see the snippet below). Both are static text, fetch them, cache them, feed them into context. For an agent that speaks MCP, the read-only [MCP server](/mcp) (`npx turbine mcp`) additionally exposes your **live schema**, migration status, index advice, `EXPLAIN` plans, and sample rows over JSON-RPC, grounding the agent in the actual database, not just the docs.
+
+## The deterministic codegen flow
+
+An agent works best when the same commands always produce the same typed surface. Turbine's flow is exactly that: **introspect → generate → typed client**.
+
+```bash
+npx turbine init        # writes turbine.config.ts and a turbine/ directory
+npx turbine generate    # introspect the live database, emit a typed client
+```
+
+`generate` reads the database (or your code-first `defineSchema`) and writes three files to `generated/turbine/`:
+
+- `types.ts`, entity interfaces and `Create` / `Update` input types
+- `metadata.ts`, runtime schema metadata
+- `index.ts`, a typed `TurbineClient` subclass with `db.<table>` accessors and a `turbine()` factory
+
+Because the output is generated from the schema, an agent never has to guess column names, relation names, or types, they are all present in the emitted `.ts`, and they move in lockstep with the database. When the schema changes, the agent re-runs `generate` and the type checker immediately surfaces every call site that needs updating. For code-first projects the loop is `edit turbine/schema.ts → turbine push → turbine generate` (see [Schema & Migrations](/schema)).
+
+## Why typed query args suit agents
+
+Turbine's query arguments are fully typed against the generated schema, so a wrong query fails at compile time with a message the agent can act on, not at runtime in production.
+
+```ts
+const users = await db.users.findMany({
+  where: { orgId: 1 },
+  with: { posts: { with: { comments: { with: { author: true } } } } },
+});
+
+users[0].posts[0].comments[0].author.name; // inferred end to end, no manual casts
+```
+
+- **Invalid columns, operators, and relations are type errors.** A misspelled field in `where`, an operator that does not exist, or an unknown relation in `with` will not typecheck. An agent that runs `tsc` gets a precise pointer instead of a silent wrong result.
+- **`with` results are inferred at any depth.** The agent does not annotate nested shapes by hand; `findMany` returns the exact nested type for the `with` clause it passed.
+- **Parameterization is guaranteed.** Every user value becomes a bound `$1, $2, ...` parameter; `contains` / `startsWith` / `endsWith` escape LIKE wildcards automatically. An agent cannot accidentally build a string-interpolated query with the typed API, there is no code path that concatenates a value into SQL. Even the raw escape hatches (`db.raw` and `db.sql<T>`) bind every `${value}` as a parameter.
+
+The practical effect: an agent can propose a query, run the type checker, and know it is at least structurally correct before it ever touches the database.
+
+## Why coded errors suit agents
+
+Every Turbine error extends `TurbineError` and carries a stable `code` (`TURBINE_E001` through `E018`). Agents branch on the class or code, which is stable across versions, instead of scraping a driver's error text.
+
+```ts
+import { SerializationFailureError, UniqueConstraintError } from 'turbine-orm';
+
+try {
+  await db.orders.create({ data });
+} catch (err) {
+  if (err instanceof UniqueConstraintError) {
+    // E008, duplicate; surface a clean conflict
+  } else if (err instanceof SerializationFailureError && err.isRetryable) {
+    // E013, retry the transaction; the flag is a typed const, so the compiler knows it is safe
+  }
+}
+```
+
+Retryable failures (`DeadlockError` E012, `SerializationFailureError` E013) expose `isRetryable = true` as a const, so an agent can write a correct, type-checked retry loop. See [Typed Errors](/errors) for the full table.
+
+## Drop-in agent instructions
+
+Paste this into your project's `CLAUDE.md` or `AGENTS.md` so any agent working in the repo uses Turbine correctly. Trim it to what your project uses.
+
+```markdown
+## Database: Turbine ORM
+
+This project uses turbine-orm (Postgres-first, Prisma-like API). Reference:
+https://turbineorm.dev/llms.txt and https://turbineorm.dev/llms-full.txt.
+
+Client
+- Import the generated client: `import { turbine } from '@/generated/turbine'`.
+- `const db = turbine()` reads DATABASE_URL. Call `db.disconnect()` on shutdown.
+- Never hand-write entity types; run `npx turbine generate` after any schema change
+  and import types from `generated/turbine`.
+
+Reads
+- `db.<table>.findMany({ where, with, orderBy, limit, offset, cursor, select, omit })`.
+- Nested relations go in `with` and resolve in ONE SQL statement (json_agg), do not
+  write N+1 loops or manual joins. `with` results are fully typed at any depth.
+- `findUnique` (by PK or unique column) returns `T | null`; `findUniqueOrThrow` throws
+  NotFoundError (E001). `findFirst` for non-unique first-match.
+
+Writes
+- `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, `upsert`.
+- For counters use atomic operators: `data: { viewCount: { increment: 1 } }`.
+- `update`/`delete` with an empty `where` throws ValidationError (E003) by design.
+- Relation ops inside `data` (connect/create/disconnect/set/update/upsert) run in one tx.
+
+Safety
+- Every value is parameterized ($1, $2, ...); never string-interpolate SQL. Use `db.raw`
+  or `db.sql<T>` (both bind `${value}` as params) only when the builder can't express it.
+- Wrap multi-step writes in `db.$transaction(async (tx) => { ... })`.
+
+Errors
+- Catch typed errors and branch on the class/code (TURBINE_E001..E018), not the message.
+- Retry only when `err.isRetryable` is true (DeadlockError E012, SerializationFailureError E013).
+
+Migrations
+- Local iteration: edit `turbine/schema.ts` (defineSchema), then `turbine push`, then
+  `turbine generate`. Production: SQL migrations via `turbine migrate` (never edit an
+  applied migration file, checksums are validated).
+```
+
+## See also
+
+- **[MCP Server](/mcp)**, a read-only MCP server that grounds an agent in your live schema, plans, and sample rows.
+- **[Quick Start](/quickstart)**, the fastest path from install to first typed query.
+- **[API Reference](/queries)**, every method, operator, and option the snippet above refers to.
+- **[Typed Errors](/errors)**, the full E001-E018 table and retry patterns.
+- **[Schema & Migrations](/schema)**, code-first schemas and the migration workflow.

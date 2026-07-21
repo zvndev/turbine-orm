@@ -1,0 +1,42 @@
+# Turbine ORM
+
+> Turbine is a Postgres-first TypeScript ORM with a Prisma-like API (findMany, findUnique, with, where). It compiles nested relations to a single SQL statement using PostgreSQL json_agg, ships a fully typed client generated from your live schema, and carries exactly one runtime dependency (pg). Optional SQLite, MySQL, SQL Server, and PowDB engines expose the same typed API behind subpath exports.
+
+Turbine is designed to be legible to AI coding agents: a deterministic codegen flow (introspect the database, generate a typed client, query through it), fully typed query arguments that make invalid queries a compile error, and a stable typed error system (codes TURBINE_E001 through E018) that agents can branch on instead of parsing messages. Point an agent at this file and the docs below to teach it how to use Turbine correctly.
+
+Key facts:
+- Postgres-first; PostgreSQL 14+ is the default and primary target. Node.js 20+ (SQLite engine needs Node 22.5+).
+- Exactly one runtime dependency: pg. Optional engines load their drivers lazily and never ship to Postgres users.
+- Single-query nested relations: a `with` clause compiles to one SQL statement via json_agg + correlated subqueries. No N+1, no client-side stitching.
+- Fully typed: `npx turbine generate` introspects the schema and emits entity types, Create/Update input types, and a typed client. `with` results are inferred end to end at arbitrary depth.
+- All user values are parameterized ($1, $2, ...) and never string-interpolated. LIKE wildcards are escaped automatically.
+- Typed errors: every error extends TurbineError and carries a `code`. Retryable errors (deadlock, serialization failure) expose `isRetryable = true` as a const.
+- SQL-first migrations tracked in a _turbine_migrations table with SHA-256 checksums and an advisory lock; `turbine push` for fast local schema sync.
+- Extras: transactions with SAVEPOINT nesting and isolation levels, pipeline batching (N queries in one round-trip), server-side cursor streaming, typed raw SQL, pgvector KNN, LISTEN/NOTIFY realtime, a read-only Studio UI, and a read-only MCP server.
+
+## Docs
+
+- [Quick Start](https://turbineorm.dev/quickstart): Install, set DATABASE_URL, generate the typed client, run your first query and nested `with`.
+- [Turbine for AI agents](https://turbineorm.dev/ai-agents): How to point a coding agent at Turbine, the deterministic codegen flow, and a drop-in agent-instructions snippet.
+- [API Reference](https://turbineorm.dev/queries): Every query method, WHERE operator, nested `with` option, transaction and pipeline API.
+- [Relations](https://turbineorm.dev/relations): hasMany / belongsTo / hasOne / manyToMany and how the json_agg nesting works.
+- [Nested Writes](https://turbineorm.dev/nested-writes): Create, connect, connectOrCreate, disconnect, set, delete, update, upsert on relations inside one transaction.
+- [Transactions & Pipelines](https://turbineorm.dev/transactions): $transaction, SAVEPOINT nesting, isolation levels, and pipeline batching.
+- [Schema & Migrations](https://turbineorm.dev/schema): Code-first defineSchema, DDL generation, and auto-diff migrations.
+- [Migrations in Practice](https://turbineorm.dev/migrate): SQL-first migration files, checksums, and the destructive-statement guard.
+- [Typed Errors](https://turbineorm.dev/errors): Every error code (E001-E018) and the retry patterns.
+- [CLI](https://turbineorm.dev/cli): init, generate/pull, push, migrate, seed, doctor, studio, mcp.
+- [Database Engines](https://turbineorm.dev/engines): SQLite, MySQL, SQL Server, and PowDB behind the same typed API, and which features stay Postgres-only.
+- [Benchmarks](https://turbineorm.dev/benchmarks): Honest three-way numbers against Prisma and Drizzle on a local PostgreSQL database.
+
+## Optional
+
+- [Vector Search](https://turbineorm.dev/vector): Typed pgvector KNN ranking and distance filters, no raw SQL.
+- [Realtime](https://turbineorm.dev/realtime): Postgres LISTEN/NOTIFY pub/sub via $listen / $notify.
+- [Serverless & Edge](https://turbineorm.dev/serverless): Bind Turbine to Neon, Vercel Postgres, or Cloudflare Hyperdrive pools.
+- [Studio](https://turbineorm.dev/studio): A local, read-only database UI (npx turbine studio).
+- [MCP Server](https://turbineorm.dev/mcp): A read-only Model Context Protocol server (npx turbine mcp) that exposes schema, migrations, doctor, EXPLAIN, and sample rows to agents.
+- [Observability](https://turbineorm.dev/observability): Query lifecycle events and built-in metrics aggregation.
+- [Migrate from Prisma](https://turbineorm.dev/migrate-from-prisma): API differences and a migration path from Prisma.
+- [Migrate from Drizzle](https://turbineorm.dev/migrate-from-drizzle): API differences and a migration path from Drizzle.
+</content>
