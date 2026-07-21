@@ -41,6 +41,7 @@ import {
   capabilitiesFromVersion,
   introspectPowdbDatabase,
   PowdbJsonParam,
+  parsePowdbUrl,
   powqlSchemaDDL,
   turbinePowDB,
 } from '../powdb.js';
@@ -1405,6 +1406,17 @@ describe('powdb integration (embedded): describe-based introspection', () => {
 const powdbUrl = process.env.POWDB_URL;
 const { it: liveIt } = skipGate(!powdbUrl, 'set POWDB_URL to run the live networked PowDB suite');
 
+/** True when `version` (dotted, e.g. "0.18.1") is >= the `[major, minor, patch]` target. */
+function serverAtLeast(version: string, [tMaj, tMin, tPatch]: [number, number, number]): boolean {
+  const parts = version.split('.').map((n) => Number.parseInt(n, 10));
+  const maj = parts[0] ?? 0;
+  const min = parts[1] ?? 0;
+  const patch = parts[2] ?? 0;
+  if (maj !== tMaj) return maj > tMaj;
+  if (min !== tMin) return min > tMin;
+  return patch >= tPatch;
+}
+
 describe('powdb integration (networked): F1 param-in-segment JSON filters over TCP', () => {
   liveIt('binds `.data->$1->$2 = $3` path segments as params on a live server', async () => {
     const db: DB = await turbinePowDB(powdbUrl!, jsonSchema, { warnOnUnlimited: false });
@@ -1623,6 +1635,48 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
       await db.disconnect();
     }
   });
+
+  // A networked unique violation now arrives with the typed wire error class 8
+  // (constraint_violation) on the raw driver error. wrapPowdbError maps it to
+  // UniqueConstraintError (E008) via the message family first, so the class byte
+  // is asserted on the preserved `.cause` — this locks the 0.18.1 upstream fix
+  // (storage-raised unique violations surface class 8, not class 0/internal).
+  // The class byte is a server >= 0.18.1 feature, so this soft-skips against an
+  // older server pointed at by POWDB_URL (the E008 mapping itself holds via the
+  // message family on every server version — see the embedded error-mapping test).
+  liveIt(
+    'a networked unique violation carries wireErrorClass 8 and maps to UniqueConstraintError (E008)',
+    async (tc) => {
+      const { Client } = (await import('@zvndev/powdb-client')) as {
+        Client: { connect(o: unknown): Promise<{ serverVersion: string; close(): Promise<void> }> };
+      };
+      const probe = await Client.connect(parsePowdbUrl(powdbUrl!));
+      const serverVersion = probe.serverVersion;
+      await probe.close();
+      if (!serverAtLeast(serverVersion, [0, 18, 1])) {
+        tc.skip(`requires PowDB server >= 0.18.1 for wireErrorClass 8 (saw ${serverVersion})`);
+        return;
+      }
+      await withLive([col('id', 'id', 'string', 'text', { hasDefault: true })], async (db, t) => {
+        await db.table(t).create({ data: { id: 'dup' } });
+        let caught: unknown;
+        try {
+          await db.table(t).create({ data: { id: 'dup' } });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught !== undefined, 'duplicate primary key should have thrown');
+        assert.ok(caught instanceof UniqueConstraintError, `expected E008, got: ${caught}`);
+        assert.equal((caught as { code?: string }).code, 'TURBINE_E008');
+        const cause = (caught as { cause?: { wireErrorClass?: unknown } }).cause;
+        assert.equal(
+          cause?.wireErrorClass,
+          8,
+          `expected the raw cause to carry wireErrorClass 8, saw: ${JSON.stringify(cause?.wireErrorClass)}`,
+        );
+      });
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
