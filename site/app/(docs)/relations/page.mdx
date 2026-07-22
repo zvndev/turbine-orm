@@ -359,6 +359,19 @@ Relation subqueries then emit `json_agg(json_build_array(…))` — a key-less a
 
 Measured on a 14-column `hasMany` relation: **39% fewer wire bytes** and ~13% faster end-to-end `findMany`. The win grows with column count and result size. It composes with everything — `select` / `omit`, ordered and limited relations, `hasOne` / `belongsTo`, many-to-many, nested trees. (`relationLoadStrategy: 'batched'` bypasses it entirely — there's no JSON aggregation on that path.) Default is `'object'`, byte-unchanged.
 
+## SQL template cache size
+
+Repeated queries of the same shape reuse cached SQL text instead of rebuilding it. `sqlCacheSize` bounds the per-table LRU template cache:
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  sqlCacheSize: 2000,
+});
+```
+
+Values are parameterized (`$1, $2, …`) and never fragment the cache, so this bounds distinct query **shapes**. The default is `1000`: raise it for apps with a very large surface of query shapes to lift the hit rate at the cost of memory, or lower it to cap memory. `sqlCacheSize: 0` disables caching entirely (identical to `sqlCache: false`).
+
 ## See also
 
 - **[API Reference](/queries)** — every operator and option in `where`, `with`, `select`.

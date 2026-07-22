@@ -14,9 +14,11 @@ The [Schema & Migrations](/schema) page covers the basics: `.sql` files with `--
 ## The workflow
 
 ```bash
-# 1. Create a migration: blank, or auto-generated from the schema diff
+# 1. Create a migration: blank, auto-generated, or diff-derived with
+#    destructive statements flagged
 npx turbine migrate create add_users_table
 npx turbine migrate create add_email_index --auto
+npx turbine migrate create sync_schema --from-diff
 
 # 2. Apply pending migrations locally (interactive; prompts on destructive ops)
 npx turbine migrate up
@@ -32,7 +34,7 @@ npx turbine migrate down --step 2
 npx turbine migrate status
 ```
 
-**`create --auto`** writes a starting-point migration from the diff between your `defineSchema` output and the live database. It is a draft; always read it before committing.
+**`create --auto`** writes a starting-point migration from the diff between your `defineSchema` output and the live database. It is a draft; always read it before committing. **`create --from-diff`** does the same but flags destructive statements inline (see [below](#flagging-destructive-statements-with-from-diff)).
 
 **`up`** applies every pending migration in timestamp order. It is the interactive command: if any pending file contains a destructive statement, it stops and asks you to confirm before running anything (see [the destructive gate](#the-destructive-gate)).
 
@@ -54,6 +56,20 @@ npx turbine migrate status
 - **`SET NOT NULL` has no backfill.** Making a nullable column `notNull` emits a bare `ALTER COLUMN "col" SET NOT NULL`. On a populated table with any `NULL` in that column, apply **fails**. Backfill the column first (see below).
 - **`varchar` length changes are not detected.** The differ compares the underlying type name, not the length, so `varchar(50)` to `varchar(100)` produces no statement. Change the length by hand if you need it enforced.
 - **Table and column drops are reported, never auto-emitted.** A table or column present in the database but absent from your schema is surfaced in the diff (and in `migrate status`) but is **never written into the executable SQL**; dropping data is always a manual, deliberate act. `schemaDiff()` returns these in `drop` / the `alter` plan; you write the `DROP` yourself.
+
+## Flagging destructive statements with `--from-diff`
+
+`--from-diff` derives the same forward and reverse SQL as `--auto` (the diff goes into `-- UP` and the reverse into `-- DOWN`, with a clearly commented "irreversible, write manually" placeholder when no reverse can be derived), but it also annotates anything that destroys data:
+
+- A lossy `ALTER COLUMN … TYPE` in UP, or a `DROP TABLE` / `DROP COLUMN` reverse in DOWN, is flagged inline with loud comments and a file-level banner.
+- The statement is left **intact**, so `migrate up` still refuses it by default until you confirm interactively or pass `--allow-destructive` (see [the destructive gate](#the-destructive-gate)).
+- Diff warnings the differ won't apply automatically (e.g. enum value removals) are surfaced as `-- NOTE:` comments.
+
+```bash
+npx turbine migrate create sync_schema --from-diff
+```
+
+`--from-diff` cannot be combined with `--auto` or `--recipe`. Reach for it when a diff might touch existing data and you want the risky lines called out in the file rather than discovered at apply time.
 
 ## Changing a column type with existing data
 

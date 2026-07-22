@@ -21,8 +21,9 @@ Commands:
   generate --include-views       Include views + materialized views as read-only entities
   generate --no-timestamp        Omit the "Generated at:" header for byte-identical regens
   push                           Apply defineSchema() output to the database
-  migrate create <name>          Create a new SQL migration file
-  migrate create <name> --auto   Auto-generate migration from schema diff
+  migrate create <name>            Create a new SQL migration file
+  migrate create <name> --auto     Auto-generate migration from schema diff
+  migrate create <name> --from-diff Like --auto, but flags destructive statements
   migrate up                     Apply pending migrations
   migrate deploy                 Apply pending migrations without prompts (CI)
   migrate down                   Rollback the last applied migration
@@ -48,17 +49,26 @@ Commands:
 
 ## `turbine init`
 
-Initialize a Turbine project in the current directory.
+Bootstrap a Turbine project in the current directory. `init` is a sequenced flow that detects what already exists and runs only the missing steps: write `turbine.config.ts`, scaffold a starter `schema.ts` and `seed.ts`, and (when a reachable database is configured) offer to push the schema, generate the typed client, and run the seed file.
 
 ```bash
 npx turbine init
 npx turbine init --url postgres://user:pass@localhost:5432/mydb
 ```
 
-Creates:
+Re-runs are safe: existing files are detected and their steps are skipped, so you can run `init` repeatedly. A destructive push keeps the usual typed confirmation.
 
-- `turbine.config.ts` at the project root
-- `turbine/` directory with placeholders for `schema.ts`, `migrations/`, and `seed.ts`
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--yes`, `-y` | Accept every step's default without prompting. |
+| `--skip-schema` | Don't scaffold the starter schema file. |
+| `--skip-seed` | Don't scaffold the seed file or offer to run it. |
+| `--skip-push` | Don't offer to push the schema to the database. |
+| `--skip-generate` | Don't offer to generate the typed client. |
+
+In an interactive terminal, `init` prompts for each step. Without a TTY it degrades gracefully: it scaffolds the files and generates the client (the previous behavior), skips push and seed, and prints a note pointing at `--yes` and the `--skip-*` flags.
 
 ## `turbine pull` / `turbine generate`
 
@@ -127,9 +137,18 @@ npx turbine migrate create add_users_table
 
 # Auto-generate from diff between defineSchema() and live DB
 npx turbine migrate create add_email_index --auto
+
+# Like --auto, but flag destructive statements in the file
+npx turbine migrate create sync_schema --from-diff
 ```
 
 Writes `turbine/migrations/<timestamp>_<name>.sql` with `-- UP` and `-- DOWN` sections. Auto mode populates both sections from the schema diff. Blank mode gives you empty sections to fill in.
+
+### `--from-diff`
+
+Like `--auto`, `--from-diff` derives the forward statements into `-- UP` and the reverse statements into `-- DOWN` from the schema diff (an "irreversible, write manually" placeholder is written when no reverse can be derived). The difference is safety annotation: any data-destroying statement in either direction (a lossy `ALTER COLUMN … TYPE` in UP, a `DROP TABLE` / `DROP COLUMN` reverse in DOWN) is flagged inline with loud comments and a file-level banner, and left intact so `migrate up` still refuses it by default unless you confirm interactively or pass `--allow-destructive`. Diff warnings (e.g. enum value removals the diff won't apply automatically) are surfaced as `-- NOTE:` comments.
+
+`--from-diff` cannot be combined with `--auto` or `--recipe`.
 
 Example output of `--auto`:
 

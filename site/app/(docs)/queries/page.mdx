@@ -152,6 +152,15 @@ orderBy: { name: 'asc', lastLoginAt: { sort: 'desc', nulls: 'last' } }
 // ORDER BY "name" ASC, "last_login_at" DESC NULLS LAST
 ```
 
+For multi-key ordering you can also pass a **Prisma-style array of objects**. The array's element order is the authoritative sort precedence, so it never depends on JS object key iteration order:
+
+```ts
+orderBy: [{ createdAt: 'desc' }, { id: 'asc' }]
+// ORDER BY "created_at" DESC, "id" ASC
+```
+
+Both forms accept `{ sort, nulls }` specs and produce byte-identical SQL for the same key order. The array form works everywhere an `orderBy` is accepted: `findMany`, a `with` relation, and `groupBy`.
+
 `{ sort, nulls }` applies everywhere an `orderBy` is compiled — top-level queries, `groupBy`, and the inner subquery of a `with` relation.
 
 > **Pitfall:** `NULLS FIRST` / `NULLS LAST` is a PostgreSQL and SQLite feature. On MySQL and SQL Server, explicit nulls placement throws `UnsupportedFeatureError` (TURBINE_E017) rather than emitting broken SQL. Plain `'asc'` / `'desc'` works on every engine.
@@ -347,6 +356,16 @@ const postsByUser = await db.posts.groupBy({
 // [{ userId: 1, _count: 12, _sum: { viewCount: 4800 }, _avg: { score: 4.2 } }, ...]
 ```
 
+The result row is **fully typed** from the args (as in Prisma and Drizzle), no `as const` needed. Each `by` field carries its entity field type, `_count` is a `number`, `_sum` / `_avg` fields are `number | null` (an aggregate over zero matching rows is null), and `_min` / `_max` fields carry the field's own type. The call above infers:
+
+```ts
+// { userId: number; _count: number;
+//   _sum: { viewCount: number | null };
+//   _avg: { score: number | null } }[]
+```
+
+Grouping by a JSON path yields a runtime alias that can't be typed, so those columns are left off the row type (cast the result when grouping by a JSON path).
+
 ### Filtering groups
 
 Pass a `where` clause to filter rows before grouping:
@@ -404,6 +423,22 @@ const topCategories = await db.orderItems.groupBy({
 ```
 
 Each key re-emits the exact SQL expression it selected (the same one `having` uses), so aggregate and JSON-alias ordering works on every engine. Ordering by an aggregate you did not request, or by an unknown key, throws with the list of valid keys. `{ sort, nulls }` specs apply here too (Postgres / SQLite).
+
+### Top N groups: `limit` and `offset`
+
+`groupBy` accepts optional `limit` and `offset`, applied after `ORDER BY`. Pair them with a deterministic `orderBy` for "top N groups" and paginated grouped results:
+
+```ts
+// The 10 users with the most posts
+const topAuthors = await db.posts.groupBy({
+  by: ['userId'],
+  _count: true,
+  orderBy: { _count: 'desc' },
+  limit: 10,
+});
+```
+
+`limit` / `offset` are parameterized on PostgreSQL / SQLite / SQL Server, inlined on MySQL, and native on PowDB.
 
 ### Latest row per parent: `distinctOn`
 

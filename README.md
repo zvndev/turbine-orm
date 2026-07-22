@@ -605,9 +605,10 @@ Commands:
   init                  Initialize a Turbine project (creates config, dirs, templates)
   generate | pull       Introspect database and generate TypeScript types + client
   push                  Apply schema-builder definitions to database
-  migrate create <name>        Create a new SQL migration file
-  migrate create <name> --auto Auto-generate from schema diff
-  migrate up                   Apply pending migrations
+  migrate create <name>            Create a new SQL migration file
+  migrate create <name> --auto     Auto-generate from schema diff
+  migrate create <name> --from-diff Like --auto, but flag destructive statements
+  migrate up                       Apply pending migrations
   migrate deploy               Apply pending migrations without prompts
   migrate down                 Rollback last migration
   migrate status               Show applied/pending migrations
@@ -623,6 +624,7 @@ Options:
   --out, -o <dir>       Output directory (default: ./generated/turbine)
   --schema, -s <name>   Postgres schema (default: public)
   --auto                Auto-generate migration from schema diff
+  --from-diff           Like --auto, but flag destructive statements (migrate create)
   --dry-run             Show SQL without executing
   --verbose, -v         Detailed output
 ```
@@ -661,6 +663,10 @@ npx turbine migrate create add_users_table
 # Auto-generate migration from schema diff (compares defineSchema() vs live DB)
 npx turbine migrate create add_email_index --auto
 # -> Generates UP (ALTER/CREATE) and DOWN (reverse) SQL automatically
+
+# Same diff, but destructive statements flagged inline (still refused by
+# migrate up unless confirmed or --allow-destructive); cannot combine with --auto/--recipe
+npx turbine migrate create sync_schema --from-diff
 
 # Apply all pending migrations
 npx turbine migrate up
