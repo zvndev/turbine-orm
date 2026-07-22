@@ -23,3 +23,6 @@ AGENTS.md
 .private-terms
 .DS_Store
 test-app.ts
+
+# Local agent skills + loop state (never public)
+.claude/

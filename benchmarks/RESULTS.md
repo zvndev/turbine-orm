@@ -165,3 +165,39 @@ bubbles raw `pg` errors. That is a DX difference, not a benchmark line.
 - **Run-to-run variance is a few tenths of a millisecond** on the sub-ms
   scenarios. Winners were stable across two full runs except L3, which flipped
   between Turbine and Drizzle and should be read as a tie.
+
+## Raw results, 2026-07-21 (local socket)
+
+> **TL;DR.** Same local-socket regime as 2026-07-14, measured against the newest
+> competitor releases (Prisma 7.9.0, up from 7.6.0; Drizzle unchanged at 0.45.2;
+> pg 8.22.0). Turbine holds stable wins on flat reads, findUnique by PK and L3
+> nested, pipeline, and the hot path. Drizzle holds L2 nested. Four scenarios
+> (L3 nested, count, streaming, atomic increment) flipped winners between the two
+> runs and are reported as near-ties. Prisma 7.9 improved noticeably on flat reads
+> (0.53 to 0.37 ms) and pipeline (0.61 to 0.45 ms) but still trails everywhere.
+
+- **Database:** local PostgreSQL 17.9 (Homebrew), Unix-socket connection, dedicated freshly seeded database
+- **Client:** Apple Silicon MacBook Pro (Apple M5 Max), macOS, Node v24.18.0
+- **Data:** 5 orgs, 1,000 users, 10,000 posts, 50,000 comments, deterministic (same fixture as prior runs)
+- **Runs:** 200 iterations + 20 warmup per scenario (streaming: 3 + 1). Two full runs; the table is from the first, and the winner flips between runs are called out as near-ties rather than leads.
+- **Versions:** turbine-orm 0.39.0 (working tree) · @prisma/client 7.9.0 and @prisma/adapter-pg 7.9.0 · prisma 7.9.0 · drizzle-orm 0.45.2 · pg 8.22.0
+- **Measured:** 2026-07-21.
+
+| Scenario | Turbine | Prisma 7.9 | Drizzle 0.45 |
+|----------|---------|----------|--------------|
+| findMany, 100 users (flat)                  | **0.29 ms** | 0.37 ms | 0.39 ms |
+| findMany, 50 users + posts (L2)             | 2.86 ms | 4.64 ms | **2.39 ms** |
+| findMany, 10 users -> posts -> comments (L3), near-tie | 1.55 ms | 4.04 ms | **1.32 ms** |
+| findUnique, single user by PK               | **0.06 ms** | 0.12 ms | 0.10 ms |
+| findUnique, user + posts + comments (L3)    | **0.18 ms** | 0.45 ms | 0.31 ms |
+| count, all users, near-tie                  | **0.05 ms** | 0.08 ms | 0.06 ms |
+| stream, iterate 50K comments (batch 1000), near-tie | **60.7 ms** | 68.8 ms | 65.8 ms |
+| atomic increment, posts.view_count + 1, near-tie | **0.14 ms** | 0.19 ms | 0.19 ms |
+| pipeline, 5-query dashboard batch           | **0.20 ms** | 0.45 ms | 0.41 ms |
+| hot findUnique, 500x same shape             | **0.03 ms** | 0.06 ms | 0.08 ms |
+
+Near-tie scenarios flipped winners between the two runs (run 2: Drizzle took count
+0.07 vs 0.10, streaming 58.3 vs 70.5, and increment 0.09 vs 0.15; Turbine took L3
+0.90 vs 1.36). Treat those four as within noise on this host. Versus 2026-07-14,
+Prisma 7.9 improved flat reads by roughly 30% and pipeline by roughly 26% over
+Prisma 7.6; Drizzle's streaming number was slower this session in both runs.

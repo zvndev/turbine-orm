@@ -90,3 +90,37 @@ Normal-durability work from 0.7.0 holds.
 - **PowDB (embed·norm):** **SQLite-class-or-better on reads AND writes** as of 0.7.1 — the
   local-first / SQLite-replacement story, with a networked sibling for the same data. Mind the
   platform-binary gap (no musl/Windows/Intel-mac prebuilt yet) and the Normal-mode loss window.
+
+## Check-in, 2026-07-21 (pg, sqlite, powdb-embedded)
+
+Re-run of the same harness on the addon versions actually installed today:
+`@zvndev/powdb-embedded` 0.17.0 (the table above was recorded on 0.7.1), Node
+v24.18.0, local PostgreSQL 17.9, `ENGINES=pg,sqlite,powdb_emb` (networked PowDB,
+MySQL, and SQL Server were not running and are skipped, not measured). Two full
+runs; both agreed on every rank noted below. Same warm-cache, small-data,
+single-connection caveats as above.
+
+p50 latency (ms, run 1 of 2):
+
+| operation | Postgres | SQLite | PowDB (embed, normal) |
+|---|--:|--:|--:|
+| findUnique by PK | 0.099 | **0.007** | 0.010 |
+| findMany filter+order+limit | 0.258 | **0.099** | 0.267 |
+| nested with (posts to comments) | 0.815 | **0.474** | 0.516 |
+| create (single insert) | 0.154 | 0.018 | **0.015** |
+| createMany (100 rows) | 0.856 | 1.516 | **0.421** |
+| update (atomic increment) | 0.113 | 0.016 | **0.011** |
+
+Verdicts vs the 0.7.1-era table:
+
+- Writes still favor embedded PowDB: create, createMany, and update all beat SQLite
+  in both runs (createMany by roughly 3x, down from the recorded 4.3x).
+- Reads flipped: findUnique was a tie on 0.7.1 (0.006 vs 0.006) and SQLite now leads
+  (0.007 vs 0.010, both runs); nested `with` was an embedded win (0.355 vs 0.409) and
+  SQLite now leads (0.474 vs 0.516 run 1, 0.390 vs 0.416 run 2).
+- The headline "wins or ties SQLite on every op except filtered-list" therefore does
+  not hold as measured on addon 0.17.0: it currently reads "embedded wins the writes,
+  SQLite wins the reads." Whether this is engine drift across 0.8 through 0.17 or
+  host noise needs a controlled re-run before updating public copy.
+- Seed time: 57 ms for 6,105 rows (recorded: 31 ms; still nowhere near the 887 ms
+  Full-fsync figure).
