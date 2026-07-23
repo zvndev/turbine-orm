@@ -24,7 +24,17 @@
  *   npx turbine migrate create add_users_table
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generate } from '../generate.js';
@@ -42,11 +52,15 @@ import {
   resolveSeedFile,
   unwrapModuleDefault,
 } from './config.js';
+import { DESTRUCTIVE_KIND_LABEL } from './destructive.js';
 import { canResolveTsx, getTsLoaderError, needsTsLoader, registerTsLoader } from './loader.js';
 import { runMcpServer } from './mcp.js';
 import {
   buildDiffMigrationBody,
+  collectUpDestructive,
   createMigration,
+  type DestructiveOffender,
+  formatChecksumMismatchError,
   inspectMigrationDeploy,
   listMigrationFiles,
   MIGRATION_RECIPES,
@@ -54,6 +68,7 @@ import {
   migrateDown,
   migrateStatus,
   migrateUp,
+  type OutOfOrderApply,
 } from './migrate.js';
 import { startObserve } from './observe.js';
 import { startStudio } from './studio.js';
@@ -1386,13 +1401,14 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`    ${cyan('status')}                   Show migration status`);
     newline();
     console.log(`  ${bold('Options:')}`);
-    console.log(`    ${cyan('--auto')}             Auto-generate UP/DOWN SQL from schema diff`);
-    console.log(`    ${cyan('--from-diff')}        Like --auto, but flags destructive statements in the file`);
+    console.log(`    ${cyan('--auto')}             Auto-generate UP/DOWN SQL from schema diff (destructive flagged)`);
+    console.log(`    ${cyan('--from-diff')}        Generate from schema diff, destructive statements flagged inline`);
     console.log(`    ${cyan('--recipe <name>')}    Scaffold a sanctioned migration pattern`);
     console.log(`    ${cyan('--step, -n')}         Number of migrations to apply/rollback`);
     console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
+    console.log(`    ${cyan('--allow-destructive')} Run data-destroying statements without prompting`);
     console.log(
-      `    ${cyan('--allow-drift')}      Bypass checksum validation on ${cyan('migrate up')} ${dim('(advanced)')}`,
+      `    ${cyan('--allow-drift')}      Bypass checksum validation on ${cyan('up')} / ${cyan('deploy')} ${dim('(advanced)')}`,
     );
     newline();
     console.log(`  ${bold('Recipes')} ${dim('(--recipe):')}`);
@@ -1484,9 +1500,13 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     diffSpinner.succeed(`Found ${bold(String(diff.statements.length))} change(s)`);
     newline();
 
-    const upSQL = diff.statements.join('\n');
-    const downSQL = diff.reverseStatements.join('\n');
-    const file = createMigration(config.migrationsDir, name, { up: upSQL, down: downSQL });
+    // Route through buildDiffMigrationBody so any destructive statement (a lossy
+    // ALTER COLUMN ... TYPE, or a DROP COLUMN for a column removed from the
+    // schema) is flagged inline in the file, matching --from-diff. A
+    // destructive-only diff therefore produces a real, flagged migration instead
+    // of the old "already in sync" false negative.
+    const body = buildDiffMigrationBody(diff);
+    const file = createMigration(config.migrationsDir, name, { up: body.up, down: body.down });
     const relPath = relative(process.cwd(), file.path);
 
     success(`Created auto-migration: ${bold(file.filename)}`);
@@ -1519,6 +1539,30 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
       }
     }
     newline();
+
+    // Loudly flag any destructive statements written into the file (same as
+    // --from-diff). They stay intact so `migrate up` still refuses them by
+    // default, but the operator must know they are there before running.
+    const destructiveCount = body.destructiveUp.length + body.destructiveDown.length;
+    if (destructiveCount > 0) {
+      warn(`This migration contains ${bold(String(destructiveCount))} DESTRUCTIVE statement(s), flagged in the file.`);
+      for (const h of body.destructiveUp) {
+        console.log(`    ${red(symbols.warning)} ${dim('UP')}   [${h.kind}] ${h.target}`);
+      }
+      for (const h of body.destructiveDown) {
+        console.log(`    ${red(symbols.warning)} ${dim('DOWN')} [${h.kind}] ${h.target}`);
+      }
+      newline();
+      console.log(
+        `  ${dim('`migrate up` refuses destructive statements by default: confirm interactively or pass')} ${cyan('--allow-destructive')}${dim('.')}`,
+      );
+      newline();
+    }
+
+    if (diff.warnings && diff.warnings.length > 0) {
+      for (const w of diff.warnings) warn(w);
+      newline();
+    }
 
     console.log(`  ${dim('Review the migration, then run:')}`);
     console.log(`  ${cyan('npx turbine migrate up')}`);
@@ -1717,6 +1761,8 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
     }
   }
 
+  warnOutOfOrder(result.outOfOrder);
+
   if (result.errors.length > 0) {
     spinner.fail('Migration failed');
     for (const { file, error: msg } of result.errors) {
@@ -1730,16 +1776,41 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
   newline();
 }
 
-export function buildMigrateDeployOptions(_args: CliArgs): {
-  allowDrift: false;
+/** Print a one-line warning for each migration applied out of timestamp order. */
+function warnOutOfOrder(outOfOrder: OutOfOrderApply[]): void {
+  if (outOfOrder.length === 0) return;
+  newline();
+  for (const o of outOfOrder) {
+    warn(`Applied ${bold(o.applied)} out of order (older than already-applied ${bold(o.newestPrior)}).`);
+  }
+}
+
+export function buildMigrateDeployOptions(args: CliArgs): {
+  allowDrift: boolean;
   allowDestructive: true;
   step: undefined;
 } {
   return {
-    allowDrift: false,
+    allowDrift: args.allowDrift === true,
     allowDestructive: true,
     step: undefined,
   };
+}
+
+/**
+ * Print the itemized, classified destructive-statement report as a NOTICE.
+ * `deploy` proceeds by design (the gate ran at author time), but it must not run
+ * data-destroying SQL in total silence; the notice ends that zero-ceremony hole.
+ */
+function printDestructiveNotice(offenders: DestructiveOffender[]): void {
+  warn('NOTICE: this deploy runs DESTRUCTIVE statement(s):');
+  for (const o of offenders) {
+    console.log(`    ${red(symbols.warning)} ${o.file}`);
+    for (const h of o.hits) {
+      console.log(`      ${dim('-')} [${h.kind}] ${h.target} ${dim(DESTRUCTIVE_KIND_LABEL[h.kind])}`);
+    }
+  }
+  newline();
 }
 
 async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<void> {
@@ -1750,51 +1821,72 @@ async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<
   label('Migrations', config.migrationsDir);
   newline();
 
-  if (args.dryRun) {
-    const spinner = new Spinner('Checking pending migrations').start();
-    const plan = await inspectMigrationDeploy(url, config.migrationsDir);
-    if (plan.mismatches.length > 0) {
-      spinner.fail('Deploy blocked by migration drift');
-      for (const mismatch of plan.mismatches) {
-        const reason = mismatch.type === 'missing' ? 'deleted from disk' : 'modified on disk';
-        console.log(`    ${red(symbols.cross)} ${mismatch.name}.sql ${dim(`(${reason})`)}`);
+  const spinner = new Spinner('Checking pending migrations').start();
+  const plan = await inspectMigrationDeploy(url, config.migrationsDir);
+  spinner.stop();
+
+  // Drift handling: honor --allow-drift exactly like `up`. Without it, block;
+  // with it, warn loudly and proceed.
+  if (plan.mismatches.length > 0) {
+    if (!args.allowDrift) {
+      error('Deploy blocked by migration drift');
+      newline();
+      for (const line of formatChecksumMismatchError(plan.mismatches).split('\n')) {
+        console.log(`  ${line.replace('[turbine] ', '')}`);
       }
       newline();
       process.exit(1);
     }
+    warn('--allow-drift is set: checksum validation is DISABLED for this deploy.');
+    console.log(`  ${dim('Applied migrations may have been modified or deleted on disk.')}`);
+    newline();
+  }
 
+  if (args.dryRun) {
     if (plan.pending.length === 0) {
-      spinner.succeed('No pending migrations');
+      info('No pending migrations');
       newline();
       return;
     }
 
-    spinner.succeed(`${bold(String(plan.pending.length))} pending migration(s)`);
+    info(`${bold(String(plan.pending.length))} pending migration(s)`);
     for (const file of plan.pending) {
       console.log(`    ${yellow(symbols.dot)} ${file.filename}`);
+    }
+    // Surface destructive statements even in a dry run so CI can see them.
+    const destructive = collectUpDestructive(plan.pending);
+    if (destructive.length > 0) {
+      newline();
+      printDestructiveNotice(destructive);
     }
     newline();
     return;
   }
 
-  const spinner = new Spinner('Deploying migrations').start();
-  const result = await migrateDeploy(url, config.migrationsDir);
+  // Destructive notice before applying (deploy still proceeds by design).
+  const destructive = collectUpDestructive(plan.pending);
+  if (destructive.length > 0) printDestructiveNotice(destructive);
+
+  const runSpinner = new Spinner('Deploying migrations').start();
+  const result = await migrateDeploy(url, config.migrationsDir, { allowDrift: args.allowDrift });
 
   if (result.applied.length === 0 && result.errors.length === 0) {
-    spinner.succeed('0 applied — all migrations are up to date');
+    runSpinner.succeed('0 applied, all migrations are up to date');
     newline();
     return;
   }
 
   if (result.applied.length > 0) {
-    spinner.succeed(`${bold(String(result.applied.length))} applied`);
+    runSpinner.succeed(`${bold(String(result.applied.length))} applied`);
     for (const file of result.applied) {
       console.log(`    ${green(symbols.check)} ${file.filename}`);
     }
   }
 
+  warnOutOfOrder(result.outOfOrder);
+
   if (result.errors.length > 0) {
-    spinner.fail('Deploy failed');
+    runSpinner.fail('Deploy failed');
     for (const { file, error: msg } of result.errors) {
       console.log(`    ${red(symbols.cross)} ${file.filename}`);
       console.log(`      ${dim(msg)}`);
@@ -1931,8 +2023,20 @@ async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise
   );
   newline();
 
-  // Check for checksum mismatches
-  const driftCount = statuses.filter((s) => s.checksumValid === false).length;
+  // Applied migrations whose file was deleted from disk (distinct from an
+  // on-disk edit). Counted in "applied" above; surfaced with their own banner.
+  const missingCount = statuses.filter((s) => s.missingFile).length;
+  if (missingCount > 0) {
+    warn(`${bold(String(missingCount))} applied migration(s) are missing from disk!`);
+    console.log(`  ${dim('The history table records them, but their .sql file is gone.')}`);
+    console.log(
+      `  ${dim('Restore the file(s) before running')} ${cyan('migrate up')} ${dim('or')} ${cyan('migrate deploy')}${dim('.')}`,
+    );
+    newline();
+  }
+
+  // Check for checksum mismatches (on-disk edits only; missing files above).
+  const driftCount = statuses.filter((s) => s.checksumValid === false && !s.missingFile).length;
   if (driftCount > 0) {
     warn(`${bold(String(driftCount))} migration(s) have been modified after application!`);
     console.log(`  ${dim('Applied migrations should be immutable. Modifying them can cause drift.')}`);
@@ -1943,7 +2047,9 @@ async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise
   const headers = ['Status', 'Migration', 'Applied at'];
   const rows = statuses.map((s) => {
     let status: string;
-    if (s.applied && s.checksumValid === false) {
+    if (s.missingFile) {
+      status = red(`${symbols.warning} Missing file`);
+    } else if (s.applied && s.checksumValid === false) {
       status = red(`${symbols.warning} Drifted`);
     } else if (s.applied) {
       status = green(`${symbols.check} Applied`);
@@ -2005,22 +2111,44 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
       if (!canResolveTsx()) {
         throw new Error('TypeScript seed files require tsx — install tsx or use seed.js/seed.sql.');
       }
+      // The seed runs in a child process, so we cannot observe its callback
+      // directly. Hand it a sentinel path: `defineSeed`'s runner writes the file
+      // only after a callback executes to completion. If the child exits cleanly
+      // but the sentinel never appears, the seed module loaded without running
+      // anything: a silent no-op we must report as a failure, not success.
+      const sentinelDir = mkdtempSync(join(tmpdir(), 'turbine-seed-'));
+      const sentinel = join(sentinelDir, 'ran');
       const { execFileSync } = await import('node:child_process');
-      execFileSync(plan.command, plan.args, {
-        stdio: 'inherit',
-        env: {
-          ...process.env,
-          DATABASE_URL: config.url || process.env.DATABASE_URL,
-        },
-      });
+      try {
+        execFileSync(plan.command, plan.args, {
+          stdio: 'inherit',
+          env: {
+            ...process.env,
+            DATABASE_URL: config.url || process.env.DATABASE_URL,
+            TURBINE_SEED_SENTINEL: sentinel,
+          },
+        });
+        if (!existsSync(sentinel)) {
+          throw new Error(
+            'The seed file completed without running a seed callback. ' +
+              'Make sure it calls defineSeed(async (db) => { ... }) at the top level.',
+          );
+        }
+      } finally {
+        rmSync(sentinelDir, { recursive: true, force: true });
+      }
       return;
     }
 
     if (plan.kind === 'js') {
       const mod = await import(pathToFileURL(plan.file).href);
-      if (typeof mod.default === 'function') {
-        await mod.default();
+      if (typeof mod.default !== 'function') {
+        throw new Error(
+          'The seed file has no callable default export. ' +
+            'Export your seed with `export default defineSeed(async (db) => { ... })`.',
+        );
       }
+      await mod.default();
       return;
     }
 
@@ -2732,10 +2860,27 @@ function showHelp(): void {
 
   console.log(`  ${bold('Migrate options:')}`);
   console.log(`    ${cyan('--auto')}               Auto-generate UP/DOWN SQL from schema diff ${dim('(create)')}`);
+  console.log(
+    `    ${cyan('--from-diff')}          Generate from schema diff, destructive statements flagged ${dim('(create)')}`,
+  );
+  console.log(
+    `    ${cyan('--recipe')} ${dim('<name>')}       Scaffold a named migration recipe, e.g. backfill ${dim('(create)')}`,
+  );
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}       Number of migrations to apply/rollback`);
   console.log(
-    `    ${cyan('--allow-drift')}        Bypass checksum validation on ${cyan('migrate up')} ${dim('(advanced)')}`,
+    `    ${cyan('--allow-destructive')}  Run data-destroying statements without prompting ${dim('(up/down/push)')}`,
   );
+  console.log(
+    `    ${cyan('--allow-drift')}        Bypass checksum validation on ${cyan('migrate up')} / ${cyan('deploy')} ${dim('(advanced)')}`,
+  );
+  newline();
+
+  console.log(`  ${bold('Init options:')}`);
+  console.log(`    ${cyan('--yes, -y')}            Accept every step's default (non-interactive)`);
+  console.log(`    ${cyan('--skip-schema')}        Don't scaffold the schema file`);
+  console.log(`    ${cyan('--skip-seed')}          Don't scaffold or run the seed file`);
+  console.log(`    ${cyan('--skip-push')}          Don't offer to push the schema to the database`);
+  console.log(`    ${cyan('--skip-generate')}      Don't offer to generate the typed client`);
   newline();
 
   console.log(`  ${bold('Studio / observe options:')}`);

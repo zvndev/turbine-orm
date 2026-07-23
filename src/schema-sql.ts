@@ -1077,14 +1077,23 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         }
       }
 
-      // Check for columns in DB that are not in schema
+      // Check for columns in DB that are not in schema.
+      // The DROP COLUMN statement stays IN `result.statements` so the destructive
+      // gate (findDestructivePushStatements / scanDestructiveSql, and the migrate
+      // up gate) can see it and refuse by default. Safety is enforced by that
+      // gate, not by hiding the statement: withholding it here previously made
+      // `push` report "already in sync" for a destructive-only diff and print a
+      // false "Altered" for a mixed one, since the 0.36 guard never received it.
+      // No reverse is emitted (a dropped column and its data cannot be recreated
+      // automatically), so diff-generated migrations fall back to the documented
+      // irreversible-DOWN placeholder for this change.
       for (const dbColName of Object.keys(dbCols)) {
         const hasField = Object.entries(tableDef.columns).some(([fieldName]) => camelToSnake(fieldName) === dbColName);
         if (!hasField) {
           const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP COLUMN ${dialect.quoteIdentifier(dbColName)};`;
-          const reverseSql = `-- Cannot auto-reverse DROP COLUMN for "${dbColName}" — add it back manually`;
+          const reverseSql = `-- Cannot auto-reverse DROP COLUMN for "${dbColName}"; add it back manually`;
           alterDef.columns.push({ column: dbColName, action: 'drop', sql, reverseSql });
-          // Don't auto-add drops to statements for safety — user must opt in
+          result.statements.push(sql);
         }
       }
 

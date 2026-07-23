@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`turbine seed` now actually runs TypeScript `defineSeed` seeds.** The scaffolded
+  `seed.ts` quickstart could print `Seed completed` while the seed callback never
+  executed (no writes, no output). The self-run detection mistook the library's own
+  compiled frame (`dist/seed.js`, or a plain-path `tsx` frame) for the caller, so the
+  "this file is the entry" check never passed and the callback was never queued. Seed
+  detection now identifies the library's own module by its real path and skips it,
+  regardless of the `.ts`/`.js` layout or `tsx` plain-path stack frames, so a
+  defineSeed file run via `turbine seed`, `tsx`, or `node` executes its callback. The
+  CLI seed runner also reports honestly: if a seed file loads but no callback runs,
+  that is now an error instead of a false success.
+- **`turbine push` no longer hides destructive schema changes.** A diff that only
+  removed a column reported `Database is already in sync` (the column stayed), and a
+  mixed diff printed `Applied 0 statement(s)` next to a false `Altered`, with
+  `--allow-destructive` doing nothing. Destructive statements (a dropped column, a
+  lossy column-type change) now stay in the plan and flow through the existing
+  data-loss guard: without consent, `push` refuses loudly with the same itemized,
+  classified report the migration gate uses and a non-zero exit (nothing applied); on
+  a TTY it offers the same typed two-step confirmation as `migrate up`; and
+  `--allow-destructive` actually applies them.
+- **`migrate deploy --allow-drift` is honored.** Deploy's own drift error recommends
+  passing `--allow-drift`, but the flag previously changed nothing. It now bypasses
+  checksum validation on `deploy` exactly as it does on `up`, with a loud warning.
+- **`migrate create --auto` on a destructive-only diff produces a real migration.** It
+  used to report `Database is already in sync: nothing to migrate` when the only
+  change was a dropped column. It now writes a migration with the destructive
+  statements flagged inline, matching `--from-diff`.
+- **`migrate deploy` prints a destructive-statement notice.** Before applying, if the
+  pending batch contains data-destroying statements, deploy now prints the same
+  itemized, classified report as a notice (deploy still proceeds by design), instead
+  of running `DROP TABLE` and similar with no warning.
+- **`migrate status` lists applied migrations whose file was deleted.** Such entries
+  now appear with a `! Missing file` marker and a warning banner, and are counted in
+  "applied", instead of being silently dropped from the reported history.
+- **Out-of-order applies are flagged.** When `migrate up`/`deploy` applies a migration
+  whose timestamp is older than the newest already-applied migration, it now prints a
+  one-line warning naming both.
+- **Clearer drift remedies for deleted files.** The drift error's "roll back with
+  `migrate down`" suggestion is impossible for a file that was deleted from disk; the
+  message now tells you to restore the file for those, and scopes the roll-back
+  suggestion to modified files.
+- **Root `turbine --help` documents more flags.** The Migrate options block now lists
+  `--from-diff`, `--recipe`, and `--allow-destructive`, and a new Init options block
+  documents `--yes`, `--skip-schema`, `--skip-seed`, `--skip-push`, and
+  `--skip-generate`.
+
 ## 0.40.0 (2026-07-21)
 
 ### Added
