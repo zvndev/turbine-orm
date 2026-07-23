@@ -85,6 +85,72 @@
   the output reproducible. The command exits non-zero when anything is unresolved
   (unless `--allow-partial`). `PrismaCompatMap` is exported from the package root so
   runtime consumers can share the shape.
+### Changed
+
+- **Behavior change: `relationLoadStrategy` now defaults to `'auto'` on SQL engines.**
+  Previously every `with` clause resolved as a single-statement `json_agg` join.
+  The new `'auto'` default keeps that join for every relation EXCEPT the ones the
+  introspected metadata proves are pathological: when a relation's probe column
+  has no covering index, that relation alone falls back to the batched loader
+  (one flat `WHERE fk = ANY($1)` follow-up), which pays the missing index once
+  instead of once per parent row. This only ever replaces a provably catastrophic
+  plan with an equivalent-output one. Result bytes are identical (the batched
+  loader guarantees the same shape), and everything stays on the same
+  connection/transaction, so most callers see no difference. What can change:
+  middleware and query-event logging see more than one statement for a
+  fallen-back relation, the per-query `timeout` now applies per statement rather
+  than to a single statement, and tests that assert exact SQL text or statement
+  counts on such a query may need updating. The fallback engages only when
+  DB-backed index metadata exists (a generated / introspected client); a
+  code-first `defineSchema`-only client behaves exactly like `'join'`. To restore
+  the previous behavior everywhere, set `relationLoadStrategy: 'join'` at the
+  client level (or per query). Composite-key relations always stay on the join
+  plan. Dev builds print a once-per-relation note when the fallback engages, and
+  the query event carries a `strategy: 'auto-batched'` tag. Tip: run
+  `npx turbine doctor` (or add the missing FK index) to keep a relation on the
+  single-statement join.
+
+### Added
+
+- **Prisma-style compound-unique `where` selectors.** The `findUnique` family (and
+  `update` / `delete` / `upsert`, plus nested-write `connect` / `connectOrCreate` /
+  `disconnect` / `set` / `delete`) now accept a synthetic selector key that holds
+  a composite unique constraint's member columns, e.g.
+  `findUnique({ where: { orgId_userId: { orgId, userId } } })`, which expands to
+  the column conjunction (`WHERE "org_id" = $1 AND "user_id" = $2`). Selector names
+  are derived from the primary key, composite UNIQUE constraints, and declared
+  composite UNIQUE indexes (the code-first `defineSchema` source), and the
+  generated `*WhereUnique` union gains a matching branch (plus an
+  `*CompoundUniques` helper type). A selector with the wrong members throws a
+  clear E003 listing the required fields; a name that collides with a real field,
+  column, or relation is never treated as a selector. The expansion runs before
+  cache fingerprinting, so an expanded query is byte-identical to (and shares the
+  SQL-cache entry of) the spelled-out conjunction. The PowDB engine adopts the
+  same selectors on `findUnique`.
+- **`_count: { _all: true }` record form on `aggregate` and `groupBy`.** Both now
+  accept the reserved `_all` key alongside per-field counts:
+  `_count: { _all: true, email: true }` returns `{ _count: { _all: n, email: n } }`
+  (Prisma parity). Scalar `_count: true` is unchanged and still returns a plain
+  number; the emitted SQL for existing calls is byte-identical.
+- **Opt-in `stableRelationOrder`.** A new client-config and per-query option that
+  fills a primary-key-ascending `orderBy` into every to-many `with` relation that
+  has no explicit ordering, so unordered child arrays come back deterministically
+  (child-array order without an `orderBy` was never guaranteed, and the `'auto'`
+  fallback above can change it). An explicit per-relation `orderBy` always wins.
+  Off by default; when off the emitted SQL is byte-identical to before.
+- **`QueryEvent.strategy`.** Query events emitted for an `'auto'` query that engaged
+  the batched fallback now carry `strategy: 'auto-batched'`, so production
+  observability can see which queries were re-planned.
+
+### Fixed
+
+- **The dev-mode missing-FK-index warning now dedupes process-wide.** It previously
+  used a module-level set, which a dual-package (ESM + CJS) load or a bundler /
+  HMR re-evaluation could reset or duplicate, causing the warning to repeat. The
+  dedupe now lives on a `globalThis` registry keyed by `Symbol.for(...)`, shared
+  across every module copy in the realm and surviving dev-server recompiles, so
+  each relation warns at most once per process (bounded so it can never grow
+  unboundedly). The deep-`with` advisory moved to the same registry.
 
 ## 0.40.1 (2026-07-22)
 

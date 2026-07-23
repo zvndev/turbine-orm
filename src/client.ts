@@ -240,13 +240,29 @@ export interface TurbineConfig {
    *   - `'batched'`: run the base query, then one flat follow-up query per
    *     relation (`WHERE fk = ANY($1)`), stitching children client-side. Wins
    *     when child FK columns are unindexed or result sets are large.
+   *   - `'auto'` (the SQL-engine default since 0.41): per relation, use `'join'`
+   *     unless the introspected metadata PROVES the probe columns are unindexed,
+   *     in which case that relation falls back to the batched loader. Needs
+   *     DB-backed index metadata (a generated / introspected client); a
+   *     code-first `defineSchema`-only client behaves exactly like `'join'`.
+   *     Output shape is identical to `'join'`. See {@link RelationLoadStrategy}.
    *
    * Precedence: per-query `relationLoadStrategy` arg > this config > the engine
-   * default. On SQL engines the default is `'join'`; on PowDB the default is the
+   * default. On SQL engines the default is `'auto'`; on PowDB the default is the
    * batched loaders (an ineligible relation falls back to them silently even
-   * under `'join'`).
+   * under `'join'`; `'auto'` resolves to PowDB's own default).
    */
   relationLoadStrategy?: RelationLoadStrategy;
+  /**
+   * When `true`, every to-many `with` relation with no explicit `orderBy` is
+   * loaded ordered by the target table's primary key ascending, so unordered
+   * child arrays come back deterministically (json_agg / the batched loaders
+   * otherwise leave that order engine-dependent, and `'auto'` fallback can change
+   * it). An explicit per-relation `orderBy` always wins; a per-query
+   * `stableRelationOrder` overrides this. Default `false` (SQL is byte-identical
+   * when off). SQL engines only. See {@link RelationLoadStrategy}.
+   */
+  stableRelationOrder?: boolean;
   /**
    * How nested-relation subqueries encode each row's JSON.
    *
@@ -737,6 +753,7 @@ export class TurbineClient {
       warnOnUnlimited: config.warnOnUnlimited,
       utcTimestamps: config.utcTimestamps,
       relationLoadStrategy: config.relationLoadStrategy,
+      stableRelationOrder: config.stableRelationOrder,
       jsonEncoding: config.jsonEncoding,
       globalFilters: config.globalFilters,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),

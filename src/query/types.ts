@@ -21,13 +21,30 @@ export type OrderDirection = 'asc' | 'desc';
  *     relation (`WHERE fk = ANY($1)`), stitching children client-side. D levels
  *     cost D extra round-trips, but each is a single key-set lookup and rows come
  *     back flat (a win when FK columns are unindexed or result sets are huge).
+ *   - `'auto'` (the implicit default on SQL engines since 0.41): per relation,
+ *     use `'join'` unless the introspected metadata PROVES the probe columns are
+ *     unindexed, in which case that relation falls back to the batched loader
+ *     (where a correlated per-parent scan would be pathological). Requires
+ *     DB-backed index metadata (a generated / introspected client); a code-first
+ *     `defineSchema`-only client has no index info to prove anything, so `'auto'`
+ *     behaves exactly like `'join'` there. An EXPLICIT `'join'` or `'batched'` at
+ *     the client or query level always wins and disables the per-relation
+ *     fallback. Output is byte-for-byte identical to `'join'` (the batched loader
+ *     guarantees the same result SHAPE); child-array order for a to-many relation
+ *     WITHOUT an `orderBy` may differ from the join plan (order was never
+ *     guaranteed without `orderBy` — see `stableRelationOrder` to pin it).
+ *     Composite-key relations stay on the join plan (the batched loader does not
+ *     support them). Engagement emits a once-per-relation dev note and a
+ *     `strategy` tag on the query event.
  *
  * Precedence: per-query arg > client `relationLoadStrategy` config > the engine
- * default. On SQL engines the default is `'join'`; on PowDB the default is the
+ * default. On SQL engines the default is `'auto'`; on PowDB the default is the
  * batched loaders (an ineligible relation falls back to them per-relation and
- * silently even when `'join'` is requested).
+ * silently even when `'join'` is requested). On PowDB, `'auto'` resolves to
+ * PowDB's own existing default (loaders / nested projections); it never selects
+ * a distinct PowQL code path.
  */
-export type RelationLoadStrategy = 'join' | 'batched';
+export type RelationLoadStrategy = 'join' | 'batched' | 'auto';
 
 /**
  * Reference to ANOTHER COLUMN of the same table inside a where operator,
@@ -455,6 +472,8 @@ export interface FindUniqueArgs<
   timeout?: number;
   /** Override the client's relation-loading strategy for this query. See {@link RelationLoadStrategy}. */
   relationLoadStrategy?: RelationLoadStrategy;
+  /** Override the client's {@link TurbineConfig.stableRelationOrder} for this query. */
+  stableRelationOrder?: boolean;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
   /** Include PII-tagged columns in the result. See {@link FindManyArgs.includePii}. */
@@ -486,6 +505,15 @@ export interface FindManyArgs<
   timeout?: number;
   /** Override the client's relation-loading strategy for this query. See {@link RelationLoadStrategy}. */
   relationLoadStrategy?: RelationLoadStrategy;
+  /**
+   * Override the client's {@link TurbineConfig.stableRelationOrder} for this
+   * query. When `true`, every to-many `with` relation that has no explicit
+   * `orderBy` is loaded ordered by the target table's primary key ascending, so
+   * unordered child arrays come back in a deterministic order. An explicit
+   * per-relation `orderBy` always wins. Off by default; when off the emitted SQL
+   * is byte-identical to before.
+   */
+  stableRelationOrder?: boolean;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
   /**
@@ -931,8 +959,14 @@ export interface GroupByArgs<T> {
    * (`SELECT DISTINCT ON … ORDER BY …` row source). See {@link GroupByDistinctOn}.
    */
   distinctOn?: GroupByDistinctOn<T>;
-  /** Include count of each group */
-  _count?: true;
+  /**
+   * Count each group. `true` (or omitted) → `_count: number` (COUNT(*)). The
+   * record form counts per selection: the reserved `_all: true` key → COUNT(*),
+   * and each entity field key → COUNT(that column), yielding
+   * `_count: { _all: n, field: n }` (Prisma parity). Ordering/HAVING on `_count`
+   * stays available whenever COUNT(*) is selected (`true`, omitted, or `_all`).
+   */
+  _count?: true | ({ _all?: true } & Partial<Record<keyof T & string, boolean>>);
   /** Sum of numeric fields (or JSON paths: see {@link JsonPathAggregateTarget}) in each group */
   _sum?: GroupByAggregateSpec<T>;
   /** Average of numeric fields (or JSON paths) in each group */
@@ -1017,19 +1051,37 @@ type GroupByMinMaxPart<T, A, Key extends '_min' | '_max'> = A extends { [P in Ke
  * absent aggregate block) collapse away, so an args literal with no aggregates
  * yields exactly `{ [byField]: T[field] } & { _count: number }`.
  */
-export type GroupByResult<T, A> = { [K in GroupByFieldKeys<T, A>]: T[K] } & { _count: number } & GroupBySumAvgPart<
-    A,
-    '_sum'
-  > &
+export type GroupByResult<T, A> = { [K in GroupByFieldKeys<T, A>]: T[K] } & GroupByCountPart<A> &
+  GroupBySumAvgPart<A, '_sum'> &
   GroupBySumAvgPart<A, '_avg'> &
   GroupByMinMaxPart<T, A, '_min'> &
   GroupByMinMaxPart<T, A, '_max'>;
 
+/**
+ * The `_count` block on a groupBy result row. Scalar `_count: true` (or an
+ * omitted `_count`, which still selects COUNT(*) by default) yields a plain
+ * `number`; the record form (`_count: { _all: true, field: true }`) yields a
+ * per-selection object `{ _all: number, field: number }` (Prisma parity). Kept
+ * additive: existing `_count: true` / no-`_count` calls still infer `number`.
+ */
+type GroupByCountPart<A> = A extends { _count: infer C }
+  ? C extends true
+    ? { _count: number }
+    : [C] extends [object]
+      ? { _count: { [K in keyof C & string]: number } }
+      : { _count: number }
+  : { _count: number };
+
 /** Arguments for the standalone aggregate method */
 export interface AggregateArgs<T> {
   where?: WhereClause<T>;
-  /** Count all rows matching the filter */
-  _count?: true | Partial<Record<keyof T & string, boolean>>;
+  /**
+   * Count rows. `true` → `_count: number` (COUNT(*)). The record form counts per
+   * selection: the reserved `_all: true` key → COUNT(*), and each entity field
+   * key → COUNT(that column) (non-null count), yielding
+   * `_count: { _all: n, field: n }` (Prisma parity).
+   */
+  _count?: true | ({ _all?: true } & Partial<Record<keyof T & string, boolean>>);
   /** Sum of numeric fields */
   _sum?: Partial<Record<keyof T & string, boolean>>;
   /** Average of numeric fields */

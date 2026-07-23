@@ -519,15 +519,54 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
     }
 
     if (uniqueSets.length > 0) {
-      const branches = uniqueSets.map((cols) => {
+      const memberType = (colName: string): { field: string; tsType: string } => {
+        const col = table.columns.find((c) => c.name === colName);
+        return { field: col?.field ?? colName, tsType: col?.tsType ?? 'unknown' };
+      };
+      // Flat branches: one object per unique constraint carrying its columns.
+      const flatBranches = uniqueSets.map((cols) => {
         const fields = cols.map((colName) => {
-          const col = table.columns.find((c) => c.name === colName);
-          const field = col?.field ?? colName;
-          const tsType = col?.tsType ?? 'unknown';
-          return `${quoteIfNeeded(field)}: ${tsType}`;
+          const m = memberType(colName);
+          return `${quoteIfNeeded(m.field)}: ${m.tsType}`;
         });
         return `{ ${fields.join('; ')} }`;
       });
+
+      // Prisma-style compound-unique SELECTOR branches: a synthetic key
+      // (`orgId_userId`) whose value holds the member columns, emitted for every
+      // COMPOSITE unique (PK, composite UNIQUE constraint, or composite UNIQUE
+      // index). Runtime expansion lives in query/compound-unique.ts.
+      const compoundSeen = new Set<string>();
+      const compoundSets: string[][] = [];
+      const addCompound = (cols: string[]): void => {
+        if (cols.length < 2) return;
+        const key = cols.join(',');
+        if (compoundSeen.has(key)) return;
+        compoundSeen.add(key);
+        compoundSets.push(cols);
+      };
+      addCompound(table.primaryKey);
+      for (const uc of table.uniqueColumns) addCompound(uc);
+      for (const idx of table.indexes) {
+        if (idx.unique && !idx.docPath) addCompound(idx.columns);
+      }
+
+      const selectorEntries = compoundSets.map((cols) => {
+        const members = cols.map(memberType);
+        return {
+          selectorName: members.map((m) => m.field).join('_'),
+          memberType: `{ ${members.map((m) => `${quoteIfNeeded(m.field)}: ${m.tsType}`).join('; ')} }`,
+        };
+      });
+
+      // Named helper type for annotating a compound selector by hand (Prisma parity).
+      if (selectorEntries.length > 0) {
+        const cuFields = selectorEntries.map((e) => `${e.selectorName}: ${e.memberType}`);
+        lines.push(`export type ${typeName}CompoundUniques = { ${cuFields.join('; ')} };`);
+      }
+
+      const selectorBranches = selectorEntries.map((e) => `{ ${e.selectorName}: ${e.memberType} }`);
+      const branches = [...flatBranches, ...selectorBranches];
       lines.push(`export type ${typeName}WhereUnique = ${branches.join(' | ')};`);
       lines.push('');
     }

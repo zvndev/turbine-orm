@@ -15,6 +15,7 @@ import type { ReturningSelection } from '../dialect.js';
 import { NotFoundError, OptimisticLockError, ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
 import { camelToSnake, snakeToCamel } from '../schema.js';
+import { expandCompoundUniqueWhere } from './compound-unique.js';
 import type { DeferredQuery } from './deferred.js';
 import { UPDATE_OPERATOR_KEYS } from './filters.js';
 import type {
@@ -168,7 +169,10 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
   qi.currentSkip = args.skipGlobalFilters;
   const dataObj = args.data as Record<string, unknown>;
   assertNoGeneratedColumns(qi, dataObj, 'update');
-  const userWhere = args.where as Record<string, unknown>;
+  // Prisma compound-unique selector (e.g. `{ orgId_userId: { orgId, userId } }`)
+  // → the column conjunction, before the empty-`where` guard so the expanded
+  // members count as a real predicate.
+  const userWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
   const lock = args.optimisticLock;
   // The empty-`where` guard checks the USER predicate only — a global filter
   // must never turn an unguarded mass update into an allowed one.
@@ -285,17 +289,16 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
 export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T>): DeferredQuery<T> {
   assertWritable(qi, 'delete');
   qi.currentSkip = args.skipGlobalFilters;
+  // Prisma compound-unique selector → the column conjunction (before the guard).
+  const userWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
   // Guard the USER predicate (a global filter must not satisfy the guard).
   whereMod.assertMutationHasPredicate(
     qi,
     'delete',
-    whereMod.userPredicateIsEmpty(qi, args.where as Record<string, unknown>) ? '' : ' WHERE x',
+    whereMod.userPredicateIsEmpty(qi, userWhere) ? '' : ' WHERE x',
     args.allowFullTableScan,
   );
-  const whereObj = (whereMod.mergeGlobalFilter(qi, args.where as Record<string, unknown>) ?? {}) as Record<
-    string,
-    unknown
-  >;
+  const whereObj = (whereMod.mergeGlobalFilter(qi, userWhere) ?? {}) as Record<string, unknown>;
   const whereFp = whereMod.fingerprintWhere(qi, whereObj);
   const ck = `d:${whereFp}${whereMod.globalFilterCacheSegment(qi)}`;
 
@@ -352,6 +355,8 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   assertNoGeneratedColumns(qi, args.create as Record<string, unknown>, 'upsert');
   assertNoGeneratedColumns(qi, args.update as Record<string, unknown>, 'upsert');
   qi.currentSkip = args.skipGlobalFilters;
+  // Prisma compound-unique selector on the conflict target → its member columns.
+  const upsertWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
   // Build the INSERT part from create data
   const createEntries = Object.entries(args.create as Record<string, unknown>).filter(([, v]) => v !== undefined);
   const columns = createEntries.map(([k]) => qi.toSqlColumn(k));
@@ -360,9 +365,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   const placeholders = createEntries.map(([k], i) => `${qi.p(i + 1)}${whereMod.enumCastSuffix(qi, qi.toColumn(k))}`);
 
   // The conflict target comes from `where` keys — must be unique/PK columns
-  const conflictKeys = Object.keys(args.where as Record<string, unknown>).filter(
-    (k) => (args.where as Record<string, unknown>)[k] !== undefined,
-  );
+  const conflictKeys = Object.keys(upsertWhere).filter((k) => upsertWhere[k] !== undefined);
   const conflictColumns = conflictKeys.map((k) => qi.toSqlColumn(k));
 
   // Build the UPDATE SET part
@@ -420,7 +423,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
             await exec(sql, params);
             const sel = buildReselectByWhere(
               qi,
-              (whereMod.mergeGlobalFilter(qi, args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>,
+              (whereMod.mergeGlobalFilter(qi, upsertWhere) ?? {}) as Record<string, unknown>,
             );
             return exec(sel.sql, sel.params);
           }
