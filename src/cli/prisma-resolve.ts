@@ -13,7 +13,7 @@
  * yields a parse-only report (every item `parsed`, no map) for `--no-db`.
  */
 
-import { camelToSnake, type PrismaCompatMap, type SchemaMetadata, snakeToCamel } from '../schema.js';
+import { camelToSnake, type PrismaCompatMap, type SchemaMetadata, snakeToCamel, withDbFieldNames } from '../schema.js';
 import type { PrismaModel, PrismaSchemaAst } from './prisma-schema.js';
 
 export { DEFAULT_EXCLUDED_TABLES } from '../introspect.js';
@@ -156,13 +156,36 @@ function isRelationField(typeName: string, modelNames: Set<string>): boolean {
 // Main entry
 // ---------------------------------------------------------------------------
 
+/** Options controlling how names are resolved. */
+export interface ResolveOptions {
+  /**
+   * Resolve field names against the raw database column names instead of the
+   * camelCase default, matching a client generated with `--keep-column-names`.
+   * Applied by running the introspected metadata through {@link withDbFieldNames}
+   * up front, so every resolved `turbineField` (and compound-unique
+   * `turbineFields`) is the DB column spelling and the emitted PRISMA_MAP agrees
+   * with the generated client. Table names, accessors, and relations are
+   * unaffected (those never carry camelCased column names).
+   */
+  keepColumnNames?: boolean;
+}
+
 /**
  * Resolve `ast` against introspected `schema` (or `null` for parse-only).
  */
-export function resolvePrismaSchema(ast: PrismaSchemaAst, schema: SchemaMetadata | null): ResolutionResult {
-  const noDb = schema === null;
+export function resolvePrismaSchema(
+  ast: PrismaSchemaAst,
+  schema: SchemaMetadata | null,
+  options: ResolveOptions = {},
+): ResolutionResult {
+  // Under keep-column-names the generated client keys fields by raw DB column
+  // names; resolve against the same transformed metadata so the name map's
+  // field values match the client (D).
+  const resolvedSchema = schema && options.keepColumnNames ? withDbFieldNames(schema) : schema;
+  const noDb = resolvedSchema === null;
   const modelNames = new Set(ast.models.map((m) => m.name));
-  const tableNames = schema ? new Set(Object.keys(schema.tables)) : new Set<string>();
+  const modelsByName = new Map(ast.models.map((m) => [m.name, m]));
+  const tableNames = resolvedSchema ? new Set(Object.keys(resolvedSchema.tables)) : new Set<string>();
 
   // Pass 1 - resolve each model to a table so relation targets are known.
   const modelTable = new Map<string, { table: string | null; viaMap: boolean; reason?: string }>();
@@ -183,7 +206,7 @@ export function resolvePrismaSchema(ast: PrismaSchemaAst, schema: SchemaMetadata
   for (const model of ast.models) {
     const rt = modelTable.get(model.name)!;
     const table = rt.table;
-    const tableMeta = table && schema ? schema.tables[table] : undefined;
+    const tableMeta = table && resolvedSchema ? resolvedSchema.tables[table] : undefined;
     const accessor = table ? snakeToCamel(table) : null;
 
     const status: ResolveStatus = noDb ? 'parsed' : table ? 'resolved' : 'unresolved';
@@ -203,7 +226,17 @@ export function resolvePrismaSchema(ast: PrismaSchemaAst, schema: SchemaMetadata
     for (const field of model.fields) {
       if (isRelationField(field.type, modelNames)) {
         resolved.relations.push(
-          resolveRelation(model, field.name, field.type, field.isList, modelTable, schema, tableMeta, noDb),
+          resolveRelation(
+            model,
+            field.name,
+            field.type,
+            field.isList,
+            modelTable,
+            modelsByName,
+            resolvedSchema,
+            tableMeta,
+            noDb,
+          ),
         );
       } else {
         resolved.fields.push(resolveScalarField(model, field.name, tableMeta, noDb));
@@ -241,7 +274,7 @@ export function resolvePrismaSchema(ast: PrismaSchemaAst, schema: SchemaMetadata
 
   // Enums.
   for (const en of ast.enums) {
-    const r = resolveEnum(en.name, en.map, schema, noDb);
+    const r = resolveEnum(en.name, en.map, resolvedSchema, noDb);
     result.enums.push(r);
     if (!noDb && r.status === 'resolved' && r.turbineName) result.map.enums[en.name] = r.turbineName;
   }
@@ -310,12 +343,34 @@ function resolveScalarField(
   };
 }
 
+/**
+ * The `@relation("Name")` name on a field, from the `name:` argument or the
+ * first positional string argument. Absent when the field has no `@relation`
+ * attribute or the attribute carries no name.
+ */
+function relationNameOf(field: PrismaModel['fields'][number] | undefined): string | undefined {
+  const relAttr = field?.attrs.find((a) => a.name === 'relation');
+  if (!relAttr) return undefined;
+  const named = relAttr.args.find((a) => a.key === 'name' && a.kind === 'string');
+  if (named?.value) return named.value;
+  const positional = relAttr.args.find((a) => a.key === undefined && a.kind === 'string');
+  return positional?.value;
+}
+
+/** The FK column list a field pins via `@relation(fields: [...])`, resolved to columns. */
+function relationFkColumns(model: PrismaModel, field: PrismaModel['fields'][number] | undefined): string[] | null {
+  const relAttr = field?.attrs.find((a) => a.name === 'relation');
+  const fieldsArg = relAttr?.args.find((a) => a.key === 'fields' && a.kind === 'array');
+  return fieldsArg?.items?.map((pf) => fieldColumn(model, pf)) ?? null;
+}
+
 function resolveRelation(
   model: PrismaModel,
   fieldName: string,
   targetModelName: string,
   isList: boolean,
   modelTable: Map<string, { table: string | null }>,
+  modelsByName: Map<string, PrismaModel>,
   schema: SchemaMetadata | null,
   tableMeta: SchemaMetadata['tables'][string] | undefined,
   noDb: boolean,
@@ -337,9 +392,27 @@ function resolveRelation(
 
   // Explicit @relation(fields: [...]) names the FK columns on THIS side.
   const field = model.fields.find((f) => f.name === fieldName);
-  const relAttr = field?.attrs.find((a) => a.name === 'relation');
-  const fieldsArg = relAttr?.args.find((a) => a.key === 'fields' && a.kind === 'array');
-  const fkColumns = fieldsArg?.items?.map((pf) => fieldColumn(model, pf)) ?? null;
+  let fkColumns = relationFkColumns(model, field);
+
+  // Inverse side (no fields on this side) with a @relation("Name"): pair by that
+  // name FIRST. Find the opposing model's field carrying the same relation name
+  // AND the FK (fields: [...]), and resolve through ITS foreign key. This is how
+  // Prisma disambiguates two or more relations to the same target model. Only
+  // fall back to the ambiguity handling below when there is no relation name or
+  // the named pair cannot be found.
+  if (!fkColumns || fkColumns.length === 0) {
+    const relName = relationNameOf(field);
+    const targetModel = modelsByName.get(targetModelName);
+    if (relName && targetModel) {
+      const opposing = targetModel.fields.find(
+        (f) =>
+          f.type === model.name &&
+          relationNameOf(f) === relName &&
+          (relationFkColumns(targetModel, f)?.length ?? 0) > 0,
+      );
+      if (opposing) fkColumns = relationFkColumns(targetModel, opposing);
+    }
+  }
 
   const candidates = Object.values(tableMeta.relations).filter((def) => {
     if (targetTable && def.to !== targetTable) return false;
@@ -407,9 +480,23 @@ function resolveCompoundUnique(
     if (matches([tableMeta.primaryKey])) return { ...base, turbineFields, status: 'resolved' };
     return { ...base, reason: `no compound primary key on "${tableMeta.name}" matches (${columns.join(', ')})` };
   }
-  // Introspected metadata carries composite unique constraints in uniqueColumns.
-  if (matches(tableMeta.uniqueColumns)) return { ...base, turbineFields, status: 'resolved' };
-  return { ...base, reason: `no unique constraint on "${tableMeta.name}" matches (${columns.join(', ')})` };
+  // A composite unique can surface EITHER as a unique constraint (uniqueColumns)
+  // OR as a plain UNIQUE INDEX (Prisma creates unique indexes, not table
+  // constraints), so accept a matching unique index too. A partial unique index
+  // does not enforce uniqueness across the whole table, so it never satisfies a
+  // @@unique; skip it defensively (the marker may be added to IndexMetadata).
+  const uniqueIndexMatches = tableMeta.indexes.some((idx) => {
+    if (!idx.unique) return false;
+    if ((idx as { partial?: boolean }).partial) return false;
+    return [...idx.columns].sort().join(',') === want;
+  });
+  if (matches(tableMeta.uniqueColumns) || uniqueIndexMatches) {
+    return { ...base, turbineFields, status: 'resolved' };
+  }
+  return {
+    ...base,
+    reason: `no unique constraint or unique index on "${tableMeta.name}" matches (${columns.join(', ')})`,
+  };
 }
 
 function resolveEnum(
