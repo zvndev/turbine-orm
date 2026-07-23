@@ -9,8 +9,8 @@
  * Output goes to the specified directory (default: ./generated/turbine/).
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative, resolve } from 'node:path';
 import {
   type ColumnMetadata,
   pgTypeToTs,
@@ -19,6 +19,7 @@ import {
   singularize,
   snakeToPascal,
   type TableMetadata,
+  withDbFieldNames,
 } from './schema.js';
 
 /** Get the TypeScript type name for a table (singularized PascalCase) */
@@ -74,12 +75,43 @@ export interface GenerateOptions {
    * diffs. Default: `false` (timestamp included, unchanged behavior).
    */
   noTimestamp?: boolean;
+  /**
+   * Which extension the generated `index.ts` uses on its sibling import
+   * specifiers (`./types`, `./metadata`). F3.
+   *
+   *   - `'js'`: always `./types.js` (required by NodeNext `tsc` and by
+   *     tsc-compiled ESM run on Node; the pre-0.41 behavior).
+   *   - `'none'`: always `./types` (correct for bundlers / `moduleResolution
+   *     bundler | node10`: webpack, Next.js/SWC, Vite/esbuild).
+   *   - `'auto'` (default): walk up from `outDir` to the nearest `tsconfig.json`
+   *     (extends chains are NOT followed) and emit `'.js'` when its `module` /
+   *     `moduleResolution` is `node16`/`nodenext`, `''` when both are present and
+   *     neither is, and fall back to `'.js'` when the tsconfig is missing,
+   *     unparseable, or ambiguous (so NodeNext consumers can never regress).
+   */
+  importExtension?: 'js' | 'none' | 'auto';
+  /**
+   * Rewrite generated column FIELD names to the raw database column names
+   * (snake_case) instead of camelCase (F4). Opt-in; when unset the output is
+   * byte-identical to before. Implemented as the pure generate-time
+   * {@link withDbFieldNames} transform (identity `columnMap`/`reverseColumnMap`,
+   * zero runtime changes). Relation names, table accessors, and entity type
+   * names are unaffected.
+   */
+  keepColumnNames?: boolean;
 }
 
 /** Per-file generator options (subset of {@link GenerateOptions} the emitters need). */
 export interface GenerateFileOptions {
   /** Omit the `Generated at:` header line for reproducible output. */
   noTimestamp?: boolean;
+  /**
+   * Resolved sibling-import extension for `generateIndex` (`'.js'` or `''`).
+   * Defaults to `'.js'` when unset so direct callers stay byte-stable.
+   */
+  importExt?: string;
+  /** Human-readable resolved import mode, recorded as a comment in `index.ts`. */
+  importMode?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,32 +130,178 @@ export function generate(options: GenerateOptions): { outDir: string; files: str
 
   mkdirSync(outDir, { recursive: true });
 
+  // F4: keep raw DB column names as field names (opt-in). Pure transform: when
+  // the flag is off `withDbFieldNames` is never called and output is unchanged.
+  const schema = options.keepColumnNames ? withDbFieldNames(options.schema) : options.schema;
+
+  // F3: resolve which extension sibling imports get in index.ts.
+  const { ext: importExt, mode: importMode } = resolveImportExtension(outDir, options.importExtension ?? 'auto');
+
   const files: string[] = [];
-  const fileOptions: GenerateFileOptions = { noTimestamp: options.noTimestamp };
+  const fileOptions: GenerateFileOptions = { noTimestamp: options.noTimestamp, importExt, importMode };
 
   // Generate types.ts
-  const typesContent = generateTypes(options.schema, fileOptions);
+  const typesContent = generateTypes(schema, fileOptions);
   writeFileSync(join(outDir, 'types.ts'), typesContent, 'utf-8');
   files.push('types.ts');
 
   // Generate metadata.ts
-  const metadataContent = generateMetadata(options.schema, fileOptions);
+  const metadataContent = generateMetadata(schema, fileOptions);
   writeFileSync(join(outDir, 'metadata.ts'), metadataContent, 'utf-8');
   files.push('metadata.ts');
 
   // Generate index.ts (configured client)
-  const indexContent = generateIndex(options.schema, fileOptions);
+  const indexContent = generateIndex(schema, fileOptions);
   writeFileSync(join(outDir, 'index.ts'), indexContent, 'utf-8');
   files.push('index.ts');
 
   // Generate zod.ts (optional — --zod flag)
   if (options.zod) {
-    const zodContent = generateZod(options.schema, fileOptions);
+    const zodContent = generateZod(schema, fileOptions);
     writeFileSync(join(outDir, 'zod.ts'), zodContent, 'utf-8');
     files.push('zod.ts');
   }
 
   return { outDir, files };
+}
+
+// ---------------------------------------------------------------------------
+// Import-extension resolution (F3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the requested {@link GenerateOptions.importExtension} to the concrete
+ * extension string used on `index.ts`'s sibling imports plus a human-readable
+ * mode label for the generated comment.
+ *
+ *   - `'js'`   → `.js`
+ *   - `'none'` → `''`
+ *   - `'auto'` → tsconfig-driven ({@link detectTsconfigExtension}); falls back
+ *     to `.js` (the pre-0.41 default) when detection is uncertain, so NodeNext
+ *     consumers can never regress.
+ */
+export function resolveImportExtension(
+  outDir: string,
+  requested: 'js' | 'none' | 'auto',
+): { ext: string; mode: string } {
+  if (requested === 'js') return { ext: '.js', mode: 'js' };
+  if (requested === 'none') return { ext: '', mode: 'none' };
+  const detected = detectTsconfigExtension(resolve(outDir));
+  if (detected === 'js') return { ext: '.js', mode: 'auto (nodenext → .js)' };
+  if (detected === 'none') return { ext: '', mode: 'auto (bundler → no extension)' };
+  return { ext: '.js', mode: 'auto (fallback → .js)' };
+}
+
+/**
+ * Walk up from `startDir` to the nearest `tsconfig.json` and classify its module
+ * resolution. Does NOT follow `extends` chains (a monorepo whose base config
+ * sets `moduleResolution` needs the explicit flag). Returns:
+ *   - `'js'`: `module`/`moduleResolution` is `node16`/`nodenext`;
+ *   - `'none'`: both fields present and neither is node16/nodenext (bundler,
+ *     node, node10, classic, esnext, commonjs, preserve);
+ *   - `null`: no tsconfig found, unparseable, or the fields are absent
+ *     (possibly hidden behind `extends`) → caller falls back to `.js`.
+ */
+export function detectTsconfigExtension(startDir: string): 'js' | 'none' | null {
+  let dir = startDir;
+  for (;;) {
+    const candidate = join(dir, 'tsconfig.json');
+    if (existsSync(candidate)) {
+      try {
+        return classifyTsconfig(readFileSync(candidate, 'utf-8'));
+      } catch {
+        return null;
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return null; // reached the filesystem root
+    dir = parent;
+  }
+}
+
+/**
+ * Classify a tsconfig's `compilerOptions.module` / `moduleResolution` (see
+ * {@link detectTsconfigExtension}). Tolerant of `//` and block comments and
+ * trailing commas (real-world tsconfigs use JSONC).
+ */
+export function classifyTsconfig(text: string): 'js' | 'none' | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripJsonComments(text));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const co = (parsed as { compilerOptions?: unknown }).compilerOptions;
+  if (typeof co !== 'object' || co === null) return null;
+  const opts = co as { module?: unknown; moduleResolution?: unknown };
+  const mod = typeof opts.module === 'string' ? opts.module.toLowerCase() : undefined;
+  const modRes = typeof opts.moduleResolution === 'string' ? opts.moduleResolution.toLowerCase() : undefined;
+  const isNodeNext = (v: string | undefined) => v === 'node16' || v === 'nodenext';
+  if (isNodeNext(mod) || isNodeNext(modRes)) return 'js';
+  if (mod !== undefined && modRes !== undefined) return 'none';
+  return null;
+}
+
+/**
+ * Strip `//` line comments and block comments from JSONC text, leaving anything
+ * inside a double-quoted string untouched. Trailing commas are then removed so
+ * `JSON.parse` accepts the result.
+ */
+export function stripJsonComments(text: string): string {
+  let out = '';
+  let inString = false;
+  let inLine = false;
+  let inBlock = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    const next = text[i + 1];
+    if (inLine) {
+      if (ch === '\n') {
+        inLine = false;
+        out += ch;
+      }
+      continue;
+    }
+    if (inBlock) {
+      if (ch === '*' && next === '/') {
+        inBlock = false;
+        i++;
+      }
+      continue;
+    }
+    if (inString) {
+      out += ch;
+      if (ch === '\\') {
+        // Preserve the escaped character verbatim.
+        if (next !== undefined) {
+          out += next;
+          i++;
+        }
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      inLine = true;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      inBlock = true;
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  // Drop trailing commas before } or ].
+  return out.replace(/,(\s*[}\]])/g, '$1');
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +409,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       const piiNote = col.pii ? ' (PII: absent unless selected or includePii)' : '';
       const optional = col.pii ? '?' : '';
       lines.push(`  /** Column: ${col.name}, ${col.pgType}${pkNote}${nullNote}${piiNote} */`);
-      lines.push(`  ${col.field}${optional}: ${columnTsType(col, schema.enums)};`);
+      lines.push(`  ${quoteIfNeeded(col.field)}${optional}: ${columnTsType(col, schema.enums)};`);
     }
     lines.push('}');
     lines.push('');
@@ -249,9 +427,9 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       if (isOptional) {
         const reason = isPk ? 'auto-generated' : col.hasDefault ? 'has default' : 'nullable';
         lines.push(`  /** Optional: ${reason} */`);
-        lines.push(`  ${col.field}?: ${columnTsType(col, schema.enums)};`);
+        lines.push(`  ${quoteIfNeeded(col.field)}?: ${columnTsType(col, schema.enums)};`);
       } else {
-        lines.push(`  ${col.field}: ${columnTsType(col, schema.enums)};`);
+        lines.push(`  ${quoteIfNeeded(col.field)}: ${columnTsType(col, schema.enums)};`);
       }
     }
     lines.push('};');
@@ -264,7 +442,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
     lines.push(`/** Input type for updating a row in \`${table.name}\` */`);
     lines.push(`export type ${typeName}Update = {`);
     for (const col of nonPkCols) {
-      lines.push(`  ${col.field}?: ${updateFieldType(columnTsType(col, schema.enums))};`);
+      lines.push(`  ${quoteIfNeeded(col.field)}?: ${updateFieldType(columnTsType(col, schema.enums))};`);
     }
     lines.push('};');
     lines.push('');
@@ -345,7 +523,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
           const col = table.columns.find((c) => c.name === colName);
           const field = col?.field ?? colName;
           const tsType = col?.tsType ?? 'unknown';
-          return `${field}: ${tsType}`;
+          return `${quoteIfNeeded(field)}: ${tsType}`;
         });
         return `{ ${fields.join('; ')} }`;
       });
@@ -489,7 +667,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     for (const col of table.columns) {
       let expr = zodBaseType(col, schema.enums);
       if (col.nullable) expr += '.nullable()';
-      lines.push(`  ${col.field}: ${expr},`);
+      lines.push(`  ${quoteIfNeeded(col.field)}: ${expr},`);
     }
     lines.push('});');
     lines.push('');
@@ -504,7 +682,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
       let expr = zodBaseType(col, schema.enums);
       if (col.nullable) expr += '.nullable()';
       if (col.hasDefault || col.nullable || isPk) expr += '.optional()';
-      lines.push(`  ${col.field}: ${expr},`);
+      lines.push(`  ${quoteIfNeeded(col.field)}: ${expr},`);
     }
     lines.push('});');
     lines.push('');
@@ -518,7 +696,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
       let expr = zodBaseType(col, schema.enums);
       if (col.nullable) expr += '.nullable()';
       expr += '.optional()';
-      lines.push(`  ${col.field}: ${expr},`);
+      lines.push(`  ${quoteIfNeeded(col.field)}: ${expr},`);
     }
     lines.push('});');
     lines.push('');
@@ -554,7 +732,7 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
     // columnMap
     lines.push('      columnMap: {');
     for (const [field, col] of Object.entries(table.columnMap)) {
-      lines.push(`        ${field}: '${escSQ(col)}',`);
+      lines.push(`        ${quoteIfNeeded(field)}: '${escSQ(col)}',`);
     }
     lines.push('      },');
 
@@ -677,11 +855,17 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   // table has at least one type-safe (non-column-shadowing) relation.
   const hasSafeRelations = new Map<string, boolean>();
   for (const t of tableEntries) hasSafeRelations.set(t.name, typeSafeRelations(t, false).length > 0);
+  // F3: sibling-import extension. Defaults to '.js' for direct callers so their
+  // output stays byte-stable; `generate()` resolves it (auto / js / none).
+  const ext = options?.importExt ?? '.js';
   const lines: string[] = [
     ...generatedFileHeader(options),
+    // Record the resolved import mode for debuggability (only when generate()
+    // drove it, so direct generateIndex() callers stay byte-identical).
+    ...(options?.importMode ? [`// Sibling imports resolved with importExtension: ${options.importMode}.`, ''] : []),
     "import { TurbineClient as BaseTurbineClient, TransactionClient as BaseTransactionClient, QueryInterface } from 'turbine-orm';",
     "import type { TurbineConfig, TransactionOptions, DeferredQuery, PipelineResults } from 'turbine-orm';",
-    "import { SCHEMA } from './metadata.js';",
+    `import { SCHEMA } from './metadata${ext}';`,
   ];
 
   // Import all entity types and relations maps
@@ -692,7 +876,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
       typeImports.push(`${entityName(t.name)}Relations`);
     }
   }
-  lines.push(`import type { ${typeImports.join(', ')} } from './types.js';`);
+  lines.push(`import type { ${typeImports.join(', ')} } from './types${ext}';`);
   lines.push('');
 
   // -------------------------------------------------------------------------
@@ -807,8 +991,8 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   lines.push('');
 
   // Re-export everything
-  lines.push("export * from './types.js';");
-  lines.push("export { SCHEMA } from './metadata.js';");
+  lines.push(`export * from './types${ext}';`);
+  lines.push(`export { SCHEMA } from './metadata${ext}';`);
   lines.push('');
 
   return lines.join('\n');
