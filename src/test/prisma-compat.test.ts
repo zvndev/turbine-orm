@@ -358,6 +358,31 @@ describe('prisma-compat, nested include limits', () => {
 // Result reshaping
 // ---------------------------------------------------------------------------
 
+describe('prisma-compat, delegate property spelling', () => {
+  it('exposes each model under both its Prisma name and the lowercased-first-letter alias', async () => {
+    const { schema, map } = fixture();
+    const { db } = spyDb(schema, { 'users.findMany': [{ id: 1, emailAddress: 'a@b.com', name: 'A' }] });
+    const compat = mkCompat(db, map);
+    // biome-ignore lint/suspicious/noExplicitAny: probing the untyped alias surface
+    const c = compat as any;
+    assert.equal(c.user, c.User, 'prisma.user aliases prisma.User');
+    const rows = await c.user.findMany({});
+    assert.deepEqual(rows, [{ id: 1, email: 'a@b.com', name: 'A' }]);
+  });
+
+  it('carries the alias into the $transaction callback client', async () => {
+    const { schema, map } = fixture();
+    const { db } = spyDb(schema, { 'users.findMany': [{ id: 1, emailAddress: 'a@b.com', name: 'A' }] });
+    const compat = mkCompat(db, map);
+    // biome-ignore lint/suspicious/noExplicitAny: probing the untyped alias surface
+    const out = await (compat.$transaction as any)(async (tx: any) => {
+      assert.equal(tx.user, tx.User, 'tx.user aliases tx.User');
+      return tx.user.findMany({});
+    });
+    assert.deepEqual(out, [{ id: 1, email: 'a@b.com', name: 'A' }]);
+  });
+});
+
 describe('prisma-compat, result reshaping', () => {
   it('renames turbine field keys back to Prisma names on read', async () => {
     const { schema, map } = fixture();

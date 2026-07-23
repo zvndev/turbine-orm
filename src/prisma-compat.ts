@@ -12,7 +12,9 @@
  *
  * ## What it does
  *
- * - **Model delegates** by Prisma model name (`compat.User.findMany(...)`),
+ * - **Model delegates** under both the Prisma model name (`compat.User`) and
+ *   Prisma's client-property spelling with the first letter lowercased
+ *   (`compat.user`, what generated Prisma call sites actually use),
  *   translating args recursively: `include`→`with`, `select` split into scalar
  *   selection + relations, field/relation renames both ways through the map,
  *   `take`/`skip`→`limit`/`offset`, cursor pagination, and compound-unique
@@ -1064,7 +1066,22 @@ export type PrismaCompatTransactionClient<
  */
 export type PrismaCompatClient<S extends Record<string, PrismaModelTypes> = Record<string, PrismaModelTypes>> = {
   [K in keyof S]: PrismaModelDelegate<S[K]>;
+} & {
+  // Prisma's generated client exposes each model with its first letter
+  // lowercased (`prisma.user` for `model User`); mirror that so migrated call
+  // sites keep working unchanged. Both spellings resolve to the same delegate.
+  [K in keyof S as Uncapitalize<K & string>]: PrismaModelDelegate<S[K]>;
 } & PrismaCompatClientBase<S>;
+
+/**
+ * Prisma's client-property spelling of a model name: first letter lowercased
+ * (`model User` -> `prisma.user`). Returns null when the spelling is identical
+ * (already lowercase) so callers can skip the alias.
+ */
+function prismaPropertyAlias(model: string): string | null {
+  const alias = model.charAt(0).toLowerCase() + model.slice(1);
+  return alias === model ? null : alias;
+}
 
 // ---------------------------------------------------------------------------
 // Delegate construction
@@ -1413,6 +1430,10 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
         const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
         for (const [prismaModel, mm] of Object.entries(map.models)) {
           txDelegates[prismaModel] = makeDelegate(ctx, mm, () => tx.table(mm.table));
+          const alias = prismaPropertyAlias(prismaModel);
+          if (alias && !(alias in map.models) && !(alias in txDelegates)) {
+            txDelegates[alias] = txDelegates[prismaModel]!;
+          }
         }
         return fn(txDelegates as unknown as PrismaCompatTransactionClient);
       }, txOptions);
@@ -1441,6 +1462,12 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
   // key from the map, so no dynamic-access proxy is needed.
   const result: Record<string, unknown> = { ...base };
   for (const [prismaModel, delegate] of delegates) result[prismaModel] = delegate;
+  // Prisma-spelling aliases (`prisma.user` for `model User`). Skipped when the
+  // lowercased name is itself a model or already taken (never shadow a real key).
+  for (const [prismaModel, delegate] of delegates) {
+    const alias = prismaPropertyAlias(prismaModel);
+    if (alias && !(alias in result)) result[alias] = delegate;
+  }
 
   return result as unknown as PrismaCompatClient<S>;
 }
