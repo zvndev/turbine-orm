@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Prisma implicit many-to-many junctions are now detected.** A Prisma implicit m2m
+  join table (e.g. `_UserOrganizations` with columns `A` and `B`) has no primary key,
+  just a two-column `UNIQUE` index over the two foreign-key columns, so auto-detection
+  previously skipped it and the `manyToMany` relations were missing (an `include` on
+  either side threw at runtime). `turbine generate` / `pull` now accepts a two-column
+  unique index over exactly the two single-column foreign keys as the junction key when a
+  table has no primary key, with the same purity checks as before (exactly two foreign
+  keys to two distinct tables, no payload columns). Tables that DO have a primary key, or
+  that carry an extra payload column, are still never treated as junctions.
+- **Index column parsing no longer swallows a partial-index `WHERE` clause.** Introspection
+  parsed the indexed columns with a greedy match that, for a partial index like
+  `CREATE UNIQUE INDEX ... (pos_id, pos_item_id) WHERE (pos_item_id IS NOT NULL)`, captured
+  the trailing `WHERE (...)` as part of the column list. That garbage fragment then leaked
+  into generated compound-unique selector names and produced a `types.ts` that failed to
+  parse. Column parsing is now anchored on the `USING` clause, quoted identifiers are
+  de-quoted, and expression columns are dropped conservatively.
+- **Partial unique indexes are excluded from compound-unique selectors.** A partial `UNIQUE`
+  index only guarantees uniqueness over its predicate's rows, not table-wide, so it can no
+  longer back a `findUnique`-style compound selector in either the runtime `where` expansion
+  or the generated `*WhereUnique` selector branches. `IndexMetadata` carries a new optional
+  `partial` flag.
+- **Generated compound-unique selector names are always valid TypeScript.** A synthetic
+  selector name that is not a valid identifier (for example a junction-style quoted
+  uppercase column) is now emitted as a single quoted string-literal key, so the generated
+  `types.ts` always parses.
+- **`turbine-orm/prisma-compat` delegate errors now reject instead of throwing.** Translation
+  and validation errors raised while building a query (an unknown relation in `include`, a
+  malformed compound selector, a missing `where`, a negative `take`, ...) previously threw
+  synchronously from the delegate call, so a Prisma-style `.catch()` never fired. Every
+  delegate method and the `$transaction` array-batch path now surface these as a rejected
+  promise; error types and decoration are unchanged.
+
 ## 0.41.0 (2026-07-23)
 
 ### Breaking changes
