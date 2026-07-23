@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`migrate-from-prisma` now pairs two relations to the same model by `@relation` name.**
+  When a model had two or more relations pointing at the same target model (for example a
+  `createdBy` / `modifiedBy` pair of foreign keys), the resolver reported them as
+  "ambiguous" even though Prisma disambiguates them with a shared `@relation("Name")`.
+  Resolution now matches the relation name first: an inverse relation field resolves
+  through the foreign key pinned by the opposing side that carries the same name, and only
+  falls back to the ambiguity report when there is no name or the named pair cannot be
+  found. Such pairs now resolve fully with no unresolved items.
+- **`@@unique` now matches a `UNIQUE INDEX`, not only a unique constraint.** Prisma creates
+  composite uniques as unique indexes rather than table constraints, so every `@@unique`
+  was reported as having "no unique constraint" even when the database had the exact unique
+  index. The resolver now also accepts a match from a non-partial unique index whose column
+  set equals the `@@unique` columns, and those index-backed uniques are included in the
+  emitted name map (custom `@@unique(name:)` selector names preserved).
+- **`migrate-from-prisma` now emits the generated client too.** The command previously wrote
+  only the migration report and the typed name map, so users had to run `turbine pull`
+  separately, and a partially resolved run (`--allow-partial`) emitted no client at all. It
+  now always generates the standard client (`types.ts`, `metadata.ts`, `index.ts`) from the
+  live introspected metadata alongside the report and name map, including on the
+  `--allow-partial` path (unresolved Prisma items never block the client).
+- **`migrate-from-prisma` now honors `--keep-column-names`.** The flag was accepted but
+  silently ignored, so a keep-column-names client (raw snake_case field names) and the
+  emitted name map (camelCase field names) disagreed. The flag now flows through to both the
+  generated client and the name map's field values, which become the raw database column
+  spellings so the two agree.
+
 ## 0.41.0 (2026-07-23)
 
 ### Breaking changes
