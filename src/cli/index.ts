@@ -5,6 +5,7 @@
  * Commands:
  *   turbine init                  — Initialize a Turbine project
  *   turbine generate | pull       — Introspect database and generate TypeScript types
+ *   turbine migrate-from-prisma   - Parse a schema.prisma and emit a Prisma->Turbine name map + report
  *   turbine push                  - Apply schema-builder definitions to database (destructive ops gated)
  *   turbine migrate create <name> - Create a new SQL migration file (--auto | --from-diff | --recipe <name>)
  *   turbine migrate up            — Apply pending migrations
@@ -37,7 +38,7 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { generate } from '../generate.js';
+import { generate, generatePrismaMap } from '../generate.js';
 import { findMissingRelationIndexes } from '../index-advisor.js';
 import { introspect } from '../introspect.js';
 import type { SchemaDef } from '../schema-builder.js';
@@ -71,6 +72,9 @@ import {
   type OutOfOrderApply,
 } from './migrate.js';
 import { startObserve } from './observe.js';
+import { formatPrismaReport, summaryLines } from './prisma-report.js';
+import { DEFAULT_EXCLUDED_TABLES, resolvePrismaSchema } from './prisma-resolve.js';
+import { PrismaParseError, parsePrismaSchema } from './prisma-schema.js';
 import { startStudio } from './studio.js';
 import {
   banner,
@@ -154,6 +158,11 @@ export interface CliArgs {
   showPii?: boolean;
   /** Launch Studio with a seeded in-memory sample database (`studio --demo`). */
   demo?: boolean;
+  // migrate-from-prisma flags
+  /** `migrate-from-prisma --allow-partial`: exit 0 even when some items are UNRESOLVED. */
+  allowPartial?: boolean;
+  /** `migrate-from-prisma --no-db`: parse-only, skip database resolution. */
+  noDb?: boolean;
 }
 
 export function parseArgs(argv = process.argv.slice(2)): CliArgs {
@@ -292,6 +301,12 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--demo':
         result.demo = true;
+        break;
+      case '--allow-partial':
+        result.allowPartial = true;
+        break;
+      case '--no-db':
+        result.noDb = true;
         break;
       default:
         if (!arg.startsWith('-')) {
@@ -1247,6 +1262,128 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   console.log(`  ${cyan(`import { turbine } from './${config.out.replace('./', '')}';`)}`);
   console.log(`  ${dim('const db = turbine({ connectionString: process.env.DATABASE_URL });')}`);
   console.log(`  ${dim('const user = await db.users.findUnique({ where: { id: 1 } });')}`);
+  newline();
+}
+
+// ---------------------------------------------------------------------------
+// migrate-from-prisma
+// ---------------------------------------------------------------------------
+
+/**
+ * `turbine migrate-from-prisma --schema prisma/schema.prisma` parses a Prisma
+ * schema, resolve its models/fields/relations/compound-uniques against the live
+ * database (unless `--no-db`), and emit (a) a Markdown resolution report and
+ * (b) a typed `prisma-map.ts` name map next to the generated client.
+ *
+ * NOTE: within THIS command `--schema` names the Prisma schema FILE (not the
+ * Postgres namespace, which the rest of the CLI's `--schema` means). The
+ * Postgres namespace is `public` here; multi-schema (`@@schema`) is unsupported
+ * in v1 and listed as a parser note in the report.
+ */
+async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Promise<void> {
+  banner();
+
+  // `--schema` is the Prisma schema file path in this command.
+  const prismaPath = resolve(args.schema ?? 'prisma/schema.prisma');
+  if (!existsSync(prismaPath)) {
+    error(`Prisma schema file not found: ${cyan(prismaPath)}`);
+    newline();
+    console.log(
+      `  ${dim('Point at it with')} ${cyan('--schema <path/to/schema.prisma>')} ${dim('(default: prisma/schema.prisma).')}`,
+    );
+    newline();
+    process.exit(1);
+  }
+
+  // Parse (fatal only on a construct we must understand).
+  const source = readFileSync(prismaPath, 'utf-8');
+  let ast: ReturnType<typeof parsePrismaSchema>;
+  try {
+    ast = parsePrismaSchema(source);
+  } catch (err) {
+    if (err instanceof PrismaParseError) {
+      newline();
+      error(`Could not parse ${cyan(prismaPath)}`);
+      console.log(`  ${red(err.message)}`);
+      newline();
+      process.exit(1);
+    }
+    throw err;
+  }
+
+  label('Prisma schema', prismaPath);
+  label('Models', String(ast.models.length));
+  label('Enums', String(ast.enums.length));
+
+  // Resolve against the live database, unless --no-db (parse-only).
+  let schemaMeta: Awaited<ReturnType<typeof introspect>> | null = null;
+  if (args.noDb) {
+    info('Parse-only mode (--no-db): names will not be resolved.');
+  } else {
+    const url = requireUrl(config);
+    label('Database', redactUrl(url));
+    const spinner = new Spinner('Introspecting database schema').start();
+    schemaMeta = await introspect({
+      connectionString: url,
+      // The Postgres NAMESPACE is fixed to `public` here (`--schema` names the
+      // Prisma file, not the namespace).
+      schema: 'public',
+      // Prisma `view` models resolve against introspected views.
+      includeViews: true,
+      // Inherit the shared bookkeeping-table exclusions (Turbine + Prisma).
+      exclude: [...new Set([...config.exclude, ...DEFAULT_EXCLUDED_TABLES])],
+    });
+    spinner.succeed(`Introspected ${bold(String(Object.keys(schemaMeta.tables).length))} tables`);
+  }
+  newline();
+
+  const result = resolvePrismaSchema(ast, schemaMeta);
+
+  // Console summary.
+  header('Resolution');
+  for (const line of summaryLines(result)) {
+    const marker = line.includes('[UNRESOLVED]') ? red(symbols.cross) : green(symbols.check);
+    console.log(`  ${marker} ${line}`);
+  }
+  newline();
+
+  // Write outputs into the generate outDir.
+  const outDir = resolve(config.out);
+  const rel = relative(process.cwd(), outDir);
+  if (rel.startsWith('..') || resolve(rel) !== outDir) {
+    error(`Output directory must be within the project root. Got: ${config.out}`);
+    newline();
+    process.exit(1);
+  }
+  mkdirSync(outDir, { recursive: true });
+
+  const reportPath = join(outDir, 'prisma-migration-report.md');
+  writeFileSync(
+    reportPath,
+    formatPrismaReport(result, { schemaPath: prismaPath, noTimestamp: args.noTimestamp }),
+    'utf-8',
+  );
+  console.log(`  ${dim(symbols.teeEnd)} ${cyan(reportPath)} ${dim('(report)')}`);
+
+  if (!args.noDb) {
+    const mapPath = join(outDir, 'prisma-map.ts');
+    writeFileSync(mapPath, generatePrismaMap(result.map, { noTimestamp: args.noTimestamp }), 'utf-8');
+    console.log(`  ${dim(symbols.teeEnd)} ${cyan(mapPath)} ${dim('(typed name map)')}`);
+  }
+  newline();
+
+  // Exit non-zero when anything is UNRESOLVED, unless --allow-partial.
+  if (result.hasUnresolved && !args.allowPartial) {
+    warn('Some items could not be resolved (see the report). Re-run with --allow-partial to accept a partial map.');
+    newline();
+    process.exit(1);
+  }
+
+  if (args.noDb) {
+    info(`Parse-only report written. Re-run without ${cyan('--no-db')} against your database to resolve names.`);
+  } else {
+    success('Prisma name map generated.');
+  }
   newline();
 }
 
@@ -2623,6 +2760,7 @@ function showSubcommandHelp(command: string): boolean {
     init: showInitHelp,
     generate: showGenerateHelp,
     pull: showGenerateHelp,
+    'migrate-from-prisma': showMigrateFromPrismaHelp,
     push: showPushHelp,
     migrate: showMigrateHelp,
     migration: showMigrateHelp,
@@ -2693,6 +2831,38 @@ function showGenerateHelp(): void {
     `    ${cyan('--no-timestamp')}        Omit the ${dim('Generated at:')} header line ${dim('(reproducible, diff-stable output)')}`,
   );
   console.log(`    ${cyan('--allow-empty')}         Generate even when introspection matches 0 tables`);
+  newline();
+}
+
+function showMigrateFromPrismaHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine migrate-from-prisma')} - Map a Prisma schema onto a Turbine client`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine migrate-from-prisma ${dim('--schema prisma/schema.prisma [options]')}`);
+  newline();
+  console.log(`  Parses your ${cyan('schema.prisma')}, resolves models/fields/relations/compound`);
+  console.log(`  uniques against the live database, and writes into the output directory:`);
+  console.log(`    ${dim('•')} ${cyan('prisma-migration-report.md')} - per-model resolution + unresolved items`);
+  console.log(`    ${dim('•')} ${cyan('prisma-map.ts')}              - typed PRISMA_MAP name map`);
+  newline();
+  console.log(`  ${dim('Note:')} here ${cyan('--schema')} names the Prisma FILE (not the Postgres namespace).`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(
+    `    ${cyan('--schema')} ${dim('<file>')}     Path to schema.prisma ${dim('(default: prisma/schema.prisma)')}`,
+  );
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}     Postgres connection string ${dim('(unless --no-db)')}`);
+  console.log(`    ${cyan('--out, -o')} ${dim('<dir>')}     Output directory ${dim('(default: ./generated/turbine)')}`);
+  console.log(`    ${cyan('--no-db')}             Parse-only: write the report without resolving names`);
+  console.log(`    ${cyan('--allow-partial')}     Exit 0 even when some items are UNRESOLVED`);
+  console.log(`    ${cyan('--no-timestamp')}      Omit the ${dim('Generated:')} lines ${dim('(reproducible output)')}`);
+  newline();
+  console.log(`  ${bold('Examples:')}`);
+  console.log(
+    `    ${dim('$')} DATABASE_URL=postgres://... npx turbine migrate-from-prisma --schema prisma/schema.prisma`,
+  );
+  console.log(`    ${dim('$')} npx turbine migrate-from-prisma --schema prisma/schema.prisma --no-db`);
   newline();
 }
 
@@ -2826,6 +2996,9 @@ function showHelp(): void {
   console.log(`  ${bold('Commands:')}`);
   console.log(`    ${cyan('init')}               Initialize a Turbine project`);
   console.log(`    ${cyan('generate')} ${dim('| pull')}    Introspect database ${symbols.arrow} generate types`);
+  console.log(
+    `    ${cyan('migrate-from-prisma')} Map a schema.prisma onto Turbine ${dim('(report + typed name map)')}`,
+  );
   console.log(`    ${cyan('push')}               Apply schema definitions to database`);
   console.log(`    ${cyan('migrate')} ${dim('<sub>')}      SQL migration management`);
   console.log(`      ${dim('create <name>')}    Create a new migration file`);
@@ -3046,6 +3219,10 @@ async function main() {
       case 'g':
       case 'pull':
         await cmdGenerate(args, config);
+        break;
+
+      case 'migrate-from-prisma':
+        await cmdMigrateFromPrisma(args, config);
         break;
 
       case 'push':
