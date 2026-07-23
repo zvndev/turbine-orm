@@ -115,16 +115,35 @@ export function buildGroupBy<T extends object>(
   }
 
   // _count
-  const countSelected = args._count === true || args._count === undefined;
-  if (countSelected) {
-    // default: always include count
+  //   - `true` / omitted → scalar `_count` column (COUNT(*)), result `_count: number`.
+  //   - record form → one column per selection: `_all` → COUNT(*) AS "_count__all"
+  //     (double underscore, collision-proof against a real column named `all`),
+  //     each field → COUNT(col) AS "_count_<col>", result `_count: { _all, field }`.
+  const countArg = args._count;
+  const countIsRecord = countArg !== true && countArg !== undefined && typeof countArg === 'object';
+  const scalarCount = countArg === true || countArg === undefined;
+  if (scalarCount) {
+    // default: always include the scalar count
     selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS _count`);
+  } else if (countIsRecord) {
+    for (const [field, enabled] of Object.entries(countArg as Record<string, boolean>)) {
+      if (!enabled) continue;
+      if (field === '_all') {
+        selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS ${qi.q('_count__all')}`);
+      } else {
+        const col = qi.toColumn(field);
+        selectExprs.push(`${qi.castAgg(`COUNT(${qi.q(col)})`, 'int')} AS ${qi.q(`_count_${col}`)}`);
+      }
+    }
   }
 
   // ORDER BY aggregate expressions, keyed `${aggKey}:${field}` (plus a bare
   // `_count`). Populated alongside the SELECT list below so `orderBy` can only
   // reference an aggregate that is actually requested. `COUNT(*)` (uncast) is
   // the ordering expression (the SELECT cast is only for the returned value).
+  // COUNT(*) is orderable whenever it is selected: scalar `_count`, OR the
+  // record form containing `_all`.
+  const countSelected = scalarCount || (countIsRecord && (countArg as Record<string, boolean>)._all === true);
   const aggOrderExprs = new Map<string, string>();
   if (countSelected) aggOrderExprs.set('_count', 'COUNT(*)');
 
@@ -227,10 +246,29 @@ export function buildGroupBy<T extends object>(
         }
 
         // _count
+        //   scalar form → the plain `_count` (or driver-lowercased `count`) column.
+        //   record form → assemble `{ _all, field, ... }` from the `_count__all`
+        //   and `_count_<col>` columns. `_count__all` MUST be matched before the
+        //   generic `_count_` prefix (its slice(7) would map through snakeToCamel).
         if ('_count' in row) {
           restructured._count = row._count;
         } else if ('count' in row) {
           restructured._count = row.count;
+        } else {
+          const countObj: Record<string, unknown> = {};
+          let hasCount = false;
+          for (const [rawKey, rawValue] of Object.entries(row)) {
+            if (rawKey === '_count__all') {
+              countObj._all = rawValue;
+              hasCount = true;
+            } else if (rawKey.startsWith('_count_')) {
+              const col = rawKey.slice(7);
+              const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
+              countObj[field] = rawValue;
+              hasCount = true;
+            }
+          }
+          if (hasCount) restructured._count = countObj;
         }
 
         // Collect aggregates into nested objects
@@ -634,6 +672,8 @@ export function buildAggregate<T extends object>(
     }
     if (args._count && typeof args._count === 'object') {
       for (const key of Object.keys(args._count)) {
+        // `_all` is the reserved COUNT(*) selector, not a column.
+        if (key === '_all') continue;
         if (!(key in meta.columnMap)) {
           throw new ValidationError(`Unknown column "${key}" in aggregate for table "${qi.table}"`);
         }
@@ -643,12 +683,17 @@ export function buildAggregate<T extends object>(
 
   const selectExprs: string[] = [];
 
-  // _count
+  // _count. `true` → scalar COUNT(*). Record form: reserved `_all` → COUNT(*) AS
+  // "_count__all" (double underscore, collision-proof against a real column named
+  // `all`); each field → COUNT(col) AS "_count_<col>".
   if (args._count === true) {
     selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS _count`);
   } else if (args._count && typeof args._count === 'object') {
     for (const [field, enabled] of Object.entries(args._count)) {
-      if (enabled) {
+      if (!enabled) continue;
+      if (field === '_all') {
+        selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS ${qi.q('_count__all')}`);
+      } else {
         const col = qi.toColumn(field);
         selectExprs.push(`${qi.castAgg(`COUNT(${qi.q(col)})`, 'int')} AS ${qi.q(`_count_${col}`)}`);
       }
@@ -712,11 +757,16 @@ export function buildAggregate<T extends object>(
       if (row._count !== undefined) {
         aggResult._count = row._count as number;
       } else {
-        // Check for per-column counts
+        // Check for per-column counts. `_count__all` MUST be matched before the
+        // generic `_count_` prefix (its slice(7) is `_all`, which snakeToCamel
+        // would mangle to `All`).
         const countObj: Record<string, number> = {};
         let hasCountFields = false;
         for (const [key, val] of Object.entries(row)) {
-          if (key.startsWith('_count_')) {
+          if (key === '_count__all') {
+            countObj._all = val as number;
+            hasCountFields = true;
+          } else if (key.startsWith('_count_')) {
             const col = key.slice(7);
             const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
             countObj[field] = val as number;

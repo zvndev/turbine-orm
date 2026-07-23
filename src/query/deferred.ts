@@ -60,6 +60,14 @@ export interface QueryEvent {
   rows: number;
   timestamp: Date;
   error?: Error;
+  /**
+   * Set to `'auto-batched'` on the statements of a query whose
+   * `relationLoadStrategy: 'auto'` engaged the per-relation batched fallback
+   * (the base statement and every batched follow-up). Absent for the plain join
+   * path, explicit `'join'`/`'batched'`, and non-auto queries, so production
+   * observability can see exactly which queries the auto default re-planned.
+   */
+  strategy?: 'auto-batched';
 }
 
 export type QueryEventListener = (event: QueryEvent) => void;
@@ -144,6 +152,16 @@ export interface QueryInterfaceOptions {
    * silently; see the PowDB docs).
    */
   relationLoadStrategy?: RelationLoadStrategy;
+  /**
+   * When `true`, every to-many `with` relation that carries no explicit
+   * `orderBy` is loaded ordered by the target table's primary key ascending, so
+   * unordered child arrays come back in a deterministic order (json_agg / batched
+   * loaders otherwise leave child-array order engine-dependent). An explicit
+   * per-relation `orderBy` always wins, and a per-query `stableRelationOrder`
+   * overrides this default. Default `false`; when off the emitted SQL is
+   * byte-identical to before. SQL engines only (PowDB keeps its own defaults).
+   */
+  stableRelationOrder?: boolean;
   /**
    * How nested-relation subqueries encode each row's JSON: `'object'` (default,
    * `json_build_object`) or `'positional'` (`json_build_array`, key-less — see

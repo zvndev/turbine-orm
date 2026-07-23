@@ -15,6 +15,7 @@ import type pg from 'pg';
 import type { Dialect } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
 import { NotFoundError, TimeoutError, UnsupportedFeatureError, ValidationError, wrapPgError } from '../errors.js';
+import { missingIndexForRelation, schemaHasIndexInfo } from '../index-advisor.js';
 import {
   executeNestedCreate,
   executeNestedUpdate,
@@ -22,7 +23,7 @@ import {
   type NestedWriteContext,
 } from '../nested-write.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
-import { camelToSnake, snakeToCamel } from '../schema.js';
+import { camelToSnake, normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import * as aggMod from './aggregates.js';
 import {
   type BatchedChildReader,
@@ -31,8 +32,10 @@ import {
   neededParentKeyFields,
   type RelationLoadContext,
   rejectNestedPickOrder,
+  resolveCountRelations,
   stripFields,
 } from './batched-loader.js';
+import { expandCompoundUniqueWhere } from './compound-unique.js';
 import {
   isJsonPathOrderBy,
   isOrderBySpec,
@@ -68,8 +71,12 @@ import type {
   UpdateManyArgs,
   UpsertArgs,
   WithClause,
+  WithCount,
+  WithOptions,
+  WithOrderByObject,
 } from './types.js';
 import { LRUCache, ownLookup, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
+import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 import type { WhereHost } from './where-compile.js';
@@ -184,6 +191,34 @@ function cacheParamsEqual(a: unknown[], b: unknown[]): boolean {
   return true;
 }
 
+/**
+ * Return `args` with any Prisma compound-unique selector in `args.where`
+ * expanded to its column conjunction (see {@link expandCompoundUniqueWhere}).
+ * Returns the same `args` reference when nothing expands, so untouched queries
+ * are byte-identical. Generic so it serves every unique-`where` arg shape.
+ */
+function maybeExpandCompoundUnique<A extends { where?: unknown }>(meta: TableMetadata, args: A): A {
+  const where = args.where as Record<string, unknown> | undefined;
+  if (!where) return args;
+  const expanded = expandCompoundUniqueWhere(meta, where);
+  return expanded === where ? args : { ...args, where: expanded };
+}
+
+/**
+ * Whether a relation `with`-clause `orderBy` carries no actual ordering: an
+ * empty array, or an object with no non-`undefined` own keys. Used by
+ * {@link QueryInterface.applyStableRelationOrder} so an explicit (non-empty)
+ * orderBy is never overwritten while an empty `{}` / `[]` still gets the
+ * synthesized PK order.
+ */
+function isEmptyOrderBy(orderBy: unknown): boolean {
+  if (Array.isArray(orderBy)) return orderBy.length === 0;
+  if (orderBy && typeof orderBy === 'object') {
+    return Object.values(orderBy as Record<string, unknown>).every((v) => v === undefined);
+  }
+  return orderBy === undefined || orderBy === null;
+}
+
 // ---------------------------------------------------------------------------
 // Deferred query + option types (see deferred.ts)
 // ---------------------------------------------------------------------------
@@ -229,8 +264,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private sqlCacheEnabled: boolean;
   private readonly dialect: Dialect;
-  /** Client-level default relation-loading strategy ('join' unless configured). */
+  /**
+   * Client-level default relation-loading strategy. When nothing is configured
+   * this is `'auto'` (the implicit default): per-relation, keep the single-
+   * statement join unless the introspected metadata proves a probe is unindexed,
+   * in which case that relation falls back to the batched loader. An explicit
+   * `'join'`/`'batched'` (client or query level) always wins.
+   */
   private readonly relationLoadStrategy: RelationLoadStrategy;
+  /** Client-level default for {@link applyStableRelationOrder} (off unless configured). */
+  private readonly stableRelationOrder: boolean;
   /** Nested-relation JSON encoding: 'object' (default) or 'positional'. */
   private readonly jsonEncoding: 'object' | 'positional';
   /**
@@ -264,9 +307,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private readonly crossSchemaTypeColumns: Set<string>;
 
-  /** Tracks tables that have already triggered a deep-with warning (one-time) */
-  private readonly deepWithWarned = new Set<string>();
-
   /**
    * Per-table memo of date columns keyed by their camelCase FIELD name.
    * `meta.dateColumns` is keyed by raw snake_case column name, which matches
@@ -284,6 +324,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /** Set by executeWithMiddleware so queryWithTimeout can include it in events. */
   private currentAction = 'raw';
+
+  /**
+   * Tags the query events of an in-flight `relationLoadStrategy: 'auto'` query
+   * that engaged the batched fallback (`'auto-batched'`), so observability sees
+   * which queries the auto default re-planned. Same transient-instance-state
+   * caveat as {@link currentAction}: set for the whole auto-split operation and
+   * cleared afterward; a concurrent unrelated query on the same accessor during
+   * that window could read it (a best-effort diagnostic tag, not load-bearing).
+   */
+  private currentStrategyTag: 'auto-batched' | undefined;
 
   /**
    * The active query's `skipGlobalFilters` opt-out, set at the top of each
@@ -362,7 +412,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       sqlCacheSize !== undefined && sqlCacheSize > 0 ? Math.floor(sqlCacheSize) : 1000,
     );
     this.dialect = options?.dialect ?? postgresDialect;
-    this.relationLoadStrategy = options?.relationLoadStrategy ?? 'join';
+    this.relationLoadStrategy = options?.relationLoadStrategy ?? 'auto';
+    this.stableRelationOrder = options?.stableRelationOrder === true;
     this.jsonEncoding = options?.jsonEncoding ?? 'object';
     // Only retain the map when it has at least one entry, so `globalFilters`
     // stays `undefined` (and every merge path a no-op) for the common case.
@@ -540,11 +591,309 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /**
    * Resolve the effective relation-loading strategy for a query: the per-query
-   * arg wins, then the client-level default, then `'join'`. Only meaningful when
+   * arg wins, then the client-level default, then `'auto'`. Only meaningful when
    * a `with` clause is present; the callers gate on that.
    */
   private resolveLoadStrategy(argStrategy: RelationLoadStrategy | undefined): RelationLoadStrategy {
     return argStrategy ?? this.relationLoadStrategy;
+  }
+
+  /**
+   * The effective {@link QueryInterfaceOptions.stableRelationOrder} for a query:
+   * the per-query arg wins, then the client-level default (off).
+   */
+  private resolveStableOrder(argFlag: boolean | undefined): boolean {
+    return argFlag ?? this.stableRelationOrder;
+  }
+
+  /**
+   * Fill a PK-ascending `orderBy` into every to-many `with` relation that has no
+   * explicit one, recursing into nested `with`. Returns a CLONED clause (user
+   * args are never mutated); when nothing needs filling it returns the input
+   * object unchanged, so the byte-identical fast path stays free. Only called
+   * when {@link resolveStableOrder} is true; runs BEFORE `withFingerprint`, so
+   * the two orderings get distinct SQL-cache entries automatically. To-one
+   * relations are single rows (no array to order) and PK-less targets have
+   * nothing stable to order by, so both are left untouched.
+   */
+  private applyStableRelationOrder(withClause: WithClause, table: string, depth = 0): WithClause {
+    if (depth >= 10) return withClause; // parity with the build depth cap
+    const meta = this.schema.tables[table];
+    if (!meta) return withClause;
+    let out: WithClause | undefined;
+    for (const [relName, spec] of Object.entries(withClause)) {
+      if (relName === '_count' || !spec) continue; // `_count` is a count, not a row load
+      const rel = ownLookup(meta.relations, relName);
+      if (!rel) continue; // unknown relation — let the build path surface E005
+      const options: WithOptions = spec === true ? {} : (spec as WithOptions);
+
+      // Recurse first so a nested change alone still clones this level.
+      const nestedWith = options.with as WithClause | undefined;
+      const newNested = nestedWith ? this.applyStableRelationOrder(nestedWith, rel.to, depth + 1) : undefined;
+      const nestedChanged = newNested !== undefined && newNested !== nestedWith;
+
+      const isToMany = rel.type === 'hasMany' || rel.type === 'manyToMany';
+      const hasOrder = options.orderBy !== undefined && !isEmptyOrderBy(options.orderBy);
+      let synthOrder: WithOrderByObject | WithOrderByObject[] | undefined;
+      if (isToMany && !hasOrder) {
+        const targetMeta = this.schema.tables[rel.to];
+        const pk = targetMeta?.primaryKey ?? [];
+        if (targetMeta && pk.length > 0) {
+          const pkFields = pk.map((c) => targetMeta.reverseColumnMap[c] ?? c);
+          synthOrder =
+            pkFields.length === 1 ? { [pkFields[0]!]: 'asc' } : pkFields.map((f) => ({ [f]: 'asc' as const }));
+        }
+      }
+
+      if (!synthOrder && !nestedChanged) continue; // nothing to change — keep the ref
+      out ??= { ...withClause };
+      const clonedSpec: WithOptions = { ...options };
+      if (synthOrder) clonedSpec.orderBy = synthOrder;
+      if (nestedChanged) clonedSpec.with = newNested as WithOptions['with'];
+      out[relName] = clonedSpec;
+    }
+    return out ?? withClause;
+  }
+
+  // -------------------------------------------------------------------------
+  // relationLoadStrategy: 'auto' — per-relation batched fallback when the
+  // introspected metadata proves a probe is unindexed (finding 13).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Whether a relation can be served by the batched loader, i.e. all its
+   * correlation keys are single-column (the loader throws E017 on composite
+   * keys). Composite-key relations therefore always stay on the join plan under
+   * `'auto'` (and keep the existing unindexed-probe dev warning).
+   */
+  private relationBatchEligible(rel: RelationDef): boolean {
+    if (rel.type === 'manyToMany') {
+      const through = rel.through;
+      if (!through) return false;
+      const pkLen = this.schema.tables[rel.to]?.primaryKey.length ?? 0;
+      return (
+        normalizeKeyColumns(through.sourceKey).length === 1 &&
+        normalizeKeyColumns(through.targetKey).length === 1 &&
+        normalizeKeyColumns(rel.referenceKey).length === 1 &&
+        pkLen === 1
+      );
+    }
+    return normalizeKeyColumns(rel.foreignKey).length === 1 && normalizeKeyColumns(rel.referenceKey).length === 1;
+  }
+
+  /**
+   * The verdict for one relation SUBTREE under `'auto'`: is any probe in the
+   * subtree unindexed, is EVERY relation in the subtree batched-eligible, and
+   * the first unindexed probe found (for the dev note). Subtree-atomic: a whole
+   * top-level relation falls back only when its entire subtree is eligible,
+   * mirroring the batched loader recursing the same tree.
+   */
+  private autoSubtreeVerdict(
+    rel: RelationDef,
+    spec: true | WithOptions,
+    depth: number,
+  ): { unindexed: boolean; eligible: boolean; miss?: { table: string; columns: string[]; createSql: string } } {
+    let eligible = this.relationBatchEligible(rel);
+    const ownMiss = missingIndexForRelation(this.schema, rel);
+    let unindexed = ownMiss !== null;
+    let miss = ownMiss ?? undefined;
+
+    const options: WithOptions = spec === true ? {} : spec;
+    const nested = options.with as WithClause | undefined;
+    if (nested && depth < 10) {
+      const targetMeta = this.schema.tables[rel.to];
+      for (const [childName, childSpec] of Object.entries(nested)) {
+        if (!childSpec) continue;
+        if (childName === '_count') {
+          const cv = this.autoCountVerdict(childSpec as unknown as WithCount, targetMeta);
+          eligible = eligible && cv.eligible;
+          unindexed = unindexed || cv.unindexed;
+          if (!miss && cv.miss) miss = cv.miss;
+          continue;
+        }
+        const childRel = ownLookup(targetMeta?.relations ?? {}, childName);
+        if (!childRel) continue; // unknown nested relation — let the build path surface it
+        const v = this.autoSubtreeVerdict(childRel, childSpec, depth + 1);
+        eligible = eligible && v.eligible;
+        unindexed = unindexed || v.unindexed;
+        if (!miss && v.miss) miss = v.miss;
+      }
+    }
+    return { unindexed, eligible, miss };
+  }
+
+  /** The `_count` verdict under `'auto'`: any counted probe unindexed + all single-key. */
+  private autoCountVerdict(
+    countSpec: WithCount,
+    parentMeta: TableMetadata | undefined,
+  ): { unindexed: boolean; eligible: boolean; miss?: { table: string; columns: string[]; createSql: string } } {
+    if (!parentMeta) return { unindexed: false, eligible: true };
+    let rels: RelationDef[];
+    try {
+      rels = resolveCountRelations(parentMeta, countSpec);
+    } catch {
+      return { unindexed: false, eligible: true }; // let the join/loader path surface the error
+    }
+    let unindexed = false;
+    let eligible = true;
+    let miss: { table: string; columns: string[]; createSql: string } | undefined;
+    for (const rel of rels) {
+      if (!this.relationBatchEligible(rel)) eligible = false;
+      const m = missingIndexForRelation(this.schema, rel);
+      if (m) {
+        unindexed = true;
+        miss ??= m;
+      }
+    }
+    return { unindexed, eligible, miss };
+  }
+
+  /**
+   * Partition a top-level `with` clause under `'auto'`: each relation whose
+   * subtree has a PROVEN unindexed probe AND is fully batched-eligible routes to
+   * `batchedWith`; everything else (indexed, composite-key, unknown) stays in
+   * `joinWith` (byte-identical join). The reserved `_count` key partitions the
+   * same way. Also returns the engaged relations for the dev note.
+   */
+  private partitionWithForAuto(withClause: WithClause): {
+    joinWith: WithClause;
+    batchedWith: WithClause;
+    engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[];
+  } {
+    const joinWith: WithClause = {};
+    const batchedWith: WithClause = {};
+    const engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[] = [];
+    for (const [key, spec] of Object.entries(withClause)) {
+      if (!spec) continue;
+      if (key === '_count') {
+        const cv = this.autoCountVerdict(spec as unknown as WithCount, this.tableMeta);
+        if (cv.unindexed && cv.eligible) {
+          batchedWith[key] = spec;
+          engaged.push({ relation: '_count', miss: cv.miss });
+        } else {
+          joinWith[key] = spec;
+        }
+        continue;
+      }
+      const rel = ownLookup(this.tableMeta.relations, key);
+      if (!rel) {
+        joinWith[key] = spec; // unknown relation — let the join path surface E005
+        continue;
+      }
+      const v = this.autoSubtreeVerdict(rel, spec, 0);
+      if (v.unindexed && v.eligible) {
+        batchedWith[key] = spec;
+        engaged.push({ relation: key, miss: v.miss });
+      } else {
+        joinWith[key] = spec;
+      }
+    }
+    return { joinWith, batchedWith, engaged };
+  }
+
+  /**
+   * Plan the `'auto'` split for a query's `with` clause: normalize stable order,
+   * partition, and return the split ONLY when at least one relation falls back
+   * to batched. Returns `null` (→ run the plain join path, byte-identical, same
+   * cache keys) when there is no DB-backed index metadata or nothing qualifies.
+   */
+  private planAuto(
+    withArg: WithClause,
+    stableFlag: boolean | undefined,
+  ): {
+    joinWith: WithClause;
+    batchedWith: WithClause;
+    engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[];
+  } | null {
+    // No DB-backed index info (code-first / defineSchema-only) → cannot PROVE any
+    // probe is unindexed, so 'auto' behaves exactly like 'join'.
+    if (!schemaHasIndexInfo(this.schema)) return null;
+    const withClause = this.resolveStableOrder(stableFlag)
+      ? this.applyStableRelationOrder(withArg, this.table)
+      : withArg;
+    const split = this.partitionWithForAuto(withClause);
+    if (Object.keys(split.batchedWith).length === 0) return null;
+    return split;
+  }
+
+  /** Dev-only once-per-relation note that `'auto'` engaged the batched fallback. */
+  private emitAutoNotes(
+    engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[],
+  ): void {
+    if (process.env.NODE_ENV === 'production') return;
+    for (const e of engaged) {
+      if (!shouldWarnOnce(WARN_NS.autoStrategy, `${this.table}.${e.relation}`)) continue;
+      const probe = e.miss
+        ? `probe "${e.miss.table}"(${e.miss.columns.join(', ')}) has no covering index`
+        : 'a probe in its subtree has no covering index';
+      console.warn(
+        `[turbine] auto strategy: relation "${e.relation}" on "${this.table}" loads batched (${probe}). ` +
+          "Create the covering index (or set `relationLoadStrategy: 'join'` to force the single-statement " +
+          'plan); run `npx turbine doctor` for the exact CREATE INDEX SQL.',
+      );
+    }
+  }
+
+  /**
+   * Execute a findMany/findUnique `'auto'` split: run the base query with the
+   * residual `joinWith` (plus any parent stitch keys the batched subset needs),
+   * then load `batchedWith` via the batched loader and stitch. `single` returns
+   * the first entity (findUnique) instead of the array. Output is identical in
+   * shape to the pure join plan.
+   */
+  private async runAutoSplit(
+    args: FindManyArgs<T> | FindUniqueArgs<T>,
+    split: {
+      joinWith: WithClause;
+      batchedWith: WithClause;
+      engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[];
+    },
+    single: boolean,
+  ): Promise<Record<string, unknown>[] | Record<string, unknown> | null> {
+    this.emitAutoNotes(split.engaged);
+    const { joinWith, batchedWith } = split;
+    // Scope-rule parity with the batched strategy: reject nested pick ordering
+    // on the batched subset up front.
+    rejectNestedPickOrder(batchedWith);
+    const skip = args.skipGlobalFilters;
+    const needed = neededParentKeyFields(this.tableMeta, batchedWith);
+    const proj = includeKeysForBatching(
+      args.select as Record<string, boolean> | undefined,
+      args.omit as Record<string, boolean> | undefined,
+      needed,
+    );
+    const hasJoin = Object.keys(joinWith).length > 0;
+    // Force the residual `with` onto the join plan so the base query never
+    // re-enters this auto planning.
+    const baseArgs = {
+      ...args,
+      with: hasJoin ? joinWith : undefined,
+      select: proj.select,
+      omit: proj.omit,
+      relationLoadStrategy: 'join' as RelationLoadStrategy,
+    };
+
+    this.currentStrategyTag = 'auto-batched';
+    try {
+      const deferred = single
+        ? this.buildFindUnique(baseArgs as Parameters<QueryInterface<T, R>['buildFindUnique']>[0])
+        : this.buildFindMany(baseArgs as Parameters<QueryInterface<T, R>['buildFindMany']>[0]);
+      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+      const rows = deferred.transform(result) as Record<string, unknown>[] | Record<string, unknown> | null;
+      const entities = single ? (rows ? [rows as Record<string, unknown>] : []) : (rows as Record<string, unknown>[]);
+      if (entities.length > 0) {
+        await loadRelationsBatched(
+          this.batchedContext(args.timeout, skip, args.includePii === true),
+          entities,
+          batchedWith,
+          args.timeout,
+        );
+      }
+      stripFields(entities, proj.strip);
+      return single ? (entities[0] ?? null) : entities;
+    } finally {
+      this.currentStrategyTag = undefined;
+    }
   }
 
   /**
@@ -601,7 +950,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * from the returned rows, so the shape matches the join strategy exactly.
    */
   private async runFindManyBatched(args: FindManyArgs<T>): Promise<T[]> {
-    const withClause = args.with as WithClause;
+    // Stable relation order (opt-in): the batched loader forwards each relation's
+    // orderBy into its follow-up query, so filling the synthesized PK order here
+    // makes the batched output deterministic exactly like the join path.
+    const withClause = this.resolveStableOrder(args.stableRelationOrder)
+      ? this.applyStableRelationOrder(args.with as WithClause, this.table)
+      : (args.with as WithClause);
     // Scope-rule parity with the join strategy (which throws at SQL build):
     // reject nested pick-row ordering BEFORE the base query so acceptance
     // never depends on how many rows come back.
@@ -793,7 +1147,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const onQuery = this.options?._onQuery;
     if (!onQuery) return;
     try {
-      onQuery({ sql, params, duration, model: this.table, action, rows, timestamp: new Date(), error });
+      onQuery({
+        sql,
+        params,
+        duration,
+        model: this.table,
+        action,
+        rows,
+        timestamp: new Date(),
+        error,
+        strategy: this.currentStrategyTag,
+      });
     } catch {
       // Listener errors must never crash a query
     }
@@ -975,8 +1339,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
-      if (args.with && this.resolveLoadStrategy(args.relationLoadStrategy) === 'batched') {
-        return this.runFindUniqueBatched(args as unknown as FindUniqueArgs<T>);
+      if (args.with) {
+        const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
+        if (strategy === 'batched') return this.runFindUniqueBatched(args as unknown as FindUniqueArgs<T>);
+        if (strategy === 'auto') {
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder);
+          if (split) return this.runAutoSplit(args as unknown as FindUniqueArgs<T>, split, true);
+        }
       }
       const deferred = this.buildFindUnique(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -991,7 +1360,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * strategy's shape for the one row.
    */
   private async runFindUniqueBatched(args: FindUniqueArgs<T>): Promise<T | null> {
-    const withClause = args.with as WithClause;
+    // Stable relation order (opt-in) — see runFindManyBatched.
+    const withClause = this.resolveStableOrder(args.stableRelationOrder)
+      ? this.applyStableRelationOrder(args.with as WithClause, this.table)
+      : (args.with as WithClause);
     // Same scope-rule parity as runFindManyBatched: reject before querying.
     rejectNestedPickOrder(withClause);
     const needed = neededParentKeyFields(this.tableMeta, withClause);
@@ -1020,6 +1392,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
     args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): DeferredQuery<T | null> {
     this.currentSkip = args.skipGlobalFilters;
+    // Prisma compound-unique selector expansion (before global-filter merge and
+    // fingerprinting, so the cache only ever sees the canonical expanded where).
+    args = maybeExpandCompoundUnique(this.tableMeta, args);
+    // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
+    // relations before fingerprinting (see buildFindMany).
+    if (args.with && this.resolveStableOrder(args.stableRelationOrder)) {
+      const normalized = this.applyStableRelationOrder(args.with as WithClause, this.table);
+      if (normalized !== args.with) args = { ...args, with: normalized as typeof args.with };
+    }
     const includePii = args.includePii === true;
     const columnsList = this.resolveColumns(args.select, args.omit, includePii);
     // A global filter turns the where into `{ AND: [...] }`, which the
@@ -1166,8 +1547,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (process.env.NODE_ENV !== 'production') {
       if (args?.with) {
         const depth = this.measureWithDepth(args.with as WithClause);
-        if (depth > 5 && !this.deepWithWarned.has(this.table)) {
-          this.deepWithWarned.add(this.table);
+        if (depth > 5 && shouldWarnOnce(WARN_NS.deepWith, this.table)) {
           console.warn(
             `[turbine] Deep with clause (depth ${depth}) on "${this.tableMeta.name}" — ` +
               'consider splitting into separate queries for better performance.',
@@ -1177,8 +1557,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     return this.executeWithMiddleware('findMany', (args ?? {}) as Record<string, unknown>, async () => {
-      if (args?.with && this.resolveLoadStrategy(args.relationLoadStrategy) === 'batched') {
-        return this.runFindManyBatched(args as unknown as FindManyArgs<T>);
+      if (args?.with) {
+        const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
+        if (strategy === 'batched') return this.runFindManyBatched(args as unknown as FindManyArgs<T>);
+        if (strategy === 'auto') {
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder);
+          if (split) return this.runAutoSplit(args as unknown as FindManyArgs<T>, split, false) as Promise<T[]>;
+        }
       }
       const deferred = this.buildFindMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
@@ -1303,6 +1688,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): DeferredQuery<T[]> {
     this.currentSkip = args?.skipGlobalFilters;
+    // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
+    // relations BEFORE fingerprinting, so the two orderings get distinct cache
+    // entries and every downstream path (SQL build, collect, parser) inherits it.
+    if (args?.with && this.resolveStableOrder(args.stableRelationOrder)) {
+      const normalized = this.applyStableRelationOrder(args.with as WithClause, this.table);
+      if (normalized !== args.with) args = { ...args, with: normalized as typeof args.with };
+    }
     // `distinct` + relation orderBy is refused up front (E003): the distinct
     // path re-orders in an outer wrapper (`... AS "<table>_distinct" ORDER BY
     // <userOrder>`) where a correlated relation subquery (pick-row, `_count`,
@@ -1634,10 +2026,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
-      if (args?.with && this.resolveLoadStrategy(args.relationLoadStrategy) === 'batched') {
+      if (args?.with) {
+        const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
         // findFirst is findMany + LIMIT 1: batch the single base row, then load.
-        const rows = await this.runFindManyBatched({ ...args, limit: 1 } as unknown as FindManyArgs<T>);
-        return (rows[0] ?? null) as QueryResult<T, R, W, S, O> | null;
+        if (strategy === 'batched') {
+          const rows = await this.runFindManyBatched({ ...args, limit: 1 } as unknown as FindManyArgs<T>);
+          return (rows[0] ?? null) as QueryResult<T, R, W, S, O> | null;
+        }
+        if (strategy === 'auto') {
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder);
+          if (split) {
+            const rows = (await this.runAutoSplit(
+              { ...args, limit: 1 } as unknown as FindManyArgs<T>,
+              split,
+              false,
+            )) as Record<string, unknown>[];
+            return (rows[0] ?? null) as QueryResult<T, R, W, S, O> | null;
+          }
+        }
       }
       const deferred = this.buildFindFirst(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);

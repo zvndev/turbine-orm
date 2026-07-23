@@ -57,6 +57,7 @@ import {
   requireCapability,
   rowToEntity,
 } from './powdb.js';
+import { expandCompoundUniqueWhere } from './query/compound-unique.js';
 import { isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
 import type {
@@ -1205,6 +1206,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
+    // Prisma compound-unique selector → column conjunction (engine parity with
+    // the SQL findUnique family; pure metadata, so this is a one-line adoption).
+    if (args.where) {
+      const expanded = expandCompoundUniqueWhere(this.meta, args.where as Record<string, unknown>);
+      if (expanded !== args.where) args = { ...args, where: expanded as FindUniqueArgs<T>['where'] };
+    }
     return this.withMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       const { rows, native, nestedPlans, residualWith } = await this.runFind(
         { ...args, limit: 1 } as FindManyArgs<T>,
