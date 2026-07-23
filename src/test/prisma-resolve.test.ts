@@ -9,11 +9,13 @@
  */
 
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { resolvePrismaSchema } from '../cli/prisma-resolve.js';
 import { parsePrismaSchema } from '../cli/prisma-schema.js';
-import { generatePrismaMap } from '../generate.js';
-import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
+import { generate, generatePrismaMap } from '../generate.js';
+import type { IndexMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
 // ---------------------------------------------------------------------------
 // Mock metadata helpers
@@ -26,6 +28,7 @@ function table(
     primaryKey?: string[];
     uniqueColumns?: string[][];
     relations?: Record<string, RelationDef>;
+    indexes?: IndexMetadata[];
   } = {},
 ): TableMetadata {
   const columnMap: Record<string, string> = {};
@@ -55,7 +58,7 @@ function table(
     primaryKey: opts.primaryKey ?? ['id'],
     uniqueColumns: opts.uniqueColumns ?? [],
     relations: opts.relations ?? {},
-    indexes: [],
+    indexes: opts.indexes ?? [],
   };
 }
 
@@ -277,5 +280,197 @@ describe('generatePrismaMap - deterministic output', () => {
     assert.match(a, /User: \{\n\s+table: 'shop_users'/);
     assert.match(a, /owner_sku: \['ownerId', 'sku'\]/);
     assert.match(a, /enums: \{ Role: 'shop_role' \}/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX A: two named relations to the same target model (pair by @relation name)
+// ---------------------------------------------------------------------------
+
+// User <- Item via TWO FKs, disambiguated purely by matching @relation names.
+// The inverse (list) sides carry only the name; the owning sides pin the FK.
+const NAMED_RELATION_PRISMA = `
+model User {
+  id            Int    @id
+  createdItems  Item[] @relation("CreatedBy")
+  modifiedItems Item[] @relation("ModifiedBy")
+  @@map("shop_users")
+}
+model Item {
+  id           Int  @id
+  createdById  Int  @map("created_by_id")
+  modifiedById Int  @map("modified_by_id")
+  createdBy    User @relation("CreatedBy", fields: [createdById], references: [id])
+  modifiedBy   User @relation("ModifiedBy", fields: [modifiedById], references: [id])
+  @@map("items")
+}
+`;
+
+function namedRelationSchema(): SchemaMetadata {
+  return {
+    enums: {},
+    tables: {
+      shop_users: table('shop_users', ['id'], {
+        relations: {
+          createdItems: rel('createdItems', 'hasMany', 'items', 'created_by_id'),
+          modifiedItems: rel('modifiedItems', 'hasMany', 'items', 'modified_by_id'),
+        },
+      }),
+      items: table('items', ['id', 'created_by_id', 'modified_by_id'], {
+        relations: {
+          createdBy: rel('createdBy', 'belongsTo', 'shop_users', 'created_by_id'),
+          modifiedBy: rel('modifiedBy', 'belongsTo', 'shop_users', 'modified_by_id'),
+        },
+      }),
+    },
+  };
+}
+
+describe('prisma-schema parser - @relation("Name")', () => {
+  const ast = parsePrismaSchema(NAMED_RELATION_PRISMA);
+  const relName = (modelName: string, fieldName: string): string | undefined => {
+    const field = ast.models.find((m) => m.name === modelName)!.fields.find((f) => f.name === fieldName)!;
+    const attr = field.attrs.find((a) => a.name === 'relation')!;
+    const named = attr.args.find((a) => a.key === 'name' && a.kind === 'string');
+    if (named?.value) return named.value;
+    return attr.args.find((a) => a.key === undefined && a.kind === 'string')?.value;
+  };
+
+  it('captures the relation name on the inverse (no fields) side', () => {
+    assert.equal(relName('User', 'createdItems'), 'CreatedBy');
+    assert.equal(relName('User', 'modifiedItems'), 'ModifiedBy');
+  });
+
+  it('captures the relation name on the owning (fields/references) side', () => {
+    assert.equal(relName('Item', 'createdBy'), 'CreatedBy');
+    assert.equal(relName('Item', 'modifiedBy'), 'ModifiedBy');
+  });
+});
+
+describe('resolvePrismaSchema - two named relations to one model', () => {
+  const res = resolvePrismaSchema(parsePrismaSchema(NAMED_RELATION_PRISMA), namedRelationSchema());
+
+  it('resolves both named pairs with zero ambiguous items', () => {
+    assert.equal(res.hasUnresolved, false);
+  });
+
+  it('pairs each inverse list relation through the same-named owning FK', () => {
+    const user = res.map.models.User!;
+    assert.deepEqual(user.relations.createdItems, { name: 'createdItems', cardinality: 'many' });
+    assert.deepEqual(user.relations.modifiedItems, { name: 'modifiedItems', cardinality: 'many' });
+  });
+
+  it('resolves the owning (belongsTo) sides too', () => {
+    const item = res.map.models.Item!;
+    assert.deepEqual(item.relations.createdBy, { name: 'createdBy', cardinality: 'one' });
+    assert.deepEqual(item.relations.modifiedBy, { name: 'modifiedBy', cardinality: 'one' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX B: @@unique matched by a UNIQUE INDEX (not only a constraint)
+// ---------------------------------------------------------------------------
+
+const uniqueIndex = (name: string, columns: string[], partial = false): IndexMetadata =>
+  ({ name, columns, unique: true, definition: '', ...(partial ? { partial: true } : {}) }) as IndexMetadata;
+
+describe('resolvePrismaSchema - @@unique backed by a unique index', () => {
+  const PRISMA = `
+model Product {
+  id      Int    @id
+  ownerId Int    @map("owner_id")
+  sku     String
+  @@unique([ownerId, sku])
+  @@map("products")
+}
+`;
+
+  it('resolves a compound unique that exists ONLY as a unique index', () => {
+    const schema: SchemaMetadata = {
+      enums: {},
+      tables: {
+        products: table('products', ['id', 'owner_id', 'sku'], {
+          // No unique CONSTRAINT; the composite unique is a unique INDEX.
+          uniqueColumns: [],
+          indexes: [uniqueIndex('products_owner_id_sku_key', ['owner_id', 'sku'])],
+        }),
+      },
+    };
+    const res = resolvePrismaSchema(parsePrismaSchema(PRISMA), schema);
+    const cu = res.models[0]!.compoundUniques[0]!;
+    assert.equal(cu.status, 'resolved');
+    assert.equal(res.hasUnresolved, false);
+    assert.deepEqual(res.map.models.Product!.compoundUniques.ownerId_sku, ['ownerId', 'sku']);
+  });
+
+  it('ignores a PARTIAL unique index (does not enforce table-wide uniqueness)', () => {
+    const schema: SchemaMetadata = {
+      enums: {},
+      tables: {
+        products: table('products', ['id', 'owner_id', 'sku'], {
+          uniqueColumns: [],
+          indexes: [uniqueIndex('products_owner_id_sku_partial', ['owner_id', 'sku'], true)],
+        }),
+      },
+    };
+    const res = resolvePrismaSchema(parsePrismaSchema(PRISMA), schema);
+    assert.equal(res.models[0]!.compoundUniques[0]!.status, 'unresolved');
+    assert.ok(res.hasUnresolved);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX D: --keep-column-names maps fields to raw DB column spellings
+// ---------------------------------------------------------------------------
+
+describe('resolvePrismaSchema - keepColumnNames', () => {
+  const res = resolvePrismaSchema(parsePrismaSchema(SHOP_PRISMA), mockSchema(), { keepColumnNames: true });
+
+  it('maps @map fields to the raw DB column name, not camelCase', () => {
+    assert.equal(res.map.models.User!.fields.displayName, 'display_name');
+    assert.equal(res.map.models.Order!.fields.buyerId, 'buyer_id');
+    assert.equal(res.map.models.Product!.fields.ownerId, 'owner_id');
+  });
+
+  it('emits column-name compound-unique field lists', () => {
+    assert.deepEqual(res.map.models.Product!.compoundUniques.owner_sku, ['owner_id', 'sku']);
+  });
+
+  it('leaves relations, accessors, and tables camelCase / snake as before', () => {
+    assert.equal(res.map.models.User!.table, 'shop_users');
+    assert.equal(res.map.models.User!.accessor, 'shopUsers');
+    assert.deepEqual(res.map.models.Order!.relations.buyer, { name: 'buyer', cardinality: 'one' });
+  });
+
+  it('serializes the DB column spellings into the emitted map module', () => {
+    const src = generatePrismaMap(res.map, { noTimestamp: true });
+    assert.match(src, /displayName: 'display_name'/);
+    assert.doesNotMatch(src, /displayName: 'displayName'/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX C: the client is emitted from live metadata even on the partial path
+// ---------------------------------------------------------------------------
+
+describe('migrate-from-prisma - client emission on the partial path', () => {
+  it('generate() emits the standard client files even when resolution is partial', () => {
+    // A schema with one model that does not resolve makes the run partial.
+    const partial = resolvePrismaSchema(
+      parsePrismaSchema(`${SHOP_PRISMA}\nmodel Gadget {\n  id Int @id\n}`),
+      mockSchema(),
+    );
+    assert.equal(partial.hasUnresolved, true);
+
+    // The command generates the client from the live introspected metadata, so
+    // the unresolved item does not block it. Mirror that generate() call here.
+    const dir = mkdtempSync(join(process.cwd(), 'tmp-prisma-client-'));
+    try {
+      const gen = generate({ schema: mockSchema(), outDir: dir, noTimestamp: true });
+      assert.deepEqual([...gen.files].sort(), ['index.ts', 'metadata.ts', 'types.ts']);
+      for (const f of gen.files) assert.ok(existsSync(join(dir, f)), `${f} should be written`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

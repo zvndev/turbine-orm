@@ -1349,10 +1349,11 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
 
   // Resolve against the live database, unless --no-db (parse-only).
   let schemaMeta: Awaited<ReturnType<typeof introspect>> | null = null;
+  let url: string | undefined;
   if (args.noDb) {
     info('Parse-only mode (--no-db): names will not be resolved.');
   } else {
-    const url = requireUrl(config);
+    url = requireUrl(config);
     label('Database', redactUrl(url));
     const spinner = new Spinner('Introspecting database schema').start();
     schemaMeta = await introspect({
@@ -1369,7 +1370,10 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
   }
   newline();
 
-  const result = resolvePrismaSchema(ast, schemaMeta);
+  // `--keep-column-names` makes the generated client key fields by raw DB column
+  // names; resolve the name map against the same transformed schema so the
+  // emitted PRISMA_MAP field values agree with the client (D).
+  const result = resolvePrismaSchema(ast, schemaMeta, { keepColumnNames: config.keepColumnNames });
 
   // Console summary.
   header('Resolution');
@@ -1397,10 +1401,27 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
   );
   console.log(`  ${dim(symbols.teeEnd)} ${cyan(reportPath)} ${dim('(report)')}`);
 
-  if (!args.noDb) {
+  if (!args.noDb && schemaMeta) {
     const mapPath = join(outDir, 'prisma-map.ts');
     writeFileSync(mapPath, generatePrismaMap(result.map, { noTimestamp: args.noTimestamp }), 'utf-8');
     console.log(`  ${dim(symbols.teeEnd)} ${cyan(mapPath)} ${dim('(typed name map)')}`);
+
+    // Always emit the standard generated client alongside the report + name map.
+    // It is built from the live introspected metadata, so unresolved Prisma
+    // items never block it; a partially resolved run (--allow-partial) still
+    // gets a working client (C). `--keep-column-names` flows through so the
+    // client's field names match the name map (D).
+    const gen = generate({
+      schema: schemaMeta,
+      outDir: config.out,
+      connectionString: url,
+      noTimestamp: args.noTimestamp,
+      importExtension: config.importExtension,
+      keepColumnNames: config.keepColumnNames,
+    });
+    for (const file of gen.files) {
+      console.log(`  ${dim(symbols.teeEnd)} ${cyan(join(outDir, file))} ${dim('(client)')}`);
+    }
   }
   newline();
 
