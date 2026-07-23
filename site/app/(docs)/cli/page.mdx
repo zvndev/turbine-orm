@@ -24,9 +24,10 @@ Commands:
   migrate create <name>            Create a new SQL migration file
   migrate create <name> --auto     Auto-generate migration from schema diff
   migrate create <name> --from-diff Like --auto, but flags destructive statements
+  migrate create <name> --recipe <r> Scaffold a sanctioned pattern (e.g. backfill)
   migrate up                     Apply pending migrations
   migrate deploy                 Apply pending migrations without prompts (CI)
-  migrate down                   Rollback the last applied migration
+  migrate down [--step N]        Rollback the last applied migration (or last N)
   migrate status                 Show applied vs pending migrations
   seed                           Run the seed file (.ts / .js / .sql)
   status                         Show connection info + schema summary
@@ -125,7 +126,13 @@ npx turbine push              # Apply schema changes
 npx turbine push --dry-run    # Preview generated SQL without executing
 ```
 
-`push` diffs `turbine/schema.ts` against the live database and executes the difference as a single transaction. Safe to re-run — no-op when the schema already matches. For production deploys, use migrations instead.
+`push` diffs `turbine/schema.ts` against the live database and executes the difference as a single transaction. Safe to re-run: it is a no-op when the schema already matches. For production deploys, use migrations instead.
+
+`push` runs the same destructive scanner as `migrate up`. If the diff contains a data-destroying statement (a `DROP TABLE` / `DROP COLUMN`, a lossy `ALTER COLUMN … TYPE`, and similar), `push` refuses to run, prints an itemized report, and applies nothing. To proceed, confirm interactively (type `destroy my data`, then `yes`) or pass `--allow-destructive`:
+
+```bash
+npx turbine push --allow-destructive   # apply data-destroying schema changes
+```
 
 ## `turbine migrate create <name>`
 
@@ -150,6 +157,16 @@ Like `--auto`, `--from-diff` derives the forward statements into `-- UP` and the
 
 `--from-diff` cannot be combined with `--auto` or `--recipe`.
 
+### `--recipe <name>`
+
+Scaffold a sanctioned migration pattern instead of a blank or diff-derived file. The one recipe today is `backfill`, which lays out the two-phase expand/contract skeleton for changing a populated column's type (nullable add, batched `UPDATE` backfill, `SET NOT NULL`, atomic rename swap) with placeholders to fill in. `--recipe` without a name errors.
+
+```bash
+npx turbine migrate create widen_order_total --recipe backfill
+```
+
+See [Migrations in Practice](/migrate#changing-a-column-type-with-existing-data) for the full pattern.
+
 Example output of `--auto`:
 
 ```sql
@@ -170,7 +187,7 @@ npx turbine migrate up
 npx turbine migrate up --dry-run
 ```
 
-Checks for checksum mismatches before applying — if a previously-applied migration file has been edited, the command halts and reports the conflict.
+Checks for checksum mismatches before applying: if a previously-applied migration file has been edited, the command halts and reports the conflict. Pass `--allow-drift` to bypass that checksum validation when you are intentionally rewriting history. Use `--step N` to apply only the first `N` pending migrations instead of all of them.
 
 ### Destructive-migration guard
 
@@ -195,9 +212,9 @@ npx turbine migrate deploy
 npx turbine migrate deploy --dry-run   # list pending migrations without applying
 ```
 
-`deploy` applies every pending migration inside the same advisory-lock + per-migration-transaction machinery as `migrate up`, and reports `N applied`. It applies files **as written** — the destructive-migration guard runs when you *author* a migration (`create` / `up`), not at deploy time — so it assumes your migration history has already been reviewed.
+`deploy` applies every pending migration inside the same advisory-lock + per-migration-transaction machinery as `migrate up`, and reports `N applied`. It applies files **as written**: the destructive-migration guard runs when you *author* a migration (`create` / `up`), not at deploy time, so it assumes your migration history has already been reviewed. Before it applies anything destructive, `deploy` prints a one-line NOTICE listing the data-destroying statements it is about to run, then proceeds (it never prompts).
 
-It refuses to run (exit 1, clear message) on a **checksum mismatch** or a **missing migration file** — a drifted history fails the deploy instead of silently diverging. It never auto-generates, seeds, or pushes; it only applies pending migrations.
+It refuses to run (exit 1, clear message) on a **checksum mismatch** or a **missing migration file**: a drifted history fails the deploy instead of silently diverging. When you are intentionally deploying over a rewritten history, pass `--allow-drift` to bypass that check (the same escape hatch as `migrate up`). It never auto-generates, seeds, or pushes; it only applies pending migrations.
 
 ```bash
 # Typical CI pipeline
@@ -210,8 +227,11 @@ npx turbine seed
 Roll back the most recently applied migration using its `-- DOWN` section.
 
 ```bash
-npx turbine migrate down
+npx turbine migrate down            # roll back the last migration
+npx turbine migrate down --step 2   # roll back the last 2 migrations
 ```
+
+Pass `--step N` (or `-n N`) to roll back the last `N` applied migrations instead of just one. A `-- DOWN` that drops a column is destructive and hits the same [destructive gate](#destructive-migration-guard) as `migrate up`.
 
 ## `turbine migrate status`
 
@@ -224,16 +244,18 @@ npx turbine migrate status
 Example output:
 
 ```
-Migrations in ./turbine/migrations:
+i 2 applied, 1 pending
 
-  [applied]  20260401120000_create_users.sql
-  [applied]  20260402091234_add_posts.sql
-  [pending]  20260409143022_add_email_index.sql
+ Status    | Migration                          | Applied at
+-----------|------------------------------------|-------------------------
+ v Applied | 20260401120000_create_users.sql    | 2026-04-01 12:00:00 UTC
+ v Applied | 20260402091234_add_posts.sql       | 2026-04-02 09:12:34 UTC
+ . Pending | 20260409143022_add_email_index.sql |
 
-1 pending migration. Run `turbine migrate up` to apply.
+  Run npx turbine migrate up to apply pending migrations.
 ```
 
-Checksum mismatches are reported here too — edited migrations show as `[modified]` and block `migrate up` until resolved.
+Each row carries a status marker: `v Applied`, `. Pending`, or `! Drifted`. An edited migration (its file no longer matches the checksum recorded when it was applied) shows as `! Drifted` and blocks `migrate up` until you reconcile it. An applied migration whose file was deleted from disk shows as `! Missing file`, so a drifted history is visible in `status`, not just at apply time.
 
 ## `turbine seed`
 
@@ -372,7 +394,7 @@ const config: TurbineCliConfig = {
   out: './generated/turbine',
   schema: 'public',
   migrationsDir: './turbine/migrations',
-  seedFile: './turbine/seed.ts',
+  seed: './seed.ts',
   schemaFile: './turbine/schema.ts',
 };
 

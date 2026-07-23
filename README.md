@@ -602,22 +602,22 @@ Operators for Postgres array columns (`text[]`, `int[]`, etc.).
 npx turbine <command> [options]
 
 Commands:
-  init                  Initialize a Turbine project (creates config, dirs, templates)
-  generate | pull       Introspect database and generate TypeScript types + client
-  push                  Apply schema-builder definitions to database
-  migrate create <name>            Create a new SQL migration file
-  migrate create <name> --auto     Auto-generate from schema diff
-  migrate create <name> --from-diff Like --auto, but flag destructive statements
-  migrate up                       Apply pending migrations
-  migrate deploy               Apply pending migrations without prompts
-  migrate down                 Rollback last migration
-  migrate status               Show applied/pending migrations
-  seed                         Run seed file
-  status                       Show database schema summary
-  doctor                       Check relations for missing FK indexes (--fix emits migration)
-  studio                       Launch local Studio web UI (read-only; --write for writes, --demo for a sample DB)
-  mcp                          Start read-only MCP server over JSON-RPC stdio
-  observe                      Launch local metrics dashboard (requires TURBINE_OBSERVE_URL)
+  init                               Initialize a Turbine project (creates config, dirs, templates)
+  generate | pull                    Introspect database and generate TypeScript types + client
+  push                               Apply schema-builder definitions to database
+  migrate create <name>              Create a new SQL migration file
+  migrate create <name> --auto       Auto-generate from schema diff
+  migrate create <name> --from-diff  Like --auto, but flag destructive statements
+  migrate up                         Apply pending migrations
+  migrate deploy                     Apply pending migrations without prompts
+  migrate down                       Rollback last migration (--step N for last N)
+  migrate status                     Show applied/pending migrations
+  seed                               Run seed file
+  status                             Show database schema summary
+  doctor                             Check relations for missing FK indexes (--fix emits migration)
+  studio                             Launch local Studio web UI (read-only; --write for writes, --demo for a sample DB)
+  mcp                                Start read-only MCP server over JSON-RPC stdio
+  observe                            Launch local metrics dashboard (requires TURBINE_OBSERVE_URL)
 
 Options:
   --url, -u <url>       Postgres connection string
@@ -625,6 +625,10 @@ Options:
   --schema, -s <name>   Postgres schema (default: public)
   --auto                Auto-generate migration from schema diff
   --from-diff           Like --auto, but flag destructive statements (migrate create)
+  --recipe <name>       Scaffold a sanctioned pattern, e.g. backfill (migrate create)
+  --step, -n <N>        Apply/rollback only N migrations (migrate up / down)
+  --allow-drift         Bypass checksum validation (migrate up / deploy)
+  --allow-destructive   Run data-destroying statements without confirmation (up / down / push)
   --dry-run             Show SQL without executing
   --verbose, -v         Detailed output
 ```
