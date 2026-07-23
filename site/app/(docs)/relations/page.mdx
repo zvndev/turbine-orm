@@ -321,6 +321,8 @@ If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop
 
 When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41.0): it compiles the single-statement correlated-subquery plan (`'join'`), but when schema metadata shows a relation's correlation column has **no covering index**, that relation falls back to the batched loader instead of running an unindexed probe per parent row. Engagement is visible: a once-per-relation dev note, and query events carry `strategy: 'auto-batched'`. An explicit `'join'` or `'batched'` (client-wide or per query) always wins over `'auto'`.
 
+> **Tuning note.** `'auto'` only falls back when an index is provably missing; it keeps the join plan for indexed relations. On endpoints that fan out to very large child sets (megabyte-scale JSON per request), the batched loader's flat rows can still beat the join plan even with healthy indexes. If profiling shows that, pin `relationLoadStrategy: 'batched'` on that query; the output is deep-equal either way.
+
 The correlated-subquery strategy (`relationLoadStrategy: 'join'`) resolves an entire `with` tree in **one** SQL statement: a single round-trip, and an index seek per parent when the child FK is indexed. Two situations favor the alternative:
 
 - **A child FK column is unindexed.** A correlated probe per parent becomes N-parents × full-table-scan. Run [`npx turbine doctor`](/cli#turbine-doctor) to find these — but if you can't add the index yet, batched loading pays that missing index only once.

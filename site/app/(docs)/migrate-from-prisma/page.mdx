@@ -54,6 +54,8 @@ Turbine picks a strategy per relation unless you pin one:
 
 An explicit `'join'` or `'batched'` — at the client or on a single query — always wins over `'auto'`.
 
+`'auto'` only falls back where an index is provably missing. Endpoints that fan out to very large child sets (megabyte-scale JSON per request) can still profile faster on `'batched'` even with healthy indexes; if measurement shows that, pin `relationLoadStrategy: 'batched'` on that query (results are deep-equal either way).
+
 > **Ordering caveat.** `'auto'` can load some relations via the batched path, so an **unordered** child array's order can differ from the pure-join path. Relation-array order under `json_agg` was never guaranteed to begin with. If any code relies on implicit child order, add `orderBy` to that `with` block, or enable [`stableRelationOrder`](#relation-array-order). See [Relation array order](#relation-array-order) below.
 
 ## API mapping
