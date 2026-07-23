@@ -479,6 +479,42 @@ await db.users.upsert({
 
 **Port note:** keep the `upsert` shape identical — it's the only way to get race-free "create or update" without a transaction. PowDB equivalents will need similar atomic primitives in PowQL or a transaction-wrapped fallback documented clearly.
 
+### Nested writes
+
+Relation fields inside `data` are resolved as nested writes, so you can create or wire up related rows in one call. The whole tree runs inside a single transaction, depth-capped at 10.
+
+```ts
+// Create a user and its posts in one statement group
+await db.users.create({
+  data: {
+    email: 'a@b.c',
+    name: 'A',
+    posts: {
+      create: [{ title: 'First' }, { title: 'Second' }],
+      connect: [{ id: 42 }],
+    },
+  },
+});
+
+// Update side: rewire and edit related rows
+await db.users.update({
+  where: { id: 1 },
+  data: {
+    posts: {
+      disconnect: [{ id: 7 }],
+      update: [{ where: { id: 8 }, data: { published: true } }],
+    },
+  },
+});
+```
+
+Available relation operations depend on the write:
+
+- **On `create`:** `create`, `connect`, `connectOrCreate`.
+- **On `update`:** all of the above plus `disconnect`, `set`, `delete`, `update`, `upsert`.
+
+Beyond the depth cap Turbine throws `CircularRelationError` (`TURBINE_E007`) with the full relation path. Many-to-many nested writes are not resolved automatically — write the junction rows directly.
+
 ---
 
 ## 7. Transactions

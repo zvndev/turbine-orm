@@ -218,6 +218,8 @@ await db.users.findMany({
 - **`select` / `omit`** — either one, not both. Picks/drops columns at this level.
 - **Further `with`** — recurses. Depth cap is 10; beyond that Turbine throws `CircularRelationError` (TURBINE_E007) with the full path trail.
 
+> **Relation-array order is not guaranteed.** Without an explicit `orderBy`, a `with` relation comes back in whatever order the loader produces — `json_agg` injects no `ORDER BY`, and the `'auto'` / `'batched'` load strategies can order the same rows differently again. If any code depends on child order, add `orderBy` to that `with` block, or opt into the client-wide `stableRelationOrder` flag (a per-relation `orderBy` always wins over it).
+
 ## Relation filters on the parent
 
 Filter parents *by* their relations without loading them. `some` / `every` / `none`:
@@ -338,7 +340,7 @@ const db = turbine({
 });
 ```
 
-`'batched'` runs the base query without `json_agg` subqueries, then issues **one flat follow-up query per relation** (`WHERE fk = ANY($1)`, chunked at 1,000 keys) and stitches the children onto the parents in memory. D relation levels cost D extra round-trips instead of one, but each is a single indexed key-set lookup and the rows come back flat.
+`'batched'` runs the base query without `json_agg` subqueries, then issues **one flat follow-up query per relation** (`WHERE fk = ANY($1)`, chunked at 32,000 keys) and stitches the children onto the parents in memory. D relation levels cost D extra round-trips instead of one, but each is a single indexed key-set lookup and the rows come back flat.
 
 The result is **deep-equal** to the join strategy — same shape, same camelCase keys, same `Date` coercion — so you can flip the flag without touching the rest of your code. It honors per-relation `where` / `select` / `omit` / `orderBy` and nested `with`. The per-relation `limit` is applied **client-side per parent** (a `LIMIT` on a batched `= ANY($1)` would cap total children, not children-per-parent). And it's **transaction-safe**: the follow-up queries run on the same pinned connection, so batched loads inside `$transaction` see the transaction's own writes.
 
