@@ -1098,14 +1098,34 @@ function makeDelegate(
   getQI: () => CompatQueryInterface,
 ): PrismaModelDelegate<PrismaModelTypes> {
   const pe = ctx.options.prismaErrorCodes;
-  const lift = <T>(run: () => Promise<T>, batchable?: Batchable): CompatPromise<T> =>
-    new CompatPromise<T>(async () => {
+  // Build a lazy Prisma-style promise for one delegate call. Crucially, the
+  // Prisma-arg `translate` step runs INSIDE the deferred paths (the run closure
+  // and the batchable build closure), never eagerly at call time: a
+  // translation/validation error (unknown relation in `include`, unknown
+  // compound selector, negative take, ...) must surface as a REJECTED promise
+  // so a Prisma-shaped `.catch()` fires, not as a synchronous throw. The
+  // async run wrapper also converts any synchronous throw from the underlying
+  // `qi.*` build into a rejection; the array `$transaction([...])` batch path
+  // catches the same throw from `batch.build`.
+  const defer = <T>(
+    translate: () => Args,
+    run: (qi: CompatQueryInterface, t: Args) => Promise<T>,
+    batch?: {
+      build: (qi: CompatQueryInterface, t: Args) => DeferredQuery<unknown>;
+      reshape: (raw: unknown) => unknown;
+    },
+  ): CompatPromise<T> => {
+    const batchable: Batchable | undefined = batch
+      ? { build: () => batch.build(getQI(), translate()), reshape: batch.reshape }
+      : undefined;
+    return new CompatPromise<T>(async () => {
       try {
-        return await run();
+        return await run(getQI(), translate());
       } catch (err) {
         throw decorate(err, pe);
       }
     }, batchable);
+  };
 
   const requireWhere = (args: Args | undefined, op: string): Args => {
     if (!args || args.where === undefined) {
@@ -1115,167 +1135,137 @@ function makeDelegate(
   };
 
   return {
-    findMany: (args = {}) => {
-      const t = translateReadArgs(ctx, mm, args);
-      return lift(
-        () =>
-          getQI()
-            .findMany(t)
-            .then((r) => reshapeRows(ctx, mm, r)),
-        { build: () => getQI().buildFindMany(t), reshape: (raw) => reshapeRows(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row'][]>;
-    },
-    findFirst: (args = {}) => {
-      const t = translateReadArgs(ctx, mm, args);
-      return lift(
-        () =>
-          getQI()
-            .findFirst(t)
-            .then((r) => reshapeRowOrNull(ctx, mm, r)),
-        { build: () => getQI().buildFindFirst(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row'] | null>;
-    },
-    findUnique: (args) => {
-      const t = translateReadArgs(ctx, mm, requireWhere(args, 'findUnique'));
-      return lift(
-        () =>
-          getQI()
-            .findUnique(t)
-            .then((r) => reshapeRowOrNull(ctx, mm, r)),
-        { build: () => getQI().buildFindUnique(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row'] | null>;
-    },
-    findFirstOrThrow: (args = {}) => {
-      const t = translateReadArgs(ctx, mm, args);
-      return lift(
-        () =>
-          getQI()
-            .findFirstOrThrow(t)
-            .then((r) => reshapeRow(ctx, mm, r)),
-        { build: () => getQI().buildFindFirstOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row']>;
-    },
-    findUniqueOrThrow: (args) => {
-      const t = translateReadArgs(ctx, mm, requireWhere(args, 'findUniqueOrThrow'));
-      return lift(
-        () =>
-          getQI()
-            .findUniqueOrThrow(t)
-            .then((r) => reshapeRow(ctx, mm, r)),
-        { build: () => getQI().buildFindUniqueOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row']>;
-    },
-    create: (args) => {
-      const t: Args = { data: translateWriteData(ctx, mm, (args as Args).data) };
-      if (typeof (args as Args).timeout === 'number') t.timeout = (args as Args).timeout;
-      return lift(
-        () =>
-          getQI()
-            .create(t)
-            .then((r) => reshapeRow(ctx, mm, r)),
-        { build: () => getQI().buildCreate(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row']>;
-    },
-    createMany: (args) => {
-      const data = (args as Args).data;
-      const rows = Array.isArray(data) ? data.map((d) => translateWriteData(ctx, mm, d)) : [];
-      const t: Args = { data: rows };
-      if ((args as Args).skipDuplicates) t.skipDuplicates = true;
-      return lift(
-        () =>
-          getQI()
-            .createMany(t)
-            .then((r) => ({ count: (r as unknown[]).length })),
-        { build: () => getQI().buildCreateMany(t), reshape: (raw) => ({ count: (raw as unknown[]).length }) },
-      ) as unknown as Promise<{ count: number }>;
-    },
-    update: (args) => {
-      const a = requireWhere(args, 'update');
-      const t: Args = { where: translateWhere(ctx, mm, a.where), data: translateWriteData(ctx, mm, a.data) };
-      return lift(
-        () =>
-          getQI()
-            .update(t)
-            .then((r) => reshapeRow(ctx, mm, r)),
-        { build: () => getQI().buildUpdate(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row']>;
-    },
-    updateMany: (args) => {
-      const a = args as Args;
-      const t: Args = { where: translateWhere(ctx, mm, a.where ?? {}), data: translateWriteData(ctx, mm, a.data) };
-      if (a.where === undefined) t.allowFullTableScan = true;
-      return lift(() => getQI().updateMany(t), {
-        build: () => getQI().buildUpdateMany(t),
-        reshape: (raw) => raw,
-      }) as unknown as Promise<{ count: number }>;
-    },
-    delete: (args) => {
-      const a = requireWhere(args, 'delete');
-      const t: Args = { where: translateWhere(ctx, mm, a.where) };
-      return lift(
-        () =>
-          getQI()
-            .delete(t)
-            .then((r) => reshapeRow(ctx, mm, r)),
-        { build: () => getQI().buildDelete(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row']>;
-    },
-    deleteMany: (args = {}) => {
-      const a = args as Args;
-      const t: Args = { where: translateWhere(ctx, mm, a.where ?? {}) };
-      if (a.where === undefined) t.allowFullTableScan = true;
-      return lift(() => getQI().deleteMany(t), {
-        build: () => getQI().buildDeleteMany(t),
-        reshape: (raw) => raw,
-      }) as unknown as Promise<{ count: number }>;
-    },
-    upsert: (args) => {
-      const a = requireWhere(args, 'upsert');
-      const t: Args = {
-        where: translateWhere(ctx, mm, a.where),
-        create: translateWriteData(ctx, mm, a.create),
-        update: translateWriteData(ctx, mm, a.update),
-      };
-      return lift(
-        () =>
-          getQI()
-            .upsert(t)
-            .then((r) => reshapeRow(ctx, mm, r)),
-        { build: () => getQI().buildUpsert(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row']>;
-    },
-    count: (args = {}) => {
-      const t: Args = {};
-      if ((args as Args).where !== undefined) t.where = translateWhere(ctx, mm, (args as Args).where);
-      if (typeof (args as Args).timeout === 'number') t.timeout = (args as Args).timeout;
-      return lift(() => getQI().count(t), {
-        build: () => getQI().buildCount(t),
-        reshape: (raw) => raw,
-      }) as unknown as Promise<number>;
-    },
-    aggregate: (args) => {
-      const t = translateAggregateArgs(ctx, mm, args as Args, false);
-      return lift(
-        () =>
-          getQI()
-            .aggregate(t)
-            .then((r) => reshapeAggregate(ctx, mm, r)),
-        { build: () => getQI().buildAggregate(t), reshape: (raw) => reshapeAggregate(ctx, mm, raw) },
-      ) as unknown as Promise<Record<string, unknown>>;
-    },
-    groupBy: (args) => {
-      const t = translateAggregateArgs(ctx, mm, args as Args, true);
-      return lift(
-        () =>
-          getQI()
-            .groupBy(t)
-            .then((rows) => (rows as unknown[]).map((r) => reshapeGroupRow(ctx, mm, r))),
+    findMany: (args = {}) =>
+      defer(
+        () => translateReadArgs(ctx, mm, args),
+        (qi, t) => qi.findMany(t).then((r) => reshapeRows(ctx, mm, r)),
+        { build: (qi, t) => qi.buildFindMany(t), reshape: (raw) => reshapeRows(ctx, mm, raw) },
+      ) as unknown as Promise<PrismaModelTypes['Row'][]>,
+    findFirst: (args = {}) =>
+      defer(
+        () => translateReadArgs(ctx, mm, args),
+        (qi, t) => qi.findFirst(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
+        { build: (qi, t) => qi.buildFindFirst(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
+      ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
+    findUnique: (args) =>
+      defer(
+        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUnique')),
+        (qi, t) => qi.findUnique(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
+        { build: (qi, t) => qi.buildFindUnique(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
+      ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
+    findFirstOrThrow: (args = {}) =>
+      defer(
+        () => translateReadArgs(ctx, mm, args),
+        (qi, t) => qi.findFirstOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
+        { build: (qi, t) => qi.buildFindFirstOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+      ) as unknown as Promise<PrismaModelTypes['Row']>,
+    findUniqueOrThrow: (args) =>
+      defer(
+        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUniqueOrThrow')),
+        (qi, t) => qi.findUniqueOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
+        { build: (qi, t) => qi.buildFindUniqueOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+      ) as unknown as Promise<PrismaModelTypes['Row']>,
+    create: (args) =>
+      defer(
+        () => {
+          const t: Args = { data: translateWriteData(ctx, mm, (args as Args).data) };
+          if (typeof (args as Args).timeout === 'number') t.timeout = (args as Args).timeout;
+          return t;
+        },
+        (qi, t) => qi.create(t).then((r) => reshapeRow(ctx, mm, r)),
+        { build: (qi, t) => qi.buildCreate(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+      ) as unknown as Promise<PrismaModelTypes['Row']>,
+    createMany: (args) =>
+      defer(
+        () => {
+          const data = (args as Args).data;
+          const rows = Array.isArray(data) ? data.map((d) => translateWriteData(ctx, mm, d)) : [];
+          const t: Args = { data: rows };
+          if ((args as Args).skipDuplicates) t.skipDuplicates = true;
+          return t;
+        },
+        (qi, t) => qi.createMany(t).then((r) => ({ count: (r as unknown[]).length })),
+        { build: (qi, t) => qi.buildCreateMany(t), reshape: (raw) => ({ count: (raw as unknown[]).length }) },
+      ) as unknown as Promise<{ count: number }>,
+    update: (args) =>
+      defer(
+        () => {
+          const a = requireWhere(args, 'update');
+          return { where: translateWhere(ctx, mm, a.where), data: translateWriteData(ctx, mm, a.data) } as Args;
+        },
+        (qi, t) => qi.update(t).then((r) => reshapeRow(ctx, mm, r)),
+        { build: (qi, t) => qi.buildUpdate(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+      ) as unknown as Promise<PrismaModelTypes['Row']>,
+    updateMany: (args) =>
+      defer(
+        () => {
+          const a = args as Args;
+          const t: Args = { where: translateWhere(ctx, mm, a.where ?? {}), data: translateWriteData(ctx, mm, a.data) };
+          if (a.where === undefined) t.allowFullTableScan = true;
+          return t;
+        },
+        (qi, t) => qi.updateMany(t),
+        { build: (qi, t) => qi.buildUpdateMany(t), reshape: (raw) => raw },
+      ) as unknown as Promise<{ count: number }>,
+    delete: (args) =>
+      defer(
+        () => {
+          const a = requireWhere(args, 'delete');
+          return { where: translateWhere(ctx, mm, a.where) } as Args;
+        },
+        (qi, t) => qi.delete(t).then((r) => reshapeRow(ctx, mm, r)),
+        { build: (qi, t) => qi.buildDelete(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+      ) as unknown as Promise<PrismaModelTypes['Row']>,
+    deleteMany: (args = {}) =>
+      defer(
+        () => {
+          const a = args as Args;
+          const t: Args = { where: translateWhere(ctx, mm, a.where ?? {}) };
+          if (a.where === undefined) t.allowFullTableScan = true;
+          return t;
+        },
+        (qi, t) => qi.deleteMany(t),
+        { build: (qi, t) => qi.buildDeleteMany(t), reshape: (raw) => raw },
+      ) as unknown as Promise<{ count: number }>,
+    upsert: (args) =>
+      defer(
+        () => {
+          const a = requireWhere(args, 'upsert');
+          return {
+            where: translateWhere(ctx, mm, a.where),
+            create: translateWriteData(ctx, mm, a.create),
+            update: translateWriteData(ctx, mm, a.update),
+          } as Args;
+        },
+        (qi, t) => qi.upsert(t).then((r) => reshapeRow(ctx, mm, r)),
+        { build: (qi, t) => qi.buildUpsert(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+      ) as unknown as Promise<PrismaModelTypes['Row']>,
+    count: (args = {}) =>
+      defer(
+        () => {
+          const t: Args = {};
+          if ((args as Args).where !== undefined) t.where = translateWhere(ctx, mm, (args as Args).where);
+          if (typeof (args as Args).timeout === 'number') t.timeout = (args as Args).timeout;
+          return t;
+        },
+        (qi, t) => qi.count(t),
+        { build: (qi, t) => qi.buildCount(t), reshape: (raw) => raw },
+      ) as unknown as Promise<number>,
+    aggregate: (args) =>
+      defer(
+        () => translateAggregateArgs(ctx, mm, args as Args, false),
+        (qi, t) => qi.aggregate(t).then((r) => reshapeAggregate(ctx, mm, r)),
+        { build: (qi, t) => qi.buildAggregate(t), reshape: (raw) => reshapeAggregate(ctx, mm, raw) },
+      ) as unknown as Promise<Record<string, unknown>>,
+    groupBy: (args) =>
+      defer(
+        () => translateAggregateArgs(ctx, mm, args as Args, true),
+        (qi, t) => qi.groupBy(t).then((rows) => (rows as unknown[]).map((r) => reshapeGroupRow(ctx, mm, r))),
         {
-          build: () => getQI().buildGroupBy(t),
+          build: (qi, t) => qi.buildGroupBy(t),
           reshape: (raw) => (raw as unknown[]).map((r) => reshapeGroupRow(ctx, mm, r)),
         },
-      ) as unknown as Promise<Record<string, unknown>[]>;
-    },
+      ) as unknown as Promise<Record<string, unknown>[]>,
   };
 }
 
