@@ -1,5 +1,5 @@
 /**
- * turbine-orm — relationLoadStrategy: 'auto' per-relation fallback (finding 13)
+ * turbine-orm, relationLoadStrategy: 'auto' per-relation fallback (finding 13)
  *
  * 'auto' is the implicit default: a relation stays on the single-statement join
  * unless the introspected metadata PROVES its probe is unindexed, in which case
@@ -84,7 +84,7 @@ function schema(): SchemaMetadata {
   return { enums: {}, tables: { users, posts, notes, events } };
 }
 
-/** A schema with NO index metadata anywhere (code-first) — 'auto' == 'join'. */
+/** A schema with NO index metadata anywhere (code-first), 'auto' == 'join'. */
 function schemaNoIndexInfo(): SchemaMetadata {
   const s = schema();
   for (const t of Object.values(s.tables)) t.indexes = [];
@@ -108,7 +108,7 @@ async function captureWarnings(fn: () => Promise<unknown>): Promise<string[]> {
   return out;
 }
 
-describe("relationLoadStrategy: 'auto' — engagement", () => {
+describe("relationLoadStrategy: 'auto', engagement", () => {
   it('an UNINDEXED-probe relation falls back to a batched follow-up', async () => {
     const { pool, calls } = capturePool();
     const db = new QueryInterface(pool, 'users', schema(), []);
@@ -151,7 +151,7 @@ describe("relationLoadStrategy: 'auto' — engagement", () => {
   });
 });
 
-describe("relationLoadStrategy: 'auto' — explicit override wins", () => {
+describe("relationLoadStrategy: 'auto', explicit override wins", () => {
   it("explicit 'join' keeps the unindexed relation in one statement", async () => {
     const { pool, calls } = capturePool();
     const db = new QueryInterface(pool, 'users', schema(), []);
@@ -172,7 +172,7 @@ describe("relationLoadStrategy: 'auto' — explicit override wins", () => {
   });
 });
 
-describe("relationLoadStrategy: 'auto' — observability", () => {
+describe("relationLoadStrategy: 'auto', observability", () => {
   it('warns once per relation, dev only', async () => {
     const db = qi(schema());
     const warnings = await captureWarnings(async () => {
@@ -221,7 +221,7 @@ describe("relationLoadStrategy: 'auto' — observability", () => {
   });
 });
 
-describe("relationLoadStrategy: 'auto' — findUnique / findFirst", () => {
+describe("relationLoadStrategy: 'auto', findUnique / findFirst", () => {
   it('findUnique falls back for an unindexed relation', async () => {
     const { pool, calls } = capturePool();
     const db = new QueryInterface(pool, 'users', schema(), []);

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — `_count: { _all: true }` record form (finding 9)
+ * turbine-orm, `_count: { _all: true }` record form (finding 9)
  *
  * Build-only SQL + transform assertions for the reserved `_all` COUNT(*) key on
  * BOTH `aggregate` and `groupBy`. Scalar `_count: true` stays byte-identical.

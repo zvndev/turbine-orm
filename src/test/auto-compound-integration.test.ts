@@ -1,5 +1,5 @@
 /**
- * turbine-orm — integration: 'auto' fallback parity + compound-unique lookups
+ * turbine-orm, integration: 'auto' fallback parity + compound-unique lookups
  *
  * Runs against a scratch Postgres seeded by src/test/fixtures/seed.sql. The
  * suite MUTATES its database (drops an FK index, adds a `memberships` table), so
@@ -7,7 +7,7 @@
  *
  *   DATABASE_URL=postgres://.../scratch npx tsx --test src/test/auto-compound-integration.test.ts
  *
- * Gated by DATABASE_URL — absent, every test reports as skipped.
+ * Gated by DATABASE_URL, absent, every test reports as skipped.
  */
 
 import assert from 'node:assert/strict';

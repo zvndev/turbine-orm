@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Prisma compound-unique `where` selectors (finding 7)
+ * turbine-orm, Prisma compound-unique `where` selectors (finding 7)
  *
  * Build-only assertions that a synthetic selector key (`orgId_userId`) expands to
  * its column conjunction across findUnique / update / delete / upsert, is
@@ -27,7 +27,7 @@ function schema(overrides?: (t: TableMetadata) => void): SchemaMetadata {
   return { enums: {}, tables: { memberships } };
 }
 
-describe('compound-unique selector — findUnique', () => {
+describe('compound-unique selector, findUnique', () => {
   it('expands to the column conjunction, byte-identical to the spelled-out form', () => {
     const q = makeQuery('memberships', schema());
     const compound = q.buildFindUnique({ where: { orgId_userId: { orgId: 1, userId: 2 } } } as never);
@@ -91,7 +91,7 @@ describe('compound-unique selector — findUnique', () => {
   });
 });
 
-describe('compound-unique selector — writes', () => {
+describe('compound-unique selector, writes', () => {
   it('update expands the where before the empty-guard and SET compile', () => {
     const q = makeQuery('memberships', schema());
     const { sql, params } = q.buildUpdate({
@@ -120,9 +120,9 @@ describe('compound-unique selector — writes', () => {
   });
 });
 
-describe('compound-unique selector — code-first declared unique index', () => {
+describe('compound-unique selector, code-first declared unique index', () => {
   it('sources the selector from a composite UNIQUE index (defineSchema path)', () => {
-    // No composite uniqueColumns — only a declared unique index carries it.
+    // No composite uniqueColumns, only a declared unique index carries it.
     const s = schema((t) => {
       t.uniqueColumns = [['id']];
       t.indexes = [

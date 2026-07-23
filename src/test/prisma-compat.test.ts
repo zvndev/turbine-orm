@@ -1,8 +1,8 @@
 /**
- * turbine-orm/prisma-compat — DB-less translation + reshaping tests.
+ * turbine-orm/prisma-compat, DB-less translation + reshaping tests.
  *
- * Two harnesses over one fixture (a `@@map` divergence — Prisma `User.email` →
- * column `email_address` — plus a compound `@@unique`, a to-one and a to-many
+ * Two harnesses over one fixture (a `@@map` divergence, Prisma `User.email` →
+ * column `email_address`, plus a compound `@@unique`, a to-one and a to-many
  * relation):
  *   - `sqlDb()` backs each model with a real `makeQuery` QueryInterface, so a
  *     delegate's lazy `build*` produces real SQL to assert against.
@@ -195,7 +195,7 @@ function lastArgs(calls: SpyCall[]): Any {
 // Field / relation name translation
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — field renaming (@@map divergence)', () => {
+describe('prisma-compat, field renaming (@@map divergence)', () => {
   it('renames a where field to its turbine column in real SQL', () => {
     const { schema, map } = fixture();
     const compat = mkCompat(sqlDb(schema), map);
@@ -232,7 +232,7 @@ describe('prisma-compat — field renaming (@@map divergence)', () => {
 // Pagination: take / skip / cursor
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — take/skip', () => {
+describe('prisma-compat, take/skip', () => {
   it('maps take→limit and skip→offset with no cursor', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);
@@ -251,7 +251,7 @@ describe('prisma-compat — take/skip', () => {
   });
 });
 
-describe('prisma-compat — cursor translation', () => {
+describe('prisma-compat, cursor translation', () => {
   it('cursor + skip:1 → exclusive cursor + offset 0 (idiomatic exact match)', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);
@@ -321,7 +321,7 @@ describe('prisma-compat — cursor translation', () => {
 // Compound unique
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — compound unique selectors', () => {
+describe('prisma-compat, compound unique selectors', () => {
   it('default selector name compiles to the column conjunction (via core expansion)', () => {
     const { schema, map } = fixture();
     const compat = mkCompat(sqlDb(schema), map);
@@ -343,7 +343,7 @@ describe('prisma-compat — compound unique selectors', () => {
 // Nested relation include: unsupported offset
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — nested include limits', () => {
+describe('prisma-compat, nested include limits', () => {
   it('throws on skip inside a nested relation include (no offset in with)', () => {
     const { schema, map } = fixture();
     const compat = mkCompat(spyDb(schema).db, map);
@@ -358,7 +358,7 @@ describe('prisma-compat — nested include limits', () => {
 // Result reshaping
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — result reshaping', () => {
+describe('prisma-compat, result reshaping', () => {
   it('renames turbine field keys back to Prisma names on read', async () => {
     const { schema, map } = fixture();
     const { db } = spyDb(schema, { 'users.findMany': [{ id: 1, emailAddress: 'a@b.com', name: 'A' }] });
@@ -402,7 +402,7 @@ describe('prisma-compat — result reshaping', () => {
 // Aggregate / groupBy
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — aggregate / groupBy', () => {
+describe('prisma-compat, aggregate / groupBy', () => {
   it('passes _count { _all: true } through and renames _sum field keys', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);
@@ -438,7 +438,7 @@ describe('prisma-compat — aggregate / groupBy', () => {
 // Writes + createMany skipDuplicates
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — writes', () => {
+describe('prisma-compat, writes', () => {
   it('createMany maps skipDuplicates onto the core option and returns { count }', async () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema, { 'users.createMany': [{ id: 1 }, { id: 2 }] });
@@ -483,7 +483,7 @@ describe('prisma-compat — writes', () => {
 // Laziness + $transaction + build* contract
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — laziness + $transaction', () => {
+describe('prisma-compat, laziness + $transaction', () => {
   it('a delegate call does not execute until awaited (Prisma-style lazy promise)', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);
@@ -517,7 +517,7 @@ describe('prisma-compat — laziness + $transaction', () => {
     ]);
     assert.deepEqual(u, { id: 1, email: 'a@b.com' }, 'user reshaped');
     assert.deepEqual(p, { id: 9, title: 'p' });
-    // Both were built (lazy) — the async create() path never ran.
+    // Both were built (lazy), the async create() path never ran.
     assert.ok(calls.some((c) => c.method === 'buildCreate' && c.table === 'users'));
     assert.ok(!calls.some((c) => c.method === 'create'));
   });
@@ -541,7 +541,7 @@ describe('prisma-compat — laziness + $transaction', () => {
 // build* public-contract pin (RESOLUTIONS: guard the QueryInterface seam)
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — QueryInterface build* contract', () => {
+describe('prisma-compat, QueryInterface build* contract', () => {
   it('every build* method the adapter depends on exists and returns a DeferredQuery', () => {
     const { schema } = fixture();
     const qi = makeQuery('users', schema) as Any;
@@ -574,7 +574,7 @@ describe('prisma-compat — QueryInterface build* contract', () => {
 // Raw SQL
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — raw SQL', () => {
+describe('prisma-compat, raw SQL', () => {
   it('$queryRaw flattens a template, parameterizes values, returns rows', async () => {
     const { schema, map } = fixture();
     const { db } = spyDb(schema);
@@ -617,7 +617,7 @@ describe('prisma-compat — raw SQL', () => {
 // Options: stablePkOrder + prismaErrorCodes
 // ---------------------------------------------------------------------------
 
-describe('prisma-compat — options', () => {
+describe('prisma-compat, options', () => {
   it('stablePkOrder passes through the core stableRelationOrder flag (no tree walking)', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);

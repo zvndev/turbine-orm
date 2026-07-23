@@ -1,5 +1,5 @@
 /**
- * turbine-orm — opt-in stableRelationOrder (finding 10)
+ * turbine-orm, opt-in stableRelationOrder (finding 10)
  *
  * When enabled, every to-many `with` relation lacking an explicit orderBy is
  * loaded ordered by the target PK ascending. Flag OFF must be byte-identical to
@@ -130,7 +130,7 @@ describe('stableRelationOrder ON', () => {
     const explicitOff = makeQuery('users', schema()).buildFindMany({
       with: { posts: { orderBy: { title: 'desc' } } },
     } as never);
-    assert.equal(explicitOn.sql, explicitOff.sql, 'explicit orderBy wins — flag is a no-op');
+    assert.equal(explicitOn.sql, explicitOff.sql, 'explicit orderBy wins, flag is a no-op');
     assert.match(explicitOn.sql, /"title" DESC/);
   });
 

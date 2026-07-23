@@ -1,5 +1,5 @@
 /**
- * turbine-orm/prisma-compat — a typed PrismaClient-surface adapter over a
+ * turbine-orm/prisma-compat, a typed PrismaClient-surface adapter over a
  * {@link TurbineClient}.
  *
  * This subpath lets a codebase that speaks Prisma's `db.model.findMany(...)`
@@ -20,7 +20,7 @@
  *   derivation cannot know).
  * - **`$transaction`** in both forms: a callback (`$transaction(async (tx) => …)`)
  *   and Prisma's lazy array batching (`$transaction([a.create(...), b.update(...)])`)
- *   — the un-awaited delegate calls defer to Turbine's `build*()` methods and
+ *  , the un-awaited delegate calls defer to Turbine's `build*()` methods and
  *   run atomically through the core batch `$transaction([...])` path.
  * - **Raw SQL**: `$queryRaw` / `$executeRaw` tagged templates (with
  *   `Prisma.sql`-style nested-fragment flattening) and the `*Unsafe` variants.
@@ -40,7 +40,7 @@
  * - Fluent relation chaining (`prisma.user.findUnique().posts()`).
  * - Accelerate / Pulse / driver-adapter preview features, the Mongo API, and the
  *   `prisma migrate`/`db` CLI family (Turbine ships its own migrations).
- * - **Inclusive bare cursors whose field is not the sort key** — see
+ * - **Inclusive bare cursors whose field is not the sort key**, see
  *   {@link translateCursor}. A bare Prisma cursor is inclusive; translating it
  *   correctly needs the anchor row's sort-key value. When the cursor field is
  *   the single `orderBy` field (or the cursor is the single-column PK with no
@@ -49,7 +49,7 @@
  *   page. Pair the cursor with `skip: 1` (Prisma's idiom) for the exact
  *   exclusive-cursor + `offset` translation.
  * - **Negative `take`** (take-from-end) and **`skip` on a nested relation
- *   include** throw — Turbine's `with` clause has no offset and no reverse-take.
+ *   include** throw, Turbine's `with` clause has no offset and no reverse-take.
  *
  * ## Type dependencies (0.41.0)
  *
@@ -89,7 +89,7 @@ import type { DeferredQuery } from './query/index.js';
 import type { PrismaCompatMap, PrismaModelMap, RelationDef, SchemaMetadata } from './schema.js';
 
 // ---------------------------------------------------------------------------
-// Minimal TurbineClient view — the exact surface the adapter needs. Declared
+// Minimal TurbineClient view, the exact surface the adapter needs. Declared
 // structurally so the runtime never imports the concrete client (no cycle) and
 // tests can pass a stub. The real `TurbineClient` satisfies it.
 // ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ export interface CompatTurbineClient extends CompatTransactionClient {
 }
 
 // ---------------------------------------------------------------------------
-// Prisma.sql-style raw fragments (local, minimal — never imports @prisma/client)
+// Prisma.sql-style raw fragments (local, minimal, never imports @prisma/client)
 // ---------------------------------------------------------------------------
 
 const SQL_FRAGMENT = Symbol.for('turbine.prismaCompat.sqlFragment');
@@ -164,7 +164,7 @@ function makeSql(strings: readonly string[], values: readonly unknown[]): Sql {
 }
 
 /**
- * `Prisma`-compatible raw-SQL helpers — a minimal local implementation so
+ * `Prisma`-compatible raw-SQL helpers, a minimal local implementation so
  * migrated `Prisma.sql\`…\`` / `Prisma.join(...)` / `Prisma.raw(...)` calls keep
  * composing. Fragments are flattened at execution time into a single
  * parameterized statement (values become `$N`), so composition is injection-safe
@@ -191,7 +191,7 @@ export const Prisma = {
     return makeSql(strings, values);
   },
   /**
-   * A raw, unparameterized SQL fragment. The string is spliced verbatim — never
+   * A raw, unparameterized SQL fragment. The string is spliced verbatim, never
    * pass user input here (matches Prisma's `Prisma.raw` contract).
    */
   raw(sql: string): Sql {
@@ -211,7 +211,7 @@ export interface PrismaCompatOptions {
    * When `true`, every to-many `with` relation lacking an explicit `orderBy` is
    * loaded ordered by the target table's primary key ascending (Prisma's
    * relation rows come back in a stable order). This passes through to Turbine's
-   * core `stableRelationOrder` flag — it never re-walks the `with` tree. An
+   * core `stableRelationOrder` flag, it never re-walks the `with` tree. An
    * explicit per-relation `orderBy` always wins. Default `false`.
    */
   stablePkOrder?: boolean;
@@ -243,13 +243,13 @@ function decorate(err: unknown, prismaErrorCodes: boolean): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// Compat context — the map + schema + resolved lookups, built once per client.
+// Compat context, the map + schema + resolved lookups, built once per client.
 // ---------------------------------------------------------------------------
 
 interface ModelLookups {
   /** turbine field name → prisma field name (result reshaping). */
   reverseFields: Record<string, string>;
-  /** field names are identity (prisma === turbine) — skip rekeying entirely. */
+  /** field names are identity (prisma === turbine), skip rekeying entirely. */
   identityFields: boolean;
   /** turbine relation name → { prismaName, cardinality }. */
   reverseRelations: Record<string, { prismaName: string; cardinality: 'one' | 'many' }>;
@@ -321,8 +321,8 @@ function renameField(mm: PrismaModelMap, prismaField: string): string {
  * Translate a Prisma `where` (or nested relation where) into a Turbine `where`.
  * Renames scalar field keys and relation keys through the map, recurses into
  * `AND`/`OR`/`NOT`, translates relation quantifier filters (`some`/`every`/
- * `none`) against the target model, and rewrites compound-unique selectors —
- * including custom `@@unique(name:)` names — into the core-derived selector form
+ * `none`) against the target model, and rewrites compound-unique selectors -
+ * including custom `@@unique(name:)` names, into the core-derived selector form
  * so Turbine's `findUnique`-family expansion handles them uniformly.
  */
 function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown): Record<string, unknown> | undefined {
@@ -350,7 +350,7 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown): Record<st
       out[rel.name] = translateRelationFilter(ctx, target, val);
       continue;
     }
-    // Scalar field — key renamed, value (literal or operator object) passes
+    // Scalar field, key renamed, value (literal or operator object) passes
     // through unchanged (Prisma operator names match Turbine's).
     out[renameField(mm, key)] = val;
   }
@@ -483,7 +483,7 @@ function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, v
     throw new UnsupportedFeatureError(
       'skip (offset) on a nested relation include',
       'prisma-compat',
-      "Turbine's `with` clause has no offset — page the relation with a separate query.",
+      "Turbine's `with` clause has no offset, page the relation with a separate query.",
     );
   }
   if (target && (val.select !== undefined || val.include !== undefined)) {
@@ -557,7 +557,7 @@ function singleColumnPkField(ctx: Ctx, mm: PrismaModelMap): string | undefined {
  *   it needs the anchor's sort-key value. Compiled to a `gte`/`lte` keyset
  *   predicate merged into `where` ONLY when the cursor is single-field AND that
  *   field is the single `orderBy` field (or, with no `orderBy`, is the
- *   single-column PK). Any other shape THROWS rather than emit a wrong page —
+ *   single-column PK). Any other shape THROWS rather than emit a wrong page -
  *   pair the cursor with `skip: 1` for the exact exclusive translation.
  */
 function translateCursor(
@@ -967,7 +967,7 @@ class CompatPromise<T> implements PromiseLike<T> {
     this.promise ??= this.run();
     return this.promise;
   }
-  // biome-ignore lint/suspicious/noThenProperty: a `then` member is the point — this is an intentional PrismaPromise-style thenable.
+  // biome-ignore lint/suspicious/noThenProperty: a `then` member is the point, this is an intentional PrismaPromise-style thenable.
   then<R1 = T, R2 = never>(
     onFulfilled?: ((value: T) => R1 | PromiseLike<R1>) | null,
     onRejected?: ((reason: unknown) => R2 | PromiseLike<R2>) | null,
@@ -1286,8 +1286,8 @@ function placeholderOf(db: CompatTurbineClient): (n: number) => string {
 }
 
 /**
- * Flatten a Prisma-style tagged template — including nested {@link Sql}
- * fragments — into a single `{ text, params }` pair. Values only ever become
+ * Flatten a Prisma-style tagged template, including nested {@link Sql}
+ * fragments, into a single `{ text, params }` pair. Values only ever become
  * bound `$N` params (never string-concatenated), so composition is
  * injection-safe. `Prisma.raw(...)` fragments are the sole verbatim splice, by
  * contract.
@@ -1437,7 +1437,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
   };
 
   // Assemble the result: model delegates keyed by Prisma model name, plus the
-  // client-level base methods. A plain object suffices — every model is a known
+  // client-level base methods. A plain object suffices, every model is a known
   // key from the map, so no dynamic-access proxy is needed.
   const result: Record<string, unknown> = { ...base };
   for (const [prismaModel, delegate] of delegates) result[prismaModel] = delegate;

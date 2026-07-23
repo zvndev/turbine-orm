@@ -2039,7 +2039,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         throw new UnsupportedFeatureError(
           'createMany({ skipDuplicates: true })',
           'powdb',
-          'PowQL insert has no ON CONFLICT DO NOTHING equivalent — filter duplicates before inserting.',
+          'PowQL insert has no ON CONFLICT DO NOTHING equivalent, filter duplicates before inserting.',
         );
       }
       const inputs = (args.data as Record<string, unknown>[]).map((d) => this.applyPkDefault(d));

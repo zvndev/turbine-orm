@@ -32,7 +32,7 @@ export type OrderDirection = 'asc' | 'desc';
  *     fallback. Output is byte-for-byte identical to `'join'` (the batched loader
  *     guarantees the same result SHAPE); child-array order for a to-many relation
  *     WITHOUT an `orderBy` may differ from the join plan (order was never
- *     guaranteed without `orderBy` — see `stableRelationOrder` to pin it).
+ *     guaranteed without `orderBy`, see `stableRelationOrder` to pin it).
  *     Composite-key relations stay on the join plan (the batched loader does not
  *     support them). Engagement emits a once-per-relation dev note and a
  *     `strategy` tag on the query event.

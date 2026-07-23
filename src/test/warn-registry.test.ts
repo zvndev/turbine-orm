@@ -1,5 +1,5 @@
 /**
- * turbine-orm — process-wide once-per-key dev-warning registry (finding 8)
+ * turbine-orm, process-wide once-per-key dev-warning registry (finding 8)
  *
  * The registry hangs off globalThis under a Symbol.for key so every dual-package
  * / HMR-reevaluated module copy shares ONE dedupe store. These tests drive the
@@ -47,7 +47,7 @@ describe('warn-registry', () => {
     assert.equal(shouldWarnOnce(WARN_NS.unindexedRelation, 'users.posts'), false, 'second copy must not re-warn');
   });
 
-  it('bounded at WARN_ONCE_CAP — stops recording and warning past the cap', () => {
+  it('bounded at WARN_ONCE_CAP, stops recording and warning past the cap', () => {
     for (let i = 0; i < WARN_ONCE_CAP; i++) {
       assert.equal(shouldWarnOnce(NS, `k${i}`), true);
     }

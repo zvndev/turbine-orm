@@ -646,7 +646,7 @@ export const mssqlDialect: Dialect = {
       throw new UnsupportedFeatureError(
         'createMany({ skipDuplicates: true })',
         'mssql',
-        'SQL Server has no ON CONFLICT DO NOTHING equivalent — pre-filter conflicting rows or use a MERGE.',
+        'SQL Server has no ON CONFLICT DO NOTHING equivalent, pre-filter conflicting rows or use a MERGE.',
       );
     }
     return {

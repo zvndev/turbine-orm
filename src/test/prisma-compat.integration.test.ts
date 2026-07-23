@@ -1,5 +1,5 @@
 /**
- * turbine-orm/prisma-compat — end-to-end integration against a real Postgres.
+ * turbine-orm/prisma-compat, end-to-end integration against a real Postgres.
  *
  * Drives the compat client over a self-contained fixture that exercises the
  * hard cases: a `@@map` divergence (Prisma `User.email` → column
@@ -20,7 +20,7 @@ import { skipGate } from './helpers.js';
 const url = process.env.DATABASE_URL;
 const { it, before, after } = skipGate(!url, 'DATABASE_URL not set');
 
-describe('prisma-compat — integration (real Postgres)', () => {
+describe('prisma-compat, integration (real Postgres)', () => {
   let db: TurbineClient;
   let schema: SchemaMetadata;
   let map: PrismaCompatMap;

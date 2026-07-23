@@ -1,5 +1,5 @@
 /**
- * turbine-orm — process-wide once-per-key dev-warning dedupe registry.
+ * turbine-orm, process-wide once-per-key dev-warning dedupe registry.
  *
  * Several dev-only diagnostics (the missing-FK-index warning in relations.ts,
  * the `relationLoadStrategy: 'auto'` engagement note, the deep-`with` warning)
@@ -10,7 +10,7 @@
  *   1. **Dual-package loading.** Turbine ships ESM (`dist/`) AND CJS
  *      (`dist/cjs/`). A mixed `require`/`import` graph (a compat layer, a tool
  *      that loads both) instantiates the module twice, giving two independent
- *      `Set`s that each warn once — a double warning.
+ *      `Set`s that each warn once, a double warning.
  *   2. **Bundler / HMR re-evaluation.** Under Next.js dev the module is
  *      re-evaluated per recompile, resetting a module-level `Set` and making the
  *      warning appear to fire every time.
@@ -18,7 +18,7 @@
  * Hanging the registry off `globalThis` under a `Symbol.for(...)` key gives every
  * module copy in the realm ONE shared registry (cross-copy identity without
  * polluting enumerable globals), and `globalThis` survives webpack recompiles
- * because the realm persists — which is exactly what fixes the every-recompile
+ * because the realm persists, which is exactly what fixes the every-recompile
  * firing in dev servers. Per-process firing (worker threads, separate processes)
  * is acceptable and stays.
  *
@@ -26,7 +26,7 @@
  * {@link WARN_ONCE_CAP} distinct keys. A schema with 500+ distinct unindexed
  * relations has long since gotten the message, and the cap prevents unbounded
  * growth if metadata objects are churned dynamically. (Clearing on overflow
- * would be wrong — it would re-warn.)
+ * would be wrong, it would re-warn.)
  */
 
 const REGISTRY_KEY = Symbol.for('turbine.warnOnce.registry');

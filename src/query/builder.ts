@@ -624,7 +624,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     for (const [relName, spec] of Object.entries(withClause)) {
       if (relName === '_count' || !spec) continue; // `_count` is a count, not a row load
       const rel = ownLookup(meta.relations, relName);
-      if (!rel) continue; // unknown relation — let the build path surface E005
+      if (!rel) continue; // unknown relation, let the build path surface E005
       const options: WithOptions = spec === true ? {} : (spec as WithOptions);
 
       // Recurse first so a nested change alone still clones this level.
@@ -645,7 +645,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
 
-      if (!synthOrder && !nestedChanged) continue; // nothing to change — keep the ref
+      if (!synthOrder && !nestedChanged) continue; // nothing to change, keep the ref
       out ??= { ...withClause };
       const clonedSpec: WithOptions = { ...options };
       if (synthOrder) clonedSpec.orderBy = synthOrder;
@@ -656,7 +656,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // relationLoadStrategy: 'auto' — per-relation batched fallback when the
+  // relationLoadStrategy: 'auto', per-relation batched fallback when the
   // introspected metadata proves a probe is unindexed (finding 13).
   // -------------------------------------------------------------------------
 
@@ -712,7 +712,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           continue;
         }
         const childRel = ownLookup(targetMeta?.relations ?? {}, childName);
-        if (!childRel) continue; // unknown nested relation — let the build path surface it
+        if (!childRel) continue; // unknown nested relation, let the build path surface it
         const v = this.autoSubtreeVerdict(childRel, childSpec, depth + 1);
         eligible = eligible && v.eligible;
         unindexed = unindexed || v.unindexed;
@@ -777,7 +777,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
       const rel = ownLookup(this.tableMeta.relations, key);
       if (!rel) {
-        joinWith[key] = spec; // unknown relation — let the join path surface E005
+        joinWith[key] = spec; // unknown relation, let the join path surface E005
         continue;
       }
       const v = this.autoSubtreeVerdict(rel, spec, 0);
@@ -1360,7 +1360,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * strategy's shape for the one row.
    */
   private async runFindUniqueBatched(args: FindUniqueArgs<T>): Promise<T | null> {
-    // Stable relation order (opt-in) — see runFindManyBatched.
+    // Stable relation order (opt-in), see runFindManyBatched.
     const withClause = this.resolveStableOrder(args.stableRelationOrder)
       ? this.applyStableRelationOrder(args.with as WithClause, this.table)
       : (args.with as WithClause);
