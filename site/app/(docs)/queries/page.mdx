@@ -391,7 +391,7 @@ const breakdown = await db.posts.groupBy({
 });
 ```
 
-Supported aggregate functions: `_count`, `_sum`, `_avg`, `_min`, `_max`. When `_count` is `true` (or omitted), each group includes a `_count` field with the number of rows in that group.
+Supported aggregate functions: `_count`, `_sum`, `_avg`, `_min`, `_max`. When `_count` is `true` (or omitted), each group includes a `_count` field with the number of rows in that group. For Prisma parity you can also pass `_count: { _all: true }`, which returns `_count: { _all: n }` (a record) instead of the scalar number.
 
 ### Grouping and aggregating over JSON paths
 
