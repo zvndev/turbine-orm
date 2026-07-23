@@ -417,6 +417,56 @@ describe('prisma-compat, deferred rejection (never a synchronous throw)', () => 
 // Result reshaping
 // ---------------------------------------------------------------------------
 
+describe('prisma-compat, Postgres time column parity', () => {
+  function timeFixture(): { schema: SchemaMetadata; map: PrismaCompatMap } {
+    const schedules = mockTable('schedules', [
+      { name: 'id', field: 'id' },
+      { name: 'run_at', field: 'runAt', pgType: 'time without time zone' },
+      { name: 'label', field: 'label', pgType: 'text' },
+    ]);
+    schedules.primaryKey = ['id'];
+    const schema: SchemaMetadata = { enums: {}, tables: { schedules } };
+    const map: PrismaCompatMap = {
+      enums: {},
+      models: {
+        Schedule: {
+          table: 'schedules',
+          accessor: 'schedules',
+          fields: { id: 'id', runAt: 'runAt', label: 'label' },
+          relations: {},
+          compoundUniques: {},
+        },
+      },
+    };
+    return { schema, map };
+  }
+
+  it('reshapes a raw HH:MM:SS string to the epoch-day Date convention', async () => {
+    const { schema, map } = timeFixture();
+    const { db } = spyDb(schema, {
+      'schedules.findMany': [{ id: 1, runAt: '17:30:39', label: 'x' }],
+    });
+    const compat = createPrismaCompatClient(db as unknown as TurbineClient, map);
+    // biome-ignore lint/suspicious/noExplicitAny: untyped probe
+    const rows: any[] = await (compat as any).schedule.findMany({});
+    const v = rows[0].runAt;
+    assert.ok(v instanceof Date, 'time value surfaces as a Date');
+    assert.equal(v.toISOString(), '1970-01-01T17:30:39.000Z');
+  });
+
+  it('handles fractional seconds and leaves non-time strings alone', async () => {
+    const { schema, map } = timeFixture();
+    const { db } = spyDb(schema, {
+      'schedules.findMany': [{ id: 1, runAt: '05:00:01.25', label: '17:30:39' }],
+    });
+    const compat = createPrismaCompatClient(db as unknown as TurbineClient, map);
+    // biome-ignore lint/suspicious/noExplicitAny: untyped probe
+    const rows: any[] = await (compat as any).schedule.findMany({});
+    assert.equal(rows[0].runAt.toISOString(), '1970-01-01T05:00:01.250Z');
+    assert.equal(rows[0].label, '17:30:39', 'a text column with a time-shaped value is untouched');
+  });
+});
+
 describe('prisma-compat, delegate property spelling', () => {
   it('exposes each model under both its Prisma name and the lowercased-first-letter alias', async () => {
     const { schema, map } = fixture();

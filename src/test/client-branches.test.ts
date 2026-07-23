@@ -562,3 +562,35 @@ describe('withRetry — branch coverage', () => {
     assert.equal(attempt, 1, 'isRetryable must be strictly true');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 7. pg-style pool option aliases (max / idleTimeoutMillis / connectionTimeoutMillis)
+// ---------------------------------------------------------------------------
+
+describe('pool option aliases', () => {
+  // biome-ignore lint/suspicious/noExplicitAny: reading pg.Pool's options bag
+  const poolOptions = (db: TurbineClient): any => (db as any).pool.options;
+
+  it('accepts the pg spellings as aliases', async () => {
+    const db = new TurbineClient(
+      { host: 'localhost', database: 'x', max: 7, idleTimeoutMillis: 1234, connectionTimeoutMillis: 999 },
+      { tables: {}, enums: {} } as SchemaMetadata,
+    );
+    const opts = poolOptions(db);
+    assert.equal(opts.max, 7);
+    assert.equal(opts.idleTimeoutMillis, 1234);
+    assert.equal(opts.connectionTimeoutMillis, 999);
+    await db.disconnect();
+  });
+
+  it('the turbine-native field wins when both are set', async () => {
+    const db = new TurbineClient(
+      { host: 'localhost', database: 'x', poolSize: 3, max: 7, idleTimeoutMs: 50, idleTimeoutMillis: 1234 },
+      { tables: {}, enums: {} } as SchemaMetadata,
+    );
+    const opts = poolOptions(db);
+    assert.equal(opts.max, 3);
+    assert.equal(opts.idleTimeoutMillis, 50);
+    await db.disconnect();
+  });
+});

@@ -211,6 +211,12 @@ export interface TurbineConfig {
   idleTimeoutMs?: number;
   /** Connection timeout in ms (default: 5000) */
   connectionTimeoutMs?: number;
+  /** pg-style alias for {@link poolSize}; the explicit field wins when both are set. */
+  max?: number;
+  /** pg-style alias for {@link idleTimeoutMs}; the explicit field wins when both are set. */
+  idleTimeoutMillis?: number;
+  /** pg-style alias for {@link connectionTimeoutMs}; the explicit field wins when both are set. */
+  connectionTimeoutMillis?: number;
   /** Enable query logging to console (default: false) */
   logging?: boolean;
   /** Default LIMIT applied to findMany() when no limit is specified (opt-in, default: undefined) */
@@ -793,9 +799,9 @@ export class TurbineClient {
       }
     } else {
       const poolConfig: pg.PoolConfig = {
-        max: config.poolSize ?? 10,
-        idleTimeoutMillis: config.idleTimeoutMs ?? 30_000,
-        connectionTimeoutMillis: config.connectionTimeoutMs ?? 5_000,
+        max: config.poolSize ?? config.max ?? 10,
+        idleTimeoutMillis: config.idleTimeoutMs ?? config.idleTimeoutMillis ?? 30_000,
+        connectionTimeoutMillis: config.connectionTimeoutMs ?? config.connectionTimeoutMillis ?? 5_000,
       };
 
       // Did the caller supply ANY explicit connection target? If not, and a
@@ -852,9 +858,9 @@ export class TurbineClient {
       if (typeof replica === 'string') {
         const replicaPool = new pg.Pool({
           connectionString: replica,
-          max: config.poolSize ?? 10,
-          idleTimeoutMillis: config.idleTimeoutMs ?? 30_000,
-          connectionTimeoutMillis: config.connectionTimeoutMs ?? 5_000,
+          max: config.poolSize ?? config.max ?? 10,
+          idleTimeoutMillis: config.idleTimeoutMs ?? config.idleTimeoutMillis ?? 30_000,
+          connectionTimeoutMillis: config.connectionTimeoutMs ?? config.connectionTimeoutMillis ?? 5_000,
           ...(config.ssl !== undefined ? { ssl: config.ssl } : {}),
         });
         replicaPool.on('error', (err) => {

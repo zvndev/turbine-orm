@@ -255,6 +255,13 @@ interface ModelLookups {
   identityFields: boolean;
   /** turbine relation name → { prismaName, cardinality }. */
   reverseRelations: Record<string, { prismaName: string; cardinality: 'one' | 'many' }>;
+  /**
+   * turbine field names whose column is a Postgres `time` type. Prisma
+   * surfaces those as a `Date` on 1970-01-01 UTC (epoch-day convention);
+   * turbine core returns the driver's raw `HH:MM:SS` string. The adapter
+   * converts on read so `.getHours()`-style call sites survive migration.
+   */
+  timeFields: Set<string>;
 }
 
 interface Ctx {
@@ -266,7 +273,17 @@ interface Ctx {
   options: Required<PrismaCompatOptions>;
 }
 
-function buildLookups(mm: PrismaModelMap): ModelLookups {
+const TIME_PG_TYPES = new Set(['time', 'time without time zone', 'timetz', 'time with time zone']);
+
+/** `HH:MM:SS(.fff)?` (a pg `time` wire value) → Prisma's epoch-day `Date`. */
+function timeStringToDate(v: string): Date | null {
+  const m = v.match(/^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?$/);
+  if (!m) return null;
+  const ms = m[4] ? Math.round(Number(`0.${m[4]}`) * 1000) : 0;
+  return new Date(Date.UTC(1970, 0, 1, Number(m[1]), Number(m[2]), Number(m[3]), ms));
+}
+
+function buildLookups(ctx: Ctx, mm: PrismaModelMap): ModelLookups {
   const reverseFields: Record<string, string> = {};
   let identityFields = true;
   for (const [prismaField, turbineField] of Object.entries(mm.fields)) {
@@ -277,13 +294,17 @@ function buildLookups(mm: PrismaModelMap): ModelLookups {
   for (const [prismaRel, rel] of Object.entries(mm.relations)) {
     reverseRelations[rel.name] = { prismaName: prismaRel, cardinality: rel.cardinality };
   }
-  return { reverseFields, identityFields, reverseRelations };
+  const timeFields = new Set<string>();
+  for (const col of ctx.schema.tables[mm.table]?.columns ?? []) {
+    if (TIME_PG_TYPES.has(col.pgType)) timeFields.add(col.field);
+  }
+  return { reverseFields, identityFields, reverseRelations, timeFields };
 }
 
 function lookupsFor(ctx: Ctx, mm: PrismaModelMap): ModelLookups {
   let l = ctx.lookups.get(mm.table);
   if (!l) {
-    l = buildLookups(mm);
+    l = buildLookups(ctx, mm);
     ctx.lookups.set(mm.table, l);
   }
   return l;
@@ -866,7 +887,11 @@ function reshapeRow(ctx: Ctx, mm: PrismaModelMap, row: unknown): unknown {
       out[rel.prismaName] = rv;
       continue;
     }
-    out[l.identityFields ? key : (l.reverseFields[key] ?? key)] = val;
+    let sv = val;
+    if (typeof sv === 'string' && l.timeFields.has(key)) {
+      sv = timeStringToDate(sv) ?? sv;
+    }
+    out[l.identityFields ? key : (l.reverseFields[key] ?? key)] = sv;
   }
   return out;
 }
@@ -898,7 +923,11 @@ function reshapeAggregate(ctx: Ctx, mm: PrismaModelMap, res: unknown): unknown {
       out[key] = reshapeAggFieldBlock(l, val, false);
       continue;
     }
-    out[l.identityFields ? key : (l.reverseFields[key] ?? key)] = val;
+    let sv = val;
+    if (typeof sv === 'string' && l.timeFields.has(key)) {
+      sv = timeStringToDate(sv) ?? sv;
+    }
+    out[l.identityFields ? key : (l.reverseFields[key] ?? key)] = sv;
   }
   return out;
 }
@@ -930,7 +959,11 @@ function reshapeGroupRow(ctx: Ctx, mm: PrismaModelMap, row: unknown): unknown {
       out[key] = reshapeAggFieldBlock(l, val, false);
       continue;
     }
-    out[l.identityFields ? key : (l.reverseFields[key] ?? key)] = val;
+    let sv = val;
+    if (typeof sv === 'string' && l.timeFields.has(key)) {
+      sv = timeStringToDate(sv) ?? sv;
+    }
+    out[l.identityFields ? key : (l.reverseFields[key] ?? key)] = sv;
   }
   return out;
 }

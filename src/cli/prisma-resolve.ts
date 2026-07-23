@@ -364,6 +364,29 @@ function relationFkColumns(model: PrismaModel, field: PrismaModel['fields'][numb
   return fieldsArg?.items?.map((pf) => fieldColumn(model, pf)) ?? null;
 }
 
+/**
+ * FK columns for an INVERSE relation field (one carrying no `fields: [...]`),
+ * derived by @relation("Name") pairing: the opposing model's same-named field
+ * that owns the FK pins the columns. Returns undefined when there is no
+ * relation name or no named counterpart. This is how Prisma disambiguates two
+ * or more relations to the same target model.
+ */
+function pairedInverseFkColumns(
+  model: PrismaModel,
+  field: PrismaModel['fields'][number] | undefined,
+  targetModelName: string,
+  modelsByName: Map<string, PrismaModel>,
+): string[] | null {
+  const relName = relationNameOf(field);
+  const targetModel = modelsByName.get(targetModelName);
+  if (!relName || !targetModel) return null;
+  const opposing = targetModel.fields.find(
+    (f) =>
+      f.type === model.name && relationNameOf(f) === relName && (relationFkColumns(targetModel, f)?.length ?? 0) > 0,
+  );
+  return opposing ? relationFkColumns(targetModel, opposing) : null;
+}
+
 function resolveRelation(
   model: PrismaModel,
   fieldName: string,
@@ -401,17 +424,7 @@ function resolveRelation(
   // fall back to the ambiguity handling below when there is no relation name or
   // the named pair cannot be found.
   if (!fkColumns || fkColumns.length === 0) {
-    const relName = relationNameOf(field);
-    const targetModel = modelsByName.get(targetModelName);
-    if (relName && targetModel) {
-      const opposing = targetModel.fields.find(
-        (f) =>
-          f.type === model.name &&
-          relationNameOf(f) === relName &&
-          (relationFkColumns(targetModel, f)?.length ?? 0) > 0,
-      );
-      if (opposing) fkColumns = relationFkColumns(targetModel, opposing);
-    }
+    fkColumns = pairedInverseFkColumns(model, field, targetModelName, modelsByName);
   }
 
   const candidates = Object.values(tableMeta.relations).filter((def) => {
@@ -441,6 +454,34 @@ function resolveRelation(
     };
   }
   if (picked.length > 1) {
+    // Elimination pass: an UNNAMED pair can still resolve when every sibling
+    // relation field to the same target pins a different candidate (via its own
+    // `fields: [...]` or @relation("Name") pairing). Subtract those consumed
+    // candidates; exactly one survivor means the unnamed pair is unambiguous by
+    // elimination, which is how Prisma itself resolves it.
+    const consumed = new Set<string>();
+    for (const sibling of model.fields) {
+      if (sibling.name === fieldName || sibling.type !== targetModelName) continue;
+      const sibFks =
+        relationFkColumns(model, sibling) ?? pairedInverseFkColumns(model, sibling, targetModelName, modelsByName);
+      if (!sibFks || sibFks.length === 0) continue;
+      const sibWant = [...sibFks].sort().join(',');
+      for (const def of candidates) {
+        const fk = Array.isArray(def.foreignKey) ? def.foreignKey : [def.foreignKey];
+        if ([...fk].sort().join(',') === sibWant) consumed.add(def.name);
+      }
+    }
+    const surviving = picked.filter((def) => !consumed.has(def.name));
+    if (surviving.length === 1) {
+      const def = surviving[0]!;
+      return {
+        ...base,
+        turbineName: def.name,
+        cardinality,
+        junction: def.type === 'manyToMany' ? def.through?.table : undefined,
+        status: 'resolved',
+      };
+    }
     return {
       ...base,
       reason: `ambiguous - ${picked.length} candidate relations match (${picked.map((d) => d.name).join(', ')})`,

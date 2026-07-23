@@ -269,6 +269,7 @@ If you want a stable default without annotating every relation, opt into `stable
 
 - **`timestamp` columns parse as UTC.** Turbine reads Postgres `timestamp` (without time zone) values as UTC — the same convention Prisma uses — so a migrated app gets **identical instants**, not values shifted by the server's local zone. (Opt out with `utcTimestamps: false` if you relied on local-time parsing.)
 - **Bare to-one relation filters work without `is`.** `where: { vendor: { name: { contains: 'x' } } }` filters by a to-one relation with no `is` wrapper, exactly like Prisma. `is: null` / `isNot: null` compile to `NOT EXISTS` / `EXISTS`.
+- **`time` columns through the compat adapter.** Postgres `time` values surface from `turbine-orm/prisma-compat` as a `Date` on 1970-01-01 UTC, Prisma's epoch-day convention, so `.getHours()`-style call sites keep working. Turbine core keeps the driver's raw `HH:MM:SS` string (a documented core-vs-Prisma difference).
 
 ## Migration checklist
 

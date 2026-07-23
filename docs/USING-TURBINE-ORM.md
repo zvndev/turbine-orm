@@ -170,9 +170,11 @@ import { turbine } from '../generated/turbine';
 
 export const db = turbine({
   connectionString: process.env.DATABASE_URL,
-  max: 10,              // pool size
-  idleTimeoutMillis: 30_000,
+  poolSize: 10,
+  idleTimeoutMs: 30_000,
 });
+// pg-style spellings (max, idleTimeoutMillis, connectionTimeoutMillis) are
+// accepted as aliases; the turbine-native fields win when both are set.
 ```
 
 ### Edge (external pool)

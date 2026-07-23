@@ -368,6 +368,80 @@ describe('resolvePrismaSchema - two named relations to one model', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Elimination: ONE unnamed pair + named pairs to the same target model.
+// After name-pairing consumes the named candidates, exactly one candidate
+// remains for the unnamed pair, so it resolves by elimination (as Prisma does).
+// ---------------------------------------------------------------------------
+
+const ELIMINATION_PRISMA = `
+model User {
+  id            Int    @id
+  items         Item[]
+  modifiedItems Item[] @relation("ModifiedBy")
+  @@map("shop_users")
+}
+model Item {
+  id           Int   @id
+  ownerId      Int?  @map("owner_id")
+  modifiedById Int?  @map("modified_by_id")
+  owner        User? @relation(fields: [ownerId], references: [id])
+  modifiedBy   User? @relation("ModifiedBy", fields: [modifiedById], references: [id])
+  @@map("items")
+}
+`;
+
+function eliminationSchema(): SchemaMetadata {
+  return {
+    enums: {},
+    tables: {
+      shop_users: table('shop_users', ['id'], {
+        relations: {
+          itemsByOwner: rel('itemsByOwner', 'hasMany', 'items', 'owner_id'),
+          itemsByModifier: rel('itemsByModifier', 'hasMany', 'items', 'modified_by_id'),
+        },
+      }),
+      items: table('items', ['id', 'owner_id', 'modified_by_id'], {
+        relations: {
+          owner: rel('owner', 'belongsTo', 'shop_users', 'owner_id'),
+          modifier: rel('modifier', 'belongsTo', 'shop_users', 'modified_by_id'),
+        },
+      }),
+    },
+  };
+}
+
+describe('resolvePrismaSchema - unnamed pair resolves by elimination', () => {
+  const res = resolvePrismaSchema(parsePrismaSchema(ELIMINATION_PRISMA), eliminationSchema());
+
+  it('resolves everything (no ambiguous leftovers)', () => {
+    assert.equal(res.hasUnresolved, false);
+  });
+
+  it('the unnamed inverse takes the candidate the named pair did not consume', () => {
+    const user = res.map.models.User!;
+    assert.deepEqual(user.relations.items, { name: 'itemsByOwner', cardinality: 'many' });
+    assert.deepEqual(user.relations.modifiedItems, { name: 'itemsByModifier', cardinality: 'many' });
+  });
+
+  it('still reports ambiguous when TWO unnamed pairs compete', () => {
+    const twoUnnamed = `
+model User {
+  id     Int    @id
+  a      Item[]
+  b      Item[]
+  @@map("shop_users")
+}
+model Item {
+  id  Int @id
+  @@map("items")
+}
+`;
+    const res2 = resolvePrismaSchema(parsePrismaSchema(twoUnnamed), eliminationSchema());
+    assert.equal(res2.hasUnresolved, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // FIX B: @@unique matched by a UNIQUE INDEX (not only a constraint)
 // ---------------------------------------------------------------------------
 

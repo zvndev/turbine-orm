@@ -15,7 +15,7 @@ import type pg from 'pg';
 import type { Dialect } from '../dialect.js';
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
-import { camelToSnake } from '../schema.js';
+import { camelToSnake, normalizeKeyColumns } from '../schema.js';
 import {
   assertBindableEqualsOperand,
   findArrayUniqueKey,
@@ -1043,7 +1043,51 @@ export function buildRelationFilter(
 
   // Correlation: link child table to parent table (supports composite FKs)
   let correlation: string;
-  if (relDef.type === 'hasMany' || relDef.type === 'hasOne') {
+  if (relDef.type === 'manyToMany') {
+    // The target row is related iff a junction row links it to the parent.
+    // Direct FK correlation (the other branches) would compile target.pk =
+    // parent.pk and silently match nothing, so route through the junction:
+    //   EXISTS (SELECT 1 FROM junction
+    //           WHERE junction.targetKey = target.pk AND junction.sourceKey = parent.ref)
+    // All bare table names (no aliases), so the scoped sub-where machinery and
+    // nested relation filters inside the branch keep their qualification. The
+    // fragment binds no params, so collectRelationFilterParams needs no mirror.
+    if (!relDef.through) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`,
+      );
+    }
+    const qJunction = qi.q(relDef.through.table);
+    const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
+    const targetPk = targetMeta.primaryKey;
+    if (targetPk.length === 0) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}" targets table "${targetTable}" which has no primary key; ` +
+          `cannot correlate the relation filter through the junction.`,
+      );
+    }
+    if (targetKeys.length !== targetPk.length) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}": through.targetKey has ${targetKeys.length} column(s) ` +
+          `but target "${targetTable}" primary key has ${targetPk.length}. Composite keys must pair positionally.`,
+      );
+    }
+    const sourceKeys = normalizeKeyColumns(relDef.through.sourceKey);
+    const refKeys = normalizeKeyColumns(relDef.referenceKey);
+    if (sourceKeys.length !== refKeys.length) {
+      throw new ValidationError(
+        `[turbine] manyToMany relation "${relDef.name}": through.sourceKey has ${sourceKeys.length} column(s) ` +
+          `but referenceKey has ${refKeys.length}. Composite keys must pair positionally.`,
+      );
+    }
+    const targetLink = targetKeys
+      .map((jcol, i) => `${qJunction}.${qi.q(jcol)} = ${qt}.${qi.q(targetPk[i]!)}`)
+      .join(' AND ');
+    const parentLink = sourceKeys
+      .map((jcol, i) => `${qJunction}.${qi.q(jcol)} = ${qSelf}.${qi.q(refKeys[i]!)}`)
+      .join(' AND ');
+    correlation = `EXISTS (SELECT 1 FROM ${qJunction} WHERE ${targetLink} AND ${parentLink})`;
+  } else if (relDef.type === 'hasMany' || relDef.type === 'hasOne') {
     // parent.pk = child.fk
     correlation = qi.dialect.buildCorrelation(qt, relDef.foreignKey, qSelf, relDef.referenceKey);
   } else {

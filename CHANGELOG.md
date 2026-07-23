@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.43.0 (2026-07-23)
+
+### Fixed
+
+- **`where` filters on many-to-many relations now route through the junction table.**
+  A relation filter (`some` / `every` / `none`) on a `manyToMany` relation compiled the
+  direct foreign-key correlation used for `hasMany` / `belongsTo`, which degenerates to
+  `target.pk = parent.pk` and silently matches nothing (a `count` or `findMany` filtered
+  on such a relation returned 0 rows while the `include` path returned the linked rows
+  correctly). The filter now correlates through the junction:
+  `EXISTS (SELECT 1 FROM junction WHERE junction.targetKey = target.pk AND
+  junction.sourceKey = parent.ref)`, composite keys paired positionally, all bare table
+  names so nested relation filters keep working. A `manyToMany` relation missing its
+  `through` descriptor now throws a `ValidationError` instead of compiling wrong SQL.
+- **`migrate-from-prisma` resolves a remaining unnamed relation pair by elimination.**
+  When a model has several relations to the same target and all but one are pinned by
+  `@relation("Name")` pairing or explicit `fields: [...]`, the one unnamed pair now takes
+  the single unconsumed candidate instead of reporting "ambiguous", matching Prisma's own
+  resolution. Two competing unnamed pairs still report ambiguous.
+- **pg-style pool option aliases.** `turbine({ max, idleTimeoutMillis,
+  connectionTimeoutMillis })` now works as documented aliases for `poolSize` /
+  `idleTimeoutMs` / `connectionTimeoutMs` (the turbine-native field wins when both are
+  set). Previously the pg spellings failed typecheck and were silently ignored by
+  untyped callers, producing default pool sizing.
+- **`turbine-orm/prisma-compat` matches Prisma's `time` column convention.** A Postgres
+  `time` / `timetz` value now surfaces from the adapter as a `Date` on 1970-01-01 UTC
+  (Prisma's epoch-day convention) instead of the driver's raw `HH:MM:SS` string, so
+  `.getHours()`-style call sites survive migration. Turbine core is unchanged (raw
+  string, documented).
+
 ## 0.42.0 (2026-07-23)
 
 ### Fixed
