@@ -13,6 +13,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import {
   type ColumnMetadata,
+  type PrismaCompatMap,
   pgTypeToTs,
   type RelationDef,
   type SchemaMetadata,
@@ -812,6 +813,69 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   lines.push('');
 
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// prisma-map.ts generator
+// ---------------------------------------------------------------------------
+
+/**
+ * Serialize a resolved {@link PrismaCompatMap} into a `prisma-map.ts` module
+ * that exports `export const PRISMA_MAP: PrismaCompatMap = {...}`. Written next
+ * to the generated client by `turbine migrate-from-prisma`; consumed later by
+ * the phase-2 `turbine-orm/prisma-compat` runtime adapter.
+ *
+ * Deterministic: uses the same reproducible header as the other emitters, so a
+ * stable input regenerates byte-identical output under `noTimestamp`.
+ */
+export function generatePrismaMap(map: PrismaCompatMap, options?: GenerateFileOptions): string {
+  const lines: string[] = [
+    ...generatedFileHeader(options),
+    "import type { PrismaCompatMap } from 'turbine-orm';",
+    '',
+    '/**',
+    ' * Name map from your Prisma schema onto this Turbine client. Every entry was',
+    ' * resolved against the live database; unresolved items are omitted (see the',
+    ' * migration report). Pass this to the phase-2 prisma-compat adapter, or read',
+    ' * it directly for hand-written compatibility wrappers.',
+    ' */',
+    'export const PRISMA_MAP: PrismaCompatMap = {',
+    '  models: {',
+  ];
+
+  for (const [modelName, model] of Object.entries(map.models)) {
+    lines.push(`    ${quoteIfNeeded(modelName)}: {`);
+    lines.push(`      table: '${escSQ(model.table)}',`);
+    lines.push(`      accessor: '${escSQ(model.accessor)}',`);
+    lines.push(`      fields: ${serializeStringRecord(model.fields)},`);
+    lines.push('      relations: {');
+    for (const [rel, r] of Object.entries(model.relations)) {
+      lines.push(`        ${quoteIfNeeded(rel)}: { name: '${escSQ(r.name)}', cardinality: '${r.cardinality}' },`);
+    }
+    lines.push('      },');
+    lines.push(`      compoundUniques: ${serializeStringArrayRecord(model.compoundUniques)},`);
+    lines.push('    },');
+  }
+  lines.push('  },');
+  lines.push(`  enums: ${serializeStringRecord(map.enums)},`);
+  lines.push('};');
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+/** Serialize a `Record<string, string>` as an inline object literal. */
+function serializeStringRecord(rec: Record<string, string>): string {
+  const entries = Object.entries(rec);
+  if (entries.length === 0) return '{}';
+  return `{ ${entries.map(([k, v]) => `${quoteIfNeeded(k)}: '${escSQ(v)}'`).join(', ')} }`;
+}
+
+/** Serialize a `Record<string, string[]>` as an inline object literal. */
+function serializeStringArrayRecord(rec: Record<string, string[]>): string {
+  const entries = Object.entries(rec);
+  if (entries.length === 0) return '{}';
+  return `{ ${entries.map(([k, v]) => `${quoteIfNeeded(k)}: [${v.map((s) => `'${escSQ(s)}'`).join(', ')}]`).join(', ')} }`;
 }
 
 // ---------------------------------------------------------------------------

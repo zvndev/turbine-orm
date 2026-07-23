@@ -369,3 +369,55 @@ export function singularize(s: string): string {
   if (s.endsWith('s') && !s.endsWith('ss')) return s.slice(0, -1);
   return s;
 }
+
+// ---------------------------------------------------------------------------
+// Prisma-compat name map
+// ---------------------------------------------------------------------------
+
+/**
+ * A typed name map from a Prisma schema onto a Turbine client, produced by
+ * `turbine migrate-from-prisma` (`generatePrismaMap` writes it as a
+ * `prisma-map.ts` module next to the generated client). It is library-side so
+ * the phase-2 `turbine-orm/prisma-compat` runtime adapter can consume the same
+ * shape to translate Prisma model/field/relation/compound-unique names onto the
+ * Turbine surface without re-parsing anything.
+ *
+ * Every name it carries was RESOLVED against live introspected metadata: a model
+ * or field that could not be matched is omitted from the map and listed in the
+ * migration report instead, so the map only ever contains verified mappings.
+ */
+export interface PrismaCompatMap {
+  /** Prisma model name → its resolved mapping. */
+  models: Record<string, PrismaModelMap>;
+  /** Prisma enum name → resolved database enum-type name. */
+  enums: Record<string, string>;
+}
+
+/** One Prisma model's resolved mapping onto a Turbine table + client accessor. */
+export interface PrismaModelMap {
+  /** Resolved snake_case database table name. */
+  table: string;
+  /** camelCase `TurbineClient` accessor (`db.<accessor>`). */
+  accessor: string;
+  /** Prisma field name → Turbine field name (camelCase). Relation fields excluded. */
+  fields: Record<string, string>;
+  /** Prisma relation-field name → resolved Turbine relation + cardinality. */
+  relations: Record<string, PrismaRelationMap>;
+  /**
+   * Prisma compound-unique/compound-id selector name → the Turbine field names
+   * (in declared order). The selector name is Prisma's: the explicit
+   * `@@unique(name:)` / `@@id(name:)` argument, else the field names joined with
+   * `_`. Consumed by the phase-2 client to translate
+   * `where: { <selector>: { ... } }`, including custom `@@unique(name:)` names
+   * the core `findUnique`-family derivation cannot know.
+   */
+  compoundUniques: Record<string, string[]>;
+}
+
+/** A resolved Prisma relation field → Turbine relation. */
+export interface PrismaRelationMap {
+  /** Turbine relation name (the `with` clause key). */
+  name: string;
+  /** `'one'` (to-one) or `'many'` (to-many, including m2m). */
+  cardinality: 'one' | 'many';
+}
