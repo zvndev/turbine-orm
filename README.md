@@ -887,6 +887,22 @@ const db = await turbinePowDB({ embedded: './data', syncMode: 'normal' }, schema
 // const db = await turbinePowDB('powdb://127.0.0.1:7070', schema);
 ```
 
+Migrating from Prisma? `turbine migrate-from-prisma` emits a typed `PRISMA_MAP`, and the
+`turbine-orm/prisma-compat` subpath wraps a `TurbineClient` in Prisma's `db.Model.*`
+surface (no new dependencies):
+
+```ts
+import { TurbineClient } from 'turbine-orm';
+import { createPrismaCompatClient } from 'turbine-orm/prisma-compat';
+import { SCHEMA } from './generated/turbine/metadata.js';
+import { PRISMA_MAP } from './generated/turbine/prisma-map.js';
+
+const db = new TurbineClient({ connectionString: process.env.DATABASE_URL }, SCHEMA);
+const prisma = createPrismaCompatClient(db, PRISMA_MAP);
+
+const users = await prisma.User.findMany({ include: { posts: { take: 5 } } });
+```
+
 ### Capability matrix
 
 Everything is honest about what ports and what doesn't. Features marked **PG-only** throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) on other engines rather than silently degrading.

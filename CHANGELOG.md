@@ -85,6 +85,34 @@
   the output reproducible. The command exits non-zero when anything is unresolved
   (unless `--allow-partial`). `PrismaCompatMap` is exported from the package root so
   runtime consumers can share the shape.
+
+- **`turbine-orm/prisma-compat`, a runtime PrismaClient-surface adapter (phase 2).**
+  `createPrismaCompatClient(db, PRISMA_MAP, options?)` wraps a `TurbineClient` and
+  exposes Prisma's `db.Model.findMany(...)` surface, driven by the `PRISMA_MAP` that
+  `turbine migrate-from-prisma` emits. It is a pure TypeScript shim: **zero new
+  dependencies**, never imported by core. It translates args recursively (`include` →
+  `with`, `select` split into scalar selection + relations, field/relation renames both
+  ways, `take`/`skip` → `limit`/`offset`, compound-unique selectors including custom
+  `@@unique(name:)` names), reshapes results (`_count` keyed back to Prisma relation
+  names, to-one relations surfaced as `object | null`), and supports both `$transaction`
+  forms (callback and Prisma's lazy `$transaction([...])` array batching via the core
+  batch path), `$queryRaw`/`$executeRaw` (with `Prisma.sql`-style nested-fragment
+  flattening) and the `*Unsafe` variants. Options: `stablePkOrder` (passes through the
+  core `stableRelationOrder` flag) and `prismaErrorCodes` (decorates thrown
+  `TurbineError`s with the nearest Prisma code, e.g. `P2002`, without faking
+  `instanceof`). Cursor translation: the idiomatic `cursor` + `skip: n` maps to an exact
+  exclusive cursor + `offset n-1`; a **bare inclusive cursor** compiles to a `gte`/`lte`
+  keyset predicate only when its field is the single `orderBy` key (or the single-column
+  primary key with no `orderBy`) and otherwise throws a descriptive error rather than
+  emit a wrong page. Documented non-goals (client extensions, `$use`, fluent relation
+  chaining, Accelerate/Pulse, the Mongo API, byte-exact error identity) throw or are
+  listed rather than silently mis-behaving.
+
+- **`createMany({ skipDuplicates: true })` is now engine-gated.** PostgreSQL and SQLite
+  emit `ON CONFLICT DO NOTHING` and MySQL emits its no-op `ON DUPLICATE KEY UPDATE`
+  (unchanged); SQL Server and PowDB now throw `UnsupportedFeatureError`
+  (`TURBINE_E017`) instead of silently ignoring the flag and inserting duplicate rows,
+  since neither has a single-statement skip-duplicates form.
 ### Changed
 
 - **Behavior change: `relationLoadStrategy` now defaults to `'auto'` on SQL engines.**
