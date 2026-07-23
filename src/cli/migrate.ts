@@ -50,6 +50,56 @@ export interface MigrationStatus {
   appliedAt?: Date;
   /** True if the file checksum matches the stored checksum (only set for applied migrations) */
   checksumValid?: boolean;
+  /** True when the migration was applied but its file is missing from disk. */
+  missingFile?: boolean;
+}
+
+/** A pending migration whose UP section contains data-destroying statements. */
+export interface DestructiveOffender {
+  file: string;
+  hits: DestructiveStatement[];
+}
+
+/**
+ * A migration that was applied even though an already-applied migration carries
+ * a newer timestamp prefix, i.e. history was written out of order.
+ */
+export interface OutOfOrderApply {
+  /** The out-of-order migration that was just applied. */
+  applied: string;
+  /** The newest previously-applied migration it landed behind. */
+  newestPrior: string;
+}
+
+export interface MigrationRunResult {
+  applied: MigrationFile[];
+  errors: Array<{ file: MigrationFile; error: string }>;
+  /**
+   * Destructive statements found in the pending batch. Populated whether or not
+   * the run was allowed to proceed, so a caller (deploy) can print a notice even
+   * when it applies them by design.
+   */
+  destructive: DestructiveOffender[];
+  /** Migrations applied with a timestamp older than an already-applied one. */
+  outOfOrder: OutOfOrderApply[];
+}
+
+/** Extract the YYYYMMDDHHMMSS timestamp prefix from a migration name, or null. */
+export function migrationTimestamp(name: string): string | null {
+  const m = name.match(/^(\d{14})(?:_|$)/);
+  return m ? m[1]! : null;
+}
+
+/** Scan a set of migration files' UP sections for data-destroying statements. */
+export function collectUpDestructive(files: MigrationFile[]): DestructiveOffender[] {
+  const offenders: DestructiveOffender[] = [];
+  for (const file of files) {
+    const { up } = parseMigrationSQL(file.path);
+    if (!up) continue;
+    const hits = scanDestructiveSql(up);
+    if (hits.length > 0) offenders.push({ file: file.filename, hits });
+  }
+  return offenders;
 }
 
 // ---------------------------------------------------------------------------
@@ -575,7 +625,7 @@ async function validateChecksums(
   return mismatches;
 }
 
-function formatChecksumMismatchError(mismatches: ChecksumMismatch[]): string {
+export function formatChecksumMismatchError(mismatches: ChecksumMismatch[]): string {
   const modified = mismatches.filter((m) => m.type === 'modified');
   const missing = mismatches.filter((m) => m.type === 'missing');
   const lines: string[] = [
@@ -593,7 +643,14 @@ function formatChecksumMismatchError(mismatches: ChecksumMismatch[]): string {
   lines.push('');
   lines.push('Fix one of these:');
   lines.push('  1. Restore the file(s) to their original content, OR');
-  lines.push('  2. Roll back the affected migrations with `npx turbine migrate down`, OR');
+  if (modified.length > 0) {
+    // `migrate down` needs the file on disk to read its DOWN section, so it is
+    // only a remedy for MODIFIED files, never for deleted ones.
+    lines.push('  2. Roll back the affected migrations with `npx turbine migrate down` (modified files only), OR');
+  }
+  if (missing.length > 0) {
+    lines.push('     (deleted files cannot be rolled back: restore the file, then run `migrate down` if needed), OR');
+  }
   lines.push('  3. Pass `--allow-drift` to bypass this check (advanced — make sure you know what you are doing).');
   return lines.join('\n');
 }
@@ -690,7 +747,7 @@ export async function migrateUp(
     adapter?: DatabaseAdapter;
     dialect?: Dialect;
   },
-): Promise<{ applied: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
+): Promise<MigrationRunResult> {
   const client = new pg.Client({ connectionString });
   await client.connect();
 
@@ -731,6 +788,14 @@ export async function migrateUp(
       const applied = await getAppliedMigrations(client, dialect);
       const appliedNames = new Set(applied.map((m) => m.name));
 
+      // Newest already-applied timestamp. Anything applied below this line is
+      // going in out of order (an older migration created/applied after a newer
+      // one). Used to surface a warning; never blocks.
+      const newestPrior = applied
+        .map((m) => ({ ts: migrationTimestamp(m.name), name: m.name }))
+        .filter((m): m is { ts: string; name: string } => m.ts !== null)
+        .sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0))[0];
+
       const allFiles = listMigrationFiles(migrationsDir);
       let pending = allFiles.filter((f) => !appliedNames.has(f.name));
 
@@ -738,36 +803,33 @@ export async function migrateUp(
         pending = pending.slice(0, options.step);
       }
 
+      // Destructive statements in the pending batch, computed once. Returned in
+      // the result regardless of the gate so `deploy` can print a notice even
+      // though it proceeds by design.
+      const destructive = collectUpDestructive(pending);
+
       // Data-loss gate: refuse to run pending migrations containing destructive
       // statements unless the caller has EXPLICITLY opted in. The CLI layers an
       // interactive typed confirmation on top of this; programmatic callers must
       // pass `allowDestructive: true`. Safe-by-default is the whole point — a
       // DROP TABLE should never run just because a file exists.
-      if (!options?.allowDestructive) {
-        const offenders: Array<{ file: string; hits: DestructiveStatement[] }> = [];
-        for (const file of pending) {
-          const { up } = parseMigrationSQL(file.path);
-          if (!up) continue;
-          const hits = scanDestructiveSql(up);
-          if (hits.length > 0) offenders.push({ file: file.filename, hits });
-        }
-        if (offenders.length > 0) {
-          const lines = ['[turbine] Refusing to apply migrations containing DESTRUCTIVE statements:', ''];
-          for (const o of offenders) {
-            lines.push(`  ${o.file}`);
-            for (const h of o.hits) {
-              lines.push(`    - [${h.kind}] ${h.target} — ${DESTRUCTIVE_KIND_LABEL[h.kind]}`);
-            }
+      if (!options?.allowDestructive && destructive.length > 0) {
+        const lines = ['[turbine] Refusing to apply migrations containing DESTRUCTIVE statements:', ''];
+        for (const o of destructive) {
+          lines.push(`  ${o.file}`);
+          for (const h of o.hits) {
+            lines.push(`    - [${h.kind}] ${h.target}: ${DESTRUCTIVE_KIND_LABEL[h.kind]}`);
           }
-          lines.push('');
-          lines.push('Review the statements above. To proceed: run `npx turbine migrate up` interactively');
-          lines.push('and confirm, pass --allow-destructive, or set allowDestructive: true programmatically.');
-          throw new MigrationError(lines.join('\n'));
         }
+        lines.push('');
+        lines.push('Review the statements above. To proceed: run `npx turbine migrate up` interactively');
+        lines.push('and confirm, pass --allow-destructive, or set allowDestructive: true programmatically.');
+        throw new MigrationError(lines.join('\n'));
       }
 
       const results: MigrationFile[] = [];
       const errors: Array<{ file: MigrationFile; error: string }> = [];
+      const outOfOrder: OutOfOrderApply[] = [];
 
       for (const file of pending) {
         const { up } = parseMigrationSQL(file.path);
@@ -785,6 +847,11 @@ export async function migrateUp(
           await client.query(dialect.buildMigrationInsertApplied(quotedTrackingTable(dialect)), [file.name, hash]);
           await client.query('COMMIT');
           results.push(file);
+          // Flag an out-of-order apply: this file's timestamp is older than a
+          // migration that was already applied before this run started.
+          if (newestPrior && file.timestamp && file.timestamp < newestPrior.ts) {
+            outOfOrder.push({ applied: file.filename, newestPrior: `${newestPrior.name}.sql` });
+          }
         } catch (err) {
           await client.query('ROLLBACK');
           const msg = err instanceof Error ? err.message : String(err);
@@ -794,7 +861,7 @@ export async function migrateUp(
         }
       }
 
-      return { applied: results, errors };
+      return { applied: results, errors, destructive, outOfOrder };
     } finally {
       await releaseLock(client, lockId, adapter);
     }
@@ -810,10 +877,12 @@ export async function migrateUp(
 export async function migrateDeploy(
   connectionString: string,
   migrationsDir: string,
-  options?: { adapter?: DatabaseAdapter; dialect?: Dialect },
-): Promise<{ applied: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
+  options?: { adapter?: DatabaseAdapter; dialect?: Dialect; allowDrift?: boolean },
+): Promise<MigrationRunResult> {
   return migrateUp(connectionString, migrationsDir, {
-    allowDrift: false,
+    // Honor `--allow-drift` on deploy exactly as `up` does: deploy's own drift
+    // error recommends this flag, so it must actually bypass the checksum block.
+    allowDrift: options?.allowDrift === true,
     allowDestructive: true,
     adapter: options?.adapter,
     dialect: options?.dialect,
@@ -881,7 +950,7 @@ export async function migrateDown(
           for (const o of offenders) {
             lines.push(`  ${o.file}`);
             for (const h of o.hits) {
-              lines.push(`    - [${h.kind}] ${h.target} — ${DESTRUCTIVE_KIND_LABEL[h.kind]}`);
+              lines.push(`    - [${h.kind}] ${h.target}: ${DESTRUCTIVE_KIND_LABEL[h.kind]}`);
             }
           }
           lines.push('');
@@ -952,8 +1021,9 @@ export async function migrateStatus(
     const appliedMap = new Map(applied.map((m) => [m.name, m]));
 
     const allFiles = listMigrationFiles(migrationsDir);
+    const fileNames = new Set(allFiles.map((f) => f.name));
 
-    return allFiles.map((file) => {
+    const fromFiles = allFiles.map((file) => {
       const record = appliedMap.get(file.name);
       let checksumValid: boolean | undefined;
 
@@ -970,6 +1040,29 @@ export async function migrateStatus(
         checksumValid,
       };
     });
+
+    // Applied migrations whose file was deleted from disk. up/deploy already
+    // catch this as drift; status must not silently drop them from history.
+    const missing: MigrationStatus[] = applied
+      .filter((m) => !fileNames.has(m.name))
+      .map((m) => ({
+        file: parseMigrationFilename(`${m.name}.sql`) ?? {
+          filename: `${m.name}.sql`,
+          path: '',
+          name: m.name,
+          timestamp: '',
+        },
+        applied: true,
+        appliedAt: m.applied_at,
+        checksumValid: false,
+        missingFile: true,
+      }));
+
+    // Keep the overall list in timestamp order so a deleted entry appears where
+    // it belongs in history, not tacked on at the end.
+    return [...fromFiles, ...missing].sort((a, b) =>
+      a.file.name < b.file.name ? -1 : a.file.name > b.file.name ? 1 : 0,
+    );
   } finally {
     await client.end();
   }
