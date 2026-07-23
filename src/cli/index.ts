@@ -142,6 +142,12 @@ export interface CliArgs {
   includeViews?: boolean;
   /** Omit the `Generated at:` header line for reproducible (diff-stable) output. */
   noTimestamp?: boolean;
+  /** `generate --import-ext <js|none|auto>`: sibling-import extension mode (F3). */
+  importExtension?: 'js' | 'none' | 'auto';
+  /** `generate --keep-column-names`: keep raw DB column names as field names (F4). */
+  keepColumnNames?: boolean;
+  /** `generate --legacy-to-many-uniques`: opt out of the unique-FK → hasOne flip (F2). */
+  legacyToManyUniques?: boolean;
   // studio / observe flags
   port?: number;
   host?: string;
@@ -246,6 +252,21 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--no-timestamp':
         result.noTimestamp = true;
+        break;
+      case '--import-ext':
+      case '--import-extension':
+        if (next !== 'js' && next !== 'none' && next !== 'auto') {
+          console.error(`--import-ext requires one of: js, none, auto (got ${next ?? '(nothing)'})`);
+          process.exit(1);
+        }
+        result.importExtension = next;
+        i++;
+        break;
+      case '--keep-column-names':
+        result.keepColumnNames = true;
+        break;
+      case '--legacy-to-many-uniques':
+        result.legacyToManyUniques = true;
         break;
       case '--allow-destructive':
         result.allowDestructive = true;
@@ -1160,12 +1181,15 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   // Introspect
   const spinner = new Spinner('Introspecting database schema').start();
 
+  const skippedInternalTables: string[] = [];
   const schema = await introspect({
     connectionString: url,
     schema: config.schema,
     include: config.include.length ? config.include : undefined,
     exclude: config.exclude.length ? config.exclude : undefined,
     includeViews: args.includeViews,
+    legacyToManyUniques: config.legacyToManyUniques,
+    onDefaultTableExclusion: (tables) => skippedInternalTables.push(...tables),
   });
 
   const tableNames = Object.keys(schema.tables);
@@ -1175,6 +1199,12 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   spinner.succeed(
     `Found ${bold(String(tableNames.length))} tables, ${bold(String(totalColumns))} columns, ${bold(String(totalRelations))} relations`,
   );
+
+  // F12: make the default bookkeeping-table exclusions discoverable rather than
+  // silent. `include` re-adds any of them byte-for-byte.
+  for (const t of skippedInternalTables) {
+    console.log(`    ${dim(`${symbols.teeEnd} skipped internal table ${t} (add it to include to keep it)`)}`);
+  }
 
   // Guard: zero tables means the generated client would be empty. That is almost
   // always a misconfiguration (wrong `schema`, an include/exclude that filtered
@@ -1229,6 +1259,8 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     connectionString: url,
     zod: args.zod,
     noTimestamp: args.noTimestamp,
+    importExtension: config.importExtension,
+    keepColumnNames: config.keepColumnNames,
   });
 
   genSpinner.succeed(`Generated ${bold(String(result.files.length))} files in ${elapsed(startTime)}`);
@@ -2692,6 +2724,15 @@ function showGenerateHelp(): void {
   console.log(
     `    ${cyan('--no-timestamp')}        Omit the ${dim('Generated at:')} header line ${dim('(reproducible, diff-stable output)')}`,
   );
+  console.log(
+    `    ${cyan('--import-ext')} ${dim('<mode>')}    Sibling-import extension: ${cyan('js')} / ${cyan('none')} / ${cyan('auto')} ${dim('(default: auto)')}`,
+  );
+  console.log(
+    `    ${cyan('--keep-column-names')}   Keep raw DB column names as field names ${dim('(snake_case, not camelCase)')}`,
+  );
+  console.log(
+    `    ${cyan('--legacy-to-many-uniques')} Emit ${cyan('hasMany')} for unique-FK children ${dim('(pre-0.41 shape; default flips to hasOne)')}`,
+  );
   console.log(`    ${cyan('--allow-empty')}         Generate even when introspection matches 0 tables`);
   newline();
 }
@@ -3017,6 +3058,9 @@ async function main() {
     schema: args.schema,
     include: args.include,
     exclude: args.exclude,
+    importExtension: args.importExtension,
+    keepColumnNames: args.keepColumnNames,
+    legacyToManyUniques: args.legacyToManyUniques,
   };
 
   const config = resolveConfig(fileConfig, overrides);
