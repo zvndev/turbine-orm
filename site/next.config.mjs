@@ -26,6 +26,15 @@ const nextConfig = {
   pageExtensions: ['ts', 'tsx', 'js', 'jsx', 'md', 'mdx'],
   reactStrictMode: true,
   outputFileTracingRoot: tracingRoot,
+  // The docs live at root-level paths (/cli, /migrate, …), not under /docs.
+  // Redirect the common /docs and /docs/:slug guesses to their real pages
+  // instead of 404ing.
+  async redirects() {
+    return [
+      { source: '/docs', destination: '/', permanent: true },
+      { source: '/docs/:slug*', destination: '/:slug*', permanent: true },
+    ];
+  },
 };
 
 // Next 16 builds with Turbopack by default, which requires MDX loader options

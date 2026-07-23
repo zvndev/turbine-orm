@@ -18,7 +18,7 @@ Turbine throws typed errors you can catch with `instanceof`. Every error extends
 | `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete |
 | `TURBINE_E004` | `ConnectionError` | Pool connection failure |
 | `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
-| `TURBINE_E006` | `MigrationError` | Migration file parse error, checksum mismatch, apply failure |
+| `TURBINE_E006` | `MigrationError` | Checksum mismatch, migration-lock contention, or a failure while applying a migration |
 | `TURBINE_E007` | `CircularRelationError` | Relation nesting depth exceeds 10 |
 | `TURBINE_E008` | `UniqueConstraintError` | pg 23505 — translated via `wrapPgError()` |
 | `TURBINE_E009` | `ForeignKeyError` | pg 23503 — translated via `wrapPgError()` |

@@ -47,6 +47,18 @@ npx turbine migrate status
 - **SHA-256 checksums.** Every applied migration's file is hashed. If an already-applied file changes on disk, `status` reports **drift** and `up` refuses to run until you reconcile (or pass `--allow-drift` when you are intentionally rewriting history).
 - **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent `migrate up` / `deploy` runs cannot race; the second exits cleanly instead of double-applying.
 
+### Out-of-order migrations
+
+Turbine tracks migrations by name, not by a monotonic sequence number, so there is no strict ordering barrier: **any pending migration applies, even if its timestamp predates one already applied.** This is what lets two branches merge migrations that were authored in parallel: the older-timestamped file that landed second is simply pending, and the next `up` / `deploy` applies it. When the runner applies a migration whose timestamp is older than the most recently applied one, it prints a one-line warning so the out-of-order apply is visible. If your team needs strict linear history, enforce it in review (rebase the timestamp forward) rather than expecting the runner to refuse.
+
+### Rolling back additive migrations
+
+`migrate down` runs a migration's `-- DOWN` section, and the reverse of an *additive* change is a destructive one. A migration that added a column has a `-- DOWN` that **drops** it, so rolling it back trips the [destructive gate](#the-destructive-gate) exactly like any other `DROP COLUMN`. This is correct by design, not a bug: `down` will refuse and ask for the typed confirmation. In an unattended rollback script (CI), pass `--allow-destructive` so `down` does not stall waiting for a prompt:
+
+```bash
+npx turbine migrate down --allow-destructive
+```
+
 ## What `--auto` can and cannot do
 
 `create --auto` is a diff tool, not a schema-migration planner. It compares columns and types and emits the obvious DDL, but it has no notion of intent or history. Know its blind spots before you trust a generated file:
@@ -55,7 +67,7 @@ npx turbine migrate status
 - **Renames are not detected.** The differ has no way to know `full_name` was renamed from `name`. It sees one column gone and one added, so it produces an **add-new plus orphan-old**, and **the data does not move**. If you need a rename, write it by hand as `ALTER TABLE ... RENAME COLUMN`.
 - **`SET NOT NULL` has no backfill.** Making a nullable column `notNull` emits a bare `ALTER COLUMN "col" SET NOT NULL`. On a populated table with any `NULL` in that column, apply **fails**. Backfill the column first (see below).
 - **`varchar` length changes are not detected.** The differ compares the underlying type name, not the length, so `varchar(50)` to `varchar(100)` produces no statement. Change the length by hand if you need it enforced.
-- **Table and column drops are reported, never auto-emitted.** A table or column present in the database but absent from your schema is surfaced in the diff (and in `migrate status`) but is **never written into the executable SQL**; dropping data is always a manual, deliberate act. `schemaDiff()` returns these in `drop` / the `alter` plan; you write the `DROP` yourself.
+- **Table and column drops are emitted flagged as destructive.** A table or column present in the database but absent from your schema is surfaced in the diff and in `migrate status`. `create --auto` and `create --from-diff` write the `DROP` into the migration **flagged inline as destructive** (a destructive-only diff produces a flagged migration, not a "nothing to migrate"), and the [destructive gate](#the-destructive-gate) still refuses it until you confirm or pass `--allow-destructive`. Review every flagged line before applying: dropping data is a deliberate act. `schemaDiff()` also returns these in `drop` / the `alter` plan for programmatic callers.
 
 ## Flagging destructive statements with `--from-diff`
 
@@ -135,8 +147,18 @@ This generates a migration pre-filled with the expand/contract skeleton (the nul
 Turbine treats data-destroying DDL (`DROP TABLE`, `DROP COLUMN`, and similar) as opt-in, never automatic.
 
 - **`migrate up`** scans every pending migration for destructive statements. If it finds any, it stops, prints exactly which statements in which files are destructive, and asks for a two-step typed confirmation (the literal phrase `destroy my data`, then `yes`) before applying anything. Decline and nothing runs; no data is touched. You can skip the prompt with `--allow-destructive` when you know what you are doing.
-- **`migrate deploy`** applies files exactly as written, with no prompt; it is the non-interactive production path. Whatever destructive SQL is in the migration runs. That is by design: production apply is deterministic and unattended, so the review happens when the migration is authored and merged, not at deploy time.
-- **`push`**: as of 0.36, `turbine push` runs the same destructive scanner over the statements it is about to apply. Destructive operations require the same typed confirmation as `migrate up` (or `--allow-destructive`). `push` is still the fast **development** path that diffs `defineSchema` against the live database and applies the difference directly; for production, author real migrations and `deploy` them.
+- **`migrate deploy`** applies files exactly as written, with no prompt; it is the non-interactive production path. Before it runs anything destructive it prints a one-line NOTICE listing the data-destroying statements, then proceeds. That is by design: production apply is deterministic and unattended, so the review happens when the migration is authored and merged, not at deploy time.
+- **`push`**: as of 0.36, `turbine push` runs the same destructive scanner over the statements it is about to apply. Destructive operations require the same typed confirmation as `migrate up` (or `--allow-destructive`); without it, `push` refuses and applies nothing. `push` is still the fast **development** path that diffs `defineSchema` against the live database and applies the difference directly; for production, author real migrations and `deploy` them.
+
+The ceremony differs by surface. All three run the same scanner; what changes is what happens when they find something destructive:
+
+| Command | On a destructive statement | Escape hatch |
+|---|---|---|
+| `migrate up` | Refuses, prints the report, asks for the typed two-step confirm (`destroy my data`, then `yes`) | `--allow-destructive` |
+| `migrate deploy` | Proceeds by design (unattended), after printing a one-line NOTICE of what it will run | none needed; it always proceeds |
+| `push` | Refuses, prints the report, asks for the same typed two-step confirm | `--allow-destructive` |
+
+`deploy` is the only surface that runs destructive SQL without confirmation. That is deliberate: it is for reviewed, merged history applied in CI, where there is no human to answer a prompt.
 
 ## See also
 
