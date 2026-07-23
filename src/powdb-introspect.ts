@@ -55,6 +55,7 @@
  */
 
 import { ValidationError } from './errors.js';
+import { applyTableFilters } from './introspect.js';
 import { type PowdbCapabilities, quotePowqlIdent, requireCapability } from './powdb.js';
 import type { ColumnMetadata, IndexMetadata, SchemaMetadata, TableMetadata } from './schema.js';
 import { snakeToCamel } from './schema.js';
@@ -144,13 +145,13 @@ export async function introspectPowdbDatabase(
 
   // ----- Types (one row per table, columns `name`, `columns`) -----
   const schemaRows = (await exec('schema')).rows;
-  let tableNames = schemaRows.map((r) => asString(r.name)).filter((n) => n.length > 0);
+  const candidateTables = schemaRows.map((r) => asString(r.name)).filter((n) => n.length > 0);
 
   // A mis-shaped `exec` (e.g. the raw client's positional `string[][]` rows
   // passed straight through) yields rows whose `name` cell is `undefined`, so
   // every table filters out and the schema comes back silently empty. Refuse
   // that instead of losing data: real rows must carry a `name`.
-  if (schemaRows.length > 0 && tableNames.length === 0) {
+  if (schemaRows.length > 0 && candidateTables.length === 0) {
     throw new ValidationError(
       `[turbine] PowDB introspection: the \`schema\` statement returned ${schemaRows.length} row(s) but none carried a ` +
         '`name` cell. The `exec` you supplied likely returns POSITIONAL rows (string[][]) rather than records keyed by ' +
@@ -158,14 +159,8 @@ export async function introspectPowdbDatabase(
     );
   }
 
-  if (options.include?.length) {
-    const inc = new Set(options.include);
-    tableNames = tableNames.filter((t) => inc.has(t));
-  }
-  if (options.exclude?.length) {
-    const exc = new Set(options.exclude);
-    tableNames = tableNames.filter((t) => !exc.has(t));
-  }
+  // include / exclude + default bookkeeping-table exclusions (F12).
+  const tableNames = applyTableFilters(candidateTables, options);
 
   const tables: Record<string, TableMetadata> = {};
 

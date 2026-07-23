@@ -111,7 +111,7 @@ import {
   type UpsertStatementInput,
 } from './dialect.js';
 import { ConnectionError, RelationError, UnsupportedFeatureError, ValidationError } from './errors.js';
-import { deriveEngineRelations } from './introspect.js';
+import { applyTableFilters, deriveEngineRelations } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import {
   type ColumnMetadata,
@@ -1123,20 +1123,14 @@ export async function introspectMssqlWith(
   options: { include?: string[]; exclude?: string[] } = {},
 ): Promise<SchemaMetadata> {
   // ----- Tables -----
-  let tableNames = (
+  const candidateTables = (
     await exec(
       "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = @p1 AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME",
       [schema],
     )
   ).map((r) => String(r.TABLE_NAME));
-  if (options.include?.length) {
-    const inc = new Set(options.include);
-    tableNames = tableNames.filter((t) => inc.has(t));
-  }
-  if (options.exclude?.length) {
-    const exc = new Set(options.exclude);
-    tableNames = tableNames.filter((t) => !exc.has(t));
-  }
+  // include / exclude + default bookkeeping-table exclusions (F12).
+  const tableNames = applyTableFilters(candidateTables, options);
   const tableSet = new Set(tableNames);
 
   // ----- Identity columns (mark hasDefault) -----
