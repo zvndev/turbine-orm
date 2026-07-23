@@ -355,6 +355,65 @@ describe('prisma-compat, nested include limits', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Deferred rejection: a translation/validation error raised before the
+// underlying promise exists must REJECT the returned promise, never throw
+// synchronously (Prisma call sites assume a thenable, so `.catch()` must fire).
+// ---------------------------------------------------------------------------
+
+describe('prisma-compat, deferred rejection (never a synchronous throw)', () => {
+  it('an invalid include rejects rather than throwing synchronously', async () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(sqlDb(schema), map);
+    let call: unknown;
+    assert.doesNotThrow(() => {
+      call = compat.User.findMany({ include: { nonexistent: true } } as Any);
+    });
+    await assert.rejects(call as Promise<unknown>, /unknown relation "nonexistent"/);
+  });
+
+  it('findUnique with a malformed compound selector rejects rather than throwing synchronously', async () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(sqlDb(schema), map);
+    let call: unknown;
+    assert.doesNotThrow(() => {
+      call = compat.Membership.findUnique({ where: { orgId_userId: { orgId: 1 } } } as Any);
+    });
+    await assert.rejects(call as Promise<unknown>, (err: unknown) => err instanceof TurbineError);
+  });
+
+  it('findUnique missing its required where rejects rather than throwing synchronously', async () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(sqlDb(schema), map);
+    let call: unknown;
+    assert.doesNotThrow(() => {
+      call = compat.User.findUnique({} as Any);
+    });
+    await assert.rejects(call as Promise<unknown>, /requires a `where`/);
+  });
+
+  it('a negative take rejects when awaited rather than throwing synchronously', async () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(sqlDb(schema), map);
+    let call: unknown;
+    assert.doesNotThrow(() => {
+      call = compat.User.findMany({ take: -5 } as Any);
+    });
+    await assert.rejects(call as Promise<unknown>, /negative take/);
+  });
+
+  it('$transaction([...]) rejects when a batched call fails translation', async () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(spyDb(schema).db, map);
+    // The un-awaited delegate call must not throw at construction time.
+    let bad: unknown;
+    assert.doesNotThrow(() => {
+      bad = compat.User.findMany({ include: { nonexistent: true } } as Any);
+    });
+    await assert.rejects((compat.$transaction as Any)([bad]) as Promise<unknown>, /unknown relation "nonexistent"/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Result reshaping
 // ---------------------------------------------------------------------------
 

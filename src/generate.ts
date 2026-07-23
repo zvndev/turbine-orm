@@ -548,13 +548,23 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       addCompound(table.primaryKey);
       for (const uc of table.uniqueColumns) addCompound(uc);
       for (const idx of table.indexes) {
-        if (idx.unique && !idx.docPath) addCompound(idx.columns);
+        // A partial unique index does not guarantee table-wide row uniqueness,
+        // so it must not become a compound-unique selector (matches the runtime
+        // exclusion in query/compound-unique.ts).
+        if (idx.unique && !idx.docPath && !idx.partial) addCompound(idx.columns);
       }
 
       const selectorEntries = compoundSets.map((cols) => {
         const members = cols.map(memberType);
         return {
-          selectorName: members.map((m) => m.field).join('_'),
+          // The selector NAME is the underscore-join of the member FIELD names.
+          // It is normally a valid identifier (`orgId_userId`), but a
+          // junction-style column that is not a valid identifier (e.g. a quoted
+          // uppercase `"A"` / `"B"`) would join into a broken object key. Emit
+          // any non-identifier name as ONE quoted string-literal key so the
+          // generated types.ts always parses; the runtime selector map in
+          // query/compound-unique.ts registers the same name spelling.
+          selectorName: quoteIfNeeded(members.map((m) => m.field).join('_')),
           memberType: `{ ${members.map((m) => `${quoteIfNeeded(m.field)}: ${m.tsType}`).join('; ')} }`,
         };
       });
