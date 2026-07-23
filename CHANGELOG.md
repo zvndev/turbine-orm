@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`turbine migrate-from-prisma`, an official Prisma-to-Turbine migration path (phase 1).**
+  Point the new command at a `schema.prisma` and it emits two artifacts next to your
+  generated client:
+  - `prisma-migration-report.md`, a per-model resolution report: each Prisma model
+    mapped to its Turbine table + client accessor, every field, relation, junction
+    table, and compound-unique selector, plus an explicit list of anything that could
+    not be resolved (with the reason), and a fixed section of Prisma-vs-Turbine
+    behavior notes (cursor exclusivity, `_count` shape, relation-array ordering, the
+    `sslmode` URL recommendation).
+  - `prisma-map.ts`, a typed `PRISMA_MAP` name map (models, fields, relations with
+    cardinality, and compound-unique selector names including custom `@@unique(name:)`
+    ones). It is the input to hand-written compat wrappers today and to the phase-2
+    `turbine-orm/prisma-compat` runtime adapter next.
+
+  The `schema.prisma` parser is hand-rolled and adds **zero dependencies**: it
+  understands models, enums, views, `@map`/`@@map`, relations (including implicit
+  m2m junctions), `@@unique` (named and default), and `@@id`, and is deliberately
+  lenient: any attribute or block it does not recognize is skipped, never fatal.
+  Names are resolved against the live database (via `turbine`'s existing
+  introspection); a model that matches multiple candidate tables is reported
+  UNRESOLVED rather than guessed. `--no-db` produces a parse-only report without a
+  database, `--allow-partial` accepts an incomplete map, and `--no-timestamp` makes
+  the output reproducible. The command exits non-zero when anything is unresolved
+  (unless `--allow-partial`). `PrismaCompatMap` is exported from the package root so
+  runtime consumers can share the shape.
+
 ## 0.40.1 (2026-07-22)
 
 ### Fixed
