@@ -672,6 +672,160 @@ describe('prisma-compat, laziness + $transaction', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Nested writes in the $transaction([...]) array form (sequential fallback)
+// ---------------------------------------------------------------------------
+
+describe('prisma-compat, $transaction([...]) with nested write data', () => {
+  it('falls back to sequential-in-tx and runs the async nested-capable path', async () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema, {
+      'posts.create': { id: 9, title: 'p', authorId: 1 },
+      'users.create': { id: 1, emailAddress: 'a@b.com' },
+    });
+    const compat = mkCompat(db, map);
+    const [p, u] = await (compat.$transaction as Any)([
+      compat.Post.create({ data: { title: 'p', author: { connect: { id: 1 } } } }),
+      compat.User.create({ data: { email: 'a@b.com' } }),
+    ]);
+    assert.deepEqual(p, { id: 9, title: 'p', authorId: 1 });
+    assert.deepEqual(u, { id: 1, email: 'a@b.com' });
+    // The WHOLE array ran through the async create() path (order preserved),
+    // never the SQL-only buildCreate that cannot express nested writes.
+    const createCalls = calls.filter((c) => c.method === 'create');
+    assert.deepEqual(
+      createCalls.map((c) => c.table),
+      ['posts', 'users'],
+    );
+    assert.ok(!calls.some((c) => c.method === 'buildCreate'));
+    // The nested relation key survived translation into the async path.
+    assert.deepEqual(createCalls[0]!.args.data.author, { connect: { id: 1 } });
+  });
+
+  it('a plain batch still uses the single-round-trip build path', async () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema, { 'users.result': { id: 1, emailAddress: 'a@b.com' } });
+    const compat = mkCompat(db, map);
+    await (compat.$transaction as Any)([compat.User.create({ data: { email: 'a@b.com' } })]);
+    assert.ok(calls.some((c) => c.method === 'buildCreate'));
+    assert.ok(!calls.some((c) => c.method === 'create'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Upsert semantics (Prisma is where-lookup-first; native ON CONFLICT only
+// when the where key values equal the create values)
+// ---------------------------------------------------------------------------
+
+describe('prisma-compat, upsert semantics', () => {
+  it('same-key upsert passes through to the native atomic upsert', async () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema, { 'users.upsert': { id: 1, emailAddress: 'a@b.com' } });
+    const compat = mkCompat(db, map);
+    await compat.User.upsert({
+      where: { id: 1 },
+      create: { id: 1, email: 'a@b.com' } as Any,
+      update: { name: 'x' },
+    });
+    assert.ok(calls.some((c) => c.method === 'upsert'));
+    assert.ok(!calls.some((c) => c.method === 'findUnique'));
+  });
+
+  it('key mismatch: updates the where row when it exists (never inserts create)', async () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema, {
+      'users.findUnique': { id: 1, emailAddress: 'a@b.com' },
+      'users.update': { id: 1, emailAddress: 'a@b.com', name: 'X' },
+    });
+    const compat = mkCompat(db, map);
+    const row: Any = await compat.User.upsert({
+      where: { id: 1 },
+      create: { id: 2, email: 'b@c.com' } as Any,
+      update: { name: 'X' },
+    });
+    assert.equal(row.id, 1, 'row A updated, row B never inserted');
+    assert.deepEqual(
+      calls.map((c) => c.method),
+      ['findUnique', 'update'],
+    );
+  });
+
+  it('key mismatch: creates when the where row does not exist', async () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema, {
+      'users.findUnique': null,
+      'users.create': { id: 2, emailAddress: 'b@c.com' },
+    });
+    const compat = mkCompat(db, map);
+    const row: Any = await compat.User.upsert({
+      where: { id: 99 },
+      create: { id: 2, email: 'b@c.com' } as Any,
+      update: { name: 'X' },
+    });
+    assert.equal(row.id, 2);
+    assert.deepEqual(
+      calls.map((c) => c.method),
+      ['findUnique', 'create'],
+    );
+  });
+
+  it('compound-selector where matches when member values equal create values', async () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema, { 'memberships.upsert': { id: 5, orgId: 1, userId: 2, role: 'm' } });
+    const compat = mkCompat(db, map);
+    await compat.Membership.upsert({
+      where: { orgId_userId: { orgId: 1, userId: 2 } } as Any,
+      create: { orgId: 1, userId: 2, role: 'm' } as Any,
+      update: { role: 'a' },
+    });
+    assert.ok(
+      calls.some((c) => c.method === 'upsert'),
+      'native path taken',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Prisma client-side defaults (@default(uuid())/@updatedAt emulation)
+// ---------------------------------------------------------------------------
+
+describe('prisma-compat, client-side defaults', () => {
+  function defaultsFixture(): { schema: SchemaMetadata; map: PrismaCompatMap } {
+    const { schema, map } = fixture();
+    map.models.User!.fields = { id: 'id', email: 'emailAddress', name: 'name', updated_at: 'updatedAt' };
+    map.models.User!.clientDefaults = { id: 'uuid', updated_at: 'updatedAt' };
+    return { schema, map };
+  }
+
+  it('fills uuid + updatedAt on create when omitted', async () => {
+    const { schema, map } = defaultsFixture();
+    const { db, calls } = spyDb(schema, { 'users.create': { id: 'u', emailAddress: 'a@b.com' } });
+    const compat = mkCompat(db, map);
+    await (compat.User.create as Any)({ data: { email: 'a@b.com' } });
+    const data = lastArgs(calls).data;
+    assert.match(data.id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, 'uuid filled');
+    assert.ok(data.updatedAt instanceof Date, '@updatedAt filled and renamed to the turbine field');
+  });
+
+  it('never overwrites an explicitly provided value', async () => {
+    const { schema, map } = defaultsFixture();
+    const { db, calls } = spyDb(schema, { 'users.create': { id: 'fixed' } });
+    const compat = mkCompat(db, map);
+    await (compat.User.create as Any)({ data: { id: 'fixed', email: 'a@b.com' } });
+    assert.equal(lastArgs(calls).data.id, 'fixed');
+  });
+
+  it('touches @updatedAt on update and updateMany', async () => {
+    const { schema, map } = defaultsFixture();
+    const { db, calls } = spyDb(schema, { 'users.update': { id: 'u' } });
+    const compat = mkCompat(db, map);
+    await (compat.User.update as Any)({ where: { id: 'u' }, data: { name: 'n' } });
+    assert.ok(lastArgs(calls).data.updatedAt instanceof Date);
+    await (compat.User.updateMany as Any)({ where: { name: 'n' }, data: { name: 'm' } });
+    assert.ok(lastArgs(calls).data.updatedAt instanceof Date);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // build* public-contract pin (RESOLUTIONS: guard the QueryInterface seam)
 // ---------------------------------------------------------------------------
 

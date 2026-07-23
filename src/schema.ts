@@ -470,6 +470,17 @@ export interface PrismaModelMap {
    * the core `findUnique`-family derivation cannot know.
    */
   compoundUniques: Record<string, string[]>;
+  /**
+   * Prisma CLIENT-side default per Prisma field name. Prisma's
+   * `@default(uuid())` / `@default(cuid())` / `@updatedAt` (and `@default(now())`
+   * when the migration left no database default) are filled by the Prisma
+   * client, not the database, so the columns commonly have NO db default and a
+   * Prisma call site omits them. The compat adapter fills these on create
+   * (`uuid` / `cuid` / `now`) and touches `updatedAt` fields on
+   * update/updateMany/upsert, exactly like Prisma. Emitted by
+   * `migrate-from-prisma` only for columns the database does not default.
+   */
+  clientDefaults?: Record<string, 'uuid' | 'cuid' | 'now' | 'updatedAt'>;
 }
 
 /** A resolved Prisma relation field → Turbine relation. */

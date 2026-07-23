@@ -980,6 +980,16 @@ interface Batchable {
   build(): DeferredQuery<unknown>;
   /** Reshape a raw Turbine result into the Prisma-shaped value. */
   reshape(raw: unknown): unknown;
+  /**
+   * True when this call cannot run as a single deferred statement (nested
+   * write data, or an upsert needing the lookup-first path). The
+   * `$transaction([...])` batch handler falls back to running the WHOLE array
+   * sequentially inside one transaction so Prisma's array form still supports
+   * nested writes.
+   */
+  nested(): boolean;
+  /** Run the call via the async (nested-write capable) wrappers on a tx-bound table lookup. */
+  execInTx(table: (name: string) => CompatQueryInterface): Promise<unknown>;
 }
 
 /**
@@ -1125,10 +1135,121 @@ function prismaPropertyAlias(model: string): string | null {
  * QueryInterface for this model's table on the active connection (the base pool,
  * or a transaction's connection inside `$transaction(callback)`).
  */
+// ---------------------------------------------------------------------------
+// Prisma client-side defaults (@default(uuid()/cuid()) / @updatedAt / now())
+// ---------------------------------------------------------------------------
+
+let cuidCounter = Math.floor(Math.random() * 1296);
+
+/**
+ * A cuid-shaped id ('c' + timestamp + counter + fingerprint + random, 25
+ * chars): collision-resistant and format-compatible with Prisma's
+ * `@default(cuid())` call sites. Not byte-identical to any specific cuid
+ * library; Prisma treats these as opaque unique strings.
+ */
+function makeCuid(): string {
+  const ts = Date.now().toString(36);
+  const count = (cuidCounter++ % 1296).toString(36).padStart(2, '0');
+  const rand = (): string =>
+    Math.floor(Math.random() * 36 ** 4)
+      .toString(36)
+      .padStart(4, '0');
+  return `c${ts}${count}${rand()}${rand()}${rand()}`.slice(0, 25);
+}
+
+function clientDefaultValue(kind: 'uuid' | 'cuid' | 'now' | 'updatedAt'): unknown {
+  if (kind === 'uuid') return globalThis.crypto.randomUUID();
+  if (kind === 'cuid') return makeCuid();
+  return new Date();
+}
+
+/** Fill missing create-side client defaults (uuid / cuid / now / updatedAt), by Prisma field name. */
+function applyCreateDefaults(mm: PrismaModelMap, data: unknown): unknown {
+  const cd = mm.clientDefaults;
+  if (!cd || !isPlainObject(data)) return data;
+  let out = data;
+  for (const [field, kind] of Object.entries(cd)) {
+    if (out[field] === undefined) {
+      if (out === data) out = { ...data };
+      out[field] = clientDefaultValue(kind);
+    }
+  }
+  return out;
+}
+
+/** Touch @updatedAt fields on the update side (Prisma sets them on every update). */
+function applyUpdateTouch(mm: PrismaModelMap, data: unknown): unknown {
+  const cd = mm.clientDefaults;
+  if (!cd || !isPlainObject(data)) return data;
+  let out = data;
+  for (const [field, kind] of Object.entries(cd)) {
+    if (kind === 'updatedAt' && out[field] === undefined) {
+      if (out === data) out = { ...data };
+      out[field] = new Date();
+    }
+  }
+  return out;
+}
+
+/** Whether TRANSLATED write data carries relation keys (nested-write shapes). */
+function hasNestedKeys(ctx: Ctx, mm: PrismaModelMap, data: unknown): boolean {
+  const rels = ctx.schema.tables[mm.table]?.relations;
+  if (!rels || !isPlainObject(data)) return false;
+  return Object.keys(data).some((k) => {
+    if (!Object.hasOwn(rels, k)) return false;
+    const v = data[k];
+    return v !== null && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Date);
+  });
+}
+
+/**
+ * Whether an upsert's translated `where` key values all equal the
+ * corresponding `create` values. When they do (the common Prisma idiom), the
+ * native single-statement ON CONFLICT upsert is semantically identical to
+ * Prisma's lookup-first and stays atomic. When they differ, native upsert
+ * would insert the `create` row even though the `where` row exists, so the
+ * adapter must emulate lookup-first instead.
+ */
+function upsertKeysMatch(t: Args): boolean {
+  const where = t.where;
+  const create = t.create;
+  if (!isPlainObject(where) || !isPlainObject(create)) return false;
+  const scalarEq = (a: unknown, b: unknown): boolean => {
+    if (a instanceof Date || b instanceof Date) {
+      return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
+    }
+    return a === b;
+  };
+  for (const [k, v] of Object.entries(where)) {
+    if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
+      // Compound-unique selector object: every member must scalar-match create.
+      if (Array.isArray(v)) return false;
+      for (const [mk, mv] of Object.entries(v as Record<string, unknown>)) {
+        if (mv !== null && typeof mv === 'object' && !(mv instanceof Date)) return false;
+        if (!scalarEq(mv, (create as Record<string, unknown>)[mk])) return false;
+      }
+      continue;
+    }
+    if (!scalarEq(v, (create as Record<string, unknown>)[k])) return false;
+  }
+  return true;
+}
+
+/** Prisma upsert semantics: look up by where; update the found row, else insert create. */
+async function upsertLookupFirst(qi: CompatQueryInterface, t: Args): Promise<unknown> {
+  const existing = await qi.findUnique({ where: t.where });
+  if (existing) return qi.update({ where: t.where, data: t.update });
+  return qi.create({ data: t.create });
+}
+
+/** Runs `fn` atomically with a tx-bound table lookup (opens a tx, or reuses the ambient one). */
+type RunInTx = <T>(fn: (table: (name: string) => CompatQueryInterface) => Promise<T>) => Promise<T>;
+
 function makeDelegate(
   ctx: Ctx,
   mm: PrismaModelMap,
   getQI: () => CompatQueryInterface,
+  runInTx: RunInTx,
 ): PrismaModelDelegate<PrismaModelTypes> {
   const pe = ctx.options.prismaErrorCodes;
   // Build a lazy Prisma-style promise for one delegate call. Crucially, the
@@ -1146,10 +1267,32 @@ function makeDelegate(
     batch?: {
       build: (qi: CompatQueryInterface, t: Args) => DeferredQuery<unknown>;
       reshape: (raw: unknown) => unknown;
+      /** True when this call cannot run as one deferred statement (see Batchable.nested). */
+      nested?: (t: Args) => boolean;
+      /** Sequential-in-tx override used by the batch fallback (defaults to `run` on the tx table). */
+      execInTx?: (table: (name: string) => CompatQueryInterface, t: Args) => Promise<unknown>;
     },
   ): CompatPromise<T> => {
     const batchable: Batchable | undefined = batch
-      ? { build: () => batch.build(getQI(), translate()), reshape: batch.reshape }
+      ? {
+          build: () => batch.build(getQI(), translate()),
+          reshape: batch.reshape,
+          nested: () => {
+            try {
+              return batch.nested?.(translate()) ?? false;
+            } catch {
+              return false; // let the build path surface the translation error consistently
+            }
+          },
+          execInTx: async (table) => {
+            try {
+              const t = translate();
+              return batch.execInTx ? await batch.execInTx(table, t) : await run(table(mm.table), t);
+            } catch (err) {
+              throw decorate(err, pe);
+            }
+          },
+        }
       : undefined;
     return new CompatPromise<T>(async () => {
       try {
@@ -1201,18 +1344,24 @@ function makeDelegate(
     create: (args) =>
       defer(
         () => {
-          const t: Args = { data: translateWriteData(ctx, mm, (args as Args).data) };
+          const t: Args = { data: translateWriteData(ctx, mm, applyCreateDefaults(mm, (args as Args).data)) };
           if (typeof (args as Args).timeout === 'number') t.timeout = (args as Args).timeout;
           return t;
         },
         (qi, t) => qi.create(t).then((r) => reshapeRow(ctx, mm, r)),
-        { build: (qi, t) => qi.buildCreate(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+        {
+          build: (qi, t) => qi.buildCreate(t),
+          reshape: (raw) => reshapeRow(ctx, mm, raw),
+          nested: (t) => hasNestedKeys(ctx, mm, t.data),
+        },
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     createMany: (args) =>
       defer(
         () => {
           const data = (args as Args).data;
-          const rows = Array.isArray(data) ? data.map((d) => translateWriteData(ctx, mm, d)) : [];
+          const rows = Array.isArray(data)
+            ? data.map((d) => translateWriteData(ctx, mm, applyCreateDefaults(mm, d)))
+            : [];
           const t: Args = { data: rows };
           if ((args as Args).skipDuplicates) t.skipDuplicates = true;
           return t;
@@ -1224,16 +1373,26 @@ function makeDelegate(
       defer(
         () => {
           const a = requireWhere(args, 'update');
-          return { where: translateWhere(ctx, mm, a.where), data: translateWriteData(ctx, mm, a.data) } as Args;
+          return {
+            where: translateWhere(ctx, mm, a.where),
+            data: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.data)),
+          } as Args;
         },
         (qi, t) => qi.update(t).then((r) => reshapeRow(ctx, mm, r)),
-        { build: (qi, t) => qi.buildUpdate(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+        {
+          build: (qi, t) => qi.buildUpdate(t),
+          reshape: (raw) => reshapeRow(ctx, mm, raw),
+          nested: (t) => hasNestedKeys(ctx, mm, t.data),
+        },
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     updateMany: (args) =>
       defer(
         () => {
           const a = args as Args;
-          const t: Args = { where: translateWhere(ctx, mm, a.where ?? {}), data: translateWriteData(ctx, mm, a.data) };
+          const t: Args = {
+            where: translateWhere(ctx, mm, a.where ?? {}),
+            data: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.data)),
+          };
           if (a.where === undefined) t.allowFullTableScan = true;
           return t;
         },
@@ -1266,12 +1425,33 @@ function makeDelegate(
           const a = requireWhere(args, 'upsert');
           return {
             where: translateWhere(ctx, mm, a.where),
-            create: translateWriteData(ctx, mm, a.create),
-            update: translateWriteData(ctx, mm, a.update),
+            create: translateWriteData(ctx, mm, applyCreateDefaults(mm, a.create)),
+            update: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.update)),
           } as Args;
         },
-        (qi, t) => qi.upsert(t).then((r) => reshapeRow(ctx, mm, r)),
-        { build: (qi, t) => qi.buildUpsert(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+        (qi, t) => {
+          // Native ON CONFLICT upsert is only Prisma-equivalent when the where
+          // key values equal the create values AND no nested write data is
+          // present; otherwise emulate Prisma's lookup-first atomically.
+          if (upsertKeysMatch(t) && !hasNestedKeys(ctx, mm, t.create) && !hasNestedKeys(ctx, mm, t.update)) {
+            return qi.upsert(t).then((r) => reshapeRow(ctx, mm, r));
+          }
+          return runInTx(async (table) => {
+            const row = await upsertLookupFirst(table(mm.table), t);
+            return reshapeRow(ctx, mm, row);
+          });
+        },
+        {
+          build: (qi, t) => qi.buildUpsert(t),
+          reshape: (raw) => reshapeRow(ctx, mm, raw),
+          nested: (t) => !upsertKeysMatch(t) || hasNestedKeys(ctx, mm, t.create) || hasNestedKeys(ctx, mm, t.update),
+          execInTx: async (table, t) => {
+            if (upsertKeysMatch(t) && !hasNestedKeys(ctx, mm, t.create) && !hasNestedKeys(ctx, mm, t.update)) {
+              return reshapeRow(ctx, mm, await table(mm.table).upsert(t));
+            }
+            return reshapeRow(ctx, mm, await upsertLookupFirst(table(mm.table), t));
+          },
+        },
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     count: (args = {}) =>
       defer(
@@ -1407,7 +1587,12 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
   for (const [prismaModel, mm] of Object.entries(map.models)) {
     delegates.set(
       prismaModel,
-      makeDelegate(ctx, mm, () => db.table(mm.table)),
+      makeDelegate(
+        ctx,
+        mm,
+        () => db.table(mm.table),
+        (fn) => db.$transaction((tx) => fn((n) => tx.table(n))),
+      ),
     );
   }
 
@@ -1439,6 +1624,17 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
               }
               return b;
             });
+            // Nested write data (or a lookup-first upsert) cannot run as a
+            // single deferred statement. Prisma's array form still supports
+            // those, so fall back to running the WHOLE array sequentially
+            // inside one transaction; ordering and atomicity are preserved.
+            if (batchables.some((b) => b.nested())) {
+              return await db.$transaction(async (tx) => {
+                const out: unknown[] = [];
+                for (const b of batchables) out.push(await b.execInTx((n) => tx.table(n)));
+                return out;
+              }, txOptions);
+            }
             const deferreds = batchables.map((b) => b.build());
             const results = (await db.$transaction(deferreds)) as unknown[];
             return results.map((raw, i) => batchables[i]!.reshape(raw));
@@ -1452,7 +1648,12 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
       return db.$transaction((tx: CompatTransactionClient) => {
         const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
         for (const [prismaModel, mm] of Object.entries(map.models)) {
-          txDelegates[prismaModel] = makeDelegate(ctx, mm, () => tx.table(mm.table));
+          txDelegates[prismaModel] = makeDelegate(
+            ctx,
+            mm,
+            () => tx.table(mm.table),
+            (fn) => fn((n) => tx.table(n)),
+          );
           const alias = prismaPropertyAlias(prismaModel);
           if (alias && !(alias in map.models) && !(alias in txDelegates)) {
             txDelegates[alias] = txDelegates[prismaModel]!;

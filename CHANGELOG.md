@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.44.0 (2026-07-23)
+
+### Added
+
+- **`turbine-orm/prisma-compat` emulates Prisma's client-side defaults.** Prisma fills
+  `@default(uuid())` / `@default(cuid())` / `@updatedAt` in the client, so those columns
+  usually have no database default and migrated call sites omit them (previously a
+  NOT NULL violation on every such create). `migrate-from-prisma` now records these in
+  the generated name map (`clientDefaults`, including `@default(now())` when
+  introspection finds no database default), and the adapter fills them on
+  `create`/`createMany` and touches `@updatedAt` fields on `update`/`updateMany`/
+  `upsert`, exactly like Prisma. Explicitly provided values are never overwritten.
+
+### Fixed
+
+- **Nested writes now work in the `$transaction([...])` array form.** The lazy batch
+  path compiled each call to a single SQL statement, which cannot express nested write
+  data (`connect`, `create`, ...), so such a batch item failed with an unknown-field
+  validation error. When any item in the array carries nested write data (or an upsert
+  needs the lookup-first path below), the whole array now runs sequentially inside one
+  transaction through the nested-write-capable path: ordering, atomicity, and Prisma's
+  array-form contract are preserved. Plain batches keep the single-round-trip path.
+- **`turbine-orm/prisma-compat` upsert now follows Prisma's lookup-first semantics.**
+  Turbine core `upsert` compiles a single `INSERT ... ON CONFLICT` keyed on the create
+  data's unique values. When an upsert's `where` key values differ from its `create`
+  values, that inserts the create row even though the `where` row exists (a silent
+  divergence from Prisma). The adapter now passes through to the native atomic upsert
+  only when the `where` key values equal the create values; otherwise it emulates
+  Prisma inside a transaction: look up by `where`, update the found row, else insert
+  `create`. Core semantics are unchanged and now documented in the migration guide.
+
 ## 0.43.0 (2026-07-23)
 
 ### Fixed

@@ -1091,6 +1091,9 @@ export function generatePrismaMap(map: PrismaCompatMap, options?: GenerateFileOp
     }
     lines.push('      },');
     lines.push(`      compoundUniques: ${serializeStringArrayRecord(model.compoundUniques)},`);
+    if (model.clientDefaults && Object.keys(model.clientDefaults).length > 0) {
+      lines.push(`      clientDefaults: ${serializeStringRecord(model.clientDefaults)},`);
+    }
     lines.push('    },');
   }
   lines.push('  },');

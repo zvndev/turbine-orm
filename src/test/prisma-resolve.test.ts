@@ -548,3 +548,47 @@ describe('migrate-from-prisma - client emission on the partial path', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Client-side defaults (@default(uuid()) / @updatedAt / now()) in the map
+// ---------------------------------------------------------------------------
+
+describe('resolvePrismaSchema - clientDefaults emission', () => {
+  const prisma = `
+model Widget {
+  id         String   @id @default(uuid()) @db.Uuid
+  created_at DateTime @default(now())
+  stamped_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+  label      String
+}
+`;
+  function widgetSchema(): SchemaMetadata {
+    const t = table('widgets', ['id', 'created_at', 'stamped_at', 'updated_at', 'label']);
+    // uuid PK with NO database default (Prisma fills it client-side); stamped_at
+    // DOES have a db default so its now() must not be carried.
+    for (const c of t.columns) c.hasDefault = c.name === 'stamped_at';
+    return { enums: {}, tables: { widgets: t } };
+  }
+
+  it('carries uuid/now/updatedAt for db-defaultless columns only', () => {
+    const res = resolvePrismaSchema(parsePrismaSchema(prisma), widgetSchema());
+    assert.deepEqual(res.map.models.Widget!.clientDefaults, {
+      id: 'uuid',
+      created_at: 'now',
+      updated_at: 'updatedAt',
+    });
+  });
+
+  it('omits the key entirely when a model has no client-side defaults', () => {
+    const bare = 'model Widget {\n  id Int @id\n  label String\n}\n';
+    const res = resolvePrismaSchema(parsePrismaSchema(bare), widgetSchema());
+    assert.equal(res.map.models.Widget!.clientDefaults, undefined);
+  });
+
+  it('serializes clientDefaults into the generated map module', () => {
+    const res = resolvePrismaSchema(parsePrismaSchema(prisma), widgetSchema());
+    const out = generatePrismaMap(res.map);
+    assert.match(out, /clientDefaults: \{ id: 'uuid', created_at: 'now', updated_at: 'updatedAt' \}/);
+  });
+});

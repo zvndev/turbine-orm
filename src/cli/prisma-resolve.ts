@@ -268,7 +268,15 @@ export function resolvePrismaSchema(
       for (const c of resolved.compoundUniques) {
         if (c.status === 'resolved' && c.turbineFields) compoundUniques[c.selector] = c.turbineFields;
       }
-      result.map.models[model.name] = { table, accessor, fields, relations, compoundUniques };
+      const clientDefaults = collectClientDefaults(model, fields, resolvedSchema?.tables[table]);
+      result.map.models[model.name] = {
+        table,
+        accessor,
+        fields,
+        relations,
+        compoundUniques,
+        ...(clientDefaults ? { clientDefaults } : {}),
+      };
     }
   }
 
@@ -362,6 +370,41 @@ function relationFkColumns(model: PrismaModel, field: PrismaModel['fields'][numb
   const relAttr = field?.attrs.find((a) => a.name === 'relation');
   const fieldsArg = relAttr?.args.find((a) => a.key === 'fields' && a.kind === 'array');
   return fieldsArg?.items?.map((pf) => fieldColumn(model, pf)) ?? null;
+}
+
+/**
+ * Prisma CLIENT-side defaults for a resolved model: `@default(uuid())` /
+ * `@default(cuid())` / `@updatedAt` are filled by the Prisma client (the
+ * database column typically has NO default), so migrated call sites omit those
+ * fields and a plain insert violates NOT NULL. `@default(now())` is normally a
+ * database default, so it is carried only when the introspected column has no
+ * default. `@updatedAt` is always carried (Prisma touches it on every update
+ * regardless of any database default). Returns undefined when the model has
+ * none, keeping the emitted map byte-identical for unaffected schemas.
+ */
+function collectClientDefaults(
+  model: PrismaModel,
+  resolvedFields: Record<string, string>,
+  tableMeta: SchemaMetadata['tables'][string] | undefined,
+): Record<string, 'uuid' | 'cuid' | 'now' | 'updatedAt'> | undefined {
+  if (!tableMeta) return undefined;
+  const out: Record<string, 'uuid' | 'cuid' | 'now' | 'updatedAt'> = {};
+  for (const field of model.fields) {
+    const turbineField = resolvedFields[field.name];
+    if (!turbineField) continue;
+    const col = tableMeta.columns.find((c) => c.field === turbineField || c.name === turbineField);
+    if (field.attrs.some((a) => a.name === 'updatedAt')) {
+      out[field.name] = 'updatedAt';
+      continue;
+    }
+    if (col?.hasDefault) continue; // the database fills it; nothing to emulate
+    const def = field.attrs.find((a) => a.name === 'default');
+    const raw = def?.args.find((a) => a.key === undefined && a.kind === 'raw')?.value ?? '';
+    if (/^uuid\s*\(/.test(raw)) out[field.name] = 'uuid';
+    else if (/^cuid\s*\(/.test(raw)) out[field.name] = 'cuid';
+    else if (/^now\s*\(\s*\)$/.test(raw)) out[field.name] = 'now';
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
