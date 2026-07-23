@@ -67,6 +67,13 @@ describe('CLI flag regression guard', () => {
     assert.ok(source.includes('--allow-remote'), 'help / parseArgs must mention --allow-remote');
   });
 
+  it('v0.41 generator flags are wired up', () => {
+    const source = readFileSync(CLI_INDEX, 'utf-8');
+    for (const flag of ['--import-ext', '--keep-column-names', '--legacy-to-many-uniques']) {
+      assert.ok(source.includes(`'${flag}'`), `parseArgs() must handle ${flag}`);
+    }
+  });
+
   it('Studio and Observe hard-fail non-loopback without --allow-remote', () => {
     const source = readFileSync(CLI_INDEX, 'utf-8');
     // Both commands must call isLoopbackHost and process.exit(1) on refusal.
@@ -148,5 +155,26 @@ describe('parseArgs — generate flags (T-8b)', () => {
     const source = readFileSync(CLI_INDEX, 'utf-8');
     assert.ok(source.includes("'--no-timestamp'"), 'parseArgs() must handle --no-timestamp');
     assert.ok(source.includes('--no-timestamp'), 'generate help must mention --no-timestamp');
+  });
+});
+
+describe('parseArgs: v0.41 generator flags (F2/F3/F4)', () => {
+  it('parses --import-ext with a valid value', () => {
+    assert.equal(parseArgs(['generate', '--import-ext', 'none']).importExtension, 'none');
+    assert.equal(parseArgs(['generate', '--import-ext', 'js']).importExtension, 'js');
+    assert.equal(parseArgs(['generate', '--import-ext', 'auto']).importExtension, 'auto');
+  });
+
+  it('parses --keep-column-names and --legacy-to-many-uniques as booleans', () => {
+    const args = parseArgs(['generate', '--keep-column-names', '--legacy-to-many-uniques']);
+    assert.equal(args.keepColumnNames, true);
+    assert.equal(args.legacyToManyUniques, true);
+  });
+
+  it('leaves the new flags undefined by default', () => {
+    const args = parseArgs(['generate']);
+    assert.equal(args.importExtension, undefined);
+    assert.equal(args.keepColumnNames, undefined);
+    assert.equal(args.legacyToManyUniques, undefined);
   });
 });

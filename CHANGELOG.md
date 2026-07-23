@@ -1,5 +1,64 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- **Unique foreign keys now introspect as one-to-one (`hasOne`) relations.** When a
+  child table's foreign-key column set is EXACTLY covered by a `UNIQUE` constraint or a
+  plain (non-partial, non-expression) `UNIQUE` index, `turbine generate` / `pull` now
+  emits a to-one relation on the parent side (`RelationDescriptor<Child, 'one', …>`)
+  instead of a to-many array, matching Prisma one-to-one introspection. The relation is
+  also renamed to the SINGULAR of the child table (e.g. `users.profiles` becomes
+  `users.profile`), falling back to the previous plural name only if the singular
+  collides with an existing column or relation. This is a correctness fix, and it is a
+  double-barreled change when it applies:
+  - **TypeScript consumers** get loud compile errors where the relation was iterated
+    (`.map(...)`, `[0]`) or filtered with `some`/`every`/`none`; the fix is to read the
+    relation as an object-or-`null`.
+  - **Plain-JS consumers** silently receive `Child | null` (an object or `null`) where an
+    array used to be; a childless parent is now `null` rather than `[]`.
+
+  The parent-side field stays nullable (`Child | null`) even for a `NOT NULL` unique FK,
+  matching Prisma. To keep the pre-0.41 to-many shape, pass `--legacy-to-many-uniques`
+  (CLI), set `legacyToManyUniques: true` in `turbine.config`, or pass
+  `legacyToManyUniques: true` to `introspect()`. Partial and expression unique indexes are
+  deliberately excluded from the flip (they do not guarantee at most one child row).
+
+### Added
+
+- **`--import-ext <js|none|auto>` (config `importExtension`).** Controls the extension on
+  the generated `index.ts` sibling imports. `js` emits `./types.js` (required by NodeNext
+  `tsc` and by tsc-compiled ESM on Node, the previous behavior); `none` emits `./types`
+  (correct for bundlers and `moduleResolution` `bundler`/`node10`: webpack, Next.js/SWC,
+  Vite/esbuild); `auto` (the new default) walks up from the output directory to the nearest
+  `tsconfig.json` (extends chains are not followed) and picks `.js` for `node16`/`nodenext`
+  module resolution, extensionless otherwise, falling back to `.js` when the tsconfig is
+  missing, unparseable, or ambiguous. Because the fallback is the previous behavior,
+  NodeNext projects never regress; bundler projects that check generated files into source
+  control will see a one-time diff to extensionless imports on the next regenerate.
+- **`--keep-column-names` (config `keepColumnNames`).** Generates column FIELD names as the
+  raw database column names (snake_case) instead of camelCase, so `user_id` stays `user_id`
+  end to end (row keys, `where`/`orderBy`/`select`, nested `with` rows, aggregate keys). It
+  is a pure generate-time transform with zero runtime changes; relation names, table
+  accessors, and entity type names are unaffected. Opt-in: untouched schemas emit
+  byte-identical output. The transform is also exported from the package root as
+  `withDbFieldNames(schema)` so runtime-introspection and serverless users can apply the
+  same identity mapping to a schema they build at runtime.
+- **`introspect()` gains `legacyToManyUniques` and `onDefaultTableExclusion`** options, and
+  `withDbFieldNames` / `applyTableFilters` / `DEFAULT_EXCLUDED_TABLES` are exported for
+  programmatic use.
+
+### Changed
+
+- **Migration bookkeeping tables are excluded from introspection by default.**
+  `turbine generate` / `pull` now skips `_turbine_migrations`, `_prisma_migrations`, and
+  `_turbine_metrics`, so a freshly introspected schema no longer emits accessors and stray
+  FK-derived relations for them. `generate` prints a note for any that were present. To
+  keep one, name it in `include` (CLI `--include`, config `include`), which restores the
+  old output for that table byte for byte. Only these three names are special-cased; other
+  leading-underscore tables are never excluded.
+
 ## 0.40.1 (2026-07-22)
 
 ### Fixed

@@ -204,6 +204,73 @@ const SQL_ENUMS = `
 `;
 
 // ---------------------------------------------------------------------------
+// Default table exclusions (F12)
+// ---------------------------------------------------------------------------
+
+/**
+ * Migration-bookkeeping tables that introspection drops by default: Turbine's
+ * own `_turbine_migrations` / `_turbine_metrics` and Prisma's
+ * `_prisma_migrations`. These are almost never meant to be surfaced as typed
+ * accessors, and a fresh migrate-from-Prisma introspection would otherwise emit
+ * a `PrismaMigrations` entity plus stray FK-derived relations on neighbours.
+ *
+ * A table named here is dropped UNLESS it is explicitly listed in
+ * `options.include` (`include` is the escape hatch, no separate flag), and
+ * naming a default-excluded table restores its old generated output byte for
+ * byte. The list is deliberately tight (exactly these three); leading-
+ * underscore tables are legitimate user tables and are never blanket-excluded.
+ */
+export const DEFAULT_EXCLUDED_TABLES = ['_turbine_migrations', '_prisma_migrations', '_turbine_metrics'] as const;
+
+/** The include / exclude filters shared by every introspector's table selection. */
+export interface TableFilterOptions {
+  /** Tables to include (empty/undefined = all). Applied first. */
+  include?: string[];
+  /** Tables the user asked to exclude. Applied after include. */
+  exclude?: string[];
+}
+
+/**
+ * The single authority for turning a raw list of candidate table names into the
+ * introspected set, shared by the Postgres catalog reader and every engine
+ * introspector (SQLite / MySQL / MSSQL / PowDB) so all surfaces agree.
+ *
+ * Order of operations:
+ *   1. `include` filter: when non-empty, keep only the named tables.
+ *   2. user `exclude`: drop anything the caller listed.
+ *   3. {@link DEFAULT_EXCLUDED_TABLES}: drop migration bookkeeping tables,
+ *      EXCEPT any that the caller explicitly named in `include` (the escape
+ *      hatch that restores the pre-0.41 output for those tables).
+ */
+export function applyTableFilters(names: string[], options: TableFilterOptions = {}): string[] {
+  let result = names;
+  const includeSet = options.include?.length ? new Set(options.include) : null;
+  if (includeSet) {
+    result = result.filter((t) => includeSet.has(t));
+  }
+  if (options.exclude?.length) {
+    const excludeSet = new Set(options.exclude);
+    result = result.filter((t) => !excludeSet.has(t));
+  }
+  // Default exclusions never override an explicit include.
+  const defaults = new Set<string>(DEFAULT_EXCLUDED_TABLES);
+  result = result.filter((t) => !defaults.has(t) || (includeSet?.has(t) ?? false));
+  return result;
+}
+
+/**
+ * The subset of {@link DEFAULT_EXCLUDED_TABLES} that were present in `names` but
+ * dropped by {@link applyTableFilters} (i.e. not re-added via `include`). Pure
+ * helper so the CLI can report "skipped internal table X" without re-deriving
+ * the filtering rule.
+ */
+export function defaultExcludedTablesPresent(names: string[], options: TableFilterOptions = {}): string[] {
+  const includeSet = options.include?.length ? new Set(options.include) : null;
+  const present = new Set(names);
+  return DEFAULT_EXCLUDED_TABLES.filter((t) => present.has(t) && !(includeSet?.has(t) ?? false));
+}
+
+// ---------------------------------------------------------------------------
 // Introspection options
 // ---------------------------------------------------------------------------
 
@@ -223,6 +290,23 @@ export interface IntrospectOptions {
    * the generated `findUnique`-family accessor types.
    */
   includeViews?: boolean;
+  /**
+   * Opt OUT of the unique-FK → `hasOne` flip (F2). By default (`false`)
+   * introspection emits a to-one (`hasOne`) relation on the parent side when a
+   * child's foreign-key column set is EXACTLY covered by a UNIQUE constraint or
+   * a non-partial, non-expression UNIQUE index, matching Prisma one-to-one
+   * introspection. Set to `true` to keep the pre-0.41 behavior where every such
+   * relation was emitted as `hasMany` (a to-many array). See
+   * {@link detectUniqueForeignKeySets}.
+   */
+  legacyToManyUniques?: boolean;
+  /**
+   * Called with any {@link DEFAULT_EXCLUDED_TABLES} that were present in the
+   * database but dropped from this run (F12), so the CLI can print a
+   * "skipped internal table X (add it to include to keep it)" note. Not invoked
+   * when the set is empty. Postgres path only for now.
+   */
+  onDefaultTableExclusion?: (tables: string[]) => void;
   /**
    * Dialect whose {@link Dialect.introspector} drives the catalog reads.
    * Defaults to {@link postgresDialect}. Engines plug their own introspector
@@ -313,16 +397,17 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       });
     }
 
-    // Filter tables by include/exclude. Views/matviews join the base tables as
-    // candidates so include/exclude apply uniformly.
-    let tableNames: string[] = [...tablesResult.rows.map((r: { table_name: string }) => r.table_name), ...viewNameSet];
-    if (options.include?.length) {
-      const includeSet = new Set(options.include);
-      tableNames = tableNames.filter((t) => includeSet.has(t));
-    }
-    if (options.exclude?.length) {
-      const excludeSet = new Set(options.exclude);
-      tableNames = tableNames.filter((t) => !excludeSet.has(t));
+    // Filter tables by include/exclude + default bookkeeping-table exclusions
+    // (F12). Views/matviews join the base tables as candidates so the filters
+    // apply uniformly.
+    const candidateTables: string[] = [
+      ...tablesResult.rows.map((r: { table_name: string }) => r.table_name),
+      ...viewNameSet,
+    ];
+    const tableNames = applyTableFilters(candidateTables, options);
+    if (options.onDefaultTableExclusion) {
+      const skipped = defaultExcludedTablesPresent(candidateTables, options);
+      if (skipped.length > 0) options.onDefaultTableExclusion(skipped);
     }
 
     const tableSet = new Set(tableNames);
@@ -485,11 +570,18 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         new Set(cols.filter((c) => isUnknownTsType(c.tsType) && !Object.hasOwn(enums, c.pgType)).map((c) => c.field)),
       );
     }
+    // F2: unless the caller opts out, detect child FK column sets that a unique
+    // constraint / plain unique index exactly covers, so the reverse relation is
+    // emitted as a one-to-one (`hasOne`) instead of `hasMany`.
+    const uniqueSetsByTable = options.legacyToManyUniques
+      ? undefined
+      : detectUniqueForeignKeySets(pkByTable, uniqueByTable, indexesByTable);
     const relationsByTable = buildRelationsFromForeignKeys(
       foreignKeys,
       columnFieldsByTable,
       fkActions,
       unknownTypedFieldsByTable,
+      uniqueSetsByTable,
     );
 
     // ----- Conservative many-to-many auto-detection (PURELY ADDITIVE) -----
@@ -646,6 +738,89 @@ export function isUnknownTsType(tsType: string): boolean {
   return tsType === 'unknown' || tsType === 'unknown | null';
 }
 
+// ---------------------------------------------------------------------------
+// Unique-foreign-key detection for one-to-one relations (F2)
+// ---------------------------------------------------------------------------
+
+/** True when two column lists cover the same set (order-insensitive, no dupes). */
+function columnSetsEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const bs = new Set(b);
+  return a.every((c) => bs.has(c));
+}
+
+/**
+ * Parse the column list of a PLAIN unique index from its `pg_indexes.indexdef`,
+ * returning `null` for anything that does NOT guarantee at-most-one child row:
+ *
+ *   - a PARTIAL index (has a `WHERE` clause): only unique within the predicate;
+ *   - an EXPRESSION index (`lower(email)`, `(a || b)`): the uniqueness is on the
+ *     expression, not the raw FK column set.
+ *
+ * Anchors on the `USING <method> (` clause the same way
+ * {@link describeIndexDefMismatch} does, so a partial index's `WHERE (...)`
+ * parentheses are never mistaken for the column list. Every column token must be
+ * a bare or double-quoted identifier; anything else (a function call, an
+ * operator expression) fails the check and yields `null`.
+ */
+export function parsePlainUniqueIndexColumns(indexdef: string): string[] | null {
+  // Partial index: uniqueness is scoped to the WHERE predicate.
+  if (/\bWHERE\b/i.test(indexdef)) return null;
+  const paren = indexdef.match(/USING\s+\w+\s*\(([^)]*)\)/i);
+  if (!paren) return null;
+  const tokens = paren[1]!.split(',').map((c) =>
+    c
+      .trim()
+      .replace(/\s+(ASC|DESC|NULLS\s+(FIRST|LAST))\b/gi, '')
+      .trim(),
+  );
+  const columns: string[] = [];
+  for (const token of tokens) {
+    if (token.length === 0) return null;
+    if (/^"(?:[^"]|"")*"$/.test(token)) {
+      // Quoted identifier: unquote and unescape doubled quotes.
+      columns.push(token.slice(1, -1).replace(/""/g, '"'));
+    } else if (/^[A-Za-z_][A-Za-z0-9_$]*$/.test(token)) {
+      columns.push(token);
+    } else {
+      // Expression column (function call, operator, cast, and the like): never a plain FK.
+      return null;
+    }
+  }
+  return columns.length > 0 ? columns : null;
+}
+
+/**
+ * Assemble, per table, every column set that EXACTLY guarantees at-most-one row:
+ * the primary key, every UNIQUE constraint, and every PLAIN (non-partial,
+ * non-expression) UNIQUE index. Consumed by
+ * {@link buildRelationsFromForeignKeys} to flip a child relation whose FK column
+ * set matches one of these sets from `hasMany` to `hasOne` (F2, Prisma
+ * one-to-one parity).
+ */
+export function detectUniqueForeignKeySets(
+  pkByTable: Map<string, string[]>,
+  uniqueByTable: Map<string, string[][]>,
+  indexesByTable: Map<string, IndexMetadata[]>,
+): Map<string, string[][]> {
+  const result = new Map<string, string[][]>();
+  const add = (table: string, cols: string[]) => {
+    if (cols.length === 0) return;
+    if (!result.has(table)) result.set(table, []);
+    result.get(table)!.push(cols);
+  };
+  for (const [table, pk] of pkByTable) add(table, pk);
+  for (const [table, sets] of uniqueByTable) for (const cols of sets) add(table, cols);
+  for (const [table, indexes] of indexesByTable) {
+    for (const idx of indexes) {
+      if (!idx.unique) continue;
+      const cols = parsePlainUniqueIndexColumns(idx.definition);
+      if (cols) add(table, cols);
+    }
+  }
+  return result;
+}
+
 /**
  * Resolve a derived relation name against the names already taken on the
  * table (scalar column fields + previously assigned relations). On collision,
@@ -693,12 +868,21 @@ function resolveRelationNameCollision(candidate: string, taken: Set<string>, tab
  *   guarantee relations never shadow concrete-typed scalar columns.
  * @param unknownTypedFieldsByTable subset of the column fields whose tsType is
  *   `unknown` (json/jsonb) — legacy shadows of these are preserved (rule 2).
+ * @param uniqueSetsByTable when provided (F2), the child-table column sets that
+ *   guarantee at-most-one row (PK + unique constraints + plain unique indexes,
+ *   from {@link detectUniqueForeignKeySets}). A reverse relation whose FK column
+ *   set EXACTLY matches one of the child's unique sets is emitted as `hasOne`
+ *   (to-one) instead of `hasMany`, and named with the SINGULAR of the child
+ *   table (falling back to the legacy plural name on collision). Omit it (the
+ *   engine introspectors and `defineSchema` path do) to keep every reverse
+ *   relation `hasMany`.
  */
 export function buildRelationsFromForeignKeys(
   foreignKeys: ForeignKeyEntry[],
   columnFieldsByTable: Map<string, Set<string>>,
   fkActions?: Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>,
   unknownTypedFieldsByTable?: Map<string, Set<string>>,
+  uniqueSetsByTable?: Map<string, string[][]>,
 ): Map<string, Record<string, RelationDef>> {
   // Count FKs per (source, target) pair for disambiguation.
   const fkCounts = new Map<string, number>();
@@ -795,26 +979,44 @@ export function buildRelationsFromForeignKeys(
       ...actionFields,
     };
 
-    // --- hasMany on the target (parent) table ---
-    // e.g. posts.user_id → users.id creates users.posts (hasMany)
-    const legacyHasMany = needsDisambiguation
+    // --- reverse relation on the target (parent) table ---
+    // e.g. posts.user_id → users.id creates users.posts (hasMany), UNLESS the
+    // child's FK column set is exactly covered by a unique constraint / plain
+    // unique index (F2), then it is a one-to-one, emitted as `hasOne` and
+    // named with the SINGULAR of the child table.
+    const isUniqueFk = (uniqueSetsByTable?.get(fk.sourceTable) ?? []).some((set) =>
+      columnSetsEqual(set, fk.sourceColumns),
+    );
+
+    const disambSuffix = needsDisambiguation
+      ? singleColumn
+        ? `By${upperFirst(relationNameFromColumn(fk.sourceColumns[0]!))}`
+        : `By${upperFirst(snakeToCamel(constraintBase))}`
+      : '';
+    const legacyReverse = needsDisambiguation
       ? singleColumn
         ? snakeToCamel(`${fk.sourceTable}_by_${fk.sourceColumns[0]!.replace(/_id$/, '')}`)
         : snakeToCamel(`${fk.sourceTable}_by_${constraintBase}`)
       : snakeToCamel(fk.sourceTable);
-    const modernHasMany = needsDisambiguation
-      ? singleColumn
-        ? `${snakeToCamel(fk.sourceTable)}By${upperFirst(relationNameFromColumn(fk.sourceColumns[0]!))}`
-        : `${snakeToCamel(fk.sourceTable)}By${upperFirst(snakeToCamel(constraintBase))}`
-      : null;
-    const hasManyName = resolveName(legacyHasMany, modernHasMany, fk.targetTable, `FK ${fk.constraintName}`);
-    takenFor(fk.targetTable).add(hasManyName);
-    assignedFor(fk.targetTable).add(hasManyName);
+    const modernReverse = needsDisambiguation ? `${snakeToCamel(fk.sourceTable)}${disambSuffix}` : null;
+
+    let reverseName: string;
+    const reverseType: 'hasMany' | 'hasOne' = isUniqueFk ? 'hasOne' : 'hasMany';
+    if (isUniqueFk) {
+      // Prefer the singular child-table name; fall back to the legacy plural
+      // (which stays byte-stable for any app that was on the pre-flip shape).
+      const singularReverse = `${singularize(snakeToCamel(fk.sourceTable))}${disambSuffix}`;
+      reverseName = resolveName(singularReverse, legacyReverse, fk.targetTable, `FK ${fk.constraintName}`);
+    } else {
+      reverseName = resolveName(legacyReverse, modernReverse, fk.targetTable, `FK ${fk.constraintName}`);
+    }
+    takenFor(fk.targetTable).add(reverseName);
+    assignedFor(fk.targetTable).add(reverseName);
 
     if (!relationsByTable.has(fk.targetTable)) relationsByTable.set(fk.targetTable, {});
-    relationsByTable.get(fk.targetTable)![hasManyName] = {
-      type: 'hasMany',
-      name: hasManyName,
+    relationsByTable.get(fk.targetTable)![reverseName] = {
+      type: reverseType,
+      name: reverseName,
       from: fk.targetTable,
       to: fk.sourceTable,
       foreignKey,

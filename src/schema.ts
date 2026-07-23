@@ -369,3 +369,51 @@ export function singularize(s: string): string {
   if (s.endsWith('s') && !s.endsWith('ss')) return s.slice(0, -1);
   return s;
 }
+
+// ---------------------------------------------------------------------------
+// keepColumnNames transform (F4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Return a copy of `schema` in which every column's TypeScript **field** name is
+ * the raw database column name (snake_case) instead of the camelCased default,
+ * i.e. `user_id` stays `user_id` rather than becoming `userId`.
+ *
+ * This is a PURE, generate-time transform with ZERO runtime changes: it only
+ * rewrites `column.field` and rebuilds each table's `columnMap` /
+ * `reverseColumnMap` as IDENTITY maps (`user_id → user_id`). Because every
+ * runtime surface resolves column names through those maps (`toColumn`,
+ * `parseRow`, relation `json_build_object` keys, batched-loader stitching,
+ * positional decoding, aggregate/groupBy naming), the generated client returns
+ * rows keyed by DB column names and accepts DB column names in
+ * `where`/`orderBy`/`select` with no code path aware of the difference.
+ *
+ * Deliberately left untouched (the flag is literally about column names):
+ *   - `name`, `allColumns`, `dateColumns`, `dialectTypes`, `pgTypes`,
+ *     `primaryKey`, `uniqueColumns`, `indexes`, `checks`, `isView` (all already
+ *     keyed by snake_case column names);
+ *   - `relations` (relation PROPERTY names are synthetic introspection names
+ *     with no DB column equivalent, and `foreignKey`/`referenceKey`/`through`
+ *     already hold DB column names);
+ *   - entity type names, table accessors, and `enums`.
+ *
+ * Every non-PII field of each {@link ColumnMetadata} (`pii`, `pgType`,
+ * `dialectType`, `nullable`, …) is preserved. Exported from the package root so
+ * runtime-introspection and serverless users can apply the same identity mapping
+ * to a schema they build at runtime, e.g. `turbineHttp(pool,
+ * withDbFieldNames(schema))`.
+ */
+export function withDbFieldNames(schema: SchemaMetadata): SchemaMetadata {
+  const tables: Record<string, TableMetadata> = {};
+  for (const [tableKey, table] of Object.entries(schema.tables)) {
+    const columns = table.columns.map((col) => ({ ...col, field: col.name }));
+    const columnMap: Record<string, string> = {};
+    const reverseColumnMap: Record<string, string> = {};
+    for (const col of columns) {
+      columnMap[col.name] = col.name;
+      reverseColumnMap[col.name] = col.name;
+    }
+    tables[tableKey] = { ...table, columns, columnMap, reverseColumnMap };
+  }
+  return { ...schema, tables };
+}

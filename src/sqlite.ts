@@ -65,7 +65,7 @@ import {
   type UpsertStatementInput,
 } from './dialect.js';
 import { ConnectionError } from './errors.js';
-import { deriveEngineRelations } from './introspect.js';
+import { applyTableFilters, deriveEngineRelations } from './introspect.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -665,18 +665,13 @@ function pragma<T>(db: DatabaseSync, sql: string): T[] {
  */
 export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: string[]; exclude?: string[] } = {}) {
   // ----- Tables (skip SQLite internal + the migration tracking table) -----
-  let tableNames = pragma<{ name: string }>(
+  const candidateTables = pragma<{ name: string }>(
     db,
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
   ).map((r) => r.name);
-  if (options.include?.length) {
-    const inc = new Set(options.include);
-    tableNames = tableNames.filter((t) => inc.has(t));
-  }
-  if (options.exclude?.length) {
-    const exc = new Set(options.exclude);
-    tableNames = tableNames.filter((t) => !exc.has(t));
-  }
+  // include / exclude + default bookkeeping-table exclusions (F12), shared with
+  // every other introspector via applyTableFilters.
+  const tableNames = applyTableFilters(candidateTables, options);
   const tableSet = new Set(tableNames);
 
   const columnsByTable = new Map<string, ColumnMetadata[]>();

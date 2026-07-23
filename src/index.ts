@@ -205,6 +205,7 @@ export {
   singularize,
   snakeToCamel,
   snakeToPascal,
+  withDbFieldNames,
 } from './schema.js';
 // Schema builder — define schemas in TypeScript
 export {

@@ -24,6 +24,23 @@ export interface TurbineCliConfig {
   include?: string[];
   /** Tables to exclude */
   exclude?: string[];
+  /**
+   * Extension for the generated `index.ts` sibling imports (F3):
+   * `'js'` (`./types.js`), `'none'` (`./types`), or `'auto'` (default:
+   * tsconfig-detected, falling back to `'js'`).
+   */
+  importExtension?: 'js' | 'none' | 'auto';
+  /**
+   * Keep raw database column names as generated field names (snake_case)
+   * instead of camelCase (F4). Opt-in; default `false`.
+   */
+  keepColumnNames?: boolean;
+  /**
+   * Opt OUT of the unique-FK → one-to-one (`hasOne`) introspection flip (F2),
+   * emitting the pre-0.41 `hasMany` shape for unique-covered child relations.
+   * Default `false` (detection on).
+   */
+  legacyToManyUniques?: boolean;
   /** Directory for migration files (default: ./turbine/migrations) */
   migrationsDir?: string;
   /** Path to seed file. Defaults are resolved from seed.ts, seed.js, then seed.sql. */
@@ -218,6 +235,12 @@ export interface ResolvedConfig {
   migrationsDir: string;
   seedFile?: string;
   schemaFile: string;
+  /** Resolved generator import-extension mode (F3). */
+  importExtension: 'js' | 'none' | 'auto';
+  /** Resolved keep-column-names generator flag (F4). */
+  keepColumnNames: boolean;
+  /** Resolved opt-out of the unique-FK → hasOne introspection flip (F2). */
+  legacyToManyUniques: boolean;
 }
 
 export interface CliOverrides {
@@ -226,6 +249,9 @@ export interface CliOverrides {
   schema?: string;
   include?: string[];
   exclude?: string[];
+  importExtension?: 'js' | 'none' | 'auto';
+  keepColumnNames?: boolean;
+  legacyToManyUniques?: boolean;
 }
 
 /**
@@ -242,6 +268,9 @@ export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverri
     migrationsDir: fileConfig.migrationsDir ?? './turbine/migrations',
     seedFile: fileConfig.seed ?? fileConfig.seedFile,
     schemaFile: fileConfig.schemaFile ?? './turbine/schema.ts',
+    importExtension: overrides.importExtension ?? fileConfig.importExtension ?? 'auto',
+    keepColumnNames: overrides.keepColumnNames ?? fileConfig.keepColumnNames ?? false,
+    legacyToManyUniques: overrides.legacyToManyUniques ?? fileConfig.legacyToManyUniques ?? false,
   };
 }
 
