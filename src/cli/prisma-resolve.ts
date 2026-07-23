@@ -16,21 +16,7 @@
 import { camelToSnake, type PrismaCompatMap, type SchemaMetadata, snakeToCamel } from '../schema.js';
 import type { PrismaModel, PrismaSchemaAst } from './prisma-schema.js';
 
-/**
- * Bookkeeping tables Turbine never surfaces. Migration-tool tables from Turbine
- * (`_turbine_migrations`, `_turbine_metrics`) and Prisma (`_prisma_migrations`)
- * are excluded so they never masquerade as models.
- *
- * MERGE NOTE: a sibling branch introduces `DEFAULT_EXCLUDED_TABLES` in the
- * introspection layer (finding 12). This local copy is a stub for THIS branch -
- * at merge, delete it and import the introspection-layer export instead so the
- * exclusion is defined once.
- */
-export const DEFAULT_EXCLUDED_TABLES: readonly string[] = [
-  '_turbine_migrations',
-  '_turbine_metrics',
-  '_prisma_migrations',
-];
+export { DEFAULT_EXCLUDED_TABLES } from '../introspect.js';
 
 // ---------------------------------------------------------------------------
 // Report shapes
