@@ -100,6 +100,17 @@ src/
                       the caller's executor/connection (tx-safe); per-relation `limit` applied
                       client-side per parent; composite-key relations throw E017.
 
+    compound-unique.ts — Compound-unique where selectors (0.41): derives selector names
+                      (`orgId_userId` or a declared composite-unique index name) from
+                      primaryKey + uniqueColumns + IndexMetadata and normalizes
+                      `where: { orgId_userId: {...} }` into flat column equality BEFORE
+                      cache fingerprinting. Consumed by the findUnique family, nested-write
+                      unique wheres (connect/connectOrCreate/etc.), and PowqlInterface.
+    warn-registry.ts — Process-wide once-only dev-warn registry (0.41) keyed on a
+                      globalThis Symbol.for('turbine.warnOnce.registry') so multi-instance
+                      and dual-package (ESM+CJS) setups never double-warn; WARN_ONCE_CAP=500.
+                      Namespaces: FK-advisor notes, deep-with, 'auto' strategy engagement.
+
     index.ts        — Barrel re-export (~65 LOC). All imports use `./query/index.js`.
 
   index-advisor.ts  — Missing-FK-index advisor. Derives every column set relations probe
@@ -125,8 +136,11 @@ src/
                       is supplied, Turbine does NOT call pg.types.setTypeParser and
                       disconnect() becomes a no-op (caller owns lifecycle). TurbineConfig also
                       carries the relation/wire tuning added in 0.26.0:
-                      `relationLoadStrategy: 'join' | 'batched'` (client default, overridable
-                      per query → query/batched-loader.ts), `jsonEncoding: 'object' |
+                      `relationLoadStrategy: 'auto' | 'join' | 'batched'` (client default,
+                      overridable per query → query/batched-loader.ts; 'auto' is the 0.41.0
+                      implicit default: join plan with per-relation batched fallback on
+                      proven-unindexed correlation columns, event tag 'auto-batched',
+                      composite-key/unknown relations always stay join), `jsonEncoding: 'object' |
                       'positional'` (Postgres-only lean `json_build_array` wire encoding for
                       `with` subqueries), and `utcTimestamps` (default true — registers the
                       OID 1114 parser, only for Turbine-owned pools, so offset-less `timestamp`
@@ -293,7 +307,8 @@ src/
                       PowQL joins (`Child as c join Parent as p on … { __tpk: p.pk, c.cols }`) with the
                       parent where re-emitted alias-qualified; eligibility = no parent limit/offset +
                       unique/PK correlation column + top-level, else silent loader fallback; PowDB's
-                      DEFAULT stays the batched loaders (never inherits the SQL 'join' default). Join and
+                      DEFAULT stays the batched loaders / nested projections (never inherits the
+                      SQL-side default, 'join' pre-0.41 or 'auto' since). Join and
                       loader paths share one correlation-key normalizer (Date → micros; the old loader
                       Date-identity Map bug and the select-omits-FK bug are fixed). **Readonly** (≥0.14):
                       `{ embedded, readonly: true }` opens via `openReadOnly`; client-level
@@ -413,6 +428,20 @@ src/
                       Hyperdrive, etc.). Pure TypeScript shim — no extra runtime deps.
                       Published as the `turbine-orm/serverless` subpath export.
 
+  prisma-compat.ts  — `turbine-orm/prisma-compat` subpath (0.41, ~1.5K LOC): typed
+                      PrismaClient-surface adapter over TurbineClient, driven by the
+                      PrismaCompatMap that `turbine migrate-from-prisma` emits. Model
+                      delegates under BOTH the Prisma model name (compat.User) and
+                      Prisma's lowercased property spelling (compat.user); translates
+                      include/select→with, take/skip, cursors (bare inclusive cursor
+                      whose field != sort key THROWS rather than off-by-one),
+                      compound-unique custom @@unique(name:) selectors, _count
+                      reshaping, to-one array→object|null. $transaction in callback AND
+                      lazy-array-batching forms, $queryRaw/$executeRaw (+Unsafe) with
+                      Prisma.sql-style fragments, createMany skipDuplicates → core
+                      ON CONFLICT DO NOTHING (E017 on mssql/powdb). Pure shim: zero new
+                      deps, never imported by core.
+
   typed-sql.ts      — Typed raw SQL escape hatch (Turbine's TypedSQL). buildTypedSql()
                       turns a tagged template into a parameterized (sql, params) pair —
                       every ${value} becomes $N, impossible to string-concat a value in.
@@ -501,7 +530,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 
 ## CLI Architecture
 
-The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration), `studio`.
+The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`.
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.js` / `.json`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 

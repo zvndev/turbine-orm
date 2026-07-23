@@ -317,9 +317,11 @@ LIMIT 1000
 
 If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop to `db.raw` — Turbine's opinion on relation loading is correlated subqueries; reporting queries have different shape.
 
-## Load strategy: `join` vs `batched`
+## Load strategy: `auto`, `join`, `batched`
 
-The correlated-subquery default (`relationLoadStrategy: 'join'`) resolves an entire `with` tree in **one** SQL statement. It's the right default: a single round-trip, and an index seek per parent when the child FK is indexed. Two situations favor the alternative:
+When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41.0): it compiles the single-statement correlated-subquery plan (`'join'`), but when schema metadata shows a relation's correlation column has **no covering index**, that relation falls back to the batched loader instead of running an unindexed probe per parent row. Engagement is visible: a once-per-relation dev note, and query events carry `strategy: 'auto-batched'`. An explicit `'join'` or `'batched'` (client-wide or per query) always wins over `'auto'`.
+
+The correlated-subquery strategy (`relationLoadStrategy: 'join'`) resolves an entire `with` tree in **one** SQL statement: a single round-trip, and an index seek per parent when the child FK is indexed. Two situations favor the alternative:
 
 - **A child FK column is unindexed.** A correlated probe per parent becomes N-parents × full-table-scan. Run [`npx turbine doctor`](/cli#turbine-doctor) to find these — but if you can't add the index yet, batched loading pays that missing index only once.
 - **Huge result sets.** Nested JSON (`json_build_object` per row, re-serialized inside `json_agg`) is heavier to encode and decode than flat rows.
@@ -344,7 +346,7 @@ const db = turbine({
 
 The result is **deep-equal** to the join strategy — same shape, same camelCase keys, same `Date` coercion — so you can flip the flag without touching the rest of your code. It honors per-relation `where` / `select` / `omit` / `orderBy` and nested `with`. The per-relation `limit` is applied **client-side per parent** (a `LIMIT` on a batched `= ANY($1)` would cap total children, not children-per-parent). And it's **transaction-safe**: the follow-up queries run on the same pinned connection, so batched loads inside `$transaction` see the transaction's own writes.
 
-> **Note.** Composite-key relations aren't supported by `'batched'` — use the default `'join'` strategy for those.
+> **Note.** Composite-key relations aren't supported by `'batched'` — use the `'join'` strategy for those (`'auto'` never batch-falls-back on a composite-key relation).
 
 ## Lean JSON encoding
 

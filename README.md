@@ -360,10 +360,12 @@ A few client options tune how `with` relations are loaded and encoded. All are o
 ```typescript
 const db = turbine({
   connectionString: process.env.DATABASE_URL,
-  // How with-clause relations resolve: 'join' (default, one correlated-subquery
-  // statement) or 'batched' (base query + one flat follow-up per relation).
-  // Override per query on findMany/findFirst/findUnique. See Relations.
-  relationLoadStrategy: 'join',
+  // How with-clause relations resolve: 'auto' (default since 0.41.0: the
+  // single-statement join plan, with a per-relation batched fallback when the
+  // correlation column has no covering index), 'join' (always one correlated-
+  // subquery statement), or 'batched' (base query + one flat follow-up per
+  // relation). Override per query on findMany/findFirst/findUnique.
+  relationLoadStrategy: 'auto',
   // 'positional' (Postgres-only) drops repeated JSON keys from relation
   // subqueries — ~39% fewer wire bytes on wide relations, byte-identical output.
   // Default 'object'.
