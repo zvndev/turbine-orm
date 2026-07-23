@@ -1,0 +1,59 @@
+// Parser-focused fixture: self-relations, a composite type block, doc comments,
+// a URL literal containing "//", and unknown attributes/blocks. Not backed by a
+// database - used to unit-test the parser and the parse-only report.
+
+datasource db {
+  provider = "postgresql"
+  url      = "postgresql://user:pass@localhost:5432/blog" // inline // comment after a URL
+}
+
+/// A blog author.
+model Author {
+  id       Int      @id @default(autoincrement())
+  handle   String   @unique
+  bio      String?  @db.Text // unknown native-type attribute
+  websites String[] // list of scalars
+  posts    Post[]
+
+  @@map("authors")
+}
+
+model Post {
+  id         Int       @id @default(autoincrement())
+  authorId   Int       @map("author_id")
+  slug       String
+  title      String
+  /// The published-state timestamp.
+  publishedAt DateTime? @map("published_at")
+
+  author   Author    @relation(fields: [authorId], references: [id])
+  comments Comment[]
+
+  @@unique([authorId, slug], name: "author_slug")
+  @@index([slug])
+}
+
+// Self-relation: a comment can reply to another comment.
+model Comment {
+  id       Int      @id @default(autoincrement())
+  postId   Int      @map("post_id")
+  parentId Int?     @map("parent_id")
+  body     String
+
+  post    Comment? @relation("thread", fields: [parentId], references: [id])
+  replies Comment[] @relation("thread")
+
+  @@id([postId, id])
+}
+
+/// Composite/embedded type - not a table (should be parsed, not resolved).
+type Address {
+  street String
+  city   String
+  zip    String
+}
+
+enum Visibility {
+  PUBLIC
+  PRIVATE
+}

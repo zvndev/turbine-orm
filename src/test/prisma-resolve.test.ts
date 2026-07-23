@@ -1,0 +1,281 @@
+/**
+ * turbine-orm - Prisma schema resolver + prisma-map generator (no DB).
+ *
+ * Drives resolvePrismaSchema against hand-built mock SchemaMetadata (resolved /
+ * diverged / unresolved paths, compound-unique derivation) and pins
+ * generatePrismaMap output under noTimestamp.
+ *
+ * Run: npx tsx --test src/test/prisma-resolve.test.ts
+ */
+
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+import { resolvePrismaSchema } from '../cli/prisma-resolve.js';
+import { parsePrismaSchema } from '../cli/prisma-schema.js';
+import { generatePrismaMap } from '../generate.js';
+import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
+
+// ---------------------------------------------------------------------------
+// Mock metadata helpers
+// ---------------------------------------------------------------------------
+
+function table(
+  name: string,
+  columns: string[], // snake_case column names
+  opts: {
+    primaryKey?: string[];
+    uniqueColumns?: string[][];
+    relations?: Record<string, RelationDef>;
+  } = {},
+): TableMetadata {
+  const columnMap: Record<string, string> = {};
+  const reverseColumnMap: Record<string, string> = {};
+  for (const c of columns) {
+    const field = c.replace(/_([a-z])/g, (_, x: string) => x.toUpperCase());
+    columnMap[field] = c;
+    reverseColumnMap[c] = field;
+  }
+  return {
+    name,
+    columns: columns.map((c) => ({
+      name: c,
+      field: reverseColumnMap[c]!,
+      pgType: 'int8',
+      tsType: 'number',
+      nullable: false,
+      hasDefault: c === 'id',
+      isArray: false,
+      pgArrayType: 'bigint[]',
+    })),
+    columnMap,
+    reverseColumnMap,
+    dateColumns: new Set(),
+    pgTypes: Object.fromEntries(columns.map((c) => [c, 'int8'])),
+    allColumns: columns,
+    primaryKey: opts.primaryKey ?? ['id'],
+    uniqueColumns: opts.uniqueColumns ?? [],
+    relations: opts.relations ?? {},
+    indexes: [],
+  };
+}
+
+const rel = (
+  name: string,
+  type: RelationDef['type'],
+  to: string,
+  foreignKey: string | string[],
+  through?: RelationDef['through'],
+): RelationDef => ({ name, type, from: '', to, foreignKey, referenceKey: 'id', through });
+
+// A schema matching a small shop: shop_users, products, orders.
+function mockSchema(): SchemaMetadata {
+  return {
+    enums: { shop_role: ['ADMIN', 'MEMBER'] },
+    tables: {
+      shop_users: table('shop_users', ['id', 'email', 'display_name', 'role'], {
+        uniqueColumns: [['email']],
+        relations: { products: rel('products', 'hasMany', 'products', 'owner_id') },
+      }),
+      products: table('products', ['id', 'owner_id', 'sku', 'name'], {
+        uniqueColumns: [['owner_id', 'sku']],
+        relations: {
+          owner: rel('owner', 'belongsTo', 'shop_users', 'owner_id'),
+          tags: rel('tags', 'manyToMany', 'tags', 'id', { table: '_ProductToTag', sourceKey: 'A', targetKey: 'B' }),
+        },
+      }),
+      tags: table('tags', ['id', 'label'], {
+        relations: {
+          products: rel('products', 'manyToMany', 'products', 'id', {
+            table: '_ProductToTag',
+            sourceKey: 'B',
+            targetKey: 'A',
+          }),
+        },
+      }),
+      orders: table('orders', ['id', 'buyer_id', 'reviewer_id', 'product_id'], {
+        uniqueColumns: [['buyer_id', 'product_id']],
+        relations: {
+          buyer: rel('buyer', 'belongsTo', 'shop_users', 'buyer_id'),
+          reviewer: rel('reviewer', 'belongsTo', 'shop_users', 'reviewer_id'),
+          product: rel('product', 'belongsTo', 'products', 'product_id'),
+        },
+      }),
+    },
+  };
+}
+
+const SHOP_PRISMA = `
+model User {
+  id          Int    @id
+  email       String @unique
+  displayName String @map("display_name")
+  role        Role
+  products    Product[]
+  @@map("shop_users")
+}
+model Product {
+  id      Int    @id
+  ownerId Int    @map("owner_id")
+  sku     String
+  name    String
+  owner   User   @relation(fields: [ownerId], references: [id])
+  tags    Tag[]
+  @@unique([ownerId, sku], name: "owner_sku")
+}
+model Tag {
+  id       Int    @id
+  label    String @unique
+  products Product[]
+}
+model Order {
+  id         Int  @id
+  buyerId    Int  @map("buyer_id")
+  reviewerId Int? @map("reviewer_id")
+  productId  Int  @map("product_id")
+  buyer    User    @relation("buyer", fields: [buyerId], references: [id])
+  reviewer User?   @relation("reviewer", fields: [reviewerId], references: [id])
+  product  Product @relation(fields: [productId], references: [id])
+  @@unique([buyerId, productId])
+}
+enum Role {
+  ADMIN
+  MEMBER
+  @@map("shop_role")
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('resolvePrismaSchema - resolved shop schema', () => {
+  const res = resolvePrismaSchema(parsePrismaSchema(SHOP_PRISMA), mockSchema());
+
+  it('resolves every model, marking @@map divergence', () => {
+    assert.equal(res.hasUnresolved, false);
+    const user = res.models.find((m) => m.prismaName === 'User')!;
+    assert.equal(user.table, 'shop_users');
+    assert.equal(user.accessor, 'shopUsers');
+    assert.equal(user.viaMap, true);
+
+    const product = res.models.find((m) => m.prismaName === 'Product')!;
+    assert.equal(product.table, 'products'); // heuristic (product -> products)
+    assert.equal(product.viaMap, false);
+  });
+
+  it('maps fields via @map to the camelCase turbine field', () => {
+    assert.equal(res.map.models.User!.fields.displayName, 'displayName');
+    assert.equal(res.map.models.Order!.fields.buyerId, 'buyerId');
+  });
+
+  it('disambiguates two relations to the same model via @relation fields', () => {
+    const order = res.map.models.Order!;
+    assert.deepEqual(order.relations.buyer, { name: 'buyer', cardinality: 'one' });
+    assert.deepEqual(order.relations.reviewer, { name: 'reviewer', cardinality: 'one' });
+  });
+
+  it('resolves an implicit m2m relation and records the junction', () => {
+    const product = res.models.find((m) => m.prismaName === 'Product')!;
+    const tags = product.relations.find((r) => r.prismaName === 'tags')!;
+    assert.equal(tags.status, 'resolved');
+    assert.equal(tags.cardinality, 'many');
+    assert.equal(tags.junction, '_ProductToTag');
+    assert.equal(res.map.models.Product!.relations.tags!.name, 'tags');
+  });
+
+  it('derives named and default compound-unique selectors', () => {
+    assert.deepEqual(res.map.models.Product!.compoundUniques.owner_sku, ['ownerId', 'sku']);
+    assert.deepEqual(res.map.models.Order!.compoundUniques.buyerId_productId, ['buyerId', 'productId']);
+  });
+
+  it('resolves an enum via @@map', () => {
+    assert.equal(res.map.enums.Role, 'shop_role');
+  });
+});
+
+describe('resolvePrismaSchema - unresolved / diverged paths', () => {
+  it('marks a model UNRESOLVED when no table matches and never guesses', () => {
+    const src = 'model Gadget {\n  id Int @id\n}';
+    const res = resolvePrismaSchema(parsePrismaSchema(src), mockSchema());
+    const gadget = res.models[0]!;
+    assert.equal(gadget.status, 'unresolved');
+    assert.equal(gadget.table, null);
+    assert.ok(res.hasUnresolved);
+    assert.match(gadget.reason!, /no table matched/);
+  });
+
+  it('marks a model UNRESOLVED (never guesses) when multiple candidate tables match', () => {
+    // Both `widget` and `widgets` exist - ambiguous, must not pick one.
+    const schema: SchemaMetadata = {
+      enums: {},
+      tables: { widget: table('widget', ['id']), widgets: table('widgets', ['id']) },
+    };
+    const res = resolvePrismaSchema(parsePrismaSchema('model Widget {\n  id Int @id\n}'), schema);
+    assert.equal(res.models[0]!.status, 'unresolved');
+    assert.match(res.models[0]!.reason!, /ambiguous/);
+  });
+
+  it('reports an unresolved field when the column is missing', () => {
+    const src = 'model User {\n  id Int @id\n  ghost Int @map("does_not_exist")\n  @@map("shop_users")\n}';
+    const res = resolvePrismaSchema(parsePrismaSchema(src), mockSchema());
+    const ghost = res.models[0]!.fields.find((f) => f.prismaName === 'ghost')!;
+    assert.equal(ghost.status, 'unresolved');
+    assert.match(ghost.reason!, /not found/);
+    // and the field is omitted from the verified map
+    assert.equal(res.map.models.User!.fields.ghost, undefined);
+  });
+
+  it('reports an unresolved compound-unique when no constraint matches', () => {
+    const src =
+      'model User {\n  id Int @id\n  email String\n  role Int\n  @@unique([email, role])\n  @@map("shop_users")\n}';
+    const res = resolvePrismaSchema(parsePrismaSchema(src), mockSchema());
+    const cu = res.models[0]!.compoundUniques[0]!;
+    assert.equal(cu.status, 'unresolved');
+    assert.match(cu.reason!, /no unique constraint/);
+  });
+
+  it('flags an ambiguous relation (two FKs to one table) when @relation fields are absent', () => {
+    // A back-relation list with no @relation(fields) cannot pick between the two
+    // FKs orders has into shop_users.
+    const src =
+      'model User {\n  id Int @id\n  orders Order[]\n  @@map("shop_users")\n}\nmodel Order {\n  id Int @id\n}';
+    const schema = mockSchema();
+    // give shop_users two hasMany into orders
+    schema.tables.shop_users!.relations = {
+      ordersByBuyer: rel('ordersByBuyer', 'hasMany', 'orders', 'buyer_id'),
+      ordersByReviewer: rel('ordersByReviewer', 'hasMany', 'orders', 'reviewer_id'),
+    };
+    const res = resolvePrismaSchema(parsePrismaSchema(src), schema);
+    const orders = res.models.find((m) => m.prismaName === 'User')!.relations.find((r) => r.prismaName === 'orders')!;
+    assert.equal(orders.status, 'unresolved');
+    assert.match(orders.reason!, /ambiguous/);
+  });
+});
+
+describe('resolvePrismaSchema - --no-db (parse-only)', () => {
+  const res = resolvePrismaSchema(parsePrismaSchema(SHOP_PRISMA), null);
+
+  it('produces a parse-only report with no resolution and no map', () => {
+    assert.equal(res.noDb, true);
+    assert.equal(res.hasUnresolved, false); // parse-only never fails
+    assert.equal(Object.keys(res.map.models).length, 0);
+    for (const m of res.models) {
+      assert.equal(m.status, 'parsed');
+      assert.equal(m.table, null);
+    }
+  });
+});
+
+describe('generatePrismaMap - deterministic output', () => {
+  it('emits a byte-identical module across runs under noTimestamp', () => {
+    const res = resolvePrismaSchema(parsePrismaSchema(SHOP_PRISMA), mockSchema());
+    const a = generatePrismaMap(res.map, { noTimestamp: true });
+    const b = generatePrismaMap(res.map, { noTimestamp: true });
+    assert.equal(a, b);
+    assert.doesNotMatch(a, /Generated at:/); // no volatile timestamp line
+    assert.match(a, /export const PRISMA_MAP: PrismaCompatMap = \{/);
+    assert.match(a, /User: \{\n\s+table: 'shop_users'/);
+    assert.match(a, /owner_sku: \['ownerId', 'sku'\]/);
+    assert.match(a, /enums: \{ Role: 'shop_role' \}/);
+  });
+});
