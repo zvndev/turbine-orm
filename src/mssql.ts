@@ -639,7 +639,16 @@ export const mssqlDialect: Dialect = {
       .map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`)
       .join(', ');
     const out = mssqlOutput(input.returning, 'INSERTED');
-    // skipDuplicates has no single-statement equivalent here; ignored (documented).
+    // SQL Server has no single-statement skip-duplicates form (no ON CONFLICT /
+    // INSERT IGNORE), so silently dropping the flag would let duplicate rows
+    // through against the caller's intent. Refuse loudly instead.
+    if (input.skipDuplicates) {
+      throw new UnsupportedFeatureError(
+        'createMany({ skipDuplicates: true })',
+        'mssql',
+        'SQL Server has no ON CONFLICT DO NOTHING equivalent — pre-filter conflicting rows or use a MERGE.',
+      );
+    }
     return {
       sql: `INSERT INTO ${input.table} (${input.columns.join(', ')})${out} VALUES ${placeholders}`,
       params: input.rowValues.flat(),

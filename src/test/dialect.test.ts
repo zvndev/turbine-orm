@@ -445,7 +445,10 @@ describe('Dialect conformance matrix (no Postgres leakage)', () => {
                 { id: 1, name: 'Ada' },
                 { id: 2, name: 'Grace' },
               ],
-              skipDuplicates: true,
+              // No skipDuplicates here: it is engine-gated (MSSQL/PowDB throw
+              // E017), and this suite only asserts no-Postgres-token leakage.
+              // Per-engine skipDuplicates behavior is covered in each engine's
+              // own test file.
             }).sql,
           },
           {

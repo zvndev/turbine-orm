@@ -14,6 +14,11 @@
       "import": "./dist/serverless.js",
       "require": "./dist/cjs/serverless.js"
     },
+    "./prisma-compat": {
+      "types": "./dist/prisma-compat.d.ts",
+      "import": "./dist/prisma-compat.js",
+      "require": "./dist/cjs/prisma-compat.js"
+    },
     "./sqlite": {
       "types": "./dist/sqlite.d.ts",
       "import": "./dist/sqlite.js",

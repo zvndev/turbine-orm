@@ -169,6 +169,14 @@ describe('turbine-orm/mssql — dialect conformance (no Postgres leakage)', () =
     assert.doesNotMatch(d.sql, FORBIDDEN);
   });
 
+  it('createMany({ skipDuplicates }) throws E017 (no ON CONFLICT / INSERT IGNORE on SQL Server)', () => {
+    assert.throws(
+      () => q().buildCreateMany({ data: [{ id: 1, name: 'Ada' }], skipDuplicates: true }),
+      (err: unknown) =>
+        (err as { code?: string }).code === 'TURBINE_E017' && /skipDuplicates/.test((err as Error).message),
+    );
+  });
+
   it('upsert → MERGE … WHEN MATCHED … WHEN NOT MATCHED … OUTPUT INSERTED.* ; (ends with semicolon)', () => {
     const d = q().buildUpsert({ where: { id: 1 }, create: { id: 1, name: 'Ada' }, update: { name: 'Ada L.' } });
     assert.match(d.sql, /^MERGE INTO \[users\] AS T USING \(VALUES \(@p1, @p2\)\) AS S \(\[id\], \[name\]\)/);

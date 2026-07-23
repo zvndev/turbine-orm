@@ -682,6 +682,16 @@ describe('powdb: write generation', () => {
     assert.equal((rows[1] as { age: number }).age, 2); // coerced from "2"
   });
 
+  it('createMany({ skipDuplicates }) throws E017 (PowQL insert has no ON CONFLICT DO NOTHING)', async () => {
+    const m = mockPool();
+    await assert.rejects(
+      () => qi(m).createMany({ data: [{ name: 'A', age: 1 }], skipDuplicates: true }),
+      (err: unknown) =>
+        (err as { code?: string }).code === 'TURBINE_E017' && /skipDuplicates/.test((err as Error).message),
+    );
+    assert.equal(m.calls.length, 0, 'refused before any statement ran');
+  });
+
   it('update emits `returning` and shapes the post-update row (no reselect)', async () => {
     const m = mockPool();
     m.setRows([{ id: 'a', name: 'Z', age: '40' }]);
