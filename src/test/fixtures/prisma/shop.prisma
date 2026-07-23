@@ -1,0 +1,82 @@
+// Integration + parser fixture for `turbine migrate-from-prisma`.
+// Matches src/test/fixtures/prisma/shop.sql. Exercises @@map divergence, a
+// named and a default @@unique, a compound @@id, an enum, multiple FKs to one
+// table, and an implicit m2m relation.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+/// Application user. Table name diverges via @@map.
+model User {
+  id          Int      @id @default(autoincrement())
+  email       String   @unique
+  displayName String   @map("display_name")
+  role        Role     @default(MEMBER)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  // Back-relations (single FK each - cleanly resolvable).
+  ownedProducts Product[]
+
+  @@map("shop_users")
+}
+
+model Product {
+  id      Int     @id @default(autoincrement())
+  ownerId Int     @map("owner_id")
+  sku     String  @db.VarChar(64) // unknown attribute - skipped
+  name    String
+  price   Decimal @default(0)
+
+  owner  User    @relation(fields: [ownerId], references: [id])
+  orders Order[]
+  tags   Tag[]   // implicit m2m via _ProductToTag
+
+  @@unique([ownerId, sku], name: "owner_sku")
+}
+
+model Tag {
+  id       Int       @id @default(autoincrement())
+  label    String    @unique
+  products Product[] // implicit m2m back-reference
+}
+
+model Order {
+  id         Int  @id @default(autoincrement())
+  buyerId    Int  @map("buyer_id")
+  reviewerId Int? @map("reviewer_id")
+  productId  Int  @map("product_id")
+  quantity   Int  @default(1)
+
+  // Two relations to the SAME model (User) - disambiguated by @relation fields.
+  buyer    User     @relation("buyer", fields: [buyerId], references: [id])
+  reviewer User?    @relation("reviewer", fields: [reviewerId], references: [id])
+  product  Product  @relation(fields: [productId], references: [id])
+
+  @@unique([buyerId, productId])
+}
+
+/// Composite primary key, mapped table name.
+model OrderItem {
+  orderId   Int @map("order_id")
+  productId Int @map("product_id")
+  quantity  Int @default(1)
+
+  order   Order   @relation(fields: [orderId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+
+  @@id([orderId, productId])
+  @@map("order_items")
+}
+
+enum Role {
+  ADMIN
+  MEMBER
+
+  @@map("shop_role")
+}
