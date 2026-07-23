@@ -38,6 +38,7 @@ import type {
   WithOptions,
 } from './types.js';
 import { ownLookup } from './utils.js';
+import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 import * as writesMod from './writes.js';
@@ -59,9 +60,6 @@ export interface RelationShape {
   nested: Record<string, RelationShape>;
   cardinality: 'many' | 'one';
 }
-
-/** Relations already warned about missing FK indexes (once per process, dev only). */
-const unindexedRelationWarned = new Set<string>();
 
 /**
  * Resolve select/omit options into a list of snake_case column names.
@@ -1650,10 +1648,13 @@ export function buildRelationSubquery(
   // instead of letting the slowness look like an ORM problem.
   if (process.env.NODE_ENV !== 'production') {
     const warnKey = `${relDef.from}.${relDef.name}`;
-    if (!unindexedRelationWarned.has(warnKey)) {
+    // Compute the (potentially costly) probe only for a key not yet warned, and
+    // claim the key through the process-wide registry ONLY when we actually warn,
+    // so a dual-package / HMR-reevaluated second module copy cannot re-warn the
+    // same relation, and indexed relations never consume the dedupe cap.
+    if (!hasWarnedOnce(WARN_NS.unindexedRelation, warnKey)) {
       const miss = missingIndexForRelation(qi.schema, relDef);
-      if (miss) {
-        unindexedRelationWarned.add(warnKey);
+      if (miss && shouldWarnOnce(WARN_NS.unindexedRelation, warnKey)) {
         console.warn(
           `[turbine] Relation "${relDef.name}" on "${relDef.from}" probes ` +
             `"${miss.table}"(${miss.columns.join(', ')}) which has no covering index — ` +
