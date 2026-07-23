@@ -851,8 +851,12 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
     // indexes
     lines.push('      indexes: [');
     for (const idx of table.indexes) {
+      // `partial` must round-trip: the runtime compound-unique derivation reads
+      // the GENERATED metadata, so dropping the flag here would re-arm a
+      // partial-unique selector that types.ts correctly excludes.
+      const partialSeg = idx.partial ? ', partial: true' : '';
       lines.push(
-        `        { name: '${escSQ(idx.name)}', columns: [${idx.columns.map((c) => `'${escSQ(c)}'`).join(', ')}], unique: ${idx.unique}, definition: ${JSON.stringify(idx.definition)} },`,
+        `        { name: '${escSQ(idx.name)}', columns: [${idx.columns.map((c) => `'${escSQ(c)}'`).join(', ')}], unique: ${idx.unique}${partialSeg}, definition: ${JSON.stringify(idx.definition)} },`,
       );
     }
     lines.push('      ],');

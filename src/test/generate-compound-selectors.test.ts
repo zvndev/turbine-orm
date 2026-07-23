@@ -13,7 +13,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import ts from 'typescript';
-import { generateTypes } from '../generate.js';
+import { generateMetadata, generateTypes } from '../generate.js';
 import type { ColumnMetadata, IndexMetadata, SchemaMetadata, TableMetadata } from '../schema.js';
 
 function col(name: string, field: string, tsType = 'number', pgType = 'int8'): ColumnMetadata {
@@ -112,5 +112,51 @@ describe('generateTypes: compound-unique selector emission', () => {
     assert.match(out, /'"A"_"B"':/);
     // The broken bare form must NOT appear.
     assert.doesNotMatch(out, /[^'"]"A"_"B":/);
+  });
+
+  it('round-trips the partial flag through generateMetadata (runtime agreement)', () => {
+    // If the emitted metadata drops `partial`, the runtime compound-unique
+    // derivation (which reads GENERATED metadata) re-arms the selector that
+    // types.ts correctly excludes: type and runtime must agree.
+    const schema: SchemaMetadata = {
+      enums: {},
+      tables: {
+        pos_items: table(
+          'pos_items',
+          [col('id', 'id'), col('pos_id', 'posId'), col('pos_item_id', 'posItemId')],
+          [
+            {
+              name: 'pos_items_partial_key',
+              columns: ['pos_id', 'pos_item_id'],
+              unique: true,
+              partial: true,
+              definition:
+                'CREATE UNIQUE INDEX pos_items_partial_key ON public.pos_items USING btree (pos_id, pos_item_id) WHERE (pos_item_id IS NOT NULL)',
+            },
+          ],
+        ),
+      },
+    };
+    const meta = generateMetadata(schema);
+    assert.match(meta, /partial: true/);
+    // A non-partial index must not gain the flag.
+    const clean = generateMetadata({
+      enums: {},
+      tables: {
+        pos_items: table(
+          'pos_items',
+          [col('id', 'id'), col('pos_id', 'posId'), col('pos_item_id', 'posItemId')],
+          [
+            {
+              name: 'pos_items_key',
+              columns: ['pos_id', 'pos_item_id'],
+              unique: true,
+              definition: 'CREATE UNIQUE INDEX pos_items_key ON public.pos_items USING btree (pos_id, pos_item_id)',
+            },
+          ],
+        ),
+      },
+    });
+    assert.doesNotMatch(clean, /partial/);
   });
 });
