@@ -2033,6 +2033,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async createMany(args: CreateManyArgs<T>): Promise<T[]> {
     return this.withMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
+      if (args.skipDuplicates) {
+        // PowQL's `insert … returning` has no conflict clause, so there is no
+        // faithful skip-duplicates form; refuse rather than silently insert.
+        throw new UnsupportedFeatureError(
+          'createMany({ skipDuplicates: true })',
+          'powdb',
+          'PowQL insert has no ON CONFLICT DO NOTHING equivalent — filter duplicates before inserting.',
+        );
+      }
       const inputs = (args.data as Record<string, unknown>[]).map((d) => this.applyPkDefault(d));
       if (!inputs.length) return [];
       const params: unknown[] = [];
