@@ -134,4 +134,22 @@ describe('compound-unique selector, code-first declared unique index', () => {
     assert.match(sql, /WHERE "org_id" = \$1 AND "user_id" = \$2 LIMIT 1$/);
     assert.deepEqual(params, [3, 4]);
   });
+
+  it('does NOT source a selector from a PARTIAL unique index', () => {
+    // A partial unique index only guarantees uniqueness over its predicate's
+    // rows, so it must never back a compound-unique selector.
+    const s = schema((t) => {
+      t.uniqueColumns = [['id']];
+      t.indexes = [
+        { name: 'uq_org_user_partial', columns: ['org_id', 'user_id'], unique: true, definition: '', partial: true },
+      ];
+    });
+    const q = makeQuery('memberships', s);
+    // The synthetic selector name is not registered, so it falls through to the
+    // standard unknown-column error at SQL-build time.
+    assert.throws(
+      () => q.buildFindUnique({ where: { orgId_userId: { orgId: 3, userId: 4 } } } as never),
+      (err: unknown) => err instanceof ValidationError,
+    );
+  });
 });

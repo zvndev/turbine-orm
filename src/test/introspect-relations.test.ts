@@ -528,6 +528,82 @@ describe('addAutoManyToManyRelations — column-shadow handling (N-2)', () => {
     assert.match(warnings[0]!, /json\/jsonb/);
   });
 
+  it('detects a PK-less Prisma implicit junction via a two-column UNIQUE index', () => {
+    // Prisma implicit m2m junctions (`_UserOrganizations`) have NO primary key:
+    // just a two-column UNIQUE index on the quoted "A"/"B" FK columns. The
+    // unique-index fallback must treat this exactly like a two-column-PK
+    // junction and add m2m on both sides.
+    const fks = [
+      fk('_UserOrganizations', ['A'], 'users', ['id'], 'uo_a_fkey'),
+      fk('_UserOrganizations', ['B'], 'organizations', ['id'], 'uo_b_fkey'),
+    ];
+    const relationsByTable = buildRelationsFromForeignKeys(fks, new Map());
+    const [, warnings] = captureWarnings(() =>
+      addAutoManyToManyRelations(
+        ['users', 'organizations', '_UserOrganizations'],
+        fks,
+        new Map(), // no primary keys anywhere
+        new Map([['_UserOrganizations', ['A', 'B']]]),
+        relationsByTable,
+        undefined,
+        undefined,
+        new Map([['_UserOrganizations', [['A', 'B']]]]),
+      ),
+    );
+    assert.deepEqual(warnings, []);
+    assert.equal(relationsByTable.get('users')!.organizations!.type, 'manyToMany');
+    assert.equal(relationsByTable.get('organizations')!.users!.type, 'manyToMany');
+    assert.deepEqual(relationsByTable.get('users')!.organizations!.through, {
+      table: '_UserOrganizations',
+      sourceKey: 'A',
+      targetKey: 'B',
+    });
+  });
+
+  it('does NOT treat a PK-less two-FK table with a PAYLOAD column as a junction', () => {
+    // A first-class entity: same two FKs + unique(A,B), but an extra `grade`
+    // column. The payload guard must reject it (no m2m added).
+    const fks = [
+      fk('enrollments', ['A'], 'students', ['id'], 'en_a_fkey'),
+      fk('enrollments', ['B'], 'courses', ['id'], 'en_b_fkey'),
+    ];
+    const relationsByTable = buildRelationsFromForeignKeys(fks, new Map());
+    addAutoManyToManyRelations(
+      ['students', 'courses', 'enrollments'],
+      fks,
+      new Map(),
+      new Map([['enrollments', ['A', 'B', 'grade']]]),
+      relationsByTable,
+      undefined,
+      undefined,
+      new Map([['enrollments', [['A', 'B']]]]),
+    );
+    assert.equal(relationsByTable.get('students')?.courses, undefined);
+    assert.equal(relationsByTable.get('courses')?.students, undefined);
+  });
+
+  it('does NOT use the unique-index fallback when the table HAS a primary key', () => {
+    // A table with a surrogate PK is not a pure junction even if it carries a
+    // two-column unique index over its FKs. The fallback is PK-less-only.
+    const fks = [
+      fk('memberships', ['A'], 'users', ['id'], 'm_a_fkey'),
+      fk('memberships', ['B'], 'orgs', ['id'], 'm_b_fkey'),
+    ];
+    const relationsByTable = buildRelationsFromForeignKeys(fks, new Map());
+    addAutoManyToManyRelations(
+      ['users', 'orgs', 'memberships'],
+      fks,
+      new Map([['memberships', ['id']]]),
+      new Map([['memberships', ['id', 'A', 'B']]]),
+      relationsByTable,
+      undefined,
+      undefined,
+      new Map([['memberships', [['A', 'B']]]]),
+    );
+    assert.equal(relationsByTable.get('users')?.orgs, undefined);
+    assert.equal(relationsByTable.get('orgs')?.users, undefined);
+  });
+
   it('stays additive: an existing relation with the same name is never clobbered', () => {
     const relationsByTable = new Map<string, Record<string, import('../schema.js').RelationDef>>([
       [

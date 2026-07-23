@@ -497,16 +497,16 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       if (!tableSet.has(row.tablename)) continue;
       if (!indexesByTable.has(row.tablename)) indexesByTable.set(row.tablename, []);
 
-      const isUnique = (row.indexdef as string).includes('UNIQUE');
-      // Extract column names from indexdef (e.g. "CREATE INDEX idx ON tbl USING btree (col1, col2)")
-      const colMatch = (row.indexdef as string).match(/\((.+)\)/);
-      const columns = colMatch ? colMatch[1]!.split(',').map((c) => c.trim().replace(/ (ASC|DESC)/i, '')) : [];
+      const indexdef = row.indexdef as string;
+      const isUnique = indexdef.includes('UNIQUE');
+      const isPartial = indexHasWhere(indexdef);
 
       indexesByTable.get(row.tablename)!.push({
         name: row.indexname,
-        columns,
+        columns: parseIndexColumns(indexdef),
         unique: isUnique,
-        definition: row.indexdef,
+        definition: indexdef,
+        ...(isPartial ? { partial: true } : {}),
       });
     }
 
@@ -605,6 +605,15 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     // hasMany relations derived from J's FKs are left untouched — this block
     // never removes or renames anything. Naming/collision handling lives in the
     // shared addAutoManyToManyRelations helper.
+    //
+    // Prisma's implicit m2m junctions have no primary key (just a two-column
+    // UNIQUE index over the FK columns), so pass the introspected two-column
+    // unique indexes as the fallback junction-key source.
+    const uniqueIndexColsByTable = new Map<string, string[][]>();
+    for (const [tbl, idxs] of indexesByTable) {
+      const twoColUniques = idxs.filter((idx) => idx.unique && idx.columns.length === 2).map((idx) => idx.columns);
+      if (twoColUniques.length > 0) uniqueIndexColsByTable.set(tbl, twoColUniques);
+    }
     addAutoManyToManyRelations(
       tableNames,
       foreignKeys,
@@ -613,6 +622,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       relationsByTable,
       columnFieldsByTable,
       unknownTypedFieldsByTable,
+      uniqueIndexColsByTable,
     );
 
     // ----- Assemble TableMetadata for each table -----
@@ -662,6 +672,56 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
   } finally {
     await pool.end();
   }
+}
+
+/**
+ * Parse the indexed column names out of a `pg_indexes.indexdef` string.
+ *
+ * `indexdef` always reads `CREATE [UNIQUE] INDEX name ON tbl USING method
+ * (col, ...) [WHERE predicate]`. We anchor on the `USING` clause's parenthesised
+ * column list (the same precedent as `describeIndexDefMismatch` in
+ * schema-sql.ts) so a PARTIAL index's trailing `WHERE (...)` parentheses are
+ * never mistaken for the column list. The older greedy `/\((.+)\)/` swallowed
+ * `) WHERE (` and spliced a raw predicate fragment into the column names, which
+ * then leaked into generated compound-unique selector names.
+ *
+ * Each column is de-quoted (Postgres quotes non-lowercase identifiers such as a
+ * Prisma implicit m2m junction's `"A"` / `"B"`), so the names match the
+ * unquoted column names carried elsewhere in the metadata. Expression columns
+ * (anything containing a parenthesis) are dropped conservatively: a functional
+ * index does not name a plain column.
+ */
+export function parseIndexColumns(indexdef: string): string[] {
+  const m = indexdef.match(/USING\s+\w+\s*\(([^)]*)\)/i) ?? indexdef.match(/\(([^)]*)\)/);
+  if (!m) return [];
+  return m[1]!
+    .split(',')
+    .map((c) =>
+      unquoteIndexIdent(
+        c
+          .trim()
+          .replace(/\s+(ASC|DESC)$/i, '')
+          .trim(),
+      ),
+    )
+    .filter((c) => c.length > 0 && !c.includes('(') && !c.includes(')'));
+}
+
+/** Strip one pair of surrounding double quotes and unescape doubled `""`. */
+function unquoteIndexIdent(col: string): string {
+  if (col.length >= 2 && col.startsWith('"') && col.endsWith('"')) {
+    return col.slice(1, -1).replace(/""/g, '"');
+  }
+  return col;
+}
+
+/**
+ * Whether an `indexdef` carries a top-level `WHERE` predicate (a PARTIAL index).
+ * pg_indexes only ever emits `WHERE` as the partial predicate, so a keyword
+ * match is sufficient (matches the `describeIndexDefMismatch` precedent).
+ */
+export function indexHasWhere(indexdef: string): boolean {
+  return /\bWHERE\b/i.test(indexdef);
 }
 
 /**
@@ -1035,11 +1095,15 @@ export function buildRelationsFromForeignKeys(
  * IDENTICAL relation names for the same logical schema.
  *
  * A table J is a PURE junction only when ALL of these hold:
- *   1. J's primary key is exactly two columns.
+ *   1. J's junction KEY is exactly two columns: either a two-column primary
+ *      key, OR (Prisma implicit m2m junctions have NO primary key) a two-column
+ *      UNIQUE index over exactly the two FK columns, supplied via the optional
+ *      `uniqueIndexColsByTable`. When that map is absent the behavior is
+ *      unchanged: only a two-column PK qualifies.
  *   2. J has exactly two FKs, each single-column.
- *   3. Each FK's source column is one of J's two PK columns.
+ *   3. Each FK's source column is one of J's two key columns.
  *   4. The two FKs target two DISTINCT tables (A and B).
- *   5. J has no payload columns beyond the two FK/PK columns.
+ *   5. J has no payload columns beyond the two FK/key columns.
  *
  * For such a J linking A and B this ADDS a `manyToMany` on A → B and B → A
  * routed `through` J. It never removes or renames an existing relation:
@@ -1058,29 +1122,41 @@ export function addAutoManyToManyRelations(
   relationsByTable: Map<string, Record<string, RelationDef>>,
   columnFieldsByTable?: Map<string, Set<string>>,
   unknownTypedFieldsByTable?: Map<string, Set<string>>,
+  uniqueIndexColsByTable?: Map<string, string[][]>,
 ): void {
   for (const tableName of tableNames) {
-    const pk = pkByTable.get(tableName) ?? [];
-    if (pk.length !== 2) continue;
-
     // FKs whose source is this table — both must be single-column.
     const tableFks = foreignKeys.filter((fk) => fk.sourceTable === tableName);
     if (tableFks.length !== 2) continue;
     if (tableFks.some((fk) => fk.sourceColumns.length !== 1)) continue;
 
     const fkCols = tableFks.map((fk) => fk.sourceColumns[0]!);
-    const pkSet = new Set(pk);
-    // Both FK columns must be the PK columns (and vice-versa).
-    if (!fkCols.every((c) => pkSet.has(c))) continue;
     if (new Set(fkCols).size !== 2) continue;
+    const fkSet = new Set(fkCols);
+
+    // The junction KEY is normally the two-column PK. Prisma's implicit m2m
+    // junctions have NO primary key, so accept instead a two-column UNIQUE
+    // index that covers exactly the two FK columns. Only a PK-less table is
+    // eligible for the unique-index fallback, so a real entity that happens to
+    // carry a two-column unique index is never mistaken for a junction.
+    const pk = pkByTable.get(tableName) ?? [];
+    let keyCols: string[] | undefined;
+    if (pk.length === 2 && pk.every((c) => fkSet.has(c))) {
+      keyCols = pk;
+    } else if (pk.length === 0) {
+      const uniques = uniqueIndexColsByTable?.get(tableName) ?? [];
+      keyCols = uniques.find((u) => u.length === 2 && u.every((c) => fkSet.has(c)));
+    }
+    if (!keyCols) continue;
 
     // Two DISTINCT target tables.
     const [fkA, fkB] = tableFks as [ForeignKeyEntry, ForeignKeyEntry];
     if (fkA.targetTable === fkB.targetTable) continue;
 
-    // No payload columns: J's columns are exactly the two FK/PK columns.
+    // No payload columns: J's columns are exactly the two FK/key columns.
     const jCols = columnNamesByTable.get(tableName) ?? [];
     if (jCols.length !== 2) continue;
+    if (!jCols.every((c) => fkSet.has(c))) continue;
 
     // For each direction, the m2m `referenceKey` is the *targeted* table's
     // referenced column(s); the junction's sourceKey is the FK column pointing

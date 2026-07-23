@@ -199,6 +199,16 @@ export interface IndexMetadata {
   unique: boolean;
   definition: string;
   /**
+   * True when the index carries a top-level `WHERE` predicate (a Postgres
+   * PARTIAL index). A partial UNIQUE index only guarantees uniqueness over the
+   * rows matching its predicate, NOT over the whole table, so it must be
+   * EXCLUDED from compound-unique selector derivation (both the runtime
+   * `where` expansion and the generated `*WhereUnique` selector branches):
+   * addressing a row by it could match zero or many rows. Introspection sets
+   * it from the `indexdef`; absent / `false` means a full (table-wide) index.
+   */
+  partial?: boolean;
+  /**
    * Set only for a PowDB doc-field expression index: the JSON path (string keys
    * and integer array indexes) into the single json document column named by
    * `columns[0]`. When present, `columns` is `[<json column>]` and the index
