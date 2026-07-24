@@ -63,6 +63,87 @@ test('ignores destructive keywords inside comments and string literals', () => {
   assert.deepEqual(hits, []);
 });
 
+test('flags the optional-COLUMN drop shorthand', () => {
+  const hits = scanDestructiveSql('ALTER TABLE users DROP email;');
+  assert.deepEqual(
+    hits.map((h) => [h.kind, h.target]),
+    [['drop-column', 'users.email']],
+  );
+  // ...and the IF EXISTS / quoted / ONLY spellings of the same shorthand.
+  assert.deepEqual(
+    scanDestructiveSql('ALTER TABLE ONLY users DROP IF EXISTS "email";').map((h) => [h.kind, h.target]),
+    [['drop-column', 'users.email']],
+  );
+});
+
+test('does not confuse the other ALTER TABLE ... DROP sub-actions for a column drop', () => {
+  const hits = scanDestructiveSql(`
+    ALTER TABLE users DROP CONSTRAINT users_pkey;
+    ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
+    ALTER TABLE users ALTER COLUMN email DROP DEFAULT;
+    ALTER TABLE users ALTER COLUMN id DROP IDENTITY IF EXISTS;
+    ALTER TABLE users ALTER COLUMN total DROP EXPRESSION;
+  `);
+  assert.deepEqual(hits, []);
+});
+
+test('flags a data-modifying CTE', () => {
+  assert.deepEqual(
+    scanDestructiveSql('WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d;').map((h) => [h.kind, h.target]),
+    [['delete', 'users']],
+  );
+  // The OUTER query's WHERE does not restrict the CTE's UPDATE.
+  assert.deepEqual(
+    scanDestructiveSql('WITH u AS (UPDATE users SET tier = 0 RETURNING *) SELECT * FROM u WHERE id = 1;').map((h) => [
+      h.kind,
+      h.target,
+    ]),
+    [['update-without-where', 'users']],
+  );
+  // A read-only CTE stays clean.
+  assert.deepEqual(scanDestructiveSql('WITH d AS (SELECT * FROM users) SELECT * FROM d;'), []);
+});
+
+test('flags dynamic SQL inside a DO block', () => {
+  const hits = scanDestructiveSql(`DO $$ BEGIN EXECUTE 'DROP TABLE users'; END $$;`);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0]?.kind, 'drop-table');
+  assert.equal(hits[0]?.target, 'users');
+  assert.match(hits[0]?.statement ?? '', /in block: DROP TABLE users/);
+  // A procedural block with no destructive SQL stays clean.
+  assert.deepEqual(scanDestructiveSql('DO $$ BEGIN PERFORM 1; END $$;'), []);
+});
+
+test('scopes the UPDATE WHERE check to the top level', () => {
+  assert.deepEqual(
+    scanDestructiveSql(`UPDATE users SET tier = (SELECT t FROM defaults WHERE k = 'x');`).map((h) => [
+      h.kind,
+      h.target,
+    ]),
+    [['update-without-where', 'users']],
+  );
+  // A real top-level WHERE still suppresses the rule, subquery or not.
+  assert.deepEqual(
+    scanDestructiveSql(`UPDATE users SET tier = (SELECT t FROM defaults WHERE k = 'x') WHERE id = 2;`),
+    [],
+  );
+});
+
+test('flags MERGE ... THEN DELETE', () => {
+  assert.deepEqual(
+    scanDestructiveSql('MERGE INTO users u USING staged s ON u.id = s.id WHEN MATCHED THEN DELETE;').map((h) => [
+      h.kind,
+      h.target,
+    ]),
+    [['merge-delete', 'users']],
+  );
+  // An insert-only MERGE removes nothing.
+  assert.deepEqual(
+    scanDestructiveSql('MERGE INTO users u USING staged s ON u.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id);'),
+    [],
+  );
+});
+
 test('multi-statement files report each offender once', () => {
   const hits = scanDestructiveSql('CREATE TABLE a (id int); DROP TABLE b; CREATE TABLE c (id int); TRUNCATE d;');
   assert.equal(hits.length, 2);

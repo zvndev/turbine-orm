@@ -114,11 +114,29 @@ export interface TableStats {
   existingIndexCount?: number;
 }
 
+/**
+ * Placeholder for an index column that is an EXPRESSION, not a plain column
+ * (`pg_index.indkey` stores 0 for those, and no `pg_attribute` row has attnum 0).
+ * It keeps expression POSITIONS in `IndexStat.columns` instead of silently
+ * collapsing `(tenant_id, lower(email))` to `['tenant_id']`, which would make a
+ * functional index look like a droppable prefix of an unrelated plain index.
+ */
+export const EXPRESSION_COLUMN = '(expression)';
+
 /** A single index's identity + validity, from pg_index / pg_stat_user_indexes. */
 export interface IndexStat {
   table: string;
   indexName: string;
+  /** Key + INCLUDE columns in order; an expression slot is {@link EXPRESSION_COLUMN}. */
   columns: string[];
+  /** pg_am.amname (btree / gin / gist / hash / brin / spgist). Absent when unread. */
+  accessMethod?: string;
+  /** True when the index has at least one expression column (pg_index.indexprs). */
+  hasExpressions?: boolean;
+  /** The partial-index predicate text (pg_index.indpred), or null when not partial. */
+  predicate?: string | null;
+  /** pg_get_indexdef, the authoritative definition (used for honest reporting). */
+  indexDef?: string;
   idxScan?: number;
   isValid: boolean;
   isUnique: boolean;
@@ -467,6 +485,22 @@ export interface UnusedIndex {
   sizeBytes: number | null;
   /** `DROP INDEX CONCURRENTLY IF EXISTS`: printed only, never written to a migration. */
   dropSql: string;
+  /**
+   * What is special about this index (functional / partial / non-btree), or null
+   * for a plain btree. `idx_scan = 0` is a fact either way, but the caveat says
+   * what is actually being dropped: a rebuild is not always a `CREATE INDEX (col)`.
+   */
+  caveat: string | null;
+}
+
+/** Describe an index's non-plain-btree properties, or null when it is plain. */
+function describeIndexShape(idx: IndexStat): string | null {
+  const parts: string[] = [];
+  if (idx.hasExpressions === true || idx.columns.includes(EXPRESSION_COLUMN)) parts.push('expression index');
+  if (idx.predicate != null) parts.push(`partial index (WHERE ${idx.predicate})`);
+  if (idx.accessMethod !== undefined && idx.accessMethod !== 'btree') parts.push(`${idx.accessMethod} index`);
+  if (parts.length === 0) return null;
+  return `${parts.join('; ')}${idx.indexDef ? `: ${idx.indexDef}` : ''}`;
 }
 
 /**
@@ -488,6 +522,7 @@ export function findUnusedIndexes(snapshot: StatsSnapshot, options: { minScans?:
       idxScan: idx.idxScan ?? 0,
       sizeBytes: idx.sizeBytes ?? null,
       dropSql: buildDropIndexSql(idx.indexName, { concurrently: true }),
+      caveat: describeIndexShape(idx),
     }))
     .sort((a, b) => (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0) || a.indexName.localeCompare(b.indexName));
 }
@@ -511,6 +546,31 @@ function isLeadingPrefix(prefix: string[], columns: string[]): boolean {
 }
 
 /**
+ * Whether prefix coverage is even a meaningful question for this pair. Only a
+ * plain btree has leading-prefix semantics, and only two indexes of the SAME
+ * shape are interchangeable:
+ *
+ *   - access method must be btree on BOTH (a GIN index on a column answers
+ *     queries a btree cannot, and vice versa);
+ *   - neither may contain an expression column (`lower(email)` is a different
+ *     lookup from `email`, and an unresolved expression slot makes the column
+ *     list an unreliable basis for a drop verdict);
+ *   - the partial predicates must be IDENTICAL (both absent, or the same text).
+ *     A full index does technically answer a partial index's lookups, but it is
+ *     not the same object and the partial one exists to be small.
+ *
+ * Anything unknown (an access method or expression flag the collector could not
+ * read) answers "not comparable": doctor stays silent rather than suggesting a
+ * drop it cannot justify.
+ */
+function isCoverageComparable(narrow: IndexStat, wider: IndexStat): boolean {
+  if (narrow.accessMethod !== 'btree' || wider.accessMethod !== 'btree') return false;
+  if (narrow.hasExpressions !== false || wider.hasExpressions !== false) return false;
+  if (narrow.columns.includes(EXPRESSION_COLUMN) || wider.columns.includes(EXPRESSION_COLUMN)) return false;
+  return (narrow.predicate ?? null) === (wider.predicate ?? null);
+}
+
+/**
  * Non-unique indexes whose column list is a leading prefix of a WIDER index on
  * the same table. A btree serves any leading-prefix lookup, so the narrow index
  * is redundant. Pure metadata (no idx_scan needed).
@@ -518,6 +578,9 @@ function isLeadingPrefix(prefix: string[], columns: string[]): boolean {
  * Uniqueness compatibility: only a NON-unique index is ever reported. A unique
  * or primary-key prefix is load-bearing (it enforces a constraint), so it is
  * never called redundant even when a wider index shares its leading columns.
+ *
+ * Shape compatibility: see {@link isCoverageComparable}. A functional, partial,
+ * or non-btree index is never reported as covered by a plain btree.
  */
 export function findRedundantIndexes(snapshot: StatsSnapshot): RedundantIndex[] {
   const byTable = new Map<string, IndexStat[]>();
@@ -538,7 +601,12 @@ export function findRedundantIndexes(snapshot: StatsSnapshot): RedundantIndex[] 
       // remove a uniqueness/PK/exclusion guarantee or a replica identity.
       if (isConstraintBacking(narrow)) continue;
       if (narrow.columns.length === 0) continue;
-      const wider = list.find((w) => w.indexName !== narrow.indexName && isLeadingPrefix(narrow.columns, w.columns));
+      const wider = list.find(
+        (w) =>
+          w.indexName !== narrow.indexName &&
+          isCoverageComparable(narrow, w) &&
+          isLeadingPrefix(narrow.columns, w.columns),
+      );
       if (!wider) continue;
       out.push({
         table: narrow.table,
@@ -773,8 +841,15 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
       idx_scan: string | null;
       index_size: string | null;
       columns: string[] | null;
+      access_method: string;
+      has_expressions: boolean;
+      predicate: string | null;
+      index_def: string | null;
     }>(
       'pg_index',
+      // The column list LEFT JOINs pg_attribute so an EXPRESSION slot (indkey = 0,
+      // which no pg_attribute row matches) survives as a marker instead of being
+      // dropped by an inner join, which silently shortened functional indexes.
       `SELECT c.relname AS table_name,
               ic.relname AS index_name,
               i.indisvalid, i.indisunique, i.indisprimary, i.indisreplident,
@@ -782,12 +857,17 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
                        WHERE con.conindid = i.indexrelid AND con.contype = 'x') AS is_exclusion,
               s.idx_scan::text AS idx_scan,
               pg_relation_size(i.indexrelid)::text AS index_size,
-              (SELECT array_agg(a.attname::text ORDER BY k.ord)
+              am.amname AS access_method,
+              (i.indexprs IS NOT NULL) AS has_expressions,
+              pg_get_expr(i.indpred, i.indrelid) AS predicate,
+              pg_get_indexdef(i.indexrelid) AS index_def,
+              (SELECT array_agg(coalesce(a.attname::text, '${EXPRESSION_COLUMN}') ORDER BY k.ord)
                  FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
-                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum) AS columns
+                 LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum) AS columns
          FROM pg_index i
          JOIN pg_class c ON c.oid = i.indrelid
          JOIN pg_class ic ON ic.oid = i.indexrelid
+         JOIN pg_am am ON am.oid = ic.relam
          JOIN pg_namespace n ON n.oid = c.relnamespace
          LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = i.indexrelid
         WHERE n.nspname = $1`,
@@ -799,6 +879,10 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
           table: row.table_name,
           indexName: row.index_name,
           columns: row.columns ?? [],
+          accessMethod: row.access_method,
+          hasExpressions: row.has_expressions,
+          predicate: row.predicate,
+          indexDef: row.index_def ?? undefined,
           idxScan: row.idx_scan == null ? undefined : Number(row.idx_scan),
           isValid: row.indisvalid,
           isUnique: row.indisunique,
