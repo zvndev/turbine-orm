@@ -152,14 +152,75 @@ function buildSchema(): SchemaMetadata {
   // and the `nullable` schema-payload assertion.
   markNullable(users, 'name');
 
-  const posts = mockTable('posts', [
-    { name: 'id', field: 'id' },
-    { name: 'user_id', field: 'userId' },
-    { name: 'secret', field: 'secret', pgType: 'text' },
-  ]);
+  const posts = mockTable(
+    'posts',
+    [
+      { name: 'id', field: 'id' },
+      { name: 'user_id', field: 'userId' },
+      { name: 'secret', field: 'secret', pgType: 'text' },
+    ],
+    {
+      // The forward (belongsTo) side of users.posts — the click-through target.
+      author: {
+        type: 'belongsTo',
+        name: 'author',
+        from: 'posts',
+        to: 'users',
+        foreignKey: 'user_id',
+        referenceKey: 'id',
+      },
+    },
+  );
   markPii(posts, 'secret');
 
-  return { tables: { users, posts }, enums: {} };
+  // Sessions carries three belongsTo relations that exercise the PII rules on
+  // both ends of a link: a clean one, one pointing AT a PII column, and one
+  // whose own FK column is PII.
+  const sessions = mockTable(
+    'sessions',
+    [
+      { name: 'id', field: 'id' },
+      { name: 'user_id', field: 'userId' },
+      { name: 'owner_email', field: 'ownerEmail', pgType: 'text' },
+      { name: 'secret_ref', field: 'secretRef', pgType: 'text' },
+    ],
+    {
+      user: {
+        type: 'belongsTo',
+        name: 'user',
+        from: 'sessions',
+        to: 'users',
+        foreignKey: 'user_id',
+        referenceKey: 'id',
+      },
+      owner: {
+        type: 'belongsTo',
+        name: 'owner',
+        from: 'sessions',
+        to: 'users',
+        foreignKey: 'owner_email',
+        referenceKey: 'email',
+      },
+      secretUser: {
+        type: 'belongsTo',
+        name: 'secretUser',
+        from: 'sessions',
+        to: 'users',
+        foreignKey: 'secret_ref',
+        referenceKey: 'id',
+      },
+    },
+  );
+  markPii(sessions, 'secret_ref');
+
+  // A relation-free table: the "degrade silently" case (defineSchema-only or
+  // PowDB metadata, where relations are always empty).
+  const tags = mockTable('tags', [
+    { name: 'id', field: 'id' },
+    { name: 'label', field: 'label', pgType: 'text' },
+  ]);
+
+  return { tables: { users, posts, sessions, tags }, enums: {} };
 }
 
 function markPii(table: TableMetadata, columnName: string): void {
@@ -979,5 +1040,179 @@ describe('Studio PII: redacted columns are excluded from search and orderBy', ()
     const main = calls.find((c) => /^SELECT \* FROM/.test(c.text.trim()));
     assert.ok(main, 'main rows query recorded');
     assert.match(main!.text, /ORDER BY "email" ASC/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Foreign-key click-through navigation
+//
+// Links are derived from relation metadata and served on /api/schema; following
+// one is an ordinary /api/tables read with a single equals filter, so it adds no
+// route and inherits that route's validation, redaction, auth, and read-only
+// posture. These tests pin both halves.
+// ---------------------------------------------------------------------------
+
+interface SchemaTablePayload {
+  name: string;
+  foreignKeys: Array<{ column: string; relation: string; targetTable: string; targetColumn: string }>;
+  referencedBy: Array<{ column: string; relation: string; targetTable: string; targetColumn: string }>;
+}
+
+async function fetchSchemaTables(ctx: StudioContext): Promise<SchemaTablePayload[]> {
+  const req = makeReq({ method: 'GET', url: '/api/schema', headers: authHeaders() });
+  const { res, done } = makeRes();
+  await handleRequest(req, res, ctx);
+  const r = await done;
+  assert.equal(r.status, 200, r.body);
+  return (r.json as { tables: SchemaTablePayload[] }).tables;
+}
+
+function tableNamed(tables: SchemaTablePayload[], name: string): SchemaTablePayload {
+  const t = tables.find((x) => x.name === name);
+  assert.ok(t, `${name} present in schema payload`);
+  return t as SchemaTablePayload;
+}
+
+describe('Studio navigation: foreign-key link derivation', () => {
+  it('derives forward links from belongsTo metadata, never from column names', async () => {
+    const { pool } = makePool([{ rows: [] }]);
+    const ctx = makeCtx(pool, {});
+    const posts = tableNamed(await fetchSchemaTables(ctx), 'posts');
+    assert.deepEqual(posts.foreignKeys, [
+      { column: 'user_id', relation: 'author', targetTable: 'users', targetColumn: 'id' },
+    ]);
+  });
+
+  it('derives reverse links from hasMany metadata', async () => {
+    const { pool } = makePool([{ rows: [] }]);
+    const ctx = makeCtx(pool, {});
+    const users = tableNamed(await fetchSchemaTables(ctx), 'users');
+    assert.deepEqual(users.referencedBy, [
+      { column: 'id', relation: 'posts', targetTable: 'posts', targetColumn: 'user_id' },
+    ]);
+    // users itself holds no belongsTo relation, so it offers no forward link.
+    assert.deepEqual(users.foreignKeys, []);
+  });
+
+  it('emits no links at all for a relation-free table', async () => {
+    const { pool } = makePool([{ rows: [] }]);
+    const ctx = makeCtx(pool, {});
+    const tags = tableNamed(await fetchSchemaTables(ctx), 'tags');
+    assert.deepEqual(tags.foreignKeys, []);
+    assert.deepEqual(tags.referencedBy, []);
+  });
+
+  it('omits a link whose target column is PII-redacted, and restores it under --show-pii', async () => {
+    const redacted = tableNamed(await fetchSchemaTables(makeCtx(makePool([{ rows: [] }]).pool, {})), 'sessions');
+    const columns = redacted.foreignKeys.map((l) => l.column);
+    assert.ok(!columns.includes('owner_email'), 'a link pointing at users.email must not be offered');
+
+    const shown = tableNamed(
+      await fetchSchemaTables(makeCtx(makePool([{ rows: [] }]).pool, { showPii: true })),
+      'sessions',
+    );
+    const shownLink = shown.foreignKeys.find((l) => l.column === 'owner_email');
+    assert.ok(shownLink, 'the link is available once PII is shown');
+    assert.equal(shownLink?.targetColumn, 'email');
+  });
+
+  it('omits a link whose own FK column is PII-redacted, and restores it under --show-pii', async () => {
+    const redacted = tableNamed(await fetchSchemaTables(makeCtx(makePool([{ rows: [] }]).pool, {})), 'sessions');
+    const columns = redacted.foreignKeys.map((l) => l.column);
+    assert.ok(!columns.includes('secret_ref'), 'a redacted cell holds no clickable value');
+    // The clean link on the same table is unaffected.
+    assert.ok(columns.includes('user_id'));
+
+    const shown = tableNamed(
+      await fetchSchemaTables(makeCtx(makePool([{ rows: [] }]).pool, { showPii: true })),
+      'sessions',
+    );
+    assert.ok(shown.foreignKeys.some((l) => l.column === 'secret_ref'));
+  });
+});
+
+describe('Studio navigation: following a link', () => {
+  it('compiles a parameterized equals filter on the target column', async () => {
+    const { pool, calls } = makePool([{}, {}, { rows: [{ id: 4 }] }, { rows: [{ count: '1' }] }, {}]);
+    const ctx = makeCtx(pool, {});
+    const filters = encodeURIComponent(JSON.stringify([{ column: 'id', op: 'equals', value: 4 }]));
+    const req = makeReq({ method: 'GET', url: `/api/tables/users?filters=${filters}`, headers: authHeaders() });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+
+    assert.equal(r.status, 200, r.body);
+    const main = calls.find((c) => /^SELECT \* FROM/.test(c.text.trim()));
+    assert.ok(main, 'main rows query recorded');
+    assert.match(main!.text, /WHERE "id" = \$3/, 'the value is a bound parameter, never inlined');
+    assert.deepEqual(main!.values, [50, 0, 4]);
+    // Still a read: navigation never leaves the READ ONLY transaction.
+    assert.ok(calls.some((c) => /BEGIN READ ONLY/.test(c.text)));
+  });
+
+  it('refuses a destination table that is not in the metadata', async () => {
+    const { pool } = makePool();
+    const ctx = makeCtx(pool, {});
+    const req = makeReq({ method: 'GET', url: '/api/tables/pg_shadow', headers: authHeaders() });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+    assert.equal(r.status, 404);
+  });
+
+  it('refuses a destination column that is not in the metadata', async () => {
+    const { pool } = makePool();
+    const ctx = makeCtx(pool, {});
+    const filters = encodeURIComponent(JSON.stringify([{ column: 'id; DROP TABLE users', op: 'equals', value: 1 }]));
+    const req = makeReq({ method: 'GET', url: `/api/tables/users?filters=${filters}`, headers: authHeaders() });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+    assert.equal(r.status, 400);
+    assert.match(String((r.json as { error: string }).error), /unknown filter column/);
+  });
+
+  it('refuses a hand-forged jump onto a redacted PII column', async () => {
+    const { pool } = makePool();
+    const ctx = makeCtx(pool, {});
+    const filters = encodeURIComponent(JSON.stringify([{ column: 'email', op: 'equals', value: 'a@b.c' }]));
+    const req = makeReq({ method: 'GET', url: `/api/tables/users?filters=${filters}`, headers: authHeaders() });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+    assert.equal(r.status, 400);
+    assert.match(String((r.json as { error: string }).error), /PII-redacted/);
+  });
+
+  it('requires the session token to read link metadata or follow a link', async () => {
+    for (const url of ['/api/schema', '/api/tables/users?filters=%5B%5D']) {
+      const { pool } = makePool([{ rows: [] }]);
+      const ctx = makeCtx(pool, {});
+      const req = makeReq({ method: 'GET', url, headers: { origin: ORIGIN } });
+      const { res, done } = makeRes();
+      await handleRequest(req, res, ctx);
+      const r = await done;
+      assert.equal(r.status, 401, url);
+    }
+  });
+
+  it('opens no write surface: a followed link still 404s the write routes in read-only mode', async () => {
+    const { pool } = makePool([{}, {}, { rows: [{ id: 4 }] }, { rows: [{ count: '1' }] }, {}]);
+    const ctx = makeCtx(pool, { writable: false });
+    const filters = encodeURIComponent(JSON.stringify([{ column: 'id', op: 'equals', value: 4 }]));
+    const nav = makeReq({ method: 'GET', url: `/api/tables/users?filters=${filters}`, headers: authHeaders() });
+    const navRes = makeRes();
+    await handleRequest(nav, navRes.res, ctx);
+    assert.equal((await navRes.done).status, 200);
+
+    const write = makeReq({
+      method: 'POST',
+      url: '/api/row/update',
+      headers: authHeaders(),
+      body: { table: 'users', where: { id: 4 }, data: { name: 'x' } },
+    });
+    const writeRes = makeRes();
+    await handleRequest(write, writeRes.res, ctx);
+    assert.equal((await writeRes.done).status, 404);
   });
 });
