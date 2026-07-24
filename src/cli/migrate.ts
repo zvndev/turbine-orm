@@ -82,6 +82,13 @@ export interface MigrationRunResult {
   destructive: DestructiveOffender[];
   /** Migrations applied with a timestamp older than an already-applied one. */
   outOfOrder: OutOfOrderApply[];
+  /**
+   * Migrations applied WITHOUT a transaction (they carried the
+   * `-- turbine:no-transaction` directive). The CLI prints a loud notice for
+   * each: a mid-file failure leaves earlier statements applied and the migration
+   * unrecorded, so every statement in one of these must be idempotent.
+   */
+  noTransaction: MigrationFile[];
 }
 
 /** Extract the YYYYMMDDHHMMSS timestamp prefix from a migration name, or null. */
@@ -202,23 +209,48 @@ export function listMigrationFiles(migrationsDir: string): MigrationFile[] {
 }
 
 /**
- * Parse migration content string into UP and DOWN sections.
+ * The `-- turbine:no-transaction` directive: when present in a migration's
+ * header (before `-- UP`), the runner applies the file WITHOUT wrapping it in
+ * BEGIN/COMMIT and runs one statement per `client.query()` call. Required for
+ * `CREATE INDEX CONCURRENTLY`, which Postgres forbids inside any transaction,
+ * including the implicit transaction a multi-statement simple query creates.
+ */
+const NO_TRANSACTION_DIRECTIVE = /^--\s*turbine:no-transaction\s*$/i;
+
+/** The parsed sections of a migration file plus its execution directives. */
+export interface ParsedMigration {
+  up: string;
+  down: string;
+  /** True when the `-- turbine:no-transaction` directive is present in the header. */
+  noTransaction: boolean;
+}
+
+/**
+ * Parse migration content string into UP and DOWN sections plus directives.
  * Exported for unit testing.
  */
-export function parseMigrationContent(content: string): { up: string; down: string } {
+export function parseMigrationContent(content: string): ParsedMigration {
   const lines = content.split('\n');
 
   let section: 'none' | 'up' | 'down' = 'none';
+  let noTransaction = false;
   const upLines: string[] = [];
   const downLines: string[] = [];
 
   for (const line of lines) {
-    const trimmed = line.trim().toUpperCase();
-    if (trimmed === '-- UP') {
+    const trimmed = line.trim();
+    const upper = trimmed.toUpperCase();
+    // The directive is only honored in the header (before -- UP), so it can
+    // never be smuggled in via a DOWN-section comment.
+    if (section === 'none' && NO_TRANSACTION_DIRECTIVE.test(trimmed)) {
+      noTransaction = true;
+      continue;
+    }
+    if (upper === '-- UP') {
       section = 'up';
       continue;
     }
-    if (trimmed === '-- DOWN') {
+    if (upper === '-- DOWN') {
       section = 'down';
       continue;
     }
@@ -230,13 +262,156 @@ export function parseMigrationContent(content: string): { up: string; down: stri
   return {
     up: upLines.join('\n').trim(),
     down: downLines.join('\n').trim(),
+    noTransaction,
   };
+}
+
+/**
+ * Split a SQL script into individual statements on top-level semicolons.
+ *
+ * A correct tokenizer, not a `split(';')`: a semicolon inside a single-quoted
+ * string, a double-quoted identifier, a dollar-quoted body, a line comment
+ * (`--`), or a block comment (`/* *\/`, which Postgres allows to nest) must NOT
+ * split. This is the one production-destroying failure mode of no-transaction
+ * migrations (a partial statement executed against production), so the behavior
+ * is pinned by exhaustive unit tests.
+ *
+ * Comment-only fragments are dropped; every returned statement is trimmed and
+ * carries no trailing semicolon.
+ */
+export function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let current = '';
+  let i = 0;
+  const n = sql.length;
+
+  while (i < n) {
+    const ch = sql[i]!;
+    const next = sql[i + 1];
+
+    // Line comment: consume to end of line (kept verbatim in the statement).
+    if (ch === '-' && next === '-') {
+      let j = i;
+      while (j < n && sql[j] !== '\n') j++;
+      current += sql.slice(i, j);
+      i = j;
+      continue;
+    }
+
+    // Block comment (Postgres allows nesting: /* /* */ */).
+    if (ch === '/' && next === '*') {
+      let depth = 1;
+      let j = i + 2;
+      current += '/*';
+      while (j < n && depth > 0) {
+        if (sql[j] === '/' && sql[j + 1] === '*') {
+          depth++;
+          current += '/*';
+          j += 2;
+        } else if (sql[j] === '*' && sql[j + 1] === '/') {
+          depth--;
+          current += '*/';
+          j += 2;
+        } else {
+          current += sql[j];
+          j++;
+        }
+      }
+      i = j;
+      continue;
+    }
+
+    // Single-quoted string ('' is an escaped quote, stays inside the string).
+    if (ch === "'") {
+      let j = i + 1;
+      current += "'";
+      while (j < n) {
+        if (sql[j] === "'" && sql[j + 1] === "'") {
+          current += "''";
+          j += 2;
+          continue;
+        }
+        if (sql[j] === "'") {
+          current += "'";
+          j++;
+          break;
+        }
+        current += sql[j];
+        j++;
+      }
+      i = j;
+      continue;
+    }
+
+    // Double-quoted identifier ("" is an escaped quote).
+    if (ch === '"') {
+      let j = i + 1;
+      current += '"';
+      while (j < n) {
+        if (sql[j] === '"' && sql[j + 1] === '"') {
+          current += '""';
+          j += 2;
+          continue;
+        }
+        if (sql[j] === '"') {
+          current += '"';
+          j++;
+          break;
+        }
+        current += sql[j];
+        j++;
+      }
+      i = j;
+      continue;
+    }
+
+    // Dollar-quoted body ($tag$ ... $tag$; tag is empty or an identifier, never
+    // digit-leading, so a `$1` parameter placeholder is not mistaken for one).
+    if (ch === '$') {
+      const tagMatch = /^\$([A-Za-z_][A-Za-z_0-9]*)?\$/.exec(sql.slice(i));
+      if (tagMatch) {
+        const tag = tagMatch[0];
+        const end = sql.indexOf(tag, i + tag.length);
+        if (end === -1) {
+          current += sql.slice(i);
+          i = n;
+          continue;
+        }
+        current += sql.slice(i, end + tag.length);
+        i = end + tag.length;
+        continue;
+      }
+    }
+
+    // Top-level statement terminator.
+    if (ch === ';') {
+      const trimmed = current.trim();
+      if (trimmed) statements.push(trimmed);
+      current = '';
+      i++;
+      continue;
+    }
+
+    current += ch;
+    i++;
+  }
+
+  const tail = current.trim();
+  if (tail) statements.push(tail);
+
+  return statements.filter((s) => !isCommentOnlyStatement(s));
+}
+
+/** True when a fragment contains nothing but comments and whitespace. */
+function isCommentOnlyStatement(stmt: string): boolean {
+  const withoutComments = stmt.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ');
+  return withoutComments.trim().length === 0;
 }
 
 /**
  * Parse a migration file into UP and DOWN sections.
  */
-export function parseMigrationSQL(filePath: string): { up: string; down: string } {
+export function parseMigrationSQL(filePath: string): ParsedMigration {
   const content = readFileSync(filePath, 'utf-8');
   return parseMigrationContent(content);
 }
@@ -444,12 +619,15 @@ export function buildDiffMigrationBody(diff: {
  * - `autoContent`: pre-populate UP/DOWN from a schema diff.
  * - `options.recipe`: scaffold a named recipe (see {@link MIGRATION_RECIPES}).
  *   Mutually exclusive with `autoContent`; an unknown recipe throws.
+ * - `options.header`: extra header line(s) injected BEFORE `-- UP` (the only
+ *   place a `-- turbine:no-transaction` directive is honored). Used with
+ *   `autoContent`.
  */
 export function createMigration(
   migrationsDir: string,
   name: string,
   autoContent?: { up: string; down: string },
-  options?: { recipe?: string },
+  options?: { recipe?: string; header?: string },
 ): MigrationFile {
   mkdirSync(migrationsDir, { recursive: true });
 
@@ -479,10 +657,11 @@ ${body.up}
 ${body.down}
 `;
   } else if (autoContent) {
-    template = `-- Migration: ${name} (auto-generated from schema diff)
+    const headerBlock = options?.header ? `${options.header}\n` : '';
+    template = `-- Migration: ${name} (auto-generated)
 -- Created: ${now.toISOString()}
 -- Review this file before running: npx turbine migrate up
-
+${headerBlock}
 -- UP
 ${autoContent.up}
 
@@ -746,6 +925,12 @@ export async function migrateUp(
     allowDestructive?: boolean;
     adapter?: DatabaseAdapter;
     dialect?: Dialect;
+    /**
+     * Called right before a `-- turbine:no-transaction` migration runs, so the
+     * CLI can print its loud pre-run notice (a concurrent index build can wait a
+     * long time on other transactions and otherwise looks hung).
+     */
+    onNoTransaction?: (file: MigrationFile) => void;
   },
 ): Promise<MigrationRunResult> {
   const client = new pg.Client({ connectionString });
@@ -830,9 +1015,19 @@ export async function migrateUp(
       const results: MigrationFile[] = [];
       const errors: Array<{ file: MigrationFile; error: string }> = [];
       const outOfOrder: OutOfOrderApply[] = [];
+      const noTransactionApplied: MigrationFile[] = [];
+
+      const flagOutOfOrder = (file: MigrationFile): void => {
+        // Flag an out-of-order apply: this file's timestamp is older than a
+        // migration that was already applied before this run started.
+        if (newestPrior && file.timestamp && file.timestamp < newestPrior.ts) {
+          outOfOrder.push({ applied: file.filename, newestPrior: `${newestPrior.name}.sql` });
+        }
+      };
 
       for (const file of pending) {
-        const { up } = parseMigrationSQL(file.path);
+        const parsed = parseMigrationSQL(file.path);
+        const up = parsed.up;
         if (!up) {
           errors.push({ file, error: 'No UP section found in migration file' });
           continue;
@@ -840,18 +1035,38 @@ export async function migrateUp(
 
         const content = readFileSync(file.path, 'utf-8');
         const hash = checksum(content);
+        const insertApplied = dialect.buildMigrationInsertApplied(quotedTrackingTable(dialect));
+
+        if (parsed.noTransaction) {
+          // No BEGIN/COMMIT: run ONE statement per query() call (a multi-statement
+          // simple query would be wrapped in an implicit transaction, breaking
+          // CREATE INDEX CONCURRENTLY). Recording happens only after all statements
+          // succeed: a mid-file failure leaves earlier (idempotent) statements
+          // applied and the migration unrecorded, so a rerun resumes it.
+          options?.onNoTransaction?.(file);
+          noTransactionApplied.push(file);
+          try {
+            for (const stmt of splitSqlStatements(up)) {
+              await client.query(stmt);
+            }
+            await client.query(insertApplied, [file.name, hash]);
+            results.push(file);
+            flagOutOfOrder(file);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            errors.push({ file, error: msg });
+            break;
+          }
+          continue;
+        }
 
         try {
           await client.query('BEGIN');
           await client.query(up);
-          await client.query(dialect.buildMigrationInsertApplied(quotedTrackingTable(dialect)), [file.name, hash]);
+          await client.query(insertApplied, [file.name, hash]);
           await client.query('COMMIT');
           results.push(file);
-          // Flag an out-of-order apply: this file's timestamp is older than a
-          // migration that was already applied before this run started.
-          if (newestPrior && file.timestamp && file.timestamp < newestPrior.ts) {
-            outOfOrder.push({ applied: file.filename, newestPrior: `${newestPrior.name}.sql` });
-          }
+          flagOutOfOrder(file);
         } catch (err) {
           await client.query('ROLLBACK');
           const msg = err instanceof Error ? err.message : String(err);
@@ -861,7 +1076,7 @@ export async function migrateUp(
         }
       }
 
-      return { applied: results, errors, destructive, outOfOrder };
+      return { applied: results, errors, destructive, outOfOrder, noTransaction: noTransactionApplied };
     } finally {
       await releaseLock(client, lockId, adapter);
     }
@@ -973,16 +1188,36 @@ export async function migrateDown(
           continue;
         }
 
-        const { down } = parseMigrationSQL(file.path);
+        const parsed = parseMigrationSQL(file.path);
+        const down = parsed.down;
         if (!down) {
           errors.push({ file, error: 'No DOWN section found in migration file' });
+          continue;
+        }
+
+        const deleteApplied = dialect.buildMigrationDeleteApplied(quotedTrackingTable(dialect));
+
+        if (parsed.noTransaction) {
+          // Untransacted rollback (DROP INDEX CONCURRENTLY IF EXISTS), one
+          // statement per query() call: same contract as the untransacted UP.
+          try {
+            for (const stmt of splitSqlStatements(down)) {
+              await client.query(stmt);
+            }
+            await client.query(deleteApplied, [migration.name]);
+            results.push(file);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            errors.push({ file, error: msg });
+            break;
+          }
           continue;
         }
 
         try {
           await client.query('BEGIN');
           await client.query(down);
-          await client.query(dialect.buildMigrationDeleteApplied(quotedTrackingTable(dialect)), [migration.name]);
+          await client.query(deleteApplied, [migration.name]);
           await client.query('COMMIT');
           results.push(file);
         } catch (err) {

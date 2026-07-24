@@ -14,7 +14,7 @@
  *   turbine migrate status        — Show migration status
  *   turbine seed                  — Run seed file
  *   turbine status                — Show schema summary
- *   turbine doctor                — Check relations for missing FK indexes (--fix emits migration)
+ *   turbine doctor                - Cost-aware missing-FK-index triage (--fix, --json, --no-concurrently)
  *   turbine studio                : Launch local read-only web UI (--demo for a seeded sample DB)
  *   turbine mcp                   — Start read-only MCP server over JSON-RPC stdio
  *   turbine observe               — Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
@@ -39,8 +39,26 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generate, generatePrismaMap } from '../generate.js';
-import { findMissingRelationIndexes } from '../index-advisor.js';
+import {
+  buildCreateIndexSql,
+  buildDropIndexSql,
+  findMissingRelationIndexes,
+  type MissingRelationIndex,
+} from '../index-advisor.js';
+import {
+  collectStatsSnapshot,
+  findInvalidIndexes,
+  formatBytes,
+  type IndexTier,
+  isSnapshotUsable,
+  type ProbedColumn,
+  type ScoredMissingIndex,
+  STATS_THRESHOLDS,
+  type StatsSnapshot,
+  scoreMissingIndex,
+} from '../index-stats.js';
 import { introspect } from '../introspect.js';
+import type { SchemaMetadata } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
 import type { CliOverrides, ResolvedConfig } from './config.js';
@@ -65,6 +83,7 @@ import {
   inspectMigrationDeploy,
   listMigrationFiles,
   MIGRATION_RECIPES,
+  type MigrationFile,
   migrateDeploy,
   migrateDown,
   migrateStatus,
@@ -130,6 +149,10 @@ export interface CliArgs {
   /** `migrate create --recipe <name>` scaffold selector. */
   recipe?: string;
   fix?: boolean;
+  /** `doctor --json`: emit a stable, versioned machine-readable report. */
+  json?: boolean;
+  /** `doctor --fix --no-concurrently`: emit plain CREATE INDEX instead of the CONCURRENTLY + no-transaction form. */
+  noConcurrently?: boolean;
   // init flags
   /** `init --yes`/`-y`: accept every step's default non-interactively. */
   yes?: boolean;
@@ -252,6 +275,12 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--fix':
         result.fix = true;
+        break;
+      case '--json':
+        result.json = true;
+        break;
+      case '--no-concurrently':
+        result.noConcurrently = true;
         break;
       case '--zod':
         result.zod = true;
@@ -1915,12 +1944,25 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
 
   const spinner = new Spinner('Applying migrations').start();
 
+  // A no-transaction migration (CREATE INDEX CONCURRENTLY) can wait a long time
+  // on other transactions and otherwise looks hung. Stop the spinner and print
+  // a loud notice the moment one is about to run.
+  const onNoTransaction = (file: MigrationFile): void => {
+    spinner.stop();
+    warn(`Running ${bold(file.filename)} WITHOUT a transaction (-- turbine:no-transaction).`);
+    console.log(`  ${dim('Each statement runs on its own. A mid-file failure leaves earlier statements')}`);
+    console.log(`  ${dim('applied and the migration UNRECORDED, so every statement must be idempotent.')}`);
+    console.log(`  ${dim('CREATE INDEX CONCURRENTLY can wait on long-running transactions: not a hang.')}`);
+    newline();
+  };
+
   let result: Awaited<ReturnType<typeof migrateUp>>;
   try {
     result = await migrateUp(url, config.migrationsDir, {
       step: args.step,
       allowDrift: args.allowDrift,
       allowDestructive: args.allowDestructive,
+      onNoTransaction,
     });
   } catch (err) {
     if (!isDestructiveRefusal(err)) throw err;
@@ -1935,6 +1977,7 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
       step: args.step,
       allowDrift: args.allowDrift,
       allowDestructive: true,
+      onNoTransaction,
     });
   }
 
@@ -2468,15 +2511,61 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
 // Command: doctor — relation/index health check
 // ---------------------------------------------------------------------------
 
+/** A topology finding paired with its cost-aware score. */
+interface DoctorFinding {
+  missing: MissingRelationIndex;
+  score: ScoredMissingIndex;
+}
+
+/** Human labels + tier ordering for the three triage buckets. */
+const TIER_ORDER: IndexTier[] = ['take-freely', 'take-deliberately', 'scrutinize'];
+const TIER_LABEL: Record<IndexTier, string> = {
+  'take-freely': 'TAKE FREELY',
+  'take-deliberately': 'TAKE DELIBERATELY',
+  scrutinize: 'SCRUTINIZE',
+};
+
+/** Build the `CREATE INDEX` for a finding, honoring the partial-null suggestion. */
+function doctorCreateSql(f: DoctorFinding, opts: { concurrently: boolean }): string {
+  return buildCreateIndexSql(f.missing.table, f.missing.columns, f.missing.indexName, {
+    concurrently: opts.concurrently,
+    partialNotNull: f.score.partialNotNull,
+  });
+}
+
+/** The commented recipe prepended to a CONCURRENTLY fix migration's UP body. */
+const CONCURRENTLY_RECIPE_COMMENT = [
+  '-- CREATE INDEX CONCURRENTLY builds without holding a write lock, but it cannot',
+  '-- run inside a transaction (that is why this file carries the',
+  '-- "-- turbine:no-transaction" directive above). Read before applying:',
+  '--',
+  '--   1. Idempotency is required. This migration is recorded only after ALL',
+  '--      statements succeed; a mid-file failure leaves earlier indexes built and',
+  '--      the migration unrecorded, so a rerun must be safe. IF NOT EXISTS keeps',
+  '--      each CREATE idempotent.',
+  '--   2. The INVALID-index trap. A CREATE INDEX CONCURRENTLY that fails partway',
+  '--      leaves an INVALID index behind. On rerun, IF NOT EXISTS SKIPS that',
+  '--      corpse (the name already exists), so the index is never actually built.',
+  '--      Fix: DROP INDEX CONCURRENTLY the invalid index, then rerun. Run',
+  '--      "turbine doctor" to list invalid indexes.',
+  '--   3. Locking. CREATE INDEX CONCURRENTLY waits for every transaction that can',
+  '--      see the table to finish. A long-running transaction makes it wait and',
+  '--      makes "migrate up" look hung. For bounded waits, SET lock_timeout /',
+  '--      statement_timeout in a psql session.',
+].join('\n');
+
 async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
-  banner();
+  const jsonMode = args.json === true;
   const url = requireUrl(config);
 
-  label('Database', redactUrl(url));
-  label('Schema', config.schema);
-  newline();
+  if (!jsonMode) {
+    banner();
+    label('Database', redactUrl(url));
+    label('Schema', config.schema);
+    newline();
+  }
 
-  const spinner = new Spinner('Introspecting database').start();
+  const spinner = jsonMode ? null : new Spinner('Introspecting database').start();
 
   const schema = await introspect({
     connectionString: url,
@@ -2487,72 +2576,251 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
 
   const missing = findMissingRelationIndexes(schema);
 
-  if (missing.length === 0) {
-    spinner.succeed('Every relation probe is backed by an index');
+  // Collect live statistics. The collector reads whole-schema indexes (for
+  // invalid-index detection) plus per-table stats + probed-column null_frac.
+  const probedTables = [...new Set(missing.map((m) => m.table))];
+  const probedColumns: ProbedColumn[] = [];
+  for (const m of missing) {
+    if (m.columns.length === 1 && m.columns[0] !== undefined) {
+      probedColumns.push({ table: m.table, column: m.columns[0] });
+    }
+  }
+
+  let snapshot: StatsSnapshot;
+  try {
+    snapshot = await collectStatsSnapshot({
+      connectionString: url,
+      schema: config.schema,
+      tables: probedTables,
+      columns: probedColumns,
+    });
+  } catch (err) {
+    snapshot = {
+      available: false,
+      statsReset: null,
+      statsAgeDays: null,
+      tables: {},
+      indexes: [],
+      nullFrac: {},
+      notices: [`statistics collection failed: ${err instanceof Error ? err.message : String(err)}`],
+    };
+  }
+
+  const invalid = findInvalidIndexes(snapshot);
+  const usable = isSnapshotUsable(snapshot);
+  const findings: DoctorFinding[] = missing.map((m) => ({ missing: m, score: scoreMissingIndex(m, snapshot) }));
+
+  if (jsonMode) {
+    spinner?.stop();
+    console.log(JSON.stringify(buildDoctorJson({ schema, findings, invalid, snapshot, usable, args }), null, 2));
+    return;
+  }
+
+  await renderDoctorHuman({ spinner: spinner!, schema, findings, invalid, snapshot, usable, args, config });
+}
+
+/** The stable, versioned JSON contract (schemaVersion: 1). First external consumer: BataDB import. */
+function buildDoctorJson(ctx: {
+  schema: SchemaMetadata;
+  findings: DoctorFinding[];
+  invalid: ReturnType<typeof findInvalidIndexes>;
+  snapshot: StatsSnapshot;
+  usable: boolean;
+  args: CliArgs;
+}): Record<string, unknown> {
+  const concurrently = ctx.args.noConcurrently !== true;
+  return {
+    schemaVersion: 1,
+    scannedTables: Object.keys(ctx.schema.tables).length,
+    stats: {
+      available: ctx.snapshot.available,
+      usable: ctx.usable,
+      statsReset: ctx.snapshot.statsReset ? ctx.snapshot.statsReset.toISOString() : null,
+      statsAgeDays: ctx.snapshot.statsAgeDays,
+      notices: ctx.snapshot.notices,
+    },
+    thresholds: STATS_THRESHOLDS,
+    findings: ctx.findings.map((f) => ({
+      table: f.missing.table,
+      columns: f.missing.columns,
+      indexName: f.missing.indexName,
+      tier: f.score.tier,
+      reasons: f.score.reasons,
+      metrics: f.score.metrics,
+      hotWarning: f.score.hotWarning,
+      partialNotNull: f.score.partialNotNull,
+      probes: f.missing.probes,
+      createSql: doctorCreateSql(f, { concurrently }),
+      dropSql: buildDropIndexSql(f.missing.indexName, { concurrently }),
+    })),
+    invalidIndexes: ctx.invalid,
+  };
+}
+
+async function renderDoctorHuman(ctx: {
+  spinner: Spinner;
+  schema: SchemaMetadata;
+  findings: DoctorFinding[];
+  invalid: ReturnType<typeof findInvalidIndexes>;
+  snapshot: StatsSnapshot;
+  usable: boolean;
+  args: CliArgs;
+  config: ResolvedConfig;
+}): Promise<void> {
+  const { spinner, schema, findings, invalid, snapshot, usable, args, config } = ctx;
+
+  spinner.succeed(`Scanned ${bold(String(Object.keys(schema.tables).length))} tables`);
+
+  if (findings.length === 0 && invalid.length === 0) {
+    success('Every relation probe is backed by an index, and no invalid indexes were found');
     newline();
     return;
   }
 
-  spinner.succeed(`Scanned ${bold(String(Object.keys(schema.tables).length))} tables`);
-  warn(`Found ${bold(String(missing.length))} unindexed relation probe(s)`);
-  newline();
+  if (findings.length > 0) {
+    warn(`Found ${bold(String(findings.length))} unindexed relation probe(s)`);
+    newline();
+    console.log(`  ${dim('Turbine loads relations as correlated subqueries: the child table is probed')}`);
+    console.log(`  ${dim('once per parent row, so an unindexed FK costs a full table scan PER PARENT.')}`);
+    newline();
 
-  // Row counts put the findings in severity order: a missing index on a 300-row
-  // table is noise; on a 300K-row table it is the whole page load.
-  const rowCounts = new Map<string, number>();
-  {
-    const { Pool } = (await import('pg')).default;
-    const pool = new Pool({ connectionString: url, max: 1 });
-    try {
-      const tables = [...new Set(missing.map((m) => m.table))];
-      const res = await pool.query<{ relname: string; reltuples: string }>(
-        `SELECT c.relname, c.reltuples::bigint::text AS reltuples
-           FROM pg_class c
-           JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE n.nspname = $1 AND c.relname = ANY($2)`,
-        [config.schema, tables],
-      );
-      for (const row of res.rows) rowCounts.set(row.relname, Math.max(0, Number(row.reltuples)));
-    } finally {
-      await pool.end();
+    if (usable) {
+      renderTiers(findings, snapshot, args);
+    } else {
+      renderTopologyFallback(findings, snapshot);
     }
   }
 
-  missing.sort((a, b) => (rowCounts.get(b.table) ?? 0) - (rowCounts.get(a.table) ?? 0));
+  renderInvalidIndexes(invalid);
 
-  console.log(`  ${dim('Turbine loads relations as correlated subqueries — the child table is probed')}`);
-  console.log(`  ${dim('once per parent row, so an unindexed FK costs a full table scan PER PARENT.')}`);
+  if (findings.length > 0) {
+    if (args.fix) {
+      renderFixMigration(findings, config, args);
+    } else {
+      console.log(`  ${dim('Generate a fix migration with:')} ${cyan('npx turbine doctor --fix')}`);
+      console.log(`  ${dim('Machine-readable report:')} ${cyan('npx turbine doctor --json')}`);
+      newline();
+    }
+  }
+}
+
+/** Cost-aware tiered output: three sections, each finding annotated with its numbers. */
+function renderTiers(findings: DoctorFinding[], snapshot: StatsSnapshot, _args: CliArgs): void {
+  const ageLabel = snapshot.statsAgeDays !== null ? `${Math.round(snapshot.statsAgeDays)}d` : 'unknown';
+  console.log(
+    `  ${dim(`Cost triage based on live statistics (stats reset ${ageLabel} ago). Thresholds: tiny < ${STATS_THRESHOLDS.tinyTableRows.toLocaleString()} rows,`)}`,
+  );
+  console.log(
+    `  ${dim(`"real" write rate >= ${STATS_THRESHOLDS.highWritesPerDay.toLocaleString()}/day, "many" indexes >= ${STATS_THRESHOLDS.manyIndexes}.`)}`,
+  );
   newline();
 
-  for (const m of missing) {
-    const rows = rowCounts.get(m.table);
-    const rowsLabel = rows !== undefined ? `~${rows.toLocaleString()} rows` : 'row count unknown';
+  const tierColor: Record<IndexTier, (s: string) => string> = {
+    'take-freely': green,
+    'take-deliberately': yellow,
+    scrutinize: red,
+  };
+
+  for (const tier of TIER_ORDER) {
+    const inTier = findings
+      .filter((f) => f.score.tier === tier)
+      .sort((a, b) => b.score.benefitScore - a.score.benefitScore);
+    if (inTier.length === 0) continue;
+
+    console.log(`  ${bold(tierColor[tier](`${TIER_LABEL[tier]} (${inTier.length})`))}`);
+    newline();
+    for (const f of inTier) {
+      renderFinding(f, { concurrently: true, withReasons: true });
+    }
+  }
+}
+
+/** Degraded output: today's size-sorted topology report when stats are absent/young. */
+function renderTopologyFallback(findings: DoctorFinding[], snapshot: StatsSnapshot): void {
+  warn('Statistics unavailable or too young to score cost: showing size-sorted topology only.');
+  for (const notice of snapshot.notices) console.log(`  ${dim(`- ${notice}`)}`);
+  if (snapshot.statsAgeDays !== null && snapshot.statsAgeDays < STATS_THRESHOLDS.minStatsAgeDays) {
     console.log(
-      `  ${yellow(symbols.warning)} ${bold(cyan(m.table))} ${dim(`(${m.columns.join(', ')})`)}  ${gray(rowsLabel)}`,
+      `  ${dim(`- statistics were reset less than ${STATS_THRESHOLDS.minStatsAgeDays} day(s) ago; write rates are not yet meaningful.`)}`,
     );
-    for (const p of m.probes) {
-      console.log(`    ${dim(symbols.tee)} probed by ${p.from}.${blue(p.relation)} ${dim(`(${p.type})`)}`);
+  }
+  newline();
+
+  const sorted = [...findings].sort((a, b) => (b.score.metrics.rows ?? 0) - (a.score.metrics.rows ?? 0));
+  for (const f of sorted) {
+    renderFinding(f, { concurrently: false, withReasons: false });
+  }
+}
+
+/** Render one finding: table + columns, probing relations, reasons, and the create SQL. */
+function renderFinding(f: DoctorFinding, opts: { concurrently: boolean; withReasons: boolean }): void {
+  const m = f.missing;
+  const rows = f.score.metrics.rows;
+  const rowsLabel = rows !== null ? `~${rows.toLocaleString()} rows` : 'row count unknown';
+  const sizeLabel = f.score.metrics.sizeBytes !== null ? `, ${formatBytes(f.score.metrics.sizeBytes)}` : '';
+  console.log(
+    `  ${yellow(symbols.warning)} ${bold(cyan(m.table))} ${dim(`(${m.columns.join(', ')})`)}  ${gray(`${rowsLabel}${sizeLabel}`)}`,
+  );
+  for (const p of m.probes) {
+    console.log(`    ${dim(symbols.tee)} probed by ${p.from}.${blue(p.relation)} ${dim(`(${p.type})`)}`);
+  }
+  if (opts.withReasons) {
+    for (const reason of f.score.reasons) {
+      console.log(`    ${dim(symbols.tee)} ${dim(reason)}`);
     }
-    console.log(`    ${dim(symbols.teeEnd)} ${green(m.createSql)}`);
+  }
+  console.log(`    ${dim(symbols.teeEnd)} ${green(doctorCreateSql(f, { concurrently: opts.concurrently }))}`);
+  newline();
+}
+
+/** The invalid-index report section (a failed CONCURRENTLY build leaves these behind). */
+function renderInvalidIndexes(invalid: ReturnType<typeof findInvalidIndexes>): void {
+  if (invalid.length === 0) return;
+  warn(`Found ${bold(String(invalid.length))} INVALID index(es) (a failed CREATE INDEX CONCURRENTLY leaves these).`);
+  console.log(`  ${dim('IF NOT EXISTS skips an invalid index on rerun, so it never rebuilds. Drop it, then rerun:')}`);
+  newline();
+  for (const idx of invalid) {
+    console.log(
+      `  ${red(symbols.warning)} ${bold(cyan(idx.table))} ${dim(`(${idx.columns.join(', ') || '?'})`)}  ${gray(idx.indexName)}`,
+    );
+    console.log(`    ${dim(symbols.teeEnd)} ${green(idx.dropSql)}`);
     newline();
   }
+}
 
-  if (args.fix) {
-    const up = missing.map((m) => m.createSql).join('\n');
-    const down = missing.map((m) => m.dropSql).join('\n');
-    const file = createMigration(config.migrationsDir, 'add_relation_fk_indexes', { up, down });
-    success(`Created migration: ${bold(file.filename)}`);
-    newline();
+/** Write the --fix migration (CONCURRENTLY + directive by default; plain with --no-concurrently). */
+function renderFixMigration(findings: DoctorFinding[], config: ResolvedConfig, args: CliArgs): void {
+  const concurrently = args.noConcurrently !== true;
+  const up = findings.map((f) => doctorCreateSql(f, { concurrently })).join('\n');
+  const down = findings.map((f) => buildDropIndexSql(f.missing.indexName, { concurrently })).join('\n');
+
+  let file: MigrationFile;
+  if (concurrently) {
+    file = createMigration(
+      config.migrationsDir,
+      'add_relation_fk_indexes',
+      { up: `${CONCURRENTLY_RECIPE_COMMENT}\n\n${up}`, down },
+      { header: '-- turbine:no-transaction' },
+    );
+  } else {
+    file = createMigration(config.migrationsDir, 'add_relation_fk_indexes', { up, down });
+  }
+
+  success(`Created migration: ${bold(file.filename)}`);
+  newline();
+  if (concurrently) {
+    console.log(`  ${dim('This is a')} ${cyan('no-transaction')} ${dim('migration (CREATE INDEX CONCURRENTLY).')}`);
     console.log(`  ${dim('Review it, then apply with:')} ${cyan('npx turbine migrate up')}`);
     console.log(
-      `  ${dim('Large, hot tables: consider running the statements manually with')} ${cyan('CREATE INDEX CONCURRENTLY')}`,
+      `  ${dim('For a plain in-transaction migration instead, use')} ${cyan('doctor --fix --no-concurrently')}`,
     );
-    console.log(`  ${dim('(cannot run inside a transaction, so it is not emitted in the migration).')}`);
-    newline();
   } else {
-    console.log(`  ${dim('Generate a fix migration with:')} ${cyan('npx turbine doctor --fix')}`);
-    newline();
+    console.log(`  ${dim('Review it, then apply with:')} ${cyan('npx turbine migrate up')}`);
+    console.log(
+      `  ${dim('For large, hot tables prefer the CONCURRENTLY form (drop')} ${cyan('--no-concurrently')}${dim(').')}`,
+    );
   }
+  newline();
 }
 
 // ---------------------------------------------------------------------------
@@ -3071,7 +3339,7 @@ function showHelp(): void {
   console.log(`    ${cyan('seed')}               Run seed file`);
   console.log(`    ${cyan('status')} ${dim('| info')}      Show schema summary`);
   console.log(
-    `    ${cyan('doctor')}             Check relations for missing FK indexes ${dim('(--fix emits migration)')}`,
+    `    ${cyan('doctor')}             Cost-aware missing-FK-index triage ${dim('(--fix, --json, --no-concurrently)')}`,
   );
   console.log(
     `    ${cyan('studio')}             Launch local read-only web UI ${dim('(--write for writes, --demo for a sample DB)')}`,

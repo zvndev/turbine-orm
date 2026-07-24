@@ -47,6 +47,28 @@ npx turbine migrate status
 - **SHA-256 checksums.** Every applied migration's file is hashed. If an already-applied file changes on disk, `status` reports **drift** and `up` refuses to run until you reconcile (or pass `--allow-drift` when you are intentionally rewriting history).
 - **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent `migrate up` / `deploy` runs cannot race; the second exits cleanly instead of double-applying.
 
+### No-transaction migrations (`CREATE INDEX CONCURRENTLY`)
+
+Some statements cannot run inside a transaction. `CREATE INDEX CONCURRENTLY` is the common one: it builds without holding a write lock, but Postgres forbids it in any transaction block, including the implicit one that wraps a multi-statement query. Put `-- turbine:no-transaction` in the migration's header (before `-- UP`) and the runner applies that file **without** `BEGIN` / `COMMIT`, executing one statement per call:
+
+```sql
+-- Migration: add_relation_fk_indexes
+-- turbine:no-transaction
+
+-- UP
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_comments_post_id" ON "comments" ("post_id");
+
+-- DOWN
+DROP INDEX CONCURRENTLY IF EXISTS "idx_comments_post_id";
+```
+
+This is exactly what `turbine doctor --fix` writes. Two things to know:
+
+- **Every statement must be idempotent.** With no transaction, a mid-file failure leaves earlier statements applied while the migration stays **unrecorded**, so a rerun re-executes the whole file. `IF NOT EXISTS` / `IF EXISTS` keep each statement safe to repeat.
+- **A failed concurrent build leaves an INVALID index.** On rerun, `IF NOT EXISTS` skips that corpse, so it never rebuilds. Fix it with `DROP INDEX CONCURRENTLY`, then rerun; `turbine doctor` lists invalid indexes for you.
+
+`migrate up` prints a loud notice whenever it runs a no-transaction file, and `CREATE INDEX CONCURRENTLY` can wait a while on other open transactions (that is normal, not a hang). The advisory lock and checksum checks are unchanged.
+
 ### Out-of-order migrations
 
 Turbine tracks migrations by name, not by a monotonic sequence number, so there is no strict ordering barrier: **any pending migration applies, even if its timestamp predates one already applied.** This is what lets two branches merge migrations that were authored in parallel: the older-timestamped file that landed second is simply pending, and the next `up` / `deploy` applies it. When the runner applies a migration whose timestamp is older than the most recently applied one, it prints a one-line warning so the out-of-order apply is visible. If your team needs strict linear history, enforce it in review (rebase the timestamp forward) rather than expecting the runner to refuse.
