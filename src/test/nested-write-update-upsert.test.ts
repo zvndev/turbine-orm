@@ -152,7 +152,8 @@ describe('nested-write: hasMany update', () => {
     const updateOps = log.filter((l) => l.op === 'update' && l.table === 'posts');
     assert.equal(updateOps.length, 1);
     const args = updateOps[0]!.args as { where: Record<string, unknown>; data: Record<string, unknown> };
-    assert.deepStrictEqual(args.where, { id: 5 });
+    // The parent correlation (userId = the parent's id) is ANDed onto the caller's where.
+    assert.deepStrictEqual(args.where, { id: 5, userId: 1 });
     assert.deepStrictEqual(args.data, { title: 'Updated Title' });
   });
 
@@ -175,8 +176,8 @@ describe('nested-write: hasMany update', () => {
 
     const updateOps = log.filter((l) => l.op === 'update' && l.table === 'posts');
     assert.equal(updateOps.length, 2);
-    assert.deepStrictEqual((updateOps[0]!.args as { where: Record<string, unknown> }).where, { id: 5 });
-    assert.deepStrictEqual((updateOps[1]!.args as { where: Record<string, unknown> }).where, { id: 6 });
+    assert.deepStrictEqual((updateOps[0]!.args as { where: Record<string, unknown> }).where, { id: 5, userId: 1 });
+    assert.deepStrictEqual((updateOps[1]!.args as { where: Record<string, unknown> }).where, { id: 6, userId: 1 });
   });
 
   it('throws ValidationError when update is missing where', async () => {
@@ -256,7 +257,7 @@ describe('nested-write: hasMany upsert', () => {
     const updateOps = log.filter((l) => l.op === 'update' && l.table === 'posts');
     assert.equal(updateOps.length, 1);
     const args = updateOps[0]!.args as { where: Record<string, unknown>; data: Record<string, unknown> };
-    assert.deepStrictEqual(args.where, { id: 5 });
+    assert.deepStrictEqual(args.where, { id: 5, userId: 1 });
     assert.deepStrictEqual(args.data, { title: 'Updated Post' });
 
     // Should NOT create

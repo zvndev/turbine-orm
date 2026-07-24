@@ -482,7 +482,8 @@ describe('nested-write: executeNestedUpdate', () => {
 
     const deleteOp = log.find((l) => l.op === 'delete' && l.table === 'posts');
     assert.ok(deleteOp);
-    assert.deepStrictEqual((deleteOp!.args as { where: Record<string, unknown> }).where, { id: 5 });
+    // Scoped to the parent: the child FK is ANDed onto the caller's where.
+    assert.deepStrictEqual((deleteOp!.args as { where: Record<string, unknown> }).where, { id: 5, userId: 1 });
   });
 
   it('supports set operation — disconnects all then connects new', async () => {

@@ -244,6 +244,49 @@ describe('batched relation loading — SQL shape', () => {
     assert.match(followUp.sql, /"user_id"/);
   });
 
+  it('a relation where ON the correlation column is ANDed with the chunk, not replaced', async () => {
+    const { pool, calls } = makeFakePool(CANNED);
+    await usersQi(pool, CANNED).findMany({ with: { posts: { where: { userId: 1 } } } });
+    const followUp = calls.find((c) => /FROM "posts"/.test(c.sql))!;
+    // BOTH predicates must survive: the caller's equality AND the batch chunk.
+    assert.match(followUp.sql, /"user_id" = \$\d+/, "the caller's own FK filter must not be dropped");
+    assert.match(followUp.sql, /"user_id" = ANY\(\$\d+\)/, 'the batch correlation must still be applied');
+    assert.ok(
+      followUp.params.some((p) => p === 1),
+      "the caller's filter value must be bound",
+    );
+    assert.ok(
+      followUp.params.some((p) => Array.isArray(p)),
+      'the parent-key array must be bound',
+    );
+  });
+
+  it('a belongsTo relation where on the parent PK is ANDed with the chunk', async () => {
+    const { pool, calls } = makeFakePool(CANNED);
+    const postsQi = new QueryInterface(
+      // biome-ignore lint/suspicious/noExplicitAny: fake pool
+      pool as any,
+      'posts',
+      makeSchema(),
+      [],
+      { preparedStatements: false, warnOnUnlimited: false, relationLoadStrategy: 'batched' },
+    );
+    await postsQi.findMany({ with: { author: { where: { id: 999 } } } });
+    const followUp = calls.find((c) => /FROM "users"/.test(c.sql))!;
+    assert.match(followUp.sql, /"id" = \$\d+/);
+    assert.match(followUp.sql, /"id" = ANY\(\$\d+\)/);
+    assert.ok(followUp.params.some((p) => p === 999));
+  });
+
+  it('a relation where NOT naming the correlation column keeps the flat merge', async () => {
+    const { pool, calls } = makeFakePool(CANNED);
+    await usersQi(pool, CANNED).findMany({ with: { posts: { where: { title: 'p1' } } } });
+    const followUp = calls.find((c) => /FROM "posts"/.test(c.sql))!;
+    // No AND-wrapping parentheses around the pair: the emitted SQL for this
+    // (overwhelmingly common) case is unchanged.
+    assert.match(followUp.sql, /WHERE "title" = \$\d+ AND "user_id" = ANY\(\$\d+\)/);
+  });
+
   it('per-relation limit is NOT pushed down (applied client-side)', async () => {
     const { pool, calls } = makeFakePool(CANNED);
     await usersQi(pool, CANNED).findMany({ with: { posts: { limit: 1 } } });
