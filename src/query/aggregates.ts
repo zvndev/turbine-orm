@@ -10,6 +10,7 @@
  */
 
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
+import type { TableMetadata } from '../schema.js';
 import { snakeToCamel } from '../schema.js';
 import type { DeferredQuery } from './deferred.js';
 import { isJsonPathOrderBy, isVectorOrderBy, normalizeOrderBy, orderByEntries } from './filters.js';
@@ -28,6 +29,42 @@ import type {
 } from './types.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
+
+/**
+ * Enforce the PII contract on the aggregate surface. A PII-tagged
+ * (`defineSchema` `pii: true`) column is excluded from every default
+ * projection, and a value-returning aggregate is a projection by another name:
+ * `groupBy({ by: ['email'] })` emits one row per distinct plaintext email, and
+ * `_min`/`_max` return a stored cell verbatim. Both therefore REQUIRE the same
+ * `includePii: true` opt-in reads use.
+ *
+ * Deliberately NOT gated: `_count` (a count, never a value), `_sum` / `_avg`
+ * (a computed total across many rows, not a stored cell), and `where` /
+ * `orderBy` / `having` on PII columns (they return no values at all). Untagged
+ * schemas short-circuit on the `pii` lookup, so their SQL is byte-identical.
+ *
+ * Shared with the PowQL aggregate paths (src/powql.ts) so every engine applies
+ * one policy.
+ */
+export function assertAggregatePiiOptIn(
+  table: string,
+  meta: TableMetadata | undefined,
+  field: string,
+  column: string,
+  usage: string,
+  includePii: boolean | undefined,
+): void {
+  if (includePii === true || !meta) return;
+  const colMeta = meta.columns.find((c) => c.name === column);
+  if (!colMeta?.pii) return;
+  throw new ValidationError(
+    `[turbine] ${usage} on column "${field}" of table "${table}" is refused: that column is ` +
+      'PII-tagged (`pii: true`), and this aggregate returns its stored values, which are excluded ' +
+      'from every default projection. Pass `includePii: true` on this call to opt in. ' +
+      '`_count` over a PII column (a count, not a value) and `where` / `orderBy` / `having` on PII ' +
+      'columns need no opt-in.',
+  );
+}
 
 export function buildGroupBy<T extends object>(
   qi: BuilderCtx,
@@ -89,6 +126,7 @@ export function buildGroupBy<T extends object>(
   for (const entry of args.by) {
     if (typeof entry === 'string') {
       const col = qi.toColumn(entry);
+      assertAggregatePiiOptIn(qi.table, meta, entry, col, 'groupBy `by` key', args.includePii);
       claimResultKey(entry, `column "${col}"`);
       // The emitted output column is the snake_case name; claim it too (when
       // it differs from the result key) so a JSON alias like 'created_at'
@@ -100,6 +138,7 @@ export function buildGroupBy<T extends object>(
       byOrderExprs.set(entry, qi.q(col));
     } else {
       const col = resolveJsonPathTarget(qi, 'group key', entry.field, entry.path);
+      assertAggregatePiiOptIn(qi.table, meta, entry.field, col, 'groupBy JSON `by` key', args.includePii);
       params.push(whereMod.jsonPathParam(qi, entry.path));
       const extract = qi.dialect.buildJsonPathExtract(qi.q(col), qi.p(params.length));
       const alias = entry.alias ?? String(entry.path[entry.path.length - 1]);
@@ -164,6 +203,9 @@ export function buildGroupBy<T extends object>(
       if (!target) continue;
       if (target === true) {
         const col = qi.toColumn(key);
+        if (aggKey === '_min' || aggKey === '_max') {
+          assertAggregatePiiOptIn(qi.table, meta, key, col, `groupBy ${aggKey}`, args.includePii);
+        }
         // Aggregate output aliases share the same output-name namespace as
         // the group keys: `_sum: { totalPrice: true, total_price: {json} }`
         // would emit two "_sum_total_price" columns and silently drop one.
@@ -175,6 +217,9 @@ export function buildGroupBy<T extends object>(
         continue;
       }
       const col = resolveJsonPathTarget(qi, `${aggKey} target "${key}"`, target.field, target.path);
+      if (aggKey === '_min' || aggKey === '_max') {
+        assertAggregatePiiOptIn(qi.table, meta, target.field, col, `groupBy ${aggKey} JSON target`, args.includePii);
+      }
       const alwaysNumeric = aggKey === '_sum' || aggKey === '_avg';
       if (alwaysNumeric && target.type === 'text') {
         throw new ValidationError(
@@ -720,11 +765,13 @@ export function buildAggregate<T extends object>(
     }
   }
 
-  // _min
+  // _min / _max return a stored cell verbatim, so a PII-tagged column needs the
+  // same `includePii` opt-in a row projection needs. _count / _sum / _avg do not.
   if (args._min) {
     for (const [field, enabled] of Object.entries(args._min)) {
       if (enabled) {
         const col = qi.toColumn(field);
+        assertAggregatePiiOptIn(qi.table, meta, field, col, 'aggregate _min', args.includePii);
         selectExprs.push(`MIN(${qi.q(col)}) AS ${qi.q(`_min_${col}`)}`);
       }
     }
@@ -735,6 +782,7 @@ export function buildAggregate<T extends object>(
     for (const [field, enabled] of Object.entries(args._max)) {
       if (enabled) {
         const col = qi.toColumn(field);
+        assertAggregatePiiOptIn(qi.table, meta, field, col, 'aggregate _max', args.includePii);
         selectExprs.push(`MAX(${qi.q(col)}) AS ${qi.q(`_max_${col}`)}`);
       }
     }

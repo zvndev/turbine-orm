@@ -429,6 +429,11 @@ export const mysqlDialect: Dialect = {
   supportsReturning: false,
   supportsILike: false,
   supportsVector: false,
+  // MySQL full-text is `MATCH(col) AGAINST(...)` over a FULLTEXT index: a
+  // different surface with different semantics, not the emitted tsvector form.
+  supportsFullTextSearch: false,
+  // No array column type (a JSON column is not an array column).
+  supportsArrayColumns: false,
   supportsListenNotify: false,
   supportsRLS: false,
   // MySQL 8.0.14+ supports LATERAL, but the opt-in lateral pick plan stays

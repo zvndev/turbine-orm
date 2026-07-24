@@ -560,6 +560,11 @@ export const mssqlDialect: Dialect = {
   supportsReturning: false,
   supportsILike: false,
   supportsVector: false,
+  // SQL Server full-text is `CONTAINS`/`FREETEXT` over a full-text catalog: a
+  // different surface with different semantics, not the emitted tsvector form.
+  supportsFullTextSearch: false,
+  // No array column type (a JSON column is not an array column).
+  supportsArrayColumns: false,
   supportsListenNotify: false,
   supportsRLS: false,
   // SQL Server has OUTER APPLY, not FROM-clause LATERAL: the lateral pick plan

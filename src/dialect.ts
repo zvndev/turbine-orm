@@ -328,6 +328,27 @@ export interface Dialect {
   /** Whether this dialect/engine supports pgvector distance ops (KNN / distance WHERE). */
   readonly supportsVector: boolean;
 
+  /**
+   * Whether this dialect/engine supports the PostgreSQL full-text `search`
+   * filter (`to_tsvector(...) @@ to_tsquery(...)`). Optional: absent is treated
+   * as `false`, so only dialects that set it true admit a `search` filter and
+   * every other engine throws {@link UnsupportedFeatureError} (E017) instead of
+   * emitting SQL its parser cannot read. MySQL `MATCH … AGAINST` and SQL Server
+   * `CONTAINS` are different surfaces with different index requirements, so they
+   * deliberately stay `false` rather than silently changing the semantics.
+   */
+  readonly supportsFullTextSearch?: boolean;
+
+  /**
+   * Whether this dialect/engine supports native array columns and the array
+   * filter operators built on them (`has` → `= ANY(col)`, `hasEvery` → `@>`,
+   * `hasSome` → `&&`, `isEmpty` → `cardinality(col)`). Optional: absent is
+   * treated as `false`, so SQLite / MySQL / SQL Server (which have no array
+   * column type; a JSON column is not the same thing) throw
+   * {@link UnsupportedFeatureError} (E017) instead of emitting `ANY(...)`.
+   */
+  readonly supportsArrayColumns?: boolean;
+
   /** Whether this dialect/engine supports LISTEN/NOTIFY realtime pub/sub. */
   readonly supportsListenNotify: boolean;
 
@@ -581,6 +602,8 @@ export const postgresDialect: Dialect = {
   nullJsonLiteral: 'NULL',
   aggSupportsInlineOrderBy: true,
   supportsVector: true,
+  supportsFullTextSearch: true,
+  supportsArrayColumns: true,
   supportsListenNotify: true,
   supportsRLS: true,
   supportsAdvisoryLock: true,

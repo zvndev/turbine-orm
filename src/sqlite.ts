@@ -415,6 +415,11 @@ export const sqliteDialect: Dialect = {
   supportsReturning: true,
   supportsILike: false,
   supportsVector: false,
+  // FTS5 is a virtual-table feature with its own MATCH syntax, not the
+  // `to_tsvector @@ to_tsquery` shape Turbine's `search` filter emits.
+  supportsFullTextSearch: false,
+  // No array column type (a JSON column is not an array column).
+  supportsArrayColumns: false,
   supportsListenNotify: false,
   supportsRLS: false,
   supportsAdvisoryLock: false,

@@ -108,6 +108,9 @@ export const powdbDialect: Dialect = {
   resultStrategy: 'returning',
   supportsReturning: true,
   supportsVector: false,
+  // PowQL has no tsvector/tsquery surface and no array column type.
+  supportsFullTextSearch: false,
+  supportsArrayColumns: false,
   supportsListenNotify: false,
   supportsRLS: false,
   supportsAdvisoryLock: false,
