@@ -573,6 +573,19 @@ describe('powdb: wrapPowdbError', () => {
     assert.ok(wal instanceof ConnectionError);
     assert.match(wal.message, /flush the WAL/);
   });
+
+  it('maps an unsupported-catalog-version open failure to ConnectionError E004 with an upgrade hint', () => {
+    // A pre-0.19 binary cannot open a directory whose catalog was upgraded to v7
+    // by a `link` declaration (one-way upgrade). Open-time connection failure, not
+    // a query defect, with a hint to upgrade the addon/server.
+    const catalog = wrapPowdbError({ code: 'GenericFailure', message: 'unsupported catalog version: 7' });
+    assert.ok(catalog instanceof ConnectionError);
+    assert.equal((catalog as ConnectionError).code, TurbineErrorCode.CONNECTION);
+    assert.match(catalog.message, /upgrade the PowDB addon\/server/);
+    assert.ok((catalog as ConnectionError).cause, 'cause preserved');
+    // Must NOT be misclassified as a query defect by the generic validation regex.
+    assert.ok(!(catalog instanceof ValidationError));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -611,6 +624,43 @@ describe('powdb: findMany generation', () => {
 
     await qi(m).findMany({ where: { OR: [{ name: 'a' }, { name: 'b' }] } });
     assert.match(m.last().powql, /\(\.name = \$1 or \.name = \$2\)/);
+  });
+
+  it('not: spells as `!=` (SQL null parity), plain and insensitive', async () => {
+    // `lhs != $N` EXCLUDES missing-value rows on PowDB >= 0.18.2, matching SQL,
+    // where the old `not (lhs = $N)` matched them. No `not (` wrapping.
+    const m = mockPool();
+    await qi(m).findMany({ where: { name: { not: 'ada' } } });
+    assert.match(m.last().powql, /\.name != \$1/);
+    assert.ok(!/not \(/.test(m.last().powql), 'must not emit `not (` wrapping');
+
+    await qi(m).findMany({ where: { name: { not: 'ada', mode: 'insensitive' } } });
+    assert.match(m.last().powql, /lower\(\.name\) != lower\(\$1\)/);
+
+    // A null `not` stays an `is not null` presence check (unchanged).
+    await qi(m).findMany({ where: { name: { not: null } } });
+    assert.match(m.last().powql, /\.name is not null/);
+  });
+
+  it('notIn (non-empty) appends `and lhs is not null` for SQL null parity', async () => {
+    // PowQL `not in` matches missing-value rows, so the presence guard is appended.
+    const m = mockPool();
+    await qi(m).findMany({ where: { name: { notIn: ['a', 'b'] } } });
+    assert.match(m.last().powql, /\(\.name not in \(\$1, \$2\) and \.name is not null\)/);
+    assert.deepEqual(m.last().params, ['a', 'b']);
+
+    // Insensitive lowercases both sides and guards on the same lowered lhs.
+    await qi(m).findMany({ where: { name: { notIn: ['a'], mode: 'insensitive' } } });
+    assert.match(m.last().powql, /\(lower\(\.name\) not in \(lower\(\$1\)\) and lower\(\.name\) is not null\)/);
+  });
+
+  it('notIn [] keeps match-everything with NO presence guard (empty-list special case)', async () => {
+    // SQL parity requires a missing-value row to match `notIn []`, so the guard is
+    // deliberately NOT appended for the empty list.
+    const m = mockPool();
+    await qi(m).findMany({ where: { name: { notIn: [] } } });
+    assert.match(m.last().powql, /\(1 = 1\)/);
+    assert.ok(!/is not null/.test(m.last().powql), 'no presence guard on notIn []');
   });
 
   it('relation filter `some` resolves client-side to a literal in-list (never an IN-subquery)', async () => {
@@ -2260,6 +2310,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       docFieldIndexes: false,
       serverJoins: false,
       nestedProjections: false,
+      entityLinks: false,
       nativeRaw: false,
     });
     // 0.10: introspection only.
@@ -2303,6 +2354,20 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
     );
   });
 
+  it('gates entityLinks at >= 0.19 (0.18.2 false, 0.19.0 true)', () => {
+    assert.equal(capabilitiesFromVersion('0.18.2').entityLinks, false);
+    assert.equal(capabilitiesFromVersion('0.19.0').entityLinks, true);
+    assert.equal(capabilitiesFromVersion('1.0.0').entityLinks, true);
+    // Unknown / non-semver version turns it off, like every other feature gate.
+    assert.equal(capabilitiesFromVersion('preview-build').entityLinks, false);
+    assert.equal(capabilitiesFromVersion(null).entityLinks, false);
+    // The E017 hint for a missing entityLinks names the 0.19 floor.
+    assert.throws(
+      () => requireCapability(capabilitiesFromVersion('0.18.2'), 'entityLinks', 'entity links'),
+      /entity links requires PowDB >= 0\.19/,
+    );
+  });
+
   it('turns every gate OFF for an unknown / non-semver version', () => {
     const caps = capabilitiesFromVersion('preview-build');
     assert.deepEqual(caps, {
@@ -2312,6 +2377,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       docFieldIndexes: false,
       serverJoins: false,
       nestedProjections: false,
+      entityLinks: false,
       nativeRaw: false,
     });
     assert.equal(capabilitiesFromVersion(null).engineVersion, null);
@@ -2359,6 +2425,10 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       // must only be enabled by an actual version probe (>= 0.18), never
       // assumed for a bare-constructed pool.
       nestedProjections: false,
+      // OFF for a stronger reason still: declaring a link one-way-upgrades the
+      // on-disk catalog to v7 and locks out pre-0.19 binaries, so it lights up
+      // only behind a real version probe.
+      entityLinks: false,
       nativeRaw: false,
     });
     // A directly-constructed pool defaults to it.
@@ -3290,17 +3360,17 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
   it('the tested ceiling is the expected engine line', () => {
     // A canary: bumping the ceiling MUST be a deliberate, reviewed act (it
     // asserts the escaper was re-verified against a newer lexer).
-    assert.equal(POWQL_LEXER_TESTED_CEILING, '0.18');
+    assert.equal(POWQL_LEXER_TESTED_CEILING, '0.19');
   });
 
   it('refuses the legacy materialize path on an addon newer than the ceiling', async () => {
     // A legacy-only handle (no queryWithParams) whose capabilities claim engine
-    // 0.19.0, newer than the escaper's verified lexer range. Reaching the legacy
+    // 0.20.0, newer than the escaper's verified lexer range. Reaching the legacy
     // wire in this state is the dangerous "newer-addon-without-native" anomaly, so
     // exec() must refuse rather than inline-encode against an unverified lexer.
     const { pool, seen } = fakeEmbeddedDb(
       { kind: 'ok', affected: 1n },
-      { capabilities: capabilitiesFromVersion('0.19.0', { hasNativeRaw: true }) },
+      { capabilities: capabilitiesFromVersion('0.20.0', { hasNativeRaw: true }) },
     );
     const err = await pool.query('insert app_user { name := $1 }', ['Ada']).then(
       () => null,
@@ -3308,7 +3378,7 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
     );
     assert.ok(err instanceof ValidationError, 'refusal is a typed ValidationError');
     assert.equal((err as ValidationError).code, TurbineErrorCode.VALIDATION);
-    assert.match((err as Error).message, /0\.19\.0/, 'names the reported engine version');
+    assert.match((err as Error).message, /0\.20\.0/, 'names the reported engine version');
     assert.match((err as Error).message, new RegExp(POWQL_LEXER_TESTED_CEILING.replace('.', '\\.')));
     assert.match((err as Error).message, /queryWithParams/, 'explains the feature-detect anomaly');
     // Nothing was ever handed to the engine.

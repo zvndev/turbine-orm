@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.44.0",
+  "version": "0.45.0",
   "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "exports": {
@@ -109,8 +109,8 @@
     "@size-limit/esbuild": "^12.1.0",
     "@size-limit/file": "^12.1.0",
     "@types/node": "^26.1.0",
-    "@zvndev/powdb-client": "^0.18.1",
-    "@zvndev/powdb-embedded": "^0.18.1",
+    "@zvndev/powdb-client": "^0.19.0",
+    "@zvndev/powdb-embedded": "^0.19.0",
     "c8": "^11.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^17.0.8",

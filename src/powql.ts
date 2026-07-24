@@ -415,7 +415,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           conds.push(opVal === null ? `${ref} is null` : `${lhs} = ${this.bind(opVal, params, insensitive)}`);
           break;
         case 'not':
-          conds.push(opVal === null ? `${ref} is not null` : `not (${lhs} = ${this.bind(opVal, params, insensitive)})`);
+          // Spell as `lhs != $N` (not `not (lhs = $N)`) so a missing-value row is
+          // EXCLUDED, matching SQL null semantics on PowDB >= 0.18.2. Behavior-neutral
+          // on older engines (pre-0.18.2 `!=` MATCHED missing rows exactly like the
+          // old `not (...)` spelling), so no capability gate is needed.
+          conds.push(opVal === null ? `${ref} is not null` : `${lhs} != ${this.bind(opVal, params, insensitive)}`);
           break;
         case 'gt':
           conds.push(`${lhs} > ${this.bind(opVal, params, insensitive)}`);
@@ -580,11 +584,17 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     negate: boolean,
   ): string {
     if (!Array.isArray(values) || values.length === 0) {
-      // `in []` matches nothing; `not in []` matches everything.
+      // `in []` matches nothing; `not in []` matches everything (SQL parity requires a
+      // missing-value row to match `notIn []`, so NO presence guard is appended here).
       return negate ? '(1 = 1)' : this.alwaysFalse();
     }
     const items = values.map((v) => this.bind(v, params, insensitive)).join(', ');
-    return `${lhs} ${negate ? 'not in' : 'in'} (${items})`;
+    if (negate) {
+      // PowQL `not in` matches missing-value rows, so append `and lhs is not null`
+      // for SQL null-semantics parity (non-empty list only, per the empty-list note above).
+      return `(${lhs} not in (${items}) and ${lhs} is not null)`;
+    }
+    return `${lhs} in (${items})`;
   }
 
   /**

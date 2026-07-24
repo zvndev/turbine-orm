@@ -321,12 +321,26 @@ export interface PowdbCapabilities {
    * batched loaders.
    */
   nestedProjections: boolean;
+  /**
+   * ≥ 0.19: entity links (`link` DDL, scalar/block traversal). Capability is
+   * recognized (probe-only), but query generation deliberately does NOT consume
+   * links yet: turbine keeps composing its own nested projections (see the
+   * PowDB engine page for the rationale). Declaring a link permanently upgrades
+   * the on-disk catalog to v7, so this stays FALSE in ALL_POWDB_CAPABILITIES.
+   */
+  entityLinks: boolean;
   /** Networked only: server ≥ 0.13 AND the client exposes `queryNativeRaw`. */
   nativeRaw: boolean;
 }
 
 /** The feature-gate capability keys (everything except the version/nativeRaw metadata). */
-type PowdbFeatureKey = 'jsonDocs' | 'docFieldIndexes' | 'introspection' | 'serverJoins' | 'nestedProjections';
+type PowdbFeatureKey =
+  | 'jsonDocs'
+  | 'docFieldIndexes'
+  | 'introspection'
+  | 'serverJoins'
+  | 'nestedProjections'
+  | 'entityLinks';
 
 /** Minimum engine version each gated feature needs, for the E017 hint text. */
 const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
@@ -335,6 +349,7 @@ const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
   docFieldIndexes: '0.13',
   serverJoins: '0.13',
   nestedProjections: '0.18',
+  entityLinks: '0.19',
 };
 
 /**
@@ -346,6 +361,9 @@ const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
  * never inferred from a bare construction. `nestedProjections` stays OFF for
  * the same reason: it changes the generated PowQL for every `with` query, and
  * an unprobed engine below 0.18 would reject the syntax outright.
+ * `entityLinks` stays OFF for a stronger reason still: declaring a link
+ * one-way-upgrades the on-disk catalog to v7 and locks out pre-0.19 binaries,
+ * so it must only ever light up behind a real version probe.
  */
 export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   engineVersion: null,
@@ -354,6 +372,7 @@ export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   introspection: true,
   serverJoins: true,
   nestedProjections: false,
+  entityLinks: false,
   nativeRaw: false,
 };
 
@@ -388,6 +407,7 @@ export function capabilitiesFromVersion(
       introspection: false,
       serverJoins: false,
       nestedProjections: false,
+      entityLinks: false,
       nativeRaw: false,
     };
   }
@@ -398,6 +418,7 @@ export function capabilitiesFromVersion(
     docFieldIndexes: atLeastVersion(sem, 0, 13),
     serverJoins: atLeastVersion(sem, 0, 13),
     nestedProjections: atLeastVersion(sem, 0, 18),
+    entityLinks: atLeastVersion(sem, 0, 19),
     nativeRaw: Boolean(opts.hasNativeRaw) && atLeastVersion(sem, 0, 13),
   };
 }
@@ -924,6 +945,18 @@ export function wrapPowdbError(err: unknown): Error {
     return new ConnectionError(
       `[turbine] PowDB could not open the directory read-only: ${msg}. Open it once with a writable handle to ` +
         'flush the WAL (recover the directory), then reopen it read-only for snapshot serving.',
+      { cause: err },
+    );
+  }
+  // Catalog-version mismatch → ConnectionError (E004). A pre-0.19 binary/addon
+  // cannot open a data directory whose catalog was upgraded to v7 by a `link`
+  // declaration (the upgrade is one-way). It is an open-time connection failure,
+  // not a query defect, so it runs among the connection families BEFORE the
+  // generic validation regexes below.
+  if (/unsupported catalog version/i.test(msg)) {
+    return new ConnectionError(
+      `[turbine] PowDB could not open the data directory: ${msg}. This directory uses a newer PowDB catalog ` +
+        'format (a `link` declaration upgrades it to v7); upgrade the PowDB addon/server to a version that can read it.',
       { cause: err },
     );
   }
@@ -1778,8 +1811,14 @@ export function encodePowqlLiteral(value: unknown): string {
  * {@link PowdbEmbeddedPool.exec}): an embedded addon whose engine line exceeds
  * the ceiling yet still routes through the string wire is refused rather than
  * materialized.
+ *
+ * Verification for the 0.19 line: `crates/query/src/lexer.rs` is byte-identical
+ * between v0.18.0 and v0.19.0 (empty git diff), and `link` was already a lexer
+ * keyword at 0.18.0. The 0.19 entity-links surface adds new STATEMENTS built from
+ * pre-existing tokens, so the tokenization / escape surface this ceiling guards is
+ * unmoved.
  */
-export const POWQL_LEXER_TESTED_CEILING = '0.18';
+export const POWQL_LEXER_TESTED_CEILING = '0.19';
 
 /** Escape a string into a PowQL `"…"` literal, matching the engine lexer's escape rules. */
 function encodePowqlString(s: string): string {

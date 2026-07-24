@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.45.0 (2026-07-23)
+
+### Fixed
+
+- **PowDB: `not` and `notIn` filters now match SQL null semantics.** PowDB 0.18.2
+  changed `!=` and range comparisons to exclude missing-value rows (SQL parity), but
+  Turbine still emitted `not (col = $n)` for the `not:` operator and a bare `not in`
+  for `notIn`, both of which continue to match missing-value rows. On a nullable
+  column, `where: { col: { not: v } }` and `{ notIn: [...] }` therefore returned
+  different rows on PowDB than on every SQL engine. The `not:` leaf now compiles to
+  `col != $n` (including the case-insensitive variant) and non-empty `notIn` appends
+  an `is not null` presence guard; `notIn: []` keeps its match-everything semantics
+  (SQL parity requires missing-value rows to match an empty `notIn`). The change is
+  behavior-neutral on pre-0.18.2 engines, so it is not capability-gated. The
+  `NOT: {...}` combinator remains a documented divergence for null-involved
+  sub-clauses on PowDB (its whole-clause negation cannot be mechanically re-spelled).
+
+### Added
+
+- **PowDB 0.19 support: `entityLinks` capability and catalog v7 awareness.** The
+  capability map now recognizes PowDB 0.19's entity links (`entityLinks`, gated on an
+  engine version probe of 0.19+, never assumed). Query generation deliberately keeps
+  Turbine-composed nested projections instead of link traversal: link-bearing plans
+  are not cached by the engine, declared links cannot be introspected (so drift from
+  the schema would be undetectable), and the published 0.19.0 builds have known
+  link-projection defects. `wrapPowdbError` maps the new
+  `unsupported catalog version` failure to `ConnectionError` (E004) with an upgrade
+  hint, and the engines page documents the catalog v7 one-way door: the first `link`
+  declaration permanently upgrades a data directory so pre-0.19 binaries can no
+  longer open it; databases that never declare links stay on v6.
+- **PowDB tested ceiling raised to 0.19.** The PowQL lexer is verified byte-identical
+  from 0.18.0 through 0.19.0 (`link` was already a reserved keyword), so the string
+  encoding ceiling (`POWQL_LEXER_TESTED_CEILING`) rises to `'0.19'`. Dev dependencies
+  now track `@zvndev/powdb-client` / `@zvndev/powdb-embedded` `^0.19.0`, and the live
+  integration suite exercises link DDL, traversal, catalog persistence, and the new
+  null-semantics parity against the real 0.19.0 embedded engine.
+
 ## 0.44.0 (2026-07-23)
 
 ### Added

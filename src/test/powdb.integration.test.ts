@@ -1677,6 +1677,41 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
       });
     },
   );
+
+  // Null-semantics parity over the networked transport (mirror of the embedded
+  // block). The `not` -> `!=` and `notIn` -> `not in (...) and is not null`
+  // spellings must exclude a missing-value row on the real server too. Soft-skips
+  // below server 0.18.2, the version where PowQL `!=` began excluding missing rows.
+  liveIt('null-semantics parity: not / notIn / gt exclude a missing-value row over TCP', async (tc) => {
+    const { Client } = (await import('@zvndev/powdb-client')) as {
+      Client: { connect(o: unknown): Promise<{ serverVersion: string; close(): Promise<void> }> };
+    };
+    const probe = await Client.connect(parsePowdbUrl(powdbUrl!));
+    const serverVersion = probe.serverVersion;
+    await probe.close();
+    if (!serverAtLeast(serverVersion, [0, 18, 2])) {
+      tc.skip(`requires PowDB server >= 0.18.2 for != missing-value exclusion (saw ${serverVersion})`);
+      return;
+    }
+    await withLive(
+      [
+        col('id', 'id', 'number', 'int4'),
+        col('total', 'total', 'number', 'float8'),
+        col('label', 'label', 'string', 'text', { nullable: true }),
+      ],
+      async (db, t) => {
+        await db.table(t).create({ data: { id: 1, total: 5, label: 'a' } });
+        await db.table(t).create({ data: { id: 2, total: 15, label: 'b' } });
+        // Row 3 omits label (a missing value; SQL-NULL-equivalent).
+        await db.raw([`insert ${t} { id := 3, total := 25 }`]);
+        const ids = (rows: { id: number }[]) => rows.map((r) => Number(r.id)).sort((a, b) => a - b);
+        assert.deepEqual(ids(await db.table(t).findMany({ where: { label: { not: 'a' } } })), [2]);
+        assert.deepEqual(ids(await db.table(t).findMany({ where: { label: { notIn: ['a'] } } })), [2]);
+        assert.deepEqual(ids(await db.table(t).findMany({ where: { label: { notIn: [] } } })), [1, 2, 3]);
+        assert.deepEqual(ids(await db.table(t).findMany({ where: { total: { gt: 10 } } })), [2, 3]);
+      },
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2098,4 +2133,148 @@ describe('powdb integration (embedded): nested projections (0.18 shaped results)
       assert.deepEqual(u.posts, viaLoader.posts);
     });
   });
+});
+
+// ---------------------------------------------------------------------------
+// Entity links + catalog v7 + null-semantics parity (PowDB >= 0.19), live
+// through the embedded addon. Gated separately: CI on a pre-0.19 addon skips
+// these cleanly (the capability is version-derived). Turbine does NOT consume
+// links for query generation this round, so link DDL/traversal is exercised via
+// raw PowQL; the null-parity block runs through the real PowqlInterface.
+// ---------------------------------------------------------------------------
+
+let embeddedEntityLinks = false;
+try {
+  const req = createRequire(import.meta.url);
+  const pkg = JSON.parse(readFileSync(req.resolve('@zvndev/powdb-embedded/package.json'), 'utf8')) as {
+    version?: string;
+  };
+  embeddedEntityLinks = embeddedAvailable && capabilitiesFromVersion(pkg.version).entityLinks;
+} catch {
+  embeddedEntityLinks = false;
+}
+const { it: linkIt } = skipGate(
+  !embeddedEntityLinks,
+  'requires @zvndev/powdb-embedded >= 0.19 (entity links / catalog v7)',
+);
+
+// l_order.label is nullable so a row can OMIT it (a missing value, PowQL's
+// null-equivalent) to probe not / notIn / gt semantics against SQL parity.
+const linkSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    l_user: makeTable('l_user', [col('id', 'id', 'number', 'int4'), col('name', 'name', 'string', 'text')]),
+    l_order: makeTable('l_order', [
+      col('id', 'id', 'number', 'int4'),
+      col('user_id', 'userId', 'number', 'int4', { nullable: true }),
+      col('total', 'total', 'number', 'float8'),
+      col('label', 'label', 'string', 'text', { nullable: true }),
+    ]),
+  },
+};
+
+async function withLinkDb(fn: (db: DB) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'powdb-links-it-'));
+  const db: DB = await turbinePowDB({ embedded: dir }, linkSchema, { warnOnUnlimited: false });
+  try {
+    for (const stmt of powqlSchemaDDL(linkSchema)) await db.raw([stmt]);
+    // Links are declared via raw PowQL: powqlSchemaDDL deliberately does NOT emit
+    // `link` DDL this round (declaring one one-way-upgrades the catalog to v7).
+    await db.raw(['link l_order.user -> l_user on user_id = id']);
+    await db.raw(['link l_user.orders -> l_order on id = user_id']);
+    await fn(db);
+  } finally {
+    await db.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('powdb integration (embedded): entity links (0.19 catalog v7)', () => {
+  linkIt('raw link DDL: scalar hop and to-many block traversal read through the catalog', async () => {
+    await withLinkDb(async (db) => {
+      await db.lUser.create({ data: { id: 1, name: 'alice' } });
+      await db.lOrder.create({ data: { id: 1, userId: 1, total: 9.5, label: 'a' } });
+      await db.lOrder.create({ data: { id: 2, userId: 1, total: 20.25, label: 'b' } });
+      // A NULL FK order traverses to an empty scalar, never dropping the row.
+      await db.raw(['insert l_order { id := 3, total := 1.0 }']);
+
+      // Scalar to-one hop: `o.user.name` (aliased form; the published 0.19.0 bare
+      // dotted-path is buggy, so turbine's future adoption would alias-qualify too).
+      const scalar = (await db.raw(['l_order as o { o.id, o.user.name } order o.id asc'])) as Record<string, unknown>[];
+      assert.equal(scalar.length, 3, 'null / dangling FK rows are not dropped by the hop');
+      assert.equal(Number(scalar[0]!['o.id']), 1);
+      assert.equal(scalar[0]!['o.user.name'], 'alice');
+      assert.equal(scalar[2]!['o.user.name'], null, 'the NULL-FK order hops to an empty target');
+
+      // To-many block traversal: `u.orders { total }` returns a per-parent array.
+      const block = (await db.raw(['l_user as u { u.name, orders: u.orders { total } } order u.id asc'])) as Record<
+        string,
+        unknown
+      >[];
+      assert.equal(block.length, 1);
+      assert.equal(block[0]!.name ?? block[0]!['u.name'], 'alice');
+      const orders = block[0]!.orders as { total: number }[];
+      assert.deepEqual(
+        orders.map((o) => Number(o.total)).sort((a, b) => a - b),
+        [9.5, 20.25],
+      );
+    });
+  });
+
+  linkIt('a declared link persists across reopen (catalog v7 is durable)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-links-reopen-'));
+    let db: DB = await turbinePowDB({ embedded: dir }, linkSchema, { warnOnUnlimited: false });
+    try {
+      for (const stmt of powqlSchemaDDL(linkSchema)) await db.raw([stmt]);
+      await db.raw(['link l_order.user -> l_user on user_id = id']);
+      await db.lUser.create({ data: { id: 1, name: 'alice' } });
+      await db.lOrder.create({ data: { id: 1, userId: 1, total: 9.5, label: 'a' } });
+      await db.disconnect();
+      // Reopen the SAME data directory: the v7 catalog (and its link) must survive.
+      db = await turbinePowDB({ embedded: dir }, linkSchema, { warnOnUnlimited: false });
+      const scalar = (await db.raw(['l_order as o { o.id, o.user.name }'])) as Record<string, unknown>[];
+      assert.equal(scalar.length, 1);
+      assert.equal(scalar[0]!['o.user.name'], 'alice', 'the link survived a reopen without re-declaration');
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  linkIt(
+    'null-semantics parity: not / notIn / gt through PowqlInterface match SQL on a missing-value column',
+    async () => {
+      await withLinkDb(async (db) => {
+        await db.lUser.create({ data: { id: 1, name: 'alice' } });
+        await db.lOrder.create({ data: { id: 1, userId: 1, total: 5, label: 'a' } });
+        await db.lOrder.create({ data: { id: 2, userId: 1, total: 15, label: 'b' } });
+        // Row 3 OMITS label entirely (a missing value). SQL treats it as NULL, so it
+        // is excluded from `not`, `notIn`, and `gt` results.
+        await db.raw(['insert l_order { id := 3, user_id := 1, total := 25 }']);
+        const ids = (rows: { id: number }[]) => rows.map((r) => Number(r.id)).sort((a, b) => a - b);
+
+        // not 'a' EXCLUDES the missing-label row (row 3), matching SQL (the whole
+        // point of the `!=` re-spelling).
+        assert.deepEqual(
+          ids(await db.lOrder.findMany({ where: { label: { not: 'a' } } })),
+          [2],
+          'not excludes the matching row AND the missing-value row',
+        );
+        // notIn ['a'] likewise excludes the missing-value row (presence guard).
+        assert.deepEqual(
+          ids(await db.lOrder.findMany({ where: { label: { notIn: ['a'] } } })),
+          [2],
+          'notIn (non-empty) excludes the missing-value row',
+        );
+        // notIn [] matches EVERYTHING including the missing-value row (no guard).
+        assert.deepEqual(
+          ids(await db.lOrder.findMany({ where: { label: { notIn: [] } } })),
+          [1, 2, 3],
+          'notIn [] keeps the missing-value row (match-everything)',
+        );
+        // gt on total: a plain numeric filter, missing-value label row is unaffected.
+        assert.deepEqual(ids(await db.lOrder.findMany({ where: { total: { gt: 10 } } })), [2, 3]);
+      });
+    },
+  );
 });
