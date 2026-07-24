@@ -276,6 +276,13 @@
     *::after {
       box-sizing: border-box;
     }
+    /* An author `display` rule (every bar and banner below is a flex row) beats
+       the user-agent `[hidden] { display: none }`, so restate it here: the whole
+       UI gates optional strips — the link bar, filter bar, selection bar, and
+       the write / PII / demo banners — on the `hidden` property. */
+    [hidden] {
+      display: none !important;
+    }
     html,
     body {
       margin: 0;
