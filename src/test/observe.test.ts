@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { floorToMinute, ObserveEngine, percentile } from '../observe.js';
+import { floorToMinute, type MetricsFlushBatch, ObserveEngine, percentile } from '../observe.js';
 import type { QueryEvent } from '../query/index.js';
 
 // ---------------------------------------------------------------------------
@@ -209,6 +209,80 @@ describe('ObserveEngine flush', () => {
 
     await engine.flush();
     assert.equal(queries.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-minute bucket attribution
+// ---------------------------------------------------------------------------
+
+describe('ObserveEngine bucket attribution', () => {
+  function makeEvent(timestamp: Date, duration: number, overrides: Partial<QueryEvent> = {}): QueryEvent {
+    return {
+      sql: 'SELECT 1',
+      params: [],
+      duration,
+      model: 'users',
+      action: 'findMany',
+      rows: 1,
+      timestamp,
+      ...overrides,
+    };
+  }
+
+  function captureEngine(batches: MetricsFlushBatch[]): ObserveEngine {
+    return new ObserveEngine({
+      sink: {
+        flush: async (batch) => {
+          batches.push(batch);
+        },
+      },
+    });
+  }
+
+  it('flushes one correctly stamped row per minute bucket', async () => {
+    const batches: MetricsFlushBatch[] = [];
+    const engine = captureEngine(batches);
+
+    const listener = engine.getListener();
+    listener(makeEvent(new Date('2026-01-15T10:00:30.000Z'), 10));
+    listener(makeEvent(new Date('2026-01-15T10:00:30.000Z'), 20));
+    listener(makeEvent(new Date('2026-01-15T10:01:10.000Z'), 30));
+
+    await engine.flush();
+
+    assert.equal(batches.length, 1);
+    const rows = batches[0]!.rows;
+    assert.equal(rows.length, 2);
+
+    const first = rows.find((r) => r.bucket.getTime() === new Date('2026-01-15T10:00:00.000Z').getTime());
+    const second = rows.find((r) => r.bucket.getTime() === new Date('2026-01-15T10:01:00.000Z').getTime());
+    assert.ok(first, 'expected a row stamped 10:00:00');
+    assert.ok(second, 'expected a row stamped 10:01:00');
+    assert.equal(first.count, 2);
+    assert.equal(first.avg, 15);
+    assert.equal(second.count, 1);
+    assert.equal(second.avg, 30);
+  });
+
+  it('keeps model/action identity separate within one bucket', async () => {
+    const batches: MetricsFlushBatch[] = [];
+    const engine = captureEngine(batches);
+
+    const listener = engine.getListener();
+    const at = new Date('2026-01-15T10:00:05.000Z');
+    listener(makeEvent(at, 10));
+    listener(makeEvent(at, 40, { model: 'posts', action: 'create', error: new Error('oops') }));
+
+    await engine.flush();
+
+    const rows = batches[0]!.rows;
+    assert.equal(rows.length, 2);
+    for (const row of rows) {
+      assert.equal(row.bucket.getTime(), new Date('2026-01-15T10:00:00.000Z').getTime());
+    }
+    assert.equal(rows.find((r) => r.model === 'posts')!.errors, 1);
+    assert.equal(rows.find((r) => r.model === 'users')!.errors, 0);
   });
 });
 
