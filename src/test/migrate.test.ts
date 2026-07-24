@@ -21,6 +21,7 @@ import {
   parseMigrationContent,
   parseMigrationFilename,
   sanitizeName,
+  splitSqlStatements,
 } from '../cli/migrate.js';
 
 // ---------------------------------------------------------------------------
@@ -146,6 +147,123 @@ DROP TABLE users;
     assert.ok(result.up.includes('CREATE TABLE users'));
     assert.ok(result.down.includes('-- This drops the users table'));
     assert.ok(result.down.includes('DROP TABLE users'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseMigrationContent - no-transaction directive
+// ---------------------------------------------------------------------------
+
+describe('parseMigrationContent - no-transaction directive', () => {
+  it('defaults noTransaction to false', () => {
+    const result = parseMigrationContent('-- UP\nCREATE TABLE t (id int);\n-- DOWN\nDROP TABLE t;');
+    assert.equal(result.noTransaction, false);
+  });
+
+  it('detects the directive in the header before -- UP', () => {
+    const content = `-- Migration: add index
+-- turbine:no-transaction
+
+-- UP
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_t_x ON t (x);
+
+-- DOWN
+DROP INDEX CONCURRENTLY IF EXISTS idx_t_x;`;
+    const result = parseMigrationContent(content);
+    assert.equal(result.noTransaction, true);
+    assert.ok(result.up.includes('CREATE INDEX CONCURRENTLY'));
+    // The directive line itself is not part of the UP body.
+    assert.ok(!result.up.includes('turbine:no-transaction'));
+  });
+
+  it('is case-insensitive and tolerant of spacing', () => {
+    const result = parseMigrationContent('--   TURBINE:NO-TRANSACTION\n-- UP\nSELECT 1;');
+    assert.equal(result.noTransaction, true);
+  });
+
+  it('does NOT honor the directive when it appears in the DOWN section', () => {
+    const content = `-- UP
+SELECT 1;
+-- DOWN
+-- turbine:no-transaction
+SELECT 2;`;
+    const result = parseMigrationContent(content);
+    assert.equal(result.noTransaction, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// splitSqlStatements - the no-transaction tokenizer (production-destroying if wrong)
+// ---------------------------------------------------------------------------
+
+describe('splitSqlStatements', () => {
+  it('splits simple statements on semicolons', () => {
+    assert.deepEqual(splitSqlStatements('SELECT 1; SELECT 2;'), ['SELECT 1', 'SELECT 2']);
+  });
+
+  it('trims and drops empty fragments and a missing trailing semicolon', () => {
+    assert.deepEqual(splitSqlStatements('  SELECT 1 ;;;  SELECT 2  '), ['SELECT 1', 'SELECT 2']);
+  });
+
+  it('keeps a semicolon inside a single-quoted string', () => {
+    assert.deepEqual(splitSqlStatements(`INSERT INTO t VALUES ('a;b'); SELECT 1;`), [
+      `INSERT INTO t VALUES ('a;b')`,
+      'SELECT 1',
+    ]);
+  });
+
+  it('handles a doubled single quote (escaped) inside a string', () => {
+    assert.deepEqual(splitSqlStatements(`SELECT 'it''s; fine'; SELECT 2;`), [`SELECT 'it''s; fine'`, 'SELECT 2']);
+  });
+
+  it('keeps a semicolon inside a double-quoted identifier', () => {
+    assert.deepEqual(splitSqlStatements(`CREATE INDEX ON t ("we;ird"); SELECT 1;`), [
+      `CREATE INDEX ON t ("we;ird")`,
+      'SELECT 1',
+    ]);
+  });
+
+  it('keeps a semicolon inside a dollar-quoted body', () => {
+    const sql = `CREATE FUNCTION f() RETURNS int AS $$ BEGIN; RETURN 1; END; $$ LANGUAGE plpgsql; SELECT 2;`;
+    assert.deepEqual(splitSqlStatements(sql), [
+      `CREATE FUNCTION f() RETURNS int AS $$ BEGIN; RETURN 1; END; $$ LANGUAGE plpgsql`,
+      'SELECT 2',
+    ]);
+  });
+
+  it('keeps a semicolon inside a tagged dollar-quoted body', () => {
+    const sql = `SELECT $tag$ a; b $tag$; SELECT 2;`;
+    assert.deepEqual(splitSqlStatements(sql), [`SELECT $tag$ a; b $tag$`, 'SELECT 2']);
+  });
+
+  it('does not mistake a $1 parameter placeholder for a dollar quote', () => {
+    assert.deepEqual(splitSqlStatements('UPDATE t SET x = $1 WHERE id = $2; SELECT 3;'), [
+      'UPDATE t SET x = $1 WHERE id = $2',
+      'SELECT 3',
+    ]);
+  });
+
+  it('keeps a semicolon inside a line comment', () => {
+    const sql = `SELECT 1; -- a comment; with a semicolon\nSELECT 2;`;
+    assert.deepEqual(splitSqlStatements(sql), ['SELECT 1', '-- a comment; with a semicolon\nSELECT 2']);
+  });
+
+  it('keeps a semicolon inside a block comment (and nests)', () => {
+    const sql = `SELECT 1; /* outer; /* inner; */ still; */ SELECT 2;`;
+    assert.deepEqual(splitSqlStatements(sql), ['SELECT 1', '/* outer; /* inner; */ still; */ SELECT 2']);
+  });
+
+  it('drops a comment-only fragment', () => {
+    assert.deepEqual(splitSqlStatements('-- just a note\n; SELECT 1;'), ['SELECT 1']);
+    assert.deepEqual(splitSqlStatements('/* only a block comment */'), []);
+  });
+
+  it('splits multiple CREATE INDEX CONCURRENTLY statements', () => {
+    const sql = `CREATE INDEX CONCURRENTLY IF NOT EXISTS a ON t (x);\nCREATE INDEX CONCURRENTLY IF NOT EXISTS b ON t (y);`;
+    const out = splitSqlStatements(sql);
+    assert.equal(out.length, 2);
+    assert.ok(out[0]!.includes('a ON t (x)'));
+    assert.ok(out[1]!.includes('b ON t (y)'));
   });
 });
 

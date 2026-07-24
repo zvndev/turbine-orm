@@ -31,8 +31,9 @@ Commands:
   migrate status                 Show applied vs pending migrations
   seed                           Run the seed file (.ts / .js / .sql)
   status                         Show connection info + schema summary
-  doctor                         Check relations for missing FK indexes
-  doctor --fix                   Write a migration that adds the missing indexes
+  doctor                         Cost-aware triage of missing FK indexes
+  doctor --fix                   Write a CONCURRENTLY migration that adds them
+  doctor --json                  Machine-readable report (schemaVersion 1)
   studio                         Launch local read-only Studio web UI
   mcp                            Start read-only MCP server over JSON-RPC stdio
   observe                        Launch local metrics dashboard
@@ -295,44 +296,61 @@ Outputs the detected database name, host, Postgres version, table count, and the
 
 ## `turbine doctor`
 
-Check every relation for a missing foreign-key index.
+Cost-aware triage of missing foreign-key indexes.
 
 ```bash
 npx turbine doctor
 npx turbine doctor --fix
+npx turbine doctor --json
 ```
 
-Turbine loads `with` relations as **correlated subqueries** — the child table is probed once per parent row (`child.fk = parent.pk`). When the probed column is indexed, that's an index seek per parent. When it isn't, it's a full table scan *per parent*, which multiplies by the parent row count and can turn a fast query into a many-second one. Batched-loader ORMs pay a missing FK index only once (a single `WHERE fk IN (…)` scan), so schemas migrated from them routinely lack the FK indexes Turbine's strategy needs. `doctor` finds them before they hit production.
+Turbine loads `with` relations as **correlated subqueries**: the child table is probed once per parent row (`child.fk = parent.pk`). When the probed column is indexed, that is an index seek per parent. When it is not, it is a full table scan *per parent*, which multiplies by the parent row count and can turn a fast query into a many-second one. Batched-loader ORMs pay a missing FK index only once (a single `WHERE fk IN (...)` scan), so schemas migrated from them routinely lack the FK indexes Turbine's strategy needs. `doctor` finds them before they hit production.
 
-It introspects the database, derives every column set relations will probe (hasMany/hasOne child FKs, belongsTo reference keys, many-to-many junction keys), and reports the unindexed ones sorted by table row count — the biggest tables first, since a missing index on a 300-row table is noise and on a 300K-row table is the whole page load.
+It introspects the database, derives every column set relations will probe (hasMany/hasOne child FKs, belongsTo reference keys, many-to-many junction keys), and then reads live Postgres statistics to score each finding into one of three tiers.
 
-Example report:
+### Three-tier triage
 
-```
-⚠ Found 2 unindexed relation probe(s)
+`doctor` never just lists missing indexes: an index is not free (it taxes every write, dilutes cache, and can disable heap-only-tuple updates), so it weighs the cost against the benefit and sorts findings into three buckets, each with the numbers behind the verdict:
 
-  Turbine loads relations as correlated subqueries — the child table is probed
-  once per parent row, so an unindexed FK costs a full table scan PER PARENT.
+- **Take freely**: a large table with a low write rate and few existing indexes. The index is almost pure upside.
+- **Take deliberately**: a real write rate (writes/day normalized by the stats-reset age), many existing indexes, or a table currently relying on HOT updates. Worth a second look before you add write cost.
+- **Scrutinize**: a tiny table (a sequential scan is already cheap), an append-only log shape (high inserts, near-zero reads), or a never-analyzed table where the stats cannot support a verdict.
 
-  ⚠ comments (post_id)  ~357,000 rows
-    ├ probed by posts.comments (hasMany)
-    └ CREATE INDEX IF NOT EXISTS "idx_comments_post_id" ON "comments" ("post_id");
+Every finding prints its size, writes/day since the last stats reset, existing index count, and probing relations, plus the exact `CREATE INDEX` statement. The thresholds behind the tiers are printed too, so you can see the precise number that drove a verdict and disagree with it.
 
-  ⚠ posts (user_id)  ~46,000 rows
-    ├ probed by users.posts (hasMany)
-    └ CREATE INDEX IF NOT EXISTS "idx_posts_user_id" ON "posts" ("user_id");
+Two extra signals ride the same statistics:
 
-  Generate a fix migration with: npx turbine doctor --fix
-```
+- **Partial indexes**: when a probed FK column is mostly NULL (null fraction at or above 90%), `doctor` suggests a partial `CREATE INDEX ... WHERE col IS NOT NULL`, which covers every relation probe (the correlation is `child.fk = parent.pk`, and NULL never equals anything) at a fraction of the size. It prints the caveat that a hand-written `where: { fk: null }` filter will not use it.
+- **HOT-update awareness**: a table with a high HOT-update ratio and real update volume gets a warning and is bumped to at least "take deliberately", because a new index can disqualify those heap-only-tuple updates and amplify write cost.
 
-`--fix` writes a ready-to-apply migration whose `-- UP` section is the `CREATE INDEX IF NOT EXISTS` statements and whose `-- DOWN` section drops them. Review it, then apply with `npx turbine migrate up`:
+If Postgres statistics are unavailable, or too young or absent to trust (for example the stats have never been reset), `doctor` says so in one line and falls back to the size-sorted topology report instead of faking confidence. On non-Postgres engines the statistics layer is skipped and you get the same topology-only output.
+
+### Invalid indexes
+
+`doctor` also reports **invalid** indexes (`pg_index.indisvalid = false`). These are the artifact of a `CREATE INDEX CONCURRENTLY` that failed partway: the corpse is left behind, and `IF NOT EXISTS` then silently skips it on a rerun so the index never actually builds. `doctor` surfaces each one with a `DROP INDEX CONCURRENTLY` statement to clear it.
+
+### `--fix` writes a CONCURRENTLY migration
+
+By default `--fix` writes a migration that adds the missing indexes with `CREATE INDEX CONCURRENTLY IF NOT EXISTS`. Because a concurrent build cannot run inside a transaction, the file carries a `-- turbine:no-transaction` directive in its header, and `turbine migrate up` runs it without wrapping it in BEGIN/COMMIT (one statement at a time). The generated file also documents the idempotency requirement, the invalid-index trap, and lock-timeout guidance.
 
 ```bash
 npx turbine doctor --fix
 # Created migration: 20260708143022_add_relation_fk_indexes.sql
+
+npx turbine migrate up
+# ! Running ...add_relation_fk_indexes.sql WITHOUT a transaction (-- turbine:no-transaction).
+# v Applied 1 migration(s)
 ```
 
-For large, hot tables, prefer running the statements manually with `CREATE INDEX CONCURRENTLY` — it doesn't hold a write lock, but it can't run inside a transaction, so `doctor` never emits it in the migration.
+Pass `--no-concurrently` for a plain, in-transaction `CREATE INDEX` migration instead (handy for dev databases where the concurrent build is not worth the wait). Non-Postgres engines always get the plain form.
+
+### `--json`
+
+`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, and any degradation notices. The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added.
+
+### Where this fits
+
+Turbine's advantage here is that it knows which columns its correlated subqueries will probe *before any traffic exists*, so it can advise from schema topology alone, then sharpen that with local statistics. The advice is free, runs on your machine with no telemetry, and produces reviewed migrations with DBA-grade caveats. Prisma's Optimize is client-extension telemetry sent to its cloud rather than a local advisor, and Drizzle has nothing in this space; the tools that do read live index usage (pganalyze, Supabase's index_advisor, `pg_stat_statements` front-ends) work from the SQL your database has already run, not from the ORM's knowledge of what it is about to run.
 
 ### Dev-mode warning
 
