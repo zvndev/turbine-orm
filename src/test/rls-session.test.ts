@@ -185,6 +185,9 @@ testFn('rls session-context integration', () => {
     const bootstrap = new TurbineClient({ connectionString: DATABASE_URL! }, MOCK_SCHEMA);
     await bootstrap.pool.query(`DROP TABLE IF EXISTS "${TABLE}"`);
     // (Re)create a constrained role. NOBYPASSRLS is the default, but be explicit.
+    // The schema-level grant below outlives the table, so revoke it first or the
+    // DROP fails with "role cannot be dropped because some objects depend on it".
+    await bootstrap.pool.query(`REVOKE USAGE ON SCHEMA public FROM ${RLS_ROLE}`).catch(() => {});
     await bootstrap.pool.query(`DROP ROLE IF EXISTS ${RLS_ROLE}`).catch(() => {});
     await bootstrap.pool.query(`CREATE ROLE ${RLS_ROLE} NOLOGIN NOSUPERUSER NOBYPASSRLS`);
     await bootstrap.pool.query(`
@@ -202,6 +205,11 @@ testFn('rls session-context integration', () => {
       CREATE POLICY tenant_isolation ON "${TABLE}"
         USING (tenant = current_setting('app.current_tenant', true))
     `);
+    // PostgreSQL 15 removed the implicit PUBLIC usage grant on schema `public`,
+    // so without this the constrained role cannot resolve the table at all and
+    // every query fails with 42P01 "relation does not exist" instead of being
+    // filtered by the policy.
+    await bootstrap.pool.query(`GRANT USAGE ON SCHEMA public TO ${RLS_ROLE}`);
     // The constrained role must be allowed to SELECT (RLS filters WHAT it sees).
     await bootstrap.pool.query(`GRANT SELECT ON "${TABLE}" TO ${RLS_ROLE}`);
     await bootstrap.pool.query(
@@ -217,6 +225,9 @@ testFn('rls session-context integration', () => {
   after(async () => {
     try {
       await client.pool.query(`DROP TABLE IF EXISTS "${TABLE}"`);
+      // Dropping the table clears its own grant; the schema grant has to go
+      // explicitly or DROP ROLE reports a dependent-object error.
+      await client.pool.query(`REVOKE USAGE ON SCHEMA public FROM ${RLS_ROLE}`);
       await client.pool.query(`DROP ROLE IF EXISTS ${RLS_ROLE}`);
     } catch {
       // best-effort cleanup

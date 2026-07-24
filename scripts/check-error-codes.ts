@@ -40,6 +40,17 @@ const KNOWN_ERRORS = new Set([
 // Also allow standard Error in test files and CLI UI code
 const ALLOWED_IN_TESTS = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError']);
 
+// Error classes that are defined AND thrown inside a single CLI-only module.
+// They carry no TURBINE_E* code because they never reach a query runtime: the
+// CLI catches them and prints them. Scoped per file so the same class name
+// cannot be thrown from library code without tripping this check.
+//
+// PrismaParseError (src/cli/prisma-schema.ts) is the parse failure of the
+// zero-dependency schema.prisma reader used by `turbine migrate-from-prisma`.
+const FILE_LOCAL_ERRORS = new Map<string, Set<string>>([
+  ['src/cli/prisma-schema.ts', new Set(['PrismaParseError'])],
+]);
+
 function walkDir(dir: string): string[] {
   const files: string[] = [];
   for (const entry of readdirSync(dir)) {
@@ -93,6 +104,9 @@ for (const file of files) {
 
       // Standard errors are OK in test files, CLI code, and tooling files
       if ((isTestFile || isCliFile || isToolingFile) && ALLOWED_IN_TESTS.has(errorClass)) continue;
+
+      // Module-local error classes are OK in the one file that owns them
+      if (FILE_LOCAL_ERRORS.get(relPath)?.has(errorClass)) continue;
 
       violations.push({
         file: relPath,

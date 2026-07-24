@@ -14,6 +14,7 @@
  */
 
 import pg from 'pg';
+import { ValidationError } from './errors.js';
 import type { QueryEvent, QueryEventListener } from './query/index.js';
 
 // ---------------------------------------------------------------------------
@@ -75,9 +76,24 @@ export interface ObserveSink {
 // Internal buffer
 // ---------------------------------------------------------------------------
 
+/**
+ * One accumulating aggregate. The buffer key carries the minute bucket as well
+ * as the model/action identity, so events that land in different minutes never
+ * merge, and each entry remembers its own identity rather than having it parsed
+ * back out of the key (a model or action containing ':' would otherwise split
+ * wrong).
+ */
 interface BucketEntry {
+  bucket: Date;
+  model: string;
+  action: string;
   durations: number[];
   errors: number;
+}
+
+/** Buffer key: minute bucket + model + action. */
+function bufferKey(bucket: Date, model: string, action: string): string {
+  return `${bucket.getTime()}:${model}:${action}`;
 }
 
 function floorToMinute(date: Date): Date {
@@ -239,7 +255,6 @@ export class HttpJsonSink implements ObserveSink {
 export class ObserveEngine {
   private readonly sink: ObserveSink;
   private readonly buffer = new Map<string, BucketEntry>();
-  private currentBucket: Date;
   private readonly flushIntervalMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly listener: QueryEventListener;
@@ -247,24 +262,22 @@ export class ObserveEngine {
 
   constructor(config: ObserveConfig) {
     if (!config.sink && !config.connectionString) {
-      throw new Error('ObserveEngine requires either a connectionString or a sink');
+      throw new ValidationError('ObserveEngine requires either a connectionString or a sink');
     }
     this.sink =
       config.sink ??
       new PgMetricsSink({ connectionString: config.connectionString!, retentionDays: config.retentionDays ?? 30 });
     this.flushIntervalMs = config.flushIntervalMs ?? 60_000;
-    this.currentBucket = floorToMinute(new Date());
 
     this.listener = (event: QueryEvent) => {
       if (this.stopped) return;
-      const nowBucket = floorToMinute(new Date());
-      if (nowBucket.getTime() !== this.currentBucket.getTime()) {
-        this.currentBucket = nowBucket;
-      }
-      const key = `${event.model}:${event.action}`;
+      // Bucket by the event's own timestamp so a late-arriving event is
+      // attributed to the minute it happened in, not the minute it was seen.
+      const bucket = floorToMinute(event.timestamp);
+      const key = bufferKey(bucket, event.model, event.action);
       let entry = this.buffer.get(key);
       if (!entry) {
-        entry = { durations: [], errors: 0 };
+        entry = { bucket, model: event.model, action: event.action, durations: [], errors: 0 };
         this.buffer.set(key, entry);
       }
       entry.durations.push(event.duration);
@@ -290,20 +303,20 @@ export class ObserveEngine {
   async flush(): Promise<void> {
     if (this.buffer.size === 0) return;
 
-    const bucket = this.currentBucket;
     const entries = new Map(this.buffer);
     this.buffer.clear();
 
     const rows: MetricsFlushRow[] = [];
-    for (const [key, entry] of entries) {
-      const [model, action] = key.split(':');
+    for (const entry of entries.values()) {
       const sorted = entry.durations.slice().sort((a, b) => a - b);
       const count = sorted.length;
       const avg = sorted.reduce((s, v) => s + v, 0) / count;
       rows.push({
-        bucket,
-        model: model ?? '',
-        action: action ?? '',
+        // Each entry carries the minute it accumulated in, so a flush that
+        // spans a rollover emits one correctly stamped row per minute.
+        bucket: entry.bucket,
+        model: entry.model,
+        action: entry.action,
         count,
         avg,
         p50: percentile(sorted, 0.5),

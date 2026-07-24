@@ -47,8 +47,26 @@ jobs:
       - run: npm ci
       - run: npm run test:unit
 
+  # Coverage runs the FULL suite against a real Postgres, seeded exactly like the
+  # integration-tests job. Without a database roughly half of the query engine is
+  # unreachable, so the measurement (and the thresholds in .c8rc.json) would be
+  # against a run that can never exercise execution paths, only SQL generation.
   coverage:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: turbine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -56,7 +74,16 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Seed test database
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f src/test/fixtures/seed.sql
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+          PGPASSWORD: test
       - run: npm run test:coverage
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
 
   # Integration tests run against a real Postgres service container, exercised
   # across a version matrix (PG 14/15/16/17). The service is seeded from

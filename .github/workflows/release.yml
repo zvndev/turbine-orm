@@ -12,17 +12,23 @@ name: Release
 #   npm version patch   # or minor / major — bumps package.json and creates a git tag
 #   git push --follow-tags
 #
-# The workflow runs lint → typecheck → unit tests → build, then two release
-# gates that mirror ci.yml — a real Postgres integration run (seeded fixture)
-# and the packed-tarball smoke test — before it verifies that package.json
-# version matches the tag and publishes with `--provenance` so the npm registry
-# can attest the build to this repo.
+# The workflow runs lint → typecheck → unit tests → build, then the release
+# gates that mirror ci.yml (a real Postgres integration run on the seeded fixture,
+# the packed-tarball smoke test, the coverage thresholds, and the error-code
+# contract check) before it verifies that package.json version matches the tag
+# and publishes with `--provenance` so the npm registry can attest the build to
+# this repo.
 #
 # A publish requires ALL of: test (lint/typecheck/unit/build/size),
-# integration-postgres (real DB), and pack-smoke (published package surface).
-# The full multi-version / multi-engine matrix still lives in ci.yml on push;
-# the release gate runs one representative Postgres and the pack smoke so a tag
-# can never publish SQL a real Postgres rejects or a broken package surface.
+# integration-postgres (real DB), pack-smoke (published package surface),
+# coverage (.c8rc.json thresholds, measured against a real DB), and error-codes
+# (every thrown error inside the TURBINE_E* contract). Each gate job is defined
+# here rather than reused from ci.yml because ci.yml is triggered by push/PR, not
+# by the tag that starts a release, so a tag run has no CI run to depend on. The
+# full multi-version / multi-engine matrix still lives in ci.yml on push; the
+# release gate runs one representative Postgres so a tag can never publish SQL a
+# real Postgres rejects, a broken package surface, a coverage regression, or an
+# untracked error class.
 
 on:
   push:
@@ -178,8 +184,62 @@ jobs:
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/adapters'); if (!m.cockroachdb || !m.yugabytedb || !m.postgresql) { console.error('adapters subpath broken'); process.exit(1); } console.log('adapters subpath OK', Object.keys(m).slice(0,8).join(','));"
 
+  # Coverage gate: mirrors ci.yml's coverage job (same Postgres 16 service, same
+  # seed, same DATABASE_URL wiring) so the thresholds in .c8rc.json are enforced
+  # on the release path too, not only on push. A tag cannot publish under a
+  # coverage regression.
+  coverage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: turbine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Seed test database
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f src/test/fixtures/seed.sql
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+          PGPASSWORD: test
+      - run: npm run test:coverage
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+
+  # Error-code gate: mirrors ci.yml's error-codes job. Every `throw new` in src/
+  # must be a known TurbineError subclass (or an explicitly allow-listed
+  # module-local class), so a release can never ship an error outside the
+  # documented TURBINE_E* contract.
+  error-codes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Check error code enforcement
+        run: npx tsx scripts/check-error-codes.ts
+
   publish:
-    needs: [test, integration-postgres, pack-smoke]
+    needs: [test, integration-postgres, pack-smoke, coverage, error-codes]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
