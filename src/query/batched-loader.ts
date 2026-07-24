@@ -694,13 +694,27 @@ async function loadOneCount(
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/** Merge the batched correlation predicate (`key IN chunk`) into the relation's own where. */
+/**
+ * AND the batched correlation predicate (`key IN chunk`) onto the relation's own
+ * `where`, matching the join strategy, which appends the correlation with
+ * ` AND <extra>` and so never lets one predicate replace the other.
+ *
+ * A flat spread is kept for the overwhelmingly common case where the caller's
+ * `where` does not name the correlation field, so the emitted SQL is unchanged
+ * there. When it DOES name it (e.g. `with: { posts: { where: { userId: 1 } } }`,
+ * or a belongsTo `where` on the child's PK), a bare spread would let the chunk
+ * predicate silently overwrite the caller's filter and return rows the join
+ * strategy excludes; the two are combined with `AND` instead so both apply.
+ */
 function mergeChildWhere(
   where: Record<string, unknown> | undefined,
   keyField: string,
   chunk: unknown[],
 ): Record<string, unknown> {
-  return { ...(where ?? {}), [keyField]: { in: chunk } };
+  const correlation = { [keyField]: { in: chunk } };
+  if (!where) return correlation;
+  if (Object.hasOwn(where, keyField)) return { AND: [where, correlation] };
+  return { ...where, ...correlation };
 }
 
 /** Distinct, non-null values of `field` across `rows`. */
