@@ -57,8 +57,8 @@
 import { ValidationError } from './errors.js';
 import { applyTableFilters } from './introspect.js';
 import { type PowdbCapabilities, quotePowqlIdent, requireCapability } from './powdb.js';
-import type { ColumnMetadata, IndexMetadata, SchemaMetadata, TableMetadata } from './schema.js';
-import { snakeToCamel } from './schema.js';
+import type { ColumnMetadata, IndexMetadata, RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
+import { singularize, snakeToCamel } from './schema.js';
 
 /** A minimal rows-returning executor over a PowDB connection (embedded or networked). */
 export type PowdbExec = (powql: string) => Promise<{ rows: Record<string, unknown>[] }>;
@@ -168,12 +168,21 @@ export async function introspectPowdbDatabase(
     // `describe` needs the table name in bare-identifier position → quote it so
     // a reserved-word / non-bare table name (`order`) does not become a parse
     // error.
-    const describeRows = (await exec(`describe ${quotePowqlIdent(tableName)}`)).rows.map<DescribeRow>((r) => ({
-      column: asString(r.column),
-      type: asString(r.type),
-      nullable: asBool(r.nullable),
-      index: asString(r.index),
-    }));
+    const describeRows = (await exec(`describe ${quotePowqlIdent(tableName)}`)).rows
+      // PowDB >= 0.19.1 appends entity-LINK rows after the 4 column rows in
+      // `describe <T>` (a `type` cell of literally `"link"`, an Empty nullable
+      // slot, and an arrow description in the index slot). They are NOT columns,
+      // so drop them before column parsing, unconditionally (no capability check):
+      // the rows simply never appear on a pre-0.19.1 engine, and a linked database
+      // introspected without this filter would produce garbage `link`-typed
+      // columns. Declared links are read separately via `schema links` below.
+      .filter((r) => asString(r.type) !== 'link')
+      .map<DescribeRow>((r) => ({
+        column: asString(r.column),
+        type: asString(r.type),
+        nullable: asBool(r.nullable),
+        index: asString(r.index),
+      }));
 
     const columns: ColumnMetadata[] = [];
     const columnMap: Record<string, string> = {};
@@ -253,11 +262,133 @@ export async function introspectPowdbDatabase(
       allColumns,
       primaryKey,
       uniqueColumns,
-      // PowDB has no declared foreign keys → no relations from introspection.
+      // Populated below from `schema links` when the engine supports link
+      // introspection (>= 0.19.1); stays `{}` otherwise (PowDB has no declared
+      // foreign keys, so pre-link introspection reports no relations).
       relations: {},
       indexes,
     };
   }
 
+  // Link introspection (>= 0.19.1): populate relations from declared entity links.
+  // Behaves exactly as before (relations stay `{}`) when the capability is absent
+  // or not supplied.
+  if (options.capabilities?.linkIntrospection) {
+    await introspectPowdbLinks(exec, tables);
+  }
+
   return { tables, enums: {} };
+}
+
+/** One row of the `schema links` listing, after string-coercing each cell. */
+interface LinkRow {
+  owner: string;
+  name: string;
+  target: string;
+  localKey: string;
+  targetKey: string;
+  cardinality: string;
+}
+
+/**
+ * Read `schema links` and populate {@link TableMetadata.relations}: the first
+ * time PowDB introspection can report relations. Each declared link becomes a
+ * relation on its OWNER, and its natural REVERSE is synthesized on the target
+ * (mirroring the SQL introspector, which always emits both sides of a FK):
+ *
+ *   - `"to-one"`  link `Order.user -> User`: owner gets a `belongsTo` (localKey =
+ *     the FK on the owner, targetKey = the referenced key on target); the target
+ *     gets a reverse `hasMany` named for the pluralized owner table.
+ *   - `"to-many"` link `User.orders -> Order`: owner gets a `hasMany` (localKey =
+ *     the referenced key on the owner, targetKey = the FK on the child); the
+ *     target gets a reverse `belongsTo` named for the singularized owner table.
+ *
+ * Reverse synthesis is best-effort and collision-guarded: a synthesized name that
+ * would shadow a column field or an already-present relation on the target is
+ * skipped (never a hard error), so introspection can only ADD relations, never
+ * clobber. m2m junctions cannot be inferred from links and stay undetected;
+ * `defineSchema` remains the relation-complete path. Column names arrive as
+ * PowDB's emitted (snake) names and stay snake in `foreignKey`/`referenceKey`
+ * (the SQL introspector's convention); the relation NAME is camelCased to match
+ * the query field surface. Naming edge: `schema links` is the contextual listing
+ * keyword: a table literally named `links` is still read via `describe links`.
+ */
+async function introspectPowdbLinks(exec: PowdbExec, tables: Record<string, TableMetadata>): Promise<void> {
+  const linkRows: LinkRow[] = (await exec('schema links')).rows.map((r) => ({
+    owner: asString(r.owner),
+    name: asString(r.name),
+    target: asString(r.target),
+    localKey: asString(r.local_key),
+    targetKey: asString(r.target_key),
+    cardinality: asString(r.cardinality),
+  }));
+
+  for (const link of linkRows) {
+    const owner = tables[link.owner];
+    const target = tables[link.target];
+    // A link referencing a filtered-out (include/exclude) table is skipped: we
+    // cannot describe the target, so the relation would be unusable.
+    if (!owner || !target) continue;
+    const toOne = link.cardinality === 'to-one';
+    const relName = snakeToCamel(link.name);
+
+    // Forward relation on the owner (the declared direction).
+    if (toOne) {
+      addRelation(owner, {
+        type: 'belongsTo',
+        name: relName,
+        from: link.owner,
+        to: link.target,
+        foreignKey: link.localKey,
+        referenceKey: link.targetKey,
+      });
+    } else {
+      addRelation(owner, {
+        type: 'hasMany',
+        name: relName,
+        from: link.owner,
+        to: link.target,
+        foreignKey: link.targetKey, // FK on the child (target) side
+        referenceKey: link.localKey, // referenced key on the owner (parent) side
+      });
+    }
+
+    // Reverse relation on the target (synthesized, collision-guarded).
+    const reverseName = toOne ? pluralize(snakeToCamel(link.owner)) : singularize(snakeToCamel(link.owner));
+    if (!relationNameTaken(target, reverseName)) {
+      addRelation(target, {
+        type: toOne ? 'hasMany' : 'belongsTo',
+        name: reverseName,
+        from: link.target,
+        to: link.owner,
+        // Same two columns, roles swapped for the opposite direction.
+        foreignKey: toOne ? link.localKey : link.targetKey,
+        referenceKey: toOne ? link.targetKey : link.localKey,
+      });
+    }
+  }
+}
+
+/** True when `name` already names a relation OR a column field/name on `meta`. */
+function relationNameTaken(meta: TableMetadata, name: string): boolean {
+  if (meta.relations[name]) return true;
+  return meta.columns.some((c) => c.field === name || c.name === name);
+}
+
+/** Add a relation to a table's relations map (keyed by its camelCase name). */
+function addRelation(meta: TableMetadata, rel: RelationDef): void {
+  if (meta.relations[rel.name]) return; // never clobber an existing relation
+  meta.relations[rel.name] = rel;
+}
+
+/**
+ * Minimal English pluralizer for reverse-relation names (`user` → `users`,
+ * `company` → `companies`, `box` → `boxes`). Only ever produces a candidate name
+ * that {@link relationNameTaken} then vets, so an imperfect plural can at worst be
+ * skipped, never break a query.
+ */
+function pluralize(word: string): string {
+  if (/[^aeiou]y$/i.test(word)) return `${word.slice(0, -1)}ies`;
+  if (/(s|x|z|ch|sh)$/i.test(word)) return `${word}es`;
+  return `${word}s`;
 }

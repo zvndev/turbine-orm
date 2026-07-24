@@ -2311,6 +2311,8 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       serverJoins: false,
       nestedProjections: false,
       entityLinks: false,
+      linkIntrospection: false,
+      linkPaths: false,
       nativeRaw: false,
     });
     // 0.10: introspection only.
@@ -2378,6 +2380,8 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       serverJoins: false,
       nestedProjections: false,
       entityLinks: false,
+      linkIntrospection: false,
+      linkPaths: false,
       nativeRaw: false,
     });
     assert.equal(capabilitiesFromVersion(null).engineVersion, null);
@@ -2429,6 +2433,10 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       // on-disk catalog to v7 and locks out pre-0.19 binaries, so it lights up
       // only behind a real version probe.
       entityLinks: false,
+      // OFF for the same probe-only discipline: linkPaths flips real query
+      // generation, and linkIntrospection is only meaningful once probed.
+      linkIntrospection: false,
+      linkPaths: false,
       nativeRaw: false,
     });
     // A directly-constructed pool defaults to it.

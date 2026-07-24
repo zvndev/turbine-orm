@@ -72,8 +72,10 @@ import {
   ValidationError,
 } from './errors.js';
 import importOptionalPeer from './optional-peer-import.cjs';
+import type { PowdbExec } from './powdb-introspect.js';
 import type { QueryInterface, QueryInterfaceOptions } from './query/index.js';
-import type { ColumnMetadata, SchemaMetadata, TableMetadata } from './schema.js';
+import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
+import { type ColumnMetadata, normalizeKeyColumns, type SchemaMetadata, type TableMetadata } from './schema.js';
 
 /**
  * Capability descriptor for PowDB. PowQL generation is owned by
@@ -329,6 +331,24 @@ export interface PowdbCapabilities {
    * the on-disk catalog to v7, so this stays FALSE in ALL_POWDB_CAPABILITIES.
    */
   entityLinks: boolean;
+  /**
+   * ≥ 0.19.1: link INTROSPECTION, the `schema links` listing statement and the
+   * appended link rows in `describe <T>`. Only meaningful when probed (there is
+   * no query-generation flip behind it), so it stays FALSE in
+   * ALL_POWDB_CAPABILITIES like the other probe-only gates. Floored at the PATCH
+   * 0.19.1: the listing statement shipped there, not in 0.19.0.
+   */
+  linkIntrospection: boolean;
+  /**
+   * ≥ 0.19.1: scalar to-one link PATHS in query generation. Floored at the PATCH
+   * 0.19.1 (never 0.19.0) because 0.19.0 had silent-wrong-results link bugs
+   * (bare-dotted-path split, wrong aggregates over links) that make traversal
+   * unsafe; 0.19.1 turned those into hard errors. This flag flips real query
+   * generation (a to-one `with` whose child carries bigint/bytes compiles to
+   * link-path projections instead of a loader), so it stays FALSE in
+   * ALL_POWDB_CAPABILITIES: it must only light up behind a real version probe.
+   */
+  linkPaths: boolean;
   /** Networked only: server ≥ 0.13 AND the client exposes `queryNativeRaw`. */
   nativeRaw: boolean;
 }
@@ -340,9 +360,18 @@ type PowdbFeatureKey =
   | 'introspection'
   | 'serverJoins'
   | 'nestedProjections'
-  | 'entityLinks';
+  | 'entityLinks'
+  | 'linkIntrospection'
+  | 'linkPaths';
 
-/** Minimum engine version each gated feature needs, for the E017 hint text. */
+/**
+ * Minimum engine version each gated feature needs, for the E017 hint text.
+ * Most gates carry a `major.minor` floor (patch-insensitive); the two link
+ * lanes carry a `major.minor.patch` floor (`0.19.1`) because the listing
+ * statement and the safe traversal semantics landed in the PATCH release, not
+ * in 0.19.0. {@link atLeastVersion} compares all three components, so a
+ * `major.minor` floor still matches every patch of that minor.
+ */
 const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
   introspection: '0.10',
   jsonDocs: '0.12',
@@ -350,6 +379,8 @@ const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
   serverJoins: '0.13',
   nestedProjections: '0.18',
   entityLinks: '0.19',
+  linkIntrospection: '0.19.1',
+  linkPaths: '0.19.1',
 };
 
 /**
@@ -364,6 +395,11 @@ const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
  * `entityLinks` stays OFF for a stronger reason still: declaring a link
  * one-way-upgrades the on-disk catalog to v7 and locks out pre-0.19 binaries,
  * so it must only ever light up behind a real version probe.
+ * `linkIntrospection` / `linkPaths` stay OFF for the same probe-only discipline:
+ * `linkPaths` flips real query generation (a to-one `with` compiling to link
+ * projections), and `linkIntrospection` is only meaningful once genuinely
+ * probed, so both must come from a real version resolution, never a bare
+ * construction.
  */
 export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   engineVersion: null,
@@ -373,6 +409,8 @@ export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   serverJoins: true,
   nestedProjections: false,
   entityLinks: false,
+  linkIntrospection: false,
+  linkPaths: false,
   nativeRaw: false,
 };
 
@@ -383,9 +421,23 @@ function parsePowdbSemver(version: string | undefined | null): { major: number; 
   return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3] ?? 0) };
 }
 
-/** Is `sem` at least `major.minor`? */
-function atLeastVersion(sem: { major: number; minor: number }, major: number, minor: number): boolean {
-  return sem.major > major || (sem.major === major && sem.minor >= minor);
+/**
+ * Is `sem` at least `major.minor.patch`? PATCH-AWARE: `patch` defaults to `0`,
+ * so a two-component floor (`atLeastVersion(sem, 0, 19)`) behaves exactly as the
+ * old major/minor comparison did (matches every patch of 0.19), while a
+ * three-component floor (`atLeastVersion(sem, 0, 19, 1)`) additionally requires
+ * the patch, the distinction the link lanes need (0.19.1, never 0.19.0). Every
+ * existing two-argument call keeps its prior semantics unchanged.
+ */
+function atLeastVersion(
+  sem: { major: number; minor: number; patch: number },
+  major: number,
+  minor: number,
+  patch = 0,
+): boolean {
+  if (sem.major !== major) return sem.major > major;
+  if (sem.minor !== minor) return sem.minor > minor;
+  return sem.patch >= patch;
 }
 
 /**
@@ -408,6 +460,8 @@ export function capabilitiesFromVersion(
       serverJoins: false,
       nestedProjections: false,
       entityLinks: false,
+      linkIntrospection: false,
+      linkPaths: false,
       nativeRaw: false,
     };
   }
@@ -419,6 +473,11 @@ export function capabilitiesFromVersion(
     serverJoins: atLeastVersion(sem, 0, 13),
     nestedProjections: atLeastVersion(sem, 0, 18),
     entityLinks: atLeastVersion(sem, 0, 19),
+    // PATCH-floored at 0.19.1: the `schema links` listing + `describe` link rows
+    // and the safe (hard-erroring) scalar-path traversal both landed in 0.19.1,
+    // never 0.19.0.
+    linkIntrospection: atLeastVersion(sem, 0, 19, 1),
+    linkPaths: atLeastVersion(sem, 0, 19, 1),
     nativeRaw: Boolean(opts.hasNativeRaw) && atLeastVersion(sem, 0, 13),
   };
 }
@@ -656,6 +715,86 @@ export function quotePowqlIdent(name: string): string {
  */
 export interface PowqlSchemaDDLOptions {
   capabilities?: PowdbCapabilities;
+  /**
+   * Emit `link Owner.name -> Target on local = target` declarations (PowDB entity
+   * links, >= 0.19) for every single-column hasMany / hasOne / belongsTo relation
+   * in the metadata, appended after the `type` / index statements. Default
+   * `false`: links are opt-in. Composite-key relations and m2m junctions are
+   * skipped (a link is single-column only); a relation whose name collides with a
+   * column on the owner is skipped with a one-time warning (the engine hard-errors
+   * on such a collision). When `capabilities` is also supplied it must pass the
+   * `entityLinks` gate, else this throws a typed E017.
+   *
+   * ONE-WAY DOOR: the FIRST `link` a database ever executes permanently upgrades
+   * its on-disk catalog to format v7; pre-0.19 PowDB binaries / addons can then no
+   * longer open that data directory. A database that never declares a link stays
+   * on its current catalog format. The DDL is create-only (no `if not exists`, no
+   * drop spelling), so an apply layer must existence-check first (see
+   * {@link applyPowdbLinks}).
+   */
+  emitLinks?: boolean;
+}
+
+/**
+ * One entity link Turbine wants declared for a relation: `link owner.name ->
+ * target on localKey = targetKey`. Cardinality is NOT part of the DDL (PowDB
+ * derives to-one vs to-many from whether `targetKey` is unique on `target` at
+ * declare time), so a belongsTo and its reverse hasMany both round-trip to the
+ * same shape from opposite owners.
+ */
+export interface PowdbDesiredLink {
+  owner: string;
+  name: string;
+  target: string;
+  localKey: string;
+  targetKey: string;
+}
+
+/**
+ * Derive the entity links Turbine would declare from a schema's relations. One
+ * link per single-column hasMany / hasOne / belongsTo relation, owned by the
+ * relation's `from` table:
+ *   - belongsTo Order->User: `Order.user -> User on user_id = id`
+ *     (localKey = the FK on the owner, targetKey = the referenced key on target).
+ *   - hasMany  User->Order: `User.orders -> Order on id = user_id`
+ *     (localKey = the referenced key on the owner, targetKey = the FK on the child).
+ * Composite-key relations and m2m junctions are skipped (links are single-column;
+ * a junction cannot be inferred from links). A relation whose name collides with
+ * a column on the owner is skipped and reported through `onCollision` (the caller
+ * decides whether to warn). Pure: no capability gate, no side effects.
+ */
+export function deriveDesiredLinks(
+  schema: SchemaMetadata,
+  onCollision?: (owner: string, name: string) => void,
+): PowdbDesiredLink[] {
+  const links: PowdbDesiredLink[] = [];
+  for (const meta of Object.values(schema.tables)) {
+    for (const rel of Object.values(meta.relations)) {
+      if (rel.type === 'manyToMany') continue;
+      const fk = normalizeKeyColumns(rel.foreignKey);
+      const rk = normalizeKeyColumns(rel.referenceKey);
+      if (fk.length !== 1 || rk.length !== 1) continue; // links are single-column
+      // A link name that collides with a column on the owner is a hard engine
+      // error at declare time, so skip it (and let the caller warn).
+      const collides = meta.columns.some((c) => c.name === rel.name || c.field === rel.name);
+      if (collides) {
+        onCollision?.(meta.name, rel.name);
+        continue;
+      }
+      const localKey = rel.type === 'belongsTo' ? fk[0]! : rk[0]!;
+      const targetKey = rel.type === 'belongsTo' ? rk[0]! : fk[0]!;
+      links.push({ owner: meta.name, name: rel.name, target: rel.to, localKey, targetKey });
+    }
+  }
+  return links;
+}
+
+/** Render one {@link PowdbDesiredLink} as its create-only `link ...` DDL statement. */
+export function powdbLinkStatement(link: PowdbDesiredLink): string {
+  return (
+    `link ${quotePowqlIdent(link.owner)}.${quotePowqlIdent(link.name)} -> ` +
+    `${quotePowqlIdent(link.target)} on ${quotePowqlIdent(link.localKey)} = ${quotePowqlIdent(link.targetKey)}`
+  );
 }
 
 export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptions = {}): string[] {
@@ -735,7 +874,105 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
       }
     }
   }
+  // Entity-link DDL (opt-in). Appended after every type so the referenced types
+  // already exist when the links declare. Gated behind the entityLinks capability
+  // when a caller supplied one (an old engine has no `link` statement).
+  if (opts.emitLinks) {
+    if (caps) requireCapability(caps, 'entityLinks', 'entity link DDL (`emitLinks`)');
+    const links = deriveDesiredLinks(schema, (owner, name) => {
+      if (shouldWarnOnce(WARN_NS.powdbLinks, `collide:${owner}.${name}`)) {
+        console.warn(
+          `[turbine] powqlSchemaDDL(emitLinks): relation "${name}" on "${owner}" collides with a column of the ` +
+            'same name; skipping its link declaration (PowDB hard-errors on a link that shadows a column).',
+        );
+      }
+    });
+    for (const link of links) stmts.push(powdbLinkStatement(link));
+  }
   return stmts;
+}
+
+/**
+ * Existence-checked apply of entity-link DDL against a LIVE PowDB database.
+ * Because link DDL is create-only (no `if not exists`, redeclaring is an error,
+ * and there is no drop spelling), an apply layer must diff against the live
+ * catalog first: this reads the `schema links` listing, then executes only the
+ * links that are genuinely missing.
+ *
+ *   - a desired link already declared with the SAME endpoints  → skipped (idempotent);
+ *   - a link declared with the same owner + name but DIFFERENT endpoints → skipped
+ *     with a one-time warning (never dropped/replaced: there is no drop DDL, and a
+ *     silent replace would be a destructive schema change);
+ *   - a name/column collision on the owner → skipped (deriveDesiredLinks warns).
+ *
+ * Requires the `entityLinks` + `linkIntrospection` capabilities when `capabilities`
+ * is supplied (the listing statement is 0.19.1+). Returns the statements executed.
+ * `exec` runs one PowQL statement (embedded `db.raw` / a networked query shim); it
+ * must return rows keyed by column name for the `schema links` read.
+ */
+export async function applyPowdbLinks(
+  exec: PowdbExec,
+  schema: SchemaMetadata,
+  options: { capabilities?: PowdbCapabilities } = {},
+): Promise<string[]> {
+  const caps = options.capabilities;
+  if (caps) {
+    requireCapability(caps, 'entityLinks', 'entity link DDL (`applyPowdbLinks`)');
+    requireCapability(caps, 'linkIntrospection', 'PowDB `schema links` introspection');
+  }
+  const existing = await listPowdbLinks(exec);
+  const byOwnerName = new Map(existing.map((l) => [`${l.owner} ${l.name}`, l]));
+  const desired = deriveDesiredLinks(schema, (owner, name) => {
+    if (shouldWarnOnce(WARN_NS.powdbLinks, `collide:${owner}.${name}`)) {
+      console.warn(
+        `[turbine] applyPowdbLinks: relation "${name}" on "${owner}" collides with a column of the same name; ` +
+          'skipping its link (PowDB hard-errors on a link that shadows a column).',
+      );
+    }
+  });
+  const executed: string[] = [];
+  for (const link of desired) {
+    const found = byOwnerName.get(`${link.owner} ${link.name}`);
+    if (found) {
+      const same =
+        found.target === link.target && found.localKey === link.localKey && found.targetKey === link.targetKey;
+      if (!same && shouldWarnOnce(WARN_NS.powdbLinks, `drift:${link.owner}.${link.name}`)) {
+        console.warn(
+          `[turbine] applyPowdbLinks: link "${link.name}" on "${link.owner}" is already declared with different ` +
+            `endpoints (have ${found.target} on ${found.localKey} = ${found.targetKey}, want ${link.target} on ` +
+            `${link.localKey} = ${link.targetKey}); leaving it untouched (PowDB has no drop-link DDL).`,
+        );
+      }
+      continue; // identical → idempotent skip; drift → warned skip
+    }
+    const stmt = powdbLinkStatement(link);
+    await exec(stmt);
+    executed.push(stmt);
+  }
+  return executed;
+}
+
+/**
+ * Read the live `schema links` listing into {@link PowdbDesiredLink} rows (owner,
+ * name, target, localKey, targetKey; cardinality is dropped — it is derived, not
+ * a DDL input). An empty catalog returns `[]`, never an error. Naming edge: a
+ * table literally named `links` is described with `describe links`, but the
+ * link LISTING is the contextual keyword form `schema links`.
+ */
+async function listPowdbLinks(exec: PowdbExec): Promise<PowdbDesiredLink[]> {
+  const { rows } = await exec('schema links');
+  return rows.map((r) => ({
+    owner: powdbCell(r.owner),
+    name: powdbCell(r.name),
+    target: powdbCell(r.target),
+    localKey: powdbCell(r.local_key),
+    targetKey: powdbCell(r.target_key),
+  }));
+}
+
+/** Coerce a wire cell (string on the legacy wire, typed on the native wire) to string. */
+function powdbCell(v: unknown): string {
+  return v === null || v === undefined ? '' : String(v);
 }
 
 /** Coerce a JS value into a PowDB positional param (the write side). */
@@ -980,6 +1217,18 @@ export function wrapPowdbError(err: unknown): Error {
   // that fix-hint intact so the caller knows how to make the join eligible.
   if (/nested-loop join would evaluate|join result exceeds row limit/i.test(msg)) {
     return new ValidationError(`[turbine] PowDB join rejected: ${msg}`);
+  }
+  // Entity-link misuse hard errors (0.19.1 turned the two silent-wrong-results
+  // 0.19.0 behaviors into hard errors) → ValidationError (E003), a query defect
+  // to fix. Matched explicitly on the pinned message text so both transports
+  // classify identically regardless of how the wire wraps them (embedded tags
+  // every error `GenericFailure`; networked carries a wire class): a bare dotted
+  // projection path that was not alias-qualified, and an aggregate over a nested
+  // or link projection. Turbine's own generator never emits either shape (it
+  // always aliases and never aggregates over a link), so these fire only for a
+  // raw user PowQL string; mapping them keeps that path typed.
+  if (/is ambiguous in a projection|aggregates over a nested or link projection/i.test(msg)) {
+    return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
   }
 
   // Typed wire error class (networked, server >= 0.17): the client surfaces the
@@ -1816,7 +2065,11 @@ export function encodePowqlLiteral(value: unknown): string {
  * between v0.18.0 and v0.19.0 (empty git diff), and `link` was already a lexer
  * keyword at 0.18.0. The 0.19 entity-links surface adds new STATEMENTS built from
  * pre-existing tokens, so the tokenization / escape surface this ceiling guards is
- * unmoved.
+ * unmoved. The 0.19.1 link-introspection / link-path round is likewise lexer-neutral:
+ * `git diff v0.19.0 v0.19.1 -- crates/query/src/lexer.rs` is empty (the bare-dotted-path
+ * hard error is parser-level, not tokenization), so this ceiling stays `'0.19'`. The
+ * guard in {@link PowdbEmbeddedPool.exec} compares major.minor only, so `'0.19'`
+ * already covers every 0.19.x patch — no bump is needed for 0.19.1.
  */
 export const POWQL_LEXER_TESTED_CEILING = '0.19';
 

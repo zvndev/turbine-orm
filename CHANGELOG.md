@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.48.0 (2026-07-24)
+
+### Added
+
+- **PowDB introspection is relation-aware on 0.19.1+.** PowDB 0.19.1 ships a link
+  introspection surface (`schema links` plus link rows in `describe`).
+  `introspectPowdbDatabase` now reads declared entity links and populates
+  `SchemaMetadata.relations` for the first time on PowDB: to-one links become
+  `belongsTo` (with a synthesized reverse `hasMany`), to-many links become
+  `hasMany`. Many-to-many junctions cannot be inferred from links, so
+  `defineSchema` remains the recommended relation-aware path. Gated on a new
+  patch-aware `linkIntrospection` capability (engine version probe, 0.19.1 floor).
+- **Scalar link paths lift the bigint/bytes to-one loader fallback.** On PowDB
+  0.19.1+, a `with` clause for a `belongsTo` relation whose projected child columns
+  include bigint or bytes (which JSON projection blocks cannot carry, previously a
+  per-relation loader round trip) now compiles to alias-qualified scalar link-path
+  projections on the parent statement, single statement, when a matching link is
+  declared in the database (verified against a cached `schema links` snapshot;
+  any mismatch falls back silently to the loader). Output is loader-identical,
+  including missing-relation `null` shapes and native bigint values. Cases nested
+  projections already serve keep nested projections: the engine never plan-caches
+  link-bearing queries, so hot cacheable paths are deliberately left alone. Gated
+  on a new `linkPaths` capability (0.19.1 floor; 0.19.0 is never eligible).
+- **Opt-in link DDL emission.** `powqlSchemaDDL` accepts `emitLinks: true` and
+  emits one `link Owner.name -> Target on local = target` per single-column
+  relation (composite-key and junction relations skipped; owner-column name
+  collisions skipped with a once-only warning). The apply path existence-checks
+  via `schema links` first (link DDL is create-only with no `if not exists`):
+  already-declared identical links are skipped, and a declared link with
+  different endpoints is warned about, never dropped or replaced. Note: the first
+  link declaration permanently upgrades the data directory to catalog v7;
+  pre-0.19 binaries can no longer open it.
+- **0.19.1 hard-error mapping.** The two behaviors that silently returned wrong
+  results on 0.19.0 (bare dotted projection paths, aggregates over link or nested
+  projections) are hard errors on 0.19.1 and now wrap to `ValidationError` (E003)
+  on both transports. Dev dependencies track `^0.19.1`; the PowQL lexer is
+  verified unchanged 0.19.0 to 0.19.1, so the tested ceiling continues to cover
+  the 0.19 line.
+
 ## 0.47.0 (2026-07-23)
 
 ### Added

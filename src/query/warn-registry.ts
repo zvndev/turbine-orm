@@ -97,4 +97,6 @@ export const WARN_NS = {
   autoStrategy: 'autoStrategy',
   /** Deep-`with` (depth > 5) advisory (builder.ts `findMany`). */
   deepWith: 'deepWith',
+  /** PowDB `emitLinks` DDL skips (name/column collision, endpoint drift). */
+  powdbLinks: 'powdbLinks',
 } as const;

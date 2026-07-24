@@ -38,6 +38,7 @@ import {
   ValidationError,
 } from '../errors.js';
 import {
+  applyPowdbLinks,
   capabilitiesFromVersion,
   introspectPowdbDatabase,
   PowdbJsonParam,
@@ -2144,18 +2145,27 @@ describe('powdb integration (embedded): nested projections (0.18 shaped results)
 // ---------------------------------------------------------------------------
 
 let embeddedEntityLinks = false;
+let embeddedLinkPaths = false;
 try {
   const req = createRequire(import.meta.url);
   const pkg = JSON.parse(readFileSync(req.resolve('@zvndev/powdb-embedded/package.json'), 'utf8')) as {
     version?: string;
   };
-  embeddedEntityLinks = embeddedAvailable && capabilitiesFromVersion(pkg.version).entityLinks;
+  const caps = capabilitiesFromVersion(pkg.version);
+  embeddedEntityLinks = embeddedAvailable && caps.entityLinks;
+  embeddedLinkPaths = embeddedAvailable && caps.linkPaths;
 } catch {
   embeddedEntityLinks = false;
+  embeddedLinkPaths = false;
 }
 const { it: linkIt } = skipGate(
   !embeddedEntityLinks,
   'requires @zvndev/powdb-embedded >= 0.19 (entity links / catalog v7)',
+);
+// The 0.19.1 lane: link introspection + scalar link paths + emitLinks apply.
+const { it: link11It } = skipGate(
+  !embeddedLinkPaths,
+  'requires @zvndev/powdb-embedded >= 0.19.1 (link introspection / scalar link paths)',
 );
 
 // l_order.label is nullable so a row can OMIT it (a missing value, PowQL's
@@ -2277,4 +2287,134 @@ describe('powdb integration (embedded): entity links (0.19 catalog v7)', () => {
       });
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// PowDB >= 0.19.1: link introspection, scalar link paths (bigint child), and
+// the existence-checked emitLinks apply path — live through the embedded addon.
+// lp_account.balance is a bigint (int8) column: a JSON nested block cannot carry
+// it, so `with: { account }` falls to a loader today and becomes a scalar link
+// path here, the exact narrow case this round adopts. Parity (loader vs link
+// path deep-equal, incl. the bigint and a missing to-one) is the acceptance bar.
+// ---------------------------------------------------------------------------
+
+// order.account belongsTo account (bigint balance on the parent).
+const linkPathSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    lp_account: makeTable('lp_account', [
+      col('id', 'id', 'number', 'int4'),
+      col('name', 'name', 'string', 'text'),
+      col('balance', 'balance', 'bigint', 'int8', { nullable: true }),
+    ]),
+    lp_order: makeTable(
+      'lp_order',
+      [
+        col('id', 'id', 'number', 'int4'),
+        col('account_id', 'accountId', 'number', 'int4', { nullable: true }),
+        col('total', 'total', 'number', 'float8'),
+      ],
+      {
+        account: {
+          type: 'belongsTo',
+          name: 'account',
+          from: 'lp_order',
+          to: 'lp_account',
+          foreignKey: 'account_id',
+          referenceKey: 'id',
+        },
+      },
+    ),
+  },
+};
+
+async function withLinkPathDb(fn: (db: DB) => Promise<void>, declareLinks = true): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'powdb-linkpath-it-'));
+  const db: DB = await turbinePowDB({ embedded: dir }, linkPathSchema, { warnOnUnlimited: false });
+  try {
+    for (const stmt of powqlSchemaDDL(linkPathSchema)) await db.raw([stmt]);
+    if (declareLinks) {
+      await db.raw(['link lp_order.account -> lp_account on account_id = id']);
+      await db.raw(['link lp_account.orders -> lp_order on id = account_id']);
+    }
+    await fn(db);
+  } finally {
+    await db.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('powdb integration (embedded): 0.19.1 link introspection + scalar link paths', () => {
+  link11It('describe drops link rows; schema links populates SchemaMetadata.relations', async () => {
+    await withLinkPathDb(async (db) => {
+      const exec = async (q: string) => ({ rows: await db.raw([q]) });
+      // A big enough balance to prove the native bigint wire (beyond 2^53).
+      await db.lpAccount.create({ data: { id: 1, name: 'acme', balance: 9007199254740993n } });
+      const caps = capabilitiesFromVersion('0.19.1');
+      const meta = await introspectPowdbDatabase(exec, { capabilities: caps });
+      // describe must not have turned the link rows into `link`-typed columns.
+      const orderCols = meta.tables.lp_order!.columns.map((c) => c.name);
+      assert.deepEqual(orderCols.sort(), ['account_id', 'id', 'total']);
+      assert.ok(meta.tables.lp_order!.columns.every((c) => c.dialectType !== 'link'));
+      // The declared to-one link → belongsTo on the owner.
+      assert.equal(meta.tables.lp_order!.relations.account?.type, 'belongsTo');
+      assert.equal(meta.tables.lp_order!.relations.account?.to, 'lp_account');
+      assert.equal(meta.tables.lp_order!.relations.account?.foreignKey, 'account_id');
+      // The to-many link → hasMany on its owner.
+      assert.equal(meta.tables.lp_account!.relations.orders?.type, 'hasMany');
+      assert.equal(meta.tables.lp_account!.relations.orders?.to, 'lp_order');
+    });
+  });
+
+  link11It('parity: loader vs scalar link path deep-equal (bigint child + missing to-one)', async () => {
+    await withLinkPathDb(async (db) => {
+      await db.lpAccount.create({ data: { id: 1, name: 'acme', balance: 9007199254740993n } });
+      await db.lpOrder.create({ data: { id: 1, accountId: 1, total: 9.5 } });
+      // A NULL-FK order: its to-one account is absent on both paths.
+      await db.raw(['insert lp_order { id := 2, total := 1.0 }']);
+
+      // Loader path (explicit batched) vs the default (link path, since the child
+      // carries a bigint the JSON block cannot). Both must be identical.
+      const viaLoader = await db.lpOrder.findMany({
+        with: { account: true },
+        orderBy: { id: 'asc' },
+        relationLoadStrategy: 'batched',
+      });
+      const viaLink = await db.lpOrder.findMany({ with: { account: true }, orderBy: { id: 'asc' } });
+      assert.deepEqual(viaLink, viaLoader);
+      // Spot-check the load-bearing pieces of parity.
+      assert.equal(viaLink[0].account.balance, 9007199254740993n, 'bigint survives the scalar hop');
+      assert.equal(viaLink[0].account.name, 'acme');
+      assert.equal(viaLink[1].account, null, 'a missing to-one is null on the link path too');
+    });
+  });
+
+  link11It('applyPowdbLinks is idempotent: second run declares nothing', async () => {
+    // Do NOT pre-declare links: applyPowdbLinks should create them, then skip.
+    await withLinkPathDb(async (db) => {
+      const exec = async (q: string) => ({ rows: await db.raw([q]) });
+      const first = await applyPowdbLinks(exec, linkPathSchema);
+      assert.ok(first.length >= 1, 'first apply creates the missing links');
+      const second = await applyPowdbLinks(exec, linkPathSchema);
+      assert.deepEqual(second, [], 'the second apply is a no-op (existence-checked)');
+    }, /* declareLinks */ false);
+  });
+
+  link11It('the two 0.19.1 hard errors surface as ValidationError (E003)', async () => {
+    await withLinkPathDb(async (db) => {
+      // Bare dotted projection path (not alias-qualified) → parse error with hint.
+      await assert.rejects(
+        db.raw(['lp_order { .account.name }']),
+        (e: unknown) => e instanceof ValidationError,
+        'bare dotted link path is a ValidationError',
+      );
+      // Aggregate OVER a link projection → rejected (the aggregate would ignore
+      // the projection and count parent rows; the engine refuses).
+      await assert.rejects(
+        db.raw(['count(lp_order as o { o.account.name })']),
+        (e: unknown) => e instanceof ValidationError,
+        'aggregate over a link projection is a ValidationError',
+      );
+    });
+  });
 });

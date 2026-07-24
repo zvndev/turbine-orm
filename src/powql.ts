@@ -169,6 +169,58 @@ interface NestedRelationPlan {
   children: NestedRelationPlan[];
 }
 
+/**
+ * One row of the `schema links` catalog listing (PowDB >= 0.19.1): a declared
+ * entity link owned by `owner`, traversable as `owner.name`, correlating
+ * `owner.localKey = target.targetKey`. `cardinality` is `"to-one"` / `"to-many"`,
+ * derived by the engine from whether `targetKey` is unique on `target`.
+ */
+interface LinkSnapshotRow {
+  owner: string;
+  name: string;
+  target: string;
+  localKey: string;
+  targetKey: string;
+  cardinality: string;
+}
+
+/**
+ * Per-pool cache of the `schema links` snapshot (fetched at most once per pool):
+ * scalar link-path query generation verifies a declared link matches the
+ * relation before compiling to it. Keyed on the pool object identity so every
+ * table interface over the same connection shares one snapshot; a WeakMap lets a
+ * discarded pool's snapshot be collected. A fetch failure caches `[]` (a missing
+ * listing means "no verifiable links" — a silent fallback to loaders, never an
+ * error).
+ */
+const LINK_SNAPSHOT_CACHE = new WeakMap<object, Promise<LinkSnapshotRow[]>>();
+
+/**
+ * One planned scalar to-one link-path relation (PowDB >= 0.19.1): a belongsTo
+ * `with` whose child columns include a bigint/bytes value that a JSON nested
+ * block cannot carry, compiled to alias-qualified scalar link paths
+ * (`t0.<linkName>.<col>`) on the parent statement instead of a per-relation
+ * loader. Each projected child column rides its own native typed cell (that is
+ * the whole point — a scalar hop returns a native cell, so bigint/bytes survive),
+ * reconstructed into the child entity by {@link PowqlInterface.attachLinkRows}.
+ */
+interface LinkPathPlan {
+  /** The `with`-clause key: the field the reconstructed child is attached under. */
+  relName: string;
+  /** The DECLARED link name on the owner (the path spelling `t0.<linkName>.<col>`). */
+  linkName: string;
+  /** A fresh interface over the link target (coercion metadata for the child). */
+  targetQi: PowqlInterface<object>;
+  /** Projected child columns (snake names; select/omit/PII applied) plus the PK. */
+  cols: string[];
+  /** Target PK column (snake): its Empty-at-hop marks an absent to-one → null. */
+  pkCol: string;
+  /** Whether the user actually projected the PK (else it is stripped after presence). */
+  pkProjected: boolean;
+  /** Synthetic result-key prefix (`l1_…`) keeping the flat hop fields collision-free. */
+  keyPrefix: string;
+}
+
 /** Operator keys recognised inside a `WhereOperator` object. */
 const OPERATOR_KEYS = new Set([
   'equals',
@@ -1073,9 +1125,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     return this.withMiddleware('findMany', args as unknown as Record<string, unknown>, async () => {
-      const { rows, native, resolvedWhere, nestedPlans, residualWith } = await this.runFind(args, 'findMany');
+      const { rows, native, resolvedWhere, nestedPlans, linkPlans, residualWith } = await this.runFind(
+        args,
+        'findMany',
+      );
       const entities = this.shape(rows, native);
       if (nestedPlans.length) this.attachNestedRows(entities, nestedPlans);
+      if (linkPlans.length) this.attachLinkRows(entities, linkPlans, native);
       if (residualWith) {
         await this.loadRelations(
           entities,
@@ -1110,6 +1166,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     powql: string;
     resolvedWhere: WhereClause<T> | undefined;
     nestedPlans: NestedRelationPlan[];
+    linkPlans: LinkPathPlan[];
     residualWith: Record<string, unknown> | undefined;
   }> {
     if ((args as { cursor?: unknown }).cursor) {
@@ -1129,6 +1186,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     // key would duplicate the column's).
     const withClause = args.with as Record<string, unknown> | undefined;
     const nestedPlans: NestedRelationPlan[] = [];
+    const linkPlans: LinkPathPlan[] = [];
     let residualWith = withClause;
     if (withClause && !args.distinct?.length && this.nestedProjectionsPreferred(args)) {
       const residue: Record<string, unknown> = {};
@@ -1137,13 +1195,25 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         const rel = this.meta.relations[relName];
         const plan =
           rel && !cols.includes(relName) ? this.planNestedRelation(relName, rel, opt, args.includePii === true) : null;
-        if (plan) nestedPlans.push(plan);
+        if (plan) {
+          nestedPlans.push(plan);
+          continue;
+        }
+        // Nested projection could not serve it: try a scalar link path (the narrow
+        // to-one bigint/bytes case; the `schema links` snapshot is fetched lazily
+        // inside, only when a genuine candidate reaches it), else it stays on the
+        // loaders.
+        const linkPlan =
+          rel && !cols.includes(relName)
+            ? await this.planLinkPathRelation(relName, rel, opt, args.includePii === true, cols, linkPlans.length + 1)
+            : null;
+        if (linkPlan) linkPlans.push(linkPlan);
         else residue[relName] = opt; // unknown relation: the loader raises its E003
       }
       residualWith = Object.keys(residue).length ? residue : undefined;
     }
 
-    const nest = nestedPlans.length > 0;
+    const nest = nestedPlans.length > 0 || linkPlans.length > 0;
     const alias = nest ? 't0' : undefined;
     const where = this.buildWhere(resolvedWhere, params, alias);
     const distinct = args.distinct?.length ? ' distinct' : '';
@@ -1165,12 +1235,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       for (const plan of nestedPlans) {
         parts.push(await this.buildNestedBlock(plan, 't0', aliasCtr, params, args.timeout));
       }
+      // Scalar link-path hops (flat native-typed fields; never a JSON block).
+      for (const plan of linkPlans) parts.push(...this.linkPathFields(plan, 't0'));
       projection = `{ ${parts.join(', ')} }`;
     } else {
       projection = this.projection(cols);
     }
     const powql = `${this.qt}${nest ? ' as t0' : ''}${distinct}${filter}${order}${limitClause}${offsetClause} ${projection}`;
-    return { powql, resolvedWhere, nestedPlans, residualWith };
+    return { powql, resolvedWhere, nestedPlans, linkPlans, residualWith };
   }
 
   /** Build + run the findMany select; returns raw rows, the serving wire, the resolved where, and the `with` partition. */
@@ -1182,12 +1254,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     native: boolean;
     resolvedWhere: WhereClause<T> | undefined;
     nestedPlans: NestedRelationPlan[];
+    linkPlans: LinkPathPlan[];
     residualWith: Record<string, unknown> | undefined;
   }> {
     const params: unknown[] = [];
-    const { powql, resolvedWhere, nestedPlans, residualWith } = await this.buildFind(args, params);
+    const { powql, resolvedWhere, nestedPlans, linkPlans, residualWith } = await this.buildFind(args, params);
     const { rows, native } = await this.exec(powql, params, args.timeout, action);
-    return { rows, native, resolvedWhere, nestedPlans, residualWith };
+    return { rows, native, resolvedWhere, nestedPlans, linkPlans, residualWith };
   }
 
   /**
@@ -1223,13 +1296,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (expanded !== args.where) args = { ...args, where: expanded as FindUniqueArgs<T>['where'] };
     }
     return this.withMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
-      const { rows, native, nestedPlans, residualWith } = await this.runFind(
+      const { rows, native, nestedPlans, linkPlans, residualWith } = await this.runFind(
         { ...args, limit: 1 } as FindManyArgs<T>,
         'findUnique',
       );
       if (!rows.length) return null;
       const entities = this.shape(rows, native);
       if (nestedPlans.length) this.attachNestedRows(entities, nestedPlans);
+      if (linkPlans.length) this.attachLinkRows(entities, linkPlans, native);
       if (residualWith)
         await this.loadRelations(entities, residualWith, args.timeout, 0, undefined, args.includePii === true);
       return entities[0]!;
@@ -1238,13 +1312,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
     return this.withMiddleware('findFirst', args as unknown as Record<string, unknown>, async () => {
-      const { rows, native, nestedPlans, residualWith } = await this.runFind(
+      const { rows, native, nestedPlans, linkPlans, residualWith } = await this.runFind(
         { ...args, limit: 1 } as FindManyArgs<T>,
         'findFirst',
       );
       if (!rows.length) return null;
       const entities = this.shape(rows, native);
       if (nestedPlans.length) this.attachNestedRows(entities, nestedPlans);
+      if (linkPlans.length) this.attachLinkRows(entities, linkPlans, native);
       if (residualWith)
         await this.loadRelations(entities, residualWith, args.timeout, 0, undefined, args.includePii === true);
       return entities[0]!;
@@ -1962,6 +2037,186 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       for (const sub of plan.children) plan.targetQi.attachOneNested(child, sub);
     }
     row[plan.relName] = plan.single ? (shaped[0] ?? null) : shaped;
+  }
+
+  // -------------------------------------------------------------------------
+  // Scalar to-one link paths (PowDB >= 0.19.1, `linkPaths` capability)
+  // -------------------------------------------------------------------------
+
+  /**
+   * The `schema links` snapshot for this pool, fetched at most once and cached on
+   * the pool identity. A fetch failure resolves to `[]` (a missing listing is a
+   * silent fallback to loaders, never an error). Only called when the `linkPaths`
+   * capability is on, so the listing statement is guaranteed to exist.
+   */
+  private linksSnapshot(): Promise<LinkSnapshotRow[]> {
+    const pool = this.pool as object;
+    let snap = LINK_SNAPSHOT_CACHE.get(pool);
+    if (!snap) {
+      snap = this.fetchLinksSnapshot();
+      LINK_SNAPSHOT_CACHE.set(pool, snap);
+    }
+    return snap;
+  }
+
+  private async fetchLinksSnapshot(): Promise<LinkSnapshotRow[]> {
+    try {
+      const { rows } = await this.exec('schema links', [], undefined, 'introspect');
+      return rows.map((r) => ({
+        owner: String(r.owner ?? ''),
+        name: String(r.name ?? ''),
+        target: String(r.target ?? ''),
+        localKey: String(r.local_key ?? ''),
+        targetKey: String(r.target_key ?? ''),
+        cardinality: String(r.cardinality ?? ''),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /** True when `name` is a bare PowQL identifier (quoting leaves it unchanged). */
+  private isBareIdent(name: string): boolean {
+    return quotePowqlIdent(name) === name;
+  }
+
+  /**
+   * Find the declared to-one link on THIS table that matches `rel` exactly: same
+   * target, same correlation columns (owner localKey = the FK on this table, target
+   * targetKey = the referenced key on target), cardinality `"to-one"`. Returns the
+   * declared link (whose NAME drives the path spelling, which may differ from the
+   * relation's own name) or `null` for no verifiable match (→ silent loader
+   * fallback, never an error).
+   */
+  private findMatchingLink(snapshot: LinkSnapshotRow[], rel: RelationDef): LinkSnapshotRow | null {
+    const localKey = normalizeKeyColumns(rel.foreignKey)[0];
+    const targetKey = normalizeKeyColumns(rel.referenceKey)[0];
+    if (!localKey || !targetKey) return null;
+    for (const l of snapshot) {
+      if (
+        l.cardinality === 'to-one' &&
+        l.owner === this.table &&
+        l.target === rel.to &&
+        l.localKey === localKey &&
+        l.targetKey === targetKey
+      ) {
+        return l;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Plan one belongsTo `with` as a scalar link-path relation, or `null` when it
+   * must stay on the loaders (ALWAYS a silent fallback with identical output).
+   *
+   * SCOPED TIGHT: this fires ONLY for a to-one relation whose child projection
+   * includes a bigint/bytes column — exactly the case a JSON nested block cannot
+   * carry, so nested projections have already fallen back to a per-relation loader
+   * (`planNestedRelation` returned `null` for the same shape). Cases nested
+   * projections DO serve keep nested projections: link-bearing statements are
+   * NEVER plan-cached upstream, so replacing a cacheable nested projection with a
+   * link path would regress a hot path for no gain. Requires: single-column
+   * belongsTo; no relation `with` / `where` / `distinct` / `orderBy` /
+   * `limit` / `offset` (a scalar path has no per-hop filter/order and cannot
+   * reproduce those — such inputs stay on the loader for exact parity); a link
+   * name and all projected columns that are bare identifiers (a quoted segment in
+   * a dotted link path is outside the verified spelling — fall back); and a
+   * DECLARED link that verifiably matches (`findMatchingLink`).
+   */
+  private async planLinkPathRelation(
+    relName: string,
+    rel: RelationDef,
+    opt: unknown,
+    includePii: boolean,
+    parentCols: string[],
+    index: number,
+  ): Promise<LinkPathPlan | null> {
+    if (!this.capabilities.linkPaths) return null;
+    if (rel.type !== 'belongsTo') return null;
+    if (normalizeKeyColumns(rel.foreignKey).length !== 1 || normalizeKeyColumns(rel.referenceKey).length !== 1) {
+      return null;
+    }
+    const targetMeta = this.schema.tables[rel.to];
+    if (targetMeta?.primaryKey.length !== 1) return null;
+    const options = (opt === true ? {} : opt) as FindManyArgs<object> & { with?: Record<string, unknown> };
+    if (options.with || options.where || options.distinct?.length) return null;
+    if (options.orderBy || options.limit !== undefined || options.offset) return null;
+
+    const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
+    const userCols = targetQi.projectedColumns(
+      options.select as Record<string, boolean> | undefined,
+      options.omit as Record<string, boolean> | undefined,
+      includePii,
+    );
+    const byName = new Map(targetMeta.columns.map((c) => [c.name, c]));
+    // Only adopt link paths where a JSON block genuinely cannot serve the case:
+    // at least one projected child column is bigint/bytes. Otherwise nested
+    // projections already handle it (and cache), so leave it to them.
+    const hasCarrierBlockedCol = userCols.some((c) => {
+      const ts = (byName.get(c)?.tsType ?? '').replace(/\s*\|\s*null$/i, '').trim();
+      return ts === 'bigint' || ts === 'Uint8Array';
+    });
+    if (!hasCarrierBlockedCol) return null;
+
+    // All cheap checks passed: NOW fetch (and cache) the link snapshot — never
+    // before, so a query with no link-path candidate issues no `schema links`.
+    const link = this.findMatchingLink(await this.linksSnapshot(), rel);
+    if (!link) return null;
+    if (!this.isBareIdent(link.name)) return null;
+    if (!userCols.every((c) => this.isBareIdent(c))) return null;
+
+    // Always project the target PK for presence detection (an absent to-one yields
+    // Empty at every hop; PK-Empty is the unambiguous "no linked row" signal). Add
+    // it if the user's projection dropped it, and remember to strip it back off.
+    const pkCol = targetMeta.primaryKey[0]!;
+    if (!this.isBareIdent(pkCol)) return null;
+    const pkProjected = userCols.includes(pkCol);
+    const cols = pkProjected ? userCols : [...userCols, pkCol];
+
+    // Synthetic flat result keys (`l<index>_<col>`) keep the hop fields from
+    // colliding with real parent columns or each other. Refuse the (astronomically
+    // unlikely) case where a real parent/child column already uses the prefix.
+    const keyPrefix = `l${index}_`;
+    if (parentCols.some((c) => c.startsWith(keyPrefix)) || cols.some((c) => c.startsWith(keyPrefix))) return null;
+
+    return { relName, linkName: link.name, targetQi, cols, pkCol, pkProjected, keyPrefix };
+  }
+
+  /** The flat `l<i>_<col>: t0.<linkName>.<col>` projection fields for one link plan. */
+  private linkPathFields(plan: LinkPathPlan, parentAlias: string): string[] {
+    return plan.cols.map((c) => `${plan.keyPrefix}${c}: ${parentAlias}.${plan.linkName}.${c}`);
+  }
+
+  /**
+   * Reconstruct each link-path relation's child entity from its flat hop fields
+   * and attach it under the relation name — output indistinguishable from the
+   * loader (same keys, same coercions). Presence: the target PK cell arriving
+   * Empty (a null/dangling FK at the hop) means no linked row → `null`, matching
+   * the loader's `matches[0] ?? null`. Otherwise the gathered snake cells go
+   * through the SAME `rowToEntity` policy the loader uses (native micros → Date,
+   * bigint per the int8 policy), and the PK is stripped back off if the user did
+   * not project it. `native` is the wire that actually served the parent row.
+   */
+  private attachLinkRows(entities: T[], plans: LinkPathPlan[], native: boolean): void {
+    for (const plan of plans) {
+      const pkField = plan.targetQi.meta.reverseColumnMap[plan.pkCol] ?? plan.pkCol;
+      for (const entity of entities) {
+        const row = entity as Record<string, unknown>;
+        const raw: Record<string, unknown> = {};
+        for (const c of plan.cols) {
+          raw[c] = row[`${plan.keyPrefix}${c}`];
+          delete row[`${plan.keyPrefix}${c}`];
+        }
+        const child = rowToEntity(raw, plan.targetQi.meta, native);
+        if (child[pkField] == null) {
+          row[plan.relName] = null;
+          continue;
+        }
+        if (!plan.pkProjected) delete child[pkField];
+        row[plan.relName] = child;
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
