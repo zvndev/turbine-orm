@@ -176,7 +176,7 @@ users: {
 }
 ```
 
-A PII column is **excluded from default projections**. It comes back only when you name it explicitly in `select`, or pass `includePii: true` to the query; see [includePii on reads](/queries#pii-fields-includepii). Writes are unaffected: you may write PII fields freely, but a write's returned row applies the same read policy (the value is persisted; it is just absent from the returned object unless you re-read with an opt-in). Referencing a PII column in `where`, `orderBy`, `groupBy`, or an aggregate is always allowed, because the reference is explicit.
+A PII column is **excluded from default projections**. It comes back only when you name it explicitly in `select`, or pass `includePii: true` to the query; see [includePii on reads](/queries#pii-fields-includepii). Writes are unaffected: you may write PII fields freely, but a write's returned row applies the same read policy (the value is persisted; it is just absent from the returned object unless you re-read with an opt-in). Referencing a PII column in `where`, `orderBy`, or `having` is always allowed: those narrow, sort, or filter rows and return no PII value. Two aggregate shapes *would* return stored values, so they are gated behind the same `includePii: true` opt-in and otherwise throw a `ValidationError` (`TURBINE_E003`): a PII column used as a `groupBy` **`by`** key (including a JSON-path key), and **`_min` / `_max`** over a PII column in either `groupBy` or `aggregate` (including JSON-path targets). `_count`, `_sum`, and `_avg` over a PII column stay allowed, since none of them hands back a stored cell. See [includePii on reads](/queries#pii-fields-includepii).
 
 The tag flows through the whole stack: [`turbine studio`](/studio) redacts PII cells in its Data and Query views by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type so it tells the truth about default absence. The tag is a **code-first declaration only**: introspection never auto-tags a column as PII, so tagging is always a deliberate choice you make in `defineSchema`.
 
@@ -212,6 +212,32 @@ npx turbine push
 ```
 
 `push` is the fast path for development — it diffs your `defineSchema` output against the live database and applies the difference directly. For production, use migrations.
+
+### Programmatic: `schemaToSQL` and `schemaPush`
+
+Both are exported from the package root, for test harnesses, custom bootstrap scripts, and setups where the CLI is not the right entry point.
+
+```ts
+import { schemaToSQL, schemaToSQLString, schemaPush } from 'turbine-orm';
+import schema from './turbine/schema';
+
+// Build the DDL. No connection involved, so this works for any engine
+// whose driver can execute the statements.
+const statements = schemaToSQL(schema);          // string[]
+const oneScript = schemaToSQLString(schema);     // the same, joined
+
+// Diff against a live Postgres database and apply the difference in ONE
+// transaction. Never drops tables or columns.
+const result = await schemaPush(schema, process.env.DATABASE_URL!);
+console.log(result.statementsExecuted, result.tablesCreated, result.tablesAltered);
+
+// Preview instead of applying
+await schemaPush(schema, url, { dryRun: true });
+```
+
+`schemaPush(schema, connectionString, options?)` accepts `{ dryRun, allowDestructive, precomputedDiff }`. If the computed diff contains a data-destroying statement (a lossy `ALTER COLUMN ... TYPE` and similar), it **throws** a `DestructivePushRefusal` (a `ValidationError` subclass carrying the offending statements on `.destructive`) and applies nothing, unless you pass `allowDestructive: true`. This is the same gate `turbine push` puts behind an interactive confirmation. `precomputedDiff` lets a caller diff once, show the plan, confirm, and then apply exactly the statements it displayed, rather than re-diffing.
+
+`schemaPush` and `schemaDiff` connect through `pg` and are **Postgres-only**. `schemaToSQL` has no connection and is not.
 
 ## SQL-first migrations
 

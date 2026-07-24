@@ -36,6 +36,8 @@ Commands:
   doctor --json                  Machine-readable report (schemaVersion 1)
   doctor --unused                Report never-scanned + redundant indexes (no auto-drop)
   doctor --audit                 Unused report scoped to doctor's own suggestions
+  migrate-from-prisma            Map a schema.prisma onto Turbine (report + typed name map)
+  migrate-from-prisma --no-db    Parse-only: write the report without resolving names
   studio                         Launch local read-only Studio web UI
   mcp                            Start read-only MCP server over JSON-RPC stdio
   observe                        Launch local metrics dashboard
@@ -119,6 +121,28 @@ npx turbine generate --no-timestamp
 ```
 
 Useful when generated code is committed to source control or checked in CI — a `generate` that changes nothing leaves the tree clean.
+
+### `--import-ext <mode>`
+
+Controls the extension on the sibling imports between the generated files (`types.ts`, `metadata.ts`, `index.ts`).
+
+```bash
+npx turbine generate --import-ext js     # './types.js'  (NodeNext / ESM resolution)
+npx turbine generate --import-ext none   # './types'     (bundler / classic resolution)
+npx turbine generate --import-ext auto   # detect from tsconfig (default)
+```
+
+`auto` walks up from the output directory to the nearest `tsconfig.json` and picks the spelling that config's module resolution requires. Set it explicitly if your build resolves differently from what detection infers.
+
+### `--legacy-to-many-uniques`
+
+Since 0.41, a child table whose foreign-key columns are exactly covered by a unique constraint or unique index introspects as a **one-to-one** (`hasOne`) relation rather than `hasMany`, so the parent side is typed `Child | null` instead of `Child[]`. That is the correct shape, and it matches Prisma, but it is a breaking type change for clients generated before 0.41.
+
+```bash
+npx turbine generate --legacy-to-many-uniques
+```
+
+restores the pre-0.41 `hasMany` output while you port the affected call sites. It is also settable as `legacyToManyUniques: true` in `turbine.config.ts`, and it only affects what introspection emits, never runtime behavior.
 
 ## `turbine push`
 
@@ -348,7 +372,7 @@ Pass `--no-concurrently` for a plain, in-transaction `CREATE INDEX` migration in
 
 ### Workload-heat boost
 
-When a `_turbine_metrics` table exists (written by [`db.$observe()`](/observability#metrics-dbobserve) with its default Postgres sink), `doctor` maps per-model query heat onto physical tables and uses it as an extra benefit signal: a table your app hits hard is a table where a missing index hurts most. A hot finding is annotated (`hot in your workload: N queries/min, p95 X ms`) and sorted first. Heat is a *benefit* signal only, never a cost one, so it re-prioritizes and annotates but never downgrades a cost tier. Read metrics from a separate database with `--metrics-url`.
+When a `_turbine_metrics` table exists (written by [`db.$observe()`](/observability#metrics--dbobserve) with its default Postgres sink), `doctor` maps per-model query heat onto physical tables and uses it as an extra benefit signal: a table your app hits hard is a table where a missing index hurts most. A hot finding is annotated (`hot in your workload: N queries/min, p95 X ms`) and sorted first. Heat is a *benefit* signal only, never a cost one, so it re-prioritizes and annotates but never downgrades a cost tier. Read metrics from a separate database with `--metrics-url`.
 
 When the metrics table is absent, or observe is configured with a non-Postgres sink, `doctor` prints one honesty line that heat boosting is unavailable and continues, exactly as it does when statistics are missing.
 
@@ -383,6 +407,36 @@ Turbine's advantage here is that it knows which columns its correlated subquerie
 ### Dev-mode warning
 
 You don't have to remember to run `doctor`. In non-production (`NODE_ENV !== 'production'`), the first query that builds a relation subquery over an unindexed FK logs a one-time warning naming the relation, the table and columns, and the exact `CREATE INDEX` statement. The warning only fires when the schema metadata actually carries index information (introspected or generated clients), so `defineSchema`-only setups see no false positives.
+
+## `turbine migrate-from-prisma`
+
+Parse a `schema.prisma`, resolve every name in it against your live database, and emit a migration report plus a typed name map that the [`turbine-orm/prisma-compat`](/migrate-from-prisma#createprismacompatclient) adapter runs on.
+
+```bash
+DATABASE_URL=postgres://... npx turbine migrate-from-prisma --schema prisma/schema.prisma
+
+# Audit a schema with no database in reach
+npx turbine migrate-from-prisma --schema prisma/schema.prisma --no-db
+```
+
+The parser is a zero-dependency subset parser: neither `prisma` nor `@prisma/client` needs to still be installed. Outputs land in the generate output directory (default `./generated/turbine`):
+
+- `prisma-migration-report.md`: per-model resolution, junction tables detected for implicit many-to-many, enums, unresolved items, and parser notes
+- `prisma-map.ts`: the typed `PRISMA_MAP` consumed by the compat adapter
+- the standard generated client (`types.ts`, `metadata.ts`, `index.ts`)
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--schema <file>` | Path to `schema.prisma` (default `prisma/schema.prisma`). **In this command `--schema` names the Prisma file**, not the Postgres namespace it means everywhere else; the namespace is fixed to `public` here. |
+| `--url`, `-u <url>` | Connection string, unless `--no-db`. |
+| `--out`, `-o <dir>` | Output directory (default `./generated/turbine`), which must be inside the project root. |
+| `--no-db` | Parse-only. Writes the report and skips introspection, so no `prisma-map.ts` and no client are emitted. |
+| `--allow-partial` | Exit 0 even when items are unresolved. Without it an unresolved item exits 1. |
+| `--no-timestamp` | Omit the generated-at lines for byte-identical regeneration. |
+
+Unresolved items never block the generated client: it is built from live introspected metadata, so a partial run still produces a working `db`. See [Migrating from Prisma](/migrate-from-prisma#the-migration-toolkit) for the full workflow and the adapter's documented gaps.
 
 ## `turbine studio`
 

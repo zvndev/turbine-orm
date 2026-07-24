@@ -9,6 +9,8 @@ export const metadata = {
 
 Three-way head-to-head against **Prisma 7.9** (`@prisma/adapter-pg`, `relationJoins` preview on) and **Drizzle 0.45** (node-postgres relational API) on a **local PostgreSQL 17.9** database reached over a Unix socket. 200 iterations + 20 warmup per scenario, same schema, same data, same connection pool config.
 
+> **Measured on turbine-orm 0.39.0, 2026-07-21.** The harness has not been re-run since, so these are not 0.48.0 numbers. One later change is worth knowing about when you reproduce them: since 0.41 the default `relationLoadStrategy` is `'auto'` rather than `'join'`, which keeps the single-statement plan for indexed relations (as in this schema) but falls back to a batched follow-up for any relation whose foreign key it can see is unindexed. Pin `relationLoadStrategy: 'join'` to measure exactly what ran here.
+
 > **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and every number is sub-millisecond. Turbine takes five scenarios outright (flat reads, both findUnique shapes, pipeline, and the hot path), Drizzle takes L2 nested, and four scenarios (L3 nested, count, streaming, atomic increment) flipped winners between two full runs and are reported as near-ties. Prisma 7.9 trails on every scenario here because its per-query work is no longer hidden behind network latency, though it improved noticeably on flat reads and pipeline over 7.6. These are a different measurement regime from the earlier pooled-Neon run and are not directly comparable to it.
 
 ## Setup
@@ -93,7 +95,7 @@ Prisma 7 dropped its Rust engine, but the client still does meaningful per-query
 - **These are socket-local numbers.** They isolate per-query overhead and deliberately exclude the network that usually dominates production latency. For a networked, pooled database the deltas here shrink toward the noise floor.
 - **All measurements are wall-clock from the client** over a local socket, including query execution and result serialization.
 - **Single machine.** Client and database are the same host, so there is no round-trip and no pooler hop.
-- **Prisma 7's `relationJoins` is a preview feature.** Without it, Prisma falls back to N+1 and would lose the nested scenarios by a much wider margin.
+- **Prisma's nested scenarios run on its `join` strategy, deliberately.** `benchmarks/prisma/schema.prisma` enables the `relationJoins` preview feature, which per Prisma's docs makes `join` the client-wide default, and the harness never overrides `relationLoadStrategy` on a query. Without the flag Prisma would use its `query` strategy (one follow-up query per relation, merged in the client) and would lose the nested scenarios by a wider margin. We measured Prisma in its favorable configuration.
 - **We did not test connection pool starvation, long transactions, or write-heavy workloads.** Those are different benchmarks.
 - **The streaming scenario drains the full table.** A scenario that breaks out after the first match would show cursor cleanup advantages that a single number cannot capture.
 - **Four scenarios are near-ties.** L3 nested, count, streaming, and atomic increment each flipped winner between the two runs (the second run gave Drizzle count, streaming, and increment, and Turbine L3). Treat all four as within noise on this host rather than a lead for either ORM.

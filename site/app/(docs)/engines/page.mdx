@@ -15,15 +15,26 @@ Two of these engines run **in-process**, with no server to start: **SQLite** (al
 
 > **The `turbine` CLI drives PostgreSQL only.** `turbine generate`, `turbine push`, and `turbine migrate` are Postgres-only today. Every other engine (SQLite, MySQL, SQL Server, PowDB) is **code-first and programmatic**: define your schema with `defineSchema`, derive runtime metadata with `schemaDefToMetadata`, and construct the client through the engine's factory. The typed query API is identical across all engines; only the schema/migration *tooling* stays on Postgres for now. Each dialect already emits its own migration-tracking SQL, so a per-engine runner is a future adapter, not a rewrite.
 
-## Honest by design
+## What is actually Postgres-only
 
-Several of Turbine's flagship Postgres features have no portable equivalent. Rather than silently degrade, the non-Postgres engines throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) the moment you reach for one:
+The typed query API (`findMany` / `with` / `where` / `create` / `aggregate` and the types they return) runs on **every** engine. Two smaller sets do not, and it is worth keeping them apart, because they fail in different ways.
+
+**Query features with no portable equivalent.** The non-Postgres engines throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) the moment you reach for one, rather than silently degrading:
 
 - **pgvector** distance ops / KNN ordering
 - **LISTEN/NOTIFY** realtime (`$listen` / `$notify`)
 - **RLS `sessionContext`** (the transaction-local GUCs `$withSession` sets)
+- **`DISTINCT ON`**, which is not translated for SQL Server
 
-If those are core to your app, stay on Postgres. If you need a second database for tests, edge demos, or an existing MySQL/SQL Server deployment, the engines below give you Turbine's nested-relation query model and typed errors without compromising the Postgres path.
+**Schema and diagnostic tooling that talks to `pg` directly.** These are not query features and do not throw a capability error; they simply target PostgreSQL:
+
+- The whole `turbine` **CLI**: `generate` / `pull`, `push`, `migrate`, `seed`, `status`, `studio`, `mcp`, `observe`, `doctor`, `migrate-from-prisma`
+- The programmatic schema-management functions **`schemaPush`** and **`schemaDiff`** (`schemaToSQL`, which only builds DDL strings, has no connection and works anywhere you can execute the statements yourself)
+- **`doctor`** and its missing-index advisor
+
+Every other engine is **code-first and programmatic**: define your schema with `defineSchema`, derive runtime metadata with `schemaDefToMetadata`, and construct the client through the engine's factory. Each dialect already emits its own migration-tracking SQL, so a per-engine migration runner is a future adapter rather than a rewrite.
+
+If pgvector, realtime, or RLS is core to your app, stay on Postgres. If you need a second database for tests, edge demos, or an existing MySQL/SQL Server deployment, the engines below give you Turbine's nested-relation query model and typed errors without compromising the Postgres path.
 
 ## Capability matrix
 
@@ -62,9 +73,11 @@ The biggest difference between engines is how a write surfaces the row it affect
 | SQLite ≥ 3.35 | `returning` | trailing `RETURNING *` |
 | MySQL 8 | `reselect` | run the write, then `SELECT` the affected row by primary key / `where` |
 | SQL Server | `output` | `OUTPUT INSERTED.*` / `MERGE` in the same statement |
-| PowDB | `reselect` | run the write, then read the affected row back by primary key |
+| PowDB | `returning` | trailing `returning` keyword (`upsert` excepted, see below) |
 
 The one user-visible consequence: on MySQL, **`createMany` returns an empty array** (`[]`). The rows are inserted — MySQL just cannot return them safely in bulk, so re-query if you need them back.
+
+PowDB's `returning` keyword takes no column list, so it returns the whole row and Turbine applies any PII projection client-side. Its **`upsert`** is the one write that reselects: PowQL's upsert statement rejects `returning`, so Turbine runs the write and reads the row back by primary key (a composite-primary-key upsert does the lookup-or-write in a single flat transaction).
 
 ## SQLite
 
@@ -199,20 +212,26 @@ The embedded addon lets Turbine choose how aggressively PowDB fsyncs, via `turbi
 
 An optional `memoryLimit` (bytes) caps the embedded cache. `syncMode` / `memoryLimit` require the 0.7.1+ addon; on an older addon Turbine raises a clear `ConnectionError` rather than silently ignoring them.
 
-### Why embedded PowDB is fast
+### Embedded PowDB vs SQLite: writes win, reads do not
 
-On **v0.7.1**, embedded PowDB with `syncMode: 'normal'` **wins or ties SQLite on every operation except the filtered list** in our cross-engine benchmark (warm cache, small dataset, single connection, app-assigned integer PKs):
+The short version, as most recently measured: **embedded PowDB with `syncMode: 'normal'` beats SQLite on writes, and SQLite beats it on reads.** Neither engine wins outright.
+
+The numbers below are the 2026-07-21 check-in of the cross-engine harness (`benchmarks/cross-engine.ts`) on `@zvndev/powdb-embedded` **0.17.0**, Node v24.18.0, `ENGINES=pg,sqlite,powdb_emb`. Two full runs agreed on every rank shown:
 
 | op (p50, ms) | SQLite | PowDB embed (normal) | |
 |---|--:|--:|:--|
-| `findUnique` by PK | 0.006 | 0.006 | tie |
-| `create` | 0.016 | **0.009** | 1.8× faster |
-| `update` (atomic increment) | 0.012 | **0.008** | 1.5× faster |
-| `createMany` (100 rows) | 1.197 | **0.278** | 4.3× faster |
-| nested `with` | 0.409 | **0.355** | faster |
-| `findMany` (filter+order+limit) | **0.095** | 0.158 | SQLite wins |
+| `create` | 0.018 | **0.015** | PowDB faster |
+| `update` (atomic increment) | 0.016 | **0.011** | PowDB faster |
+| `createMany` (100 rows) | 1.516 | **0.421** | PowDB ~3.6x faster |
+| `findUnique` by PK | **0.007** | 0.010 | SQLite faster |
+| `findMany` (filter+order+limit) | **0.099** | 0.267 | SQLite faster |
+| nested `with` | **0.474** | 0.516 | SQLite faster |
 
-Embedded keeps a real storage engine (indexes, WAL) *and* has a networked sibling for the same data — something SQLite cannot offer. Numbers are per-op latency on a warm cache, not concurrent throughput; the relative embed-vs-SQLite signal is the robust takeaway. Tail (p99) variance is heavier under `normal`, so mean-based ops/sec is closer than the medians suggest.
+An earlier run on addon **0.7.1** recorded embedded PowDB winning or tying every operation except the filtered list, including a `findUnique` tie and a nested-`with` win. That result no longer reproduces: on 0.17.0 both reads go to SQLite in both runs. Whether that is engine drift across 0.8 through 0.17 or host noise has not been isolated by a controlled re-run, so treat the read side as SQLite's and the write side as PowDB's until it is. Both tables, and the caveats, are recorded in [`benchmarks/CROSS-ENGINE-RESULTS.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/CROSS-ENGINE-RESULTS.md).
+
+What has held across every run is the bulk-write gap (`createMany` roughly 3x to 4x faster) and the fact that embedded keeps a real storage engine (indexes, WAL) *and* has a networked sibling serving the same data, which SQLite cannot offer.
+
+Read all of this as per-op latency on a warm cache, a small dataset, and a single connection, not as concurrent throughput or large-data scaling. Tail (p99) variance is heavier under `normal`, so mean-based ops/sec is closer than the medians suggest.
 
 ### What PowDB does differently
 

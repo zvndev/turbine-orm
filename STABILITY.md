@@ -21,8 +21,8 @@ These are the surfaces we intend to carry to 1.0 and beyond. We will not break t
 |---|---|
 | **Query API** | `findMany`, `findUnique`, `findFirst`, `findUniqueOrThrow`, `findFirstOrThrow`, `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, `upsert`, `count`, `aggregate`, `groupBy` — including their `where`, `with`, `orderBy`, `select`, `omit`, and `limit`/cursor arguments and the types they return. |
 | **`with`-clause type inference** | The compile-time return types produced by `with`, `select`, and `omit`. We treat a regression in inference as a bug, not a free minor change. |
-| **Typed errors** | The `TurbineError` hierarchy and the **error codes** (`TURBINE_E001`–`TURBINE_E017`). A code, once assigned, keeps its meaning. Structured fields on errors (`.code`, `.columns`, `.constraint`, `.where`, `.cause`) are stable; human-readable `.message` *text* is not (see below). |
-| **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|deploy\|status`, `seed`, `status`, `doctor`, `studio`, `mcp`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. |
+| **Typed errors** | The `TurbineError` hierarchy and the **error codes** (`TURBINE_E001`–`TURBINE_E018`). A code, once assigned, keeps its meaning. Structured fields on errors (`.code`, `.columns`, `.constraint`, `.where`, `.cause`) are stable; human-readable `.message` *text* is not (see below). |
+| **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|deploy\|status`, `seed`, `status`, `doctor`, `studio`, `mcp`, `observe`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. |
 | **Client configuration** | `TurbineConfig` fields and the `$transaction`, `$use`, `$on`/`$off`, `pipeline`, and raw-SQL tagged-template APIs on `TurbineClient`. |
 
 ### Experimental surfaces
@@ -34,6 +34,8 @@ These work and are tested, but they are still moving. We may change their API or
 | **Non-Postgres dialect adapters** (`src/adapters/` — CockroachDB, YugabyteDB) | These ride on PostgreSQL wire compatibility and are not yet covered by a full parity suite. Behavior may change as we expand coverage. |
 | **Observability** (`db.$observe`, the `_turbine_metrics` table, `turbine observe`) | The metric schema, aggregation windows, and dashboard are subject to change. |
 | **Serverless / edge binding** (`turbine-orm/serverless`, `turbineHttp`) | The query API it exposes is Stable; the *driver-binding contract* (which external pools we accept and how) may evolve as serverless Postgres drivers change. |
+| **Non-Postgres engines** (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) | The typed query API is shared with the Postgres path, but each engine's capability boundaries and factory options are still moving, and PowDB tracks a young upstream engine whose supported feature set is version-gated. |
+| **Prisma migration toolkit** (`turbine migrate-from-prisma`, `turbine-orm/prisma-compat`) | The report format, the emitted `PRISMA_MAP` shape, and the set of Prisma behaviors the adapter translates are all expected to grow. It is a migration aid, not a surface to build on long-term. |
 
 > **Note**
 > The `_turbine_metrics` and `_turbine_migrations` tables and the `_turbine_*` naming prefix are reserved. Don't create your own tables with that prefix.
@@ -63,9 +65,11 @@ Turbine is pre-1.0. **Security and correctness fixes land on the latest minor re
 
 | Version | Supported |
 |---|---|
-| 0.28.x | Yes |
-| 0.27.x | Yes (security fixes prefer 0.28.x) |
-| < 0.27 | No |
+| 0.48.x | Yes (current) |
+| 0.47.x | Yes (security fixes prefer 0.48.x) |
+| < 0.47 | No |
+
+This table names the current minor and the one behind it. If you are reading a checked-out copy older than the published version, treat [npm](https://www.npmjs.com/package/turbine-orm) as authoritative for what "current" means.
 
 The practical guidance: stay on the latest minor. We do not backport fixes to older minors. To report a vulnerability privately, email **dev@zvndev.com** — see [SECURITY.md](./SECURITY.md) for the process.
 
@@ -75,12 +79,12 @@ The practical guidance: stay on the latest minor. We do not backport fixes to ol
 
 - **Stable-surface API freeze, sustained.** No breaking change to a Stable surface for **three consecutive minor releases**. If we have to break one, the clock resets.
 - **A real parity suite, green.** The non-Postgres adapters move from Experimental to a defined support tier only once a cross-dialect parity suite passes against real engines — not mocks. (The 0.17.0 Studio bug shipped green precisely because a test mocked the pool instead of hitting a server; we are not repeating that.)
-- **Real-engine CI.** Integration tests run against live PostgreSQL in CI on every change, not only locally. The full suite (1127 tests as of 0.17.0) stays green.
-- **Coverage gate held.** The configured thresholds in `.c8rc.json` (lines 80%, functions 82%, branches 82% as of 0.28.x) stay green on the unit set, with no silently-narrowed subset. Floors are ratcheted up only after measured actuals leave headroom.
+- **Real-engine CI.** Integration tests run against live PostgreSQL in CI on every change, not only locally, and the full suite stays green.
+- **Coverage gate held.** The configured thresholds in `.c8rc.json` (currently lines 80%, statements 80%, functions 82%, branches 82%) stay green on the unit set, with no silently-narrowed subset. Floors are ratcheted up only after measured actuals leave headroom.
 - **Published releases, in sync.** Every release has a matching `vX.Y.Z` git tag **and** a published GitHub Release with notes. npm, git tags, and GitHub Releases agree. (See [docs/releases/](./docs/releases/).)
 - **Migration durability.** The migration format and `_turbine_migrations` schema are committed to as-is — a 1.0 upgrade must not require re-checksumming or re-applying existing migrations.
 
-### Honest status today (0.28.0)
+### Honest status today (0.48.0)
 
 We are **not at 1.0 yet**, and the gaps are specific:
 

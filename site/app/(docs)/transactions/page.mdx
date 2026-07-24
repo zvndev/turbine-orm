@@ -152,23 +152,10 @@ Two error classes carry `readonly isRetryable = true as const` — so TypeScript
 | E012 | `DeadlockError` | 40P01 |
 | E013 | `SerializationFailureError` | 40001 |
 
-Canonical retry loop:
+Canonical retry loop, using the `withRetry` helper the package exports (or the identical `db.$retry`):
 
 ```ts
-import { DeadlockError, SerializationFailureError } from 'turbine-orm';
-
-async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const retryable = err instanceof DeadlockError || err instanceof SerializationFailureError;
-      if (!retryable || attempt === maxAttempts) throw err;
-      await new Promise((r) => setTimeout(r, 50 * 2 ** (attempt - 1)));
-    }
-  }
-  throw new Error('unreachable');
-}
+import { withRetry } from 'turbine-orm';
 
 await withRetry(() =>
   db.$transaction(
@@ -180,7 +167,9 @@ await withRetry(() =>
 );
 ```
 
-The `as const` on `isRetryable` means `err.isRetryable` is the literal type `true` on those classes and never narrows to `false` — your control flow type-checks without casts.
+`withRetry` retries only errors carrying `isRetryable === true` and rethrows everything else at once. Tune it with `maxAttempts` (default `3`), `baseDelay` (default `50` ms), `maxDelay` (default `5000` ms), and `onRetry(error, attempt)`; backoff is exponential with jitter.
+
+The `as const` on `isRetryable` means `err.isRetryable` is the literal type `true` on those classes and never narrows to `false`, so your control flow type-checks without casts, whether you use the helper or write your own loop.
 
 ## pipeline — N queries, 1 round-trip
 
@@ -199,6 +188,18 @@ const [user, posts, commentCount, orgs, latestLogin] = await db.pipeline([
 Each `build*` method returns a `DeferredQuery<T>` — `{ sql, params, transform, tag }`. The pipeline driver writes them all to the wire, reads all responses, applies each `transform`.
 
 Result type is a tuple that matches the input order and carries the per-query return type.
+
+### Driving a pipeline yourself
+
+`db.pipeline()` is the ergonomic wrapper. The underlying function is exported too, for cases where you hold a `pg.Pool` directly rather than a `TurbineClient`:
+
+```ts
+import { executePipeline, pipelineSupported } from 'turbine-orm';
+
+const results = await executePipeline(pool, queries, options);
+```
+
+`executePipeline(pool, queries, options?)` takes a `pg.Pool`, a readonly array of `DeferredQuery` objects, and the same `PipelineOptions` as `db.pipeline()`; it returns the same order-matched tuple. An empty array short-circuits to `[]` without touching the pool. `await pipelineSupported(pool)` resolves to a boolean telling you whether that pool's driver exposes the wire-protocol path (some pg-compatible serverless drivers do not), so you can fall back to sequential execution rather than fail.
 
 ## When pipeline wins
 

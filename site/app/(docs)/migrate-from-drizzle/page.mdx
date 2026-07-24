@@ -195,7 +195,7 @@ await db.$transaction(async (tx) => {
 ## What you'll lose
 
 - **SQL-like syntax.** If you prefer `select().from().where()` chaining, Turbine's object API is a style change.
-- **Multi-database support.** Drizzle supports MySQL, SQLite, and Postgres. Turbine is Postgres-only (including CockroachDB and YugabyteDB).
+- **First-class multi-database support.** Drizzle treats MySQL, SQLite, and Postgres as peers. Turbine is **Postgres-first**: PostgreSQL (plus the wire-compatible CockroachDB and YugabyteDB) is the primary target, and SQLite, MySQL 8, SQL Server, and PowDB ship behind subpath exports (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) sharing the same typed query API. What you give up on those engines is narrower than "no support": a handful of query features throw a typed `UnsupportedFeatureError` (pgvector, LISTEN/NOTIFY, RLS session context), and the schema tooling (`turbine generate` / `push` / `migrate`, `schemaPush` / `schemaDiff`, `doctor`) targets Postgres, so the other engines are code-first via `defineSchema`. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only) for the exact line.
 - **`$inferSelect` / `$inferInsert`.** Turbine generates types from introspection instead of inferring from schema definitions. Run `npx turbine generate` after schema changes.
 
 ## Migration checklist

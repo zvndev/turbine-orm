@@ -87,7 +87,38 @@ const full = await db.users.findMany({
 });
 ```
 
-`includePii` is only valid on reads (`findMany` / `findUnique` / `findFirst` and their `*OrThrow` forms, plus `findManyStream`); it is not a write option. Filtering or ordering by a PII column (`where`, `orderBy`, `groupBy`, aggregates) is always allowed regardless of the flag, since naming the column is itself explicit. Schemas with no PII-tagged columns are unaffected: the emitted SQL is byte-identical either way.
+`includePii` is a read option (`findMany` / `findUnique` / `findFirst` and their `*OrThrow` forms, `findManyStream`, and the gated `groupBy` / `aggregate` shapes below); it is never a write option. Schemas with no PII-tagged columns are unaffected: the emitted SQL is byte-identical either way.
+
+The line the flag draws is **whether a stored PII value can reach your application**. `where`, `orderBy`, and `having` on a PII column are therefore always allowed, with or without the flag: they narrow, sort, or filter rows and return no PII value of their own.
+
+Aggregates are where this needs care, because some of them return stored cells. Two shapes are **refused** without `includePii: true`, throwing a `ValidationError` (`TURBINE_E003`) that names the column:
+
+- A PII-tagged column used as a `groupBy` **`by`** key, including a **JSON-path** group key. The group keys *are* the values.
+- **`_min` / `_max`** over a PII column, in **both** `groupBy` and `aggregate`, including JSON-path targets. Each returns one row's actual stored value.
+
+Everything else over a PII column is **allowed with no opt-in**:
+
+- **`_count`**, which returns a count rather than a value.
+- **`_sum` / `_avg`**, which return a value computed across many rows rather than a stored cell. (A group of exactly one row is a known theoretical edge; the gate is deliberately narrow rather than blanket.)
+
+```ts
+// Refused: the group keys would be the email values
+await db.users.groupBy({ by: ['email'], _count: true });
+// ValidationError [TURBINE_E003]: ... "email" is a PII column ...
+
+// Refused: _max returns one row's stored email
+await db.users.aggregate({ _max: { email: true } });
+
+// Allowed: explicit opt-in on either args type
+await db.users.groupBy({ by: ['email'], _count: true, includePii: true });
+await db.users.aggregate({ _max: { email: true }, includePii: true });
+
+// Allowed with no flag: no stored PII value is returned
+await db.users.groupBy({ by: ['role'], _count: true });
+await db.users.aggregate({ _count: true, where: { email: { endsWith: '@acme.com' } } });
+```
+
+`includePii` is a field on both `GroupByArgs` and `AggregateArgs`. With it set, the emitted SQL is byte-identical to what an untagged schema would produce. The whole policy applies on **PowDB** as well as the SQL engines, and it only affects schemas that opted into `pii: true`: untagged schemas are completely unaffected.
 
 Writes enforce the same boundary at the SQL level. A write against a table with PII columns (`create`, `createMany`, `update`, `delete`, `upsert`, and nested writes) returns an explicit non-PII projection instead of `RETURNING *`: `RETURNING "id", "name", ...` on Postgres and SQLite, the follow-up `SELECT` on MySQL, and `OUTPUT INSERTED.…` / `OUTPUT DELETED.…` on SQL Server all list only the non-PII columns. You may still write PII values freely (they are persisted); they simply never cross the wire back to your application unrequested. A PII-tagged primary key is kept in the projection anyway, so the returned row stays addressable. Tables with no PII columns keep `RETURNING *` byte-for-byte. (PowDB is the one exception: its `returning` keyword accepts no column list, so PII is stripped client-side from the returned row there; the upsert path reselects by PK through the non-PII read projection.)
 

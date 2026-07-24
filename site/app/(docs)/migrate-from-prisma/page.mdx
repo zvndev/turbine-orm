@@ -7,7 +7,22 @@ export const metadata = {
 
 # Migrating from Prisma
 
-Turbine is a Postgres-native TypeScript ORM with a Prisma-inspired API. If you're on Prisma but want a smaller dependency footprint, edge/serverless without an extra adapter, and a code-first schema (no `.prisma` DSL), Turbine is a near drop-in. Most of your query code moves over by renaming `include` to `with` and re-pointing your imports. One step is mandatory before you benchmark: run `npx turbine doctor`, covered first below.
+Turbine is a Postgres-native TypeScript ORM with a Prisma-inspired API. If you're on Prisma but want a smaller dependency footprint, edge/serverless without an extra adapter, and a code-first schema (no `.prisma` DSL), Turbine is a near drop-in.
+
+## Two ways to migrate
+
+**Pick one deliberately. They compose: you can start with the adapter and port modules to native calls over time.**
+
+| | [Compat adapter](#the-migration-toolkit) | [Native port](#api-mapping) |
+|---|---|---|
+| What you run | `turbine migrate-from-prisma`, then wrap the client in `createPrismaCompatClient` | Rename `include` to `with`, re-point imports |
+| Call sites | Unchanged. `prisma.user.findMany({ include })` keeps working | Rewritten to `db.users.findMany({ with })` |
+| Time to first green build | Hours | Proportional to your call-site count |
+| Ceiling | A documented set of Prisma features [it will not translate](#what-the-adapter-does-not-do) | The full Turbine API |
+
+The adapter is a **runtime shim, not a codemod**: it exposes a PrismaClient-shaped surface over a `TurbineClient` and translates arguments on the way in and results on the way out. It never edits your source. Nothing is rewritten for you, so a `git diff` after adopting it touches your client construction and nothing else.
+
+One step is mandatory on either path before you benchmark: run `npx turbine doctor`, covered next.
 
 ## Before anything else: run doctor
 
@@ -58,9 +73,123 @@ An explicit `'join'` or `'batched'` — at the client or on a single query — a
 
 > **Ordering caveat.** `'auto'` can load some relations via the batched path, so an **unordered** child array's order can differ from the pure-join path. Relation-array order under `json_agg` was never guaranteed to begin with. If any code relies on implicit child order, add `orderBy` to that `with` block, or enable [`stableRelationOrder`](#relation-array-order). See [Relation array order](#relation-array-order) below.
 
+## The migration toolkit
+
+Two pieces ship with the package: a CLI command that reads your `schema.prisma` and resolves it against your live database, and a runtime adapter that serves a PrismaClient-shaped API from the map that command emits.
+
+### `turbine migrate-from-prisma`
+
+```bash
+DATABASE_URL=postgres://... npx turbine migrate-from-prisma --schema prisma/schema.prisma
+```
+
+It parses `schema.prisma` with a zero-dependency subset parser (no `prisma` CLI, no `@prisma/client`, neither needs to still be installed), introspects your database, and resolves every model, field, relation, enum, and compound unique against what is actually there. It writes three things into your generate output directory (default `./generated/turbine`):
+
+- **`prisma-migration-report.md`**: per-model resolution, detected junction tables for implicit many-to-many, enums, an **Unresolved items** section, and parser notes. Read this first: it is the list of things that will not translate.
+- **`prisma-map.ts`**: the typed `PRISMA_MAP` the adapter is driven by. Every name in it was proven to exist during introspection, so the adapter only ever translates names it can resolve.
+- **The standard generated client** (`types.ts`, `metadata.ts`, `index.ts`), exactly as `turbine generate` writes it.
+
+| Flag | Effect |
+|---|---|
+| `--schema <file>` | Path to `schema.prisma` (default `prisma/schema.prisma`). **In this command only**, `--schema` names the Prisma *file*, not the Postgres namespace the rest of the CLI means by it. The namespace is fixed to `public` here. |
+| `--url`, `-u <url>` | Connection string, unless `--no-db`. Falls back to `DATABASE_URL`. |
+| `--out`, `-o <dir>` | Output directory (default `./generated/turbine`). Must be inside the project root. |
+| `--no-db` | Parse-only. Writes the report, skips introspection, and emits **no** `prisma-map.ts` and **no** client. Useful for auditing a schema before you have a database to point at. |
+| `--allow-partial` | Exit 0 even when items are unresolved. By default an unresolved item exits **1** so CI fails loudly. |
+| `--no-timestamp` | Omit the generated-at lines, for byte-identical regeneration. |
+
+An unresolved item never blocks the client: it is generated from live introspected metadata, so a partial run still gives you a working `db`. Only the *map* entry is missing, which means the adapter will not know that one Prisma name.
+
+### `createPrismaCompatClient`
+
+`turbine-orm/prisma-compat` wraps a `TurbineClient` in Prisma's surface. It is a pure TypeScript shim: zero new dependencies, never imported by Turbine core.
+
+```ts
+import { TurbineClient } from 'turbine-orm';
+import { createPrismaCompatClient } from 'turbine-orm/prisma-compat';
+import { SCHEMA } from './generated/turbine/metadata.js';
+import { PRISMA_MAP } from './generated/turbine/prisma-map.js';
+
+const db = new TurbineClient({ connectionString: process.env.DATABASE_URL }, SCHEMA);
+export const prisma = createPrismaCompatClient(db, PRISMA_MAP);
+```
+
+Swap that in for `new PrismaClient()` and existing call sites keep working:
+
+```ts
+// unchanged from your Prisma codebase
+const users = await prisma.user.findMany({
+  where: { email: { contains: '@acme.com' } },
+  include: { posts: { orderBy: { createdAt: 'desc' }, take: 5 } },
+});
+```
+
+Model delegates are registered under **both** spellings, the Prisma model name (`prisma.User`) and Prisma's generated client property (`prisma.user`), so either style resolves to the same delegate.
+
+**What it translates:** `include` to `with`; `select` split into scalar selection plus relations; field and relation renames in both directions; `take`/`skip` to `limit`/`offset`; cursor pagination; compound-unique selectors including custom `@@unique(name:)` names; `$transaction` in both the callback and lazy-array-batching forms; `$queryRaw` / `$executeRaw` and their `Unsafe` variants with `Prisma.sql`-style fragment flattening; `createMany({ skipDuplicates })` to `ON CONFLICT DO NOTHING`; `_count` objects keyed back to Prisma relation names; to-one relations surfaced as `object | null`. Prisma's client-side defaults (`@default(uuid())`, `@default(cuid())`, `@updatedAt`) are emulated on write, since Prisma fills those in the client and the columns usually have no database default.
+
+Two options. `prismaErrorCodes: true` sets `.code` on thrown `TurbineError`s to the nearest Prisma code (`P2002` for a unique violation, `P2025` for not-found, and so on) without pretending to be `instanceof PrismaClientKnownRequestError`; left off, Turbine's own `TURBINE_E0NN` codes are preserved. `stablePkOrder: true` loads every to-many `with` relation that has no explicit `orderBy` ordered by the target table's primary key ascending, which is closer to how Prisma's relation rows tend to arrive; an explicit per-relation `orderBy` always wins.
+
+### What the adapter does *not* do
+
+Read this before you commit to the adapter path. These are verified against the implementation, not aspirational.
+
+**Absent entirely.** `$use`, `$on`, and `$extends` are not implemented and are not present on the returned object. Calling one is a plain `TypeError: prisma.$use is not a function`, not a typed Turbine error. Turbine's own middleware is `db.$use` on the underlying `TurbineClient`, with different semantics: it runs *after* SQL generation and cannot rewrite a query. Client extensions have no equivalent at all.
+
+**Present but inert.** `$connect()` and `$disconnect()` exist and resolve immediately without doing anything. The `TurbineClient` owns the pool, so shut down with `db.disconnect()`, not `prisma.$disconnect()`. A migration that relies on `$disconnect()` closing connections (tests, serverless teardown) will leak the pool.
+
+**`count()` silently ignores most of its options.** Only `where` and `timeout` are forwarded. Prisma's `select`, `cursor`, `take`, `skip`, `orderBy`, and `distinct` on `count` are dropped without error, so `count({ take: 10 })` returns the count of *all* matching rows, not 10. If you count with any of those, rewrite the call.
+
+**Throws rather than guessing.** Three shapes raise `UnsupportedFeatureError` instead of returning a subtly wrong result:
+
+- **A bare inclusive cursor whose field is not the sort key.** Prisma's bare cursor is inclusive; translating it exactly needs the anchor row's sort-key value. When the cursor field *is* the single `orderBy` field (or is the single-column primary key with no `orderBy`) it compiles to a `gte`/`lte` keyset predicate. Otherwise it throws rather than emit an off-by-one page. Pairing the cursor with `skip: 1`, Prisma's usual idiom, translates exactly.
+- **Negative `take`** (take-from-end). Turbine's `limit` has no reverse form.
+- **`skip` inside a nested relation `include`.** Turbine's `with` clause has no per-relation offset.
+
+**Not attempted.** Fluent relation chaining (`prisma.user.findUnique(...).posts()`); `instanceof PrismaClientKnownRequestError` identity and byte-identical error messages; `Prisma.join` / `Prisma.raw` composition beyond plain fragment flattening; Accelerate, Pulse, and the driver-adapter preview features; the MongoDB API; the `prisma migrate` / `prisma db` CLI family (Turbine ships its own migrations). `createMany({ skipDuplicates })` throws `UnsupportedFeatureError` on the SQL Server and PowDB engines.
+
+### Breaking change in 0.41: unique foreign keys introspect as `hasOne`
+
+If you generated a client before 0.41, this one changes types on you. When a child table's foreign-key columns are exactly covered by a unique constraint or unique index, the relation is genuinely one-to-one, and introspection now emits **`hasOne`** for the parent side instead of `hasMany`. In the generated types, `Child[]` becomes `Child | null`:
+
+```ts
+// Before 0.41
+const user = await db.users.findUnique({ where: { id: 1 }, with: { profile: true } });
+user.profile[0]?.bio;   // array, always length 0 or 1
+
+// 0.41 and later
+user.profile?.bio;      // object | null
+```
+
+This matches Prisma's own shape for a `@unique` back-relation, so migrating call sites usually get *more* correct, not less. If you need the old shape while you port, regenerate with the escape hatch:
+
+```bash
+npx turbine generate --legacy-to-many-uniques
+```
+
+It is also settable as `legacyToManyUniques: true` in `turbine.config.ts`. It only affects introspection output, never runtime behavior.
+
+### Compound-unique `where` selectors
+
+Prisma addresses a multi-column unique constraint through a single synthetic key. Turbine accepts the same spelling, so these call sites port verbatim:
+
+```ts
+// Prisma and Turbine, identical
+await db.members.findUnique({ where: { orgId_userId: { orgId: 1, userId: 7 } } });
+
+// equivalent to
+await db.members.findUnique({ where: { orgId: 1, userId: 7 } });
+```
+
+Selector names are derived from your metadata: a composite primary key, each composite unique constraint, and each composite unique index. Two spellings are registered for every column set, the underscore join of the camelCase field names (`orgId_userId`, Prisma's default) and, when it differs, the underscore join of the raw column names (`org_id_user_id`).
+
+Two rules keep it unambiguous. A synthetic name is never registered when it collides with a real field, column, or relation name (the real member wins), and when two different column sets would produce the same name, that name is dropped entirely. A **partial** unique index never backs a selector, since it only guarantees uniqueness across the rows matching its predicate. Custom `@@unique(name:)` names from your Prisma schema are handled on top of this by the compat adapter, which reads them from `PRISMA_MAP`.
+
+Selectors work on the whole `findUnique` family and in nested-write unique `where`s (`connect`, `connectOrCreate`, and friends), on every engine including PowDB.
+
 ## API mapping
 
-This is the full mapping. Skip to [Side-by-side](#side-by-side) if you want to see it working.
+If you are doing a native port, this is the full mapping. Skip to [Side-by-side](#side-by-side) if you want to see it working.
 
 | Prisma | Turbine | Notes |
 |---|---|---|
@@ -247,7 +376,7 @@ const active = await db.users.findMany({
 - **Typed errors with codes.** `UniqueConstraintError` / `ForeignKeyError` / `NotNullViolationError` / `CheckConstraintError` all carry `code` (`TURBINE_E008`–`E011`) and `cause`. `findUniqueOrThrow` throws `NotFoundError` (`TURBINE_E001`) with the `where` attached. `DeadlockError` / `SerializationFailureError` have `readonly isRetryable = true as const`.
 - **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, SCHEMA)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.
 - **Single runtime dependency.** `pg` only. No engine binary, no WASM, no `@prisma/client`.
-- **Postgres-first, not Postgres-only.** Postgres is the default and primary target; optional SQLite, MySQL, SQL Server, and PowDB engines ship behind subpath exports (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) and share the same typed API. A few flagship features (pgvector, LISTEN/NOTIFY, RLS session context) stay Postgres-only and throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) elsewhere. See [Engines](/engines).
+- **Postgres-first, not Postgres-only.** Postgres is the default and primary target; optional SQLite, MySQL, SQL Server, and PowDB engines ship behind subpath exports (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) and share the same typed API. A few flagship features (pgvector, LISTEN/NOTIFY, RLS session context) stay Postgres-only and throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) elsewhere, and the schema tooling (the CLI, `schemaPush` / `schemaDiff`, `doctor`) targets Postgres. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only).
 - **Nested writes are fully supported.** `create` / `connect` / `connectOrCreate` on a create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on an update — one transaction, depth cap 10. See [Nested writes](/nested-writes).
 
 ### Cursor pagination
@@ -275,11 +404,13 @@ If you want a stable default without annotating every relation, opt into `stable
 
 ## Migration checklist
 
+The steps below are the **native port**. If you are taking the adapter path instead, the short version is: install `turbine-orm`, run `npx turbine doctor --fix`, run `npx turbine migrate-from-prisma`, read `prisma-migration-report.md`, replace `new PrismaClient()` with `createPrismaCompatClient(db, PRISMA_MAP)`, and work through [what the adapter does not do](#what-the-adapter-does-not-do). Steps 1, 2, and 9 still apply.
+
 1. `npm install turbine-orm && npm uninstall @prisma/client prisma`.
 2. **Fix FK indexes before you benchmark.** Run `npx turbine doctor --fix` to add the indexes Prisma left off, then `npx turbine migrate up` — or set `relationLoadStrategy: 'batched'` on the client to reproduce Prisma's loading pattern until the migration lands (see [above](#before-anything-else-run-doctor)).
 3. Write `schema.ts` mirroring your `.prisma` models (or run `npx turbine pull` to introspect your live DB).
 4. `npx turbine generate` — writes `./generated/turbine/{types,metadata,index}.ts`.
-5. Find/replace:
+5. Rewrite the call sites. Nothing rewrites them for you: the compat adapter serves Prisma's surface at runtime, it does not edit source. Find/replace:
    - `prisma.` → `db.`
    - Singular model names → plural snake-camelCase table names (`prisma.user` → `db.users`)
    - `include:` → `with:`
