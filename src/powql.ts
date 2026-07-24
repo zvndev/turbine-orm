@@ -57,6 +57,7 @@ import {
   requireCapability,
   rowToEntity,
 } from './powdb.js';
+import { assertAggregatePiiOptIn } from './query/aggregates.js';
 import { expandCompoundUniqueWhere } from './query/compound-unique.js';
 import { isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
@@ -2632,6 +2633,17 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         const acc: Record<string, number | null> = {};
         for (const field of Object.keys(spec).filter((f) => (spec as Record<string, boolean>)[f])) {
           const powfn = fn.slice(1); // sum/avg/min/max
+          // Same PII contract as the SQL engines: _min/_max return a stored cell.
+          if (fn === '_min' || fn === '_max') {
+            assertAggregatePiiOptIn(
+              this.table,
+              this.meta,
+              field,
+              this.column(field).name,
+              `aggregate ${fn}`,
+              args.includePii,
+            );
+          }
           acc[field] = await scalar(`${powfn}(${this.qt}${filter} { ${this.ref(field)} })`);
         }
         (result as Record<string, unknown>)[fn] = acc;
@@ -2696,6 +2708,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       for (const entry of args.by as ((keyof T & string) | JsonPathGroupKey)[]) {
         if (typeof entry === 'string') {
           const col = this.column(entry);
+          assertAggregatePiiOptIn(this.table, this.meta, entry, col.name, 'groupBy `by` key', args.includePii);
           claim(entry, `column "${col.name}"`);
           if (col.name !== entry) claim(col.name, `column "${col.name}"`);
           groupExprs.push(`.${col.name}`);
@@ -2709,6 +2722,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
               `[turbine] groupBy JSON group key on "${entry.field}" (table "${this.table}") requires a json column.`,
             );
           }
+          assertAggregatePiiOptIn(
+            this.table,
+            this.meta,
+            entry.field,
+            col.name,
+            'groupBy JSON `by` key',
+            args.includePii,
+          );
           this.assertJsonPath('group key', entry.field, entry.path);
           const pathExpr = this.jsonPathExpr(col, entry.path, params);
           const alias = entry.alias ?? String(entry.path[entry.path.length - 1]);
@@ -2757,6 +2778,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           const alias = `agg_${aggN++}`;
           if (target === true) {
             const col = this.column(key);
+            if (fn === '_min' || fn === '_max') {
+              assertAggregatePiiOptIn(this.table, this.meta, key, col.name, `groupBy ${fn}`, args.includePii);
+            }
             claim(`${fn}_${col.name}`, `${fn} of column "${col.name}"`);
             const inner = `.${col.name}`;
             proj.push(`${alias}: ${powfn}(${inner})`);
@@ -2768,6 +2792,16 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             if (!isJsonColumn(col)) {
               throw new ValidationError(
                 `[turbine] groupBy ${fn} target "${key}" on "${target.field}" (table "${this.table}") requires a json column.`,
+              );
+            }
+            if (fn === '_min' || fn === '_max') {
+              assertAggregatePiiOptIn(
+                this.table,
+                this.meta,
+                target.field,
+                col.name,
+                `groupBy ${fn} JSON target`,
+                args.includePii,
               );
             }
             this.assertJsonPath(`${fn} target "${key}"`, target.field, target.path);

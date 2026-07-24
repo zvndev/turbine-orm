@@ -301,6 +301,9 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
       collectArrayFilterParams(qi, value as ArrayFilter, params);
       return;
     case 'textsearch':
+      // Same gate the build path applies, so the collect path never diverges
+      // (it throws before any param is pushed).
+      requireFullTextSearch(qi);
       params.push((value as TextSearchFilter).search);
       return;
     case 'operator':
@@ -444,7 +447,8 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
 }
 
 /** Collect params from array filter. Mirrors buildArrayFilterClauses. */
-export function collectArrayFilterParams(_qi: BuilderCtx, filter: ArrayFilter, params: unknown[]): void {
+export function collectArrayFilterParams(qi: BuilderCtx, filter: ArrayFilter, params: unknown[]): void {
+  requireArrayColumns(qi);
   if (filter.has !== undefined) params.push(filter.has);
   if (filter.hasEvery !== undefined) params.push(filter.hasEvery);
   if (filter.hasSome !== undefined) params.push(filter.hasSome);
@@ -1456,6 +1460,41 @@ export function buildOperatorClauses(
 }
 
 /**
+ * Gate the full-text `search` filter on {@link Dialect.supportsFullTextSearch}.
+ * The clause it guards is `to_tsvector(...) @@ to_tsquery(...)`, which only
+ * PostgreSQL parses, so every other engine gets a typed
+ * {@link UnsupportedFeatureError} (E017) instead of a raw driver syntax error.
+ * Called from BOTH the build and the param-collect side (mirroring the vector
+ * gate) so the two paths can never diverge.
+ */
+export function requireFullTextSearch(qi: BuilderCtx): void {
+  if (qi.dialect.supportsFullTextSearch) return;
+  throw new UnsupportedFeatureError(
+    'full-text search filters (`search`)',
+    qi.dialect.name,
+    'Full-text `search` compiles to PostgreSQL to_tsvector/to_tsquery. ' +
+      'Use `contains` (LIKE) on this engine, or run the query on PostgreSQL.',
+  );
+}
+
+/**
+ * Gate the array filter operators (`has` / `hasEvery` / `hasSome` / `isEmpty`)
+ * on {@link Dialect.supportsArrayColumns}. They compile to PostgreSQL array
+ * operators (`= ANY(col)`, `@>`, `&&`, `cardinality(col)`) over a native array
+ * column, which no other supported engine has. Called from BOTH the build and
+ * the param-collect side.
+ */
+export function requireArrayColumns(qi: BuilderCtx): void {
+  if (qi.dialect.supportsArrayColumns) return;
+  throw new UnsupportedFeatureError(
+    'array column filters (`has` / `hasEvery` / `hasSome` / `isEmpty`)',
+    qi.dialect.name,
+    'Array filters compile to PostgreSQL array operators over a native array ' +
+      'column; this engine has no array column type.',
+  );
+}
+
+/**
  * Resolve a {@link VectorMetric} to its pgvector distance operator from a
  * fixed allow-list, validating the target column is actually a `vector`
  * column. Throws {@link ValidationError} for an unknown metric or a
@@ -1733,6 +1772,7 @@ export function buildArrayFilterClauses(
   params: unknown[],
   pgType: string,
 ): string[] {
+  requireArrayColumns(qi);
   const clauses: string[] = [];
   const elementType = getArrayElementType(qi, pgType);
 
@@ -1820,6 +1860,7 @@ export function buildTextSearchClause(
   filter: TextSearchFilter,
   params: unknown[],
 ): string {
+  requireFullTextSearch(qi);
   const config = filter.config ?? 'english';
   if (!validateTextSearchConfig(config)) {
     throw new ValidationError(

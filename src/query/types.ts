@@ -999,6 +999,14 @@ export interface GroupByArgs<T> {
    * grouped results; combine with `limit` and a deterministic `orderBy`.
    */
   offset?: number;
+  /**
+   * Opt in to grouping on / aggregating PII-tagged (`defineSchema` `pii: true`)
+   * columns. A PII column in `by`, and `_min` / `_max` over a PII column, return
+   * STORED VALUES, so without this they throw `ValidationError` (E003).
+   * `_count` (a count, not a value), `_sum` / `_avg`, and `where` / `orderBy` /
+   * `having` on PII columns stay allowed.
+   */
+  includePii?: boolean;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
@@ -1090,6 +1098,14 @@ export interface AggregateArgs<T> {
   _min?: Partial<Record<keyof T & string, boolean>>;
   /** Maximum value of fields */
   _max?: Partial<Record<keyof T & string, boolean>>;
+  /**
+   * Opt in to aggregating PII-tagged (`defineSchema` `pii: true`) columns.
+   * `_min` / `_max` return a STORED VALUE, so without this they throw
+   * `ValidationError` (E003) on a PII column. `_count` (a count, not a value)
+   * and `_sum` / `_avg` (a computed total over many rows) stay allowed, as do
+   * `where` filters on PII columns.
+   */
+  includePii?: boolean;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
