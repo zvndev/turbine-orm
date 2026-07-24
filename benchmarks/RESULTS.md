@@ -1,6 +1,13 @@
 # Three-way benchmark: Turbine vs Prisma 7 vs Drizzle 0.45
 
-> **TL;DR.** Measured 2026-07-14 on a **local PostgreSQL 17.9** database over a
+> **Which run is current?** This file records two runs of the same harness. The
+> **most recent** is [2026-07-21](#raw-results-2026-07-21-local-socket) (turbine-orm
+> 0.39.0 vs Prisma 7.9.0 vs Drizzle 0.45.2), and it is the run quoted in the README
+> and on turbineorm.dev. The 2026-07-14 run below (turbine-orm 0.32.0 vs Prisma
+> 7.6.0) is kept for the per-scenario analysis and the p50/p95/p99 detail. Neither
+> run has been repeated on 0.48.0.
+
+> **TL;DR (2026-07-14 run).** Measured on a **local PostgreSQL 17.9** database over a
 > Unix socket (no network hop). With the network removed, every query is
 > sub-millisecond and the gap between ORMs is per-query overhead, not noise.
 > Turbine wins 6 of 10 scenarios (flat reads, findUnique by PK and nested,
@@ -155,8 +162,13 @@ bubbles raw `pg` errors. That is a DX difference, not a benchmark line.
   including query execution and result serialization.
 - **Single machine.** Client and database are the same host; there is no
   round-trip and no pooler hop.
-- **Prisma 7's `relationJoins` is a preview feature.** Without it, Prisma falls
-  back to N+1 and would lose the nested scenarios by a much wider margin.
+- **Prisma's nested scenarios run on its `join` strategy.**
+  `prisma/schema.prisma` enables the `relationJoins` preview feature, which per
+  Prisma's docs makes `join` the client-wide default; `bench.ts` never overrides
+  `relationLoadStrategy` on a query. Without the flag Prisma would use its `query`
+  strategy (one follow-up query per relation, merged in the client) and would lose
+  the nested scenarios by a wider margin. This is the favorable configuration for
+  Prisma, chosen deliberately.
 - **We did not test connection pool starvation, long transactions, or true
   write-heavy workloads.** Those are different benchmarks.
 - **The streaming scenario drains the full table.** A scenario that breaks out

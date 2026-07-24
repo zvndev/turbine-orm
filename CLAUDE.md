@@ -366,9 +366,30 @@ src/
                       interfaces, camelToSnake/snakeToCamel utilities, singularize helper.
                       ColumnMetadata.pii (0.36): code-first-only PII tag (defineSchema
                       `pii: true` / fluent `.pii()`; introspection NEVER auto-tags).
-                      Contract: PII columns are excluded from every default projection
-                      (top-level, `with` subqueries, batched loader, positional encoding,
-                      PowQL loaders + native joins, and write returns). Writes on
+                      Contract, stated by enforcement point:
+                      (1) ROW PROJECTIONS: a PII column is excluded from every default
+                      row projection (top-level, `with` subqueries, batched loader,
+                      positional encoding, PowQL loaders + native joins, and write
+                      returns), and comes back only when named explicitly in `select`
+                      or unlocked by the `includePii: true` read arg. Enforced AT THE
+                      SQL LEVEL on every engine (see the write projection below), with
+                      parseWriteRow's strip as defense-in-depth.
+                      (2) AGGREGATES: two shapes are REFUSED without `includePii: true`
+                      (ValidationError E003 naming the column): a PII column used as a
+                      groupBy `by` key INCLUDING a JSON-path group key (the keys ARE the
+                      values), and _min/_max over a PII column in BOTH groupBy and
+                      aggregate INCLUDING JSON-path targets (they return a row's stored
+                      cell). ALLOWED with no opt-in: _count (a count, not a value) and
+                      _sum/_avg (computed across many rows, not a stored cell; the
+                      single-row group is a known theoretical edge, the gate is
+                      deliberately narrow). `includePii?: boolean` is a field on BOTH
+                      GroupByArgs and AggregateArgs (query/types.ts); with it set the
+                      emitted SQL is byte-identical to an untagged schema. Applies on
+                      PowDB as well as the SQL engines.
+                      (3) PREDICATES AND ORDERING: where / orderBy / having on a PII
+                      column are ALWAYS permitted, with or without the flag: they return
+                      no PII value, only narrow or sort rows.
+                      `includePii` is a read arg, never a mutation arg. Writes on
                       PII-tagged tables emit an explicit non-PII projection AT THE SQL
                       LEVEL (writeReturningColumns: RETURNING list on PG/SQLite, projected
                       reselect on MySQL, per-column OUTPUT INSERTED./DELETED. on MSSQL via
@@ -376,12 +397,10 @@ src/
                       addressable; untagged tables keep RETURNING * byte-for-byte).
                       PowDB is the exception: its `returning` keyword takes no column list
                       (driver spec), so stripWritePii removes PII client-side there.
-                      parseWriteRow's strip stays as defense-in-depth. Returned only via explicit
-                      `select` naming or the `includePii: true` read arg (reads only, not
-                      mutations); where/orderBy/groupBy on PII always allowed. The fm:/fu:
-                      SQL-cache keys carry a `|pii=0/1` segment (projection-invariant
-                      withFp made this mandatory). Untagged schemas emit byte-identical
-                      SQL (tested). TableMetadata.checks round-trips named check
+                      The fm:/fu: SQL-cache keys carry a `|pii=0/1` segment
+                      (projection-invariant withFp made this mandatory). A schema with no
+                      pii-tagged column is unaffected by ANY of the above and emits
+                      byte-identical SQL (tested). TableMetadata.checks round-trips named check
                       constraints through generate (emitted into metadata.ts).
 
   schema-builder.ts — defineSchema() API for code-first schema definitions. Produces

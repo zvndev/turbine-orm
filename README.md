@@ -14,39 +14,44 @@ Every TS ORM now resolves nested relations in a single `json_agg` query — Pris
 
 1. **Read-only-by-default Studio your DBA will approve.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and (since v0.19) no raw-SQL surface at all: queries are composed in the ORM's own validated builder. In the default mode the write endpoints do not exist and every transaction is read-only at the database level; edits require an explicit `--write` opt-in per launch, and every edit is addressed by its full primary key (never a predicate).
 2. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
-3. **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages to keep in lockstep. The main entry's **import graph** is ~53 kB brotli (edge ~40 kB) with `pg` external (that is the client footprint your bundler sees, not the dual ESM+CJS install size on disk, ~3 MB). Prisma 7 dropped its Rust query engine, but its client still ships a TypeScript/WASM query compiler: a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
+3. **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages to keep in lockstep. The main entry's **import graph** is ~57 kB brotli (edge ~43 kB) with `pg` external (that is the client footprint your bundler sees, not the dual ESM+CJS install size on disk, ~3 MB). Prisma 7 dropped its Rust query engine, but its client still ships a TypeScript/WASM query compiler: a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
 5. **Edge-native — one import swap.** `turbineHttp(pool, SCHEMA)` — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle, no adapter package, no separate serverless build.
 6. **Pipeline batching via wire protocol.** Real Parse/Bind/Execute pipeline — not queries wrapped in a transaction. N independent queries in one round-trip.
 
 See [How It Works](#how-it-works) for the `json_agg` query strategy itself, but the query strategy isn't why you'd pick Turbine. The safety bundle above is: a Studio that is read-only unless you explicitly opt in to writes, PII columns that stay out of results until asked for, errors that never leak data, one dependency, and checksummed migrations.
 
-**New in 0.28.0:** [global filters](https://turbineorm.dev/global-filters) for soft-delete and multi-tenancy · [read replicas](https://turbineorm.dev/read-replicas) with a `$primary()` escape hatch · a read-only [MCP server](https://turbineorm.dev/mcp) for AI agents · [seed-as-code](https://turbineorm.dev/seeding) and a non-interactive `migrate deploy` for CI · [Zod generation](https://turbineorm.dev/zod) · read-only [views & generated columns](https://turbineorm.dev/views) · `NULLS FIRST/LAST` ordering, relation `_count`, and ordering by a relation · schema referential actions, enums, array, `vector`, and check constraints.
+**Beyond the safety bundle, what ships today:** [global filters](https://turbineorm.dev/global-filters) for soft-delete and multi-tenancy · [read replicas](https://turbineorm.dev/read-replicas) with a `$primary()` escape hatch · a read-only [MCP server](https://turbineorm.dev/mcp) for AI agents · [seed-as-code](https://turbineorm.dev/seeding) and a non-interactive `migrate deploy` for CI · [Zod generation](https://turbineorm.dev/zod) · read-only [views & generated columns](https://turbineorm.dev/views) · [optional SQLite / MySQL / SQL Server / PowDB engines](https://turbineorm.dev/engines) behind subpath exports · a [Prisma migration toolkit](https://turbineorm.dev/migrate-from-prisma) (schema mapper plus a runtime compat adapter) · a cost-aware index advisor in [`turbine doctor`](https://turbineorm.dev/cli#turbine-doctor).
+
+Per-release detail lives in the [CHANGELOG](./CHANGELOG.md) and at [turbineorm.dev/changelog](https://turbineorm.dev/changelog).
 
 ## Benchmarks
 
-Tested against **Prisma 7.6** (adapter-pg, relationJoins preview on) and **Drizzle 0.45** (relational queries) on a **local PostgreSQL 17.9** database over a Unix socket. 200 iterations, 20 warmup, Node v24. Same schema, same data (1K users, 10K posts, 50K comments), same connection pool config. _Measured 2026-07-14 on turbine-orm 0.32.0 (Apple Silicon MacBook Pro, macOS). A local socket has no network round-trip, so these numbers are sub-millisecond and are **not** comparable to the earlier pooled-Neon table: they isolate per-query overhead instead of hiding it behind ~35 ms of network latency. See [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) to reproduce._
+Tested against **Prisma 7.9.0** (`@prisma/adapter-pg`) and **Drizzle 0.45.2** (relational queries) on a **local PostgreSQL 17.9** database over a Unix socket. 200 iterations, 20 warmup, Node v24.18.0. Same schema, same data (1K users, 10K posts, 50K comments), same connection pool config. _Measured 2026-07-21 on turbine-orm 0.39.0 (Apple Silicon MacBook Pro, macOS); the harness has not been re-run since, so these are not 0.48.0 numbers. A local socket has no network round-trip, so these numbers are sub-millisecond and are **not** comparable to the earlier pooled-Neon table: they isolate per-query overhead instead of hiding it behind ~35 ms of network latency. See [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) to reproduce._
 
-| Scenario | Turbine | Prisma 7 | Drizzle 0.45 |
+Prisma's nested scenarios run on its **`join`** load strategy: `benchmarks/prisma/schema.prisma` enables the `relationJoins` preview feature, which (per Prisma's docs) makes `join` the client-wide default, and the harness never overrides `relationLoadStrategy` on a query. Without that flag Prisma would fall back to its per-relation `query` strategy and lose the nested scenarios by a wider margin.
+
+| Scenario | Turbine | Prisma 7.9 | Drizzle 0.45 |
 |---|---|---|---|
-| findMany, 100 users (flat) | **0.22 ms** | 0.53 ms | 0.34 ms |
-| findMany, 50 users + posts (L2) | 2.41 ms | 4.63 ms | **1.82 ms** |
-| findMany, 10 users → posts → comments (L3) | 1.13 ms | 3.69 ms | **1.01 ms** |
-| findUnique, single user by PK | **0.06 ms** | 0.11 ms | 0.09 ms |
-| findUnique, user + posts + comments (L3) | **0.18 ms** | 0.43 ms | 0.30 ms |
-| count, all users | **0.06 ms** | 0.08 ms | 0.07 ms |
-| stream, iterate 50K rows (batch 1000) | 58.6 ms | 69.7 ms | **48.9 ms** |
-| atomic increment, `view_count + 1` | 0.13 ms | 0.23 ms | **0.11 ms** |
-| pipeline, 5-query batch | **0.20 ms** | 0.61 ms | 0.58 ms |
-| hot findUnique, 500x same shape | **0.05 ms** | 0.09 ms | 0.10 ms |
+| findMany, 100 users (flat) | **0.29 ms** | 0.37 ms | 0.39 ms |
+| findMany, 50 users + posts (L2) | 2.86 ms | 4.64 ms | **2.39 ms** |
+| findMany, 10 users → posts → comments (L3) *(near-tie)* | 1.55 ms | 4.04 ms | **1.32 ms** |
+| findUnique, single user by PK | **0.06 ms** | 0.12 ms | 0.10 ms |
+| findUnique, user + posts + comments (L3) | **0.18 ms** | 0.45 ms | 0.31 ms |
+| count, all users *(near-tie)* | **0.05 ms** | 0.08 ms | 0.06 ms |
+| stream, iterate 50K rows (batch 1000) *(near-tie)* | **60.7 ms** | 68.8 ms | 65.8 ms |
+| atomic increment, `view_count + 1` *(near-tie)* | **0.14 ms** | 0.19 ms | 0.19 ms |
+| pipeline, 5-query batch | **0.20 ms** | 0.45 ms | 0.41 ms |
+| hot findUnique, 500x same shape | **0.03 ms** | 0.06 ms | 0.08 ms |
 
-**Over a local socket the network floor disappears, so per-query overhead becomes the whole signal.** The picture that emerges (stable across two full runs):
+**Over a local socket the network floor disappears, so per-query overhead becomes the whole signal.** The picture that emerges across two full runs:
 
-- **Turbine leads flat reads, findUnique, count, pipeline, and the hot path.** SQL template caching and prepared statements keep its per-call overhead lowest on simple and repeated-shape queries, and its real Postgres pipeline protocol (one TCP flush for 5 queries) runs the dashboard batch ~3x faster than Prisma's or Drizzle's sequential transaction.
-- **Drizzle leads nested reads (L2), streaming, and atomic increment.** Its relational query builder emits tighter SQL for the posts/comments joins, and its keyset pagination drains 50K rows fastest. Turbine's `json_agg` nesting is close behind and still 1.9x to 3.3x ahead of Prisma on the same L2/L3 shapes. L3 is a genuine Turbine/Drizzle near-tie that flips between runs.
-- **Prisma trails on every scenario here.** Its engine-less client's per-query work is no longer masked by network latency; on a pooled remote database (the regime we measured previously) these same deltas compress back into the noise floor.
+- **Turbine leads flat reads, both findUnique shapes, pipeline, and the hot path.** SQL template caching and prepared statements keep its per-call overhead lowest on simple and repeated-shape queries, and its real Postgres pipeline protocol (one TCP flush for 5 queries) runs the dashboard batch ~2x faster than Prisma's or Drizzle's sequential transaction.
+- **Drizzle leads nested reads (L2).** Its relational query builder emits tighter SQL for the posts/comments joins. Turbine's `json_agg` nesting is close behind and still 1.7x to 3.1x ahead of Prisma on the same L2/L3 shapes.
+- **Four scenarios are near-ties.** L3 nested, count, streaming, and atomic increment each flipped winner between the two runs. Treat them as within noise on this host rather than a lead for either side.
+- **Prisma trails on every scenario here.** Its engine-less client's per-query work is no longer masked by network latency; on a pooled remote database (the regime we measured previously) these same deltas compress back into the noise floor. Prisma 7.9 is a real improvement on 7.6 (flat reads ~30% faster, the pipeline batch ~26%).
 
-Net: on a local socket Turbine wins 6 of 10 scenarios, loses L2 / streaming / atomic increment to Drizzle, and trades the L3 lead run-to-run. It is competitive-to-ahead across the board rather than a clean sweep, and the honest takeaway is unchanged: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only-by-default Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
+Net: on a local socket Turbine takes five scenarios outright, loses L2 to Drizzle, and trades four more run-to-run. It is competitive-to-ahead across the board rather than a clean sweep, and the honest takeaway is unchanged: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only-by-default Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
 
 > Full analysis with p50/p95/p99 and methodology notes: [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench.ts`
@@ -404,20 +409,29 @@ db.$use(async (params, next) => {
 
 > **Warning:** `params.args` is a read-only snapshot — mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
 
-Because middleware can't rewrite queries, cross-cutting filters like **soft deletes** belong in the query itself — either explicitly or via a small scoped helper:
+Middleware can't rewrite queries, so cross-cutting predicates like **soft deletes** and **multi-tenancy** belong to [global filters](https://turbineorm.dev/global-filters) instead. A global filter is a `WhereClause` that Turbine `AND`-merges into the compiled `WHERE` of every query on a table: reads, the relation subqueries that target it, and the predicate of `update` / `delete` / `upsert`. `create` and `createMany` are never filtered, since a new row has nothing to scope.
 
 ```typescript
-import type { WhereClause } from 'turbine-orm';
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  globalFilters: {
+    // Soft delete (static)
+    posts: { deletedAt: null },
+    users: { deletedAt: null },
+    // Multi-tenancy: a function is evaluated every time a query is built,
+    // so a closure over per-request state gives you request-scoped isolation
+    orders: () => ({ tenantId: currentTenant() }),
+  },
+});
 
-// Explicit filter
-const users = await db.users.findMany({ where: { deletedAt: null } });
+await db.posts.findMany();
+// SELECT ... FROM "posts" WHERE "deleted_at" IS NULL
 
-// Scoped helper that always applies the filter
-const activeUsers = (where: WhereClause<User> = {}) =>
-  db.users.findMany({ where: { ...where, deletedAt: null } });
-
-const rows = await activeUsers({ orgId: 1 });
+await db.users.findMany({ where: { role: 'admin' } });
+// SELECT ... FROM "users" WHERE "role" = $1 AND "deleted_at" IS NULL
 ```
+
+Values are always parameterized. Opt a single query out with `skipGlobalFilters: true` (or a table-name array). Note that a global filter does **not** satisfy the empty-`where` guard: an `update` or `delete` with no `where` of its own still throws unless you pass `allowFullTableScan: true`.
 
 ### Error handling
 
@@ -881,12 +895,17 @@ const db = await turbineMssql('mssql://sa:Passw0rd!@localhost:1433/app', SCHEMA)
 ```ts
 // PowDB — async; embedded (in-process) or networked. Schema is code-defined.
 import { turbinePowDB } from 'turbine-orm/powdb';
+import { schemaDefToMetadata } from 'turbine-orm';
 import { schema } from './schema.js'; // defineSchema({...})
 
-// Embedded, in-process — syncMode 'normal' makes writes beat SQLite:
-const db = await turbinePowDB({ embedded: './data', syncMode: 'normal' }, schema);
+// PowDB has no introspection-driven `turbine generate`, so derive the runtime
+// SchemaMetadata from the code-first definition.
+const SCHEMA = schemaDefToMetadata(schema);
+
+// Embedded, in-process. syncMode 'normal' moves fsync off the commit path:
+const db = await turbinePowDB({ embedded: './data', syncMode: 'normal' }, SCHEMA);
 // …or networked against a running powdb-server:
-// const db = await turbinePowDB('powdb://127.0.0.1:7070', schema);
+// const db = await turbinePowDB('powdb://127.0.0.1:7070', SCHEMA);
 ```
 
 Migrating from Prisma? `turbine migrate-from-prisma` emits a typed `PRISMA_MAP`, and the
@@ -976,11 +995,11 @@ Turbine maps Postgres types to TypeScript:
 |---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
-| **Main bundle (brotli)** | ~53 kB | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
+| **Main bundle (brotli)** | ~57 kB | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
 | **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Free; hosted Gateway paid | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, ~40 kB brotli | Driver adapter + WASM compiler | Native | Native |
+| **Edge runtime** | One import swap, ~43 kB brotli | Driver adapter + WASM compiler | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query, shallow inference | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |

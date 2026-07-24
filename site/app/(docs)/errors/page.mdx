@@ -102,38 +102,11 @@ try {
 
 `DeadlockError` and `SerializationFailureError` expose a `readonly isRetryable = true as const` field. This isn't just a comment — it's a type-level signal so your retry loop narrows correctly.
 
+You do not have to write that loop. Turbine exports **`withRetry`**, and `TurbineClient` exposes the same thing as **`db.$retry`**:
+
 ```ts
-import {
-  DeadlockError,
-  SerializationFailureError,
-} from 'turbine-orm';
+import { withRetry } from 'turbine-orm';
 
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  maxAttempts = 3,
-): Promise<T> {
-  let lastErr: unknown;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (
-        (err instanceof DeadlockError && err.isRetryable) ||
-        (err instanceof SerializationFailureError && err.isRetryable)
-      ) {
-        // Exponential backoff with jitter
-        const backoff = 2 ** attempt * 50 + Math.random() * 25;
-        await new Promise((r) => setTimeout(r, backoff));
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw lastErr;
-}
-
-// Use it on a serializable transaction:
 await withRetry(() =>
   db.$transaction(
     async (tx) => {
@@ -147,6 +120,8 @@ await withRetry(() =>
   ),
 );
 ```
+
+`withRetry(fn, options?)` retries only when the thrown error carries `isRetryable === true`, and rethrows anything else immediately. Options: `maxAttempts` (default `3`), `baseDelay` in ms (default `50`), `maxDelay` (default `5000`), and an `onRetry(error, attempt)` hook. Backoff is exponential with jitter, capped at `maxDelay`. `db.$retry(fn, options)` is the same function bound to the client, for when you would rather not add an import.
 
 Neither Prisma nor Drizzle surfaces a comparable typed retry signal — Prisma uses the stringly-typed `code: 'P2034'` on a generic `PrismaClientKnownRequestError`, and Drizzle bubbles up raw pg errors for you to grep SQL states from.
 
