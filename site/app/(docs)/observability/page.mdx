@@ -83,6 +83,62 @@ CREATE TABLE IF NOT EXISTS _turbine_metrics (
 
 Calling `$observe` again replaces the previous engine (the old one is stopped and unsubscribed first).
 
+## Custom sinks: where the aggregates go
+
+By default `$observe` writes to `_turbine_metrics` in Postgres. The flush target is pluggable: pass a `sink` and the same per-minute aggregates flow wherever you point them. A sink is a small interface:
+
+```ts
+interface MetricsFlushBatch {
+  rows: Array<{
+    bucket: Date;   // the minute bucket
+    model: string;  // table name
+    action: string; // operation
+    count: number;
+    avg: number;
+    p50: number;
+    p95: number;
+    p99: number;
+    errors: number;
+  }>;
+}
+
+interface ObserveSink {
+  init?(): Promise<void>;                     // once at startup
+  flush(batch: MetricsFlushBatch): Promise<void>; // each aggregate batch
+  stop?(): Promise<void>;                     // on shutdown
+}
+```
+
+When you supply a `sink`, `connectionString` becomes optional (at least one of the two is required). The default Postgres sink is unchanged and byte-identical to the built-in writer when no sink is passed.
+
+### `HttpJsonSink`
+
+A generic sink that POSTs each batch as JSON, ready for Grafana, a self-hosted collector, or any HTTP endpoint:
+
+```ts
+import { HttpJsonSink } from 'turbine-orm';
+
+const handle = await db.$observe({
+  sink: new HttpJsonSink({
+    url: 'https://metrics.internal/ingest',
+    headers: { authorization: `Bearer ${process.env.METRICS_TOKEN}` },
+    // fetchFunction: customFetch, // optional override
+  }),
+});
+```
+
+It is **fire-and-forget**: a failed request is swallowed and never throws, and there are no retries beyond the engine's next scheduled flush, so a down collector can never affect a query. The request body carries the aggregate batch and nothing else.
+
+### Privacy posture
+
+The aggregation boundary is deliberate and structural. A batch (to any sink, HTTP or Postgres) contains **only**:
+
+- the model (table) name and the action (`findMany`, `create`, …);
+- the count of queries and the count of errors;
+- latency aggregates (avg, p50, p95, p99).
+
+It carries **no SQL text and no parameter values** — those never leave the app process. Observability is opt-in and off by default: nothing is collected until you call `$observe`.
+
 ## Dashboard — `npx turbine observe`
 
 A local, read-only dashboard over `_turbine_metrics` — latency over time and a per-`model.action` breakdown:

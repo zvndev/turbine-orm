@@ -34,6 +34,8 @@ Commands:
   doctor                         Cost-aware triage of missing FK indexes
   doctor --fix                   Write a CONCURRENTLY migration that adds them
   doctor --json                  Machine-readable report (schemaVersion 1)
+  doctor --unused                Report never-scanned + redundant indexes (no auto-drop)
+  doctor --audit                 Unused report scoped to doctor's own suggestions
   studio                         Launch local read-only Studio web UI
   mcp                            Start read-only MCP server over JSON-RPC stdio
   observe                        Launch local metrics dashboard
@@ -344,9 +346,35 @@ npx turbine migrate up
 
 Pass `--no-concurrently` for a plain, in-transaction `CREATE INDEX` migration instead (handy for dev databases where the concurrent build is not worth the wait). Non-Postgres engines always get the plain form.
 
+### Workload-heat boost
+
+When a `_turbine_metrics` table exists (written by [`db.$observe()`](/observability#metrics-dbobserve) with its default Postgres sink), `doctor` maps per-model query heat onto physical tables and uses it as an extra benefit signal: a table your app hits hard is a table where a missing index hurts most. A hot finding is annotated (`hot in your workload: N queries/min, p95 X ms`) and sorted first. Heat is a *benefit* signal only, never a cost one, so it re-prioritizes and annotates but never downgrades a cost tier. Read metrics from a separate database with `--metrics-url`.
+
+When the metrics table is absent, or observe is configured with a non-Postgres sink, `doctor` prints one honesty line that heat boosting is unavailable and continues, exactly as it does when statistics are missing.
+
+### `doctor --unused` (report-only)
+
+`doctor` also learns to subtract. `--unused` reports indexes that are candidates for removal, in three classes:
+
+- **Never scanned**: `idx_scan = 0` (or below `--min-scans N`) since the last statistics reset. Every finding prints the stats-reset age and the caveats: usage counters zero on a crash or a stats reset, and **a read replica's index scans never feed the primary's counters**, so an index only a replica uses looks dead here. Primary-key, unique-constraint, exclusion-constraint, and replica-identity indexes are excluded from day one.
+- **Redundant prefix duplicates**: a non-unique index whose columns are a leading prefix of a wider index that already serves the same lookups. A unique or primary-key prefix is never called redundant (dropping it would remove a constraint).
+- **Invalid indexes**: the failed-`CONCURRENTLY` corpses, now carrying the drop suggestion.
+
+The output is `DROP INDEX CONCURRENTLY` statements with the size each reclaims. This is **printed only**: it is never written to a migration and never auto-applied. There is deliberately no `--fix` for drops, because whether an index is truly unused is a judgment the counters can only inform, not settle.
+
+```bash
+npx turbine doctor --unused
+npx turbine doctor --unused --min-scans 10   # treat < 10 scans as unused
+npx turbine doctor --unused --json           # additive: adds unused/redundant/invalid arrays
+```
+
+### `doctor --audit`
+
+`--audit` is the `--unused` never-scanned machinery scoped to doctor's own previously-suggested indexes (the `idx_<table>_<cols>` names `doctor --fix` emits). It frames the output as: *doctor previously suggested these indexes; N have never been scanned since the stats reset (age printed); consider dropping.* Because those names are truncated to Postgres's 63-byte identifier limit, the matcher compares truncated names and flags any post-truncation collision between different column sets as **ambiguous** rather than issuing a confident verdict.
+
 ### `--json`
 
-`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, and any degradation notices. The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added.
+`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, workload-heat availability, and any degradation notices. The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added: `--unused` adds `unused`, `redundant`, and `invalid` arrays; `--audit` adds an `audit` array.
 
 ### Where this fits
 

@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.47.0 (2026-07-23)
+
+### Added
+
+- **`turbine doctor --unused`: index subtraction advice.** Doctor now reports the
+  other half of index hygiene: indexes with zero scans since `stats_reset` (with the
+  reset age printed and the honest caveats: counters zero on stats resets, and
+  replica reads never feed primary counters, so a replica-only index looks dead
+  here), redundant indexes whose columns are a leading prefix of a wider compatible
+  index, and invalid indexes left behind by failed `CONCURRENTLY` builds. Suggestions
+  are `DROP INDEX CONCURRENTLY` statements with reclaimable sizes, report-only:
+  never written to a migration, never auto-applied, and there is deliberately no
+  `--fix` for drops. Primary-key, unique-constraint, exclusion-constraint, and
+  replica-identity indexes are always excluded. `--min-scans` adjusts the
+  never-scanned threshold.
+- **`turbine doctor --audit`: did doctor's own advice earn its keep?** Audits the
+  indexes doctor previously suggested (by their deterministic names, 63-character
+  truncation handled, post-truncation collisions reported as ambiguous rather than
+  guessed) and flags the ones that have never been scanned since stats reset.
+- **Workload-heat annotations.** When the `_turbine_metrics` table from the observe
+  module is present (same database or `--metrics-url`), doctor maps query heat to
+  tables and annotates findings ("hot in your workload: N queries/min, p95 X ms"),
+  prioritizing hot findings. One honesty line is printed when heat data is
+  unavailable. `doctor --json` carries all of the above as additive fields under the
+  same `schemaVersion: 1` contract.
+- **Pluggable observe sinks.** `ObserveEngine`'s flush target is now the
+  `ObserveSink` interface. The default remains the `_turbine_metrics` Postgres
+  writer, byte-identical to previous behavior (covered by a regression test). New
+  `HttpJsonSink` POSTs metric batches as JSON to any HTTP endpoint (fire-and-forget,
+  never throws), for self-hosted dashboards and metrics pipelines.
+  `ObserveConfig.connectionString` is optional when a custom sink is provided.
+  Telemetry remains aggregates only (model, action, counts, latency percentiles):
+  no SQL text, no parameters, opt-in, off by default.
+
+### Fixed
+
+- **Doctor's index-column reads now survive node-pg's `name[]` handling.** The stats
+  collector aggregated `pg_attribute.attname` into a `name[]`, which the driver
+  returns as an unparsed string; iterating those columns (new in the redundancy
+  check) would have thrown. The collector now casts to `text[]`.
+
 ## 0.46.0 (2026-07-23)
 
 ### Added

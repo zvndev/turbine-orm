@@ -11,8 +11,12 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { collectDoctorProbeIndexNames, doctorIndexName } from '../index-advisor.js';
 import {
+  auditDoctorIndexes,
   findInvalidIndexes,
+  findRedundantIndexes,
+  findUnusedIndexes,
   formatBytes,
   type IndexStat,
   isSnapshotUsable,
@@ -22,6 +26,7 @@ import {
   scoreMissingIndex,
   type TableStats,
 } from '../index-stats.js';
+import type { RelationDef, SchemaMetadata } from '../schema.js';
 
 // ---------------------------------------------------------------------------
 // Snapshot builders
@@ -293,5 +298,265 @@ describe('STATS_THRESHOLDS', () => {
     assert.equal(STATS_THRESHOLDS.tinyTableRows, 1_000);
     assert.equal(STATS_THRESHOLDS.partialNullFrac, 0.9);
     assert.ok(STATS_THRESHOLDS.highWritesPerDay > 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Table-heat boost
+// ---------------------------------------------------------------------------
+
+describe('scoreMissingIndex - table-heat boost', () => {
+  it('annotates and re-prioritizes a hot table without downgrading its cost tier', () => {
+    const snap = makeSnapshot({ tables: { posts: tableStats('posts') } });
+    const cold = scoreMissingIndex(missing('posts', ['user_id']), snap);
+    const hot = scoreMissingIndex(missing('posts', ['user_id']), snap, { queriesPerMin: 240, p95Ms: 18.4 });
+    assert.equal(hot.tier, cold.tier); // heat never changes the cost tier
+    assert.equal(hot.heatBoosted, true);
+    assert.equal(cold.heatBoosted, false);
+    assert.ok(hot.reasons.some((r) => r.includes('hot in your workload') && r.includes('240 queries/min')));
+    assert.ok(hot.benefitScore > cold.benefitScore); // hot findings sort first
+  });
+
+  it('does not boost below the queries/min threshold', () => {
+    const snap = makeSnapshot({ tables: { posts: tableStats('posts') } });
+    const s = scoreMissingIndex(missing('posts', ['user_id']), snap, { queriesPerMin: 0, p95Ms: 5 });
+    assert.equal(s.heatBoosted, false);
+    assert.ok(!s.reasons.some((r) => r.includes('hot in your workload')));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unused-index detection
+// ---------------------------------------------------------------------------
+
+function indexStat(overrides: Partial<IndexStat> & { indexName: string }): IndexStat {
+  return {
+    table: 'posts',
+    columns: ['x'],
+    isValid: true,
+    isUnique: false,
+    isPrimary: false,
+    isReplicaIdent: false,
+    isExclusion: false,
+    idxScan: 0,
+    sizeBytes: 1024,
+    ...overrides,
+  };
+}
+
+describe('findUnusedIndexes', () => {
+  it('flags a zero-scan non-constraint index with a CONCURRENTLY drop', () => {
+    const snap = makeSnapshot({ indexes: [indexStat({ indexName: 'idx_posts_slug', idxScan: 0 })] });
+    const unused = findUnusedIndexes(snap);
+    assert.equal(unused.length, 1);
+    assert.equal(unused[0]!.indexName, 'idx_posts_slug');
+    assert.match(unused[0]!.dropSql, /DROP INDEX CONCURRENTLY IF EXISTS "idx_posts_slug";/);
+  });
+
+  it('respects the --min-scans threshold (below counts, at/above does not)', () => {
+    const snap = makeSnapshot({
+      indexes: [indexStat({ indexName: 'idx_cold', idxScan: 3 }), indexStat({ indexName: 'idx_warm', idxScan: 10 })],
+    });
+    const unused = findUnusedIndexes(snap, { minScans: 5 });
+    assert.deepEqual(
+      unused.map((u) => u.indexName),
+      ['idx_cold'],
+    );
+  });
+
+  it('excludes PK, unique, exclusion, and replica-identity indexes', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'pk', isPrimary: true, idxScan: 0 }),
+        indexStat({ indexName: 'uq', isUnique: true, idxScan: 0 }),
+        indexStat({ indexName: 'excl', isExclusion: true, idxScan: 0 }),
+        indexStat({ indexName: 'ident', isReplicaIdent: true, idxScan: 0 }),
+        indexStat({ indexName: 'plain', idxScan: 0 }),
+      ],
+    });
+    assert.deepEqual(
+      findUnusedIndexes(snap).map((u) => u.indexName),
+      ['plain'],
+    );
+  });
+
+  it('skips an index whose idx_scan could not be read (no guessing)', () => {
+    const snap = makeSnapshot({ indexes: [indexStat({ indexName: 'idx_unknown', idxScan: undefined })] });
+    assert.deepEqual(findUnusedIndexes(snap), []);
+  });
+
+  it('sorts by reclaimable size descending', () => {
+    const snap = makeSnapshot({
+      indexes: [indexStat({ indexName: 'small', sizeBytes: 100 }), indexStat({ indexName: 'big', sizeBytes: 10_000 })],
+    });
+    assert.deepEqual(
+      findUnusedIndexes(snap).map((u) => u.indexName),
+      ['big', 'small'],
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Redundant leading-prefix detection
+// ---------------------------------------------------------------------------
+
+describe('findRedundantIndexes', () => {
+  it('flags a non-unique index that is a leading prefix of a wider one', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_a', columns: ['org_id'] }),
+        indexStat({ indexName: 'idx_ab', columns: ['org_id', 'user_id'] }),
+      ],
+    });
+    const redundant = findRedundantIndexes(snap);
+    assert.equal(redundant.length, 1);
+    assert.equal(redundant[0]!.indexName, 'idx_a');
+    assert.equal(redundant[0]!.coveredBy, 'idx_ab');
+  });
+
+  it('does not flag a non-prefix (different leading column)', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_a', columns: ['user_id'] }),
+        indexStat({ indexName: 'idx_ab', columns: ['org_id', 'user_id'] }),
+      ],
+    });
+    assert.deepEqual(findRedundantIndexes(snap), []);
+  });
+
+  it('does not flag a same-length pair (neither is wider)', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_a', columns: ['org_id'] }),
+        indexStat({ indexName: 'idx_a2', columns: ['org_id'] }),
+      ],
+    });
+    assert.deepEqual(findRedundantIndexes(snap), []);
+  });
+
+  it('uniqueness incompatibility: a UNIQUE prefix is never called redundant', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'uq_org', columns: ['org_id'], isUnique: true }),
+        indexStat({ indexName: 'idx_org_user', columns: ['org_id', 'user_id'] }),
+      ],
+    });
+    assert.deepEqual(findRedundantIndexes(snap), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// doctorIndexName + collectDoctorProbeIndexNames + audit
+// ---------------------------------------------------------------------------
+
+function rel(overrides: Partial<RelationDef> & { name: string; to: string }): RelationDef {
+  return {
+    type: 'hasMany',
+    from: 'x',
+    foreignKey: 'x_id',
+    referenceKey: 'id',
+    ...overrides,
+  };
+}
+
+function schemaWithRelations(tables: Record<string, RelationDef[]>): SchemaMetadata {
+  const meta: SchemaMetadata = { tables: {}, enums: {} };
+  const names = new Set([...Object.keys(tables), ...Object.values(tables).flatMap((rs) => rs.map((r) => r.to))]);
+  for (const name of names) {
+    meta.tables[name] = {
+      name,
+      columns: [],
+      columnMap: {},
+      reverseColumnMap: {},
+      dateColumns: new Set(),
+      pgTypes: {},
+      allColumns: [],
+      primaryKey: ['id'],
+      uniqueColumns: [],
+      relations: Object.fromEntries((tables[name] ?? []).map((r) => [r.name, r])),
+      indexes: [],
+    };
+  }
+  return meta;
+}
+
+describe('doctorIndexName', () => {
+  it('builds idx_<table>_<cols> truncated to 63 bytes', () => {
+    assert.equal(doctorIndexName('posts', ['user_id']), 'idx_posts_user_id');
+    const long = doctorIndexName('t', ['a'.repeat(80)]);
+    assert.equal(long.length, 63);
+  });
+});
+
+describe('collectDoctorProbeIndexNames', () => {
+  it('maps deterministic names to their probe column sets', () => {
+    const schema = schemaWithRelations({
+      users: [rel({ name: 'posts', type: 'hasMany', to: 'posts', foreignKey: 'user_id' })],
+    });
+    const names = collectDoctorProbeIndexNames(schema);
+    const entry = names.get('idx_posts_user_id');
+    assert.ok(entry);
+    assert.equal(entry!.length, 1);
+    assert.deepEqual(entry![0]!.columns, ['user_id']);
+  });
+
+  it('records a post-truncation collision as two distinct column sets under one name', () => {
+    const colA = `${'z'.repeat(60)}a`;
+    const colB = `${'z'.repeat(60)}b`;
+    // idx_posts_<60 z's + a/b> both truncate to the same 63 bytes.
+    assert.equal(doctorIndexName('posts', [colA]), doctorIndexName('posts', [colB]));
+    const schema = schemaWithRelations({
+      users: [rel({ name: 'ra', type: 'hasMany', to: 'posts', foreignKey: colA })],
+      orgs: [rel({ name: 'rb', type: 'hasMany', to: 'posts', foreignKey: colB })],
+    });
+    const names = collectDoctorProbeIndexNames(schema);
+    const entry = names.get(doctorIndexName('posts', [colA]));
+    assert.ok(entry);
+    assert.equal(entry!.length, 2); // two distinct column sets collide
+  });
+});
+
+describe('auditDoctorIndexes', () => {
+  it('reports a never-scanned index matching a doctor-suggested name', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ table: 'posts', indexName: 'idx_posts_user_id', columns: ['user_id'], idxScan: 0 }),
+        indexStat({ table: 'posts', indexName: 'random_hand_named_idx', columns: ['slug'], idxScan: 0 }),
+      ],
+    });
+    const names = new Map([['idx_posts_user_id', [{ table: 'posts', columns: ['user_id'] }]]]);
+    const audit = auditDoctorIndexes(snap, names);
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0]!.indexName, 'idx_posts_user_id');
+    assert.equal(audit[0]!.ambiguous, false);
+  });
+
+  it('marks a collision (name maps to >1 column set) as ambiguous', () => {
+    const snap = makeSnapshot({
+      indexes: [indexStat({ table: 'posts', indexName: 'idx_collide', columns: ['a'], idxScan: 0 })],
+    });
+    const names = new Map([
+      [
+        'idx_collide',
+        [
+          { table: 'posts', columns: ['a'] },
+          { table: 'posts', columns: ['b'] },
+        ],
+      ],
+    ]);
+    const audit = auditDoctorIndexes(snap, names);
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0]!.ambiguous, true);
+  });
+
+  it('ignores scanned indexes and non-doctor names', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_posts_user_id', columns: ['user_id'], idxScan: 42 }),
+        indexStat({ indexName: 'not_doctor', columns: ['x'], idxScan: 0 }),
+      ],
+    });
+    const names = new Map([['idx_posts_user_id', [{ table: 'posts', columns: ['user_id'] }]]]);
+    assert.deepEqual(auditDoctorIndexes(snap, names), []);
   });
 });

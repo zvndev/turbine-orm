@@ -111,7 +111,17 @@ export {
   type NestedWriteContext,
 } from './nested-write.js';
 // Observability
-export type { ObserveConfig, ObserveHandle } from './observe.js';
+export {
+  HttpJsonSink,
+  type HttpJsonSinkOptions,
+  type MetricsFlushBatch,
+  type MetricsFlushRow,
+  type ObserveConfig,
+  type ObserveHandle,
+  type ObserveSink,
+  PgMetricsSink,
+  type PgMetricsSinkOptions,
+} from './observe.js';
 // Pipeline
 export { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 // Query builder

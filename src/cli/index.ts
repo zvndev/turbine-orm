@@ -14,7 +14,7 @@
  *   turbine migrate status        — Show migration status
  *   turbine seed                  — Run seed file
  *   turbine status                — Show schema summary
- *   turbine doctor                - Cost-aware missing-FK-index triage (--fix, --json, --no-concurrently)
+ *   turbine doctor                - Cost-aware missing-FK-index triage (--fix, --json, --no-concurrently, --unused, --audit)
  *   turbine studio                : Launch local read-only web UI (--demo for a seeded sample DB)
  *   turbine mcp                   — Start read-only MCP server over JSON-RPC stdio
  *   turbine observe               — Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
@@ -42,20 +42,29 @@ import { generate, generatePrismaMap } from '../generate.js';
 import {
   buildCreateIndexSql,
   buildDropIndexSql,
+  collectDoctorProbeIndexNames,
   findMissingRelationIndexes,
   type MissingRelationIndex,
 } from '../index-advisor.js';
 import {
+  auditDoctorIndexes,
   collectStatsSnapshot,
+  collectTableHeat,
+  type DoctorIndexAudit,
   findInvalidIndexes,
+  findRedundantIndexes,
+  findUnusedIndexes,
   formatBytes,
   type IndexTier,
   isSnapshotUsable,
   type ProbedColumn,
+  type RedundantIndex,
   type ScoredMissingIndex,
   STATS_THRESHOLDS,
   type StatsSnapshot,
   scoreMissingIndex,
+  type TableHeatResult,
+  type UnusedIndex,
 } from '../index-stats.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
@@ -153,6 +162,14 @@ export interface CliArgs {
   json?: boolean;
   /** `doctor --fix --no-concurrently`: emit plain CREATE INDEX instead of the CONCURRENTLY + no-transaction form. */
   noConcurrently?: boolean;
+  /** `doctor --unused`: report-only never-scanned / redundant / invalid indexes with DROP suggestions. */
+  unused?: boolean;
+  /** `doctor --audit`: unused report scoped to doctor's own previously-suggested index names. */
+  audit?: boolean;
+  /** `doctor --min-scans <n>`: idx_scan below this counts as never-scanned (default 1 = idx_scan 0). */
+  minScans?: number;
+  /** `doctor --metrics-url <url>`: read _turbine_metrics for the table-heat boost from a separate DB. */
+  metricsUrl?: string;
   // init flags
   /** `init --yes`/`-y`: accept every step's default non-interactively. */
   yes?: boolean;
@@ -281,6 +298,20 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--no-concurrently':
         result.noConcurrently = true;
+        break;
+      case '--unused':
+        result.unused = true;
+        break;
+      case '--audit':
+        result.audit = true;
+        break;
+      case '--min-scans':
+        result.minScans = next ? Number.parseInt(next, 10) : undefined;
+        i++;
+        break;
+      case '--metrics-url':
+        result.metricsUrl = next;
+        i++;
         break;
       case '--zod':
         result.zod = true;
@@ -2606,30 +2637,92 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
     };
   }
 
+  // Table-heat boost: read _turbine_metrics (app DB or --metrics-url) and use
+  // per-model heat as an extra benefit signal. Best-effort; a missing table just
+  // means "heat boosting unavailable" and the triage continues without it.
+  const heat =
+    probedTables.length > 0
+      ? await collectTableHeatSafe(args.metricsUrl ?? url, probedTables)
+      : { available: false, tables: {}, notice: null };
+
   const invalid = findInvalidIndexes(snapshot);
   const usable = isSnapshotUsable(snapshot);
-  const findings: DoctorFinding[] = missing.map((m) => ({ missing: m, score: scoreMissingIndex(m, snapshot) }));
+  const findings: DoctorFinding[] = missing.map((m) => ({
+    missing: m,
+    score: scoreMissingIndex(m, snapshot, heat.tables[m.table]),
+  }));
+
+  // "doctor learns to subtract": report-only drop suggestions, never a migration.
+  const unusedRan = args.unused === true;
+  const auditRan = args.audit === true;
+  const minScans = args.minScans;
+  const unused = unusedRan ? findUnusedIndexes(snapshot, { minScans }) : [];
+  const redundant = unusedRan ? findRedundantIndexes(snapshot) : [];
+  const audit = auditRan ? auditDoctorIndexes(snapshot, collectDoctorProbeIndexNames(schema), { minScans }) : [];
+
+  const subtract: DoctorSubtractReport = { unusedRan, auditRan, minScans, unused, redundant, audit };
 
   if (jsonMode) {
     spinner?.stop();
-    console.log(JSON.stringify(buildDoctorJson({ schema, findings, invalid, snapshot, usable, args }), null, 2));
+    console.log(
+      JSON.stringify(buildDoctorJson({ schema, findings, invalid, snapshot, usable, heat, subtract, args }), null, 2),
+    );
     return;
   }
 
-  await renderDoctorHuman({ spinner: spinner!, schema, findings, invalid, snapshot, usable, args, config });
+  await renderDoctorHuman({
+    spinner: spinner!,
+    schema,
+    findings,
+    invalid,
+    snapshot,
+    usable,
+    heat,
+    subtract,
+    args,
+    config,
+  });
 }
 
-/** The stable, versioned JSON contract (schemaVersion: 1). First external consumer: BataDB import. */
+/** Best-effort table-heat read: any failure degrades to unavailable, never throws. */
+async function collectTableHeatSafe(connectionString: string, models: string[]): Promise<TableHeatResult> {
+  try {
+    return await collectTableHeat({ connectionString, models });
+  } catch (err) {
+    return {
+      available: false,
+      tables: {},
+      notice: `heat boosting is unavailable (reading _turbine_metrics failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}).`,
+    };
+  }
+}
+
+/** The report-only "subtract" findings, grouped so the CLI and JSON share one shape. */
+interface DoctorSubtractReport {
+  unusedRan: boolean;
+  auditRan: boolean;
+  minScans: number | undefined;
+  unused: UnusedIndex[];
+  redundant: RedundantIndex[];
+  audit: DoctorIndexAudit[];
+}
+
+/**
+ * The stable, versioned JSON contract (schemaVersion: 1). Fields are only ever
+ * added, never removed or repurposed, so a parser never breaks on an upgrade.
+ */
 function buildDoctorJson(ctx: {
   schema: SchemaMetadata;
   findings: DoctorFinding[];
   invalid: ReturnType<typeof findInvalidIndexes>;
   snapshot: StatsSnapshot;
   usable: boolean;
+  heat: TableHeatResult;
+  subtract: DoctorSubtractReport;
   args: CliArgs;
 }): Record<string, unknown> {
   const concurrently = ctx.args.noConcurrently !== true;
-  return {
+  const out: Record<string, unknown> = {
     schemaVersion: 1,
     scannedTables: Object.keys(ctx.schema.tables).length,
     stats: {
@@ -2638,6 +2731,10 @@ function buildDoctorJson(ctx: {
       statsReset: ctx.snapshot.statsReset ? ctx.snapshot.statsReset.toISOString() : null,
       statsAgeDays: ctx.snapshot.statsAgeDays,
       notices: ctx.snapshot.notices,
+    },
+    heat: {
+      available: ctx.heat.available,
+      notice: ctx.heat.notice,
     },
     thresholds: STATS_THRESHOLDS,
     findings: ctx.findings.map((f) => ({
@@ -2649,12 +2746,24 @@ function buildDoctorJson(ctx: {
       metrics: f.score.metrics,
       hotWarning: f.score.hotWarning,
       partialNotNull: f.score.partialNotNull,
+      heatBoosted: f.score.heatBoosted,
       probes: f.missing.probes,
       createSql: doctorCreateSql(f, { concurrently }),
       dropSql: buildDropIndexSql(f.missing.indexName, { concurrently }),
     })),
     invalidIndexes: ctx.invalid,
   };
+
+  // Additive: the drop-suggestion arrays appear only when --unused / --audit ran.
+  if (ctx.subtract.unusedRan) {
+    out.unused = ctx.subtract.unused;
+    out.redundant = ctx.subtract.redundant;
+    out.invalid = ctx.invalid;
+  }
+  if (ctx.subtract.auditRan) {
+    out.audit = ctx.subtract.audit;
+  }
+  return out;
 }
 
 async function renderDoctorHuman(ctx: {
@@ -2664,15 +2773,26 @@ async function renderDoctorHuman(ctx: {
   invalid: ReturnType<typeof findInvalidIndexes>;
   snapshot: StatsSnapshot;
   usable: boolean;
+  heat: TableHeatResult;
+  subtract: DoctorSubtractReport;
   args: CliArgs;
   config: ResolvedConfig;
 }): Promise<void> {
-  const { spinner, schema, findings, invalid, snapshot, usable, args, config } = ctx;
+  const { spinner, schema, findings, invalid, snapshot, usable, heat, subtract, args, config } = ctx;
 
   spinner.succeed(`Scanned ${bold(String(Object.keys(schema.tables).length))} tables`);
 
-  if (findings.length === 0 && invalid.length === 0) {
-    success('Every relation probe is backed by an index, and no invalid indexes were found');
+  const subtractRan = subtract.unusedRan || subtract.auditRan;
+  const nothingToAdd = findings.length === 0 && invalid.length === 0;
+  const nothingToSubtract =
+    subtract.unused.length === 0 && subtract.redundant.length === 0 && subtract.audit.length === 0;
+
+  if (nothingToAdd && (!subtractRan || nothingToSubtract)) {
+    if (subtractRan) {
+      success('No never-scanned or redundant indexes found, and no invalid indexes were found');
+    } else {
+      success('Every relation probe is backed by an index, and no invalid indexes were found');
+    }
     newline();
     return;
   }
@@ -2689,9 +2809,23 @@ async function renderDoctorHuman(ctx: {
     } else {
       renderTopologyFallback(findings, snapshot);
     }
+
+    // Heat honesty: one line when the workload-heat boost could not be sourced.
+    if (!heat.available && heat.notice) {
+      console.log(`  ${dim(`Note: ${heat.notice}`)}`);
+      newline();
+    }
   }
 
   renderInvalidIndexes(invalid);
+
+  if (subtract.unusedRan) {
+    renderUnusedIndexes(subtract.unused, subtract.minScans, snapshot);
+    renderRedundantIndexes(subtract.redundant);
+  }
+  if (subtract.auditRan) {
+    renderDoctorAudit(subtract.audit, subtract.minScans, snapshot);
+  }
 
   if (findings.length > 0) {
     if (args.fix) {
@@ -2702,6 +2836,83 @@ async function renderDoctorHuman(ctx: {
       newline();
     }
   }
+}
+
+/** Shared caveat block: what an idx_scan of zero does and does not prove. */
+function renderUnusedCaveats(minScans: number | undefined, snapshot: StatsSnapshot): void {
+  const ageLabel = snapshot.statsAgeDays !== null ? `${Math.round(snapshot.statsAgeDays)}d` : 'unknown';
+  const threshold = minScans ?? STATS_THRESHOLDS.unusedMinScans;
+  console.log(`  ${dim(`Usage counters are since the last stats reset (${ageLabel} ago).`)}`);
+  console.log(`  ${dim(`Caveats: counters zero on a stats reset or crash; a read replica's index scans NEVER feed`)}`);
+  console.log(
+    `  ${dim(`the primary's counters, so an index only a replica uses looks dead here. Threshold: idx_scan < ${threshold}.`)}`,
+  );
+  console.log(
+    `  ${dim('Primary-key, unique, exclusion, and replica-identity indexes are excluded. Nothing here is auto-dropped.')}`,
+  );
+  newline();
+}
+
+/** doctor --unused: never-scanned indexes with DROP suggestions (report-only). */
+function renderUnusedIndexes(unused: UnusedIndex[], minScans: number | undefined, snapshot: StatsSnapshot): void {
+  if (unused.length === 0) return;
+  const total = unused.reduce((sum, u) => sum + (u.sizeBytes ?? 0), 0);
+  warn(`Found ${bold(String(unused.length))} never-scanned index(es) (${formatBytes(total)} reclaimable).`);
+  renderUnusedCaveats(minScans, snapshot);
+  for (const u of unused) {
+    console.log(
+      `  ${yellow(symbols.warning)} ${bold(cyan(u.table))} ${dim(`(${u.columns.join(', ') || '?'})`)}  ${gray(`${u.indexName} · ${u.idxScan} scans · ${formatBytes(u.sizeBytes)}`)}`,
+    );
+    console.log(`    ${dim(symbols.teeEnd)} ${green(u.dropSql)}`);
+    newline();
+  }
+}
+
+/** doctor --unused: redundant leading-prefix indexes with DROP suggestions (report-only). */
+function renderRedundantIndexes(redundant: RedundantIndex[]): void {
+  if (redundant.length === 0) return;
+  const total = redundant.reduce((sum, r) => sum + (r.sizeBytes ?? 0), 0);
+  warn(`Found ${bold(String(redundant.length))} redundant index(es) (${formatBytes(total)} reclaimable).`);
+  console.log(
+    `  ${dim('Each is a leading prefix of a wider index that already serves the same lookups. Report-only, never auto-dropped.')}`,
+  );
+  newline();
+  for (const r of redundant) {
+    console.log(
+      `  ${yellow(symbols.warning)} ${bold(cyan(r.table))} ${dim(`(${r.columns.join(', ')})`)}  ${gray(`${r.indexName} · ${formatBytes(r.sizeBytes)}`)}`,
+    );
+    console.log(`    ${dim(symbols.tee)} covered by ${blue(r.coveredBy)} ${dim(`(${r.coveredByColumns.join(', ')})`)}`);
+    console.log(`    ${dim(symbols.teeEnd)} ${green(r.dropSql)}`);
+    newline();
+  }
+}
+
+/** doctor --audit: doctor's own previously-suggested indexes now never scanned. */
+function renderDoctorAudit(audit: DoctorIndexAudit[], minScans: number | undefined, snapshot: StatsSnapshot): void {
+  if (audit.length === 0) {
+    success('No doctor-suggested index is going unused');
+    newline();
+    return;
+  }
+  warn(
+    `doctor previously suggested these indexes; ${bold(String(audit.length))} have never been scanned since the stats reset.`,
+  );
+  renderUnusedCaveats(minScans, snapshot);
+  for (const a of audit) {
+    const tag = a.ambiguous ? red(' [ambiguous: truncated name collides with another column set]') : '';
+    console.log(
+      `  ${yellow(symbols.warning)} ${bold(cyan(a.table))} ${dim(`(${a.columns.join(', ') || '?'})`)}  ${gray(`${a.indexName} · ${a.idxScan} scans · ${formatBytes(a.sizeBytes)}`)}${tag}`,
+    );
+    if (a.ambiguous) {
+      console.log(
+        `    ${dim(symbols.tee)} ${dim('the 63-byte name maps to more than one probe column set; confirm before dropping')}`,
+      );
+    }
+    console.log(`    ${dim(symbols.teeEnd)} ${green(a.dropSql)}`);
+    newline();
+  }
+  console.log(`  ${dim('Consider dropping the ones you confirm are unused. Nothing here is auto-dropped.')}`);
+  newline();
 }
 
 /** Cost-aware tiered output: three sections, each finding annotated with its numbers. */
@@ -3339,7 +3550,7 @@ function showHelp(): void {
   console.log(`    ${cyan('seed')}               Run seed file`);
   console.log(`    ${cyan('status')} ${dim('| info')}      Show schema summary`);
   console.log(
-    `    ${cyan('doctor')}             Cost-aware missing-FK-index triage ${dim('(--fix, --json, --no-concurrently)')}`,
+    `    ${cyan('doctor')}             Cost-aware missing-FK-index triage ${dim('(--fix, --json, --unused, --audit)')}`,
   );
   console.log(
     `    ${cyan('studio')}             Launch local read-only web UI ${dim('(--write for writes, --demo for a sample DB)')}`,

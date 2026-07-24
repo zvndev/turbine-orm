@@ -75,6 +75,18 @@ export const STATS_THRESHOLDS = {
   appendHeavyInsertRatio: 0.95,
   /** ... and seq_scan at or below this ("near-zero probe reads") → scrutinize. */
   appendHeavyMaxSeqScan: 5,
+  /**
+   * Default `--min-scans` for the unused-index report: an index with fewer than
+   * this many scans since stats_reset is flagged never-scanned. Default 1 makes
+   * the bare report mean exactly "idx_scan = 0".
+   */
+  unusedMinScans: 1,
+  /**
+   * Queries/min (from _turbine_metrics) at or above this makes a table "hot in
+   * your workload": a benefit signal that boosts the finding's priority and
+   * annotates it. It never downgrades a cost tier (write cost is a separate axis).
+   */
+  heatMinQueriesPerMin: 1,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -112,6 +124,10 @@ export interface IndexStat {
   isUnique: boolean;
   isPrimary: boolean;
   isReplicaIdent: boolean;
+  /** Backs an exclusion constraint (pg_constraint.contype = 'x'). */
+  isExclusion?: boolean;
+  /** pg_relation_size of the index heap, bytes. Size reclaimed by a drop. */
+  sizeBytes?: number;
 }
 
 /**
@@ -182,8 +198,18 @@ export interface ScoredMissingIndex {
   hotWarning: string | null;
   /** When true, the emitted index should be a partial `WHERE col IS NOT NULL`. */
   partialNotNull: boolean;
-  /** Sort key within a tier: bigger, more-probed tables first. */
+  /** True when workload heat lifted this finding's priority (see {@link TableHeatEntry}). */
+  heatBoosted: boolean;
+  /** Sort key within a tier: bigger, more-probed tables first; hot tables first of all. */
   benefitScore: number;
+}
+
+/** Per-table workload heat, derived from the _turbine_metrics per-minute aggregates. */
+export interface TableHeatEntry {
+  /** Average queries per minute across the observed window. */
+  queriesPerMin: number;
+  /** Worst observed p95 latency (ms) across the window. */
+  p95Ms: number;
 }
 
 /** The subset of a topology finding the scorer needs. */
@@ -215,7 +241,11 @@ function formatInt(n: number): string {
  * Score a single missing-index finding against a snapshot. Pure and total:
  * every unknown degrades to a caveat rather than a fabricated number.
  */
-export function scoreMissingIndex(missing: ScorableMissingIndex, snapshot: StatsSnapshot): ScoredMissingIndex {
+export function scoreMissingIndex(
+  missing: ScorableMissingIndex,
+  snapshot: StatsSnapshot,
+  heat?: TableHeatEntry,
+): ScoredMissingIndex {
   const t = STATS_THRESHOLDS;
   const stats = snapshot.tables[missing.table];
   const probingRelations = missing.probes.length;
@@ -347,8 +377,20 @@ export function scoreMissingIndex(missing: ScorableMissingIndex, snapshot: Stats
     );
   }
 
+  // Workload heat is a BENEFIT signal, not a cost one: a table your app hits hard
+  // is a table where a missing index hurts most. It never downgrades a cost tier
+  // (write cost is decided above); it re-prioritizes and annotates.
+  const heatBoosted = heat !== undefined && heat.queriesPerMin >= t.heatMinQueriesPerMin;
+  if (heatBoosted && heat !== undefined) {
+    reasons.push(
+      `hot in your workload: ${formatInt(heat.queriesPerMin)} queries/min, p95 ${heat.p95Ms >= 10 ? Math.round(heat.p95Ms) : heat.p95Ms.toFixed(1)} ms`,
+    );
+  }
+
   // Benefit sort key: bigger, more-probed tables first. Unknown rows sort last.
-  const benefitScore = (rows ?? 0) * Math.max(1, probingRelations);
+  // A heat-boosted finding is lifted above every non-hot finding in its tier.
+  const base = (rows ?? 0) * Math.max(1, probingRelations);
+  const benefitScore = heatBoosted && heat !== undefined ? base + (heat.queriesPerMin + 1) * 1e12 : base;
 
   return {
     table: missing.table,
@@ -358,6 +400,7 @@ export function scoreMissingIndex(missing: ScorableMissingIndex, snapshot: Stats
     metrics,
     hotWarning,
     partialNotNull,
+    heatBoosted,
     benefitScore,
   };
 }
@@ -397,6 +440,170 @@ export function findInvalidIndexes(snapshot: StatsSnapshot): InvalidIndex[] {
       dropSql: buildDropIndexSql(idx.indexName, { concurrently: true }),
     }))
     .sort((a, b) => a.indexName.localeCompare(b.indexName));
+}
+
+// ---------------------------------------------------------------------------
+// Unused-index detection (pure): doctor learns to subtract
+// ---------------------------------------------------------------------------
+
+/**
+ * An index constraint-backing indexes are NEVER candidates for a drop suggestion:
+ * a primary key, a unique constraint, or an exclusion constraint owns its index,
+ * and a replica-identity index is load-bearing for logical replication. Dropping
+ * any of these changes semantics, not just performance.
+ */
+function isConstraintBacking(idx: IndexStat): boolean {
+  return idx.isPrimary || idx.isUnique || idx.isExclusion === true || idx.isReplicaIdent;
+}
+
+/** A never-scanned index and the DROP statement that would reclaim it. */
+export interface UnusedIndex {
+  table: string;
+  indexName: string;
+  columns: string[];
+  /** idx_scan since the last stats reset (0 or below --min-scans). */
+  idxScan: number;
+  /** Size reclaimed by the drop, bytes (null when the size read degraded). */
+  sizeBytes: number | null;
+  /** `DROP INDEX CONCURRENTLY IF EXISTS`: printed only, never written to a migration. */
+  dropSql: string;
+}
+
+/**
+ * Indexes never (or barely) scanned since the last stats reset. Report-only:
+ * counters reset on a crash/reset and REPLICA READS NEVER FEED PRIMARY COUNTERS,
+ * so an index only a read replica uses looks dead here. Constraint-backing and
+ * replica-identity indexes are excluded by construction. An index whose idx_scan
+ * could not be read (no pg_stat row) is skipped rather than guessed.
+ */
+export function findUnusedIndexes(snapshot: StatsSnapshot, options: { minScans?: number } = {}): UnusedIndex[] {
+  const minScans = options.minScans ?? STATS_THRESHOLDS.unusedMinScans;
+  return snapshot.indexes
+    .filter((idx) => idx.isValid && !isConstraintBacking(idx))
+    .filter((idx) => idx.idxScan !== undefined && idx.idxScan < minScans)
+    .map((idx) => ({
+      table: idx.table,
+      indexName: idx.indexName,
+      columns: idx.columns,
+      idxScan: idx.idxScan ?? 0,
+      sizeBytes: idx.sizeBytes ?? null,
+      dropSql: buildDropIndexSql(idx.indexName, { concurrently: true }),
+    }))
+    .sort((a, b) => (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0) || a.indexName.localeCompare(b.indexName));
+}
+
+/** A redundant index whose columns are a leading prefix of a wider index. */
+export interface RedundantIndex {
+  table: string;
+  indexName: string;
+  columns: string[];
+  /** The wider index that already covers this one's leading-prefix lookups. */
+  coveredBy: string;
+  coveredByColumns: string[];
+  sizeBytes: number | null;
+  dropSql: string;
+}
+
+/** Whether `prefix` is a strict leading prefix of `columns`. */
+function isLeadingPrefix(prefix: string[], columns: string[]): boolean {
+  if (prefix.length === 0 || prefix.length >= columns.length) return false;
+  return prefix.every((c, i) => columns[i] === c);
+}
+
+/**
+ * Non-unique indexes whose column list is a leading prefix of a WIDER index on
+ * the same table. A btree serves any leading-prefix lookup, so the narrow index
+ * is redundant. Pure metadata (no idx_scan needed).
+ *
+ * Uniqueness compatibility: only a NON-unique index is ever reported. A unique
+ * or primary-key prefix is load-bearing (it enforces a constraint), so it is
+ * never called redundant even when a wider index shares its leading columns.
+ */
+export function findRedundantIndexes(snapshot: StatsSnapshot): RedundantIndex[] {
+  const byTable = new Map<string, IndexStat[]>();
+  for (const idx of snapshot.indexes) {
+    if (!idx.isValid) continue;
+    let list = byTable.get(idx.table);
+    if (!list) {
+      list = [];
+      byTable.set(idx.table, list);
+    }
+    list.push(idx);
+  }
+
+  const out: RedundantIndex[] = [];
+  for (const list of byTable.values()) {
+    for (const narrow of list) {
+      // Candidate must be a plain, non-constraint index: dropping it must not
+      // remove a uniqueness/PK/exclusion guarantee or a replica identity.
+      if (isConstraintBacking(narrow)) continue;
+      if (narrow.columns.length === 0) continue;
+      const wider = list.find((w) => w.indexName !== narrow.indexName && isLeadingPrefix(narrow.columns, w.columns));
+      if (!wider) continue;
+      out.push({
+        table: narrow.table,
+        indexName: narrow.indexName,
+        columns: narrow.columns,
+        coveredBy: wider.indexName,
+        coveredByColumns: wider.columns,
+        sizeBytes: narrow.sizeBytes ?? null,
+        dropSql: buildDropIndexSql(narrow.indexName, { concurrently: true }),
+      });
+    }
+  }
+  return out.sort((a, b) => a.table.localeCompare(b.table) || a.indexName.localeCompare(b.indexName));
+}
+
+/**
+ * A `doctor --audit` finding: an existing index that matches doctor's own
+ * deterministic naming AND has not been scanned since the stats reset.
+ */
+export interface DoctorIndexAudit {
+  table: string;
+  indexName: string;
+  columns: string[];
+  idxScan: number;
+  sizeBytes: number | null;
+  dropSql: string;
+  /**
+   * True when the truncated (63-byte) name collides across DIFFERENT column sets
+   * in the schema's probes, so which suggestion this index realizes is
+   * ambiguous. Reported as ambiguous instead of a confident drop verdict.
+   */
+  ambiguous: boolean;
+}
+
+/**
+ * The unused-index machinery scoped to doctor's OWN previously-suggested indexes:
+ * existing indexes whose name matches the `idx_<table>_<cols>` (63-byte truncated)
+ * shape doctor emits, never scanned since the stats reset. `doctorNames` maps each
+ * deterministic name to the distinct column sets that truncate to it (see
+ * `collectDoctorProbeIndexNames`); a name with more than one column set is a
+ * post-truncation collision, reported as ambiguous.
+ */
+export function auditDoctorIndexes(
+  snapshot: StatsSnapshot,
+  doctorNames: Map<string, Array<{ table: string; columns: string[] }>>,
+  options: { minScans?: number } = {},
+): DoctorIndexAudit[] {
+  const minScans = options.minScans ?? STATS_THRESHOLDS.unusedMinScans;
+  const out: DoctorIndexAudit[] = [];
+  for (const idx of snapshot.indexes) {
+    if (!idx.isValid || isConstraintBacking(idx)) continue;
+    const candidates = doctorNames.get(idx.indexName);
+    if (!candidates || candidates.length === 0) continue;
+    if (idx.idxScan === undefined || idx.idxScan >= minScans) continue;
+    out.push({
+      table: idx.table,
+      indexName: idx.indexName,
+      columns: idx.columns,
+      idxScan: idx.idxScan,
+      sizeBytes: idx.sizeBytes ?? null,
+      dropSql: buildDropIndexSql(idx.indexName, { concurrently: true }),
+      ambiguous: candidates.length > 1,
+    });
+  }
+  return out.sort((a, b) => a.indexName.localeCompare(b.indexName));
 }
 
 /**
@@ -562,15 +769,20 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
       indisunique: boolean;
       indisprimary: boolean;
       indisreplident: boolean;
+      is_exclusion: boolean;
       idx_scan: string | null;
+      index_size: string | null;
       columns: string[] | null;
     }>(
       'pg_index',
       `SELECT c.relname AS table_name,
               ic.relname AS index_name,
               i.indisvalid, i.indisunique, i.indisprimary, i.indisreplident,
+              EXISTS (SELECT 1 FROM pg_constraint con
+                       WHERE con.conindid = i.indexrelid AND con.contype = 'x') AS is_exclusion,
               s.idx_scan::text AS idx_scan,
-              (SELECT array_agg(a.attname ORDER BY k.ord)
+              pg_relation_size(i.indexrelid)::text AS index_size,
+              (SELECT array_agg(a.attname::text ORDER BY k.ord)
                  FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum) AS columns
          FROM pg_index i
@@ -592,6 +804,8 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
           isUnique: row.indisunique,
           isPrimary: row.indisprimary,
           isReplicaIdent: row.indisreplident,
+          isExclusion: row.is_exclusion,
+          sizeBytes: row.index_size == null ? undefined : Number(row.index_size),
         });
       }
     }
@@ -624,4 +838,104 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
   }
 
   return snapshot;
+}
+
+// ---------------------------------------------------------------------------
+// Table-heat collector (impure): reads _turbine_metrics, Postgres only
+// ---------------------------------------------------------------------------
+
+export interface CollectTableHeatOptions {
+  /** Where _turbine_metrics lives (the app DB, or a separate --metrics-url DB). */
+  connectionString: string;
+  /** Model names to read heat for (the probed table names). */
+  models: string[];
+  /** Trailing window of per-minute buckets to average, minutes. Default 60. */
+  windowMinutes?: number;
+  statementTimeoutMs?: number;
+}
+
+export interface TableHeatResult {
+  /** True when _turbine_metrics existed and was read. False = heat boosting off. */
+  available: boolean;
+  /** Per-model heat, keyed by model (= table) name. */
+  tables: Record<string, TableHeatEntry>;
+  /** One honesty line when heat could not be sourced (absent table / non-pg sink). */
+  notice: string | null;
+}
+
+/**
+ * Read per-model workload heat from a `_turbine_metrics` table (written by
+ * `db.$observe()` with the default Postgres sink). When the table is absent, the
+ * result is `available: false` with a notice: this is the expected state when
+ * observe uses a non-Postgres sink, or when no metrics have been collected yet.
+ * Every read is best-effort; a failure degrades to unavailable, never throws.
+ */
+export async function collectTableHeat(options: CollectTableHeatOptions): Promise<TableHeatResult> {
+  const windowMinutes = options.windowMinutes ?? 60;
+  const timeout = options.statementTimeoutMs ?? 5000;
+  const result: TableHeatResult = { available: false, tables: {}, notice: null };
+
+  if (options.models.length === 0) {
+    result.notice = 'no probed tables to correlate against workload heat.';
+    return result;
+  }
+
+  const { Pool } = (await import('pg')).default;
+  const pool = new Pool({ connectionString: options.connectionString, max: 1 }) as unknown as MinimalPool;
+
+  try {
+    try {
+      await pool.query(`SET statement_timeout = ${Number(timeout)}`);
+    } catch {
+      /* best-effort */
+    }
+
+    const exists = await pool
+      .query<{ reg: string | null }>(`SELECT to_regclass('_turbine_metrics')::text AS reg`)
+      .then((r) => r.rows[0]?.reg ?? null)
+      .catch(() => null);
+
+    if (!exists) {
+      result.notice =
+        'the _turbine_metrics table was not found: heat boosting is unavailable (observe may be using a non-Postgres sink, or no metrics have been collected yet).';
+      return result;
+    }
+
+    const rows = await pool
+      .query<{ model: string; total_count: string; p95: string | null; buckets: string }>(
+        `SELECT model,
+                sum(count)::float8::text AS total_count,
+                max(p95_ms)::text AS p95,
+                count(*)::text AS buckets
+           FROM _turbine_metrics
+          WHERE bucket >= NOW() - (INTERVAL '1 minute' * $1) AND model = ANY($2)
+          GROUP BY model`,
+        [windowMinutes, options.models],
+      )
+      .then((r) => r.rows)
+      .catch(() => null);
+
+    if (rows === null) {
+      result.notice = 'reading _turbine_metrics failed: heat boosting is unavailable.';
+      return result;
+    }
+
+    result.available = true;
+    for (const row of rows) {
+      const total = Number(row.total_count);
+      if (!Number.isFinite(total)) continue;
+      result.tables[row.model] = {
+        queriesPerMin: total / Math.max(1, windowMinutes),
+        p95Ms: row.p95 == null ? 0 : Number(row.p95),
+      };
+    }
+  } finally {
+    try {
+      await pool.end();
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  return result;
 }

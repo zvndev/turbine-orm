@@ -7,21 +7,20 @@ const nodePlatform = (config) => {
   return config;
 };
 
-// Budgets re-baselined 2026-07-23 (v0.41.0). Measured at the release HEAD:
-// main 56.37 kB, serverless 42.54 kB, sqlite 45.11 kB, mysql 46.19 kB,
-// mssql 47.85 kB. All five entries moved ~1 kB after the 0.41 core work
-// (compound-unique where normalization, the process-wide warn-once registry,
-// and the relationLoadStrategy 'auto' partitioner) landed on the shared
-// client/query graph. The prisma-compat subpath is NOT in any of these graphs
-// (pure shim, separate entry). A feature that trips a budget must consciously
-// re-baseline here, never bump blindly. Prior baseline 2026-07-17 (v0.36.0):
-// main 52.96 / serverless 39.78 / sqlite 42.31 / mysql 43.36 / mssql 44.91.
-// Re-measure and re-baseline on each bump.
+// Budgets re-baselined 2026-07-23 (v0.47.0). Measured at the release HEAD:
+// main 57.06 kB, serverless 43.03 kB, sqlite 45.56 kB, mysql 46.71 kB,
+// mssql 48.3 kB. main/edge moved ~0.1-0.3 kB when the ObserveSink seam
+// (PgMetricsSink/HttpJsonSink) landed on the observe graph exported from the
+// barrel; the doctor/index-stats work is CLI-only and not in any entry graph.
+// A feature that trips a budget must consciously re-baseline here, never bump
+// blindly. Prior baseline 2026-07-23 (v0.41.0): main 56.37 / serverless 42.54
+// / sqlite 45.11 / mysql 46.19 / mssql 47.85. Re-measure and re-baseline on
+// each bump.
 export default [
   {
     name: "main entry — import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
-    limit: '57 kB',
+    limit: '58 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
@@ -32,7 +31,7 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '43 kB',
+    limit: '44 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },

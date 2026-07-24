@@ -136,9 +136,9 @@ describe('ObserveEngine flush', () => {
       end: async () => {},
     };
 
-    // Hack: replace the internal pool with our mock
+    // Hack: replace the default sink's internal pool with our mock
     const engine = new ObserveEngine({ connectionString: 'postgres://unused', retentionDays: 7 });
-    (engine as unknown as { pool: unknown }).pool = mockPool;
+    (engine as unknown as { sink: { pool: unknown } }).sink.pool = mockPool;
 
     const listener = engine.getListener();
     listener({
@@ -205,7 +205,7 @@ describe('ObserveEngine flush', () => {
     };
 
     const engine = new ObserveEngine({ connectionString: 'postgres://unused' });
-    (engine as unknown as { pool: unknown }).pool = mockPool;
+    (engine as unknown as { sink: { pool: unknown } }).sink.pool = mockPool;
 
     await engine.flush();
     assert.equal(queries.length, 0);
