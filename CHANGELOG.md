@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.46.0 (2026-07-23)
+
+### Added
+
+- **`turbine doctor` scores index suggestions by cost, not just topology.** On
+  PostgreSQL, doctor now reads live statistics (`pg_stat_user_tables`,
+  `pg_stat_user_indexes`, `pg_stats`, relation sizes, `stats_reset` age) and sorts
+  missing-FK-index findings into three tiers: take freely, take deliberately, and
+  scrutinize, printing the numbers behind each verdict (table size, writes per day
+  since stats reset, existing index count, probing relations). Mostly-NULL FK columns
+  get a partial-index suggestion (`CREATE INDEX ... WHERE col IS NOT NULL`) instead
+  of a full one, and candidates on tables with high HOT-update ratios carry an
+  explicit warning and a tier bump. Invalid indexes (failed `CONCURRENTLY` builds)
+  are reported. When statistics are unavailable, too young, or never reset, doctor
+  degrades honestly to the previous size-sorted topology report with a printed
+  reason; it never fakes confidence. Non-Postgres engines keep the topology-only
+  report.
+- **`turbine doctor --json`.** Machine-readable report with a stable versioned
+  contract (`schemaVersion: 1`): scored findings with tier, numbers, and SQL,
+  invalid indexes, and degradation notices. Built for CI gates and external tooling.
+- **No-transaction migrations and `CREATE INDEX CONCURRENTLY`.** A migration whose
+  header carries the `-- turbine:no-transaction` directive now runs outside a
+  transaction, one statement per query (required for `CONCURRENTLY`), and is
+  recorded only after every statement succeeds. The statement splitter understands
+  quotes, dollar-quoting, and line/block comments. `doctor --fix` emits
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS` migrations with this directive by
+  default, including a recipe comment covering idempotency, the
+  failed-build-leaves-INVALID-index trap, and `lock_timeout` guidance;
+  `--no-concurrently` keeps the plain transactional form. `migrate up` prints a
+  loud notice whenever it applies a no-transaction file.
+
 ## 0.45.0 (2026-07-23)
 
 ### Fixed

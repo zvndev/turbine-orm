@@ -144,7 +144,9 @@ describe('byte-identity of the flag-off path', () => {
   });
 
   it('generateMetadata is stable across repeated runs', () => {
-    assert.equal(generateMetadata(schema()), generateMetadata(schema()));
+    // noTimestamp: the default header carries a wall-clock line, so two calls
+    // straddling a millisecond tick would differ and flake this assertion.
+    assert.equal(generateMetadata(schema(), { noTimestamp: true }), generateMetadata(schema(), { noTimestamp: true }));
   });
 });
 
