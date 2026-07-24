@@ -14,6 +14,7 @@ import { describe, it } from 'node:test';
 import { collectDoctorProbeIndexNames, doctorIndexName } from '../index-advisor.js';
 import {
   auditDoctorIndexes,
+  EXPRESSION_COLUMN,
   findInvalidIndexes,
   findRedundantIndexes,
   findUnusedIndexes,
@@ -333,6 +334,9 @@ function indexStat(overrides: Partial<IndexStat> & { indexName: string }): Index
   return {
     table: 'posts',
     columns: ['x'],
+    accessMethod: 'btree',
+    hasExpressions: false,
+    predicate: null,
     isValid: true,
     isUnique: false,
     isPrimary: false,
@@ -442,6 +446,117 @@ describe('findRedundantIndexes', () => {
       ],
     });
     assert.deepEqual(findRedundantIndexes(snap), []);
+  });
+
+  // A functional index arrives with an expression SLOT, not a shortened column
+  // list. Treating `(tenant_id, lower(email))` as `['tenant_id']` made doctor
+  // suggest dropping a load-bearing index.
+  it('never flags a functional index as covered by a plain btree', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({
+          indexName: 'idx_users_tenant_lower_email',
+          columns: ['tenant_id', EXPRESSION_COLUMN],
+          hasExpressions: true,
+        }),
+        indexStat({ indexName: 'idx_users_tenant_created', columns: ['tenant_id', 'created_at'] }),
+      ],
+    });
+    assert.deepEqual(findRedundantIndexes(snap), []);
+  });
+
+  it('never flags the wider index as covering when IT has an expression column', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_tenant', columns: ['tenant_id'] }),
+        indexStat({
+          indexName: 'idx_tenant_expr',
+          columns: ['tenant_id', EXPRESSION_COLUMN],
+          hasExpressions: true,
+        }),
+      ],
+    });
+    assert.deepEqual(findRedundantIndexes(snap), []);
+  });
+
+  it('never flags a partial index as covered by an equivalent full index', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_partial', columns: ['org_id'], predicate: '(deleted_at IS NULL)' }),
+        indexStat({ indexName: 'idx_full', columns: ['org_id', 'user_id'], predicate: null }),
+      ],
+    });
+    assert.deepEqual(findRedundantIndexes(snap), []);
+  });
+
+  it('flags a partial prefix only when the predicates are identical', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_narrow', columns: ['org_id'], predicate: '(deleted_at IS NULL)' }),
+        indexStat({ indexName: 'idx_wide', columns: ['org_id', 'user_id'], predicate: '(deleted_at IS NULL)' }),
+      ],
+    });
+    assert.deepEqual(
+      findRedundantIndexes(snap).map((r) => r.indexName),
+      ['idx_narrow'],
+    );
+  });
+
+  it('never flags across access methods (a GIN index is not a btree prefix)', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_gin_tags', columns: ['tags'], accessMethod: 'gin' }),
+        indexStat({ indexName: 'idx_btree_tags_id', columns: ['tags', 'id'], accessMethod: 'btree' }),
+      ],
+    });
+    assert.deepEqual(findRedundantIndexes(snap), []);
+  });
+
+  it('stays silent when the index shape could not be read', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_a', columns: ['org_id'], accessMethod: undefined }),
+        indexStat({ indexName: 'idx_ab', columns: ['org_id', 'user_id'], accessMethod: undefined }),
+      ],
+    });
+    assert.deepEqual(findRedundantIndexes(snap), []);
+  });
+
+  it('still flags a genuine plain-btree prefix duplicate', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_org', columns: ['org_id'] }),
+        indexStat({ indexName: 'idx_org_user_created', columns: ['org_id', 'user_id', 'created_at'] }),
+      ],
+    });
+    const redundant = findRedundantIndexes(snap);
+    assert.equal(redundant.length, 1);
+    assert.equal(redundant[0]!.indexName, 'idx_org');
+    assert.equal(redundant[0]!.coveredBy, 'idx_org_user_created');
+  });
+});
+
+describe('findUnusedIndexes - shape caveats', () => {
+  it('reports what a special index actually is instead of an implied plain rebuild', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({
+          indexName: 'idx_expr',
+          columns: [EXPRESSION_COLUMN],
+          hasExpressions: true,
+          indexDef: 'CREATE INDEX idx_expr ON posts (lower(title))',
+          sizeBytes: 3000,
+        }),
+        indexStat({ indexName: 'idx_gin', columns: ['tags'], accessMethod: 'gin', sizeBytes: 2000 }),
+        indexStat({ indexName: 'idx_part', columns: ['org_id'], predicate: '(deleted_at IS NULL)', sizeBytes: 1000 }),
+        indexStat({ indexName: 'idx_plain', columns: ['slug'], sizeBytes: 500 }),
+      ],
+    });
+    const byName = new Map(findUnusedIndexes(snap).map((u) => [u.indexName, u.caveat]));
+    assert.match(byName.get('idx_expr') ?? '', /expression index.*lower\(title\)/);
+    assert.match(byName.get('idx_gin') ?? '', /gin index/);
+    assert.match(byName.get('idx_part') ?? '', /partial index \(WHERE \(deleted_at IS NULL\)\)/);
+    assert.equal(byName.get('idx_plain'), null);
   });
 });
 

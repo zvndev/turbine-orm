@@ -270,7 +270,8 @@ export function parseMigrationContent(content: string): ParsedMigration {
  * Split a SQL script into individual statements on top-level semicolons.
  *
  * A correct tokenizer, not a `split(';')`: a semicolon inside a single-quoted
- * string, a double-quoted identifier, a dollar-quoted body, a line comment
+ * string (including a backslash-escaping `E'...'` string), a double-quoted
+ * identifier, a dollar-quoted body, a line comment
  * (`--`), or a block comment (`/* *\/`, which Postgres allows to nest) must NOT
  * split. This is the one production-destroying failure mode of no-transaction
  * migrations (a partial statement executed against production), so the behavior
@@ -322,10 +323,19 @@ export function splitSqlStatements(sql: string): string[] {
     }
 
     // Single-quoted string ('' is an escaped quote, stays inside the string).
+    // An E-prefixed string (E'...') additionally honors backslash escapes, so
+    // `E'p\'q'` is ONE string: treating the `\'` as a terminator would close the
+    // string early and let the next quote swallow a real statement terminator.
     if (ch === "'") {
+      const backslashEscapes = isEscapeStringPrefix(sql, i);
       let j = i + 1;
       current += "'";
       while (j < n) {
+        if (backslashEscapes && sql[j] === '\\' && j + 1 < n) {
+          current += sql[j]! + sql[j + 1]!;
+          j += 2;
+          continue;
+        }
         if (sql[j] === "'" && sql[j + 1] === "'") {
           current += "''";
           j += 2;
@@ -400,6 +410,23 @@ export function splitSqlStatements(sql: string): string[] {
   if (tail) statements.push(tail);
 
   return statements.filter((s) => !isCommentOnlyStatement(s));
+}
+
+/**
+ * True when the quote at `quoteAt` opens a Postgres escape string (`E'...'`),
+ * whose body treats a backslash as an escape character.
+ *
+ * The `E` must be a standalone token: an identifier that merely ends in `e`
+ * (`some_table` cannot be followed by a quote in valid SQL, but the check keeps
+ * the tokenizer honest) does not turn the following literal into an E-string.
+ * Ordinary literals are left alone on purpose: with the modern
+ * `standard_conforming_strings = on` default, `'a\'` IS a complete string.
+ */
+function isEscapeStringPrefix(sql: string, quoteAt: number): boolean {
+  const prev = sql[quoteAt - 1];
+  if (prev !== 'E' && prev !== 'e') return false;
+  const before = sql[quoteAt - 2];
+  return before === undefined || !/[A-Za-z0-9_$"]/.test(before);
 }
 
 /** True when a fragment contains nothing but comments and whitespace. */

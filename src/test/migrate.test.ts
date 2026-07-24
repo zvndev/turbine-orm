@@ -265,6 +265,55 @@ describe('splitSqlStatements', () => {
     assert.ok(out[0]!.includes('a ON t (x)'));
     assert.ok(out[1]!.includes('b ON t (y)'));
   });
+
+  // E-strings (E'...') treat a backslash as an escape character. Closing such a
+  // string on the `\'` merges the following statements into one, which Postgres
+  // then runs as an implicit transaction: fatal for a no-transaction migration.
+  it('keeps an escaped quote inside an E-string from ending the string', () => {
+    const sql = `UPDATE a SET x = E'p\\'q';\nUPDATE b SET y = E'r\\'s';\nDROP TABLE c;`;
+    assert.deepEqual(splitSqlStatements(sql), [
+      `UPDATE a SET x = E'p\\'q'`,
+      `UPDATE b SET y = E'r\\'s'`,
+      'DROP TABLE c',
+    ]);
+  });
+
+  it('keeps a semicolon inside an E-string', () => {
+    assert.deepEqual(splitSqlStatements(`INSERT INTO t VALUES (E'a;b\\'c'); SELECT 1;`), [
+      `INSERT INTO t VALUES (E'a;b\\'c')`,
+      'SELECT 1',
+    ]);
+  });
+
+  it('handles a lowercase e prefix', () => {
+    assert.deepEqual(splitSqlStatements(`SELECT e'x\\';y'; SELECT 2;`), [`SELECT e'x\\';y'`, 'SELECT 2']);
+  });
+
+  it('mixes E-strings and ordinary strings in one script', () => {
+    const sql = `INSERT INTO t VALUES ('plain;one', E'esc\\';two'); SELECT 'three;';`;
+    assert.deepEqual(splitSqlStatements(sql), [`INSERT INTO t VALUES ('plain;one', E'esc\\';two')`, `SELECT 'three;'`]);
+  });
+
+  it('handles a doubled quote inside an E-string', () => {
+    assert.deepEqual(splitSqlStatements(`SELECT E'it''s; fine'; SELECT 2;`), [`SELECT E'it''s; fine'`, 'SELECT 2']);
+  });
+
+  it('handles an escaped backslash at the end of an E-string', () => {
+    assert.deepEqual(splitSqlStatements(`SELECT E'path\\\\'; SELECT 2;`), [`SELECT E'path\\\\'`, 'SELECT 2']);
+  });
+
+  it('does not treat a backslash as an escape in an ordinary string', () => {
+    // standard_conforming_strings = on: 'a\' is a COMPLETE string, so the
+    // statement ends at the following semicolon.
+    assert.deepEqual(splitSqlStatements(`SELECT 'a\\'; SELECT 2;`), [`SELECT 'a\\'`, 'SELECT 2']);
+  });
+
+  it('does not treat an identifier ending in e as an E-string prefix', () => {
+    assert.deepEqual(splitSqlStatements(`SELECT * FROM t WHERE code='a\\'; SELECT 2;`), [
+      `SELECT * FROM t WHERE code='a\\'`,
+      'SELECT 2',
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------

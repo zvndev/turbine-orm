@@ -2863,6 +2863,9 @@ function renderUnusedIndexes(unused: UnusedIndex[], minScans: number | undefined
     console.log(
       `  ${yellow(symbols.warning)} ${bold(cyan(u.table))} ${dim(`(${u.columns.join(', ') || '?'})`)}  ${gray(`${u.indexName} · ${u.idxScan} scans · ${formatBytes(u.sizeBytes)}`)}`,
     );
+    // A functional / partial / non-btree index is not a plain `(col)` rebuild:
+    // say what it actually is before anyone runs the DROP.
+    if (u.caveat) console.log(`    ${dim(symbols.tee)} ${yellow(u.caveat)}`);
     console.log(`    ${dim(symbols.teeEnd)} ${green(u.dropSql)}`);
     newline();
   }
