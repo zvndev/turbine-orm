@@ -503,6 +503,8 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
       foreignKey: rel.foreignKey,
       referenceKey: rel.referenceKey,
     })),
+    // Click-through navigation targets, derived from relation metadata only.
+    ...relationLinksForTable(tbl, ctx.metadata, ctx.showPii === true),
   }));
 
   // Row counts (cheap enough to fetch inline).
@@ -542,6 +544,106 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
     // Demo flag drives the in-UI mode switcher + persistent demo banner.
     demo: ctx.demo === true,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Foreign-key click-through targets
+//
+// Derived ONLY from relation metadata (never from a column-name suffix): the
+// table's `belongsTo` relations name the local column holding the reference and
+// the column it points at on the target table, and its `hasMany`/`hasOne`
+// relations name the child column pointing back. Both directions compile to a
+// plain `/api/tables/:name?filters=[{column,op:'equals',value}]` request, so
+// navigation adds no new API surface and inherits that route's validation,
+// redaction, rate limiting, auth, and read-only posture unchanged.
+//
+// A link is only emitted when every identifier resolves against the introspected
+// metadata AND neither side is a currently redacted PII column: a redacted value
+// cannot be clicked (the client never sees it) and the destination filter would
+// be refused by parseTableFilters anyway, so offering the affordance would just
+// be a broken promise. Schemas with no relations (defineSchema-only, PowDB) get
+// empty arrays and the UI renders exactly as before.
+// ---------------------------------------------------------------------------
+
+/** One clickable reference from a column on this table to a row in another. */
+export interface ForeignKeyLink {
+  /** Column on THIS table whose cell becomes the link. */
+  column: string;
+  /** Relation the link was derived from. */
+  relation: string;
+  /** Table the reference points at. */
+  targetTable: string;
+  /** Column on the target table the value is matched against. */
+  targetColumn: string;
+}
+
+/** One reverse jump: rows in a child table that reference this table. */
+export interface ReferencedByLink {
+  /** Column on THIS table whose value the child column matches (usually the PK). */
+  column: string;
+  /** Relation the link was derived from. */
+  relation: string;
+  /** Child table holding the referencing rows. */
+  targetTable: string;
+  /** Referencing column on the child table. */
+  targetColumn: string;
+}
+
+/** True when `columnName` on `table` is PII-tagged and currently redacted. */
+function isRedactedColumn(table: TableMetadata, columnName: string, showPii: boolean): boolean {
+  if (showPii) return false;
+  const col = table.columns.find((c) => c.name === columnName);
+  return col?.pii === true;
+}
+
+/**
+ * Resolve a relation key to a single column name on `table`, or `null`. Composite
+ * (array) keys return null: a composite reference has no single cell to click, so
+ * those relations simply produce no link rather than a half-working one.
+ */
+function singleRelationColumn(table: TableMetadata, key: string | string[]): string | null {
+  if (typeof key !== 'string') return null;
+  return resolveColumnName(table, key);
+}
+
+export function relationLinksForTable(
+  table: TableMetadata,
+  metadata: SchemaMetadata,
+  showPii: boolean,
+): { foreignKeys: ForeignKeyLink[]; referencedBy: ReferencedByLink[] } {
+  const foreignKeys: ForeignKeyLink[] = [];
+  const referencedBy: ReferencedByLink[] = [];
+  const seenFkColumns = new Set<string>();
+
+  for (const [name, rel] of Object.entries(table.relations)) {
+    const target = metadata.tables[rel.to];
+    if (!target) continue;
+
+    if (rel.type === 'belongsTo') {
+      // The FK lives on this table; the reference key on the target.
+      const column = singleRelationColumn(table, rel.foreignKey);
+      const targetColumn = singleRelationColumn(target, rel.referenceKey);
+      if (!column || !targetColumn) continue;
+      if (seenFkColumns.has(column)) continue;
+      if (isRedactedColumn(table, column, showPii) || isRedactedColumn(target, targetColumn, showPii)) continue;
+      seenFkColumns.add(column);
+      foreignKeys.push({ column, relation: name, targetTable: target.name, targetColumn });
+      continue;
+    }
+
+    if (rel.type === 'hasMany' || rel.type === 'hasOne') {
+      // The FK lives on the child table; the reference key on this one.
+      const column = singleRelationColumn(table, rel.referenceKey);
+      const targetColumn = singleRelationColumn(target, rel.foreignKey);
+      if (!column || !targetColumn) continue;
+      if (isRedactedColumn(table, column, showPii) || isRedactedColumn(target, targetColumn, showPii)) continue;
+      referencedBy.push({ column, relation: name, targetTable: target.name, targetColumn });
+    }
+    // manyToMany deliberately produces no link: navigating it means traversing a
+    // junction table, which the single-column filter path cannot express.
+  }
+
+  return { foreignKeys, referencedBy };
 }
 
 // ---------------------------------------------------------------------------

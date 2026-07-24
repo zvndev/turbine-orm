@@ -624,3 +624,126 @@ describe('Studio demo: isolation', () => {
     assert.equal(ada?.name, 'Ada Lovelace', 'second launch is pristine');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Foreign-key click-through navigation (against the real seeded store)
+// ---------------------------------------------------------------------------
+
+interface LinkPayload {
+  column: string;
+  relation: string;
+  targetTable: string;
+  targetColumn: string;
+}
+
+interface SchemaTablePayload {
+  name: string;
+  foreignKeys: LinkPayload[];
+  referencedBy: LinkPayload[];
+}
+
+async function schemaTables(ctx: StudioContext): Promise<SchemaTablePayload[]> {
+  const r = await dispatch(ctx, { method: 'GET', url: '/api/schema', headers: authHeaders() });
+  assert.equal(r.status, 200, r.body);
+  return (r.json as { tables: SchemaTablePayload[] }).tables;
+}
+
+/** The request a followed link produces: the table view pinned to one value. */
+function navUrl(table: string, column: string, value: unknown): string {
+  return filtersUrl(table, [{ column, op: 'equals', value }], '&limit=50');
+}
+
+describe('Studio demo: foreign-key navigation', () => {
+  it('serves forward + reverse links derived from the seeded relations', async () => {
+    const tables = await schemaTables(makeDemoCtx());
+    const posts = tables.find((t) => t.name === 'posts');
+    assert.deepEqual(posts?.foreignKeys, [
+      { column: 'user_id', relation: 'author', targetTable: 'users', targetColumn: 'id' },
+    ]);
+    assert.deepEqual(posts?.referencedBy, [
+      { column: 'id', relation: 'comments', targetTable: 'comments', targetColumn: 'post_id' },
+    ]);
+
+    const comments = tables.find((t) => t.name === 'comments');
+    assert.deepEqual(comments?.foreignKeys.map((l) => `${l.column}->${l.targetTable}.${l.targetColumn}`).sort(), [
+      'post_id->posts.id',
+      'user_id->users.id',
+    ]);
+
+    // orgs has no relations at all: no affordance, no broken link.
+    const orgs = tables.find((t) => t.name === 'orgs');
+    assert.deepEqual(orgs?.foreignKeys, []);
+    assert.deepEqual(orgs?.referencedBy, []);
+  });
+
+  it('following a link opens exactly the referenced row', async () => {
+    const ctx = makeDemoCtx();
+    // A comment row carries post_id; follow it to the post it belongs to.
+    const comments = await dispatch(ctx, {
+      method: 'GET',
+      url: '/api/tables/comments?limit=1',
+      headers: authHeaders(),
+    });
+    const first = (comments.json as { rows: Array<Record<string, unknown>> }).rows[0];
+    assert.ok(first, 'seeded comment present');
+    const postId = first?.post_id as number;
+
+    const r = await dispatch(ctx, { method: 'GET', url: navUrl('posts', 'id', postId), headers: authHeaders() });
+    assert.equal(r.status, 200, r.body);
+    const json = r.json as { rows: Array<{ id: number }>; total: number };
+    assert.equal(json.total, 1);
+    assert.deepEqual(
+      json.rows.map((row) => row.id),
+      [postId],
+    );
+  });
+
+  it('reverse navigation lists only the children of the pinned row', async () => {
+    const ctx = makeDemoCtx();
+    const r = await dispatch(ctx, { method: 'GET', url: navUrl('posts', 'user_id', 1), headers: authHeaders() });
+    assert.equal(r.status, 200, r.body);
+    const json = r.json as { rows: Array<{ user_id: number }>; total: number };
+    assert.ok(json.total > 0, 'user 1 authored posts');
+    assert.ok(
+      json.rows.every((row) => row.user_id === 1),
+      'every row references the pinned parent',
+    );
+  });
+
+  it('never links to a PII column and refuses a forged jump onto one', async () => {
+    const ctx = makeDemoCtx();
+    const tables = await schemaTables(ctx);
+    for (const t of tables) {
+      for (const link of [...t.foreignKeys, ...t.referencedBy]) {
+        assert.notEqual(link.targetColumn, 'email', 'no link may point at a redacted column');
+        assert.notEqual(link.targetColumn, 'phone');
+      }
+    }
+    const r = await dispatch(ctx, {
+      method: 'GET',
+      url: navUrl('users', 'email', 'ada@example.com'),
+      headers: authHeaders(),
+    });
+    assert.equal(r.status, 400);
+    assert.match(String((r.json as { error: string }).error), /PII-redacted/);
+  });
+
+  it('requires the session token to follow a link', async () => {
+    const ctx = makeDemoCtx();
+    const r = await dispatch(ctx, { method: 'GET', url: navUrl('posts', 'id', 1), headers: { origin: ORIGIN } });
+    assert.equal(r.status, 401);
+  });
+
+  it('navigation opens no write surface in read-only demo mode', async () => {
+    const ctx = makeDemoCtx();
+    const nav = await dispatch(ctx, { method: 'GET', url: navUrl('posts', 'id', 1), headers: authHeaders() });
+    assert.equal(nav.status, 200, nav.body);
+    const write = await dispatch(ctx, {
+      method: 'POST',
+      url: '/api/row/update',
+      headers: authHeaders(),
+      body: { table: 'posts', where: { id: 1 }, data: { title: 'x' } },
+    });
+    assert.equal(write.status, 404, 'read-only demo has no write routes');
+  });
+});

@@ -1687,6 +1687,63 @@
       background: var(--bg-elev);
       flex-shrink: 0;
     }
+
+    /* =====================================================================
+       Foreign-key navigation bar (Data tab)
+       ===================================================================== */
+    .link-bar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 6px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--accent-dim);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--text-dim);
+      flex-shrink: 0;
+    }
+    .link-bar .btn {
+      padding: 3px 9px;
+      font-size: 11px;
+    }
+    .link-bar-target {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .link-bar-sep {
+      color: var(--text-muted);
+    }
+    .fk-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--accent);
+      border-bottom: 1px dashed var(--border-strong);
+      padding: 0;
+      background: none;
+      font: inherit;
+      cursor: pointer;
+      transition: color var(--t), border-color var(--t);
+    }
+    .fk-link:hover {
+      color: var(--accent-hover);
+      border-bottom-color: var(--accent);
+    }
+    .fk-arrow {
+      font-size: 9px;
+      color: var(--text-muted);
+    }
+    .fk-link:hover .fk-arrow {
+      color: var(--accent);
+    }
+    .th-note {
+      margin-left: 6px;
+      font-size: 10px;
+      color: var(--text-muted);
+      font-weight: 400;
+    }
     .filter-row {
       display: grid;
       grid-template-columns: minmax(120px, 1fr) minmax(100px, 0.8fr) minmax(140px, 1.4fr) auto;
@@ -2057,6 +2114,7 @@
               </button>
             </div>
           </div>
+          <div class="link-bar" id="dataLinkBar" hidden></div>
           <div class="filter-bar" id="dataFilterBar" hidden></div>
           <div class="selection-bar" id="dataSelectionBar" hidden>
             <span class="selection-count" id="selectionCount">0 selected</span>
@@ -2281,6 +2339,11 @@
         filters: [],
         // selected rows keyed by PK signature (Map key -> row object)
         selected: new Map(),
+        // Foreign-key click-through: the views we navigated away from (each
+        // entry restores a table + its filters/search/sort/page), plus a label
+        // describing the reference that produced the current view.
+        linkTrail: [],
+        linkLabel: null,
         loading: false,
         error: null,
       },
@@ -2778,7 +2841,12 @@
         $('#dataSearch').value = '';
         State.data.filters = [];
         State.data.selected.clear();
+        // Picking a table from the sidebar is a fresh start: drop any
+        // foreign-key navigation trail so the back affordance never lies.
+        State.data.linkTrail = [];
+        State.data.linkLabel = null;
         FilterBar.render();
+        Nav.render();
         Storage.set('currentTable', name);
         Sidebar.render();
         if (State.currentTab === 'data') DataPane.loadAndRender();
@@ -2798,6 +2866,171 @@
     };
 
     // =====================================================================
+    // Foreign-key navigation (Data tab)
+    //
+    // The server derives every link from relation metadata and omits any whose
+    // columns are currently PII-redacted, so the UI only has to follow them.
+    // A jump is just the normal table view with one equals filter applied, so
+    // it reuses the Data tab's own loading, paging, and filter-bar plumbing —
+    // and the filter is a real filter row the user can delete.
+    // =====================================================================
+    const Nav = {
+      // Forward links (this row references another table), keyed by column.
+      fkFor(column) {
+        const t = State.currentTable;
+        const links = (t && t.foreignKeys) || [];
+        return links.find((l) => l.column === column) || null;
+      },
+
+      // Reverse links (other tables reference this one).
+      childLinks() {
+        const t = State.currentTable;
+        return (t && t.referencedBy) || [];
+      },
+
+      // The single equals filter pinning the current view to one value, or null.
+      pinnedFilter() {
+        const active = FilterBar.activeFilters();
+        if (active.length !== 1) return null;
+        return active[0].op === 'equals' ? active[0] : null;
+      },
+
+      // Open `table` filtered to `column = value`, remembering where we came
+      // from so Back can restore it exactly.
+      open(tableName, column, value, label, push) {
+        const target = State.tablesByName.get(tableName);
+        if (!target) {
+          toast('Unknown table: ' + tableName, 'err');
+          return;
+        }
+        if (push && State.currentTable) {
+          State.data.linkTrail.push({
+            table: State.currentTable.name,
+            filters: State.data.filters.map((f) => ({ ...f })),
+            search: State.data.search,
+            orderBy: State.data.orderBy,
+            dir: State.data.dir,
+            offset: State.data.offset,
+            linkLabel: State.data.linkLabel,
+          });
+        }
+        State.currentTable = target;
+        State.data.offset = 0;
+        State.data.search = '';
+        $('#dataSearch').value = '';
+        State.data.orderBy =
+          (target.primaryKey && target.primaryKey[0]) || (target.columns[0] && target.columns[0].name);
+        State.data.dir = 'asc';
+        State.data.filters = [{ column, op: 'equals', value: String(value) }];
+        State.data.selected.clear();
+        State.data.linkLabel = label;
+        Storage.set('currentTable', target.name);
+        Sidebar.render();
+        FilterBar.render();
+        if (State.currentTab !== 'data') Router.selectTab('data');
+        DataPane.loadAndRender();
+      },
+
+      // Follow the reference in one cell to the row it points at.
+      follow(link, value) {
+        if (value === null || value === undefined) return;
+        const from = State.currentTable ? State.currentTable.name : '?';
+        Nav.open(link.targetTable, link.targetColumn, value, from + '.' + link.relation, true);
+      },
+
+      // Jump the other way: the child rows referencing the pinned row.
+      followChild(link, value) {
+        const from = State.currentTable ? State.currentTable.name : '?';
+        Nav.open(link.targetTable, link.targetColumn, value, from + '.' + link.relation, true);
+      },
+
+      back() {
+        const prev = State.data.linkTrail.pop();
+        if (!prev) return;
+        const target = State.tablesByName.get(prev.table);
+        if (!target) return;
+        State.currentTable = target;
+        State.data.filters = prev.filters.map((f) => ({ ...f }));
+        State.data.search = prev.search || '';
+        $('#dataSearch').value = State.data.search;
+        State.data.orderBy = prev.orderBy;
+        State.data.dir = prev.dir;
+        State.data.offset = prev.offset || 0;
+        State.data.linkLabel = prev.linkLabel || null;
+        State.data.selected.clear();
+        Storage.set('currentTable', target.name);
+        Sidebar.render();
+        FilterBar.render();
+        DataPane.loadAndRender();
+      },
+
+      clearFilter() {
+        State.data.filters = [];
+        State.data.linkLabel = null;
+        State.data.offset = 0;
+        FilterBar.render();
+        DataPane.loadAndRender();
+      },
+
+      // The bar above the filter bar: where we came from, what is pinned, and
+      // the reverse jumps available from a pinned row.
+      render() {
+        const bar = $('#dataLinkBar');
+        if (!bar) return;
+        bar.innerHTML = '';
+        const t = State.currentTable;
+        const pinned = t ? Nav.pinnedFilter() : null;
+        const trail = State.data.linkTrail;
+        const children = pinned ? Nav.childLinks().filter((l) => l.column === pinned.column) : [];
+        if (!t || (!trail.length && !State.data.linkLabel && !children.length)) {
+          bar.hidden = true;
+          return;
+        }
+        bar.hidden = false;
+
+        if (trail.length) {
+          const prev = trail[trail.length - 1];
+          bar.appendChild(
+            el('button', {
+              class: 'btn btn-sm',
+              text: '← Back to ' + prev.table,
+              onclick: () => Nav.back(),
+            })
+          );
+        }
+        if (State.data.linkLabel) {
+          bar.appendChild(el('span', { class: 'link-bar-sep', text: 'via' }));
+          bar.appendChild(el('span', { class: 'link-bar-target', text: State.data.linkLabel }));
+        }
+        if (pinned) {
+          bar.appendChild(el('span', { class: 'link-bar-sep', text: '·' }));
+          bar.appendChild(
+            el('span', { text: t.name + '.' + pinned.column + ' = ' + String(pinned.value) })
+          );
+          bar.appendChild(
+            el('button', {
+              class: 'btn btn-ghost btn-sm',
+              text: 'Clear filter',
+              onclick: () => Nav.clearFilter(),
+            })
+          );
+        }
+        if (children.length && pinned) {
+          bar.appendChild(el('span', { class: 'link-bar-sep', text: 'referenced by' }));
+          for (const link of children) {
+            bar.appendChild(
+              el('button', {
+                class: 'btn btn-sm',
+                text: link.targetTable + '.' + link.targetColumn + ' →',
+                onclick: () => Nav.followChild(link, pinned.value),
+              })
+            );
+          }
+        }
+      },
+    };
+
+    // =====================================================================
     // Data pane
     // =====================================================================
     const DataPane = {
@@ -2807,6 +3040,7 @@
           $('#dataTitle').textContent = '—';
           $('#dataTotal').textContent = '';
           $('#dataScroll').innerHTML = '<div class="empty">Select a table to browse data.</div>';
+          $('#dataLinkBar').hidden = true;
           $('#dataRange').textContent = '—';
           $('#pageIndicator').textContent = '—';
           return;
@@ -2814,6 +3048,7 @@
         $('#dataTitle').textContent = t.name;
         $('#dataTotal').textContent = State.data.loading ? 'loading…' : formatNumber(State.data.total) + ' rows';
         DataPane.renderSelectionBar();
+        Nav.render();
 
         const host = $('#dataScroll');
 
@@ -2879,6 +3114,20 @@
         host.appendChild(Table.render(cols, State.data.rows, {
           sortable: true,
           sortableFor: (col) => !piiRedacted.has(col),
+          // Foreign-key cells become links to the referenced row; a null
+          // reference (or a column with no relation) renders exactly as before.
+          cellLink: (col, val) => {
+            const link = Nav.fkFor(col);
+            if (!link || val === null || val === undefined) return null;
+            return {
+              title: 'Open ' + link.targetTable + ' where ' + link.targetColumn + ' = ' + String(val),
+              onClick: () => Nav.follow(link, val),
+            };
+          },
+          headerNote: (col) => {
+            const link = Nav.fkFor(col);
+            return link ? '→ ' + link.targetTable + '.' + link.targetColumn : null;
+          },
           orderBy: State.data.orderBy,
           dir: State.data.dir,
           actions: State.writable ? (row) => DataPane.rowActions(row) : null,
@@ -3563,6 +3812,8 @@
           }
           const th = el('th', attrs);
           th.appendChild(document.createTextNode(c));
+          const note = opts.headerNote ? opts.headerNote(c) : null;
+          if (note) th.appendChild(el('span', { class: 'th-note', text: note }));
           if (canSort && opts.orderBy === c) {
             th.appendChild(el('span', { class: 'sort-ind', text: opts.dir === 'asc' ? '▲' : '▼' }));
             th.setAttribute('aria-sort', opts.dir === 'asc' ? 'ascending' : 'descending');
@@ -3589,7 +3840,8 @@
           }
           for (const c of cols) {
             const val = row[c];
-            tr.appendChild(Table.renderCell(val));
+            const link = opts.cellLink ? opts.cellLink(c, val, row) : null;
+            tr.appendChild(link ? Table.renderLinkCell(val, link) : Table.renderCell(val));
           }
           if (opts.actions) {
             const td = el('td');
@@ -3600,6 +3852,30 @@
         }
         table.appendChild(tbody);
         return table;
+      },
+
+      // A foreign-key cell: the value stays exactly as rendered elsewhere (raw
+      // text, copyable via double-click) but is wrapped in a button that opens
+      // the referenced row.
+      renderLinkCell(val, link) {
+        const s = String(val);
+        const td = el('td', { class: 'cell-fk' });
+        td.dataset.raw = s;
+        td.appendChild(
+          el(
+            'button',
+            {
+              class: 'fk-link',
+              title: link.title,
+              onclick: (e) => {
+                e.stopPropagation();
+                link.onClick();
+              },
+            },
+            [s, el('span', { class: 'fk-arrow', text: '↗' })]
+          )
+        );
+        return td;
       },
 
       renderCell(val) {
