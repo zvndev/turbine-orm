@@ -1,5 +1,5 @@
 /**
- * turbine-orm CLI — Observe
+ * turbine-orm CLI: Observe
  *
  * A local, read-only dashboard for viewing query metrics stored in
  * _turbine_metrics. Same security model as Studio: loopback binding,
@@ -10,6 +10,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import pg from 'pg';
 import { OBSERVE_HTML } from './observe-ui.js';
+import { callerKey, checkRateLimit } from './rate-limit.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,9 +48,10 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
   }
 
   const authToken = randomBytes(24).toString('hex');
+  const rateLimiter = new Map<string, { count: number; resetAt: number }>();
 
   const server = createServer((req, res) => {
-    handleRequest(req, res, pool, options, authToken).catch((err) => {
+    handleRequest(req, res, pool, options, authToken, rateLimiter).catch((err) => {
       sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
     });
   });
@@ -83,12 +85,13 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
 // Request routing
 // ---------------------------------------------------------------------------
 
-async function handleRequest(
+export async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   pool: pg.Pool,
   options: ObserveOptions,
   authToken: string,
+  rateLimiter: Map<string, { count: number; resetAt: number }>,
 ): Promise<void> {
   const hostPart = options.host.includes(':') && !options.host.startsWith('[') ? `[${options.host}]` : options.host;
   const expectedOrigin = `http://${hostPart}:${options.port}`;
@@ -116,11 +119,23 @@ async function handleRequest(
       res.end();
       return;
     }
-    sendHtml(res, 200, OBSERVE_HTML);
+    sendHtml(res, 200, OBSERVE_HTML, cspNonce());
     return;
   }
 
-  if (!isAuthorized(req, authToken)) {
+  // Rate limiting: the same fixed window as Studio (shared implementation), applied
+  // before the auth gate so unauthenticated probing is throttled too, and keyed
+  // per caller so the two never share a bucket.
+  const authorized = isAuthorized(req, authToken);
+  const rateLimitResult = checkRateLimit(rateLimiter, `${authorized ? 'session' : 'anon'}:${callerKey(req)}`);
+  if (!rateLimitResult.allowed) {
+    const retryAfter = Math.ceil((rateLimitResult.resetAt - Date.now()) / 1000);
+    res.setHeader('Retry-After', String(retryAfter));
+    sendJson(res, 429, { error: 'Rate limit exceeded', retryAfter });
+    return;
+  }
+
+  if (!authorized) {
     sendJson(res, 401, { error: 'unauthorized' });
     return;
   }
@@ -146,7 +161,10 @@ function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
     return true;
   }
   const cookieHeader = req.headers.cookie ?? '';
-  const match = /turbine_observe_token=([a-f0-9]+)/.exec(cookieHeader);
+  // Anchored on a cookie boundary: unanchored, a decoy cookie whose name merely
+  // ENDS with this one (`x_turbine_observe_token=...`) matched first and the real
+  // token was never compared, denying the legitimate session.
+  const match = /(?:^|;\s*)turbine_observe_token=([a-f0-9]+)/.exec(cookieHeader);
   if (match?.[1] && constantTimeEqual(match[1], expectedToken)) {
     return true;
   }
@@ -252,22 +270,44 @@ const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'no-referrer',
-  'Content-Security-Policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
 };
+
+/**
+ * A fresh CSP nonce for one HTML response, matching Studio's posture: the value
+ * is stamped into both the header and the inline `<script nonce="...">` tag so
+ * script-src drops `unsafe-inline`.
+ */
+function cspNonce(): string {
+  return randomBytes(16).toString('base64');
+}
+
+/** Non-document responses render no markup, so no inline script is allowed at all. */
+const JSON_CSP = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'";
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': 'application/json' });
+  res.writeHead(status, {
+    ...SECURITY_HEADERS,
+    'Content-Security-Policy': JSON_CSP,
+    'Content-Type': 'application/json',
+  });
   res.end(payload);
 }
 
-function sendHtml(res: ServerResponse, status: number, html: string): void {
-  res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(html);
+function sendHtml(res: ServerResponse, status: number, html: string, nonce: string): void {
+  const body = html.replaceAll('__CSP_NONCE__', nonce);
+  res.writeHead(status, {
+    ...SECURITY_HEADERS,
+    // style-src keeps 'unsafe-inline' (the dashboard styles inline, and nonces
+    // do not cover style attributes); script-src moves to the per-request nonce.
+    'Content-Security-Policy': `default-src 'none'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'`,
+    'Content-Type': 'text/html; charset=utf-8',
+  });
+  res.end(body);
 }
 
 function sendText(res: ServerResponse, status: number, text: string): void {
-  res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' });
+  res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Security-Policy': JSON_CSP, 'Content-Type': 'text/plain' });
   res.end(text);
 }
 

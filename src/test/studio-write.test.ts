@@ -160,7 +160,7 @@ function buildSchema(): SchemaMetadata {
       { name: 'secret', field: 'secret', pgType: 'text' },
     ],
     {
-      // The forward (belongsTo) side of users.posts — the click-through target.
+      // The forward (belongsTo) side of users.posts: the click-through target.
       author: {
         type: 'belongsTo',
         name: 'author',
@@ -502,7 +502,7 @@ describe('Studio write: single-row round-trips', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Bulk writes: `rows` array on insert/delete — one txn, all-or-nothing,
+// Bulk writes: `rows` array on insert/delete: one txn, all-or-nothing,
 // every row still PK-addressed / column-validated.
 // ---------------------------------------------------------------------------
 
@@ -1219,5 +1219,328 @@ describe('Studio navigation: following a link', () => {
     const writeRes = makeRes();
     await handleRequest(write, writeRes.res, ctx);
     assert.equal((await writeRes.done).status, 404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PII guard: relation-filter wrappers
+//
+// The guard walked `{ rel: <clause> }` against the relation's TARGET table, but
+// a relation predicate normally arrives wrapped (`{ rel: { some: <clause> } }`).
+// Walking the wrapper treated `some` as a column name, so the inner clause was
+// never visited and `where: { author: { is: { email: { startsWith: 'a' } } } }`
+// was answered: a binary oracle that reads a redacted value one character at a
+// time.
+// ---------------------------------------------------------------------------
+
+describe('Studio builder: PII guard covers relation-filter wrappers', () => {
+  async function build(ctx: StudioContext, table: string, args: unknown): Promise<RecordedResponse> {
+    const req = makeReq({ method: 'POST', url: '/api/builder', headers: authHeaders(), body: { table, args } });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    return done;
+  }
+
+  for (const wrapper of ['some', 'none', 'every', 'is', 'isNot']) {
+    it(`refuses a PII predicate wrapped in \`${wrapper}\``, async () => {
+      const { pool } = makePool([{ rows: [] }]);
+      const ctx = makeCtx(pool, {});
+      const r = await build(ctx, 'posts', { where: { author: { [wrapper]: { email: { startsWith: 'a' } } } } });
+      assert.equal(r.status, 400, r.body);
+      assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted/);
+    });
+
+    it(`refuses a \`${wrapper}\`-wrapped PII predicate one level down inside a with clause`, async () => {
+      const { pool } = makePool([{ rows: [] }]);
+      const ctx = makeCtx(pool, {});
+      const r = await build(ctx, 'users', {
+        with: { posts: { where: { author: { [wrapper]: { email: { equals: 'a@b.c' } } } } } },
+      });
+      assert.equal(r.status, 400, r.body);
+      assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted/);
+    });
+  }
+
+  it('refuses a wrapper nested under a boolean combinator', async () => {
+    const { pool } = makePool([{ rows: [] }]);
+    const ctx = makeCtx(pool, {});
+    const r = await build(ctx, 'posts', {
+      where: { OR: [{ id: 1 }, { author: { is: { email: { contains: '@' } } } }] },
+    });
+    assert.equal(r.status, 400, r.body);
+    assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted/);
+  });
+
+  it('still refuses the bare (unwrapped) relation form', async () => {
+    const { pool } = makePool([{ rows: [] }]);
+    const ctx = makeCtx(pool, {});
+    const r = await build(ctx, 'posts', { where: { author: { email: { startsWith: 'a' } } } });
+    assert.equal(r.status, 400, r.body);
+    assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted/);
+  });
+
+  it('leaves a non-PII wrapped relation filter alone', async () => {
+    const { pool } = makePool([{}, {}, {}, { rows: [{ id: 1 }] }, {}]);
+    const ctx = makeCtx(pool, {});
+    const r = await build(ctx, 'users', { where: { posts: { some: { id: 1 } } }, limit: 1 });
+    assert.equal(r.status, 200, r.body);
+  });
+
+  it('allows the wrapped PII predicate once --show-pii is on', async () => {
+    const { pool } = makePool([{}, {}, {}, { rows: [{ id: 1 }] }, {}]);
+    const ctx = makeCtx(pool, { showPii: true });
+    const r = await build(ctx, 'posts', { where: { author: { is: { email: { startsWith: 'a' } } } }, limit: 1 });
+    assert.equal(r.status, 200, r.body);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The rest of the predicate surface: cursor, distinct, array orderBy
+// ---------------------------------------------------------------------------
+
+/** A builder request that reaches the pool needs BEGIN + timeout + search_path + data + COMMIT. */
+function okPool(): pg.Pool {
+  return makePool([{}, {}, {}, { rows: [{ id: 1 }] }, {}]).pool;
+}
+
+describe('Studio builder: PII guard covers cursor, distinct, and array orderBy', () => {
+  async function build(ctx: StudioContext, table: string, args: unknown): Promise<RecordedResponse> {
+    const req = makeReq({ method: 'POST', url: '/api/builder', headers: authHeaders(), body: { table, args } });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    return done;
+  }
+
+  // `cursor` compiles to a WHERE range comparison against the sort key
+  // (`"email" > $1`). Paired with a NON-PII orderBy it used to sail past a guard
+  // that only looked at `where` and `orderBy`, and the fully redacted response
+  // body is exactly what made it look safe: the row COUNT is the oracle, and a
+  // byte-range binary search reads the hidden value out a character at a time.
+  it('refuses a cursor on a PII column paired with a non-PII sort key', async () => {
+    const ctx = makeCtx(okPool(), {});
+    const r = await build(ctx, 'users', {
+      orderBy: { id: 'asc' },
+      cursor: { email: 'ada@example.com' },
+      take: 100,
+    });
+    assert.equal(r.status, 400, r.body);
+    assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted/);
+  });
+
+  for (const [table, column] of [
+    ['users', 'email'],
+    ['posts', 'secret'],
+  ] as const) {
+    it(`refuses a cursor on ${table}.${column}`, async () => {
+      const ctx = makeCtx(okPool(), {});
+      const r = await build(ctx, table, { orderBy: { id: 'asc' }, cursor: { [column]: 'x' }, take: 5 });
+      assert.equal(r.status, 400, r.body);
+      assert.match(String((r.json as { error: string }).error), new RegExp(`"${column}"`));
+    });
+  }
+
+  it('refuses distinct on a PII column (a cardinality leak at minimum)', async () => {
+    const ctx = makeCtx(okPool(), {});
+    const r = await build(ctx, 'users', { distinct: ['email'], limit: 5 });
+    assert.equal(r.status, 400, r.body);
+    assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted/);
+  });
+
+  // `OrderByClause` is `OrderByObject | OrderByObject[]`. The array form walked
+  // as `{ '0': {...} }`, whose key is an index rather than a column name, so the
+  // PII column inside was never inspected.
+  it('refuses the ARRAY form of orderBy on a PII column', async () => {
+    const ctx = makeCtx(okPool(), {});
+    const r = await build(ctx, 'users', { orderBy: [{ id: 'asc' }, { email: 'asc' }], limit: 5 });
+    assert.equal(r.status, 400, r.body);
+    assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted/);
+  });
+
+  it('refuses a cursor on a PII column one level down in a with clause', async () => {
+    const ctx = makeCtx(okPool(), {});
+    const r = await build(ctx, 'users', { with: { posts: { cursor: { secret: 'x' } } } });
+    assert.equal(r.status, 400, r.body);
+    assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted/);
+  });
+
+  // Positive controls: the guard must not have turned into a blanket refusal.
+  it('allows a cursor on a NON-PII column', async () => {
+    const ctx = makeCtx(okPool(), {});
+    const r = await build(ctx, 'users', { orderBy: { id: 'asc' }, cursor: { id: 3 }, take: 5 });
+    assert.equal(r.status, 200, r.body);
+  });
+
+  it('allows the array form of orderBy over non-PII columns', async () => {
+    const ctx = makeCtx(okPool(), {});
+    const r = await build(ctx, 'users', { orderBy: [{ id: 'asc' }, { name: 'desc' }], limit: 5 });
+    assert.equal(r.status, 200, r.body);
+  });
+
+  for (const [label, args] of [
+    ['cursor', { orderBy: { id: 'asc' }, cursor: { email: 'ada@example.com' }, take: 5 }],
+    ['distinct', { distinct: ['email'], limit: 5 }],
+    ['array orderBy', { orderBy: [{ email: 'asc' }], limit: 5 }],
+  ] as const) {
+    it(`allows the same ${label} once --show-pii is on`, async () => {
+      const ctx = makeCtx(okPool(), { showPii: true });
+      const r = await build(ctx, 'users', args);
+      assert.equal(r.status, 200, r.body);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The depth cap fails CLOSED
+// ---------------------------------------------------------------------------
+
+/** `NOT` wrapped `times` deep around `leaf`. */
+function nest(times: number, leaf: Record<string, unknown>): Record<string, unknown> {
+  let node: Record<string, unknown> = leaf;
+  for (let i = 0; i < times; i++) node = { NOT: node };
+  return node;
+}
+
+describe('Studio builder: the PII guard depth cap fails closed', () => {
+  async function build(ctx: StudioContext, table: string, args: unknown): Promise<RecordedResponse> {
+    const req = makeReq({ method: 'POST', url: '/api/builder', headers: authHeaders(), body: { table, args } });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    return done;
+  }
+
+  // The guard used to `return` at depth > 10 while the query builder applied no
+  // matching cap to boolean combinators, so padding the payload walked the guard
+  // off the end of its own recursion and handed the predicate through intact.
+  for (const depth of [11, 12, 40, 200]) {
+    it(`refuses a PII predicate padded with ${depth} NOT wrappers`, async () => {
+      const ctx = makeCtx(okPool(), {});
+      const r = await build(ctx, 'users', { where: nest(depth, { email: { startsWith: 'a' } }), limit: 5 });
+      assert.equal(r.status, 400, r.body);
+      assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted|nested more than/);
+    });
+  }
+
+  it('refuses a PII predicate reached through many relation hops', async () => {
+    const ctx = makeCtx(okPool(), {});
+    // users -> posts -> author -> ... -> email, four hops out and back.
+    let leaf: Record<string, unknown> = { email: { startsWith: 'ada' } };
+    for (let hop = 0; hop < 4; hop++) {
+      leaf = { posts: { some: { author: { is: leaf } } } };
+    }
+    const r = await build(ctx, 'users', { where: leaf, limit: 5 });
+    assert.equal(r.status, 400, r.body);
+    assert.match(String((r.json as { error: string }).error), /PII-tagged and redacted|nested more than/);
+  });
+
+  it('refuses a query nested past the cap even with no PII column in it', async () => {
+    const ctx = makeCtx(okPool(), {});
+    const r = await build(ctx, 'users', { where: nest(64, { id: 1 }), limit: 5 });
+    assert.equal(r.status, 400, r.body);
+    assert.match(String((r.json as { error: string }).error), /nested more than/);
+  });
+
+  it('still allows a normal two-level query', async () => {
+    const ctx = makeCtx(okPool(), {});
+    const r = await build(ctx, 'users', {
+      where: { OR: [{ id: 1 }, { name: 'Ada' }] },
+      orderBy: { id: 'asc' },
+      with: { posts: { where: { id: 2 }, orderBy: { id: 'desc' }, limit: 2 } },
+      limit: 5,
+    });
+    assert.equal(r.status, 200, r.body);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Prototype-key table lookups, rate limiting, cookie parsing
+// ---------------------------------------------------------------------------
+
+describe('Studio perimeter: prototype keys, throttling, cookie parsing', () => {
+  for (const key of ['constructor', '__proto__', 'toString']) {
+    it(`404s /api/tables/${key} instead of resolving Object.prototype`, async () => {
+      const { pool } = makePool();
+      const ctx = makeCtx(pool, {});
+      const req = makeReq({ method: 'GET', url: `/api/tables/${key}`, headers: authHeaders() });
+      const { res, done } = makeRes();
+      await handleRequest(req, res, ctx);
+      const r = await done;
+      assert.equal(r.status, 404, r.body);
+      assert.match(String((r.json as { error: string }).error), /Unknown table/);
+    });
+  }
+
+  it('400s a builder request naming a prototype key as the table', async () => {
+    const { pool } = makePool();
+    const ctx = makeCtx(pool, {});
+    const req = makeReq({
+      method: 'POST',
+      url: '/api/builder',
+      headers: authHeaders(),
+      body: { table: 'constructor', args: {} },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    const r = await done;
+    assert.equal(r.status, 400, r.body);
+    assert.match(String((r.json as { error: string }).error), /Unknown table/);
+  });
+
+  it('throttles UNAUTHENTICATED requests (the limiter used to run after the auth gate)', async () => {
+    const { pool } = makePool();
+    const ctx = makeCtx(pool, {});
+    let last = 0;
+    for (let i = 0; i < 101; i++) {
+      const req = makeReq({ method: 'GET', url: '/api/schema', headers: { origin: ORIGIN } });
+      const { res, done } = makeRes();
+      await handleRequest(req, res, ctx);
+      last = (await done).status;
+      if (i < 100) assert.equal(last, 401, `request ${i} should still be a plain 401`);
+    }
+    assert.equal(last, 429, 'the 101st unauthenticated request is rate limited');
+  });
+
+  it('keeps the authenticated bucket separate from the unauthenticated one', async () => {
+    const { pool } = makePool(Array.from({ length: 8 }, () => ({ rows: [] })));
+    const ctx = makeCtx(pool, {});
+    for (let i = 0; i < 101; i++) {
+      const req = makeReq({ method: 'GET', url: '/api/schema', headers: { origin: ORIGIN } });
+      const { res, done } = makeRes();
+      await handleRequest(req, res, ctx);
+      await done;
+    }
+    const req = makeReq({ method: 'GET', url: '/api/schema', headers: authHeaders() });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    assert.equal((await done).status, 200, 'a probing client cannot spend the real session budget');
+  });
+
+  // The cookie value is matched as hex (that is what the server issues), so
+  // these two use a hex token rather than the header-only TOKEN constant.
+  const HEX_TOKEN = 'a1b2c3d4e5f6';
+
+  it('authenticates through a cookie shadowed by a decoy with the same suffix', async () => {
+    const { pool } = makePool([{ rows: [] }]);
+    const ctx = { ...makeCtx(pool, {}), authToken: HEX_TOKEN };
+    const req = makeReq({
+      method: 'GET',
+      url: '/api/schema',
+      headers: { origin: ORIGIN, cookie: `x_turbine_studio_token=deadbeef; turbine_studio_token=${HEX_TOKEN}` },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    assert.equal((await done).status, 200, 'the real cookie is found past the decoy');
+  });
+
+  it('still rejects a decoy cookie on its own', async () => {
+    const { pool } = makePool();
+    const ctx = { ...makeCtx(pool, {}), authToken: HEX_TOKEN };
+    const req = makeReq({
+      method: 'GET',
+      url: '/api/schema',
+      headers: { origin: ORIGIN, cookie: 'x_turbine_studio_token=deadbeef' },
+    });
+    const { res, done } = makeRes();
+    await handleRequest(req, res, ctx);
+    assert.equal((await done).status, 401);
   });
 });

@@ -20,6 +20,7 @@ import {
   singularize,
   snakeToPascal,
   type TableMetadata,
+  timeOfDayKind,
   withDbFieldNames,
 } from './schema.js';
 
@@ -44,6 +45,30 @@ function columnTsType(col: ColumnMetadata, enums: Record<string, string[]>): str
     return col.nullable ? `${t} | null` : t;
   }
   return col.tsType;
+}
+
+/**
+ * Resolve the TypeScript type a column accepts on the WRITE path (the `*Create`
+ * / `*Update` input types), which is wider than the row type for time-of-day
+ * columns.
+ *
+ * A `time` / `timetz` column reads back as a `string` (`'09:00:00'`), so the
+ * row type stays `string`. On write the runtime also accepts a JS `Date` and
+ * narrows it to its UTC time of day (see `coerceWriteValue` in
+ * query/writes.ts), matching Prisma, which types a `DateTime @db.Time(6)`
+ * field as a `Date`. Consumers porting from Prisma pass Dates, so the input
+ * type has to admit them. Every other column is unchanged.
+ */
+function writeColumnTsType(col: ColumnMetadata, enums: Record<string, string[]>): string {
+  const tsType = columnTsType(col, enums);
+  const dt = col.dialectType ?? col.pgType;
+  const isArray = col.isArray || dt.startsWith('_');
+  const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
+  if (!timeOfDayKind(base)) return tsType;
+  // A `time[]` column accepts a Date per element (the bind rewrite runs
+  // element-wise, see coerceTemporalValue in query/utils.ts).
+  const widened = isArray ? '(string | Date)[]' : 'string | Date';
+  return col.nullable ? `${widened} | null` : widened;
 }
 
 /** Escape a value for embedding in a single-quoted TypeScript string literal */
@@ -428,9 +453,9 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       if (isOptional) {
         const reason = isPk ? 'auto-generated' : col.hasDefault ? 'has default' : 'nullable';
         lines.push(`  /** Optional: ${reason} */`);
-        lines.push(`  ${quoteIfNeeded(col.field)}?: ${columnTsType(col, schema.enums)};`);
+        lines.push(`  ${quoteIfNeeded(col.field)}?: ${writeColumnTsType(col, schema.enums)};`);
       } else {
-        lines.push(`  ${quoteIfNeeded(col.field)}: ${columnTsType(col, schema.enums)};`);
+        lines.push(`  ${quoteIfNeeded(col.field)}: ${writeColumnTsType(col, schema.enums)};`);
       }
     }
     lines.push('};');
@@ -443,7 +468,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
     lines.push(`/** Input type for updating a row in \`${table.name}\` */`);
     lines.push(`export type ${typeName}Update = {`);
     for (const col of nonPkCols) {
-      lines.push(`  ${quoteIfNeeded(col.field)}?: ${updateFieldType(columnTsType(col, schema.enums))};`);
+      lines.push(`  ${quoteIfNeeded(col.field)}?: ${updateFieldType(writeColumnTsType(col, schema.enums))};`);
     }
     lines.push('};');
     lines.push('');
@@ -678,8 +703,14 @@ function zodScalar(ts: string): string {
  * Base Zod expression for a column, resolving enums → `z.enum([...])`, arrays →
  * `.array()`, and vectors → `z.array(z.number())`. Does NOT append
  * `.nullable()` / `.optional()` — callers layer those on per-schema.
+ *
+ * `forWrite` mirrors {@link writeColumnTsType}: the Create/Update schemas
+ * validate WRITE input, where a `time` / `timetz` column also accepts a JS
+ * `Date` (narrowed to its UTC time of day at bind time), so a bare
+ * `z.string()` there would reject a value the runtime happily writes. The
+ * full-row schema keeps `z.string()`, because that is what a read returns.
  */
-function zodBaseType(col: ColumnMetadata, enums: Record<string, string[]>): string {
+function zodBaseType(col: ColumnMetadata, enums: Record<string, string[]>, forWrite = false): string {
   const dt = col.dialectType ?? col.pgType;
   const isArray = col.isArray || dt.startsWith('_');
   const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
@@ -687,6 +718,8 @@ function zodBaseType(col: ColumnMetadata, enums: Record<string, string[]>): stri
   let expr: string;
   if (Object.hasOwn(enums, base)) {
     expr = `z.enum([${enums[base]!.map((l) => `'${escSQ(l)}'`).join(', ')}])`;
+  } else if (forWrite && timeOfDayKind(base)) {
+    expr = 'z.union([z.string(), z.date()])';
   } else {
     expr = zodScalar(pgTypeToTs(base, false));
   }
@@ -729,7 +762,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     for (const col of table.columns) {
       if (col.isGeneratedStored) continue;
       const isPk = table.primaryKey.includes(col.name);
-      let expr = zodBaseType(col, schema.enums);
+      let expr = zodBaseType(col, schema.enums, true);
       if (col.nullable) expr += '.nullable()';
       if (col.hasDefault || col.nullable || isPk) expr += '.optional()';
       lines.push(`  ${quoteIfNeeded(col.field)}: ${expr},`);
@@ -743,7 +776,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     for (const col of table.columns) {
       if (col.isGeneratedStored) continue;
       if (table.primaryKey.includes(col.name)) continue;
-      let expr = zodBaseType(col, schema.enums);
+      let expr = zodBaseType(col, schema.enums, true);
       if (col.nullable) expr += '.nullable()';
       expr += '.optional()';
       lines.push(`  ${quoteIfNeeded(col.field)}: ${expr},`);

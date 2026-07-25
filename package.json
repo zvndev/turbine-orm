@@ -1,53 +1,99 @@
 {
   "name": "turbine-orm",
-  "version": "0.49.0",
+  "version": "0.50.0",
   "description": "Postgres-native TypeScript ORM — runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
+  "//exports": "Each subpath declares its types PER CONDITION. A single shared top-level \"types\" resolves to the ESM declarations for `require` too, which is TS1479 (\"is an ES module ... cannot be require()d\") for any CJS consumer on moduleResolution node16/nodenext. The require condition points at dist/cjs, which ships its own {\"type\":\"commonjs\"} package.json, so those declarations are CJS declarations. Gated in CI by publint + @arethetypeswrong/cli + a real .cts consumer typecheck (see the package-types job in ci.yml).",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/cjs/index.js"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
     },
     "./serverless": {
-      "types": "./dist/serverless.d.ts",
-      "import": "./dist/serverless.js",
-      "require": "./dist/cjs/serverless.js"
+      "import": {
+        "types": "./dist/serverless.d.ts",
+        "default": "./dist/serverless.js"
+      },
+      "require": {
+        "types": "./dist/cjs/serverless.d.ts",
+        "default": "./dist/cjs/serverless.js"
+      }
     },
     "./prisma-compat": {
-      "types": "./dist/prisma-compat.d.ts",
-      "import": "./dist/prisma-compat.js",
-      "require": "./dist/cjs/prisma-compat.js"
+      "import": {
+        "types": "./dist/prisma-compat.d.ts",
+        "default": "./dist/prisma-compat.js"
+      },
+      "require": {
+        "types": "./dist/cjs/prisma-compat.d.ts",
+        "default": "./dist/cjs/prisma-compat.js"
+      }
     },
     "./sqlite": {
-      "types": "./dist/sqlite.d.ts",
-      "import": "./dist/sqlite.js",
-      "require": "./dist/cjs/sqlite.js"
+      "import": {
+        "types": "./dist/sqlite.d.ts",
+        "default": "./dist/sqlite.js"
+      },
+      "require": {
+        "types": "./dist/cjs/sqlite.d.ts",
+        "default": "./dist/cjs/sqlite.js"
+      }
     },
     "./mysql": {
-      "types": "./dist/mysql.d.ts",
-      "import": "./dist/mysql.js",
-      "require": "./dist/cjs/mysql.js"
+      "import": {
+        "types": "./dist/mysql.d.ts",
+        "default": "./dist/mysql.js"
+      },
+      "require": {
+        "types": "./dist/cjs/mysql.d.ts",
+        "default": "./dist/cjs/mysql.js"
+      }
     },
     "./mssql": {
-      "types": "./dist/mssql.d.ts",
-      "import": "./dist/mssql.js",
-      "require": "./dist/cjs/mssql.js"
+      "import": {
+        "types": "./dist/mssql.d.ts",
+        "default": "./dist/mssql.js"
+      },
+      "require": {
+        "types": "./dist/cjs/mssql.d.ts",
+        "default": "./dist/cjs/mssql.js"
+      }
     },
     "./powdb": {
-      "types": "./dist/powdb.d.ts",
-      "import": "./dist/powdb.js",
-      "require": "./dist/cjs/powdb.js"
+      "import": {
+        "types": "./dist/powdb.d.ts",
+        "default": "./dist/powdb.js"
+      },
+      "require": {
+        "types": "./dist/cjs/powdb.d.ts",
+        "default": "./dist/cjs/powdb.js"
+      }
     },
     "./cli": {
-      "types": "./dist/cli/config.d.ts",
-      "import": "./dist/cli/config.js",
-      "require": "./dist/cjs/cli/config.js"
+      "import": {
+        "types": "./dist/cli/config.d.ts",
+        "default": "./dist/cli/config.js"
+      },
+      "require": {
+        "types": "./dist/cjs/cli/config.d.ts",
+        "default": "./dist/cjs/cli/config.js"
+      }
     },
     "./adapters": {
-      "types": "./dist/adapters/index.d.ts",
-      "import": "./dist/adapters/index.js",
-      "require": "./dist/cjs/adapters/index.js"
+      "import": {
+        "types": "./dist/adapters/index.d.ts",
+        "default": "./dist/adapters/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/adapters/index.d.ts",
+        "default": "./dist/cjs/adapters/index.js"
+      }
     }
   },
   "main": "./dist/cjs/index.js",
@@ -80,6 +126,7 @@
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
     "check:error-codes": "tsx scripts/check-error-codes.ts",
+    "check:package": "publint --strict && attw --pack . --profile node16",
     "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run check:error-codes && npm run size",
     "prepare": "husky",
     "prepack": "node scripts/strip-prepare.mjs",
@@ -106,6 +153,7 @@
     "pg": "^8.13.1"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.2",
     "@biomejs/biome": "^2.4.10",
     "@size-limit/esbuild": "^12.1.0",
     "@size-limit/file": "^12.1.0",
@@ -117,6 +165,7 @@
     "lint-staged": "^17.0.8",
     "mssql": "^12.7.0",
     "mysql2": "^3.22.5",
+    "publint": "^0.3.16",
     "size-limit": "^12.1.0",
     "tsx": "^4.19.0",
     "typescript": "^6.0.3"

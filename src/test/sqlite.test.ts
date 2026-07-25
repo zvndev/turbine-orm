@@ -499,3 +499,42 @@ describe('turbine-orm/sqlite — constraint errors map to typed Turbine errors',
     );
   });
 });
+
+describe("turbine-orm/sqlite — relationLoadStrategy: 'flatten'", () => {
+  /** All three strategies must return byte-identical rows on SQLite too. */
+  async function threeWay(args: Record<string, unknown>): Promise<string> {
+    const join = await client.table('users').findMany({ ...args, relationLoadStrategy: 'join' } as never);
+    const batched = await client.table('users').findMany({ ...args, relationLoadStrategy: 'batched' } as never);
+    const flatten = await client.table('users').findMany({ ...args, relationLoadStrategy: 'flatten' } as never);
+    assert.deepEqual(flatten, join, 'flatten must equal join');
+    assert.deepEqual(batched, join, 'batched must equal join');
+    return JSON.stringify(flatten);
+  }
+
+  it('compiles a belongsTo to a LEFT JOIN over a derived table', () => {
+    const sql = client.table('users').buildFindMany({
+      orderBy: { id: 'asc' },
+      with: { organization: true },
+      relationLoadStrategy: 'flatten',
+    } as never).sql;
+    assert.match(sql, /LEFT JOIN \(SELECT 1 AS "f0__\$k"/);
+    assert.match(sql, /FROM "organizations" f0s\) f0 ON f0\."f0__\$c0" = "users"\."org_id"/);
+  });
+
+  it('matches the join and batched strategies row for row', async () => {
+    await threeWay({ orderBy: { id: 'asc' }, with: { organization: true } });
+    await threeWay({ orderBy: { id: 'asc' }, with: { organization: { select: { name: true } } } });
+    await threeWay({ orderBy: { id: 'asc' }, limit: 3, offset: 1, with: { organization: true } });
+    // Parent WHERE names a column the joined table also has ("name"): the
+    // derived table exposes only prefixed names, so it cannot turn ambiguous.
+    await threeWay({ where: { name: 'Alice Admin' }, with: { organization: true } });
+  });
+
+  it('a to-many stays on the subquery path', async () => {
+    const sql = client
+      .table('users')
+      .buildFindMany({ orderBy: { id: 'asc' }, with: { posts: true }, relationLoadStrategy: 'flatten' } as never).sql;
+    assert.doesNotMatch(sql, /\) f0 ON /);
+    await threeWay({ orderBy: { id: 'asc' }, with: { posts: { orderBy: { id: 'asc' } } } });
+  });
+});

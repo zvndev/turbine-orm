@@ -101,10 +101,32 @@ export interface PrismaEnum {
   line: number;
 }
 
+/**
+ * A connection-string value inside a `datasource` block: either a literal
+ * string (`url = "postgres://..."`) or an `env("NAME")` indirection.
+ */
+export type PrismaConnectionValue = { kind: 'literal'; value: string } | { kind: 'env'; variable: string };
+
+/** A parsed `datasource` block. Only the connection keys are retained. */
+export interface PrismaDatasource {
+  /** Block name (`datasource db { ... }` -> `db`). */
+  name: string;
+  /** `provider = "postgresql"`, when declared as a literal. */
+  provider?: string;
+  /** `url = ...`, when declared as a literal or an `env(...)` call. */
+  url?: PrismaConnectionValue;
+  /** `directUrl = ...` (Prisma's non-pooled connection), same forms as `url`. */
+  directUrl?: PrismaConnectionValue;
+  /** 1-based source line of the block header. */
+  line: number;
+}
+
 /** The full parse result. */
 export interface PrismaSchemaAst {
   models: PrismaModel[];
   enums: PrismaEnum[];
+  /** Parsed `datasource` blocks, in source order. */
+  datasources: PrismaDatasource[];
   /** Non-fatal notes: skipped/unknown blocks and attributes. */
   warnings: string[];
 }
@@ -539,6 +561,107 @@ function parseEnumBody(block: RawBlock, src: string): PrismaEnum {
   return en;
 }
 
+/**
+ * Parse a `datasource` block value: a quoted literal, or an `env("NAME")` call.
+ * Returns null for any other form (e.g. an interpolated expression), which the
+ * caller records as "declared but not usable" rather than guessing.
+ */
+function parseConnectionValue(raw: string): PrismaConnectionValue | null {
+  if (/^"(?:[^"\\]|\\.)*"$/.test(raw)) return { kind: 'literal', value: unquote(raw) };
+
+  const envCall = raw.match(/^env\(\s*("(?:[^"\\]|\\.)*")\s*\)$/);
+  if (envCall) {
+    const variable = unquote(envCall[1]!);
+    return variable ? { kind: 'env', variable } : null;
+  }
+
+  return null;
+}
+
+/**
+ * Parse a `datasource` block. Only `provider`, `url`, and `directUrl` are kept;
+ * every other key (`shadowDatabaseUrl`, `relationMode`, `extensions`, ...) is
+ * irrelevant to name mapping and skipped silently, as before.
+ */
+function parseDatasourceBody(block: RawBlock, src: string): PrismaDatasource {
+  const ds: PrismaDatasource = { name: block.name, line: block.headerLine };
+
+  for (const { text } of bodyLines(block.body, block.bodyOffset, src)) {
+    const m = text.match(/^([A-Za-z_]\w*)\s*=\s*(.+)$/);
+    if (!m) continue;
+    const key = m[1]!;
+    const raw = m[2]!.trim();
+
+    if (key === 'provider') {
+      const value = parseConnectionValue(raw);
+      if (value?.kind === 'literal') ds.provider = value.value;
+    } else if (key === 'url' || key === 'directUrl') {
+      const value = parseConnectionValue(raw);
+      if (value) ds[key] = value;
+    }
+  }
+
+  return ds;
+}
+
+/** Where a datasource connection string was resolved from. */
+export interface ResolvedPrismaDatasourceUrl {
+  /** The connection string itself. */
+  url: string;
+  /** Datasource block name it came from. */
+  datasource: string;
+  /** Which key supplied it. */
+  key: 'url' | 'directUrl';
+  /** The environment variable read, when the value was an `env(...)` call. */
+  variable?: string;
+}
+
+/** Result of {@link resolvePrismaDatasourceUrl}. */
+export interface PrismaDatasourceUrlLookup {
+  /** The first usable connection string found, if any. */
+  resolved?: ResolvedPrismaDatasourceUrl;
+  /**
+   * Environment variable names the schema declares via `env(...)` that were
+   * unset or empty, in lookup order. Surfaced in the no-URL error so the user
+   * sees exactly which variable the schema asked for.
+   */
+  missingVariables: string[];
+}
+
+/**
+ * Resolve the connection string a `schema.prisma` declares, reading `env(...)`
+ * indirections out of the supplied environment (pure: the environment is an
+ * argument, never `process.env` directly).
+ *
+ * Per datasource block, `url` is preferred and `directUrl` is the fallback:
+ * `url` is what Prisma itself uses for everything but migrations, and a pooled
+ * `url` introspects the same catalog as its direct twin.
+ */
+export function resolvePrismaDatasourceUrl(
+  ast: Pick<PrismaSchemaAst, 'datasources'>,
+  env: Record<string, string | undefined>,
+): PrismaDatasourceUrlLookup {
+  const missingVariables: string[] = [];
+
+  for (const ds of ast.datasources) {
+    for (const key of ['url', 'directUrl'] as const) {
+      const value = ds[key];
+      if (!value) continue;
+      if (value.kind === 'literal') {
+        if (value.value) return { resolved: { url: value.value, datasource: ds.name, key }, missingVariables };
+        continue;
+      }
+      const fromEnv = env[value.variable];
+      if (fromEnv) {
+        return { resolved: { url: fromEnv, datasource: ds.name, key, variable: value.variable }, missingVariables };
+      }
+      if (!missingVariables.includes(value.variable)) missingVariables.push(value.variable);
+    }
+  }
+
+  return { missingVariables };
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -548,15 +671,17 @@ function parseEnumBody(block: RawBlock, src: string): PrismaEnum {
  *
  * Understands: model / view / type / enum blocks; field lines with `@map`,
  * `@id`, `@unique`, `@default`, `@updatedAt`, `@ignore`, `@relation`; and block
- * attributes `@@map`, `@@id`, `@@unique`, `@@index`, `@@schema`. Unknown
- * attributes and blocks are skipped into {@link PrismaSchemaAst.warnings}.
+ * attributes `@@map`, `@@id`, `@@unique`, `@@index`, `@@schema`; plus the
+ * `provider` / `url` / `directUrl` keys of each `datasource` block (see
+ * {@link resolvePrismaDatasourceUrl}). Unknown attributes and blocks are
+ * skipped into {@link PrismaSchemaAst.warnings}.
  *
  * @throws {@link PrismaParseError} on an unterminated block/paren/string or a
  *   structurally broken `@@id` / `@@unique` / `@@map`.
  */
 export function parsePrismaSchema(source: string): PrismaSchemaAst {
   const src = stripComments(source);
-  const ast: PrismaSchemaAst = { models: [], enums: [], warnings: [] };
+  const ast: PrismaSchemaAst = { models: [], enums: [], datasources: [], warnings: [] };
 
   for (const block of scanBlocks(src)) {
     switch (block.keyword) {
@@ -576,8 +701,11 @@ export function parsePrismaSchema(source: string): PrismaSchemaAst {
         ast.enums.push(parseEnumBody(block, src));
         break;
       case 'datasource':
+        // Not a table, but it declares the connection string the CLI can reuse.
+        ast.datasources.push(parseDatasourceBody(block, src));
+        break;
       case 'generator':
-        // Configuration blocks - irrelevant to name mapping.
+        // Configuration block - irrelevant to name mapping.
         break;
       default:
         ast.warnings.push(`Skipped unsupported block "${block.keyword} ${block.name}".`);

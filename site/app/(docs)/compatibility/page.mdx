@@ -17,13 +17,15 @@ Turbine's internal `Dialect` seam routes query generation, DML, schema DDL, migr
 
 | Database | Adapter | Status | Notes |
 |---|---|---|---|
-| **PostgreSQL** 13+ | None (default) | Full | Native target |
+| **PostgreSQL** 14+ (tested) | None (default) | Full | Native target. See the note below. |
 | **AlloyDB** | `alloydb` (no-op) | Full | Google's PG storage engine |
 | **TimescaleDB** | `timescale` (no-op) | Full | PG extension — hypertables introspect fine |
 | **Neon** | None | Full | Use `turbine-orm/serverless` for HTTP driver |
 | **Supabase** | None | Full | Standard Postgres, connect directly |
 | **YugabyteDB** | `yugabytedb` | Full | Distributed lock adapter for migrations |
 | **CockroachDB** | `cockroachdb` | Full | Table-based locks, introspection overrides |
+
+> **What "14+ (tested)" means.** CI runs the full integration suite against PostgreSQL **14, 15, 16 and 17** on every change, so 14 is the oldest version anything is actually verified on, and that is the supported floor. It is not a hard technical floor: nothing in Turbine's introspection queries or generated SQL is known to require a feature newer than PostgreSQL 12, so a 12 or 13 server may well work fine. It is simply untested, so nothing is promised. If you run one and hit a problem, that is a bug report worth filing rather than a documented limitation.
 
 ## AlloyDB
 

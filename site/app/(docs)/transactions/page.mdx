@@ -213,19 +213,78 @@ const results = await executePipeline(pool, queries, options);
 - **One query depends on another's result.** Pipeline queries must be independent — they're all submitted before any response is read.
 - **A query might fail.** `PipelineError` (TURBINE_E014) wraps partial-success cases; decide how you want to handle them.
 
-## Combining — pipeline inside a transaction
+## Batching inside a transaction
 
-Rarely useful but possible: run a pipeline through `tx` for batched reads inside a transactional block. The pipeline still uses one round-trip; the transaction still wraps them in `BEGIN` / `COMMIT`.
+There is **no `tx.pipeline()`**. The extended-query pipeline protocol needs to own the connection, and inside a transaction the connection is already owned by the `BEGIN` block, so the two cannot be combined. If you want a set of statements to run atomically as one unit, use the array form of `$transaction` at the top level instead:
 
 ```ts
-await db.$transaction(async (tx) => {
-  const [user, posts] = await tx.pipeline([
-    tx.users.buildFindUnique({ where: { id: 1 } }),
-    tx.posts.buildFindMany({ where: { userId: 1 } }),
-  ]);
-  // ...
-});
+const [user, posts] = await db.$transaction([
+  db.users.buildFindUnique({ where: { id: 1 } }),
+  db.posts.buildFindMany({ where: { userId: 1 } }),
+]);
 ```
+
+That runs every statement on one connection inside one `BEGIN` / `COMMIT`, and rolls the whole batch back on the first failure. It is sequential on the connection by default, which is safe on every driver including HTTP and serverless pools. The one-write-burst path needs **both** conditions to hold: the checked-out connection advertises `supportsPipelining`, **and** the active dialect's `resultStrategy` is not `'reselect'`. When both are true the statements are dispatched in one write burst with replies collected in order, saving a round trip each. MySQL is `'reselect'`, so the burst never happens there and the batch always runs sequentially. Either way this is a transaction, not the pipeline protocol: for that, use `db.pipeline(...)` outside a transaction.
+
+## TransactionClient reference
+
+The `tx` handed to your `$transaction` callback is a `TransactionClient`, and it is deliberately a **smaller** object than `db`. Everything it exposes runs on the single dedicated connection the transaction holds.
+
+### What `tx` has
+
+| Member | Signature | Notes |
+|---|---|---|
+| Table accessors | `tx.users`, `tx.orderItems`, ... | Same `QueryInterface` API as `db.users`. Accessor names are the camelCase form of each table name in the schema, defined at construction. |
+| `tx.table<T>(name)` | `(name: string) => QueryInterface<T>` | Escape hatch for a table not present in the generated types. Same instance is reused for repeated calls. |
+| `tx.$transaction(fn)` | `(fn: (tx: TransactionClient) => Promise<R>) => Promise<R>` | Nested block via `SAVEPOINT sp_1`, `sp_2`, ... Releases the savepoint on success, rolls back **to the savepoint only** on throw, then rethrows. **Takes no options object**: isolation level, timeout and `sessionContext` are properties of the outer transaction and cannot be changed part way through. Note that `fn` receives the *same* `tx`, not a child object. |
+| `tx.raw` | ``tx.raw<T>`SELECT ... ${value}` `` | Tagged template. Every `${value}` becomes a placeholder bound by the driver. Driver errors are translated by `wrapPgError`, so you get the same typed errors as ORM queries. |
+| `tx.schema` | `SchemaMetadata` | The metadata the transaction was built from. |
+
+### What `tx` does not have
+
+Reaching for any of these is a **compile error** (`TS2339: Property '<x>' does not exist on type 'TransactionClient'`). `TransactionClient` is a plain class whose declared members are exactly `table()`, `$transaction()`, `raw` and `schema`, with no index signature, so TypeScript rejects every name below before the code ever runs. The table accessors are installed at construction with `Object.defineProperty` and typed by the generated `TypedTransactionClient` subclass, which declares one property per table. Neither the base class nor the generated subclass has a catch-all index signature, so nothing below type-checks.
+
+| Missing | Use instead | Why |
+|---|---|---|
+| `tx.sql` | `tx.raw` inside, or `db.sql` outside | `db.sql` builds a `TypedSqlQuery` bound to the **pool**, so it would check out a second connection and run outside your transaction. `tx.raw` is the transaction-scoped equivalent; you lose `.one()` / `.scalar()` and type the rows yourself. |
+| `tx.pipeline` | `db.$transaction([...])` at the top level | See above: the pipeline protocol needs to own the connection. |
+| `tx.$use` | Register middleware on `db` before opening the transaction | The transaction inherits the client's middleware list at construction. There is no way to add one mid-transaction. |
+| `tx.$listen` / `tx.$notify` | `db.$listen` / `db.$notify` | `$listen` holds its own dedicated connection for the subscription's lifetime, which is not the transaction's connection. |
+| `tx.$observe`, `tx.$on`, `tx.$off` | Configure them on `db` | Observability is client-scoped. Queries run inside the transaction still emit events and metrics through the parent client. |
+| `tx.pipelineSupported()` | `db.pipelineSupported()` | It reports whether a **pool's** driver exposes the wire-protocol path, which is a property of the pool, not of a borrowed connection. |
+| `tx.transaction(fn)` | You are already in one | `db.transaction(fn)` (no `$`) opens a fresh `BEGIN` on a pooled connection. Inside a transaction the nesting primitive is `tx.$transaction(fn)`, which uses a SAVEPOINT. |
+| `tx.connect()` | Nothing needed | `db.connect()` warms and health-checks the pool. The transaction already holds a live connection. |
+| `tx.$retry`, `withRetry` | Wrap the whole `db.$transaction(...)` call | Retrying part of an aborted transaction cannot work: after a serialization failure the transaction is already dead. Retry the whole block. |
+| `tx.$primary` | Nothing needed | Transactions always run on the primary. Read-replica routing never applies inside one. |
+| `tx.$withSession` | `db.$transaction(fn, { sessionContext })` | Session GUCs are applied right after `BEGIN`, before your callback runs. |
+| `tx.pool`, `tx.stats`, `tx.disconnect()`, `tx.end()` | The equivalents on `db` | The transaction does not own a pool and must not close one. |
+
+Because every one of these is caught at compile time, the practical failure mode is a red squiggle in your editor, not a production `TypeError`. If you are reaching for one of them, the "use instead" column is the actual answer.
+
+### Transaction options
+
+Options are passed as the second argument to `db.$transaction(fn, options)` and apply to the whole block.
+
+```ts
+await db.$transaction(
+  async (tx) => {
+    return tx.invoices.findMany();
+  },
+  {
+    isolationLevel: 'Serializable',
+    timeout: 5_000,
+    sessionContext: { 'app.current_tenant': tenantId },
+  },
+);
+```
+
+- **`isolationLevel`**: one of `'ReadUncommitted'`, `'ReadCommitted'`, `'RepeatableRead'`, `'Serializable'`. Composed into the `BEGIN` statement by the active dialect. Under `Serializable` or `RepeatableRead`, expect `SerializationFailureError` (`TURBINE_E013`) and retry the whole block.
+- **`timeout`**: milliseconds. When it fires, the transaction is rolled back and the connection is destroyed rather than returned to the pool, so the in-flight backend query is actually aborted rather than left running. You get a `TimeoutError` (`TURBINE_E002`).
+- **`sessionContext`**: a record of transaction-local Postgres GUCs, applied as `SELECT set_config($1, $2, true)` immediately after `BEGIN` and before your callback. Both the name and the value are bound parameters, and the name is additionally checked against a strict identifier pattern, so a malformed name throws `ValidationError` and rolls back before any query runs. `is_local = true` means the setting resets on `COMMIT` or `ROLLBACK` and never leaks onto the pooled connection. This is Postgres-only: on an engine whose dialect reports no RLS support it throws `UnsupportedFeatureError` (`TURBINE_E017`). `db.$withSession(context, fn)` is the shorthand for `db.$transaction(fn, { sessionContext: context })`.
+
+### The raw transaction API
+
+`db.transaction(fn)` (no `$`) is the older, lower-level form: your callback receives a raw `pg.PoolClient` rather than a `TransactionClient`, with the same `BEGIN` / `COMMIT` / rollback-on-throw handling and no typed table accessors. Prefer `$transaction`; reach for this only when you want to issue hand-written SQL on the transaction's own connection.
 
 ## See also
 

@@ -34,7 +34,7 @@ npx turbine migrate down --step 2
 npx turbine migrate status
 ```
 
-**`create --auto`** writes a starting-point migration from the diff between your `defineSchema` output and the live database. It is a draft; always read it before committing. **`create --from-diff`** does the same but flags destructive statements inline (see [below](#flagging-destructive-statements-with-from-diff)).
+**`create --auto`** writes a starting-point migration from the diff between your `defineSchema` output and the live database. It is a draft; always read it before committing. **`create --from-diff`** does the same but flags destructive statements inline (see [below](#flagging-destructive-statements-with---from-diff)).
 
 **`up`** applies every pending migration in timestamp order. It is the interactive command: if any pending file contains a destructive statement, it stops and asks you to confirm before running anything (see [the destructive gate](#the-destructive-gate)).
 

@@ -9,19 +9,27 @@
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import {
+  type AppliedMigration,
+  canUpgradeLegacyChecksum,
   createMigration,
   formatTimestamp,
   getPendingMigrations,
+  isChecksumValid,
   listMigrationFiles,
+  type MigrationTxClient,
   parseMigrationContent,
   parseMigrationFilename,
+  planMigrationDeploy,
+  runMigrationInTransaction,
   sanitizeName,
   splitSqlStatements,
+  validateChecksums,
 } from '../cli/migrate.js';
 
 // ---------------------------------------------------------------------------
@@ -600,5 +608,164 @@ describe('createMigration', () => {
     const files = listMigrationFiles(isolatedDir);
     assert.equal(files.length, 1);
     assert.ok(files[0]!.filename.includes('detectable'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Legacy checksum auto-upgrade
+// ---------------------------------------------------------------------------
+
+/** The pre-v0.6 checksum algorithm, reimplemented here as the contract. */
+function legacyHash(content: string): string {
+  let hash = 0;
+  for (let i = 0; i < content.length; i++) {
+    hash = ((hash << 5) - hash + content.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+describe('legacy checksum auto-upgrade', () => {
+  const dir = join(tmpdir(), `turbine-legacy-checksum-${Date.now()}`);
+  const NAME = '20260101000000_create_users';
+  const CONTENT = '-- UP\nCREATE TABLE users (id SERIAL PRIMARY KEY);\n\n-- DOWN\nDROP TABLE users;\n';
+
+  before(() => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${NAME}.sql`), CONTENT, 'utf-8');
+  });
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const appliedWith = (checksum: string): AppliedMigration[] => [
+    { id: 1, name: NAME, applied_at: new Date(), checksum },
+  ];
+
+  it('upgrades a legacy row whose file content is unchanged', () => {
+    assert.equal(canUpgradeLegacyChecksum(legacyHash(CONTENT), CONTENT), true);
+    const plan = planMigrationDeploy(dir, appliedWith(legacyHash(CONTENT)));
+    assert.deepEqual(plan.mismatches, []);
+  });
+
+  it('refuses to bless a legacy row whose file content CHANGED', () => {
+    // A legacy hash of some OTHER content: the stored value can no longer be
+    // reproduced from the file, so this is genuine drift, not a hash upgrade.
+    const stale = legacyHash(`${CONTENT}-- ALTER TABLE users ADD COLUMN email TEXT;\n`);
+    assert.equal(canUpgradeLegacyChecksum(stale, CONTENT), false);
+    const plan = planMigrationDeploy(dir, appliedWith(stale));
+    assert.equal(plan.mismatches.length, 1);
+    assert.equal(plan.mismatches[0]!.type, 'modified');
+    assert.equal(plan.mismatches[0]!.name, NAME);
+  });
+
+  it('reports an unchanged legacy row as valid, a drifted one as invalid', () => {
+    const sha = createHash('sha256').update(CONTENT, 'utf-8').digest('hex');
+
+    // What `migrate status` asks. A current SHA-256 row is valid.
+    assert.equal(isChecksumValid(sha, CONTENT), true);
+    // An unchanged pre-v0.6 row is valid too: `migrate up` upgrades it in place,
+    // so status must not contradict up by calling the same file drifted.
+    assert.equal(isChecksumValid(legacyHash(CONTENT), CONTENT), true);
+
+    // Genuine drift still reports invalid, in both hash generations.
+    const changed = `${CONTENT}-- ALTER TABLE users ADD COLUMN email TEXT;\n`;
+    assert.equal(isChecksumValid(sha, changed), false);
+    assert.equal(isChecksumValid(legacyHash(changed), CONTENT), false);
+    assert.equal(isChecksumValid('', CONTENT), false);
+  });
+
+  it('never treats an empty stored checksum as legacy', () => {
+    assert.equal(canUpgradeLegacyChecksum('', CONTENT), false);
+    const plan = planMigrationDeploy(dir, appliedWith(''));
+    assert.equal(plan.mismatches.length, 1);
+    assert.equal(plan.mismatches[0]!.type, 'modified');
+  });
+
+  /**
+   * A stand-in for the `pg.Client` validateChecksums() runs against: serves the
+   * applied rows and records every statement so the test can prove whether the
+   * checksum-upgrade UPDATE was issued.
+   */
+  function fakeChecksumClient(applied: AppliedMigration[]) {
+    const statements: string[] = [];
+    const client = {
+      async query(sql: string): Promise<unknown> {
+        statements.push(sql);
+        return { rows: /select/i.test(sql) ? applied : [] };
+      },
+    };
+    return { statements, client: client as unknown as Parameters<typeof validateChecksums>[0] };
+  }
+
+  it('validateChecksums() rewrites the stored hash only for an unchanged legacy row', async () => {
+    const fake = fakeChecksumClient(appliedWith(legacyHash(CONTENT)));
+    const mismatches = await validateChecksums(fake.client, dir);
+    assert.deepEqual(mismatches, []);
+    assert.ok(
+      fake.statements.some((s) => /update/i.test(s)),
+      'an unchanged legacy row should be upgraded to SHA-256',
+    );
+  });
+
+  it('validateChecksums() flags a changed legacy row instead of blessing it', async () => {
+    const stale = legacyHash(`${CONTENT}-- drifted\n`);
+    const fake = fakeChecksumClient(appliedWith(stale));
+    const mismatches = await validateChecksums(fake.client, dir);
+    assert.equal(mismatches.length, 1);
+    assert.equal(mismatches[0]!.type, 'modified');
+    assert.ok(
+      !fake.statements.some((s) => /update/i.test(s)),
+      'a drifted legacy row must never have its stored checksum rewritten',
+    );
+  });
+
+  it('leaves a matching SHA-256 row alone', () => {
+    const sha = createHash('sha256').update(CONTENT, 'utf-8').digest('hex');
+    const plan = planMigrationDeploy(dir, appliedWith(sha));
+    assert.deepEqual(plan.mismatches, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transactional migration body
+// ---------------------------------------------------------------------------
+
+/** A fake client that fails the statements named in `failOn`. */
+function fakeClient(failOn: Record<string, string>): MigrationTxClient & { calls: string[] } {
+  const calls: string[] = [];
+  return {
+    calls,
+    async query(sql: string): Promise<unknown> {
+      calls.push(sql);
+      const failure = failOn[sql];
+      if (failure) throw new Error(failure);
+      return { rows: [] };
+    },
+  };
+}
+
+describe('runMigrationInTransaction', () => {
+  const tracking = { sql: 'INSERT INTO _turbine_migrations', params: ['m1', 'hash'] };
+
+  it('commits and reports no failure on success', async () => {
+    const client = fakeClient({});
+    const failure = await runMigrationInTransaction(client, 'CREATE TABLE t (id INT)', tracking);
+    assert.equal(failure, null);
+    assert.deepEqual(client.calls, ['BEGIN', 'CREATE TABLE t (id INT)', 'INSERT INTO _turbine_migrations', 'COMMIT']);
+  });
+
+  it('rolls back and reports the statement error', async () => {
+    const client = fakeClient({ 'CREATE TABLE t (id INT)': 'syntax error at or near "TABLE"' });
+    const failure = await runMigrationInTransaction(client, 'CREATE TABLE t (id INT)', tracking);
+    assert.match(failure ?? '', /syntax error/);
+    assert.ok(client.calls.includes('ROLLBACK'));
+  });
+
+  it('surfaces the ORIGINAL error when the ROLLBACK also fails', async () => {
+    const client = fakeClient({
+      'CREATE TABLE t (id INT)': 'relation "t" already exists',
+      ROLLBACK: 'Connection terminated unexpectedly',
+    });
+    const failure = await runMigrationInTransaction(client, 'CREATE TABLE t (id INT)', tracking);
+    assert.match(failure ?? '', /relation "t" already exists/);
+    assert.doesNotMatch(failure ?? '', /Connection terminated/);
   });
 });

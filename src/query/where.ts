@@ -42,7 +42,7 @@ import type {
   WhereClause,
   WhereOperator,
 } from './types.js';
-import { escapeLike, OPERATOR_KEYS, ownLookup, type SqlCacheEntry } from './utils.js';
+import { coerceTemporalValue, escapeLike, OPERATOR_KEYS, ownLookup, type SqlCacheEntry } from './utils.js';
 import {
   classifyScalarForSql,
   fingerprintScalarToken,
@@ -69,6 +69,14 @@ export interface BuilderCtx {
   readonly scopedHostCache: Map<string, WhereHost>;
   readonly columnPgTypeMap: Map<string, string>;
   readonly columnArrayTypeMap: Map<string, string>;
+  /**
+   * The client's `utcTimestamps` setting, when the owning QueryInterface
+   * supplies it. Optional so an older ctx literal (and every test that builds
+   * one by hand) keeps the default. `false` opts out of BOTH the UTC read
+   * parsing and the symmetric UTC bind rewriting for zone-less `date` /
+   * `timestamp` columns (see `coerceWriteValue` in writes.ts).
+   */
+  readonly utcTimestamps?: boolean;
   readonly crossSchemaTypeColumns: Set<string>;
   /**
    * The active query's `skipGlobalFilters` opt-out. A live getter/setter over
@@ -112,7 +120,13 @@ export interface BuilderCtx {
   readonly camelDateFieldCache: Map<string, Set<string>>;
   limitOneClause(): string;
   buildPagination(limitPh: string | undefined, offsetPh: string | undefined, hasOrderBy: boolean): string;
-  paginationRef(value: unknown, params: unknown[]): string;
+  paginationRef(value: unknown, params: unknown[], arg?: string): string;
+  /**
+   * Coerce + validate a LIMIT/OFFSET argument (non-negative safe integer).
+   * The cache-hit param-collect paths call it directly, so a warmed template
+   * can never bind an unvalidated NaN (which Postgres reads as "no limit").
+   */
+  paginationValue(value: unknown, arg?: string): number;
 }
 
 /**
@@ -127,6 +141,13 @@ interface ColumnRefContext {
   meta: TableMetadata;
   table: string;
   prefix: string;
+  /**
+   * The operator's own RAW (unquoted) column name. The `column` argument the
+   * operator builders receive is already quoted on the build side and raw on
+   * the collect side, so the temporal bind rewrite resolves the column's type
+   * from here instead — the one value both sides pass identically.
+   */
+  rawColumn: string;
 }
 
 /**
@@ -311,6 +332,7 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
         meta: qi.tableMeta,
         table: qi.table,
         prefix: '',
+        rawColumn,
       });
       return;
     default:
@@ -318,7 +340,7 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
       // the build path, so a cache hit can never silently bind a
       // misspelled-operator object.
       assertBindableEqualityValue(qi, rawColumn, value, getColumnPgType(qi, rawColumn), qi.table);
-      params.push(value);
+      params.push(coerceWhereOperand(qi, qi.tableMeta, rawColumn, value));
       return;
   }
 }
@@ -396,17 +418,19 @@ export function collectOperatorParams(
     if (refCtx) resolveColumnRef(qi, v, refCtx, op.mode);
     return true;
   };
+  // Mirrors buildOperatorClauses' temporal bind rewrite exactly.
+  const cv = (v: unknown): unknown => (refCtx ? coerceWhereOperand(qi, refCtx.meta, refCtx.rawColumn, v) : v);
   if (op.equals !== undefined && op.equals !== null && !skipRef(op.equals)) {
     assertBindableEqualsOperand(op.equals, `"${column}"`);
-    params.push(op.equals);
+    params.push(cv(op.equals));
   }
-  if (op.gt !== undefined && !skipRef(op.gt)) params.push(op.gt);
-  if (op.gte !== undefined && !skipRef(op.gte)) params.push(op.gte);
-  if (op.lt !== undefined && !skipRef(op.lt)) params.push(op.lt);
-  if (op.lte !== undefined && !skipRef(op.lte)) params.push(op.lte);
-  if (op.not !== undefined && op.not !== null && !skipRef(op.not)) params.push(op.not);
-  if (op.in !== undefined) params.push(qi.inParam(op.in));
-  if (op.notIn !== undefined) params.push(qi.inParam(op.notIn));
+  if (op.gt !== undefined && !skipRef(op.gt)) params.push(cv(op.gt));
+  if (op.gte !== undefined && !skipRef(op.gte)) params.push(cv(op.gte));
+  if (op.lt !== undefined && !skipRef(op.lt)) params.push(cv(op.lt));
+  if (op.lte !== undefined && !skipRef(op.lte)) params.push(cv(op.lte));
+  if (op.not !== undefined && op.not !== null && !skipRef(op.not)) params.push(cv(op.not));
+  if (op.in !== undefined) params.push(qi.inParam(cv(op.in)));
+  if (op.notIn !== undefined) params.push(qi.inParam(cv(op.notIn)));
   if (op.contains !== undefined) params.push(`%${escapeLike(op.contains)}%`);
   if (op.startsWith !== undefined) params.push(`${escapeLike(op.startsWith)}%`);
   if (op.endsWith !== undefined) params.push(`%${escapeLike(op.endsWith)}`);
@@ -735,6 +759,7 @@ export function buildScalarClause(
           meta: qi.tableMeta,
           table: qi.table,
           prefix: '',
+          rawColumn,
         }),
       );
       return;
@@ -743,7 +768,7 @@ export function buildScalarClause(
       // is almost always a misspelled operator (`startWith` for `startsWith`);
       // the guard also runs on the cache-hit param-collect path.
       assertBindableEqualityValue(qi, rawColumn, value, getColumnPgType(qi, rawColumn), qi.table);
-      params.push(value);
+      params.push(coerceWhereOperand(qi, qi.tableMeta, rawColumn, value));
       andClauses.push(`${column} = ${qi.p(params.length)}`);
       return;
   }
@@ -912,13 +937,14 @@ export function buildScopedScalarClause(
         meta,
         table: scope.table,
         prefix: scope.qualifier,
+        rawColumn: col,
       }),
     );
     return;
   }
 
   assertBindableEqualityValue(qi, col, value, pgTypeForColumn(qi, meta, col), scope.table);
-  params.push(value);
+  params.push(coerceWhereOperand(qi, meta, col, value));
   clauses.push(`${qCol} = ${qi.p(params.length)}`);
 }
 
@@ -984,12 +1010,12 @@ export function collectScopedScalarParams(
   }
 
   if (isWhereOperator(value)) {
-    collectOperatorParams(qi, col, value, params, { meta, table: scope.table, prefix: '' });
+    collectOperatorParams(qi, col, value, params, { meta, table: scope.table, prefix: '', rawColumn: col });
     return;
   }
 
   assertBindableEqualityValue(qi, col, value, pgTypeForColumn(qi, meta, col), scope.table);
-  params.push(value);
+  params.push(coerceWhereOperand(qi, meta, col, value));
 }
 
 /**
@@ -1197,6 +1223,33 @@ export function pgTypeForColumn(_qi: BuilderCtx, meta: TableMetadata, column: st
 }
 
 /**
+ * Rewrite a WHERE operand bound against `column` the same way the write path
+ * rewrites a `data` value ({@link coerceTemporalValue}): a JS `Date` on a
+ * `time` / `timetz` column becomes a time-of-day literal (Postgres otherwise
+ * answers `22007 invalid input syntax for type time` for the ISO timestamp the
+ * driver would send), and on a zone-less `date` / `timestamp` column it becomes
+ * the UTC-component literal, so a predicate matches the value a write of the
+ * same `Date` stored.
+ *
+ * This is a VALUE transform only — it never changes the emitted SQL — so the
+ * SQL-template cache is unaffected, and it is applied on the cache-hit
+ * param-collect path as well as the build path.
+ *
+ * `timestamptz` and every non-temporal column are returned by identity.
+ */
+export function coerceWhereOperand(qi: BuilderCtx, meta: TableMetadata, column: string, value: unknown): unknown {
+  if (!(value instanceof Date) && !Array.isArray(value)) return value;
+  return coerceTemporalValue(
+    pgTypeForColumn(qi, meta, column),
+    value,
+    // Same PostgreSQL + `utcTimestamps` gate as the write path (see
+    // `utcDateTimeWrites` in writes.ts): only the read/write-symmetric engine
+    // gets the zone-less rewrite. Time-of-day always rewrites.
+    qi.dialect.name === 'postgresql' && qi.utcTimestamps !== false,
+  );
+}
+
+/**
  * The Postgres enum type name for a column, when the schema knows one.
  *
  * Introspection stores each column's `udt_name` in `pgTypes` and every
@@ -1378,6 +1431,9 @@ export function buildOperatorClauses(
   refCtx?: ColumnRefContext,
 ): string[] {
   const clauses: string[] = [];
+  // Temporal bind rewrite, identical to `collectOperatorParams`. Value-only, so
+  // the emitted SQL (and therefore the template cache) is untouched.
+  const cv = (v: unknown): unknown => (refCtx ? coerceWhereOperand(qi, refCtx.meta, refCtx.rawColumn, v) : v);
 
   if (op.equals !== undefined) {
     if (op.equals === null) {
@@ -1386,7 +1442,7 @@ export function buildOperatorClauses(
       clauses.push(`${column} = ${columnRefSql(qi, op.equals, refCtx, op.mode)}`);
     } else {
       assertBindableEqualsOperand(op.equals, column);
-      params.push(op.equals);
+      params.push(cv(op.equals));
       clauses.push(`${column} = ${qi.p(params.length)}`);
     }
   }
@@ -1394,7 +1450,7 @@ export function buildOperatorClauses(
     if (isColumnRef(op.gt)) {
       clauses.push(`${column} > ${columnRefSql(qi, op.gt, refCtx, op.mode)}`);
     } else {
-      params.push(op.gt);
+      params.push(cv(op.gt));
       clauses.push(`${column} > ${qi.p(params.length)}`);
     }
   }
@@ -1402,7 +1458,7 @@ export function buildOperatorClauses(
     if (isColumnRef(op.gte)) {
       clauses.push(`${column} >= ${columnRefSql(qi, op.gte, refCtx, op.mode)}`);
     } else {
-      params.push(op.gte);
+      params.push(cv(op.gte));
       clauses.push(`${column} >= ${qi.p(params.length)}`);
     }
   }
@@ -1410,7 +1466,7 @@ export function buildOperatorClauses(
     if (isColumnRef(op.lt)) {
       clauses.push(`${column} < ${columnRefSql(qi, op.lt, refCtx, op.mode)}`);
     } else {
-      params.push(op.lt);
+      params.push(cv(op.lt));
       clauses.push(`${column} < ${qi.p(params.length)}`);
     }
   }
@@ -1418,7 +1474,7 @@ export function buildOperatorClauses(
     if (isColumnRef(op.lte)) {
       clauses.push(`${column} <= ${columnRefSql(qi, op.lte, refCtx, op.mode)}`);
     } else {
-      params.push(op.lte);
+      params.push(cv(op.lte));
       clauses.push(`${column} <= ${qi.p(params.length)}`);
     }
   }
@@ -1428,16 +1484,16 @@ export function buildOperatorClauses(
     } else if (isColumnRef(op.not)) {
       clauses.push(`${column} != ${columnRefSql(qi, op.not, refCtx, op.mode)}`);
     } else {
-      params.push(op.not);
+      params.push(cv(op.not));
       clauses.push(`${column} != ${qi.p(params.length)}`);
     }
   }
   if (op.in !== undefined) {
-    params.push(qi.inParam(op.in));
+    params.push(qi.inParam(cv(op.in)));
     clauses.push(qi.inClause(column, qi.p(params.length), false));
   }
   if (op.notIn !== undefined) {
-    params.push(qi.inParam(op.notIn));
+    params.push(qi.inParam(cv(op.notIn)));
     clauses.push(qi.inClause(column, qi.p(params.length), true));
   }
   const buildLikeClause = (paramRef: string) =>
@@ -1515,7 +1571,10 @@ export function vectorOperator(qi: BuilderCtx, field: string, rawColumn: string,
         `(actual type: ${colType}); cannot apply a vector distance operation.`,
     );
   }
-  const op = VECTOR_METRIC_OPERATORS[metric];
+  // ownLookup, not a bare index: an inherited Object.prototype member
+  // ("constructor", "toString", …) would otherwise resolve to a truthy builtin
+  // and be spliced into the ORDER BY / WHERE clause as its source text.
+  const op = ownLookup(VECTOR_METRIC_OPERATORS, metric);
   if (!op) {
     throw new ValidationError(
       `[turbine] Unknown vector metric "${metric}" for column "${field}". ` +

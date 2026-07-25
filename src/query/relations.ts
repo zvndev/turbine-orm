@@ -37,7 +37,7 @@ import type {
   WithCount,
   WithOptions,
 } from './types.js';
-import { ownLookup } from './utils.js';
+import { coerceJsonWireValue, jsonWireCoercionOid, ownLookup } from './utils.js';
 import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -145,7 +145,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
       );
       continue;
     }
-    const relDef = meta.relations[relName];
+    const relDef = ownLookup(meta.relations, relName);
     if (!relDef) {
       parts.push(`unknown:${relName}`);
       continue;
@@ -179,9 +179,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
     // `{title: {contains: 'x'}}` emit different SQL so they must not share
     // a fingerprint)
     if (opts.where) {
-      subParts.push(
-        `w=${whereMod.fingerprintAliasWhere(qi, opts.where as Record<string, unknown>, meta.relations[relName]?.to)}`,
-      );
+      subParts.push(`w=${whereMod.fingerprintAliasWhere(qi, opts.where as Record<string, unknown>, relDef.to)}`);
     }
 
     // orderBy shape (OrderBySpec nulls placement changes the SQL, so fingerprint it)
@@ -216,13 +214,24 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
  * Collect params from a `with` clause tree. Mirrors buildSelectWithRelations +
  * buildRelationSubquery param-push order.
  */
-export function collectWithParams(qi: BuilderCtx, withClause: WithClause, params: unknown[], table?: string): void {
+export function collectWithParams(
+  qi: BuilderCtx,
+  withClause: WithClause,
+  params: unknown[],
+  table?: string,
+  flattenPlan?: FlattenPlan | null,
+): void {
   const meta = qi.schema.tables[table ?? qi.table];
   if (!meta) return;
 
   for (const [relName, relSpec] of sortedEntries(withClause)) {
-    const relDef = meta.relations[relName];
+    const relDef = ownLookup(meta.relations, relName);
     if (!relDef) continue;
+    const flatNode = flattenPlan?.nodes[relName];
+    if (flatNode) {
+      collectFlattenNodeParams(qi, flatNode, params);
+      continue;
+    }
     collectRelationSubqueryParams(qi, relDef, relSpec, params, table ?? qi.table);
   }
 
@@ -273,11 +282,11 @@ export function collectRelationSubqueryParams(
     }
     whereMod.collectTargetGlobalFilterAlias(qi, targetTable, params);
     if (spec.limit !== undefined && !qi.dialect.inlineLimitOffset) {
-      params.push(Number(spec.limit));
+      params.push(qi.paginationValue(spec.limit, 'relation limit'));
     }
     if (spec.with) {
       for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-        const nestedRelDef = targetMeta.relations[nestedRelName];
+        const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
         if (!nestedRelDef) continue;
         collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'alias', depth + 1);
       }
@@ -293,7 +302,7 @@ export function collectRelationSubqueryParams(
   // Non-wrapped path: nested relations BEFORE where/limit
   if (!willWrap && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) continue;
       collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'alias', depth + 1);
     }
@@ -320,13 +329,13 @@ export function collectRelationSubqueryParams(
   // pushing one here would orphan a param and desync the collect path.
   // `limit: 0` pushes (LIMIT 0 is honored), so check !== undefined.
   if (relDef.type === 'hasMany' && spec.limit !== undefined && !qi.dialect.inlineLimitOffset) {
-    params.push(Number(spec.limit));
+    params.push(qi.paginationValue(spec.limit, 'relation limit'));
   }
 
   // Wrapped path: nested relations AFTER where/limit (inside inner subquery)
   if (willWrap && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) continue;
       collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'innerAlias', depth + 1);
     }
@@ -623,7 +632,7 @@ export function buildRelationOrderBy(
   const ownerMeta = ctx?.meta ?? qi.tableMeta;
   const ownerTable = ctx?.table ?? qi.table;
   const parentRef = ctx?.parentRef ?? qi.table;
-  const relDef = ownerMeta.relations[relName];
+  const relDef = ownLookup(ownerMeta.relations, relName);
   if (!relDef) {
     // A table with no relations at all would otherwise render a dangling
     // "Available: " and read as a broken message; and the most likely cause of
@@ -1052,7 +1061,7 @@ export function collectRelationOrderParams(
       if (isRelationPickOrderBy(dirValue)) {
         throw pickOrderNestedError(qi, key);
       }
-      const relDef = targetMeta.relations[key];
+      const relDef = ownLookup(targetMeta.relations, key);
       if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
         collectRelationCountParams(qi, relDef, params);
       } else if (relDef) {
@@ -1175,11 +1184,27 @@ export function getCamelDateFields(qi: BuilderCtx, table: string, meta: TableMet
   return camel;
 }
 
-/** Parse a row that may contain JSON nested relation columns */
-export function parseNestedRow(qi: BuilderCtx, row: Record<string, unknown>, table: string): Record<string, unknown> {
-  const parsed = qi.parseRow(row, table);
+/**
+ * Parse a row that may contain JSON nested relation columns.
+ *
+ * `fromJson` says where THIS row's own scalar columns came from. A root row
+ * (join, batched, flatten) is read straight off the driver, so `false`; a row
+ * decoded out of a `json_agg`/`json_build_object` column is `true` and gets
+ * its divergent scalars decoded back to the driver's representation first (see
+ * the JSON-wire section above). Recursion into a relation column is always
+ * `true`, which is exactly right on every strategy: `batched` and `flatten`
+ * hand this function driver rows, but any relation still nested INSIDE one of
+ * those rows arrived as a correlated JSON subquery.
+ */
+export function parseNestedRow(
+  qi: BuilderCtx,
+  row: Record<string, unknown>,
+  table: string,
+  fromJson = false,
+): Record<string, unknown> {
   const meta = qi.schema.tables[table];
-  if (!meta) return parsed;
+  if (!meta) return qi.parseRow(row, table);
+  const parsed = qi.parseRow(fromJson ? decodeJsonWireRow(qi, row, table, meta) : row, table);
 
   // Assemble reserved `_count__<rel>` scalar columns into a `_count` object.
   // parseRow copies these unknown columns through under their raw key.
@@ -1221,11 +1246,11 @@ export function parseNestedRow(qi: BuilderCtx, row: Record<string, unknown>, tab
         if (Array.isArray(jsonVal)) {
           parsed[relName] = jsonVal.map((item: unknown) =>
             typeof item === 'object' && item !== null
-              ? parseNestedRow(qi, item as Record<string, unknown>, relDef.to)
+              ? parseNestedRow(qi, item as Record<string, unknown>, relDef.to, true)
               : item,
           );
         } else if (typeof jsonVal === 'object' && jsonVal !== null) {
-          parsed[relName] = parseNestedRow(qi, jsonVal as Record<string, unknown>, relDef.to);
+          parsed[relName] = parseNestedRow(qi, jsonVal as Record<string, unknown>, relDef.to, true);
         } else {
           parsed[relName] = jsonVal;
         }
@@ -1238,11 +1263,11 @@ export function parseNestedRow(qi: BuilderCtx, row: Record<string, unknown>, tab
     } else if (Array.isArray(rawValue)) {
       parsed[relName] = rawValue.map((item) =>
         typeof item === 'object' && item !== null
-          ? parseNestedRow(qi, item as Record<string, unknown>, relDef.to)
+          ? parseNestedRow(qi, item as Record<string, unknown>, relDef.to, true)
           : item,
       );
     } else if (typeof rawValue === 'object' && rawValue !== null) {
-      parsed[relName] = parseNestedRow(qi, rawValue as Record<string, unknown>, relDef.to);
+      parsed[relName] = parseNestedRow(qi, rawValue as Record<string, unknown>, relDef.to, true);
     } else {
       parsed[relName] = rawValue;
     }
@@ -1302,6 +1327,122 @@ export function buildJsonRow(qi: BuilderCtx, jsonPairs: [key: string, expr: stri
   return qi.dialect.buildJsonObject(jsonPairs);
 }
 
+// ---------------------------------------------------------------------------
+// JSON-wire value fidelity (see JSON_WIRE_COERCION_OIDS in utils.ts)
+//
+// `json_build_object` renders a handful of Postgres types as something other
+// than the value the driver hands back for the same column, so the 'join'
+// strategy used to disagree with a top-level read, with 'batched', and with
+// 'flatten' — losing precision outright on numeric and int8. The two halves of
+// the fix live here and must stay in lockstep:
+//
+//   SQL side   jsonScalarPairs() emits `alias."col"::text` for a divergent
+//              column, so the JSON carries the driver's wire text verbatim.
+//   parse side parseNestedRow(..., fromJson = true) runs that text back
+//              through the driver's own parser for the column's OID.
+//
+// Both derive the column set from the SAME jsonWireCoercionOid() call over the
+// target table's `pgTypes`, so a cast can never be emitted without a matching
+// decode (or vice versa). Postgres-only: other engines neither use
+// json_build_object nor share this divergence set.
+// ---------------------------------------------------------------------------
+
+/** True when this query's engine gets the JSON-wire cast/decode treatment. */
+function usesJsonWireCoercion(qi: BuilderCtx): boolean {
+  return qi.dialect.name === 'postgresql';
+}
+
+/**
+ * The JSON value expression for one scalar relation column: the plain column
+ * reference, or a `::text` cast when the type's JSON rendering would not match
+ * what the driver produces.
+ */
+function jsonScalarExpr(qi: BuilderCtx, targetMeta: TableMetadata, col: string, ref: string): string {
+  const expr = `${ref}.${qi.q(col)}`;
+  if (!usesJsonWireCoercion(qi)) return expr;
+  return jsonWireCoercionOid(targetMeta.pgTypes?.[col]) === undefined ? expr : `${expr}::text`;
+}
+
+/**
+ * The `[camelKey, valueExpr]` pairs for a relation's scalar columns. Single
+ * source for all four `json_build_object` emission sites (to-one, hasMany
+ * simple + wrapped, manyToMany) so the `::text` casts can never be applied on
+ * one path and forgotten on another.
+ */
+function jsonScalarPairs(
+  qi: BuilderCtx,
+  targetMeta: TableMetadata,
+  targetColumns: string[],
+  ref: string,
+): [key: string, expr: string][] {
+  return targetColumns.map((col) => [
+    targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
+    jsonScalarExpr(qi, targetMeta, col, ref),
+  ]);
+}
+
+/**
+ * Per-`BuilderCtx`, per-table memo of the camelCase field names that need
+ * JSON-wire decoding, mapped to the OID whose driver parser performs it.
+ * `null` records "this table has none", the overwhelmingly common case, so a
+ * relation of plain text/int columns costs one Map hit per row and no scan.
+ *
+ * Held in a WeakMap rather than on the ctx so the cache dies with the
+ * QueryInterface and no shared interface has to grow a field for it.
+ */
+const jsonWireFieldCache = new WeakMap<BuilderCtx, Map<string, Map<string, number> | null>>();
+
+function jsonWireFields(qi: BuilderCtx, table: string, meta: TableMetadata): Map<string, number> | null {
+  let byTable = jsonWireFieldCache.get(qi);
+  if (!byTable) {
+    byTable = new Map();
+    jsonWireFieldCache.set(qi, byTable);
+  }
+  const cached = byTable.get(table);
+  if (cached !== undefined) return cached;
+
+  let fields: Map<string, number> | null = null;
+  const pgTypes = meta.pgTypes;
+  if (pgTypes) {
+    for (const col of meta.allColumns) {
+      const oid = jsonWireCoercionOid(pgTypes[col]);
+      if (oid === undefined) continue;
+      if (fields === null) fields = new Map();
+      fields.set(meta.reverseColumnMap[col] ?? snakeToCamel(col), oid);
+    }
+  }
+  byTable.set(table, fields);
+  return fields;
+}
+
+/**
+ * Rewrite a JSON-sourced relation row's divergent scalars into the driver's
+ * representation. Returns `row` untouched when the table has no such column,
+ * so the ordinary relation pays nothing beyond the memo lookup.
+ */
+function decodeJsonWireRow(
+  qi: BuilderCtx,
+  row: Record<string, unknown>,
+  table: string,
+  meta: TableMetadata,
+): Record<string, unknown> {
+  if (!usesJsonWireCoercion(qi)) return row;
+  const fields = jsonWireFields(qi, table, meta);
+  if (fields === null) return row;
+  // Copy-on-first-write rather than mutating in place: the row can be a
+  // sub-object of the driver's parsed `json` column, which middleware may still
+  // be holding. Measured against an in-place variant on a 20K-child-row join the
+  // two were indistinguishable, so the copy is free insurance.
+  let decoded: Record<string, unknown> | undefined;
+  for (const [field, oid] of fields) {
+    const raw = row[field];
+    if (typeof raw !== 'string') continue;
+    if (decoded === undefined) decoded = { ...row };
+    decoded[field] = coerceJsonWireValue(oid, raw);
+  }
+  return decoded ?? row;
+}
+
 /**
  * Build the top-level relation shapes for a `with` clause, mirroring
  * {@link buildSelectWithRelations}: same relation iteration order, same
@@ -1317,7 +1458,7 @@ export function buildRelationShapes(
   if (!meta) return {};
   const shapes: Record<string, RelationShape> = {};
   for (const [relName, relSpec] of sortedEntries(withClause)) {
-    const relDef = meta.relations[relName];
+    const relDef = ownLookup(meta.relations, relName);
     if (!relDef) continue; // buildSelectWithRelations already threw for this
     shapes[relName] = buildRelationShape(qi, relDef, relSpec, meta, includePii);
   }
@@ -1345,7 +1486,7 @@ export function buildRelationShape(
   const nested: Record<string, RelationShape> = {};
   if (spec !== true && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) continue;
       keys.push(nestedRelName);
       nested[nestedRelName] = buildRelationShape(qi, nestedRelDef, nestedSpec, targetMeta, includePii);
@@ -1365,7 +1506,12 @@ export function makeNestedParser(
   qi: BuilderCtx,
   withClause: WithClause,
   includePii?: boolean,
+  flattenPlan?: FlattenPlan | null,
 ): (row: Record<string, unknown>) => Record<string, unknown> {
+  // A flatten plan and the positional encoding are mutually exclusive (the
+  // planner is only consulted for the object encoding), so this branch is safe
+  // ahead of the positional one.
+  if (flattenPlan) return makeFlattenParser(qi, flattenPlan);
   if (qi.jsonEncoding !== 'positional') {
     return (row) => parseNestedRow(qi, row, qi.table);
   }
@@ -1428,6 +1574,697 @@ export function decodePositionalObject(qi: BuilderCtx, arr: unknown, shape: Rela
   return obj;
 }
 
+// ---------------------------------------------------------------------------
+// relationLoadStrategy: 'flatten' — to-one relations compiled as LEFT JOINs
+// ---------------------------------------------------------------------------
+
+/**
+ * Alias prefix for a flattened relation's join. Deliberately distinct from the
+ * `t<n>` family {@link buildRelationSubquery} (and its `i`/`j`/`t`/`ord`
+ * suffixes) allocates, so the two compilation paths can share one SELECT list
+ * without ever colliding.
+ */
+const FLATTEN_ALIAS_PREFIX = 'f';
+
+/**
+ * WHY EACH FLATTENED SUBTREE IS WRAPPED IN A DERIVED TABLE
+ *
+ * The top-level `WHERE` and `ORDER BY` reference the parent's columns
+ * UNQUALIFIED (`WHERE "name" = $1`). A bare `LEFT JOIN "orgs" f0` puts a second
+ * table in scope, so any column name the two tables share ("id", "name",
+ * "created_at" — i.e. most of them) turns those references ambiguous and
+ * Postgres rejects the statement. Qualifying the parent's references is not an
+ * option here: they are compiled by the shared WHERE walk, which is scope-blind
+ * by design.
+ *
+ * So a flattened subtree joins as a derived table that exposes ONLY prefixed
+ * names (`f0__id`, `f0__name`, ...). Nothing it contributes can collide with an
+ * unqualified parent reference, by construction rather than by analysis. This is
+ * the same trick the `plan: 'lateral'` pick join uses when it exposes a single
+ * reserved `__turbine_pick` column.
+ *
+ * Inside the derived table every reference is alias-qualified, so the whole
+ * to-one subtree (chained joins, per-relation filters, and any to-many
+ * correlated subqueries hanging off it) lives in one flat, unambiguous scope.
+ * The subquery is a plain SELECT with no LIMIT / DISTINCT / aggregate, so
+ * Postgres pulls it up into the outer join rather than materializing it.
+ */
+
+/** Suffix for the inner (real-table) alias inside a flattened derived table. */
+const FLATTEN_SRC_SUFFIX = 's';
+
+/** Alias prefix for a top-level node's exposed correlation columns. */
+const FLATTEN_CORR = '$c';
+
+/**
+ * Maximum SELECT-list alias length. Postgres truncates identifiers at 63 bytes
+ * (MySQL/SQLite are more generous), and a truncated alias could collide with
+ * another projected column, so a relation whose prefixed projection would
+ * exceed it is ineligible and falls back to the correlated subquery.
+ */
+const FLATTEN_MAX_ALIAS_LEN = 63;
+
+/** Nesting depth past which a flattened subtree declines (mirrors the join cap). */
+const FLATTEN_MAX_DEPTH = 10;
+
+/** One relation `'flatten'` declined, with the reason, for the dev warning. */
+export interface FlattenReject {
+  /** Dotted path from the root table's `with`, e.g. `order.customer`. */
+  relation: string;
+  reason: string;
+}
+type FlattenRejects = FlattenReject[];
+
+/** Suffix of the non-null discriminator column projected for every flattened node. */
+const FLATTEN_DISCRIMINATOR = '$k';
+
+/**
+ * One entry in a flattened relation's nested `with`, in
+ * `sortedEntries(spec.with)` order. `'flat'` is another LEFT JOIN; `'json'` is
+ * a correlated subquery projected as a single JSON column, exactly as the
+ * default strategy would have emitted it (with the join alias as its parent
+ * reference). Ordering is preserved so the assembled object's key order matches
+ * the join strategy's byte for byte.
+ */
+export interface FlattenSlot {
+  relName: string;
+  kind: 'flat' | 'json';
+}
+
+/** A single to-one relation compiled as a LEFT JOIN plus a prefixed projection. */
+export interface FlattenNode {
+  relName: string;
+  relDef: RelationDef;
+  spec: true | WithOptions;
+  targetTable: string;
+  targetMeta: TableMetadata;
+  /** Output-name prefix, and the derived-table alias for a top-level node (`f0`). */
+  alias: string;
+  /** Alias of the real target table inside the derived table (`f0s`). */
+  srcAlias: string;
+  /** Target-side correlation columns (provably unique — see {@link provableUniqueTargetKey}). */
+  keyColumns: string[];
+  /**
+   * Match discriminator. A top-level node projects the constant `1` (its
+   * derived-table row exists only when the target matched, and the outer LEFT
+   * JOIN null-extends it otherwise); a nested node projects the predicate
+   * `(src.key IS NOT NULL)`. Either way the discriminator carries no cell
+   * VALUE, so a PII-tagged key column never leaves the database merely because
+   * a discriminator was needed: no PII column enters the wire, the projection
+   * or the assembled object unless the caller selected it or passed
+   * `includePii`. Without it, "the join matched nothing" would be
+   * indistinguishable from "the row exists and every projected column is NULL".
+   */
+  discAlias: string;
+  /** `[snake_case column, output alias]` for every projected column. */
+  cols: [column: string, sqlAlias: string][];
+  /** Nested `with` entries in emission order. */
+  slots: FlattenSlot[];
+  /** Nested flattened relations, keyed by relation name (the `'flat'` slots). */
+  children: Record<string, FlattenNode>;
+  /** Output alias of each `'json'` slot's correlated subquery column. */
+  jsonAliases: Record<string, string>;
+  /**
+   * Top-level nodes only: the correlation columns re-exposed by the derived
+   * table (`f0__$c0`, ...) so the OUTER join condition can reference them
+   * without the real column names entering the outer scope. Never surfaced to
+   * the caller.
+   */
+  corrAliases: string[];
+  /** Nesting depth, matching {@link buildRelationSubquery}'s depth accounting. */
+  depth: number;
+  /** Breadcrumb trail for {@link CircularRelationError} parity. */
+  path: string[];
+}
+
+/**
+ * The compiled `'flatten'` plan for one `with` clause: which top-level
+ * relations become LEFT JOINs, and a signature that keys the SQL template
+ * cache. Relations absent from `nodes` compile exactly as they do today.
+ */
+export interface FlattenPlan {
+  nodes: Record<string, FlattenNode>;
+  /** Every SELECT-list alias the plan introduces (flat rows carry them all). */
+  aliases: string[];
+  /** Structural signature for the `fl=` SQL-cache-key segment. */
+  signature: string;
+}
+
+/** Set equality over two column lists (order-insensitive, duplicate-intolerant). */
+function sameColumnSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length === 0 || a.length !== b.length) return false;
+  const set = new Set(a);
+  if (set.size !== a.length) return false;
+  for (const col of b) if (!set.has(col)) return false;
+  return true;
+}
+
+/**
+ * The target-side correlation columns of a to-one relation, but ONLY when the
+ * schema PROVES they are unique on the target table. This is the row-
+ * multiplication guard: a LEFT JOIN over a non-unique key silently duplicates
+ * parent rows, which would change results rather than just the plan.
+ *
+ * Proof sources, all exact set matches (a unique index on `(a, b)` does NOT
+ * make `a` unique):
+ *   - the target's primary key,
+ *   - a declared unique constraint (`uniqueColumns`),
+ *   - a full, non-expression UNIQUE index. Partial unique indexes are refused
+ *     (they only constrain the rows matching their predicate) and PowDB
+ *     doc-field expression indexes are refused (they index a JSON path, not the
+ *     raw column).
+ *
+ * Returns `null` for to-many / manyToMany relations and for anything it cannot
+ * prove, which routes the relation back to the correlated subquery.
+ *
+ * NULLs need no special handling: a unique constraint permits repeated NULLs,
+ * but `target.key = parent.fk` never matches a NULL key, so a null-keyed target
+ * row can never join.
+ */
+export function provableUniqueTargetKey(relDef: RelationDef, targetMeta: TableMetadata): string[] | null {
+  let cols: string[];
+  if (relDef.type === 'belongsTo') {
+    // belongsTo: SOURCE holds the FK, so the join is target.referenceKey = parent.foreignKey.
+    cols = normalizeKeyColumns(relDef.referenceKey);
+  } else if (relDef.type === 'hasOne') {
+    // hasOne: TARGET holds the FK, so the join is target.foreignKey = parent.referenceKey.
+    cols = normalizeKeyColumns(relDef.foreignKey);
+  } else {
+    return null;
+  }
+  if (cols.length === 0) return null;
+  if (!cols.every((col) => targetMeta.allColumns.includes(col))) return null;
+  if (sameColumnSet(cols, targetMeta.primaryKey)) return cols;
+  for (const unique of targetMeta.uniqueColumns) {
+    if (sameColumnSet(cols, unique)) return cols;
+  }
+  for (const idx of targetMeta.indexes) {
+    if (!idx.unique || idx.partial || idx.docPath) continue;
+    if (sameColumnSet(cols, idx.columns)) return cols;
+  }
+  return null;
+}
+
+/**
+ * Plan one relation as a flattened LEFT JOIN, or return `null` to leave it on
+ * the correlated-subquery path.
+ *
+ * A relation is ELIGIBLE when all of the following hold:
+ *   1. it is `belongsTo` or `hasOne` AND its target-side correlation columns are
+ *      provably unique ({@link provableUniqueTargetKey}) — the row-multiplication
+ *      guard;
+ *   2. its spec declares no `limit` and no `orderBy` (both are no-ops over a
+ *      single matching row, but refusing them keeps the emitted SQL and the
+ *      param stream trivially equivalent);
+ *   3. its nested `with` names only real relations and no reserved `_count`
+ *      (nested `_count` is unsupported on every strategy — falling back lets the
+ *      subquery path raise the same error);
+ *   4. the depth cap is not reached, so a too-deep chain still raises
+ *      {@link CircularRelationError} from the subquery path instead of silently
+ *      succeeding;
+ *   5. its projected aliases are unique within the node and within the identifier
+ *      length limit.
+ *
+ * Relation `where` IS supported: it moves into the join's `ON` clause, where a
+ * non-matching row null-extends exactly as the subquery's `LIMIT 1` returned
+ * NULL. The target's global filter is applied the same way, so a flattened
+ * relation can never surface soft-deleted / out-of-tenant rows.
+ */
+function planFlattenNode(
+  qi: BuilderCtx,
+  counter: { n: number },
+  relName: string,
+  relDef: RelationDef,
+  spec: true | WithOptions,
+  depth: number,
+  path: string[],
+  includePii: boolean | undefined,
+  aliasSink: string[],
+  rejects: FlattenRejects,
+): FlattenNode | null {
+  /** Record why this relation stays on the subquery path, then decline it. */
+  const decline = (reason: string): null => {
+    rejects.push({ relation: [...path.slice(1), relName].join('.'), reason });
+    return null;
+  };
+
+  if (depth >= FLATTEN_MAX_DEPTH) return decline(`it nests more than ${FLATTEN_MAX_DEPTH} levels deep`);
+  const targetMeta = qi.schema.tables[relDef.to];
+  if (!targetMeta) return decline(`its target table "${relDef.to}" is not in the schema metadata`);
+  const key = provableUniqueTargetKey(relDef, targetMeta);
+  if (!key) {
+    return decline(
+      relDef.type !== 'belongsTo' && relDef.type !== 'hasOne'
+        ? `it is ${relDef.type}, and only a to-one relation can be flattened into a join`
+        : `its correlation column(s) on "${relDef.to}" are not provably unique (no primary key, ` +
+            'unique constraint or non-partial unique index covers them), so a join could multiply parent rows',
+    );
+  }
+
+  const opts = spec === true ? undefined : spec;
+  if (opts) {
+    if (opts.limit !== undefined) return decline('it declares a `limit`');
+    if (opts.orderBy && orderByEntries(opts.orderBy).some(([, dir]) => dir !== undefined)) {
+      return decline('it declares an `orderBy`');
+    }
+  }
+
+  const nestedEntries = opts?.with ? sortedEntries(opts.with as WithClause) : [];
+  for (const [nestedRelName] of nestedEntries) {
+    if (nestedRelName === '_count') return decline('its nested `with` uses `_count`');
+    if (!ownLookup(targetMeta.relations, nestedRelName)) {
+      return decline(`its nested \`with\` names "${nestedRelName}", which is not a relation of "${relDef.to}"`);
+    }
+  }
+
+  const alias = `${FLATTEN_ALIAS_PREFIX}${counter.n++}`;
+  const cols = resolveTargetColumns(qi, spec, targetMeta, includePii);
+  const discAlias = `${alias}__${FLATTEN_DISCRIMINATOR}`;
+
+  const node: FlattenNode = {
+    relName,
+    relDef,
+    spec,
+    targetTable: relDef.to,
+    targetMeta,
+    alias,
+    srcAlias: `${alias}${FLATTEN_SRC_SUFFIX}`,
+    keyColumns: key,
+    discAlias,
+    cols: cols.map((col) => [col, `${alias}__${col}`] as [string, string]),
+    slots: [],
+    children: {},
+    jsonAliases: {},
+    corrAliases: depth === 0 ? key.map((_, i) => `${alias}__${FLATTEN_CORR}${i}`) : [],
+    depth,
+    path,
+  };
+
+  // Local alias uniqueness: a target whose relation name equals one of its own
+  // column names ("owner" the column and "owner" the relation) would otherwise
+  // project two `f0__owner` columns and silently clobber one.
+  const local = [discAlias, ...node.corrAliases, ...node.cols.map(([, a]) => a)];
+  for (const [nestedRelName] of nestedEntries) local.push(`${alias}__${nestedRelName}`);
+  if (new Set(local).size !== local.length) {
+    return decline('a projected column alias would collide (a relation name matches one of its own column names)');
+  }
+  if (local.some((a) => a.length > FLATTEN_MAX_ALIAS_LEN)) {
+    return decline(`a projected column alias would exceed ${FLATTEN_MAX_ALIAS_LEN} characters`);
+  }
+
+  for (const [nestedRelName, nestedSpec] of nestedEntries) {
+    const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName)!;
+    const child = planFlattenNode(
+      qi,
+      counter,
+      nestedRelName,
+      nestedRelDef,
+      nestedSpec,
+      depth + 1,
+      [...path, relName],
+      includePii,
+      aliasSink,
+      rejects,
+    );
+    if (child) {
+      node.slots.push({ relName: nestedRelName, kind: 'flat' });
+      node.children[nestedRelName] = child;
+    } else {
+      node.slots.push({ relName: nestedRelName, kind: 'json' });
+      node.jsonAliases[nestedRelName] = `${alias}__${nestedRelName}`;
+    }
+  }
+
+  aliasSink.push(discAlias, ...node.cols.map(([, a]) => a), ...Object.values(node.jsonAliases));
+  return node;
+}
+
+/** Structural signature of one node, recursively. Feeds the SQL cache key. */
+function flattenNodeSignature(node: FlattenNode): string {
+  const slots = node.slots
+    .map((slot) =>
+      slot.kind === 'flat' ? `+${flattenNodeSignature(node.children[slot.relName]!)}` : `~${slot.relName}`,
+    )
+    .join('');
+  return `${node.relName}@${node.alias}(${node.cols.map(([col]) => col).join(',')})${slots}`;
+}
+
+/**
+ * Dev-only, once-per-(table, relation, reason) note that an explicitly
+ * requested `relationLoadStrategy: 'flatten'` did NOT engage for a relation.
+ *
+ * Worth its own warning because the fallback is otherwise INVISIBLE: the query
+ * succeeds, the rows are correct (the strategies are value-identical), and the
+ * only symptom is that the plan the caller asked for is not the plan that ran.
+ * Silence there is indistinguishable from the strategy being a no-op, which is
+ * exactly the shape of thing that gets filed as a bug.
+ *
+ * Suppressed in production like the other planner notes, and deduped through
+ * the shared registry so a hot query logs once rather than per call. Note that
+ * a flatten plan is recomputed on the build, param-collect and row-assembly
+ * paths for the same query; the registry is what keeps that to one line.
+ */
+function warnFlattenFallback(table: string, rejects: readonly FlattenReject[]): void {
+  if (rejects.length === 0) return;
+  if (process.env.NODE_ENV === 'production') return;
+  for (const { relation, reason } of rejects) {
+    if (!shouldWarnOnce(WARN_NS.flattenFallback, `${table}.${relation}|${reason}`)) continue;
+    console.warn(
+      `[turbine] relationLoadStrategy: 'flatten' did not engage for relation "${relation}" on "${table}": ` +
+        `${reason}. It loads via the correlated subquery instead (same rows, same values, different plan).`,
+    );
+  }
+}
+
+/**
+ * Compile the `'flatten'` plan for a top-level `with` clause, or return `null`
+ * when nothing in it is eligible (in which case the caller emits exactly the SQL
+ * it emits today, down to the cache key).
+ *
+ * The plan is a pure function of the schema, the `with` clause shape and
+ * `includePii` — never of any bound value — so the build path, the cache-hit
+ * param-collect path and the row assembler can each recompute it and agree.
+ */
+export function planFlattenWith(
+  qi: BuilderCtx,
+  table: string,
+  withClause: WithClause,
+  includePii?: boolean,
+): FlattenPlan | null {
+  const meta = qi.schema.tables[table];
+  if (!meta) return null;
+  const counter = { n: 0 };
+  const aliases: string[] = [];
+  const nodes: Record<string, FlattenNode> = {};
+  const rejects: FlattenRejects = [];
+
+  for (const [relName, relSpec] of sortedEntries(withClause)) {
+    if (relName === '_count') continue;
+    const relDef = ownLookup(meta.relations, relName);
+    // An unknown relation stays on the subquery path so it raises E005 there.
+    if (!relDef) continue;
+    const node = planFlattenNode(qi, counter, relName, relDef, relSpec, 0, [table], includePii, aliases, rejects);
+    if (node) nodes[relName] = node;
+  }
+
+  warnFlattenFallback(table, rejects);
+
+  if (Object.keys(nodes).length === 0) return null;
+
+  // Flat rows carry the root table's own columns, one column per non-flattened
+  // relation (named for the relation) and `_count__<rel>` scalars alongside the
+  // prefixed aliases. A collision would make the assembler read the wrong cell,
+  // so refuse the whole plan rather than plan around it.
+  const reserved = new Set<string>([...meta.allColumns, ...Object.keys(withClause)]);
+  for (const alias of aliases) {
+    if (reserved.has(alias)) {
+      warnFlattenFallback(table, [
+        {
+          relation: Object.keys(nodes).join(', '),
+          reason: `the projected alias "${alias}" collides with a column or relation name on "${table}"`,
+        },
+      ]);
+      return null;
+    }
+  }
+
+  const signature = Object.keys(nodes)
+    .sort()
+    .map((relName) => flattenNodeSignature(nodes[relName]!))
+    .join('|');
+  return { nodes, aliases, signature };
+}
+
+/**
+ * Compile the correlation of a to-one relation as a join condition:
+ *   - `belongsTo` → `target.referenceKey = parent.foreignKey` (SOURCE holds the FK)
+ *   - `hasOne`    → `target.foreignKey   = parent.referenceKey` (TARGET holds the FK)
+ *
+ * Same column pairing {@link buildRelationSubquery} correlates on; getting it
+ * backwards silently compares the wrong columns.
+ */
+function flattenCorrelation(
+  qi: BuilderCtx,
+  relDef: RelationDef,
+  targetRef: string,
+  targetColumns: string | string[],
+  parentRef: string,
+): string {
+  const parentColumns = relDef.type === 'belongsTo' ? relDef.foreignKey : relDef.referenceKey;
+  return qi.dialect.buildCorrelation(targetRef, targetColumns, parentRef, parentColumns);
+}
+
+/**
+ * Emit one TOP-LEVEL flattened relation: a derived table holding its whole
+ * to-one subtree, joined to the parent on the re-exposed correlation columns,
+ * plus the pass-through projection of every name that subtree contributes.
+ *
+ * ```sql
+ *  LEFT JOIN (
+ *    SELECT 1 AS "f0__$k", f0s."id" AS "f0__$c0",
+ *           f0s."id" AS "f0__id", f0s."name" AS "f0__name",
+ *           (f1s."id" IS NOT NULL) AS "f1__$k", f1s."code" AS "f1__code"
+ *    FROM "orgs" f0s
+ *    LEFT JOIN "regions" f1s ON f1s."id" = f0s."region_id"
+ *    WHERE f0s."deleted" = $1
+ *  ) f0 ON f0."f0__$c0" = "users"."org_id"
+ * ```
+ *
+ * See the derived-table note above for why the join cannot expose the target's
+ * real column names.
+ */
+export function emitFlattenNode(
+  qi: BuilderCtx,
+  node: FlattenNode,
+  parentRef: string,
+  params: unknown[],
+  joinSink: string[],
+  selectSink: string[],
+  aliasCounter: { n: number },
+  includePii?: boolean,
+): void {
+  const innerSelects: string[] = [];
+  const innerJoins: string[] = [];
+  const innerWhere: string[] = [];
+
+  emitFlattenInner(qi, node, params, innerSelects, innerJoins, innerWhere, aliasCounter, includePii);
+
+  const whereSql = innerWhere.length > 0 ? ` WHERE ${innerWhere.join(' AND ')}` : '';
+  const derived = `SELECT ${innerSelects.join(', ')} FROM ${qi.q(node.targetTable)} ${node.srcAlias}${innerJoins.join('')}${whereSql}`;
+  const on = flattenCorrelation(qi, node.relDef, node.alias, node.corrAliases, parentRef);
+  joinSink.push(` LEFT JOIN (${derived}) ${node.alias} ON ${on}`);
+
+  projectFlattenNode(qi, node, node.alias, selectSink);
+}
+
+/**
+ * Build one node's contribution INSIDE its top-level derived table: its filters,
+ * its prefixed column projection, and its nested slots (another inner LEFT JOIN
+ * for a flattened child, a correlated subquery column for anything else).
+ *
+ * Param push order, mirrored exactly by {@link collectFlattenNodeParams}:
+ * relation `where` → target global filter → each nested slot in `slots` order.
+ */
+function emitFlattenInner(
+  qi: BuilderCtx,
+  node: FlattenNode,
+  params: unknown[],
+  innerSelects: string[],
+  innerJoins: string[],
+  innerWhere: string[],
+  aliasCounter: { n: number },
+  includePii: boolean | undefined,
+): void {
+  const { srcAlias, targetTable, targetMeta } = node;
+  const isRoot = node.depth === 0;
+
+  // A root node's filters go in the derived table's WHERE; a nested node's go in
+  // its own inner LEFT JOIN's ON. Both null-extend the relation on a miss rather
+  // than dropping the parent row, matching what the correlated subquery's
+  // `LIMIT 1` did when it returned NULL.
+  const filters = innerWhere;
+  if (node.spec !== true && node.spec.where) {
+    const extra = whereMod.buildAliasWhere(
+      qi,
+      targetTable,
+      targetMeta,
+      srcAlias,
+      node.spec.where as Record<string, unknown>,
+      params,
+    );
+    if (extra) filters.push(extra);
+  }
+  // Global filter on the target (soft-delete / tenancy): a flattened relation
+  // must never surface rows the join strategy would have filtered out.
+  const gf = whereMod.targetGlobalFilterAlias(qi, targetTable, srcAlias, params);
+  if (gf) filters.push(gf);
+
+  if (isRoot) {
+    // The derived table's rows exist only where the target matched, so a
+    // constant marks the match; the outer LEFT JOIN nulls it on a miss.
+    innerSelects.push(`1 AS ${qi.q(node.discAlias)}`);
+    node.keyColumns.forEach((col, i) => {
+      innerSelects.push(`${srcAlias}.${qi.q(col)} AS ${qi.q(node.corrAliases[i]!)}`);
+    });
+  } else {
+    innerSelects.push(`(${srcAlias}.${qi.q(node.keyColumns[0]!)} IS NOT NULL) AS ${qi.q(node.discAlias)}`);
+  }
+
+  for (const [col, sqlAlias] of node.cols) {
+    innerSelects.push(`${srcAlias}.${qi.q(col)} AS ${qi.q(sqlAlias)}`);
+  }
+
+  for (const slot of node.slots) {
+    if (slot.kind === 'flat') {
+      const child = node.children[slot.relName]!;
+      const on = flattenCorrelation(qi, child.relDef, child.srcAlias, child.keyColumns, srcAlias);
+      // Placeholder: the child's own filters are appended to this ON below, so
+      // reserve the slot now to keep join order matching slot order.
+      const at = innerJoins.length;
+      innerJoins.push('');
+      const childFilters: string[] = [];
+      emitFlattenInner(qi, child, params, innerSelects, innerJoins, childFilters, aliasCounter, includePii);
+      const conds = [on, ...childFilters].join(' AND ');
+      innerJoins[at] = ` LEFT JOIN ${qi.q(child.targetTable)} ${child.srcAlias} ON ${conds}`;
+      continue;
+    }
+    const nestedRelDef = ownLookup(targetMeta.relations, slot.relName)!;
+    const nestedSpec = (node.spec as WithOptions).with![slot.relName] as true | WithOptions;
+    const sub = buildRelationSubquery(
+      qi,
+      nestedRelDef,
+      nestedSpec,
+      params,
+      srcAlias,
+      aliasCounter,
+      node.depth + 1,
+      [...node.path, node.relName],
+      includePii,
+    );
+    // Same fallback the subquery path picks for a nested relation slot.
+    const fallback = nestedRelDef.type === 'hasMany' ? qi.dialect.emptyJsonArrayLiteral : qi.dialect.nullJsonLiteral;
+    innerSelects.push(`${qi.dialect.wrapJsonSubresult(sub, fallback)} AS ${qi.q(node.jsonAliases[slot.relName]!)}`);
+  }
+}
+
+/**
+ * Pass every name a flattened subtree contributes through the outer SELECT, in
+ * the same order {@link emitFlattenInner} produced it (which is the order the
+ * join strategy's `json_build_object` uses, so assembled key order matches).
+ * The internal `$c` correlation columns are deliberately NOT projected: they
+ * exist only for the outer join condition.
+ */
+function projectFlattenNode(qi: BuilderCtx, node: FlattenNode, outerAlias: string, selectSink: string[]): void {
+  const ref = (name: string) => `${qi.q(outerAlias)}.${qi.q(name)}`;
+  selectSink.push(ref(node.discAlias));
+  for (const [, sqlAlias] of node.cols) selectSink.push(ref(sqlAlias));
+  for (const slot of node.slots) {
+    if (slot.kind === 'flat') projectFlattenNode(qi, node.children[slot.relName]!, outerAlias, selectSink);
+    else selectSink.push(ref(node.jsonAliases[slot.relName]!));
+  }
+}
+
+/** Param-collect mirror of {@link emitFlattenNode}. */
+export function collectFlattenNodeParams(qi: BuilderCtx, node: FlattenNode, params: unknown[]): void {
+  if (node.spec !== true && node.spec.where) {
+    whereMod.collectAliasWhereParams(
+      qi,
+      node.targetTable,
+      node.targetMeta,
+      node.spec.where as Record<string, unknown>,
+      params,
+    );
+  }
+  whereMod.collectTargetGlobalFilterAlias(qi, node.targetTable, params);
+  for (const slot of node.slots) {
+    if (slot.kind === 'flat') {
+      collectFlattenNodeParams(qi, node.children[slot.relName]!, params);
+      continue;
+    }
+    const nestedRelDef = ownLookup(node.targetMeta.relations, slot.relName);
+    if (!nestedRelDef) continue;
+    const nestedSpec = (node.spec as WithOptions).with![slot.relName] as true | WithOptions;
+    collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, node.alias, node.depth + 1);
+  }
+}
+
+/**
+ * Rebuild one flattened relation's object from a flat row.
+ *
+ * Returns `null` when the discriminator is NULL (the LEFT JOIN matched
+ * nothing), which is the ONLY signal that distinguishes "no related row" from
+ * "a related row whose every projected column is NULL".
+ *
+ * The sub-row is keyed by the target's raw snake_case column names and handed
+ * to {@link parseNestedRow}, so the flattened object goes through the very same
+ * camelCase mapping, Date coercion and nested-JSON parsing the join strategy's
+ * `json_build_object` output does. Nested flattened relations are assigned
+ * after the parse, over placeholder keys inserted in slot order, so the
+ * assembled object's key order matches the join strategy's exactly.
+ */
+export function assembleFlattenNode(
+  qi: BuilderCtx,
+  row: Record<string, unknown>,
+  node: FlattenNode,
+): Record<string, unknown> | null {
+  // The discriminator is the projected predicate `key IS NOT NULL`, so its
+  // truthy encodings are engine-specific (Postgres booleans, MySQL/SQLite 0/1,
+  // and a text-mode driver's 't'/'1'). Whitelist the matched forms: an
+  // unrecognized encoding reads as "no related row", which the cross-engine
+  // parity suites surface loudly rather than as scattered wrong objects.
+  const disc = row[node.discAlias];
+  const matched = disc === true || disc === 1 || disc === '1' || disc === 't' || disc === 'true';
+  if (!matched) return null;
+
+  const sub: Record<string, unknown> = {};
+  for (const [col, sqlAlias] of node.cols) sub[col] = row[sqlAlias];
+  for (const slot of node.slots) {
+    // A 'flat' slot is a placeholder here: parseNestedRow skips `undefined`
+    // relation values, so the key keeps its position and is filled in below.
+    sub[slot.relName] = slot.kind === 'json' ? row[node.jsonAliases[slot.relName]!] : undefined;
+  }
+
+  const parsed = parseNestedRow(qi, sub, node.targetTable);
+  for (const slot of node.slots) {
+    if (slot.kind === 'flat') parsed[slot.relName] = assembleFlattenNode(qi, row, node.children[slot.relName]!);
+  }
+  return parsed;
+}
+
+/**
+ * Row parser for a `'flatten'` plan: strip the prefixed join columns out of the
+ * flat row (inserting a placeholder at the position each relation's block
+ * started, so key order is preserved), parse the remainder exactly as the join
+ * strategy does, then assemble each flattened relation.
+ */
+export function makeFlattenParser(
+  qi: BuilderCtx,
+  plan: FlattenPlan,
+): (row: Record<string, unknown>) => Record<string, unknown> {
+  const flatAliases = new Set(plan.aliases);
+  // The discriminator is emitted FIRST for each node, so it marks where a
+  // relation's block begins in the flat row's key order.
+  const relationByLeadAlias = new Map<string, string>();
+  for (const [relName, node] of Object.entries(plan.nodes)) relationByLeadAlias.set(node.discAlias, relName);
+
+  return (row) => {
+    const stripped: Record<string, unknown> = {};
+    for (const key of Object.keys(row)) {
+      if (!flatAliases.has(key)) {
+        stripped[key] = row[key];
+        continue;
+      }
+      const relName = relationByLeadAlias.get(key);
+      if (relName !== undefined) stripped[relName] = undefined;
+    }
+    const parsed = parseNestedRow(qi, stripped, qi.table);
+    for (const [relName, node] of Object.entries(plan.nodes)) {
+      parsed[relName] = assembleFlattenNode(qi, row, node);
+    }
+    return parsed;
+  };
+}
+
 /**
  * Build a SELECT clause that includes both base columns and nested relation subqueries.
  *
@@ -1478,6 +2315,7 @@ export function buildSelectWithRelations(
   depth?: number,
   path?: string[],
   includePii?: boolean,
+  flatten?: { plan: FlattenPlan; joinSink: string[] },
 ): string {
   const meta = qi.schema.tables[table];
   if (!meta) throw new ValidationError(`[turbine] Unknown table "${table}"`);
@@ -1504,12 +2342,21 @@ export function buildSelectWithRelations(
   for (const [relName, relSpec] of sortedEntries(withClause)) {
     // `_count` is a reserved key handled after the relation subqueries.
     if (relName === '_count') continue;
-    const relDef = meta.relations[relName];
+    const relDef = ownLookup(meta.relations, relName);
     if (!relDef) {
       throw new RelationError(
         `[turbine] Unknown relation "${relName}" on table "${table}". ` +
           `Available: ${Object.keys(meta.relations).join(', ')}`,
       );
+    }
+
+    // `relationLoadStrategy: 'flatten'`: an eligible to-one relation becomes a
+    // LEFT JOIN + prefixed scalar projection instead of a per-parent-row
+    // correlated subquery. Every other relation falls through unchanged.
+    const flatNode = flatten?.plan.nodes[relName];
+    if (flatNode) {
+      emitFlattenNode(qi, flatNode, qi.q(table), params, flatten!.joinSink, relationSelects, aliasCounter, includePii);
+      continue;
     }
 
     // The main table is not aliased, so pass table name as parentRef
@@ -1721,10 +2568,7 @@ export function buildRelationSubquery(
   }
 
   // Build JSON object pairs for resolved columns
-  const jsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
-    targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
-    `${alias}.${qi.q(col)}`,
-  ]);
+  const jsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, alias);
 
   // Determine if this hasMany will take the wrapped subquery path (LIMIT or ORDER BY).
   // When wrapping, nested relations are built in the wrapped path referencing innerAlias,
@@ -1760,7 +2604,7 @@ export function buildRelationSubquery(
   // Nested relations — only in the non-wrapped path (wrapped path builds them separately)
   if (!willWrap && spec !== true && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) {
         throw new RelationError(
           `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
@@ -1842,7 +2686,7 @@ export function buildRelationSubquery(
   // `limit: 0` is honored (LIMIT 0 → empty array), so check !== undefined.
   let limitClause = '';
   if (relDef.type === 'hasMany' && spec !== true && spec.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params)}`;
+    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params, 'relation limit')}`;
   }
 
   if (relDef.type === 'hasMany') {
@@ -1854,14 +2698,11 @@ export function buildRelationSubquery(
       // Inner SELECT always needs all columns for WHERE/ORDER to work; json_build_object filters later
       const innerSql = `SELECT ${targetMeta.allColumns.map((c) => `${alias}.${qi.q(c)}`).join(', ')} FROM ${qTarget} ${alias} WHERE ${whereClause}${orderClause}${limitClause}`;
       // For the json_build_object, reference the inner alias — only include resolved columns
-      const innerJsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
-        targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
-        `${innerAlias}.${qi.q(col)}`,
-      ]);
+      const innerJsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, innerAlias);
       // Build nested relation subqueries referencing innerAlias
       if (spec !== true && spec.with) {
         for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-          const nestedRelDef = targetMeta.relations[nestedRelName];
+          const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
           if (!nestedRelDef) {
             throw new RelationError(
               `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
@@ -2013,7 +2854,7 @@ export function buildManyToManySubquery(
   // LIMIT — `limit: 0` is honored (LIMIT 0 → empty array)
   let limitClause = '';
   if (spec !== true && spec.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params)}`;
+    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params, 'relation limit')}`;
   }
 
   const fromJoin = `FROM ${qTarget} ${talias} JOIN ${qJunction} ${jalias} ON ${joinOn}`;
@@ -2025,14 +2866,11 @@ export function buildManyToManySubquery(
     const innerSql =
       `SELECT ${targetMeta.allColumns.map((c) => `${talias}.${qi.q(c)}`).join(', ')} ` +
       `${fromJoin} WHERE ${whereClause}${orderClause}${limitClause}`;
-    const innerJsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
-      targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
-      `${innerAlias}.${qi.q(col)}`,
-    ]);
+    const innerJsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, innerAlias);
     // Nested relations reference the inner alias.
     if (spec !== true && spec.with) {
       for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-        const nestedRelDef = targetMeta.relations[nestedRelName];
+        const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
         if (!nestedRelDef) {
           throw new RelationError(
             `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
@@ -2063,13 +2901,10 @@ export function buildManyToManySubquery(
 
   // Simple path: build the json object pairs directly off the target alias,
   // including any nested relations (correlated to the target alias).
-  const jsonPairs: [key: string, expr: string][] = targetColumns.map((col) => [
-    targetMeta.reverseColumnMap[col] ?? snakeToCamel(col),
-    `${talias}.${qi.q(col)}`,
-  ]);
+  const jsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, talias);
   if (spec !== true && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) {
         throw new RelationError(
           `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +

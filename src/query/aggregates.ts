@@ -27,6 +27,7 @@ import type {
   OrderDirection,
   WhereClause,
 } from './types.js';
+import { ownLookup } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 
@@ -269,8 +270,8 @@ export function buildGroupBy<T extends object>(
   // no `$n` renumbering. `offset` without a deterministic `orderBy` yields an
   // arbitrary window (same caveat as findMany).
   if (args.limit !== undefined || args.offset !== undefined) {
-    const limitPh = args.limit !== undefined ? qi.paginationRef(args.limit, params) : undefined;
-    const offsetPh = args.offset !== undefined ? qi.paginationRef(args.offset, params) : undefined;
+    const limitPh = args.limit !== undefined ? qi.paginationRef(args.limit, params, 'limit') : undefined;
+    const offsetPh = args.offset !== undefined ? qi.paginationRef(args.offset, params, 'skip/offset') : undefined;
     sql += qi.buildPagination(limitPh, offsetPh, args.orderBy !== undefined);
   }
 
@@ -609,7 +610,10 @@ export function buildHavingClauses<T extends object>(
 
     for (const [aggKey, filter] of Object.entries(value as Record<string, HavingFilter>)) {
       if (filter === undefined) continue;
-      const fn = aggFnByKey[aggKey];
+      // ownLookup, not a bare index: an inherited Object.prototype member
+      // ("constructor", "toString", …) would otherwise resolve to a truthy
+      // builtin and be spliced into the HAVING clause as its source text.
+      const fn = ownLookup(aggFnByKey, aggKey);
       if (!fn) {
         throw new ValidationError(
           `[turbine] Unknown aggregate "${aggKey}" in having for field "${key}" on table "${qi.table}". ` +

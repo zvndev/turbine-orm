@@ -1,5 +1,5 @@
 /**
- * turbine-orm CLI — Studio
+ * turbine-orm CLI: Studio
  *
  * A local web UI for browsing databases, exploring relations, and composing
  * queries visually. ORM-native since v0.19: there is no raw-SQL input surface.
@@ -50,8 +50,12 @@ import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { CreateArgs, DeleteArgs, FindManyArgs, UpdateArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
+// `ownLookup` is not re-exported from the query barrel, so it is imported from
+// its defining leaf module rather than duplicated here.
+import { ownLookup } from '../query/utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
+import { callerKey, checkRateLimit } from './rate-limit.js';
 import { createDemoContext } from './studio-demo.js';
 import { STUDIO_HTML } from './studio-ui.generated.js';
 
@@ -107,7 +111,7 @@ export interface StudioHandle {
   piiTags: { path: string; applied: number } | null;
   /** Random per-process session token the UI sends via cookie. */
   authToken: string;
-  /** Full URL including `?token=...` — safe to print for the user. */
+  /** Full URL including `?token=...`, safe to print for the user. */
   url: string;
 }
 
@@ -124,9 +128,9 @@ export interface StudioContext {
   options: StudioOptions;
   authToken: string;
   stateDir: string;
-  /** Resolved statement timeout (adapter-aware) — parameterized SQL + values. */
+  /** Resolved statement timeout (adapter-aware): parameterized SQL + values. */
   statementTimeout: { sql: string; params: unknown[] };
-  /** Rate limiter state — tracks requests per authenticated session. */
+  /** Rate limiter state: tracks requests per authenticated session. */
   rateLimiter: Map<string, { count: number; resetAt: number }>;
   /**
    * True when write mode is enabled (`--write`): the `/api/row/*` routes exist
@@ -192,11 +196,11 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     // seam in client.ts); the cast keeps one typed pool field for both modes.
     pool = new pg.Pool({
       connectionString: options.url,
-      max: 4, // small pool — single-user tool
+      max: 4, // small pool, single-user tool
       idleTimeoutMillis: 10_000,
     }) as unknown as PgCompatPool;
 
-    // Verify connectivity before starting the server — fail fast.
+    // Verify connectivity before starting the server, fail fast.
     const probe = await pool.connect();
     try {
       await probe.query('SELECT 1');
@@ -302,7 +306,7 @@ function originFor(host: string, port: number): string {
 
 export async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
   const expectedOrigin = originFor(ctx.options.host, ctx.options.port);
-  // CORS: not needed — same-origin only. Explicitly refuse cross-origin.
+  // CORS: not needed, same-origin only. Explicitly refuse cross-origin.
   const origin = req.headers.origin;
   if (origin && origin !== expectedOrigin) {
     sendJson(res, 403, { error: 'cross-origin requests not allowed' });
@@ -334,7 +338,7 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse, c
     return;
   }
 
-  // Favicon — answered before the auth gate so the browser's automatic request
+  // Favicon: answered before the auth gate so the browser's automatic request
   // doesn't 401/404 on every load. No icon body needed (204).
   if (pathname === '/favicon.ico') {
     res.writeHead(204, { 'Content-Length': '0' });
@@ -342,18 +346,24 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse, c
     return;
   }
 
-  // API routes — all require auth.
-  if (!isAuthorized(req, ctx.authToken)) {
-    sendJson(res, 401, { error: 'unauthorized — use the URL printed in the terminal' });
-    return;
-  }
-
-  // Rate limiting — 100 requests per 60 seconds per authenticated session.
-  const rateLimitResult = checkRateLimit(ctx.rateLimiter, ctx.authToken);
+  // Rate limiting: 100 requests per 60 seconds, applied BEFORE the auth gate so
+  // an unauthenticated caller is throttled too (it used to run after, leaving
+  // token guessing unmetered). Keyed per caller rather than on `ctx.authToken`:
+  // that token is a single constant, so keying on it made one global bucket that
+  // every session shared. Authenticated and unauthenticated callers get separate
+  // buckets so a probing client cannot spend the real session's budget.
+  const authorized = isAuthorized(req, ctx.authToken);
+  const rateLimitResult = checkRateLimit(ctx.rateLimiter, `${authorized ? 'session' : 'anon'}:${callerKey(req)}`);
   if (!rateLimitResult.allowed) {
     const retryAfter = Math.ceil((rateLimitResult.resetAt - Date.now()) / 1000);
     res.setHeader('Retry-After', String(retryAfter));
     sendJson(res, 429, { error: 'Rate limit exceeded', retryAfter });
+    return;
+  }
+
+  // API routes: all require auth.
+  if (!authorized) {
+    sendJson(res, 401, { error: 'unauthorized: use the URL printed in the terminal' });
     return;
   }
 
@@ -446,42 +456,14 @@ function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
     return true;
   }
   const cookieHeader = req.headers.cookie ?? '';
-  const match = /turbine_studio_token=([a-f0-9]+)/.exec(cookieHeader);
+  // Anchored on a cookie boundary: unanchored, a decoy cookie named
+  // `x_turbine_studio_token=...` matched first and the real cookie was never
+  // compared, locking the legitimate session out of its own Studio.
+  const match = /(?:^|;\s*)turbine_studio_token=([a-f0-9]+)/.exec(cookieHeader);
   if (match?.[1] && constantTimeEqual(match[1], expectedToken)) {
     return true;
   }
   return false;
-}
-
-// ---------------------------------------------------------------------------
-// Rate limiting
-// ---------------------------------------------------------------------------
-
-const RATE_LIMIT_WINDOW_MS = 60_000; // 60 seconds
-const RATE_LIMIT_MAX_REQUESTS = 100;
-
-interface RateLimitResult {
-  allowed: boolean;
-  resetAt: number;
-}
-
-function checkRateLimit(limiter: Map<string, { count: number; resetAt: number }>, token: string): RateLimitResult {
-  const now = Date.now();
-  const entry = limiter.get(token);
-
-  if (!entry || now >= entry.resetAt) {
-    // Start a new window
-    const resetAt = now + RATE_LIMIT_WINDOW_MS;
-    limiter.set(token, { count: 1, resetAt });
-    return { allowed: true, resetAt };
-  }
-
-  entry.count++;
-  if (entry.count > RATE_LIMIT_MAX_REQUESTS) {
-    return { allowed: false, resetAt: entry.resetAt };
-  }
-
-  return { allowed: true, resetAt: entry.resetAt };
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -614,11 +596,6 @@ export interface ReferencedByLink {
   targetColumn: string;
 }
 
-/** Own-property lookup: a key like `constructor` must not resolve off the prototype. */
-function ownLookup(map: Record<string, string>, key: string): string | undefined {
-  return Object.hasOwn(map, key) ? map[key] : undefined;
-}
-
 /** True when `columnName` on `table` is PII-tagged and currently redacted. */
 function isRedactedColumn(table: TableMetadata, columnName: string, showPii: boolean): boolean {
   if (showPii) return false;
@@ -709,7 +686,9 @@ export async function apiTableRows(
   rawTableName: string,
   params: URLSearchParams,
 ): Promise<void> {
-  const table = ctx.metadata.tables[rawTableName];
+  // Own-property lookup: `/api/tables/constructor` must 404 like any other
+  // unknown table rather than resolving Object.prototype and crashing.
+  const table = ownLookup(ctx.metadata.tables, rawTableName);
   if (!table) {
     sendJson(res, 404, { error: unknownTableMessage(rawTableName, ctx) });
     return;
@@ -721,7 +700,7 @@ export async function apiTableRows(
   const orderByRaw = params.get('orderBy');
   const dir = params.get('dir')?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
-  // orderBy — accept either the Postgres column name (snake) or the TS field
+  // orderBy: accept either the Postgres column name (snake) or the TS field
   // name (camel). Always emit the Postgres column in the SQL.
   // When redaction is on, PII columns are excluded from orderBy (and from the
   // search OR-set below): a redacted value must not be inferable through sort
@@ -750,7 +729,7 @@ export async function apiTableRows(
   // Per-column filters: `filters` is a JSON array of { column, op, value }
   // composed by the Data tab's filter bar. Every column is validated against
   // the metadata, every op against a fixed whitelist, and every value is a
-  // parameter — same discipline as the builder route.
+  // parameter, same discipline as the builder route.
   let filters: TableFilter[];
   try {
     filters = parseTableFilters(params.get('filters'), table, redactedPii);
@@ -897,7 +876,7 @@ const FILTER_OPS: Record<string, string> = {
 
 const FILTER_OP_NAMES = new Set([...Object.keys(FILTER_OPS), 'contains', 'isNull', 'notNull']);
 
-/** Hard cap on filter clauses per request — the UI never composes more. */
+/** Hard cap on filter clauses per request; the UI never composes more. */
 const MAX_TABLE_FILTERS = 10;
 
 interface TableFilter {
@@ -963,22 +942,45 @@ function parseTableFilters(raw: string | null, table: TableMetadata, redactedPii
 }
 
 // ---------------------------------------------------------------------------
-// API: /api/builder — Turbine ORM findMany spec runner
+// API: /api/builder: Turbine ORM findMany spec runner
 // ---------------------------------------------------------------------------
 
+/** Relation-filter wrappers whose body is a clause against the relation's target. */
+const RELATION_FILTER_WRAPPERS = ['some', 'none', 'every', 'is', 'isNot'] as const;
+
 /**
- * Refuse a builder query that FILTERS or SORTS on a redacted PII column.
+ * Recursion bound for the PII guard walk.
+ *
+ * This number is NOT the security boundary: reaching it REFUSES the request
+ * (see `assertWithinDepth`). It only bounds the walk on a pathological payload.
+ * It sits well above the query builder's own depth-10 relation cap
+ * (`CircularRelationError`) and far above any hand-composed boolean nesting, so
+ * nothing the builder would accept is refused here for depth alone.
+ */
+const PII_GUARD_MAX_DEPTH = 32;
+
+/**
+ * Refuse a builder query that FILTERS, SORTS, PAGES, or DE-DUPLICATES on a
+ * redacted PII column.
  *
  * Redacting the cells is not enough on its own: `where: { email: { startsWith:
  * 'a' } }` answers a question about the hidden value, and so does an `isNull`,
- * and so does an `orderBy`. The Data tab already refuses all three
- * (`parseTableFilters`); the builder route accepted them, which mattered the
- * moment PII tags actually started reaching Studio's metadata.
+ * and so does an `orderBy`. So does a `cursor`, which compiles into a WHERE
+ * range comparison (`"email" > $1`) and gives a clean binary search over the
+ * byte range even though every returned cell is redacted. So, more weakly, does
+ * `distinct`, which reports the cardinality of the hidden values. The Data tab
+ * already refuses its own equivalents (`parseTableFilters`); the builder route
+ * has to refuse all of them too.
  *
- * Walks the whole args tree: top-level `where` / `orderBy`, boolean
- * combinators, and each `with` level against that relation's target table.
- * `select` is NOT refused: it returns values, and those values are redacted on
- * the way out.
+ * Walks the whole args tree: `where`, `orderBy` (object AND array form),
+ * `cursor`, `distinct`, boolean combinators, relation filters, and each `with`
+ * level against that relation's target table. `select` / `omit` are NOT
+ * refused: they return values, and those values are redacted on the way out.
+ *
+ * Every depth check FAILS CLOSED. Returning quietly at the cap (what this used
+ * to do) meant padding a payload with, for example, eleven nested `NOT`
+ * wrappers walked the guard off the end of its own recursion and then handed
+ * the untouched predicate to the builder.
  */
 function assertNoPiiPredicates(
   args: Record<string, unknown>,
@@ -988,34 +990,86 @@ function assertNoPiiPredicates(
 ): void {
   if (showPii) return;
 
+  const assertWithinDepth = (depth: number): void => {
+    if (depth <= PII_GUARD_MAX_DEPTH) return;
+    throw new ValidationError(
+      `[turbine] Query is nested more than ${PII_GUARD_MAX_DEPTH} levels deep, which is past the point where ` +
+        `Studio can prove it does not filter or sort on a PII-tagged and redacted column, so it is refused. ` +
+        `Flatten the query, or restart Studio with --show-pii.`,
+    );
+  };
+
+  const refuse = (table: TableMetadata, column: string): never => {
+    throw new ValidationError(
+      `[turbine] Column "${column}" on "${table.name}" is PII-tagged and redacted, so it cannot be used ` +
+        `in a where, orderBy, cursor, or distinct: filtering, sorting, paging, or de-duplicating on a hidden ` +
+        `value reveals it. Restart Studio with --show-pii to query it.`,
+    );
+  };
+
   const visitClause = (node: unknown, table: TableMetadata | undefined, depth: number): void => {
-    if (!table || depth > 10 || node === null || typeof node !== 'object') return;
+    assertWithinDepth(depth);
+    if (!table || node === null || typeof node !== 'object') return;
+    // `orderBy` accepts a Prisma-style array of single-key objects, and so does
+    // a `NOT` list. Element order carries no nesting, so the depth is unchanged.
+    if (Array.isArray(node)) {
+      for (const item of node) visitClause(item, table, depth);
+      return;
+    }
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
       if (key === 'AND' || key === 'OR' || key === 'NOT') {
-        for (const item of Array.isArray(value) ? value : [value]) visitClause(item, table, depth + 1);
+        visitClause(value, table, depth + 1);
         continue;
       }
       const relation = Object.hasOwn(table.relations, key) ? table.relations[key] : undefined;
       if (relation) {
-        // some / none / every / is / isNot wrappers all resolve against the target.
-        visitClause(value, metadata.tables[relation.to], depth + 1);
+        visitRelationValue(value, metadata.tables[relation.to], depth + 1);
         continue;
       }
       const column = ownLookup(table.columnMap, key) ?? key;
-      if (isRedactedColumn(table, column, showPii)) {
-        throw new ValidationError(
-          `[turbine] Column "${column}" on "${table.name}" is PII-tagged and redacted, so it cannot be used ` +
-            `in a where or orderBy: filtering or sorting on a hidden value reveals it. ` +
-            `Restart Studio with --show-pii to query it.`,
-        );
-      }
+      if (isRedactedColumn(table, column, showPii)) refuse(table, column);
+    }
+  };
+
+  /**
+   * A relation predicate arrives in one of two shapes, and BOTH resolve against
+   * the relation's target table: bare (`{ user: { email: {...} } }`) or wrapped
+   * in a cardinality / to-one operator (`{ user: { is: { email: {...} } } }`,
+   * likewise `some` / `none` / `every` / `isNot`). Handing the wrapper straight
+   * to `visitClause` walked its keys as if `is` were a column of the target, so
+   * the inner clause was never visited and a PII predicate slipped through.
+   * Descend into every wrapper member AND into the value itself.
+   */
+  const visitRelationValue = (value: unknown, target: TableMetadata | undefined, depth: number): void => {
+    assertWithinDepth(depth);
+    if (!target || value === null || typeof value !== 'object') return;
+    const node = value as Record<string, unknown>;
+    for (const wrapper of RELATION_FILTER_WRAPPERS) {
+      if (Object.hasOwn(node, wrapper)) visitClause(node[wrapper], target, depth + 1);
+    }
+    visitClause(node, target, depth);
+  };
+
+  /** Field-name lists (`distinct`) name columns directly rather than in a clause. */
+  const visitFieldList = (value: unknown, table: TableMetadata): void => {
+    if (!Array.isArray(value)) return;
+    for (const field of value) {
+      if (typeof field !== 'string') continue;
+      const column = ownLookup(table.columnMap, field) ?? field;
+      if (isRedactedColumn(table, column, showPii)) refuse(table, column);
     }
   };
 
   const visitLevel = (level: Record<string, unknown>, table: TableMetadata | undefined, depth: number): void => {
-    if (!table || depth > 10) return;
+    assertWithinDepth(depth);
+    if (!table) return;
     visitClause(level.where, table, depth);
     visitClause(level.orderBy, table, depth);
+    // `cursor` is a flat `{ field: value }` seek key that the builder turns into
+    // a WHERE range comparison against the sort key, so it reads exactly like a
+    // where on the same column.
+    visitClause(level.cursor, table, depth);
+    visitFieldList(level.distinct, table);
     const withClause = level.with;
     if (!withClause || typeof withClause !== 'object') return;
     for (const [relName, spec] of Object.entries(withClause as Record<string, unknown>)) {
@@ -1033,7 +1087,7 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
   const tableName = typeof body?.table === 'string' ? body.table : '';
   const args = (body?.args ?? {}) as FindManyArgs<Record<string, unknown>>;
 
-  if (!tableName || !ctx.metadata.tables[tableName]) {
+  if (!tableName || !ownLookup(ctx.metadata.tables, tableName)) {
     sendJson(res, 400, { error: unknownTableMessage(tableName, ctx) });
     return;
   }
@@ -1117,11 +1171,11 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
 // from those PK values alone, so a statement can only ever touch one row.
 //
 // Bulk form (insert/delete only): pass `rows: [...]` instead of `data`/`where`
-// — an array of data objects (insert) or PK-where objects (delete). Each entry
+// (an array of data objects for insert, or PK-where objects for delete). Each entry
 // goes through the exact same per-row validation and compiles to its own
 // single-row statement; all statements run in ONE transaction (all-or-nothing,
 // capped at MAX_BULK_ROWS). Predicate-based bulk writes stay deliberately
-// unsupported — every row is still addressed by its full primary key.
+// unsupported: every row is still addressed by its full primary key.
 // ---------------------------------------------------------------------------
 
 /** Hard cap on rows per bulk insert/delete request (matches the max page size). */
@@ -1135,7 +1189,7 @@ export async function apiRowWrite(
 ): Promise<void> {
   const body = await readJsonBody(req);
   const tableName = typeof body?.table === 'string' ? body.table : '';
-  const table = ctx.metadata.tables[tableName];
+  const table = ownLookup(ctx.metadata.tables, tableName);
   if (!table) {
     sendJson(res, 400, { error: unknownTableMessage(tableName, ctx) });
     return;
@@ -1365,14 +1419,14 @@ function extractPkWhere(
 }
 
 // ---------------------------------------------------------------------------
-// API: /api/saved-queries — persisted per-table query library
+// API: /api/saved-queries: persisted per-table query library
 // ---------------------------------------------------------------------------
 
 interface SavedQuery {
   id: string;
   table: string;
   name: string;
-  /** Studio only saves visual-builder queries — there is no raw-SQL surface. */
+  /** Studio only saves visual-builder queries: there is no raw-SQL surface. */
   kind: 'builder';
   args?: unknown;
   createdAt: string;
@@ -1391,7 +1445,7 @@ function savedQueriesPath(ctx: StudioContext): string {
 let legacyDropNoticeShown = false;
 
 function loadSavedQueries(ctx: StudioContext): SavedQueriesFile {
-  // Demo mode: in-memory only — never read the user's real saved-query file.
+  // Demo mode: in-memory only, never read the user's real saved-query file.
   if (ctx.demo) {
     if (!ctx.memorySavedQueries) ctx.memorySavedQueries = { version: 1, queries: [] };
     return ctx.memorySavedQueries;
@@ -1402,7 +1456,7 @@ function loadSavedQueries(ctx: StudioContext): SavedQueriesFile {
     const raw = readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw) as SavedQueriesFile;
     if (!parsed.queries || !Array.isArray(parsed.queries)) return { version: 1, queries: [] };
-    // Drop any legacy raw-SQL entries — Studio is builder-only now. Tell the
+    // Drop any legacy raw-SQL entries: Studio is builder-only now. Tell the
     // user instead of silently discarding their saved work (the file on disk
     // is only rewritten when a new query is saved, so this is recoverable).
     const queries = parsed.queries.filter((q) => q && q.kind === 'builder');
@@ -1410,7 +1464,7 @@ function loadSavedQueries(ctx: StudioContext): SavedQueriesFile {
     if (dropped > 0 && !legacyDropNoticeShown) {
       legacyDropNoticeShown = true;
       console.warn(
-        `[turbine studio] Ignoring ${dropped} legacy raw-SQL saved quer${dropped === 1 ? 'y' : 'ies'} in ${file} — ` +
+        `[turbine studio] Ignoring ${dropped} legacy raw-SQL saved quer${dropped === 1 ? 'y' : 'ies'} in ${file}. ` +
           'Studio is builder-only since v0.19. The entries remain in the file until a new query is saved.',
       );
     }
@@ -1421,7 +1475,7 @@ function loadSavedQueries(ctx: StudioContext): SavedQueriesFile {
 }
 
 function writeSavedQueries(ctx: StudioContext, data: SavedQueriesFile): void {
-  // Demo mode: in-memory only — nothing is ever written to disk.
+  // Demo mode: in-memory only, nothing is ever written to disk.
   if (ctx.demo) {
     ctx.memorySavedQueries = data;
     return;
@@ -1744,6 +1798,6 @@ function openUrl(url: string): void {
     const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
     child.unref();
   } catch {
-    // Non-fatal — user can click the URL manually.
+    // Non-fatal: user can click the URL manually.
   }
 }

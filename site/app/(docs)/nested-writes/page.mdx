@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'Nested Writes',
   description:
-    'Create and update related rows in a single call with Turbine ORM: create, connect, connectOrCreate, disconnect, set, delete, update, and upsert across hasMany, hasOne, and belongsTo relations — all in one transaction.',
+    'Create and update related rows in a single call with Turbine ORM: create, connect, connectOrCreate, disconnect, set, delete, update, and upsert across hasMany, hasOne, belongsTo and many-to-many relations, all in one transaction.',
   alternates: { canonical: '/nested-writes' },
 };
 
@@ -26,18 +26,18 @@ The examples below assume this shape:
 
 | Op | Context | Relations | What it does |
 |---|---|---|---|
-| `create` | create + update | all | Insert new related row(s) and link them |
-| `connect` | create + update | all | Link existing row(s) by a unique `where` |
-| `connectOrCreate` | create + update | all | Connect the row matching `where`, else create it |
-| `disconnect` | update only | all | Null the foreign key (FK must be nullable) |
-| `set` | update only | hasMany / hasOne | Replace the whole set — disconnect current, connect listed |
-| `delete` | update only | all | Delete the related row(s) matching `where` |
-| `update` | update only | all | Update the related row(s) (`where` is optional for belongsTo) |
-| `upsert` | update only | all | Update the row matching `where`, else create it |
+| `create` | create + update | belongsTo / hasOne / hasMany | Insert new related row(s) and link them |
+| `connect` | create + update | all, incl. manyToMany | Link existing row(s) by a unique `where` |
+| `connectOrCreate` | create + update | belongsTo / hasOne / hasMany | Connect the row matching `where`, else create it |
+| `disconnect` | update only | all, incl. manyToMany | Unlink: null the FK, or drop the junction row |
+| `set` | update only | hasOne / hasMany / manyToMany | Replace the whole set: unlink current, link listed |
+| `delete` | update only | belongsTo / hasOne / hasMany | Delete the related row(s) matching `where` |
+| `update` | update only | belongsTo / hasOne / hasMany | Update the related row(s) (`where` is optional for belongsTo) |
+| `upsert` | update only | belongsTo / hasOne / hasMany | Update the row matching `where`, else create it |
 
-"Relations" above means **to-one and one-to-many** (`belongsTo`, `hasOne`, `hasMany`). **Many-to-many relations have no nested-write support on any engine**: a relation op on an m2m relation throws a `ValidationError` ([E003](/errors)) naming the junction table, rather than silently doing nothing. Write junction rows directly (`db.userTags.createMany(...)`) inside the same `$transaction`.
+`create`, `connect`, and `connectOrCreate` are valid in both `create()` and `update()`. The other five are **update-only**: using them inside `create()` throws `ValidationError` ([E003](/errors)). An unknown operation name throws too.
 
-`create`, `connect`, and `connectOrCreate` are valid in both `create()` and `update()`. The other five are **update-only** — using them inside `create()` throws `ValidationError` ([E003](/errors)). An unknown operation name throws too.
+**Many-to-many** relations support the three operations that only ever touch the junction table: `connect`, `disconnect`, and `set` (see [Many-to-many relations](#many-to-many-relations) below). The operations that would also have to write the *target* row (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) still throw `ValidationError` ([E003](/errors)), because there is no safe default for the junction's own extra columns.
 
 ## Create context
 
@@ -250,12 +250,95 @@ await db.users.update({
 });
 ```
 
+## Many-to-many relations
+
+A many-to-many relation has no foreign key on either side: the link lives in a junction row. Turbine writes those junction rows for you, in the same transaction as the parent write, on **every engine** (the SQL dialects and PowDB share one nested-write engine).
+
+Three operations are supported, because three operations only ever touch the junction table:
+
+| Op | Context | What it writes |
+|---|---|---|
+| `connect` | create + update | Inserts the missing junction rows for the named targets |
+| `disconnect` | update only | Deletes the junction rows for exactly the named targets |
+| `set` | update only | Deletes this parent's junction rows, then inserts the named ones |
+
+The examples below assume `posts` and `tags` are linked through a `post_tags` junction:
+
+```ts
+// On create: connect only (disconnect and set are update-only on every relation)
+await db.posts.create({
+  data: {
+    title: 'Single-query relations',
+    tags: {
+      connect: [{ slug: 'postgres' }, { slug: 'orm' }],
+    },
+  },
+});
+
+// On update: all three
+await db.posts.update({
+  where: { id: 1 },
+  data: {
+    tags: {
+      set: [{ slug: 'postgres' }, { slug: 'sql' }], // these become the post's only tags
+    },
+  },
+});
+
+await db.posts.update({
+  where: { id: 1 },
+  data: {
+    tags: {
+      connect: { slug: 'performance' },
+      disconnect: { slug: 'sql' },
+    },
+  },
+});
+```
+
+Behavior worth knowing:
+
+- **`connect` is idempotent.** Turbine reads the parent's existing links for exactly the named targets inside the transaction and inserts only the missing ones. It does not rely on `ON CONFLICT DO NOTHING`, which SQL Server and PowDB refuse and which assumes a unique constraint an implicit junction need not declare. Connecting an already-linked tag is a no-op, not a duplicate row and not a constraint error.
+- **`disconnect` is scoped by both keys.** The delete names the parent key *and* the listed targets, so it can neither clear the parent's other links nor touch another parent's rows.
+- **`set` replaces the whole set.** `set: []` clears every link this parent has. The clearing delete is always scoped by the parent key.
+- **Order within one payload:** `set` runs first, then `disconnect`, then `connect`.
+- **A selector that matches no row is refused**, with `ValidationError` ([E003](/errors)) naming the relation and the selector, rather than being skipped.
+- **Composite junction keys are refused.** A link row that needs more than one column per side cannot be addressed by the single-column predicates these writes use, so Turbine throws instead of writing a partial key. Write those junction rows directly.
+
+### What still throws
+
+`create`, `connectOrCreate`, `update`, `upsert`, and `delete` on a many-to-many relation throw `ValidationError` ([E003](/errors)). Each of those would have to write the *target* row as well as the link, and there is no safe default for the junction's own extra columns. The error names the operation and the supported set.
+
+To create a target and link it, write the target and connect it:
+
+```ts
+await db.$transaction(async (tx) => {
+  const tag = await tx.tags.create({ data: { slug: 'indexes', name: 'Indexes' } });
+  await tx.posts.update({
+    where: { id: 1 },
+    data: { tags: { connect: { id: tag.id } } },
+  });
+});
+```
+
+To write link rows by hand (a junction with its own payload columns, for instance), address the junction table directly. On the core client it is an ordinary table, reachable through the camelCased accessor or `table()`:
+
+```ts
+await db.$transaction(async (tx) => {
+  await tx.table('post_tags').createMany({
+    data: [{ postId: 1, tagId: 7, addedBy: 'editor' }],
+  });
+});
+```
+
+Since 0.50 the [prisma-compat](/migrate-from-prisma) client exposes the same junction tables too, under their raw name, so this escape hatch is reachable from a migrated codebase as well.
+
 ## Guarantees
 
 - **Atomic.** Every statement runs inside a single transaction. A failure anywhere rolls the whole tree back.
 - **Ordered correctly.** `belongsTo` targets are resolved before the parent insert (so `NOT NULL` FKs hold); `hasMany`/`hasOne` children are written after the parent exists.
 - **Depth-capped at 10.** Deeper trees throw `CircularRelationError` ([E007](/errors)) with the full relation path.
-- **Validated.** Update-only ops in `create()`, unknown op names, non-nullable `disconnect`, missing `connect` targets, and any op on a many-to-many relation all throw `ValidationError` ([E003](/errors)) before anything commits.
+- **Validated.** Update-only ops in `create()`, unknown op names, non-nullable `disconnect`, missing `connect` targets, and the unsupported many-to-many ops (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) all throw `ValidationError` ([E003](/errors)) before anything commits. An unsupported many-to-many op is refused *before* the parent row is written, so a refused create leaves nothing behind.
 - **Scoped to the parent.** `delete` / `update` / `disconnect` / `upsert` can only touch rows that actually belong to the parent being written: the relation correlation is ANDed onto your `where`, and a target outside the relation reports `NotFoundError` ([E001](/errors)) instead of modifying a row owned by someone else. A selector that binds nothing (`{}`, or a field that is `undefined`) is refused rather than widened to the whole relation.
 - **Read back.** The return value is the parent row with the touched relations loaded via Turbine's `json_agg` machinery.
 

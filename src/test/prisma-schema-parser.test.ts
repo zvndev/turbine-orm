@@ -8,7 +8,12 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { type PrismaModel, PrismaParseError, parsePrismaSchema } from '../cli/prisma-schema.js';
+import {
+  type PrismaModel,
+  PrismaParseError,
+  parsePrismaSchema,
+  resolvePrismaDatasourceUrl,
+} from '../cli/prisma-schema.js';
 
 const FIXTURES = join(process.cwd(), 'src/test/fixtures/prisma');
 const readFixture = (name: string) => readFileSync(join(FIXTURES, name), 'utf-8');
@@ -184,5 +189,92 @@ describe('parsePrismaSchema - lenience', () => {
       ast.models[0]!.fields.map((f) => f.name),
       ['id'],
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// datasource block + connection-string resolution
+// ---------------------------------------------------------------------------
+
+describe('parsePrismaSchema - datasource blocks', () => {
+  it('records provider and an env() url', () => {
+    const ast = parsePrismaSchema(readFixture('shop.prisma'));
+    assert.equal(ast.datasources.length, 1);
+    const ds = ast.datasources[0]!;
+    assert.equal(ds.name, 'db');
+    assert.equal(ds.provider, 'postgresql');
+    assert.deepEqual(ds.url, { kind: 'env', variable: 'DATABASE_URL' });
+    assert.equal(ds.directUrl, undefined);
+    // Parsing the block must stay silent: it is not a table.
+    assert.equal(ast.warnings.length, 0);
+  });
+
+  it('records a literal url, a directUrl, and skips unrelated keys', () => {
+    const src = [
+      'datasource db {',
+      '  provider          = "postgresql"',
+      '  url               = "postgres://localhost:5432/app"',
+      '  directUrl         = env("DIRECT_URL")',
+      '  shadowDatabaseUrl = env("SHADOW_URL")',
+      '  relationMode      = "prisma"',
+      '}',
+    ].join('\n');
+    const ds = parsePrismaSchema(src).datasources[0]!;
+    assert.deepEqual(ds.url, { kind: 'literal', value: 'postgres://localhost:5432/app' });
+    assert.deepEqual(ds.directUrl, { kind: 'env', variable: 'DIRECT_URL' });
+  });
+
+  it('leaves url undefined for a form it cannot read', () => {
+    const src = 'datasource db {\n  provider = "postgresql"\n  url = someExpr(DATABASE_URL)\n}';
+    assert.equal(parsePrismaSchema(src).datasources[0]!.url, undefined);
+  });
+});
+
+describe('resolvePrismaDatasourceUrl', () => {
+  const parse = (body: string) => parsePrismaSchema(`datasource db {\n${body}\n}`);
+
+  it('reads the declared env() variable name', () => {
+    const ast = parse('  provider = "postgresql"\n  url = env("DATABASE_URL_AUG_4")');
+    const got = resolvePrismaDatasourceUrl(ast, { DATABASE_URL_AUG_4: 'postgres://a/b' });
+    assert.deepEqual(got.resolved, {
+      url: 'postgres://a/b',
+      datasource: 'db',
+      key: 'url',
+      variable: 'DATABASE_URL_AUG_4',
+    });
+    assert.deepEqual(got.missingVariables, []);
+  });
+
+  it('reads a direct string url', () => {
+    const ast = parse('  url = "postgres://direct/db"');
+    assert.equal(resolvePrismaDatasourceUrl(ast, {}).resolved?.url, 'postgres://direct/db');
+  });
+
+  it('falls back to directUrl when the url variable is unset', () => {
+    const ast = parse('  url = env("POOLED_URL")\n  directUrl = env("DIRECT_URL")');
+    const got = resolvePrismaDatasourceUrl(ast, { DIRECT_URL: 'postgres://direct/db' });
+    assert.equal(got.resolved?.key, 'directUrl');
+    assert.equal(got.resolved?.url, 'postgres://direct/db');
+    // The unset `url` variable is still reported, so the error can name it.
+    assert.deepEqual(got.missingVariables, ['POOLED_URL']);
+  });
+
+  it('reports every declared-but-unset variable and resolves nothing', () => {
+    const ast = parse('  url = env("DATABASE_URL_AUG_4")\n  directUrl = env("DIRECT_URL_AUG_4")');
+    const got = resolvePrismaDatasourceUrl(ast, { OTHER: 'x' });
+    assert.equal(got.resolved, undefined);
+    assert.deepEqual(got.missingVariables, ['DATABASE_URL_AUG_4', 'DIRECT_URL_AUG_4']);
+  });
+
+  it('treats an empty env value as unset', () => {
+    const ast = parse('  url = env("DATABASE_URL_AUG_4")');
+    const got = resolvePrismaDatasourceUrl(ast, { DATABASE_URL_AUG_4: '' });
+    assert.equal(got.resolved, undefined);
+    assert.deepEqual(got.missingVariables, ['DATABASE_URL_AUG_4']);
+  });
+
+  it('resolves nothing when the schema declares no datasource', () => {
+    const ast = parsePrismaSchema('model User {\n  id Int @id\n}');
+    assert.deepEqual(resolvePrismaDatasourceUrl(ast, { DATABASE_URL: 'x' }), { missingVariables: [] });
   });
 });

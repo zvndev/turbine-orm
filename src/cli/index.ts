@@ -71,9 +71,10 @@ import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
-import type { CliOverrides, ResolvedConfig } from './config.js';
+import type { CliOverrides, ConfigLoadError, ResolvedConfig, TurbineCliConfig } from './config.js';
 import {
   configTemplate,
+  DEFAULT_INIT_SEED_FILE,
   findConfigFile,
   loadConfigResult,
   looksLikeSchemaFilePath,
@@ -103,7 +104,13 @@ import {
 import { startObserve } from './observe.js';
 import { formatPrismaReport, summaryLines } from './prisma-report.js';
 import { DEFAULT_EXCLUDED_TABLES, resolvePrismaSchema } from './prisma-resolve.js';
-import { PrismaParseError, parsePrismaSchema } from './prisma-schema.js';
+import {
+  PrismaParseError,
+  type PrismaSchemaAst,
+  parsePrismaSchema,
+  type ResolvedPrismaDatasourceUrl,
+  resolvePrismaDatasourceUrl,
+} from './prisma-schema.js';
 import { startStudio } from './studio.js';
 import {
   banner,
@@ -445,10 +452,86 @@ function failMissingTsLoader(filePath: string, reason: 'missing' | 'unsupported'
 }
 
 // ---------------------------------------------------------------------------
+// Config bootstrap
+// ---------------------------------------------------------------------------
+
+/**
+ * Does this invocation need a `turbine.config.*` file?
+ *
+ * Everything does, with one deliberate exception: `turbine studio --demo` boots
+ * a seeded in-memory database, needs no `DATABASE_URL` and no config file, and
+ * is the very next command the quickstart suggests after `turbine init`.
+ * Resolving the config anyway means a freshly scaffolded directory (a
+ * `turbine.config.ts` with `tsx` not installed yet) dies with "Cannot load
+ * TypeScript file" before demo mode ever starts.
+ *
+ * @internal exported for tests.
+ */
+export function usesProjectConfig(args: Pick<CliArgs, 'command' | 'demo'>): boolean {
+  return !(args.command === 'studio' && args.demo === true);
+}
+
+/**
+ * Outcome of {@link bootstrapCliConfig}.
+ *
+ * @internal exported for tests.
+ */
+export interface CliConfigBootstrap {
+  /** Merged config: CLI flags > env vars > config file > defaults. */
+  config: ResolvedConfig;
+  /** The raw config-file contents (`{}` when none was loaded). */
+  fileConfig: TurbineCliConfig;
+  /** Set when a config file existed but failed to import. */
+  loadError?: ConfigLoadError;
+  /** True when config resolution was deliberately skipped (see {@link usesProjectConfig}). */
+  skipped: boolean;
+}
+
+/**
+ * Resolve the effective CLI config: register the tsx loader when the config file
+ * is TypeScript, import it, then merge it with env vars and CLI flags. Exits with
+ * the actionable "Cannot load TypeScript file" error when a `.ts` config cannot
+ * be loaded. Config-free invocations short-circuit without touching the disk.
+ *
+ * @internal exported for tests.
+ */
+export async function bootstrapCliConfig(
+  args: Pick<CliArgs, 'command' | 'demo'>,
+  overrides: CliOverrides,
+): Promise<CliConfigBootstrap> {
+  if (!usesProjectConfig(args)) {
+    return { config: resolveConfig({}, overrides), fileConfig: {}, skipped: true };
+  }
+
+  // If the user has a TypeScript config file, register the tsx ESM loader
+  // before we attempt to import it. Otherwise Node throws
+  // ERR_UNKNOWN_FILE_EXTENSION for `.ts`.
+  const configPath = findConfigFile();
+  if (needsTsLoader(configPath)) {
+    const status = await registerTsLoader();
+    if (status === 'missing' || status === 'unsupported' || status === 'failed') {
+      failMissingTsLoader(configPath ?? 'turbine.config.ts', status);
+    }
+  }
+
+  const { config: fileConfig, loadError } = await loadConfigResult();
+  return { config: resolveConfig(fileConfig, overrides), fileConfig, loadError, skipped: false };
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function requireUrl(config: ResolvedConfig): string {
+interface RequireUrlOptions {
+  /**
+   * Environment variable names a `schema.prisma` datasource declares via
+   * `env(...)` that were unset. Listed as an extra way to supply the URL, so
+   * the user sees the exact variable the CLI looked for.
+   */
+  datasourceVars?: string[];
+}
+
+function requireUrl(config: ResolvedConfig, options: RequireUrlOptions = {}): string {
   if (!config.url) {
     error('No database URL provided.');
     newline();
@@ -461,6 +544,14 @@ function requireUrl(config: ResolvedConfig): string {
       `    ${dim('2.')} Set ${cyan('DATABASE_URL')} in your environment or a ${cyan('.env')} file ${dim(envFileNote)}`,
     );
     console.log(`    ${dim('3.')} Pass ${cyan('--url')} flag`);
+    const vars = options.datasourceVars ?? [];
+    if (vars.length > 0) {
+      const list = vars.map((v) => cyan(v)).join(', ');
+      const plural = vars.length > 1 ? 'these variables' : 'this variable';
+      console.log(
+        `    ${dim('4.')} Set ${list} ${dim(`(${plural}, declared by your schema.prisma datasource, ${vars.length > 1 ? 'are' : 'is'} unset)`)}`,
+      );
+    }
     newline();
     process.exit(1);
   }
@@ -659,6 +750,60 @@ export function dotEnvUrlConflictWarning(input: {
     `(${redactUrl(fileUrl)}). Using the .env value. Remove DATABASE_URL from .env, or unset the config url, ` +
     `to silence this.`
   );
+}
+
+/** Package managers we can name an exact install command for. */
+export type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';
+
+/**
+ * Detect the consumer's package manager from its lockfile, defaulting to npm.
+ * Used only to print an exact, copy-pasteable install command.
+ *
+ * @internal exported for tests.
+ */
+export function detectPackageManager(cwd = process.cwd()): PackageManager {
+  if (existsSync(join(cwd, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (existsSync(join(cwd, 'yarn.lock'))) return 'yarn';
+  if (existsSync(join(cwd, 'bun.lockb')) || existsSync(join(cwd, 'bun.lock'))) return 'bun';
+  return 'npm';
+}
+
+/**
+ * The exact "add tsx as a dev dependency" command for a package manager.
+ *
+ * @internal exported for tests.
+ */
+export function tsxInstallCommand(pm: PackageManager): string {
+  switch (pm) {
+    case 'pnpm':
+      return 'pnpm add -D tsx';
+    case 'yarn':
+      return 'yarn add -D tsx';
+    case 'bun':
+      return 'bun add -d tsx';
+    default:
+      return 'npm install --save-dev tsx';
+  }
+}
+
+/**
+ * The heads-up `turbine init` prints when it has just scaffolded TypeScript
+ * files and `tsx` is not resolvable: without it the CLI cannot load them, and
+ * the very next command the user runs dies on "Cannot load TypeScript file".
+ * Pure (returns the lines, prints nothing) so it can be asserted in tests.
+ *
+ * @internal exported for tests.
+ */
+export function tsxRequiredNotice(tsFiles: string[], installCommand: string): string[] {
+  return [
+    `Turbine needs ${cyan('tsx')} to load the TypeScript files just created:`,
+    ...tsFiles.map((f) => `    ${dim(symbols.dot)} ${cyan(f)}`),
+    '',
+    `  ${dim('Install it as a dev dependency:')}`,
+    `    ${cyan(installCommand)}`,
+    '',
+    `  ${dim('Without it, the next Turbine command fails with')} ${dim('"Cannot load TypeScript file".')}`,
+  ];
 }
 
 /**
@@ -1047,6 +1192,66 @@ function initPromptQuestion(step: InitPlanStep, config: ResolvedConfig, seedFile
   }
 }
 
+/**
+ * The one-line connection heads-up `turbine init` opens with.
+ *
+ * @internal exported for tests.
+ */
+export interface InitEnvNotice {
+  kind: 'success' | 'info';
+  message: string;
+}
+
+/**
+ * Decide which connection notice `turbine init` prints. Pure so the whole
+ * decision matrix is testable.
+ *
+ * "No DATABASE_URL found in environment" is reserved for the case where NO
+ * source supplied one: printing it while happily using `--url` (or a config
+ * `url`) reads like a failure the user then goes looking for.
+ *
+ * @internal exported for tests.
+ */
+export function initEnvNotice(input: {
+  envUrl: string | undefined;
+  hasEnvFile: boolean;
+  hasEnvLocal: boolean;
+  canAutoLoadEnv: boolean;
+  flagUrl: string | undefined;
+  configUrl: string | undefined;
+}): InitEnvNotice {
+  if (input.envUrl) {
+    return { kind: 'success', message: `Detected ${cyan('DATABASE_URL')} in the environment` };
+  }
+  if (input.hasEnvFile && !input.canAutoLoadEnv) {
+    return {
+      kind: 'info',
+      message: `Found ${cyan('.env')} ${dim('(this Node version cannot auto-load it. Upgrade to Node 20.12+ or export')} ${cyan('DATABASE_URL')}${dim(')')}`,
+    };
+  }
+  if (input.hasEnvFile) {
+    // .env exists but did not provide DATABASE_URL; if it had, the auto-load
+    // in main() would have populated envUrl above.
+    return {
+      kind: 'info',
+      message: `Found ${cyan('.env')} ${dim('(no')} ${cyan('DATABASE_URL')} ${dim('set in it yet)')}`,
+    };
+  }
+  if (input.hasEnvLocal) {
+    return {
+      kind: 'info',
+      message: `Found ${cyan('.env.local')} ${dim('(note: Turbine only auto-loads')} ${cyan('.env')}${dim(')')}`,
+    };
+  }
+  if (input.flagUrl) {
+    return { kind: 'success', message: `Using the connection string passed with ${cyan('--url')}` };
+  }
+  if (input.configUrl) {
+    return { kind: 'success', message: `Using the ${cyan('url')} from your config file` };
+  }
+  return { kind: 'info', message: `No ${cyan('DATABASE_URL')} found in environment` };
+}
+
 async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
   header('Initializing Turbine project');
@@ -1061,21 +1266,16 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   // we cannot claim it "has no DATABASE_URL"; we simply could not read it.
   const canAutoLoadEnv = typeof process.loadEnvFile === 'function';
 
-  if (envUrl) {
-    success(`Detected ${cyan('DATABASE_URL')} in the environment`);
-  } else if (hasEnvFile && !canAutoLoadEnv) {
-    info(
-      `Found ${cyan('.env')} ${dim('(this Node version cannot auto-load it. Upgrade to Node 20.12+ or export')} ${cyan('DATABASE_URL')}${dim(')')}`,
-    );
-  } else if (hasEnvFile) {
-    // .env exists but did not provide DATABASE_URL; if it had, the auto-load
-    // in main() would have populated envUrl above.
-    info(`Found ${cyan('.env')} ${dim('(no')} ${cyan('DATABASE_URL')} ${dim('set in it yet)')}`);
-  } else if (hasEnvLocal) {
-    info(`Found ${cyan('.env.local')} ${dim('(note: Turbine only auto-loads')} ${cyan('.env')}${dim(')')}`);
-  } else {
-    info(`No ${cyan('DATABASE_URL')} found in environment`);
-  }
+  const envNotice = initEnvNotice({
+    envUrl,
+    hasEnvFile,
+    hasEnvLocal,
+    canAutoLoadEnv,
+    flagUrl: args.url,
+    configUrl: config.url,
+  });
+  if (envNotice.kind === 'success') success(envNotice.message);
+  else info(envNotice.message);
   newline();
 
   // Heads-up (not an edit) about the consumer's module system. A CommonJS
@@ -1096,7 +1296,9 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const hasUrl = Boolean(url);
   const interactive = Boolean(process.stdin.isTTY);
   const yes = args.yes === true;
-  const seedFilePath = config.seedFile ?? './seed.ts';
+  // Where init scaffolds the seed file. A root-level ./seed.ts from an older
+  // init still counts, so a re-run never scaffolds a second seed file.
+  const seedFilePath = config.seedFile ?? (existsSync('./seed.ts') ? './seed.ts' : DEFAULT_INIT_SEED_FILE);
   const configPath = findConfigFile();
 
   const state: InitPlanState = {
@@ -1133,6 +1335,9 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   ensureInitScaffoldDirs(config);
   newline();
 
+  // TypeScript files this run actually created: they drive the tsx heads-up below.
+  const tsFilesWritten: string[] = [];
+
   // Execute the plan in order. `run` proceeds; `prompt` asks; `skip` reports.
   for (const step of plan) {
     if (step.action === 'skip') {
@@ -1150,12 +1355,15 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
       case 'config':
         writeFileSync('turbine.config.ts', configTemplate(args.url ?? undefined), 'utf-8');
         success(state.configExists ? `Overwrote ${cyan('turbine.config.ts')}` : `Created ${cyan('turbine.config.ts')}`);
+        tsFilesWritten.push('turbine.config.ts');
         break;
       case 'schema':
         writeInitSchemaTemplate(config);
+        if (needsTsLoader(config.schemaFile)) tsFilesWritten.push(config.schemaFile);
         break;
       case 'seed-file':
         writeInitSeedTemplate(seedFilePath);
+        if (needsTsLoader(seedFilePath)) tsFilesWritten.push(seedFilePath);
         break;
       case 'push':
         await runInitPush(config, url);
@@ -1167,6 +1375,17 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
         await runInitSeed(config);
         break;
     }
+  }
+
+  // Scaffolding .ts files and staying silent about tsx is how a fresh project
+  // hits "Cannot load TypeScript file" on its very next command. Warn now, name
+  // the exact install command, and never install anything ourselves.
+  const tsxMissing = tsFilesWritten.length > 0 && !canResolveTsx();
+  if (tsxMissing) {
+    newline();
+    const [headline, ...rest] = tsxRequiredNotice(tsFilesWritten, tsxInstallCommand(detectPackageManager()));
+    warn(headline ?? '');
+    for (const line of rest) console.log(line);
   }
 
   if (degraded) {
@@ -1192,9 +1411,10 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
       );
     }
     console.log(`  ${dim('2.')} Run ${cyan('npx turbine generate')} to introspect your DB`);
-    if (!canResolveTsx()) {
+    // Only when the fuller heads-up above did not already run (nothing scaffolded).
+    if (!tsxMissing && !canResolveTsx()) {
       console.log(
-        `     ${dim('Note: the TypeScript config requires')} ${cyan('tsx')} ${dim('—')} ${cyan('npm install --save-dev tsx')}`,
+        `     ${dim('Note: the TypeScript config requires')} ${cyan('tsx')}: ${cyan(tsxInstallCommand(detectPackageManager()))}`,
       );
     }
   } else {
@@ -1373,6 +1593,46 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
  * Postgres namespace is `public` here; multi-schema (`@@schema`) is unsupported
  * in v1 and listed as a parser note in the report.
  */
+/** Outcome of {@link resolveMigrateFromPrismaUrl}. */
+export interface MigrateFromPrismaUrl {
+  /** The connection string to use, or undefined when none could be found. */
+  url?: string;
+  /** Where it came from: the normal CLI resolution, or the Prisma datasource. */
+  source: 'config' | 'datasource' | 'none';
+  /** Datasource detail, set only when `source` is `'datasource'`. */
+  datasource?: ResolvedPrismaDatasourceUrl;
+  /** Datasource `env(...)` variable names that were declared but unset. */
+  missingVariables: string[];
+}
+
+/**
+ * Pick the connection string for `migrate-from-prisma`.
+ *
+ * `configUrl` is what {@link resolveConfig} already produced (`--url`, then
+ * `DATABASE_URL`, then `turbine.config.ts`) and always wins: an explicit flag
+ * must never be overridden by a value declared in someone else's schema file.
+ * Only when that is empty do we fall back to the `datasource` block, which
+ * removes the flag a project with a non-standard variable name would otherwise
+ * pass on every run.
+ */
+export function resolveMigrateFromPrismaUrl(
+  configUrl: string | undefined,
+  ast: Pick<PrismaSchemaAst, 'datasources'>,
+  env: Record<string, string | undefined>,
+): MigrateFromPrismaUrl {
+  const lookup = resolvePrismaDatasourceUrl(ast, env);
+  if (configUrl) return { url: configUrl, source: 'config', missingVariables: lookup.missingVariables };
+  if (lookup.resolved) {
+    return {
+      url: lookup.resolved.url,
+      source: 'datasource',
+      datasource: lookup.resolved,
+      missingVariables: lookup.missingVariables,
+    };
+  }
+  return { source: 'none', missingVariables: lookup.missingVariables };
+}
+
 async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
 
@@ -1414,7 +1674,15 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
   if (args.noDb) {
     info('Parse-only mode (--no-db): names will not be resolved.');
   } else {
-    url = requireUrl(config);
+    // The schema.prisma datasource is the LAST resort for the connection string,
+    // below `--url`, `DATABASE_URL`, and `turbine.config.ts`.
+    const resolvedUrl = resolveMigrateFromPrismaUrl(config.url, ast, process.env);
+    if (resolvedUrl.source === 'datasource' && resolvedUrl.datasource) {
+      const { variable, datasource: dsName, key } = resolvedUrl.datasource;
+      const origin = variable ? `${cyan(variable)} via datasource "${dsName}"` : `datasource "${dsName}" ${key}`;
+      info(`Using the connection string declared by your Prisma schema (${origin}).`);
+    }
+    url = resolvedUrl.url ?? requireUrl(config, { datasourceVars: resolvedUrl.missingVariables });
     label('Database', redactUrl(url));
     const spinner = new Spinner('Introspecting database schema').start();
     schemaMeta = await introspect({
@@ -3448,6 +3716,10 @@ function showMigrateFromPrismaHelp(): void {
   console.log(`    ${dim('•')} ${cyan('prisma-map.ts')}              - typed PRISMA_MAP name map`);
   newline();
   console.log(`  ${dim('Note:')} here ${cyan('--schema')} names the Prisma FILE (not the Postgres namespace).`);
+  console.log(
+    `  ${dim('Note:')} with no ${cyan('--url')} / ${cyan('DATABASE_URL')} / config ${cyan('url')}, the connection string`,
+  );
+  console.log(`        declared by your ${cyan('datasource')} block is used (including its ${cyan('env("...")')}).`);
   newline();
   console.log(`  ${bold('Options:')}`);
   console.log(
@@ -3763,28 +4035,6 @@ async function main() {
     );
   }
 
-  // If the user has a TypeScript config file, register the tsx ESM loader
-  // before we attempt to import it. Otherwise Node throws
-  // ERR_UNKNOWN_FILE_EXTENSION for `.ts`.
-  const configPath = findConfigFile();
-  if (needsTsLoader(configPath)) {
-    const status = await registerTsLoader();
-    if (status === 'missing' || status === 'unsupported' || status === 'failed') {
-      failMissingTsLoader(configPath ?? 'turbine.config.ts', status);
-    }
-  }
-
-  // Load config file. A config that exists but fails to import is surfaced
-  // loudly (with a name + the underlying error) instead of being swallowed and
-  // later misreported as a missing database URL.
-  const { config: fileConfig, loadError } = await loadConfigResult();
-  if (loadError && args.command !== 'init') {
-    const underlying = loadError.error instanceof Error ? loadError.error.message : String(loadError.error);
-    warn(`Could not load ${cyan(loadError.filename)}: ${underlying}`);
-    if (loadError.error instanceof Error) printCjsHintIfApplicable(loadError.error);
-    newline();
-  }
-
   const overrides: CliOverrides = {
     url: args.url,
     out: args.out,
@@ -3796,7 +4046,17 @@ async function main() {
     legacyToManyUniques: args.legacyToManyUniques,
   };
 
-  const config = resolveConfig(fileConfig, overrides);
+  // Resolve the config file (skipped entirely for config-free invocations such
+  // as `studio --demo`). A config that exists but fails to import is surfaced
+  // loudly (with a name + the underlying error) instead of being swallowed and
+  // later misreported as a missing database URL.
+  const { config, fileConfig, loadError } = await bootstrapCliConfig(args, overrides);
+  if (loadError && args.command !== 'init') {
+    const underlying = loadError.error instanceof Error ? loadError.error.message : String(loadError.error);
+    warn(`Could not load ${cyan(loadError.filename)}: ${underlying}`);
+    if (loadError.error instanceof Error) printCjsHintIfApplicable(loadError.error);
+    newline();
+  }
 
   // Warn (don't change precedence) when an .env-sourced DATABASE_URL is silently
   // overriding a differing, non-empty url in the config file (a wrong-database

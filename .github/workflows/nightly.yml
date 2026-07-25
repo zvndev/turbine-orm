@@ -1,7 +1,16 @@
 name: Publish @next & nightly engine tests
 
 on:
-  push:
+  # The @next publish is triggered by a SUCCESSFUL CI run on main, not by the
+  # push itself. Publishing directly on push only ever ran lint / typecheck /
+  # unit / build: no integration, no pack-smoke, no coverage, no error-code
+  # check. ci.yml's real gates ran in parallel, so a push that broke a real
+  # Postgres could still ship to the @next tag before CI went red. Hanging the
+  # publish off `workflow_run` makes every ci.yml gate a prerequisite while
+  # keeping this an on-push (per-commit) prerelease.
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
     branches: [main]
   # Nightly run for the heavy/flaky engine-integration jobs that were parked
   # out of per-PR CI (see yugabytedb-integration below). 09:17 UTC daily.
@@ -22,11 +31,21 @@ permissions:
 jobs:
   publish-next:
     runs-on: ubuntu-latest
-    # Only publish on branch pushes — not on the nightly schedule, and not on
-    # tag pushes (release.yml handles those).
-    if: "github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')"
+    # Only publish when a CI run on main SUCCEEDED. Not on the nightly schedule,
+    # and never off a red, cancelled or skipped CI run. `head_branch` is checked
+    # explicitly as well as in the trigger filter so a workflow_run replay from
+    # another branch can never publish.
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push'
     steps:
+      # workflow_run runs against the default branch by default; check out the
+      # exact commit CI validated so the published prerelease is that commit.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - uses: actions/setup-node@v6
         with:

@@ -4,6 +4,9 @@
  * Standalone utility functions and classes used by the query builder.
  */
 
+import pg from 'pg';
+import { localDateTimeKind, timeOfDayKind } from '../schema.js';
+
 // ---------------------------------------------------------------------------
 // Identifier quoting — prevents SQL injection via table/column names
 // ---------------------------------------------------------------------------
@@ -171,6 +174,116 @@ export function buildCorrelation(
 }
 
 /**
+ * Render a JS `Date` as a TIME-OF-DAY literal for a `time` / `timetz` column.
+ *
+ * Which time of day? The **UTC** components of the Date, never the process
+ * local zone. That is what Prisma does (`new Date('1970-01-01T09:00:00Z')`
+ * written to a `@db.Time(6)` column stores `09:00:00`), and the affected
+ * consumers are porting from Prisma, so Prisma is the contract. It is also the
+ * only choice that round-trips: the same Date produces the same literal no
+ * matter where the process runs.
+ *
+ * `timetz` gets an explicit `+00:00`, because the value's zone IS UTC and
+ * omitting it would let Postgres attach the session's `TimeZone` instead.
+ * Fractional seconds are emitted only when non-zero, so an even-second Date
+ * binds the plain `HH:MM:SS` form.
+ */
+export function toTimeOfDayLiteral(value: Date, kind: 'time' | 'timetz'): string {
+  const pad = (n: number, width = 2) => String(n).padStart(width, '0');
+  const ms = value.getUTCMilliseconds();
+  const literal =
+    `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}` +
+    (ms === 0 ? '' : `.${pad(ms, 3)}`);
+  return kind === 'timetz' ? `${literal}+00:00` : literal;
+}
+
+/** The temporal column shapes that need a bound Date rewritten to a literal. */
+export type TemporalBindKind = 'time' | 'timetz' | 'date' | 'timestamp';
+
+/** Render the UTC calendar date of a `Date` as `YYYY-MM-DD`. */
+function utcDatePart(value: Date): string {
+  const year = value.getUTCFullYear();
+  const y = year < 0 ? `-${String(-year).padStart(4, '0')}` : String(year).padStart(4, '0');
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${y}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`;
+}
+
+/**
+ * Render a JS `Date` as a literal for a zone-less `date` / `timestamp` column,
+ * using the value's **UTC** components.
+ *
+ * This is the write-side mirror of `parseDbDate`, which reads an offset-less
+ * database value back as UTC. Without it the driver serializes the Date with
+ * the PROCESS's offset (`prepareValue` → `dateToString`), so a `timestamp`
+ * column is not round-trip stable outside a UTC process: writing
+ * `2026-07-25T00:00Z` from `America/Los_Angeles` stores
+ * `2026-07-24 17:00:00` and reads back as `2026-07-24T17:00Z`. It also matches
+ * the choice {@link toTimeOfDayLiteral} already makes for `time` columns, and
+ * Prisma, which writes UTC components to zone-less columns.
+ *
+ * `timestamptz` is NOT handled here (and must not be): it stores a real
+ * instant, so the driver's local-offset string is already correct.
+ */
+export function toLocalDateTimeLiteral(value: Date, kind: 'date' | 'timestamp'): string {
+  const datePart = utcDatePart(value);
+  if (kind === 'date') return datePart;
+  return `${datePart} ${toTimeOfDayLiteral(value, 'time')}`;
+}
+
+/**
+ * Classify a column's database type for temporal bind rewriting.
+ *
+ * `utcDateTimes: false` restricts the classification to the time-of-day types,
+ * whose rewrite is a hard-error fix (Postgres rejects an ISO timestamp for a
+ * `time` column outright) rather than a value correction.
+ */
+export function temporalBindKind(dbType: string | undefined, utcDateTimes = true): TemporalBindKind | null {
+  const timeKind = timeOfDayKind(dbType);
+  if (timeKind) return timeKind;
+  return utcDateTimes ? localDateTimeKind(dbType) : null;
+}
+
+/**
+ * Rewrite one bound value for a temporal column: a JS `Date` on a `time` /
+ * `timetz` / `date` / `timestamp` column becomes the corresponding UTC literal,
+ * and an array of Dates on such a column is rewritten element-wise (the
+ * per-element rewrite is what a `time[]` column needs, and matches the scalar
+ * case rather than silently binding an ISO timestamp).
+ *
+ * Everything else — every non-Date, every non-temporal column, and every
+ * `timestamptz` column — is returned by IDENTITY, so this is a byte-for-byte
+ * no-op outside the shapes above.
+ */
+export function coerceTemporalValue(dbType: string | undefined, value: unknown, utcDateTimes = true): unknown {
+  const isDate = value instanceof Date;
+  if (!isDate && !Array.isArray(value)) return value;
+  if (isDate && Number.isNaN(value.getTime())) return value;
+  // An array value is either an `in`/`notIn` list on a scalar temporal column
+  // (type already the element type) or the value of an array column, whose
+  // introspected type is the `_time` / `_timestamp` array spelling.
+  const kind = temporalBindKind(isDate ? dbType : arrayElementDbType(dbType), utcDateTimes);
+  if (!kind) return value;
+  if (isDate) return renderTemporal(value, kind);
+  // Rewrite only if the list actually holds a Date, so a string list stays
+  // byte-identical (and the same array instance is returned).
+  if (!value.some((v) => v instanceof Date)) return value;
+  return value.map((v) => (v instanceof Date && !Number.isNaN(v.getTime()) ? renderTemporal(v, kind) : v));
+}
+
+/** `_time` → `time`, `time[]` → `time`, anything else unchanged. */
+function arrayElementDbType(dbType: string | undefined): string | undefined {
+  if (!dbType) return dbType;
+  if (dbType.startsWith('_')) return dbType.slice(1);
+  return dbType.endsWith('[]') ? dbType.slice(0, -2) : dbType;
+}
+
+function renderTemporal(value: Date, kind: TemporalBindKind): string {
+  return kind === 'date' || kind === 'timestamp'
+    ? toLocalDateTimeLiteral(value, kind)
+    : toTimeOfDayLiteral(value, kind);
+}
+
+/**
  * Matches an explicit timezone suffix on a date-time string: a trailing `Z`
  * or a `±HH`, `±HHMM`, `±HH:MM` offset.
  */
@@ -204,4 +317,94 @@ export function parseDbDate(value: string): Date {
   }
   // normalize `YYYY-MM-DD HH:MM:SS` (driver form) to ISO before pinning UTC
   return new Date(`${value.replace(' ', 'T')}Z`);
+}
+
+// ---------------------------------------------------------------------------
+// JSON-wire value coercion (relationLoadStrategy: 'join')
+// ---------------------------------------------------------------------------
+
+/**
+ * Postgres type name → OID, for every type family whose `json_build_object`
+ * rendering is NOT the value the pg driver produces for the same column.
+ *
+ * Why this table exists: the `'join'` strategy reads a relation through
+ * `json_agg(json_build_object(...))`, so its values are whatever
+ * `JSON.parse` makes of Postgres's JSON rendering. Every other read path in
+ * the library — a top-level row, `'batched'`, `'flatten'` — reads the column
+ * through the driver and gets the driver's representation. Measured against
+ * PostgreSQL 17, those two disagree for exactly the families below, which
+ * made the SAME query return a different JS type depending on which plan ran
+ * (and `'auto'` picks the plan from a row-count heuristic, so it could differ
+ * between two runs of one query). Three of these are lossy, not merely
+ * different:
+ *
+ *   type         driver (target)              json_build_object
+ *   ──────────── ──────────────────────────── ─────────────────────────────
+ *   numeric      '1000.50'   (string)         1000.5    (number, LOSSY)
+ *   int8         '9007199254740993'           9007199254740992 (LOSSY)
+ *   bytea        Buffer                       '\xdeadbeef' (string)
+ *   date         Date (local midnight)        Date (UTC midnight, off by tz)
+ *   interval     { days, hours, … }           '1 day 02:03:04' (string)
+ *   point        { x, y }                     '(1,2)'   (string)
+ *   circle       { x, y, radius }             '<(1,2),3>' (string)
+ *
+ * The array forms diverge the same way, plus `_timestamp`/`_timestamptz`
+ * (driver: `Date[]`; JSON: `string[]`) — the scalar `timestamp` /
+ * `timestamptz` are deliberately ABSENT because the existing `dateColumns`
+ * coercion in `parseRow` already lands them on the driver's value, and they
+ * are the hottest column type in a typical schema (no reason to add a cast to
+ * every `created_at`).
+ *
+ * The fix these OIDs drive: emit the column as `col::text` inside
+ * `json_build_object` so the JSON carries the same wire text the driver would
+ * receive, then run the DRIVER'S OWN parser for that OID over it. Parity is
+ * then by construction rather than by coincidence, and it automatically
+ * honours a caller's `pg.types.setTypeParser` (including the int8 parser
+ * TurbineClient itself registers) instead of second-guessing it.
+ *
+ * Postgres-only: the JSON functions and the divergence set are both
+ * engine-specific, so callers gate this on the postgres dialect.
+ */
+export const JSON_WIRE_COERCION_OIDS: Readonly<Record<string, number>> = {
+  numeric: 1700,
+  int8: 20,
+  bytea: 17,
+  date: 1082,
+  interval: 1186,
+  point: 600,
+  circle: 718,
+  _numeric: 1231,
+  _int8: 1016,
+  _bytea: 1001,
+  _date: 1182,
+  _interval: 1187,
+  _point: 1017,
+  _timestamp: 1115,
+  _timestamptz: 1185,
+};
+
+/**
+ * The OID whose driver parser reproduces `pgType`'s driver representation from
+ * its text rendering, or `undefined` when the type's JSON rendering already
+ * matches the driver (the common case: text, uuid, bool, int4, float8, json,
+ * jsonb, arrays of those, …).
+ */
+export function jsonWireCoercionOid(pgType: string | undefined): number | undefined {
+  if (!pgType) return undefined;
+  return JSON_WIRE_COERCION_OIDS[pgType];
+}
+
+/**
+ * Apply the driver's text parser for `oid` to a JSON-sourced wire string.
+ *
+ * Resolved through `pg.types.getTypeParser` on every call rather than
+ * memoized: parser registration is process-global and happens in the
+ * TurbineClient constructor (int8, and `timestamp` under `utcTimestamps`), and
+ * a caller may register their own at any point. A stale memo would silently
+ * reintroduce the very divergence this exists to remove. The lookup is a plain
+ * object index in pg-types, so it is not worth caching.
+ */
+export function coerceJsonWireValue(oid: number, value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  return pg.types.getTypeParser(oid, 'text')(value);
 }

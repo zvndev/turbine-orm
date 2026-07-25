@@ -1,5 +1,554 @@
 # Changelog
 
+## 0.50.0 (2026-07-25)
+
+A correctness release, and the widest one so far. Four things in it are worth
+reading before you upgrade:
+
+- **A nested `belongsTo` update could rewrite every row of the related table.**
+  A `NULL` parent foreign key compiled to `refKey IS NULL`, which matches every
+  related row with a null reference key, and the nested `data` was applied to
+  all of them. This is the reason to upgrade.
+- **A `Date` written to a `date` or `timestamp` column was stored with the
+  process's local offset**, so outside UTC the stored value was wrong and a
+  `timestamp` column did not round-trip. Fixing it changes stored values for
+  affected users: see the BREAKING entry under Changed, which tells you how to
+  check whether you are one.
+- **Studio's PII predicate guard had three holes**, and its depth limit failed
+  open, so a query could read a redacted column through a relation filter,
+  through `cursor` / `distinct`, or by nesting past the cap.
+- **Many-to-many nested writes exist.** `connect` / `disconnect` / `set` on an
+  m2m relation, which before 0.49 reported success and wrote nothing at all, are
+  implemented rather than merely refused: the oldest silent-write gap in the
+  library.
+
+Around those: an unvalidated pagination argument could turn a paginated read
+into a full-table read on Postgres, and a misspelled update operator could write
+JSON text into a scalar column. Both are hard errors now. Every behavior that
+changes in a way an existing app can notice is listed under Changed with the
+exact error and the concrete fix.
+
+### Added
+
+- **Many-to-many nested writes: `connect`, `disconnect` and `set`.** m2m has
+  never had a nested-write implementation on any engine. Before 0.49 the write
+  fell off the end of the relation dispatch, so
+  `db.posts.update({ where: { id: 1 }, data: { tags: { connect: [{ id: 7 }] } } })`
+  returned a row and reported success while writing no junction row at all; 0.49
+  turned that silence into a `ValidationError`. It now writes the junction rows,
+  in the same transaction as the parent write, on every engine (the shared
+  nested-write engine backs the SQL dialects and PowDB alike). `connect` is
+  idempotent, by the strongest means each engine offers: where the junction
+  constrains the pair and the dialect supports it (PostgreSQL, SQLite, MySQL),
+  the insert goes through `createMany({ skipDuplicates: true })`, so the engine
+  itself dedupes and two concurrent transactions connecting the same pair cannot
+  both insert. Where that is unavailable (SQL Server and PowDB refuse it, and an
+  implicit junction need not declare the constraint it fires on), it falls back
+  to reading the parent's existing links for exactly the named targets inside
+  the transaction and inserting only the missing ones. Target selectors resolve
+  in ONE query for the whole list rather than one query per target, and are
+  compared by a normalized key, so a junction column that a table parser hands
+  back as a string cannot fail to match the number the parent write returned and
+  insert a duplicate. `disconnect` is scoped by BOTH the parent key and the named
+  targets, so it can neither clear the parent's other links nor touch another
+  parent's rows, and `set` replaces the whole set (`set: []` clears it). On
+  `create` only `connect` applies
+  (`disconnect` / `set` are update-only on every relation type) and the junction
+  rows are written after the parent insert, since they carry its key. A target
+  selector that matches no row is refused rather than skipped, a composite
+  junction key is refused rather than partially written, and a junction whose
+  `sourceKey` and `targetKey` name the SAME column is refused rather than
+  writing a link row that cannot mean what it says.
+- **Junction-table accessors on the `prisma-compat` client.** Prisma's schema has
+  no model for an implicit junction, so `PRISMA_MAP` has no entry for one and the
+  compat client exposed no accessor: the escape hatch the m2m error message
+  recommended was unreachable, and following it literally meant a second
+  transaction on the core client, breaking the atomicity the advice asked for.
+  Every many-to-many junction table in the Turbine metadata now gets an identity
+  delegate (same table, no renames, no relations), built from one shared list so
+  the accessor exists both on the client and inside `$transaction`. The
+  accessor is an escape hatch and never worth breaking a real member of the
+  client for, so a colliding junction name is skipped rather than installed: a
+  Prisma model name, a table some model maps to, a model's lowercased property
+  alias (`compat.user` for `model User`), and the client's own `$transaction` /
+  `$queryRaw` / `$connect` family all keep their key. Every skip that costs the
+  caller a capability warns once in dev.
+- **`implicitPkOrdering` (client config, default `false` in core).** A `findMany`
+  that paginates with no `orderBy` is ordered by the table's primary key
+  ascending (every column of a composite key, in declaration order). An explicit
+  `orderBy` wins and a PK-less table is untouched. A `cursor` query is ordered on
+  the CURSOR's own field rather than the primary key when the two differ: a seek
+  on column X ordered by column Y walks the table in an order the seek does not
+  follow, which is no better than no order at all. Two shapes are deliberately
+  left alone: `distinct` (an added `orderBy` changes which representative row
+  `DISTINCT ON` picks, so it would change results, not just their order) and a
+  MULTI-field cursor, where `a > $1 AND b > $2` is a conjunction rather than a
+  composite keyset seek and no single ordering makes it sound. Both still warn.
+  Off by default in core because switching it on rewrites SQL that existing
+  applications already emit. `turbine-orm/prisma-compat` applies the same
+  ordering unconditionally, with no flag to set (see Changed).
+- **A dev warning for an unordered paginated `findMany`.** An unordered `LIMIT`
+  is not stable in Postgres: as the heap changes underneath it the same query can
+  return different rows, so a row can appear on two pages or on none. The warning
+  names the table, the pagination shape, and the exact `orderBy` to add, and
+  fires once per table and shape. A `cursor` counts as pagination and is the
+  worst case rather than an exception: `WHERE id > $1 LIMIT $2` with no `ORDER
+  BY` is precisely this bug, and the warning names the cursor's field rather than
+  the primary key when they differ. It is gated exactly like `warnOnUnlimited`
+  (per-call, per-table, then the global flag), silent under
+  `NODE_ENV=production`, and suppressed only when `implicitPkOrdering` will
+  actually order the query, so a PK-less table and an ambiguous multi-field
+  cursor still hear about it with the flag on.
+- **`autoToOneJoinMaxRows` (client config, default 1000).** The parent-row
+  ceiling for the `'auto'` strategy's new to-one rule (see Changed).
+- **`turbine migrate-from-prisma` reads the connection string your
+  `datasource` block declares**, including its `env("NAME")` indirection, so a
+  project whose schema says `url = env("DATABASE_URL_STAGING")` needs no `--url`
+  flag. Precedence is unchanged where it already existed and the datasource is
+  last: `--url`, then `DATABASE_URL`, then `url` in `turbine.config.ts`, then the
+  datasource (`url`, then `directUrl`). A literal `url = "postgres://..."` works
+  too. When nothing yields a URL, the existing error gains a fourth suggestion
+  naming the exact variable the schema asked for.
+- **The migration report resolves your many-to-many call sites for you.** A
+  migration audit that greps the Turbine relation names (`grep -rn "manyToMany"
+  generated/`, then searching for the names it prints) cannot find anything:
+  application code written against the compat client uses the PRISMA field names,
+  and the two are related only through `PRISMA_MAP`. That is true of every compat
+  integration, so the recipe reports a clean audit no matter how many m2m writes
+  a codebase has. `prisma-migration-report.md` now has a **"Many-to-many
+  relations (audit these call sites)"** section listing every m2m relation with
+  BOTH its Prisma field name and its Turbine relation name plus the junction
+  table, and a ready-to-run `grep` over the Prisma names. In `--no-db` mode it
+  says the list needs a database run rather than printing an empty one.
+- **`relationLoadStrategy: 'flatten'`, a fourth relation plan.** An eligible
+  to-one relation compiles to a `LEFT JOIN` over a derived table inside the same
+  statement instead of a correlated subquery: one round-trip, no per-parent
+  re-evaluation of the subquery, and no client-side stitching. The whole to-one
+  subtree collapses into a single derived table that exposes only prefixed
+  column names (`f0__id`, `f1__code`, …), so a child column can never collide
+  with a parent column of the same name, and the nested object is reassembled
+  client-side to a result **deep-equal** to the join strategy: same shape, same
+  camelCase keys, same `Date` coercion. The match discriminator each node
+  carries is deliberately value-free, so a PII-tagged key column never reaches
+  the wire, and the correlation columns the outer `ON` needs are never projected
+  to the caller. It is an **explicit opt-in** at the client or on a single query;
+  `'auto'` is unchanged and never selects it. Cache keys carry a plan
+  signature, so every pre-existing cache key stays byte-identical.
+  **Eligibility, which matters because an ineligible relation falls back
+  silently rather than erroring:** `belongsTo` / `hasOne` only, where the
+  target-side correlation columns are PROVABLY unique, meaning an exact set
+  match against the target primary key, a declared unique constraint, or a full
+  unique index that is neither partial nor an expression index. The proof is
+  exact set equality, so a unique index on `(a, b)` does not prove `(a)`. The
+  relation must also carry no `limit` and no `orderBy`, contain no nested
+  `_count` (a top-level `_count` is fine and stays a correlated `COUNT(*)`), and
+  sit under the same depth cap of 10 the subquery path uses. Inside an eligible
+  relation these all work: a relation `where`, target global filters, `select` /
+  `omit`, to-one chains to the depth cap, self-relations, and a nested to-many,
+  which stays a correlated subquery hanging off the joined node. Fallback is per
+  relation, so one ineligible relation does not stop the others. Four conditions
+  disable flattening for the whole query instead: `distinct`, `jsonEncoding:
+  'positional'`, SQL Server (which has its own `FOR JSON PATH` relation
+  compiler), and `findUnique`, which never plans one. `findFirst` does, since it
+  routes through `findMany`. Runs on PostgreSQL, MySQL and SQLite; PowDB has its
+  own relation path and is unaffected.
+  **Performance, stated exactly:** measured on 9,200 parent rows against local
+  PostgreSQL, `'flatten'` runs **1.33x faster than `'join'`** on a shallow to-one
+  and **1.56x** on a two-deep to-one chain, and **loses to `'batched'`, which is
+  2.83x faster than `'join'`** on the same shape. That ordering is structural
+  rather than a defect: with 2,000 distinct targets behind 9,200 parents the join
+  transmits the target's columns 9,200 times while the batched loader transmits
+  2,000 rows once, and the gap closes as cardinality approaches 1:1. Local
+  round-trip time of about 0.1 ms also favors the batched loader's extra
+  round-trip more than a real network would. So the claim for `'flatten'` is one
+  round-trip, transaction-trivial, no client-side stitching, and strictly better
+  than `'join'` on large to-one parent sets. It is **not** the fastest plan, and
+  that is why it is deliberately not wired into `'auto'`.
+- **`where` is key-checked at compile time.** On a generated, typed client an
+  unknown key in a `where` clause is now a type error rather than a silently
+  ignored one: `where: { emial: 'x' }` used to compile, match nothing in the
+  emitted SQL, and hand back the whole table. The check follows the clause
+  wherever it nests, including inside `AND` / `OR` / `NOT`, inside a relation
+  filter at arbitrary depth, and inside a nested `with` block's own `where`. No
+  generator change was needed and no regeneration is required: it threads the
+  `RelationDescriptor` brand the code generator has emitted on `*Relations`
+  interfaces since 0.7.1, so an existing generated client picks it up on
+  upgrade. The change is purely type-level and the emitted SQL is byte-identical.
+  It is still deliberately permissive in four places, listed so nobody reads a
+  clean compile as full coverage: (1) a client with no relations map, meaning a
+  `defineSchema`-only client or an untyped `client.table(name)` call site, keeps
+  the historical open-keyed clause because there is no relation type to thread;
+  (2) a legacy generated client whose `*Relations` members are bare types
+  (`posts: Post[]`) rather than brands has its relation KEY checked but not its
+  VALUE; (3) `orderBy` everywhere, and `select` / `omit` inside a `with` block,
+  remain open-keyed, though top-level `select` / `omit` are checked; and (4) the
+  deferred `build*` variants used by `pipeline()` take the entity type only, so
+  their `where` stays open-keyed. Every awaitable method is checked: `findMany`,
+  `findFirst`, `findFirstOrThrow`, `findUnique`, `findUniqueOrThrow`,
+  `findManyStream`, `update`, `delete`, `upsert`, `count`, `updateMany`,
+  `deleteMany`, `aggregate` and `groupBy`. Because the
+  guarantee is type-level, a transpile-only runner such as `tsx` will not
+  surface it; `tsc --noEmit` is the gate.
+
+### Fixed
+
+- **A JS `Date` written to a `time` / `timetz` column was rejected outright.**
+  The driver serialized it as a full ISO timestamp with the process offset
+  (`1970-01-01T04:00:00.000-05:00`), and Postgres answered `22007 invalid input
+  syntax for type time`, so a Prisma `DateTime @db.Time(6)` field had no working
+  write path and no compat-layer workaround. A `Date` bound to a time-of-day
+  column is now narrowed to a time literal built from its **UTC** components
+  (Prisma's choice, and the only one that round-trips regardless of where the
+  process runs), with an explicit `+00:00` on `timetz` so the session's
+  `TimeZone` cannot be attached instead, and fractional seconds only when
+  non-zero. Applied on every write path (create, createMany, upsert, and the
+  update `set` clause) including the cache-hit param path, and on `where` too:
+  filtering a time column by a `Date` raised the same `22007`, so the column had
+  no working read path either. `createMany` needed a second fix on top of the
+  value narrowing: the per-column array cast had no entry for `time` / `timetz`,
+  so the value list fell through to `text[]` and Postgres answered `42804 column
+  "start_at" is of type time without time zone but expression is of type text`
+  even though every literal in it was valid. The cast table now covers every
+  Postgres type that has no assignment cast from `text` (time and interval
+  types, the network / geometric / range / multirange families, `tsvector`,
+  `citext`, `money`, `vector`); `varchar` / `char` keep their `text[]` cast,
+  which is correct and already-emitted SQL. `time` and `timetz` are deliberately
+  still not `dateColumns`: they have no date part and still read back as
+  strings. Every other column type emits byte-identical SQL and params.
+- **BREAKING: a `Date` written to a `date` or `timestamp` column was stored with
+  the process's local offset.** The driver serializes a `Date` using the
+  process's calendar fields, and a zone-less column keeps whatever fields it is
+  handed, so the value stored depended on the `TZ` of the machine that wrote it.
+  Writing `new Date('2026-07-25T00:00:00Z')` to a `timestamp` column from a
+  process in `America/Los_Angeles` stored `2026-07-24 17:00:00`, and reading it
+  back gave `2026-07-24T17:00:00Z`, because Turbine's read path parses an
+  offset-less value as UTC (`utcTimestamps`, on by default). A `timestamp`
+  column was therefore not round-trip stable anywhere but UTC, a `date` column
+  could land on the wrong day, and two app instances in different zones wrote
+  different values for the same instant. Writes now bind the `Date`'s UTC
+  components, mirroring the read path exactly. `timestamptz` is untouched (it
+  stores a real instant, and the driver's offset-carrying string is already
+  correct for it), as is every non-temporal column. PostgreSQL only: MySQL and
+  SQL Server bind these types through their own drivers, and MySQL reads a
+  zone-less literal in the session time zone, where a UTC literal would be
+  misread. See Changed for who is affected and how to check.
+- **An empty `orderBy` emitted invalid SQL.** `orderBy: []` (and an object whose
+  every value is `undefined`) compiled to a bare `ORDER BY` with nothing after
+  it: `SELECT "posts".* FROM "posts" ORDER BY  LIMIT $1`, which Postgres rejects
+  with `syntax error at or near "LIMIT"`. It carries no ordering, so it is now
+  treated as absent, which is also what the implicit-ordering and unordered-page
+  logic already assumed. This matters more than it did: "pass an explicit
+  `orderBy`" is the documented way out of the implicit ordering above, and code
+  that assembles that array conditionally ends up passing `[]`.
+- **`prisma-compat` pagination returned non-deterministic pages.** Prisma
+  appends an implicit `ORDER BY <primary key> ASC` to a paginated `findMany`;
+  the compat layer emitted a bare `LIMIT`, so a ported paginated endpoint
+  silently inherited pages that can repeat a row or skip one as the heap changes
+  underneath the query, and took the slower unordered plan. Compat now matches
+  Prisma (see Changed).
+- **The `'auto'` relation strategy ignored cardinality.** It kept the
+  single-statement join whenever the correlation columns were indexed, but an
+  index says nothing about how many parent rows the correlated subquery will be
+  re-evaluated for. A to-one include on a large parent set is exactly the case
+  where the batched follow-up wins, and `'auto'` was picking the slower plan.
+  See Changed for the new rule.
+- **The `'auto'` strategy demoted relation `_count` for nothing.** A grouped
+  `COUNT(*) ... GROUP BY fk` scans the child table once whether it runs inline or
+  as a follow-up, so moving `_count` off the join plan because its FK is
+  unindexed bought no scan and cost a round-trip. See Changed.
+- **A nested `belongsTo` update could rewrite every row of the related table.**
+  `processBelongsToUpdate` derived its `where` by reading the parent's foreign
+  key and comparing the related table's reference key to it. When the parent FK
+  was `NULL`, that compiled to `refKey IS NULL`, which matches every related row
+  with a null reference key, and the nested `data` was applied to all of them.
+  `db.posts.update({ where: { id: 1 }, data: { author: { update: { name: 'x' } } } })`
+  on a post with no `authorId` renamed every author-less row it could reach. The
+  operation now routes through the same correlation helper every sibling nested
+  operation uses: a `NULL` parent FK points at nothing, so there is nothing in
+  scope, and it throws `NotFoundError` (E001) naming the relation. A target that
+  exists but belongs to a different parent reports the same error rather than
+  being written. **This is the reason to upgrade.**
+- **`limit` / `offset` are validated on every path.** An unvalidated bound was
+  passed through `Number()`, so `NaN` bound as SQL `NULL`, and Postgres reads
+  `LIMIT NULL` as *no limit at all*: forwarding an unvalidated
+  `req.query.limit` silently turned a paginated endpoint into a full-table read,
+  and a bad `offset` silently vanished. This was never MySQL-specific; the
+  inlined-literal path (MySQL) already checked, the parameterized path
+  (Postgres, SQLite, SQL Server) did not. A single `paginationValue()` helper now
+  validates every call site: top-level `limit` / `offset`, per-relation `limit`,
+  the SQL-build path and the cache-hit param-collect path (a warmed template
+  could otherwise bind an unvalidated value with the build path never running).
+  Anything that is not a non-negative safe integer throws `ValidationError`
+  (E003) naming the argument and the table.
+- **A misspelled atomic operator was written into the column as JSON text.**
+  `data: { viewCount: { incremnt: 1 } }` did not match a known operator, fell
+  through to the plain-value branch, and stored the string `{"incremnt":1}`.
+  It now throws `ValidationError` (E003) naming the unknown key and listing the
+  supported operators. See Changed for the exact scope of the check.
+- **Studio's PII predicate guard had three holes.** Relation filters were walked
+  as if the wrapper (`some` / `none` / `every` / `is` / `isNot`) were itself a
+  clause, so a redacted column inside one was never inspected; `cursor` and
+  `distinct` were not walked at all, though both name columns directly and both
+  leak the hidden value (paging on it is an oracle just as filtering is); and
+  the depth limit **failed open**, returning silently past depth 10 so a
+  deeply-nested clause was simply not checked. The walker now handles relation
+  wrappers and field-name lists, and the depth cap fails **closed**: past 32
+  levels the query is refused with `ValidationError` (E003) rather than passed
+  unverified.
+- **`findManyStream` inside a caller transaction opened a second connection.**
+  It checked a connection out of the pool unconditionally, so a stream started
+  inside `$transaction` ran on a different connection and a different snapshot,
+  outside the caller's transaction. Inside a transaction it now rides the
+  caller's pinned connection, emits no transaction control of its own
+  (`ambientTransaction`), and releases nothing, so the caller's transaction is
+  intact when iteration ends. Outside a transaction the behavior is unchanged.
+- **A read-only client's nested writes bypassed the read-only guard.**
+  `runInImplicitTx` built its `TransactionClient` without passing the source
+  pool, so the transaction-scoped proxy pool lost the pool's `readonly` flag and
+  its PowDB capability set. A read-only PowDB client's nested write skipped the
+  `ReadOnlyError` (E018) check, and an older-engine client fell back to the full
+  capability set inside the implicit transaction and could emit PowQL the engine
+  rejects. The pool is now threaded through.
+- **A failed `BEGIN` no longer emits a stray `ROLLBACK`.** The implicit-transaction
+  wrapper rolled back in its `catch` even when the `BEGIN` itself had thrown, so a
+  connection that never opened a transaction received a `ROLLBACK`.
+- **Prototype-chain lookups in metadata and operator maps.** Relation names,
+  aggregate-function keys, vector metric names and Studio table names were read
+  with a bare index, so a key such as `constructor` or `toString` resolved to an
+  inherited builtin and its source text could be spliced into the emitted
+  statement. Every one of those lookups now goes through an own-property helper
+  (or a `Map`, in the PowQL builders).
+- **MySQL string-literal escaping doubled the quote but not the backslash.**
+  `escapeStringLiteral` inherited the Postgres rule, but unless MySQL runs with
+  `NO_BACKSLASH_ESCAPES` a `\` escapes the following character, so a value ending
+  in a backslash could escape its own closing quote. The backslash is now escaped
+  first. The only caller is `buildJsonObject` (relation and column names from
+  schema metadata), so this is defence in depth rather than a user-value path.
+- **PowQL `having` interpolated the caller's aggregate key.** The function token
+  was derived from the key by stripping its leading underscore and emitted
+  verbatim into the PowQL text. It now comes from a fixed allowlist
+  (`_sum` / `_avg` / `_min` / `_max` / `_count`); any other key throws
+  `ValidationError` (E003) listing the supported set. The comparison operators
+  moved to a `Map` for the same reason.
+- **`redactUrl` could be defeated, and backtracked.** The pattern missed a
+  password containing `/`, `:` or `@`, so `postgres://u:pa/ss@host/db` printed in
+  full, and its nested quantifiers made it a ReDoS candidate on a long
+  non-matching string. It is replaced by a linear scan that anchors on the scheme
+  and consumes the whole userinfo section.
+- **`vector(n)` dimensions are validated before they reach the DDL.**
+  `vectorDimensions` is the one number interpolated into a type token and was
+  trusted to be numeric. It must now be an integer between 1 and 16000
+  (pgvector's cap) or `ValidationError` (E003) names the column.
+- **The upsert conflict-UPDATE predicate no longer orphans parameters.** MySQL
+  and SQL Server both reported the inherited `supportsUpsertUpdateWhere: true`
+  while their `buildUpsertStatement` emitted no predicate: `ON DUPLICATE KEY
+  UPDATE` has no predicate slot, and `MERGE`'s `WHEN MATCHED AND` cannot take the
+  unqualified column references the builder supplies (they are ambiguous between
+  the target and source aliases). With a global filter in play the builder
+  compiled the predicate and bound its parameters, which the statement then had
+  no placeholder for. Both now report `false`. SQLite genuinely supports it and
+  now emits it.
+- **CJS consumers no longer see TS1479.** The CommonJS build emitted no
+  declarations, so a consumer on `moduleResolution: node16` / `nodenext` that
+  resolved the `require` condition was pointed at the ESM declarations, which
+  live in a `"type": "module"` package: `tsc` reported "the file is an ES module
+  and cannot be require()d" even though the runtime `require` worked. `dist/cjs`
+  now ships its own declarations beside its `{"type":"commonjs"}` package.json.
+- **PowQL doc-field index DDL quotes the indexed column.** The json document
+  column was spliced in bare. See Changed: this changes emitted bytes for a
+  keyword-named column.
+- **Studio's session cookie was matched mid-value**, so a cookie whose name
+  merely *ended* in `turbine_studio_token` could supply the token. The pattern is
+  anchored on a cookie boundary now.
+- **Studio's rate limiter counted only authenticated sessions.** Unauthenticated
+  requests were rejected before the limiter ran, so they were unlimited. The
+  limiter now runs first, keyed per caller.
+- **Legacy migration checksums are upgraded only when they actually match.**
+  A stored pre-0.6 djb2 checksum was accepted on length alone, so any short
+  stored value suppressed drift detection for that file. The legacy hash is now
+  recomputed and compared before the record is upgraded, and `migrate status`
+  uses the same rule as `migrate up`.
+
+### Changed
+
+- **`prisma-compat` reads now emit `ORDER BY <primary key> ASC`.**
+  A compat `findMany` with `take` / `skip` and no `orderBy` is ordered by the
+  model's primary key ascending, matching Prisma. So is every `findFirst` /
+  `findFirstOrThrow`, which core compiles to a bare `LIMIT 1`: "give me any one
+  row" quietly meant "give me whichever row the heap hands back today", and it
+  is the most common nondeterministic shape in Prisma-shaped code.
+  `findUnique` / `findUniqueOrThrow` are never ordered (at most one row matches,
+  so it would be pure overhead) and `distinct` reads are never ordered either:
+  an added `orderBy` moves core's `DISTINCT ON` into its two-level derived-table
+  rewrite, whose outer `ORDER BY` sees only the projected columns, so a
+  `distinct` + `select` + `take` read would fail with `column "id" does not
+  exist`. Cursor reads ARE ordered here, unlike core: the ordering is applied
+  strictly after the cursor translation, so the seek direction is still resolved
+  from the caller's own `orderBy`, and Prisma pairs cursor pagination with the
+  same implicit key. This changes the SQL existing compat call sites emit and
+  therefore which rows a given page returns: the new pages are the deterministic
+  ones, and the old ones could repeat or skip a row. There is no opt-out flag,
+  because reproducing Prisma's semantics is this layer's contract. Migration:
+  none to keep Prisma's behavior. To page in a different order, pass an explicit
+  `orderBy`, which always wins. Core is unchanged and still emits a bare `LIMIT`
+  unless you set `implicitPkOrdering: true`.
+- **The `'auto'` strategy (the default) picks a different plan for to-one
+  relations on a large parent set.** A `belongsTo` / `hasOne` include now loads
+  batched when the query is unbounded or its `limit` exceeds
+  `autoToOneJoinMaxRows` (default 1000), instead of staying in the
+  single-statement join whenever its correlation column happened to be indexed.
+  `findUnique` is never affected (its parent set is one row). Results are
+  unchanged and byte-identical either way; what changes is the plan and the
+  round-trip count, so a query that was tuned against the old choice can move in
+  either direction. Migration: pin the old plan with
+  `relationLoadStrategy: 'join'` (per query or client-wide), or raise
+  `autoToOneJoinMaxRows`. A dev-mode note names each relation `'auto'` moved and
+  why.
+- **The `'auto'` strategy keeps relation `_count` inline unless the parent set is
+  large.** `_count` on an unindexed foreign key previously always moved to the
+  batched follow-up; it now does so only when the query is also unbounded or
+  bounded above `autoToOneJoinMaxRows`. Same results, one fewer round-trip on
+  bounded queries. Related: the unindexed fallback now requires DB-backed index
+  metadata to engage at all (a `defineSchema`-only schema can never prove a probe
+  unindexed), while the new cardinality rule applies with or without it.
+- **The many-to-many nested-write error covers a smaller set, and points
+  somewhere reachable.** `connect` / `disconnect` / `set` no longer throw (see
+  Added). The remaining operations (`create`, `connectOrCreate`, `update`,
+  `upsert`, `delete`) still throw `ValidationError` (E003), and the message now
+  names the operation, lists the supported set, and points at
+  `db.table("<junction>")`, the one spelling that actually resolves on both the
+  core and compat clients (and inside `$transaction`), rather than promising
+  transaction scoping the old advice could not deliver.
+- **Generated `*Create` / `*Update` input types accept a `Date` on `time` /
+  `timetz` columns** (`string | Date`), matching the write path above and
+  Prisma, which types those fields as `Date`. The row type stays `string`: that
+  is what the column reads back as. This only widens an input type, so existing
+  code still compiles.
+- **BREAKING: a nested `belongsTo` update with a `NULL` parent FK throws.**
+  It previously matched (and wrote) every related row with a null reference key.
+  It now throws `NotFoundError` (E001). Migration: this is the fix, not a
+  regression. If you were relying on the old behavior you were relying on a
+  full-table update; write it explicitly as
+  `db.authors.updateMany({ where: { ... }, data: { ... } })`.
+- **BREAKING: a `Date` bound to a `date` or `timestamp` column is stored in
+  UTC.** It was stored using the writing process's local calendar fields, so the
+  value in the column depended on that machine's `TZ`. Writes now bind the
+  `Date`'s UTC components, matching the read path, which has always interpreted
+  an offset-less value as UTC. This changes the values your application writes
+  from today on, and it means rows written BEFORE the upgrade from a non-UTC
+  process are shifted relative to rows written after it. Only PostgreSQL, only
+  the zone-less `date` / `timestamp` types, and only `Date` values: a string
+  literal, a `timestamptz` column, and every other engine are unaffected.
+  Migration: you are affected only if all three hold. (1) You have a `date` or
+  `timestamp` column (not `timestamptz`), which you can check with
+  `SELECT table_name, column_name, data_type FROM information_schema.columns
+  WHERE data_type IN ('timestamp without time zone', 'date')`.
+  (2) You write `Date` values to it
+  through Turbine. (3) The process doing the writing did not run in UTC:
+  `node -e "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone,
+  new Date().getTimezoneOffset())"` in your deployment environment, where a
+  non-zero offset means the old writes were shifted by exactly that many
+  minutes. If all three hold, existing rows written by that process can be
+  corrected with `UPDATE t SET col = col + interval 'N minutes'` using that
+  offset, scoped to the rows written before the upgrade. To keep the old
+  behavior instead, set `utcTimestamps: false` in the client config: that is the
+  same switch that turns off UTC read parsing, so reads and writes stay
+  symmetric either way.
+  Anything that is not a non-negative safe integer (`NaN`, a non-numeric string,
+  a negative, a fraction, a value past `Number.MAX_SAFE_INTEGER`) throws
+  `ValidationError` (E003): `limit on "users" must be a non-negative integer,
+  received: NaN`. Numeric strings (`'5'`) still coerce. This applies to
+  top-level `limit` / `offset` and per-relation `limit`, on every engine.
+  Migration: coerce and validate at the edge, for example
+  `const limit = Math.min(Number(req.query.limit) || 20, 100)`.
+- **BREAKING: a single-key plain object in `data` on a non-json column throws.**
+  On a scalar column that shape can only be a misspelled atomic operator, and
+  binding it plainly wrote JSON text into the column. It now throws
+  `ValidationError` (E003): `Unknown update operator "incremnt" on
+  "posts.viewCount"`, listing the supported operators. The check is deliberately
+  narrow and skips json / jsonb columns, arrays, `Date`s, class instances
+  (`Buffer`, decimal wrappers) and multi-key objects, none of which are
+  operator-shaped. Migration: fix the operator spelling, or move the value onto
+  a json / jsonb column if it really is a payload.
+- **BREAKING: the `dialect` option is removed from `migrateUp`, `migrateDown`,
+  `migrateDeploy`, `migrateStatus` and `inspectMigrationDeploy`.** It advertised
+  multi-engine migrations the runner never implemented: every one of these opens
+  a `pg.Client` directly, so passing a SQLite or MySQL dialect produced
+  non-Postgres SQL sent to a Postgres connection. The migration runner is
+  Postgres-only and now says so in its signature. Migration: delete the option.
+  If you were passing `postgresDialect`, the behavior is unchanged.
+- **BREAKING (type-level): a typo in `select` or `omit` is a compile error.**
+  `select?: S` alone could never reject one, because `S` is inferred *from* the
+  object literal, so `{ emial: true }` simply became the inferred type and
+  silently narrowed the result to `Pick<T, never>`. The property is now
+  `S & FieldFlags<T, S>`, which maps any key that is not a field of `T` to
+  `never` and reports the error at the offending key. Legitimate flag maps are
+  unaffected and the result narrowing is unchanged. Migration: fix the
+  misspelled key the compiler now points at.
+- **`seedFile` is the canonical config key.** `turbine init` writes `seedFile`
+  and scaffolds the seed to `./turbine/seed.ts` (a pre-existing root-level
+  `./seed.ts` is kept, so a re-run never creates a second seed file). `seed`
+  remains a back-compat alias and still works; `seedFile` wins when both are
+  present. Config-less discovery gained the `turbine/` locations, appended after
+  the root-level ones so no project that relies on `./seed.ts` changes behavior:
+  `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`,
+  `turbine/seed.sql`. Migration: none required; rename `seed` to `seedFile` when
+  convenient.
+- **PowQL doc-field index DDL quotes the indexed column**, so
+  `alter T add index (.order->"x")` becomes ``alter T add index (.`order`->"x")``.
+  This changes the emitted bytes for a column whose name is a PowQL keyword or is
+  otherwise not a bare identifier; every other column emits identically. The
+  previous form spliced the name in raw and failed to parse on a keyword-named
+  column. Migration: none, unless you diff generated DDL byte-for-byte.
+- **Studio refuses a query it cannot prove is PII-safe past 32 levels of
+  nesting** rather than passing it through unchecked, and refuses a redacted
+  column in `cursor` and `distinct` as it already did in `where` and `orderBy`.
+  Migration: flatten the query, or restart Studio with `--show-pii`.
+
+### Documentation
+
+- **A published benchmark claim was wrong and has been corrected.** The README
+  and the benchmarks page showed Turbine fastest at streaming 50K rows (60.7 ms)
+  and labelled the scenario a near-tie. A fresh run against 0.50.0 measures
+  **Drizzle 0.45 fastest at 50.18 ms against Turbine's 63.87 ms, a 27% Drizzle
+  win**, reproduced in five runs across two harnesses, with Drizzle sitting
+  exactly on the hand-written `pg` keyset control at 50.97 ms. The published
+  figure rested on a single Drizzle measurement of 65.8 ms that did not
+  reproduce. The loss is now stated plainly on both surfaces rather than the row
+  being dropped. Two further corrections in the same table: the "four near-ties"
+  is **two** (`count` is a clean Turbine win, streaming is a Drizzle win), and
+  the "1.6x to 2.6x ahead of Prisma" range on nested shapes is actually **1.9x
+  to 3.0x**, corrected even though it errs in our favor.
+- **The whole benchmark section is republished from a fresh 2026-07-25 run
+  against 0.50.0**, replacing figures measured once on 2026-07-21 against 0.39.0.
+  The new harness (`benchmarks/bench-interleaved.ts`) runs every arm once per
+  round, rotates the arm order every round, reports medians over three full runs,
+  and adds a hand-written raw `pg` control arm. That control yields the strongest
+  claim available, and the pages now lead with it: **Turbine runs at 1.07x
+  hand-written `pg`, where Drizzle runs at 1.47x and Prisma at 1.84x.** Headline
+  geomeans over ten scenarios are **1.87x faster than Prisma 7.9** and **1.36x
+  faster than Drizzle 0.45**. The **measurement drift floor is now published
+  alongside the table**: the identical control arm drifts 1% to 14% between runs
+  on multi-millisecond scenarios but **21% to 47%** on the sub-0.15 ms ones, so
+  every published sub-0.15 ms figure carries roughly one third uncertainty in its
+  absolute value even though its ordering is stable. Full writeup in
+  `benchmarks/RESULTS-0.50.0.md`; `benchmarks/RESULTS.md` is marked historical
+  and its contradictory "pipeline about 3x faster" prose is scoped to the retired
+  Prisma 7.6 table it describes. Claims this run cannot speak to are called out
+  as unverified rather than carried forward, including the Prisma 7.6-to-7.9
+  improvement percentages, which have been removed.
+- **The migrate-from-prisma page no longer argues that a correlated indexed
+  subquery beats the batched loader.** The page cited 659 parent rows to make
+  that case, and fresh data contradicts it for to-one relations at every size at
+  or above about 25 parent rows, on a plan Turbine's own `'auto'` default no
+  longer follows. The passage now explains the actual tradeoff: a correlated
+  subquery is one round-trip whose cost scales per parent row, the batched loader
+  is two round-trips each of which is a flat keyset lookup, so the crossover
+  depends on both parent-set size and round-trip time, with a table of break-even
+  points from a local socket to a cross-region pooled connection. The
+  index-versus-no-index finding, which is the point of the section and a ~290x
+  difference, is unchanged.
+
 ## 0.49.0 (2026-07-25)
 
 A correctness release. Two silent wrong-data paths on default code paths are
@@ -1711,6 +2260,10 @@ Identical to 0.27.0 with an internal lint cleanup in the destructive-statement s
 - **Repositioning + onboarding fixes:** README and landing now lead with the "safety bundle" (read-only Studio, PII-safe errors, one dependency, checksummed migrations). Fixed copy-paste-breaking docs: serverless `SCHEMA` casing (the generator now also emits a lowercase `schema` alias), the non-existent `db.$queryRaw` (→ `db.sql`/`db.raw`), `timeoutMs` → `timeout`, and the `withRetry()` "built-in" claim.
 - **Security:** closed a LOW stored-XSS gap in the Observe dashboard (`row.model`/`row.action` now escaped); hardened the Studio/Observe token check to SHA-256 + `crypto.timingSafeEqual`.
 - **Docs + tests:** new nested-writes, optimistic-locking, and framework-recipes pages; Studio security-perimeter tests (401/403/429/READ-ONLY).
+
+## 0.20.0 (not released)
+
+There is no 0.20.0. The version was reserved for a product-review sprint whose work was folded into 0.21.0 instead, so the line jumps 0.19.2 to 0.21.0. Nothing was published to npm under 0.20.0 and no entry is missing from this file.
 
 ## 0.19.2 (2026-06-10)
 

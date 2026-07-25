@@ -2,9 +2,9 @@
 
 Documentation site for [turbine-orm](https://www.npmjs.com/package/turbine-orm).
 
-This app is a fully independent Next.js 15 project that lives inside the main
-`turbine-orm` repository. The library code in `../src` is **not** imported —
-all content is static MDX in `app/*/page.mdx`.
+This app is a fully independent Next.js project (currently on `next@^16`) that
+lives inside the main `turbine-orm` repository. The library code in `../src` is
+**not** imported. All content is static MDX in `app/(docs)/*/page.mdx`.
 
 ## Local development
 
@@ -37,17 +37,34 @@ vercel --prod
 
 ## Editing content
 
-Every page is an MDX file under `app/<slug>/page.mdx`. Add new pages by
-creating a new route folder and dropping a `page.mdx` in it, then add a link
-to `components/Sidebar.tsx`.
+Every docs page is an MDX file under `app/(docs)/<slug>/page.mdx`. Adding a new
+page means four edits, not one:
+
+1. Create `app/(docs)/<slug>/page.mdx` with an exported `metadata` object
+   including `alternates.canonical`.
+2. Add the route to `components/Sidebar.tsx`.
+3. Add the route to `app/sitemap.ts`.
+4. Add the route to `public/llms.txt`.
+
+Two components are available in every MDX file without an import, because
+`mdx-components.tsx` provides them: `<Callout type="note|warning|tip" title="...">`
+for boxed asides, and `h2` / `h3` are wrapped to render a hover-revealed anchor
+link from the id `rehype-slug` already stamped.
+
+Version and changelog content is generated, never hand-written:
+`lib/version.ts` and `lib/changelog.generated.ts` are rebuilt from the root
+`package.json` and `CHANGELOG.md` by the `predev` / `prebuild` scripts. Import
+`TURBINE_VERSION` rather than typing a version into prose. The landing hero
+tagline comes from `lib/tagline.ts`, which derives from the changelog and
+allows a per-version manual override.
 
 Code blocks are highlighted by [rehype-pretty-code](https://rehype-pretty.pages.dev/)
 (Shiki under the hood). The theme is configured in `next.config.mjs`.
 
 ## Stack
 
-- Next.js 15 (App Router)
-- React 19 RC
+- Next.js 16 (App Router); see `package.json` for the exact pin
+- React 19
 - Tailwind CSS 3
 - `@next/mdx` + `@mdx-js/react`
 - `rehype-pretty-code` + Shiki for syntax highlighting

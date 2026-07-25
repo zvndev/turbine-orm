@@ -55,7 +55,7 @@ Commands:
 
 ## `turbine init`
 
-Bootstrap a Turbine project in the current directory. `init` is a sequenced flow that detects what already exists and runs only the missing steps: write `turbine.config.ts`, scaffold a starter `schema.ts` and `seed.ts`, and (when a reachable database is configured) offer to push the schema, generate the typed client, and run the seed file.
+Bootstrap a Turbine project in the current directory. `init` is a sequenced flow that detects what already exists and runs only the missing steps: write `turbine.config.ts`, scaffold a starter `./turbine/schema.ts` and `./turbine/seed.ts` (if a root-level `./seed.ts` from an older `init` already exists, that one is kept instead, so a re-run never creates a second seed file), and (when a reachable database is configured) offer to push the schema, generate the typed client, and run the seed file.
 
 ```bash
 npx turbine init
@@ -293,7 +293,7 @@ npx turbine seed
 npx turbine seed --verbose
 ```
 
-Turbine resolves the seed from the `seed` field in `turbine.config.ts`, or the first default candidate found: `seed.ts`, `seed.js`, then `seed.sql`. Each extension has its own runner:
+Turbine resolves the seed from the `seedFile` field in `turbine.config.ts` (the pre-0.50 spelling `seed` is still accepted as an alias), or the first default candidate found: `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, then `turbine/seed.sql`. Each extension has its own runner:
 
 - **`.ts`** — run with `npx tsx` (no build step). Export a `defineSeed(fn)` or run inserts directly.
 - **`.js`** — imported dynamically; a default-export function is called.
@@ -421,9 +421,22 @@ npx turbine migrate-from-prisma --schema prisma/schema.prisma --no-db
 
 The parser is a zero-dependency subset parser: neither `prisma` nor `@prisma/client` needs to still be installed. Outputs land in the generate output directory (default `./generated/turbine`):
 
-- `prisma-migration-report.md`: per-model resolution, junction tables detected for implicit many-to-many, enums, unresolved items, and parser notes
+- `prisma-migration-report.md`: per-model resolution, a **many-to-many audit list** pairing each Prisma field name with its Turbine relation name and junction table, junction tables detected for implicit many-to-many, enums, unresolved items, and parser notes
 - `prisma-map.ts`: the typed `PRISMA_MAP` consumed by the compat adapter
 - the standard generated client (`types.ts`, `metadata.ts`, `index.ts`)
+
+### Connection string
+
+The command resolves the database URL in this order: `--url`, then `DATABASE_URL`, then `url` in `turbine.config.ts`, then the **`datasource` block of the schema you pointed it at**, including its `env("...")` indirection (`url` first, then `directUrl`). A literal `url = "postgres://..."` is read too.
+
+So a project whose schema says `url = env("DATABASE_URL_STAGING")` needs no flag, as long as that variable is exported:
+
+```bash
+export DATABASE_URL_STAGING=postgres://...
+npx turbine migrate-from-prisma --schema prisma/schema.prisma
+```
+
+The datasource is deliberately last: an explicit `--url` is never overridden by a value declared in a schema file. When the run does use it, the command says so. When nothing yields a URL, the "no database URL" error gains a fourth suggestion naming the exact variable the datasource asked for.
 
 ### Flags
 
@@ -440,7 +453,7 @@ Unresolved items never block the generated client: it is built from live introsp
 
 ## `turbine studio`
 
-Launch a local, read-only web UI for exploring your database. The only Postgres ORM Studio your DBA will approve — no mutations, no writes, no way around the transaction guard.
+Launch a local, read-only web UI for exploring your database. In the default mode the write endpoints are not registered in the router at all (they 404), every read runs inside `BEGIN READ ONLY` so writes are impossible at the database level, there is no raw-SQL input surface, and PII-tagged columns are redacted server-side before the response is serialized. As of July 2026, no other TypeScript ORM ships a studio that is read-only by default or that redacts PII.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
@@ -494,7 +507,7 @@ const config: TurbineCliConfig = {
   out: './generated/turbine',
   schema: 'public',
   migrationsDir: './turbine/migrations',
-  seed: './seed.ts',
+  seedFile: './turbine/seed.ts',
   schemaFile: './turbine/schema.ts',
 };
 

@@ -85,9 +85,11 @@ export const OBSERVE_HTML = `<!doctype html>
     <h2>Error rates</h2>
     <div id="errors-table"></div>
   </div>
-  <script>
+  <script nonce="__CSP_NONCE__">
     let currentRange = '1h';
-    const token = document.cookie.match(/turbine_observe_token=([a-f0-9]+)/)?.[1] || '';
+    // Anchored on a cookie boundary so a decoy cookie whose name ends with this
+    // one cannot shadow the real token.
+    const token = document.cookie.match(/(?:^|;\\s*)turbine_observe_token=([a-f0-9]+)/)?.[1] || '';
     const headers = { 'x-turbine-token': token };
 
     document.querySelector('.controls').addEventListener('click', e => {
@@ -140,13 +142,20 @@ export const OBSERVE_HTML = `<!doctype html>
         .replace(/'/g, '&#39;');
     }
 
+    // Numeric sink: counts are integer aggregates, but they are still values
+    // arriving over the wire, so coerce rather than interpolating them raw.
+    function num(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? String(n) : '0';
+    }
+
     function renderModels(data) {
       const el = document.getElementById('models-table');
       if (!data || data.length === 0) { el.innerHTML = '<p class="empty">No data yet</p>'; return; }
       let html = '<table><thead><tr><th>Model</th><th>Action</th><th class="num">Count</th><th class="num">Avg (ms)</th><th class="num">P95 (ms)</th><th class="num">P99 (ms)</th></tr></thead><tbody>';
       for (const row of data) {
         html += '<tr><td>' + escapeHtml(row.model) + '</td><td>' + escapeHtml(row.action) + '</td>'
-          + '<td class="num">' + row.count + '</td>'
+          + '<td class="num">' + num(row.count) + '</td>'
           + '<td class="num">' + row.avg_ms.toFixed(1) + '</td>'
           + '<td class="num">' + row.p95_ms.toFixed(1) + '</td>'
           + '<td class="num">' + row.p99_ms.toFixed(1) + '</td></tr>';
@@ -163,8 +172,8 @@ export const OBSERVE_HTML = `<!doctype html>
         const rate = row.count > 0 ? (row.error_count / row.count * 100).toFixed(1) : '0.0';
         const cls = parseFloat(rate) > 5 ? 'error-rate' : 'low-error';
         html += '<tr><td>' + escapeHtml(row.model) + '</td><td>' + escapeHtml(row.action) + '</td>'
-          + '<td class="num">' + row.count + '</td>'
-          + '<td class="num">' + row.error_count + '</td>'
+          + '<td class="num">' + num(row.count) + '</td>'
+          + '<td class="num">' + num(row.error_count) + '</td>'
           + '<td class="num ' + cls + '">' + rate + '%</td></tr>';
       }
       html += '</tbody></table>';

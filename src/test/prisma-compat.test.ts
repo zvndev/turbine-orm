@@ -16,12 +16,14 @@ import { describe, it } from 'node:test';
 import type { TurbineClient } from '../client.js';
 import { TurbineError, TurbineErrorCode } from '../errors.js';
 import {
+  CLIENT_RESERVED_KEYS,
   COMPAT_DEFERRED,
   type CompatTurbineClient,
   createPrismaCompatClient,
   Prisma,
   type PrismaCompatOptions,
 } from '../prisma-compat.js';
+import { resetWarnOnce } from '../query/warn-registry.js';
 import type { PrismaCompatMap, SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -935,5 +937,396 @@ describe('prisma-compat, options', () => {
       () => compat.User.findMany({}) as Promise<unknown>,
       (e: Any) => e.code === 'P2002',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Implicit many-to-many junction tables (no Prisma model, so no PRISMA_MAP entry)
+// ---------------------------------------------------------------------------
+
+/** The base fixture plus a `tags` model linked to `posts` through `_PostToTag`. */
+function m2mFixture(): { schema: SchemaMetadata; map: PrismaCompatMap } {
+  const { schema, map } = fixture();
+
+  const tags = mockTable('tags', [
+    { name: 'id', field: 'id' },
+    { name: 'label', field: 'label', pgType: 'text' },
+  ]);
+  tags.primaryKey = ['id'];
+
+  const junction = mockTable('_PostToTag', [
+    { name: 'post_id', field: 'postId' },
+    { name: 'tag_id', field: 'tagId' },
+  ]);
+  junction.primaryKey = ['post_id', 'tag_id'];
+
+  schema.tables.tags = tags;
+  schema.tables._PostToTag = junction;
+  schema.tables.posts!.relations.tags = {
+    type: 'manyToMany',
+    name: 'tags',
+    from: 'posts',
+    to: 'tags',
+    foreignKey: 'id',
+    referenceKey: 'id',
+    through: { table: '_PostToTag', sourceKey: 'post_id', targetKey: 'tag_id' },
+  };
+  // Prisma has no model for an implicit junction: `map.models` deliberately
+  // stays without one, which is exactly the gap under test.
+  map.models.Post!.relations.tags = { name: 'tags', cardinality: 'many' };
+  return { schema, map };
+}
+
+/** Re-key an m2m fixture's junction table (and its relation) to `name`. */
+function renameJunction(
+  fx: { schema: SchemaMetadata; map: PrismaCompatMap },
+  name: string,
+): { schema: SchemaMetadata; map: PrismaCompatMap } {
+  const junction = fx.schema.tables._PostToTag!;
+  junction.name = name;
+  delete fx.schema.tables._PostToTag;
+  fx.schema.tables[name] = junction;
+  fx.schema.tables.posts!.relations.tags!.through!.table = name;
+  return fx;
+}
+
+/** Run `fn` with console.warn captured (into `sink` when given). */
+function silenceWarnings<T>(fn: () => T, sink?: string[]): T {
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    sink?.push(args.map(String).join(' '));
+  };
+  try {
+    return fn();
+  } finally {
+    console.warn = original;
+  }
+}
+
+describe('prisma-compat, junction table accessors', () => {
+  it('exposes the implicit junction table under its raw name', () => {
+    const { schema, map } = m2mFixture();
+    const compat = mkCompat(spyDb(schema).db, map) as Any;
+    assert.equal(typeof compat._PostToTag, 'object', '_PostToTag accessor exists');
+    assert.equal(typeof compat._PostToTag.create, 'function');
+    assert.equal(typeof compat._PostToTag.createMany, 'function');
+  });
+
+  it('writes a junction row through the accessor', async () => {
+    const { schema, map } = m2mFixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map) as Any;
+
+    await compat._PostToTag.create({ data: { postId: 1, tagId: 2 } });
+
+    const call = calls[calls.length - 1]!;
+    assert.equal(call.table, '_PostToTag');
+    assert.equal(call.method, 'create');
+    assert.deepEqual(call.args.data, { postId: 1, tagId: 2 }, 'identity field mapping, no renames');
+  });
+
+  it('the accessor also exists on the transaction-scoped client', async () => {
+    const { schema, map } = m2mFixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map) as Any;
+
+    const seen = await compat.$transaction(async (tx: Any) => {
+      assert.equal(typeof tx._PostToTag, 'object', 'junction accessor present inside $transaction');
+      await tx._PostToTag.createMany({ data: [{ postId: 1, tagId: 2 }] });
+      return true;
+    });
+
+    assert.equal(seen, true);
+    const call = calls[calls.length - 1]!;
+    assert.equal(call.table, '_PostToTag');
+    assert.equal(call.method, 'createMany');
+    assert.deepEqual(call.args.data, [{ postId: 1, tagId: 2 }]);
+  });
+
+  it('never shadows a real model that happens to carry the junction name', async () => {
+    const { schema, map } = m2mFixture();
+    // A real Prisma model literally named `_PostToTag`, mapped to another table.
+    schema.tables.audit = mockTable('audit', [{ name: 'id', field: 'id' }]);
+    map.models._PostToTag = {
+      table: 'audit',
+      accessor: 'audit',
+      fields: { id: 'id' },
+      relations: {},
+      compoundUniques: {},
+    };
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map) as Any;
+
+    await compat._PostToTag.create({ data: { id: 1 } });
+    assert.equal(calls[calls.length - 1]!.table, 'audit', 'the declared model keeps its key');
+  });
+
+  it('adds no junction delegate when a model already maps to that table', () => {
+    const { schema, map } = m2mFixture();
+    map.models.PostTag = {
+      table: '_PostToTag',
+      accessor: 'postTag',
+      fields: { postId: 'postId', tagId: 'tagId' },
+      relations: {},
+      compoundUniques: {},
+    };
+    const compat = mkCompat(spyDb(schema).db, map) as Any;
+    assert.equal(typeof compat.PostTag, 'object');
+    assert.equal(compat._PostToTag, undefined, 'the mapped model is the only accessor for that table');
+  });
+
+  it('never shadows a model’s lowercased Prisma-property alias', async () => {
+    // A junction table literally named `user`, next to `model User @@map("users")`:
+    // `compat.user` is the Prisma spelling of the User delegate and must stay it.
+    const { schema, map } = renameJunction(m2mFixture(), 'user');
+    const { db, calls } = spyDb(schema);
+    const compat = silenceWarnings(() => mkCompat(db, map)) as Any;
+
+    assert.equal(compat.user, compat.User, 'the alias still resolves to the User delegate');
+    await compat.user.create({ data: { id: 1 } });
+    assert.equal(calls[calls.length - 1]!.table, 'users', 'the write hits the model table, not the junction');
+  });
+
+  it('never shadows a client-level method', async () => {
+    // A junction table named `$transaction` must not replace the transaction surface.
+    const { schema, map } = renameJunction(m2mFixture(), '$transaction');
+    const { db } = spyDb(schema);
+    const compat = silenceWarnings(() => mkCompat(db, map)) as Any;
+
+    assert.equal(typeof compat.$transaction, 'function', '$transaction is still callable');
+    assert.equal(await compat.$transaction(async () => 'ran'), 'ran');
+  });
+
+  it('warns once when a junction accessor is dropped on a name collision', () => {
+    const { schema, map } = renameJunction(m2mFixture(), 'user');
+    resetWarnOnce('prismaCompatJunction');
+    const warnings: string[] = [];
+    silenceWarnings(() => mkCompat(spyDb(schema).db, map), warnings);
+    silenceWarnings(() => mkCompat(spyDb(schema).db, map), warnings);
+    assert.equal(warnings.length, 1, 'once per junction name, not once per client');
+    assert.match(warnings[0]!, /junction table "user" collides/);
+  });
+
+  it('the client exposes no non-delegate key outside CLIENT_RESERVED_KEYS', () => {
+    // Guards the hand-written reserved set against the real base object: a new
+    // `$method` that is not listed would let a junction of that name shadow it.
+    const { schema } = fixture();
+    const empty: PrismaCompatMap = { enums: {}, models: {} };
+    const compat = mkCompat(spyDb(schema).db, empty) as Any;
+    for (const key of Object.keys(compat)) {
+      assert.ok(CLIENT_RESERVED_KEYS.has(key), `unlisted client key: ${key}`);
+    }
+    assert.equal(Object.keys(compat).length, CLIENT_RESERVED_KEYS.size);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Implicit primary-key ordering on paginated reads (Prisma parity)
+// ---------------------------------------------------------------------------
+
+describe('prisma-compat, implicit primary-key ordering', () => {
+  it('take with no orderBy gets the primary key ascending', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findMany({ take: 50 }));
+    assert.deepEqual(lastArgs(calls).orderBy, { id: 'asc' });
+  });
+
+  it('skip with no orderBy gets the primary key ascending', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findMany({ skip: 100 }));
+    assert.deepEqual(lastArgs(calls).orderBy, { id: 'asc' });
+  });
+
+  it('emits a real ORDER BY on the paginated statement', () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(sqlDb(schema), map);
+    const q = built(compat.User.findMany({ take: 50, skip: 50 }));
+    assert.match(q.sql, /ORDER BY .*"id" ASC/);
+    assert.match(q.sql, /LIMIT/);
+  });
+
+  it('leaves an explicit orderBy untouched', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findMany({ take: 50, orderBy: { name: 'desc' } }));
+    assert.deepEqual(lastArgs(calls).orderBy, { name: 'desc' });
+  });
+
+  it('orders on every column of a composite primary key, in declaration order', () => {
+    const { schema, map } = fixture();
+    schema.tables.memberships!.primaryKey = ['org_id', 'user_id'];
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.Membership.findMany({ take: 10 }));
+    assert.deepEqual(lastArgs(calls).orderBy, [{ orgId: 'asc' }, { userId: 'asc' }]);
+  });
+
+  it('invents nothing for a model with no primary key', () => {
+    const { schema, map } = fixture();
+    schema.tables.memberships!.primaryKey = [];
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.Membership.findMany({ take: 10 }));
+    assert.equal(lastArgs(calls).orderBy, undefined);
+  });
+
+  it('leaves an unpaginated query unchanged', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findMany({ where: { name: 'a' } }));
+    assert.equal(lastArgs(calls).orderBy, undefined);
+  });
+
+  // --- distinct (core `isUnorderedPage` excludes it, so this layer must too) ---
+
+  it('never orders a distinct read (an injected order breaks DISTINCT ON + select)', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.Post.findMany({ distinct: ['authorId'], select: { title: true }, take: 5 }));
+    assert.equal(lastArgs(calls).orderBy, undefined);
+  });
+
+  it('distinct + select + take references no column outside the projection', () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(sqlDb(schema), map);
+    const q = built(compat.Post.findMany({ distinct: ['authorId'], select: { title: true }, take: 5 }));
+    // The failing shape: an injected `ORDER BY "id"` forces the two-level
+    // derived-table rewrite whose outer ORDER BY cannot see "id" (Postgres:
+    // `column "id" does not exist`).
+    assert.doesNotMatch(q.sql, /ORDER BY/);
+    assert.doesNotMatch(q.sql, /"id"/);
+    assert.doesNotMatch(q.sql, /FROM \(SELECT/, 'stays in the plain DISTINCT ON branch');
+    assert.match(q.sql, /DISTINCT ON \("author_id"\)/);
+    assert.match(q.sql, /LIMIT/);
+  });
+
+  it('distinct reads emit byte-identical SQL to the equivalent core query', () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(sqlDb(schema), map);
+    const core = makeQuery('posts', schema) as Any;
+    for (const [prismaArgs, turbineArgs] of [
+      [
+        { distinct: ['authorId'], take: 5 },
+        { distinct: ['authorId'], limit: 5 },
+      ],
+      [
+        { distinct: ['authorId'], select: { title: true }, take: 5 },
+        { distinct: ['authorId'], select: { title: true }, limit: 5 },
+      ],
+      [
+        { distinct: ['authorId'], where: { title: 'x' }, skip: 2, take: 5 },
+        { distinct: ['authorId'], where: { title: 'x' }, offset: 2, limit: 5 },
+      ],
+    ] as [Any, Any][]) {
+      const got = built(compat.Post.findMany(prismaArgs));
+      const want = core.buildFindMany(turbineArgs);
+      assert.equal(got.sql, want.sql, JSON.stringify(prismaArgs));
+      assert.deepEqual(got.params, want.params, JSON.stringify(prismaArgs));
+      // The LIMIT stays INSIDE the DISTINCT ON statement, so the inner scan is
+      // still limited (an injected order would have lifted it into a wrapper).
+      assert.match(got.sql, /DISTINCT ON .*LIMIT/s);
+    }
+  });
+
+  // --- findFirst / findFirstOrThrow (a bare LIMIT 1 is a page of one) --------
+
+  it('findFirst with no orderBy gets the primary key ascending', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findFirst({ where: { name: 'a' } }));
+    assert.deepEqual(lastArgs(calls).orderBy, { id: 'asc' });
+  });
+
+  it('findFirst emits a real ORDER BY on the LIMIT 1 statement', () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(sqlDb(schema), map);
+    const q = built(compat.User.findFirst({}));
+    assert.match(q.sql, /ORDER BY .*"id" ASC/);
+    assert.match(q.sql, /LIMIT/);
+  });
+
+  it('findFirstOrThrow with no orderBy gets the primary key ascending', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findFirstOrThrow({}));
+    assert.deepEqual(lastArgs(calls).orderBy, { id: 'asc' });
+  });
+
+  it('findFirst keeps an explicit orderBy', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findFirst({ orderBy: { name: 'desc' } }));
+    assert.deepEqual(lastArgs(calls).orderBy, { name: 'desc' });
+  });
+
+  it('findFirst on a model with no primary key is untouched', () => {
+    const { schema, map } = fixture();
+    schema.tables.memberships!.primaryKey = [];
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.Membership.findFirst({}));
+    assert.equal(lastArgs(calls).orderBy, undefined);
+  });
+
+  it('leaves findUnique alone (a unique key matches at most one row)', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findUnique({ where: { id: 1 } }));
+    assert.equal(lastArgs(calls).orderBy, undefined);
+  });
+
+  it('leaves a nested relation take alone (core owns relation ordering)', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findMany({ take: 5, include: { posts: { take: 3 } } }));
+    const args = lastArgs(calls);
+    assert.deepEqual(args.orderBy, { id: 'asc' }, 'the top level is still ordered');
+    assert.deepEqual(args.with.posts, { limit: 3 }, 'the relation keeps exactly what was asked for');
+  });
+
+  it('forwards stablePkOrder as the relation-ordering mechanism instead', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map, { stablePkOrder: true });
+    built(compat.User.findMany({ include: { posts: { take: 3 } } }));
+    assert.equal(lastArgs(calls).stableRelationOrder, true);
+  });
+
+  // --- ordering of the two translation steps (see translateReadArgs) --------
+
+  it('cursor decisions are made against the user’s own orderBy', () => {
+    // Guard for a load-bearing statement order: `translateCursor` runs BEFORE
+    // `applyImplicitPkOrder`. A bare inclusive cursor on a non-PK field with no
+    // orderBy must still hit the no-orderBy branch and name the primary key in
+    // its message. Swap the two calls and the injected `{ id: 'asc' }` sends it
+    // down the has-orderBy branch, throwing a DIFFERENT error.
+    const { schema, map } = fixture();
+    const compat = mkCompat(spyDb(schema).db, map);
+    // findFirst is the sharp case: it is ordered unconditionally, so a swap
+    // hands the cursor an orderBy the caller never wrote.
+    assert.throws(() => built(compat.Post.findFirst({ cursor: { title: 'x' } })), /single-column primary key/);
+    assert.throws(() => built(compat.Post.findMany({ cursor: { title: 'x' }, take: 5 })), /single-column primary key/);
+  });
+
+  it('an exclusive cursor page still gets the primary-key ordering', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.Post.findMany({ cursor: { id: 100 }, skip: 1, take: 5 }));
+    const args = lastArgs(calls);
+    assert.deepEqual(args.cursor, { id: 100 }, 'the cursor is untouched');
+    assert.deepEqual(args.orderBy, { id: 'asc' });
   });
 });

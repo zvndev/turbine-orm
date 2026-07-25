@@ -558,6 +558,12 @@ export const mssqlDialect: Dialect = {
   // round-trip (Phase-0 'output' strategy, executed like 'returning').
   resultStrategy: 'output',
   supportsReturning: false,
+  // MERGE can carry `WHEN MATCHED AND <pred>`, but the predicate the builder
+  // hands over is written in UNQUALIFIED column references, which are ambiguous
+  // between the MERGE target (T) and source (S) aliases. `buildUpsertStatement`
+  // below therefore emits no predicate; reporting false keeps the builder from
+  // compiling one (and from binding its now-orphaned parameters).
+  supportsUpsertUpdateWhere: false,
   supportsILike: false,
   supportsVector: false,
   // SQL Server full-text is `CONTAINS`/`FREETEXT` over a full-text catalog: a

@@ -675,6 +675,22 @@ a:hover {
   letter-spacing: -0.01em;
 }
 
+/* Heading anchor links (rendered by site/mdx-components.tsx). Hidden until
+   the heading is hovered or the anchor itself is keyboard-focused, so the
+   affordance is discoverable without adding permanent visual noise. */
+.mdx-content .heading-anchor {
+  margin-left: 0.4rem;
+  color: var(--accent);
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 0.12s ease-in-out;
+}
+
+.mdx-content .heading-anchored:hover .heading-anchor,
+.mdx-content .heading-anchor:focus-visible {
+  opacity: 1;
+}
+
 .mdx-content h4 {
   font-family: var(--font-display);
   font-size: 0.95rem;

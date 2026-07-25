@@ -142,6 +142,18 @@ export interface StreamableConnection {
   query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
 }
 
+/** Options for {@link Dialect.openStream}. */
+export interface OpenStreamOptions {
+  /**
+   * The connection is already inside a caller-owned transaction. Dialects that
+   * would otherwise wrap the stream in their own transaction MUST emit no
+   * BEGIN / COMMIT / ROLLBACK when this is true: the caller opened the
+   * transaction and owns ending it. Cursor cleanup (`CLOSE`) still runs, since
+   * the cursor lives on the caller's connection until their transaction ends.
+   */
+  ambientTransaction?: boolean;
+}
+
 /**
  * Inputs for {@link Dialect.buildUpdateStatement} — full UPDATE assembly. Used by
  * engines whose returning shape is injected MID-statement rather than as a trailing
@@ -511,12 +523,18 @@ export interface Dialect {
    * row batches of up to `batchSize`. PostgreSQL uses a `DECLARE CURSOR` /
    * `FETCH` / `CLOSE` loop inside a transaction; other engines use their
    * driver's native streaming iterator.
+   *
+   * `opts.ambientTransaction` tells the dialect the connection is ALREADY inside
+   * a caller-owned transaction, so it must not emit its own BEGIN / COMMIT /
+   * ROLLBACK (doing so would commit or discard the caller's uncommitted work
+   * mid-stream). Engines that emit no transaction control here ignore it.
    */
   openStream(
     connection: StreamableConnection,
     sql: string,
     params: unknown[],
     batchSize: number,
+    opts?: OpenStreamOptions,
   ): AsyncGenerator<Record<string, unknown>[], void, undefined>;
 
   // ---- Introspection ------------------------------------------------------
@@ -826,13 +844,18 @@ export const postgresDialect: Dialect = {
     sql: string,
     params: unknown[],
     batchSize: number,
+    opts?: OpenStreamOptions,
   ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
-    // Cursors require a single connection inside a transaction. Identical SQL
-    // sequence to the historical inline implementation: BEGIN → DECLARE … NO
-    // SCROLL CURSOR FOR → FETCH n (loop) → CLOSE → COMMIT; ROLLBACK on error.
+    // Cursors require a single connection inside a transaction: BEGIN → DECLARE
+    // … NO SCROLL CURSOR FOR → FETCH n (loop) → CLOSE → COMMIT; ROLLBACK on
+    // error. Under an ambient (caller-owned) transaction the three transaction
+    // statements are skipped, but the cursor is still CLOSEd: it would otherwise
+    // sit open on the caller's connection until their transaction ends.
+    const ambient = opts?.ambientTransaction === true;
     const cursorName = `turbine_cursor_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const quotedCursor = this.quoteIdentifier(cursorName);
-    await connection.query(this.beginStatement());
+    if (!ambient) await connection.query(this.beginStatement());
+    let failed = false;
     try {
       await connection.query(`DECLARE ${quotedCursor} NO SCROLL CURSOR FOR ${sql}`, params);
       while (true) {
@@ -841,15 +864,32 @@ export const postgresDialect: Dialect = {
         yield batch.rows;
         if (batch.rows.length < batchSize) break;
       }
-      await connection.query(`CLOSE ${quotedCursor}`);
-      await connection.query(this.commitStatement());
     } catch (err) {
-      try {
-        await connection.query(this.rollbackStatement());
-      } catch {
-        // Connection may already be broken — ignore rollback error.
+      // The transaction is aborted, so CLOSE would fail too: skip cleanup and
+      // let the rollback (ours, or the caller's on an ambient transaction) drop
+      // the cursor. Never let a cleanup failure mask this error.
+      failed = true;
+      if (!ambient) {
+        try {
+          await connection.query(this.rollbackStatement());
+        } catch {
+          // Connection may already be broken, ignore rollback error.
+        }
       }
       throw err;
+    } finally {
+      // Reached on normal completion AND on early exit (`break` from the
+      // consumer's `for await` runs the generator's return path through here),
+      // which is the case the old try-only cleanup leaked.
+      if (!failed) {
+        try {
+          await connection.query(`CLOSE ${quotedCursor}`);
+        } catch {
+          // Best-effort: a broken CLOSE must not replace a clean drain with an
+          // error. Ending the transaction drops the cursor regardless.
+        }
+        if (!ambient) await connection.query(this.commitStatement());
+      }
     }
   },
 

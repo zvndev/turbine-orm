@@ -48,11 +48,21 @@ describe('batched-loader integration (join vs batched parity)', () => {
     await db.disconnect();
   });
 
-  /** Run `args` under both strategies and assert the results are deeply equal. */
+  /**
+   * Run `args` under every relation-loading strategy and assert the results are
+   * deeply equal. `'flatten'` is the third arm: on these to-many-heavy shapes it
+   * mostly falls back to the join plan, which is exactly what should be pinned
+   * (an ineligible shape must produce the join strategy's result, not a
+   * fanned-out one). Shapes built specifically to exercise the flatten plan live
+   * in flatten-parity.integration.test.ts.
+   */
   async function assertParity(table: string, args: Record<string, unknown>): Promise<unknown[]> {
     const join = await db.table(table).findMany({ ...args, relationLoadStrategy: 'join' } as never);
     const batched = await db.table(table).findMany({ ...args, relationLoadStrategy: 'batched' } as never);
-    assert.deepEqual(batched, join, `batched must equal join for ${table} ${JSON.stringify(args)}`);
+    const flatten = await db.table(table).findMany({ ...args, relationLoadStrategy: 'flatten' } as never);
+    const label = `${table} ${JSON.stringify(args)}`;
+    assert.deepEqual(batched, join, `batched must equal join for ${label}`);
+    assert.deepEqual(flatten, join, `flatten must equal join for ${label}`);
     return batched as unknown[];
   }
 

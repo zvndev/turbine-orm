@@ -9,8 +9,11 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { type PgCompatPool, TurbineClient } from '../client.js';
 import { floorToMinute, type MetricsFlushBatch, ObserveEngine, percentile } from '../observe.js';
 import type { QueryEvent } from '../query/index.js';
+import type { SchemaMetadata } from '../schema.js';
+import { mockTable } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // percentile()
@@ -67,11 +70,29 @@ describe('floorToMinute()', () => {
 // ObserveEngine buffer accumulation
 // ---------------------------------------------------------------------------
 
+/**
+ * Build an engine whose sink captures every flushed batch. This is the public
+ * seam for observing the (private) per-minute buffer: the aggregates the engine
+ * would have written are handed to the sink verbatim, so assertions here are
+ * assertions on the real aggregation, not on a re-implementation of it.
+ */
+function captureEngine(batches: MetricsFlushBatch[]): ObserveEngine {
+  return new ObserveEngine({
+    sink: {
+      flush: async (batch) => {
+        batches.push(batch);
+      },
+    },
+  });
+}
+
 describe('ObserveEngine buffer', () => {
-  it('accumulates durations from listener events', () => {
-    const engine = new ObserveEngine({ connectionString: 'postgres://unused' });
+  it('accumulates count, avg, errors and percentiles from listener events', async () => {
+    const batches: MetricsFlushBatch[] = [];
+    const engine = captureEngine(batches);
     const listener = engine.getListener();
 
+    const at = new Date('2026-01-15T10:00:00.000Z');
     const event: QueryEvent = {
       sql: 'SELECT 1',
       params: [],
@@ -79,22 +100,35 @@ describe('ObserveEngine buffer', () => {
       model: 'users',
       action: 'findMany',
       rows: 10,
-      timestamp: new Date(),
+      timestamp: at,
     };
 
     listener(event);
     listener({ ...event, duration: 8.3 });
     listener({ ...event, duration: 20.1, error: new Error('fail') });
 
-    // Access buffer via flush mock — we test that flush produces correct values
-    // by capturing the SQL that would be sent. Since we don't call init() (no pool),
-    // we just verify the listener accumulates correctly.
-    // The engine's internal buffer is private so we test via the flush output below.
-    assert.ok(true); // listener did not throw
+    await engine.flush();
+
+    assert.equal(batches.length, 1);
+    const rows = batches[0]!.rows;
+    assert.equal(rows.length, 1);
+    const row = rows[0]!;
+    assert.equal(row.model, 'users');
+    assert.equal(row.action, 'findMany');
+    assert.equal(row.count, 3);
+    assert.equal(row.errors, 1);
+    // avg = (12.5 + 8.3 + 20.1) / 3
+    assert.ok(Math.abs(row.avg - 13.633333333333333) < 1e-9, `avg was ${row.avg}`);
+    // Percentiles are computed over the SORTED durations [8.3, 12.5, 20.1] at
+    // index ceil(p * n) - 1: p50 -> 1, p95 -> 2, p99 -> 2.
+    assert.equal(row.p50, 12.5);
+    assert.equal(row.p95, 20.1);
+    assert.equal(row.p99, 20.1);
   });
 
-  it('buffers different model:action keys separately', () => {
-    const engine = new ObserveEngine({ connectionString: 'postgres://unused' });
+  it('flushing twice does not re-report an already-flushed bucket', async () => {
+    const batches: MetricsFlushBatch[] = [];
+    const engine = captureEngine(batches);
     const listener = engine.getListener();
 
     listener({
@@ -104,20 +138,36 @@ describe('ObserveEngine buffer', () => {
       model: 'users',
       action: 'findMany',
       rows: 1,
-      timestamp: new Date(),
-    });
-    listener({
-      sql: 'INSERT',
-      params: [],
-      duration: 10,
-      model: 'posts',
-      action: 'create',
-      rows: 1,
-      timestamp: new Date(),
+      timestamp: new Date('2026-01-15T10:00:00.000Z'),
     });
 
-    // No crash — both keys buffered independently
-    assert.ok(true);
+    await engine.flush();
+    await engine.flush();
+
+    assert.equal(batches.length, 1, 'the second flush had an empty buffer and must be a no-op');
+    assert.equal(batches[0]!.rows.length, 1);
+  });
+
+  it('buffers different model:action keys separately', async () => {
+    const batches: MetricsFlushBatch[] = [];
+    const engine = captureEngine(batches);
+    const listener = engine.getListener();
+
+    const at = new Date('2026-01-15T10:00:00.000Z');
+    listener({ sql: 'SELECT', params: [], duration: 5, model: 'users', action: 'findMany', rows: 1, timestamp: at });
+    listener({ sql: 'SELECT', params: [], duration: 7, model: 'users', action: 'findUnique', rows: 1, timestamp: at });
+    listener({ sql: 'INSERT', params: [], duration: 10, model: 'posts', action: 'create', rows: 1, timestamp: at });
+
+    await engine.flush();
+
+    const rows = batches[0]!.rows;
+    assert.equal(rows.length, 3);
+    const key = (r: (typeof rows)[number]) => `${r.model}:${r.action}`;
+    assert.deepEqual(rows.map(key).sort(), ['posts:create', 'users:findMany', 'users:findUnique']);
+    for (const row of rows) {
+      assert.equal(row.count, 1, `${key(row)} must not absorb another key's events`);
+    }
+    assert.equal(rows.find((r) => key(r) === 'users:findUnique')!.avg, 7);
   });
 });
 
@@ -230,16 +280,6 @@ describe('ObserveEngine bucket attribution', () => {
     };
   }
 
-  function captureEngine(batches: MetricsFlushBatch[]): ObserveEngine {
-    return new ObserveEngine({
-      sink: {
-        flush: async (batch) => {
-          batches.push(batch);
-        },
-      },
-    });
-  }
-
   it('flushes one correctly stamped row per minute bucket', async () => {
     const batches: MetricsFlushBatch[] = [];
     const engine = captureEngine(batches);
@@ -291,22 +331,52 @@ describe('ObserveEngine bucket attribution', () => {
 // ---------------------------------------------------------------------------
 
 describe('$on/$off with ObserveEngine', () => {
-  it('listener receives events and can be removed', () => {
-    const engine = new ObserveEngine({ connectionString: 'postgres://unused' });
+  function createMockPool(): PgCompatPool {
+    return {
+      query: async () => ({ rows: [{ id: 1 }] as Record<string, unknown>[], rowCount: 1, fields: [] }),
+      connect: async () => ({
+        query: async () => ({ rows: [{ id: 1 }] as Record<string, unknown>[], rowCount: 1, fields: [] }),
+        release: () => {},
+      }),
+      end: async () => {},
+    } as unknown as PgCompatPool;
+  }
+
+  function createSchema(): SchemaMetadata {
+    return {
+      tables: {
+        users: mockTable('users', [
+          { name: 'id', field: 'id' },
+          { name: 'email', field: 'email', pgType: 'text' },
+        ]),
+      },
+      enums: {},
+    };
+  }
+
+  it('records the queries emitted while attached, and none after removal', async () => {
+    const batches: MetricsFlushBatch[] = [];
+    const engine = captureEngine(batches);
     const listener = engine.getListener();
 
-    const event: QueryEvent = {
-      sql: 'SELECT 1',
-      params: [],
-      duration: 5,
-      model: 'test',
-      action: 'findMany',
-      rows: 1,
-      timestamp: new Date(),
-    };
+    const db = new TurbineClient({ pool: createMockPool() }, createSchema());
+    db.$on('query', listener);
 
-    // Should not throw
-    listener(event);
-    assert.ok(true);
+    await db.table('users').findMany();
+    await db.table('users').findMany();
+
+    db.$off('query', listener);
+    await db.table('users').findMany();
+
+    await engine.flush();
+
+    assert.equal(batches.length, 1);
+    const rows = batches[0]!.rows;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.model, 'users');
+    assert.equal(rows[0]!.action, 'findMany');
+    // Two queries ran while the listener was attached, one after $off.
+    assert.equal(rows[0]!.count, 2);
+    assert.equal(rows[0]!.errors, 0);
   });
 });

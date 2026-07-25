@@ -12,7 +12,7 @@
  */
 
 import type pg from 'pg';
-import type { Dialect } from '../dialect.js';
+import type { Dialect, StreamableConnection } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
 import { NotFoundError, TimeoutError, UnsupportedFeatureError, ValidationError, wrapPgError } from '../errors.js';
 import { missingIndexForRelation, schemaHasIndexInfo } from '../index-advisor.js';
@@ -126,6 +126,122 @@ function cacheCrossCheckMode(): 'dev' | 'sampled' | 'off' {
  * so this set is only ever touched on the `'sampled'` path.
  */
 const loggedCacheMismatchFingerprints = new Set<string>();
+
+/**
+ * Marginal cost of keeping a to-one relation on the JOIN plan, per parent row.
+ *
+ * A to-one relation compiled into the join plan is a CORRELATED subquery: the
+ * engine re-evaluates it once per parent row, so the join plan costs roughly
+ * `AUTO_JOIN_PENALTY_MS_PER_ROW * parentRows` more CPU than one flat follow-up
+ * query, no matter how well indexed the correlation column is. The batched plan
+ * pays that back as a second statement, i.e. one extra round trip.
+ *
+ * Break-even is therefore, to a first approximation:
+ *
+ *     parentRows = roundTripMs / AUTO_JOIN_PENALTY_MS_PER_ROW
+ *
+ * Measured (PostgreSQL 17, hasOne over a UNIQUE FK, 10K-row parent table,
+ * median of 15 reps per point) at two very different link speeds:
+ *
+ *   link                RTT      penalty/row   break-even   observed crossover
+ *   ─────────────────── ──────── ───────────── ──────────── ──────────────────
+ *   loopback TCP        0.118ms  0.000711ms    ~166-236     between 200 and 400
+ *   +1ms/direction      2.683ms  0.000717ms    ~3744-3993   between 3000 and 5000
+ *
+ * The two things that matters most in that table: the per-row penalty is
+ * essentially IDENTICAL across the two links (it is a property of the plan, not
+ * the wire), while the break-even moved by 17x. So the break-even is a function
+ * of the deployment's round-trip time and NOTHING ELSE that is knowable at plan
+ * time. That is why this is expressed as a per-row cost and a round-trip time
+ * rather than as a hard-coded row count: a row count tuned on a Unix socket is
+ * off by ~20x for a cross-region deployment, and vice versa. Concretely, the
+ * previously shipped flat `1000` was simultaneously too HIGH on loopback
+ * (up to 1.44x slower than the better plan just under the cliff) and too LOW
+ * over a 2.7ms link (1.26x slower just above it).
+ */
+export const AUTO_JOIN_PENALTY_MS_PER_ROW = 0.0007;
+
+/**
+ * Round-trip time assumed before this process has observed a real one, chosen
+ * as a typical same-region managed-Postgres latency (app and database in one
+ * region over TCP). It is stated as a LATENCY rather than a row count so the
+ * assumption is visible and re-derivable: at
+ * {@link AUTO_JOIN_PENALTY_MS_PER_ROW} it yields exactly the 1000-row default
+ * this heuristic has always shipped, so an unmeasured process behaves exactly
+ * as before.
+ */
+export const AUTO_ASSUMED_ROUND_TRIP_MS = 0.7;
+
+/**
+ * Default parent-row ceiling under which `'auto'` keeps a to-one relation on
+ * the single-statement join plan: {@link AUTO_ASSUMED_ROUND_TRIP_MS} divided by
+ * {@link AUTO_JOIN_PENALTY_MS_PER_ROW}. Used until the process has measured its
+ * own round-trip time, and whenever measurement is unavailable.
+ */
+export const AUTO_TO_ONE_JOIN_MAX_ROWS = Math.round(AUTO_ASSUMED_ROUND_TRIP_MS / AUTO_JOIN_PENALTY_MS_PER_ROW);
+
+/**
+ * Clamps on the MEASURED threshold (an explicit `autoToOneJoinMaxRows` is an
+ * instruction, not an estimate, and bypasses both).
+ *
+ * The lower clamp matters: on a very fast link the formula can drop the
+ * threshold to a few dozen rows, and the sweep shows the join plan winning by
+ * up to 1.83x on a handful of parent rows, where the second statement's fixed
+ * cost dwarfs everything. Holding the floor at 100 rows keeps those small
+ * queries on the join plan; the cost of doing so, in the band where batched has
+ * just started to win, is under 1.2x. The upper clamp is a sanity bound for a
+ * pathological latency reading (a 70ms measurement would otherwise ask for
+ * 100K rows).
+ */
+export const AUTO_TO_ONE_JOIN_ROWS_MIN = 100;
+export const AUTO_TO_ONE_JOIN_ROWS_MAX = 100_000;
+
+/**
+ * WHY THIS IS A CONFIGURED LATENCY AND NOT A MEASURED ONE.
+ *
+ * The obvious next step from the formula above is to have the client measure
+ * its own round-trip time and derive the threshold at runtime. That was built
+ * and benchmarked, and it is NOT what ships, for a reason worth recording so it
+ * is not re-litigated blind:
+ *
+ * Every query's wall time is `roundTrip + serverWork`, and nothing in a
+ * duration distinguishes the two. An all-time MINIMUM reads a lucky packet
+ * (1.489ms on a link whose real per-statement cost was 2.862ms) and lands the
+ * threshold at half the true break-even. A MEDIAN over recent durations is
+ * accurate when the workload is cheap queries, but the workload being planned
+ * for here is precisely the expensive one: in the verification sweep the ring
+ * filled with 10-17ms relation queries, the estimate inflated, and `'auto'`
+ * held an 8,000-row query on the join plan — 1.30x slower than the better plan,
+ * WORSE than the fixed constant it replaced. Capping the median against a
+ * multiple of the floor mitigates it but turns the whole thing into a pair of
+ * magic numbers tuned against two synthetic links, which is the same mistake as
+ * a socket-tuned row count wearing a different hat.
+ *
+ * Round-trip time is a deployment fact, not a runtime discovery: it is fixed by
+ * where the app runs relative to the database, the operator knows it (or gets
+ * it from one `ping`), and it does not change between queries. So it is
+ * configuration. That also keeps plan selection deterministic, which matters
+ * for a library whose documented guarantee is that the strategy changes the
+ * plan and never the result.
+ */
+
+/** One relation that `'auto'` moved off the join plan, with the reason (dev note). */
+interface AutoEngaged {
+  relation: string;
+  /**
+   * `'unindexed'`: a probe in the subtree has no covering index.
+   * `'to-one-cardinality'`: a to-one relation on a potentially large parent set.
+   */
+  reason: 'unindexed' | 'to-one-cardinality';
+  miss?: { table: string; columns: string[]; createSql: string };
+}
+
+/** The `'auto'` per-relation partition of one `with` clause. */
+interface AutoSplit {
+  joinWith: WithClause;
+  batchedWith: WithClause;
+  engaged: AutoEngaged[];
+}
 
 /**
  * Strict structural equality for a single SQL parameter value. Handles the
@@ -275,6 +391,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly relationLoadStrategy: RelationLoadStrategy;
   /** Client-level default for {@link applyStableRelationOrder} (off unless configured). */
   private readonly stableRelationOrder: boolean;
+  /**
+   * Client-level opt-in: apply an implicit primary-key ascending `ORDER BY` to a
+   * `findMany` that paginates (`limit`/`take`/`offset`) but declares no
+   * `orderBy`. OFF by default in core, see {@link applyImplicitPkOrdering}.
+   */
+  private readonly implicitPkOrdering: boolean;
+  /**
+   * Explicitly configured parent-row ceiling for the `'auto'` to-one rule, or
+   * `undefined` to derive it from the observed round-trip time. See
+   * {@link autoToOneThreshold}.
+   */
+  private readonly autoToOneJoinMaxRowsOption: number | undefined;
+  /**
+   * Deployment round-trip time in milliseconds, from which the to-one threshold
+   * is derived. See {@link autoToOneThreshold}.
+   */
+  private readonly autoRoundTripMs: number | undefined;
   /** Nested-relation JSON encoding: 'object' (default) or 'positional'. */
   private readonly jsonEncoding: 'object' | 'positional';
   /**
@@ -415,6 +548,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.dialect = options?.dialect ?? postgresDialect;
     this.relationLoadStrategy = options?.relationLoadStrategy ?? 'auto';
     this.stableRelationOrder = options?.stableRelationOrder === true;
+    this.implicitPkOrdering = options?.implicitPkOrdering === true;
+    const autoToOne = options?.autoToOneJoinMaxRows;
+    this.autoToOneJoinMaxRowsOption =
+      autoToOne !== undefined && Number.isFinite(autoToOne) && autoToOne >= 0 ? Math.floor(autoToOne) : undefined;
+    const rtt = options?.autoRoundTripMs;
+    this.autoRoundTripMs = rtt !== undefined && Number.isFinite(rtt) && rtt > 0 ? rtt : undefined;
     this.jsonEncoding = options?.jsonEncoding ?? 'object';
     // Only retain the map when it has at least one entry, so `globalFilters`
     // stays `undefined` (and every merge path a no-op) for the common case.
@@ -485,7 +624,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       camelDateFieldCache: this.camelDateFieldCache,
       limitOneClause: () => this.limitOneClause(),
       buildPagination: (limitPh, offsetPh, hasOrderBy) => this.buildPagination(limitPh, offsetPh, hasOrderBy),
-      paginationRef: (value, params) => this.paginationRef(value, params),
+      paginationRef: (value: unknown, params: unknown[], arg: string) => this.paginationRef(value, params, arg),
+      paginationValue: (value: unknown, arg: string) => this.paginationValue(value, arg),
     };
   }
 
@@ -541,18 +681,35 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Coerce a LIMIT/OFFSET argument and validate it as a non-negative safe
+   * integer. Numeric strings (`'5'`) coerce; everything else (`NaN`, a
+   * non-numeric string, a negative, a fractional or out-of-safe-range number)
+   * throws {@link ValidationError} (E003) naming the argument and the table.
+   *
+   * This runs on EVERY pagination path, parameterized as well as inlined: a
+   * bound `NaN` serializes as SQL NULL, and Postgres reads `LIMIT NULL` as
+   * "no limit", so an unvalidated value silently turns a paginated query into
+   * a full-table read (and a bad OFFSET silently disappears).
+   */
+  private paginationValue(value: unknown, arg: string): number {
+    const n = Number(value);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new ValidationError(
+        `[turbine] ${arg} on "${this.table}" must be a non-negative integer, received: ${String(value)}`,
+      );
+    }
+    return n;
+  }
+
+  /**
    * Validate a LIMIT/OFFSET value as a non-negative integer and return it as an
    * inline SQL literal. Used only on `dialect.inlineLimitOffset` engines (MySQL).
    * The input is always a Turbine-controlled pagination value, never a raw user
-   * string — and this guard guarantees the output is `String` of a validated
+   * string, and this guard guarantees the output is `String` of a validated
    * integer, so inlining cannot inject SQL.
    */
-  private limitOffsetLiteral(value: unknown): string {
-    const n = Number(value);
-    if (!Number.isInteger(n) || n < 0) {
-      throw new ValidationError(`LIMIT/OFFSET must be a non-negative integer, received: ${String(value)}`);
-    }
-    return String(n);
+  private limitOffsetLiteral(value: unknown, arg: string): string {
+    return String(this.paginationValue(value, arg));
   }
 
   /**
@@ -562,11 +719,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * the param order stays mirrored; PG/SQLite/SQL Server keep parameterizing and
    * stay byte-identical.
    */
-  private paginationRef(value: unknown, params: unknown[]): string {
+  private paginationRef(value: unknown, params: unknown[], arg: string): string {
     if (this.dialect.inlineLimitOffset) {
-      return this.limitOffsetLiteral(value);
+      return this.limitOffsetLiteral(value, arg);
     }
-    params.push(Number(value));
+    params.push(this.paginationValue(value, arg));
     return this.p(params.length);
   }
 
@@ -654,6 +811,197 @@ export class QueryInterface<T extends object, R extends object = {}> {
       out[relName] = clonedSpec;
     }
     return out ?? withClause;
+  }
+
+  // -------------------------------------------------------------------------
+  // Deterministic pagination (unordered LIMIT/OFFSET)
+  // -------------------------------------------------------------------------
+
+  /**
+   * The primary key of this table as an ascending `orderBy`, in DECLARATION
+   * order (a composite PK orders on every column), or `undefined` for a PK-less
+   * table. Field names are the camelCase accessor names, so the emitted SQL goes
+   * through the normal column mapping.
+   */
+  private pkOrderBy(): WithOrderByObject | WithOrderByObject[] | undefined {
+    const pk = this.tableMeta.primaryKey ?? [];
+    if (pk.length === 0) return undefined;
+    const fields = pk.map((c) => this.tableMeta.reverseColumnMap[c] ?? c);
+    return fields.length === 1 ? { [fields[0]!]: 'asc' } : fields.map((f) => ({ [f]: 'asc' as const }));
+  }
+
+  /**
+   * The field names a `cursor` actually seeks on (its own keys with a defined
+   * value), in the canonical sorted order the cursor conditions are built in.
+   * Empty for a missing cursor or one whose every value is `undefined` (which
+   * emits no seek condition at all, so it does not paginate).
+   */
+  private cursorFields(cursor: unknown): string[] {
+    if (!cursor || typeof cursor !== 'object') return [];
+    return Object.entries(cursor as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .map(([k]) => k)
+      .sort();
+  }
+
+  /**
+   * The ascending ordering implied by a `cursor`, or `undefined` when the shape
+   * is too ambiguous to order safely.
+   *
+   * A cursor seek emits `col > $n` per field (`<` when the orderBy says desc),
+   * so the ONLY ordering coherent with it is on the cursor's own field: ordering
+   * a seek on column X by column Y walks the table in an order the seek does not
+   * follow, which skips and repeats rows just as badly as no order at all. That
+   * is why this orders on the cursor field rather than blindly on the primary
+   * key when the two differ.
+   *
+   * Returns `undefined` (warn, inject nothing) for two shapes:
+   *  - a MULTI-field cursor. `a > $1 AND b > $2` is a conjunction, not a proper
+   *    composite keyset seek (`(a, b) > ($1, $2)`), so no single ORDER BY makes
+   *    it correct. Injecting `(a asc, b asc)` would dress a broken seek up as a
+   *    sound one.
+   *  - a field that does not resolve to a real column. Column validation belongs
+   *    to the normal build path, which raises a precise error; synthesizing an
+   *    ORDER BY on it here would only change which error the caller sees.
+   */
+  private cursorOrderBy(cursor: unknown): WithOrderByObject | undefined {
+    const fields = this.cursorFields(cursor);
+    if (fields.length !== 1) return undefined;
+    const field = fields[0]!;
+    try {
+      this.toColumn(field);
+    } catch {
+      return undefined;
+    }
+    return { [field]: 'asc' };
+  }
+
+  /**
+   * Whether a findMany paginates (`limit` / `take` / `offset` / `cursor`) but
+   * declares no ordering, which makes the returned page NON-DETERMINISTIC:
+   * Postgres is free to return different rows for the same unordered `LIMIT`
+   * once the heap changes underneath it, so a row can appear on two pages or on
+   * none.
+   *
+   * `cursor` counts, and is the worst case rather than an exception: a keyset
+   * seek with no ORDER BY is exactly this bug (`WHERE id > $1 LIMIT $2` walks
+   * the heap in whatever order the plan happens to produce). An empty orderBy
+   * (`[]`, or an object whose every value is `undefined`) counts as absent,
+   * because it emits no ordering.
+   *
+   * `distinct` is still excluded: that path re-orders in an outer wrapper around
+   * a `DISTINCT ON` whose ordering picks the representative row, so an implicit
+   * key would change which rows come back, not just their order.
+   */
+  private isUnorderedPage(args?: {
+    limit?: number;
+    take?: number;
+    offset?: number;
+    cursor?: unknown;
+    orderBy?: unknown;
+    distinct?: unknown;
+  }): boolean {
+    if (!args) return false;
+    if (args.distinct !== undefined) return false;
+    if (!isEmptyOrderBy(args.orderBy)) return false;
+    if (args.limit !== undefined || args.take !== undefined || args.offset !== undefined) return true;
+    return this.cursorFields(args.cursor).length > 0;
+  }
+
+  /**
+   * Opt-in (`implicitPkOrdering`) primary-key ascending ordering for a paginating
+   * findMany that declares no `orderBy`, making its pages deterministic.
+   *
+   * OFF by default in CORE, deliberately: turning it on would add an `ORDER BY`
+   * to SQL that existing applications already emit, changing both the rows a
+   * given page returns and the plan the engine picks. That is a breaking change
+   * in everything but the type signature, so it waits for a major. The
+   * `turbine-orm/prisma-compat` layer defaults it ON instead, because reproducing
+   * Prisma's semantics is that layer's whole contract.
+   *
+   * An explicit `orderBy` always wins, a PK-less table is left alone (nothing
+   * stable to order by), and a composite PK orders on every column in
+   * declaration order. A `cursor` query orders on the CURSOR's field instead
+   * (see {@link cursorOrderBy}), and is left alone when that shape is ambiguous.
+   * `distinct` shapes are skipped (see {@link isUnorderedPage}). With the flag
+   * off this returns `undefined` before touching anything, so the emitted SQL is
+   * byte-identical to before.
+   */
+  private implicitPkOrderBy(args?: {
+    limit?: number;
+    take?: number;
+    offset?: number;
+    cursor?: unknown;
+    orderBy?: unknown;
+    distinct?: unknown;
+  }): WithOrderByObject | WithOrderByObject[] | undefined {
+    if (!this.implicitPkOrdering) return undefined;
+    if (!this.isUnorderedPage(args)) return undefined;
+    if (this.cursorFields(args?.cursor).length > 0) return this.cursorOrderBy(args?.cursor);
+    return this.pkOrderBy();
+  }
+
+  /**
+   * Dev-only, once per query shape: an unordered paginating findMany returns a
+   * non-deterministic page (see {@link isUnorderedPage}), and on real data it is
+   * also usually the slower plan (an unordered `LIMIT` can discard tens of
+   * thousands of heap rows that an index scan on the key would have skipped).
+   *
+   * Gated exactly like the other dev diagnostics (silent under
+   * `NODE_ENV=production`) and consistent with `warnOnUnlimited`: a per-call
+   * `warnOnUnlimited: false` silences it, `true` forces it past a config-level
+   * opt-out, and a config/per-table `warnOnUnlimited: false` silences it. Deduped
+   * process-wide through the shared warn registry, so it can never spam.
+   *
+   * Suppressed only when `implicitPkOrdering` will ACTUALLY order this query.
+   * The flag being on is not enough: a PK-less table and an ambiguous
+   * multi-field cursor both get no injected ordering, and those are precisely
+   * the shapes that still need saying out loud.
+   */
+  private maybeWarnUnorderedPage(args?: {
+    limit?: number;
+    take?: number;
+    offset?: number;
+    cursor?: unknown;
+    orderBy?: unknown;
+    distinct?: unknown;
+    warnOnUnlimited?: boolean;
+  }): void {
+    if (process.env.NODE_ENV === 'production') return;
+    if (this.implicitPkOrdering && this.implicitPkOrderBy(args) !== undefined) return;
+    const perCall = args?.warnOnUnlimited;
+    if (perCall === false) return;
+    if (perCall === undefined && !this.warnOnUnlimited) return;
+    if (!this.isUnorderedPage(args)) return;
+    const cursorFields = this.cursorFields(args?.cursor);
+    const shape = [
+      cursorFields.length > 0 ? 'cursor' : '',
+      args?.limit !== undefined ? 'limit' : '',
+      args?.take !== undefined ? 'take' : '',
+      args?.offset !== undefined ? 'offset' : '',
+    ]
+      .filter(Boolean)
+      .join('+');
+    if (!shouldWarnOnce(WARN_NS.unorderedPage, `${this.table}|${shape}`)) return;
+    const asOrderBy = (fields: string[]) =>
+      fields.length === 1 ? `{ ${fields[0]}: 'asc' }` : `[${fields.map((f) => `{ ${f}: 'asc' }`).join(', ')}]`;
+    const pk = (this.tableMeta.primaryKey ?? []).map((c) => this.tableMeta.reverseColumnMap[c] ?? c);
+    // A cursor seeks on its own field, so that is the ordering to recommend:
+    // the primary key would be the wrong advice whenever the two differ.
+    const orderFields = cursorFields.length > 0 ? cursorFields : pk;
+    const suggestion =
+      orderFields.length > 0 ? `Add \`orderBy: ${asOrderBy(orderFields)}\`` : 'Add an `orderBy` on a unique column';
+    const seek =
+      cursorFields.length > 0
+        ? 'a `cursor` seek with no orderBy compares against rows the engine is free to return in any order, so ' +
+          'paging with it skips and repeats rows: '
+        : '';
+    console.warn(
+      `[turbine] findMany on "${this.table}" paginates (${shape}) with no orderBy: ${seek}the page is NOT ` +
+        'deterministic (the same query can return different rows as the table changes, so a row may appear ' +
+        `on two pages or on none). ${suggestion}, or set \`implicitPkOrdering: true\` in the client config ` +
+        'to order paginated queries automatically (by the cursor field, or by the primary key).',
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -750,27 +1098,79 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * Partition a top-level `with` clause under `'auto'`: each relation whose
-   * subtree has a PROVEN unindexed probe AND is fully batched-eligible routes to
-   * `batchedWith`; everything else (indexed, composite-key, unknown) stays in
-   * `joinWith` (byte-identical join). The reserved `_count` key partitions the
-   * same way. Also returns the engaged relations for the dev note.
+   * Whether a query's parent set is potentially large at plan time, which is the
+   * only cardinality signal available before the base query runs. A `findMany`
+   * with no `limit`/`take` (or one above {@link autoToOneJoinMaxRows}) can return
+   * an arbitrary number of parent rows; a small `limit` bounds it. `findUnique` /
+   * `findFirst` pass `false` explicitly (their parent set is one row).
    */
-  private partitionWithForAuto(withClause: WithClause): {
-    joinWith: WithClause;
-    batchedWith: WithClause;
-    engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[];
-  } {
+  private autoParentSetLarge(args?: { limit?: number; take?: number }): boolean {
+    const limit = args?.take ?? args?.limit ?? this.defaultLimit;
+    return limit === undefined || limit > this.autoToOneThreshold();
+  }
+
+  /**
+   * The parent-row count at which `'auto'` stops preferring the single-statement
+   * join for a to-one relation.
+   *
+   * Resolution order:
+   *   1. an explicit `autoToOneJoinMaxRows` — an instruction, used verbatim
+   *      (no clamping: the caller has measured their own workload);
+   *   2. the configured `autoRoundTripMs` divided by
+   *      {@link AUTO_JOIN_PENALTY_MS_PER_ROW}, clamped to
+   *      [{@link AUTO_TO_ONE_JOIN_ROWS_MIN}, {@link AUTO_TO_ONE_JOIN_ROWS_MAX}];
+   *   3. {@link AUTO_TO_ONE_JOIN_MAX_ROWS}, which is that same division applied
+   *      to {@link AUTO_ASSUMED_ROUND_TRIP_MS}.
+   *
+   * Deriving it rather than hard-coding a row count is the whole point: the
+   * sweep in {@link AUTO_JOIN_PENALTY_MS_PER_ROW} shows the break-even moving
+   * 17x between a loopback link and a 2.7ms one while the per-row penalty stays
+   * put, so any single constant is wrong for someone by more than the margin it
+   * is trying to save. Placing the switch AT the break-even is also what removes
+   * the old cliff: two plans that cost the same at the boundary make the regret
+   * there ~1.0x, rising only as the true row count moves away from it — where
+   * the previous fixed 1000 put its WORST case (1.44x measured) immediately
+   * below its own switch point.
+   *
+   * Cheap enough to recompute per call (a division and two comparisons over
+   * readonly fields), so there is no cached copy to invalidate.
+   */
+  private autoToOneThreshold(): number {
+    if (this.autoToOneJoinMaxRowsOption !== undefined) return this.autoToOneJoinMaxRowsOption;
+    if (this.autoRoundTripMs === undefined) return AUTO_TO_ONE_JOIN_MAX_ROWS;
+    const rows = Math.round(this.autoRoundTripMs / AUTO_JOIN_PENALTY_MS_PER_ROW);
+    return Math.min(AUTO_TO_ONE_JOIN_ROWS_MAX, Math.max(AUTO_TO_ONE_JOIN_ROWS_MIN, rows));
+  }
+
+  /**
+   * Partition a top-level `with` clause under `'auto'`. A relation routes to
+   * `batchedWith` when it is fully batched-eligible AND either
+   *
+   *   1. its subtree has a PROVEN unindexed probe (index metadata only), or
+   *   2. it is TO-ONE and the parent set is potentially large
+   *      ({@link AUTO_TO_ONE_JOIN_MAX_ROWS}), since a correlated to-one subquery
+   *      is re-evaluated per parent row no matter how well indexed it is.
+   *
+   * Everything else (indexed to-many, composite-key, unknown) stays in `joinWith`
+   * (byte-identical join). The reserved `_count` key falls back on rule 1 only,
+   * and only for a large parent set: an inline `_count` is one correlated
+   * `COUNT(*)` per parent row, so the grouped follow-up wins exactly when there
+   * are many parents, while for a handful of parents the extra round-trip costs
+   * more than the repeated (small) scans. Also returns the engaged relations for
+   * the dev note.
+   */
+  private partitionWithForAuto(withClause: WithClause, parentSetLarge: boolean): AutoSplit {
+    const hasIndexInfo = schemaHasIndexInfo(this.schema);
     const joinWith: WithClause = {};
     const batchedWith: WithClause = {};
-    const engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[] = [];
+    const engaged: AutoEngaged[] = [];
     for (const [key, spec] of Object.entries(withClause)) {
       if (!spec) continue;
       if (key === '_count') {
         const cv = this.autoCountVerdict(spec as unknown as WithCount, this.tableMeta);
-        if (cv.unindexed && cv.eligible) {
+        if (hasIndexInfo && parentSetLarge && cv.unindexed && cv.eligible) {
           batchedWith[key] = spec;
-          engaged.push({ relation: '_count', miss: cv.miss });
+          engaged.push({ relation: '_count', reason: 'unindexed', miss: cv.miss });
         } else {
           joinWith[key] = spec;
         }
@@ -782,9 +1182,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
       const v = this.autoSubtreeVerdict(rel, spec, 0);
-      if (v.unindexed && v.eligible) {
+      const unindexedFallback = hasIndexInfo && v.unindexed;
+      const toOne = rel.type === 'belongsTo' || rel.type === 'hasOne';
+      const cardinalityFallback = toOne && parentSetLarge;
+      if (v.eligible && (unindexedFallback || cardinalityFallback)) {
         batchedWith[key] = spec;
-        engaged.push({ relation: key, miss: v.miss });
+        engaged.push({
+          relation: key,
+          reason: unindexedFallback ? 'unindexed' : 'to-one-cardinality',
+          miss: unindexedFallback ? v.miss : undefined,
+        });
       } else {
         joinWith[key] = spec;
       }
@@ -796,34 +1203,35 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Plan the `'auto'` split for a query's `with` clause: normalize stable order,
    * partition, and return the split ONLY when at least one relation falls back
    * to batched. Returns `null` (→ run the plain join path, byte-identical, same
-   * cache keys) when there is no DB-backed index metadata or nothing qualifies.
+   * cache keys) when nothing qualifies.
    */
-  private planAuto(
-    withArg: WithClause,
-    stableFlag: boolean | undefined,
-  ): {
-    joinWith: WithClause;
-    batchedWith: WithClause;
-    engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[];
-  } | null {
-    // No DB-backed index info (code-first / defineSchema-only) → cannot PROVE any
-    // probe is unindexed, so 'auto' behaves exactly like 'join'.
-    if (!schemaHasIndexInfo(this.schema)) return null;
+  private planAuto(withArg: WithClause, stableFlag: boolean | undefined, parentSetLarge: boolean): AutoSplit | null {
+    // Without DB-backed index info (code-first / defineSchema-only) no probe can
+    // be PROVEN unindexed; the to-one cardinality rule does not depend on index
+    // metadata, so it still applies.
+    if (!schemaHasIndexInfo(this.schema) && !parentSetLarge) return null;
     const withClause = this.resolveStableOrder(stableFlag)
       ? this.applyStableRelationOrder(withArg, this.table)
       : withArg;
-    const split = this.partitionWithForAuto(withClause);
+    const split = this.partitionWithForAuto(withClause, parentSetLarge);
     if (Object.keys(split.batchedWith).length === 0) return null;
     return split;
   }
 
   /** Dev-only once-per-relation note that `'auto'` engaged the batched fallback. */
-  private emitAutoNotes(
-    engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[],
-  ): void {
+  private emitAutoNotes(engaged: AutoEngaged[]): void {
     if (process.env.NODE_ENV === 'production') return;
     for (const e of engaged) {
       if (!shouldWarnOnce(WARN_NS.autoStrategy, `${this.table}.${e.relation}`)) continue;
+      if (e.reason === 'to-one-cardinality') {
+        console.warn(
+          `[turbine] auto strategy: to-one relation "${e.relation}" on "${this.table}" loads batched ` +
+            `(the query is unbounded or its limit exceeds ${this.autoToOneThreshold()} rows, and a correlated ` +
+            'to-one subquery is re-evaluated per parent row). Bound the query with a smaller `limit`, tune ' +
+            "`autoToOneJoinMaxRows`, or set `relationLoadStrategy: 'join'` to force the single-statement plan.",
+        );
+        continue;
+      }
       const probe = e.miss
         ? `probe "${e.miss.table}"(${e.miss.columns.join(', ')}) has no covering index`
         : 'a probe in its subtree has no covering index';
@@ -844,11 +1252,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private async runAutoSplit(
     args: FindManyArgs<T> | FindUniqueArgs<T>,
-    split: {
-      joinWith: WithClause;
-      batchedWith: WithClause;
-      engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[];
-    },
+    split: AutoSplit,
     single: boolean,
   ): Promise<Record<string, unknown>[] | Record<string, unknown> | null> {
     this.emitAutoNotes(split.engaged);
@@ -1346,7 +1750,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
         if (strategy === 'batched') return this.runFindUniqueBatched(args as unknown as FindUniqueArgs<T>);
         if (strategy === 'auto') {
-          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder);
+          // findUnique's parent set is a single row: the join plan's correlated
+          // subqueries run once, so the cardinality rule never applies here.
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false);
           if (split) return this.runAutoSplit(args as unknown as FindUniqueArgs<T>, split, true);
         }
       }
@@ -1406,6 +1812,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (normalized !== args.with) args = { ...args, with: normalized as typeof args.with };
     }
     const includePii = args.includePii === true;
+    // findUnique is never flatten-planned: it reads ONE parent row, so the
+    // correlated subquery already runs exactly once and a join buys nothing.
+    // Say so, because the caller did ask for a strategy that is not running.
+    if (args.with && this.resolveLoadStrategy(args.relationLoadStrategy) === 'flatten') {
+      this.warnFlattenBlocked('findUnique reads a single parent row, where the correlated subquery already runs once');
+    }
     const columnsList = this.resolveColumns(args.select, args.omit, includePii);
     // A global filter turns the where into `{ AND: [...] }`, which the
     // `isSimpleWhere` test below rejects → the general (buildWhereClause) path
@@ -1546,6 +1958,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>[]> {
     this.maybeWarnUnlimited(args);
+    this.maybeWarnUnorderedPage(args);
 
     // Dev-only: warn on deeply nested with clauses
     if (process.env.NODE_ENV !== 'production') {
@@ -1565,7 +1978,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
         if (strategy === 'batched') return this.runFindManyBatched(args as unknown as FindManyArgs<T>);
         if (strategy === 'auto') {
-          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder);
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, this.autoParentSetLarge(args));
           if (split) return this.runAutoSplit(args as unknown as FindManyArgs<T>, split, false) as Promise<T[]>;
         }
       }
@@ -1699,6 +2112,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const normalized = this.applyStableRelationOrder(args.with as WithClause, this.table);
       if (normalized !== args.with) args = { ...args, with: normalized as typeof args.with };
     }
+    // An empty orderBy carries no ordering, so treat it as ABSENT rather than
+    // emitting a bare `ORDER BY` with nothing after it (a syntax error at the
+    // following LIMIT). This matters most for the documented escape hatch from
+    // implicit ordering, "pass an explicit orderBy": callers who assemble that
+    // array conditionally end up passing `[]`. Normalized here, before the
+    // implicit-ordering and fingerprinting steps, so every downstream path sees
+    // one shape.
+    if (args?.orderBy !== undefined && isEmptyOrderBy(args.orderBy)) {
+      args = { ...args, orderBy: undefined };
+    }
+    // Deterministic pagination (opt-in): fill a PK-asc orderBy into a paginating
+    // query that declares none, BEFORE fingerprinting so the ordered and
+    // unordered shapes get distinct cache entries. No-op unless
+    // `implicitPkOrdering` is enabled (see implicitPkOrderBy).
+    const implicitOrder = this.implicitPkOrderBy(args);
+    if (implicitOrder) args = { ...args, orderBy: implicitOrder as NonNullable<typeof args>['orderBy'] };
     // `distinct` + relation orderBy is refused up front (E003): the distinct
     // path re-orders in an outer wrapper (`... AS "<table>_distinct" ORDER BY
     // <userOrder>`) where a correlated relation subquery (pick-row, `_count`,
@@ -1765,7 +2194,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `withFp` does NOT capture; it is projection-invariant). So it MUST be its
     // own cache-key segment: a cached no-PII statement must never serve an
     // `includePii` call, nor vice versa.
-    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${this.globalFilterCacheSegment()}`;
+    // `relationLoadStrategy: 'flatten'` compiles eligible to-one relations to
+    // LEFT JOINs instead of correlated subqueries — a completely different
+    // statement for the same `with` shape, which `withFp` (strategy-blind)
+    // does not distinguish. So the plan gets its own cache-key segment, exactly
+    // like `pii=`: a join-planned template must never serve a flatten-planned
+    // call. Absent (the default), the segment is empty and every existing cache
+    // key is byte-identical to before.
+    const flattenPlan = this.planFlatten(args, includePii);
+    const flattenFp = flattenPlan ? `|fl=${flattenPlan.signature}` : '';
+
+    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${flattenFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -1787,6 +2226,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
         distinctPrefix = `DISTINCT ON (${distinctCols.join(', ')}) `;
       }
 
+      // Join-sink for `relationLoadStrategy: 'flatten'`. Filled while the SELECT
+      // list is built (so the flattened relations' ON-clause params interleave
+      // with the `with` params in one traversal, which the collect path
+      // mirrors) and spliced into the FROM clause at assembly. Stays empty for
+      // every other plan → byte-identical SQL.
+      const relationJoins: string[] = [];
+
       let selectClause: string;
       if (args?.with) {
         selectClause = this.buildSelectWithRelations(
@@ -1797,6 +2243,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           undefined,
           undefined,
           includePii,
+          flattenPlan ? { plan: flattenPlan, joinSink: relationJoins } : undefined,
         );
       } else if (columnsList) {
         selectClause = columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ');
@@ -1863,7 +2310,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const orderBySql = args?.orderBy
           ? ` ORDER BY ${this.buildOrderBy(args.orderBy, freshParams, lateralJoins)}`
           : '';
-        sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${lateralJoins.join('')}${tail}${orderBySql}`;
+        sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${relationJoins.join('')}${lateralJoins.join('')}${tail}${orderBySql}`;
       }
 
       // Pagination — push params in the same order the collect path mirrors
@@ -1872,10 +2319,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
       let limitPh: string | undefined;
       let offsetPh: string | undefined;
       if (effectiveLimit !== undefined) {
-        limitPh = this.paginationRef(effectiveLimit, freshParams);
+        limitPh = this.paginationRef(effectiveLimit, freshParams, 'limit');
       }
       if (args?.offset !== undefined) {
-        offsetPh = this.paginationRef(args.offset, freshParams);
+        offsetPh = this.paginationRef(args.offset, freshParams, 'skip/offset');
       }
       sql += this.buildPagination(limitPh, offsetPh, !!args?.orderBy);
 
@@ -1890,7 +2337,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
     // 2. WITH relation params
     if (args?.with) {
-      this.collectWithParams(args.with as WithClause, params);
+      this.collectWithParams(args.with as WithClause, params, undefined, flattenPlan);
     }
     // 3. Cursor params — sorted (canonical) order, matching cursorFp and the build path.
     if (args?.cursor) {
@@ -1907,16 +2354,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // 5. LIMIT param — skipped when the dialect inlines pagination (build path
     //    mirrors via paginationRef → no placeholder, no param).
     if (effectiveLimit !== undefined && !this.dialect.inlineLimitOffset) {
-      params.push(Number(effectiveLimit));
+      // Validate here too: on a cache HIT the build path never runs, and a
+      // warmed template would otherwise bind an unvalidated NaN (= SQL NULL,
+      // i.e. no limit at all).
+      params.push(this.paginationValue(effectiveLimit, 'limit'));
     }
     // 6. OFFSET param — same inline gate as LIMIT above.
     if (args?.offset !== undefined && !this.dialect.inlineLimitOffset) {
-      params.push(Number(args.offset));
+      params.push(this.paginationValue(args.offset, 'skip/offset'));
     }
     this.crossCheckCache('findMany', ck, entry, buildSql, params);
 
     // Build the row parser once (positional shapes are computed here, not per row).
-    const parseWith = args?.with ? this.makeNestedParser(args.with as WithClause, includePii) : null;
+    const parseWith = args?.with ? this.makeNestedParser(args.with as WithClause, includePii, flattenPlan) : null;
 
     return {
       sql: entry.sql,
@@ -1943,14 +2393,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * method fall back to the full cursor path.
    *
    * **Cursor path:** Uses DECLARE CURSOR within a dedicated transaction on a
-   * single pooled connection. The cursor is automatically closed and the
-   * connection released when iteration completes or is terminated early
-   * (e.g. `break` from `for await`).
+   * single pooled connection. The cursor is CLOSEd (in the dialect's `finally`)
+   * and the connection released both when iteration completes normally and when
+   * it ends early (`break` from `for await`). An error mid-stream skips the
+   * CLOSE and rolls back instead, which drops the cursor with the transaction.
    *
-   * **Snapshot semantics note:** The speculative fast-path runs outside a
-   * transaction. If the result overflows and the cursor path is opened, the
-   * cursor runs in its own transaction — spanning two separate snapshots.
-   * For strict single-snapshot semantics, wrap the call in `$transaction`.
+   * **Snapshot semantics note:** Outside a transaction the speculative
+   * fast-path runs unwrapped, and an overflow opens the cursor in its own
+   * transaction, so the two fetches span two separate snapshots. Wrapping the
+   * call in `$transaction` gives strict single-snapshot semantics: both the
+   * speculative fetch and the cursor then run on the caller's connection
+   * inside the caller's transaction (the cursor path issues no BEGIN/COMMIT of
+   * its own and releases nothing, so the caller's transaction is intact when
+   * iteration finishes).
    *
    * @example
    * ```ts
@@ -1968,7 +2423,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
     const hasRelations = !!args?.with;
     // Build the positional-aware relation parser once for the whole stream.
-    const parseWith = hasRelations ? this.makeNestedParser(args!.with as WithClause, args?.includePii === true) : null;
+    // Same flatten plan buildFindMany compiles below. The plan is a pure
+    // function of the schema, the `with` shape and `includePii` — never of
+    // `limit` — so the batch-size override the speculative fetch applies cannot
+    // change it, and the stream's parser matches the emitted SQL.
+    const streamFlattenPlan = hasRelations ? this.planFlatten(args, args?.includePii === true) : null;
+    const parseWith = hasRelations
+      ? this.makeNestedParser(args!.with as WithClause, args?.includePii === true, streamFlattenPlan)
+      : null;
 
     // --- Speculative first fetch: try to satisfy the entire drain in one RTT ---
     const speculativeDeferred = this.buildFindMany({
@@ -2000,13 +2462,25 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // --- Overflow: fall back to cursor path from scratch ---
     const deferred = this.buildFindMany(args);
 
-    // Acquire a dedicated connection — cursors require a single connection in a
+    // Acquire a dedicated connection: cursors require a single connection in a
     // transaction. The dialect owns the streaming SQL (Postgres: BEGIN → DECLARE
     // … NO SCROLL CURSOR FOR → FETCH n → CLOSE → COMMIT, ROLLBACK on error); we
     // just parse + yield the row batches it produces.
-    const client = await this.pool.connect();
+    //
+    // Inside a caller-owned transaction there is nothing to check out: the
+    // transaction-scoped pool pins every query to the transaction's own
+    // connection, so `pool.query` already IS that connection. The stream rides
+    // on it, is never released here, and the dialect is told to emit no
+    // transaction control of its own (`ambientTransaction`).
+    const client = this.txScoped ? null : await this.pool.connect();
+    const conn: StreamableConnection = client ?? {
+      query: async (text: string, values?: unknown[]) =>
+        (await this.pool.query(text, values)) as { rows: Record<string, unknown>[] },
+    };
     try {
-      for await (const batch of this.dialect.openStream(client, deferred.sql, deferred.params, batchSize)) {
+      for await (const batch of this.dialect.openStream(conn, deferred.sql, deferred.params, batchSize, {
+        ambientTransaction: this.txScoped,
+      })) {
         for (const row of batch) {
           yield (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as QueryResult<T, R, W, S, O>;
         }
@@ -2015,7 +2489,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Wrap pg constraint errors so streaming surfaces typed errors like the rest of the API
       throw wrapPgError(err);
     } finally {
-      client.release();
+      client?.release();
     }
   }
 
@@ -2038,7 +2512,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
           return (rows[0] ?? null) as QueryResult<T, R, W, S, O> | null;
         }
         if (strategy === 'auto') {
-          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder);
+          // findFirst is findMany + LIMIT 1: a one-row parent set.
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false);
           if (split) {
             const rows = (await this.runAutoSplit(
               { ...args, limit: 1 } as unknown as FindManyArgs<T>,
@@ -2237,21 +2712,39 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>): Promise<R> {
     const client = await this.pool.connect();
+    let began = false;
     try {
       await client.query(this.dialect.beginStatement());
+      began = true;
       const { TransactionClient } = await import('../client.js');
-      // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
-      const tx = new TransactionClient(client as any, this.schema, this.middlewares as any, this.options);
+      const tx = new TransactionClient(
+        // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
+        client as any,
+        this.schema,
+        // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
+        this.middlewares as any,
+        this.options,
+        // Pass the source pool so its read-only guard + capabilities carry into
+        // the transaction-scoped proxy pool (see createTxPool). Without it a
+        // read-only client's nested writes bypass the E018 guard and an
+        // older-engine client falls back to the full capability set inside the
+        // implicit transaction.
+        this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
+      );
       // biome-ignore lint/suspicious/noExplicitAny: TransactionClient satisfies NestedWriteContext['tx'] at runtime
       const ctx: NestedWriteContext = { schema: this.schema, tx: tx as any };
       const result = await fn(ctx);
       await client.query(this.dialect.commitStatement());
       return result;
     } catch (err) {
-      try {
-        await client.query(this.dialect.rollbackStatement());
-      } catch {
-        // Best-effort rollback — connection may have died.
+      // Only roll back a transaction we actually opened: a failed BEGIN must
+      // not emit a stray ROLLBACK on a connection that never began one.
+      if (began) {
+        try {
+          await client.query(this.dialect.rollbackStatement());
+        } catch {
+          // Best-effort rollback: connection may have died.
+        }
       }
       throw err;
     } finally {
@@ -2281,7 +2774,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // delete
   // -------------------------------------------------------------------------
 
-  async delete(args: DeleteArgs<T>): Promise<T> {
+  async delete(args: DeleteArgs<T, R>): Promise<T> {
     return this.executeWithMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDelete(args);
       return this.executeMutation(deferred, args.timeout);
@@ -2292,7 +2785,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // upsert — INSERT ... ON CONFLICT ... DO UPDATE
   // -------------------------------------------------------------------------
 
-  async upsert(args: UpsertArgs<T>): Promise<T> {
+  async upsert(args: UpsertArgs<T, R>): Promise<T> {
     return this.executeWithMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpsert(args);
       return this.executeMutation(deferred, args.timeout);
@@ -2303,7 +2796,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // updateMany — UPDATE ... WHERE ... returning count
   // -------------------------------------------------------------------------
 
-  async updateMany(args: UpdateManyArgs<T>): Promise<{ count: number }> {
+  async updateMany(args: UpdateManyArgs<T, R>): Promise<{ count: number }> {
     return this.executeWithMiddleware('updateMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpdateMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -2315,7 +2808,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // deleteMany — DELETE ... WHERE ... returning count
   // -------------------------------------------------------------------------
 
-  async deleteMany(args: DeleteManyArgs<T>): Promise<{ count: number }> {
+  async deleteMany(args: DeleteManyArgs<T, R>): Promise<{ count: number }> {
     return this.executeWithMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDeleteMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -2327,7 +2820,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // count
   // -------------------------------------------------------------------------
 
-  async count(args?: CountArgs<T>): Promise<number> {
+  async count(args?: CountArgs<T, R>): Promise<number> {
     return this.executeWithMiddleware('count', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildCount(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
@@ -2378,7 +2871,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * {@link GroupByResult}). Grouping by a JSON-path key yields a runtime alias
    * that cannot be typed, so those columns are not projected onto the row type.
    */
-  async groupBy<A extends GroupByArgs<T>>(args: A): Promise<GroupByResult<T, A>[]> {
+  async groupBy<A extends GroupByArgs<T, R>>(args: A): Promise<GroupByResult<T, A>[]> {
     return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildGroupBy(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -2402,7 +2895,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // aggregate — standalone aggregation without groupBy
   // -------------------------------------------------------------------------
 
-  async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
+  async aggregate(args: AggregateArgs<T, R>): Promise<AggregateResult<T>> {
     return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildAggregate(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -2430,8 +2923,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return relationsMod.withFingerprint(this.ctx, withClause, table, depth);
   }
 
-  private collectWithParams(withClause: WithClause, params: unknown[], table?: string): void {
-    relationsMod.collectWithParams(this.ctx, withClause, params, table);
+  private collectWithParams(
+    withClause: WithClause,
+    params: unknown[],
+    table?: string,
+    flattenPlan?: relationsMod.FlattenPlan | null,
+  ): void {
+    relationsMod.collectWithParams(this.ctx, withClause, params, table, flattenPlan);
   }
 
   private orderByEntryFingerprint(d: unknown, targetTable?: string): string {
@@ -2489,8 +2987,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private makeNestedParser(
     withClause: WithClause,
     includePii?: boolean,
+    flattenPlan?: relationsMod.FlattenPlan | null,
   ): (row: Record<string, unknown>) => Record<string, unknown> {
-    return relationsMod.makeNestedParser(this.ctx, withClause, includePii);
+    return relationsMod.makeNestedParser(this.ctx, withClause, includePii, flattenPlan);
   }
 
   private buildSelectWithRelations(
@@ -2501,6 +3000,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     depth?: number,
     path?: string[],
     includePii?: boolean,
+    flatten?: { plan: relationsMod.FlattenPlan; joinSink: string[] },
   ): string {
     return relationsMod.buildSelectWithRelations(
       this.ctx,
@@ -2511,6 +3011,75 @@ export class QueryInterface<T extends object, R extends object = {}> {
       depth,
       path,
       includePii,
+      flatten,
+    );
+  }
+
+  /**
+   * Compile the `relationLoadStrategy: 'flatten'` plan for a findMany-shaped
+   * query, or `null` to emit exactly the SQL (and cache key) the default
+   * strategy emits.
+   *
+   * `'flatten'` compiles an eligible to-one relation to a `LEFT JOIN` with a
+   * prefixed scalar projection instead of a correlated `json_build_object`
+   * subquery. The correlated form is re-evaluated once per parent row, so its
+   * cost scales with the parent set no matter how well the FK is indexed; the
+   * join does not, and unlike `'batched'` it stays a single round trip.
+   *
+   * It is an EXPLICIT opt-in: `'auto'` is unchanged and never selects it.
+   *
+   * Query-shape gates (any of these routes the WHOLE query back to the default
+   * strategy, silently and byte-identically):
+   *   - the resolved strategy is not `'flatten'`;
+   *   - `jsonEncoding: 'positional'` (a flattened relation emits no JSON at all,
+   *     so the two encodings are not composed in this version);
+   *   - the dialect owns relation-subquery generation
+   *     (`dialect.buildRelationSubquery`, i.e. SQL Server's `FOR JSON PATH`);
+   *   - `distinct` (the `DISTINCT ON` rewrite re-orders in an outer wrapper, and
+   *     the extra projected columns have not been proven safe there).
+   *
+   * `limit` / `offset` / `cursor` / `orderBy` need no gate: every flattened join
+   * is over a PROVABLY UNIQUE target key, so it matches at most one row per
+   * parent and cannot change the parent row count that pagination applies to.
+   *
+   * Per-relation eligibility lives in `planFlattenWith` / `planFlattenNode`.
+   * Only the findMany family is planned (`findMany`, `findFirst`,
+   * `findManyStream`, and pipelined `buildFindMany`); `findUnique` reads a single
+   * parent row, where the correlated subquery runs exactly once, so it stays on
+   * the default path.
+   */
+  private planFlatten(
+    args: { with?: unknown; relationLoadStrategy?: RelationLoadStrategy; distinct?: readonly string[] } | undefined,
+    includePii: boolean,
+  ): relationsMod.FlattenPlan | null {
+    const withClause = args?.with as WithClause | undefined;
+    if (!withClause) return null;
+    if (this.resolveLoadStrategy(args?.relationLoadStrategy) !== 'flatten') return null;
+    // Query-level refusals: the whole plan is off, so name the reason once for
+    // the query rather than once per relation (relations.ts warns per relation
+    // for the eligibility rules it owns).
+    const queryLevelBlock =
+      this.jsonEncoding === 'positional'
+        ? "`jsonEncoding: 'positional'` is active, and a flattened relation emits no JSON to encode"
+        : this.dialect.buildRelationSubquery
+          ? `the ${this.dialect.name} dialect generates relation subqueries itself`
+          : args?.distinct && args.distinct.length > 0
+            ? 'the query uses `distinct`'
+            : undefined;
+    if (queryLevelBlock) {
+      this.warnFlattenBlocked(queryLevelBlock);
+      return null;
+    }
+    return relationsMod.planFlattenWith(this.ctx, this.table, withClause, includePii);
+  }
+
+  /** Dev-only once-only note that `'flatten'` was refused for the whole query. */
+  private warnFlattenBlocked(reason: string): void {
+    if (process.env.NODE_ENV === 'production') return;
+    if (!shouldWarnOnce(WARN_NS.flattenFallback, `${this.table}|query|${reason}`)) return;
+    console.warn(
+      `[turbine] relationLoadStrategy: 'flatten' did not engage on "${this.table}": ${reason}. ` +
+        'Every relation loads via the correlated subquery instead (same rows, same values, different plan).',
     );
   }
 
@@ -2738,7 +3307,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const value = row[col];
         const field = reverseMap[col] ?? col; // fall back to raw col name, not regex
         // Top-level rows are snake_case (dateCols); nested rows are camelCase (camelDateFields).
-        if ((dateCols.has(col) || camelDateFields.has(field)) && value !== null && !(value instanceof Date)) {
+        //
+        // An ARRAY value is excluded: `dateColumns` includes array-of-date
+        // columns (`date[]`, `timestamp[]`, `timestamptz[]`), for which the
+        // driver already hands back a `Date[]`. Coercing it ran
+        // `new Date(String(theArray))` and replaced the whole array with a
+        // single Invalid Date — the column was unreadable on every strategy.
+        // The join strategy's string arrays are handled upstream instead, by
+        // the JSON-wire decode in relations.ts.
+        if (
+          (dateCols.has(col) || camelDateFields.has(field)) &&
+          value !== null &&
+          !(value instanceof Date) &&
+          !Array.isArray(value)
+        ) {
           // Offset-less strings (Postgres `timestamp`, json_agg output) are
           // pinned to UTC so results don't depend on the server's time zone.
           parsed[field] = this.utcTimestamps ? parseDbDate(String(value)) : new Date(value as string);

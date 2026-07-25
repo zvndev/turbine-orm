@@ -116,6 +116,9 @@ export function formatPrismaReport(result: ResolutionResult, options: ReportOpti
     }
   }
 
+  // ---- Many-to-many call sites -----------------------------------------
+  L.push(...manyToManySection(result));
+
   // ---- Junction tables --------------------------------------------------
   const junctions = new Set<string>();
   for (const m of result.models) {
@@ -163,6 +166,83 @@ export function formatPrismaReport(result: ResolutionResult, options: ReportOpti
   return `${L.join('\n')}\n`;
 }
 
+/** One resolved many-to-many relation, named from both sides. */
+interface ManyToManyCallSite {
+  /** `Model.field` as written in schema.prisma (what application code says). */
+  prismaPath: string;
+  /** The Prisma field name on its own (what to grep for). */
+  prismaField: string;
+  /** The Turbine relation name (what `generated/metadata.ts` says). */
+  turbineName: string;
+  /** Junction table, when it could be named. */
+  junction?: string;
+}
+
+/** Every resolved manyToMany relation in the result, in model/field order. */
+export function manyToManyCallSites(result: ResolutionResult): ManyToManyCallSite[] {
+  const out: ManyToManyCallSite[] = [];
+  for (const m of result.models) {
+    for (const r of m.relations) {
+      if (r.status !== 'resolved' || !r.turbineName) continue;
+      if (!r.manyToMany && !r.junction) continue;
+      out.push({
+        prismaPath: `${m.prismaName}.${r.prismaName}`,
+        prismaField: r.prismaName,
+        turbineName: r.turbineName,
+        junction: r.junction,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * The many-to-many audit section.
+ *
+ * A migration audit that greps the TURBINE relation names cannot find anything:
+ * application code written against the compat client uses the PRISMA field
+ * names, and the two are related only through `PRISMA_MAP`. That is true of
+ * every compat integration, so the report resolves the pairing itself rather
+ * than leaving it to a recipe the reader has to get right.
+ */
+function manyToManySection(result: ResolutionResult): string[] {
+  const sites = manyToManyCallSites(result);
+  if (sites.length === 0) {
+    if (!result.noDb) return [];
+    return [
+      '## Many-to-many relations (audit these call sites)',
+      '',
+      'Not determined: many-to-many relations are recognized from the live database.',
+      'Re-run without `--no-db` to get the audit list.',
+      '',
+    ];
+  }
+
+  const L: string[] = [];
+  L.push('## Many-to-many relations (audit these call sites)');
+  L.push('');
+  L.push('Turbine and Prisma name these relations differently, and your application code');
+  L.push('uses the PRISMA name. Grepping the Turbine relation name (for example');
+  L.push('`grep -rn "manyToMany" generated/`, then searching for the names it prints) finds');
+  L.push('nothing and silently reports a clean audit. Both names are paired below.');
+  L.push('');
+  L.push('| Prisma call site | Turbine relation | Junction table |');
+  L.push('| --- | --- | --- |');
+  for (const s of sites) {
+    L.push(`| \`${s.prismaPath}\` | \`${s.turbineName}\` | ${s.junction ? `\`${s.junction}\`` : '-'} |`);
+  }
+  L.push('');
+  L.push('Audit every write whose `data` nests one of the Prisma field names above');
+  L.push('(`connect`, `disconnect`, `set`, `connectOrCreate`, `create`, `update`, `upsert`,');
+  L.push('`delete`): those are the many-to-many writes in your codebase.');
+  L.push('');
+  L.push('```bash');
+  L.push(`grep -rEn "\\b(${[...new Set(sites.map((s) => s.prismaField))].sort().join('|')})\\b" src`);
+  L.push('```');
+  L.push('');
+  return L;
+}
+
 /** Flat list of unresolved item descriptions across the whole result. */
 export function collectUnresolved(result: ResolutionResult): string[] {
   const out: string[] = [];
@@ -198,6 +278,11 @@ phase-2 \`turbine-orm/prisma-compat\` adapter handles most of these translations
 - Aggregate / groupBy \`_count\`. Prisma returns \`_count\` as a record
   (\`{ _all: n }\` / per-field counts). Turbine's scalar \`_count: true\` returns a
   number. Reshape as needed (the phase-2 adapter does this both directions).
+- Paginated reads. Prisma appends an implicit \`ORDER BY <primary key> ASC\` to a
+  \`findMany\` with \`take\`/\`skip\`; core Turbine emits a bare \`LIMIT\`, which is not
+  deterministic (a row can appear on two pages or on none). The phase-2
+  \`prisma-compat\` adapter restores Prisma's ordering; on the core client, pass an
+  explicit \`orderBy\` or set \`implicitPkOrdering: true\`.
 - Relation-array order. Without an \`orderBy\` on a \`with\`/\`include\` clause, the
   order of a to-many relation array is unspecified in Turbine (\`json_agg\` order).
   Add an explicit \`orderBy\` where order matters.

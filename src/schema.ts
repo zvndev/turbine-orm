@@ -305,26 +305,81 @@ const PG_TO_TS: Record<string, string> = {
 
 const DATE_TYPES = new Set(['timestamptz', 'timestamp', 'date']);
 
+/**
+ * Postgres type → the array cast `createMany`'s `UNNEST(ARRAY[...]::<type>)`
+ * applies to that column's value list.
+ *
+ * Every entry must be present for a type that has NO assignment cast from
+ * `text`: the `text[]` fallback below then produces text-typed UNNEST output
+ * and Postgres refuses the insert with `42804 column "x" is of type <t> but
+ * expression is of type text`. `varchar` / `char` / `bpchar` deliberately keep
+ * the `text[]` cast — `text` assignment-casts to all three, and pinning them
+ * would change already-emitted SQL for no behavioral gain.
+ */
 const PG_TO_ARRAY: Record<string, string> = {
+  // Numeric
   int2: 'smallint[]',
   int4: 'integer[]',
   int8: 'bigint[]',
   float4: 'real[]',
   float8: 'double precision[]',
   numeric: 'numeric[]',
+  money: 'money[]',
+  oid: 'oid[]',
   bool: 'boolean[]',
+  // Character
   text: 'text[]',
   varchar: 'text[]',
   char: 'text[]',
   bpchar: 'text[]',
+  name: 'name[]',
+  citext: 'citext[]',
+  xml: 'xml[]',
   uuid: 'uuid[]',
+  // Date / time. `time` and `timetz` were missing, so a `createMany` on a
+  // time-of-day column cast its values `text[]` and failed 42804 even though
+  // the per-value narrowing produced a valid `'09:00:00'` literal.
   timestamptz: 'timestamptz[]',
   timestamp: 'timestamp[]',
   date: 'date[]',
+  time: 'time[]',
+  timetz: 'timetz[]',
+  interval: 'interval[]',
+  // JSON / binary
   json: 'json[]',
   jsonb: 'jsonb[]',
   bytea: 'bytea[]',
+  // Network
   inet: 'inet[]',
+  cidr: 'cidr[]',
+  macaddr: 'macaddr[]',
+  macaddr8: 'macaddr8[]',
+  // Geometric
+  point: 'point[]',
+  line: 'line[]',
+  lseg: 'lseg[]',
+  box: 'box[]',
+  path: 'path[]',
+  polygon: 'polygon[]',
+  circle: 'circle[]',
+  // Text search
+  tsvector: 'tsvector[]',
+  tsquery: 'tsquery[]',
+  // Ranges / multiranges
+  int4range: 'int4range[]',
+  int8range: 'int8range[]',
+  numrange: 'numrange[]',
+  tsrange: 'tsrange[]',
+  tstzrange: 'tstzrange[]',
+  daterange: 'daterange[]',
+  int4multirange: 'int4multirange[]',
+  int8multirange: 'int8multirange[]',
+  nummultirange: 'nummultirange[]',
+  tsmultirange: 'tsmultirange[]',
+  tstzmultirange: 'tstzmultirange[]',
+  datemultirange: 'datemultirange[]',
+  // pgvector
+  vector: 'vector[]',
 };
 
 /** Map a Postgres type to its TypeScript equivalent */
@@ -343,6 +398,70 @@ export function pgTypeToTs(pgType: string, nullable: boolean): string {
 /** Check if a Postgres type is a date/timestamp that needs Date parsing */
 export function isDateType(pgType: string): boolean {
   return DATE_TYPES.has(pgType);
+}
+
+/**
+ * Classify a column type as a TIME-OF-DAY type (`time` / `timetz`), or `null`
+ * for anything else.
+ *
+ * These are deliberately NOT part of {@link isDateType}/`dateColumns`: a
+ * time-of-day value has no date part, so it is never coerced to a JS `Date` on
+ * read (Postgres hands back `09:00:00` and that is what the row carries). They
+ * still need their own classification on the WRITE path, because a JS `Date`
+ * bound straight through serializes as a full ISO timestamp
+ * (`1970-01-01T04:00:00.000-05:00`), which Postgres rejects for a `time`
+ * column with `22007 invalid input syntax for type time`.
+ *
+ * Recognizes the `udt_name` spellings introspection records (`time`, `timetz`),
+ * the SQL-standard long spellings, and a trailing precision suffix
+ * (`time(6)`), so MySQL and SQL Server `TIME` columns classify from their
+ * dialect type as well.
+ */
+export function timeOfDayKind(dbType: string | undefined): 'time' | 'timetz' | null {
+  if (!dbType) return null;
+  const t = dbType
+    .trim()
+    .toLowerCase()
+    // Precision can sit at the end (`time(6)`) or mid-spelling
+    // (`time(6) with time zone`), so strip it wherever it appears.
+    .replace(/\s*\(\s*\d+\s*\)\s*/, ' ')
+    .trim();
+  if (t === 'time' || t === 'time without time zone') return 'time';
+  if (t === 'timetz' || t === 'time with time zone') return 'timetz';
+  return null;
+}
+
+/**
+ * Classify a column type as a ZONE-LESS date/timestamp type (`date`,
+ * `timestamp` = `timestamp without time zone`), or `null` for anything else.
+ *
+ * `timestamptz` is deliberately excluded: it carries a real instant, and the
+ * driver's local-offset serialization is CORRECT for it (Postgres converts the
+ * offset away). The two types here store the literal wall-clock fields they
+ * are given, so binding a JS `Date` through the driver stores the process's
+ * LOCAL calendar fields — in `America/Los_Angeles`, `2026-07-25T00:00:00Z`
+ * lands as `2026-07-24 17:00:00`. The read path already interprets an
+ * offset-less value as UTC (see `parseDbDate`), so the write path has to bind
+ * the UTC components for the round trip to be stable.
+ *
+ * Recognizes the `udt_name` spellings introspection records, the SQL-standard
+ * long spellings, and a trailing precision suffix (`timestamp(3)`).
+ * Deliberately does NOT recognize `datetime`: MySQL's `TIMESTAMP`/`DATETIME`
+ * are converted by the session time zone, so a UTC-component literal would be
+ * misread there. The callers additionally gate on the PostgreSQL dialect.
+ */
+export function localDateTimeKind(dbType: string | undefined): 'date' | 'timestamp' | null {
+  if (!dbType) return null;
+  const t = dbType
+    .trim()
+    .toLowerCase()
+    // Precision can sit at the end (`timestamp(3)`) or mid-spelling
+    // (`timestamp(3) without time zone`), so strip it wherever it appears.
+    .replace(/\s*\(\s*\d+\s*\)\s*/, ' ')
+    .trim();
+  if (t === 'date') return 'date';
+  if (t === 'timestamp' || t === 'timestamp without time zone') return 'timestamp';
+  return null;
 }
 
 /** Get the Postgres array cast type for UNNEST batch inserts */

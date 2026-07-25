@@ -115,6 +115,21 @@ export function collectUpDestructive(files: MigrationFile[]): DestructiveOffende
 
 const TRACKING_TABLE = '_turbine_migrations';
 
+/**
+ * The dialect the migration runner speaks.
+ *
+ * The runner connects with `pg.Client`, so Postgres (and the Postgres-compatible
+ * engines behind `adapters/`) is the only thing it can actually reach. The
+ * dialect is still threaded through every tracking-table statement, so making
+ * migrations dialect-aware is a matter of teaching this layer to build the
+ * engine's own client. Until then there is deliberately NO caller-supplied
+ * dialect option: accepting one would advertise sqlite/mysql/mssql migrations
+ * that silently run their SQL against Postgres.
+ */
+function migrationDialect(): Dialect {
+  return postgresDialect;
+}
+
 function quotedTrackingTable(dialect: Dialect): string {
   return dialect.quoteIdentifier(TRACKING_TABLE);
 }
@@ -451,9 +466,56 @@ function checksum(content: string): string {
   return createHash('sha256').update(content, 'utf-8').digest('hex');
 }
 
-/** Detect legacy djb2 checksums (short alphanumeric strings, pre-v0.6) */
+/**
+ * The pre-v0.6 checksum algorithm (a 32-bit rolling hash rendered as base36).
+ * Kept verbatim so a legacy stored value can be RE-DERIVED from the current
+ * file content before we upgrade the row to SHA-256. Never used for new rows.
+ */
+function legacyChecksum(content: string): string {
+  let hash = 0;
+  for (let i = 0; i < content.length; i++) {
+    const chr = content.charCodeAt(i);
+    hash = ((hash << 5) - hash + chr) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+/**
+ * Detect legacy checksums (short alphanumeric strings, pre-v0.6).
+ * An EMPTY checksum is never legacy: blessing it would silently disarm drift
+ * detection for a row whose stored hash was lost or never written.
+ */
 function isLegacyChecksum(hash: string): boolean {
-  return hash.length < 64;
+  return hash.length > 0 && hash.length < 64;
+}
+
+/**
+ * Can a stored pre-v0.6 checksum be safely upgraded to SHA-256?
+ *
+ * Only when the LEGACY algorithm, run over the file's CURRENT content,
+ * reproduces the stored value: that is what proves the file has not changed
+ * since it was applied. Upgrading without this proof blesses whatever the file
+ * says today and permanently disables drift detection for that migration.
+ *
+ * @internal exported for tests.
+ */
+export function canUpgradeLegacyChecksum(stored: string, content: string): boolean {
+  return isLegacyChecksum(stored) && legacyChecksum(content) === stored;
+}
+
+/**
+ * Is an applied migration's stored checksum still valid for the file on disk?
+ *
+ * A SHA-256 match is the normal case. A pre-v0.6 row that {@link
+ * canUpgradeLegacyChecksum} would upgrade counts as valid too: `migrate up`
+ * accepts and upgrades it, so reporting it as invalid in `migrate status` would
+ * have the two commands disagree about the same unchanged file. Genuine drift
+ * (a legacy hash the current content no longer reproduces) still reports false.
+ *
+ * @internal exported for tests.
+ */
+export function isChecksumValid(stored: string, content: string): boolean {
+  return checksum(content) === stored || canUpgradeLegacyChecksum(stored, content);
 }
 
 // ---------------------------------------------------------------------------
@@ -767,6 +829,50 @@ async function releaseLock(client: pg.Client, lockId: number, adapter?: Database
 }
 
 // ---------------------------------------------------------------------------
+// Transactional migration body
+// ---------------------------------------------------------------------------
+
+/**
+ * The minimal query surface a transactional migration body needs.
+ * `pg.Client` satisfies it; tests supply a fake.
+ */
+export interface MigrationTxClient {
+  query(sql: string, params?: unknown[]): Promise<unknown>;
+}
+
+/**
+ * Run one migration body (UP or DOWN) plus its tracking-table write inside a
+ * single transaction. Returns `null` on success, or the error message on
+ * failure, leaving the caller to record it and stop.
+ *
+ * The ROLLBACK is best-effort: if the connection died, ROLLBACK throws too, and
+ * letting that escape would replace the real migration failure with a
+ * connection error. Same guard as `client.ts`, `query/builder.ts`, `dialect.ts`.
+ *
+ * @internal exported for tests; not part of the CLI's public surface.
+ */
+export async function runMigrationInTransaction(
+  client: MigrationTxClient,
+  body: string,
+  tracking: { sql: string; params: unknown[] },
+): Promise<string | null> {
+  try {
+    await client.query('BEGIN');
+    await client.query(body);
+    await client.query(tracking.sql, tracking.params);
+    await client.query('COMMIT');
+    return null;
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Best effort: the original error below is what the user needs to see.
+    }
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Checksum validation
 // ---------------------------------------------------------------------------
 
@@ -786,8 +892,10 @@ export interface MigrationDeployPlan {
 /**
  * Validate that applied migration files have not been modified or deleted since they were run.
  * Returns an array of mismatched migrations (empty if all are clean).
+ *
+ * @internal exported for tests; not part of the CLI's public surface.
  */
-async function validateChecksums(
+export async function validateChecksums(
   client: pg.Client,
   migrationsDir: string,
   dialect: Dialect = postgresDialect,
@@ -811,8 +919,11 @@ async function validateChecksums(
     const content = readFileSync(file.path, 'utf-8');
     const currentHash = checksum(content);
     if (currentHash !== migration.checksum) {
-      // Auto-upgrade legacy djb2 checksums to SHA-256 without flagging as modified
-      if (isLegacyChecksum(migration.checksum)) {
+      // Auto-upgrade a pre-v0.6 checksum to SHA-256 without flagging it as
+      // modified, but ONLY when the legacy hash of the current content still
+      // matches what was stored. A legacy row whose file HAS changed falls
+      // through to the mismatch path below (bypassable with --allow-drift).
+      if (canUpgradeLegacyChecksum(migration.checksum, content)) {
         await client.query(dialect.buildMigrationUpdateChecksum(quotedTrackingTable(dialect)), [
           currentHash,
           migration.name,
@@ -884,8 +995,11 @@ export function planMigrationDeploy(migrationsDir: string, applied: AppliedMigra
       continue;
     }
 
-    const currentHash = checksum(readFileSync(file.path, 'utf-8'));
-    if (currentHash !== migration.checksum && !isLegacyChecksum(migration.checksum)) {
+    const content = readFileSync(file.path, 'utf-8');
+    const currentHash = checksum(content);
+    // A pre-v0.6 checksum is only forgiven when the legacy algorithm over the
+    // current content still reproduces it: otherwise the file really has drifted.
+    if (currentHash !== migration.checksum && !canUpgradeLegacyChecksum(migration.checksum, content)) {
       mismatches.push({
         name: migration.name,
         expected: migration.checksum,
@@ -907,11 +1021,10 @@ export function planMigrationDeploy(migrationsDir: string, applied: AppliedMigra
 export async function inspectMigrationDeploy(
   connectionString: string,
   migrationsDir: string,
-  options?: { dialect?: Dialect },
 ): Promise<MigrationDeployPlan> {
   const client = new pg.Client({ connectionString });
   await client.connect();
-  const dialect = options?.dialect ?? postgresDialect;
+  const dialect = migrationDialect();
 
   try {
     await ensureTrackingTable(client, dialect);
@@ -951,7 +1064,6 @@ export async function migrateUp(
     /** Run migrations even when they contain data-destroying statements. Default false. */
     allowDestructive?: boolean;
     adapter?: DatabaseAdapter;
-    dialect?: Dialect;
     /**
      * Called right before a `-- turbine:no-transaction` migration runs, so the
      * CLI can print its loud pre-run notice (a concurrent index build can wait a
@@ -965,7 +1077,7 @@ export async function migrateUp(
 
   // Treat `force` as an alias for `allowDrift` for backwards compatibility.
   const allowDrift = options?.allowDrift === true || options?.force === true;
-  const dialect = options?.dialect ?? postgresDialect;
+  const dialect = migrationDialect();
 
   try {
     // Derive an advisory lock ID per-database so concurrent migrations in
@@ -1087,20 +1199,17 @@ export async function migrateUp(
           continue;
         }
 
-        try {
-          await client.query('BEGIN');
-          await client.query(up);
-          await client.query(insertApplied, [file.name, hash]);
-          await client.query('COMMIT');
-          results.push(file);
-          flagOutOfOrder(file);
-        } catch (err) {
-          await client.query('ROLLBACK');
-          const msg = err instanceof Error ? err.message : String(err);
-          errors.push({ file, error: msg });
+        const failure = await runMigrationInTransaction(client, up, {
+          sql: insertApplied,
+          params: [file.name, hash],
+        });
+        if (failure !== null) {
+          errors.push({ file, error: failure });
           // Stop on first error
           break;
         }
+        results.push(file);
+        flagOutOfOrder(file);
       }
 
       return { applied: results, errors, destructive, outOfOrder, noTransaction: noTransactionApplied };
@@ -1119,7 +1228,7 @@ export async function migrateUp(
 export async function migrateDeploy(
   connectionString: string,
   migrationsDir: string,
-  options?: { adapter?: DatabaseAdapter; dialect?: Dialect; allowDrift?: boolean },
+  options?: { adapter?: DatabaseAdapter; allowDrift?: boolean },
 ): Promise<MigrationRunResult> {
   return migrateUp(connectionString, migrationsDir, {
     // Honor `--allow-drift` on deploy exactly as `up` does: deploy's own drift
@@ -1127,7 +1236,6 @@ export async function migrateDeploy(
     allowDrift: options?.allowDrift === true,
     allowDestructive: true,
     adapter: options?.adapter,
-    dialect: options?.dialect,
   });
 }
 
@@ -1142,11 +1250,11 @@ export async function migrateDeploy(
 export async function migrateDown(
   connectionString: string,
   migrationsDir: string,
-  options?: { step?: number; allowDestructive?: boolean; adapter?: DatabaseAdapter; dialect?: Dialect },
+  options?: { step?: number; allowDestructive?: boolean; adapter?: DatabaseAdapter },
 ): Promise<{ rolledBack: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
   const client = new pg.Client({ connectionString });
   await client.connect();
-  const dialect = options?.dialect ?? postgresDialect;
+  const dialect = migrationDialect();
 
   try {
     // Derive a per-database advisory lock ID so concurrent migrations in
@@ -1241,18 +1349,15 @@ export async function migrateDown(
           continue;
         }
 
-        try {
-          await client.query('BEGIN');
-          await client.query(down);
-          await client.query(deleteApplied, [migration.name]);
-          await client.query('COMMIT');
-          results.push(file);
-        } catch (err) {
-          await client.query('ROLLBACK');
-          const msg = err instanceof Error ? err.message : String(err);
-          errors.push({ file, error: msg });
+        const failure = await runMigrationInTransaction(client, down, {
+          sql: deleteApplied,
+          params: [migration.name],
+        });
+        if (failure !== null) {
+          errors.push({ file, error: failure });
           break;
         }
+        results.push(file);
       }
 
       return { rolledBack: results, errors };
@@ -1266,16 +1371,15 @@ export async function migrateDown(
 
 /**
  * Get the status of all migrations (applied vs pending).
- * Includes checksum validation for applied migrations.
+ *
+ * Applied rows carry `checksumValid`, decided by {@link isChecksumValid} so an
+ * unchanged pre-v0.6 row reports the same way `migrate up` treats it (valid,
+ * pending an in-place hash upgrade) rather than looking like drift.
  */
-export async function migrateStatus(
-  connectionString: string,
-  migrationsDir: string,
-  options?: { dialect?: Dialect },
-): Promise<MigrationStatus[]> {
+export async function migrateStatus(connectionString: string, migrationsDir: string): Promise<MigrationStatus[]> {
   const client = new pg.Client({ connectionString });
   await client.connect();
-  const dialect = options?.dialect ?? postgresDialect;
+  const dialect = migrationDialect();
 
   try {
     await ensureTrackingTable(client, dialect);
@@ -1290,9 +1394,7 @@ export async function migrateStatus(
       let checksumValid: boolean | undefined;
 
       if (record) {
-        const content = readFileSync(file.path, 'utf-8');
-        const currentHash = checksum(content);
-        checksumValid = currentHash === record.checksum;
+        checksumValid = isChecksumValid(record.checksum, readFileSync(file.path, 'utf-8'));
       }
 
       return {

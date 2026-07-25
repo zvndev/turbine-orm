@@ -164,10 +164,51 @@ describe('nested writes: the child predicate carries the parent correlation', ()
     }
   });
 
-  it('a nested write on a many-to-many relation is refused, not silently dropped', async () => {
-    // m2m has no nested-write branch on any engine; before this it fell off the
-    // end of the dispatch, so the write never happened and the call reported
-    // success.
+  it('an unsupported many-to-many nested write is refused, not silently dropped', async () => {
+    // connect / disconnect / set now write junction rows (see nested-write.test.ts);
+    // every other m2m operation still refuses. Before either change it fell off
+    // the end of the dispatch, so the write never happened and the call
+    // reported success.
+    const m2mSchema: SchemaMetadata = {
+      enums: {},
+      tables: {
+        users: {
+          ...mockTable('users', [
+            { name: 'id', field: 'id' },
+            { name: 'name', field: 'name', pgType: 'text' },
+          ]),
+          relations: {
+            tags: {
+              type: 'manyToMany',
+              name: 'tags',
+              from: 'users',
+              to: 'tags',
+              foreignKey: 'id',
+              referenceKey: 'id',
+              through: { table: 'user_tags', sourceKey: 'user_id', targetKey: 'tag_id' },
+            },
+          },
+        },
+        tags: mockTable('tags', [
+          { name: 'id', field: 'id' },
+          { name: 'label', field: 'label', pgType: 'text' },
+        ]),
+      },
+    };
+    const { ctx, log } = recordingCtx();
+    await assert.rejects(
+      executeNestedUpdate({ ...ctx, schema: m2mSchema }, 'users', { id: 7 }, { tags: { delete: { id: 1 } } }),
+      (err: unknown) => err instanceof ValidationError && /many-to-many/.test((err as Error).message),
+    );
+    assert.equal(
+      log.some((l) => l.table === 'user_tags'),
+      false,
+    );
+  });
+
+  it('a supported many-to-many op still refuses when the junction table is absent from the metadata', async () => {
+    // The junction rows cannot be addressed without its metadata, so connect
+    // must report that rather than write nothing and return success.
     const m2mSchema: SchemaMetadata = {
       enums: {},
       tables: {
@@ -197,10 +238,11 @@ describe('nested writes: the child predicate carries the parent correlation', ()
     const { ctx, log } = recordingCtx();
     await assert.rejects(
       executeNestedUpdate({ ...ctx, schema: m2mSchema }, 'users', { id: 7 }, { tags: { connect: { id: 1 } } }),
-      (err: unknown) => err instanceof ValidationError && /many-to-many/.test((err as Error).message),
+      (err: unknown) =>
+        err instanceof ValidationError && /junction table "user_tags" is not present/.test((err as Error).message),
     );
     assert.equal(
-      log.some((l) => l.op === 'update' && l.table === 'user_tags'),
+      log.some((l) => l.table === 'user_tags'),
       false,
     );
   });

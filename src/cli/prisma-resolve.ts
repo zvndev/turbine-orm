@@ -43,6 +43,12 @@ export interface ResolvedRelation {
   targetModel: string;
   /** Junction table for an m2m relation, if resolved. */
   junction?: string;
+  /**
+   * True when the resolved Turbine relation is `manyToMany`. Distinct from
+   * {@link ResolvedRelation.junction}, which is absent when the junction table
+   * itself could not be named.
+   */
+  manyToMany?: boolean;
   status: ResolveStatus;
   reason?: string;
 }
@@ -493,6 +499,7 @@ function resolveRelation(
       turbineName: def.name,
       cardinality,
       junction: def.type === 'manyToMany' ? def.through?.table : undefined,
+      manyToMany: def.type === 'manyToMany' ? true : undefined,
       status: 'resolved',
     };
   }

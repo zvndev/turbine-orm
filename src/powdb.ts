@@ -169,7 +169,11 @@ export class PowdbFloatParam {
  * pass `'"x"'` to store the JSON string `"x"`), and `null` stays `null`.
  */
 export class PowdbJsonParam {
-  constructor(readonly value: unknown) {}
+  /** `column` is diagnostic only: it names the target column when serialization fails. */
+  constructor(
+    readonly value: unknown,
+    readonly column?: string,
+  ) {}
 }
 
 /** The four shapes a PowQL result takes over the legacy string wire. */
@@ -842,9 +846,10 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
     // Declared indexes: PowDB doc-field expression indexes (docPath) and plain
     // single-column indexes. A doc-field index MUST be parenthesized (the engine
     // rejects a bare JSON path); string path segments emit lexer-exact via the
-    // shared `encodePowqlString`, integer array indexes emit bare. A json
-    // document column reference stays dotted-bare (`.col`), which bypasses
-    // keyword lookup on every engine version exactly like a filter path.
+    // shared `encodePowqlString`, integer array indexes emit bare. The json
+    // document column goes through `quotePowqlIdent` exactly like the plain
+    // index branch below, so a keyword or non-bare identifier is backtick-quoted
+    // instead of being spliced raw into the statement.
     for (const idx of meta.indexes) {
       const kind = idx.unique ? 'unique' : 'index';
       if (idx.docPath) {
@@ -856,7 +861,7 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
           );
         }
         const segs = idx.docPath.map((s) => (typeof s === 'number' ? `->${s}` : `->${encodePowqlString(s)}`)).join('');
-        stmts.push(`alter ${quotePowqlIdent(meta.name)} add ${kind} (.${column}${segs})`);
+        stmts.push(`alter ${quotePowqlIdent(meta.name)} add ${kind} (.${quotePowqlIdent(column)}${segs})`);
       } else {
         // Plain column index. PowDB has no composite index (`add index` takes a
         // single `.column`), so a multi-column entry is a typed E017.
@@ -978,14 +983,51 @@ function powdbCell(v: unknown): string {
   return v === null || v === undefined ? '' : String(v);
 }
 
+/**
+ * Serialize a json-column value to the canonical JSON text both transports
+ * send. `JSON.stringify` can throw (circular structure, a BigInt cell, a
+ * throwing `toJSON`) and can return `undefined` (a value that serializes to
+ * nothing, e.g. a `toJSON` returning undefined); both surface as a typed E003
+ * naming the column instead of a raw TypeError or an undefined param.
+ */
+function powdbJsonText(param: PowdbJsonParam, position?: string): string {
+  const where = `for column "${param.column ?? '(unknown)'}"${position ? ` (${position})` : ''}`;
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(param.value);
+  } catch (err) {
+    throw new ValidationError(
+      `[turbine] The json value ${where} cannot be serialized for PowDB: ${(err as Error).message}`,
+    );
+  }
+  if (json === undefined) {
+    throw new ValidationError(
+      `[turbine] The json value ${where} serializes to nothing (JSON.stringify returned undefined); ` +
+        'write `null` explicitly instead.',
+    );
+  }
+  return json;
+}
+
+/** Convert a Date to PowDB epoch micros, refusing an invalid Date (getTime() is NaN). */
+function powdbDateMicros(value: Date, position?: string): bigint {
+  const ms = value.getTime();
+  if (!Number.isFinite(ms)) {
+    throw new ValidationError(
+      `[turbine] Invalid Date${position ? ` (${position})` : ''} cannot be encoded as a PowDB timestamp.`,
+    );
+  }
+  return BigInt(ms) * 1000n;
+}
+
 /** Coerce a JS value into a PowDB positional param (the write side). */
 function toPowdbParam(value: unknown, col?: ColumnMetadata): PowdbParam {
   if (value instanceof PowdbFloatParam) return value.value; // wire-side: a float column takes the plain number
   // json document: serialize to canonical JSON text and bind as a str param,
   // the engine validates it as JSON and stores the canonical binary form.
-  if (value instanceof PowdbJsonParam) return JSON.stringify(value.value);
+  if (value instanceof PowdbJsonParam) return powdbJsonText(value);
   if (value === undefined || value === null) return null;
-  if (value instanceof Date) return BigInt(value.getTime()) * 1000n; // ms → micros (int column)
+  if (value instanceof Date) return powdbDateMicros(value); // ms → micros (int column)
   if (col && isDateColumn(col) && typeof value === 'number') return BigInt(value) * 1000n;
   if (
     typeof value === 'boolean' ||
@@ -2021,28 +2063,63 @@ function normalizeEmbeddedResult(r: EmbeddedQueryResult): PowdbResult {
  * quotes, backslashes, `$N`, `"); drop … --`, raw CR, and emoji all round-trip
  * as data and cannot break out of the literal or inject a second statement.
  */
-export function encodePowqlLiteral(value: unknown): string {
+export function encodePowqlLiteral(value: unknown, position?: string): string {
+  const at = position ? ` (${position})` : '';
   if (value instanceof PowdbFloatParam) {
     const n = value.value;
-    if (!Number.isFinite(n)) throw new ValidationError(`[turbine] Non-finite float cannot be encoded for PowDB.`);
+    if (!Number.isFinite(n)) throw new ValidationError(`[turbine] Non-finite float cannot be encoded for PowDB${at}.`);
     // Force a float-form literal so an integer-valued float column stays a float.
-    return Number.isInteger(n) ? `${n}.0` : String(n);
+    const text = powqlNumberText(n);
+    return text.includes('.') ? text : `${text}.0`;
   }
   // json document: emit the canonical JSON text as a PowQL string literal (the
   // embedded engine validates and stores it as a json document).
-  if (value instanceof PowdbJsonParam) return encodePowqlString(JSON.stringify(value.value));
+  if (value instanceof PowdbJsonParam) return encodePowqlString(powdbJsonText(value, position), position);
   if (value === undefined || value === null) return 'null';
-  if (value instanceof Date) return `${BigInt(value.getTime()) * 1000n}`; // epoch micros (int column)
+  if (value instanceof Date) return `${powdbDateMicros(value, position)}`; // epoch micros (int column)
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new ValidationError(`[turbine] Non-finite number cannot be encoded for PowDB.`);
-    // `String(n)` renders an integer as an int literal (`42`) and a fractional
-    // number as a float literal (`4.2`) — PowQL distinguishes them by the dot.
-    return String(value);
+    if (!Number.isFinite(value))
+      throw new ValidationError(`[turbine] Non-finite number cannot be encoded for PowDB${at}.`);
+    // Renders an integer as an int literal (`42`) and a fractional number as a
+    // float literal (`4.2`); PowQL distinguishes them by the dot.
+    return powqlNumberText(value);
   }
-  if (typeof value === 'string') return encodePowqlString(value);
-  throw new ValidationError(`[turbine] Value of type ${typeof value} cannot be encoded as a PowDB literal.`);
+  if (typeof value === 'string') return encodePowqlString(value, position);
+  throw new ValidationError(`[turbine] Value of type ${typeof value} cannot be encoded as a PowDB literal${at}.`);
+}
+
+/**
+ * Render a finite JS number as PowQL numeric text.
+ *
+ * `String(n)` is used verbatim for every ordinary magnitude (an integer becomes
+ * `42`, a fractional number `4.2`), but it switches to exponential notation at
+ * `1e21` and below `1e-6` (`1e+21`, `1.5e-7`), which the PowQL lexer does not
+ * accept as a number token (and which the float path would further mangle into
+ * `1e+21.0`). Those two ranges are expanded into plain decimal digits so any
+ * finite double round-trips to a literal the engine can parse.
+ */
+function powqlNumberText(n: number): string {
+  const s = String(n);
+  if (!s.includes('e') && !s.includes('E')) return s;
+  // Integer-valued doubles (|n| >= 1e21) expand exactly through BigInt.
+  if (Number.isInteger(n)) return BigInt(n).toString();
+  const m = /^(-?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(s);
+  if (!m) {
+    throw new ValidationError(`[turbine] Number ${s} cannot be rendered as a PowDB literal.`);
+  }
+  const sign = m[1] ?? '';
+  const intPart = m[2] ?? '';
+  const fracPart = m[3] ?? '';
+  const exp = Number(m[4]);
+  const digits = intPart + fracPart;
+  const pointPos = intPart.length + exp;
+  let body: string;
+  if (pointPos <= 0) body = `0.${'0'.repeat(-pointPos)}${digits}`;
+  else if (pointPos >= digits.length) body = digits + '0'.repeat(pointPos - digits.length);
+  else body = `${digits.slice(0, pointPos)}.${digits.slice(pointPos)}`;
+  return sign + body;
 }
 
 /**
@@ -2076,8 +2153,23 @@ export function encodePowqlLiteral(value: unknown): string {
  */
 export const POWQL_LEXER_TESTED_CEILING = '0.19';
 
-/** Escape a string into a PowQL `"…"` literal, matching the engine lexer's escape rules. */
-function encodePowqlString(s: string): string {
+/**
+ * Escape a string into a PowQL `"…"` literal, matching the engine lexer's
+ * escape rules.
+ *
+ * A raw NUL (U+0000) is REFUSED rather than emitted: the lexer defines no `\0`
+ * escape (its escape set is exactly `\"`, `\\`, `\n`, `\t`, see
+ * {@link POWQL_LEXER_TESTED_CEILING}), so a NUL would travel into the query
+ * text as a raw byte and any layer that treats that text as a C string would
+ * silently truncate the statement there.
+ */
+function encodePowqlString(s: string, position?: string): string {
+  if (s.includes('\0')) {
+    throw new ValidationError(
+      `[turbine] String value${position ? ` (${position})` : ''} contains a NUL byte (U+0000), which PowQL string ` +
+        'literals cannot represent. Strip it before writing.',
+    );
+  }
   let out = '"';
   for (const ch of s) {
     if (ch === '\\') out += '\\\\';
@@ -2103,7 +2195,7 @@ export function materializePowql(powql: string, params: unknown[]): string {
     if (idx < 0 || idx >= params.length) {
       throw new ValidationError(`[turbine] PowQL placeholder $${n} has no bound parameter (have ${params.length}).`);
     }
-    return encodePowqlLiteral(params[idx]);
+    return encodePowqlLiteral(params[idx], `parameter $${n}`);
   });
 }
 

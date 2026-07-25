@@ -100,6 +100,19 @@ describe('turbine-orm/mysql — dialect conformance (no Postgres leakage)', () =
     assert.deepEqual(d.params, ['%Ada%']);
   });
 
+  it('escapeStringLiteral escapes backslashes as well as quotes (MySQL, unlike Postgres)', () => {
+    // MySQL treats `\` as a string escape unless NO_BACKSLASH_ESCAPES is set, so
+    // the inherited Postgres rule (double `'` only) would let a key ending in a
+    // backslash escape its own closing quote.
+    assert.equal(mysqlDialect.escapeStringLiteral('a\\'), 'a\\\\');
+    assert.equal(mysqlDialect.escapeStringLiteral("o'b\\"), "o''b\\\\");
+    // Ordinary keys are untouched (JSON_OBJECT output stays byte-identical).
+    assert.equal(mysqlDialect.escapeStringLiteral('createdAt'), 'createdAt');
+    // And the escaped key stays inside its literal in real emitted SQL.
+    const json = mysqlDialect.buildJsonObject([["we'ird\\", 't0.x']]);
+    assert.equal(json, "JSON_OBJECT('we''ird\\\\', t0.x)");
+  });
+
   it('nested with → JSON_OBJECT / JSON_ARRAYAGG / CAST(... AS JSON) wrap, no json_agg', () => {
     const sql = q().buildFindMany({ with: { posts: { with: { author: true } } } }).sql;
     assert.match(sql, /JSON_ARRAYAGG/);
@@ -683,6 +696,26 @@ describe('turbine-orm/mysql — integration (real MySQL 8)', () => {
     await rawPool.query('SET FOREIGN_KEY_CHECKS=1');
     for (const stmt of SEED) await rawPool.query(stmt);
   }
+
+  gate.it("relationLoadStrategy: 'flatten' matches join and batched", async () => {
+    // MySQL has no `buildRelationSubquery` dialect override, so the flatten plan
+    // is eligible here: a belongsTo compiles to a LEFT JOIN over a derived table
+    // exposing only prefixed names.
+    const args = { orderBy: { id: 'asc' }, with: { user: true } };
+    const sql = client.table('posts').buildFindMany({ ...args, relationLoadStrategy: 'flatten' }).sql;
+    assert.match(sql, /LEFT JOIN \(SELECT 1 AS `f0__\$k`/);
+    const join = await client.table('posts').findMany({ ...args, relationLoadStrategy: 'join' });
+    const batched = await client.table('posts').findMany({ ...args, relationLoadStrategy: 'batched' });
+    const flatten = await client.table('posts').findMany({ ...args, relationLoadStrategy: 'flatten' });
+    assert.deepEqual(flatten, join, 'flatten must equal join');
+    assert.deepEqual(batched, join, 'batched must equal join');
+    // Parent WHERE naming a column the joined table also has must not turn
+    // ambiguous (the derived table exposes only `f0__*` names).
+    const filtered = await client
+      .table('posts')
+      .findMany({ where: { id: 1 }, with: { user: true }, relationLoadStrategy: 'flatten' });
+    assert.equal(filtered.length, 1);
+  });
 
   gate.it('introspection discovers tables, PKs, relations, m2m', () => {
     assert.deepEqual(

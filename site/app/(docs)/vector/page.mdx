@@ -71,6 +71,56 @@ An unknown metric throws `ValidationError`. A `distance` op on a non-`vector` co
 
 > **Note:** pg has no built-in parser for the `vector` type, so a fetched `vector` column comes back as a string literal like `'[1,2,3]'` unless you register a parser (for example via pgvector's own client helpers). Querying *by* distance works regardless — this only affects how the column value reads when you select it.
 
+## The exported types
+
+The vector surface is fully typed and every type is exported from the package root, so you can build a query object in a helper and hand it to `findMany` without losing type safety.
+
+```ts
+import type {
+  VectorMetric,
+  VectorFilter,
+  VectorDistanceFilter,
+  VectorOrderBy,
+  VectorOrderByDistance,
+} from 'turbine-orm';
+```
+
+| Type | Shape | Where it goes |
+|---|---|---|
+| `VectorMetric` | `'l2' \| 'cosine' \| 'ip'` | The `metric` field of both specs below. A fixed allow-list, so a user-supplied string can never become a SQL operator. |
+| `VectorDistanceFilter` | `{ to: number[]; metric: VectorMetric; lt?, lte?, gt?, gte?: number }` | The `distance` value inside a `where`. |
+| `VectorFilter` | `{ distance: VectorDistanceFilter }` | The per-column value in `where`, i.e. `where: { embedding: VectorFilter }`. |
+| `VectorOrderByDistance` | `{ to: number[]; metric: VectorMetric; direction?: 'asc' \| 'desc' }` | The `distance` value inside an `orderBy`. `direction` defaults to `'asc'`, which is nearest-first. |
+| `VectorOrderBy` | `{ distance: VectorOrderByDistance }` | The per-column value in `orderBy`, i.e. `orderBy: { embedding: VectorOrderBy }`. |
+
+A typical use is a shared retrieval helper that takes the query embedding once and builds both halves:
+
+```ts
+import type { VectorFilter, VectorMetric, VectorOrderBy } from 'turbine-orm';
+
+function knn(to: number[], metric: VectorMetric = 'cosine', maxDistance?: number) {
+  const order: VectorOrderBy = { distance: { to, metric } };
+  const filter: VectorFilter | undefined =
+    maxDistance === undefined ? undefined : { distance: { to, metric, lt: maxDistance } };
+  return { order, filter };
+}
+
+const { order, filter } = knn(queryVector, 'cosine', 0.4);
+
+const results = await db.items.findMany({
+  where: filter ? { embedding: filter } : undefined,
+  orderBy: { embedding: order },
+  limit: 10,
+});
+```
+
+<Callout type="note" title="Postgres only">
+  The vector operators are gated on the dialect's `supportsVector` capability
+  flag. On the SQLite, MySQL, SQL Server and PowDB engines a `distance` filter
+  or ordering throws `UnsupportedFeatureError` (`TURBINE_E017`) rather than
+  emitting SQL that cannot work.
+</Callout>
+
 ## Validation and safety
 
 Every value in a vector query is bound as a parameter, so hostile input can't escape the query:

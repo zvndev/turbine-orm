@@ -351,7 +351,12 @@ describe('nested-write: hasMany upsert', () => {
 
 describe('nested-write: belongsTo update', () => {
   it('derives where from parent FK and updates related record', async () => {
-    const { ctx, log } = makeMockCtx(schema);
+    // The parent post must carry a real FK value: the correlation is what puts
+    // the related row in scope, and a null/absent FK means nothing is (see
+    // nested-write-belongs-to-null-fk.test.ts).
+    const { ctx, log } = makeMockCtx(schema, {
+      findUniqueOverride: { table: 'posts', returns: { id: 10, userId: 42 } },
+    });
 
     await executeNestedUpdate(
       ctx,
@@ -369,7 +374,7 @@ describe('nested-write: belongsTo update', () => {
     const args = updateOps[0]!.args as { where: Record<string, unknown>; data: Record<string, unknown> };
     assert.deepStrictEqual(args.data, { name: 'Updated Author' });
     // The where should be derived from parent's FK (userId -> id on users)
-    assert.ok('id' in args.where, 'Where should use the reference key on the related table');
+    assert.deepStrictEqual(args.where, { id: 42 }, 'Where should use the reference key on the related table');
   });
 
   it('throws ValidationError when belongsTo update is missing data', async () => {

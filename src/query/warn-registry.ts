@@ -97,6 +97,15 @@ export const WARN_NS = {
   autoStrategy: 'autoStrategy',
   /** Deep-`with` (depth > 5) advisory (builder.ts `findMany`). */
   deepWith: 'deepWith',
+  /** Non-deterministic page advisory: paginating findMany with no orderBy. */
+  unorderedPage: 'unorderedPage',
   /** PowDB `emitLinks` DDL skips (name/column collision, endpoint drift). */
   powdbLinks: 'powdbLinks',
+  /**
+   * `relationLoadStrategy: 'flatten'` was asked for but a relation stayed on the
+   * correlated-subquery path (relations.ts `planFlattenWith`, builder.ts
+   * `planFlatten`). An explicitly requested strategy that quietly does not
+   * engage is indistinguishable from one that does nothing, so say so once.
+   */
+  flattenFallback: 'flattenFallback',
 } as const;

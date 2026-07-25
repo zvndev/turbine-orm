@@ -88,6 +88,7 @@
 import type { TurbineClient } from './client.js';
 import { TurbineError, TurbineErrorCode, UnsupportedFeatureError, ValidationError, wrapPgError } from './errors.js';
 import type { DeferredQuery } from './query/index.js';
+import { shouldWarnOnce } from './query/warn-registry.js';
 import type { PrismaCompatMap, PrismaModelMap, RelationDef, SchemaMetadata } from './schema.js';
 
 // ---------------------------------------------------------------------------
@@ -537,11 +538,28 @@ function modelName(ctx: Ctx, mm: PrismaModelMap): string {
 }
 
 /**
+ * Which read shape a set of args is being translated for. It selects the
+ * implicit-ordering rule (see {@link applyImplicitPkOrder}) and nothing else:
+ *
+ * - `many`: `findMany`, ordered only when it paginates.
+ * - `first`: `findFirst` / `findFirstOrThrow`, always a bare `LIMIT 1`, so it
+ *   is always an unordered page of one.
+ * - `unique`: `findUnique` / `findUniqueOrThrow`, addressed by a unique key, so
+ *   at most one row matches and an ordering would be pure overhead.
+ */
+type ReadKind = 'many' | 'first' | 'unique';
+
+/**
  * Assemble Turbine findMany-family args from Prisma read args. Order matters:
  * `where` / `orderBy` are translated first so the cursor step (which may inject
  * a keyset predicate) operates in the translated turbine-field space.
  */
-function translateReadArgs(ctx: Ctx, mm: PrismaModelMap, prismaArgs: Record<string, unknown>): Record<string, unknown> {
+function translateReadArgs(
+  ctx: Ctx,
+  mm: PrismaModelMap,
+  prismaArgs: Record<string, unknown>,
+  kind: ReadKind,
+): Record<string, unknown> {
   const t: Record<string, unknown> = {};
   if (prismaArgs.where !== undefined) t.where = translateWhere(ctx, mm, prismaArgs.where);
   if (prismaArgs.orderBy !== undefined) t.orderBy = translateOrderBy(ctx, mm, prismaArgs.orderBy);
@@ -558,8 +576,80 @@ function translateReadArgs(ctx: Ctx, mm: PrismaModelMap, prismaArgs: Record<stri
   // adapter is a one-way door into redacted reads and refused aggregates.
   if (prismaArgs.includePii !== undefined) t.includePii = prismaArgs.includePii;
   if (ctx.options.stablePkOrder) t.stableRelationOrder = true;
+  // ORDER IS LOAD-BEARING: translateCursor MUST run BEFORE applyImplicitPkOrder.
+  // The cursor translation reads `t.orderBy` to decide the seek direction and to
+  // validate that a bare inclusive cursor names the sort key; it must see the
+  // USER's ordering, never an ordering this layer invented. Swap these two lines
+  // and a bare inclusive cursor on a non-PK field silently compiles against the
+  // injected primary-key order instead of throwing. See the guard test
+  // "cursor decisions are made against the user's own orderBy".
   translateCursor(ctx, mm, prismaArgs, t);
+  applyImplicitPkOrder(ctx, mm, t, kind);
   return t;
+}
+
+/**
+ * Prisma appends an implicit `ORDER BY <primary key> ASC` to a paginated read;
+ * Turbine emits a bare `LIMIT`. An unordered `LIMIT` is not stable in Postgres:
+ * once the heap changes underneath it (autovacuum, a heap rewrite, a plan flip)
+ * successive pages can repeat a row or skip one entirely, and the unordered
+ * plan is also the slower one (a seq scan instead of a primary-key index scan).
+ *
+ * So a top-level compat read whose page is not already ordered gets the model's
+ * primary key ascending, matching Prisma. An explicit `orderBy` always wins, a
+ * composite primary key orders on every column in declaration order, and a model
+ * with no primary key is left exactly as it was (nothing is invented).
+ *
+ * ## Which reads this covers
+ *
+ * - `findMany` only when it paginates (`take` / `skip`): without a limit there
+ *   is no page to be unstable.
+ * - `findFirst` / `findFirstOrThrow` ALWAYS: core compiles both to a bare
+ *   `LIMIT 1`, which is the single most common nondeterministic read shape in
+ *   Prisma-shaped code ("give me any one row" quietly becoming "give me
+ *   whichever row the heap hands back today").
+ * - `findUnique` / `findUniqueOrThrow` NEVER: they are addressed by a unique
+ *   key, so at most one row matches and an ordering is pure overhead.
+ * - Nested relation includes (`include: { posts: { take: 3 } }`) are NOT
+ *   touched here, deliberately. Relation ordering is a core concern (core owns
+ *   the target table's metadata and the subquery shape), and core already
+ *   exposes it as `stableRelationOrder`, which this layer forwards from the
+ *   {@link PrismaCompatOptions.stablePkOrder} option. Re-walking the `with` tree
+ *   here would duplicate that mechanism and fight it inside the subquery.
+ *
+ * ## Mirrored exclusions (keep in sync with core `isUnorderedPage`)
+ *
+ * Core's `QueryInterface.isUnorderedPage` (query/builder.ts) excludes both
+ * `distinct` and `cursor`. This layer mirrors them one at a time rather than
+ * copying the predicate, because the two layers do NOT have the same default:
+ *
+ * - `distinct`: EXCLUDED, same as core, and this one is a hard requirement.
+ *   Adding an `orderBy` flips core's `DISTINCT ON` out of its plain branch into
+ *   the two-level derived-table rewrite whose OUTER `ORDER BY` can only see the
+ *   projected columns, so `distinct` + `select` + `take` would fail at runtime
+ *   with `column "id" does not exist`. Injecting also lifts the `LIMIT` outside
+ *   the `DISTINCT ON`, so the inner scan stops being limited. `distinct` reads
+ *   keep the exact SQL they emitted before this ordering existed.
+ * - `cursor`: NOT excluded here, unlike core. Core is a general-purpose layer
+ *   whose cursor callers chose their own ordering; this layer's contract is
+ *   Prisma parity, and Prisma pairs cursor pagination with the same implicit
+ *   primary-key order. The injection is safe because it runs strictly AFTER
+ *   {@link translateCursor}: the cursor comparison direction was already
+ *   resolved from the user's own `orderBy` (ascending by default, matching an
+ *   ascending primary key), and the bare-inclusive-cursor branch has already
+ *   set or demanded an `orderBy`, so only the exclusive `cursor` + `skip`
+ *   branch reaches here. It gains an `ORDER BY <pk> ASC` and nothing else.
+ */
+function applyImplicitPkOrder(ctx: Ctx, mm: PrismaModelMap, t: Record<string, unknown>, kind: ReadKind): void {
+  if (kind === 'unique') return;
+  if (t.orderBy !== undefined) return;
+  if (t.distinct !== undefined) return;
+  if (kind === 'many' && t.limit === undefined && t.offset === undefined) return;
+  const meta = ctx.schema.tables[mm.table];
+  const pk = meta?.primaryKey ?? [];
+  if (pk.length === 0) return;
+  const fields = pk.map((col) => meta?.reverseColumnMap?.[col] ?? col);
+  t.orderBy = fields.length === 1 ? { [fields[0]!]: 'asc' } : fields.map((f) => ({ [f]: 'asc' }));
 }
 
 /** turbine field names of the model's single-column primary key, if any. */
@@ -1320,31 +1410,31 @@ function makeDelegate(
   return {
     findMany: (args = {}) =>
       defer(
-        () => translateReadArgs(ctx, mm, args),
+        () => translateReadArgs(ctx, mm, args, 'many'),
         (qi, t) => qi.findMany(t).then((r) => reshapeRows(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindMany(t), reshape: (raw) => reshapeRows(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row'][]>,
     findFirst: (args = {}) =>
       defer(
-        () => translateReadArgs(ctx, mm, args),
+        () => translateReadArgs(ctx, mm, args, 'first'),
         (qi, t) => qi.findFirst(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindFirst(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
     findUnique: (args) =>
       defer(
-        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUnique')),
+        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUnique'), 'unique'),
         (qi, t) => qi.findUnique(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindUnique(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
     findFirstOrThrow: (args = {}) =>
       defer(
-        () => translateReadArgs(ctx, mm, args),
+        () => translateReadArgs(ctx, mm, args, 'first'),
         (qi, t) => qi.findFirstOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindFirstOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     findUniqueOrThrow: (args) =>
       defer(
-        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUniqueOrThrow')),
+        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUniqueOrThrow'), 'unique'),
         (qi, t) => qi.findUniqueOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindUniqueOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row']>,
@@ -1549,6 +1639,82 @@ function flattenTemplate(
 // ---------------------------------------------------------------------------
 
 /**
+ * The client-level members every compat client carries, as a total map over
+ * {@link PrismaCompatClientBase}. Declaring it `Record<keyof …, true>` makes the
+ * compiler keep it in sync: adding a `$method` to the interface without listing
+ * it here is a type error, and listing one that does not exist is too. The
+ * derived key set is what {@link junctionModels} refuses to shadow.
+ */
+const CLIENT_RESERVED_KEY_MAP: Record<keyof PrismaCompatClientBase, true> = {
+  $transaction: true,
+  $queryRaw: true,
+  $queryRawUnsafe: true,
+  $executeRaw: true,
+  $executeRawUnsafe: true,
+  $connect: true,
+  $disconnect: true,
+};
+
+/** @internal Names on a compat client that are NOT model delegates. */
+export const CLIENT_RESERVED_KEYS: ReadonlySet<string> = new Set(Object.keys(CLIENT_RESERVED_KEY_MAP));
+
+/** Warn-once namespace for junction accessors dropped on a name collision. */
+const JUNCTION_WARN_NS = 'prismaCompatJunction';
+
+/**
+ * Synthesize a model map per implicit many-to-many JUNCTION table, keyed by the
+ * junction's raw table name (`_ReportToSchedule`, `post_tags`, ...).
+ *
+ * Prisma's schema has no model for an implicit junction, so `PRISMA_MAP` has no
+ * entry for it and the adapter would expose no accessor: a compat caller had no
+ * way to touch link rows at all, not even inside a `$transaction`. The junction
+ * tables ARE in the Turbine schema metadata (`through.table` on every
+ * many-to-many relation), so the delegate is a plain identity mapping over the
+ * real table: no field renames, no relations, no compound uniques.
+ *
+ * A junction accessor is an ESCAPE HATCH, never worth breaking a real member of
+ * the client for, so it FAILS SAFE: the name is skipped (leaving the existing
+ * member intact) whenever it collides with anything the client already exposes,
+ * which is a Prisma model name, a table some model maps to, a model's
+ * lowercased Prisma-property alias (`compat.user` for `model User`), or one of
+ * the client-level {@link CLIENT_RESERVED_KEYS} (a junction table named
+ * `$transaction` must not turn the transaction surface into a delegate).
+ *
+ * Every skip except the mapped-table one loses a capability the caller might
+ * expect, so those warn once per junction name in dev; a table that a model
+ * already maps to is not a loss (the model IS that table's accessor).
+ */
+function junctionModels(ctx: Ctx, map: PrismaCompatMap, tableToModel: Map<string, string>): [string, PrismaModelMap][] {
+  const out: [string, PrismaModelMap][] = [];
+  const seen = new Set<string>(CLIENT_RESERVED_KEYS);
+  for (const model of Object.keys(map.models)) {
+    seen.add(model);
+    const alias = prismaPropertyAlias(model);
+    if (alias) seen.add(alias);
+  }
+  for (const table of Object.values(ctx.schema.tables)) {
+    for (const rel of Object.values(table.relations ?? {})) {
+      if (rel.type !== 'manyToMany') continue;
+      const name = rel.through?.table;
+      if (!name || !ctx.schema.tables[name] || tableToModel.has(name)) continue;
+      if (seen.has(name)) {
+        if (process.env.NODE_ENV !== 'production' && shouldWarnOnce(JUNCTION_WARN_NS, name)) {
+          console.warn(
+            `[turbine] prisma-compat: the many-to-many junction table "${name}" collides with an ` +
+              'existing client member of the same name, so no junction accessor was created for it. ' +
+              'Reach its rows through $queryRaw / $executeRaw, or through the owning model relation.',
+          );
+        }
+        continue;
+      }
+      seen.add(name);
+      out.push([name, { table: name, accessor: name, fields: {}, relations: {}, compoundUniques: {} }]);
+    }
+  }
+  return out;
+}
+
+/**
  * Create a PrismaClient-surface adapter over a {@link TurbineClient}, driven by a
  * {@link PrismaCompatMap} (the `prisma-map.ts` that `turbine
  * migrate-from-prisma` emits).
@@ -1589,9 +1755,18 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
     },
   };
 
+  // Every model the client exposes: the map's Prisma models, plus the implicit
+  // many-to-many junction tables (see below). Both delegate loops (base and
+  // transaction-scoped) build from this ONE list, so an accessor can never
+  // exist on the client but be missing inside `$transaction`.
+  const delegateModels: [string, PrismaModelMap][] = [
+    ...Object.entries(map.models),
+    ...junctionModels(ctx, map, tableToModel),
+  ];
+
   // Delegates bound to the base client (each call reads db.table(...) lazily).
   const delegates = new Map<string, PrismaModelDelegate<PrismaModelTypes>>();
-  for (const [prismaModel, mm] of Object.entries(map.models)) {
+  for (const [prismaModel, mm] of delegateModels) {
     delegates.set(
       prismaModel,
       makeDelegate(
@@ -1654,7 +1829,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
       const fn = arg as (tx: PrismaCompatTransactionClient) => Promise<unknown>;
       return db.$transaction((tx: CompatTransactionClient) => {
         const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
-        for (const [prismaModel, mm] of Object.entries(map.models)) {
+        for (const [prismaModel, mm] of delegateModels) {
           txDelegates[prismaModel] = makeDelegate(
             ctx,
             mm,

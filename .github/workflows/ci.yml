@@ -356,6 +356,78 @@ jobs:
       - name: Check bundle sizes
         run: npx size-limit
 
+  # Publish-surface type gate. pack-smoke proves the package RUNS from CJS
+  # (`node -e "require(...)"`), which is exactly the blind spot that let broken
+  # CJS TYPES ship: with one shared top-level "types" per subpath, a CJS
+  # consumer on moduleResolution node16/nodenext resolved the ESM declarations
+  # and got TS1479 on every import while the runtime worked fine. This job
+  # checks the three things that would have caught it:
+  #   1. publint --strict: exports map / file / field sanity.
+  #   2. attw --profile node16: every entry point resolves to declarations that
+  #      are valid for BOTH the import and the require condition. node10 is
+  #      ignored: the subpath exports have never been node10-resolvable (that
+  #      would need typesVersions or physical root files) and pretending
+  #      otherwise would make the gate permanently red.
+  #   3. A real .cts consumer typechecked against the packed tarball, which is
+  #      the actual user-visible symptom rather than a proxy for it.
+  package-types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: publint + are-the-types-wrong
+        run: npm run check:package
+      - name: Pack tarball
+        run: echo "TARBALL=$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)" >> "$GITHUB_ENV"
+      - name: Typecheck a CommonJS consumer against the packed tarball
+        run: |
+          CONSUMER=$(mktemp -d)
+          cd "$CONSUMER"
+          cat > package.json <<'JSON'
+          { "name": "cjs-consumer", "version": "1.0.0", "private": true, "type": "commonjs" }
+          JSON
+          cat > tsconfig.json <<'JSON'
+          {
+            "compilerOptions": {
+              "module": "nodenext",
+              "moduleResolution": "nodenext",
+              "target": "ES2022",
+              "strict": true,
+              "noEmit": true,
+              "skipLibCheck": true
+            },
+            "include": ["consumer.cts"]
+          }
+          JSON
+          cat > consumer.cts <<'TS'
+          import { TurbineClient, TurbineError } from 'turbine-orm';
+          import { turbineHttp } from 'turbine-orm/serverless';
+          import { turbineSqlite } from 'turbine-orm/sqlite';
+          import { turbineMysql } from 'turbine-orm/mysql';
+          import { turbineMssql } from 'turbine-orm/mssql';
+          import { turbinePowDB } from 'turbine-orm/powdb';
+          import { postgresql } from 'turbine-orm/adapters';
+          const req = require('turbine-orm') as typeof import('turbine-orm');
+          export const check = [
+            TurbineClient, TurbineError, turbineHttp, turbineSqlite,
+            turbineMysql, turbineMssql, turbinePowDB, postgresql, req.TurbineClient,
+          ];
+          TS
+          npm install "$TARBALL" --no-audit --no-fund
+          npm install --no-save typescript @types/node --no-audit --no-fund
+          # Both resolution modes: node16 still refuses require() of an ES module
+          # outright, nodenext on TS >= 5.8 allows it but must still find CJS
+          # declarations for the require condition.
+          npx tsc --noEmit -p tsconfig.json
+          sed -i 's/"module": "nodenext"/"module": "node16"/; s/"moduleResolution": "nodenext"/"moduleResolution": "node16"/' tsconfig.json
+          npx tsc --noEmit -p tsconfig.json
+          echo "CJS consumer typecheck OK (nodenext + node16)"
+
   # Installs the real npm tarball (npm pack) into a clean temp project and
   # verifies the published package surface end-to-end: ESM import, CJS require,
   # the `turbine` CLI bin, and the /serverless subpath export. Catches

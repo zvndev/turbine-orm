@@ -238,6 +238,22 @@ const OPERATOR_KEYS = new Set([
   'mode',
 ]);
 
+/**
+ * Aggregate keys accepted inside a per-field `having` filter, mapped to the
+ * PowQL function each one emits. The set is FIXED: any other key is rejected by
+ * {@link PowqlInterface.buildHaving} rather than interpolated into the query
+ * text (the SQL builder holds the same contract, see `aggFnByKey` in
+ * query/aggregates.ts). A Map is used deliberately so an inherited object key
+ * (`constructor`, `toString`, `__proto__`) can never resolve to a function name.
+ */
+const POWQL_HAVING_AGG_FNS = new Map<string, string>([
+  ['_sum', 'sum'],
+  ['_avg', 'avg'],
+  ['_min', 'min'],
+  ['_max', 'max'],
+  ['_count', 'count'],
+]);
+
 /** Filters that have no PowDB representation and must throw E017. */
 function rejectUnsupportedFilter(value: Record<string, unknown>, field: string): void {
   if ('distance' in value || 'metric' in value) {
@@ -343,7 +359,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // json document column: a JS object/array is serialized to canonical JSON
       // text and stored as a json document (a JS string passes through raw, same
       // contract as pg jsonb; `null` stays `null`).
-      tagged = new PowdbJsonParam(value);
+      tagged = new PowdbJsonParam(value, col.name);
     }
     params.push(tagged);
     return `$${params.length}`;
@@ -2888,6 +2904,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * with the projection); a per-field aggregate re-emits its inner expression
    * (from `aggInner` when the field is a requested aggregate, so a JSON-path
    * aggregate reuses its bound placeholders, else `.field` for a plain column).
+   *
+   * Every token that reaches the PowQL text is builder-controlled: the field is
+   * validated by `ref()`, the aggregate function comes from
+   * {@link POWQL_HAVING_AGG_FNS} (unknown keys throw E003), the operator from a
+   * fixed map, and every compared value is bound as a `$N` param.
    */
   private buildHaving(having: GroupByArgs<T>['having'], params: unknown[], aggInner: Map<string, string>): string {
     if (!having) return '';
@@ -2895,10 +2916,19 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const cmp = (expr: string, filter: unknown) => {
       if (typeof filter === 'number') return `${expr} = ${this.param(filter, params)}`;
       const f = filter as Record<string, number>;
-      const ops: Record<string, string> = { equals: '=', gt: '>', gte: '>=', lt: '<', lte: '<=', not: '!=' };
+      // Map (not an object literal) so an inherited key such as `constructor`
+      // cannot resolve to a truthy value and reach the emitted PowQL.
+      const ops = new Map<string, string>([
+        ['equals', '='],
+        ['gt', '>'],
+        ['gte', '>='],
+        ['lt', '<'],
+        ['lte', '<='],
+        ['not', '!='],
+      ]);
       return Object.entries(f)
-        .filter(([k]) => ops[k])
-        .map(([k, v]) => `${expr} ${ops[k]} ${this.param(v, params)}`)
+        .filter(([k]) => ops.has(k))
+        .map(([k, v]) => `${expr} ${ops.get(k)} ${this.param(v, params)}`)
         .join(' and ');
     };
     for (const [key, spec] of Object.entries(having)) {
@@ -2906,10 +2936,19 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (key === '_count') {
         conds.push(cmp('count(*)', spec));
       } else {
-        for (const [fn, filter] of Object.entries(spec as Record<string, unknown>)) {
+        for (const [aggKey, filter] of Object.entries(spec as Record<string, unknown>)) {
           if (filter == null) continue;
+          // The function token is emitted verbatim into the PowQL text, so it
+          // must come from the fixed allowlist, never from the caller's key.
+          const fn = POWQL_HAVING_AGG_FNS.get(aggKey);
+          if (!fn) {
+            throw new ValidationError(
+              `[turbine] Unknown aggregate "${aggKey}" in having for field "${key}" on table "${this.table}". ` +
+                `Supported: ${[...POWQL_HAVING_AGG_FNS.keys()].join(', ')}.`,
+            );
+          }
           const inner = aggInner.get(key) ?? this.ref(key);
-          conds.push(cmp(`${fn.slice(1)}(${inner})`, filter));
+          conds.push(cmp(`${fn}(${inner})`, filter));
         }
       }
     }
