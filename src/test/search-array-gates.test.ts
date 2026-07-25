@@ -13,6 +13,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import { describe, it } from 'node:test';
 import { postgresDialect } from '../dialect.js';
 import { UnsupportedFeatureError } from '../errors.js';
@@ -155,8 +156,25 @@ describe('non-PostgreSQL engines refuse both filters with E017', () => {
 // Live SQLite: the engine really refuses, on a real in-process connection.
 // ---------------------------------------------------------------------------
 
+// `turbine-orm/sqlite` needs Node's built-in node:sqlite (Node >= 22.5). On an
+// older Node the build-only cases above still run; this one registers as
+// skipped rather than failing with a ConnectionError, matching every other
+// live-SQLite test in the suite.
+const hasNodeSqlite = (() => {
+  try {
+    createRequire(process.cwd())('node:sqlite');
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+const liveIt: typeof it = hasNodeSqlite
+  ? it
+  : (((name: string) => it(name, { skip: 'requires node:sqlite (Node >= 22.5)' }, () => {})) as typeof it);
+
 describe('live SQLite engine refuses `search` and array filters', () => {
-  it('throws E017 rather than a raw driver syntax error', async () => {
+  liveIt('throws E017 rather than a raw driver syntax error', async () => {
     const { turbineSqlite } = await import('../sqlite.js');
     const db = turbineSqlite(':memory:', docsSchema());
     try {
