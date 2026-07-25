@@ -107,7 +107,7 @@ DATABASE_URL=postgres://... npx turbine migrate-from-prisma --schema prisma/sche
 
 It parses `schema.prisma` with a zero-dependency subset parser (no `prisma` CLI, no `@prisma/client`, neither needs to still be installed), introspects your database, and resolves every model, field, relation, enum, and compound unique against what is actually there. It writes three things into your generate output directory (default `./generated/turbine`):
 
-- **`prisma-migration-report.md`**: per-model resolution, detected junction tables for implicit many-to-many, enums, an **Unresolved items** section, and parser notes. Read this first: it is the list of things that will not translate.
+- **`prisma-migration-report.md`**: per-model resolution, a **Many-to-many relations (audit these call sites)** section pairing each relation's Prisma field name with its Turbine relation name and junction table, detected junction tables for implicit many-to-many, enums, an **Unresolved items** section, and parser notes. Read this first: it is the list of things that will not translate.
 - **`prisma-map.ts`**: the typed `PRISMA_MAP` the adapter is driven by. Every name in it was proven to exist during introspection, so the adapter only ever translates names it can resolve.
 - **The standard generated client** (`types.ts`, `metadata.ts`, `index.ts`), exactly as `turbine generate` writes it.
 
@@ -121,6 +121,28 @@ It parses `schema.prisma` with a zero-dependency subset parser (no `prisma` CLI,
 | `--no-timestamp` | Omit the generated-at lines, for byte-identical regeneration. |
 
 An unresolved item never blocks the client: it is generated from live introspected metadata, so a partial run still gives you a working `db`. Only the *map* entry is missing, which means the adapter will not know that one Prisma name.
+
+**Connection string.** The command resolves the URL in this order: `--url`, then `DATABASE_URL`, then `url` in `turbine.config.ts`, then the `datasource` block of the schema you pointed it at, including its `env("...")` indirection (`url` first, then `directUrl`). So a project whose schema declares `url = env("DATABASE_URL_STAGING")` needs no flag, as long as that variable is exported. The datasource is last on purpose: an explicit `--url` is never overridden by a value declared in a schema file. If nothing yields a URL, the error names the exact variable the datasource asked for.
+
+### Auditing your many-to-many call sites
+
+The many-to-many rules changed in 0.50 (see [Notable differences](#notable-differences)), so a port needs to know which call sites are affected. The obvious recipe does not work.
+
+Turbine relation names and Prisma field names are two different names for the same relation, related only through `PRISMA_MAP`. Application code written against the compat client uses the **Prisma** name. So an audit that greps the Turbine side (`grep -rn "manyToMany" generated/`, then searching the codebase for the relation names it prints) matches nothing in that code and reports a clean bill of health that is not real.
+
+You do not need to get this right by hand. The report's **"Many-to-many relations (audit these call sites)"** section lists every resolved m2m relation with both names and the junction table:
+
+| Prisma call site | Turbine relation | Junction table |
+| --- | --- | --- |
+| `Post.tags` | `tags` | `_PostToTag` |
+
+and closes with a ready-to-run grep over the **Prisma** field names:
+
+```bash
+grep -rEn "\b(tags)\b" src
+```
+
+Run it, then review every write whose `data` nests one of those fields. In `--no-db` mode the section says the list needs a database run rather than printing an empty one, because m2m relations are recognized from the live database.
 
 ### `createPrismaCompatClient`
 
@@ -147,6 +169,19 @@ const users = await prisma.user.findMany({
 ```
 
 Model delegates are registered under **both** spellings, the Prisma model name (`prisma.User`) and Prisma's generated client property (`prisma.user`), so either style resolves to the same delegate.
+
+**Implicit junction tables get a delegate too** (since 0.50). Prisma's schema has no model for an implicit many-to-many junction, so `PRISMA_MAP` has no entry for one and there used to be no way to touch link rows from the compat client at all. Every many-to-many junction in the Turbine metadata is now exposed under its raw table name, with identity field mapping (no renames, no relations), on the client and inside `$transaction`:
+
+```ts
+// The delegate is keyed by the junction's raw table name, and its fields are
+// that table's own columns in Turbine's usual camelCase spelling.
+await prisma.$transaction(async (tx) => {
+  const junction = (tx as Record<string, any>)._PostToTag;
+  await junction.createMany({ data: [{ postId: 1, tagId: 7 }] });
+});
+```
+
+A junction name that collides with a real Prisma model, or with a table some model already maps to, is skipped: the model always wins its own key. These delegates are real at runtime but are not part of the generated `PrismaCompatClient` type (there is no Prisma model to type them from), so a cast is needed to reach them, as above. Check the junction's column names in the report's junction-tables section.
 
 **What it translates:** `include` to `with`; `select` split into scalar selection plus relations; field and relation renames in both directions; `take`/`skip` to `limit`/`offset`; cursor pagination; compound-unique selectors including custom `@@unique(name:)` names; `$transaction` in both the callback and lazy-array-batching forms; `$queryRaw` / `$executeRaw` and their `Unsafe` variants with `Prisma.sql`-style fragment flattening; `createMany({ skipDuplicates })` to `ON CONFLICT DO NOTHING`; `_count` objects keyed back to Prisma relation names; to-one relations surfaced as `object | null`. Prisma's client-side defaults (`@default(uuid())`, `@default(cuid())`, `@updatedAt`) are emulated on write, since Prisma fills those in the client and the columns usually have no database default.
 
@@ -406,7 +441,7 @@ const active = await db.users.findMany({
 - **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, SCHEMA)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.
 - **Single runtime dependency.** `pg` only. No engine binary, no WASM, no `@prisma/client`.
 - **Postgres-first, not Postgres-only.** Postgres is the default and primary target; optional SQLite, MySQL, SQL Server, and PowDB engines ship behind subpath exports (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) and share the same typed API. A few flagship features (pgvector, LISTEN/NOTIFY, RLS session context, full-text `search`, array-column filters, `groupBy({ distinctOn })`) stay Postgres-only and throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) elsewhere, and the schema tooling (the CLI, `schemaPush` / `schemaDiff`, `doctor`) targets Postgres. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only).
-- **Nested writes on to-one and one-to-many relations.** `create` / `connect` / `connectOrCreate` on a create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on an update, in one transaction with a depth cap of 10. **Many-to-many is the gap**: a relation op on an m2m relation throws a `ValidationError` rather than doing nothing, so port those call sites to explicit junction-table writes inside a `$transaction`. This is the difference most likely to bite a Prisma port, since implicit m2m plus `connect` is a common Prisma idiom. See [Nested writes](/nested-writes).
+- **Nested writes, including many-to-many.** `create` / `connect` / `connectOrCreate` on a create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on an update, in one transaction with a depth cap of 10. Since 0.50 a **many-to-many** relation supports the three operations that only touch the junction table: `connect`, `disconnect`, and `set`, which covers the common Prisma implicit-m2m idiom. The rest (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) throw `ValidationError` (`TURBINE_E003`) naming the supported set, because there is no safe default for a junction's extra payload columns; port those call sites to a target write plus a `connect`, or to explicit junction-table writes inside a `$transaction`. The compat client now exposes an accessor per implicit junction table (under its raw Prisma name, for example `_PostToTag`), on the client and inside `$transaction`, so those writes stay in one transaction. See [Nested writes](/nested-writes#many-to-many-relations) and [Auditing your many-to-many call sites](#auditing-your-many-to-many-call-sites).
 
 ### Cursor pagination
 
@@ -426,6 +461,7 @@ If you want a stable default without annotating every relation, opt into `stable
 ## Behaviors that match Prisma
 
 - **`timestamp` columns parse as UTC.** Turbine reads Postgres `timestamp` (without time zone) values as UTC — the same convention Prisma uses — so a migrated app gets **identical instants**, not values shifted by the server's local zone. (Opt out with `utcTimestamps: false` if you relied on local-time parsing.)
+- **Paginated reads are ordered by the primary key.** Prisma appends an implicit `ORDER BY <primary key> ASC` to a `findMany` with `take` / `skip`; since 0.50 the adapter does the same (every column of a composite key, in declaration order). Without it, a ported paginated endpoint inherits an unordered `LIMIT`, which Postgres is free to answer with different rows as the heap changes, so a row can appear on two pages or on none. An explicit `orderBy` always wins, and a model with no primary key is left alone. There is no flag to turn this off: matching Prisma is the adapter's contract. Turbine core still emits a bare `LIMIT` unless you set [`implicitPkOrdering: true`](/queries#deterministic-pages-the-unordered-pagination-warning).
 - **Bare to-one relation filters work without `is`.** `where: { vendor: { name: { contains: 'x' } } }` filters by a to-one relation with no `is` wrapper, exactly like Prisma. `is: null` / `isNot: null` compile to `NOT EXISTS` / `EXISTS`.
 - **`time` columns through the compat adapter.** Postgres `time` values surface from `turbine-orm/prisma-compat` as a `Date` on 1970-01-01 UTC, Prisma's epoch-day convention, so `.getHours()`-style call sites keep working. Turbine core keeps the driver's raw `HH:MM:SS` string (a documented core-vs-Prisma difference).
 - **Client-side defaults are emulated.** Prisma's `@default(uuid())`, `@default(cuid())`, and `@updatedAt` are filled by the Prisma *client*, so those columns usually have no database default and Prisma call sites omit them. `migrate-from-prisma` records them in the generated map (`clientDefaults`), and the compat adapter fills them on `create`/`createMany` and touches `@updatedAt` fields on `update`/`updateMany`/`upsert`, exactly like Prisma. `@default(now())` is carried only when introspection finds no database default.

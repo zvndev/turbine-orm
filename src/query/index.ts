@@ -115,4 +115,4 @@ export type {
   QueryInterfaceOptions,
   ReselectExecutor,
 } from './builder.js';
-export { QueryInterface } from './builder.js';
+export { AUTO_TO_ONE_JOIN_MAX_ROWS, QueryInterface } from './builder.js';

@@ -397,6 +397,33 @@ type CountResult<C> = C extends true
 // Select / Omit compile-time type narrowing
 // ---------------------------------------------------------------------------
 
+/**
+ * Key-validating companion for an inferred `select` / `omit` flag map.
+ *
+ * `select?: S` alone can never reject a typo: `S` is inferred FROM the object
+ * literal, so `{ emial: true }` simply becomes the inferred type and a
+ * misspelled column silently narrows the result to `Pick<T, never>`. Writing
+ * the property as `S & FieldFlags<T, S>` keeps `S` inferred exactly as before
+ * (the naked `S` member is still the inference site, so literal `true` values
+ * and the `TrueKeys` result narrowing are unchanged) while the mapped member
+ * maps every key that is NOT a field of `T` to `never`, which makes the
+ * supplied `true` unassignable and reports the typo at the offending key.
+ *
+ * A key that IS a field of `T` maps to plain `boolean`, so every legitimate
+ * flag map (`{ id: true }`, `{ id: true, email: false }`, `{}`) is unaffected.
+ *
+ * An OPEN flag map (`Record<string, boolean>`, which is what the internal
+ * pass-through signatures instantiate `S` with) has nothing to validate: it is
+ * returned unchanged so those instantiations stay assignable to each other.
+ */
+export type FieldFlags<T, S> = S extends object
+  ? string extends keyof S
+    ? S
+    : {
+        [K in keyof S]: K extends keyof T ? boolean : never;
+      }
+  : S;
+
 /** Extract keys from a boolean record where the value is `true`. */
 type TrueKeys<S extends Record<string, boolean>> = {
   [K in keyof S]: S[K] extends true ? K : never;
@@ -465,8 +492,10 @@ export interface FindUniqueArgs<
   O extends Record<string, boolean> | undefined = undefined,
 > {
   where: WhereClause<T>;
-  select?: S;
-  omit?: O;
+  /** Only return these fields. Keys are checked against `T` (see {@link FieldFlags}). */
+  select?: S & FieldFlags<T, S>;
+  /** Exclude these fields. Keys are checked against `T` (see {@link FieldFlags}). */
+  omit?: O & FieldFlags<T, O>;
   with?: W;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
@@ -489,8 +518,10 @@ export interface FindManyArgs<
   O extends Record<string, boolean> | undefined = undefined,
 > {
   where?: WhereClause<T>;
-  select?: S;
-  omit?: O;
+  /** Only return these fields. Keys are checked against `T` (see {@link FieldFlags}). */
+  select?: S & FieldFlags<T, S>;
+  /** Exclude these fields. Keys are checked against `T` (see {@link FieldFlags}). */
+  omit?: O & FieldFlags<T, O>;
   orderBy?: OrderByClause;
   limit?: number;
   offset?: number;

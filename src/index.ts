@@ -129,6 +129,7 @@ export {
   type AggregateArgs,
   type AggregateResult,
   type ArrayFilter,
+  AUTO_TO_ONE_JOIN_MAX_ROWS,
   type ColumnRef,
   type ConnectOrCreateOp,
   type CountArgs,

@@ -7,7 +7,13 @@
 
 import { after, before, it } from 'node:test';
 import { QueryInterface, type QueryInterfaceOptions } from '../query/index.js';
-import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
+import {
+  type ColumnMetadata,
+  pgArrayType,
+  type RelationDef,
+  type SchemaMetadata,
+  type TableMetadata,
+} from '../schema.js';
 
 /** Test runners returned by {@link skipGate}. */
 export interface GatedRunners {
@@ -36,7 +42,14 @@ export function skipGate(skip: boolean, reason: string): GatedRunners {
   return { it: skippedIt, before: noop as typeof before, after: noop as typeof after };
 }
 
-/** Build a minimal ColumnMetadata for testing */
+/**
+ * Build a minimal ColumnMetadata for testing.
+ *
+ * `pgArrayType` is DERIVED from `pgType` via the same {@link pgArrayType} map
+ * introspection uses. Hardcoding it (it used to be a flat `'bigint[]'`) made
+ * every mock table claim a bigint array cast, which silently encoded whatever
+ * the real UNNEST cast happened to be into `createMany` SQL assertions.
+ */
 export function mockColumn(name: string, field: string, pgType = 'int8'): ColumnMetadata {
   return {
     name,
@@ -46,7 +59,7 @@ export function mockColumn(name: string, field: string, pgType = 'int8'): Column
     nullable: false,
     hasDefault: name === 'id',
     isArray: false,
-    pgArrayType: 'bigint[]',
+    pgArrayType: pgArrayType(pgType),
   };
 }
 

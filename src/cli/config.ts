@@ -43,10 +43,17 @@ export interface TurbineCliConfig {
   legacyToManyUniques?: boolean;
   /** Directory for migration files (default: ./turbine/migrations) */
   migrationsDir?: string;
-  /** Path to seed file. Defaults are resolved from seed.ts, seed.js, then seed.sql. */
-  seed?: string;
-  /** Path to seed file. Deprecated alias for `seed`. */
+  /**
+   * Path to the seed file (canonical key). With no value, discovery falls back
+   * to seed.ts, seed.js, seed.sql, then the same three under `turbine/`.
+   */
   seedFile?: string;
+  /**
+   * Path to the seed file. Back-compat alias for {@link TurbineCliConfig.seedFile}:
+   * older `turbine init` runs scaffolded this spelling. `seedFile` wins when both
+   * are set.
+   */
+  seed?: string;
   /** Schema builder file path (for push command) */
   schemaFile?: string;
   /**
@@ -86,7 +93,29 @@ export function looksLikeSchemaFilePath(schema: string): boolean {
 // ---------------------------------------------------------------------------
 
 const CONFIG_FILES = ['turbine.config.ts', 'turbine.config.mts', 'turbine.config.js', 'turbine.config.mjs'] as const;
-const DEFAULT_SEED_CANDIDATES = ['seed.ts', 'seed.js', 'seed.sql'] as const;
+/**
+ * Config-less fallback locations for the seed file, in priority order.
+ *
+ * Root-level candidates stay FIRST so no project that already relies on
+ * `./seed.ts` changes behavior. The `turbine/` candidates are appended so a
+ * project that drops the `seedFile` key can still auto-discover the file
+ * `turbine init` scaffolds (see {@link DEFAULT_INIT_SEED_FILE}).
+ */
+const DEFAULT_SEED_CANDIDATES = [
+  'seed.ts',
+  'seed.js',
+  'seed.sql',
+  'turbine/seed.ts',
+  'turbine/seed.js',
+  'turbine/seed.sql',
+] as const;
+
+/**
+ * Where `turbine init` scaffolds the seed file, and the `seedFile` value it
+ * writes into the generated config. Kept next to the schema file so a new
+ * project's Turbine files live in one directory.
+ */
+export const DEFAULT_INIT_SEED_FILE = './turbine/seed.ts';
 
 // ---------------------------------------------------------------------------
 // Load config
@@ -266,7 +295,9 @@ export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverri
     include: overrides.include ?? fileConfig.include ?? [],
     exclude: overrides.exclude ?? fileConfig.exclude ?? [],
     migrationsDir: fileConfig.migrationsDir ?? './turbine/migrations',
-    seedFile: fileConfig.seed ?? fileConfig.seedFile,
+    // `seedFile` is canonical (what the docs and `turbine init` use); `seed` is a
+    // back-compat alias kept working for configs scaffolded before 0.50.
+    seedFile: fileConfig.seedFile ?? fileConfig.seed,
     schemaFile: fileConfig.schemaFile ?? './turbine/schema.ts',
     importExtension: overrides.importExtension ?? fileConfig.importExtension ?? 'auto',
     keepColumnNames: overrides.keepColumnNames ?? fileConfig.keepColumnNames ?? false,
@@ -276,13 +307,15 @@ export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverri
 
 /**
  * Resolve the seed file path. An explicit config value wins even if the file
- * does not exist yet; otherwise the root-level defaults are tried in order.
+ * does not exist yet; otherwise {@link DEFAULT_SEED_CANDIDATES} is tried in
+ * order (root-level first, then the `turbine/` location `init` scaffolds).
  */
 export function resolveSeedFile(
   config: Pick<TurbineCliConfig, 'seed' | 'seedFile'>,
   cwd = process.cwd(),
 ): string | null {
-  const explicit = config.seed ?? config.seedFile;
+  // Canonical `seedFile` first, then the back-compat `seed` alias (see resolveConfig).
+  const explicit = config.seedFile ?? config.seed;
   if (explicit) return resolve(cwd, explicit);
 
   for (const candidate of DEFAULT_SEED_CANDIDATES) {
@@ -323,8 +356,8 @@ ${urlLine}
   /** Directory for SQL migration files */
   migrationsDir: './turbine/migrations',
 
-  /** Path to seed file (defaults: ./seed.ts, ./seed.js, ./seed.sql) */
-  seed: './seed.ts',
+  /** Path to seed file (defaults: ./seed.ts, ./seed.js, ./seed.sql, ./turbine/seed.ts) */
+  seedFile: '${DEFAULT_INIT_SEED_FILE}',
 
   /** Path to schema builder file (for turbine push) */
   schemaFile: './turbine/schema.ts',

@@ -633,3 +633,84 @@ describe('resultStrategy execution', () => {
     assert.deepEqual(calls[1]!.params, [42]);
   });
 });
+
+// ===========================================================================
+// openStream: the ambientTransaction option
+// ===========================================================================
+
+/**
+ * `findManyStream`'s cursor path must not open (or end) a transaction when the
+ * connection already belongs to the caller's `$transaction`. That used to be
+ * enforced by intercepting statements whose TEXT equaled `beginStatement()` /
+ * `commitStatement()` / `rollbackStatement()`, which silently missed any variant
+ * (e.g. `beginStatement('REPEATABLE READ')`). It is now a real dialect option,
+ * so these tests assert on the statements the dialect itself decides to emit.
+ */
+describe('postgresDialect.openStream: ambientTransaction', () => {
+  function recordingConnection(batches: Record<string, unknown>[][]) {
+    const statements: string[] = [];
+    let fetches = 0;
+    return {
+      statements,
+      conn: {
+        query: async (text: string) => {
+          statements.push(text);
+          if (text.startsWith('FETCH')) return { rows: batches[fetches++] ?? [] };
+          return { rows: [] };
+        },
+      },
+    };
+  }
+
+  const TX_CONTROL = /^(BEGIN|COMMIT|ROLLBACK)\b/;
+
+  it('emits no transaction control at all under an ambient transaction', async () => {
+    const { conn, statements } = recordingConnection([[{ id: 1 }], []]);
+    for await (const _batch of postgresDialect.openStream(conn, 'SELECT 1', [], 1, {
+      ambientTransaction: true,
+    })) {
+      // drain
+    }
+    assert.deepEqual(
+      statements.filter((s) => TX_CONTROL.test(s)),
+      [],
+      `no BEGIN/COMMIT/ROLLBACK of any spelling: ${statements.join(' | ')}`,
+    );
+    assert.ok(
+      statements.some((s) => s.startsWith('CLOSE ')),
+      'the cursor is still closed on the caller connection',
+    );
+  });
+
+  it('wraps the cursor in its own transaction when the option is absent', async () => {
+    const { conn, statements } = recordingConnection([[{ id: 1 }], []]);
+    for await (const _batch of postgresDialect.openStream(conn, 'SELECT 1', [], 1)) {
+      // drain
+    }
+    assert.equal(statements[0], 'BEGIN');
+    assert.ok(statements.some((s) => s.startsWith('CLOSE ')));
+    assert.equal(statements.at(-1), 'COMMIT');
+  });
+
+  it('an ambient stream that throws leaves the rollback to the caller', async () => {
+    const statements: string[] = [];
+    const conn = {
+      query: async (text: string) => {
+        statements.push(text);
+        if (text.startsWith('FETCH')) throw new Error('boom');
+        return { rows: [] as Record<string, unknown>[] };
+      },
+    };
+    await assert.rejects(async () => {
+      for await (const _batch of postgresDialect.openStream(conn, 'SELECT 1', [], 1, {
+        ambientTransaction: true,
+      })) {
+        // drain
+      }
+    }, /boom/);
+    assert.deepEqual(
+      statements.filter((s) => TX_CONTROL.test(s)),
+      [],
+    );
+  });
+});

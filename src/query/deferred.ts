@@ -163,6 +163,31 @@ export interface QueryInterfaceOptions {
    */
   stableRelationOrder?: boolean;
   /**
+   * When `true`, a `findMany` that paginates (`limit` / `take` / `offset`) but
+   * declares no `orderBy` is ordered by the table's primary key ascending
+   * (every column of a composite PK, in declaration order), making its pages
+   * deterministic. An explicit `orderBy` always wins, PK-less tables are left
+   * alone, and `distinct` / `cursor` shapes are skipped.
+   *
+   * Default `false` in core: an unordered `LIMIT` is non-deterministic, but
+   * adding an `ORDER BY` to SQL that existing applications already emit changes
+   * both the rows a page returns and the plan the engine picks, so the fix is
+   * opt-in until a major. `turbine-orm/prisma-compat` defaults it ON, since
+   * matching Prisma's semantics is that layer's contract. When off, the emitted
+   * SQL is byte-identical to before.
+   */
+  implicitPkOrdering?: boolean;
+  /**
+   * Parent-row ceiling for the `relationLoadStrategy: 'auto'` to-one rule: a
+   * to-one relation stays in the single-statement join when the query's `limit`
+   * bounds the parent set at or under this many rows, and loads batched when the
+   * query is unbounded or bounded above it (a correlated to-one subquery is
+   * re-evaluated per parent row regardless of indexing). Defaults to
+   * `AUTO_TO_ONE_JOIN_MAX_ROWS` (1000); `0` sends every unbounded-or-limited
+   * to-one relation batched. Ignored under an explicit `'join'` / `'batched'`.
+   */
+  autoToOneJoinMaxRows?: number;
+  /**
    * How nested-relation subqueries encode each row's JSON: `'object'` (default,
    * `json_build_object`) or `'positional'` (`json_build_array`, key-less — see
    * {@link Dialect.buildJsonArray}). Positional is Postgres-only in v1; a

@@ -488,6 +488,62 @@ describe('Studio demo: the builder refuses PII predicates', () => {
     assert.equal(rows[0]?.email, PII_REDACTED);
   });
 
+  // A relation predicate normally arrives WRAPPED: `{ user: { is: {...} } }`.
+  // The guard used to hand that wrapper to the column walker, which saw only the
+  // key `is`, found no PII column, and let the query run. Against the seeded
+  // store that answered `startsWith: 'ada'` with 5 rows and `startsWith: 'zzz'`
+  // with 0: a binary oracle that reads a redacted email one character at a time.
+  for (const wrapper of ['some', 'none', 'every', 'is', 'isNot']) {
+    it(`refuses a PII predicate wrapped in \`${wrapper}\` on a relation`, async () => {
+      const ctx = makeDemoCtx();
+      const r = await dispatch(ctx, {
+        method: 'POST',
+        url: '/api/builder',
+        headers: authHeaders(),
+        body: { table: 'comments', args: { where: { user: { [wrapper]: { email: { startsWith: 'ada' } } } } } },
+      });
+      assert.equal(r.status, 400, r.body);
+      assert.match((r.json as { error: string }).error, /PII-tagged and redacted/);
+    });
+
+    it(`refuses a \`${wrapper}\`-wrapped PII predicate one level down in a with clause`, async () => {
+      const ctx = makeDemoCtx();
+      const r = await dispatch(ctx, {
+        method: 'POST',
+        url: '/api/builder',
+        headers: authHeaders(),
+        body: {
+          table: 'posts',
+          args: { with: { comments: { where: { user: { [wrapper]: { email: { startsWith: 'ada' } } } } } } },
+        },
+      });
+      assert.equal(r.status, 400, r.body);
+      assert.match((r.json as { error: string }).error, /PII-tagged and redacted/);
+    });
+  }
+
+  it('still runs a wrapped relation filter that touches no PII column', async () => {
+    const ctx = makeDemoCtx();
+    const r = await dispatch(ctx, {
+      method: 'POST',
+      url: '/api/builder',
+      headers: authHeaders(),
+      body: { table: 'users', args: { where: { posts: { some: { published: true } } }, limit: 3 } },
+    });
+    assert.equal(r.status, 200, r.body);
+  });
+
+  it('allows the wrapped PII predicate once --show-pii is on', async () => {
+    const ctx = { ...makeDemoCtx(), showPii: true };
+    const r = await dispatch(ctx, {
+      method: 'POST',
+      url: '/api/builder',
+      headers: authHeaders(),
+      body: { table: 'comments', args: { where: { user: { is: { email: { startsWith: 'ada' } } } } } },
+    });
+    assert.equal(r.status, 200, r.body);
+  });
+
   it('allows the same predicates once --show-pii is on', async () => {
     const ctx = { ...makeDemoCtx(), showPii: true };
     const r = await dispatch(ctx, {
@@ -495,6 +551,107 @@ describe('Studio demo: the builder refuses PII predicates', () => {
       url: '/api/builder',
       headers: authHeaders(),
       body: { table: 'users', args: { where: { email: { contains: '@' } }, limit: 1 } },
+    });
+    assert.equal(r.status, 200, r.body);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The rest of the predicate surface, against the real seeded store
+// ---------------------------------------------------------------------------
+
+describe('Studio demo: the builder refuses cursor / distinct / array-orderBy oracles', () => {
+  async function build(ctx: StudioContext, table: string, args: unknown): Promise<RecordedResponse> {
+    return dispatch(ctx, { method: 'POST', url: '/api/builder', headers: authHeaders(), body: { table, args } });
+  }
+
+  // A cursor is a WHERE range comparison (`"email" > $1`) against the seek key.
+  // Paired with a non-PII sort key it slipped past a guard that inspected only
+  // `where` and `orderBy`: the rows come back redacted, but the row COUNT moves
+  // with the probe, so a byte-range binary search reads the hidden email out.
+  for (const column of ['email', 'phone']) {
+    it(`refuses a cursor on users.${column} paired with a non-PII sort key`, async () => {
+      const ctx = makeDemoCtx();
+      const r = await build(ctx, 'users', { orderBy: { id: 'asc' }, cursor: { [column]: 'a' }, take: 100 });
+      assert.equal(r.status, 400, r.body);
+      assert.match((r.json as { error: string }).error, /PII-tagged and redacted/);
+    });
+
+    it(`refuses distinct on users.${column}`, async () => {
+      const ctx = makeDemoCtx();
+      const r = await build(ctx, 'users', { distinct: [column], limit: 5 });
+      assert.equal(r.status, 400, r.body);
+      assert.match((r.json as { error: string }).error, /PII-tagged and redacted/);
+    });
+
+    it(`refuses the array form of orderBy on users.${column}`, async () => {
+      const ctx = makeDemoCtx();
+      const r = await build(ctx, 'users', { orderBy: [{ id: 'asc' }, { [column]: 'asc' }], limit: 5 });
+      assert.equal(r.status, 400, r.body);
+      assert.match((r.json as { error: string }).error, /PII-tagged and redacted/);
+    });
+  }
+
+  it('allows a cursor on a non-PII column and pages the real store', async () => {
+    const ctx = makeDemoCtx();
+    const r = await build(ctx, 'users', { orderBy: { id: 'asc' }, cursor: { id: 3 }, take: 2 });
+    assert.equal(r.status, 200, r.body);
+    const rows = (r.json as { rows: Array<{ id: number }> }).rows;
+    assert.deepEqual(
+      rows.map((row) => row.id),
+      [4, 5],
+      'the cursor really did seek past id 3',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The depth cap fails closed against the real store
+// ---------------------------------------------------------------------------
+
+describe('Studio demo: the PII guard depth cap fails closed', () => {
+  /** `NOT` wrapped `times` deep around `leaf`. */
+  function nest(times: number, leaf: Record<string, unknown>): Record<string, unknown> {
+    let node: Record<string, unknown> = leaf;
+    for (let i = 0; i < times; i++) node = { NOT: node };
+    return node;
+  }
+
+  async function build(ctx: StudioContext, table: string, args: unknown): Promise<RecordedResponse> {
+    return dispatch(ctx, { method: 'POST', url: '/api/builder', headers: authHeaders(), body: { table, args } });
+  }
+
+  // Depth 10 was refused and depth 11 was not: the guard returned quietly at its
+  // own cap while the builder applied none, so padding the payload handed the
+  // predicate straight through against the real seeded rows.
+  for (const depth of [10, 11, 12, 64]) {
+    it(`refuses a PII predicate padded with ${depth} NOT wrappers`, async () => {
+      const ctx = makeDemoCtx();
+      const r = await build(ctx, 'users', { where: nest(depth, { email: { startsWith: 'a' } }), limit: 100 });
+      assert.equal(r.status, 400, r.body);
+      assert.match((r.json as { error: string }).error, /PII-tagged and redacted|nested more than/);
+    });
+  }
+
+  it('refuses a PII predicate reached through many relation hops', async () => {
+    const ctx = makeDemoCtx();
+    // users -> posts -> comments -> user -> ... -> email
+    let leaf: Record<string, unknown> = { email: { startsWith: 'ada' } };
+    for (let hop = 0; hop < 3; hop++) {
+      leaf = { posts: { some: { comments: { some: { user: { is: leaf } } } } } };
+    }
+    const r = await build(ctx, 'users', { where: leaf, limit: 100 });
+    assert.equal(r.status, 400, r.body);
+    assert.match((r.json as { error: string }).error, /PII-tagged and redacted|nested more than/);
+  });
+
+  it('still runs a normal two-level query against the real store', async () => {
+    const ctx = makeDemoCtx();
+    const r = await build(ctx, 'users', {
+      where: { OR: [{ role: 'admin' }, { name: { contains: 'a' } }] },
+      orderBy: { id: 'asc' },
+      with: { posts: { where: { published: true }, orderBy: { id: 'desc' }, limit: 2 } },
+      limit: 3,
     });
     assert.equal(r.status, 200, r.body);
   });
@@ -595,7 +752,7 @@ describe('Studio demo: /api/demo/mode switcher', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Saved queries: in-memory only — "nothing you do here is saved anywhere"
+// Saved queries: in-memory only: "nothing you do here is saved anywhere"
 // ---------------------------------------------------------------------------
 
 describe('Studio demo: saved queries stay in memory', () => {

@@ -12,7 +12,7 @@
  */
 
 import type pg from 'pg';
-import type { Dialect } from '../dialect.js';
+import type { Dialect, StreamableConnection } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
 import { NotFoundError, TimeoutError, UnsupportedFeatureError, ValidationError, wrapPgError } from '../errors.js';
 import { missingIndexForRelation, schemaHasIndexInfo } from '../index-advisor.js';
@@ -126,6 +126,46 @@ function cacheCrossCheckMode(): 'dev' | 'sampled' | 'off' {
  * so this set is only ever touched on the `'sampled'` path.
  */
 const loggedCacheMismatchFingerprints = new Set<string>();
+
+/**
+ * Default parent-row ceiling for the `'auto'` to-one cardinality rule.
+ *
+ * A to-one relation compiled into the join plan is a CORRELATED subquery: the
+ * engine evaluates it once per parent row, so its cost scales with the parent
+ * set size, and an index on the correlation column says nothing about how many
+ * parent rows the query returns. Measured on a real dataset (`orderItem`
+ * findMany with a nested to-one include, every FK indexed), the single-statement
+ * join was 1.39x / 0.84x against a reference client on 9,206- and 7,919-row
+ * result sets, while the batched loader (one flat follow-up per relation) was
+ * 2.18x / 2.63x on the same data. Below roughly a thousand parent rows the extra
+ * round-trip dominates and the join plan wins, so `'auto'` keeps the join for a
+ * query whose `limit` bounds the parent set at or under this value, and prefers
+ * batched when the query is unbounded or bounded above it.
+ *
+ * This is a HEURISTIC: the real parent count is unknown until the base query
+ * runs, and `limit` is the only bound available at plan time. Tune it with
+ * `autoToOneJoinMaxRows`, or pin the plan with an explicit
+ * `relationLoadStrategy`.
+ */
+export const AUTO_TO_ONE_JOIN_MAX_ROWS = 1000;
+
+/** One relation that `'auto'` moved off the join plan, with the reason (dev note). */
+interface AutoEngaged {
+  relation: string;
+  /**
+   * `'unindexed'`: a probe in the subtree has no covering index.
+   * `'to-one-cardinality'`: a to-one relation on a potentially large parent set.
+   */
+  reason: 'unindexed' | 'to-one-cardinality';
+  miss?: { table: string; columns: string[]; createSql: string };
+}
+
+/** The `'auto'` per-relation partition of one `with` clause. */
+interface AutoSplit {
+  joinWith: WithClause;
+  batchedWith: WithClause;
+  engaged: AutoEngaged[];
+}
 
 /**
  * Strict structural equality for a single SQL parameter value. Handles the
@@ -275,6 +315,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly relationLoadStrategy: RelationLoadStrategy;
   /** Client-level default for {@link applyStableRelationOrder} (off unless configured). */
   private readonly stableRelationOrder: boolean;
+  /**
+   * Client-level opt-in: apply an implicit primary-key ascending `ORDER BY` to a
+   * `findMany` that paginates (`limit`/`take`/`offset`) but declares no
+   * `orderBy`. OFF by default in core, see {@link applyImplicitPkOrdering}.
+   */
+  private readonly implicitPkOrdering: boolean;
+  /**
+   * Parent-row ceiling under which `'auto'` still considers a to-one relation
+   * cheap enough for the single-statement join plan. See
+   * {@link AUTO_TO_ONE_JOIN_MAX_ROWS}.
+   */
+  private readonly autoToOneJoinMaxRows: number;
   /** Nested-relation JSON encoding: 'object' (default) or 'positional'. */
   private readonly jsonEncoding: 'object' | 'positional';
   /**
@@ -415,6 +467,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.dialect = options?.dialect ?? postgresDialect;
     this.relationLoadStrategy = options?.relationLoadStrategy ?? 'auto';
     this.stableRelationOrder = options?.stableRelationOrder === true;
+    this.implicitPkOrdering = options?.implicitPkOrdering === true;
+    const autoToOne = options?.autoToOneJoinMaxRows;
+    this.autoToOneJoinMaxRows =
+      autoToOne !== undefined && Number.isFinite(autoToOne) && autoToOne >= 0
+        ? Math.floor(autoToOne)
+        : AUTO_TO_ONE_JOIN_MAX_ROWS;
     this.jsonEncoding = options?.jsonEncoding ?? 'object';
     // Only retain the map when it has at least one entry, so `globalFilters`
     // stays `undefined` (and every merge path a no-op) for the common case.
@@ -485,7 +543,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       camelDateFieldCache: this.camelDateFieldCache,
       limitOneClause: () => this.limitOneClause(),
       buildPagination: (limitPh, offsetPh, hasOrderBy) => this.buildPagination(limitPh, offsetPh, hasOrderBy),
-      paginationRef: (value, params) => this.paginationRef(value, params),
+      paginationRef: (value: unknown, params: unknown[], arg: string) => this.paginationRef(value, params, arg),
+      paginationValue: (value: unknown, arg: string) => this.paginationValue(value, arg),
     };
   }
 
@@ -541,18 +600,35 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Coerce a LIMIT/OFFSET argument and validate it as a non-negative safe
+   * integer. Numeric strings (`'5'`) coerce; everything else (`NaN`, a
+   * non-numeric string, a negative, a fractional or out-of-safe-range number)
+   * throws {@link ValidationError} (E003) naming the argument and the table.
+   *
+   * This runs on EVERY pagination path, parameterized as well as inlined: a
+   * bound `NaN` serializes as SQL NULL, and Postgres reads `LIMIT NULL` as
+   * "no limit", so an unvalidated value silently turns a paginated query into
+   * a full-table read (and a bad OFFSET silently disappears).
+   */
+  private paginationValue(value: unknown, arg: string): number {
+    const n = Number(value);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new ValidationError(
+        `[turbine] ${arg} on "${this.table}" must be a non-negative integer, received: ${String(value)}`,
+      );
+    }
+    return n;
+  }
+
+  /**
    * Validate a LIMIT/OFFSET value as a non-negative integer and return it as an
    * inline SQL literal. Used only on `dialect.inlineLimitOffset` engines (MySQL).
    * The input is always a Turbine-controlled pagination value, never a raw user
-   * string — and this guard guarantees the output is `String` of a validated
+   * string, and this guard guarantees the output is `String` of a validated
    * integer, so inlining cannot inject SQL.
    */
-  private limitOffsetLiteral(value: unknown): string {
-    const n = Number(value);
-    if (!Number.isInteger(n) || n < 0) {
-      throw new ValidationError(`LIMIT/OFFSET must be a non-negative integer, received: ${String(value)}`);
-    }
-    return String(n);
+  private limitOffsetLiteral(value: unknown, arg: string): string {
+    return String(this.paginationValue(value, arg));
   }
 
   /**
@@ -562,11 +638,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * the param order stays mirrored; PG/SQLite/SQL Server keep parameterizing and
    * stay byte-identical.
    */
-  private paginationRef(value: unknown, params: unknown[]): string {
+  private paginationRef(value: unknown, params: unknown[], arg: string): string {
     if (this.dialect.inlineLimitOffset) {
-      return this.limitOffsetLiteral(value);
+      return this.limitOffsetLiteral(value, arg);
     }
-    params.push(Number(value));
+    params.push(this.paginationValue(value, arg));
     return this.p(params.length);
   }
 
@@ -654,6 +730,197 @@ export class QueryInterface<T extends object, R extends object = {}> {
       out[relName] = clonedSpec;
     }
     return out ?? withClause;
+  }
+
+  // -------------------------------------------------------------------------
+  // Deterministic pagination (unordered LIMIT/OFFSET)
+  // -------------------------------------------------------------------------
+
+  /**
+   * The primary key of this table as an ascending `orderBy`, in DECLARATION
+   * order (a composite PK orders on every column), or `undefined` for a PK-less
+   * table. Field names are the camelCase accessor names, so the emitted SQL goes
+   * through the normal column mapping.
+   */
+  private pkOrderBy(): WithOrderByObject | WithOrderByObject[] | undefined {
+    const pk = this.tableMeta.primaryKey ?? [];
+    if (pk.length === 0) return undefined;
+    const fields = pk.map((c) => this.tableMeta.reverseColumnMap[c] ?? c);
+    return fields.length === 1 ? { [fields[0]!]: 'asc' } : fields.map((f) => ({ [f]: 'asc' as const }));
+  }
+
+  /**
+   * The field names a `cursor` actually seeks on (its own keys with a defined
+   * value), in the canonical sorted order the cursor conditions are built in.
+   * Empty for a missing cursor or one whose every value is `undefined` (which
+   * emits no seek condition at all, so it does not paginate).
+   */
+  private cursorFields(cursor: unknown): string[] {
+    if (!cursor || typeof cursor !== 'object') return [];
+    return Object.entries(cursor as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .map(([k]) => k)
+      .sort();
+  }
+
+  /**
+   * The ascending ordering implied by a `cursor`, or `undefined` when the shape
+   * is too ambiguous to order safely.
+   *
+   * A cursor seek emits `col > $n` per field (`<` when the orderBy says desc),
+   * so the ONLY ordering coherent with it is on the cursor's own field: ordering
+   * a seek on column X by column Y walks the table in an order the seek does not
+   * follow, which skips and repeats rows just as badly as no order at all. That
+   * is why this orders on the cursor field rather than blindly on the primary
+   * key when the two differ.
+   *
+   * Returns `undefined` (warn, inject nothing) for two shapes:
+   *  - a MULTI-field cursor. `a > $1 AND b > $2` is a conjunction, not a proper
+   *    composite keyset seek (`(a, b) > ($1, $2)`), so no single ORDER BY makes
+   *    it correct. Injecting `(a asc, b asc)` would dress a broken seek up as a
+   *    sound one.
+   *  - a field that does not resolve to a real column. Column validation belongs
+   *    to the normal build path, which raises a precise error; synthesizing an
+   *    ORDER BY on it here would only change which error the caller sees.
+   */
+  private cursorOrderBy(cursor: unknown): WithOrderByObject | undefined {
+    const fields = this.cursorFields(cursor);
+    if (fields.length !== 1) return undefined;
+    const field = fields[0]!;
+    try {
+      this.toColumn(field);
+    } catch {
+      return undefined;
+    }
+    return { [field]: 'asc' };
+  }
+
+  /**
+   * Whether a findMany paginates (`limit` / `take` / `offset` / `cursor`) but
+   * declares no ordering, which makes the returned page NON-DETERMINISTIC:
+   * Postgres is free to return different rows for the same unordered `LIMIT`
+   * once the heap changes underneath it, so a row can appear on two pages or on
+   * none.
+   *
+   * `cursor` counts, and is the worst case rather than an exception: a keyset
+   * seek with no ORDER BY is exactly this bug (`WHERE id > $1 LIMIT $2` walks
+   * the heap in whatever order the plan happens to produce). An empty orderBy
+   * (`[]`, or an object whose every value is `undefined`) counts as absent,
+   * because it emits no ordering.
+   *
+   * `distinct` is still excluded: that path re-orders in an outer wrapper around
+   * a `DISTINCT ON` whose ordering picks the representative row, so an implicit
+   * key would change which rows come back, not just their order.
+   */
+  private isUnorderedPage(args?: {
+    limit?: number;
+    take?: number;
+    offset?: number;
+    cursor?: unknown;
+    orderBy?: unknown;
+    distinct?: unknown;
+  }): boolean {
+    if (!args) return false;
+    if (args.distinct !== undefined) return false;
+    if (!isEmptyOrderBy(args.orderBy)) return false;
+    if (args.limit !== undefined || args.take !== undefined || args.offset !== undefined) return true;
+    return this.cursorFields(args.cursor).length > 0;
+  }
+
+  /**
+   * Opt-in (`implicitPkOrdering`) primary-key ascending ordering for a paginating
+   * findMany that declares no `orderBy`, making its pages deterministic.
+   *
+   * OFF by default in CORE, deliberately: turning it on would add an `ORDER BY`
+   * to SQL that existing applications already emit, changing both the rows a
+   * given page returns and the plan the engine picks. That is a breaking change
+   * in everything but the type signature, so it waits for a major. The
+   * `turbine-orm/prisma-compat` layer defaults it ON instead, because reproducing
+   * Prisma's semantics is that layer's whole contract.
+   *
+   * An explicit `orderBy` always wins, a PK-less table is left alone (nothing
+   * stable to order by), and a composite PK orders on every column in
+   * declaration order. A `cursor` query orders on the CURSOR's field instead
+   * (see {@link cursorOrderBy}), and is left alone when that shape is ambiguous.
+   * `distinct` shapes are skipped (see {@link isUnorderedPage}). With the flag
+   * off this returns `undefined` before touching anything, so the emitted SQL is
+   * byte-identical to before.
+   */
+  private implicitPkOrderBy(args?: {
+    limit?: number;
+    take?: number;
+    offset?: number;
+    cursor?: unknown;
+    orderBy?: unknown;
+    distinct?: unknown;
+  }): WithOrderByObject | WithOrderByObject[] | undefined {
+    if (!this.implicitPkOrdering) return undefined;
+    if (!this.isUnorderedPage(args)) return undefined;
+    if (this.cursorFields(args?.cursor).length > 0) return this.cursorOrderBy(args?.cursor);
+    return this.pkOrderBy();
+  }
+
+  /**
+   * Dev-only, once per query shape: an unordered paginating findMany returns a
+   * non-deterministic page (see {@link isUnorderedPage}), and on real data it is
+   * also usually the slower plan (an unordered `LIMIT` can discard tens of
+   * thousands of heap rows that an index scan on the key would have skipped).
+   *
+   * Gated exactly like the other dev diagnostics (silent under
+   * `NODE_ENV=production`) and consistent with `warnOnUnlimited`: a per-call
+   * `warnOnUnlimited: false` silences it, `true` forces it past a config-level
+   * opt-out, and a config/per-table `warnOnUnlimited: false` silences it. Deduped
+   * process-wide through the shared warn registry, so it can never spam.
+   *
+   * Suppressed only when `implicitPkOrdering` will ACTUALLY order this query.
+   * The flag being on is not enough: a PK-less table and an ambiguous
+   * multi-field cursor both get no injected ordering, and those are precisely
+   * the shapes that still need saying out loud.
+   */
+  private maybeWarnUnorderedPage(args?: {
+    limit?: number;
+    take?: number;
+    offset?: number;
+    cursor?: unknown;
+    orderBy?: unknown;
+    distinct?: unknown;
+    warnOnUnlimited?: boolean;
+  }): void {
+    if (process.env.NODE_ENV === 'production') return;
+    if (this.implicitPkOrdering && this.implicitPkOrderBy(args) !== undefined) return;
+    const perCall = args?.warnOnUnlimited;
+    if (perCall === false) return;
+    if (perCall === undefined && !this.warnOnUnlimited) return;
+    if (!this.isUnorderedPage(args)) return;
+    const cursorFields = this.cursorFields(args?.cursor);
+    const shape = [
+      cursorFields.length > 0 ? 'cursor' : '',
+      args?.limit !== undefined ? 'limit' : '',
+      args?.take !== undefined ? 'take' : '',
+      args?.offset !== undefined ? 'offset' : '',
+    ]
+      .filter(Boolean)
+      .join('+');
+    if (!shouldWarnOnce(WARN_NS.unorderedPage, `${this.table}|${shape}`)) return;
+    const asOrderBy = (fields: string[]) =>
+      fields.length === 1 ? `{ ${fields[0]}: 'asc' }` : `[${fields.map((f) => `{ ${f}: 'asc' }`).join(', ')}]`;
+    const pk = (this.tableMeta.primaryKey ?? []).map((c) => this.tableMeta.reverseColumnMap[c] ?? c);
+    // A cursor seeks on its own field, so that is the ordering to recommend:
+    // the primary key would be the wrong advice whenever the two differ.
+    const orderFields = cursorFields.length > 0 ? cursorFields : pk;
+    const suggestion =
+      orderFields.length > 0 ? `Add \`orderBy: ${asOrderBy(orderFields)}\`` : 'Add an `orderBy` on a unique column';
+    const seek =
+      cursorFields.length > 0
+        ? 'a `cursor` seek with no orderBy compares against rows the engine is free to return in any order, so ' +
+          'paging with it skips and repeats rows: '
+        : '';
+    console.warn(
+      `[turbine] findMany on "${this.table}" paginates (${shape}) with no orderBy: ${seek}the page is NOT ` +
+        'deterministic (the same query can return different rows as the table changes, so a row may appear ' +
+        `on two pages or on none). ${suggestion}, or set \`implicitPkOrdering: true\` in the client config ` +
+        'to order paginated queries automatically (by the cursor field, or by the primary key).',
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -750,27 +1017,46 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * Partition a top-level `with` clause under `'auto'`: each relation whose
-   * subtree has a PROVEN unindexed probe AND is fully batched-eligible routes to
-   * `batchedWith`; everything else (indexed, composite-key, unknown) stays in
-   * `joinWith` (byte-identical join). The reserved `_count` key partitions the
-   * same way. Also returns the engaged relations for the dev note.
+   * Whether a query's parent set is potentially large at plan time, which is the
+   * only cardinality signal available before the base query runs. A `findMany`
+   * with no `limit`/`take` (or one above {@link autoToOneJoinMaxRows}) can return
+   * an arbitrary number of parent rows; a small `limit` bounds it. `findUnique` /
+   * `findFirst` pass `false` explicitly (their parent set is one row).
    */
-  private partitionWithForAuto(withClause: WithClause): {
-    joinWith: WithClause;
-    batchedWith: WithClause;
-    engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[];
-  } {
+  private autoParentSetLarge(args?: { limit?: number; take?: number }): boolean {
+    const limit = args?.take ?? args?.limit ?? this.defaultLimit;
+    return limit === undefined || limit > this.autoToOneJoinMaxRows;
+  }
+
+  /**
+   * Partition a top-level `with` clause under `'auto'`. A relation routes to
+   * `batchedWith` when it is fully batched-eligible AND either
+   *
+   *   1. its subtree has a PROVEN unindexed probe (index metadata only), or
+   *   2. it is TO-ONE and the parent set is potentially large
+   *      ({@link AUTO_TO_ONE_JOIN_MAX_ROWS}), since a correlated to-one subquery
+   *      is re-evaluated per parent row no matter how well indexed it is.
+   *
+   * Everything else (indexed to-many, composite-key, unknown) stays in `joinWith`
+   * (byte-identical join). The reserved `_count` key falls back on rule 1 only,
+   * and only for a large parent set: an inline `_count` is one correlated
+   * `COUNT(*)` per parent row, so the grouped follow-up wins exactly when there
+   * are many parents, while for a handful of parents the extra round-trip costs
+   * more than the repeated (small) scans. Also returns the engaged relations for
+   * the dev note.
+   */
+  private partitionWithForAuto(withClause: WithClause, parentSetLarge: boolean): AutoSplit {
+    const hasIndexInfo = schemaHasIndexInfo(this.schema);
     const joinWith: WithClause = {};
     const batchedWith: WithClause = {};
-    const engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[] = [];
+    const engaged: AutoEngaged[] = [];
     for (const [key, spec] of Object.entries(withClause)) {
       if (!spec) continue;
       if (key === '_count') {
         const cv = this.autoCountVerdict(spec as unknown as WithCount, this.tableMeta);
-        if (cv.unindexed && cv.eligible) {
+        if (hasIndexInfo && parentSetLarge && cv.unindexed && cv.eligible) {
           batchedWith[key] = spec;
-          engaged.push({ relation: '_count', miss: cv.miss });
+          engaged.push({ relation: '_count', reason: 'unindexed', miss: cv.miss });
         } else {
           joinWith[key] = spec;
         }
@@ -782,9 +1068,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
         continue;
       }
       const v = this.autoSubtreeVerdict(rel, spec, 0);
-      if (v.unindexed && v.eligible) {
+      const unindexedFallback = hasIndexInfo && v.unindexed;
+      const toOne = rel.type === 'belongsTo' || rel.type === 'hasOne';
+      const cardinalityFallback = toOne && parentSetLarge;
+      if (v.eligible && (unindexedFallback || cardinalityFallback)) {
         batchedWith[key] = spec;
-        engaged.push({ relation: key, miss: v.miss });
+        engaged.push({
+          relation: key,
+          reason: unindexedFallback ? 'unindexed' : 'to-one-cardinality',
+          miss: unindexedFallback ? v.miss : undefined,
+        });
       } else {
         joinWith[key] = spec;
       }
@@ -796,34 +1089,35 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Plan the `'auto'` split for a query's `with` clause: normalize stable order,
    * partition, and return the split ONLY when at least one relation falls back
    * to batched. Returns `null` (→ run the plain join path, byte-identical, same
-   * cache keys) when there is no DB-backed index metadata or nothing qualifies.
+   * cache keys) when nothing qualifies.
    */
-  private planAuto(
-    withArg: WithClause,
-    stableFlag: boolean | undefined,
-  ): {
-    joinWith: WithClause;
-    batchedWith: WithClause;
-    engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[];
-  } | null {
-    // No DB-backed index info (code-first / defineSchema-only) → cannot PROVE any
-    // probe is unindexed, so 'auto' behaves exactly like 'join'.
-    if (!schemaHasIndexInfo(this.schema)) return null;
+  private planAuto(withArg: WithClause, stableFlag: boolean | undefined, parentSetLarge: boolean): AutoSplit | null {
+    // Without DB-backed index info (code-first / defineSchema-only) no probe can
+    // be PROVEN unindexed; the to-one cardinality rule does not depend on index
+    // metadata, so it still applies.
+    if (!schemaHasIndexInfo(this.schema) && !parentSetLarge) return null;
     const withClause = this.resolveStableOrder(stableFlag)
       ? this.applyStableRelationOrder(withArg, this.table)
       : withArg;
-    const split = this.partitionWithForAuto(withClause);
+    const split = this.partitionWithForAuto(withClause, parentSetLarge);
     if (Object.keys(split.batchedWith).length === 0) return null;
     return split;
   }
 
   /** Dev-only once-per-relation note that `'auto'` engaged the batched fallback. */
-  private emitAutoNotes(
-    engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[],
-  ): void {
+  private emitAutoNotes(engaged: AutoEngaged[]): void {
     if (process.env.NODE_ENV === 'production') return;
     for (const e of engaged) {
       if (!shouldWarnOnce(WARN_NS.autoStrategy, `${this.table}.${e.relation}`)) continue;
+      if (e.reason === 'to-one-cardinality') {
+        console.warn(
+          `[turbine] auto strategy: to-one relation "${e.relation}" on "${this.table}" loads batched ` +
+            `(the query is unbounded or its limit exceeds ${this.autoToOneJoinMaxRows} rows, and a correlated ` +
+            'to-one subquery is re-evaluated per parent row). Bound the query with a smaller `limit`, tune ' +
+            "`autoToOneJoinMaxRows`, or set `relationLoadStrategy: 'join'` to force the single-statement plan.",
+        );
+        continue;
+      }
       const probe = e.miss
         ? `probe "${e.miss.table}"(${e.miss.columns.join(', ')}) has no covering index`
         : 'a probe in its subtree has no covering index';
@@ -844,11 +1138,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private async runAutoSplit(
     args: FindManyArgs<T> | FindUniqueArgs<T>,
-    split: {
-      joinWith: WithClause;
-      batchedWith: WithClause;
-      engaged: { relation: string; miss?: { table: string; columns: string[]; createSql: string } }[];
-    },
+    split: AutoSplit,
     single: boolean,
   ): Promise<Record<string, unknown>[] | Record<string, unknown> | null> {
     this.emitAutoNotes(split.engaged);
@@ -1346,7 +1636,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
         if (strategy === 'batched') return this.runFindUniqueBatched(args as unknown as FindUniqueArgs<T>);
         if (strategy === 'auto') {
-          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder);
+          // findUnique's parent set is a single row: the join plan's correlated
+          // subqueries run once, so the cardinality rule never applies here.
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false);
           if (split) return this.runAutoSplit(args as unknown as FindUniqueArgs<T>, split, true);
         }
       }
@@ -1546,6 +1838,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>[]> {
     this.maybeWarnUnlimited(args);
+    this.maybeWarnUnorderedPage(args);
 
     // Dev-only: warn on deeply nested with clauses
     if (process.env.NODE_ENV !== 'production') {
@@ -1565,7 +1858,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
         if (strategy === 'batched') return this.runFindManyBatched(args as unknown as FindManyArgs<T>);
         if (strategy === 'auto') {
-          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder);
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, this.autoParentSetLarge(args));
           if (split) return this.runAutoSplit(args as unknown as FindManyArgs<T>, split, false) as Promise<T[]>;
         }
       }
@@ -1699,6 +1992,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const normalized = this.applyStableRelationOrder(args.with as WithClause, this.table);
       if (normalized !== args.with) args = { ...args, with: normalized as typeof args.with };
     }
+    // An empty orderBy carries no ordering, so treat it as ABSENT rather than
+    // emitting a bare `ORDER BY` with nothing after it (a syntax error at the
+    // following LIMIT). This matters most for the documented escape hatch from
+    // implicit ordering, "pass an explicit orderBy": callers who assemble that
+    // array conditionally end up passing `[]`. Normalized here, before the
+    // implicit-ordering and fingerprinting steps, so every downstream path sees
+    // one shape.
+    if (args?.orderBy !== undefined && isEmptyOrderBy(args.orderBy)) {
+      args = { ...args, orderBy: undefined };
+    }
+    // Deterministic pagination (opt-in): fill a PK-asc orderBy into a paginating
+    // query that declares none, BEFORE fingerprinting so the ordered and
+    // unordered shapes get distinct cache entries. No-op unless
+    // `implicitPkOrdering` is enabled (see implicitPkOrderBy).
+    const implicitOrder = this.implicitPkOrderBy(args);
+    if (implicitOrder) args = { ...args, orderBy: implicitOrder as NonNullable<typeof args>['orderBy'] };
     // `distinct` + relation orderBy is refused up front (E003): the distinct
     // path re-orders in an outer wrapper (`... AS "<table>_distinct" ORDER BY
     // <userOrder>`) where a correlated relation subquery (pick-row, `_count`,
@@ -1872,10 +2181,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
       let limitPh: string | undefined;
       let offsetPh: string | undefined;
       if (effectiveLimit !== undefined) {
-        limitPh = this.paginationRef(effectiveLimit, freshParams);
+        limitPh = this.paginationRef(effectiveLimit, freshParams, 'limit');
       }
       if (args?.offset !== undefined) {
-        offsetPh = this.paginationRef(args.offset, freshParams);
+        offsetPh = this.paginationRef(args.offset, freshParams, 'skip/offset');
       }
       sql += this.buildPagination(limitPh, offsetPh, !!args?.orderBy);
 
@@ -1907,11 +2216,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // 5. LIMIT param — skipped when the dialect inlines pagination (build path
     //    mirrors via paginationRef → no placeholder, no param).
     if (effectiveLimit !== undefined && !this.dialect.inlineLimitOffset) {
-      params.push(Number(effectiveLimit));
+      // Validate here too: on a cache HIT the build path never runs, and a
+      // warmed template would otherwise bind an unvalidated NaN (= SQL NULL,
+      // i.e. no limit at all).
+      params.push(this.paginationValue(effectiveLimit, 'limit'));
     }
     // 6. OFFSET param — same inline gate as LIMIT above.
     if (args?.offset !== undefined && !this.dialect.inlineLimitOffset) {
-      params.push(Number(args.offset));
+      params.push(this.paginationValue(args.offset, 'skip/offset'));
     }
     this.crossCheckCache('findMany', ck, entry, buildSql, params);
 
@@ -1943,14 +2255,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * method fall back to the full cursor path.
    *
    * **Cursor path:** Uses DECLARE CURSOR within a dedicated transaction on a
-   * single pooled connection. The cursor is automatically closed and the
-   * connection released when iteration completes or is terminated early
-   * (e.g. `break` from `for await`).
+   * single pooled connection. The cursor is CLOSEd (in the dialect's `finally`)
+   * and the connection released both when iteration completes normally and when
+   * it ends early (`break` from `for await`). An error mid-stream skips the
+   * CLOSE and rolls back instead, which drops the cursor with the transaction.
    *
-   * **Snapshot semantics note:** The speculative fast-path runs outside a
-   * transaction. If the result overflows and the cursor path is opened, the
-   * cursor runs in its own transaction — spanning two separate snapshots.
-   * For strict single-snapshot semantics, wrap the call in `$transaction`.
+   * **Snapshot semantics note:** Outside a transaction the speculative
+   * fast-path runs unwrapped, and an overflow opens the cursor in its own
+   * transaction, so the two fetches span two separate snapshots. Wrapping the
+   * call in `$transaction` gives strict single-snapshot semantics: both the
+   * speculative fetch and the cursor then run on the caller's connection
+   * inside the caller's transaction (the cursor path issues no BEGIN/COMMIT of
+   * its own and releases nothing, so the caller's transaction is intact when
+   * iteration finishes).
    *
    * @example
    * ```ts
@@ -2000,13 +2317,25 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // --- Overflow: fall back to cursor path from scratch ---
     const deferred = this.buildFindMany(args);
 
-    // Acquire a dedicated connection — cursors require a single connection in a
+    // Acquire a dedicated connection: cursors require a single connection in a
     // transaction. The dialect owns the streaming SQL (Postgres: BEGIN → DECLARE
     // … NO SCROLL CURSOR FOR → FETCH n → CLOSE → COMMIT, ROLLBACK on error); we
     // just parse + yield the row batches it produces.
-    const client = await this.pool.connect();
+    //
+    // Inside a caller-owned transaction there is nothing to check out: the
+    // transaction-scoped pool pins every query to the transaction's own
+    // connection, so `pool.query` already IS that connection. The stream rides
+    // on it, is never released here, and the dialect is told to emit no
+    // transaction control of its own (`ambientTransaction`).
+    const client = this.txScoped ? null : await this.pool.connect();
+    const conn: StreamableConnection = client ?? {
+      query: async (text: string, values?: unknown[]) =>
+        (await this.pool.query(text, values)) as { rows: Record<string, unknown>[] },
+    };
     try {
-      for await (const batch of this.dialect.openStream(client, deferred.sql, deferred.params, batchSize)) {
+      for await (const batch of this.dialect.openStream(conn, deferred.sql, deferred.params, batchSize, {
+        ambientTransaction: this.txScoped,
+      })) {
         for (const row of batch) {
           yield (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as QueryResult<T, R, W, S, O>;
         }
@@ -2015,7 +2344,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Wrap pg constraint errors so streaming surfaces typed errors like the rest of the API
       throw wrapPgError(err);
     } finally {
-      client.release();
+      client?.release();
     }
   }
 
@@ -2038,7 +2367,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
           return (rows[0] ?? null) as QueryResult<T, R, W, S, O> | null;
         }
         if (strategy === 'auto') {
-          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder);
+          // findFirst is findMany + LIMIT 1: a one-row parent set.
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false);
           if (split) {
             const rows = (await this.runAutoSplit(
               { ...args, limit: 1 } as unknown as FindManyArgs<T>,
@@ -2237,21 +2567,39 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>): Promise<R> {
     const client = await this.pool.connect();
+    let began = false;
     try {
       await client.query(this.dialect.beginStatement());
+      began = true;
       const { TransactionClient } = await import('../client.js');
-      // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
-      const tx = new TransactionClient(client as any, this.schema, this.middlewares as any, this.options);
+      const tx = new TransactionClient(
+        // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
+        client as any,
+        this.schema,
+        // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
+        this.middlewares as any,
+        this.options,
+        // Pass the source pool so its read-only guard + capabilities carry into
+        // the transaction-scoped proxy pool (see createTxPool). Without it a
+        // read-only client's nested writes bypass the E018 guard and an
+        // older-engine client falls back to the full capability set inside the
+        // implicit transaction.
+        this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
+      );
       // biome-ignore lint/suspicious/noExplicitAny: TransactionClient satisfies NestedWriteContext['tx'] at runtime
       const ctx: NestedWriteContext = { schema: this.schema, tx: tx as any };
       const result = await fn(ctx);
       await client.query(this.dialect.commitStatement());
       return result;
     } catch (err) {
-      try {
-        await client.query(this.dialect.rollbackStatement());
-      } catch {
-        // Best-effort rollback — connection may have died.
+      // Only roll back a transaction we actually opened: a failed BEGIN must
+      // not emit a stray ROLLBACK on a connection that never began one.
+      if (began) {
+        try {
+          await client.query(this.dialect.rollbackStatement());
+        } catch {
+          // Best-effort rollback: connection may have died.
+        }
       }
       throw err;
     } finally {

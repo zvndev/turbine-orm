@@ -261,17 +261,58 @@ export function stripAnsi(s: string): string {
 
 export function redactUrl(url: string): string {
   return (
-    url
-      // Userinfo credentials. Anchored on `<scheme>://<user>:` and consuming up
-      // to the LAST `@` before the next `/` (or end of authority), because a
-      // password may legally contain `:`, `/`, and even `@` in percent-decoded
-      // form. The previous `:([^@/:]+)@` could not span any of those, so
-      // `postgres://u:pa/ss@host/db` came through completely unredacted and
-      // `postgres://u:a@b@host/db` leaked the tail. Global: one string may
-      // carry several URLs (a primary + replica pair).
-      .replace(/(\w+:\/\/[^/@\s]*?:)[^\s]*?@(?=[^@\s]*(?:[/?#]|$))/g, '$1***@')
+    redactUserinfo(url)
       // Query-string password params: `password=`, `sslpassword=`, and similar,
       // case-insensitive. Value runs up to the next `&`, `#`, or end of string.
       .replace(/([?&][^=&#]*password)=([^&#]*)/gi, '$1=***')
   );
+}
+
+/**
+ * Replace `<scheme>://<user>:<password>@` with `<scheme>://<user>:***@`, for
+ * every occurrence in the string (one message may carry a primary + replica
+ * pair). A password may legally contain `:`, `/`, and even `@` in
+ * percent-decoded form, so the credential runs to the LAST `@` of the authority.
+ *
+ * Deliberately a single forward scan rather than one regex: the previous
+ * `(\w+:\/\/[^/@\s]*?:)[^\s]*?@(?=[^@\s]*(?:[/?#]|$))` nested two lazy
+ * quantifiers under a lookahead and backtracked quadratically on input with no
+ * `@` at all (a 60 KB error message took ~16s). `redactUrl` runs on error text
+ * echoed back from Postgres, so that stalled the CLI. This version visits every
+ * character at most once.
+ */
+function redactUserinfo(input: string): string {
+  const scheme = /\w+:\/\//g;
+  let out = '';
+  let copied = 0;
+  for (let m = scheme.exec(input); m; m = scheme.exec(input)) {
+    const start = m.index + m[0].length;
+    // Scan the run of non-whitespace characters that could hold userinfo,
+    // remembering the last `@`. A `/`, `?`, or `#` only ends the run once an `@`
+    // has been seen, so a password containing one is still covered; a URL with
+    // no credentials simply reaches the end of the run with no `@` recorded.
+    let i = start;
+    let lastAt = -1;
+    for (; i < input.length; i++) {
+      const ch = input.charAt(i);
+      if (/\s/.test(ch)) break;
+      if (ch === '@') {
+        lastAt = i;
+      } else if (lastAt !== -1 && (ch === '/' || ch === '?' || ch === '#')) {
+        break;
+      }
+    }
+    if (lastAt !== -1) {
+      const colon = input.slice(start, lastAt).indexOf(':');
+      if (colon !== -1) {
+        out += `${input.slice(copied, start + colon + 1)}***@`;
+        copied = lastAt + 1;
+      }
+    }
+    // Resume after the scanned run. Every character in it has been accounted
+    // for, and a credential cannot span whitespace, so nothing is missed and the
+    // total work stays linear however many `scheme://` prefixes the input holds.
+    scheme.lastIndex = Math.max(i, start);
+  }
+  return copied === 0 ? input : out + input.slice(copied);
 }

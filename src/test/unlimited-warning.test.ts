@@ -48,6 +48,11 @@ async function captureWarnings(fn: () => Promise<unknown>): Promise<string[]> {
   return captured;
 }
 
+/** Keep only the unlimited-query warning (drop other dev advisories). */
+function unlimitedOnly(warnings: string[]): string[] {
+  return warnings.filter((w) => /has no limit/.test(w));
+}
+
 describe('findMany unlimited-query warning', () => {
   it('warns when limit is omitted (default behaviour)', async () => {
     const q = new QueryInterface(stubPool(), 'users', buildSchema());
@@ -61,19 +66,25 @@ describe('findMany unlimited-query warning', () => {
   it('does NOT warn when limit is provided', async () => {
     const q = new QueryInterface(stubPool(), 'users', buildSchema());
     const warnings = await captureWarnings(() => q.findMany({ limit: 10 }));
-    assert.equal(warnings.length, 0);
+    // A bounded query can still draw the separate non-deterministic-page
+    // advisory (it paginates with no orderBy); only the unlimited warning is
+    // under test here.
+    assert.equal(unlimitedOnly(warnings).length, 0);
   });
 
   it('does NOT warn when take is provided', async () => {
     const q = new QueryInterface(stubPool(), 'users', buildSchema());
     const warnings = await captureWarnings(() => q.findMany({ take: 10 }));
-    assert.equal(warnings.length, 0);
+    assert.equal(unlimitedOnly(warnings).length, 0);
   });
 
   it('does NOT warn when cursor pagination is used', async () => {
     const q = new QueryInterface(stubPool(), 'users', buildSchema());
     const warnings = await captureWarnings(() => q.findMany({ cursor: { id: 1 } as never }));
-    assert.equal(warnings.length, 0);
+    // A cursor seek with no orderBy draws the separate non-deterministic-page
+    // advisory (see deterministic-pagination.test.ts); only the unlimited
+    // warning is under test here.
+    assert.equal(unlimitedOnly(warnings).length, 0);
   });
 
   it('dedupes — warns at most once per table per QueryInterface', async () => {

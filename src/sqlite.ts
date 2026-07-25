@@ -518,6 +518,10 @@ export const sqliteDialect: Dialect = {
     return (
       `INSERT INTO ${input.table} (${input.insertColumns.join(', ')}) VALUES (${input.valuePlaceholders.join(', ')})` +
       ` ON CONFLICT (${input.conflictColumns.join(', ')}) DO UPDATE SET ${input.updateSetClauses.join(', ')}` +
+      // SQLite's upsert takes the same trailing conflict-UPDATE predicate as
+      // Postgres, so `supportsUpsertUpdateWhere` (inherited true) is honest and
+      // global filters restrict the UPDATE branch here too.
+      (input.updateWhere ? ` WHERE ${input.updateWhere}` : '') +
       this.buildReturningClause(input.returning)
     );
   },

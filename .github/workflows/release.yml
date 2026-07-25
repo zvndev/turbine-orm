@@ -21,6 +21,7 @@ name: Release
 #
 # A publish requires ALL of: test (lint/typecheck/unit/build/size),
 # integration-postgres (real DB), pack-smoke (published package surface),
+# package-types (publint + attw + a real CJS consumer typecheck),
 # coverage (.c8rc.json thresholds, measured against a real DB), and error-codes
 # (every thrown error inside the TURBINE_E* contract). Each gate job is defined
 # here rather than reused from ci.yml because ci.yml is triggered by push/PR, not
@@ -238,8 +239,67 @@ jobs:
       - name: Check error code enforcement
         run: npx tsx scripts/check-error-codes.ts
 
+  # Publish-surface type gate: mirrors ci.yml's package-types job. pack-smoke
+  # only proves the package RUNS from CJS; this proves its TYPES resolve from
+  # CJS too (the TS1479 class of bug, invisible at runtime). publint + attw on
+  # the packed tarball, then a real .cts consumer typechecked against it.
+  package-types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: publint + are-the-types-wrong
+        run: npm run check:package
+      - name: Pack tarball
+        run: echo "TARBALL=$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)" >> "$GITHUB_ENV"
+      - name: Typecheck a CommonJS consumer against the packed tarball
+        run: |
+          CONSUMER=$(mktemp -d)
+          cd "$CONSUMER"
+          cat > package.json <<'JSON'
+          { "name": "cjs-consumer", "version": "1.0.0", "private": true, "type": "commonjs" }
+          JSON
+          cat > tsconfig.json <<'JSON'
+          {
+            "compilerOptions": {
+              "module": "nodenext",
+              "moduleResolution": "nodenext",
+              "target": "ES2022",
+              "strict": true,
+              "noEmit": true,
+              "skipLibCheck": true
+            },
+            "include": ["consumer.cts"]
+          }
+          JSON
+          cat > consumer.cts <<'TS'
+          import { TurbineClient, TurbineError } from 'turbine-orm';
+          import { turbineHttp } from 'turbine-orm/serverless';
+          import { turbineSqlite } from 'turbine-orm/sqlite';
+          import { turbineMysql } from 'turbine-orm/mysql';
+          import { turbineMssql } from 'turbine-orm/mssql';
+          import { turbinePowDB } from 'turbine-orm/powdb';
+          import { postgresql } from 'turbine-orm/adapters';
+          const req = require('turbine-orm') as typeof import('turbine-orm');
+          export const check = [
+            TurbineClient, TurbineError, turbineHttp, turbineSqlite,
+            turbineMysql, turbineMssql, turbinePowDB, postgresql, req.TurbineClient,
+          ];
+          TS
+          npm install "$TARBALL" --no-audit --no-fund
+          npm install --no-save typescript @types/node --no-audit --no-fund
+          npx tsc --noEmit -p tsconfig.json
+          sed -i 's/"module": "nodenext"/"module": "node16"/; s/"moduleResolution": "nodenext"/"moduleResolution": "node16"/' tsconfig.json
+          npx tsc --noEmit -p tsconfig.json
+          echo "CJS consumer typecheck OK (nodenext + node16)"
+
   publish:
-    needs: [test, integration-postgres, pack-smoke, coverage, error-codes]
+    needs: [test, integration-postgres, pack-smoke, package-types, coverage, error-codes]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

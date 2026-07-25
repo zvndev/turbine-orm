@@ -51,6 +51,30 @@ const roles = await db.roles.findMany({ warnOnUnlimited: false });
 
 You can also set it per table on the client — `warnOnUnlimited: { userProfiles: false }` (accessor or `snake_case` keys) — leaving the warning on everywhere else. Precedence is per-call, then per-table, then the global boolean.
 
+### Deterministic pages: the unordered-pagination warning
+
+An unordered `LIMIT` is not stable. Postgres is free to return different rows for the same `LIMIT` once the heap changes underneath it, so paging through a table with no `orderBy` can hand you the same row twice, or skip one entirely. It is usually the slower plan too: an unordered `LIMIT` can discard heap rows that an index scan on the key would have skipped.
+
+So a `findMany` that paginates (`limit` / `take` / `offset`) with no `orderBy` logs a one-time dev warning naming the table, the pagination shape, and the exact `orderBy` to add:
+
+```ts
+// warns: the page is not deterministic
+const page = await db.users.findMany({ limit: 20, offset: 40 });
+
+// no warning: the page is stable
+const page = await db.users.findMany({ orderBy: { id: 'asc' }, limit: 20, offset: 40 });
+```
+
+`cursor` and `distinct` queries are exempt (both already impose their own ordering semantics). The warning is gated exactly like `warnOnUnlimited`: per-call, then per-table, then the global boolean, deduped process-wide per table and shape, and silent under `NODE_ENV=production`.
+
+To fix it globally instead of per query, set **`implicitPkOrdering: true`** on the client. Turbine then adds `ORDER BY <primary key> ASC` (every column of a composite key, in declaration order) to any paginating `findMany` that declares no `orderBy`, and the warning stops firing. An explicit `orderBy` always wins, and a table with no primary key is left alone.
+
+```ts
+const db = turbine({ connectionString: process.env.DATABASE_URL, implicitPkOrdering: true });
+```
+
+It is **off by default in core**, deliberately: turning it on adds an `ORDER BY` to SQL your application already emits, which changes both the rows a given page returns and the plan the engine picks. With it off, the emitted SQL is byte-identical to before. The [`prisma-compat`](/migrate-from-prisma) adapter applies the same ordering unconditionally, because that is what Prisma does and reproducing Prisma is that layer's contract.
+
 ### select / omit
 
 Pick or drop columns at the query level. Either one — not both.
@@ -822,6 +846,113 @@ try {
 ```
 
 HTTP / serverless pools that don't support the pipeline protocol fall back to sequential execution automatically. Probe at runtime with `db.pipelineSupported()`.
+
+### The full `build*` set
+
+Every query method has a `build*` twin that returns a `DeferredQuery` (`{ sql, params, transform, tag }`) instead of executing. There are fifteen of them, and they are **not read-only**: the write builders batch too, which is the part most people miss.
+
+| Read | Write |
+|---|---|
+| `buildFindMany` | `buildCreate` |
+| `buildFindUnique` | `buildCreateMany` |
+| `buildFindFirst` | `buildUpdate` |
+| `buildFindUniqueOrThrow` | `buildUpdateMany` |
+| `buildFindFirstOrThrow` | `buildUpsert` |
+| `buildCount` | `buildDelete` |
+| `buildAggregate` | `buildDeleteMany` |
+| `buildGroupBy` | |
+
+Pair them with the array form of `$transaction` when you want the batch to be atomic:
+
+```ts
+// One connection, one BEGIN/COMMIT, all-or-nothing
+const [order, items, user] = await db.$transaction([
+  db.orders.buildCreate({ data: { userId: 1, total: 4200 } }),
+  db.orderItems.buildCreateMany({
+    data: [
+      { orderId: 1, sku: 'A' },
+      { orderId: 1, sku: 'B' },
+    ],
+  }),
+  db.users.buildUpdate({ where: { id: 1 }, data: { orderCount: { increment: 1 } } }),
+]);
+```
+
+Choosing between the two: `db.pipeline(...)` is the extended-query protocol and is for **independent** queries where you want one round-trip and no transaction semantics. `db.$transaction([...])` is a real transaction on one connection, sequential unless the driver advertises `supportsPipelining`, and rolls the whole batch back on the first failure.
+
+<Callout type="note" title="Nested writes have no build* twin">
+  A `create` or `update` whose `data` contains relation operations opens its own
+  transaction to resolve the tree, so it cannot be reduced to a single deferred
+  statement. Those calls stay `async` and are not batchable.
+</Callout>
+
+## Client configuration
+
+`TurbineConfig` is the object you pass to `turbine()` / `new TurbineClient()`. The connection fields (`connectionString`, `host`, `port`, `database`, `user`, `password`, `ssl`, `pool`) are covered in [Quick Start](/quickstart) and [Serverless](/serverless). These are the tuning knobs that are easy to miss.
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  poolSize: 10,
+  idleTimeoutMs: 30_000,
+  connectionTimeoutMs: 5_000,
+  preparedStatements: true,
+  sqlCache: true,
+  sqlCacheSize: 1000,
+});
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `poolSize` | `10` | Maximum pooled connections. pg-style alias: `max`. |
+| `idleTimeoutMs` | `30000` | Close a pooled connection after this long idle. pg-style alias: `idleTimeoutMillis`. |
+| `connectionTimeoutMs` | `5000` | Give up acquiring a connection after this long. pg-style alias: `connectionTimeoutMillis`. |
+| `preparedStatements` | `true` for Turbine-owned pools, `false` for external pools | Submit queries as `{ name, text, values }` so Postgres caches the parse and plan per backend connection. |
+| `sqlCache` | `true` | The per-table SQL template cache. Setting `false` is the kill switch. |
+| `sqlCacheSize` | `1000` | How many distinct query **shapes** each table's LRU retains. Values are parameterized, so they never fragment the cache. `0` is equivalent to `sqlCache: false`; a negative value falls back to the default. |
+| `implicitPkOrdering` | `false` | Order a paginating `findMany` that declares no `orderBy` by the primary key ascending, making its pages [deterministic](#deterministic-pages-the-unordered-pagination-warning). An explicit `orderBy` wins; PK-less tables, `cursor` and `distinct` shapes are untouched. Off by default because switching it on rewrites SQL an existing application already emits. |
+| `autoToOneJoinMaxRows` | `1000` | Parent-row ceiling for the [`'auto'` strategy's to-one rule](/relations#load-strategy-auto-join-batched): a `belongsTo` / `hasOne` include stays in the single-statement join when the query's `limit` bounds the parent set at or under this value, and loads batched when the query is unbounded or bounded above it. Only consulted under `'auto'`. |
+
+Where a pg-style alias exists, the explicit Turbine field wins when both are set.
+
+<Callout type="warning" title="preparedStatements behind a connection pooler">
+  With prepared statements on, the named statement is prepared on **one backend
+  connection**. Behind a transaction-pooling proxy (PgBouncer in `transaction`
+  mode, Supabase's pooler port, some serverless poolers) your next query can
+  land on a different backend, and it fails with `prepared statement "..." does
+  not exist`. That is why the default is `false` for external pools, where
+  serverless drivers are the common case. If you point a **Turbine-owned** pool
+  at a transaction pooler, set `preparedStatements: false` yourself. The
+  environment variable `TURBINE_DISABLE_PREPARED=1` disables it globally with no
+  code change, which is the right lever in a deployment you cannot rebuild.
+</Callout>
+
+## Client escape hatches
+
+| Member | Type | What it is for |
+|---|---|---|
+| `db.table<T>(name)` | `QueryInterface<T>` | Query a table by string name. This is the escape hatch for tables missing from your generated types: a table created since the last `generate`, or any table reached through `turbineHttp(pool, SCHEMA)` where there is no generated subclass at all. Pass `T` yourself to get typing back; the name is still validated against the schema metadata. |
+| `db.pool` | `pg.Pool` | The underlying pool, for anything Turbine does not wrap. |
+| `db.schema` | `SchemaMetadata` | The metadata the client was built from. |
+| `db.stats` | `{ totalCount, idleCount, waitingCount }` | Pool gauges, suitable for a health endpoint. Returns zeros on drivers that do not expose counts, such as Neon HTTP. |
+| `db.transaction(fn)` | raw `pg.PoolClient` | The lower-level transaction API. Prefer `$transaction`; reach for this only to run hand-written SQL on the transaction's own connection. |
+| `db.disconnect()` / `db.end()` | `Promise<void>` | The same method. Both tear down live `$listen` subscriptions first, then close pools Turbine owns. Both are a **no-op for the primary pool when you supplied it yourself**, because the caller owns its lifecycle. |
+| `db.<table>.cacheStats()` | `{ size, hits, misses, hitRate }` | Per-table SQL-template cache counters. Use it to confirm a hot path is reusing a cached template rather than fingerprinting a fresh shape on every call: a `hitRate` near zero on a repeated query usually means something in the args is varying shape, not just value. |
+
+```ts
+// Query a table that isn't in the generated types
+type AuditRow = { id: number; action: string; at: Date };
+const audit = db.table<AuditRow>('audit_log');
+const recent = await audit.findMany({ orderBy: { at: 'desc' }, limit: 20 });
+
+// Check the template cache is doing its job
+await db.users.findUnique({ where: { id: 1 } });
+await db.users.findUnique({ where: { id: 2 } });
+db.users.cacheStats();
+// Two calls of the same SHAPE: the first is a miss that stores the template,
+// the second is a hit. Counters are per QueryInterface instance, and `db.users`
+// returns the same instance every time.
+```
 
 ## Middleware
 

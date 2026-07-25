@@ -67,8 +67,8 @@ ON CONFLICT (slug) DO NOTHING;
 
 Turbine resolves the seed file in this order:
 
-1. The `seed` field in `turbine.config.ts` (an explicit path always wins — even if the file doesn't exist yet).
-2. The first default candidate found: `seed.ts`, then `seed.js`, then `seed.sql`.
+1. The `seedFile` field in `turbine.config.ts` (an explicit path always wins, even if the file doesn't exist yet).
+2. The first default candidate found, in this order: `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, `turbine/seed.sql`.
 
 ```ts
 // turbine.config.ts
@@ -76,11 +76,13 @@ import type { TurbineCliConfig } from 'turbine-orm/cli';
 
 export default {
   url: process.env.DATABASE_URL,
-  seed: './turbine/seed.ts',
+  seedFile: './turbine/seed.ts',
 } satisfies TurbineCliConfig;
 ```
 
-(`seedFile` is still accepted as an alias for `seed`.)
+`seedFile` is the canonical key, and it is what `turbine init` writes. `seed` is a back-compat alias kept working for configs scaffolded before 0.50; when both are present, `seedFile` wins.
+
+The root-level candidates stay first in the fallback order so an existing project that relies on `./seed.ts` is unaffected. The `turbine/` candidates were appended so a project that drops the key entirely still finds the file `turbine init` scaffolds, which is `./turbine/seed.ts`.
 
 ## Seeding in CI/CD
 

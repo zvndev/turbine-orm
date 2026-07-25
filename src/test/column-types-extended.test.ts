@@ -10,7 +10,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { UnsupportedFeatureError } from '../errors.js';
+import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { defineSchema } from '../schema-builder.js';
 import { schemaToSQL, schemaToSQLString } from '../schema-sql.js';
 
@@ -93,6 +93,29 @@ describe('B4 — vector columns', () => {
     });
     const create = schemaToSQL(schema).find((s) => s.includes('CREATE TABLE "docs"'))!;
     assert.ok(create.includes('"embedding" vector(1536) NOT NULL'), create);
+  });
+
+  it('non-integer / out-of-range dimensions are refused (E003) instead of emitting vector(n)', () => {
+    // defineSchema only rejects `<= 0`, so a fractional / NaN / oversized count
+    // reaches the DDL builder; the type token interpolates the number, so the
+    // builder validates it rather than trusting the schema literal.
+    for (const dimensions of [1.5, Number.NaN, 20000]) {
+      const schema = defineSchema({
+        docs: { id: { type: 'serial', primaryKey: true }, embedding: { type: 'vector', dimensions } },
+      });
+      assert.throws(
+        () => schemaToSQL(schema),
+        (e: unknown) =>
+          e instanceof ValidationError &&
+          /Column "embedding": vector dimensions must be an integer between 1 and 16000/.test((e as Error).message),
+        `dimensions: ${dimensions}`,
+      );
+    }
+    // The valid boundary still compiles.
+    const ok = defineSchema({
+      docs: { id: { type: 'serial', primaryKey: true }, embedding: { type: 'vector', dimensions: 16000 } },
+    });
+    assert.ok(schemaToSQL(ok).some((s) => s.includes('"embedding" vector(16000)')));
   });
 
   it('prepends CREATE EXTENSION IF NOT EXISTS vector by default (auto)', () => {

@@ -204,7 +204,6 @@ describe('sampled cross-check: log once per distinct fingerprint', () => {
       const logs = withStubs(0, () => {
         assert.throws(() => q.buildFindMany({ where: { tenantId: 2 } } as never));
         assert.throws(() => q.buildFindMany({ where: { tenantId: 3 } } as never));
-        assert.equal(1, 1);
         // Second distinct fingerprint: name (text). Different cache key => a new log.
         warmAndCorrupt(q, { name: 'a' }, 'dedup-b');
         assert.throws(() => q.buildFindMany({ where: { name: 'b' } } as never));

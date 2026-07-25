@@ -270,6 +270,32 @@ export interface TurbineConfig {
    */
   stableRelationOrder?: boolean;
   /**
+   * When `true`, a `findMany` that paginates (`limit` / `take` / `offset`) but
+   * declares no `orderBy` is ordered by the table's primary key ascending
+   * (every column of a composite PK, in declaration order). An unordered
+   * `LIMIT` is non-deterministic: the same query can return different rows once
+   * the heap changes underneath it, so a row may appear on two pages or on
+   * none. An explicit `orderBy` always wins, PK-less tables are left alone, and
+   * `distinct` / `cursor` shapes are skipped.
+   *
+   * Default `false` in core, because switching it on would add an `ORDER BY` to
+   * SQL that existing applications already emit, changing both the rows a page
+   * returns and the plan the engine picks: a silent behavior change that waits
+   * for a major. `turbine-orm/prisma-compat` defaults it ON instead, since
+   * reproducing Prisma's semantics is that layer's contract. With it off the
+   * emitted SQL is byte-identical to before, and a dev-mode warning points at
+   * the affected queries.
+   */
+  implicitPkOrdering?: boolean;
+  /**
+   * Parent-row ceiling for the `relationLoadStrategy: 'auto'` to-one rule: a
+   * to-one relation stays in the single-statement join when the query's `limit`
+   * bounds the parent set at or under this many rows, and loads batched when the
+   * query is unbounded or bounded above it. Defaults to 1000 (see
+   * `AUTO_TO_ONE_JOIN_MAX_ROWS`). Only consulted under `'auto'`.
+   */
+  autoToOneJoinMaxRows?: number;
+  /**
    * How nested-relation subqueries encode each row's JSON.
    *
    *   - `'object'` (default) — `json_agg(json_build_object('key', v, …))`. Every
@@ -783,6 +809,8 @@ export class TurbineClient {
       utcTimestamps: config.utcTimestamps,
       relationLoadStrategy: config.relationLoadStrategy,
       stableRelationOrder: config.stableRelationOrder,
+      implicitPkOrdering: config.implicitPkOrdering,
+      autoToOneJoinMaxRows: config.autoToOneJoinMaxRows,
       jsonEncoding: config.jsonEncoding,
       globalFilters: config.globalFilters,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),

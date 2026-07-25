@@ -157,6 +157,32 @@ export default defineSchema({
 
 `sourceKey` / `targetKey` are the junction columns referencing each side's primary key. Add `references` if the source side is keyed on something other than `id`.
 
+### Writing links: connect, disconnect, set
+
+Since 0.50 a many-to-many relation also accepts [nested writes](/nested-writes#many-to-many-relations) for the three operations that only ever touch the junction table. Turbine writes the junction rows in the same transaction as the parent write, on every engine including PowDB.
+
+```ts
+// Link on create
+await db.posts.create({
+  data: { title: 'Single-query relations', tags: { connect: [{ slug: 'sql' }] } },
+});
+
+// Link, unlink, or replace on update
+await db.posts.update({
+  where: { id: 1 },
+  data: { tags: { connect: { slug: 'indexes' }, disconnect: { slug: 'sql' } } },
+});
+
+await db.posts.update({
+  where: { id: 1 },
+  data: { tags: { set: [{ slug: 'postgres' }] } }, // becomes the post's only tag
+});
+```
+
+`connect` is idempotent (an already-linked target is a no-op, not a duplicate and not a constraint error), `disconnect` is scoped by both the parent key and the named targets, and `set: []` clears every link. `disconnect` and `set` are update-only, as on every other relation type.
+
+The operations that would also have to write the *target* row (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) still throw `ValidationError` ([E003](/errors)): there is no safe default for a junction's extra payload columns. Composite junction keys are refused for the same reason. See [Nested writes](/nested-writes#many-to-many-relations) for the full rules and the escape hatch.
+
 ## Self-referential
 
 A self-referencing foreign key (a column on a table that references that same table's primary key) introspects to **both** a `belongsTo` and a `hasMany` on the table. Categories with a `parentId` pointing at another category, comments threaded under a parent comment, an org chart — they all work the same way, including nested trees.
@@ -319,9 +345,28 @@ If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop
 
 ## Load strategy: `auto`, `join`, `batched`
 
-When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41.0): it compiles the single-statement correlated-subquery plan (`'join'`), but when schema metadata shows a relation's correlation column has **no covering index**, that relation falls back to the batched loader instead of running an unindexed probe per parent row. Engagement is visible: a once-per-relation dev note, and query events carry `strategy: 'auto-batched'`. An explicit `'join'` or `'batched'` (client-wide or per query) always wins over `'auto'`.
+When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41.0): it compiles the single-statement correlated-subquery plan (`'join'`) and moves individual relations to the batched loader when one of two rules fires. Everything else stays in the join, byte-identical. An explicit `'join'` or `'batched'` (client-wide or per query) always wins over `'auto'`, and the results are deep-equal whichever plan runs.
 
-> **Tuning note.** `'auto'` only falls back when an index is provably missing; it keeps the join plan for indexed relations. On endpoints that fan out to very large child sets (megabyte-scale JSON per request), the batched loader's flat rows can still beat the join plan even with healthy indexes. If profiling shows that, pin `relationLoadStrategy: 'batched'` on that query; the output is deep-equal either way.
+| Rule | Fires when | Why |
+|---|---|---|
+| **Unindexed probe** | DB-backed index metadata proves a probe in the relation's subtree has no covering index | A correlated probe per parent becomes N-parents by full-table-scan |
+| **To-one cardinality** (since 0.50) | The relation is `belongsTo` / `hasOne` *and* the parent set is potentially large | A correlated to-one subquery is re-evaluated once per parent row no matter how well indexed it is |
+
+"Potentially large" means the query has no `limit` / `take` (and no client `defaultLimit`), or a limit above **`autoToOneJoinMaxRows`** (default `1000`). `findUnique` and `findFirst` never trip the cardinality rule: their parent set is one row.
+
+The unindexed rule needs index metadata that came from the database, so a `defineSchema`-only client can never prove a probe unindexed and that rule simply never fires. The cardinality rule does not depend on index metadata and applies either way.
+
+Both rules only ever move a relation that the batched loader can actually handle. Composite-key relations, and relations whose subtree the loader cannot express, always stay in the join. Engagement is visible: a once-per-relation dev note naming the reason, and query events carry `strategy: 'auto-batched'`.
+
+Relation `_count` follows the unindexed rule only, and likewise only on a large parent set: a grouped `COUNT(*) ... GROUP BY fk` scans the child table once either way, so on a bounded query the follow-up round-trip costs more than it saves.
+
+> **Tuning note.** The two rules are heuristics: the real parent count is unknown until the base query runs, and `limit` is the only bound available at plan time. If profiling disagrees with the choice, raise or lower `autoToOneJoinMaxRows`, or pin `relationLoadStrategy` on that query. On endpoints that fan out to very large child sets (megabyte-scale JSON per request), the batched loader's flat rows can beat the join plan even with healthy indexes and a small parent set, so `'batched'` is still worth pinning there.
+
+<Callout type="note" title="Upgrading to 0.50">
+  The to-one cardinality rule changes which plan an existing unbounded query
+  picks, not what it returns. If a query was tuned against the old choice, pin
+  it with `relationLoadStrategy: 'join'` or raise `autoToOneJoinMaxRows`.
+</Callout>
 
 The correlated-subquery strategy (`relationLoadStrategy: 'join'`) resolves an entire `with` tree in **one** SQL statement: a single round-trip, and an index seek per parent when the child FK is indexed. Two situations favor the alternative:
 

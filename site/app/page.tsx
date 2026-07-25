@@ -2,27 +2,37 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { codeToHtml } from 'shiki';
 import { CopyButton } from '../components/CopyButton';
-import { LATEST_TAGLINE } from '../lib/changelog.generated';
+import { HERO_TAGLINE } from '../lib/tagline';
 import { TURBINE_MINOR } from '../lib/version';
 
 export const metadata: Metadata = {
-  title: 'Turbine ORM — the Postgres ORM your DBA will sign off on.',
+  title: 'Turbine ORM: the Postgres ORM that assumes your database has real data in it.',
   description:
-    'A read-only-by-default Studio (writes are an explicit opt-in), errors that never leak PII, one dependency (pg, no WASM engine), and SQL-first migrations with SHA-256 drift detection. Postgres-maximalist underneath: typed pgvector, RLS sessions, LISTEN/NOTIFY, full-text.',
+    'A database UI that is read-only by default, PII tagged in the schema and enforced in the SQL, errors that carry keys and never values, destructive migrations that need consent, and offline missing-index advice. One runtime dependency (pg), no WASM engine.',
 };
 
-const heroCode = `const docs = await db.documents.findMany({
-  where: {
-    body: { search: 'vector & index' },
-    embedding: { distance: { to: queryVec, metric: 'cosine', lt: 0.4 } },
+const heroCode = `export default defineSchema({
+  users: {
+    id:    { type: 'serial', primaryKey: true },
+    name:  { type: 'text', notNull: true },
+    email: { type: 'text', notNull: true, pii: true },
+    //                                    ^^^^^^^^^
   },
-  orderBy: { embedding: { distance: { to: queryVec, metric: 'cosine' } } },
-  with: { author: true },
-  limit: 10,
 });
 
-// full-text + pgvector KNN + a typed relation
-// ^ one Postgres query, fully parameterized`;
+// That one flag changes what the SQL is allowed to say:
+//
+//  1. the column is left out of every default projection,
+//     on every engine: top-level rows, 'with' subqueries,
+//     batched loaders, write returns. It is omitted from
+//     the emitted SQL, not filtered out afterwards.
+//  2. it is refused as a groupBy key and as a _min / _max
+//     target, because both hand back a stored cell.
+//  3. Studio renders it redacted, and refuses to filter,
+//     sort or page on it.
+
+await db.users.findMany();                     // no email
+await db.users.findMany({ includePii: true }); // email`;
 
 const sqlCode = `SELECT "users".*,
   (SELECT COALESCE(json_agg(json_build_object(
@@ -42,48 +52,41 @@ const sqlCode = `SELECT "users".*,
 FROM "users"
 WHERE "users"."org_id" = $1`;
 
-const features = [
+const safetyFeatures = [
   {
-    title: 'One dependency. No WASM.',
+    title: 'The database UI is read-only by default',
     description:
-      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. No adapter chain, no lockstep package upgrades. The main entry bundles to ~59 KB brotli, ~44 KB on the edge.',
-    stat: '1',
-    statLabel: 'runtime dep',
-  },
-  {
-    title: 'Read-only Studio your DBA will approve',
-    description:
-      'npx turbine studio launches a loopback-bound web UI. Every query runs inside BEGIN READ ONLY. 192-bit auth token, no raw-SQL surface at all, X-Frame-Options: DENY. No other TS ORM ships this. Try it with zero setup: npx turbine-orm@latest studio --demo boots a seeded in-memory sample DB (no DATABASE_URL) with a live Read-only / Show PII / Write switcher. Opt-in writable mode via turbine studio --write allows PK-addressed edits through the same validated builder; read-only stays the default.',
+      'npx turbine studio binds loopback, authenticates with a 192-bit per-process token, and runs every read inside BEGIN READ ONLY. In the default mode the write endpoints do not exist in the router at all, so there is nothing to bypass. There has been no raw-SQL surface since v0.19: queries are composed in the ORM builder and validated identifier by identifier. --write opts one launch in to edits, each addressed by its full primary key rather than a predicate. Try it with no database: npx turbine-orm@latest studio --demo boots a seeded in-memory sample DB with a live Read-only / Show PII / Write switcher.',
     stat: '0',
-    statLabel: 'write paths by default',
+    statLabel: 'write endpoints by default',
   },
   {
-    title: 'PII-safe errors and field tagging',
+    title: 'PII is a schema contract the SQL enforces',
     description:
-      'Turbine errors show WHERE keys, not values. A UniqueConstraintError says which column violated the constraint, never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed. Tag a column pii: true in your schema and Turbine excludes it from default query results and redacts it in Studio.',
+      'Tag a column pii: true and it is excluded from every default projection on every engine: top-level rows, with subqueries, batched loaders, write returns, and Studio. It is also refused as a groupBy key and as a _min / _max target, because both hand back a stored cell. includePii: true unlocks it explicitly, per read. A schema with no tagged column emits byte-identical SQL.',
+    stat: 'pii: true',
+    statLabel: 'enforced in the projection',
+  },
+  {
+    title: 'Errors carry keys, never values',
+    description:
+      'A NotFoundError says where: { id, email }. A UniqueConstraintError names the column that conflicted. Neither prints the row. That means the error is safe to forward straight to Sentry or Datadog with no scrubbing rule in front of it, and the full where object is still available as err.where in code.',
     stat: 'keys',
     statLabel: 'not values',
   },
   {
-    title: 'SQL-first migrations with drift detection',
+    title: 'Destructive migrations need consent',
     description:
-      'Write real SQL. SHA-256 checksums catch modified migrations. pg_try_advisory_lock() prevents concurrent runs. Each migration in its own transaction. No magic DSL between you and your database.',
+      'migrate up, migrate down and push scan for DROP TABLE, DROP COLUMN, TRUNCATE, unqualified DELETE and UPDATE, and ALTER COLUMN ... TYPE, print an itemized report, and refuse to run. Interactively you type "destroy my data" and then yes; in CI you pass --allow-destructive. A refused batch applies nothing. Migrations are real SQL, checksummed with SHA-256 and serialized behind pg_try_advisory_lock().',
     stat: 'SHA-256',
-    statLabel: 'checksums',
+    statLabel: 'checksums + refusal',
   },
   {
-    title: 'Edge-native. One import swap.',
+    title: 'The review a DBA would have given you, offline',
     description:
-      'turbineHttp(pool, SCHEMA) — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step.',
-    stat: '~44 KB',
-    statLabel: 'edge bundle (brotli)',
-  },
-  {
-    title: 'Pipeline batching via wire protocol',
-    description:
-      'Real Parse/Bind/Execute pipeline — not queries wrapped in a transaction. N independent queries in one round-trip. Deep with clauses compile to one SQL statement using json_agg.',
-    stat: '1',
-    statLabel: 'round-trip',
+      'npx turbine doctor derives every column set the relation subqueries probe and reports the ones with no covering index, with a cost tier per finding. --fix writes the migration. In dev the first query over an unindexed FK logs the exact CREATE INDEX. No cloud service, no telemetry, no account: it reads your introspected schema.',
+    stat: 'doctor',
+    statLabel: 'no account required',
   },
 ];
 
@@ -134,6 +137,13 @@ const postgresFeatures = [
 
 const capabilities = [
   {
+    title: 'One dependency. No WASM.',
+    description:
+      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. The main entry is ~60 KB brotli measured as an import graph with pg external, ~45 KB on the edge (measured 2026-07-25: 59.66 KB and 44.77 KB, budgeted in .size-limit.js). That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger.',
+    href: '/benchmarks',
+    cta: 'Benchmarks',
+  },
+  {
     title: 'turbine doctor: the missing-index advisor',
     description:
       "Turbine loads relations as correlated subqueries, so an unindexed foreign key becomes a full scan per parent row. npx turbine doctor finds every missing FK index before it hits production, and turbine doctor --fix writes the add-index migration for you. In dev, the first query over an unindexed FK also logs the exact CREATE INDEX. The check your DBA would have asked for, run for you.",
@@ -155,6 +165,20 @@ const capabilities = [
     cta: 'explain() docs',
   },
   {
+    title: 'Edge-native, one import swap',
+    description:
+      'turbineHttp(pool, SCHEMA) gives you the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step. ~45 KB brotli as an import graph with the driver external.',
+    href: '/serverless',
+    cta: 'Serverless docs',
+  },
+  {
+    title: 'Real pipelining, not a batch transaction',
+    description:
+      'db.pipeline(...) uses the Postgres extended-query protocol (Parse/Bind/Execute/Sync) to put N independent queries in one TCP flush. node-postgres does not expose pipelining in its pure-JS core, and Drizzle db.batch() is an implicit transaction on specific drivers rather than independent-query pipelining. Write builders batch too, so a create + createMany + update can go out as one atomic $transaction([...]).',
+    href: '/transactions',
+    cta: 'Pipeline docs',
+  },
+  {
     title: 'MCP server for AI agents',
     description:
       'turbine mcp exposes your database to Claude Code, Cursor, or any MCP client over JSON-RPC stdio. Read-only tools only, no free-form SQL: schema overview, table detail, migrate status, doctor report, EXPLAIN, and sample rows, all inside BEGIN READ ONLY. The same safety stance as Studio.',
@@ -174,7 +198,7 @@ export default async function Home() {
     '@type': 'SoftwareApplication',
     name: 'Turbine ORM',
     description:
-      'The Postgres ORM your DBA will sign off on: a read-only-by-default Studio (writes are an explicit --write opt-in), PII-safe error messages, one runtime dependency with no WASM engine, and SQL-first migrations with SHA-256 drift detection. Postgres-maximalist underneath: pgvector search, RLS session context, LISTEN/NOTIFY, and full-text as typed first-class API.',
+      'The Postgres ORM that assumes your database has real data in it: a read-only-by-default Studio (writes are an explicit --write opt-in), PII tagged in the schema and enforced in the emitted SQL, error messages that carry keys and never values, destructive migrations that require consent, and offline missing-index advice from turbine doctor. One runtime dependency with no WASM engine. Postgres-maximalist underneath: pgvector search, RLS session context, LISTEN/NOTIFY, and full-text as typed first-class API.',
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Any',
     url: 'https://turbineorm.dev',
@@ -203,21 +227,23 @@ export default async function Home() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
             </svg>
-            {TURBINE_MINOR} &middot; {LATEST_TAGLINE}
+            {TURBINE_MINOR} &middot; {HERO_TAGLINE}
           </Link>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
-            <span className="text-white">The Postgres ORM your DBA will sign off on.</span>
+            <span className="text-white">The Postgres ORM that assumes your database</span>
             <br />
-            <span className="amber">Read-only Studio. PII-safe errors. One dependency.</span>
+            <span className="amber">has real data in it.</span>
           </h1>
 
           <p className="hero-subtitle animate-fade-in-up delay-2">
-            A Studio that is read-only unless you say otherwise, error messages
-            that never leak PII, one dependency (<code>pg</code>, no WASM
-            engine), and SQL-first migrations with checksum drift detection.
-            Underneath it&apos;s Postgres-maximalist: typed pgvector, RLS
-            sessions, and realtime are all first-class. The rest is below.
+            Most query layers are designed for the shape of a laptop database:
+            empty, disposable, nobody&apos;s. Turbine is designed for the same
+            schema six months later. The database UI is read-only until you say
+            otherwise. Columns you tag as personal data stay out of results,
+            logs, and aggregates. Anything that can lose data makes you say so
+            out loud. Underneath, it is Postgres-maximalist: typed pgvector, RLS
+            sessions, and realtime are all first-class.
           </p>
 
           <div className="animate-fade-in-up delay-3">
@@ -243,13 +269,74 @@ export default async function Home() {
         </div>
       </section>
 
+      {/* ========== SAFETY DEFAULTS (the headline) ========== */}
+      <section className="features-section">
+        <div className="animate-fade-in-up">
+          <p className="section-label">Designed for a database with real rows in it</p>
+          <h2 className="section-title">
+            Five defaults, one assumption.
+          </h2>
+          <p
+            style={{
+              maxWidth: '48rem',
+              marginTop: '0.75rem',
+              color: 'var(--text-secondary)',
+              fontSize: '0.95rem',
+              lineHeight: 1.7,
+            }}
+          >
+            Each of these is checkable, so here is the checkable version, as of
+            July 2026. No other TypeScript ORM ships a studio that is read-only
+            by default or that redacts PII: Prisma Studio is proprietary and its
+            read-only request has been open since February 2021, Drizzle Studio
+            is not open source and self-hosting runs through the paid Drizzle
+            Gateway, and TypeORM, MikroORM, Kysely and Sequelize have no studio
+            at all. No TypeScript ORM CLI offers missing-index advice, and
+            Prisma Optimize was retired in March 2026 in favour of cloud-only
+            Query Insights. Prior art exists outside TypeScript, notably Ruby&apos;s
+            active_record_doctor, so the honest claim is &quot;no TypeScript
+            ORM&quot;, not &quot;no ORM&quot;.
+          </p>
+        </div>
+
+        <div className="feature-grid">
+          {safetyFeatures.map((f, i) => (
+            <div
+              key={f.title}
+              className={`feature-card animate-fade-in-up delay-${i + 1}`}
+            >
+              <div className="feature-card-stat">
+                <span className="feature-stat-value">{f.stat}</span>
+                <span className="feature-stat-label">{f.statLabel}</span>
+              </div>
+              <h3>{f.title}</h3>
+              <p>{f.description}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
       {/* ========== POSTGRES-NATIVE ========== */}
       <section className="features-section">
         <div className="animate-fade-in-up">
-          <p className="section-label">Postgres-native</p>
+          <p className="section-label">And it is still Postgres-maximalist underneath</p>
           <h2 className="section-title">
-            Use the database you actually have.
+            None of that costs you the database.
           </h2>
+          <p
+            style={{
+              maxWidth: '48rem',
+              marginTop: '0.75rem',
+              color: 'var(--text-secondary)',
+              fontSize: '0.95rem',
+              lineHeight: 1.7,
+            }}
+          >
+            Safe defaults usually arrive as a lowest-common-denominator API that
+            can only do what every database can do. Turbine goes the other way:
+            Postgres is the primary target, and the parts of it that other
+            query layers push you to raw SQL for are typed, first-class surface.
+          </p>
         </div>
 
         <div className="feature-grid">
@@ -269,32 +356,6 @@ export default async function Home() {
                 {f.cta} &rarr;
               </span>
             </Link>
-          ))}
-        </div>
-      </section>
-
-      {/* ========== FEATURES ========== */}
-      <section className="features-section">
-        <div className="animate-fade-in-up">
-          <p className="section-label">What Prisma and Drizzle don&apos;t ship</p>
-          <h2 className="section-title">
-            Built in, not bolted on.
-          </h2>
-        </div>
-
-        <div className="feature-grid">
-          {features.map((f, i) => (
-            <div
-              key={f.title}
-              className={`feature-card animate-fade-in-up delay-${i + 1}`}
-            >
-              <div className="feature-card-stat">
-                <span className="feature-stat-value">{f.stat}</span>
-                <span className="feature-stat-label">{f.statLabel}</span>
-              </div>
-              <h3>{f.title}</h3>
-              <p>{f.description}</p>
-            </div>
           ))}
         </div>
       </section>
@@ -341,11 +402,16 @@ export default async function Home() {
             <div className="showcase-text">
               <h3>Your code writes one call. Turbine writes one query.</h3>
               <p>
-                Every ORM claims single-query nested loads now. Turbine uses
-                the same <code>json_agg</code> approach as Prisma 7 and
-                Drizzle. The difference isn&apos;t the query strategy &mdash; it&apos;s
-                everything around it: the one-dependency, no-WASM footprint, the
-                read-only-by-default Studio, and the error messages that never expose user data.
+                This is table stakes, and it is here for correctness rather than
+                as a selling point. Drizzle has compiled relational queries to{' '}
+                <code>LEFT JOIN LATERAL</code> plus JSON aggregation since 0.28,
+                Prisma does the same under its <code>relationJoins</code>{' '}
+                preview flag, and Kysely ships{' '}
+                <code>jsonArrayFrom</code> / <code>jsonObjectFrom</code>{' '}
+                helpers. Turbine uses correlated <code>json_agg</code>{' '}
+                subqueries. What is worth reading below is how the nesting stays
+                correct at depth: empty relations, per-relation limits, and
+                types that survive the JSON round-trip.
               </p>
 
               <ul className="showcase-list">
@@ -453,14 +519,24 @@ export default async function Home() {
               {[
                 ['Engine / runtime', 'No engine binary (pg only)', 'Client + TS/WASM query compiler', 'No engine'],
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
-                ['Main bundle (brotli)', '~59 KB', '~1.6 MB client (TS/WASM compiler)', '~7 KB core'],
+                [
+                  'Main bundle (brotli)',
+                  '~60 KB import graph, pg external',
+                  '~1.6 MB client (TS/WASM compiler)',
+                  '~7 KB core',
+                ],
                 ['Studio', 'Read-only by default, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, ~44 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
+                ['Edge runtime', 'One import swap, ~45 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
-                ['Nested relations', '1 query, deep type inference', '1 query (relationJoins, Preview), shallow inference', 'relations() re-declaration'],
+                [
+                  'Nested relations',
+                  '1 query, deep type inference',
+                  '1 query (relationJoins, Preview), shallow inference',
+                  '1 query (lateral + JSON agg), relations() re-declaration',
+                ],
                 ['Many-to-many', 'Auto-detected from junctions', 'Implicit/explicit', 'Explicit relations()'],
                 ['Vector search', 'Built-in distance / KNN', 'Preview / raw', 'Extension API'],
                 ['LISTEN/NOTIFY', '$listen / $notify', 'None', 'None'],

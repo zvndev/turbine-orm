@@ -427,6 +427,10 @@ export const mysqlDialect: Dialect = {
   // No RETURNING → run the write, then re-SELECT by PK/where (Phase-0 reselect).
   resultStrategy: 'reselect',
   supportsReturning: false,
+  // `ON DUPLICATE KEY UPDATE` has no predicate slot, so `buildUpsertStatement`
+  // below cannot emit `input.updateWhere`. Reporting false keeps the builder
+  // from compiling one (and from binding its now-orphaned parameters).
+  supportsUpsertUpdateWhere: false,
   supportsILike: false,
   supportsVector: false,
   // MySQL full-text is `MATCH(col) AGAINST(...)` over a FULLTEXT index: a
@@ -467,6 +471,19 @@ export const mysqlDialect: Dialect = {
 
   quoteIdentifier(name: string): string {
     return `\`${name.replace(/`/g, '``')}\``;
+  },
+
+  /**
+   * MySQL is NOT Postgres here: unless the server runs with
+   * `NO_BACKSLASH_ESCAPES`, `\` is an escape character inside a string literal,
+   * so doubling only `'` (the inherited Postgres rule) leaves a value ending in
+   * a backslash able to escape its own closing quote. Escape the backslash
+   * first, then the quote; every other byte is safe raw. The only caller is
+   * `buildJsonObject` (relation / column names from schema metadata), so this
+   * is defence in depth rather than a user-value path.
+   */
+  escapeStringLiteral(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/'/g, "''");
   },
 
   buildJsonObject(pairs: [key: string, expr: string][]): string {

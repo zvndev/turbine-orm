@@ -100,6 +100,19 @@ describe('turbine-orm/mysql — dialect conformance (no Postgres leakage)', () =
     assert.deepEqual(d.params, ['%Ada%']);
   });
 
+  it('escapeStringLiteral escapes backslashes as well as quotes (MySQL, unlike Postgres)', () => {
+    // MySQL treats `\` as a string escape unless NO_BACKSLASH_ESCAPES is set, so
+    // the inherited Postgres rule (double `'` only) would let a key ending in a
+    // backslash escape its own closing quote.
+    assert.equal(mysqlDialect.escapeStringLiteral('a\\'), 'a\\\\');
+    assert.equal(mysqlDialect.escapeStringLiteral("o'b\\"), "o''b\\\\");
+    // Ordinary keys are untouched (JSON_OBJECT output stays byte-identical).
+    assert.equal(mysqlDialect.escapeStringLiteral('createdAt'), 'createdAt');
+    // And the escaped key stays inside its literal in real emitted SQL.
+    const json = mysqlDialect.buildJsonObject([["we'ird\\", 't0.x']]);
+    assert.equal(json, "JSON_OBJECT('we''ird\\\\', t0.x)");
+  });
+
   it('nested with → JSON_OBJECT / JSON_ARRAYAGG / CAST(... AS JSON) wrap, no json_agg', () => {
     const sql = q().buildFindMany({ with: { posts: { with: { author: true } } } }).sql;
     assert.match(sql, /JSON_ARRAYAGG/);

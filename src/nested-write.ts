@@ -17,6 +17,7 @@ import {
   describeTargetForMessage,
   NotFoundError,
   RelationError,
+  UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
@@ -47,7 +48,7 @@ export interface NestedWriteContext {
       name: string,
     ): {
       create(args: { data: Partial<T> }): Promise<T>;
-      createMany(args: { data: Partial<T>[] }): Promise<T[]>;
+      createMany(args: { data: Partial<T>[]; skipDuplicates?: boolean }): Promise<T[]>;
       update(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<T>;
       updateMany(args: {
         where: Record<string, unknown>;
@@ -56,7 +57,7 @@ export interface NestedWriteContext {
       }): Promise<{ count: number }>;
       delete(args: { where: Record<string, unknown> }): Promise<T>;
       deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }>;
-      findMany(args: { where: Record<string, unknown> }): Promise<T[]>;
+      findMany(args: { where: Record<string, unknown>; warnOnUnlimited?: boolean }): Promise<T[]>;
       findUnique(args: { where: Record<string, unknown>; with?: Record<string, unknown> }): Promise<T | null>;
     };
   };
@@ -145,6 +146,22 @@ export function injectForeignKey(
 
 function toArray<T>(value: T | T[]): T[] {
   return Array.isArray(value) ? value : [value];
+}
+
+/**
+ * Stringified comparison key for a key value, matching `keyOf` in
+ * query/batched-loader.ts (the loader stitches parent and child rows across two
+ * tables the same way).
+ *
+ * Two rows read from DIFFERENT tables go through different column parsers, so
+ * the same logical key can arrive as `1` from one and `'1'` from the other (a
+ * bigint junction column read as text next to a numeric target primary key).
+ * Strict identity also fails outright for object-valued keys: two `Date`s or two
+ * `Buffer`s holding the same value are never `===`, so a `Set` of them
+ * de-duplicates nothing. Comparing on the string form makes both work.
+ */
+function keyOf(value: unknown): string {
+  return String(value);
 }
 
 /**
@@ -297,18 +314,502 @@ function assertTargetSelectsSomething(target: unknown, op: string, relName: stri
 }
 
 /**
- * many-to-many relations have no nested-write branch on any engine: the junction
- * row would have to be written too, and there is no safe default for what to put
- * in its extra columns. Refusing loudly is the only honest option, because the
- * alternative (falling off the end of the dispatch) drops the write silently and
- * reports success.
+ * The many-to-many nested-write operations that DO write junction rows:
+ * `connect`, `disconnect` and `set`. Everything else (create, connectOrCreate,
+ * delete, update, upsert) would have to write the TARGET row as well, and there
+ * is no safe default for the junction's own extra columns, so those still
+ * refuse loudly. Falling off the end of the dispatch instead would drop the
+ * write silently and report success.
  */
-function manyToManyUnsupported(relName: string, rel: RelationDef): ValidationError {
-  return new ValidationError(
-    `[turbine] Nested writes are not supported on the many-to-many relation "${relName}" ` +
-      `(via the "${rel.through?.table ?? 'junction'}" junction table). Write the junction rows directly ` +
-      `(db.${rel.through?.table ?? 'junction'}.create / createMany) inside the same $transaction.`,
+const M2M_SUPPORTED_OPS = new Set(['connect', 'disconnect', 'set']);
+
+/**
+ * How to reach a junction table's write accessor, spelled per client because the
+ * two clients expose it under DIFFERENT keys.
+ *
+ * On the core client the auto-created property accessors are CAMELCASED
+ * (`db.userTags` for `user_tags`, see the `Object.defineProperty` loops in
+ * client.ts), so `db["user_tags"]` is `undefined` for every snake_case junction
+ * — which is every junction `turbine pull` produces over a hand-written join
+ * table. `db.table("user_tags")` takes the raw table name and exists on both
+ * TurbineClient and the TransactionClient handed to `$transaction`, so that is
+ * the form to recommend.
+ *
+ * The prisma-compat client has no `table()` method at all; it exposes each
+ * junction as a model delegate keyed by the RAW table name (`junctionModels` in
+ * prisma-compat.ts), inside `$transaction` too.
+ */
+function junctionAccessorHint(junction: string): string {
+  return (
+    `db.table("${junction}").create / createMany on the core client (inside $transaction too), ` +
+    `or db["${junction}"].create / createMany on the prisma-compat client`
   );
+}
+
+/**
+ * The refusal for a many-to-many nested operation that is still unsupported.
+ * Names the operation, the ones that ARE supported, and a remedy that is
+ * actually reachable on the reader's client (see {@link junctionAccessorHint}).
+ */
+function manyToManyOpUnsupported(op: string, relName: string, rel: RelationDef): ValidationError {
+  const junction = rel.through?.table ?? 'junction';
+  return new ValidationError(
+    `[turbine] Nested "${op}" is not supported on the many-to-many relation "${relName}" ` +
+      `(via the "${junction}" junction table). The supported many-to-many nested operations are ` +
+      `connect, disconnect and set. To ${op} a "${rel.to}" row itself, write it directly on the ` +
+      `"${rel.to}" table inside the same $transaction and link it with a nested connect; to write ` +
+      `link rows by hand, use the junction accessor: ${junctionAccessorHint(junction)}.`,
+  );
+}
+
+/** Refuse every op on an m2m relation that the junction-write path does not handle. */
+function assertManyToManyOpsSupported(relName: string, rel: RelationDef, ops: Record<string, unknown>): void {
+  for (const op of Object.keys(ops)) {
+    if (!M2M_SUPPORTED_OPS.has(op)) throw manyToManyOpUnsupported(op, relName, rel);
+  }
+}
+
+/**
+ * Everything a junction write needs, resolved once per relation operation from
+ * the SAME `through` descriptor the read path uses (see `buildManyToManySubquery`
+ * in query/relations.ts): the junction table, the field names of its source and
+ * target key columns, the parent's reference-key VALUE, and the target table's
+ * primary-key field (the column `through.targetKey` points at).
+ */
+interface JunctionPlan {
+  /** Junction table name. */
+  table: string;
+  /** Junction field holding the source (parent) key. */
+  sourceField: string;
+  /** Junction field holding the target key. */
+  targetField: string;
+  /** This parent's reference-key value, the only source key a write may use. */
+  parentValue: unknown;
+  /** Target-table field whose value goes into `targetField`. */
+  targetKeyField: string;
+  /**
+   * True when the junction declares the (source, target) PAIR unique — a
+   * two-column primary key, unique constraint, or full (non-partial) unique
+   * index over exactly those two columns.
+   *
+   * Every junction INTROSPECTION can detect is one of these by construction
+   * (`addAutoManyToManyRelations` accepts only a two-column PK or a two-column
+   * UNIQUE over exactly the two FK columns), so this is true on the generated
+   * path. A hand-declared `defineSchema` manyToMany can name a junction with no
+   * constraint at all, and there `ON CONFLICT DO NOTHING` would dedupe nothing:
+   * see {@link processManyToManyConnect}.
+   */
+  pairIsUnique: boolean;
+}
+
+/**
+ * Does the junction constrain the (source, target) pair to at most one row?
+ * Only a key over EXACTLY the two columns qualifies: a unique over a superset
+ * permits duplicate pairs, and a PARTIAL unique index only constrains the rows
+ * matching its predicate.
+ */
+function junctionPairIsUnique(junctionMeta: TableMetadata, sourceCol: string, targetCol: string): boolean {
+  const covers = (cols: readonly string[]): boolean =>
+    cols.length === 2 && cols.includes(sourceCol) && cols.includes(targetCol);
+
+  if (covers(junctionMeta.primaryKey)) return true;
+  if ((junctionMeta.uniqueColumns ?? []).some(covers)) return true;
+  return (junctionMeta.indexes ?? []).some((idx) => idx.unique && !idx.partial && !idx.docPath && covers(idx.columns));
+}
+
+/**
+ * Resolve the junction descriptor for a many-to-many nested write.
+ *
+ * Composite source/target keys are refused rather than guessed: a multi-column
+ * link row cannot be addressed with the single-column `in (...)` predicates the
+ * batched junction writes below use, and emitting a partially-keyed delete would
+ * unlink rows the caller never named.
+ */
+function junctionPlan(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  relName: string,
+  parentRow: Record<string, unknown>,
+): JunctionPlan {
+  const through = rel.through;
+  if (!through) {
+    throw new ValidationError(
+      `[turbine] manyToMany relation "${relName}" is missing a \`through\` junction descriptor.`,
+    );
+  }
+  const junctionMeta = ctx.schema.tables[through.table];
+  if (!junctionMeta) {
+    throw new ValidationError(
+      `[turbine] Nested write on the many-to-many relation "${relName}": junction table ` +
+        `"${through.table}" is not present in the schema metadata, so its rows cannot be written. ` +
+        `Regenerate the schema (turbine generate) so the junction table is included.`,
+    );
+  }
+  const targetMeta = ctx.schema.tables[rel.to];
+  if (!targetMeta) {
+    throw new ValidationError(
+      `[turbine] Nested write on the many-to-many relation "${relName}": unknown target table "${rel.to}".`,
+    );
+  }
+
+  const sourceKeys = normalizeKeyColumns(through.sourceKey);
+  const targetKeys = normalizeKeyColumns(through.targetKey);
+  const refKeys = normalizeKeyColumns(rel.referenceKey);
+  const targetPk = targetMeta.primaryKey;
+  if (sourceKeys.length !== 1 || targetKeys.length !== 1 || refKeys.length !== 1 || targetPk.length !== 1) {
+    throw new ValidationError(
+      `[turbine] Nested writes on the many-to-many relation "${relName}" (via "${through.table}") support ` +
+        `single-column junction keys only; this relation links on composite keys ` +
+        `(source ${sourceKeys.length}, target ${targetKeys.length}, target primary key ${targetPk.length} column(s)). ` +
+        `Write the junction rows directly inside the same $transaction: ${junctionAccessorHint(through.table)}.`,
+    );
+  }
+
+  // The two junction columns must DIFFER. When they collide (a `through` typo
+  // that names one column twice) every predicate and every inserted row this
+  // module builds is keyed by ONE object property, so the source key silently
+  // overwrites the target key: the disconnect predicate loses its parent scope
+  // and deletes other parents' link rows, and the inserted row carries no parent
+  // key at all. Introspection can never produce this (it requires two distinct
+  // FK columns), but a hand-declared `defineSchema` manyToMany can.
+  if (sourceKeys[0] === targetKeys[0]) {
+    throw new ValidationError(
+      `[turbine] Nested write on the many-to-many relation "${relName}" cannot run: the junction ` +
+        `"${through.table}" names the same column "${sourceKeys[0]}" as BOTH its sourceKey and its ` +
+        `targetKey, so a link row cannot hold the parent key and the target key at once. Fix the ` +
+        `relation's \`through\` descriptor to name the two distinct junction columns.`,
+    );
+  }
+
+  const parentField = ctx.schema.tables[rel.from]?.reverseColumnMap[refKeys[0]!] ?? refKeys[0]!;
+  const parentValue = parentRow[parentField];
+  if (parentValue === null || parentValue === undefined) {
+    throw new ValidationError(
+      `[turbine] Nested write on the many-to-many relation "${relName}" cannot run: the parent's reference ` +
+        `key "${parentField}" is ${parentValue === null ? 'null' : 'missing from the loaded row'}, so no ` +
+        `junction row can be correlated to this parent.`,
+    );
+  }
+
+  return {
+    table: through.table,
+    sourceField: junctionMeta.reverseColumnMap[sourceKeys[0]!] ?? sourceKeys[0]!,
+    targetField: junctionMeta.reverseColumnMap[targetKeys[0]!] ?? targetKeys[0]!,
+    parentValue,
+    targetKeyField: targetMeta.reverseColumnMap[targetPk[0]!] ?? targetPk[0]!,
+    pairIsUnique: junctionPairIsUnique(junctionMeta, sourceKeys[0]!, targetKeys[0]!),
+  };
+}
+
+/** The E003 for a target selector that matched no row. */
+function noTargetRow(op: string, relName: string, rel: RelationDef, target: unknown): ValidationError {
+  return new ValidationError(
+    `[turbine] Nested ${op} on the many-to-many relation "${relName}": no "${rel.to}" row found ` +
+      `matching ${describeTargetForMessage(target)}.`,
+  );
+}
+
+/**
+ * The plain primary-key values of `items` when EVERY selector is simple
+ * equality on the target's primary key (`{ id: 7 }`), else `null`.
+ *
+ * This is the overwhelmingly common connect payload, and it is the only shape
+ * that can be resolved by one `IN (...)` read: anything else (a secondary
+ * unique, a compound-unique selector, an operator object like
+ * `{ id: { in: [...] } }`, a multi-key selector) still needs its own
+ * `findUnique` to know WHICH row it names.
+ */
+function simplePkSelectors(items: Record<string, unknown>[], targetKeyField: string): unknown[] | null {
+  const values: unknown[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const keys = Object.keys(item);
+    if (keys.length !== 1 || keys[0] !== targetKeyField) return null;
+    const value = item[targetKeyField];
+    if (value === null || value === undefined) return null;
+    // An operator object (`{ gt: 1 }`, `{ in: [...] }`) is not an equality
+    // selector. Date and Buffer keys are objects too; they ARE plain values, but
+    // they are rare enough that routing them down the per-selector path costs
+    // nothing and keeps this test to one cheap rule.
+    if (typeof value === 'object') return null;
+    values.push(value);
+  }
+  return values;
+}
+
+/**
+ * Resolve each caller-supplied target selector to the target row's key value,
+ * de-duplicated in first-seen order. A selector that matches no row is refused:
+ * silently skipping it is exactly the failure mode this path exists to remove.
+ *
+ * A payload of plain primary-key selectors (see {@link simplePkSelectors}) is
+ * resolved with ONE `IN (...)` read instead of a `findUnique` per target, so a
+ * 20-target connect costs one round trip rather than twenty. The per-selector
+ * path stays for arbitrary unique selectors, and BOTH refuse a target that does
+ * not exist, naming it.
+ */
+async function resolveJunctionTargets(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  relName: string,
+  plan: JunctionPlan,
+  op: string,
+  items: Record<string, unknown>[],
+): Promise<unknown[]> {
+  for (const target of items) assertTargetSelectsSomething(target, op, relName, rel);
+
+  const pkValues = simplePkSelectors(items, plan.targetKeyField);
+  if (pkValues) return resolveJunctionTargetsByPk(ctx, rel, relName, plan, op, pkValues);
+
+  const values: unknown[] = [];
+  const seen = new Set<string>();
+  for (const target of items) {
+    const row = (await ctx.tx.table(rel.to).findUnique({ where: target })) as Record<string, unknown> | null;
+    if (!row) throw noTargetRow(op, relName, rel, target);
+    const value = row[plan.targetKeyField];
+    if (value === null || value === undefined) {
+      throw new ValidationError(
+        `[turbine] Nested ${op} on the many-to-many relation "${relName}": the "${rel.to}" row matching ` +
+          `${describeTargetForMessage(target)} has no "${plan.targetKeyField}" value to link.`,
+      );
+    }
+    const key = keyOf(value);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    values.push(value);
+  }
+  return values;
+}
+
+/** One-read resolution for a payload of plain primary-key selectors. */
+async function resolveJunctionTargetsByPk(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  relName: string,
+  plan: JunctionPlan,
+  op: string,
+  pkValues: unknown[],
+): Promise<unknown[]> {
+  const wanted: unknown[] = [];
+  const seen = new Set<string>();
+  for (const value of pkValues) {
+    const key = keyOf(value);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    wanted.push(value);
+  }
+  if (wanted.length === 0) return [];
+
+  const rows = (await ctx.tx.table(rel.to).findMany({
+    where: { [plan.targetKeyField]: { in: wanted } },
+    warnOnUnlimited: false,
+  })) as Record<string, unknown>[];
+
+  // Keyed by string, so a target primary key read back in a different shape than
+  // the caller wrote it (a bigint `1` for a supplied `'1'`) still matches.
+  const found = new Map<string, unknown>();
+  for (const row of rows) {
+    const value = row[plan.targetKeyField];
+    if (value === null || value === undefined) continue;
+    found.set(keyOf(value), value);
+  }
+
+  // The DB-side value is returned, not the caller's, so the junction insert
+  // writes the same shape the per-selector path would.
+  return wanted.map((value) => {
+    const hit = found.get(keyOf(value));
+    if (hit === undefined) throw noTargetRow(op, relName, rel, { [plan.targetKeyField]: value });
+    return hit;
+  });
+}
+
+/** The junction rows linking this parent to `values`. */
+function junctionRows(plan: JunctionPlan, values: unknown[]): Record<string, unknown>[] {
+  return values.map((v) => ({ [plan.sourceField]: plan.parentValue, [plan.targetField]: v }));
+}
+
+/** The `feature` string both refusing engines tag their skipDuplicates E017 with. */
+const SKIP_DUPLICATES_FEATURE = 'createMany({ skipDuplicates: true })';
+
+/**
+ * Per-schema memo of whether the bound engine accepts
+ * `createMany({ skipDuplicates })`, so the engines that refuse it pay for the
+ * refusal once instead of on every connect.
+ *
+ * The capability is not reachable from here as a flag — the `Dialect` is private
+ * to QueryInterface / TurbineClient and `NestedWriteContext` carries only the
+ * schema and the transaction — so it is read from the engine's OWN structured
+ * refusal (`UnsupportedFeatureError.feature`) rather than from a hardcoded
+ * engine list that would drift. Both refusing engines throw while BUILDING the
+ * statement, before anything is written, so the attempt is side-effect-free.
+ *
+ * Getting the memo wrong is harmless in both directions: a stale `false` only
+ * costs the read-then-insert fallback, and a stale `true` is re-detected and
+ * corrected by the same catch.
+ */
+const skipDuplicatesSupport = new WeakMap<SchemaMetadata, boolean>();
+
+/**
+ * Insert the link rows with `ON CONFLICT DO NOTHING` semantics. Returns false
+ * (having written nothing) when the engine refuses the option, so the caller can
+ * fall back.
+ */
+async function insertJunctionRowsSkippingDuplicates(
+  ctx: NestedWriteContext,
+  plan: JunctionPlan,
+  values: unknown[],
+): Promise<boolean> {
+  if (skipDuplicatesSupport.get(ctx.schema) === false) return false;
+  try {
+    await ctx.tx.table(plan.table).createMany({ data: junctionRows(plan, values), skipDuplicates: true });
+    skipDuplicatesSupport.set(ctx.schema, true);
+    return true;
+  } catch (err) {
+    if (err instanceof UnsupportedFeatureError && err.feature === SKIP_DUPLICATES_FEATURE) {
+      skipDuplicatesSupport.set(ctx.schema, false);
+      return false;
+    }
+    throw err;
+  }
+}
+
+/**
+ * `connect`: link this parent to each target, idempotently.
+ *
+ * Two strategies, because idempotence has to survive CONCURRENCY:
+ *
+ * 1. Junction constrains the pair AND the engine supports `skipDuplicates`
+ *    (PostgreSQL, SQLite and MySQL: `ON CONFLICT DO NOTHING` / a no-op
+ *    `ON DUPLICATE KEY UPDATE`) — one INSERT, no read. The engine resolves the
+ *    conflict, so two transactions connecting the same pair at the same time
+ *    both succeed and one link row exists. This is the introspected path:
+ *    every junction introspection can detect declares the pair unique.
+ * 2. Otherwise — read this parent's existing link rows for exactly these targets
+ *    and insert only the missing ones. Used when the engine refuses the option
+ *    (SQL Server and PowDB have no single-statement skip-duplicates form and
+ *    throw E017), and when the junction does NOT constrain the pair, where
+ *    `ON CONFLICT DO NOTHING` has no constraint to fire on and would let a
+ *    repeated connect insert a second link row. Read-then-insert is not
+ *    concurrency-safe (both transactions can read "missing"); on an unconstrained
+ *    junction nothing available here is, and this at least keeps a serially
+ *    repeated connect idempotent.
+ */
+async function processManyToManyConnect(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  relName: string,
+  plan: JunctionPlan,
+  items: Record<string, unknown>[],
+): Promise<void> {
+  if (items.length === 0) return;
+  const values = await resolveJunctionTargets(ctx, rel, relName, plan, 'connect', items);
+  if (values.length === 0) return;
+
+  if (plan.pairIsUnique && (await insertJunctionRowsSkippingDuplicates(ctx, plan, values))) return;
+
+  const existing = (await ctx.tx.table(plan.table).findMany({
+    where: { [plan.sourceField]: plan.parentValue, [plan.targetField]: { in: values } },
+    // An internal engine read: never lecture the caller about a missing `limit`
+    // on a statement they did not write.
+    warnOnUnlimited: false,
+  })) as Record<string, unknown>[];
+  // Compared as strings: the junction column and the target primary key are read
+  // through DIFFERENT tables' parsers, so an already-linked pair can arrive as
+  // `'1'` here and `1` there, and strict identity would re-insert it.
+  const linked = new Set(existing.map((r) => keyOf(r[plan.targetField])));
+  const missing = values.filter((v) => !linked.has(keyOf(v)));
+  if (missing.length === 0) return;
+
+  await ctx.tx.table(plan.table).createMany({ data: junctionRows(plan, missing) });
+}
+
+/**
+ * `disconnect`: remove the link rows for exactly the named targets.
+ *
+ * Scoped by BOTH keys in one statement. A delete scoped by the source key alone
+ * would unlink every target of this parent, and one scoped by the target key
+ * alone would unlink OTHER parents' rows.
+ */
+async function processManyToManyDisconnect(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  relName: string,
+  plan: JunctionPlan,
+  items: Record<string, unknown>[],
+): Promise<void> {
+  if (items.length === 0) return;
+  const values = await resolveJunctionTargets(ctx, rel, relName, plan, 'disconnect', items);
+  if (values.length === 0) return;
+
+  await ctx.tx.table(plan.table).deleteMany({
+    where: { [plan.sourceField]: plan.parentValue, [plan.targetField]: { in: values } },
+  });
+}
+
+/**
+ * `set`: replace this parent's whole link set, in one transaction.
+ *
+ * `set: []` clears every link of this parent (Prisma's semantics, and the same
+ * choice the hasMany/hasOne `set` path already makes). The clearing delete is
+ * always scoped by the source key, so it can never touch another parent's rows.
+ */
+async function processManyToManySet(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  relName: string,
+  plan: JunctionPlan,
+  items: Record<string, unknown>[],
+): Promise<void> {
+  const values = await resolveJunctionTargets(ctx, rel, relName, plan, 'set', items);
+
+  await ctx.tx.table(plan.table).deleteMany({ where: { [plan.sourceField]: plan.parentValue } });
+  if (values.length === 0) return;
+  await ctx.tx.table(plan.table).createMany({ data: junctionRows(plan, values) });
+}
+
+/**
+ * Run every supported junction operation for one many-to-many relation, in the
+ * order the caller's payload implies: `set` (a full replacement) first, then
+ * `disconnect`, then `connect`.
+ */
+async function processManyToMany(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  relName: string,
+  ops: Record<string, unknown>,
+  parentRow: Record<string, unknown>,
+): Promise<void> {
+  assertManyToManyOpsSupported(relName, rel, ops);
+  if (ops.set === undefined && ops.disconnect === undefined && ops.connect === undefined) return;
+
+  const plan = junctionPlan(ctx, rel, relName, parentRow);
+  if (ops.set !== undefined) {
+    await processManyToManySet(
+      ctx,
+      rel,
+      relName,
+      plan,
+      toArray(ops.set as Record<string, unknown> | Record<string, unknown>[]),
+    );
+  }
+  if (ops.disconnect !== undefined) {
+    await processManyToManyDisconnect(
+      ctx,
+      rel,
+      relName,
+      plan,
+      toArray(ops.disconnect as Record<string, unknown> | Record<string, unknown>[]),
+    );
+  }
+  if (ops.connect !== undefined) {
+    await processManyToManyConnect(
+      ctx,
+      rel,
+      relName,
+      plan,
+      toArray(ops.connect as Record<string, unknown> | Record<string, unknown>[]),
+    );
+  }
 }
 
 /**
@@ -397,7 +898,10 @@ export async function executeNestedCreate(
     if (rel.type === 'belongsTo') {
       Object.assign(belongsToFks, await resolveBelongsToForCreate(ctx, rel, ops, tableName, depth, path, relName));
     } else if (rel.type === 'manyToMany') {
-      throw manyToManyUnsupported(relName, rel);
+      // Validated BEFORE the parent insert so an unsupported m2m op refuses
+      // without having written anything; the junction rows themselves need the
+      // parent's key, so they are written after the insert (below).
+      assertManyToManyOpsSupported(relName, rel, ops);
     }
   }
 
@@ -412,6 +916,11 @@ export async function executeNestedCreate(
     const rel = tableMeta.relations[relName]!;
     if (rel.type === 'hasMany' || rel.type === 'hasOne') {
       await processHasManyCreate(ctx, rel, ops, parentRow, depth, path, relName);
+    } else if (rel.type === 'manyToMany') {
+      // The junction row carries the parent's key, so it can only be written
+      // once the parent row exists. Same transaction, same ordering rule the
+      // hasMany path follows.
+      await processManyToMany(ctx, rel, relName, ops, parentRow);
     }
   }
 
@@ -551,7 +1060,7 @@ export async function executeNestedUpdate(
         });
       }
     } else {
-      throw manyToManyUnsupported(relName, rel);
+      await processManyToMany(ctx, rel, relName, ops, parentRow);
     }
   }
 
@@ -1014,20 +1523,22 @@ async function processBelongsToUpdate(
     throw new ValidationError(`[turbine] Nested update on belongsTo "${rel.name}" requires a "data" field.`);
   }
 
-  // Derive where from parent's FK values
-  const fks = normalizeKeyColumns(rel.foreignKey);
-  const refs = normalizeKeyColumns(rel.referenceKey);
-  const parentMeta = ctx.schema.tables[parentTable];
-  const relatedTable = ctx.schema.tables[rel.to];
-
-  const where: Record<string, unknown> = {};
-  for (let i = 0; i < fks.length; i++) {
-    const fkField = parentMeta?.reverseColumnMap[fks[i]!] ?? fks[i]!;
-    const refField = relatedTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
-    where[refField] = parentRow[fkField];
+  // The related row is the one this parent's FK points at. Route through the
+  // shared correlation helper (like every sibling operation) so a NULL parent
+  // FK reports not-found instead of compiling to `refField IS NULL` and
+  // updating EVERY row of the related table with a null reference key.
+  const where = belongsToCorrelationWhere(ctx, rel, parentRow, parentTable);
+  if (!where) {
+    // Parent FK is NULL: it points at nothing, so nothing is in scope to update.
+    const nullFk = Object.fromEntries(normalizeKeyColumns(rel.foreignKey).map((c) => [c, null]));
+    throw notRelatedToParent('update', rel.name, rel, nullFk);
   }
 
-  await ctx.tx.table(rel.to).update({ where, data: item.data });
+  try {
+    await ctx.tx.table(rel.to).update({ where, data: item.data });
+  } catch (err) {
+    rethrowAsNotRelated(err, 'update', rel.name, rel, where);
+  }
 }
 
 async function processBelongsToUpsert(
@@ -1061,8 +1572,13 @@ async function processBelongsToUpsert(
   // relation's reference key (unique or the PK by construction), so at most one
   // row can come back.
   const existing = correlation
-    ? (((await ctx.tx.table(rel.to).findMany({ where: scopeWhereToParent(item.where, correlation) }))[0] ??
-        null) as Record<string, unknown> | null)
+    ? (((
+        await ctx.tx.table(rel.to).findMany({
+          where: scopeWhereToParent(item.where, correlation),
+          // Internal engine read (see the connect path): no unlimited-findMany warning.
+          warnOnUnlimited: false,
+        })
+      )[0] ?? null) as Record<string, unknown> | null)
     : null;
   if (existing) {
     const relatedMeta = ctx.schema.tables[rel.to]!;

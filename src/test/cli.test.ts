@@ -60,7 +60,8 @@ describe('CLI config', () => {
       assert.ok(result.includes("out: './generated/turbine'"));
       assert.ok(result.includes("schema: 'public'"));
       assert.ok(result.includes("migrationsDir: './turbine/migrations'"));
-      assert.ok(result.includes("seed: './seed.ts'"));
+      // `seedFile` is the canonical key (`seed` remains a back-compat alias).
+      assert.ok(result.includes("seedFile: './turbine/seed.ts'"));
       assert.ok(result.includes("schemaFile: './turbine/schema.ts'"));
     });
 

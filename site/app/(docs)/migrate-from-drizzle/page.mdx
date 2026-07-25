@@ -7,7 +7,7 @@ export const metadata = {
 
 # Migrating from Drizzle
 
-Drizzle is a great TypeScript ORM with a SQL-like query builder. Turbine takes a different approach: a Prisma-inspired API that generates single-query nested relations (no N+1), typed errors, and edge/serverless support with zero config. If you want the ergonomics of `findMany({ with: { posts: true } })` instead of manual joins, Turbine is a natural step.
+Drizzle is a great TypeScript ORM with a SQL-like query builder, and both libraries resolve a nested read in a single statement: Drizzle's relational queries compile to `LEFT JOIN LATERAL` plus JSON aggregation, Turbine's `with` compiles to correlated `json_agg` subqueries. That is not the difference between them. What Turbine adds is a Prisma-inspired typed surface with schema-generated types (no `relations()` re-declaration), typed errors, a read-only-by-default Studio, PII enforced in the emitted SQL, and edge/serverless support with no config. If you want the ergonomics of `findMany({ with: { posts: true } })` and those defaults, Turbine is a natural step.
 
 ## API mapping
 

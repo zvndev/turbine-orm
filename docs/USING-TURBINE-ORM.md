@@ -515,7 +515,9 @@ Available relation operations depend on the write:
 - **On `create`:** `create`, `connect`, `connectOrCreate`.
 - **On `update`:** all of the above plus `disconnect`, `set`, `delete`, `update`, `upsert`.
 
-Beyond the depth cap Turbine throws `CircularRelationError` (`TURBINE_E007`) with the full relation path. Many-to-many nested writes are not resolved automatically — write the junction rows directly.
+Beyond the depth cap Turbine throws `CircularRelationError` (`TURBINE_E007`) with the full relation path.
+
+On a **many-to-many** relation the supported nested operations are `connect` (create and update), plus `disconnect` and `set` (update only): Turbine writes the junction rows itself, inside the same transaction. `connect` is idempotent, `disconnect` is scoped by both the parent and the named targets, and `set: []` clears the parent's links. The remaining operations (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) would have to write the target row as well, so they throw `ValidationError` (`TURBINE_E003`) naming the supported set: write the target row on its own table and link it with `connect`, or write junction rows directly through the junction accessor, in the same `$transaction`. Composite junction keys are refused rather than partially written.
 
 ---
 

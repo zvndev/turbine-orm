@@ -302,6 +302,26 @@ describe('powdb: powqlSchemaDDL doc-field expression indexes', () => {
     assert.deepEqual(ddl, ['alter doc add index (.data->"$1")']);
   });
 
+  it('quotes a doc-field index column that needs quoting (parity with the plain-index branch)', () => {
+    // The json column name was previously spliced in raw while the sibling
+    // plain-index branch quoted it, so a keyword / non-bare identifier emitted
+    // a broken (or attacker-shaped) statement.
+    const t: TableMetadata = {
+      ...table('doc', [
+        col('id', 'id', 'string', 'text', { hasDefault: true }),
+        col('order', 'order', 'Record<string, unknown>', 'jsonb', { nullable: true }),
+      ]),
+      indexes: [{ name: 'i', columns: ['order'], unique: false, definition: '', docPath: ['k'] }],
+    };
+    const ddl = powqlSchemaDDL({ enums: {}, tables: { doc: t } }).filter((s) => s.startsWith('alter'));
+    assert.deepEqual(ddl, ['alter doc add index (.`order`->"k")']);
+    // A plain identifier is untouched (existing output stays byte-identical).
+    assert.deepEqual(
+      alters(docTable([{ name: 'i', columns: ['data'], unique: false, definition: '', docPath: ['k'] }])),
+      ['alter doc add index (.data->"k")'],
+    );
+  });
+
   it('emits a plain single-column index / unique when no docPath is set', () => {
     const idxDdl = alters(docTable([{ name: 'i', columns: ['data'], unique: false, definition: '' }]));
     assert.deepEqual(idxDdl, ['alter doc add index .data']);
@@ -989,6 +1009,68 @@ describe('powdb: encodePowqlLiteral (typed encoding)', () => {
     assert.equal(encodePowqlLiteral('$1'), '"$1"');
     // Unicode / emoji pass through untouched.
     assert.equal(encodePowqlLiteral('café 😀'), '"café 😀"');
+  });
+});
+
+describe('powdb: encodePowqlLiteral robustness', () => {
+  it('refuses a raw NUL byte (the lexer has no \\0 escape)', () => {
+    // A NUL cannot ADD a clause, but any layer treating the query as a C string
+    // would truncate the statement at it, so it is refused, not passed through.
+    assert.throws(
+      () => encodePowqlLiteral('a\0b'),
+      (e: unknown) => e instanceof ValidationError && /NUL byte/.test((e as Error).message),
+    );
+    // The rejection names the parameter position when materializing.
+    assert.throws(
+      () => materializePowql('U filter .name = $1 { .id }', ['a\0b']),
+      (e: unknown) => e instanceof ValidationError && /parameter \$1/.test((e as Error).message),
+    );
+    // A json document carrying a NUL is already safe: JSON.stringify escapes it
+    // to an escaped six-character sequence, so no raw NUL reaches the literal.
+    assert.equal(encodePowqlLiteral(new PowdbJsonParam({ a: '\0' }, 'data')), '"{\\"a\\":\\"\\\\u0000\\"}"');
+  });
+
+  it('renders exponential-range doubles as plain decimal literals', () => {
+    // String(1e21) is "1e+21", which the lexer cannot read as a number (and the
+    // float path used to append ".0" to it, producing "1e+21.0").
+    assert.equal(encodePowqlLiteral(1e21), '1000000000000000000000');
+    assert.equal(encodePowqlLiteral(new PowdbFloatParam(1e21)), '1000000000000000000000.0');
+    assert.equal(encodePowqlLiteral(-1e21), '-1000000000000000000000');
+    assert.equal(encodePowqlLiteral(1e-7), '0.0000001');
+    assert.equal(encodePowqlLiteral(1.5e-7), '0.00000015');
+    assert.equal(encodePowqlLiteral(new PowdbFloatParam(1e-7)), '0.0000001');
+    // No emitted literal keeps exponential notation.
+    for (const n of [1e21, 1e-7, 1.5e-7, -1e21, 5e-324, Number.MAX_VALUE]) {
+      assert.doesNotMatch(encodePowqlLiteral(n), /e/i, `plain number ${n}`);
+      assert.doesNotMatch(encodePowqlLiteral(new PowdbFloatParam(n)), /e/i, `float param ${n}`);
+    }
+    // Ordinary magnitudes are byte-identical to the previous String(n) form.
+    for (const n of [0, -0.5, 42, 4.2, 1e20, 0.000001, Number.MAX_SAFE_INTEGER]) {
+      assert.equal(encodePowqlLiteral(n), String(n), `unchanged: ${n}`);
+    }
+  });
+
+  it('refuses an invalid Date as E003 (not a raw RangeError)', () => {
+    assert.throws(
+      () => encodePowqlLiteral(new Date('nope')),
+      (e: unknown) => e instanceof ValidationError && /Invalid Date/.test((e as Error).message),
+    );
+  });
+
+  it('refuses an unserializable json value as E003 naming the column', () => {
+    const circular: Record<string, unknown> = { a: 1 };
+    circular.self = circular;
+    assert.throws(
+      () => encodePowqlLiteral(new PowdbJsonParam(circular, 'data')),
+      (e: unknown) => e instanceof ValidationError && /json value for column "data"/.test((e as Error).message),
+    );
+    // `toJSON` returning undefined makes JSON.stringify return undefined.
+    assert.throws(
+      () => encodePowqlLiteral(new PowdbJsonParam({ toJSON: () => undefined }, 'data')),
+      (e: unknown) => e instanceof ValidationError && /serializes to nothing/.test((e as Error).message),
+    );
+    // A normal json document still encodes unchanged.
+    assert.equal(encodePowqlLiteral(new PowdbJsonParam({ a: 1 }, 'data')), '"{\\"a\\":1}"');
   });
 });
 
@@ -3099,6 +3181,58 @@ describe('powdb F2: JSON-path + aggregate groupBy', () => {
     m.setRows([]);
     await qi(m, 'doc').groupBy({ by: ['region'], _count: true, having: { _count: { gt: 1 } } } as never);
     assert.match(m.last().powql, /having count\(\*\) > \$/);
+  });
+
+  it('HAVING per-field aggregates compile to the fixed PowQL function set', async () => {
+    const m = mockPool();
+    m.setRows([]);
+    await qi(m, 'app_user').groupBy({
+      by: ['name'],
+      _sum: { age: true },
+      having: { age: { _sum: { gt: 1 }, _avg: { lte: 9 }, _min: 3, _max: { not: 4 }, _count: { gte: 2 } } },
+    } as never);
+    // Byte-exact: field validated by ref(), function from the allowlist,
+    // operator from the fixed map, every compared value bound as $N.
+    assert.equal(
+      m.last().powql,
+      'app_user group .name having sum(.age) > $1 and avg(.age) <= $2 and min(.age) = $3 and ' +
+        'max(.age) != $4 and count(.age) >= $5 { .name, agg_0: count(*), agg_1: sum(.age) }',
+    );
+    assert.deepEqual(m.last().params, [1, 9, 3, 4, 2]);
+  });
+
+  it('HAVING with an unknown or inherited aggregate key → E003 (never interpolated)', async () => {
+    // The function token used to be `key.slice(1)` straight from the caller.
+    await assert.rejects(
+      qi(mockPool(), 'app_user').groupBy({
+        by: ['name'],
+        having: { age: { '_count(*) > 0 or evil': { gt: 1 } } },
+      } as never),
+      (e: unknown) =>
+        e instanceof ValidationError && /Unknown aggregate "_count\(\*\) > 0 or evil"/.test((e as Error).message),
+    );
+    // A prototype-borrowed key must not resolve to a function name either.
+    for (const key of ['constructor', 'toString', '__proto__']) {
+      const having = { age: {} as Record<string, unknown> };
+      Object.defineProperty(having.age, key, { value: { gt: 1 }, enumerable: true, configurable: true });
+      await assert.rejects(
+        qi(mockPool(), 'app_user').groupBy({ by: ['name'], having } as never),
+        (e: unknown) => e instanceof ValidationError && /Unknown aggregate/.test((e as Error).message),
+        key,
+      );
+    }
+  });
+
+  it('HAVING drops a prototype-borrowed comparison operator instead of emitting it', async () => {
+    const m = mockPool();
+    m.setRows([]);
+    // `constructor` used to resolve through the operator OBJECT's prototype to a
+    // truthy value, splicing the stringified function into the predicate.
+    const filter = { lt: 5, constructor: 1 } as unknown as Record<string, number>;
+    await qi(m, 'app_user').groupBy({ by: ['name'], having: { age: { _sum: filter } } } as never);
+    assert.match(m.last().powql, / having sum\(\.age\) < \$1 /);
+    assert.doesNotMatch(m.last().powql, /function|native code/);
+    assert.deepEqual(m.last().params, [5]);
   });
 
   it('groupBy nulls:first ordering → E017', async () => {

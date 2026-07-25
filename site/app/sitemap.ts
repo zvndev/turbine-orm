@@ -1,11 +1,8 @@
+import { statSync } from 'node:fs';
+import { join } from 'node:path';
 import type { MetadataRoute } from 'next';
 
 const SITE = 'https://turbineorm.dev';
-
-// A stable, build-time constant so we don't stamp every page as "modified"
-// on every deploy (which `new Date()` did). Bump this when docs content
-// meaningfully changes.
-const LAST_MODIFIED = '2026-07-21';
 
 const ROUTES = [
   '',
@@ -31,7 +28,10 @@ const ROUTES = [
   '/read-replicas',
   '/engines',
   '/compatibility',
+  '/powdb',
+  '/dialects',
   '/cli',
+  '/cli-module',
   '/studio',
   '/mcp',
   '/ai-agents',
@@ -42,11 +42,39 @@ const ROUTES = [
   '/changelog',
 ] as const;
 
+/**
+ * Last-modified is DERIVED from each page file's mtime rather than a
+ * hand-maintained constant (which was stamped 2026-07-21 and had already gone
+ * stale). Sitemaps are generated at build time in a Node context, so the file
+ * is right there to stat. A page nobody touched keeps its old date, which is
+ * exactly what the field is supposed to mean, and there is nothing to remember
+ * to bump.
+ *
+ * The build directory is the site root, so page files resolve relative to it.
+ * If a stat fails for any reason, the field is simply omitted for that route:
+ * `lastModified` is optional in the sitemap spec, and a wrong date is worse
+ * than no date.
+ */
+function pageLastModified(route: string): Date | undefined {
+  const dir = route === '' ? 'app' : join('app', '(docs)', route.slice(1));
+  for (const file of ['page.mdx', 'page.tsx']) {
+    try {
+      return statSync(join(process.cwd(), dir, file)).mtime;
+    } catch {
+      // Try the next extension.
+    }
+  }
+  return undefined;
+}
+
 export default function sitemap(): MetadataRoute.Sitemap {
-  return ROUTES.map((path) => ({
-    url: `${SITE}${path}`,
-    lastModified: LAST_MODIFIED,
-    changeFrequency: 'weekly',
-    priority: path === '' ? 1 : 0.8,
-  }));
+  return ROUTES.map((path) => {
+    const lastModified = pageLastModified(path);
+    return {
+      url: `${SITE}${path}`,
+      ...(lastModified ? { lastModified } : {}),
+      changeFrequency: 'weekly' as const,
+      priority: path === '' ? 1 : 0.8,
+    };
+  });
 }

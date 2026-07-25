@@ -81,13 +81,24 @@ function generateCreateEnumType(enumName: string, labels: readonly string[], dia
 /**
  * Resolve the DDL type token for a column: an enum type name, a `vector(n)`
  * literal, or the dialect's scalar type — with a trailing `[]` for arrays.
+ *
+ * `vectorDimensions` is the one number interpolated into the type token, so it
+ * is validated here as a positive integer within pgvector's limit rather than
+ * being trusted to be numeric.
  */
-function resolveDdlType(config: ColumnConfig, dialect: Dialect): string {
+function resolveDdlType(config: ColumnConfig, dialect: Dialect, columnName: string): string {
   let base: string;
   if (config.enumName) {
     base = dialect.quoteIdentifier(config.enumName);
   } else if (config.vectorDimensions != null) {
-    base = `vector(${config.vectorDimensions})`;
+    const dims = config.vectorDimensions;
+    // pgvector caps a `vector` column at 16000 dimensions.
+    if (typeof dims !== 'number' || !Number.isInteger(dims) || dims < 1 || dims > 16000) {
+      throw new ValidationError(
+        `[turbine] Column "${columnName}": vector dimensions must be an integer between 1 and 16000, got ${String(dims)}.`,
+      );
+    }
+    base = `vector(${dims})`;
   } else {
     base = dialect.buildColumnType({ type: config.type, maxLength: config.maxLength });
   }
@@ -268,6 +279,9 @@ function generateCreateTable(
   }
 
   // Table-level CHECK constraints (named → CONSTRAINT "name" CHECK (...)).
+  // The constraint NAME is quoted; the EXPRESSION is raw SQL emitted verbatim
+  // by design (see the CheckSpec.expression contract) and must never be built
+  // from untrusted input.
   for (const chk of table.checks ?? []) {
     columnDefs.push(
       chk.name
@@ -327,7 +341,7 @@ function generateColumnDef(
   // Resolve the DDL type (enum name / vector(n) / scalar, plus [] for arrays).
   // Passed as a fully-formed `type` token with no maxLength so the dialect
   // doesn't re-apply VARCHAR(n) on top of it.
-  const ddlType = resolveDdlType(config, dialect);
+  const ddlType = resolveDdlType(config, dialect, snakeName);
 
   let def = dialect.buildColumnDefinition({
     name: dialect.quoteIdentifier(snakeName),
@@ -347,7 +361,9 @@ function generateColumnDef(
     if (config.onUpdate) def += ` ON UPDATE ${referentialActionToSql(config.onUpdate)}`;
   }
 
-  // Column-level CHECK constraint (raw SQL expression, user-authored).
+  // Column-level CHECK constraint. The expression is RAW SQL authored in the
+  // schema and is emitted verbatim by design (a DDL builder cannot parse or
+  // parameterize a boolean expression); never build it from untrusted input.
   if (config.check) {
     def += ` CHECK (${config.check})`;
   }
@@ -701,7 +717,21 @@ export function diffEnumValues(
 
 /** A check constraint as declared or read from the DB. */
 export interface CheckSpec {
+  /** Constraint name. Always emitted through `dialect.quoteIdentifier`. */
   name: string;
+  /**
+   * RAW SQL boolean expression (e.g. `price >= 0`), emitted VERBATIM into the
+   * `CHECK (...)` clause.
+   *
+   * This is a deliberate escape hatch: a CHECK body is an arbitrary SQL
+   * expression, so it cannot be quoted, parameterized, or validated by the DDL
+   * builder without reimplementing the server's expression parser. The contract
+   * is therefore on the caller: the expression MUST come from the project's own
+   * schema definition (a `defineSchema` literal or an introspected constraint),
+   * and must NEVER be built from user input, request data, or any other
+   * untrusted source. Anything interpolated into it runs with the privileges of
+   * the migration.
+   */
   expression: string;
 }
 
@@ -724,6 +754,8 @@ export function diffCheckConstraints(
   const dbByName = new Map(dbChecks.map((c) => [c.name, c]));
   const schemaByName = new Map(schemaChecks.map((c) => [c.name, c]));
   const norm = (e: string) => e.replace(/\s+/g, ' ').trim();
+  // `c.expression` is raw SQL emitted verbatim by design (see CheckSpec):
+  // schema-authored only, never untrusted input.
   const addStmt = (c: CheckSpec) => `ALTER TABLE ${q(table)} ADD CONSTRAINT ${q(c.name)} CHECK (${c.expression});`;
   const dropStmt = (name: string) => `ALTER TABLE ${q(table)} DROP CONSTRAINT ${q(name)};`;
 
@@ -993,7 +1025,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         if (expectedUdt && !isSerialType(config.type) && dbCol.udtName !== expectedUdt) {
           // resolveDdlType handles enum names, vector(n), arrays, and VARCHAR(n) —
           // config.type alone would emit the internal ENUM/VECTOR sentinels here.
-          const sqlType = resolveDdlType(config, dialect);
+          const sqlType = resolveDdlType(config, dialect, snakeName);
           const oldSqlType = udtToSqlType(dbCol.udtName, dbCol.maxLength);
           const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${sqlType} USING ${dialect.quoteIdentifier(snakeName)}::${sqlType};`;
           const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${oldSqlType} USING ${dialect.quoteIdentifier(snakeName)}::${oldSqlType};`;
@@ -1141,6 +1173,8 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       const normExpr = (e: string) => e.replace(/\s+/g, ' ').trim();
       for (const sc of namedSchemaChecks) {
         const existing = dbCheckByName.get(sc.name);
+        // The constraint name is quoted; `sc.expression` is raw SQL emitted
+        // verbatim by design (see CheckSpec) and must be schema-authored.
         const addSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ADD CONSTRAINT ${dialect.quoteIdentifier(sc.name)} CHECK (${sc.expression});`;
         const dropSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP CONSTRAINT ${dialect.quoteIdentifier(sc.name)};`;
         if (!existing) {

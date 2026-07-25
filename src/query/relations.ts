@@ -145,7 +145,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
       );
       continue;
     }
-    const relDef = meta.relations[relName];
+    const relDef = ownLookup(meta.relations, relName);
     if (!relDef) {
       parts.push(`unknown:${relName}`);
       continue;
@@ -179,9 +179,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
     // `{title: {contains: 'x'}}` emit different SQL so they must not share
     // a fingerprint)
     if (opts.where) {
-      subParts.push(
-        `w=${whereMod.fingerprintAliasWhere(qi, opts.where as Record<string, unknown>, meta.relations[relName]?.to)}`,
-      );
+      subParts.push(`w=${whereMod.fingerprintAliasWhere(qi, opts.where as Record<string, unknown>, relDef.to)}`);
     }
 
     // orderBy shape (OrderBySpec nulls placement changes the SQL, so fingerprint it)
@@ -221,7 +219,7 @@ export function collectWithParams(qi: BuilderCtx, withClause: WithClause, params
   if (!meta) return;
 
   for (const [relName, relSpec] of sortedEntries(withClause)) {
-    const relDef = meta.relations[relName];
+    const relDef = ownLookup(meta.relations, relName);
     if (!relDef) continue;
     collectRelationSubqueryParams(qi, relDef, relSpec, params, table ?? qi.table);
   }
@@ -273,11 +271,11 @@ export function collectRelationSubqueryParams(
     }
     whereMod.collectTargetGlobalFilterAlias(qi, targetTable, params);
     if (spec.limit !== undefined && !qi.dialect.inlineLimitOffset) {
-      params.push(Number(spec.limit));
+      params.push(qi.paginationValue(spec.limit, 'relation limit'));
     }
     if (spec.with) {
       for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-        const nestedRelDef = targetMeta.relations[nestedRelName];
+        const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
         if (!nestedRelDef) continue;
         collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'alias', depth + 1);
       }
@@ -293,7 +291,7 @@ export function collectRelationSubqueryParams(
   // Non-wrapped path: nested relations BEFORE where/limit
   if (!willWrap && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) continue;
       collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'alias', depth + 1);
     }
@@ -320,13 +318,13 @@ export function collectRelationSubqueryParams(
   // pushing one here would orphan a param and desync the collect path.
   // `limit: 0` pushes (LIMIT 0 is honored), so check !== undefined.
   if (relDef.type === 'hasMany' && spec.limit !== undefined && !qi.dialect.inlineLimitOffset) {
-    params.push(Number(spec.limit));
+    params.push(qi.paginationValue(spec.limit, 'relation limit'));
   }
 
   // Wrapped path: nested relations AFTER where/limit (inside inner subquery)
   if (willWrap && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) continue;
       collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'innerAlias', depth + 1);
     }
@@ -623,7 +621,7 @@ export function buildRelationOrderBy(
   const ownerMeta = ctx?.meta ?? qi.tableMeta;
   const ownerTable = ctx?.table ?? qi.table;
   const parentRef = ctx?.parentRef ?? qi.table;
-  const relDef = ownerMeta.relations[relName];
+  const relDef = ownLookup(ownerMeta.relations, relName);
   if (!relDef) {
     // A table with no relations at all would otherwise render a dangling
     // "Available: " and read as a broken message; and the most likely cause of
@@ -1052,7 +1050,7 @@ export function collectRelationOrderParams(
       if (isRelationPickOrderBy(dirValue)) {
         throw pickOrderNestedError(qi, key);
       }
-      const relDef = targetMeta.relations[key];
+      const relDef = ownLookup(targetMeta.relations, key);
       if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
         collectRelationCountParams(qi, relDef, params);
       } else if (relDef) {
@@ -1317,7 +1315,7 @@ export function buildRelationShapes(
   if (!meta) return {};
   const shapes: Record<string, RelationShape> = {};
   for (const [relName, relSpec] of sortedEntries(withClause)) {
-    const relDef = meta.relations[relName];
+    const relDef = ownLookup(meta.relations, relName);
     if (!relDef) continue; // buildSelectWithRelations already threw for this
     shapes[relName] = buildRelationShape(qi, relDef, relSpec, meta, includePii);
   }
@@ -1345,7 +1343,7 @@ export function buildRelationShape(
   const nested: Record<string, RelationShape> = {};
   if (spec !== true && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) continue;
       keys.push(nestedRelName);
       nested[nestedRelName] = buildRelationShape(qi, nestedRelDef, nestedSpec, targetMeta, includePii);
@@ -1504,7 +1502,7 @@ export function buildSelectWithRelations(
   for (const [relName, relSpec] of sortedEntries(withClause)) {
     // `_count` is a reserved key handled after the relation subqueries.
     if (relName === '_count') continue;
-    const relDef = meta.relations[relName];
+    const relDef = ownLookup(meta.relations, relName);
     if (!relDef) {
       throw new RelationError(
         `[turbine] Unknown relation "${relName}" on table "${table}". ` +
@@ -1760,7 +1758,7 @@ export function buildRelationSubquery(
   // Nested relations — only in the non-wrapped path (wrapped path builds them separately)
   if (!willWrap && spec !== true && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) {
         throw new RelationError(
           `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
@@ -1842,7 +1840,7 @@ export function buildRelationSubquery(
   // `limit: 0` is honored (LIMIT 0 → empty array), so check !== undefined.
   let limitClause = '';
   if (relDef.type === 'hasMany' && spec !== true && spec.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params)}`;
+    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params, 'relation limit')}`;
   }
 
   if (relDef.type === 'hasMany') {
@@ -1861,7 +1859,7 @@ export function buildRelationSubquery(
       // Build nested relation subqueries referencing innerAlias
       if (spec !== true && spec.with) {
         for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-          const nestedRelDef = targetMeta.relations[nestedRelName];
+          const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
           if (!nestedRelDef) {
             throw new RelationError(
               `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
@@ -2013,7 +2011,7 @@ export function buildManyToManySubquery(
   // LIMIT — `limit: 0` is honored (LIMIT 0 → empty array)
   let limitClause = '';
   if (spec !== true && spec.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params)}`;
+    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params, 'relation limit')}`;
   }
 
   const fromJoin = `FROM ${qTarget} ${talias} JOIN ${qJunction} ${jalias} ON ${joinOn}`;
@@ -2032,7 +2030,7 @@ export function buildManyToManySubquery(
     // Nested relations reference the inner alias.
     if (spec !== true && spec.with) {
       for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-        const nestedRelDef = targetMeta.relations[nestedRelName];
+        const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
         if (!nestedRelDef) {
           throw new RelationError(
             `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
@@ -2069,7 +2067,7 @@ export function buildManyToManySubquery(
   ]);
   if (spec !== true && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
-      const nestedRelDef = targetMeta.relations[nestedRelName];
+      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) {
         throw new RelationError(
           `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +

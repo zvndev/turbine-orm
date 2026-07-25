@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
+import { formatPrismaReport, manyToManyCallSites } from '../cli/prisma-report.js';
 import { resolvePrismaSchema } from '../cli/prisma-resolve.js';
 import { parsePrismaSchema } from '../cli/prisma-schema.js';
 import { generate, generatePrismaMap } from '../generate.js';
@@ -590,5 +591,77 @@ model Widget {
     const res = resolvePrismaSchema(parsePrismaSchema(prisma), widgetSchema());
     const out = generatePrismaMap(res.map);
     assert.match(out, /clientDefaults: \{ id: 'uuid', created_at: 'now', updated_at: 'updatedAt' \}/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Report: the many-to-many audit section
+// ---------------------------------------------------------------------------
+
+describe('formatPrismaReport - many-to-many audit section', () => {
+  const res = resolvePrismaSchema(parsePrismaSchema(SHOP_PRISMA), mockSchema());
+  const report = formatPrismaReport(res, { noTimestamp: true });
+
+  it('lists every m2m relation with BOTH the Prisma field name and the Turbine name', () => {
+    assert.match(report, /## Many-to-many relations \(audit these call sites\)/);
+    // Product.tags (Prisma) is `tags` on the Turbine side; Tag.products is `products`.
+    assert.match(report, /\| `Product\.tags` \| `tags` \| `_ProductToTag` \|/);
+    assert.match(report, /\| `Tag\.products` \| `products` \| `_ProductToTag` \|/);
+  });
+
+  it('greps the PRISMA field names, never the Turbine relation names', () => {
+    const grep = report.split('\n').find((l) => l.startsWith('grep -rEn'));
+    assert.ok(grep, 'report must include a ready-to-run grep');
+    assert.match(grep, /\bproducts\b/);
+    assert.match(grep, /\btags\b/);
+  });
+
+  it('names the exact broken recipe so a reader recognizes it', () => {
+    assert.match(report, /grep -rn "manyToMany" generated\//);
+    assert.match(report, /silently reports a clean audit/);
+  });
+
+  it('resolves the pairing itself (both names come out of PRISMA_MAP data)', () => {
+    const sites = manyToManyCallSites(res);
+    assert.deepEqual(sites.map((s) => `${s.prismaPath}=>${s.turbineName}`).sort(), [
+      'Product.tags=>tags',
+      'Tag.products=>products',
+    ]);
+  });
+
+  it('says so honestly in --no-db mode instead of claiming a clean audit', () => {
+    const parseOnly = formatPrismaReport(resolvePrismaSchema(parsePrismaSchema(SHOP_PRISMA), null), {
+      noTimestamp: true,
+    });
+    assert.match(parseOnly, /## Many-to-many relations \(audit these call sites\)/);
+    assert.match(parseOnly, /Re-run without `--no-db`/);
+  });
+
+  it('pairs a DIVERGING Turbine name with its Prisma field (the whole point)', () => {
+    // The consumer case: `reports` in application code, `reportSchedule` in
+    // generated/metadata.ts. Grepping the Turbine name finds zero call sites.
+    const schema = mockSchema();
+    const products = schema.tables.products!;
+    products.relations = {
+      ...products.relations,
+      productTags: { ...products.relations.tags!, name: 'productTags' },
+    };
+    delete products.relations.tags;
+
+    const out = formatPrismaReport(resolvePrismaSchema(parsePrismaSchema(SHOP_PRISMA), schema), {
+      noTimestamp: true,
+    });
+    assert.match(out, /\| `Product\.tags` \| `productTags` \| `_ProductToTag` \|/);
+    // The grep must use the Prisma spelling, not the Turbine one.
+    const grep = out.split('\n').find((l) => l.startsWith('grep -rEn'))!;
+    assert.doesNotMatch(grep, /productTags/);
+    assert.match(grep, /\btags\b/);
+  });
+
+  it('omits the section for a schema with no m2m relation', () => {
+    const noM2m = 'model Widget {\n  id Int @id\n  label String\n}\n';
+    const schema: SchemaMetadata = { enums: {}, tables: { widgets: table('widgets', ['id', 'label']) } };
+    const out = formatPrismaReport(resolvePrismaSchema(parsePrismaSchema(noM2m), schema), { noTimestamp: true });
+    assert.doesNotMatch(out, /Many-to-many relations/);
   });
 });

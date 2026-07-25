@@ -4,6 +4,8 @@
  * Standalone utility functions and classes used by the query builder.
  */
 
+import { localDateTimeKind, timeOfDayKind } from '../schema.js';
+
 // ---------------------------------------------------------------------------
 // Identifier quoting — prevents SQL injection via table/column names
 // ---------------------------------------------------------------------------
@@ -168,6 +170,116 @@ export function buildCorrelation(
   return leftCols
     .map((col, i) => `${leftRef}.${quoteIdent(col)} = ${rightRef}.${quoteIdent(rightCols[i]!)}`)
     .join(' AND ');
+}
+
+/**
+ * Render a JS `Date` as a TIME-OF-DAY literal for a `time` / `timetz` column.
+ *
+ * Which time of day? The **UTC** components of the Date, never the process
+ * local zone. That is what Prisma does (`new Date('1970-01-01T09:00:00Z')`
+ * written to a `@db.Time(6)` column stores `09:00:00`), and the affected
+ * consumers are porting from Prisma, so Prisma is the contract. It is also the
+ * only choice that round-trips: the same Date produces the same literal no
+ * matter where the process runs.
+ *
+ * `timetz` gets an explicit `+00:00`, because the value's zone IS UTC and
+ * omitting it would let Postgres attach the session's `TimeZone` instead.
+ * Fractional seconds are emitted only when non-zero, so an even-second Date
+ * binds the plain `HH:MM:SS` form.
+ */
+export function toTimeOfDayLiteral(value: Date, kind: 'time' | 'timetz'): string {
+  const pad = (n: number, width = 2) => String(n).padStart(width, '0');
+  const ms = value.getUTCMilliseconds();
+  const literal =
+    `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}` +
+    (ms === 0 ? '' : `.${pad(ms, 3)}`);
+  return kind === 'timetz' ? `${literal}+00:00` : literal;
+}
+
+/** The temporal column shapes that need a bound Date rewritten to a literal. */
+export type TemporalBindKind = 'time' | 'timetz' | 'date' | 'timestamp';
+
+/** Render the UTC calendar date of a `Date` as `YYYY-MM-DD`. */
+function utcDatePart(value: Date): string {
+  const year = value.getUTCFullYear();
+  const y = year < 0 ? `-${String(-year).padStart(4, '0')}` : String(year).padStart(4, '0');
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${y}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`;
+}
+
+/**
+ * Render a JS `Date` as a literal for a zone-less `date` / `timestamp` column,
+ * using the value's **UTC** components.
+ *
+ * This is the write-side mirror of `parseDbDate`, which reads an offset-less
+ * database value back as UTC. Without it the driver serializes the Date with
+ * the PROCESS's offset (`prepareValue` → `dateToString`), so a `timestamp`
+ * column is not round-trip stable outside a UTC process: writing
+ * `2026-07-25T00:00Z` from `America/Los_Angeles` stores
+ * `2026-07-24 17:00:00` and reads back as `2026-07-24T17:00Z`. It also matches
+ * the choice {@link toTimeOfDayLiteral} already makes for `time` columns, and
+ * Prisma, which writes UTC components to zone-less columns.
+ *
+ * `timestamptz` is NOT handled here (and must not be): it stores a real
+ * instant, so the driver's local-offset string is already correct.
+ */
+export function toLocalDateTimeLiteral(value: Date, kind: 'date' | 'timestamp'): string {
+  const datePart = utcDatePart(value);
+  if (kind === 'date') return datePart;
+  return `${datePart} ${toTimeOfDayLiteral(value, 'time')}`;
+}
+
+/**
+ * Classify a column's database type for temporal bind rewriting.
+ *
+ * `utcDateTimes: false` restricts the classification to the time-of-day types,
+ * whose rewrite is a hard-error fix (Postgres rejects an ISO timestamp for a
+ * `time` column outright) rather than a value correction.
+ */
+export function temporalBindKind(dbType: string | undefined, utcDateTimes = true): TemporalBindKind | null {
+  const timeKind = timeOfDayKind(dbType);
+  if (timeKind) return timeKind;
+  return utcDateTimes ? localDateTimeKind(dbType) : null;
+}
+
+/**
+ * Rewrite one bound value for a temporal column: a JS `Date` on a `time` /
+ * `timetz` / `date` / `timestamp` column becomes the corresponding UTC literal,
+ * and an array of Dates on such a column is rewritten element-wise (the
+ * per-element rewrite is what a `time[]` column needs, and matches the scalar
+ * case rather than silently binding an ISO timestamp).
+ *
+ * Everything else — every non-Date, every non-temporal column, and every
+ * `timestamptz` column — is returned by IDENTITY, so this is a byte-for-byte
+ * no-op outside the shapes above.
+ */
+export function coerceTemporalValue(dbType: string | undefined, value: unknown, utcDateTimes = true): unknown {
+  const isDate = value instanceof Date;
+  if (!isDate && !Array.isArray(value)) return value;
+  if (isDate && Number.isNaN(value.getTime())) return value;
+  // An array value is either an `in`/`notIn` list on a scalar temporal column
+  // (type already the element type) or the value of an array column, whose
+  // introspected type is the `_time` / `_timestamp` array spelling.
+  const kind = temporalBindKind(isDate ? dbType : arrayElementDbType(dbType), utcDateTimes);
+  if (!kind) return value;
+  if (isDate) return renderTemporal(value, kind);
+  // Rewrite only if the list actually holds a Date, so a string list stays
+  // byte-identical (and the same array instance is returned).
+  if (!value.some((v) => v instanceof Date)) return value;
+  return value.map((v) => (v instanceof Date && !Number.isNaN(v.getTime()) ? renderTemporal(v, kind) : v));
+}
+
+/** `_time` → `time`, `time[]` → `time`, anything else unchanged. */
+function arrayElementDbType(dbType: string | undefined): string | undefined {
+  if (!dbType) return dbType;
+  if (dbType.startsWith('_')) return dbType.slice(1);
+  return dbType.endsWith('[]') ? dbType.slice(0, -2) : dbType;
+}
+
+function renderTemporal(value: Date, kind: TemporalBindKind): string {
+  return kind === 'date' || kind === 'timestamp'
+    ? toLocalDateTimeLiteral(value, kind)
+    : toTimeOfDayLiteral(value, kind);
 }
 
 /**

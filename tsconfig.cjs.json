@@ -5,7 +5,15 @@
     "moduleResolution": "Node",
     "ignoreDeprecations": "6.0",
     "outDir": "./dist/cjs",
-    "declaration": false,
+    // Declarations ARE emitted here, and they are not redundant with dist/*.d.ts.
+    // Under `moduleResolution: node16`/`nodenext` a CJS consumer that resolves the
+    // `require` condition also resolves that condition's `types`. Pointing it at
+    // the ESM declarations (which live in a `"type": "module"` package) makes tsc
+    // report TS1479 ("the file is an ES module ... cannot be require()d"), even
+    // though the runtime require works fine. dist/cjs ships its own
+    // `{"type":"commonjs"}` package.json (written by `npm run build`), so the
+    // declarations emitted next to it are CJS declarations and resolve cleanly.
+    "declaration": true,
     "declarationMap": false,
     "sourceMap": false,
     "verbatimModuleSyntax": false

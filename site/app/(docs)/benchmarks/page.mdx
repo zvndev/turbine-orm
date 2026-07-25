@@ -1,3 +1,5 @@
+import { TURBINE_VERSION } from '../../../lib/version';
+
 export const metadata = {
   title: 'Benchmarks',
   description:
@@ -9,7 +11,7 @@ export const metadata = {
 
 Three-way head-to-head against **Prisma 7.9** (`@prisma/adapter-pg`, `relationJoins` preview on) and **Drizzle 0.45** (node-postgres relational API) on a **local PostgreSQL 17.9** database reached over a Unix socket. 200 iterations + 20 warmup per scenario, same schema, same data, same connection pool config.
 
-> **Measured on turbine-orm 0.39.0, 2026-07-21.** The harness has not been re-run since, so these are not 0.48.0 numbers. One later change is worth knowing about when you reproduce them: since 0.41 the default `relationLoadStrategy` is `'auto'` rather than `'join'`, which keeps the single-statement plan for indexed relations (as in this schema) but falls back to a batched follow-up for any relation whose foreign key it can see is unindexed. Pin `relationLoadStrategy: 'join'` to measure exactly what ran here.
+> **These numbers are stale, on purpose, until the harness is re-run.** Every figure on this page was measured **once, on 2026-07-21, against turbine-orm 0.39.0**. The current release is **{TURBINE_VERSION}**, and the harness has not been re-run since. Treat the table as a snapshot of one build on one machine, not as a claim about the version you are installing. One later change matters if you reproduce it: since 0.41 the default `relationLoadStrategy` is `'auto'` rather than `'join'`, which keeps the single-statement plan for indexed relations (as in this schema) but falls back to a batched follow-up for any relation whose foreign key it can see is unindexed. Pin `relationLoadStrategy: 'join'` to measure exactly what ran here.
 
 > **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and every number is sub-millisecond. Turbine takes five scenarios outright (flat reads, both findUnique shapes, pipeline, and the hot path), Drizzle takes L2 nested, and four scenarios (L3 nested, count, streaming, atomic increment) flipped winners between two full runs and are reported as near-ties. Prisma 7.9 trails on every scenario here because its per-query work is no longer hidden behind network latency, though it improved noticeably on flat reads and pipeline over 7.6. These are a different measurement regime from the earlier pooled-Neon run and are not directly comparable to it.
 
