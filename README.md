@@ -26,7 +26,7 @@ The reason to reach for Turbine is that every layer between you and a production
 
 Two more things worth knowing, which are about cost rather than safety:
 
-- **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages in lockstep. The main entry's **import graph** is ~60 kB brotli (edge ~45 kB) with `pg` external (measured 2026-07-25: 59.66 kB and 44.77 kB, budgeted in `.size-limit.js`). That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger. Prisma 7 dropped its Rust query engine but its client still ships a TypeScript/WASM query compiler, a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
+- **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages in lockstep. The main entry's **import graph** is ~65 kB brotli (edge ~50 kB) with `pg` external (measured 2026-07-25 on 0.50.0: 65.16 kB and 50.18 kB, budgeted in `.size-limit.js`). That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger. Prisma 7 dropped its Rust query engine but its client still ships a TypeScript/WASM query compiler, a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
 - **Real pipelining, not a batch transaction.** `db.pipeline(...)` uses the Postgres extended-query protocol (Parse/Bind/Execute/Sync) to put N independent queries in one TCP flush. node-postgres does not expose pipelining in its pure-JS core ([brianc/node-postgres#2646](https://github.com/brianc/node-postgres/issues/2646) was still open as of July 2026), and Drizzle's `db.batch()` is an implicit transaction on specific drivers rather than independent-query pipelining.
 
 **Beyond the safety bundle, what ships today:** [global filters](https://turbineorm.dev/global-filters) for soft-delete and multi-tenancy · [read replicas](https://turbineorm.dev/read-replicas) with a `$primary()` escape hatch · a read-only [MCP server](https://turbineorm.dev/mcp) for AI agents · [seed-as-code](https://turbineorm.dev/seeding) and a non-interactive `migrate deploy` for CI · [Zod generation](https://turbineorm.dev/zod) · read-only [views & generated columns](https://turbineorm.dev/views) · [optional SQLite / MySQL / SQL Server / PowDB engines](https://turbineorm.dev/engines) behind subpath exports · a [Prisma migration toolkit](https://turbineorm.dev/migrate-from-prisma) (schema mapper plus a runtime compat adapter) · a cost-aware index advisor in [`turbine doctor`](https://turbineorm.dev/cli#turbine-doctor).
@@ -1076,11 +1076,11 @@ Turbine maps Postgres types to TypeScript:
 |---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
-| **Main bundle (brotli)** | ~60 kB import graph, `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
+| **Main bundle (brotli)** | ~65 kB import graph, `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
 | **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Free; hosted Gateway paid | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, ~45 kB brotli | Driver adapter + WASM compiler | Native | Native |
+| **Edge runtime** | One import swap, ~50 kB brotli | Driver adapter + WASM compiler | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query, shallow inference | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |
