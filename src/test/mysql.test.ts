@@ -697,6 +697,26 @@ describe('turbine-orm/mysql — integration (real MySQL 8)', () => {
     for (const stmt of SEED) await rawPool.query(stmt);
   }
 
+  gate.it("relationLoadStrategy: 'flatten' matches join and batched", async () => {
+    // MySQL has no `buildRelationSubquery` dialect override, so the flatten plan
+    // is eligible here: a belongsTo compiles to a LEFT JOIN over a derived table
+    // exposing only prefixed names.
+    const args = { orderBy: { id: 'asc' }, with: { user: true } };
+    const sql = client.table('posts').buildFindMany({ ...args, relationLoadStrategy: 'flatten' }).sql;
+    assert.match(sql, /LEFT JOIN \(SELECT 1 AS `f0__\$k`/);
+    const join = await client.table('posts').findMany({ ...args, relationLoadStrategy: 'join' });
+    const batched = await client.table('posts').findMany({ ...args, relationLoadStrategy: 'batched' });
+    const flatten = await client.table('posts').findMany({ ...args, relationLoadStrategy: 'flatten' });
+    assert.deepEqual(flatten, join, 'flatten must equal join');
+    assert.deepEqual(batched, join, 'batched must equal join');
+    // Parent WHERE naming a column the joined table also has must not turn
+    // ambiguous (the derived table exposes only `f0__*` names).
+    const filtered = await client
+      .table('posts')
+      .findMany({ where: { id: 1 }, with: { user: true }, relationLoadStrategy: 'flatten' });
+    assert.equal(filtered.length, 1);
+  });
+
   gate.it('introspection discovers tables, PKs, relations, m2m', () => {
     assert.deepEqual(
       Object.keys(dbSchema.tables).sort(),

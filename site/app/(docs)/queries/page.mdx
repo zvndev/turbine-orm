@@ -575,6 +575,49 @@ Under the hood Turbine issues a speculative `LIMIT batchSize + 1` first fetch â€
 
 Every operator composes freely with `AND`, `OR`, `NOT`, and relation filters.
 
+### Misspelled keys are a compile error
+
+<Callout type="note" title="New in 0.50">
+  On a generated, typed client, an unknown key in `where` no longer compiles.
+</Callout>
+
+A typo used to be silently accepted and silently ignored, which returned the wrong rows with no error anywhere:
+
+```ts
+// Before 0.50: compiled, matched every user, returned the whole table.
+// From 0.50: compile error, "emial" does not exist on the where clause.
+await db.users.findMany({ where: { emial: 'a@b.com' } });
+```
+
+The check follows the clause everywhere it nests:
+
+```ts
+await db.users.findMany({
+  where: {
+    OR: [
+      { emial: 'a@b.com' },              // error, inside OR
+      { posts: { some: { titel: 'x' } } }, // error, inside a relation filter
+    ],
+  },
+  with: {
+    posts: { where: { titel: 'x' } },     // error, inside a with block
+  },
+});
+```
+
+No regeneration is needed. It reuses the relation brand your generated client already emits, so an existing generated client picks this up on upgrade. It is also purely a type-level change: the SQL is byte-identical.
+
+**Where it is still permissive.** These compile, deliberately or as a known gap:
+
+| Still open-keyed | Why |
+|---|---|
+| Clients with no relations map | `defineSchema`-only clients and `client.table(name)` have no relation type to thread, so the clause falls back to its historical open-keyed form |
+| Legacy generated clients whose `*Relations` members are bare types rather than brands | The relation **key** is checked; its **value** is not |
+| `orderBy`, and `select` / `omit` inside a `with` block | Not yet converted. Top-level `select` / `omit` **are** checked |
+| The `build*` variants (`buildFindMany`, `buildDelete`, and the rest) | The deferred builders used by `pipeline()` take the entity type only, so their `where` stays open-keyed. Every `await`-able method is checked: `findMany`, `findFirst`, `findFirstOrThrow`, `findUnique`, `findUniqueOrThrow`, `findManyStream`, `update`, `delete`, `upsert`, `count`, `updateMany`, `deleteMany`, `aggregate` and `groupBy` |
+
+Because this is a type-level guarantee, `tsx` and other transpile-only runners will not catch it. Run `tsc --noEmit` in CI.
+
 ### Equality
 
 | Operator | Description | Example |
@@ -911,7 +954,7 @@ const db = turbine({
 | `sqlCache` | `true` | The per-table SQL template cache. Setting `false` is the kill switch. |
 | `sqlCacheSize` | `1000` | How many distinct query **shapes** each table's LRU retains. Values are parameterized, so they never fragment the cache. `0` is equivalent to `sqlCache: false`; a negative value falls back to the default. |
 | `implicitPkOrdering` | `false` | Order a paginating `findMany` that declares no `orderBy` by the primary key ascending, making its pages [deterministic](#deterministic-pages-the-unordered-pagination-warning). An explicit `orderBy` wins; PK-less tables, `cursor` and `distinct` shapes are untouched. Off by default because switching it on rewrites SQL an existing application already emits. |
-| `autoToOneJoinMaxRows` | `1000` | Parent-row ceiling for the [`'auto'` strategy's to-one rule](/relations#load-strategy-auto-join-batched): a `belongsTo` / `hasOne` include stays in the single-statement join when the query's `limit` bounds the parent set at or under this value, and loads batched when the query is unbounded or bounded above it. Only consulted under `'auto'`. |
+| `autoToOneJoinMaxRows` | `1000` | Parent-row ceiling for the [`'auto'` strategy's to-one rule](/relations#load-strategy-auto-join-batched-flatten): a `belongsTo` / `hasOne` include stays in the single-statement join when the query's `limit` bounds the parent set at or under this value, and loads batched when the query is unbounded or bounded above it. Only consulted under `'auto'`. |
 
 Where a pg-style alias exists, the explicit Turbine field wins when both are set.
 

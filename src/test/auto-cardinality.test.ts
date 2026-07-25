@@ -19,7 +19,14 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, it } from 'node:test';
 import type pg from 'pg';
 import type { QueryEvent } from '../query/deferred.js';
-import { QueryInterface } from '../query/index.js';
+import {
+  AUTO_ASSUMED_ROUND_TRIP_MS,
+  AUTO_JOIN_PENALTY_MS_PER_ROW,
+  AUTO_TO_ONE_JOIN_MAX_ROWS,
+  AUTO_TO_ONE_JOIN_ROWS_MAX,
+  AUTO_TO_ONE_JOIN_ROWS_MIN,
+  QueryInterface,
+} from '../query/index.js';
 import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { IndexMetadata, SchemaMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
@@ -155,6 +162,61 @@ describe("'auto', to-one cardinality", () => {
     const { q, calls } = db();
     await q.findMany({ limit: 5000, with: { order: true } } as never);
     assert.ok(calls.length > 1, 'unbounded-in-practice parent set → batched');
+  });
+
+  it('the default threshold is the assumed round trip divided by the per-row penalty', () => {
+    // The three constants must stay algebraically consistent, and the derived
+    // default must reproduce the 1000 rows this heuristic has always shipped —
+    // an unconfigured client must not silently change plans.
+    assert.equal(
+      AUTO_TO_ONE_JOIN_MAX_ROWS,
+      Math.round(AUTO_ASSUMED_ROUND_TRIP_MS / AUTO_JOIN_PENALTY_MS_PER_ROW),
+      'the default must be derived, not independently hard-coded',
+    );
+    assert.equal(AUTO_TO_ONE_JOIN_MAX_ROWS, 1000, 'back-compat: the shipped default is unchanged');
+  });
+
+  it('autoRoundTripMs derives the threshold, and brackets it correctly', async () => {
+    // 0.13ms (a loopback link, measured) → round(0.13 / 0.0007) = 186 rows.
+    const threshold = Math.round(0.13 / AUTO_JOIN_PENALTY_MS_PER_ROW);
+    assert.equal(threshold, 186);
+
+    const under = db({ autoRoundTripMs: 0.13 });
+    await under.q.findMany({ limit: threshold, with: { order: true } } as never);
+    assert.equal(under.calls.length, 1, `limit ${threshold} is AT the threshold → join`);
+
+    const over = db({ autoRoundTripMs: 0.13 });
+    await over.q.findMany({ limit: threshold + 1, with: { order: true } } as never);
+    assert.ok(over.calls.length > 1, `limit ${threshold + 1} is above the threshold → batched`);
+
+    // The same limit that batches on a fast link stays on the join plan for a
+    // cross-region one, which is the entire point of deriving from latency.
+    const farAway = db({ autoRoundTripMs: 35 });
+    await farAway.q.findMany({ limit: threshold + 1, with: { order: true } } as never);
+    assert.equal(farAway.calls.length, 1, 'a 35ms link pays for far more per-row join work');
+  });
+
+  it('a derived threshold is clamped, an explicit row count is not', async () => {
+    // An absurdly fast reading must not push the switch into the band where the
+    // join plan wins by a lot on a handful of rows.
+    const tiny = db({ autoRoundTripMs: 0.000001 });
+    await tiny.q.findMany({ limit: AUTO_TO_ONE_JOIN_ROWS_MIN, with: { order: true } } as never);
+    assert.equal(tiny.calls.length, 1, `clamped up to ${AUTO_TO_ONE_JOIN_ROWS_MIN} rows → still join`);
+
+    const huge = db({ autoRoundTripMs: 10_000 });
+    await huge.q.findMany({ limit: AUTO_TO_ONE_JOIN_ROWS_MAX + 1, with: { order: true } } as never);
+    assert.ok(huge.calls.length > 1, `clamped down to ${AUTO_TO_ONE_JOIN_ROWS_MAX} rows → batched`);
+
+    // An explicit row count is an instruction, not an estimate: no clamping.
+    const explicitTiny = db({ autoToOneJoinMaxRows: 10 });
+    await explicitTiny.q.findMany({ limit: 50, with: { order: true } } as never);
+    assert.ok(explicitTiny.calls.length > 1, 'an explicit 10 is honoured below the clamp floor');
+  });
+
+  it('an explicit autoToOneJoinMaxRows overrides autoRoundTripMs', async () => {
+    const { q, calls } = db({ autoRoundTripMs: 35, autoToOneJoinMaxRows: 10 });
+    await q.findMany({ limit: 50, with: { order: true } } as never);
+    assert.ok(calls.length > 1, 'the explicit row count wins over the derived one');
   });
 
   it('autoToOneJoinMaxRows tunes the threshold', async () => {

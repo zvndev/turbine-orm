@@ -188,6 +188,20 @@ export interface QueryInterfaceOptions {
    */
   autoToOneJoinMaxRows?: number;
   /**
+   * Round-trip time to the database, in milliseconds, used to DERIVE the
+   * `relationLoadStrategy: 'auto'` to-one threshold instead of guessing a row
+   * count. Prefer this over `autoToOneJoinMaxRows`: the break-even between the
+   * single-statement join and the batched follow-up is
+   * `roundTripMs / AUTO_JOIN_PENALTY_MS_PER_ROW`, and measurement shows the
+   * per-row penalty is a constant of the plan while the break-even moves ~17x
+   * between a loopback link and a 2.7ms one. Set it to what `ping` says (a
+   * Unix socket is ~0.05, same-region managed Postgres ~0.5-2, cross-region
+   * ~30-60). Defaults to `AUTO_ASSUMED_ROUND_TRIP_MS` (0.7ms, same-region),
+   * which reproduces the historical 1000-row threshold exactly. Overridden by
+   * an explicit `autoToOneJoinMaxRows`; only consulted under `'auto'`.
+   */
+  autoRoundTripMs?: number;
+  /**
    * How nested-relation subqueries encode each row's JSON: `'object'` (default,
    * `json_build_object`) or `'positional'` (`json_build_array`, key-less — see
    * {@link Dialect.buildJsonArray}). Positional is Postgres-only in v1; a

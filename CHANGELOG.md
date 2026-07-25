@@ -120,6 +120,75 @@ exact error and the concrete fix.
   BOTH its Prisma field name and its Turbine relation name plus the junction
   table, and a ready-to-run `grep` over the Prisma names. In `--no-db` mode it
   says the list needs a database run rather than printing an empty one.
+- **`relationLoadStrategy: 'flatten'`, a fourth relation plan.** An eligible
+  to-one relation compiles to a `LEFT JOIN` over a derived table inside the same
+  statement instead of a correlated subquery: one round-trip, no per-parent
+  re-evaluation of the subquery, and no client-side stitching. The whole to-one
+  subtree collapses into a single derived table that exposes only prefixed
+  column names (`f0__id`, `f1__code`, …), so a child column can never collide
+  with a parent column of the same name, and the nested object is reassembled
+  client-side to a result **deep-equal** to the join strategy: same shape, same
+  camelCase keys, same `Date` coercion. The match discriminator each node
+  carries is deliberately value-free, so a PII-tagged key column never reaches
+  the wire, and the correlation columns the outer `ON` needs are never projected
+  to the caller. It is an **explicit opt-in** at the client or on a single query;
+  `'auto'` is unchanged and never selects it. Cache keys carry a plan
+  signature, so every pre-existing cache key stays byte-identical.
+  **Eligibility, which matters because an ineligible relation falls back
+  silently rather than erroring:** `belongsTo` / `hasOne` only, where the
+  target-side correlation columns are PROVABLY unique, meaning an exact set
+  match against the target primary key, a declared unique constraint, or a full
+  unique index that is neither partial nor an expression index. The proof is
+  exact set equality, so a unique index on `(a, b)` does not prove `(a)`. The
+  relation must also carry no `limit` and no `orderBy`, contain no nested
+  `_count` (a top-level `_count` is fine and stays a correlated `COUNT(*)`), and
+  sit under the same depth cap of 10 the subquery path uses. Inside an eligible
+  relation these all work: a relation `where`, target global filters, `select` /
+  `omit`, to-one chains to the depth cap, self-relations, and a nested to-many,
+  which stays a correlated subquery hanging off the joined node. Fallback is per
+  relation, so one ineligible relation does not stop the others. Four conditions
+  disable flattening for the whole query instead: `distinct`, `jsonEncoding:
+  'positional'`, SQL Server (which has its own `FOR JSON PATH` relation
+  compiler), and `findUnique`, which never plans one. `findFirst` does, since it
+  routes through `findMany`. Runs on PostgreSQL, MySQL and SQLite; PowDB has its
+  own relation path and is unaffected.
+  **Performance, stated exactly:** measured on 9,200 parent rows against local
+  PostgreSQL, `'flatten'` runs **1.33x faster than `'join'`** on a shallow to-one
+  and **1.56x** on a two-deep to-one chain, and **loses to `'batched'`, which is
+  2.83x faster than `'join'`** on the same shape. That ordering is structural
+  rather than a defect: with 2,000 distinct targets behind 9,200 parents the join
+  transmits the target's columns 9,200 times while the batched loader transmits
+  2,000 rows once, and the gap closes as cardinality approaches 1:1. Local
+  round-trip time of about 0.1 ms also favors the batched loader's extra
+  round-trip more than a real network would. So the claim for `'flatten'` is one
+  round-trip, transaction-trivial, no client-side stitching, and strictly better
+  than `'join'` on large to-one parent sets. It is **not** the fastest plan, and
+  that is why it is deliberately not wired into `'auto'`.
+- **`where` is key-checked at compile time.** On a generated, typed client an
+  unknown key in a `where` clause is now a type error rather than a silently
+  ignored one: `where: { emial: 'x' }` used to compile, match nothing in the
+  emitted SQL, and hand back the whole table. The check follows the clause
+  wherever it nests, including inside `AND` / `OR` / `NOT`, inside a relation
+  filter at arbitrary depth, and inside a nested `with` block's own `where`. No
+  generator change was needed and no regeneration is required: it threads the
+  `RelationDescriptor` brand the code generator has emitted on `*Relations`
+  interfaces since 0.7.1, so an existing generated client picks it up on
+  upgrade. The change is purely type-level and the emitted SQL is byte-identical.
+  It is still deliberately permissive in four places, listed so nobody reads a
+  clean compile as full coverage: (1) a client with no relations map, meaning a
+  `defineSchema`-only client or an untyped `client.table(name)` call site, keeps
+  the historical open-keyed clause because there is no relation type to thread;
+  (2) a legacy generated client whose `*Relations` members are bare types
+  (`posts: Post[]`) rather than brands has its relation KEY checked but not its
+  VALUE; (3) `orderBy` everywhere, and `select` / `omit` inside a `with` block,
+  remain open-keyed, though top-level `select` / `omit` are checked; and (4) the
+  deferred `build*` variants used by `pipeline()` take the entity type only, so
+  their `where` stays open-keyed. Every awaitable method is checked: `findMany`,
+  `findFirst`, `findFirstOrThrow`, `findUnique`, `findUniqueOrThrow`,
+  `findManyStream`, `update`, `delete`, `upsert`, `count`, `updateMany`,
+  `deleteMany`, `aggregate` and `groupBy`. Because the
+  guarantee is type-level, a transpile-only runner such as `tsx` will not
+  surface it; `tsc --noEmit` is the gate.
 
 ### Fixed
 
@@ -435,6 +504,50 @@ exact error and the concrete fix.
   nesting** rather than passing it through unchecked, and refuses a redacted
   column in `cursor` and `distinct` as it already did in `where` and `orderBy`.
   Migration: flatten the query, or restart Studio with `--show-pii`.
+
+### Documentation
+
+- **A published benchmark claim was wrong and has been corrected.** The README
+  and the benchmarks page showed Turbine fastest at streaming 50K rows (60.7 ms)
+  and labelled the scenario a near-tie. A fresh run against 0.50.0 measures
+  **Drizzle 0.45 fastest at 50.18 ms against Turbine's 63.87 ms, a 27% Drizzle
+  win**, reproduced in five runs across two harnesses, with Drizzle sitting
+  exactly on the hand-written `pg` keyset control at 50.97 ms. The published
+  figure rested on a single Drizzle measurement of 65.8 ms that did not
+  reproduce. The loss is now stated plainly on both surfaces rather than the row
+  being dropped. Two further corrections in the same table: the "four near-ties"
+  is **two** (`count` is a clean Turbine win, streaming is a Drizzle win), and
+  the "1.6x to 2.6x ahead of Prisma" range on nested shapes is actually **1.9x
+  to 3.0x**, corrected even though it errs in our favor.
+- **The whole benchmark section is republished from a fresh 2026-07-25 run
+  against 0.50.0**, replacing figures measured once on 2026-07-21 against 0.39.0.
+  The new harness (`benchmarks/bench-interleaved.ts`) runs every arm once per
+  round, rotates the arm order every round, reports medians over three full runs,
+  and adds a hand-written raw `pg` control arm. That control yields the strongest
+  claim available, and the pages now lead with it: **Turbine runs at 1.07x
+  hand-written `pg`, where Drizzle runs at 1.47x and Prisma at 1.84x.** Headline
+  geomeans over ten scenarios are **1.87x faster than Prisma 7.9** and **1.36x
+  faster than Drizzle 0.45**. The **measurement drift floor is now published
+  alongside the table**: the identical control arm drifts 1% to 14% between runs
+  on multi-millisecond scenarios but **21% to 47%** on the sub-0.15 ms ones, so
+  every published sub-0.15 ms figure carries roughly one third uncertainty in its
+  absolute value even though its ordering is stable. Full writeup in
+  `benchmarks/RESULTS-0.50.0.md`; `benchmarks/RESULTS.md` is marked historical
+  and its contradictory "pipeline about 3x faster" prose is scoped to the retired
+  Prisma 7.6 table it describes. Claims this run cannot speak to are called out
+  as unverified rather than carried forward, including the Prisma 7.6-to-7.9
+  improvement percentages, which have been removed.
+- **The migrate-from-prisma page no longer argues that a correlated indexed
+  subquery beats the batched loader.** The page cited 659 parent rows to make
+  that case, and fresh data contradicts it for to-one relations at every size at
+  or above about 25 parent rows, on a plan Turbine's own `'auto'` default no
+  longer follows. The passage now explains the actual tradeoff: a correlated
+  subquery is one round-trip whose cost scales per parent row, the batched loader
+  is two round-trips each of which is a flat keyset lookup, so the crossover
+  depends on both parent-set size and round-trip time, with a table of break-even
+  points from a local socket to a cross-region pooled connection. The
+  index-versus-no-index finding, which is the point of the section and a ~290x
+  difference, is unchanged.
 
 ## 0.49.0 (2026-07-25)
 

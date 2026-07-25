@@ -1,11 +1,25 @@
 # Three-way benchmark: Turbine vs Prisma 7 vs Drizzle 0.45
 
-> **Which run is current?** This file records two runs of the same harness. The
-> **most recent** is [2026-07-21](#raw-results-2026-07-21-local-socket) (turbine-orm
-> 0.39.0 vs Prisma 7.9.0 vs Drizzle 0.45.2), and it is the run quoted in the README
-> and on turbineorm.dev. The 2026-07-14 run below (turbine-orm 0.32.0 vs Prisma
-> 7.6.0) is kept for the per-scenario analysis and the p50/p95/p99 detail. Neither
-> run has been repeated on 0.48.0.
+> **This file is historical. The current numbers are in
+> [`RESULTS-0.50.0.md`](./RESULTS-0.50.0.md).**
+>
+> The run quoted in the README and on turbineorm.dev is the **2026-07-25**
+> interleaved run against turbine-orm **0.50.0**, recorded in
+> `RESULTS-0.50.0.md`. That run uses a different harness
+> (`bench-interleaved.ts`: every arm once per round, rotated order, medians, plus
+> a hand-written raw `pg` control arm) because the block-sequential harness used
+> below charges process-lifetime drift to whichever arm occupied that slice of
+> wall clock, and has no control to separate drift from signal.
+>
+> This file records two runs of the older `bench.ts` harness, kept for the
+> per-scenario analysis and the p50/p95/p99 detail:
+> [2026-07-21](#raw-results-2026-07-21-local-socket) (turbine-orm 0.39.0 vs Prisma
+> 7.9.0) and [2026-07-14](#raw-results-2026-07-14-local-socket) (turbine-orm 0.32.0
+> vs Prisma 7.6.0). **Do not quote either table as a current claim.** One figure in
+> the 2026-07-21 table did not survive re-measurement: it shows Turbine fastest at
+> streaming (60.7 ms) against Drizzle at 65.8 ms, and five later runs across both
+> harnesses put Drizzle fastest by 27% (50.18 ms vs 63.87 ms), sitting exactly on
+> the raw `pg` keyset control. The 65.8 ms Drizzle figure appears to be an outlier.
 
 > **TL;DR (2026-07-14 run).** Measured on a **local PostgreSQL 17.9** database over a
 > Unix socket (no network hop). With the network removed, every query is
@@ -135,7 +149,10 @@ Turbine's cursor still has advantages a single number does not show:
 ### 4. Pipeline batching is Turbine's clearest win
 
 The 5-query dashboard batch runs in ~0.20 ms on Turbine versus ~0.61 ms
-(Prisma) and ~0.58 ms (Drizzle), about 3x faster. Turbine sends all five
+(Prisma) and ~0.58 ms (Drizzle), about 3x faster **in this retired 2026-07-14
+table**. That ratio is specific to Prisma 7.6; on the current 2026-07-25 run
+against Prisma 7.9 it is **2.09x vs Prisma and 1.95x vs Drizzle**, which is the
+figure the README and the site quote. Turbine sends all five
 queries in a single TCP flush using the Postgres extended-query pipeline
 protocol; Prisma's `$transaction([])` and Drizzle's `db.transaction()` both run
 their queries sequentially, waiting for each reply before sending the next. On
@@ -203,7 +220,7 @@ bubbles raw `pg` errors. That is a DX difference, not a benchmark line.
 | findUnique, single user by PK               | **0.06 ms** | 0.12 ms | 0.10 ms |
 | findUnique, user + posts + comments (L3)    | **0.18 ms** | 0.45 ms | 0.31 ms |
 | count, all users, near-tie                  | **0.05 ms** | 0.08 ms | 0.06 ms |
-| stream, iterate 50K comments (batch 1000), near-tie | **60.7 ms** | 68.8 ms | 65.8 ms |
+| stream, iterate 50K comments (batch 1000), **NOT REPRODUCED, see header** | 60.7 ms | 68.8 ms | 65.8 ms |
 | atomic increment, posts.view_count + 1, near-tie | **0.14 ms** | 0.19 ms | 0.19 ms |
 | pipeline, 5-query dashboard batch           | **0.20 ms** | 0.45 ms | 0.41 ms |
 | hot findUnique, 500x same shape             | **0.03 ms** | 0.06 ms | 0.08 ms |

@@ -343,9 +343,9 @@ LIMIT 1000
 
 If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop to `db.raw` — Turbine's opinion on relation loading is correlated subqueries; reporting queries have different shape.
 
-## Load strategy: `auto`, `join`, `batched`
+## Load strategy: `auto`, `join`, `batched`, `flatten`
 
-When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41.0): it compiles the single-statement correlated-subquery plan (`'join'`) and moves individual relations to the batched loader when one of two rules fires. Everything else stays in the join, byte-identical. An explicit `'join'` or `'batched'` (client-wide or per query) always wins over `'auto'`, and the results are deep-equal whichever plan runs.
+When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41.0): it compiles the single-statement correlated-subquery plan (`'join'`) and moves individual relations to the batched loader when one of two rules fires. Everything else stays in the join, byte-identical. An explicit `'join'`, `'batched'` or `'flatten'` (client-wide or per query) always wins over `'auto'`, and the results are deep-equal whichever plan runs.
 
 | Rule | Fires when | Why |
 |---|---|---|
@@ -394,6 +394,78 @@ const db = turbine({
 The result is **deep-equal** to the join strategy — same shape, same camelCase keys, same `Date` coercion — so you can flip the flag without touching the rest of your code. It honors per-relation `where` / `select` / `omit` / `orderBy` and nested `with`. The per-relation `limit` is applied **client-side per parent** (a `LIMIT` on a batched `= ANY($1)` would cap total children, not children-per-parent). And it's **transaction-safe**: the follow-up queries run on the same pinned connection, so batched loads inside `$transaction` see the transaction's own writes.
 
 > **Note.** Composite-key relations aren't supported by `'batched'` — use the `'join'` strategy for those (`'auto'` never batch-falls-back on a composite-key relation).
+
+## `'flatten'`: to-one relations as a LEFT JOIN
+
+<Callout type="note" title="New in 0.50">
+  `'flatten'` is an **explicit opt-in**. `'auto'` never selects it, and the
+  default plan is unchanged.
+</Callout>
+
+`relationLoadStrategy: 'flatten'` compiles an eligible **to-one** relation into a `LEFT JOIN` in the same statement, instead of a correlated subquery. One round-trip, no per-parent re-evaluation, and no client-side stitching.
+
+```ts
+const posts = await db.posts.findMany({
+  with: { author: { with: { org: true } } },
+  relationLoadStrategy: 'flatten',
+});
+```
+
+The whole to-one subtree becomes one derived table, joined once:
+
+```sql
+SELECT "posts".*, f0."f0__id", f0."f0__name", f0."f1__code"
+FROM "posts"
+LEFT JOIN (
+  SELECT 1 AS "f0__$k", f0s."id" AS "f0__$c0",
+         f0s."id" AS "f0__id", f0s."name" AS "f0__name",
+         (f1s."id" IS NOT NULL) AS "f1__$k", f1s."code" AS "f1__code"
+  FROM "users" f0s
+  LEFT JOIN "orgs" f1s ON f1s."id" = f0s."org_id"
+  WHERE f0s."deleted" = $1
+) f0 ON f0."f0__$c0" = "posts"."author_id"
+```
+
+Every column the join exposes is prefixed (`f0__`, `f1__`, …), so a child column can never collide with a parent column of the same name. The `$k` columns are match discriminators (deliberately value-free, so a PII-tagged key column never reaches the wire), and the `$c` correlation columns are used only in the outer `ON` and are never handed to you. Turbine reassembles the nested object client-side, and the result is **deep-equal to the join strategy**: same shape, same camelCase keys, same `Date` coercion.
+
+### Eligibility, and what silently falls back
+
+This matters more than usual, because an ineligible relation **falls back to a correlated subquery without an error**. You get correct results either way; you just may not get the plan you asked for.
+
+A relation is eligible only when **all** of these hold:
+
+- It is **`belongsTo` or `hasOne`**. Every to-many relation falls back.
+- The target-side correlation columns are **provably unique**. That means an exact match against the target's primary key, a declared unique constraint, or a **full, non-partial, non-expression** unique index. Partial and expression indexes are refused, and a unique index on `(a, b)` does **not** prove `(a)`: the proof is exact set equality, so a subset never qualifies.
+- The relation has **no `limit`** and **no `orderBy`** (a to-one row has nothing to order or limit anyway).
+- It contains **no nested `_count`**. A `_count` at the top level of the `with` is fine and stays a correlated `COUNT(*)`.
+- It is under the **depth cap of 10**, the same cap the subquery path uses.
+
+Inside an eligible relation, all of this is supported: a relation `where`, target [global filters](/global-filters), `select` / `omit`, **to-one chains of arbitrary depth** (each becomes a further inner join in the same derived table), **self-relations**, and a **nested to-many**, which stays a correlated subquery hanging off the joined node.
+
+Fallback is **per relation** for the rules above: one ineligible relation in a `with` clause does not stop the others from flattening. Four conditions instead disable flattening for the **whole query**:
+
+| Whole-query fallback | Why |
+|---|---|
+| `distinct` | The join multiplies rows before `DISTINCT` sees them |
+| `jsonEncoding: 'positional'` | A different wire encoding for relation payloads |
+| **SQL Server** | Uses its own `FOR JSON PATH` relation compiler |
+| **`findUnique`** | Never plans a flatten. `findFirst` does (it routes through `findMany`) |
+
+`'flatten'` works on **PostgreSQL, MySQL and SQLite**. PowDB has its own relation path and is unaffected.
+
+### Performance: better than `'join'`, not the fastest
+
+Measured on **9,200 parent rows** against local PostgreSQL, as a speedup over the `'join'` plan:
+
+| Plan | Shallow to-one | Two-deep to-one chain |
+|---|---|---|
+| `'join'` | 1.00x | 1.00x |
+| **`'flatten'`** | **1.33x** | **1.56x** |
+| `'batched'` | **2.83x** | not measured |
+
+**`'flatten'` beats `'join'` and loses to `'batched'`.** The reason is structural, not a defect. With 2,000 distinct targets sitting behind 9,200 parents, the join transmits the target's columns 9,200 times, while the batched loader transmits 2,000 rows exactly once. As the cardinality approaches 1:1 that gap closes. Local round-trip time is also about 0.1 ms here, which structurally favors the batched loader's extra round-trip more than a real network would.
+
+So the honest pitch for `'flatten'` is: **one round-trip, transaction-trivial, no client-side stitching, and strictly better than `'join'` on large to-one parent sets.** It is not the fastest plan. If raw throughput on a wide to-one fan-in is what you want and a second round-trip is acceptable, `'batched'` is still faster. That is also why `'flatten'` is deliberately not wired into `'auto'`.
 
 ## Lean JSON encoding
 

@@ -322,10 +322,13 @@ describe('pick-row lateral plan: byte-identical default-plan SQL (buildSql restr
     },
     {
       name: 'with-relations',
+      // The `::text` casts on the int8 columns are the JSON-wire fidelity fix:
+      // json_build_object renders int8 as a JSON number, which loses precision
+      // above 2^53 and disagrees with what every non-join read path returns.
       args: { with: { versions: true } },
       sql:
         'SELECT "instances"."id", "instances"."name", (SELECT COALESCE(json_agg(json_build_object(\'id\', ' +
-        't0."id", \'instanceId\', t0."instance_id", \'title\', t0."title", \'data\', t0."data", \'createdAt\', ' +
+        't0."id"::text, \'instanceId\', t0."instance_id"::text, \'title\', t0."title", \'data\', t0."data", \'createdAt\', ' +
         't0."created_at", \'isCurrent\', t0."is_current")), \'[]\'::json) FROM "versions" t0 WHERE t0."instance_id" ' +
         '= "instances"."id") AS "versions" FROM "instances"',
       params: [],

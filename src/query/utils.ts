@@ -4,6 +4,7 @@
  * Standalone utility functions and classes used by the query builder.
  */
 
+import pg from 'pg';
 import { localDateTimeKind, timeOfDayKind } from '../schema.js';
 
 // ---------------------------------------------------------------------------
@@ -316,4 +317,94 @@ export function parseDbDate(value: string): Date {
   }
   // normalize `YYYY-MM-DD HH:MM:SS` (driver form) to ISO before pinning UTC
   return new Date(`${value.replace(' ', 'T')}Z`);
+}
+
+// ---------------------------------------------------------------------------
+// JSON-wire value coercion (relationLoadStrategy: 'join')
+// ---------------------------------------------------------------------------
+
+/**
+ * Postgres type name → OID, for every type family whose `json_build_object`
+ * rendering is NOT the value the pg driver produces for the same column.
+ *
+ * Why this table exists: the `'join'` strategy reads a relation through
+ * `json_agg(json_build_object(...))`, so its values are whatever
+ * `JSON.parse` makes of Postgres's JSON rendering. Every other read path in
+ * the library — a top-level row, `'batched'`, `'flatten'` — reads the column
+ * through the driver and gets the driver's representation. Measured against
+ * PostgreSQL 17, those two disagree for exactly the families below, which
+ * made the SAME query return a different JS type depending on which plan ran
+ * (and `'auto'` picks the plan from a row-count heuristic, so it could differ
+ * between two runs of one query). Three of these are lossy, not merely
+ * different:
+ *
+ *   type         driver (target)              json_build_object
+ *   ──────────── ──────────────────────────── ─────────────────────────────
+ *   numeric      '1000.50'   (string)         1000.5    (number, LOSSY)
+ *   int8         '9007199254740993'           9007199254740992 (LOSSY)
+ *   bytea        Buffer                       '\xdeadbeef' (string)
+ *   date         Date (local midnight)        Date (UTC midnight, off by tz)
+ *   interval     { days, hours, … }           '1 day 02:03:04' (string)
+ *   point        { x, y }                     '(1,2)'   (string)
+ *   circle       { x, y, radius }             '<(1,2),3>' (string)
+ *
+ * The array forms diverge the same way, plus `_timestamp`/`_timestamptz`
+ * (driver: `Date[]`; JSON: `string[]`) — the scalar `timestamp` /
+ * `timestamptz` are deliberately ABSENT because the existing `dateColumns`
+ * coercion in `parseRow` already lands them on the driver's value, and they
+ * are the hottest column type in a typical schema (no reason to add a cast to
+ * every `created_at`).
+ *
+ * The fix these OIDs drive: emit the column as `col::text` inside
+ * `json_build_object` so the JSON carries the same wire text the driver would
+ * receive, then run the DRIVER'S OWN parser for that OID over it. Parity is
+ * then by construction rather than by coincidence, and it automatically
+ * honours a caller's `pg.types.setTypeParser` (including the int8 parser
+ * TurbineClient itself registers) instead of second-guessing it.
+ *
+ * Postgres-only: the JSON functions and the divergence set are both
+ * engine-specific, so callers gate this on the postgres dialect.
+ */
+export const JSON_WIRE_COERCION_OIDS: Readonly<Record<string, number>> = {
+  numeric: 1700,
+  int8: 20,
+  bytea: 17,
+  date: 1082,
+  interval: 1186,
+  point: 600,
+  circle: 718,
+  _numeric: 1231,
+  _int8: 1016,
+  _bytea: 1001,
+  _date: 1182,
+  _interval: 1187,
+  _point: 1017,
+  _timestamp: 1115,
+  _timestamptz: 1185,
+};
+
+/**
+ * The OID whose driver parser reproduces `pgType`'s driver representation from
+ * its text rendering, or `undefined` when the type's JSON rendering already
+ * matches the driver (the common case: text, uuid, bool, int4, float8, json,
+ * jsonb, arrays of those, …).
+ */
+export function jsonWireCoercionOid(pgType: string | undefined): number | undefined {
+  if (!pgType) return undefined;
+  return JSON_WIRE_COERCION_OIDS[pgType];
+}
+
+/**
+ * Apply the driver's text parser for `oid` to a JSON-sourced wire string.
+ *
+ * Resolved through `pg.types.getTypeParser` on every call rather than
+ * memoized: parser registration is process-global and happens in the
+ * TurbineClient constructor (int8, and `timestamp` under `utcTimestamps`), and
+ * a caller may register their own at any point. A stale memo would silently
+ * reintroduce the very divergence this exists to remove. The lookup is a plain
+ * object index in pg-types, so it is not worth caching.
+ */
+export function coerceJsonWireValue(oid: number, value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  return pg.types.getTypeParser(oid, 'text')(value);
 }

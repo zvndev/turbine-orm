@@ -15,11 +15,13 @@
  * An unused `@ts-expect-error` is itself an error, so a regression that lets a
  * typo through fails the typecheck job.
  *
- * NOT covered here, deliberately: `where`. `WhereClause<T>` carries a
+ * NOT covered here, deliberately: `where` — it has its own file now
+ * (where-key-types.test.ts). `WhereClause<T>` used to carry a
  * `[relationName: string]: unknown` index signature (needed for relation
- * filters) which annihilates excess-property checking; keying it requires the
- * code generator to emit a per-model union of column and relation keys.
- * `orderBy` is likewise still open-keyed (see the note at the end of the file).
+ * filters) which annihilated excess-property checking; it now takes the
+ * generated relations map as a second type argument (`WhereClause<T, R>`) and
+ * enumerates the relation keys explicitly instead.
+ * `orderBy` is still open-keyed (see the note at the end of the file).
  */
 
 import { describe, it } from 'node:test';
