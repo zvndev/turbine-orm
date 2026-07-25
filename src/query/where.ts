@@ -1470,7 +1470,7 @@ export function buildOperatorClauses(
 export function requireFullTextSearch(qi: BuilderCtx): void {
   if (qi.dialect.supportsFullTextSearch) return;
   throw new UnsupportedFeatureError(
-    'full-text search filters (`search`)',
+    'the full-text search filter (`search`)',
     qi.dialect.name,
     'Full-text `search` compiles to PostgreSQL to_tsvector/to_tsquery. ' +
       'Use `contains` (LIKE) on this engine, or run the query on PostgreSQL.',
@@ -1487,7 +1487,7 @@ export function requireFullTextSearch(qi: BuilderCtx): void {
 export function requireArrayColumns(qi: BuilderCtx): void {
   if (qi.dialect.supportsArrayColumns) return;
   throw new UnsupportedFeatureError(
-    'array column filters (`has` / `hasEvery` / `hasSome` / `isEmpty`)',
+    'the array column filter set (`has` / `hasEvery` / `hasSome` / `isEmpty`)',
     qi.dialect.name,
     'Array filters compile to PostgreSQL array operators over a native array ' +
       'column; this engine has no array column type.',

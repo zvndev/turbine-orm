@@ -625,9 +625,19 @@ export function buildRelationOrderBy(
   const parentRef = ctx?.parentRef ?? qi.table;
   const relDef = ownerMeta.relations[relName];
   if (!relDef) {
+    // A table with no relations at all would otherwise render a dangling
+    // "Available: " and read as a broken message; and the most likely cause of
+    // landing here on such a table is an orderBy VALUE of the wrong shape on a
+    // scalar column, which deserves to be named rather than reported as a
+    // missing relation.
+    const known = Object.keys(ownerMeta.relations);
+    const isColumn = Object.hasOwn(ownerMeta.columnMap, relName) || ownerMeta.allColumns.includes(relName);
     throw new RelationError(
-      `[turbine] Unknown relation "${relName}" in orderBy on table "${ownerTable}". ` +
-        `Available: ${Object.keys(ownerMeta.relations).join(', ')}`,
+      isColumn
+        ? `[turbine] orderBy on "${ownerTable}.${relName}" got a relation-shaped value, but "${relName}" is a ` +
+            `column. Order a column with 'asc' / 'desc' (or { sort, nulls }); the object form is for relations.`
+        : `[turbine] Unknown relation "${relName}" in orderBy on table "${ownerTable}". ` +
+            (known.length > 0 ? `Available: ${known.join(', ')}` : `"${ownerTable}" has no relations.`),
     );
   }
 

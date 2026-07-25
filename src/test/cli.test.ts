@@ -684,6 +684,19 @@ describe('CLI UI utilities', () => {
       const url = 'postgres://localhost:5432/mydb?sslmode=require';
       assert.equal(redactUrl(url), url);
     });
+
+    it('redacts passwords containing /, :, and @ (the shapes the old pattern missed)', () => {
+      // The previous `:([^@/:]+)@` character class could not span any of these,
+      // so the whole URL came through unredacted or leaked its tail.
+      assert.equal(redactUrl('postgres://u:pa/ss@host/db'), 'postgres://u:***@host/db');
+      assert.equal(redactUrl('postgres://u:a@b@host/db'), 'postgres://u:***@host/db');
+      assert.equal(redactUrl('postgres://u:pa:ss@host/db'), 'postgres://u:***@host/db');
+    });
+
+    it('leaves a userinfo-less URL and non-URL text alone', () => {
+      assert.equal(redactUrl('postgres://user@host/db'), 'postgres://user@host/db');
+      assert.equal(redactUrl('error: relation "users" does not exist'), 'error: relation "users" does not exist');
+    });
   });
 
   // -------------------------------------------------------------------------

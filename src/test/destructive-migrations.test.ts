@@ -63,6 +63,79 @@ test('ignores destructive keywords inside comments and string literals', () => {
   assert.deepEqual(hits, []);
 });
 
+test('an E-string literal cannot hide the statements that follow it', () => {
+  // `E'a\'b'` is ONE literal: inside an E-string a backslash escapes the next
+  // character. A scanner that ends the literal at the backslash-quote reads the
+  // rest of the file as part of a string and flags nothing at all.
+  const hits = scanDestructiveSql(String.raw`
+    INSERT INTO notes (body) VALUES (E'it\'s fine');
+    DROP TABLE users;
+  `);
+  assert.deepEqual(
+    hits.map((h) => [h.kind, h.target]),
+    [['drop-table', 'users']],
+  );
+});
+
+test('an E-string still shields its own contents, and `e` is accepted too', () => {
+  assert.deepEqual(scanDestructiveSql(String.raw`INSERT INTO t (b) VALUES (e'\'DROP TABLE users;');`), []);
+  // A trailing `e` that is part of an identifier must NOT start an E-string.
+  assert.deepEqual(
+    scanDestructiveSql(`INSERT INTO some_table VALUES ('plain'); DROP TABLE users;`).map((h) => h.kind),
+    ['drop-table'],
+  );
+});
+
+test('an apostrophe inside a quoted identifier cannot blind the scanner', () => {
+  assert.deepEqual(
+    scanDestructiveSql(`CREATE TABLE "customer's_orders" (id int); DROP TABLE users;`).map((h) => [h.kind, h.target]),
+    [['drop-table', 'users']],
+  );
+});
+
+test('a dollar-quote tag containing digits still hides its body from the top level', () => {
+  // `$do1$` is a valid tag; a letters-only tag regex reads the body as code.
+  assert.deepEqual(
+    scanDestructiveSql('DO $do1$ BEGIN DROP TABLE users; END $do1$;').map((h) => h.kind),
+    ['drop-table'],
+  );
+});
+
+test('a leading CTE list does not hide a top-level DELETE or UPDATE', () => {
+  assert.deepEqual(
+    scanDestructiveSql('WITH c AS (SELECT 1) DELETE FROM users;').map((h) => [h.kind, h.target]),
+    [['delete', 'users']],
+  );
+  assert.deepEqual(
+    scanDestructiveSql('WITH a AS (SELECT 1), b AS (SELECT 2) UPDATE users SET x = 1;').map((h) => h.kind),
+    ['update-without-where'],
+  );
+  // A read-only CTE followed by a SELECT stays clean.
+  assert.deepEqual(scanDestructiveSql('WITH c AS (SELECT 1) SELECT * FROM c;'), []);
+});
+
+test('schema-qualified targets are reported qualified, not truncated to the schema', () => {
+  assert.deepEqual(
+    scanDestructiveSql('DELETE FROM public.users;').map((h) => h.target),
+    ['public.users'],
+  );
+});
+
+test('flags DROP DATABASE, DROP OWNED BY, and DROP MATERIALIZED VIEW', () => {
+  assert.deepEqual(
+    scanDestructiveSql(`
+      DROP DATABASE IF EXISTS analytics;
+      DROP OWNED BY reporting;
+      DROP MATERIALIZED VIEW daily_totals;
+    `).map((h) => [h.kind, h.target]),
+    [
+      ['drop-database', 'analytics'],
+      ['drop-owned', 'reporting'],
+      ['drop-matview', 'daily_totals'],
+    ],
+  );
+});
+
 test('flags the optional-COLUMN drop shorthand', () => {
   const hits = scanDestructiveSql('ALTER TABLE users DROP email;');
   assert.deepEqual(

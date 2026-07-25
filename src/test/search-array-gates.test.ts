@@ -122,7 +122,7 @@ describe('non-PostgreSQL engines refuse both filters with E017', () => {
         (err: unknown) => {
           assert.ok(err instanceof UnsupportedFeatureError);
           assert.equal(err.code, 'TURBINE_E017');
-          assert.match(err.message, /array column filters/);
+          assert.match(err.message, /array column filter set/);
           assert.match(err.message, new RegExp(`"${name}"`));
           return true;
         },

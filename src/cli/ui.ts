@@ -262,9 +262,14 @@ export function stripAnsi(s: string): string {
 export function redactUrl(url: string): string {
   return (
     url
-      // Userinfo credentials: `:secret@` in any authority (global: a string may
-      // carry more than one URL, e.g. a primary + replica connection pair).
-      .replace(/:([^@/:]+)@/g, ':***@')
+      // Userinfo credentials. Anchored on `<scheme>://<user>:` and consuming up
+      // to the LAST `@` before the next `/` (or end of authority), because a
+      // password may legally contain `:`, `/`, and even `@` in percent-decoded
+      // form. The previous `:([^@/:]+)@` could not span any of those, so
+      // `postgres://u:pa/ss@host/db` came through completely unredacted and
+      // `postgres://u:a@b@host/db` leaked the tail. Global: one string may
+      // carry several URLs (a primary + replica pair).
+      .replace(/(\w+:\/\/[^/@\s]*?:)[^\s]*?@(?=[^@\s]*(?:[/?#]|$))/g, '$1***@')
       // Query-string password params: `password=`, `sslpassword=`, and similar,
       // case-insensitive. Value runs up to the next `&`, `#`, or end of string.
       .replace(/([?&][^=&#]*password)=([^&#]*)/gi, '$1=***')

@@ -433,6 +433,73 @@ describe('Studio demo: builder with relations', () => {
   });
 });
 
+describe('Studio demo: the builder refuses PII predicates', () => {
+  // Redacting the cells is not enough: a where or orderBy on a hidden column
+  // answers a question about the value. The Data tab already refused these.
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['top-level where', { where: { email: { startsWith: 'a' } } }],
+    ['isNull is an oracle too', { where: { phone: null } }],
+    ['inside OR', { where: { OR: [{ name: 'x' }, { email: 'a@b.c' }] } }],
+    ['orderBy', { orderBy: { email: 'asc' } }],
+    ['relation where one level down', { with: { posts: { where: { title: 'x' } } } }],
+  ];
+
+  for (const [label, args] of cases) {
+    it(`refuses: ${label}`, async () => {
+      const ctx = makeDemoCtx();
+      const r = await dispatch(ctx, {
+        method: 'POST',
+        url: '/api/builder',
+        headers: authHeaders(),
+        body: { table: 'users', args },
+      });
+      if (label === 'relation where one level down') {
+        // Control: a non-PII predicate on a relation still works.
+        assert.equal(r.status, 200, r.body);
+        return;
+      }
+      assert.equal(r.status, 400, r.body);
+      assert.match((r.json as { error: string }).error, /PII-tagged and redacted/);
+    });
+  }
+
+  it('refuses a PII predicate nested inside a with clause', async () => {
+    const ctx = makeDemoCtx();
+    const r = await dispatch(ctx, {
+      method: 'POST',
+      url: '/api/builder',
+      headers: authHeaders(),
+      body: { table: 'posts', args: { with: { author: { where: { email: { contains: '@' } } } } } },
+    });
+    assert.equal(r.status, 400, r.body);
+    assert.match((r.json as { error: string }).error, /PII-tagged and redacted/);
+  });
+
+  it('allows selecting a PII column (the values come back redacted)', async () => {
+    const ctx = makeDemoCtx();
+    const r = await dispatch(ctx, {
+      method: 'POST',
+      url: '/api/builder',
+      headers: authHeaders(),
+      body: { table: 'users', args: { select: { id: true, email: true }, limit: 1 } },
+    });
+    assert.equal(r.status, 200, r.body);
+    const rows = (r.json as { rows: Array<Record<string, unknown>> }).rows;
+    assert.equal(rows[0]?.email, PII_REDACTED);
+  });
+
+  it('allows the same predicates once --show-pii is on', async () => {
+    const ctx = { ...makeDemoCtx(), showPii: true };
+    const r = await dispatch(ctx, {
+      method: 'POST',
+      url: '/api/builder',
+      headers: authHeaders(),
+      body: { table: 'users', args: { where: { email: { contains: '@' } }, limit: 1 } },
+    });
+    assert.equal(r.status, 200, r.body);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Live mode switcher
 // ---------------------------------------------------------------------------

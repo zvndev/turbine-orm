@@ -1,5 +1,162 @@
 # Changelog
 
+## 0.49.0 (2026-07-25)
+
+A correctness release. Two silent wrong-data paths on default code paths are
+closed, several safety guards that could be switched off by a single character
+are fixed, and every public claim that a file in this repo disproved has been
+corrected. Two behaviors change in ways an existing app can notice; both are
+listed under Changed with the exact opt-in.
+
+### Fixed
+
+- **Nested writes could touch rows belonging to another parent.**
+  `delete` / `update` / `disconnect` / `upsert` inside a relation's `data` used
+  only the caller-supplied `where`, with no predicate tying the target to the
+  parent being written. `users.update({ where: { id: 1 }, data: { posts: { delete: { id: 4 } } } })`
+  deleted post 4 even when it belonged to user 2, which turns any endpoint that
+  forwards a client-supplied id into a cross-tenant write primitive. Every one of
+  those operations now ANDs the relation correlation (`child.foreignKey =
+  parent.referenceKey`) onto the caller's `where`, and reports `NotFoundError`
+  (E001) when the target is not related to this parent. The same fix covers the
+  `belongsTo` upsert, which looked up and rewrote the row named by `where`
+  regardless of which row the parent actually pointed at.
+- **The batched relation loader discarded relation `where` filters.** With
+  `relationLoadStrategy: 'batched'` (and therefore on the `'auto'` default's
+  batched fallback), the correlation predicate was spread over the caller's
+  `where` when both named the same key, so `with: { posts: { where: { userId: 2 } } }`
+  silently returned the parent's own posts instead of an empty set. The two
+  predicates are now ANDed, and the join and batched strategies return
+  byte-identical results.
+- **A single `E'...'` string could disable the destructive-migration guard.**
+  Both the migration statement splitter and the destructive scanner treated a
+  backslash-escaped quote inside an escape string as the end of the literal, so
+  everything after it parsed as string content: a migration containing
+  `E'it\'s fine'` hid every following `DROP TABLE` from the two-step
+  confirmation. Quoted identifiers containing an apostrophe (`"customer's_orders"`)
+  had the same effect, and a dollar-quote tag with a digit in it (`$do1$`) hid a
+  procedural body. All three are fixed, with regression tests that fail on the
+  old code.
+- **`doctor --unused` / `--audit` no longer recommend dropping an index the same
+  run demands.** Indexes serving a live relation probe are subtracted from the
+  drop suggestions (audit keeps the row, annotates it, and withholds the DROP),
+  so the report can no longer contradict its own missing-index section.
+- **`doctor` reports exact-duplicate indexes.** Two byte-identical indexes were
+  invisible to the redundancy check, which only looked for a strict leading
+  prefix. Exactly one side of the pair is reported.
+- **Studio: banners no longer open a several-hundred-pixel void.** The app grid
+  declared two rows for five children, so any visible banner (write, PII, demo)
+  stretched into the implicit row. Also fixed: switching tables from another tab
+  and then opening the Data tab rendered the previous table's rows under the new
+  table's name until the next refresh.
+- **PII redaction in Studio and the MCP server now has something to redact.**
+  `pii: true` is a code-first declaration that introspection never infers, and
+  both tools build their schema from live introspection, so their redaction was
+  inert against a real database (it only ever worked under `studio --demo`).
+  Both now read tags from the generated metadata in your `out` directory, Studio
+  states at startup how many it found (and warns plainly when it found none), and
+  the MCP `sample_rows` tool redacts tagged columns before rows reach an agent's
+  context.
+- **`_min` / `_max` and `groupBy` keys respected the PII contract only by
+  accident.** See Changed: they are now gated.
+- **A PII-tagged correlation column silently emptied its relation.** When a
+  relation's `referenceKey` (or a child FK) was itself `pii: true`, the default
+  projection left it out, the batched loader had no keys to stitch on, and every
+  parent came back with an empty relation array on the DEFAULT `'auto'`
+  strategy, with no error. The key is now projected explicitly and stripped
+  after stitching, so the value still never reaches the caller.
+- **Studio's query builder refused nothing on PII columns.** The Data tab
+  already refused a `where` / `orderBy` / `isNull` on a redacted column (the
+  answer is an oracle for the hidden value); `/api/builder` accepted all of
+  them, at every `with` level. It now refuses them the same way. This became
+  reachable in this same release, when PII tags started reaching Studio at all.
+- **`redactUrl` left credentials in CLI output.** A password containing `/`,
+  `:`, or `@` defeated the pattern, so `postgres://u:pa/ss@host/db` printed in
+  full. It now anchors on the scheme and consumes the whole userinfo section.
+- **`prisma-compat` had no way to opt into PII.** `includePii` now passes
+  through on reads, `groupBy`, and `aggregate`, so a tagged schema is not a
+  one-way door for compat call sites.
+- **Nested-write `NotFoundError` carries `table` / `where` / `operation` again**,
+  as the errors documentation promises, and its message says the target may
+  belong to a different parent rather than only that it was not found.
+- **Full-text `search` and array-column filters throw on engines that cannot run
+  them.** They previously emitted PostgreSQL-only SQL on SQLite / MySQL / SQL
+  Server; both are now gated by dialect capability and throw
+  `UnsupportedFeatureError` (E017) with the portable alternative named.
+- **Observability metrics were attributed to the wrong minute** when a flush
+  straddled a bucket boundary; the bucket is part of the buffer key now.
+- **The `_turbine` RLS test fixture** no longer needs a manual
+  `GRANT USAGE ON SCHEMA public`, so `npm test` passes on a stock PostgreSQL.
+- **`doctor --unused` now says when its own statistics are too young to act on**,
+  matching the cost section, which already refuses to score them.
+- **A wrong-shaped schema fails at construction with an actionable message**
+  instead of dying later as `TypeError: this.tableMeta.columns is not iterable`.
+  A `defineSchema()` result is named specifically, with the
+  `schemaDefToMetadata(def)` fix.
+- **Studio: reverse navigation finds one-sided relations.** "Referenced by" was
+  derived only from a table's own `hasMany` / `hasOne`, so a relation declared
+  only on the child (`comments.user -> users`, the norm in a `defineSchema`
+  file) was unreachable from the parent even though the child grid visibly
+  rendered the foreign key. Inbound `belongsTo` relations now count too.
+- **Studio: counts read `1 row`, not `1 rows`**, and the PII banner no longer
+  cites `--show-pii` when the flag was not passed (demo-mode pill).
+
+### Changed
+
+- **BREAKING (opt-in restores it): `groupBy` by a PII column, and `_min` / `_max`
+  over one, now require `includePii: true`.** Both return stored values, which
+  contradicted the documented contract that PII columns stay out of every default
+  projection. Without the flag they throw `ValidationError` (E003) naming the
+  column, the table, and the fix. `_count`, `_sum`, and `_avg` over a PII column
+  need no opt-in, and `where` / `orderBy` / `having` on PII columns stay
+  unrestricted. Untagged schemas emit byte-identical SQL and are unaffected.
+  Migration: add `includePii: true` to the affected `groupBy` / `aggregate` call,
+  or drop the PII column from `by` / `_min` / `_max`.
+- **BREAKING (previously silent): a nested write on a many-to-many relation
+  throws.** m2m has never had a nested-write implementation on any engine; the
+  relation op fell off the end of the dispatch, so the write never happened and
+  the call reported success. It now throws `ValidationError` (E003) naming the
+  junction table. Migration: write junction rows directly
+  (`db.userTags.createMany(...)`) inside the same `$transaction`.
+- **A nested `delete` / `update` / `disconnect` selector that binds nothing is
+  refused.** `delete: {}` or `delete: { id: undefined }` used to be caught by the
+  empty-where guard; with the parent correlation now ANDed on, the merged
+  predicate is never empty, so the caller's half is checked directly. It throws
+  `ValidationError` (E003) rather than deleting every child of that parent.
+  `delete: true` remains valid on a to-one relation and is refused on a to-many.
+- **`doctor --json` has a stable key set.** `unused`, `redundant`, `audit`, and
+  `invalid` are always present (empty when the scan did not run) rather than
+  appearing only with a flag, and a `subtraction` object reports which scans
+  ran. Each unused-index entry gained a structured `shape`
+  (`kinds` / `accessMethod` / `definition`) beside the prose `caveat`, so a
+  consumer never parses a sentence.
+- **Coverage thresholds re-baselined to measured values** (lines/statements 75,
+  branches 85, functions 59) with type-only modules excluded from the
+  denominator, and the release workflow now gates publishing on the coverage and
+  error-code jobs. The previous floors had been failing continuously, which is
+  how a red gate got normalized. The reasoning, the measuring command, and a
+  dated target for function coverage are recorded in `.c8rc.json`; floors ratchet
+  up only.
+
+### Documentation
+
+- Corrected every claim a file in this repo disproved: the nested-relation
+  benchmark ratios and the "slowest on all ten scenarios" line, the bundle-size
+  figures on the landing page, the superseded PowDB-versus-SQLite headline in the
+  cross-engine benchmark notes, `DISTINCT ON` described as a SQL Server gap when
+  it is Postgres-only, and the coverage thresholds quoted in `STABILITY.md`.
+- The Prisma migration guide gained a **Silent value differences** section
+  (`Decimal` as `string`, `BigInt` as `number`, `select` / `include` dropped on
+  writes, `aggregate()` ignoring `orderBy` / `take` / `skip`, JSON `equals`
+  compiling to containment), documents that the 0.41 unique-FK change renames the
+  relation as well as changing its shape, and no longer claims nested writes cover
+  many-to-many.
+- Full-text `search`, array-column filters, and `groupBy({ distinctOn })` are
+  listed in the Postgres-only sets on the engines page, the README, and the
+  migration guide, and appear in the capability matrix.
+- The PII gate is documented where a reader lands: the `groupBy` and `aggregate`
+  sections, the E003 row in the error table, and the Studio / MCP pages.
+
 ## 0.48.0 (2026-07-24)
 
 ### Added

@@ -28,22 +28,15 @@ import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
-import { skipGate } from './helpers.js';
+import { mockTable, skipGate } from './helpers.js';
 
-// Minimal schema with a single table so TurbineClient constructs.
+// Minimal REAL SchemaMetadata with a single table so TurbineClient constructs
+// (the client validates the shape, so a hand-written approximation behind a
+// cast no longer passes).
 const MOCK_SCHEMA: SchemaMetadata = {
-  tables: {
-    widgets: {
-      name: 'widgets',
-      columns: {
-        id: { name: 'id', type: 'number', dbType: 'int4', nullable: false, isPrimaryKey: true, hasDefault: true },
-      },
-      primaryKey: ['id'],
-      relations: {},
-      indexes: [],
-    },
-  },
-} as unknown as SchemaMetadata;
+  enums: {},
+  tables: { widgets: mockTable('widgets', [{ name: 'id', field: 'id' }]) },
+};
 
 /**
  * A mock pool whose checked-out client records every query. Good enough to

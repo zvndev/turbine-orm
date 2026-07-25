@@ -34,7 +34,12 @@ where each is strong/weak *as seen through the ORM* (not a raw-driver or cross-O
 | createMany (100 rows) | 1.800 | 1.197 | 1.228 | 0.698 | **0.278** |
 | update (atomic increment) | 0.211 | 0.012 | 0.260 | 0.065 | **0.008** |
 
-## The headline: embedded `syncMode:'normal'` (0.7.1) closes the write gap — embedded now beats SQLite
+## The headline: embedded `syncMode:'normal'` (0.7.1) closes the write gap
+
+> SUPERSEDED as measured on addon 0.17.0: embedded wins the writes, SQLite wins the reads.
+> See the 0.17.0 check-in near the end of this file. The 0.7.1 result below is kept as a
+> dated earlier measurement, not a current claim. A controlled re-run is still needed to
+> tell engine drift from host noise.
 
 PowDB's stated goal was to beat SQLite. On **v0.7.0** embedded reads already matched SQLite, but
 embedded *writes* were Full-fsync-bound (~4 ms) because the addon couldn't select durability from
@@ -50,7 +55,7 @@ With `'normal'`, embedded writes drop ~440× and pass SQLite:
 | nested `with` | 0.409 | 0.314 | **0.355** | **faster** ✅ |
 | findMany | 0.095 | 0.156 | 0.158 | SQLite wins |
 
-Embedded PowDB 0.7.1 now **wins or ties SQLite on every op except filtered-list**, while keeping a
+Embedded PowDB 0.7.1 **won or tied SQLite on every op except filtered-list as measured on 0.7.1** (superseded, see the note above), while keeping a
 real storage engine, indexes, WAL, and (unlike SQLite) a networked transport for the same data.
 Seed time: 6,105 rows in **31 ms** (was 887 ms on 0.7.0-Full).
 

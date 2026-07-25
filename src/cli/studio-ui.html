@@ -352,7 +352,11 @@
        ===================================================================== */
     .app {
       display: grid;
-      grid-template-rows: var(--header-h) 1fr;
+      /* One `auto` track per banner (write / PII / demo), then the header, then
+         the body takes the rest. Declaring only two tracks made every visible
+         banner stretch into the implicit-row space and open a several-hundred-
+         pixel void above the app: `auto` sizes each banner to its content. */
+      grid-template-rows: auto auto auto var(--header-h) 1fr;
       height: 100vh;
       width: 100vw;
     }
@@ -1956,7 +1960,7 @@
     <!-- PII banner (shown only when the server runs with --show-pii) -->
     <div class="pii-banner" id="piiBanner" role="alert" hidden>
       <strong>PII SHOWN</strong>
-      <span>PII-tagged column values are displayed unredacted (--show-pii)</span>
+      <span id="piiBannerWhy">PII-tagged column values are displayed unredacted (--show-pii)</span>
     </div>
     <!-- Demo banner + live mode switcher (shown only in --demo mode) -->
     <div class="demo-banner" id="demoBanner" role="note" hidden>
@@ -2337,6 +2341,9 @@
         rows: [],
         columns: [],
         total: 0,
+        // Table the rows above were actually fetched for; the Data tab refuses
+        // to render rows belonging to a different table than the selected one.
+        loadedTable: null,
         limit: 50,
         offset: 0,
         orderBy: null,
@@ -2581,6 +2588,15 @@
       if (n < 1_000_000_000) return (n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0).replace(/\.0$/, '') + 'M';
       return (n / 1_000_000_000).toFixed(1).replace(/\.0$/, '') + 'B';
     }
+
+    // "1 rows" reads like a bug report; keep counts grammatical everywhere.
+
+    function plural(n, word) {
+
+      return formatNumber(n) + ' ' + word + (n === 1 ? '' : 's');
+
+    }
+
 
     function formatNumber(n) {
       if (n == null) return '—';
@@ -2833,7 +2849,14 @@
           p.classList.toggle('active', p.id === 'pane-' + tab)
         );
         if (tab === 'schema') SchemaPane.render();
-        if (tab === 'data') DataPane.render();
+        if (tab === 'data') {
+          // Re-fetch when the loaded rows belong to a different table (the user
+          // picked one from the sidebar while on another tab). Rendering stale
+          // rows under the new table's header is worse than a brief spinner.
+          const stale = !State.currentTable || State.data.loadedTable !== State.currentTable.name;
+          if (stale) DataPane.loadAndRender();
+          else DataPane.render();
+        }
         if (tab === 'builder') BuilderPane.render();
       },
 
@@ -3053,7 +3076,9 @@
           return;
         }
         $('#dataTitle').textContent = t.name;
-        $('#dataTotal').textContent = State.data.loading ? 'loading…' : formatNumber(State.data.total) + ' rows';
+        $('#dataTotal').textContent = State.data.loading
+          ? 'loading…'
+          : formatNumber(State.data.total) + (State.data.total === 1 ? ' row' : ' rows');
         DataPane.renderSelectionBar();
         Nav.render();
 
@@ -3235,7 +3260,7 @@
         try {
           const res = await Api.rowDeleteBulk(t.name, targets);
           State.data.selected.clear();
-          toast('Deleted ' + (res.rowCount || targets.length) + ' rows', 'ok');
+          toast('Deleted ' + plural(res.rowCount || targets.length, 'row'), 'ok');
           DataPane.loadAndRender();
         } catch (err) {
           toast('Delete failed: ' + (err && err.message ? err.message : 'unknown'), 'err');
@@ -3309,10 +3334,16 @@
           State.data.rows = res.rows || [];
           State.data.columns = res.columns || [];
           State.data.total = res.total || 0;
+          // Which table the rows in State.data actually came from. The Data tab
+          // renders whatever is in State.data, so without this a table picked
+          // from another tab would render the PREVIOUS table's rows under the
+          // new table's name until the next refresh.
+          State.data.loadedTable = t.name;
         } catch (err) {
           State.data.error = err.message;
           State.data.rows = [];
           State.data.total = 0;
+          State.data.loadedTable = t.name;
         } finally {
           State.data.loading = false;
           DataPane.render();
@@ -3768,7 +3799,7 @@
         try {
           const res = await Api.rowInsertBulk(t.name, rows);
           Modal.close('pasteBackdrop');
-          toast('Inserted ' + (res.rowCount || rows.length) + ' rows', 'ok');
+          toast('Inserted ' + plural(res.rowCount || rows.length, 'row'), 'ok');
           DataPane.loadAndRender();
         } catch (err) {
           const preview = $('#pastePreview');
@@ -4683,7 +4714,8 @@
           host.innerHTML = '<div class="empty">Run to see results.</div>';
           return;
         }
-        header.textContent = 'Results · ' + formatNumber(r.rowCount) + ' rows · ' + r.elapsedMs + 'ms';
+        header.textContent =
+          'Results · ' + formatNumber(r.rowCount) + (r.rowCount === 1 ? ' row · ' : ' rows · ') + r.elapsedMs + 'ms';
         host.innerHTML = '';
         if (!r.rows || !r.rows.length) {
           host.appendChild(el('div', { class: 'empty', text: 'No rows.' }));
@@ -5487,8 +5519,12 @@
         $('#writeBanner').hidden = !State.writable;
         $('#dataInsert').hidden = !State.writable;
         $('#dataPaste').hidden = !State.writable;
-        // Persistent unredacted-PII indicator (only under --show-pii).
+        // Persistent unredacted-PII indicator. In demo mode the in-UI pill can
+        // flip it, so the reason line must not blame a flag that was not passed.
         $('#piiBanner').hidden = !State.showPii;
+        $('#piiBannerWhy').textContent = State.demo
+          ? 'PII-tagged column values are displayed unredacted (switched on in this demo session)'
+          : 'PII-tagged column values are displayed unredacted (--show-pii)';
         // Demo banner + live switcher (only in --demo mode). Its two toggle
         // pills reflect the current server state (which the write/PII banners
         // above also mirror).

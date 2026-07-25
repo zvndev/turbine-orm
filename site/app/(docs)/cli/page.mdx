@@ -398,7 +398,7 @@ npx turbine doctor --unused --json           # additive: adds unused/redundant/i
 
 ### `--json`
 
-`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, workload-heat availability, and any degradation notices. The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added: `--unused` adds `unused`, `redundant`, and `invalid` arrays; `--audit` adds an `audit` array.
+`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, workload-heat availability, and any degradation notices. The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added. The `unused`, `redundant`, `audit`, and `invalid` arrays are ALWAYS present: they are empty when the corresponding scan did not run, and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`) so the key set never varies by flag. Each unused-index entry also carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the human-readable `caveat` string, so a consumer never has to parse prose.
 
 ### Where this fits
 

@@ -19,7 +19,7 @@ import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import type { TurbineClient } from '../client.js';
-import { NotFoundError } from '../errors.js';
+import { NotFoundError, ValidationError } from '../errors.js';
 import { executeNestedUpdate, type NestedWriteContext } from '../nested-write.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
@@ -147,6 +147,72 @@ describe('nested writes: the child predicate carries the parent correlation', ()
     assert.deepEqual(childOp(log, 'findUnique').where, { id: 4, userId: 7 });
   });
 
+  it('an empty or all-undefined selector is refused, never widened to the whole relation', async () => {
+    // The correlation makes the merged predicate non-empty, so the empty-where
+    // guard downstream can no longer see that the CALLER selected nothing.
+    for (const target of [{}, { id: undefined }]) {
+      const { ctx, log } = recordingCtx();
+      await assert.rejects(
+        executeNestedUpdate(ctx, 'users', { id: 7 }, { posts: { delete: target } }),
+        (err: unknown) => err instanceof ValidationError && /at least one defined value/.test((err as Error).message),
+      );
+      assert.equal(
+        log.some((l) => l.table === 'posts' && l.op === 'delete'),
+        false,
+        'no delete may reach the child table',
+      );
+    }
+  });
+
+  it('a nested write on a many-to-many relation is refused, not silently dropped', async () => {
+    // m2m has no nested-write branch on any engine; before this it fell off the
+    // end of the dispatch, so the write never happened and the call reported
+    // success.
+    const m2mSchema: SchemaMetadata = {
+      enums: {},
+      tables: {
+        users: {
+          ...mockTable('users', [
+            { name: 'id', field: 'id' },
+            { name: 'name', field: 'name', pgType: 'text' },
+          ]),
+          relations: {
+            tags: {
+              type: 'manyToMany',
+              name: 'tags',
+              from: 'users',
+              to: 'tags',
+              foreignKey: 'id',
+              referenceKey: 'id',
+              through: { table: 'user_tags', sourceKey: 'user_id', targetKey: 'tag_id' },
+            },
+          },
+        },
+        tags: mockTable('tags', [
+          { name: 'id', field: 'id' },
+          { name: 'label', field: 'label', pgType: 'text' },
+        ]),
+      },
+    };
+    const { ctx, log } = recordingCtx();
+    await assert.rejects(
+      executeNestedUpdate({ ...ctx, schema: m2mSchema }, 'users', { id: 7 }, { tags: { connect: { id: 1 } } }),
+      (err: unknown) => err instanceof ValidationError && /many-to-many/.test((err as Error).message),
+    );
+    assert.equal(
+      log.some((l) => l.op === 'update' && l.table === 'user_tags'),
+      false,
+    );
+  });
+
+  it('"delete: true" is refused on a to-many relation', async () => {
+    const { ctx } = recordingCtx();
+    await assert.rejects(
+      executeNestedUpdate(ctx, 'users', { id: 7 }, { posts: { delete: true } }),
+      (err: unknown) => err instanceof ValidationError && /every related "posts" row/.test((err as Error).message),
+    );
+  });
+
   it('a parent whose reference key is null relates to no child (E001, no write issued)', async () => {
     const { ctx, log } = recordingCtx();
     await assert.rejects(
@@ -211,6 +277,10 @@ afterEach(async () => {
   if (!DatabaseSync) return;
   await client.disconnect();
 });
+
+function user(id: number): Record<string, unknown> | undefined {
+  return db.prepare('SELECT id, name FROM users WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+}
 
 function post(id: number): Record<string, unknown> | undefined {
   return db.prepare('SELECT id, user_id, title FROM posts WHERE id = ?').get(id) as Record<string, unknown> | undefined;
@@ -277,5 +347,46 @@ describe('nested writes: a child of a different parent is untouchable', () => {
     });
     assert.equal(post(1)!.title, 'updated');
     assert.equal(db.prepare("SELECT COUNT(*) AS c FROM posts WHERE title = 'never'").get()!.c, 0);
+  });
+  dbIt('belongsTo upsert never rewrites the row this parent does not point at', async () => {
+    // Post 1 belongs to user 1. A nested `user` upsert addressing user 2 must
+    // not rename user 2: it is out of the relation, so the upsert falls to its
+    // create branch and re-points post 1 at the newly created row.
+    await client.table('posts').update({
+      where: { id: 1 },
+      data: { user: { upsert: { where: { id: 2 }, create: { name: 'fresh' }, update: { name: 'hijacked' } } } },
+    } as never);
+    assert.equal(user(2)!.name, 'bob', "another row's name must not be rewritten");
+    const created = db.prepare("SELECT id FROM users WHERE name = 'fresh'").get() as { id: number };
+    assert.equal(post(1)!.user_id, created.id);
+  });
+
+  dbIt('belongsTo upsert on the row this parent DOES point at updates it in place', async () => {
+    await client.table('posts').update({
+      where: { id: 1 },
+      data: { user: { upsert: { where: { id: 1 }, create: { name: 'never' }, update: { name: 'renamed' } } } },
+    } as never);
+    assert.equal(user(1)!.name, 'renamed');
+    assert.equal(post(1)!.user_id, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) AS c FROM users WHERE name = 'never'").get()!.c, 0);
+  });
+  dbIt('set refuses to run when the parent reference key is missing, instead of clearing the table', async () => {
+    // `set` clears current children with allowFullTableScan, which is exactly
+    // what disables the empty-where guard: a missing reference key would null
+    // every FK in the child table.
+    const ctx = {
+      schema: introspectSqliteDatabase(db),
+      tx: {
+        // The parent row comes back WITHOUT its `id` (the reference key), which
+        // is the shape a projection that omits the correlation column produces.
+        // biome-ignore lint/suspicious/noExplicitAny: only the guard runs; no write is issued
+        table: () => ({ findUnique: async () => ({ name: 'alice' }) }) as any,
+      },
+    };
+    await assert.rejects(
+      executeNestedUpdate(ctx, 'users', { name: 'alice' }, { posts: { set: [{ id: 1 }] } }),
+      (err: unknown) => err instanceof ValidationError && /reference key/.test((err as Error).message),
+    );
+    assert.equal(post(1)!.user_id, 1, 'no FK may be nulled');
   });
 });

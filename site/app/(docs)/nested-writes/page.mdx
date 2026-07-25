@@ -35,6 +35,8 @@ The examples below assume this shape:
 | `update` | update only | all | Update the related row(s) (`where` is optional for belongsTo) |
 | `upsert` | update only | all | Update the row matching `where`, else create it |
 
+"Relations" above means **to-one and one-to-many** (`belongsTo`, `hasOne`, `hasMany`). **Many-to-many relations have no nested-write support on any engine**: a relation op on an m2m relation throws a `ValidationError` ([E003](/errors)) naming the junction table, rather than silently doing nothing. Write junction rows directly (`db.userTags.createMany(...)`) inside the same `$transaction`.
+
 `create`, `connect`, and `connectOrCreate` are valid in both `create()` and `update()`. The other five are **update-only** — using them inside `create()` throws `ValidationError` ([E003](/errors)). An unknown operation name throws too.
 
 ## Create context
@@ -253,7 +255,8 @@ await db.users.update({
 - **Atomic.** Every statement runs inside a single transaction. A failure anywhere rolls the whole tree back.
 - **Ordered correctly.** `belongsTo` targets are resolved before the parent insert (so `NOT NULL` FKs hold); `hasMany`/`hasOne` children are written after the parent exists.
 - **Depth-capped at 10.** Deeper trees throw `CircularRelationError` ([E007](/errors)) with the full relation path.
-- **Validated.** Update-only ops in `create()`, unknown op names, non-nullable `disconnect`, and missing `connect` targets all throw `ValidationError` ([E003](/errors)) before anything commits.
+- **Validated.** Update-only ops in `create()`, unknown op names, non-nullable `disconnect`, missing `connect` targets, and any op on a many-to-many relation all throw `ValidationError` ([E003](/errors)) before anything commits.
+- **Scoped to the parent.** `delete` / `update` / `disconnect` / `upsert` can only touch rows that actually belong to the parent being written: the relation correlation is ANDed onto your `where`, and a target outside the relation reports `NotFoundError` ([E001](/errors)) instead of modifying a row owned by someone else. A selector that binds nothing (`{}`, or a field that is `undefined`) is refused rather than widened to the whole relation.
 - **Read back.** The return value is the parent row with the touched relations loaded via Turbine's `json_agg` machinery.
 
 ## See also

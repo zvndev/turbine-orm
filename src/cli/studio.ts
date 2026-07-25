@@ -46,10 +46,12 @@ import { dirname, resolve as pathResolve } from 'node:path';
 import pg from 'pg';
 import type { PgCompatPool } from '../client.js';
 import type { Dialect } from '../dialect.js';
+import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { CreateArgs, DeleteArgs, FindManyArgs, UpdateArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
+import { applyPiiTags, loadPiiTags } from './pii-tags.js';
 import { createDemoContext } from './studio-demo.js';
 import { STUDIO_HTML } from './studio-ui.generated.js';
 
@@ -85,11 +87,24 @@ export interface StudioOptions {
    * three-mode switcher (`/api/demo/mode`). Default `false`.
    */
   demo?: boolean;
+  /**
+   * Directory holding generated Turbine metadata (`turbine generate`'s `out`).
+   * PII tags are code-first declarations that introspection never sets, so
+   * without this Studio's redaction has nothing to redact against a real
+   * database. Read as text; nothing from it is executed. See `pii-tags.ts`.
+   */
+  metadataDir?: string;
 }
 
 export interface StudioHandle {
   /** Shut down the server + pool cleanly. */
   dispose: () => Promise<void>;
+  /**
+   * Where PII tags came from, so the CLI can say so at startup. `null` when no
+   * generated metadata was found: redaction is then inert and the user needs to
+   * know that rather than assume protection.
+   */
+  piiTags: { path: string; applied: number } | null;
   /** Random per-process session token the UI sends via cookie. */
   authToken: string;
   /** Full URL including `?token=...` — safe to print for the user. */
@@ -160,6 +175,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
   let metadata: SchemaMetadata;
   let dialect: Dialect | undefined;
   let statementTimeout: { sql: string; params: unknown[] };
+  let piiTags: { path: string; applied: number } | null = null;
 
   if (demo) {
     // Seeded in-memory SQLite store: no DATABASE_URL, no network. Each launch
@@ -194,6 +210,14 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
       include: options.include,
       exclude: options.exclude,
     });
+
+    // PII tags are code-first only, so a live-introspected schema carries none.
+    // Layer them on from the generated metadata when there is one, and record
+    // what happened so the CLI can be explicit about it at startup.
+    if (options.metadataDir) {
+      const source = loadPiiTags(options.metadataDir);
+      if (source) piiTags = { path: source.path, applied: applyPiiTags(metadata, source.tags) };
+    }
 
     statementTimeout = options.adapter?.statementTimeout?.(30) ?? {
       // Postgres rejects parameters in `SET LOCAL` (`SET LOCAL ... = $1` is a
@@ -250,6 +274,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
   return {
     authToken,
     url,
+    piiTags,
     dispose: async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await pool.end();
@@ -589,6 +614,11 @@ export interface ReferencedByLink {
   targetColumn: string;
 }
 
+/** Own-property lookup: a key like `constructor` must not resolve off the prototype. */
+function ownLookup(map: Record<string, string>, key: string): string | undefined {
+  return Object.hasOwn(map, key) ? map[key] : undefined;
+}
+
 /** True when `columnName` on `table` is PII-tagged and currently redacted. */
 function isRedactedColumn(table: TableMetadata, columnName: string, showPii: boolean): boolean {
   if (showPii) return false;
@@ -641,6 +671,29 @@ export function relationLinksForTable(
     }
     // manyToMany deliberately produces no link: navigating it means traversing a
     // junction table, which the single-column filter path cannot express.
+  }
+
+  // Inbound references declared only on the OTHER side. A `defineSchema` author
+  // routinely writes `comments.user -> users` without also declaring
+  // `users.comments`, and scanning only this table's own hasMany/hasOne made
+  // those children unreachable even though the child grid visibly renders the
+  // FK. Scan every other table's belongsTo relations that point here.
+  const seenInbound = new Set(referencedBy.map((r) => `${r.targetTable}.${r.targetColumn}`));
+  for (const other of Object.values(metadata.tables)) {
+    if (other.name === table.name) continue;
+    for (const [name, rel] of Object.entries(other.relations)) {
+      if (rel.type !== 'belongsTo' || rel.to !== table.name) continue;
+      const column = singleRelationColumn(table, rel.referenceKey);
+      const targetColumn = singleRelationColumn(other, rel.foreignKey);
+      if (!column || !targetColumn) continue;
+      if (seenInbound.has(`${other.name}.${targetColumn}`)) continue;
+      if (isRedactedColumn(table, column, showPii) || isRedactedColumn(other, targetColumn, showPii)) continue;
+      seenInbound.add(`${other.name}.${targetColumn}`);
+      // Named for the direction the user travels: from this row, to the rows of
+      // `other` that reference it. `relation` is the child's own relation name,
+      // which is what the child table calls this link.
+      referencedBy.push({ column, relation: name, targetTable: other.name, targetColumn });
+    }
   }
 
   return { foreignKeys, referencedBy };
@@ -913,6 +966,68 @@ function parseTableFilters(raw: string | null, table: TableMetadata, redactedPii
 // API: /api/builder — Turbine ORM findMany spec runner
 // ---------------------------------------------------------------------------
 
+/**
+ * Refuse a builder query that FILTERS or SORTS on a redacted PII column.
+ *
+ * Redacting the cells is not enough on its own: `where: { email: { startsWith:
+ * 'a' } }` answers a question about the hidden value, and so does an `isNull`,
+ * and so does an `orderBy`. The Data tab already refuses all three
+ * (`parseTableFilters`); the builder route accepted them, which mattered the
+ * moment PII tags actually started reaching Studio's metadata.
+ *
+ * Walks the whole args tree: top-level `where` / `orderBy`, boolean
+ * combinators, and each `with` level against that relation's target table.
+ * `select` is NOT refused: it returns values, and those values are redacted on
+ * the way out.
+ */
+function assertNoPiiPredicates(
+  args: Record<string, unknown>,
+  tableName: string,
+  metadata: SchemaMetadata,
+  showPii: boolean,
+): void {
+  if (showPii) return;
+
+  const visitClause = (node: unknown, table: TableMetadata | undefined, depth: number): void => {
+    if (!table || depth > 10 || node === null || typeof node !== 'object') return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === 'AND' || key === 'OR' || key === 'NOT') {
+        for (const item of Array.isArray(value) ? value : [value]) visitClause(item, table, depth + 1);
+        continue;
+      }
+      const relation = Object.hasOwn(table.relations, key) ? table.relations[key] : undefined;
+      if (relation) {
+        // some / none / every / is / isNot wrappers all resolve against the target.
+        visitClause(value, metadata.tables[relation.to], depth + 1);
+        continue;
+      }
+      const column = ownLookup(table.columnMap, key) ?? key;
+      if (isRedactedColumn(table, column, showPii)) {
+        throw new ValidationError(
+          `[turbine] Column "${column}" on "${table.name}" is PII-tagged and redacted, so it cannot be used ` +
+            `in a where or orderBy: filtering or sorting on a hidden value reveals it. ` +
+            `Restart Studio with --show-pii to query it.`,
+        );
+      }
+    }
+  };
+
+  const visitLevel = (level: Record<string, unknown>, table: TableMetadata | undefined, depth: number): void => {
+    if (!table || depth > 10) return;
+    visitClause(level.where, table, depth);
+    visitClause(level.orderBy, table, depth);
+    const withClause = level.with;
+    if (!withClause || typeof withClause !== 'object') return;
+    for (const [relName, spec] of Object.entries(withClause as Record<string, unknown>)) {
+      const relation = Object.hasOwn(table.relations, relName) ? table.relations[relName] : undefined;
+      if (!relation || spec === true || spec === null || typeof spec !== 'object') continue;
+      visitLevel(spec as Record<string, unknown>, metadata.tables[relation.to], depth + 1);
+    }
+  };
+
+  visitLevel(args, metadata.tables[tableName], 0);
+}
+
 export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
   const body = await readJsonBody(req);
   const tableName = typeof body?.table === 'string' ? body.table : '';
@@ -939,6 +1054,7 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
         dialect: ctx.dialect,
       },
     );
+    assertNoPiiPredicates(args as Record<string, unknown>, tableName, ctx.metadata, ctx.showPii === true);
     deferred = qi.buildFindMany(args);
   } catch (err) {
     sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });

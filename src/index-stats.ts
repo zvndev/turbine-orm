@@ -491,6 +491,24 @@ export interface UnusedIndex {
    * what is actually being dropped: a rebuild is not always a `CREATE INDEX (col)`.
    */
   caveat: string | null;
+  /**
+   * The same information as `caveat`, structured, so a `--json` consumer never
+   * has to regex prose. `kinds` is empty for a plain btree index.
+   */
+  shape: {
+    kinds: Array<'expression' | 'partial' | 'non-btree'>;
+    accessMethod: string | null;
+    definition: string | null;
+  };
+}
+
+/** The structured counterpart of {@link describeIndexShape}. */
+function indexShape(idx: IndexStat): UnusedIndex['shape'] {
+  const kinds: Array<'expression' | 'partial' | 'non-btree'> = [];
+  if (idx.hasExpressions === true || idx.columns.includes(EXPRESSION_COLUMN)) kinds.push('expression');
+  if (idx.predicate != null) kinds.push('partial');
+  if (idx.accessMethod !== undefined && idx.accessMethod !== 'btree') kinds.push('non-btree');
+  return { kinds, accessMethod: idx.accessMethod ?? null, definition: idx.indexDef ?? null };
 }
 
 /** Describe an index's non-plain-btree properties, or null when it is plain. */
@@ -510,11 +528,16 @@ function describeIndexShape(idx: IndexStat): string | null {
  * replica-identity indexes are excluded by construction. An index whose idx_scan
  * could not be read (no pg_stat row) is skipped rather than guessed.
  */
-export function findUnusedIndexes(snapshot: StatsSnapshot, options: { minScans?: number } = {}): UnusedIndex[] {
+export function findUnusedIndexes(
+  snapshot: StatsSnapshot,
+  options: { minScans?: number; relationProbes?: Array<{ table: string; columns: string[] }> } = {},
+): UnusedIndex[] {
   const minScans = options.minScans ?? STATS_THRESHOLDS.unusedMinScans;
+  const probes = options.relationProbes ?? [];
   return snapshot.indexes
     .filter((idx) => idx.isValid && !isConstraintBacking(idx))
     .filter((idx) => idx.idxScan !== undefined && idx.idxScan < minScans)
+    .filter((idx) => !servesRelationProbe(idx, probes))
     .map((idx) => ({
       table: idx.table,
       indexName: idx.indexName,
@@ -523,6 +546,7 @@ export function findUnusedIndexes(snapshot: StatsSnapshot, options: { minScans?:
       sizeBytes: idx.sizeBytes ?? null,
       dropSql: buildDropIndexSql(idx.indexName, { concurrently: true }),
       caveat: describeIndexShape(idx),
+      shape: indexShape(idx),
     }))
     .sort((a, b) => (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0) || a.indexName.localeCompare(b.indexName));
 }
@@ -543,6 +567,26 @@ export interface RedundantIndex {
 function isLeadingPrefix(prefix: string[], columns: string[]): boolean {
   if (prefix.length === 0 || prefix.length >= columns.length) return false;
   return prefix.every((c, i) => columns[i] === c);
+}
+
+/** Whether two column lists are identical, in order. */
+function sameColumns(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((c, i) => b[i] === c);
+}
+
+/**
+ * Whether this index answers a relation probe Turbine actually issues: the
+ * probe's columns are the index's leading columns (an exact match, or a wider
+ * index whose prefix serves the probe). Such an index is never handed a DROP,
+ * because the missing-index half of the same report demands it.
+ */
+function servesRelationProbe(idx: IndexStat, probes: Array<{ table: string; columns: string[] }>): boolean {
+  if (probes.length === 0) return false;
+  if (idx.accessMethod !== undefined && idx.accessMethod !== 'btree') return false;
+  if (idx.predicate != null) return false;
+  return probes.some(
+    (p) => p.table === idx.table && (sameColumns(p.columns, idx.columns) || isLeadingPrefix(p.columns, idx.columns)),
+  );
 }
 
 /**
@@ -601,12 +645,25 @@ export function findRedundantIndexes(snapshot: StatsSnapshot): RedundantIndex[] 
       // remove a uniqueness/PK/exclusion guarantee or a replica identity.
       if (isConstraintBacking(narrow)) continue;
       if (narrow.columns.length === 0) continue;
-      const wider = list.find(
-        (w) =>
-          w.indexName !== narrow.indexName &&
-          isCoverageComparable(narrow, w) &&
-          isLeadingPrefix(narrow.columns, w.columns),
-      );
+      // Prefer a genuinely wider index; fall back to an exact duplicate, which
+      // is the most obvious index problem there is and which a strict
+      // leading-prefix test (prefix.length < columns.length) can never see. For
+      // a duplicate pair only ONE side is reported: the later name, so the
+      // report never tells you to drop both copies.
+      const wider =
+        list.find(
+          (w) =>
+            w.indexName !== narrow.indexName &&
+            isCoverageComparable(narrow, w) &&
+            isLeadingPrefix(narrow.columns, w.columns),
+        ) ??
+        list.find(
+          (w) =>
+            w.indexName < narrow.indexName &&
+            !isConstraintBacking(w) &&
+            isCoverageComparable(narrow, w) &&
+            sameColumns(narrow.columns, w.columns),
+        );
       if (!wider) continue;
       out.push({
         table: narrow.table,
@@ -632,13 +689,21 @@ export interface DoctorIndexAudit {
   columns: string[];
   idxScan: number;
   sizeBytes: number | null;
-  dropSql: string;
+  /** `null` when the index still serves a live relation probe (see stillProbed). */
+  dropSql: string | null;
   /**
    * True when the truncated (63-byte) name collides across DIFFERENT column sets
    * in the schema's probes, so which suggestion this index realizes is
    * ambiguous. Reported as ambiguous instead of a confident drop verdict.
    */
   ambiguous: boolean;
+  /**
+   * True when the schema still declares a relation whose probe this index
+   * serves. `dropSql` is null in that case: the index is unused only because
+   * this workload has not run those relation queries yet, and dropping it
+   * recreates the missing-index finding in the same report's top half.
+   */
+  stillProbed: boolean;
 }
 
 /**
@@ -652,23 +717,26 @@ export interface DoctorIndexAudit {
 export function auditDoctorIndexes(
   snapshot: StatsSnapshot,
   doctorNames: Map<string, Array<{ table: string; columns: string[] }>>,
-  options: { minScans?: number } = {},
+  options: { minScans?: number; relationProbes?: Array<{ table: string; columns: string[] }> } = {},
 ): DoctorIndexAudit[] {
   const minScans = options.minScans ?? STATS_THRESHOLDS.unusedMinScans;
+  const probes = options.relationProbes ?? [];
   const out: DoctorIndexAudit[] = [];
   for (const idx of snapshot.indexes) {
     if (!idx.isValid || isConstraintBacking(idx)) continue;
     const candidates = doctorNames.get(idx.indexName);
     if (!candidates || candidates.length === 0) continue;
     if (idx.idxScan === undefined || idx.idxScan >= minScans) continue;
+    const stillProbed = servesRelationProbe(idx, probes);
     out.push({
       table: idx.table,
       indexName: idx.indexName,
       columns: idx.columns,
       idxScan: idx.idxScan,
       sizeBytes: idx.sizeBytes ?? null,
-      dropSql: buildDropIndexSql(idx.indexName, { concurrently: true }),
+      dropSql: stillProbed ? null : buildDropIndexSql(idx.indexName, { concurrently: true }),
       ambiguous: candidates.length > 1,
+      stillProbed,
     });
   }
   return out.sort((a, b) => a.indexName.localeCompare(b.indexName));

@@ -1083,12 +1083,17 @@ describe('Studio navigation: foreign-key link derivation', () => {
     ]);
   });
 
-  it('derives reverse links from hasMany metadata', async () => {
+  it('derives reverse links from hasMany metadata AND from inbound belongsTo', async () => {
     const { pool } = makePool([{ rows: [] }]);
     const ctx = makeCtx(pool, {});
     const users = tableNamed(await fetchSchemaTables(ctx), 'users');
+    // `posts` comes from users' own hasMany. `sessions` is declared ONLY on the
+    // child side (`sessions.user -> users`), which is the norm in a
+    // defineSchema-authored schema; scanning just this table's own relations
+    // made those children unreachable even though the child grid renders the FK.
     assert.deepEqual(users.referencedBy, [
       { column: 'id', relation: 'posts', targetTable: 'posts', targetColumn: 'user_id' },
+      { column: 'id', relation: 'user', targetTable: 'sessions', targetColumn: 'user_id' },
     ]);
     // users itself holds no belongsTo relation, so it offers no forward link.
     assert.deepEqual(users.foreignKeys, []);

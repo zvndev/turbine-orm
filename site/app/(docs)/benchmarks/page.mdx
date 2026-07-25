@@ -74,7 +74,7 @@ Flat `findMany`, both `findUnique` shapes (by PK and L3-nested), the 5-query pip
 
 ### 3. Nested reads, streaming, and atomic increment
 
-Drizzle's relational query builder is the clear winner on L2 (50 users + posts, 2.39 ms vs Turbine's 2.86 ms and Prisma's 4.64 ms). The other three to-many-heavy scenarios (L3 nested, the 50K-comment streaming drain, and the tagged-`sql` atomic increment) each flipped winner between the two runs and are near-ties on this host. Turbine's `json_agg` nesting sits just behind Drizzle and comfortably ahead of Prisma (roughly 1.7x to 3.1x) on every nested shape.
+Drizzle's relational query builder is the clear winner on L2 (50 users + posts, 2.39 ms vs Turbine's 2.86 ms and Prisma's 4.64 ms). The other three to-many-heavy scenarios (L3 nested, the 50K-comment streaming drain, and the tagged-`sql` atomic increment) each flipped winner between the two runs and are near-ties on this host. Turbine's `json_agg` nesting sits just behind Drizzle and comfortably ahead of Prisma (roughly 1.6x to 2.6x on this run) on every nested shape.
 
 Turbine's cursor still has advantages a single number does not show:
 
@@ -88,7 +88,7 @@ The 5-query dashboard batch runs in ~0.20 ms on Turbine versus ~0.45 ms (Prisma)
 
 ### 5. Prisma trails everywhere on a local socket
 
-Prisma 7 dropped its Rust engine, but the client still does meaningful per-query work in TypeScript. With no network to hide it, that overhead is the reason Prisma is slowest on all ten scenarios here. Prisma 7.9 is a real step up from 7.6 (flat reads improved about 30%, 0.53 to 0.37 ms, and the pipeline batch about 26%, 0.61 to 0.45 ms), but it still trails Turbine and Drizzle on every scenario over a local socket. This is a socket-local finding, not a claim about production: over the pooled-Neon network the same Prisma queries landed inside the noise floor.
+Prisma 7 dropped its Rust engine, but the client still does meaningful per-query work in TypeScript. With no network to hide it, that overhead is why Prisma trails Turbine on all ten scenarios here (it edges out Drizzle on the two flat-read shapes and ties it on the atomic increment). Prisma 7.9 is a real step up from 7.6 (flat reads improved about 30%, 0.53 to 0.37 ms, and the pipeline batch about 26%, 0.61 to 0.45 ms), but it still trails Turbine on every scenario over a local socket. This is a socket-local finding, not a claim about production: over the pooled-Neon network the same Prisma queries landed inside the noise floor.
 
 ## Caveats
 

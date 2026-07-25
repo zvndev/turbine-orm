@@ -26,7 +26,7 @@ Six read-only tools. Every database access runs inside a `BEGIN READ ONLY` trans
 | `migrate_status` | Migration files and the tracking table — applied vs pending, without applying anything. |
 | `doctor_report` | Missing relation indexes, from the same [index advisor](/cli#turbine-doctor) `turbine doctor` uses. |
 | `explain_query` | `EXPLAIN (FORMAT JSON)` for a schema-validated `findMany` plan (see below). |
-| `sample_rows` | Up to 50 rows from a table whose name is validated against the introspected schema. |
+| `sample_rows` | Up to 50 rows from a table whose name is validated against the introspected schema. PII-tagged columns come back redacted. |
 
 `explain_query` never accepts free-form SQL. You pass a **subset** of Studio’s builder args (`table` + optional `where` / `orderBy` / `limit` / `select` — not `with` / `omit`). Turbine validates identifiers against the introspected schema, builds parameterized SQL via `QueryInterface.buildFindMany`, then runs `EXPLAIN (FORMAT JSON)` on that SQL with bound params only.
 
@@ -38,7 +38,7 @@ Six read-only tools. Every database access runs inside a `BEGIN READ ONLY` trans
 | `limit` | no | Positive integer row limit for the planned query. |
 | `select` | no | Field selection map (`{ field: true }`). |
 
-`sample_rows` caps at 50 rows and validates the table name against the live schema. Together, an agent can explore query plans and real data without a path to writing or to arbitrary SQL.
+`sample_rows` caps at 50 rows, validates the table name against the live schema, and **redacts PII-tagged columns** before the rows reach the agent's context (the response lists which columns were redacted). Tags are a code-first declaration that introspection never infers, so the server reads them from the generated metadata in your `out` directory: with no generated metadata there is nothing to redact, and rows come back whole. Together, an agent can explore query plans and real data without a path to writing or to arbitrary SQL.
 
 ## Options
 

@@ -65,7 +65,7 @@ function schema(): SchemaMetadata {
  */
 function makeCtx(): NestedWriteContext {
   // biome-ignore lint/suspicious/noExplicitAny: mock transaction for unit tests
-  const table = (name: string): any => ({
+  const table = (_name: string): any => ({
     async create(args: { data: Record<string, unknown> }) {
       return { id: 1, ...args.data };
     },

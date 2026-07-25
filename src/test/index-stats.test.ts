@@ -428,14 +428,36 @@ describe('findRedundantIndexes', () => {
     assert.deepEqual(findRedundantIndexes(snap), []);
   });
 
-  it('does not flag a same-length pair (neither is wider)', () => {
+  it('flags an exact duplicate exactly once, never both copies', () => {
+    // Two byte-identical indexes are the most obvious index problem there is,
+    // and a strict leading-prefix test can never see them (equal lengths).
     const snap = makeSnapshot({
       indexes: [
         indexStat({ indexName: 'idx_a', columns: ['org_id'] }),
         indexStat({ indexName: 'idx_a2', columns: ['org_id'] }),
       ],
     });
-    assert.deepEqual(findRedundantIndexes(snap), []);
+    const hits = findRedundantIndexes(snap);
+    assert.equal(hits.length, 1, 'exactly one side of the pair is reported');
+    assert.equal(hits[0]!.indexName, 'idx_a2');
+    assert.equal(hits[0]!.coveredBy, 'idx_a');
+  });
+
+  it('never calls a UNIQUE index a duplicate of a plain one', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_a', columns: ['org_id'] }),
+        indexStat({ indexName: 'uq_org', columns: ['org_id'], isUnique: true }),
+      ],
+    });
+    // The unique index backs a constraint, so it is never a drop candidate; the
+    // plain one is not redundant either, because dropping it loses nothing the
+    // unique index does not already provide... but the unique index is not a
+    // "wider" cover, so doctor stays silent rather than guess.
+    assert.deepEqual(
+      findRedundantIndexes(snap).map((h) => h.indexName),
+      [],
+    );
   });
 
   it('uniqueness incompatibility: a UNIQUE prefix is never called redundant', () => {
@@ -533,6 +555,55 @@ describe('findRedundantIndexes', () => {
     assert.equal(redundant.length, 1);
     assert.equal(redundant[0]!.indexName, 'idx_org');
     assert.equal(redundant[0]!.coveredBy, 'idx_org_user_created');
+  });
+});
+
+describe('findUnusedIndexes / auditDoctorIndexes - relation-probe subtraction', () => {
+  const probes = [{ table: 'posts', columns: ['user_id'] }];
+
+  it('never suggests dropping an index that serves a live relation probe', () => {
+    // The same report's top half demands this index; recommending a drop in the
+    // bottom half is how the tool contradicts itself in one screenshot.
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_posts_user_id', columns: ['user_id'], idxScan: 0 }),
+        indexStat({ indexName: 'idx_posts_slug', columns: ['slug'], idxScan: 0 }),
+      ],
+    });
+    assert.deepEqual(
+      findUnusedIndexes(snap, { relationProbes: probes }).map((u) => u.indexName),
+      ['idx_posts_slug'],
+    );
+    // Without the probe list, nothing is subtracted (back-compat default).
+    assert.equal(findUnusedIndexes(snap).length, 2);
+  });
+
+  it('a wider index whose leading columns serve the probe is also kept', () => {
+    const snap = makeSnapshot({
+      indexes: [indexStat({ indexName: 'idx_posts_uid_created', columns: ['user_id', 'created_at'], idxScan: 0 })],
+    });
+    assert.deepEqual(findUnusedIndexes(snap, { relationProbes: probes }), []);
+  });
+
+  it('a partial or non-btree index on the probe columns cannot serve the probe, so it is still reported', () => {
+    const snap = makeSnapshot({
+      indexes: [
+        indexStat({ indexName: 'idx_partial', columns: ['user_id'], predicate: '(published = true)', idxScan: 0 }),
+        indexStat({ indexName: 'idx_gin', columns: ['user_id'], accessMethod: 'gin', idxScan: 0 }),
+      ],
+    });
+    assert.equal(findUnusedIndexes(snap, { relationProbes: probes }).length, 2);
+  });
+
+  it('audit keeps a still-probed index and withholds its drop statement', () => {
+    const snap = makeSnapshot({
+      indexes: [indexStat({ indexName: 'idx_posts_user_id', columns: ['user_id'], idxScan: 0 })],
+    });
+    const names = new Map([['idx_posts_user_id', [{ table: 'posts', columns: ['user_id'] }]]]);
+    const [entry] = auditDoctorIndexes(snap, names, { relationProbes: probes });
+    assert.ok(entry);
+    assert.equal(entry.stillProbed, true);
+    assert.equal(entry.dropSql, null);
   });
 });
 

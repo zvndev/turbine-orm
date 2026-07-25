@@ -22,7 +22,7 @@ Turbine is a Postgres-native TypeScript ORM with a Prisma-inspired API. If you'r
 
 The adapter is a **runtime shim, not a codemod**: it exposes a PrismaClient-shaped surface over a `TurbineClient` and translates arguments on the way in and results on the way out. It never edits your source. Nothing is rewritten for you, so a `git diff` after adopting it touches your client construction and nothing else.
 
-One step is mandatory on either path before you benchmark: run `npx turbine doctor`, covered next.
+One step is mandatory on either path before you benchmark: run `npx turbine doctor`, covered next. Then read [Silent value differences](#silent-value-differences-check-these-first), which applies to both paths.
 
 ## Before anything else: run doctor
 
@@ -72,6 +72,28 @@ An explicit `'join'` or `'batched'` — at the client or on a single query — a
 `'auto'` only falls back where an index is provably missing. Endpoints that fan out to very large child sets (megabyte-scale JSON per request) can still profile faster on `'batched'` even with healthy indexes; if measurement shows that, pin `relationLoadStrategy: 'batched'` on that query (results are deep-equal either way).
 
 > **Ordering caveat.** `'auto'` can load some relations via the batched path, so an **unordered** child array's order can differ from the pure-join path. Relation-array order under `json_agg` was never guaranteed to begin with. If any code relies on implicit child order, add `orderBy` to that `with` block, or enable [`stableRelationOrder`](#relation-array-order). See [Relation array order](#relation-array-order) below.
+
+## Silent value differences: check these first
+
+These are the differences that do not throw. Everything else in this page either
+errors loudly or changes a type your compiler catches; the five below hand back a
+value of a different shape or a different row set and let your code carry on. They
+apply to **both** migration paths, adapter and native port alike. Grep for them
+before you port, not after.
+
+| What | Prisma returns | Turbine returns | Why it bites |
+|---|---|---|---|
+| `Decimal` / `numeric` column | a `Decimal` instance (decimal.js) | a **`string`** | `total.plus(x)`, `.toNumber()`, and `Number(total) * qty` all change meaning. Arithmetic on the string silently coerces through JS floats, which is exactly what the `numeric` type exists to prevent. |
+| `BigInt` / `int8` column | a JS `bigint` | a **`number`**, or a `string` above `Number.MAX_SAFE_INTEGER` | The type is a union in practice. Code doing `id + 1n` breaks at the type level (loud), but code doing `id > cutoff` compares a `string` lexicographically past 2^53 (silent). |
+| `select` / `include` on a **write** (`create`, `update`, `upsert`, `delete`) | only the selected fields, plus the included relations | the **full row**, no relations | The option is dropped without error. Extra columns leak into anything that spreads the result into a response body. Re-read with `findUnique` if you need a projection. |
+| `aggregate()` with `orderBy`, `take`, `skip`, or `cursor` | applies them | **ignores them** (they are honored on `groupBy`, not on `aggregate`) | An aggregate over what you thought was a 10-row window is an aggregate over the whole matching set. |
+| `where` on a JSON column with a pathless `equals` | strict deep equality | **containment** (`@>`) | `{ meta: { equals: { plan: 'pro' } } }` also matches `{ plan: 'pro', seats: 5 }`. Turbine's `equals` on JSON is the same operator as its `contains`. Add a `path` to get exact scalar equality, or filter in application code for strict whole-document equality. |
+
+The two column-type rows are the ones to take seriously if you have a billing,
+ledger, or metering schema. `numeric` as `string` is deliberate (it refuses to
+round-trip money through a JS float), and `int8` as `number` is deliberate (auto
+-increment ids and counts should not force `bigint` on every call site), but both
+are divergences from Prisma that your test suite will not necessarily surface.
 
 ## The migration toolkit
 
@@ -130,6 +152,8 @@ Model delegates are registered under **both** spellings, the Prisma model name (
 
 Two options. `prismaErrorCodes: true` sets `.code` on thrown `TurbineError`s to the nearest Prisma code (`P2002` for a unique violation, `P2025` for not-found, and so on) without pretending to be `instanceof PrismaClientKnownRequestError`; left off, Turbine's own `TURBINE_E0NN` codes are preserved. `stablePkOrder: true` loads every to-many `with` relation that has no explicit `orderBy` ordered by the target table's primary key ascending, which is closer to how Prisma's relation rows tend to arrive; an explicit per-relation `orderBy` always wins.
 
+One Turbine-only argument passes straight through: `includePii: true` on a read, a `groupBy`, or an `aggregate`. Prisma has no PII concept, so if your schema tags columns `pii: true` this is the only way a compat call site can ask for them (or run a `groupBy` keyed on one). Everything else about the tag behaves exactly as it does on the native API.
+
 ### What the adapter does *not* do
 
 Read this before you commit to the adapter path. These are verified against the implementation, not aspirational.
@@ -150,16 +174,21 @@ Read this before you commit to the adapter path. These are verified against the 
 
 ### Breaking change in 0.41: unique foreign keys introspect as `hasOne`
 
-If you generated a client before 0.41, this one changes types on you. When a child table's foreign-key columns are exactly covered by a unique constraint or unique index, the relation is genuinely one-to-one, and introspection now emits **`hasOne`** for the parent side instead of `hasMany`. In the generated types, `Child[]` becomes `Child | null`:
+If you generated a client before 0.41, this one changes types on you. When a child table's foreign-key columns are exactly covered by a unique constraint or unique index, the relation is genuinely one-to-one, and introspection now emits **`hasOne`** for the parent side instead of `hasMany`.
+
+**Two things change together, and it is easy to notice only the first.** The generated type goes from `Child[]` to `Child | null`, *and* the relation is renamed from the plural child-table name to its singular (`profiles` becomes `profile`). A call site that only fixes the shape and keeps the old key gets a `RelationError` (`TURBINE_E005`) for an unknown relation.
 
 ```ts
-// Before 0.41
-const user = await db.users.findUnique({ where: { id: 1 }, with: { profile: true } });
-user.profile[0]?.bio;   // array, always length 0 or 1
+// Before 0.41: plural key, array value
+const user = await db.users.findUnique({ where: { id: 1 }, with: { profiles: true } });
+user.profiles[0]?.bio;   // array, always length 0 or 1
 
-// 0.41 and later
-user.profile?.bio;      // object | null
+// 0.41 and later: singular key, object-or-null value
+const user = await db.users.findUnique({ where: { id: 1 }, with: { profile: true } });
+user.profile?.bio;       // object | null
 ```
+
+If the singular name would collide with an existing field, column, or relation, introspection keeps the legacy plural name instead, so a colliding schema sees only the shape change.
 
 This matches Prisma's own shape for a `@unique` back-relation, so migrating call sites usually get *more* correct, not less. If you need the old shape while you port, regenerate with the escape hatch:
 
@@ -213,7 +242,7 @@ If you are doing a native port, this is the full mapping. Skip to [Side-by-side]
 | `select: { id: true, name: true }` | `select: { id: true, name: true }` | Same. |
 | `where: { name: { contains: 'a' } }` | `where: { name: { contains: 'a' } }` | All operators ported. |
 | `where: { posts: { some: ... } }` | `where: { posts: { some: ... } }` | Relation filters: `some` / `every` / `none`. |
-| `data: { posts: { create: [...] } }` | `data: { posts: { create: [...] } }` | Nested writes map unchanged: `create` / `connect` / `connectOrCreate` on create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on update. One transaction, depth cap 10. See [Nested writes](/nested-writes). |
+| `data: { posts: { create: [...] } }` | `data: { posts: { create: [...] } }` | Nested writes map unchanged on to-one and one-to-many relations: `create` / `connect` / `connectOrCreate` on create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on update. One transaction, depth cap 10. **Many-to-many relations have no nested-write support**: those throw a `ValidationError` (write the junction rows directly in the same transaction). See [Nested writes](/nested-writes). |
 | `include: { _count: { select: { posts: true } } }` | `with: { _count: { posts: true } }` | No `select` wrapper. `_count: true` counts every to-many relation. |
 | `prisma.$queryRaw` | ``db.raw`...` `` | Typed form: ``db.sql<T>`...` `` returns `T[]` with `.one()` / `.scalar()`. |
 | `take: 10` | `take: 10` | Works as-is — `take` is an alias for `limit`. |
@@ -376,8 +405,8 @@ const active = await db.users.findMany({
 - **Typed errors with codes.** `UniqueConstraintError` / `ForeignKeyError` / `NotNullViolationError` / `CheckConstraintError` all carry `code` (`TURBINE_E008`–`E011`) and `cause`. `findUniqueOrThrow` throws `NotFoundError` (`TURBINE_E001`) with the `where` attached. `DeadlockError` / `SerializationFailureError` have `readonly isRetryable = true as const`.
 - **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, SCHEMA)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.
 - **Single runtime dependency.** `pg` only. No engine binary, no WASM, no `@prisma/client`.
-- **Postgres-first, not Postgres-only.** Postgres is the default and primary target; optional SQLite, MySQL, SQL Server, and PowDB engines ship behind subpath exports (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) and share the same typed API. A few flagship features (pgvector, LISTEN/NOTIFY, RLS session context) stay Postgres-only and throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) elsewhere, and the schema tooling (the CLI, `schemaPush` / `schemaDiff`, `doctor`) targets Postgres. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only).
-- **Nested writes are fully supported.** `create` / `connect` / `connectOrCreate` on a create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on an update — one transaction, depth cap 10. See [Nested writes](/nested-writes).
+- **Postgres-first, not Postgres-only.** Postgres is the default and primary target; optional SQLite, MySQL, SQL Server, and PowDB engines ship behind subpath exports (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) and share the same typed API. A few flagship features (pgvector, LISTEN/NOTIFY, RLS session context, full-text `search`, array-column filters, `groupBy({ distinctOn })`) stay Postgres-only and throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) elsewhere, and the schema tooling (the CLI, `schemaPush` / `schemaDiff`, `doctor`) targets Postgres. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only).
+- **Nested writes on to-one and one-to-many relations.** `create` / `connect` / `connectOrCreate` on a create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on an update, in one transaction with a depth cap of 10. **Many-to-many is the gap**: a relation op on an m2m relation throws a `ValidationError` rather than doing nothing, so port those call sites to explicit junction-table writes inside a `$transaction`. This is the difference most likely to bite a Prisma port, since implicit m2m plus `connect` is a common Prisma idiom. See [Nested writes](/nested-writes).
 
 ### Cursor pagination
 
@@ -394,7 +423,7 @@ Relation arrays have no guaranteed order unless you pass `orderBy` in the `with`
 
 If you want a stable default without annotating every relation, opt into `stableRelationOrder` — a client-wide or per-query flag that gives relation arrays a deterministic order. It is off by default, and a per-relation `orderBy` always wins over it.
 
-## Two behaviors that match Prisma
+## Behaviors that match Prisma
 
 - **`timestamp` columns parse as UTC.** Turbine reads Postgres `timestamp` (without time zone) values as UTC — the same convention Prisma uses — so a migrated app gets **identical instants**, not values shifted by the server's local zone. (Opt out with `utcTimestamps: false` if you relied on local-time parsing.)
 - **Bare to-one relation filters work without `is`.** `where: { vendor: { name: { contains: 'x' } } }` filters by a to-one relation with no `is` wrapper, exactly like Prisma. `is: null` / `isNot: null` compile to `NOT EXISTS` / `EXISTS`.

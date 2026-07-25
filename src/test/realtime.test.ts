@@ -26,21 +26,15 @@ import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import { validateChannel } from '../realtime.js';
 import type { SchemaMetadata } from '../schema.js';
-import { skipGate } from './helpers.js';
+import { mockTable, skipGate } from './helpers.js';
 
+// Real SchemaMetadata, not a hand-shaped approximation: the client now
+// validates the shape at construction, which is the point (this fixture used a
+// `columns` OBJECT and only survived because of the cast).
 const MOCK_SCHEMA: SchemaMetadata = {
-  tables: {
-    widgets: {
-      name: 'widgets',
-      columns: {
-        id: { name: 'id', type: 'number', dbType: 'int4', nullable: false, isPrimaryKey: true, hasDefault: true },
-      },
-      primaryKey: ['id'],
-      relations: {},
-      indexes: [],
-    },
-  },
-} as unknown as SchemaMetadata;
+  enums: {},
+  tables: { widgets: mockTable('widgets', [{ name: 'id', field: 'id' }]) },
+};
 
 // ---------------------------------------------------------------------------
 // Unit — no DB

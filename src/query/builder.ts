@@ -27,6 +27,7 @@ import { camelToSnake, normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import * as aggMod from './aggregates.js';
 import {
   type BatchedChildReader,
+  defaultProjectionFields,
   includeKeysForBatching,
   loadRelationsBatched,
   neededParentKeyFields,
@@ -861,6 +862,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       needed,
+      defaultProjectionFields(this.tableMeta, args.includePii),
     );
     const hasJoin = Object.keys(joinWith).length > 0;
     // Force the residual `with` onto the join plan so the base query never
@@ -996,6 +998,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       needed,
+      defaultProjectionFields(this.tableMeta, args.includePii),
     );
     const baseArgs = {
       ...args,
@@ -1371,6 +1374,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       needed,
+      defaultProjectionFields(this.tableMeta, args.includePii),
     );
     const baseArgs = { ...args, with: undefined, select: proj.select, omit: proj.omit } as unknown as FindUniqueArgs<T>;
     const deferred = this.buildFindUnique(baseArgs as Parameters<QueryInterface<T, R>['buildFindUnique']>[0]);

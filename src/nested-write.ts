@@ -211,6 +211,37 @@ function parentCorrelationWhere(
 }
 
 /**
+ * The related-side predicate for a belongsTo relation: the parent holds the
+ * foreign key, so the related row this parent points at satisfies
+ * `related.referenceKey = parent.foreignKey`. The mirror image of
+ * {@link parentCorrelationWhere}, which reads the hasMany/hasOne direction.
+ *
+ * Returns `null` when the parent's foreign key is null/undefined: the parent
+ * points at nothing, so no related row is in scope.
+ */
+function belongsToCorrelationWhere(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  parentRow: Record<string, unknown>,
+  parentTable: string,
+): Record<string, unknown> | null {
+  const fks = normalizeKeyColumns(rel.foreignKey);
+  const refs = normalizeKeyColumns(rel.referenceKey);
+  const parentMeta = ctx.schema.tables[parentTable];
+  const relatedTable = ctx.schema.tables[rel.to];
+  const where: Record<string, unknown> = {};
+
+  for (let i = 0; i < fks.length; i++) {
+    const fkField = parentMeta?.reverseColumnMap[fks[i]!] ?? fks[i]!;
+    const refField = relatedTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
+    const value = parentRow[fkField];
+    if (value === null || value === undefined) return null;
+    where[refField] = value;
+  }
+  return where;
+}
+
+/**
  * AND the caller-supplied child `where` with the parent correlation so a nested
  * delete/update/disconnect can only ever touch rows that actually belong to the
  * parent being written.
@@ -233,21 +264,86 @@ function scopeWhereToParent(
 }
 
 /**
+ * The caller's own selector must name at least one bound value.
+ *
+ * The parent correlation is ANDed onto every nested delete/update/disconnect
+ * target, which makes the merged predicate non-empty by construction. That
+ * defeats the empty-where guard downstream: `delete: {}` or
+ * `delete: { id: req.body.postId }` with an undefined body field would compile
+ * to `WHERE user_id = $1` and remove EVERY child of this parent instead of
+ * throwing. So the caller's half is checked here, before the merge.
+ *
+ * `true` is accepted only on a to-one relation, where it means "the single
+ * related row" and the correlation alone identifies it. On a to-many it would
+ * mean "all of them", which is never what a caller spelled `delete: true` for.
+ */
+function assertTargetSelectsSomething(target: unknown, op: string, relName: string, rel: RelationDef): void {
+  const toOne = rel.type === 'hasOne' || rel.type === 'belongsTo';
+  if (target === true) {
+    if (toOne) return;
+    throw new ValidationError(
+      `[turbine] Nested ${op} on to-many relation "${relName}" needs a "where" selector: ` +
+        `"${op}: true" would ${op} every related "${rel.to}" row.`,
+    );
+  }
+  if (target && typeof target === 'object' && !Array.isArray(target)) {
+    const bound = Object.values(target as Record<string, unknown>).some((v) => v !== undefined);
+    if (bound) return;
+  }
+  throw new ValidationError(
+    `[turbine] Nested ${op} on relation "${relName}" requires a selector with at least one defined value. ` +
+      `An empty or all-undefined "where" would ${op} every related "${rel.to}" row of this parent.`,
+  );
+}
+
+/**
+ * many-to-many relations have no nested-write branch on any engine: the junction
+ * row would have to be written too, and there is no safe default for what to put
+ * in its extra columns. Refusing loudly is the only honest option, because the
+ * alternative (falling off the end of the dispatch) drops the write silently and
+ * reports success.
+ */
+function manyToManyUnsupported(relName: string, rel: RelationDef): ValidationError {
+  return new ValidationError(
+    `[turbine] Nested writes are not supported on the many-to-many relation "${relName}" ` +
+      `(via the "${rel.through?.table ?? 'junction'}" junction table). Write the junction rows directly ` +
+      `(db.${rel.through?.table ?? 'junction'}.create / createMany) inside the same $transaction.`,
+  );
+}
+
+/**
  * The E001 raised when a nested delete/update/disconnect target is not a child
  * of this parent (it belongs to another parent, or does not exist at all).
  * Matches Prisma's behavior: the nested where is scoped to the relation, so a
  * row outside the relation is simply "not found".
  */
 function notRelatedToParent(op: string, relName: string, rel: RelationDef, target: unknown): NotFoundError {
-  return new NotFoundError(
-    `[turbine] Nested ${op} on relation "${relName}": no "${rel.to}" record matching ` +
-      `${describeTargetForMessage(target)} is related to this parent.`,
-  );
+  // Object form, not the legacy string one: `err.table` / `err.where` /
+  // `err.operation` are a documented part of the NotFoundError contract, and a
+  // string-constructed error silently drops all three.
+  return new NotFoundError({
+    table: rel.to,
+    where: target,
+    operation: `nested ${op}`,
+    message:
+      `[turbine] Nested ${op} on relation "${relName}": no "${rel.to}" record matching ` +
+      `${describeTargetForMessage(target)} is related to this parent. Either it does not exist, ` +
+      `or it belongs to a different parent (a nested ${op} can only touch this parent's rows).`,
+  });
 }
 
 /** Re-tag a NotFoundError from a scoped child write as a relation-scoped miss. */
 function rethrowAsNotRelated(err: unknown, op: string, relName: string, rel: RelationDef, target: unknown): never {
-  if (err instanceof NotFoundError) throw notRelatedToParent(op, relName, rel, target);
+  if (err instanceof NotFoundError) {
+    // Only re-tag a miss on THIS relation's own write. A NotFoundError raised
+    // deeper in the tree already names its own relation, and re-tagging it here
+    // would rename someone else's failure; keep it, and preserve the original
+    // as `cause` in either direction.
+    if (err.operation?.startsWith('nested ')) throw err;
+    const tagged = notRelatedToParent(op, relName, rel, target);
+    (tagged as { cause?: unknown }).cause ??= err;
+    throw tagged;
+  }
   throw err;
 }
 
@@ -300,6 +396,8 @@ export async function executeNestedCreate(
     const rel = tableMeta.relations[relName]!;
     if (rel.type === 'belongsTo') {
       Object.assign(belongsToFks, await resolveBelongsToForCreate(ctx, rel, ops, tableName, depth, path, relName));
+    } else if (rel.type === 'manyToMany') {
+      throw manyToManyUnsupported(relName, rel);
     }
   }
 
@@ -452,6 +550,8 @@ export async function executeNestedUpdate(
           data: updateData,
         });
       }
+    } else {
+      throw manyToManyUnsupported(relName, rel);
     }
   }
 
@@ -762,6 +862,7 @@ async function processDisconnect(
   // parent's child off that parent. Scope every target to this parent's rows.
   const correlation = parentCorrelationWhere(ctx, rel, parentRow);
   for (const target of items) {
+    assertTargetSelectsSomething(target, 'disconnect', relName, rel);
     if (!correlation) throw notRelatedToParent('disconnect', relName, rel, target);
     try {
       await ctx.tx.table(rel.to).update({ where: scopeWhereToParent(target, correlation), data: nullData });
@@ -782,12 +883,25 @@ async function processSet(
   const childTable = ctx.schema.tables[rel.to];
   if (!childTable) return;
 
-  // Build parent FK match for finding current children
+  // Build parent FK match for finding current children. `set` clears the
+  // current children with `allowFullTableScan: true`, which is exactly what
+  // disables the empty-where guard downstream, so a null/undefined reference
+  // key here would null the FK of EVERY row in the child table. Same guard as
+  // parentCorrelationWhere, spelled inline because `set` also needs the
+  // (identical) forward direction for the reconnect below.
   const parentWhere: Record<string, unknown> = {};
   for (let i = 0; i < fks.length; i++) {
     const fkField = childTable.reverseColumnMap[fks[i]!] ?? fks[i]!;
     const refField = ctx.schema.tables[rel.from]?.reverseColumnMap[refs[i]!] ?? refs[i]!;
-    parentWhere[fkField] = parentRow[refField];
+    const value = parentRow[refField];
+    if (value === null || value === undefined) {
+      throw new ValidationError(
+        `[turbine] Nested set on relation "${rel.name}" cannot run: the parent's reference key ` +
+          `"${refField}" is ${value === null ? 'null' : 'missing from the loaded row'}, so no child rows ` +
+          `can be correlated to this parent.`,
+      );
+    }
+    parentWhere[fkField] = value;
   }
 
   // Disconnect all current children
@@ -837,6 +951,7 @@ async function processNestedUpdate(
     if (!item.where || !item.data) {
       throw new ValidationError(`[turbine] Nested update on "${rel.name}" requires both "where" and "data" fields.`);
     }
+    assertTargetSelectsSomething(item.where, 'update', relName, rel);
     if (!correlation) throw notRelatedToParent('update', relName, rel, item.where);
     try {
       await ctx.tx.table(rel.to).update({ where: scopeWhereToParent(item.where, correlation), data: item.data });
@@ -871,6 +986,7 @@ async function processNestedUpsert(
         `[turbine] Nested upsert on "${rel.name}" requires "where", "create", and "update" fields.`,
       );
     }
+    assertTargetSelectsSomething(item.where, 'upsert', relName, rel);
     const scoped = correlation ? scopeWhereToParent(item.where, correlation) : null;
     const existing = scoped ? await ctx.tx.table(rel.to).findUnique({ where: scoped }) : null;
     if (existing && scoped) {
@@ -932,9 +1048,25 @@ async function processBelongsToUpsert(
     );
   }
 
-  const existing = await ctx.tx.table(rel.to).findUnique({ where: item.where });
+  // Scope the lookup to the row this parent actually points at. Without the
+  // correlation, a `where` naming any other row would update a record with no
+  // relationship to the parent being written. A miss falls through to the
+  // create branch (and re-points the parent's FK), which is the same choice the
+  // hasMany/hasOne nested upsert makes: an upsert whose target is out of the
+  // relation creates a row owned by this parent rather than rewriting a
+  // stranger's.
+  const correlation = belongsToCorrelationWhere(ctx, rel, parentRow, parentTable);
+  // findMany, not findUnique: the scoped where ANDs a non-unique-looking
+  // correlation onto the caller's selector. The correlation targets the
+  // relation's reference key (unique or the PK by construction), so at most one
+  // row can come back.
+  const existing = correlation
+    ? (((await ctx.tx.table(rel.to).findMany({ where: scopeWhereToParent(item.where, correlation) }))[0] ??
+        null) as Record<string, unknown> | null)
+    : null;
   if (existing) {
-    await ctx.tx.table(rel.to).update({ where: item.where, data: item.update });
+    const relatedMeta = ctx.schema.tables[rel.to]!;
+    await ctx.tx.table(rel.to).update({ where: pkWhere(relatedMeta, existing), data: item.update });
   } else {
     // Create the related row, then update parent's FK to point at it
     const createdRow = (await ctx.tx.table(rel.to).create({ data: item.create })) as Record<string, unknown>;
@@ -971,6 +1103,7 @@ async function processDelete(
   // cross-tenant delete primitive for any endpoint that forwards a client id.
   const correlation = parentCorrelationWhere(ctx, rel, parentRow);
   for (const target of items) {
+    assertTargetSelectsSomething(target, 'delete', relName, rel);
     if (!correlation) throw notRelatedToParent('delete', relName, rel, target);
     try {
       await ctx.tx.table(rel.to).delete({ where: scopeWhereToParent(target, correlation) });

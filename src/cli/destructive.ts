@@ -25,6 +25,9 @@
 export type DestructiveKind =
   | 'drop-table'
   | 'drop-schema'
+  | 'drop-database'
+  | 'drop-owned'
+  | 'drop-matview'
   | 'drop-column'
   | 'truncate'
   | 'delete'
@@ -44,6 +47,9 @@ export interface DestructiveStatement {
 export const DESTRUCTIVE_KIND_LABEL: Record<DestructiveKind, string> = {
   'drop-table': 'drops a table and ALL its rows',
   'drop-schema': 'drops an entire schema',
+  'drop-database': 'drops an entire database and everything in it',
+  'drop-owned': 'drops every object owned by a role, and their rows',
+  'drop-matview': 'drops a materialized view and its stored rows',
   'drop-column': 'drops a column and its data in every row',
   truncate: 'deletes every row',
   delete: 'deletes rows',
@@ -66,6 +72,13 @@ interface StrippedSql {
   blocks: ProceduralBlock[];
 }
 
+/**
+ * A dollar-quote tag. Postgres allows digits after the first character
+ * (`$do1$`), so a tag regex that stops at letters reads the body as code and
+ * misses everything inside it. Same shape as the splitter in `migrate.ts`.
+ */
+const DOLLAR_TAG = /^\$([A-Za-z_][A-Za-z_0-9]*)?\$/;
+
 /** Strip -- line comments, C-style block comments, and quoted literals. */
 function stripCommentsAndStrings(sql: string): StrippedSql {
   const blocks: ProceduralBlock[] = [];
@@ -81,18 +94,37 @@ function stripCommentsAndStrings(sql: string): StrippedSql {
       i = end === -1 ? sql.length : end + 2;
       out += ' ';
     } else if (sql[i] === "'") {
-      // single-quoted literal ('' escapes a quote)
+      // Single-quoted literal. `''` always escapes a quote; inside an E-string
+      // (`E'...'`) a backslash escapes the next character too, so `E'a\'b'` is
+      // ONE literal. Without the E-string case the scan ends the literal at the
+      // backslash-quote and treats the rest of the file as code, which
+      // (worse) then hides every following statement from the guard.
+      const escapes = isEscapeStringPrefix(sql, i);
       let j = i + 1;
       while (j < sql.length) {
-        if (sql[j] === "'" && sql[j + 1] === "'") j += 2;
+        if (escapes && sql[j] === '\\') j += 2;
+        else if (sql[j] === "'" && sql[j + 1] === "'") j += 2;
         else if (sql[j] === "'") break;
         else j++;
       }
       i = j + 1;
       out += "''";
-    } else if (sql[i] === '$' && /^\$[a-zA-Z_]*\$/.test(sql.slice(i))) {
+    } else if (sql[i] === '"') {
+      // Quoted identifier. Kept VERBATIM (rules match on identifiers), but it
+      // has to be consumed as one token: an apostrophe inside a quoted name
+      // (`"customer's_orders"`) would otherwise open a string literal and hide
+      // every statement after it from the scan.
+      let j = i + 1;
+      while (j < sql.length) {
+        if (sql[j] === '"' && sql[j + 1] === '"') j += 2;
+        else if (sql[j] === '"') break;
+        else j++;
+      }
+      out += sql.slice(i, Math.min(j + 1, sql.length));
+      i = j + 1;
+    } else if (sql[i] === '$' && DOLLAR_TAG.test(sql.slice(i))) {
       // dollar-quoted literal ($$...$$ / $tag$...$tag$)
-      const tag = sql.slice(i).match(/^\$[a-zA-Z_]*\$/)?.[0] ?? '$$';
+      const tag = sql.slice(i).match(DOLLAR_TAG)?.[0] ?? '$$';
       const end = sql.indexOf(tag, i + tag.length);
       blocks.push({ at: out.length, body: sql.slice(i + tag.length, end === -1 ? sql.length : end) });
       i = end === -1 ? sql.length : end + tag.length;
@@ -103,6 +135,22 @@ function stripCommentsAndStrings(sql: string): StrippedSql {
     }
   }
   return { text: out, blocks };
+}
+
+/**
+ * True when the quote at `quoteAt` opens an E-string (`E'...'`), where a
+ * backslash escapes the next character. The preceding `E` must not itself be
+ * part of an identifier, so `some_table'` never turns the following literal
+ * into an E-string. Ordinary literals are left alone on purpose: with the
+ * modern `standard_conforming_strings = on` default, `'a\'` IS a complete
+ * string. Mirrors the same-named helper in `migrate.ts`; kept local so this
+ * module stays a pure leaf with no CLI imports of its own.
+ */
+function isEscapeStringPrefix(sql: string, quoteAt: number): boolean {
+  const prev = sql[quoteAt - 1];
+  if (prev !== 'E' && prev !== 'e') return false;
+  const before = sql[quoteAt - 2];
+  return before === undefined || !/[A-Za-z0-9_$"]/.test(before);
 }
 
 /** Unquote a "quoted" identifier for display. */
@@ -131,6 +179,22 @@ const RULES: Rule[] = [
     target: (m) => ident(m[2]),
   },
   {
+    kind: 'drop-matview',
+    regex: new RegExp(String.raw`^DROP\s+MATERIALIZED\s+VIEW\s+(IF\s+EXISTS\s+)?${IDENT}`, 'i'),
+    target: (m) => (m[4] ? `${ident(m[2])}.${ident(m[4])}` : ident(m[2])),
+  },
+  {
+    kind: 'drop-database',
+    regex: new RegExp(String.raw`^DROP\s+DATABASE\s+(IF\s+EXISTS\s+)?${IDENT}`, 'i'),
+    target: (m) => ident(m[2]),
+  },
+  {
+    // `DROP OWNED BY role` removes every object that role owns, rows included.
+    kind: 'drop-owned',
+    regex: new RegExp(String.raw`^DROP\s+OWNED\s+BY\s+${IDENT}`, 'i'),
+    target: (m) => ident(m[1]),
+  },
+  {
     kind: 'truncate',
     regex: new RegExp(String.raw`^TRUNCATE\s+(TABLE\s+)?(ONLY\s+)?${IDENT}`, 'i'),
     target: (m) => (m[5] ? `${ident(m[3])}.${ident(m[5])}` : ident(m[3])),
@@ -157,20 +221,20 @@ const RULES: Rule[] = [
   {
     kind: 'delete',
     regex: new RegExp(String.raw`^DELETE\s+FROM\s+(ONLY\s+)?${IDENT}`, 'i'),
-    target: (m) => ident(m[2]),
+    target: (m) => (m[4] ? `${ident(m[2])}.${ident(m[4])}` : ident(m[2])),
   },
   {
     // MERGE's DELETE action removes rows from the target table.
     kind: 'merge-delete',
     regex: new RegExp(String.raw`^MERGE\s+INTO\s+(ONLY\s+)?${IDENT}\b[\s\S]*?\bTHEN\s+DELETE\b`, 'i'),
-    target: (m) => ident(m[2]),
+    target: (m) => (m[4] ? `${ident(m[2])}.${ident(m[4])}` : ident(m[2])),
   },
   {
     // A WHERE inside a scalar subquery (`SET x = (SELECT ... WHERE ...)`) does
     // NOT restrict the rows updated, so the guard tests only the TOP level.
     kind: 'update-without-where',
     regex: new RegExp(String.raw`^UPDATE\s+(ONLY\s+)?${IDENT}\b`, 'i'),
-    target: (m) => ident(m[2]),
+    target: (m) => (m[4] ? `${ident(m[2])}.${ident(m[4])}` : ident(m[2])),
     also: (stmt) => !hasTopLevelWhere(stmt),
   },
 ];
@@ -187,6 +251,29 @@ function hasTopLevelWhere(stmt: string): boolean {
     m = re.exec(stmt);
   }
   return false;
+}
+
+/**
+ * A leading CTE list is a prefix, not a statement: `WITH c AS (SELECT 1) DELETE
+ * FROM users` is a plain DELETE that the anchored rules would otherwise skip.
+ * Strip balanced `WITH name AS ( ... )` groups (and their comma-separated
+ * siblings) so the real statement head is what gets matched. The CTE bodies
+ * themselves are handled separately by {@link cteSubstatements}.
+ */
+function stripLeadingCtes(stmt: string): string {
+  if (!/^WITH\b/i.test(stmt)) return stmt;
+  let rest = stmt.replace(/^WITH\s+(RECURSIVE\s+)?/i, '');
+  for (;;) {
+    const open = rest.indexOf('(');
+    if (open === -1) return stmt;
+    const close = closingParenIndex(rest, open);
+    rest = rest.slice(close + 1).trimStart();
+    if (rest.startsWith(',')) {
+      rest = rest.slice(1).trimStart();
+      continue;
+    }
+    return rest;
+  }
 }
 
 /** First matching rule for one candidate fragment, or null. */
@@ -276,7 +363,10 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
     // Top level, then data-modifying CTEs, then any procedural body this
     // statement blanked. First match per statement wins, as before.
     const display = stmt.replace(/\s+/g, ' ');
-    const candidates: Array<{ text: string; display: string }> = [stmt, ...cteSubstatements(stmt)].map((text) => ({
+    const candidates: Array<{ text: string; display: string }> = [
+      stripLeadingCtes(stmt),
+      ...cteSubstatements(stmt),
+    ].map((text) => ({
       text,
       display,
     }));

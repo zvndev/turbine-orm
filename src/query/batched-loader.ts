@@ -135,6 +135,30 @@ export interface RelationLoadContext {
 }
 
 /**
+ * The default projection of `meta` expressed in FIELD names: which fields the
+ * default (no `select`/`omit`) projection hides, and which it returns. Today the
+ * only hidden class is PII-tagged columns, and only when `includePii` is off.
+ *
+ * Returns `undefined` for the overwhelmingly common untagged case, so callers
+ * keep the `select: undefined, omit: undefined` fast path and the emitted SQL
+ * stays byte-identical.
+ */
+export function defaultProjectionFields(
+  meta: TableMetadata,
+  includePii: boolean | undefined,
+): { hidden: ReadonlySet<string>; visible: string[] } | undefined {
+  if (includePii) return undefined;
+  const hidden = new Set<string>();
+  const visible: string[] = [];
+  for (const col of meta.columns) {
+    const field = meta.reverseColumnMap[col.name] ?? col.name;
+    if (col.pii) hidden.add(field);
+    else visible.push(field);
+  }
+  return hidden.size === 0 ? undefined : { hidden, visible };
+}
+
+/**
  * Adjust a `select`/`omit` pair so that `fields` are guaranteed present in the
  * query result, returning the adjusted projection plus the list of fields that
  * were added ONLY for stitching and must be stripped from the final entities.
@@ -147,6 +171,18 @@ export function includeKeysForBatching(
   select: Record<string, boolean> | undefined,
   omit: Record<string, boolean> | undefined,
   fields: string[],
+  /**
+   * The default projection for this table when it is NOT `select`/`omit`-driven:
+   * `hidden` are fields the default projection leaves out (today: PII-tagged
+   * columns without `includePii`), `visible` is everything it does return.
+   *
+   * Without this, a correlation key that is itself PII-tagged is absent from
+   * every row, the loader sees no keys, and it silently hands back empty
+   * relation arrays. Passing it turns that case into an explicit select that
+   * re-adds only the key, which is then stripped like any other stitch-only
+   * field, so no PII value ever reaches the caller.
+   */
+  defaultProjection?: { hidden: ReadonlySet<string>; visible: string[] },
 ): { select?: Record<string, boolean>; omit?: Record<string, boolean>; strip: string[] } {
   const unique = [...new Set(fields)];
   if (select) {
@@ -171,7 +207,17 @@ export function includeKeysForBatching(
     }
     return { select, omit: next, strip };
   }
-  // Neither select nor omit — every column is already present; nothing to strip.
+  // Neither select nor omit. Every column the DEFAULT projection returns is
+  // already present, so normally there is nothing to strip; the exception is a
+  // key the default projection hides (a PII-tagged correlation column), which
+  // has to be asked for explicitly.
+  const hiddenKeys = defaultProjection ? unique.filter((f) => defaultProjection.hidden.has(f)) : [];
+  if (hiddenKeys.length > 0 && defaultProjection) {
+    const explicit: Record<string, boolean> = {};
+    for (const f of defaultProjection.visible) explicit[f] = true;
+    for (const f of hiddenKeys) explicit[f] = true;
+    return { select: explicit, omit: undefined, strip: hiddenKeys };
+  }
   return { select, omit, strip: [] };
 }
 
@@ -379,7 +425,12 @@ async function loadToOneOrMany(
 
   // The follow-up must project the child correlation key even if the caller's
   // select/omit excluded it; strip it back off afterwards so the shape matches join.
-  const proj = includeKeysForBatching(options.select, options.omit, [childKeyField]);
+  const proj = includeKeysForBatching(
+    options.select,
+    options.omit,
+    [childKeyField],
+    defaultProjectionFields(targetMeta, ctx.includePii),
+  );
   const child = ctx.makeChild(rel.to);
 
   const chunks: unknown[][] = [];
@@ -507,7 +558,12 @@ async function loadManyToMany(
   }
 
   // (2) Target rows by PK, honouring the relation's own where/select/omit/orderBy.
-  const proj = includeKeysForBatching(options.select, options.omit, [targetPkField]);
+  const proj = includeKeysForBatching(
+    options.select,
+    options.omit,
+    [targetPkField],
+    defaultProjectionFields(targetMeta, ctx.includePii),
+  );
   const child = ctx.makeChild(rel.to);
   const targetVals = [...targetValSet];
   const tChunks: unknown[][] = [];

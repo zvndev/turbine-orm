@@ -91,9 +91,13 @@ interface BucketEntry {
   errors: number;
 }
 
-/** Buffer key: minute bucket + model + action. */
+/**
+ * Buffer key: minute bucket + model + action. Joined on a NUL, which cannot
+ * appear in a table name or an action, so `model: 'a:b'` and `action: 'c'`
+ * can never collapse into the same series as `model: 'a'` / `action: 'b:c'`.
+ */
 function bufferKey(bucket: Date, model: string, action: string): string {
-  return `${bucket.getTime()}:${model}:${action}`;
+  return `${bucket.getTime()}\u0000${model}\u0000${action}`;
 }
 
 function floorToMinute(date: Date): Date {

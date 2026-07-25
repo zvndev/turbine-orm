@@ -63,6 +63,8 @@ function makeMockCtx(
   overrides?: {
     /** Override findUnique for a specific table (others use default behavior) */
     findUniqueOverride?: { table: string; returns: Record<string, unknown> | null };
+    /** Override findMany for a specific table (the scoped belongsTo lookup uses it) */
+    findManyOverride?: { table: string; returns: Record<string, unknown>[] };
   },
 ): {
   ctx: NestedWriteContext;
@@ -103,6 +105,9 @@ function makeMockCtx(
     },
     async findMany(args: { where: Record<string, unknown> }) {
       log.push({ op: 'findMany', table: name, args });
+      if (overrides?.findManyOverride && overrides.findManyOverride.table === name) {
+        return overrides.findManyOverride.returns;
+      }
       return [];
     },
     async findUnique(args: { where: Record<string, unknown>; with?: Record<string, unknown> }) {
@@ -395,14 +400,17 @@ describe('nested-write: belongsTo update', () => {
 
 describe('nested-write: belongsTo upsert', () => {
   it('updates existing related record when found', async () => {
+    // The parent post must actually point at user 5: the belongsTo upsert only
+    // updates the row this parent references, and looks it up with findMany.
     const { ctx, log } = makeMockCtx(schema, {
-      findUniqueOverride: { table: 'users', returns: { id: 5, name: 'Alice', email: 'a@b.com' } },
+      findUniqueOverride: { table: 'posts', returns: { id: 10, userId: 5 } },
+      findManyOverride: { table: 'users', returns: [{ id: 5, name: 'Alice', email: 'a@b.com' }] },
     });
 
     await executeNestedUpdate(
       ctx,
       'posts',
-      { id: 10 },
+      { id: 10, userId: 5 },
       {
         author: {
           upsert: {

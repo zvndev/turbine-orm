@@ -698,11 +698,34 @@ export class TurbineClient {
     // constructor with an opaque "Cannot read properties of undefined
     // (reading 'tables')". Fail fast with an actionable message instead.
     if (!schema || typeof schema !== 'object' || !schema.tables) {
+      // A `defineSchema()` result is the most common wrong shape here: it is a
+      // SchemaDef (`{ tables: { users: { columns: { id: ... } } } }`-ish builder
+      // output), not runtime SchemaMetadata, so name the conversion rather than
+      // just the requirement.
+      const looksLikeSchemaDef =
+        schema !== null && typeof schema === 'object' && Object.hasOwn(schema as object, 'name') === false;
       throw new ValidationError(
         '[turbine] TurbineClient requires schema metadata as its second argument. ' +
           'Run `npx turbine generate` and use the generated client (`turbine()` from your output dir), ' +
-          'or pass the generated `schemaMetadata` object: new TurbineClient(config, schemaMetadata).',
+          'or pass the generated `schemaMetadata` object: new TurbineClient(config, schemaMetadata).' +
+          (looksLikeSchemaDef
+            ? ' If you have a `defineSchema()` result, convert it first with `schemaDefToMetadata(def)`.'
+            : ''),
       );
+    }
+    // A wrong-SHAPED schema (a `defineSchema()` result, whose tables carry no
+    // `columns` array) used to survive this check and die later as
+    // `TypeError: this.tableMeta.columns is not iterable`, several frames from
+    // the cause. Validate one table's shape here, where the fix is obvious.
+    for (const [name, meta] of Object.entries(schema.tables)) {
+      if (!meta || typeof meta !== 'object' || !Array.isArray((meta as { columns?: unknown }).columns)) {
+        throw new ValidationError(
+          `[turbine] Table "${name}" in the schema passed to TurbineClient has no \`columns\` array, so this is ` +
+            'not runtime SchemaMetadata. A `defineSchema()` result is a SchemaDef: convert it with ' +
+            '`schemaDefToMetadata(def)`, or use the metadata emitted by `npx turbine generate`.',
+        );
+      }
+      break;
     }
     /**
      * Parse int8 (bigint, OID 20) as JavaScript number instead of string.

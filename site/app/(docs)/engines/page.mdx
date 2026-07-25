@@ -24,7 +24,9 @@ The typed query API (`findMany` / `with` / `where` / `create` / `aggregate` and 
 - **pgvector** distance ops / KNN ordering
 - **LISTEN/NOTIFY** realtime (`$listen` / `$notify`)
 - **RLS `sessionContext`** (the transaction-local GUCs `$withSession` sets)
-- **`DISTINCT ON`**, which is not translated for SQL Server
+- **`DISTINCT ON`** (`groupBy({ distinctOn })`), which is not translated on any non-Postgres engine
+- **Full-text `search`** in a `where` clause, which compiles to `to_tsvector` / `to_tsquery` (use `contains` elsewhere)
+- **Array-column filters** (`has` / `hasEvery` / `hasSome` / `isEmpty`), which need a native array column type
 
 **Schema and diagnostic tooling that talks to `pg` directly.** These are not query features and do not throw a capability error; they simply target PostgreSQL:
 
@@ -52,6 +54,9 @@ Every cell reflects the actual behavior of the engine's dialect. `✗ E017` mean
 | pgvector distance / KNN | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 | LISTEN/NOTIFY realtime | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 | RLS `sessionContext` | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
+| Full-text `search` filter | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
+| Array-column filters (`has`, `hasEvery`, …) | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
+| `groupBy({ distinctOn })` | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 
 ¹ SQLite is single-writer — one write transaction at a time; concurrent writers get `SQLITE_BUSY` (treated as retryable). WAL mode is enabled for file databases so readers do not block.
 
@@ -151,7 +156,7 @@ await db.disconnect();
 
 `turbineMssql(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` may be a connection string, an `mssql` config object, or an existing pool (injection — `disconnect()` is a no-op). When Turbine builds the pool it probes `SERVERPROPERTY('ProductMajorVersion')` to reject any SQL Server older than 2016. The `schema` option sets the introspection / DDL schema (default `dbo`), plus `logging` / `defaultLimit` / `warnOnUnlimited`.
 
-**Caveats:** SQL Server has no `RETURNING` or `json_agg`. Writes return rows via `OUTPUT INSERTED.*` (and upserts via `MERGE … OUTPUT`); nested relations use a dedicated `FOR JSON PATH` correlated-subquery generator, wrapping to-many results in `ISNULL(…, '[]')` and embedding nested objects with `JSON_QUERY`. Paging is `ORDER BY … OFFSET … FETCH NEXT` (a stable order is injected when a query has none). `createMany` is capped at 1000 rows / 2100 parameters per statement (exceeding either throws a `ValidationError` — chunk it yourself). `MERGE` is not a substitute for a unique constraint, so keep the upsert conflict target backed by a real `UNIQUE` / `PK` index; the loser of a race surfaces as a typed `UniqueConstraintError`. `DISTINCT ON` is Postgres-only and is not translated.
+**Caveats:** SQL Server has no `RETURNING` or `json_agg`. Writes return rows via `OUTPUT INSERTED.*` (and upserts via `MERGE … OUTPUT`); nested relations use a dedicated `FOR JSON PATH` correlated-subquery generator, wrapping to-many results in `ISNULL(…, '[]')` and embedding nested objects with `JSON_QUERY`. Paging is `ORDER BY … OFFSET … FETCH NEXT` (a stable order is injected when a query has none). `createMany` is capped at 1000 rows / 2100 parameters per statement (exceeding either throws a `ValidationError` — chunk it yourself). `MERGE` is not a substitute for a unique constraint, so keep the upsert conflict target backed by a real `UNIQUE` / `PK` index; the loser of a race surfaces as a typed `UniqueConstraintError`. `DISTINCT ON` is Postgres-only and is not translated (it throws `UnsupportedFeatureError` on every non-Postgres engine, not only SQL Server).
 
 ## PowDB
 

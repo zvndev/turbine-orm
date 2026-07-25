@@ -24,6 +24,7 @@ import {
   type TableMetadata,
 } from '../schema.js';
 import { listMigrationFiles } from './migrate.js';
+import { applyPiiTags, loadPiiTags } from './pii-tags.js';
 
 /**
  * Walk up from the running script to find turbine-orm's own package.json.
@@ -65,6 +66,13 @@ export interface McpServerOptions {
   migrationsDir: string;
   include?: string[];
   exclude?: string[];
+  /**
+   * Directory holding generated Turbine metadata (`turbine generate`'s `out`).
+   * PII tags are code-first declarations that introspection never sets, so
+   * without this the server has nothing to redact against. Read as text;
+   * nothing from it is executed. See `pii-tags.ts`.
+   */
+  metadataDir?: string;
 }
 
 export interface McpTransport {
@@ -498,14 +506,27 @@ async function sampleRows(ctx: McpContext, tableName: string, limit: number): Pr
     const table = requireTable(metadata, tableName);
     const qualifiedTable = `${quoteIdent(ctx.options.schema)}.${quoteIdent(table.name)}`;
     const result = await client.query(`SELECT * FROM ${qualifiedTable} LIMIT $1`, [limit]);
+    // Sample rows go straight into an LLM context, so PII-tagged values are
+    // replaced before serialization, the same stance Studio's Data tab takes.
+    const piiColumns = new Set(table.columns.filter((c) => c.pii).map((c) => c.name));
     return {
       table: table.name,
       limit,
+      redactedColumns: [...piiColumns],
       columns: result.fields.map((field) => ({ name: field.name, dataTypeID: field.dataTypeID })),
-      rows: result.rows,
+      rows: piiColumns.size === 0 ? result.rows : result.rows.map((row) => redactRow(row, piiColumns)),
       rowCount: result.rowCount ?? result.rows.length,
     };
   });
+}
+
+/** Replace PII-tagged cells with a fixed marker (never the value, never null). */
+function redactRow(row: Record<string, unknown>, piiColumns: ReadonlySet<string>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    out[key] = piiColumns.has(key) ? '•• redacted ••' : value;
+  }
+  return out;
 }
 
 async function withReadOnly<T>(ctx: McpContext, fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
@@ -725,7 +746,14 @@ async function loadSchemaMetadata(client: pg.PoolClient, options: McpServerOptio
     };
   }
 
-  return { tables, enums };
+  const metadata: SchemaMetadata = { tables, enums };
+  // Code-first PII tags, layered onto the live catalog. Without this the
+  // redaction below has nothing to act on (introspection never infers a tag).
+  if (options.metadataDir) {
+    const source = loadPiiTags(options.metadataDir);
+    if (source) applyPiiTags(metadata, source.tags);
+  }
+  return metadata;
 }
 
 interface ForeignKeyRow {

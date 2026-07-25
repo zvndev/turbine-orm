@@ -373,6 +373,11 @@ const stats = await db.posts.aggregate({
 });
 ```
 
+On a **PII-tagged** column, `_min` / `_max` return stored values, so they require
+`includePii: true` and otherwise throw a `ValidationError` (`TURBINE_E003`).
+`_count` needs no opt-in (it is a count, not a value), and neither does `where`.
+See [PII fields](#pii-fields-includepii).
+
 ## groupBy
 
 Group rows by one or more columns and compute aggregations per group. Similar to SQL `GROUP BY` with aggregate functions.
@@ -386,6 +391,12 @@ const postsByUser = await db.posts.groupBy({
 });
 // [{ userId: 1, _count: 12, _sum: { viewCount: 4800 }, _avg: { score: 4.2 } }, ...]
 ```
+
+Grouping **by** a PII-tagged column returns its stored values as the group keys,
+so that also requires `includePii: true` and otherwise throws `TURBINE_E003`. The
+same holds for `_min` / `_max` over a PII column, including JSON-path targets.
+`where` / `orderBy` / `having` on PII columns stay unrestricted, because none of
+them return the value. See [PII fields](#pii-fields-includepii).
 
 The result row is **fully typed** from the args (as in Prisma and Drizzle), no `as const` needed. Each `by` field carries its entity field type, `_count` is a `number`, `_sum` / `_avg` fields are `number | null` (an aggregate over zero matching rows is null), and `_min` / `_max` fields carry the field's own type. The call above infers:
 

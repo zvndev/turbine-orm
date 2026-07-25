@@ -43,6 +43,7 @@ import {
   buildCreateIndexSql,
   buildDropIndexSql,
   collectDoctorProbeIndexNames,
+  collectRelationProbeColumns,
   findMissingRelationIndexes,
   type MissingRelationIndex,
 } from '../index-advisor.js';
@@ -2656,9 +2657,14 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const unusedRan = args.unused === true;
   const auditRan = args.audit === true;
   const minScans = args.minScans;
-  const unused = unusedRan ? findUnusedIndexes(snapshot, { minScans }) : [];
+  // Never suggest dropping an index that still serves a relation probe: the
+  // missing-index half of this very report demands it.
+  const relationProbes = collectRelationProbeColumns(schema);
+  const unused = unusedRan ? findUnusedIndexes(snapshot, { minScans, relationProbes }) : [];
   const redundant = unusedRan ? findRedundantIndexes(snapshot) : [];
-  const audit = auditRan ? auditDoctorIndexes(snapshot, collectDoctorProbeIndexNames(schema), { minScans }) : [];
+  const audit = auditRan
+    ? auditDoctorIndexes(snapshot, collectDoctorProbeIndexNames(schema), { minScans, relationProbes })
+    : [];
 
   const subtract: DoctorSubtractReport = { unusedRan, auditRan, minScans, unused, redundant, audit };
 
@@ -2754,15 +2760,19 @@ function buildDoctorJson(ctx: {
     invalidIndexes: ctx.invalid,
   };
 
-  // Additive: the drop-suggestion arrays appear only when --unused / --audit ran.
-  if (ctx.subtract.unusedRan) {
-    out.unused = ctx.subtract.unused;
-    out.redundant = ctx.subtract.redundant;
-    out.invalid = ctx.invalid;
-  }
-  if (ctx.subtract.auditRan) {
-    out.audit = ctx.subtract.audit;
-  }
+  // The keys below are ALWAYS present under `schemaVersion: 1`: a declared
+  // schema version that changes shape by flag forces every consumer to write
+  // `json.unused ?? []`. Which subtraction scans actually ran is reported as
+  // data (`ran`), not as the presence or absence of a key.
+  out.subtraction = {
+    unusedRan: ctx.subtract.unusedRan,
+    auditRan: ctx.subtract.auditRan,
+    minScans: ctx.subtract.minScans ?? null,
+  };
+  out.unused = ctx.subtract.unusedRan ? ctx.subtract.unused : [];
+  out.redundant = ctx.subtract.unusedRan ? ctx.subtract.redundant : [];
+  out.audit = ctx.subtract.auditRan ? ctx.subtract.audit : [];
+  out.invalid = ctx.invalid;
   return out;
 }
 
@@ -2850,6 +2860,19 @@ function renderUnusedCaveats(minScans: number | undefined, snapshot: StatsSnapsh
   console.log(
     `  ${dim('Primary-key, unique, exclusion, and replica-identity indexes are excluded. Nothing here is auto-dropped.')}`,
   );
+  console.log(
+    `  ${dim('Indexes that still serve a relation Turbine probes are withheld: this report demands those.')}`,
+  );
+  // The cost section refuses to SCORE on stats this young; prescribing drops off
+  // the same counters in the next section would be the report contradicting
+  // itself. Say so where the advice is, not only where the scoring is.
+  if (snapshot.statsAgeDays !== null && snapshot.statsAgeDays < STATS_THRESHOLDS.minStatsAgeDays) {
+    console.log(
+      `  ${yellow(`Statistics are only ${ageLabel} old, below the ${STATS_THRESHOLDS.minStatsAgeDays}d floor this report uses to score cost.`)}`,
+    );
+    console.log(`  ${yellow('Treat everything below as a list to investigate, not advice to act on: an index your')}`);
+    console.log(`  ${yellow('workload simply has not reached yet looks identical to a dead one.')}`);
+  }
   newline();
 }
 
@@ -2911,7 +2934,14 @@ function renderDoctorAudit(audit: DoctorIndexAudit[], minScans: number | undefin
         `    ${dim(symbols.tee)} ${dim('the 63-byte name maps to more than one probe column set; confirm before dropping')}`,
       );
     }
-    console.log(`    ${dim(symbols.teeEnd)} ${green(a.dropSql)}`);
+    if (a.stillProbed) {
+      console.log(
+        `    ${dim(symbols.teeEnd)} ${dim('kept: a relation in your schema still probes these columns, so dropping it would')}`,
+      );
+      console.log(`      ${dim('reappear as a missing-index finding in this same report.')}`);
+    } else if (a.dropSql) {
+      console.log(`    ${dim(symbols.teeEnd)} ${green(a.dropSql)}`);
+    }
     newline();
   }
   console.log(`  ${dim('Consider dropping the ones you confirm are unused. Nothing here is auto-dropped.')}`);
@@ -3091,7 +3121,12 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
   }
 
   const spinner = new Spinner(demo ? 'Seeding demo dataset' : 'Introspecting database').start();
-  let studio: { dispose: () => Promise<void>; authToken: string; url: string };
+  let studio: {
+    dispose: () => Promise<void>;
+    authToken: string;
+    url: string;
+    piiTags: { path: string; applied: number } | null;
+  };
   try {
     studio = await startStudio({
       url,
@@ -3106,6 +3141,7 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
       write: args.write === true,
       showPii: args.showPii === true,
       demo,
+      metadataDir: config.out,
     });
     spinner.succeed(demo ? 'Demo Studio is running' : 'Studio is running');
   } catch (err) {
@@ -3147,6 +3183,26 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
     if (args.showPii) {
       newline();
       console.log(warn('--show-pii is ON. PII-tagged column values are shown UNREDACTED in Studio.'));
+    }
+
+    // PII tags are a code-first declaration; introspection never infers them.
+    // Say plainly whether any reached this session, so nobody assumes a
+    // redaction guarantee that has nothing to act on.
+    if (!args.showPii) {
+      newline();
+      if (studio.piiTags && studio.piiTags.applied > 0) {
+        console.log(
+          `  ${dim('PII redaction:')} ${studio.piiTags.applied} tagged column(s) from ${dim(studio.piiTags.path)}`,
+        );
+      } else {
+        console.log(
+          warn(
+            'No PII-tagged columns found, so nothing will be redacted. Tags are declared in code ' +
+              `(defineSchema \`pii: true\`) and read from generated metadata in ${config.out}; ` +
+              'introspection alone never infers them. Run `turbine generate` after tagging.',
+          ),
+        );
+      }
     }
 
     newline();
@@ -3196,6 +3252,7 @@ async function cmdMcp(_args: CliArgs, config: ResolvedConfig): Promise<void> {
     url,
     schema: config.schema,
     migrationsDir: config.migrationsDir,
+    metadataDir: config.out,
     include: config.include.length ? config.include : undefined,
     exclude: config.exclude.length ? config.exclude : undefined,
   });

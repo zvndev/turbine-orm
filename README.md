@@ -14,7 +14,7 @@ Every TS ORM now resolves nested relations in a single `json_agg` query — Pris
 
 1. **Read-only-by-default Studio your DBA will approve.** `npx turbine studio` spins up a loopback-bound web UI with 192-bit auth tokens, `BEGIN READ ONLY` transactions, and (since v0.19) no raw-SQL surface at all: queries are composed in the ORM's own validated builder. In the default mode the write endpoints do not exist and every transaction is read-only at the database level; edits require an explicit `--write` opt-in per launch, and every edit is addressed by its full primary key (never a predicate).
 2. **PII-safe error messages.** Turbine errors show WHERE keys, not values. A `UniqueConstraintError` says which column violated the constraint — never the actual user data. Safe to log, safe to surface to monitoring, no scrubbing needed.
-3. **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages to keep in lockstep. The main entry's **import graph** is ~57 kB brotli (edge ~43 kB) with `pg` external (that is the client footprint your bundler sees, not the dual ESM+CJS install size on disk, ~3 MB). Prisma 7 dropped its Rust query engine, but its client still ships a TypeScript/WASM query compiler: a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
+3. **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages to keep in lockstep. The main entry's **import graph** is ~59 kB brotli (edge ~44 kB) with `pg` external (that is the client footprint your bundler sees, not the dual ESM+CJS install size on disk, ~3 MB). Prisma 7 dropped its Rust query engine, but its client still ships a TypeScript/WASM query compiler: a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
 4. **SQL-first migrations with drift detection.** Write real SQL. SHA-256 checksums catch modified migration files. `pg_try_advisory_lock()` prevents concurrent runs. Each migration in its own transaction. No shadow database, no magic DSL.
 5. **Edge-native — one import swap.** `turbineHttp(pool, SCHEMA)` — same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase. No WASM bundle, no adapter package, no separate serverless build.
 6. **Pipeline batching via wire protocol.** Real Parse/Bind/Execute pipeline — not queries wrapped in a transaction. N independent queries in one round-trip.
@@ -47,9 +47,9 @@ Prisma's nested scenarios run on its **`join`** load strategy: `benchmarks/prism
 **Over a local socket the network floor disappears, so per-query overhead becomes the whole signal.** The picture that emerges across two full runs:
 
 - **Turbine leads flat reads, both findUnique shapes, pipeline, and the hot path.** SQL template caching and prepared statements keep its per-call overhead lowest on simple and repeated-shape queries, and its real Postgres pipeline protocol (one TCP flush for 5 queries) runs the dashboard batch ~2x faster than Prisma's or Drizzle's sequential transaction.
-- **Drizzle leads nested reads (L2).** Its relational query builder emits tighter SQL for the posts/comments joins. Turbine's `json_agg` nesting is close behind and still 1.7x to 3.1x ahead of Prisma on the same L2/L3 shapes.
+- **Drizzle leads nested reads (L2).** Its relational query builder emits tighter SQL for the posts/comments joins. Turbine's `json_agg` nesting is close behind and still 1.6x to 2.6x ahead of Prisma on the same L2/L3 shapes on this run.
 - **Four scenarios are near-ties.** L3 nested, count, streaming, and atomic increment each flipped winner between the two runs. Treat them as within noise on this host rather than a lead for either side.
-- **Prisma trails on every scenario here.** Its engine-less client's per-query work is no longer masked by network latency; on a pooled remote database (the regime we measured previously) these same deltas compress back into the noise floor. Prisma 7.9 is a real improvement on 7.6 (flat reads ~30% faster, the pipeline batch ~26%).
+- **Prisma trails Turbine on every scenario here.** It edges out Drizzle on the flat read and ties it on the atomic increment, but is behind Turbine on all ten. Its engine-less client's per-query work is no longer masked by network latency; on a pooled remote database (the regime we measured previously) these same deltas compress back into the noise floor. Prisma 7.9 is a real improvement on 7.6 (flat reads ~30% faster, the pipeline batch ~26%).
 
 Net: on a local socket Turbine takes five scenarios outright, loses L2 to Drizzle, and trades four more run-to-run. It is competitive-to-ahead across the board rather than a clean sweep, and the honest takeaway is unchanged: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only-by-default Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
 
@@ -723,7 +723,7 @@ npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 - **Saved queries.** Named builder queries persisted to `.turbine/studio-queries.json` — share them across runs without committing them.
 - **Cmd+K command palette.** Jump to any table, tab, or saved query in one keystroke.
 - **Full-text search across rows.** The Data tab supports substring search across every text column of the current table.
-- **PII redaction.** Columns tagged `pii: true` in the schema render as a redaction placeholder in every tab. `--show-pii` reveals them, with a loud startup warning.
+- **PII redaction.** Columns tagged `pii: true` in the schema render as a redaction placeholder in every tab. `--show-pii` reveals them, with a loud startup warning. Tags are a code-first declaration (introspection never infers one), so Studio reads them from the generated metadata in your `out` directory; if it finds none it says so at startup rather than implying a protection it cannot apply.
 - **Opt-in write mode.** `--write` enables insert/update/delete from the Data tab (single rows, multi-select delete, and paste-to-insert batches), gated per row by the full primary key, compiled by the same validated builders, and flagged with a persistent WRITE MODE banner. Read-only stays the default on every launch.
 
 **Security posture (read-only by default)**
@@ -995,11 +995,11 @@ Turbine maps Postgres types to TypeScript:
 |---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
-| **Main bundle (brotli)** | ~57 kB | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
+| **Main bundle (brotli)** | ~59 kB | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
 | **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Free; hosted Gateway paid | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, ~43 kB brotli | Driver adapter + WASM compiler | Native | Native |
+| **Edge runtime** | One import swap, ~44 kB brotli | Driver adapter + WASM compiler | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query, shallow inference | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |
@@ -1016,8 +1016,8 @@ All three ORMs now do single-query nested loads — that's table stakes. Turbine
 
 Turbine is focused and opinionated. Here's what it doesn't do:
 
-- **Postgres-first.** PostgreSQL is the default and primary target — going deep on one database is what enables the safety bundle and the edge-runtime story. SQLite, MySQL 8, and SQL Server engines are available as additive subpath exports (see [Database engines](#database-engines)), but several flagship features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) are Postgres-only and throw `UnsupportedFeatureError` elsewhere.
-- **Full-text search** is available via a `search` filter — `where: { title: { search: 'hello & world', config: 'english' } }` compiles to a parameterized `to_tsvector(...) @@ to_tsquery(...)`. For advanced ranking (`ts_rank`, weighted vectors) use `db.raw`.
+- **Postgres-first.** PostgreSQL is the default and primary target — going deep on one database is what enables the safety bundle and the edge-runtime story. SQLite, MySQL 8, and SQL Server engines are available as additive subpath exports (see [Database engines](#database-engines)), but several flagship features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`, full-text `search`, array-column filters, `groupBy({ distinctOn })`) are Postgres-only and throw `UnsupportedFeatureError` elsewhere.
+- **Full-text search** is available via a `search` filter — `where: { title: { search: 'hello & world', config: 'english' } }` compiles to a parameterized `to_tsvector(...) @@ to_tsquery(...)`. PostgreSQL only: the other engines throw `UnsupportedFeatureError` (`TURBINE_E017`) rather than degrade to a `LIKE`. For advanced ranking (`ts_rank`, weighted vectors) use `db.raw`.
 - **Large nested result sets.** Nested results are materialized server-side in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause — or stream the parents with `findManyStream` and resolve children per-row.
 
 ## Examples

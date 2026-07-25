@@ -553,6 +553,10 @@ function translateReadArgs(ctx: Ctx, mm: PrismaModelMap, prismaArgs: Record<stri
   }
   if (prismaArgs.relationLoadStrategy !== undefined) t.relationLoadStrategy = prismaArgs.relationLoadStrategy;
   if (typeof prismaArgs.timeout === 'number') t.timeout = prismaArgs.timeout;
+  // Turbine-only passthrough. Prisma has no PII concept, so a compat caller
+  // whose schema tags columns needs SOME way to opt in; without this the
+  // adapter is a one-way door into redacted reads and refused aggregates.
+  if (prismaArgs.includePii !== undefined) t.includePii = prismaArgs.includePii;
   if (ctx.options.stablePkOrder) t.stableRelationOrder = true;
   translateCursor(ctx, mm, prismaArgs, t);
   return t;
@@ -808,6 +812,9 @@ function translateAggregateArgs(
     if (args[block] !== undefined) t[block] = renameAggBlock(mm, args[block], false);
   }
   if (typeof args.timeout === 'number') t.timeout = args.timeout;
+  // Turbine-only passthrough: the PII gate on groupBy keys and _min/_max needs
+  // an opt-in that Prisma's arg shape has no equivalent for.
+  if (args.includePii !== undefined) t.includePii = args.includePii;
   if (isGroupBy) {
     if (Array.isArray(args.by)) t.by = (args.by as string[]).map((f) => renameField(mm, f));
     if (args.orderBy !== undefined) t.orderBy = translateOrderBy(ctx, mm, args.orderBy);
