@@ -13,6 +13,7 @@
  * the findMany/findUnique execute assembly.
  */
 
+import type { JsonWireRule } from '../dialect.js';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { missingIndexForRelation } from '../index-advisor.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
@@ -37,7 +38,7 @@ import type {
   WithCount,
   WithOptions,
 } from './types.js';
-import { coerceJsonWireValue, jsonWireCoercionOid, ownLookup } from './utils.js';
+import { ownLookup } from './utils.js';
 import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -1480,9 +1481,16 @@ export function buildJsonRow(qi: BuilderCtx, jsonPairs: [key: string, expr: stri
 // json_build_object nor share this divergence set.
 // ---------------------------------------------------------------------------
 
-/** True when this query's engine gets the JSON-wire cast/decode treatment. */
-function usesJsonWireCoercion(qi: BuilderCtx): boolean {
-  return qi.dialect.name === 'postgresql';
+/**
+ * The JSON-wire rule for one column, or undefined when its JSON rendering
+ * already matches the driver. Routed entirely through the dialect, so each
+ * engine states its own divergence set (see {@link Dialect.jsonWireRule}); a
+ * dialect that omits the hook keeps the pre-0.51 no-cast behavior.
+ */
+function jsonWireRuleFor(qi: BuilderCtx, meta: TableMetadata, col: string): JsonWireRule | undefined {
+  const type = meta.pgTypes?.[col];
+  if (!type) return undefined;
+  return qi.dialect.jsonWireRule?.(type);
 }
 
 /**
@@ -1492,8 +1500,7 @@ function usesJsonWireCoercion(qi: BuilderCtx): boolean {
  */
 function jsonScalarExpr(qi: BuilderCtx, targetMeta: TableMetadata, col: string, ref: string): string {
   const expr = `${ref}.${qi.q(col)}`;
-  if (!usesJsonWireCoercion(qi)) return expr;
-  return jsonWireCoercionOid(targetMeta.pgTypes?.[col]) === undefined ? expr : `${expr}::text`;
+  return jsonWireRuleFor(qi, targetMeta, col)?.sql(expr) ?? expr;
 }
 
 /**
@@ -1523,9 +1530,9 @@ function jsonScalarPairs(
  * Held in a WeakMap rather than on the ctx so the cache dies with the
  * QueryInterface and no shared interface has to grow a field for it.
  */
-const jsonWireFieldCache = new WeakMap<BuilderCtx, Map<string, Map<string, number> | null>>();
+const jsonWireFieldCache = new WeakMap<BuilderCtx, Map<string, Map<string, JsonWireRule> | null>>();
 
-function jsonWireFields(qi: BuilderCtx, table: string, meta: TableMetadata): Map<string, number> | null {
+function jsonWireFields(qi: BuilderCtx, table: string, meta: TableMetadata): Map<string, JsonWireRule> | null {
   let byTable = jsonWireFieldCache.get(qi);
   if (!byTable) {
     byTable = new Map();
@@ -1534,15 +1541,12 @@ function jsonWireFields(qi: BuilderCtx, table: string, meta: TableMetadata): Map
   const cached = byTable.get(table);
   if (cached !== undefined) return cached;
 
-  let fields: Map<string, number> | null = null;
-  const pgTypes = meta.pgTypes;
-  if (pgTypes) {
-    for (const col of meta.allColumns) {
-      const oid = jsonWireCoercionOid(pgTypes[col]);
-      if (oid === undefined) continue;
-      if (fields === null) fields = new Map();
-      fields.set(meta.reverseColumnMap[col] ?? snakeToCamel(col), oid);
-    }
+  let fields: Map<string, JsonWireRule> | null = null;
+  for (const col of meta.allColumns) {
+    const rule = jsonWireRuleFor(qi, meta, col);
+    if (rule === undefined) continue;
+    if (fields === null) fields = new Map();
+    fields.set(meta.reverseColumnMap[col] ?? snakeToCamel(col), rule);
   }
   byTable.set(table, fields);
   return fields;
@@ -1559,7 +1563,6 @@ function decodeJsonWireRow(
   table: string,
   meta: TableMetadata,
 ): Record<string, unknown> {
-  if (!usesJsonWireCoercion(qi)) return row;
   const fields = jsonWireFields(qi, table, meta);
   if (fields === null) return row;
   // Copy-on-first-write rather than mutating in place: the row can be a
@@ -1567,11 +1570,11 @@ function decodeJsonWireRow(
   // be holding. Measured against an in-place variant on a 20K-child-row join the
   // two were indistinguishable, so the copy is free insurance.
   let decoded: Record<string, unknown> | undefined;
-  for (const [field, oid] of fields) {
+  for (const [field, rule] of fields) {
     const raw = row[field];
     if (typeof raw !== 'string') continue;
     if (decoded === undefined) decoded = { ...row };
-    decoded[field] = coerceJsonWireValue(oid, raw);
+    decoded[field] = rule.decode(raw);
   }
   return decoded ?? row;
 }

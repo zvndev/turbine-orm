@@ -237,6 +237,17 @@ export interface TurbineConfig {
    */
   utcTimestamps?: boolean;
   /**
+   * Refuse a nested `connect` / `connectOrCreate` that would re-parent a
+   * to-many child already owned by a different parent. Off by default,
+   * because it changes the outcome of writes that currently succeed.
+   *
+   * Worth turning on for any multi-tenant application: without it, a handler
+   * that forwards a client-supplied id into a nested connect lets a caller
+   * take another tenant's row. See
+   * {@link import('./nested-write.js').NestedWriteContext.scopedConnect}.
+   */
+  scopedConnect?: boolean;
+  /**
    * Default strategy for resolving `with`-clause relations, applied to every
    * `findMany`/`findUnique`/`findFirst` unless overridden per query.
    *
@@ -821,6 +832,7 @@ export class TurbineClient {
       defaultLimit: config.defaultLimit,
       warnOnUnlimited: config.warnOnUnlimited,
       utcTimestamps: config.utcTimestamps,
+      scopedConnect: config.scopedConnect,
       relationLoadStrategy: config.relationLoadStrategy,
       stableRelationOrder: config.stableRelationOrder,
       implicitPkOrdering: config.implicitPkOrdering,

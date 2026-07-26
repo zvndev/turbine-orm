@@ -379,6 +379,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly middlewares: MiddlewareFn[];
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
+  private readonly scopedConnect: boolean;
   private readonly utcTimestamps: boolean;
   private readonly preparedStatementsEnabled: boolean;
   /**
@@ -541,6 +542,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       typeof warnOpt === 'object' && warnOpt !== null
         ? (warnOpt[table] ?? warnOpt[snakeToCamel(table)]) !== false
         : warnOpt !== false;
+    this.scopedConnect = options?.scopedConnect === true;
     this.utcTimestamps = options?.utcTimestamps !== false;
     this.preparedStatementsEnabled = options?.preparedStatements ?? true;
     // SQL template cache capacity. `sqlCacheSize: 0` disables caching entirely
@@ -2779,7 +2781,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
       );
       // biome-ignore lint/suspicious/noExplicitAny: TransactionClient satisfies NestedWriteContext['tx'] at runtime
-      const ctx: NestedWriteContext = { schema: this.schema, tx: tx as any };
+      const ctx: NestedWriteContext = { schema: this.schema, tx: tx as any, scopedConnect: this.scopedConnect };
       const result = await fn(ctx);
       await client.query(this.dialect.commitStatement());
       return result;

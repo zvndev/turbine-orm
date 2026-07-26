@@ -2494,7 +2494,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         // the transaction-scoped proxy pool (see createTxPool).
         this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
       );
-      const ctx: NestedWriteContext = { schema: this.schema, tx: tx as unknown as NestedWriteContext['tx'] };
+      const ctx: NestedWriteContext = {
+        schema: this.schema,
+        tx: tx as unknown as NestedWriteContext['tx'],
+        scopedConnect: this.options?.scopedConnect === true,
+      };
       // Plant the single-writer re-entrancy marker for the implicit tx's
       // subtree (same seam TurbineClient.$transaction uses) — user code that
       // fires db.$transaction from inside (e.g. $use middleware around a

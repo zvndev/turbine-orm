@@ -59,6 +59,7 @@ import {
   type DialectIntrospector,
   type InsertStatementInput,
   type IntrospectOptions,
+  type JsonWireRule,
   postgresDialect,
   type ReturningSelection,
   type StreamableConnection,
@@ -470,6 +471,40 @@ export const sqliteDialect: Dialect = {
    */
   wrapJsonSubresult(subquery: string, fallback: string): string {
     return `COALESCE(json((${subquery})), ${fallback})`;
+  },
+
+  jsonWireRule(columnType: string): JsonWireRule | undefined {
+    // SQLite's storage classes, as introspection records them.
+    const t = columnType.toUpperCase();
+
+    // INTEGER is 64-bit, and `json_object` renders it as a JSON number, which
+    // is an IEEE double: 9007199254740993 came back through a `with` join as
+    // …992 while a top-level read and the batched loader both returned the
+    // exact decimal string. Carry the text and re-apply the SAME safe-integer
+    // policy `normalizeValue` applies to the driver's bigint, so all three
+    // paths agree for both small and large values.
+    if (t.includes('INT')) {
+      return {
+        sql: (ref) => `CAST(${ref} AS TEXT)`,
+        decode: (value) => {
+          if (typeof value !== 'string' || !/^-?\d+$/.test(value)) return value;
+          const asNumber = Number(value);
+          return Number.isSafeInteger(asNumber) ? asNumber : value;
+        },
+      };
+    }
+
+    // A BLOB cannot go into JSON at all: SQLite raises "JSON cannot hold BLOB
+    // values" and the whole query fails with a raw SQL logic error, where the
+    // batched loader returns the row fine. Carry hex and rebuild the bytes.
+    if (t.includes('BLOB')) {
+      return {
+        sql: (ref) => `hex(${ref})`,
+        decode: (value) => (typeof value === 'string' ? Uint8Array.from(Buffer.from(value, 'hex')) : value),
+      };
+    }
+
+    return undefined;
   },
 
   castAggregate(expr: string, target: 'int' | 'float'): string {

@@ -1349,7 +1349,10 @@ export async function introspectMssql(options: IntrospectOptions): Promise<Schem
   try {
     const mp = new MssqlPool(pool, sqlNS);
     const exec: MssqlRowExecutor = async (sql, params) => (await mp.query(sql, params)).rows;
-    return introspectMssqlWith(exec, options.schema ?? 'dbo', {
+    // `await` is LOAD-BEARING: `return somePromise` inside a try/finally runs
+    // the finally BEFORE the promise settles, so `pool.close()` would tear the
+    // connection down underneath the introspection queries.
+    return await introspectMssqlWith(exec, options.schema ?? 'dbo', {
       include: options.include,
       exclude: options.exclude,
     });

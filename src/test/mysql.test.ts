@@ -116,7 +116,13 @@ describe('turbine-orm/mysql — dialect conformance (no Postgres leakage)', () =
   it('nested with → JSON_OBJECT / JSON_ARRAYAGG / CAST(... AS JSON) wrap, no json_agg', () => {
     const sql = q().buildFindMany({ with: { posts: { with: { author: true } } } }).sql;
     assert.match(sql, /JSON_ARRAYAGG/);
-    assert.match(sql, /JSON_OBJECT\('id', t0\.`id`/);
+    // `id` is BIGINT in this fixture, and JSON_OBJECT would render it as a JSON
+    // number (an IEEE double) — measured to return 9007199254740992 for a stored
+    // 9007199254740993, while a top-level read and the batched loader both give
+    // the exact string. So a bigint is carried as CHAR and decoded back with the
+    // driver's own safe-integer policy. A non-divergent column is uncast.
+    assert.match(sql, /JSON_OBJECT\('id', CAST\(t0\.`id` AS CHAR\)/);
+    assert.match(sql, /'title', t0\.`title`/);
     assert.match(sql, /COALESCE\(JSON_ARRAYAGG/);
     // nested to-one subresult is CAST(... AS JSON)-wrapped (no string double-encoding)
     assert.match(sql, /COALESCE\(CAST\(\(SELECT JSON_OBJECT/);

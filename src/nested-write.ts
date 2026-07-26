@@ -43,6 +43,25 @@ export interface ExtractedFields {
  */
 export interface NestedWriteContext {
   schema: SchemaMetadata;
+  /**
+   * Refuse a `connect` / `connectOrCreate` that would RE-PARENT a to-many
+   * child already owned by a different parent. Off by default.
+   *
+   * `connect: { id: 42 }` on a to-many relation means "make row 42 mine", and
+   * it does that unconditionally: if another parent owns row 42, the row is
+   * silently taken from them. A handler that forwards a client-supplied id
+   * into a nested connect therefore hands any caller a cross-tenant write
+   * primitive, and the only defense is a hand-rolled ownership check at every
+   * call site. With this on, connecting a child whose foreign key already
+   * points at a DIFFERENT parent raises E003; connecting an unowned child
+   * (null FK) or one this parent already owns still succeeds, so the
+   * legitimate uses are untouched.
+   *
+   * Applies to `hasMany` / `hasOne` only. A `belongsTo` connect points the row
+   * being written at a parent, which takes nothing from anyone, and a
+   * many-to-many connect adds a junction row rather than moving one.
+   */
+  scopedConnect?: boolean;
   tx: {
     table<T extends object>(
       name: string,
@@ -1270,6 +1289,48 @@ async function processBelongsToCreate(
 // connect, connectOrCreate, disconnect, set, delete helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Refuse a connect that would take a to-many child away from another parent,
+ * when {@link NestedWriteContext.scopedConnect} is on. See that field for why.
+ *
+ * Compares the child's CURRENT foreign key against the parent's reference
+ * value. Null (unowned) passes, an exact match passes (idempotent re-connect),
+ * anything else is refused. Values are compared after normalizing to a
+ * primitive, so a bigint FK read back as a string cannot look like a mismatch
+ * against the number the parent write returned.
+ */
+function assertConnectInScope(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  child: Record<string, unknown>,
+  parentRow: Record<string, unknown>,
+  target: Record<string, unknown>,
+): void {
+  if (!ctx.scopedConnect) return;
+  if (rel.type !== 'hasMany' && rel.type !== 'hasOne') return;
+
+  const childTable = ctx.schema.tables[rel.to];
+  const parentTable = ctx.schema.tables[rel.from];
+  if (!childTable) return;
+
+  const fks = normalizeKeyColumns(rel.foreignKey);
+  const refs = normalizeKeyColumns(rel.referenceKey);
+  const key = (v: unknown): string | null => (v === null || v === undefined ? null : String(v));
+
+  for (let i = 0; i < fks.length; i++) {
+    const fkField = childTable.reverseColumnMap[fks[i]!] ?? fks[i]!;
+    const refField = parentTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
+    const current = key(child[fkField]);
+    if (current === null) continue;
+    if (current === key(parentRow[refField])) continue;
+    throw new ValidationError(
+      `[turbine] connect refused: ${rel.to} row ${describeTargetForMessage(target)} is already owned by ` +
+        `another "${rel.from}" (its ${fks[i]} is ${current}). \`scopedConnect\` only allows connecting a row ` +
+        `that is unowned or already owned by this parent; re-parenting must be an explicit update.`,
+    );
+  }
+}
+
 async function batchConnect(
   ctx: NestedWriteContext,
   rel: RelationDef,
@@ -1290,6 +1351,7 @@ async function batchConnect(
         `[turbine] connect: no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
       );
     }
+    assertConnectInScope(ctx, rel, existing as Record<string, unknown>, parentRow, target);
   }
 
   // Build FK update data to point children at parent
@@ -1325,6 +1387,7 @@ async function connectOrCreate(
     const injected = injectForeignKey(op.create, rel, parentRow, ctx.schema);
     row = (await ctx.tx.table(rel.to).create({ data: injected })) as Record<string, unknown>;
   } else {
+    assertConnectInScope(ctx, rel, row, parentRow, op.where);
     // Update FK to point to parent
     const updateData: Record<string, unknown> = {};
     for (let i = 0; i < fks.length; i++) {

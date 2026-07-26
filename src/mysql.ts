@@ -75,6 +75,7 @@ import {
   type DialectIntrospector,
   type InsertStatementInput,
   type IntrospectOptions,
+  type JsonWireRule,
   postgresDialect,
   type StreamableConnection,
   type UpsertStatementInput,
@@ -512,6 +513,43 @@ export const mysqlDialect: Dialect = {
 
   // MySQL aggregate casts: COUNT → SIGNED (BIGINT, comes back as a JS number when
   // safe), AVG/float → DECIMAL (string, the aggregate transform Number()-coerces).
+  jsonWireRule(columnType: string): JsonWireRule | undefined {
+    const t = columnType.toLowerCase();
+
+    // JSON_OBJECT renders these as JSON numbers, which are IEEE doubles, so a
+    // relation read through the join strategy disagreed with a top-level read
+    // and with the batched loader — LOSSILY. Measured: BIGINT 9007199254740993
+    // came back 9007199254740992, and DECIMAL '1000.50' came back 1000.5.
+    // mysql2 hands both back as STRINGS at top level (supportBigNumbers, and
+    // DECIMAL is always a string), so carry the text and keep it.
+    if (t === 'bigint') {
+      return {
+        sql: (ref) => `CAST(${ref} AS CHAR)`,
+        decode: (value) => {
+          // Same policy as the driver's supportBigNumbers/bigNumberStrings:false.
+          if (typeof value !== 'string' || !/^-?\d+$/.test(value)) return value;
+          const asNumber = Number(value);
+          return Number.isSafeInteger(asNumber) ? asNumber : value;
+        },
+      };
+    }
+    if (t === 'decimal' || t === 'numeric') {
+      return { sql: (ref) => `CAST(${ref} AS CHAR)`, decode: (value) => value };
+    }
+
+    // Binary columns are worse than lossy: JSON_OBJECT emits MySQL's internal
+    // `base64:type15:…` marker string, so the caller got that text instead of
+    // bytes. Carry hex and rebuild the buffer.
+    if (t === 'binary' || t === 'varbinary' || t.endsWith('blob')) {
+      return {
+        sql: (ref) => `HEX(${ref})`,
+        decode: (value) => (typeof value === 'string' ? Uint8Array.from(Buffer.from(value, 'hex')) : value),
+      };
+    }
+
+    return undefined;
+  },
+
   castAggregate(expr: string, target: 'int' | 'float'): string {
     return `CAST(${expr} AS ${target === 'int' ? 'SIGNED' : 'DECIMAL(65,30)'})`;
   },
@@ -958,7 +996,11 @@ export async function introspectMysql(options: IntrospectOptions): Promise<Schem
         '[turbine] Could not determine the MySQL database to introspect — pass a database in the connection string or a `schema` option.',
       );
     }
-    return introspectMysqlWith(exec, schemaName, { include: options.include, exclude: options.exclude });
+    // `await` is LOAD-BEARING, not stylistic: `return somePromise` inside a
+    // try/finally runs the finally BEFORE the promise settles, so `pool.end()`
+    // closed the pool out from under every introspection query and the whole
+    // call failed with mysql2's "Pool is closed".
+    return await introspectMysqlWith(exec, schemaName, { include: options.include, exclude: options.exclude });
   } finally {
     await pool.end();
   }

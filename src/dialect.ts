@@ -8,6 +8,7 @@
 
 import { ValidationError } from './errors.js';
 import type { WithOptions } from './query/types.js';
+import { coerceJsonWireValue, jsonWireCoercionOid } from './query/utils.js';
 import { pgArrayType, pgTypeToTs, type RelationDef, type SchemaMetadata, type TableMetadata } from './schema.js';
 
 export type DialectName = 'postgresql' | 'mysql' | 'sqlite' | (string & {});
@@ -57,6 +58,18 @@ export interface BulkInsertStatementInput {
    * ignore it.
    */
   requireRowValues?: boolean;
+}
+
+/**
+ * The cast/decode pair for one JSON-divergent column type. See
+ * {@link Dialect.jsonWireRule}. The two halves MUST agree: a cast with no
+ * matching decode silently returns text where a value is expected.
+ */
+export interface JsonWireRule {
+  /** The SQL expression to place in the JSON builder, given the column reference. */
+  sql(columnRef: string): string;
+  /** Turn the JSON-carried value back into the driver's representation. */
+  decode(value: unknown): unknown;
 }
 
 export interface BuiltStatement {
@@ -436,6 +449,29 @@ export interface Dialect {
     rightColumns: string | string[],
   ): string;
 
+  /**
+   * How a column whose JSON rendering DIVERGES from the driver's own value
+   * should be carried through a `with` subquery, or `undefined` when the
+   * column's JSON form already matches.
+   *
+   * A nested-relation subquery builds JSON (`json_build_object`,
+   * `json_group_array`, …) and the JSON number grammar is not the wire
+   * grammar: PostgreSQL renders `numeric` as a JSON number, SQLite renders a
+   * 64-bit INTEGER as one, and a JSON number is an IEEE double. So the same
+   * column read at top level and read through a relation came back as
+   * different values, LOSSILY past 2^53 — and because `auto` picks between the
+   * join and batched strategies by row count, the same query could return
+   * either. The fix is to carry the value as text and decode it back with the
+   * engine's own rule, which is what this hook pairs up: `sql` must emit an
+   * expression the JSON builder can hold, and `decode` must turn that back
+   * into exactly what the driver would have produced.
+   *
+   * Omitting the hook keeps a dialect on the old behavior (no cast, no
+   * decode), which is correct for any engine whose JSON rendering agrees with
+   * its wire format.
+   */
+  jsonWireRule?(columnType: string): JsonWireRule | undefined;
+
   /** Optional type mapping hook for code generation/introspection. */
   typeToTypeScript?(dialectType: string, nullable: boolean): string;
 
@@ -780,6 +816,21 @@ export const postgresDialect: Dialect = {
 
   arrayType(baseType: string): string {
     return pgArrayType(baseType);
+  },
+
+  jsonWireRule(columnType: string): JsonWireRule | undefined {
+    // `json_build_object` renders these as a JSON number / bare token that does
+    // not match what the driver returns for the same column (numeric past
+    // double precision and int8 past 2^53 lose digits outright). Carry the
+    // driver's own wire TEXT instead and hand it back to the driver's parser
+    // for that OID, so the join strategy returns exactly what a top-level read
+    // returns.
+    const oid = jsonWireCoercionOid(columnType);
+    if (oid === undefined) return undefined;
+    return {
+      sql: (ref) => `${ref}::text`,
+      decode: (value) => coerceJsonWireValue(oid, value),
+    };
   },
 
   buildColumnType(input: ColumnTypeInput): string {

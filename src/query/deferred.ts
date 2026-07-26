@@ -90,6 +90,12 @@ export interface QueryInterfaceOptions {
    */
   warnOnUnlimited?: boolean | Record<string, boolean>;
   /**
+   * Refuse a nested `connect` / `connectOrCreate` that would re-parent a
+   * to-many child already owned by a different parent. Off by default; see
+   * {@link import('../nested-write.js').NestedWriteContext.scopedConnect}.
+   */
+  scopedConnect?: boolean;
+  /**
    * Enable prepared statements. When true, queries are submitted with a
    * `{ name, text, values }` object to the pg driver, which caches the
    * parse+plan on the server per connection.
