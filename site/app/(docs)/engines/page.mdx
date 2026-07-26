@@ -68,6 +68,21 @@ Every cell reflects the actual behavior of the engine's dialect. `✗ E017` mean
 
 ⁵ `findManyStream` works on every engine, it yields rows in `batchSize` batches and you can `break` early. Only PostgreSQL streams with a true server-side cursor (`DECLARE CURSOR`, constant memory regardless of result size); SQLite, MySQL, and SQL Server currently materialize the full result first, then yield it in batches. For very large exports, stream on Postgres or paginate with `limit` on the other engines.
 
+## Value fidelity inside `with`
+
+A nested relation is assembled as JSON by the database, and the JSON number grammar is not the wire grammar: a JSON number is an IEEE double, and some engines cannot put binary in a JSON document at all. Left alone, that means a column read through a `with` relation can come back **different** from the same column read at top level, which also makes the `join` and `batched` strategies disagree.
+
+Turbine closes this per engine: divergent columns are carried through the JSON layer as text and decoded back through the engine's own rule, so all read paths return the same value.
+
+| Engine | Columns that needed it | Symptom before |
+|---|---|---|
+| PostgreSQL | `numeric`, `int8`, `date` | precision loss on large ints and exact decimals |
+| SQLite | `INTEGER`, `BLOB` | 64-bit ints rounded; `BLOB` failed the query ("JSON cannot hold BLOB values") |
+| MySQL 8 | `BIGINT`, `DECIMAL`, `VARBINARY` / `BLOB` | ints rounded, decimals as floats, binary as the literal text `base64:type15:…` |
+| SQL Server | `BIGINT`, `VARBINARY` | ints rounded, binary as base64 text |
+
+Postgres was fixed in 0.50; the other three in 0.51. If you read a bigint, decimal, or binary column through a relation before then, the values you get back change with the upgrade, to the correct ones.
+
 ## How writes return rows
 
 The biggest difference between engines is how a write surfaces the row it affected, Turbine's `resultStrategy` seam handles it so `create` / `update` / `delete` / `upsert` keep returning the full row everywhere:

@@ -240,7 +240,24 @@ const posts = await db.posts.findMany({
 });
 ```
 
+Since v0.51 the chain can be **more than one hop long**, as long as every hop is to-one:
+
+```ts
+// Versions, ordered by the name of their model's category
+const versions = await db.versions.findMany({
+  orderBy: { model: { category: { name: 'asc' } } },
+});
+```
+
+Each extra hop becomes an INNER JOIN inside the *same* correlated subquery, so an N-hop chain still costs one subquery with one `LIMIT 1`, not N levels of nesting. Every hop applies its target's global filter to the join condition, so ordering never keys off a soft-deleted or other-tenant row.
+
+A **to-many** hop mid-chain is refused rather than silently picking an arbitrary row: it has no single value to order by. Use a pick-row ordering (`{ pick, by }`) or `_count` instead.
+
 Relation ordering adds no bound parameters. An unknown relation throws `RelationError` (TURBINE_E005); a non-`_count` key on a to-many relation, or an unknown column on a to-one relation, throws `ValidationError` (TURBINE_E003).
+
+<Callout type="note" title="New in 0.51">
+`orderBy` keys are now checked at **compile time** against the table's columns and relations, the way `where` has been since 0.50. `orderBy: { nmae: 'asc' }` is a type error rather than a runtime `TURBINE_E003`. The same check now applies to a `with` block's `select`, `omit` and `orderBy`, each scoped to that relation's target rather than the parent. A clause built dynamically (`Record<string, 'asc' | 'desc'>`) still assigns, and an untyped `db.table(name)` keeps the open escape hatch.
+</Callout>
 
 ## findUnique / findUniqueOrThrow
 
@@ -681,6 +698,9 @@ Filter into a JSON document with a `JsonFilter`. `path` drills into nested keys 
 | `contains` | jsonb containment (`@>`) | `where: { data: { contains: { active: true } } }` |
 | `hasKey` | Top-level key exists (`?`) | `where: { data: { hasKey: 'meta' } }` |
 | `gt` / `gte` / `lt` / `lte` | Range-compare the value at `path` | `where: { data: { path: ['rating'], gte: 4 } }` |
+| `stringContains` | Substring match on the text at `path` | `where: { data: { path: ['title'], stringContains: 'orm' } }` |
+| `stringStartsWith` / `stringEndsWith` | Prefix / suffix match on the text at `path` | `where: { data: { path: ['slug'], stringStartsWith: 'v2-' } }` |
+| `mode` | `'insensitive'` for the three substring operators | `where: { data: { path: ['title'], stringContains: 'ORM', mode: 'insensitive' } }` |
 
 The range operators (`gt` / `gte` / `lt` / `lte`, new in v0.30) require `path`. A numeric value casts the extracted text, `(col #>> path)::numeric >= $n`, while a string value compares as text:
 
@@ -692,6 +712,21 @@ const topRated = await db.products.findMany({
 ```
 
 > **Note:** A bare `{ gt: 5 }` with no `path` on a jsonb column is the plain column comparison, not a JSON test, reach for `path` whenever you mean "the value inside the document."
+
+The three substring operators (new in v0.51) are the JSON counterpart of the scalar `contains` / `startsWith` / `endsWith`, and they all require `path`. They are deliberately **not** spelled `contains`, because on a JSON column `contains` already means whole-document jsonb containment (`@>`) and means something entirely different. The operand is LIKE-escaped, so `%` and `_` match literally.
+
+```ts
+// Rows whose jsonb `title` contains "orm", case-insensitively
+const matches = await db.docs.findMany({
+  where: { data: { path: ['title'], stringContains: 'orm', mode: 'insensitive' } },
+});
+```
+
+<Callout type="warning">
+**Unknown JSON operators are refused (changed in v0.51).** A key that is not in the table above, and a `path` with no comparison at all, now raise `ValidationError` (`TURBINE_E003`).
+
+Before v0.51 both shapes compiled to **no predicate at all**, so the query silently returned *every row of the table*, and inside an `AND` the offending term simply vanished, widening the result. Prisma's spelling `string_contains` was the common way to hit it; the error now names the turbine operator to use instead. The same typo on a scalar column has always thrown, so this only closes an inconsistency, but it is a runtime behavior change: a query that appeared to "work" may now error, which means it was returning the wrong rows.
+</Callout>
 
 ### Column-to-column comparison
 

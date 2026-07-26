@@ -105,6 +105,23 @@ await db.users.create({
 });
 ```
 
+#### Connecting a row someone else owns, `scopedConnect`
+
+`connect: { id: 42 }` on a to-many relation means "make row 42 mine", and by default it does exactly that: if another parent currently owns row 42, the row is **taken from them**. That is the intended behavior for an admin tool moving records around, and a cross-tenant write primitive for any handler that forwards a client-supplied id into a nested connect.
+
+Set `scopedConnect: true` on the client to close it:
+
+```ts
+const db = turbine({ connectionString: process.env.DATABASE_URL, scopedConnect: true });
+
+// Refused with ValidationError (TURBINE_E003): post 42 belongs to another user.
+await db.users.update({ where: { id: 7 }, data: { posts: { connect: { id: 42 } } } });
+```
+
+With the flag on, a connect succeeds when the child is **unowned** (its foreign key is null) or **already owned by this parent** (an idempotent re-connect), and is refused otherwise. Re-parenting then has to be an explicit update, which is the point: it stops being something a request body can do by accident.
+
+It is off by default because it changes the outcome of writes that currently succeed. It applies to `hasMany` and `hasOne` only: a `belongsTo` connect points the row being written at a parent and takes nothing from anyone, and a many-to-many connect adds a junction row rather than moving one.
+
 ### connectOrCreate, connect or insert
 
 Each item is `{ where, create }`: Turbine looks up `where`, links it if found, otherwise inserts the `create` payload (with the FK injected for `hasMany`/`hasOne`).

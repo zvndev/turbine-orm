@@ -1,5 +1,151 @@
 # Changelog
 
+## 0.51.0 (2026-07-26)
+
+A read-correctness release. Two things in it silently returned wrong data, and
+both were found by porting a real application onto the library rather than by
+reading the code:
+
+- **An unrecognized JSON filter operator compiled to no predicate at all.**
+  `{ path: ['title'], string_contains: 'x' }` (the Prisma spelling, which
+  turbine did not have) returned every row of the table, and inside an `AND` it
+  dropped that conjunct, so a tenant scope written that way widened to the whole
+  table. The same typo on a scalar column had always thrown. Unknown keys are
+  refused now. Reads only, mutations were never at risk.
+- **Values read through a `with` relation could differ from the same values read
+  at top level, on every engine except Postgres.** A nested relation is built as
+  JSON, and a JSON number is an IEEE double: SQLite and MySQL and SQL Server all
+  rounded 64-bit integers, MySQL flattened `DECIMAL` to a float, and binary
+  columns came back as base64 text or failed the query outright. Postgres was
+  fixed in 0.50; the other three are measured and fixed here, so a top-level
+  read, the `join` strategy, and the batched loader now agree everywhere.
+
+Around those: `update({ data: {} })` emitted invalid SQL rather than doing
+nothing, `createMany` into a table with an array column failed outright,
+`orderBy` through more than one relation hop was refused, and MySQL and SQL
+Server introspection ran every query against a pool the `finally` had already
+closed. `orderBy` and nested `select` / `omit` are key-checked at compile time
+now, the same way `where` became in 0.50.
+
+### Added
+
+- **`stringContains` / `stringStartsWith` / `stringEndsWith` on JSON path
+  filters**, with `mode: 'insensitive'`. These match against the text at a JSON
+  path. They are deliberately not called `contains`, which on a JSON column
+  already means `@>` containment. Prisma's `string_contains` has no equivalent
+  spelling in turbine, and the new strictness error names these when it sees it.
+- **`orderBy` through multiple to-one relation hops.**
+  `orderBy: { model: { category: { name: 'asc' } } }` threw E003 before; only a
+  single hop compiled. Each additional hop becomes an `INNER JOIN` inside the
+  SAME correlated subquery, so an N-hop chain still costs one subquery with one
+  `LIMIT 1` rather than N levels of nesting. Every hop must be to-one: a to-many
+  hop is refused with a message pointing at `{ pick, by }` or `_count`, because
+  it has no single value to order by and picking an arbitrary row silently is
+  worse than an error. Each hop applies its target's global filter to the join
+  condition, so ordering never keys off a soft-deleted or other-tenant row.
+  Depth is capped like nested `with`.
+- **`updatedAt: true` / `.updatedAt()`** sets a column to the current time on
+  every update that does not name it (Prisma's `@updatedAt`). Opt-in per column
+  and NEVER inferred from a column name, so an application already managing its
+  own timestamp is untouched and an untagged schema emits byte-identical SQL.
+  The timestamp is client-side, so it flows through the same UTC coercion as any
+  other bound `Date`.
+- **`scopedConnect`** (client config, off by default) refuses a nested `connect`
+  / `connectOrCreate` that would re-parent a to-many child already owned by a
+  different parent. `connect: { id: 42 }` takes row 42 unconditionally, so a
+  handler forwarding a client-supplied id hands any caller a cross-tenant write
+  primitive, closable only by a hand-rolled check at every call site. Unowned
+  children and idempotent re-connects still succeed. hasMany and hasOne only: a
+  `belongsTo` connect takes nothing from anyone, and an m2m connect adds a
+  junction row rather than moving one.
+- **`relationNames`**, a per-table rename map for DERIVED relation names, on the
+  introspection config AND as a `turbine.config.ts` key threaded to every CLI
+  introspect call site (nobody introspects by hand; a port runs
+  `npx turbine generate`). A port from another ORM becomes a mechanical mapping
+  instead of a hand edit at every call site. A typo, an unknown table, or a name
+  that would shadow a column is a typed E003, not a silent no-op: ignoring it
+  would break the very call sites it exists to fix, at runtime.
+- **Relation names in the "unknown field" error.** The message listed only
+  columns (`Known fields: id, name.`), so a user who guessed a relation name
+  wrong concluded that relations are not valid in `where` at all. It now lists
+  relations too, marks them as valid in `where` and `with`, and suggests the
+  closest match, with containment ranked above edit distance because the real
+  miss is a longer guess like `modelVersions` for a relation derived as
+  `versions`. Naming a relation where a column is expected says so and shows the
+  nested form.
+
+### Fixed
+
+- **An unrecognized JSON filter operator was silently dropped.** See the summary
+  above. Unknown keys and a `path` with no comparison now raise E003, on the SQL
+  builder and PowQL alike, and the check runs on the cache-hit param-collect
+  path too so a warmed cache cannot skip it.
+  **Migration:** a filter that was silently matching everything now throws. The
+  common case is a Prisma spelling: `string_contains` becomes `stringContains`,
+  `string_starts_with` becomes `stringStartsWith`, `string_ends_with` becomes
+  `stringEndsWith`. The error names the replacement.
+- **Values diverged between read paths on SQLite, MySQL, and SQL Server.**
+  Measured, not assumed, per engine: SQLite `INTEGER` 9007199254740993 came back
+  9007199254740992 through `join` and `BLOB` failed the query outright ("JSON
+  cannot hold BLOB values"); MySQL rounded `BIGINT` the same way, returned
+  `DECIMAL` `'1000.50'` as `1000.5`, and returned `VARBINARY` as the literal
+  string `base64:type15:AQL/`; SQL Server rounded `BIGINT` and returned
+  `VARBINARY` as base64 text. The Postgres fix does not port directly (it
+  decodes via pg OIDs), so the cast/decode pair is now a dialect hook,
+  `jsonWireRule`, and each engine states its own divergent set. Postgres keeps
+  its exact behavior through it.
+  **Migration:** if you read a bigint, decimal, or binary column through a
+  `with` relation on one of those three engines, the values you get back change
+  with this upgrade, to the correct ones. Code that worked around the old
+  behavior (parsing `base64:type15:…`, re-fetching a bigint at top level) should
+  be removed.
+- **`update({ data: {} })` emitted invalid SQL.** It compiled to
+  `UPDATE t SET WHERE …` and failed with Postgres 42601. Any handler building a
+  payload from optional fields produces `{}` on a legitimate request. It is a
+  no-op returning the current row now, matching Prisma. The empty-where guard
+  and `NotFoundError` still apply, and `optimisticLock` still emits a real
+  `UPDATE`. `updateMany` reports `count: 0` and issues no statement.
+- **`createMany` into a table with an array column failed.** The PostgreSQL bulk
+  path is a column-major `UNNEST` transpose, and `unnest` flattens, so N rows of
+  `text[]` arrived as one flat `text[]` and failed with 42804. Those tables use
+  the row-major `VALUES` form now; tables with no array column keep the
+  byte-identical `UNNEST` form.
+- **MySQL and SQL Server introspection queried a closed pool.** Both
+  `introspectMysql` and `introspectMssql` did `return somePromise` inside a
+  `try` / `finally` whose `finally` closed the pool, so the pool closed before
+  the promise settled. MySQL introspection failed outright.
+- **`warnOnUnlimited` fired on reads that can match at most one row.** It no
+  longer warns when the `where` pins a full primary key or unique column set to
+  literal values. Conservative: an operator object, a null, an `OR`, or a
+  partial key all still warn. A warning that cries wolf on correct code teaches
+  people to disable it.
+
+### Changed
+
+- **`orderBy` and nested `select` / `omit` are key-checked.** `where` became
+  key-checked in 0.50.0, but these stayed open records, so
+  `orderBy: { nmae: 'asc' }` and `with: { posts: { select: { titel: true } } }`
+  compiled and failed at runtime with E003. All four (including nested
+  `orderBy`) are now checked against the right entity: `orderBy` against the
+  table's columns AND its relations, and each nested block against the RELATION
+  TARGET rather than the parent. A clause built dynamically still assigns,
+  because an index signature satisfies each optional target key, so computed
+  `orderBy` is not broken. The types degrade to the open record when the entity
+  or its relations are unknown (`db.table(name)`, or a client generated before
+  the relation brand), matching how `TypedWithClause` already degrades.
+  **Migration:** this is a compile-time break only, and every error it produces
+  was a runtime E003 before. Fix the misspelling, or regenerate if your client
+  predates the relation brand.
+- **The deferred `build*` family now carries its `with` generic into the return
+  type.** `buildFindMany` / `buildFindUnique` / `buildFindFirst` and their
+  `OrThrow` variants took the generic and discarded it, so a `pipeline()` result
+  lost its relations. They return `DeferredQuery<QueryResult<…>>` now, the same
+  type their async counterparts do.
+  **Migration:** a hand-written annotation on a `build*` result that omitted the
+  relations may now be too narrow; remove the annotation and let it infer.
+- **Every em-dash is gone from the tracked source, docs, and site**, 3,253 of
+  them across 254 files. No behavioral content.
+
 ## 0.50.0 (2026-07-25)
 
 A correctness release, and the widest one so far. Four things in it are worth

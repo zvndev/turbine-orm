@@ -144,6 +144,35 @@ npx turbine generate --legacy-to-many-uniques
 
 restores the pre-0.41 `hasMany` output while you port the affected call sites. It is also settable as `legacyToManyUniques: true` in `turbine.config.ts`, and it only affects what introspection emits, never runtime behavior.
 
+### Renaming derived relations, `relationNames`
+
+A database does not name its relationships, so introspection composes a name from the foreign key. Two foreign keys pointing at the same table produce names nobody would guess:
+
+```
+messages.sender_id    -> people.msgsBySender
+messages.recipient_id -> people.msgsByRecipient
+```
+
+A codebase migrating from another ORM already has names for these, chosen by different rules, so every call site would have to be hand-edited. Declare the mapping once instead (new in v0.51):
+
+```ts
+// turbine.config.ts
+export default {
+  relationNames: {
+    people: {
+      msgsBySender: 'sentMessages',
+      msgsByRecipient: 'receivedMessages',
+    },
+  },
+};
+```
+
+`turbine generate` then emits `sentMessages` / `receivedMessages` everywhere, in the metadata and the types alike, and they work in `where`, `with`, and `orderBy` like any other relation.
+
+A typo is an **error, not a silent no-op**: an unknown table, an unknown source relation, or a target name that would shadow a column fails the command with `TURBINE_E003`, listing the names that do exist. Ignoring a bad mapping would break the very call sites it was written to fix, and it would break them at runtime rather than at `generate` time.
+
+> Not sure what a relation ended up called? Query it wrong once. The unknown-field error lists the table's relations alongside its columns and suggests the closest match.
+
 ## `turbine push`
 
 Apply your `defineSchema()` output directly to the database. The fast path for local development.

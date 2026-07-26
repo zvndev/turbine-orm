@@ -347,6 +347,16 @@ If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop
 
 When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41.0): it compiles the single-statement correlated-subquery plan (`'join'`) and moves individual relations to the batched loader when one of two rules fires. Everything else stays in the join, byte-identical. An explicit `'join'`, `'batched'` or `'flatten'` (client-wide or per query) always wins over `'auto'`, and the results are deep-equal whichever plan runs.
 
+<Callout type="note" title="Value fidelity across strategies">
+"Deep-equal whichever plan runs" is a guarantee that had to be *earned*, and on some engines it only became true in v0.51.
+
+A nested relation is built as JSON (`json_build_object`, `JSON_OBJECT`, `FOR JSON PATH`, `json_group_array`), and the JSON number grammar is not the wire grammar: a JSON number is an IEEE double. So a value read through the join strategy could differ from the same value read at top level or through the batched loader, **lossily**, and since `auto` picks between those plans by row count, the same query could return either.
+
+Measured and fixed, per engine: PostgreSQL `numeric` / `int8` / `date` (v0.50); SQLite `INTEGER` and `BLOB` (the latter failed the query outright with "JSON cannot hold BLOB values"); MySQL `BIGINT`, `DECIMAL` and `VARBINARY` (which arrived as the literal text `base64:type15:…`); SQL Server `BIGINT` and `VARBINARY`. Divergent columns are now carried as text and decoded back through each driver's own rule, so all three read paths agree on all four engines.
+
+If you were reading a bigint, decimal or binary column through a `with` relation before v0.51, the values you get back **change** with this upgrade, to the correct ones.
+</Callout>
+
 | Rule | Fires when | Why |
 |---|---|---|
 | **Unindexed probe** | DB-backed index metadata proves a probe in the relation's subtree has no covering index | A correlated probe per parent becomes N-parents by full-table-scan |
