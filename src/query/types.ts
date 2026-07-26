@@ -1287,6 +1287,25 @@ export interface JsonFilter {
   lt?: number | string;
   /** Less-than-or-equal comparison of the value at `path` (required). See {@link JsonFilter.gt}. */
   lte?: number | string;
+  /**
+   * Substring match against the TEXT at `path` (required): `col #>> path LIKE
+   * '%value%'`. This is Prisma's `string_contains`.
+   *
+   * Deliberately not spelled `contains`, which on a JSON column already means
+   * whole-document containment (`@>`) and means something entirely different.
+   * The operand is LIKE-escaped, so `%` and `_` match literally.
+   */
+  stringContains?: string;
+  /** Prefix match against the text at `path` (required). Prisma's `string_starts_with`. See {@link JsonFilter.stringContains}. */
+  stringStartsWith?: string;
+  /** Suffix match against the text at `path` (required). Prisma's `string_ends_with`. See {@link JsonFilter.stringContains}. */
+  stringEndsWith?: string;
+  /**
+   * Case-insensitive matching for the substring operators above (ILIKE on
+   * PostgreSQL, the dialect's equivalent elsewhere). Has no effect on
+   * `equals` / `contains` / `hasKey` / the range operators.
+   */
+  mode?: 'default' | 'insensitive';
 }
 
 /** Array query operators for where clauses */

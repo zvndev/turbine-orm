@@ -46,6 +46,17 @@ export interface BulkInsertStatementInput {
   skipDuplicates?: boolean;
   /** Optional SQL-ready RETURNING selection. */
   returning?: ReturningSelection;
+  /**
+   * Force the row-major `VALUES (…), (…)` form even on a dialect that would
+   * otherwise batch column-major.
+   *
+   * Set when any target column is ARRAY-typed: PostgreSQL's `UNNEST` transpose
+   * flattens a nested array, so an array-valued column cannot survive it. The
+   * flag costs one placeholder per cell rather than per column, which is why
+   * it is opt-in rather than the default. Dialects that already emit `VALUES`
+   * ignore it.
+   */
+  requireRowValues?: boolean;
 }
 
 export interface BuiltStatement {
@@ -690,6 +701,28 @@ export const postgresDialect: Dialect = {
   buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement {
     if (!input.columnArrayTypes || input.columnArrayTypes.length !== input.columns.length) {
       throw new ValidationError('PostgreSQL bulk insert requires one array type per column');
+    }
+
+    // Row-major form: required when a target column is itself array-typed,
+    // because the UNNEST transpose below flattens nested arrays (see
+    // `requireRowValues`). One placeholder per cell instead of per column.
+    if (input.requireRowValues) {
+      const params: unknown[] = [];
+      const tuples = input.rowValues.map((row) => {
+        const cells = input.columns.map((_, i) => {
+          params.push(row[i]);
+          // No cast: PostgreSQL infers each parameter's type from the INSERT
+          // target column, which is what single-row `create` already relies on
+          // and is what makes arrays and enums both work here. The casts in
+          // `columnArrayTypes` are ARRAY-OF-column-type, correct for the
+          // UNNEST transpose below but wrong for an individual cell.
+          return this.paramPlaceholder(params.length);
+        });
+        return `(${cells.join(', ')})`;
+      });
+      let rowSql = `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples.join(', ')}`;
+      if (input.skipDuplicates) rowSql += ' ON CONFLICT DO NOTHING';
+      return { sql: `${rowSql}${this.buildReturningClause(input.returning)}`, params };
     }
 
     const columnArrays = input.columns.map((_, columnIndex) => input.rowValues.map((row) => row[columnIndex]));

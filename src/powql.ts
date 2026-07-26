@@ -85,6 +85,7 @@ import type {
   WhereClause,
 } from './query/types.js';
 import { escapeLike } from './query/utils.js';
+import { assertJsonFilterKeys, jsonStringEntries } from './query/where.js';
 import {
   type ColumnMetadata,
   normalizeKeyColumns,
@@ -570,6 +571,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * by the empty-where guard.
    */
   private buildJsonPathCondition(col: ColumnMetadata, filter: JsonFilter, params: unknown[], alias?: string): string {
+    // Same strict-key check as the SQL path. Without it an unrecognized
+    // operator compiled to zero conditions and the predicate silently
+    // disappeared, returning every row (see assertJsonFilterKeys).
+    assertJsonFilterKeys(filter, col.name);
     const conds: string[] = [];
     // Bind the path segments at most once and reuse the expression string across
     // equals + range comparisons (they share the same `path`).
@@ -628,7 +633,23 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       conds.push(`${pathP()} ${powOp} ${this.param(v, params)}`);
     }
 
-    if (!conds.length) return '';
+    // Substring comparisons against the text at `path`, in the same fixed
+    // order as the SQL path. PowQL has `like`, so these compile natively.
+    for (const { pattern, value } of jsonStringEntries(filter, col.name)) {
+      const insensitive = filter.mode === 'insensitive';
+      const lhs = insensitive ? `lower(${pathP()})` : pathP();
+      conds.push(`${lhs} like ${this.bindLike(pattern(escapeLike(value)), params, insensitive)}`);
+    }
+
+    // Every reachable shape now emits a condition or throws: assertJsonFilterKeys
+    // rejects a filter that compares nothing, so an empty list here would be a
+    // generator bug rather than a user error, and must not silently widen the
+    // query the way it used to.
+    if (!conds.length) {
+      throw new ValidationError(
+        `[turbine] internal: JSON filter on "${col.name}" compiled to no condition. This is a bug in turbine-orm.`,
+      );
+    }
     return conds.length > 1 ? `(${conds.join(' and ')})` : conds[0]!;
   }
 

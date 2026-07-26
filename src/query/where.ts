@@ -25,7 +25,9 @@ import {
   isJsonFilter,
   isUnmatchedPlainObject,
   isWhereOperator,
+  JSON_FILTER_KEYS,
   JSON_RANGE_OPERATORS,
+  JSON_STRING_OPERATORS,
   VECTOR_DISTANCE_COMPARATORS,
   VECTOR_METRIC_OPERATORS,
   validateTextSearchConfig,
@@ -443,6 +445,7 @@ export function collectOperatorParams(
  * comparison values in {@link JSON_RANGE_OPERATORS} order.
  */
 export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, params: unknown[], column: string): void {
+  assertJsonFilterKeys(filter, column);
   let pathPushed = false;
   const pushPathOnce = (): void => {
     if (!pathPushed) {
@@ -467,6 +470,10 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
   for (const { value } of jsonRangeEntries(qi, filter, column)) {
     pushPathOnce();
     params.push(value);
+  }
+  for (const { pattern, value } of jsonStringEntries(filter, column)) {
+    pushPathOnce();
+    params.push(pattern(escapeLike(value)));
   }
 }
 
@@ -1496,20 +1503,19 @@ export function buildOperatorClauses(
     params.push(qi.inParam(cv(op.notIn)));
     clauses.push(qi.inClause(column, qi.p(params.length), true));
   }
-  const buildLikeClause = (paramRef: string) =>
-    op.mode === 'insensitive' ? qi.dialect.buildInsensitiveLike(column, paramRef) : `${column} LIKE ${paramRef}`;
+  const insensitive = op.mode === 'insensitive';
 
   if (op.contains !== undefined) {
     params.push(`%${escapeLike(op.contains)}%`);
-    clauses.push(`${buildLikeClause(qi.p(params.length))} ESCAPE '\\'`);
+    clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
   }
   if (op.startsWith !== undefined) {
     params.push(`${escapeLike(op.startsWith)}%`);
-    clauses.push(`${buildLikeClause(qi.p(params.length))} ESCAPE '\\'`);
+    clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
   }
   if (op.endsWith !== undefined) {
     params.push(`%${escapeLike(op.endsWith)}`);
-    clauses.push(`${buildLikeClause(qi.p(params.length))} ESCAPE '\\'`);
+    clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
   }
 
   return clauses;
@@ -1697,6 +1703,104 @@ export function getArrayElementType(_qi: BuilderCtx, pgType: string): string {
  * on which params are pushed — and both throw identically for invalid
  * shapes, so a warmed cache can never skip validation.
  */
+/**
+ * One LIKE comparison, honoring `mode: 'insensitive'` through the dialect and
+ * always carrying the `ESCAPE '\'` clause that pairs with {@link escapeLike}.
+ *
+ * Shared by the scalar `contains` / `startsWith` / `endsWith` operators and by
+ * the JSON substring operators, so the two can never drift into escaping their
+ * operands the same way but comparing them differently.
+ */
+function buildLikeClause(qi: BuilderCtx, column: string, paramRef: string, insensitive: boolean): string {
+  const base = insensitive ? qi.dialect.buildInsensitiveLike(column, paramRef) : `${column} LIKE ${paramRef}`;
+  return `${base} ESCAPE '\\'`;
+}
+
+/**
+ * Refuse a {@link JsonFilter} carrying a key that is not a JSON operator, and
+ * refuse a filter that selects a `path` but never compares it.
+ *
+ * Both shapes used to compile to NOTHING. `buildJsonFilterClauses` only ever
+ * emitted a clause for a key it recognized, so `{ path: ['title'],
+ * string_contains: 'x' }` — the Prisma spelling, and an easy typo besides —
+ * produced an empty clause list, the predicate vanished, and the query
+ * returned EVERY row. Inside an `AND` it silently dropped that conjunct, so a
+ * tenant scope written this way widened to the whole table. The equivalent
+ * typo on a scalar column has always thrown; this closes the inconsistency.
+ *
+ * Called from both the SQL-build path and the cache-hit param-collect path, so
+ * a warmed SQL cache cannot skip the check.
+ */
+export function assertJsonFilterKeys(filter: JsonFilter, column: string): void {
+  const obj = filter as Record<string, unknown>;
+  const present = Object.keys(obj).filter((k) => obj[k] !== undefined);
+
+  for (const key of present) {
+    if (JSON_FILTER_KEYS.has(key)) continue;
+    const suggestion = JSON_PRISMA_SPELLINGS[key];
+    throw new ValidationError(
+      `[turbine] Unknown JSON filter operator "${key}" on ${column}.` +
+        (suggestion ? ` Did you mean \`${suggestion}\`?` : '') +
+        ` Supported operators: ${[...JSON_FILTER_KEYS].sort().join(', ')}.`,
+    );
+  }
+
+  // `mode` and `path` are modifiers, not comparisons: a filter made only of
+  // those compares nothing, which is exactly the silent no-op shape above.
+  if (present.length > 0 && present.every((k) => k === 'path' || k === 'mode')) {
+    throw new ValidationError(
+      `[turbine] JSON filter on ${column} selects a \`path\` but has no comparison. ` +
+        `Add one of: ${[...JSON_FILTER_KEYS]
+          .filter((k) => k !== 'path' && k !== 'mode')
+          .sort()
+          .join(', ')}.`,
+    );
+  }
+}
+
+/**
+ * The Prisma spelling of each JSON operator, so a migrator who writes the
+ * name they already know gets told the turbine one instead of a bare list.
+ */
+const JSON_PRISMA_SPELLINGS: Record<string, string> = {
+  string_contains: 'stringContains',
+  string_starts_with: 'stringStartsWith',
+  string_ends_with: 'stringEndsWith',
+  array_contains: 'contains',
+  startsWith: 'stringStartsWith',
+  endsWith: 'stringEndsWith',
+};
+
+/**
+ * Validate and enumerate the substring comparisons on a JSON filter, in the
+ * fixed {@link JSON_STRING_OPERATORS} order. Shared by the build and collect
+ * paths exactly like {@link jsonRangeEntries}, so both agree on the params
+ * pushed and both throw identically on an invalid shape.
+ */
+export function jsonStringEntries(
+  filter: JsonFilter,
+  column: string,
+): { op: string; pattern: (escaped: string) => string; value: string }[] {
+  const entries: { op: string; pattern: (escaped: string) => string; value: string }[] = [];
+  for (const [op, pattern] of Object.entries(JSON_STRING_OPERATORS)) {
+    const value = (filter as Record<string, unknown>)[op];
+    if (value === undefined) continue;
+    if (filter.path === undefined) {
+      throw new ValidationError(
+        `[turbine] JSON operator '${op}' on ${column} requires a \`path\` ` +
+          `(e.g. { path: ['meta', 'title'], ${op}: ${JSON.stringify(value)} }).`,
+      );
+    }
+    if (typeof value !== 'string') {
+      throw new ValidationError(
+        `[turbine] JSON operator '${op}' on ${column} requires a string, got ${JSON.stringify(value)}.`,
+      );
+    }
+    entries.push({ op, pattern, value });
+  }
+  return entries;
+}
+
 export function jsonRangeEntries(
   _qi: BuilderCtx,
   filter: JsonFilter,
@@ -1740,6 +1844,7 @@ export function buildJsonFilterClauses(
   filter: JsonFilter,
   params: unknown[],
 ): string[] {
+  assertJsonFilterKeys(filter, column);
   const clauses: string[] = [];
 
   // Lazily bind the path once; reuse the same $N in every extraction clause.
@@ -1783,6 +1888,15 @@ export function buildJsonFilterClauses(
     params.push(value);
     const lhs = typeof value === 'number' ? castJsonNumeric(qi, extract) : extract;
     clauses.push(`${lhs} ${sqlOp} ${qi.p(params.length)}`);
+  }
+
+  // Substring comparisons on the extracted path. The operand is LIKE-escaped
+  // exactly like the scalar `contains` family, so a value containing `%` or
+  // `_` matches literally instead of turning into a wildcard.
+  for (const { pattern, value } of jsonStringEntries(filter, column)) {
+    const extract = pathExtract();
+    params.push(pattern(escapeLike(value)));
+    clauses.push(buildLikeClause(qi, extract, qi.p(params.length), filter.mode === 'insensitive'));
   }
 
   return clauses;

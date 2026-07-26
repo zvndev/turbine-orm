@@ -3016,11 +3016,32 @@ describe('powdb F1: JsonFilter → PowQL path filters', () => {
     );
   });
 
-  it('a bare `{ path }` compiles to no clauses → mutation refused by the empty-where guard', async () => {
+  it('a bare `{ path }` is refused for what it is, not as a generic empty where', async () => {
+    // This used to compile to ZERO clauses and lean on the empty-where guard to
+    // catch the mutation — which meant the same shape on a READ silently
+    // returned the whole table. It is now rejected at the filter itself, so the
+    // read and the write fail the same way and the message names the cause.
     const m = mockPool();
     await assert.rejects(
       qi(m, 'doc').updateMany({ where: { data: { path: ['a'] } }, data: { region: 'z' } }),
-      (e: unknown) => e instanceof ValidationError && /where` clause is empty/.test((e as Error).message),
+      (e: unknown) =>
+        e instanceof ValidationError && /selects a `path` but has no comparison/.test((e as Error).message),
+    );
+    await assert.rejects(
+      qi(m, 'doc').findMany({ where: { data: { path: ['a'] } }, limit: 1 }),
+      (e: unknown) =>
+        e instanceof ValidationError && /selects a `path` but has no comparison/.test((e as Error).message),
+    );
+  });
+
+  it('an unknown JSON operator is refused rather than dropped', async () => {
+    const m = mockPool();
+    await assert.rejects(
+      qi(m, 'doc').findMany({ where: { data: { path: ['a'], string_contains: 'x' } as never }, limit: 1 }),
+      (e: unknown) =>
+        e instanceof ValidationError &&
+        /Unknown JSON filter operator "string_contains"/.test((e as Error).message) &&
+        /stringContains/.test((e as Error).message),
     );
   });
 

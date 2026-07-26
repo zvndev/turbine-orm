@@ -143,7 +143,12 @@ export function sortedEntries<V>(obj: Record<string, V>): [string, V][] {
 /** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
 export const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
 
-/** Known JSONB operator keys */
+/**
+ * Known JSONB operator keys. `stringContains` / `stringStartsWith` /
+ * `stringEndsWith` are appended below, once {@link JSON_STRING_OPERATORS} is
+ * declared: they have no `WhereOperator` counterpart, so their presence is an
+ * unambiguous JSON-filter signal.
+ */
 export const JSONB_OPERATOR_KEYS = new Set<string>(['path', 'equals', 'contains', 'hasKey']);
 
 /**
@@ -163,18 +168,69 @@ export const JSON_RANGE_OPERATORS: Record<'gt' | 'gte' | 'lt' | 'lte', string> =
 };
 
 /**
+ * JSON substring operators → the LIKE pattern each one builds around its
+ * escaped operand, in the FIXED order the build and collect paths iterate
+ * them. These compare the TEXT at `path` (which every one of them requires),
+ * so they are the JSON counterpart of the scalar `contains` / `startsWith` /
+ * `endsWith` operators rather than of jsonb containment.
+ *
+ * They are deliberately NOT named `contains` / `startsWith` / `endsWith`:
+ * `contains` on a JSON column already means whole-document containment
+ * (`@>`), and silently changing that would break every existing caller.
+ */
+export const JSON_STRING_OPERATORS: Record<
+  'stringContains' | 'stringStartsWith' | 'stringEndsWith',
+  (escaped: string) => string
+> = {
+  stringContains: (escaped) => `%${escaped}%`,
+  stringStartsWith: (escaped) => `${escaped}%`,
+  stringEndsWith: (escaped) => `%${escaped}`,
+};
+
+/**
+ * Every key a {@link JsonFilter} may carry. Used by the strict-key check so an
+ * unrecognized operator is REFUSED rather than dropped.
+ *
+ * This existed as tribal knowledge spread across `buildJsonFilterClauses` and
+ * `collectJsonFilterParams`: each simply ignored what it did not recognize, so
+ * `{ path: ['title'], string_contains: 'x' }` (the Prisma spelling) compiled to
+ * no predicate at all and returned every row of the table. The scalar operator
+ * path has always thrown on an unknown key; this set is what lets the JSON path
+ * behave the same way.
+ */
+for (const k of Object.keys(JSON_STRING_OPERATORS)) JSONB_OPERATOR_KEYS.add(k);
+
+export const JSON_FILTER_KEYS: ReadonlySet<string> = new Set<string>([
+  'path',
+  'equals',
+  'contains',
+  'hasKey',
+  'mode',
+  ...Object.keys(JSON_RANGE_OPERATORS),
+  ...Object.keys(JSON_STRING_OPERATORS),
+]);
+
+/**
  * Value-invariant shape fingerprint for a {@link JsonFilter}. Range operators
  * are annotated with the comparison value's kind (`#n` numeric / `#s` string)
  * because a numeric comparison compiles to a `::numeric` cast — a different
  * SQL text than the text comparison — so the two must never share a cached
- * SQL entry.
+ * SQL entry. `mode` is part of the shape for the same reason: it selects
+ * between `LIKE` and the dialect's case-insensitive form, which is different
+ * SQL text.
  */
 export function fingerprintJsonFilterShape(filter: JsonFilter): string {
   const obj = filter as Record<string, unknown>;
   const parts = Object.keys(obj)
     .filter((k) => obj[k] !== undefined)
     .sort()
-    .map((k) => (k in JSON_RANGE_OPERATORS ? `${k}#${typeof obj[k] === 'number' ? 'n' : 's'}` : k));
+    .map((k) => {
+      if (k in JSON_RANGE_OPERATORS) return `${k}#${typeof obj[k] === 'number' ? 'n' : 's'}`;
+      // `mode` carries its VALUE, not just its presence: 'insensitive' and any
+      // other spelling select different SQL, so they must not share an entry.
+      if (k === 'mode') return `mode#${String(obj[k])}`;
+      return k;
+    });
   return `json(${parts.join(',')})`;
 }
 
@@ -187,7 +243,7 @@ export function fingerprintJsonFilterShape(filter: JsonFilter): string {
  * set: on non-JSON columns it is a plain equality operator (`WhereOperator`),
  * so it must fall through instead of throwing.
  */
-export const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'hasKey']);
+export const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'hasKey', ...Object.keys(JSON_STRING_OPERATORS)]);
 
 /** Check if a value is a JSONB filter object */
 export function isJsonFilter(value: unknown): value is JsonFilter {

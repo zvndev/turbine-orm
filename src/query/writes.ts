@@ -198,6 +198,19 @@ export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateMa
   });
   const quotedColumns = columns.map((c) => qi.q(c));
 
+  // ARRAY-TYPED COLUMNS force the row-at-a-time VALUES form.
+  //
+  // The default PostgreSQL shape is `SELECT * FROM UNNEST($1::text[], …)`,
+  // one bound array per COLUMN. That is a column-major transpose, and it
+  // cannot express an array-valued column: `unnest` flattens, so N rows each
+  // holding a `text[]` arrive as one flat `text[]` and PostgreSQL rejects the
+  // insert with 42804 ("column is of type text[] but expression is of type
+  // text"). Single-row `create` never hit it because it binds each value
+  // directly. Detected from the column's own declared type rather than from
+  // the shape of the first row's value, so a row whose array column happens to
+  // be null or absent still takes the correct form.
+  const hasArrayColumn = columns.some((col) => (qi.columnPgTypeMap.get(col) ?? '').startsWith('_'));
+
   const built = qi.dialect.buildBulkInsertStatement({
     table: qt,
     columns: quotedColumns,
@@ -205,6 +218,7 @@ export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateMa
     columnArrayTypes: typeCasts,
     skipDuplicates: args.skipDuplicates,
     returning: writeReturningColumns(qi),
+    requireRowValues: hasArrayColumn,
   });
 
   return {
@@ -232,6 +246,36 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
   // The SQL is built from the global-filter-merged where (soft-delete keeps an
   // update from touching already-deleted rows).
   const whereObj = (whereMod.mergeGlobalFilter(qi, userWhere) ?? {}) as Record<string, unknown>;
+
+  // An update with nothing to set is a NO-OP that returns the current row.
+  //
+  // It used to render `UPDATE t SET WHERE …` and fail with a raw PostgreSQL
+  // 42601 syntax error. That is easy to hit honestly: any handler that builds
+  // its payload from optional request fields produces `{}` on a request that
+  // supplied none of them, so a legitimate request turned into a 500. Prisma
+  // treats the same call as a no-op and returns the row, so a ported handler
+  // inherited a crash where the original returned 200.
+  //
+  // The row is re-selected through the same projection a real update would
+  // return (PII columns excluded on tagged tables), and a where matching no
+  // row still raises NotFoundError, so only the SQL differs, not the contract.
+  // `optimisticLock` is excluded: it always has a version column to SET and a
+  // version check that must still run.
+  const hasSetData = Object.values(dataObj).some((v) => v !== undefined);
+  if (!hasSetData && !lock) {
+    const sel = buildReselectByWhere(qi, whereObj);
+    return {
+      sql: sel.sql,
+      params: sel.params,
+      transform: (result) => {
+        const row = result.rows[0];
+        if (!row) throw new NotFoundError({ table: qi.table, where: args.where, operation: 'update' });
+        return parseWriteRow(qi, row) as T;
+      },
+      tag: `${qi.table}.update`,
+    };
+  }
+
   const setFp = fingerprintSet(qi, dataObj);
   const whereFp = whereMod.fingerprintWhere(qi, whereObj);
   const ck = lock ? null : `u:${setFp}|${whereFp}${whereMod.globalFilterCacheSegment(qi)}`;
@@ -500,6 +544,19 @@ export function buildUpdateMany<T extends object>(
     string,
     unknown
   >;
+  // Nothing to SET: a no-op, for the same reason as `update` above (that path
+  // has the full rationale). Reports `count: 0` because zero rows were
+  // modified — no statement is issued at all, so this is not the count of rows
+  // the predicate MATCHED.
+  if (!Object.values(dataObj).some((v) => v !== undefined)) {
+    return {
+      sql: `SELECT ${qi.p(1)} AS count`,
+      params: [0],
+      transform: () => ({ count: 0 }),
+      tag: `${qi.table}.updateMany`,
+    };
+  }
+
   const setFp = fingerprintSet(qi, dataObj);
   const whereFp = whereMod.fingerprintWhere(qi, whereObj);
   const ck = `um:${setFp}|${whereFp}${whereMod.globalFilterCacheSegment(qi)}`;
