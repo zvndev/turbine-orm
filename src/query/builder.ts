@@ -1807,9 +1807,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
-  buildFindUnique<W extends TypedWithClause<R> = {}>(
-    args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T | null> {
+  buildFindUnique<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
     this.currentSkip = args.skipGlobalFilters;
     // Prisma compound-unique selector expansion (before global-filter merge and
     // fingerprinting, so the cache only ever sees the canonical expanded where).
@@ -1882,7 +1885,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         params,
         transform: (result) => {
           const row = result.rows[0];
-          return row ? (this.parseRow(row, this.table) as T) : null;
+          return row ? (this.parseRow(row, this.table) as unknown as QueryResult<T, R, W, S, O>) : null;
         },
         tag: `${this.table}.findUnique`,
         preparedName: entry.name,
@@ -1909,7 +1912,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         params,
         transform: (result) => {
           const row = result.rows[0];
-          return row ? (this.parseRow(row, this.table) as T) : null;
+          return row ? (this.parseRow(row, this.table) as unknown as QueryResult<T, R, W, S, O>) : null;
         },
         tag: `${this.table}.findUnique`,
         preparedName: entry.name,
@@ -1949,7 +1952,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        return row ? (parseWith(row) as T) : null;
+        return row ? (parseWith(row) as unknown as QueryResult<T, R, W, S, O>) : null;
       },
       tag: `${this.table}.findUnique`,
       preparedName: entry.name,
@@ -1991,7 +1994,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           if (split) return this.runAutoSplit(args as unknown as FindManyArgs<T>, split, false) as Promise<T[]>;
         }
       }
-      const deferred = this.buildFindMany(args);
+      const deferred = this.buildFindMany(args as unknown as FindManyArgs<T, R, W, S, O>);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
     }) as Promise<QueryResult<T, R, W, S, O>[]>;
@@ -2150,9 +2153,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
-  buildFindMany<W extends TypedWithClause<R> = {}>(
-    args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T[]> {
+  buildFindMany<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>[]> {
     this.currentSkip = args?.skipGlobalFilters;
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations BEFORE fingerprinting, so the two orderings get distinct cache
@@ -2421,7 +2427,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
       sql: entry.sql,
       params,
       transform: (result) =>
-        result.rows.map((row) => (parseWith ? (parseWith(row) as T) : (this.parseRow(row, this.table) as T))),
+        result.rows.map(
+          (row) =>
+            (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as unknown as QueryResult<T, R, W, S, O>,
+        ),
       tag: `${this.table}.findMany`,
       preparedName: entry.name,
     };
@@ -2509,7 +2518,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     // --- Overflow: fall back to cursor path from scratch ---
-    const deferred = this.buildFindMany(args);
+    const deferred = this.buildFindMany(args as unknown as FindManyArgs<T, R, W, S, O>);
 
     // Acquire a dedicated connection: cursors require a single connection in a
     // transaction. The dialect owns the streaming SQL (Postgres: BEGIN → DECLARE
@@ -2580,18 +2589,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
-  buildFindFirst<W extends TypedWithClause<R> = {}>(
-    args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T | null> {
+  buildFindFirst<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
     // Reuse findMany's SQL builder but force LIMIT 1
-    const findManyArgs = { ...args, limit: 1 } as FindManyArgs<
-      T,
-      R,
-      W,
-      Record<string, boolean> | undefined,
-      Record<string, boolean> | undefined
-    >;
-    const deferred = this.buildFindMany(findManyArgs);
+    const findManyArgs = { ...args, limit: 1 } as FindManyArgs<T, R, W, S, O>;
+    const deferred = this.buildFindMany<W, S, O>(findManyArgs);
 
     return {
       sql: deferred.sql,
@@ -2622,9 +2628,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
-  buildFindFirstOrThrow<W extends TypedWithClause<R> = {}>(
-    args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T> {
+  buildFindFirstOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>> {
     const inner = this.buildFindFirst(args);
 
     return {
@@ -2663,9 +2672,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
-  buildFindUniqueOrThrow<W extends TypedWithClause<R> = {}>(
-    args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T> {
+  buildFindUniqueOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>> {
     const inner = this.buildFindUnique(args);
 
     return {

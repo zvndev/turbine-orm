@@ -305,6 +305,47 @@ export type WithWhere<NestedT, NestedR extends object> = [unknown] extends [Nest
   : WhereClause<NestedT & object, NestedR>;
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no nested relations", using object would break WithResult inference
+/**
+ * A key-checked orderBy object over an entity and its relations.
+ *
+ * A column key takes a direction, an {@link OrderBySpec}, a JSON-path ordering
+ * or a vector KNN ordering; a RELATION key takes a {@link RelationOrderBy}
+ * (`_count`, or a target column) or a pick-row ordering. Written as an
+ * intersection of two mapped types so an object literal with a key in neither
+ * set is an excess property, which is what turns `orderBy: { titel: 'asc' }`
+ * into a compile error instead of a runtime E003.
+ *
+ * Degrades to the open {@link OrderByObject} when the entity is untyped, so
+ * `db.table(name)` and dynamically built clauses keep working. A value typed
+ * `Record<string, OrderDirection>` still assigns, because an index signature
+ * satisfies each optional target key.
+ */
+export type TypedOrderByObject<T, R extends object> = [unknown] extends [T]
+  ? OrderByObject
+  : // No relation information (the untyped escape hatch, or a client generated
+    // before the brand existed): relation ordering cannot be key-checked, so the
+    // whole clause stays open rather than rejecting valid relation keys. Same
+    // degrade rule as {@link TypedWithClause}.
+    [keyof R] extends [never]
+    ? OrderByObject
+    : {
+        [K in keyof T]?: OrderDirection | OrderBySpec | JsonPathOrderBy | VectorOrderBy;
+      } & {
+        [K in keyof R]?: RelationOrderBy | RelationPickOrderBy;
+      };
+
+/** {@link TypedOrderByObject}, single or Prisma-style array. */
+export type TypedOrderByClause<T, R extends object> = TypedOrderByObject<T, R> | TypedOrderByObject<T, R>[];
+
+/**
+ * `select` / `omit` inside a relation `with` block, key-checked against the
+ * relation TARGET when it is known, and the historical open record when it is
+ * not (the untyped {@link WithClause} escape hatch).
+ */
+export type WithFieldFlags<NestedT> = [unknown] extends [NestedT]
+  ? Record<string, boolean>
+  : { [K in keyof NestedT]?: boolean };
+
 export interface WithOptions<NestedR extends object = {}, NestedT = unknown> {
   with?: TypedWithClause<NestedR>;
   /** Filter the related rows. Keys are checked against the relation target when it is known (see {@link WithWhere}). */
@@ -314,12 +355,12 @@ export interface WithOptions<NestedR extends object = {}, NestedT = unknown> {
    * or a Prisma-style array of objects (`[{ a: 'asc' }, { b: 'desc' }]`, whose
    * element order is the authoritative multi-key sort precedence).
    */
-  orderBy?: WithOrderByObject | WithOrderByObject[];
+  orderBy?: TypedOrderByClause<NestedT, NestedR>;
   limit?: number;
-  /** Only include these fields from the relation */
-  select?: Record<string, boolean>;
-  /** Exclude these fields from the relation */
-  omit?: Record<string, boolean>;
+  /** Only include these fields from the relation. Key-checked against the target when it is known. */
+  select?: WithFieldFlags<NestedT>;
+  /** Exclude these fields from the relation. Key-checked against the target when it is known. */
+  omit?: WithFieldFlags<NestedT>;
 }
 
 // ---------------------------------------------------------------------------
@@ -595,7 +636,7 @@ export interface FindManyArgs<
   select?: S & FieldFlags<T, S>;
   /** Exclude these fields. Keys are checked against `T` (see {@link FieldFlags}). */
   omit?: O & FieldFlags<T, O>;
-  orderBy?: OrderByClause;
+  orderBy?: TypedOrderByClause<T, R>;
   limit?: number;
   offset?: number;
   with?: W;
