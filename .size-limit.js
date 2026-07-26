@@ -17,7 +17,30 @@ const nodePlatform = (config) => {
 // regression (a new module pulled into a shared graph) trips it and has to be
 // re-baselined CONSCIOUSLY, with the reason recorded here.
 //
-// Measured 2026-07-25 at the 0.50.0 RELEASE COMMIT, `npm run build` then
+// Measured 2026-07-26 at the 0.52.0 RELEASE COMMIT, `npm run build` then
+// `npx size-limit`: main 68.78 kB, serverless 53.74 kB, sqlite 56.39 kB,
+// mysql 57.68 kB, mssql 59.26 kB, powdb 74.09 kB, prisma-compat 7.53 kB.
+//
+// The gate went red on five entries before this re-baseline, which is the
+// convention working rather than failing: 0.52.0 is a correctness release whose
+// fixes land almost entirely in the SHARED client/query graph, so every entry
+// moved together. Growth from the 0.50.0 line: main +3.6, serverless +3.6,
+// sqlite +3.8, mysql +3.9, mssql +3.8 kB. That uniformity is the signature of a
+// shared-graph change and is what makes it believable; ONE entry jumping alone
+// would be the thing to investigate. It is accounted for: the two-source column
+// type resolution and the untyped-column warning (builder.ts), the symmetric
+// createMany row-shape guard (writes.ts), deterministic relation and `_count`
+// key seeding (batched-loader.ts), the utcTimestamps process-scope check and
+// logQueryParams (client.ts), and the new engine-config.ts forwarding module
+// that all three non-Postgres factories now import.
+//
+// powdb rose more (+5.5 kB), and correctly so: it carries the shared graph plus
+// its own PowDB 0.20 work, the datetime `in`/`notIn` equality-chain compiler and
+// the per-column capability gates. prisma-compat rose 0.4 kB and stays an order
+// of magnitude below the rest, so it is still type-only against the core; its
+// limit is unchanged at 9 kB because the measured 7.53 kB is still under it.
+//
+// Prior baseline 2026-07-25 at the 0.50.0 RELEASE COMMIT, `npm run build` then
 // `npx size-limit`, and confirmed byte-identical in CI: main 65.16 kB,
 // serverless 50.18 kB, sqlite 52.61 kB, mysql 53.79 kB, mssql 55.45 kB,
 // powdb 68.55 kB, prisma-compat 7.15 kB.
@@ -61,7 +84,7 @@ export default [
   {
     name: "main entry, import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
-    limit: '69 kB',
+    limit: '73 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
@@ -72,21 +95,21 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '53 kB',
+    limit: '57 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'sqlite entry, turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
-    limit: '56 kB',
+    limit: '60 kB',
     ignore: ['pg', 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'mysql entry, turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
     path: 'dist/mysql.js',
-    limit: '57 kB',
+    limit: '61 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
     // it is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mysql2', 'mysql2/promise'],
@@ -97,7 +120,7 @@ export default [
     path: 'dist/mssql.js',
     // Slightly larger than the other engines: the FOR JSON PATH relation generator
     // and the INFORMATION_SCHEMA/sys introspector add real code (no extra deps).
-    limit: '59 kB',
+    limit: '63 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mssql'],
@@ -108,7 +131,7 @@ export default [
     // The largest entry: it carries the whole client/query graph AND powql.ts,
     // a second, parallel query generator for a non-SQL language.
     path: 'dist/powdb.js',
-    limit: '72 kB',
+    limit: '78 kB',
     // Both PowDB drivers are optional peers behind dynamic imports (the
     // networked client and the embedded napi addon), so neither is in the
     // static graph.

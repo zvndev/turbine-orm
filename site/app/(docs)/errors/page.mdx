@@ -15,7 +15,7 @@ Turbine throws typed errors you can catch with `instanceof`. Every error extends
 |---|---|---|
 | `TURBINE_E001` | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, update/delete against a non-matching row |
 | `TURBINE_E002` | `TimeoutError` | Query or transaction exceeds its configured timeout |
-| `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii` |
+| `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii`, a `createMany` whose first data row names no column while a later row does |
 | `TURBINE_E004` | `ConnectionError` | Pool connection failure |
 | `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
 | `TURBINE_E006` | `MigrationError` | Checksum mismatch, migration-lock contention, or a failure while applying a migration |
@@ -172,6 +172,16 @@ try {
 ```
 
 On PostgreSQL these features never throw, `TURBINE_E017` only appears on the non-Postgres engines. See [Database Engines](/engines) for the full capability matrix.
+
+The same error carries PowDB's **version-gated** capabilities, where the feature exists but the connected engine is too old for it. Those messages name the feature once and then give the floor and what the connection reported:
+
+```
+[turbine] JSON path filters is unsupported on "PowDB". Requires PowDB >= 0.12;
+this connection reports 0.11.0. Upgrade powdb-server / @zvndev/powdb-embedded
+(or pass `assumeEngineVersion` if the version cannot be detected).
+```
+
+Some gates append one more sentence naming a workaround. `err.feature` is the label from the first sentence, `err.dialect` is `'PowDB'`.
 
 ## Read-only refusals
 

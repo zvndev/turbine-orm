@@ -28,6 +28,7 @@ import {
   encodePowqlLiteral,
   introspectPowdbDatabase,
   isJsonColumn,
+  isPowdbDatetimeColumn,
   isStaleFramePowdbError,
   materializePowql,
   POWQL_LEXER_TESTED_CEILING,
@@ -47,7 +48,7 @@ import {
   turbinePowDB,
   wrapPowdbError,
 } from '../powdb.js';
-import { PowqlInterface } from '../powql.js';
+import { MAX_POWQL_DATETIME_TERMS, PowqlInterface } from '../powql.js';
 import type { DeferredQuery } from '../query/index.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
@@ -750,6 +751,49 @@ describe('powdb: write generation', () => {
     assert.equal(m.calls.length, 1); // no reselect
     assert.equal(rows.length, 2);
     assert.equal((rows[1] as { age: number }).age, 2); // coerced from "2"
+  });
+
+  it('createMany refuses rows that do not name the same fields (SQL-engine parity)', async () => {
+    const m = mockPool();
+    // PowQL would insert both rows (each tuple carries its own column list), but
+    // the SQL engines take the column list from the FIRST row, so the second
+    // row's `age` would be silently dropped there. Accepting it on PowDB alone
+    // turns a later move to Postgres into a hard error in production.
+    await assert.rejects(
+      () => qi(m).createMany({ data: [{ name: 'A' }, { name: 'B', age: 2 }] }),
+      (err: unknown) =>
+        err instanceof ValidationError &&
+        /row 1 supplies "age", which the first row does not/.test((err as Error).message),
+    );
+    await assert.rejects(
+      () => qi(m).createMany({ data: [{ name: 'A', age: 1 }, { name: 'B' }] }),
+      (err: unknown) => err instanceof ValidationError && /row 1 does not supply "age"/.test((err as Error).message),
+    );
+    assert.equal(m.calls.length, 0, 'refused before any statement ran');
+
+    // `undefined` counts as omitted, exactly as it does in `create`.
+    await assert.rejects(
+      () =>
+        qi(m).createMany({
+          data: [
+            { name: 'A', age: 1 },
+            { name: 'B', age: undefined },
+          ],
+        }),
+      (err: unknown) => err instanceof ValidationError,
+    );
+
+    // The check runs AFTER applyPkDefault, so the client-generated string PK
+    // (present on every row by then) never trips it, and rows of pure defaults
+    // stay legal.
+    m.setRows([
+      { id: 'a', name: 'A' },
+      { id: 'b', name: 'B' },
+    ]);
+    const ok = await qi(m).createMany({ data: [{ name: 'A' }, { name: 'B' }] });
+    assert.equal(ok.length, 2);
+    const uuidTuples = m.last().powql.match(/id := \$/g);
+    assert.equal(uuidTuples?.length, 2, 'both rows got their PK filled in');
   });
 
   it('createMany({ skipDuplicates }) throws E017 (PowQL insert has no ON CONFLICT DO NOTHING)', async () => {
@@ -2395,6 +2439,8 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       entityLinks: false,
       linkIntrospection: false,
       linkPaths: false,
+      datetimeCompare: false,
+      projectedCountNonNull: false,
       nativeRaw: false,
     });
     // 0.10: introspection only.
@@ -2424,7 +2470,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
     // The E017 hint for a missing serverJoins names the 0.13 floor.
     assert.throws(
       () => requireCapability(capabilitiesFromVersion('0.12.0'), 'serverJoins', 'server-side joins'),
-      /server-side joins requires PowDB >= 0\.13/,
+      /server-side joins is unsupported.*Requires PowDB >= 0\.13/s,
     );
   });
 
@@ -2434,7 +2480,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
     assert.equal(capabilitiesFromVersion('1.0.0').nestedProjections, true);
     assert.throws(
       () => requireCapability(capabilitiesFromVersion('0.17.0'), 'nestedProjections', 'nested projections'),
-      /nested projections requires PowDB >= 0\.18/,
+      /nested projections is unsupported.*Requires PowDB >= 0\.18/s,
     );
   });
 
@@ -2448,7 +2494,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
     // The E017 hint for a missing entityLinks names the 0.19 floor.
     assert.throws(
       () => requireCapability(capabilitiesFromVersion('0.18.2'), 'entityLinks', 'entity links'),
-      /entity links requires PowDB >= 0\.19/,
+      /entity links is unsupported.*Requires PowDB >= 0\.19/s,
     );
   });
 
@@ -2464,6 +2510,8 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       entityLinks: false,
       linkIntrospection: false,
       linkPaths: false,
+      datetimeCompare: false,
+      projectedCountNonNull: false,
       nativeRaw: false,
     });
     assert.equal(capabilitiesFromVersion(null).engineVersion, null);
@@ -2478,7 +2526,7 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       thrown = e as UnsupportedFeatureError;
     }
     assert.ok(thrown instanceof UnsupportedFeatureError);
-    assert.match(thrown.message, /JSON path filters requires PowDB >= 0.12/);
+    assert.match(thrown.message, /JSON path filters is unsupported.*Requires PowDB >= 0.12/s);
     assert.match(thrown.message, /this connection reports 0\.11\.0/);
     assert.match(thrown.message, /assumeEngineVersion/);
     // A satisfied gate is a no-op.
@@ -2519,6 +2567,10 @@ describe('powdb: capability gating (PowdbCapabilities)', () => {
       // generation, and linkIntrospection is only meaningful once probed.
       linkIntrospection: false,
       linkPaths: false,
+      // ON, like jsonDocs / serverJoins: pure REFUSAL gates that never change the
+      // emitted PowQL, so the trusted-caller default lets them through.
+      datetimeCompare: true,
+      projectedCountNonNull: true,
       nativeRaw: false,
     });
     // A directly-constructed pool defaults to it.
@@ -2531,7 +2583,7 @@ describe('powdb: introspectPowdbDatabase gating + mis-shaped exec guard', () => 
     const exec = async () => ({ rows: [] as Record<string, unknown>[] });
     await assert.rejects(
       introspectPowdbDatabase(exec, { capabilities: capabilitiesFromVersion('0.9.0') }),
-      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0\.10/.test((e as Error).message),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /Requires PowDB >= 0\.10/.test((e as Error).message),
     );
   });
 
@@ -2598,7 +2650,7 @@ describe('powdb: json document column type', () => {
     // jsonDocs off → E017 with the version hint.
     assert.throws(
       () => powqlSchemaDDL(s, { capabilities: capabilitiesFromVersion('0.11.0') }),
-      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0.12/.test((e as Error).message),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /Requires PowDB >= 0.12/.test((e as Error).message),
     );
   });
 });
@@ -3012,7 +3064,7 @@ describe('powdb F1: JsonFilter → PowQL path filters', () => {
     const m = mockPool(capabilitiesFromVersion('0.11.0'));
     await assert.rejects(
       qi(m, 'doc').findMany({ where: { data: { path: ['a'], equals: 1 } }, limit: 1 }),
-      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0\.12/.test((e as Error).message),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /Requires PowDB >= 0\.12/.test((e as Error).message),
     );
   });
 
@@ -3125,7 +3177,7 @@ describe('powdb F2: JSON-path orderBy', () => {
         orderBy: { data: { path: ['k'] } } as never,
         limit: 1,
       }),
-      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0\.12/.test((e as Error).message),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /Requires PowDB >= 0\.12/.test((e as Error).message),
     );
   });
 });
@@ -3273,7 +3325,7 @@ describe('powdb F2: JSON-path + aggregate groupBy', () => {
         by: [{ field: 'data', path: ['a'] }] as never,
         _count: true,
       }),
-      (e: unknown) => e instanceof UnsupportedFeatureError && /requires PowDB >= 0\.12/.test((e as Error).message),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /Requires PowDB >= 0\.12/.test((e as Error).message),
     );
   });
 
@@ -3523,17 +3575,17 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
   it('the tested ceiling is the expected engine line', () => {
     // A canary: bumping the ceiling MUST be a deliberate, reviewed act (it
     // asserts the escaper was re-verified against a newer lexer).
-    assert.equal(POWQL_LEXER_TESTED_CEILING, '0.19');
+    assert.equal(POWQL_LEXER_TESTED_CEILING, '0.20');
   });
 
   it('refuses the legacy materialize path on an addon newer than the ceiling', async () => {
     // A legacy-only handle (no queryWithParams) whose capabilities claim engine
-    // 0.20.0, newer than the escaper's verified lexer range. Reaching the legacy
+    // 0.21.0, newer than the escaper's verified lexer range. Reaching the legacy
     // wire in this state is the dangerous "newer-addon-without-native" anomaly, so
     // exec() must refuse rather than inline-encode against an unverified lexer.
     const { pool, seen } = fakeEmbeddedDb(
       { kind: 'ok', affected: 1n },
-      { capabilities: capabilitiesFromVersion('0.20.0', { hasNativeRaw: true }) },
+      { capabilities: capabilitiesFromVersion('0.21.0', { hasNativeRaw: true }) },
     );
     const err = await pool.query('insert app_user { name := $1 }', ['Ada']).then(
       () => null,
@@ -3541,7 +3593,7 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
     );
     assert.ok(err instanceof ValidationError, 'refusal is a typed ValidationError');
     assert.equal((err as ValidationError).code, TurbineErrorCode.VALIDATION);
-    assert.match((err as Error).message, /0\.20\.0/, 'names the reported engine version');
+    assert.match((err as Error).message, /0\.21\.0/, 'names the reported engine version');
     assert.match((err as Error).message, new RegExp(POWQL_LEXER_TESTED_CEILING.replace('.', '\\.')));
     assert.match((err as Error).message, /queryWithParams/, 'explains the feature-detect anomaly');
     // Nothing was ever handed to the engine.
@@ -3559,5 +3611,351 @@ describe('powdb: PowdbEmbeddedPool legacy-wire lexer ceiling (E1)', () => {
     assert.equal(seen.length, 1);
     assert.equal(seen[0], 'insert app_user { id := "u1", name := "Ada" } returning');
     assert.deepEqual(res.rows, [{ id: 'u1', name: 'Ada' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PowDB 0.20: datetime comparison gate, projected-count gate, pagination
+// validation, and the new engine-error mappings.
+// ---------------------------------------------------------------------------
+
+/**
+ * A NATIVE PowDB `datetime` column (`dialectType: 'datetime'`), the shape
+ * `introspectPowdbDatabase` reports for a table created outside Turbine, plus an
+ * `int` column carrying the same epoch micros as the control.
+ */
+const dtSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    ev: table('ev', [
+      col('id', 'id', 'string', 'text', { hasDefault: true }),
+      col('ts', 'ts', 'Date', 'datetime', { dialectType: 'datetime', nullable: true }),
+      col('at_micros', 'atMicros', 'Date', 'timestamptz', { nullable: true }),
+    ]),
+  },
+};
+
+const DT = new Date('2025-01-01T00:00:00.000Z');
+
+describe('powdb: datetime comparison gate (0.20)', () => {
+  it('identifies only PowDB-native datetime columns', () => {
+    assert.equal(isPowdbDatetimeColumn(col('ts', 'ts', 'Date', 'datetime', { dialectType: 'datetime' })), true);
+    // A Postgres timestamp column is DDL'd as PowQL `int` epoch micros, so it is
+    // NOT a PowDB datetime and must never be gated.
+    assert.equal(isPowdbDatetimeColumn(col('created_at', 'createdAt', 'Date', 'timestamptz')), false);
+    assert.equal(isPowdbDatetimeColumn(col('age', 'age', 'number', 'int4')), false);
+  });
+
+  it('refuses every literal comparison on a pre-0.20 engine, and allows null checks', async () => {
+    const mock = mockPool(capabilitiesFromVersion('0.19.1'));
+    const q = new PowqlInterface(mock.pool, 'ev', dtSchema);
+    for (const where of [
+      { ts: DT },
+      { ts: { gt: DT } },
+      { ts: { lte: DT } },
+      { ts: { not: DT } },
+      { ts: { equals: DT } },
+    ]) {
+      await assert.rejects(
+        q.findMany({ where: where as never }),
+        (e: unknown) =>
+          e instanceof UnsupportedFeatureError &&
+          /datetime column "ts"/.test((e as Error).message) &&
+          /Requires PowDB >= 0\.20/.test((e as Error).message),
+      );
+    }
+    // Null checks compare no literal: correct on every version, never refused.
+    await q.findMany({ where: { ts: null } as never });
+    assert.match(mock.last().powql, /\.ts is null/);
+    await q.findMany({ where: { ts: { not: null } } as never });
+    assert.match(mock.last().powql, /\.ts is not null/);
+    // The sibling int-micros column is untouched by the gate.
+    await q.findMany({ where: { atMicros: { gt: DT } } as never });
+    assert.match(mock.last().powql, /\.at_micros > \$1/);
+  });
+
+  it('allows comparisons on a 0.20 engine and emits byte-identical PowQL', async () => {
+    const mock = mockPool(capabilitiesFromVersion('0.20.0'));
+    const q = new PowqlInterface(mock.pool, 'ev', dtSchema);
+    await q.findMany({ where: { ts: { gt: DT } } as never });
+    assert.match(mock.last().powql, /filter \.ts > \$1/);
+    assert.deepEqual(mock.last().params, [DT]);
+  });
+
+  it('expands `in` / `notIn` on a datetime column into an equality chain', async () => {
+    // The 0.20 timestamp fix covered the binary operators only: the LIST form
+    // still compares by type tag upstream (`in` matches nothing, `not in`
+    // matches everything), so no datetime `in (…)` is ever emitted. The chain
+    // uses the operators 0.20 did fix.
+    const mock = mockPool(capabilitiesFromVersion('0.20.0'));
+    const q = new PowqlInterface(mock.pool, 'ev', dtSchema);
+    const DT2 = new Date('2025-02-02T00:00:00.000Z');
+
+    await q.findMany({ where: { ts: { in: [DT, DT2] } } as never });
+    assert.match(mock.last().powql, /^ev filter \(\.ts = \$1 or \.ts = \$2\) /);
+    assert.deepEqual(mock.last().params, [DT, DT2]);
+    assert.doesNotMatch(mock.last().powql, /\bin \(/);
+
+    await q.findMany({ where: { ts: { notIn: [DT] } } as never });
+    assert.match(mock.last().powql, /^ev filter \(\.ts != \$1 and \.ts is not null\) /);
+
+    // An empty list stays the compile-time constant it always was.
+    await q.findMany({ where: { ts: { in: [] } } as never });
+    assert.doesNotMatch(mock.last().powql, /\bin \(/);
+
+    // A NON-datetime column keeps the plain list form, byte for byte.
+    await q.findMany({ where: { atMicros: { in: [DT, DT2] } } as never });
+    assert.match(mock.last().powql, /^ev filter \.at_micros in \(\$1, \$2\) /);
+  });
+
+  it('refuses a datetime `in` wider than the chain budget, and below 0.20 refuses it outright', async () => {
+    const mock = mockPool(capabilitiesFromVersion('0.20.0'));
+    const q = new PowqlInterface(mock.pool, 'ev', dtSchema);
+    const many = Array.from({ length: MAX_POWQL_DATETIME_TERMS + 1 }, (_, i) => new Date(DT.getTime() + i * 1000));
+    // PowQL spends one nesting level per chain term (63 at the top level on
+    // 0.20), so an unbounded expansion would become an engine parse failure.
+    await assert.rejects(
+      q.findMany({ where: { ts: { in: many } } as never }),
+      (e: unknown) =>
+        e instanceof UnsupportedFeatureError &&
+        /datetime column "ts"/.test((e as Error).message) &&
+        /equality chain/.test((e as Error).message),
+    );
+    // Exactly at the cap is fine.
+    await q.findMany({ where: { ts: { in: many.slice(0, MAX_POWQL_DATETIME_TERMS) } } as never });
+    assert.equal(mock.last().params.length, MAX_POWQL_DATETIME_TERMS);
+
+    // The chain is a binary comparison, so below 0.20 it is refused by the same
+    // one gate as `=` / `>`, not by a separate `in`-only rule.
+    const old = mockPool(capabilitiesFromVersion('0.19.1'));
+    await assert.rejects(
+      new PowqlInterface(old.pool, 'ev', dtSchema).findMany({ where: { ts: { in: [DT] } } as never }),
+      (e: unknown) =>
+        e instanceof UnsupportedFeatureError &&
+        /comparisons on the PowDB datetime column "ts"/.test((e as Error).message),
+    );
+  });
+
+  it('gates the datetime and projected-count capabilities at >= 0.20', () => {
+    assert.equal(capabilitiesFromVersion('0.19.1').datetimeCompare, false);
+    assert.equal(capabilitiesFromVersion('0.20.0').datetimeCompare, true);
+    assert.equal(capabilitiesFromVersion('1.0.0').datetimeCompare, true);
+    assert.equal(capabilitiesFromVersion('0.19.1').projectedCountNonNull, false);
+    assert.equal(capabilitiesFromVersion('0.20.0').projectedCountNonNull, true);
+    assert.throws(
+      () => requireCapability(capabilitiesFromVersion('0.19.1'), 'projectedCountNonNull', 'per-field `_count`'),
+      /per-field `_count` is unsupported.*Requires PowDB >= 0\.20/s,
+    );
+  });
+});
+
+/**
+ * A relation whose correlation column is a NATIVE `datetime` on both sides, the
+ * shape that made the same relation refused through one load strategy and served
+ * through another.
+ */
+const dtRelSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    parent: table(
+      'parent',
+      [
+        col('id', 'id', 'number', 'int4'),
+        col('ts', 'ts', 'Date', 'datetime', {
+          dialectType: 'datetime',
+          nullable: true,
+        }),
+      ],
+      {
+        kids: { type: 'hasMany', name: 'kids', from: 'parent', to: 'kid', foreignKey: 'pts', referenceKey: 'ts' },
+      },
+    ),
+    kid: table('kid', [
+      col('id', 'id', 'number', 'int4'),
+      col('pts', 'pts', 'Date', 'datetime', { dialectType: 'datetime', nullable: true }),
+      col('tag', 'tag', 'string', 'text', { nullable: true }),
+    ]),
+  },
+};
+
+describe('powdb: datetime relation keys behave the same on every load strategy (0.20)', () => {
+  const parents = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ id: String(i + 1), ts: DT.getTime() * 1000 + i * 1000 }));
+
+  it('the batched loader emits an equality chain, chunked to the term budget', async () => {
+    const mock = mockPool(capabilitiesFromVersion('0.20.0'));
+    const q = new PowqlInterface(mock.pool, 'parent', dtRelSchema, [], { warnOnUnlimited: false });
+    // 40 distinct parent timestamps: one chunk of 32 plus one of 8, because an
+    // expanded chain spends one nesting level per term.
+    mock.setRows(parents(40));
+    await q.findMany({ with: { kids: true }, relationLoadStrategy: 'batched' } as never);
+    const childCalls = mock.calls.filter((c) => c.powql.startsWith('kid'));
+    assert.equal(childCalls.length, 2, 'chunked at the chain budget, not at MAX_RELATION_KEYS');
+    assert.equal(childCalls[0]!.params.length, MAX_POWQL_DATETIME_TERMS);
+    assert.equal(childCalls[1]!.params.length, 40 - MAX_POWQL_DATETIME_TERMS);
+    for (const call of childCalls) {
+      assert.doesNotMatch(call.powql, /\bin \(/, 'never the broken list form');
+      assert.match(call.powql, /\(\.pts = \$1 or \.pts = \$2/);
+    }
+  });
+
+  it('a relation FILTER resolves to the same chain, so no strategy is a special case', async () => {
+    const mock = mockPool(capabilitiesFromVersion('0.20.0'));
+    const q = new PowqlInterface(mock.pool, 'parent', dtRelSchema, [], { warnOnUnlimited: false });
+    mock.setRows([{ id: '10', pts: DT.getTime() * 1000 }]);
+    await q.findMany({ where: { kids: { some: { tag: 'k' } } } } as never);
+    // The parent query filters on the resolved key set, expanded, not `in (…)`.
+    assert.match(mock.last().powql, /^parent filter \(\(\.ts = \$1\)\)/);
+    assert.doesNotMatch(mock.last().powql, /\bin \(/);
+  });
+
+  it('below 0.20 the whole family refuses with ONE message that names the working path', async () => {
+    const mock = mockPool(capabilitiesFromVersion('0.19.1'));
+    const q = new PowqlInterface(mock.pool, 'parent', dtRelSchema, [], { warnOnUnlimited: false });
+    // Rows carry both correlation columns so each path below really reaches its
+    // key comparison (the loader reads `ts` off the parent, the relation filter
+    // collects `pts` off the child).
+    mock.setRows([{ id: '10', ts: DT.getTime() * 1000, pts: DT.getTime() * 1000 }]);
+    const refusal = /comparisons on the PowDB datetime column .* nested `with`/s;
+    for (const args of [
+      { where: { kids: { some: { tag: 'k' } } } },
+      { with: { kids: true }, relationLoadStrategy: 'batched' },
+      { where: { ts: DT } },
+    ]) {
+      await assert.rejects(
+        q.findMany(args as never),
+        (e: unknown) => e instanceof UnsupportedFeatureError && refusal.test((e as Error).message),
+      );
+    }
+  });
+});
+
+describe('powdb: per-field _count gate (0.20)', () => {
+  it('below 0.20, refuses a NULLABLE column only, and still serves a NOT NULL one', async () => {
+    const mock = mockPool(capabilitiesFromVersion('0.19.1'));
+    const q = qi(mock);
+    // `age` is nullable, so the pre-0.20 row count genuinely differed from the
+    // non-null count every SQL engine returns.
+    await assert.rejects(
+      q.aggregate({ _count: { age: true } } as never),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /nullable column "age"/.test((e as Error).message),
+      'a projected count of a nullable column returned the ROW count below 0.20',
+    );
+    // `name` is NOT NULL, so row count == non-null count: the pre-0.20 engine
+    // already answered this correctly and the call must keep working. This is
+    // the whole install base turbine-orm 0.51.0 shipped against.
+    mock.setScalar('4');
+    const notNull = await q.aggregate({ _count: { name: true } } as never);
+    assert.deepEqual(notNull._count, { name: 4 });
+    assert.match(mock.last().powql, /^count\(app_user \{ \.name \}\)$/);
+    // A mixed request is refused for the nullable member, and refused BEFORE any
+    // count query is issued for it.
+    await assert.rejects(
+      q.aggregate({ _count: { name: true, age: true } } as never),
+      (e: unknown) => e instanceof UnsupportedFeatureError && /nullable column "age"/.test((e as Error).message),
+    );
+    mock.setScalar('7');
+    const rows = await q.aggregate({ _count: true } as never);
+    assert.equal(rows._count, 7);
+    assert.match(mock.last().powql, /^count\(app_user\)$/);
+  });
+
+  it('gates nothing at all on a 0.20 engine', async () => {
+    const mock = mockPool(capabilitiesFromVersion('0.20.0'));
+    mock.setScalar('4');
+    const res = await qi(mock).aggregate({ _count: { age: true, name: true } } as never);
+    assert.deepEqual(res._count, { age: 4, name: 4 });
+  });
+
+  it('emits `count(T { .col })` on a 0.20 engine', async () => {
+    const mock = mockPool(capabilitiesFromVersion('0.20.0'));
+    mock.setScalar('4');
+    await qi(mock).aggregate({ _count: { age: true } } as never);
+    assert.match(mock.last().powql, /^count\(app_user \{ \.age \}\)$/);
+  });
+});
+
+describe('powdb: pagination validation (0.20)', () => {
+  it('answers `limit: 0` client-side and never sends a query', async () => {
+    const mock = mockPool();
+    // PowDB's projection fast path returned ONE row for `limit 0` below 0.20, so
+    // Turbine resolves it locally and is correct on every engine version.
+    assert.deepEqual(await qi(mock).findMany({ limit: 0 }), []);
+    assert.deepEqual(await qi(mock).groupBy({ by: ['name'], limit: 0 } as never), []);
+    assert.equal(mock.calls.length, 0, 'nothing reached the engine');
+  });
+
+  it('refuses a negative limit / offset before it reaches the engine', async () => {
+    const mock = mockPool();
+    for (const args of [{ limit: -1 }, { offset: -2 }, { take: -3 } as never]) {
+      await assert.rejects(
+        qi(mock).findMany(args),
+        (e: unknown) => e instanceof ValidationError && /must not be negative/.test((e as Error).message),
+      );
+    }
+    assert.equal(mock.calls.length, 0, 'nothing reached the engine');
+    // A relation-level negative limit is caught while the nested-projection block
+    // is planned, before the parent statement is built.
+    const nested = mockPool(capabilitiesFromVersion('0.20.0'));
+    await assert.rejects(
+      qi(nested).findMany({ with: { posts: { limit: -1 } } } as never),
+      (e: unknown) => e instanceof ValidationError && /relation "posts"/.test((e as Error).message),
+    );
+    assert.equal(nested.calls.length, 0, 'the relation limit is caught before any statement runs');
+  });
+});
+
+describe('powdb: 0.20 engine-error mappings', () => {
+  it('maps an unknown column to a ValidationError naming the column', () => {
+    const e = wrapPowdbError({ message: "query failed: column 'agee' not found" });
+    assert.ok(e instanceof ValidationError);
+    assert.match(e.message, /"agee"/);
+    assert.match(e.message, /drifted/);
+    // The qualified form carries the table too.
+    const q = wrapPowdbError({ message: "column 'x' not found in table 'app_user'" });
+    assert.match(q.message, /table "app_user"/);
+  });
+
+  it('maps a type-mismatched comparison to a ValidationError naming the column', () => {
+    const e = wrapPowdbError({ message: "type mismatch for column 'name': expected Str, got int" });
+    assert.ok(e instanceof ValidationError);
+    assert.match(e.message, /"name"/);
+    assert.match(e.message, /never coerces/);
+  });
+
+  it('maps the operator-chain nesting refusal to an actionable ValidationError', () => {
+    const e = wrapPowdbError({ message: 'query failed: query nesting depth exceeds maximum of 64' });
+    assert.ok(e instanceof ValidationError);
+    assert.match(e.message, /Split a large `OR` \/ `AND` array/);
+    assert.match(e.message, /`in` list/, 'names the in-list escape hatch');
+  });
+
+  it('maps a negative limit / offset refusal to a ValidationError', () => {
+    assert.ok(wrapPowdbError({ message: 'limit must not be negative, got -1' }) instanceof ValidationError);
+    assert.ok(wrapPowdbError({ message: 'offset must not be negative, got -3' }) instanceof ValidationError);
+  });
+
+  it('maps the client result-cell cap to a ValidationError with both remedies', () => {
+    const e = wrapPowdbError({
+      message: 'result too large: 4000000 cells (1000000 rows x 4 columns, max 2000000)',
+    });
+    assert.ok(e instanceof ValidationError);
+    assert.match(e.message, /limit` \/ `offset/);
+    assert.match(e.message, /select/);
+  });
+
+  it('maps a corrupt page to a ConnectionError, not a query defect', () => {
+    // 0.20 verifies page checksums at table-OPEN time and fails closed. This is a
+    // data-integrity failure with one documented recovery, so it must not land in
+    // the E003 query-defect bucket the `StorageError` regex would otherwise give it.
+    for (const message of [
+      'page corrupt: page 12 CRC32 mismatch: stored 0x1, computed 0x2',
+      'catalog corrupt: bad header',
+      'corrupt heap superblock',
+    ]) {
+      const e = wrapPowdbError({ message });
+      assert.ok(e instanceof ConnectionError, message);
+      assert.match(e.message, /restoring the directory from a backup/);
+    }
   });
 });

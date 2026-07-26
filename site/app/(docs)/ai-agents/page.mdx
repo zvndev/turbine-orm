@@ -96,8 +96,14 @@ Client
 
 Reads
 - `db.<table>.findMany({ where, with, orderBy, limit, offset, cursor, select, omit })`.
-- Nested relations go in `with` and resolve in ONE SQL statement (json_agg), do not
-  write N+1 loops or manual joins. `with` results are fully typed at any depth.
+- Nested relations go in `with`, never as N+1 loops or manual joins. `with` results
+  are fully typed at any depth.
+- Under `relationLoadStrategy: 'join'` the whole `with` tree resolves in ONE SQL
+  statement (json_agg). The default is `'auto'`, which keeps that plan but may move
+  an individual relation (or `_count`) to one flat follow-up statement when the join
+  would be slower, e.g. an unindexed correlation column. The returned rows are
+  identical either way, so do not assert on statement counts unless the query pins
+  a strategy.
 - `findUnique` (by PK or unique column) returns `T | null`; `findUniqueOrThrow` throws
   NotFoundError (E001). `findFirst` for non-unique first-match.
 

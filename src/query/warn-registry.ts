@@ -108,4 +108,14 @@ export const WARN_NS = {
    * engage is indistinguishable from one that does nothing, so say so once.
    */
   flattenFallback: 'flattenFallback',
+  /**
+   * Columns whose database type resolves from NEITHER the column entry nor the
+   * table-level type maps, so Turbine cannot tell which of them are zone-less
+   * and a bound `Date` is left to the driver rather than rewritten to a UTC
+   * literal (builder.ts `warnUntypedColumns`). The scan covers every column,
+   * not just `dateColumns`, because an unresolved type is precisely the state
+   * in which the kind is unknown; the warning emits one line per table listing
+   * the offenders, not one per column. The namespace name is historical.
+   */
+  untypedDateColumn: 'untypedDateColumn',
 } as const;

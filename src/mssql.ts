@@ -90,13 +90,14 @@
  * ```
  */
 
-import { type PgCompatPool, type PgCompatPoolClient, TurbineClient, type TurbineConfig } from './client.js';
+import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
 import {
   type BulkInsertStatementInput,
   type ColumnDefinitionInput,
   type ColumnTypeInput,
   type CreateIndexStatementInput,
   type CreateTableStatementInput,
+  type DefaultValuesInsertStatementInput,
   type DeleteStatementInput,
   type Dialect,
   type DialectIntrospector,
@@ -111,6 +112,7 @@ import {
   type UpdateStatementInput,
   type UpsertStatementInput,
 } from './dialect.js';
+import type { EngineClientConfig } from './engine-config.js';
 import { ConnectionError, RelationError, UnsupportedFeatureError, ValidationError } from './errors.js';
 import { applyTableFilters, deriveEngineRelations } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
@@ -690,6 +692,31 @@ export const mssqlDialect: Dialect = {
       sql: `INSERT INTO ${input.table} (${input.columns.join(', ')})${out} VALUES ${placeholders}`,
       params: input.rowValues.flat(),
     };
+  },
+
+  buildDefaultValuesInsertStatement(input: DefaultValuesInsertStatementInput): string {
+    // T-SQL puts OUTPUT between the (absent) column list and the value source,
+    // so `DEFAULT VALUES` follows it, exactly like the VALUES form above.
+    if (input.skipDuplicates) {
+      throw new UnsupportedFeatureError(
+        'createMany({ skipDuplicates: true })',
+        'mssql',
+        'SQL Server has no ON CONFLICT DO NOTHING equivalent, pre-filter conflicting rows or use a MERGE.',
+      );
+    }
+    // `DEFAULT VALUES` is single-row only in T-SQL, and the multi-row VALUES
+    // form needs one DEFAULT keyword per column, which rows of pure defaults
+    // do not name.
+    if (input.rowCount !== 1) {
+      throw new UnsupportedFeatureError(
+        `createMany with ${input.rowCount} empty data rows`,
+        'mssql',
+        'SQL Server INSERT … DEFAULT VALUES inserts a single row and has no multi-row form; ' +
+          'issue one create({ data: {} }) per row.',
+      );
+    }
+    const out = mssqlOutput(input.returning, 'INSERTED');
+    return `INSERT INTO ${input.table}${out} DEFAULT VALUES`;
   },
 
   buildUpsertStatement(input: UpsertStatementInput): string {
@@ -1476,8 +1503,12 @@ function assertSupportedVersion(majorVersion: number): void {
 // turbineMssql, the public factory
 // ---------------------------------------------------------------------------
 
-/** Options for {@link turbineMssql}. Mirrors the relevant {@link TurbineConfig} fields. */
-export interface TurbineMssqlOptions extends Pick<TurbineConfig, 'logging' | 'defaultLimit' | 'warnOnUnlimited'> {
+/**
+ * Options for {@link turbineMssql}: every client-level `TurbineConfig` field the
+ * engine can honour (see {@link EngineClientConfig}) plus the SQL Server schema
+ * below.
+ */
+export interface TurbineMssqlOptions extends EngineClientConfig {
   /** SQL Server schema for introspection / DDL (default `dbo`). */
   schema?: string;
 }
@@ -1542,14 +1573,17 @@ export async function turbineMssql(
     // A non-version probe failure (permissions, etc.) should not block startup.
   }
 
+  // Everything that is not a SQL Server introspection option is client config
+  // and rides through untouched, so a new TurbineConfig option works here the
+  // day it lands. The engine-owned keys come last, so no caller can unbind the
+  // dialect.
+  const { schema: _dbSchema, ...clientConfig } = options;
   const client = new TurbineClient(
     {
+      ...clientConfig,
       pool,
       dialect: mssqlDialect,
       preparedStatements: false,
-      logging: options.logging,
-      defaultLimit: options.defaultLimit,
-      warnOnUnlimited: options.warnOnUnlimited,
     },
     schema,
   );

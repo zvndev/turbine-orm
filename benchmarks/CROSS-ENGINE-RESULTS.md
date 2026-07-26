@@ -125,7 +125,29 @@ Verdicts vs the 0.7.1-era table:
   SQLite now leads (0.474 vs 0.516 run 1, 0.390 vs 0.416 run 2).
 - The headline "wins or ties SQLite on every op except filtered-list" therefore does
   not hold as measured on addon 0.17.0: it currently reads "embedded wins the writes,
-  SQLite wins the reads." Whether this is engine drift across 0.8 through 0.17 or
-  host noise needs a controlled re-run before updating public copy.
+  SQLite wins the reads." That much is published.
+- Attribution, per row, is NOT uniform, and the public copy is scoped accordingly:
+  - `findUnique` (1.43x) is explained. PowDB's own 2026-07-24 wide-bench snapshot
+    measured an indexed point lookup at 7.9x slower than SQLite through PowQL and
+    attributed essentially all of it to fixed per-query front-end cost (lex, parse,
+    canonicalize, plan-cache lookup) that SQLite amortizes with a prepared
+    statement. Same workload shape, same direction, so this row is an engine
+    property rather than host noise.
+  - `findMany` (2.7x) and nested `with` (1.09x) are NOT. Upstream measured neither,
+    and neither is a point lookup. A fixed per-query cost predicts the gap shrinks
+    as work per query grows: nested `with` fits that, `findMany` does not. Whether
+    these two are engine drift across 0.8 through 0.17 or host noise still needs a
+    controlled re-run, and the public copy says so.
+  - Magnitudes are not comparable across the two harnesses: upstream is Rust on an
+    M5 Max over 100,000 rows with WAL sync off, isolating a 1,442 ns delta; this
+    harness is Node through the napi addon over 6,105 rows at `syncMode: 'normal'`,
+    where driver and JS overhead dominate. Upstream also flags `point_lookup_indexed`
+    as the one verdict worth re-checking on other hardware, and names a harness
+    asymmetry (its SQLite adapter uses `prepare_cached` on every read workload while
+    PowDB re-parses a fresh string).
+  - The engine's `prepare` / `execute_prepared` path is not reachable from any
+    driver (no prepare frame in the wire protocol, none on the napi binding, and the
+    driver spec names prepared plans only to warn drivers off assuming them), so it
+    is not an optimization Turbine is leaving on the table.
 - Seed time: 57 ms for 6,105 rows (recorded: 31 ms; still nowhere near the 887 ms
   Full-fsync figure).

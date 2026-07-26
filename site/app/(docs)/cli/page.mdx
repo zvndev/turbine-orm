@@ -473,12 +473,37 @@ The datasource is deliberately last: an explicit `--url` is never overridden by 
 |---|---|
 | `--schema <file>` | Path to `schema.prisma` (default `prisma/schema.prisma`). **In this command `--schema` names the Prisma file**, not the Postgres namespace it means everywhere else; the namespace is fixed to `public` here. |
 | `--url`, `-u <url>` | Connection string, unless `--no-db`. |
-| `--out`, `-o <dir>` | Output directory (default `./generated/turbine`), which must be inside the project root. |
+| `--out`, `-o <dir>` | Output directory (default `./generated/turbine`), which must resolve inside the directory you ran the command from. See [The `--out` directory guard](#the---out-directory-guard). |
 | `--no-db` | Parse-only. Writes the report and skips introspection, so no `prisma-map.ts` and no client are emitted. |
 | `--allow-partial` | Exit 0 even when items are unresolved. Without it an unresolved item exits 1. |
 | `--no-timestamp` | Omit the generated-at lines for byte-identical regeneration. |
 
 Unresolved items never block the generated client: it is built from live introspected metadata, so a partial run still produces a working `db`. See [Migrating from Prisma](/migrate-from-prisma#the-migration-toolkit) for the full workflow and the adapter's documented gaps.
+
+### The `--out` directory guard
+
+`migrate-from-prisma` writes a report, a name map, and a full generated client. It refuses to write any of it outside the directory you ran it from:
+
+```bash
+$ npx turbine migrate-from-prisma --out /tmp/turbine-scratch
+Output directory must be within the project root. Got: /tmp/turbine-scratch
+# exit code 1
+```
+
+Specifics worth knowing before you script it:
+
+- **"Project root" means the process's current working directory**, not the directory holding `turbine.config.ts`. The path is resolved against the cwd and must land on it or below it. A relative `--out` that climbs out (`--out ../shared/generated`) is refused for the same reason.
+- **The refusal comes after introspection.** The command has already connected and read your schema by the time it checks, so the failure costs a round trip and produces no files at all.
+- **This guard is specific to `migrate-from-prisma`.** `turbine generate --out` has no such restriction.
+
+If you are generating into a scratch directory, run the command from inside it and point `--schema` at the absolute path instead:
+
+```bash
+mkdir -p /tmp/turbine-scratch && cd /tmp/turbine-scratch
+DATABASE_URL=postgres://... npx turbine migrate-from-prisma \
+  --schema /path/to/app/prisma/schema.prisma \
+  --out ./generated
+```
 
 ## `turbine studio`
 

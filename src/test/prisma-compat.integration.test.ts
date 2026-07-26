@@ -12,6 +12,7 @@
 import assert from 'node:assert/strict';
 import { describe } from 'node:test';
 import { TurbineClient } from '../client.js';
+import { TurbineError, TurbineErrorCode } from '../errors.js';
 import { introspect } from '../introspect.js';
 import { createPrismaCompatClient } from '../prisma-compat.js';
 import type { PrismaCompatMap, RelationDef, SchemaMetadata } from '../schema.js';
@@ -192,5 +193,80 @@ describe('prisma-compat, integration (real Postgres)', () => {
   it('$queryRaw runs a parameterized query and returns rows', async () => {
     const rows = await compat.$queryRaw`SELECT count(*)::int AS n FROM app_user WHERE email_address LIKE ${'%acme%'}`;
     assert.ok(rows[0].n >= 2);
+  });
+
+  // -------------------------------------------------------------------------
+  // Raw SQL inside $transaction. These are the tests that PROVE atomicity: a
+  // raw statement that quietly ran on a pool connection would survive the
+  // rollback, and the caller would never know.
+  // -------------------------------------------------------------------------
+
+  it('a raw INSERT inside $transaction is rolled back when the callback throws', async () => {
+    const email = 'raw-rollback@acme.com';
+    await assert.rejects(
+      () =>
+        compat.$transaction(
+          async (tx: { $executeRaw: (s: TemplateStringsArray, ...v: unknown[]) => Promise<number> }) => {
+            const n =
+              await tx.$executeRaw`INSERT INTO app_user (email_address, display_name) VALUES (${email}, 'RawRB')`;
+            assert.equal(n, 1, 'the raw insert reported one affected row');
+            throw new Error('abort');
+          },
+        ),
+      /abort/,
+    );
+    const gone = await compat.User.findUnique({ where: { email } });
+    assert.equal(gone, null, 'the raw insert rolled back with the transaction');
+  });
+
+  it('a raw INSERT inside $transaction commits with the transaction', async () => {
+    const email = 'raw-commit@acme.com';
+    const n = await compat.$transaction(
+      async (tx: { $executeRawUnsafe: (sql: string, ...p: unknown[]) => Promise<number> }) =>
+        tx.$executeRawUnsafe('INSERT INTO app_user (email_address, display_name) VALUES ($1, $2)', email, 'RawOK'),
+    );
+    assert.equal(n, 1);
+    const back = await compat.User.findUnique({ where: { email } });
+    assert.equal(back.displayName, 'RawOK');
+  });
+
+  it('a raw read inside $transaction sees the delegate write that precedes it', async () => {
+    // Only possible on the transaction's OWN connection: an uncommitted row is
+    // invisible to any other connection, so a pool fallback would return 0.
+    const email = 'raw-sees@acme.com';
+    const seen = await compat.$transaction(
+      async (tx: {
+        User: { create: (a: unknown) => Promise<unknown> };
+        $queryRaw: (s: TemplateStringsArray, ...v: unknown[]) => Promise<{ n: number }[]>;
+      }) => {
+        await tx.User.create({ data: { email, displayName: 'Uncommitted' } });
+        const rows = await tx.$queryRaw`SELECT count(*)::int AS n FROM app_user WHERE email_address = ${email}`;
+        return rows[0]!.n;
+      },
+    );
+    assert.equal(seen, 1, 'the raw read ran on the transaction connection');
+  });
+
+  it('a delegate write is rolled back by a failing raw statement in the same transaction', async () => {
+    const email = 'raw-fail@acme.com';
+    await assert.rejects(
+      () =>
+        compat.$transaction(
+          async (tx: {
+            User: { create: (a: unknown) => Promise<unknown> };
+            $executeRawUnsafe: (sql: string, ...p: unknown[]) => Promise<number>;
+          }) => {
+            await tx.User.create({ data: { email, displayName: 'Doomed' } });
+            // Duplicate email → unique violation aborts the transaction.
+            await tx.$executeRawUnsafe('INSERT INTO app_user (email_address) VALUES ($1)', 'a@acme.com');
+          },
+        ),
+      // The statement itself must be what fails. A bare `rejects` also passes
+      // when `tx.$executeRawUnsafe` is undefined (TypeError), which rolls the
+      // transaction back for the wrong reason and proves nothing about raw SQL.
+      (e: unknown) => e instanceof TurbineError && e.code === TurbineErrorCode.UNIQUE_VIOLATION,
+    );
+    const gone = await compat.User.findUnique({ where: { email } });
+    assert.equal(gone, null, 'the delegate write rolled back too');
   });
 });

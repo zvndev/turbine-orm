@@ -17,7 +17,7 @@ First, what is **not** a reason. Resolving a nested `with` clause in one stateme
 The reason to reach for Turbine is that every layer between you and a production database is built on one assumption: **the rows are real**. That plays out in five concrete places.
 
 1. **The database UI is read-only, and writes are a per-launch decision.** `npx turbine studio` binds loopback, authenticates with a 192-bit per-process token, and runs every read inside `BEGIN READ ONLY`. In the default mode the write endpoints do not exist in the router at all (they 404), so there is nothing to bypass. `--write` opts a single launch in to edits, each addressed by its full primary key rather than a predicate, compiled by the same validated builder your app uses. There is no raw-SQL surface at all since v0.19.
-2. **PII is a schema contract, enforced in the SQL.** Tag a column `pii: true` and it is excluded from every default projection on every engine: top-level rows, `with` subqueries, batched loaders, write returns, and the Studio UI. It is also **refused** as a `groupBy` key and as a `_min` / `_max` target, because both hand back a stored cell. `includePii: true` unlocks it explicitly per read. A schema with no tagged column emits byte-identical SQL.
+2. **PII is a schema contract, enforced in the SQL.** Tag a column `pii: true` and it is excluded from every default projection: top-level rows, `with` subqueries, batched loaders, write returns, and the Studio UI. On the SQL engines the exclusion is in the emitted statement, so the value never leaves the database. (PowDB is the one exception, and it is a weaker guarantee: its `returning` keyword takes no column list, so a write's PII is stripped in the client after crossing the wire. Its read projections are still column-explicit.) A tagged column is also **refused** as a `groupBy` key and as a `_min` / `_max` target, because both hand back a stored cell. `includePii: true` unlocks it explicitly per read. A schema with no tagged column emits byte-identical SQL.
 3. **Errors carry keys, never values.** A `NotFoundError` says `where: { id, email }`. A `UniqueConstraintError` names the column that conflicted. Neither prints the user's data, so the error is safe to send straight to Sentry with no scrubbing rule in front of it. The full `where` object stays available as `err.where` in code.
 4. **Data-destroying statements need consent.** `migrate up`, `migrate down` and `push` scan for `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, unqualified `DELETE` / `UPDATE`, and `ALTER COLUMN … TYPE`, print an itemized report, and refuse to run. Interactively you type `destroy my data` and then `yes`; in CI you pass `--allow-destructive`. A refused batch applies nothing.
 5. **The review a DBA would have given you, offline.** `npx turbine doctor` derives every column set the ORM's relation subqueries probe and reports the ones with no covering index, with a cost tier per finding. `--fix` writes the migration. No cloud service, no telemetry, no account: it reads your introspected schema.
@@ -238,6 +238,9 @@ const newUser = await db.users.create({
 
 ### createMany (batch insert with UNNEST)
 
+One exception to the UNNEST shape: rows of pure defaults (`data: [{}, {}]`) name no column to unnest, so Postgres emits `INSERT INTO t SELECT FROM generate_series(1, N)` instead. `create({ data: {} })` inserts a single defaults row on every engine; the multi-row form is Postgres/MySQL only (SQLite and SQL Server throw `UnsupportedFeatureError`, as does MySQL when `skipDuplicates` is combined with it).
+
+
 ```typescript
 const users = await db.users.createMany({
   data: [
@@ -248,6 +251,8 @@ const users = await db.users.createMany({
 });
 // Single INSERT with UNNEST -- not 3 separate inserts
 ```
+
+Because it is one statement, the column list comes from the **first** row, so every row must name the same fields. A field the first row names and a later row omits would be bound as `NULL` over that column's default, and a field only a later row names would be dropped, so a ragged call throws `ValidationError` (`TURBINE_E003`) naming the row index and the differing columns instead. This holds on every engine including PowDB. A field set to `undefined` counts as omitted, exactly as in `create`; split the call into one `createMany` per field set.
 
 ### update / delete
 
@@ -300,7 +305,11 @@ await db.$transaction(async (tx) => {
 // Fully typed -- tx.users and tx.posts have the same API as db.users and db.posts
 ```
 
-`tx` is a `TransactionClient`, which is deliberately a **smaller** object than `db`. It has table accessors (`tx.users`, or `tx.table('users')`), `tx.$transaction(fn)` for SAVEPOINT-nested blocks, `tx.raw` for tagged-template raw SQL, and `tx.schema`. It does **not** have `tx.sql`, `tx.pipeline`, `tx.$use`, `tx.$listen` / `tx.$notify`, `tx.$observe`, `tx.$on` / `tx.$off`, `tx.$retry`, `tx.$primary`, `tx.$withSession`, `tx.pipelineSupported()`, `tx.transaction()`, `tx.connect()`, `tx.pool`, `tx.stats`, `tx.disconnect()` or `tx.end()`. `TransactionClient` declares exactly `table()`, `$transaction()`, `raw` and `schema` (plus the generated per-table accessors) and has no index signature, so reaching for any of the others is a **compile error** (`TS2339`), caught in your editor rather than in production. See [Transactions & Pipelines](https://turbineorm.dev/transactions#transactionclient-reference) for the full surface and the reason each omission exists.
+`tx` is a `TransactionClient`, which is deliberately a **smaller** object than `db`. Its application surface is table accessors (`tx.users`, or `tx.table('users')`), `tx.$transaction(fn)` for SAVEPOINT-nested blocks, `tx.raw` for tagged-template raw SQL, and `tx.schema`. It does **not** have `tx.sql`, `tx.pipeline`, `tx.$use`, `tx.$listen` / `tx.$notify`, `tx.$observe`, `tx.$on` / `tx.$off`, `tx.$retry`, `tx.$primary`, `tx.$withSession`, `tx.pipelineSupported()`, `tx.transaction()`, `tx.connect()`, `tx.pool`, `tx.stats`, `tx.disconnect()` or `tx.end()`. `TransactionClient` declares `table()`, `$transaction()`, `raw`, `schema` and one `@internal` member (see below), plus the generated per-table accessors, and has no index signature, so reaching for any of the others is a **compile error** (`TS2339`), caught in your editor rather than in production. Reach for `tx.raw`: the tagged template turns every `${value}` into a placeholder, so a value cannot be concatenated into the SQL text by accident.
+
+`tx.rawQuery(text, params)` is the one `@internal` member. It is the seam `turbine-orm/prisma-compat` detects by shape so it can run compat raw SQL on the transaction's own connection, and it takes the SQL as a plain string, which puts the escaping discipline back on the caller, exactly what `tx.raw` exists to remove. It still exists at runtime and still typechecks, so nothing calling it breaks, it is simply no longer part of the documented API.
+
+Note that transaction-scoped raw SQL (`tx.raw`, and `tx.rawQuery`) bypasses the instrumentation layer: it emits no `$on('query')` event, runs no middleware, and records no timing, so it is invisible to query listeners and to `$observe` metrics. Table-scoped queries inside the transaction (`tx.users.findMany(...)`) are instrumented as usual. See [Transactions & Pipelines](https://turbineorm.dev/transactions#transactionclient-reference) for the full surface and the reason each omission exists.
 
 ### Pipeline (batch queries in one round-trip)
 
@@ -409,12 +418,20 @@ const db = turbine({
   // subqueries, ~39% fewer wire bytes on wide relations, byte-identical output.
   // Default 'object'.
   jsonEncoding: 'object',
-  // Parse `timestamp` (without time zone) as UTC, the Prisma/Rails/Django
-  // convention, so results don't shift with the server's local zone.
+  // Treat zone-less `date` / `timestamp` columns as UTC, the Prisma/Rails/
+  // Django convention, so results don't shift with the server's local zone.
+  // Since v0.52 it reaches the WRITE side too (the `Date` values that
+  // create/update/upsert and where clauses bind on Postgres); before v0.52 it
+  // reached reads only, so a client that set `false` was still binding UTC.
+  // PER PROCESS, NOT PER CLIENT: see the note below.
   // Default true; set false for the legacy local-time interpretation.
   utcTimestamps: true,
 });
 ```
+
+> **`utcTimestamps` is a process-wide decision, not a per-client one.** The two halves settle differently. The WRITE half is per client: a `Date` bound to a zone-less `date` / `timestamp` column is rewritten to a UTC literal unless that client opted out. The READ half is a pg type parser on OID 1114, and `pg.types.setTypeParser` installs one parser per OID for the whole pg module, shared by every pool, every raw query, and any other library on the same `pg`. The first Turbine-owned client in the process settles it for all the rest. Constructing a second Turbine-owned client with the **opposite** value therefore throws `ValidationError` (`TURBINE_E003`) at construction, rather than handing back a client that writes UTC and reads local (or the reverse) and so does not round-trip its own values. The message names both values and the two ways out: give every client in the process the same `utcTimestamps`, or run the odd one out in its own process. Clients built on an external pool (`pool: ...`, `turbineHttp()`) never register a parser, settle nothing, and are exempt from the check, they inherit whatever parser configuration the caller set up.
+
+> **Upgrading with `utcTimestamps: false`.** If you already set `false`, this release changes the **stored text** of your writes: the write path now honors the flag where it previously ignored it, so zone-less columns receive local-calendar literals instead of UTC ones. Rows written before the upgrade and rows written after carry two conventions in the same column until you backfill.
 
 Run `npx turbine doctor` to catch relations whose child-side FK lacks a covering index, the correlated-subquery strategy probes the child once per parent row, so a missing FK index costs a full scan per parent.
 
@@ -842,6 +859,17 @@ db.$on('query', (e) => {
 });
 ```
 
+**`event.params` is redacted by default**: every value arrives as `'[REDACTED]'` so a query log can't carry user data into a log sink. Opt in with `logQueryParams: true` on the client (`errorMessages: 'verbose'` also reveals them, and keeps doing so). Nothing else about the event changes.
+
+```typescript
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  logQueryParams: process.env.NODE_ENV !== 'production',
+});
+```
+
+See [Observability](https://turbineorm.dev/observability#seeing-the-parameter-values-logqueryparams) for the full behavior.
+
 View the collected metrics in a local dashboard:
 
 ```bash
@@ -1064,7 +1092,7 @@ Turbine maps Postgres types to TypeScript:
 | `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` (2^53 - 1) are returned as `string` at runtime to avoid precision loss. This affects < 0.01% of use cases (auto-increment IDs, counts, etc. are all safe). |
 | `numeric`, `money` | `string` | Arbitrary precision, kept as string to avoid JS float issues |
 | `text`, `varchar`, `uuid`, `citext` | `string` | |
-| `timestamptz`, `timestamp`, `date` | `Date` | `timestamp` (without time zone) is parsed as UTC by default (Prisma/Rails/Django convention), so the same row yields the same instant in every region. Opt out with `utcTimestamps: false`. |
+| `timestamptz`, `timestamp`, `date` | `Date` | `timestamp` (without time zone) is parsed as UTC by default (Prisma/Rails/Django convention), so the same row yields the same instant in every region. Opt out with `utcTimestamps: false`. Since v0.52 the flag also reaches the WRITE side on Postgres: it governs the `Date` values that `create` / `update` / `upsert` and `where` clauses bind to zone-less `date` / `timestamp` columns. Before v0.52 it reached the read path only, so a client that had set `false` was still binding UTC, and those statements (and the text they store) change on upgrade. The two halves settle at different scopes: the write half is per client, the read half is a process-global pg type parser, so two Turbine-owned clients in one process must agree or construction throws `ValidationError`. See [Relation loading and wire encoding](#relation-loading-and-wire-encoding). |
 | `boolean` | `boolean` | |
 | `json`, `jsonb` | `unknown` | |
 | `bytea` | `Buffer` | |

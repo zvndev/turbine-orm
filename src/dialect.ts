@@ -60,6 +60,21 @@ export interface BulkInsertStatementInput {
   requireRowValues?: boolean;
 }
 
+export interface DefaultValuesInsertStatementInput {
+  /** SQL-ready quoted table name. */
+  table: string;
+  /**
+   * How many all-defaults rows to insert. Always a positive integer (the length
+   * of the caller's `data` array), never a user-supplied value, so a dialect may
+   * render it as a literal.
+   */
+  rowCount: number;
+  /** Skip duplicate rows when supported by the dialect. */
+  skipDuplicates?: boolean;
+  /** Optional SQL-ready RETURNING selection. */
+  returning?: ReturningSelection;
+}
+
 /**
  * The cast/decode pair for one JSON-divergent column type. See
  * {@link Dialect.jsonWireRule}. The two halves MUST agree: a cast with no
@@ -423,6 +438,26 @@ export interface Dialect {
   /** Build a multi-row bulk INSERT statement and its dialect-shaped params. */
   buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement;
 
+  /**
+   * Build an INSERT that binds NO column values, so every column takes its
+   * declared default: `create({ data: {} })` and `createMany({ data: [{}, …] })`.
+   *
+   * The naive `INSERT INTO t () VALUES ()` the column-driven builders produce for
+   * an empty `data` is a syntax error on every engine but MySQL, and an empty
+   * `data` object is easy to reach honestly (a handler that assembles its payload
+   * from optional request fields, against a table where every column has a
+   * default or is nullable). The correct statement differs per engine, so it
+   * lives here rather than as an engine test in the write builders.
+   *
+   * Implementations MUST honor `rowCount`, and MUST throw an
+   * {@link UnsupportedFeatureError} naming the engine when the engine cannot
+   * express the requested shape (several engines have a single-row-only
+   * `DEFAULT VALUES` and no multi-row equivalent) rather than emitting SQL the
+   * database will reject. Optional: a dialect that omits it raises E017 for both
+   * shapes.
+   */
+  buildDefaultValuesInsertStatement?(input: DefaultValuesInsertStatementInput): string;
+
   /** Build an upsert statement. Inputs are SQL-ready quoted fragments. */
   buildUpsertStatement(input: UpsertStatementInput): string;
 
@@ -766,6 +801,23 @@ export const postgresDialect: Dialect = {
     let sql = `INSERT INTO ${input.table} (${input.columns.join(', ')}) SELECT * FROM UNNEST(${unnestArgs.join(', ')})`;
     if (input.skipDuplicates) sql += ' ON CONFLICT DO NOTHING';
     return { sql: `${sql}${this.buildReturningClause(input.returning)}`, params: columnArrays };
+  },
+
+  buildDefaultValuesInsertStatement(input: DefaultValuesInsertStatementInput): string {
+    const conflict = input.skipDuplicates ? ' ON CONFLICT DO NOTHING' : '';
+    if (input.rowCount === 1) {
+      return `INSERT INTO ${input.table} DEFAULT VALUES${conflict}${this.buildReturningClause(input.returning)}`;
+    }
+    // N all-defaults rows: `DEFAULT VALUES` is single-row only, so feed the
+    // INSERT a zero-column SELECT of N source rows instead. Every column still
+    // takes its default (nothing is projected into the INSERT), and unlike
+    // `VALUES (DEFAULT), (DEFAULT)` it does not depend on the table's first
+    // column accepting the DEFAULT keyword. `rowCount` is the caller's array
+    // length, so the literal is an internal integer, not a bound user value.
+    return (
+      `INSERT INTO ${input.table} SELECT FROM generate_series(1, ${input.rowCount})` +
+      `${conflict}${this.buildReturningClause(input.returning)}`
+    );
   },
 
   buildUpsertStatement(input: UpsertStatementInput): string {

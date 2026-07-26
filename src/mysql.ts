@@ -63,7 +63,7 @@
  * ```
  */
 
-import { type PgCompatPool, type PgCompatPoolClient, TurbineClient, type TurbineConfig } from './client.js';
+import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
 import {
   type BuiltStatement,
   type BulkInsertStatementInput,
@@ -71,6 +71,7 @@ import {
   type ColumnTypeInput,
   type CreateIndexStatementInput,
   type CreateTableStatementInput,
+  type DefaultValuesInsertStatementInput,
   type Dialect,
   type DialectIntrospector,
   type InsertStatementInput,
@@ -80,6 +81,7 @@ import {
   type StreamableConnection,
   type UpsertStatementInput,
 } from './dialect.js';
+import type { EngineClientConfig } from './engine-config.js';
 import { ConnectionError, UnsupportedFeatureError } from './errors.js';
 import { applyTableFilters, deriveEngineRelations } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
@@ -591,6 +593,25 @@ export const mysqlDialect: Dialect = {
       sql: `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${placeholders}${conflict}`,
       params: input.rowValues.flat(),
     };
+  },
+
+  buildDefaultValuesInsertStatement(input: DefaultValuesInsertStatementInput): string {
+    // MySQL is the one engine whose empty `VALUES ()` tuple is legal, and it
+    // repeats for any row count, so this is the same statement the column-driven
+    // builders already emitted for an empty `data`.
+    if (input.skipDuplicates) {
+      // `ON DUPLICATE KEY UPDATE` needs a column to assign, and there is no
+      // column here. `INSERT IGNORE` would swallow unrelated errors too, so
+      // refuse rather than quietly change what the flag means.
+      throw new UnsupportedFeatureError(
+        'createMany({ data: [{}, …], skipDuplicates: true })',
+        'mysql',
+        'MySQL ON DUPLICATE KEY UPDATE needs a column assignment, and rows of pure defaults name none; ' +
+          'supply the conflict column in each row.',
+      );
+    }
+    const tuples = Array.from({ length: input.rowCount }, () => '()').join(', ');
+    return `INSERT INTO ${input.table} () VALUES ${tuples}`;
   },
 
   buildUpsertStatement(input: UpsertStatementInput): string {
@@ -1107,8 +1128,11 @@ function assertSupportedVersion(version: string): void {
 // turbineMysql, the public factory
 // ---------------------------------------------------------------------------
 
-/** Options for {@link turbineMysql}. Mirrors the relevant {@link TurbineConfig} fields. */
-export interface TurbineMysqlOptions extends Pick<TurbineConfig, 'logging' | 'defaultLimit' | 'warnOnUnlimited'> {
+/**
+ * Options for {@link turbineMysql}: every client-level `TurbineConfig` field the
+ * engine can honour (see {@link EngineClientConfig}) plus the pool size below.
+ */
+export interface TurbineMysqlOptions extends EngineClientConfig {
   /** Maximum number of pooled connections (when Turbine builds the pool). Default: 10. */
   connectionLimit?: number;
 }
@@ -1183,14 +1207,17 @@ export async function turbineMysql(
   const versionRows = (await pool.query('SELECT VERSION() AS v')).rows as { v?: string }[];
   assertSupportedVersion(String(versionRows[0]?.v ?? ''));
 
+  // Everything that is not a pool-construction option is client config and
+  // rides through untouched, so a new TurbineConfig option works here the day
+  // it lands. The engine-owned keys come last, so no caller can unbind the
+  // dialect.
+  const { connectionLimit: _connectionLimit, ...clientConfig } = options;
   const client = new TurbineClient(
     {
+      ...clientConfig,
       pool,
       dialect: mysqlDialect,
       preparedStatements: false,
-      logging: options.logging,
-      defaultLimit: options.defaultLimit,
-      warnOnUnlimited: options.warnOnUnlimited,
     },
     schema,
   );

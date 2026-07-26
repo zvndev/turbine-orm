@@ -9,10 +9,15 @@
  * `limit` above AUTO_TO_ONE_JOIN_MAX_ROWS) and keeps the single-statement join
  * when the `limit` bounds it small.
  *
- * The reserved `_count` key is the mirror case: an inline `_count` is also one
- * correlated COUNT(*) per parent row, so its unindexed-probe fallback only pays
- * for itself when there are many parents; for a handful the extra round-trip
- * costs more than the repeated small scans.
+ * The reserved `_count` key is a RELATED but differently-shaped case, and it has
+ * its own threshold (AUTO_COUNT_BATCH_MIN_PARENT_ROWS). An inline `_count` is
+ * also one correlated subquery per parent row, but on an unindexed probe that
+ * subquery is a full scan of the child table rather than a cheap indexed
+ * lookup, so the batched follow-up (one grouped scan plus a round trip) pays for
+ * itself from the SECOND parent row upward, not at some large row count. It is
+ * therefore preferred everywhere except a parent set provably bounded at one
+ * row, where inline is one scan against batched's one scan plus a round trip and
+ * so cannot lose.
  */
 
 import assert from 'node:assert/strict';
@@ -21,6 +26,7 @@ import type pg from 'pg';
 import type { QueryEvent } from '../query/deferred.js';
 import {
   AUTO_ASSUMED_ROUND_TRIP_MS,
+  AUTO_COUNT_BATCH_MIN_PARENT_ROWS,
   AUTO_JOIN_PENALTY_MS_PER_ROW,
   AUTO_TO_ONE_JOIN_MAX_ROWS,
   AUTO_TO_ONE_JOIN_ROWS_MAX,
@@ -301,10 +307,47 @@ describe("'auto', to-one cardinality", () => {
 });
 
 describe("'auto', relation _count", () => {
-  it('a _count on an UNINDEXED FK stays inline for a bounded parent set', async () => {
+  // The bound at which the `_count` fallback engages is
+  // AUTO_COUNT_BATCH_MIN_PARENT_ROWS (2), NOT the to-one break-even. Measured
+  // (benchmarks/bench-count-strategy.ts, 200K-row child table, medians of 11
+  // interleaved reps): inline wins only at 1 parent, and by 0.9ms; at 2 parents
+  // batched wins 1.73x, at 30 parents 12.9x, at 1000 parents 311x. The 0.50
+  // release gated this fallback on the to-one parent-set-large rule, which held
+  // a bounded `limit: 30` query on the plan that is 12.9x slower.
+  it('a _count on an UNINDEXED FK falls back even for a small bounded parent set', async () => {
     const { q, calls } = db();
     await q.findMany({ limit: 30, with: { _count: { flags: true } } } as never);
-    assert.equal(calls.length, 1, 'no extra round-trip for 30 parents');
+    assert.ok(
+      calls.some((c) => /GROUP BY/.test(c.sql)),
+      '30 parents → one grouped COUNT follow-up',
+    );
+  });
+
+  it('a _count on an UNINDEXED FK falls back at exactly AUTO_COUNT_BATCH_MIN_PARENT_ROWS', async () => {
+    assert.equal(AUTO_COUNT_BATCH_MIN_PARENT_ROWS, 2);
+    const at = db();
+    await at.q.findMany({ limit: AUTO_COUNT_BATCH_MIN_PARENT_ROWS, with: { _count: { flags: true } } } as never);
+    assert.ok(
+      at.calls.some((c) => /GROUP BY/.test(c.sql)),
+      'at the threshold → grouped follow-up',
+    );
+  });
+
+  it('a _count on an UNINDEXED FK stays inline for a parent set provably bounded at one row', async () => {
+    // The only cell inline can never lose: batched costs the same one scan plus
+    // a round trip. `take` and `limit` are both honoured.
+    for (const args of [{ limit: 1 }, { take: 1 }]) {
+      const { q, calls } = db();
+      await q.findMany({ ...args, with: { _count: { flags: true } } } as never);
+      assert.equal(calls.length, 1, `no extra round-trip for a one-row parent set (${JSON.stringify(args)})`);
+      assert.match(calls[0]!.sql, /_count__flags/);
+    }
+  });
+
+  it('findFirst keeps an UNINDEXED _count inline: its parent set is one row', async () => {
+    const { q, calls } = db();
+    await q.findFirst({ with: { _count: { flags: true } } } as never);
+    assert.equal(calls.length, 1);
     assert.match(calls[0]!.sql, /_count__flags/);
   });
 

@@ -237,12 +237,20 @@ The `tx` handed to your `$transaction` callback is a `TransactionClient`, and it
 | Table accessors | `tx.users`, `tx.orderItems`, ... | Same `QueryInterface` API as `db.users`. Accessor names are the camelCase form of each table name in the schema, defined at construction. |
 | `tx.table<T>(name)` | `(name: string) => QueryInterface<T>` | Escape hatch for a table not present in the generated types. Same instance is reused for repeated calls. |
 | `tx.$transaction(fn)` | `(fn: (tx: TransactionClient) => Promise<R>) => Promise<R>` | Nested block via `SAVEPOINT sp_1`, `sp_2`, ... Releases the savepoint on success, rolls back **to the savepoint only** on throw, then rethrows. **Takes no options object**: isolation level, timeout and `sessionContext` are properties of the outer transaction and cannot be changed part way through. Note that `fn` receives the *same* `tx`, not a child object. |
-| `tx.raw` | ``tx.raw<T>`SELECT ... ${value}` `` | Tagged template. Every `${value}` becomes a placeholder bound by the driver. Driver errors are translated by `wrapPgError`, so you get the same typed errors as ORM queries. |
+| `tx.raw` | ``tx.raw<T>`SELECT ... ${value}` `` | Tagged template, and the one to reach for in application code. Every `${value}` becomes a placeholder bound by the driver, so a value cannot end up concatenated into the SQL text. Returns the rows. Driver errors are translated by `wrapPgError`, so you get the same typed errors as ORM queries. |
 | `tx.schema` | `SchemaMetadata` | The metadata the transaction was built from. |
+
+<Callout type="note">
+**Transaction-scoped raw SQL is not instrumented.** `tx.raw` (and the internal `tx.rawQuery` below) go straight to the transaction's connection: they emit no `$on('query')` event, run no middleware, and record no timing, so they never appear in query listeners or `$observe` metrics. Table-scoped calls inside the same transaction (`tx.users.findMany(...)`) are instrumented exactly as they are outside one. If you need a raw statement to show up in your query log, log it yourself at the call site.
+</Callout>
+
+### The one internal member
+
+`tx.rawQuery(text, params)` is marked `@internal` and is **not** application API. It is the seam `turbine-orm/prisma-compat` detects by shape (`typeof tx.rawQuery === 'function'`) so it can run compat raw SQL on the transaction's own connection instead of quietly falling back to a pool connection outside the transaction. It takes the SQL as a plain string rather than a tagged template, which moves the escaping discipline to the caller, and that is precisely the property `tx.raw` exists to remove. It still exists at runtime and still typechecks, so code already calling it keeps working; it is simply no longer advertised. Use `tx.raw`.
 
 ### What `tx` does not have
 
-Reaching for any of these is a **compile error** (`TS2339: Property '<x>' does not exist on type 'TransactionClient'`). `TransactionClient` is a plain class whose declared members are exactly `table()`, `$transaction()`, `raw` and `schema`, with no index signature, so TypeScript rejects every name below before the code ever runs. The table accessors are installed at construction with `Object.defineProperty` and typed by the generated `TypedTransactionClient` subclass, which declares one property per table. Neither the base class nor the generated subclass has a catch-all index signature, so nothing below type-checks.
+Reaching for any of these is a **compile error** (`TS2339: Property '<x>' does not exist on type 'TransactionClient'`). `TransactionClient` is a plain class whose declared members are `table()`, `$transaction()`, `raw`, `schema` and the internal `rawQuery()` above, with no index signature, so TypeScript rejects every name below before the code ever runs. The table accessors are installed at construction with `Object.defineProperty` and typed by the generated `TypedTransactionClient` subclass, which declares one property per table. Neither the base class nor the generated subclass has a catch-all index signature, so nothing below type-checks.
 
 | Missing | Use instead | Why |
 |---|---|---|

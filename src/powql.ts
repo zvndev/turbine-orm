@@ -47,6 +47,7 @@ import {
   ALL_POWDB_CAPABILITIES,
   coerceNativeValue,
   isJsonColumn,
+  isPowdbDatetimeColumn,
   isStaleFramePowdbError,
   type PowdbCapabilities,
   PowdbFloatParam,
@@ -102,6 +103,19 @@ import {
  * before grouping. Mirrors the chunking the parity matrix documents.
  */
 const MAX_RELATION_KEYS = 1000;
+
+/**
+ * Max values one `in` / `notIn` on a PowDB-native `datetime` column may carry.
+ *
+ * Such a list is never sent as a list: it is expanded into an equality chain
+ * (see {@link PowqlInterface.buildDatetimeInList}), and PowQL spends one level
+ * of its 64-level nesting budget per chain term. Measured on the 0.20.0 addon:
+ * 63 terms parse at the top level, 61 one level deep, whatever else the
+ * predicate contains. 32 leaves room for the surrounding filter, and is also the
+ * key-chunk size the relation loaders use for a datetime correlation column, so
+ * a loader can never build a chain the engine will reject.
+ */
+export const MAX_POWQL_DATETIME_TERMS = 32;
 
 /**
  * Read-shaped actions whose statement may be transparently replayed once on a
@@ -401,6 +415,40 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return this.pool.capabilities ?? ALL_POWDB_CAPABILITIES;
   }
 
+  /**
+   * The `limit` a query actually emits: the explicit `limit`, Prisma's `take`
+   * alias, then the client-level `defaultLimit`. Shared by {@link buildFind} and
+   * the {@link findMany} zero short-circuit so the two can never disagree about
+   * which limit is in force.
+   */
+  private effectiveLimit(args: FindManyArgs<T>): number | undefined {
+    return args.limit ?? (args as { take?: number }).take ?? this.defaultLimit;
+  }
+
+  /**
+   * Reject a negative `limit` / `offset` before it reaches the engine. PowDB
+   * casts both with `as usize` at execution, so below engine 0.20 a negative
+   * limit wrapped to `usize::MAX` and silently returned EVERY row, the opposite
+   * of what the caller asked for; 0.20 refuses it. Validating client-side makes
+   * the refusal identical on every engine version and names the argument.
+   *
+   * `limit: 0` is legal and means "no rows" (SQL `LIMIT 0`). It is not emitted:
+   * callers short-circuit it, because PowDB's projection fast path returned ONE
+   * row for `limit 0` below 0.20.
+   */
+  private assertPagination(limit: number | undefined, offset: number | undefined, context: string): void {
+    for (const [name, value] of [
+      ['limit', limit],
+      ['offset', offset],
+    ] as const) {
+      if (value !== undefined && value !== null && value < 0) {
+        throw new ValidationError(
+          `[turbine] ${context} on "${this.table}": \`${name}\` must not be negative (got ${value}).`,
+        );
+      }
+    }
+  }
+
   /** A predicate that is always false, the empty-`in` / contradiction sentinel. */
   private alwaysFalse(): string {
     const pk = this.meta.primaryKey[0] ?? this.meta.columns[0]?.name;
@@ -453,12 +501,55 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return parts.join(' and ');
   }
 
+  /**
+   * Gate a predicate on a PowDB-native `datetime` column. Turbine binds a JS
+   * `Date` as an integer count of microseconds, and PowDB writes a timestamp
+   * literal as a plain integer, so every such predicate is a `DateTime` vs `Int`
+   * comparison. Below engine 0.20 that pairing was unhandled and fell back to
+   * comparing TYPE TAGS, so `>` matched every non-null row, `=` and `<` matched
+   * none, and the answer additionally changed with the column's access path
+   * (indexed vs scanned). 0.20 compares microseconds and every binary operator
+   * (`=`, `!=`, `<`, `<=`, `>`, `>=`) is correct.
+   *
+   * ONE gate covers the whole family, whatever spelling the caller used. `in` /
+   * `not in` are included because their still-broken LIST form is never emitted:
+   * {@link buildInList} expands a datetime list into the equality chain the
+   * engine does answer correctly, which is the same binary comparison this flag
+   * governs. So on >= 0.20 every path is served (direct predicates, relation
+   * filters, the batched loaders, nested projections, native joins, and the
+   * findUnique / update / delete / upsert by-key paths), and below 0.20 every
+   * path that compares against a literal is refused with one message, which
+   * names the read paths that do not.
+   *
+   * `is null` / `is not null` are never gated: they compare no literal and are
+   * correct on every version. Ordering, grouping and `min`/`max` are likewise
+   * unaffected (they compare datetimes against each other, never against an int),
+   * as are nested-projection and join correlations, which are column-to-column.
+   *
+   * Only PowDB's native `datetime` type is affected. Turbine's own DDL emits
+   * `int` epoch micros for a `Date` column, so a Turbine-provisioned database
+   * never reaches this: the exposed shape is a table created outside Turbine and
+   * read through `introspectPowdbDatabase`, or hand-written metadata.
+   */
+  private assertDatetimePredicateSupported(col: ColumnMetadata): void {
+    if (!isPowdbDatetimeColumn(col)) return;
+    requireCapability(
+      this.capabilities,
+      'datetimeCompare',
+      `comparisons on the PowDB datetime column "${col.name}"`,
+      'Reading that column is unaffected, and so are ordering, grouping and `is null` checks; only comparing it ' +
+        'against a bound timestamp needs the fix. A nested `with` (the default nested-projection / join paths) ' +
+        'correlates column to column, so it loads the relation without any such comparison.',
+    );
+  }
+
   /** Build a single `field: value | operator` condition. */
   private buildFieldCondition(field: string, value: unknown, params: unknown[], alias?: string): string {
     const colMeta = this.column(field);
     const ref = this.ref(field, alias);
     if (value === null) return `${ref} is null`;
     if (value instanceof Date || typeof value !== 'object') {
+      this.assertDatetimePredicateSupported(colMeta);
       return `${ref} = ${this.param(value, params, colMeta)}`;
     }
     const op = value as Record<string, unknown>;
@@ -473,6 +564,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     rejectUnsupportedFilter(op, field);
     if (!Object.keys(op).some((k) => OPERATOR_KEYS.has(k))) {
       // A bare object that is not an operator set, equality by value.
+      this.assertDatetimePredicateSupported(colMeta);
       return `${ref} = ${this.param(value, params)}`;
     }
     const insensitive = op.mode === 'insensitive';
@@ -480,6 +572,17 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const conds: string[] = [];
     for (const [opName, opVal] of Object.entries(op)) {
       if (opVal === undefined || opName === 'mode') continue;
+      // Every operator below compares the column against a bound literal, which
+      // is the shape a PowDB `datetime` column can only answer from engine 0.20
+      // (see assertDatetimePredicateSupported; `in`/`notIn` reach the engine as
+      // an equality chain, so they are the same comparison). The two exceptions
+      // compare nothing and stay allowed on every version: a null operand
+      // (`equals`/`not: null` → `is [not] null`) and an empty `in`/`notIn` list
+      // (a compile-time constant, never sent).
+      const comparesNothing =
+        (opVal === null && (opName === 'equals' || opName === 'not')) ||
+        ((opName === 'in' || opName === 'notIn') && Array.isArray(opVal) && opVal.length === 0);
+      if (!comparesNothing) this.assertDatetimePredicateSupported(colMeta);
       switch (opName) {
         case 'equals':
           conds.push(opVal === null ? `${ref} is null` : `${lhs} = ${this.bind(opVal, params, insensitive)}`);
@@ -504,10 +607,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           conds.push(`${lhs} <= ${this.bind(opVal, params, insensitive)}`);
           break;
         case 'in':
-          conds.push(this.buildInList(lhs, opVal as unknown[], params, insensitive, false));
+          conds.push(this.buildInList(lhs, opVal as unknown[], params, insensitive, false, colMeta));
           break;
         case 'notIn':
-          conds.push(this.buildInList(lhs, opVal as unknown[], params, insensitive, true));
+          conds.push(this.buildInList(lhs, opVal as unknown[], params, insensitive, true, colMeta));
           break;
         case 'contains':
           conds.push(`${lhs} like ${this.bindLike(`%${escapeLike(String(opVal))}%`, params, insensitive)}`);
@@ -665,19 +768,26 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return insensitive ? `lower(${ph})` : ph;
   }
 
-  /** `lhs [not] in ($1, $2, …)`, empty list collapses to a constant. */
+  /**
+   * `lhs [not] in ($1, $2, …)`, empty list collapses to a constant.
+   *
+   * A PowDB-native `datetime` column takes the expanded form instead (see
+   * {@link buildDatetimeInList}): its `in` list is still broken upstream at 0.20.
+   */
   private buildInList(
     lhs: string,
     values: unknown[],
     params: unknown[],
     insensitive: boolean,
     negate: boolean,
+    col?: ColumnMetadata,
   ): string {
     if (!Array.isArray(values) || values.length === 0) {
       // `in []` matches nothing; `not in []` matches everything (SQL parity requires a
       // missing-value row to match `notIn []`, so NO presence guard is appended here).
       return negate ? '(1 = 1)' : this.alwaysFalse();
     }
+    if (col && isPowdbDatetimeColumn(col)) return this.buildDatetimeInList(lhs, values, params, negate, col);
     const items = values.map((v) => this.bind(v, params, insensitive)).join(', ');
     if (negate) {
       // PowQL `not in` matches missing-value rows, so append `and lhs is not null`
@@ -685,6 +795,90 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       return `(${lhs} not in (${items}) and ${lhs} is not null)`;
     }
     return `${lhs} in (${items})`;
+  }
+
+  /**
+   * `in` / `not in` on a PowDB-native `datetime` column, expanded into the
+   * equality chain the engine answers correctly:
+   *
+   *   `in`     → `(.ts = $1 or .ts = $2 …)`
+   *   `notIn`  → `(.ts != $1 and .ts != $2 … and .ts is not null)`
+   *
+   * PowQL's LIST form compares a datetime column against integer timestamp
+   * literals by TYPE TAG as of engine 0.20 (the 0.20 timestamp fix covered the
+   * binary operators only): measured on the 0.20.0 addon, `filter .ts in
+   * (<micros>, …)` matches nothing and `not in` matches everything, while the
+   * identical lists against an `int` control column answer correctly. The
+   * expanded chain uses the operators 0.20 DID fix, so it answers correctly and
+   * matches the int control exactly.
+   *
+   * This is what keeps the relation family coherent: relation filters and the
+   * batched loaders both compile to a key `in` list, so without the rewrite the
+   * same relation was refused through one strategy and served through another
+   * (nested projections and joins correlate column to column and never emit a
+   * list at all).
+   *
+   * The cost is the chain's width. PowQL bounds the SHAPE of the predicate tree,
+   * and a flat `or` / `and` chain spends one level per term against the same
+   * 64-level budget as nested parens (measured on 0.20: 63 terms at the top
+   * level, 61 one level deep), so the expansion is capped at
+   * {@link MAX_POWQL_DATETIME_TERMS} with headroom for whatever predicate it
+   * sits inside. The loaders chunk their key lists to that cap, so only a
+   * caller-written list (or a relation filter matching very many distinct
+   * timestamps) can exceed it, and that raises a typed E017 saying so rather
+   * than an engine parse failure.
+   */
+  private buildDatetimeInList(
+    lhs: string,
+    values: unknown[],
+    params: unknown[],
+    negate: boolean,
+    col: ColumnMetadata,
+  ): string {
+    if (values.length > MAX_POWQL_DATETIME_TERMS) {
+      throw new UnsupportedFeatureError(
+        `\`${negate ? 'notIn' : 'in'}\` with ${values.length} values on the PowDB datetime column "${col.name}"`,
+        'PowDB',
+        `PowQL's \`in\` list still compares a datetime column against integer timestamp literals by type tag as of ` +
+          `engine 0.20, so Turbine expands it into an equality chain, which PowQL's nesting budget caps at ` +
+          `${MAX_POWQL_DATETIME_TERMS} terms. Narrow the list (a \`gte\`/\`lte\` range over the same timestamps is ` +
+          'one comparison), split the call and merge the results, or store the column as a PowQL `int` of epoch ' +
+          "microseconds, which is what Turbine's own DDL emits for a `Date` column. A relation filter reaches this " +
+          'when the inner predicate matches more than that many distinct key timestamps.',
+      );
+    }
+    const terms = values.map((v) => `${lhs} ${negate ? '!=' : '='} ${this.param(v, params, col)}`);
+    // `!=` already excludes a missing-value row, but the trailing presence guard
+    // keeps the emitted predicate identical in meaning to the plain `not in`
+    // branch above (and to SQL null semantics) on every engine version.
+    if (negate) terms.push(`${lhs} is not null`);
+    return `(${terms.join(negate ? ' and ' : ' or ')})`;
+  }
+
+  /**
+   * A literal `ref in (…)` clause for the hand-built key lists the relation
+   * loaders emit (they bypass {@link buildWhere}). Routes a PowDB-native
+   * `datetime` key column through the same equality-chain expansion the
+   * where-builder uses, so a datetime junction / correlation key behaves
+   * identically however the statement was assembled.
+   */
+  private inClause(ref: string, values: unknown[], params: unknown[], col?: ColumnMetadata): string {
+    if (col && isPowdbDatetimeColumn(col)) {
+      this.assertDatetimePredicateSupported(col);
+      return this.buildDatetimeInList(ref, values, params, false, col);
+    }
+    return `${ref} in (${values.map((v) => this.param(v, params, col)).join(', ')})`;
+  }
+
+  /**
+   * Key-chunk size for a relation loader. A PowDB-native `datetime` correlation
+   * column's `in` list is expanded into an equality chain, which PowQL's nesting
+   * budget bounds, so those keys chunk at {@link MAX_POWQL_DATETIME_TERMS}
+   * (more, smaller round-trips) instead of {@link MAX_RELATION_KEYS}.
+   */
+  private keyChunkSize(meta: TableMetadata | undefined, colName: string): number {
+    const col = meta?.columns.find((c) => c.name === colName);
+    return col && isPowdbDatetimeColumn(col) ? MAX_POWQL_DATETIME_TERMS : MAX_RELATION_KEYS;
   }
 
   /**
@@ -816,15 +1010,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       return [...new Set(rows.map((r) => (r as Record<string, unknown>)[targetPkField]).filter((v) => v != null))];
     };
     // Junction source keys linking any of `targetPks` (literal IN-list, never a subquery).
+    const junctionMeta = this.schema.tables[through.table];
+    const targetJColMeta = junctionMeta?.columns.find((c) => c.name === targetJCol);
+    const junctionChunk = this.keyChunkSize(junctionMeta, targetJCol);
     const sourcesForTargets = async (targetPks: unknown[]): Promise<unknown[]> => {
       if (!targetPks.length) return [];
       const out = new Set<unknown>();
-      for (let i = 0; i < targetPks.length; i += MAX_RELATION_KEYS) {
-        const chunk = targetPks.slice(i, i + MAX_RELATION_KEYS);
+      for (let i = 0; i < targetPks.length; i += junctionChunk) {
+        const chunk = targetPks.slice(i, i + junctionChunk);
         const params: unknown[] = [];
-        const ph = chunk.map((v) => this.param(v, params)).join(', ');
+        const keyClause = this.inClause(`.${targetJCol}`, chunk, params, targetJColMeta);
         const { rows } = await this.exec(
-          `${quotePowqlIdent(through.table)} filter .${targetJCol} in (${ph}) { .${sourceJCol} }`,
+          `${quotePowqlIdent(through.table)} filter ${keyClause} { .${sourceJCol} }`,
           params,
           timeout,
           'findMany',
@@ -1163,6 +1360,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     return this.withMiddleware('findMany', args as unknown as Record<string, unknown>, async () => {
+      // `limit: 0` means "no rows" (SQL `LIMIT 0`), and answering it client-side
+      // is correct on every engine version: PowDB's projection fast path returned
+      // ONE row for `limit 0` below 0.20. Validate first so a negative limit still
+      // raises instead of falling through to a query.
+      this.assertPagination(this.effectiveLimit(args), args.offset, 'findMany');
+      if (this.effectiveLimit(args) === 0) return [];
       const { rows, native, resolvedWhere, nestedPlans, linkPlans, residualWith } = await this.runFind(
         args,
         'findMany',
@@ -1257,7 +1460,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const distinct = args.distinct?.length ? ' distinct' : '';
     const filter = where ? ` filter ${where}` : '';
     const order = this.buildOrder(args.orderBy, params, alias);
-    const limit = args.limit ?? (args as { take?: number }).take ?? this.defaultLimit;
+    const limit = this.effectiveLimit(args);
+    this.assertPagination(limit, args.offset, 'findMany');
     if (limit === undefined && this.warnOnUnlimited && !this.warnedUnlimited) {
       this.warnedUnlimited = true;
       console.warn(`[turbine] findMany on "${this.table}" has no limit: this scans the whole table.`);
@@ -1474,8 +1678,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // cell) so a datetime correlation column stitches instead of silently
       // returning [].
       const childByKey = new Map<string, T[]>();
-      for (let i = 0; i < keys.length; i += MAX_RELATION_KEYS) {
-        const chunk = keys.slice(i, i + MAX_RELATION_KEYS);
+      const chunkSize = this.keyChunkSize(targetMeta, childKeyCol);
+      for (let i = 0; i < keys.length; i += chunkSize) {
+        const chunk = keys.slice(i, i + chunkSize);
         const childWhere = {
           ...(fetchOptions.where as Record<string, unknown> | undefined),
           [childKeyField]: { in: chunk },
@@ -1559,13 +1764,16 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
 
     // (1) Junction rows: sourceKeyVal(String) → [targetKeyVal(String)].
+    const junctionMeta = this.schema.tables[through.table];
+    const sourceJColMeta = junctionMeta?.columns.find((c) => c.name === sourceJCol);
     const targetsBySource = new Map<string, string[]>();
     const allTargetVals = new Set<string>();
-    for (let i = 0; i < parentKeys.length; i += MAX_RELATION_KEYS) {
-      const chunk = parentKeys.slice(i, i + MAX_RELATION_KEYS);
+    const junctionChunk = this.keyChunkSize(junctionMeta, sourceJCol);
+    for (let i = 0; i < parentKeys.length; i += junctionChunk) {
+      const chunk = parentKeys.slice(i, i + junctionChunk);
       const params: unknown[] = [];
-      const placeholders = chunk.map((v) => this.param(v, params)).join(', ');
-      const powql = `${quotePowqlIdent(through.table)} filter .${sourceJCol} in (${placeholders}) { .${sourceJCol}, .${targetJCol} }`;
+      const keyClause = this.inClause(`.${sourceJCol}`, chunk, params, sourceJColMeta);
+      const powql = `${quotePowqlIdent(through.table)} filter ${keyClause} { .${sourceJCol}, .${targetJCol} }`;
       const { rows } = await this.exec(powql, params, timeout, 'findMany');
       for (const row of rows) {
         const sv = String(row[sourceJCol]);
@@ -1584,8 +1792,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const targetValList = [...allTargetVals].map((v) =>
       targetPkColMeta ? coerceScalar(v, targetPkColMeta.tsType) : v,
     );
-    for (let i = 0; i < targetValList.length; i += MAX_RELATION_KEYS) {
-      const chunk = targetValList.slice(i, i + MAX_RELATION_KEYS);
+    const targetChunk = this.keyChunkSize(targetMeta, targetPkCol);
+    for (let i = 0; i < targetValList.length; i += targetChunk) {
+      const chunk = targetValList.slice(i, i + targetChunk);
       const where = {
         ...(options.where as Record<string, unknown> | undefined),
         [targetPkField]: { in: chunk },
@@ -1692,6 +1901,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if ((options.limit !== undefined || options.offset) && (single || parentCount > MAX_RELATION_KEYS)) {
       return false;
     }
+    // A `limit 0` relation stays off the join statement for the same reason it
+    // stays off a nested projection: PowDB answered `limit 0` with one row below
+    // engine 0.20. The loader resolves it client-side, correctly on every version.
+    if (options.limit === 0) return false;
     return true;
   }
 
@@ -1750,6 +1963,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       options.timeout ?? timeout,
     );
     const order = targetQi.buildOrder(options.orderBy, params, 'c');
+    this.assertPagination(options.limit, options.offset, `relation "${relName}"`);
     const limitClause = options.limit !== undefined ? ` limit ${this.param(options.limit, params)}` : '';
     const offsetClause = options.offset ? ` offset ${this.param(options.offset, params)}` : '';
     const proj = this.joinProjection(childCols, `p.${quotePowqlIdent(parentKeyCol)}`, 'c');
@@ -1940,6 +2154,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    *   - m2m (the block takes exactly one child table; the junction-order
    *     stitch has no nested equivalent), and composite relation keys;
    *   - a to-one relation carrying `limit`/`offset` (the loaders' semantics);
+   *   - a relation `limit` of exactly 0 (a nested block would emit `limit 0`,
+   *     which PowDB's projection fast path answered with ONE row below engine
+   *     0.20; the loader path resolves it client-side and is correct on every
+   *     version). A NEGATIVE relation limit is refused outright, not fallen back;
    *   - `distinct` inside the relation options (no nested grammar for it);
    *   - a projected child column whose tsType is `bigint` or `Uint8Array`
    *     (values ride a JSON array, which cannot carry them losslessly);
@@ -1966,6 +2184,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if (options.distinct?.length) return null;
     const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
     if (single && (options.limit !== undefined || options.offset)) return null;
+    this.assertPagination(options.limit, options.offset, `relation "${relName}"`);
+    if (options.limit === 0) return null;
     const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
     const cols = targetQi.projectedColumns(
       options.select as Record<string, boolean> | undefined,
@@ -2334,6 +2554,53 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
   }
 
+  /**
+   * Refuse a `createMany` whose rows do not all name the SAME fields.
+   *
+   * PowQL could express it: a multi-row insert carries one `{ col := … }` tuple
+   * per row, each with its own column list, so a ragged call inserts every
+   * value. The SQL engines cannot, their single statement takes its column list
+   * from the first row, so a field only a later row names is dropped and a field
+   * only the first row names is written as NULL over that column's default. They
+   * refuse it (ValidationError, query/writes.ts), and PowDB matching that
+   * refusal is what makes the call portable: a shape accepted here and rejected
+   * by every other engine turns a PowDB-to-Postgres move into a hard error found
+   * in production rather than at the first run.
+   *
+   * Runs AFTER `applyPkDefault`, on the rows as they will actually be written:
+   * a defaulted string PK is filled in on every row, so `[{}, { name }]` is
+   * refused for the missing `name`, not for the PK the client supplied itself.
+   * Rows that all name the same fields (the overwhelmingly common shape,
+   * including N rows of pure defaults) cost one `Object.keys` pass and emit
+   * byte-identical PowQL.
+   */
+  private assertUniformCreateManyRows(rows: Record<string, unknown>[]): void {
+    const definedKeys = (row: Record<string, unknown>): string[] =>
+      Object.keys(row).filter((k) => row[k] !== undefined);
+    const firstKeys = definedKeys(rows[0]!);
+    const expected = new Set(firstKeys);
+    const quoteList = (names: string[]): string => names.map((n) => `"${n}"`).join(', ');
+    for (let i = 1; i < rows.length; i++) {
+      const rowKeys = definedKeys(rows[i]!);
+      // No stranger and the same count means the same set (object keys are unique).
+      const unexpected = rowKeys.filter((k) => !expected.has(k));
+      if (unexpected.length === 0 && rowKeys.length === expected.size) continue;
+      const present = new Set(rowKeys);
+      const missing = firstKeys.filter((k) => !present.has(k));
+      const parts: string[] = [];
+      if (missing.length > 0) parts.push(`does not supply ${quoteList(missing)}`);
+      if (unexpected.length > 0) parts.push(`supplies ${quoteList(unexpected)}, which the first row does not`);
+      throw new ValidationError(
+        `[turbine] createMany on "${this.table}": row ${i} ${parts.join(' and ')}. ` +
+          'Every row must supply the same fields (a field set to `undefined` counts as omitted, exactly as it does ' +
+          'in `create`). PowQL itself would insert the ragged rows, but the SQL engines build ONE statement whose ' +
+          "column list comes from the first row, so there a later row's extra field is dropped and a field it " +
+          "omits is written as NULL over that column's default. Supply the field explicitly on every row, or " +
+          'split the call into one createMany per field set.',
+      );
+    }
+  }
+
   async createMany(args: CreateManyArgs<T>): Promise<T[]> {
     return this.withMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
       if (args.skipDuplicates) {
@@ -2347,6 +2614,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       }
       const inputs = (args.data as Record<string, unknown>[]).map((d) => this.applyPkDefault(d));
       if (!inputs.length) return [];
+      this.assertUniformCreateManyRows(inputs);
       const params: unknown[] = [];
       const tuples = inputs.map((d) => {
         const assigns = this.scalarData(d);
@@ -2643,6 +2911,39 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
   }
 
+  /**
+   * Gate ONE field of a per-field `_count`.
+   *
+   * `_count: { col: true }` compiles to `count(T { .col })`, which counts
+   * NON-NULL values of the column (SQL's `COUNT(col)`) only from engine 0.20 on.
+   * Below 0.20 both PowDB frontends ignored the projection and returned the ROW
+   * count.
+   *
+   * That divergence only EXISTS on a nullable column: where the column is NOT
+   * NULL the row count and the non-null count are the same number, so the
+   * pre-0.20 answer was already the right one and the query keeps working. The
+   * gate is therefore per-column, not per-call: refusing the whole feature would
+   * take a correct, working call away from every user on the engine line Turbine
+   * shipped against and hand them nothing.
+   *
+   * Nullability comes from the column metadata (`introspectPowdbDatabase` reads
+   * PowDB's `required` modifier; `defineSchema` declares it). Metadata that
+   * claims NOT NULL for a column the live catalog lets be null would count rows
+   * instead of values below 0.20, the same drift any stale-metadata query has.
+   */
+  private assertProjectedCountSupported(field: string): void {
+    const col = this.column(field);
+    if (!col.nullable) return;
+    requireCapability(
+      this.capabilities,
+      'projectedCountNonNull',
+      `per-field \`_count\` of the nullable column "${col.name}"`,
+      'Below that version the engine ignored the column projection and returned the ROW count, which differs from ' +
+        'every SQL engine exactly when the column is nullable. `_count: true` (a row count) and a per-field ' +
+        '`_count` of a NOT NULL column are correct on every version and are never refused.',
+    );
+  }
+
   async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
     return this.withMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       // One scalar query per aggregate, PowDB's bare-projection aggregate is broken.
@@ -2663,6 +2964,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         } else {
           const counts: Record<string, number> = {};
           for (const field of Object.keys(args._count).filter((f) => (args._count as Record<string, boolean>)[f])) {
+            this.assertProjectedCountSupported(field);
             counts[field] = (await scalar(`count(${this.qt}${filter} { ${this.ref(field)} })`)) ?? 0;
           }
           result._count = counts;
@@ -2868,7 +3170,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const having = this.buildHaving(args.having, params, aggInner);
       const order = this.buildGroupOrder(args.orderBy, byOrderExprs, aggOrderExprs);
       // LIMIT / OFFSET over the result groups, applied after ORDER BY (mirrors
-      // the SQL groupBy). offset 0 is a no-op, matching findMany.
+      // the SQL groupBy). offset 0 is a no-op, matching findMany; `limit: 0` is
+      // answered client-side (PowDB returned one row for it below engine 0.20).
+      this.assertPagination(args.limit, args.offset, 'groupBy');
+      if (args.limit === 0) return [];
       const limitClause = args.limit !== undefined ? ` limit ${this.param(args.limit, params)}` : '';
       const offsetClause = args.offset ? ` offset ${this.param(args.offset, params)}` : '';
       const powql = `${this.qt}${filter} group ${groupExprs.join(', ')}${having}${order}${limitClause}${offsetClause} { ${proj.join(', ')} }`;

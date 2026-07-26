@@ -1,5 +1,219 @@
 # Changelog
 
+## 0.52.0 (2026-07-26)
+
+A correctness release, and an unusually self-critical one. Two of its four
+headline items are corrections to things this project shipped and documented
+wrongly in 0.50, not defects found in someone else's code.
+
+- **A `Date` could still be stored in the process's local time zone.** 0.50
+  fixed the binding but resolved the column's database type from ONE of the two
+  places metadata carries it. Metadata that fills the table-level
+  `dialectTypes` / `pgTypes` maps but not the per-column entries resolved to
+  nothing, the rewrite silently no-opped, and the driver stored local calendar
+  fields. A turbine-only round trip HIDES this, because the read path shifts
+  back by the same offset: the ORM reports the value you wrote while the column
+  is off by hours to psql, to another ORM, or to a BI tool.
+- **`utcTimestamps: false` never reached the write path at all.** The flag was
+  declared optional on the builder context and never copied onto it, so both
+  consumers evaluated `undefined !== false` and read that as opted IN. Setting
+  it therefore produced the worst available combination: reads stopped pinning
+  UTC while writes kept rewriting to it. It is honored now, which means anyone
+  already setting it writes DIFFERENT TEXT after this upgrade.
+- **The 0.50 note about the `auto` strategy and relation `_count` was wrong
+  twice.** It asserted that a grouped `COUNT(*)` scans the child table once
+  whether it runs inline or batched. An inline `_count` is not a grouped scan,
+  it is a correlated `COUNT(*)` re-evaluated per parent row. And the change it
+  announced as a fix was a regression: it pinned bounded queries to the plan
+  that measures 12.9x slower at 30 parent rows and 1,093x slower at 10,000.
+  Reverted, with the crossover measured rather than assumed.
+- **On PowDB below 0.20, every comparison against a `datetime` column returned
+  wrong rows.** A timestamp literal binds as an integer, and the engine compared
+  type tags rather than values, so a filter matched every non-null row, an
+  equality matched none, and the answer changed with the access path. The
+  exposure is narrow (turbine's own DDL never emits `datetime`), but where it
+  applied it was silent.
+
+Around those: `create({ data: {} })` emitted invalid SQL, `createMany` silently
+wrote NULL over a column default for any row whose shape differed from the
+first, relation `_count` key order was a race between concurrent queries, and
+three of the five engines could not set half the client config.
+
+### Added
+
+- **PowDB 0.20.0 support.** Two version-gated capabilities resolved from the
+  live version probe: comparisons against a native `datetime` column, and the
+  per-field `_count` form (`count(T { .col })`), which upstream changed from a
+  row count to a non-null count. The `_count` gate applies only to a NULLABLE
+  column, because on a NOT NULL column the row count IS the non-null count and
+  those calls were always correct. Turbine also now compiles a `datetime`
+  `in` / `notIn` into an equality chain (`(.ts = $1 or .ts = $2)`, and `!=`
+  joined by `and` plus `is not null` for the negated form), because the upstream
+  0.20 fix covered the binary operators but NOT the list forms: a raw `in` still
+  matches nothing and a raw `not in` still matches everything. That is the exact
+  shape relation filters and the batched loaders emit, so it would have been a
+  silently empty or silently widened relation. PowQL spends one nesting level
+  per chain term, so lists are capped at 32 values and the loaders chunk to the
+  same width. The tested lexer ceiling moves to 0.20, verified byte-identical
+  upstream rather than assumed.
+- **`logQueryParams`** (client config). Query-event parameters are redacted by
+  default, and the only previous way to see them was `errorMessages: 'verbose'`,
+  which also un-redacts `NotFoundError` messages. So "parameters visible, error
+  messages still safe" was unreachable. `logQueryParams` derives from
+  `errorMessages` when unset, so the default and the old spelling both still
+  work.
+- **`scopedConnect` gets a threat model in the docs**, not just a bullet. With
+  it off (the default), a handler that forwards a client-supplied id into a
+  nested `connect` hands any caller a cross-tenant write primitive.
+- **`create({ data: {} })` inserts a row of defaults** on every SQL engine
+  (`DEFAULT VALUES` on PostgreSQL and SQLite, `() VALUES ()` on MySQL,
+  `OUTPUT INSERTED.* DEFAULT VALUES` on SQL Server), through a new dialect hook.
+  It previously emitted `INSERT INTO t () VALUES ()` and failed with 42601. A
+  handler building its payload from optional fields produces `{}` on a
+  legitimate request. The multi-row all-defaults form raises a typed E017 on
+  SQLite and SQL Server, which cannot express it, rather than emitting SQL the
+  engine rejects.
+
+### Fixed
+
+- **A column's database type is resolved from both places metadata carries it.**
+  `col.dialectType ?? col.pgType ?? tableMeta.dialectTypes[name] ?? tableMeta.pgTypes[name]`.
+  A column in `dateColumns` that still resolves to nothing now raises a
+  once-per-table dev warning naming the columns, because that is the residual
+  silent-wrong-write shape.
+  **Migration:** if your metadata carries types only in the table-level maps
+  (hand-written, converted, or produced by a tool rather than by
+  `turbine generate`), your zone-less `date` / `timestamp` columns have been
+  storing local calendar fields. Establish the boundary before shifting any
+  history: upgrade, run in dev, confirm the new warning is silent, and only then
+  decide which rows predate the fix.
+- **`utcTimestamps: false` applies to writes and where-clause binds.**
+  **Migration:** the flag is genuinely per client on the write side, but the
+  read side is a pg type parser on OID 1114, which is process-global and settled
+  by the first turbine-owned client. Those cannot be made symmetric without
+  changing every non-ORM read on the same pg module. So a process that builds
+  two turbine-owned clients with OPPOSITE values now raises `ValidationError`
+  (E003) at construction rather than silently producing a client whose reads and
+  writes disagree. Give every client in a process the same value, or isolate the
+  odd one. Clients on an external pool register no parser and are exempt.
+- **Relation `_count` key order is deterministic again.** The batched loader ran
+  its per-relation follow-ups through `Promise.all` and assigned each key on
+  completion, so insertion order was a race: the same query on the same data
+  produced up to 9 distinct key orders across 12 runs. Anything deriving an
+  ETag, a cache key, or a snapshot from `JSON.stringify` of the payload saw
+  different bytes per request. Relation keys and `_count` entries are now seeded
+  in the join plan's own order before any query runs, so the batched, auto, and
+  join outputs are byte-identical. Note this is a different axis from
+  `stableRelationOrder`, which governs row order INSIDE a relation array.
+- **`createMany` silently wrote NULL over column defaults.** It derives its
+  entire column list from the first row, so a field a later row omitted was
+  written as NULL over that column's default, and a field only a later row named
+  was dropped and never reached the database. Both directions now raise E003
+  naming the row index and the differing columns. An explicit `undefined` counts
+  as omitted, matching single-row `create`.
+  **Migration:** nested writes and `prisma-compat` split mixed-shape arrays into
+  contiguous same-shape runs automatically, so `posts: { create: [...] }` and a
+  compat `createMany` keep working and now apply column defaults correctly
+  (Prisma binds literal NULL where a default exists only in the database, so
+  this is strictly better). A DIRECT `db.t.createMany` with mixed rows still
+  refuses, because it must remain one statement for `pipeline()` and the
+  `$transaction([...])` array form. Split the call, or name the field on every
+  row.
+- **Relation `_count` on an unindexed foreign key batches again, from two parent
+  rows up.** Measured on a 200,000-row child table: batched wins 1.73x at 2
+  parents, 12.9x at 30, 311x at 1,000, and 1,093x at 10,000.
+  `EXPLAIN (ANALYZE, BUFFERS)` at 30 parents shows 50,013 buffers inline against
+  1,727 batched, `loops=30` with `Rows Removed by Filter: 199980` each time. An
+  INDEXED `_count` is untouched and stays inline at every size (inline wins
+  1.30x to 2.06x), because the per-parent subquery collapses to an index-only
+  scan. No knob: choosing batched wrongly costs one round trip once, choosing
+  inline wrongly costs 31 seconds, and `relationLoadStrategy: 'join'` already
+  forces the single statement.
+- **The engine factories dropped half the client config.** SQLite, MySQL, and
+  SQL Server built their client from a hardcoded key allowlist, so
+  `errorMessages`, `globalFilters`, `scopedConnect`, `utcTimestamps`,
+  `implicitPkOrdering`, the SQL-cache options, and the new `logQueryParams` were
+  unreachable on those engines. Forwarding is now by exclusion, so the next
+  option added to `TurbineConfig` works everywhere on the day it lands.
+- **The `prisma-compat` transaction client had no raw SQL.** `$queryRaw`,
+  `$queryRawUnsafe`, `$executeRaw`, and `$executeRawUnsafe` exist on the
+  transaction surface now, bound to the transaction's own connection (proven by
+  a raw read seeing an uncommitted delegate write), sharing one factory with the
+  client-level surface so the two cannot drift.
+- **The many-to-many junction accessor warned about itself.** An m2m pair is
+  declared on both sides, so the second visit found the junction's own
+  registration and reported a collision on an accessor that existed and worked.
+  Genuine collisions still warn once.
+- **PowDB nested-projection `datetime` children came back as raw micro-second
+  strings.** Micros exceed safe-integer range so the engine renders them as JSON
+  text, and the coercion handled only numbers. Nested projections are the
+  default on engine 0.18 and above, so this was the default path.
+- **Five tracked source files contained literal NUL bytes**, each a Map-key or
+  join separator written as a raw character rather than an escape sequence
+  (`src/powdb.ts`, `src/index-advisor.ts`, `src/query/compound-unique.ts`, and
+  the Studio UI source and its generated module). `grep` and `file` classify
+  such a file as binary, so a search over it returns nothing and looks like a
+  clean miss rather than an error. The runtime values are unchanged; the bytes
+  are now escapes. Present since 0.48 in the PowDB case and longer in the
+  others.
+
+### Changed
+
+- **PowDB `createMany` requires every row to name the same fields**, matching
+  the SQL engines. PowQL tuples each carry their own column list, so ragged rows
+  were actually correct there; the alignment is for portability, so that moving
+  a codebase from PowDB to Postgres does not meet a new hard error.
+  **Migration:** split the call, or name the field on every row.
+- **PowDB storage-integrity failures are `ConnectionError` (E004), not E003.**
+  A corrupt page, corrupt catalog, or CRC mismatch is an open-time integrity
+  failure whose only recovery is restoring from a backup, not a query defect.
+  **Migration:** code catching E003 for storage failures stops matching.
+- **PowDB `limit: 0` returns `[]`** (it previously returned one row through a
+  projection fast path) and a negative `limit` or `offset` raises E003
+  client-side rather than being ignored.
+- **`TransactionClient.rawQuery` is `@internal`.** It is the seam
+  `prisma-compat` detects by shape. It takes a prebuilt SQL string, so escaping
+  is the caller's problem, which is exactly what `tx.raw`'s tagged template
+  exists to prevent. It still exists and still typechecks, so nothing breaks; it
+  is no longer advertised. Note that transaction-scoped raw SQL (`tx.raw` and
+  `tx.rawQuery`) emits no `$on('query')` event and runs no middleware or timing.
+- **`PrismaCompatTransactionClient` is now an intersection type** including the
+  raw surface and the lowercased alias delegates (the aliases already existed at
+  runtime; the type omitted them).
+  **Migration:** type-level only. A hand-built transaction-client stub typed
+  against the old shape needs the raw methods added.
+- **The `prisma-compat` SQL-fragment marker is a module-private symbol** rather
+  than a global-registry `Symbol.for`, so a fragment cannot be forged from
+  elsewhere in the process. The check fails closed either way (an unrecognized
+  fragment binds as a parameter rather than splicing), so this is hardening.
+
+### Documentation
+
+- **The relations page taught the wrong model of `_count`, and it caused a bug
+  report.** It stated that a grouped `COUNT(*)` scans the child table once
+  whether inline or batched. It does not: the inline form is a correlated
+  subquery per parent row. A reader believed the page and filed a report
+  repeating its reasoning back to us. The page now leads with the correlated
+  shape, carries the measured crossover and the `EXPLAIN` numbers, and names the
+  two remedies.
+- **"Resolves in one SQL statement" is now scoped to
+  `relationLoadStrategy: 'join'`** on the queries, quickstart, and agent-facing
+  pages. It has been inaccurate under the `auto` default since 0.41, and the new
+  `_count` threshold widens it further. The agent-facing page additionally tells
+  agents not to assert on statement counts unless a strategy is pinned.
+- **A PowDB benchmark inference was over-generalized.** Upstream re-measured its
+  own numbers and an indexed point lookup published as 3.0x FASTER than SQLite
+  is 7.9x slower. Our page correctly cited that, then used it to explain all
+  three of our read rows, when upstream measured one workload and ours differ by
+  harness, hardware, row count, and durability mode. The claim is scoped to
+  `findUnique`; `findMany` and nested `with` are stated as un-isolated between
+  engine drift and host noise, and the benchmark record file now agrees with the
+  public page instead of contradicting it.
+- The README's PII claim said enforcement is "in the SQL on every engine". PowDB
+  is the exception: its `returning` takes no column list, so the strip is
+  client-side after the values cross the wire. That distinction matters when the
+  claim is a security property.
+
 ## 0.51.0 (2026-07-26)
 
 A read-correctness release. Two things in it silently returned wrong data, and
