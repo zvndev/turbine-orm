@@ -232,7 +232,9 @@ export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateMa
 export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T>): DeferredQuery<T> {
   assertWritable(qi, 'update');
   qi.currentSkip = args.skipGlobalFilters;
-  const dataObj = args.data as Record<string, unknown>;
+  // `updatedAt`-tagged columns are filled in before anything reads `data`, so
+  // the SET list, the fingerprint and the param collector all see one object.
+  const dataObj = applyUpdatedAtColumns(qi, args.data as Record<string, unknown>);
   assertNoGeneratedColumns(qi, dataObj, 'update');
   // Prisma compound-unique selector (e.g. `{ orgId_userId: { orgId, userId } }`)
   // → the column conjunction, before the empty-`where` guard so the expanded
@@ -532,7 +534,7 @@ export function buildUpdateMany<T extends object>(
 ): DeferredQuery<{ count: number }> {
   assertWritable(qi, 'updateMany');
   qi.currentSkip = args.skipGlobalFilters;
-  const dataObj = args.data as Record<string, unknown>;
+  const dataObj = applyUpdatedAtColumns(qi, args.data as Record<string, unknown>);
   assertNoGeneratedColumns(qi, dataObj, 'updateMany');
   whereMod.assertMutationHasPredicate(
     qi,
@@ -669,6 +671,37 @@ export function piiFields(_qi: BuilderCtx, meta: TableMetadata): string[] {
  * SQL already excludes the columns). Derived purely from static per-table
  * schema metadata, so the write SQL cache needs no extra key segment.
  */
+/**
+ * Return `data` with every `updatedAt`-tagged column the caller did not name
+ * set to `now`, or the original object when the table has none.
+ *
+ * Prisma's `@updatedAt` has no turbine equivalent, so a migrated application
+ * had to remember the field on every single update — and the value is usually
+ * load-bearing in the response body, so forgetting it is a silent staleness
+ * bug rather than a crash. The tag is opt-in per column and never inferred
+ * from a column's name, so a schema that does not use it emits byte-identical
+ * SQL and an application already managing its own timestamp is untouched.
+ *
+ * The timestamp is generated CLIENT-side (like Prisma) rather than as a SQL
+ * `now()`, so it flows through the same temporal coercion as any other bound
+ * `Date` and lands in UTC on every engine.
+ *
+ * An explicit value always wins, including an explicit `null`: naming the
+ * column is a statement of intent.
+ */
+export function applyUpdatedAtColumns(qi: BuilderCtx, data: Record<string, unknown>): Record<string, unknown> {
+  const tagged = qi.tableMeta.columns.filter((c) => c.updatedAt);
+  if (tagged.length === 0) return data;
+  let out: Record<string, unknown> | null = null;
+  const now = new Date();
+  for (const col of tagged) {
+    if (Object.hasOwn(data, col.field) && data[col.field] !== undefined) continue;
+    out ??= { ...data };
+    out[col.field] = now;
+  }
+  return out ?? data;
+}
+
 export function writeReturningColumns(qi: BuilderCtx): ReturningSelection {
   const piiCols = piiColumns(qi, qi.tableMeta);
   if (piiCols.size === 0) return '*';

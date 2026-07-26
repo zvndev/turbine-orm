@@ -10,6 +10,7 @@
 
 import pg from 'pg';
 import { type Dialect, postgresDialect } from './dialect.js';
+import { ValidationError } from './errors.js';
 import {
   type CheckMetadata,
   type ColumnMetadata,
@@ -284,6 +285,15 @@ export interface IntrospectOptions {
   /** Tables to exclude (default: none). Applied after include. */
   exclude?: string[];
   /**
+   * Rename derived relations, as `{ table: { derivedName: desiredName } }`.
+   *
+   * Relation names are composed by introspection (the database does not name
+   * relationships), so a port from another ORM that named them differently has
+   * to touch every call site. Declaring the mapping here makes it mechanical.
+   * A typo is an error, not a silent no-op: see {@link applyRelationRenames}.
+   */
+  relationNames?: Record<string, Record<string, string>>;
+  /**
    * Also introspect **views** and **materialized views** as read-only
    * {@link TableMetadata} entries (`isView: true`). Off by default. Write
    * builders reject views (E003); a view without a primary key is excluded from
@@ -327,11 +337,75 @@ export interface IntrospectOptions {
 export async function introspect(options: IntrospectOptions): Promise<SchemaMetadata> {
   const dialect = options.dialect ?? postgresDialect;
   const introspector = dialect.introspector;
-  if (introspector) {
-    return introspector.introspect(options);
+  const schema = introspector
+    ? await introspector.introspect(options)
+    : // Dialects without an introspector fall back to the Postgres catalog reader.
+      await introspectPostgresCatalog(options);
+  // Applied here rather than inside each introspector so every engine gets it.
+  return options.relationNames ? applyRelationRenames(schema, options.relationNames) : schema;
+}
+
+/**
+ * Rename introspected relations, per table, from the name turbine derived to
+ * the name the caller wants.
+ *
+ * Relation names are DERIVED, not declared: the database has no name for a
+ * foreign key's relationship, so introspection composes one, and two foreign
+ * keys pointing at the same table produce composed names (`msgsBySender`,
+ * `msgsByRecipient`) that nobody would predict. A codebase migrating from
+ * another ORM already has names for these, chosen by different rules, so every
+ * call site has to be hand-edited. This map turns that into a mechanical
+ * mapping done once in the config.
+ *
+ * Renames are validated rather than best-effort: an unknown table or an
+ * unknown source relation is an ERROR, because silently ignoring a typo here
+ * means the call sites it was supposed to fix break at runtime instead.
+ */
+export function applyRelationRenames(
+  schema: SchemaMetadata,
+  renames: Record<string, Record<string, string>>,
+): SchemaMetadata {
+  const tables: Record<string, TableMetadata> = { ...schema.tables };
+
+  for (const [table, mapping] of Object.entries(renames)) {
+    const meta = tables[table];
+    if (!meta) {
+      throw new ValidationError(
+        `[turbine] relationNames: unknown table "${table}". Known tables: ${Object.keys(tables).join(', ')}.`,
+      );
+    }
+    const relations: Record<string, RelationDef> = { ...meta.relations };
+    const columnFields = new Set(Object.values(meta.columnMap));
+
+    for (const [from, to] of Object.entries(mapping)) {
+      if (!Object.hasOwn(relations, from)) {
+        throw new ValidationError(
+          `[turbine] relationNames: table "${table}" has no relation "${from}". ` +
+            `Derived relations: ${Object.keys(relations).join(', ') || '(none)'}.`,
+        );
+      }
+      if (from === to) continue;
+      if (Object.hasOwn(relations, to)) {
+        throw new ValidationError(
+          `[turbine] relationNames: cannot rename "${table}.${from}" to "${to}" — that relation already exists.`,
+        );
+      }
+      if (columnFields.has(to)) {
+        throw new ValidationError(
+          `[turbine] relationNames: cannot rename "${table}.${from}" to "${to}" — a column on "${table}" ` +
+            `already uses that field name, and a relation must never shadow a column.`,
+        );
+      }
+      const def = relations[from]!;
+      delete relations[from];
+      // `RelationDef.name` is the relation's own identity, so it moves with it.
+      relations[to] = { ...def, name: to };
+    }
+
+    tables[table] = { ...meta, relations };
   }
-  // Dialects without an introspector fall back to the Postgres catalog reader.
-  return introspectPostgresCatalog(options);
+
+  return { ...schema, tables };
 }
 
 /**

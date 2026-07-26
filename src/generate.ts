@@ -1197,6 +1197,7 @@ function serializeColumn(col: ColumnMetadata): string {
   // Introspection never sets this (code-first declaration), but a metadata
   // object built from `defineSchema` (pii: true) carries it through codegen.
   if (col.pii) parts.push(`pii: true`);
+  if (col.updatedAt) parts.push(`updatedAt: true`);
   if (col.maxLength !== undefined) parts.push(`maxLength: ${col.maxLength}`);
   return `{ ${parts.join(', ')} }`;
 }

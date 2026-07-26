@@ -408,3 +408,81 @@ export function coerceJsonWireValue(oid: number, value: unknown): unknown {
   if (typeof value !== 'string') return value;
   return pg.types.getTypeParser(oid, 'text')(value);
 }
+
+// ---------------------------------------------------------------------------
+// Unknown-field diagnostics
+// ---------------------------------------------------------------------------
+
+/**
+ * Case-insensitive closeness of `candidate` to `input`, higher is better,
+ * 0 meaning "not worth suggesting". Deliberately tiny: this runs only on the
+ * error path, and its whole job is to turn a guessed name into the real one.
+ *
+ * Substring containment is scored ABOVE edit distance because the real-world
+ * miss is a longer, more descriptive guess than the actual name (`modelVersions`
+ * for a relation turbine derived as `versions`), where the edit distance is
+ * large but the containment is exact.
+ */
+function nameCloseness(input: string, candidate: string): number {
+  const a = input.toLowerCase();
+  const b = candidate.toLowerCase();
+  if (a === b) return 1000;
+  if (a.includes(b) || b.includes(a)) return 500 + Math.min(a.length, b.length);
+  // Levenshtein, bounded: only near-misses are worth suggesting.
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  let prev = Array.from({ length: cols }, (_, j) => j);
+  for (let i = 1; i < rows; i++) {
+    const cur = [i];
+    for (let j = 1; j < cols; j++) {
+      cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  const distance = prev[cols - 1]!;
+  const limit = Math.max(2, Math.floor(Math.max(a.length, b.length) / 3));
+  return distance <= limit ? 100 - distance : 0;
+}
+
+/** The closest name in `candidates` to `input`, or null when none is close. */
+export function closestName(input: string, candidates: Iterable<string>): string | null {
+  let best: string | null = null;
+  let bestScore = 0;
+  for (const c of candidates) {
+    const score = nameCloseness(input, c);
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/**
+ * The "unknown field" error text, listing RELATIONS as well as columns.
+ *
+ * The message used to read `Known fields: id, name.` and nothing else. That is
+ * actively misleading when the key was a relation name: relation filters ARE
+ * valid in a `where`, so a user who guessed the wrong relation name concluded
+ * from this message that turbine cannot filter by relations at all. Relation
+ * names are frequently guessed wrong because introspection derives them, and
+ * two foreign keys to one table produce names (`msgsBySender`) that no one
+ * would predict.
+ */
+export function unknownFieldMessage(
+  table: string,
+  field: string,
+  meta: { columnMap: Record<string, string>; relations?: Record<string, unknown> },
+): string {
+  const columns = Object.keys(meta.columnMap);
+  const relations = Object.keys(meta.relations ?? {});
+  const suggestion = closestName(field, [...columns, ...relations]);
+  const didYouMean = suggestion
+    ? ` Did you mean "${suggestion}"${relations.includes(suggestion) ? ' (a relation)' : ''}?`
+    : '';
+  return (
+    `[turbine] Unknown field "${field}" on table "${table}".${didYouMean}` +
+    ` Known columns: ${columns.join(', ') || '(none)'}.` +
+    (relations.length ? ` Known relations (valid in \`where\` and \`with\`): ${relations.join(', ')}.` : '')
+  );
+}

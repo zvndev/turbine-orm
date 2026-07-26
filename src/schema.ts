@@ -128,6 +128,16 @@ export interface ColumnMetadata {
    * Introspection never auto-tags PII (it is a code-first declaration).
    */
   pii?: boolean;
+  /**
+   * True when this column should be set to the current time on every `update`
+   * that does not name it explicitly (Prisma's `@updatedAt`).
+   *
+   * A code-first declaration only (`defineSchema` `updatedAt: true` /
+   * `.updatedAt()`): introspection NEVER infers it from a column's name,
+   * because an application that already manages its own `updated_at` would
+   * silently have its writes changed. Untagged schemas emit byte-identical SQL.
+   */
+  updatedAt?: boolean;
   /** Whether this is an array column */
   isArray: boolean;
   /** Dialect-specific array/bulk-insert type token when needed. */

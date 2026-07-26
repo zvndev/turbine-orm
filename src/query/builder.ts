@@ -76,7 +76,14 @@ import type {
   WithOptions,
   WithOrderByObject,
 } from './types.js';
-import { LRUCache, ownLookup, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
+import {
+  LRUCache,
+  ownLookup,
+  parseDbDate,
+  type SqlCacheEntry,
+  sqlToPreparedName,
+  unknownFieldMessage,
+} from './utils.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -2077,12 +2084,52 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (this.defaultLimit !== undefined) return;
     const hasExplicitLimit = args?.limit !== undefined || args?.take !== undefined || args?.cursor !== undefined;
     if (hasExplicitLimit) return;
+    if (this.whereMatchesAtMostOneRow((args as { where?: unknown } | undefined)?.where)) return;
     if (this.warnedTables.has(this.table)) return;
     this.warnedTables.add(this.table);
     console.warn(
       `[turbine] warning: findMany on "${this.table}" has no limit: this will fetch every row. ` +
         'Pass `limit`, or silence with `warnOnUnlimited: false` (per call, per table, or in config).',
     );
+  }
+
+  /**
+   * Whether `where` can match at most one row, because it pins every column of
+   * the primary key or of some unique column set to a literal value.
+   *
+   * The unlimited-read warning is about accidentally fetching a whole table,
+   * so firing it on `findMany({ where: { id: 1 } })` is noise: that query is
+   * bounded by a uniqueness constraint just as firmly as by a `limit`, and a
+   * warning that cries wolf on correct code trains people to disable it.
+   *
+   * Deliberately conservative. Only DIRECT equality on a literal counts: an
+   * operator object (`{ id: { in: [...] } }`, `{ id: { gt: 1 } }`) can match
+   * many rows, and any `OR` / `NOT` / relation filter can widen the result, so
+   * anything that is not a plain scalar equality leaves the warning in place.
+   * A compound-unique SELECTOR (`{ orgId_userId: {...} }`) is expanded first,
+   * so both spellings are recognized.
+   */
+  private whereMatchesAtMostOneRow(where: unknown): boolean {
+    if (where === null || typeof where !== 'object' || Array.isArray(where)) return false;
+    const expanded = expandCompoundUniqueWhere(this.tableMeta, where as Record<string, unknown>);
+
+    const pinned = new Set<string>();
+    for (const [field, value] of Object.entries(expanded)) {
+      if (value === undefined) continue;
+      // A plain scalar (or a Date) is an equality. `null` is NOT: `col IS NULL`
+      // is not a uniqueness match, since SQL uniqueness permits many nulls.
+      const isScalarEquality =
+        value !== null && (typeof value !== 'object' || value instanceof Date) && typeof value !== 'function';
+      if (!isScalarEquality) return false;
+      const column = ownLookup(this.tableMeta.columnMap, field);
+      if (!column) return false;
+      pinned.add(column);
+    }
+    if (pinned.size === 0) return false;
+
+    const covers = (columns: string[] | undefined): boolean =>
+      !!columns && columns.length > 0 && columns.every((c) => pinned.has(c));
+    return covers(this.tableMeta.primaryKey) || (this.tableMeta.uniqueColumns ?? []).some(covers);
   }
 
   /**
@@ -3104,10 +3151,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (this.tableMeta.allColumns?.includes(snake)) {
       return snake;
     }
-    throw new ValidationError(
-      `[turbine] Unknown field "${field}" on table "${this.table}". ` +
-        `Known fields: ${Object.keys(this.tableMeta.columnMap).join(', ') || '(none)'}.`,
-    );
+    throw new ValidationError(unknownFieldMessage(this.table, field, this.tableMeta));
   }
 
   /** Convert camelCase field name to a double-quoted SQL identifier */

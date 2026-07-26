@@ -144,6 +144,13 @@ export interface ColumnDef {
    * `includePii: true`) and redacted by Studio. Introspection never auto-tags PII.
    */
   pii?: boolean;
+  /**
+   * Set this column to the current time on every `update` that does not name
+   * it explicitly (Prisma's `@updatedAt`). Opt-in per column and never
+   * inferred from the column name: see
+   * {@link import('./schema.js').ColumnMetadata.updatedAt}.
+   */
+  updatedAt?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +201,8 @@ export interface ColumnConfig {
   check: string | null;
   /** Whether this column is tagged as PII (personally identifiable information). */
   pii: boolean;
+  /** Whether this column is auto-set to the current time on update. */
+  updatedAt: boolean;
 }
 
 /** Convert a user-facing ColumnDef to the internal ColumnConfig */
@@ -236,6 +245,7 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
     isArray: def.array ?? false,
     check: def.check ?? null,
     pii: def.pii ?? false,
+    updatedAt: def.updatedAt ?? false,
   };
 }
 
@@ -583,6 +593,7 @@ export class ColumnBuilder {
       isArray: false,
       check: null,
       pii: false,
+      updatedAt: false,
     };
   }
 
@@ -693,6 +704,11 @@ export class ColumnBuilder {
   }
   pii(): this {
     this._config.pii = true;
+    return this;
+  }
+  /** Auto-set this column to the current time on every update. Prisma's `@updatedAt`. */
+  updatedAt(): this {
+    this._config.updatedAt = true;
     return this;
   }
   array(): this {
