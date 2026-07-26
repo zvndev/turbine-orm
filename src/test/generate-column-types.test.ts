@@ -1,9 +1,9 @@
 /**
- * turbine-orm — Codegen for extended column types (WS-B / B2–B4)
+ * turbine-orm, Codegen for extended column types (WS-B / B2–B4)
  *
  * Verifies `generateTypes()` maps enum columns to their generated string-literal
  * union, array columns to `T[]`, enum arrays to `EnumType[]`, and vector columns
- * to `number[]`. Pure — no database.
+ * to `number[]`. Pure, no database.
  *
  * Run: npx tsx --test src/test/generate-column-types.test.ts
  */
@@ -57,7 +57,7 @@ const SCHEMA: SchemaMetadata = {
   },
 };
 
-describe('B2–B4 — codegen for extended column types', () => {
+describe('B2–B4, codegen for extended column types', () => {
   const out = generateTypes(SCHEMA);
 
   it('emits the enum string-literal union type', () => {

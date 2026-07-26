@@ -1,5 +1,5 @@
 /**
- * turbine-orm/powdb — build-only unit tests (no server required).
+ * turbine-orm/powdb, build-only unit tests (no server required).
  *
  * These run in the normal `test:unit` lane: they cover the pure type-mapping /
  * coercion / error layer, and assert the exact PowQL that `PowqlInterface`
@@ -469,7 +469,7 @@ describe('powdb: wrapPowdbError', () => {
   });
 
   it('maps EMBEDDED napi errors (code:GenericFailure) by message shape', () => {
-    // The embedded addon tags EVERY error code:'GenericFailure' — the class can
+    // The embedded addon tags EVERY error code:'GenericFailure', the class can
     // only be recovered from the message. These are real engine message shapes.
     const notNull = wrapPowdbError({
       code: 'GenericFailure',
@@ -609,7 +609,7 @@ describe('powdb: wrapPowdbError', () => {
 });
 
 // ---------------------------------------------------------------------------
-// PowQL generation — reads
+// PowQL generation, reads
 // ---------------------------------------------------------------------------
 
 describe('powdb: findMany generation', () => {
@@ -698,7 +698,7 @@ describe('powdb: findMany generation', () => {
       m.calls.some((c) => /^post filter \.views >= \$1 \{/.test(c.powql.trimStart())),
       'expected a resolution query on the post table',
     );
-    // 2) the main query filters by a literal in-list of the resolved keys — no subquery
+    // 2) the main query filters by a literal in-list of the resolved keys, no subquery
     const main = m.last();
     assert.match(main.powql, /\.id in \(\$\d/);
     assert.ok(!/in \(post filter/.test(main.powql), 'must NOT emit an IN-subquery');
@@ -715,7 +715,7 @@ describe('powdb: findMany generation', () => {
 });
 
 // ---------------------------------------------------------------------------
-// PowQL generation — writes (RETURNING + UUID + float $N params)
+// PowQL generation, writes (RETURNING + UUID + float $N params)
 // ---------------------------------------------------------------------------
 
 describe('powdb: write generation', () => {
@@ -729,7 +729,7 @@ describe('powdb: write generation', () => {
     const uuid = insert.params.find((p) => typeof p === 'string' && p.length === 36);
     assert.ok(uuid, 'expected a generated UUID param');
     assert.equal((row as { name: string }).name, 'Ada');
-    // No follow-up reselect SELECT — the insert was the only call.
+    // No follow-up reselect SELECT, the insert was the only call.
     assert.equal(m.calls.length, 1);
   });
 
@@ -804,7 +804,7 @@ describe('powdb: write generation', () => {
     const up = m.calls.find((c) => c.powql.startsWith('upsert'))!;
     assert.match(up.powql, /^upsert app_user on \.id \{ .* \} on conflict \{ name := \$\d+ \}$/);
     assert.doesNotMatch(up.powql, /returning/);
-    // Upsert (no returning) must reselect by PK — so there is a follow-up SELECT.
+    // Upsert (no returning) must reselect by PK, so there is a follow-up SELECT.
     assert.ok(m.calls.some((c) => /^app_user filter \.id = \$1/.test(c.powql.trimStart())));
   });
 
@@ -874,9 +874,9 @@ describe('powdb: write generation', () => {
     await assert.rejects(() => qi(m).deleteMany({ where: {} }), ValidationError);
   });
 
-  it('FIX 1: guard gates on the COMPILED filter — combinators that compile empty are refused', async () => {
+  it('FIX 1: guard gates on the COMPILED filter, combinators that compile empty are refused', async () => {
     // These pass the old shape-based check (they HAVE keys) but compile to an
-    // empty PowQL filter — so they must be rejected and emit no write.
+    // empty PowQL filter, so they must be rejected and emit no write.
     const cases: Record<string, unknown>[] = [
       { OR: [] },
       { AND: [] },
@@ -923,7 +923,7 @@ describe('powdb: write generation', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Capability guards — "what doesn't make sense on PowDB"
+// Capability guards, "what doesn't make sense on PowDB"
 // ---------------------------------------------------------------------------
 
 describe('powdb: capability guards throw E017', () => {
@@ -952,7 +952,7 @@ describe('powdb: capability guards throw E017', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Embedded literal encoder — the security-critical surface (no params on the wire)
+// Embedded literal encoder, the security-critical surface (no params on the wire)
 // ---------------------------------------------------------------------------
 
 describe('powdb: encodePowqlLiteral (typed encoding)', () => {
@@ -995,7 +995,7 @@ describe('powdb: encodePowqlLiteral (typed encoding)', () => {
     assert.equal(encodePowqlLiteral('a\\"b'), '"a\\\\\\"b"'); // backslash + quote
     assert.equal(encodePowqlLiteral('line1\nline2'), '"line1\\nline2"');
     assert.equal(encodePowqlLiteral('a\tb'), '"a\\tb"');
-    // A raw CR must stay raw — \r is NOT a lexer escape (would drop the backslash).
+    // A raw CR must stay raw, \r is NOT a lexer escape (would drop the backslash).
     assert.equal(encodePowqlLiteral('a\rb'), '"a\rb"');
   });
 
@@ -1102,7 +1102,7 @@ describe('powdb: materializePowql ($N substitution)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Embedded pool — materializes params into the PowQL text (addon takes no params)
+// Embedded pool, materializes params into the PowQL text (addon takes no params)
 // ---------------------------------------------------------------------------
 
 /** A fake @zvndev/powdb-embedded Database that records the materialized query string. */
@@ -1433,7 +1433,7 @@ describe('powdb: readonly awareness (F3)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// FIX 2 — single-writer transaction model
+// FIX 2, single-writer transaction model
 // ---------------------------------------------------------------------------
 
 describe('powdb: transaction model (single-writer)', () => {
@@ -1491,7 +1491,7 @@ describe('powdb: transaction model (single-writer)', () => {
 
   it('REVIEW 1: a stray commit/rollback with no gate hold never reaches the embedded engine', async () => {
     const { pool, seen } = fakeEmbeddedDb();
-    // No begin ever ran in this scope — e.g. a "best-effort" ROLLBACK issued
+    // No begin ever ran in this scope, e.g. a "best-effort" ROLLBACK issued
     // after a begin that failed its queue timeout. On the ONE shared handle,
     // forwarding it would end whatever transaction ANOTHER caller has open.
     const rolled = await pool.query('rollback');
@@ -1529,7 +1529,7 @@ describe('powdb: transaction model (single-writer)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Cross-pool re-entrancy — the ALS marker is a CHAIN, so a transaction on a
+// Cross-pool re-entrancy, the ALS marker is a CHAIN, so a transaction on a
 // second pool cannot shadow the outer pool's marker (single-slot storage).
 // ---------------------------------------------------------------------------
 
@@ -1605,7 +1605,7 @@ describe('powdb: re-entrancy marker never leaks into the caller context (dogfood
 });
 
 // ---------------------------------------------------------------------------
-// Batch pipelining — the networked driver advertises FIFO in-flight support,
+// Batch pipelining, the networked driver advertises FIFO in-flight support,
 // so `$transaction([...])` dispatches all statements in one write burst.
 // ---------------------------------------------------------------------------
 
@@ -1616,7 +1616,7 @@ function drainMicrotasks(): Promise<void> {
 
 /**
  * A fake `@zvndev/powdb-client` pool with ONE client whose non-transaction
- * queries stay pending until the test releases them — so "dispatched before
+ * queries stay pending until the test releases them, so "dispatched before
  * any reply" assertions are exact, never timing-based. Mirrors the real
  * client's contract: requests are written immediately, replies match FIFO.
  */
@@ -1714,7 +1714,7 @@ describe('powdb: batch $transaction pipelining (networked driver)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// FIX 6 — connection-string parsing + version guard
+// FIX 6, connection-string parsing + version guard
 // ---------------------------------------------------------------------------
 
 describe('powdb: parsePowdbUrl', () => {
@@ -1759,7 +1759,7 @@ describe('powdb: assertSupportedPowdbVersion', () => {
 });
 
 // ---------------------------------------------------------------------------
-// T-7 — concurrent transactions queue FIFO on the single-writer gate instead
+// T-7, concurrent transactions queue FIFO on the single-writer gate instead
 // of failing fast with E017. Re-entrant transactions (which queueing would
 // deadlock) still throw. Queue waits are bounded by transactionQueueTimeoutMs.
 // ---------------------------------------------------------------------------
@@ -1767,7 +1767,7 @@ describe('powdb: assertSupportedPowdbVersion', () => {
 /**
  * Run one begin…marker…commit transaction through a checked-out client. The
  * `await pool.connect()` before `begin` matters: it puts the transaction in
- * its own async continuation — like any real concurrent caller — so begin's
+ * its own async continuation, like any real concurrent caller, so begin's
  * re-entrancy marker stays confined to this transaction's context instead of
  * leaking into the test's.
  */
@@ -1834,7 +1834,7 @@ describe('powdb: re-entrant transactions still throw E017 (queueing would deadlo
     const db = new TurbineClient({ pool, dialect: powdbDialect }, { tables: {}, enums: {} });
     await assert.rejects(
       db.$transaction(async () => {
-        // The outer callback awaits an inner db.$transaction — the inner would
+        // The outer callback awaits an inner db.$transaction, the inner would
         // queue behind the outer's lock while the outer waits on the inner:
         // a deadlock. The gate detects the shared async context and throws.
         await db.$transaction(async () => 'inner');
@@ -1874,7 +1874,7 @@ describe('powdb: transaction queue timeout', () => {
     const { pool } = fakeEmbeddedDb(undefined, { transactionQueueTimeoutMs: 25 });
     const holder = await pool.connect();
     await (async () => {
-      await Promise.resolve(); // own async context — see runClientTx
+      await Promise.resolve(); // own async context, see runClientTx
       await holder.query('begin');
     })();
     await assert.rejects(
@@ -1906,7 +1906,7 @@ describe('powdb: transaction queue timeout', () => {
       await pool.query('commit');
     })();
     await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal(began, false, 'still queued after 60ms — no default timeout applied');
+    assert.equal(began, false, 'still queued after 60ms, no default timeout applied');
     await holder.query('commit');
     holder.release();
     await queued;
@@ -1935,7 +1935,7 @@ describe('powdb: transaction queue timeout', () => {
 });
 
 // ---------------------------------------------------------------------------
-// N-6 — warnOnUnlimited per-table map handling on the PowQL interface.
+// N-6, warnOnUnlimited per-table map handling on the PowQL interface.
 // PowqlInterface previously treated an object map as plain truthy, so ANY map
 // (even `{ userProfiles: false }` for this exact table) left the warning on.
 // It now applies the same per-table resolution as QueryInterface: snake_case
@@ -1999,7 +1999,7 @@ describe('powdb: warnOnUnlimited per-table map (N-6)', () => {
 // ---------------------------------------------------------------------------
 
 describe('powdb: reserved-word identifiers are backtick-quoted in bare positions', () => {
-  // A table named `order` with columns named `type` and `limit` — all PowQL
+  // A table named `order` with columns named `type` and `limit`, all PowQL
   // keywords. Dotted references (.type in filters/projections) bypass keyword
   // lookup on every engine version and must stay bare for ≤0.9 compat.
   const kwSchema: SchemaMetadata = {
@@ -2056,7 +2056,7 @@ describe('powdb: reserved-word identifiers are backtick-quoted in bare positions
     assert.match(upsert.powql, /`type` := \$\d/);
   });
 
-  it('findMany quotes the table ref only — filter/order/projection stay dotted-bare', async () => {
+  it('findMany quotes the table ref only, filter/order/projection stay dotted-bare', async () => {
     const m = mockPool();
     await kwQi(m).findMany({ where: { type: 'news' }, orderBy: { limit: 'asc' }, limit: 5 });
     assert.match(
@@ -2240,7 +2240,7 @@ describe('powdb: owned-pool disconnect() closes every driver client (socket-leak
 });
 
 // ---------------------------------------------------------------------------
-// v0.31 review fixes — release destroy contract, closed guards, implicit-tx marker
+// v0.31 review fixes, release destroy contract, closed guards, implicit-tx marker
 // ---------------------------------------------------------------------------
 
 describe('powdb: connection release honors the destroy contract (review fix)', () => {
@@ -3018,7 +3018,7 @@ describe('powdb F1: JsonFilter → PowQL path filters', () => {
 
   it('a bare `{ path }` is refused for what it is, not as a generic empty where', async () => {
     // This used to compile to ZERO clauses and lean on the empty-where guard to
-    // catch the mutation — which meant the same shape on a READ silently
+    // catch the mutation, which meant the same shape on a READ silently
     // returned the whole table. It is now rejected at the filter itself, so the
     // read and the write fail the same way and the message names the cause.
     const m = mockPool();

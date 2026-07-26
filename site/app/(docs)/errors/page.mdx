@@ -7,7 +7,7 @@ export const metadata = {
 
 # Typed Errors
 
-Turbine throws typed errors you can catch with `instanceof`. Every error extends `TurbineError` and carries a stable `readonly code` field you can use for programmatic handling. Human-readable `.message` strings also start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable without structured field access — but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes automatically via `wrapPgError()`.
+Turbine throws typed errors you can catch with `instanceof`. Every error extends `TurbineError` and carries a stable `readonly code` field you can use for programmatic handling. Human-readable `.message` strings also start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable without structured field access, but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes automatically via `wrapPgError()`.
 
 ## Error code table
 
@@ -20,17 +20,17 @@ Turbine throws typed errors you can catch with `instanceof`. Every error extends
 | `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
 | `TURBINE_E006` | `MigrationError` | Checksum mismatch, migration-lock contention, or a failure while applying a migration |
 | `TURBINE_E007` | `CircularRelationError` | Relation nesting depth exceeds 10 |
-| `TURBINE_E008` | `UniqueConstraintError` | pg 23505 — translated via `wrapPgError()` |
-| `TURBINE_E009` | `ForeignKeyError` | pg 23503 — translated via `wrapPgError()` |
-| `TURBINE_E010` | `NotNullViolationError` | pg 23502 — translated via `wrapPgError()` |
-| `TURBINE_E011` | `CheckConstraintError` | pg 23514 — translated via `wrapPgError()` |
-| `TURBINE_E012` | `DeadlockError` | pg 40P01 — **retryable**, exposes `isRetryable: true` |
-| `TURBINE_E013` | `SerializationFailureError` | pg 40001 — **retryable**, exposes `isRetryable: true` |
+| `TURBINE_E008` | `UniqueConstraintError` | pg 23505, translated via `wrapPgError()` |
+| `TURBINE_E009` | `ForeignKeyError` | pg 23503, translated via `wrapPgError()` |
+| `TURBINE_E010` | `NotNullViolationError` | pg 23502, translated via `wrapPgError()` |
+| `TURBINE_E011` | `CheckConstraintError` | pg 23514, translated via `wrapPgError()` |
+| `TURBINE_E012` | `DeadlockError` | pg 40P01, **retryable**, exposes `isRetryable: true` |
+| `TURBINE_E013` | `SerializationFailureError` | pg 40001, **retryable**, exposes `isRetryable: true` |
 | `TURBINE_E014` | `PipelineError` | Non-transactional pipeline has partial failures |
-| `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update — the row was modified by another transaction |
-| `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01 — translated via `wrapPgError()` |
-| `TURBINE_E017` | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on a non-Postgres engine — exposes `feature` and `dialect` |
-| `TURBINE_E018` | `ReadOnlyError` | A write refused because the database is read-only — exposes `reason: 'snapshot' \| 'rbac'` (PowDB snapshot serving / read-only role) |
+| `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update, the row was modified by another transaction |
+| `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01, translated via `wrapPgError()` |
+| `TURBINE_E017` | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on a non-Postgres engine, exposes `feature` and `dialect` |
+| `TURBINE_E018` | `ReadOnlyError` | A write refused because the database is read-only, exposes `reason: 'snapshot' \| 'rbac'` (PowDB snapshot serving / read-only role) |
 
 ## Catching typed errors
 
@@ -88,10 +88,10 @@ try {
   await db.users.create({ data: { email: 'taken@example.com', ... } });
 } catch (err) {
   if (err instanceof UniqueConstraintError) {
-    // err.constraint — e.g. 'users_email_key'
-    // err.columns   — e.g. ['email']
-    // err.table     — e.g. 'users'
-    // err.cause     — the original pg error
+    // err.constraint, e.g. 'users_email_key'
+    // err.columns  , e.g. ['email']
+    // err.table    , e.g. 'users'
+    // err.cause    , the original pg error
     return { status: 409, message: 'Email already in use' };
   }
   throw err;
@@ -100,7 +100,7 @@ try {
 
 ## Retryable errors
 
-`DeadlockError` and `SerializationFailureError` expose a `readonly isRetryable = true as const` field. This isn't just a comment — it's a type-level signal so your retry loop narrows correctly.
+`DeadlockError` and `SerializationFailureError` expose a `readonly isRetryable = true as const` field. This isn't just a comment. It's a type-level signal so your retry loop narrows correctly.
 
 You do not have to write that loop. Turbine exports **`withRetry`**, and `TurbineClient` exposes the same thing as **`db.$retry`**:
 
@@ -123,7 +123,7 @@ await withRetry(() =>
 
 `withRetry(fn, options?)` retries only when the thrown error carries `isRetryable === true`, and rethrows anything else immediately. Options: `maxAttempts` (default `3`), `baseDelay` in ms (default `50`), `maxDelay` (default `5000`), and an `onRetry(error, attempt)` hook. Backoff is exponential with jitter, capped at `maxDelay`. `db.$retry(fn, options)` is the same function bound to the client, for when you would rather not add an import.
 
-Neither Prisma nor Drizzle surfaces a comparable typed retry signal — Prisma uses the stringly-typed `code: 'P2034'` on a generic `PrismaClientKnownRequestError`, and Drizzle bubbles up raw pg errors for you to grep SQL states from.
+Neither Prisma nor Drizzle surfaces a comparable typed retry signal, Prisma uses the stringly-typed `code: 'P2034'` on a generic `PrismaClientKnownRequestError`, and Drizzle bubbles up raw pg errors for you to grep SQL states from.
 
 ## Pipeline errors
 
@@ -148,11 +148,11 @@ try {
 }
 ```
 
-Transactional pipelines (the default) either fully succeed or roll back — a failure surfaces as whichever typed error the failing query raised.
+Transactional pipelines (the default) either fully succeed or roll back, a failure surfaces as whichever typed error the failing query raised.
 
 ## Unsupported features on other engines
 
-`UnsupportedFeatureError` (`TURBINE_E017`) is thrown when you invoke a **Postgres-only** feature on one of Turbine's other [database engines](/engines) — SQLite, MySQL, or SQL Server. It is *not* a `wrapPgError()` translation; Turbine raises it directly (from a capability flag on the active dialect) instead of generating broken SQL. The Postgres-only features are pgvector distance ops, LISTEN/NOTIFY realtime (`$listen` / `$notify`), and RLS `sessionContext` (`$withSession`).
+`UnsupportedFeatureError` (`TURBINE_E017`) is thrown when you invoke a **Postgres-only** feature on one of Turbine's other [database engines](/engines), SQLite, MySQL, or SQL Server. It is *not* a `wrapPgError()` translation; Turbine raises it directly (from a capability flag on the active dialect) instead of generating broken SQL. The Postgres-only features are pgvector distance ops, LISTEN/NOTIFY realtime (`$listen` / `$notify`), and RLS `sessionContext` (`$withSession`).
 
 ```ts
 import { UnsupportedFeatureError } from 'turbine-orm';
@@ -171,14 +171,14 @@ try {
 }
 ```
 
-On PostgreSQL these features never throw — `TURBINE_E017` only appears on the non-Postgres engines. See [Database Engines](/engines) for the full capability matrix.
+On PostgreSQL these features never throw, `TURBINE_E017` only appears on the non-Postgres engines. See [Database Engines](/engines) for the full capability matrix.
 
 ## Read-only refusals
 
 `ReadOnlyError` (`TURBINE_E018`, since v0.35) is the routing signal for writes that hit a read-only database. Its `reason` field tells you which kind:
 
-- **`'snapshot'`** — the database itself is read-only: a PowDB `--readonly` snapshot server, an embedded `{ readonly: true }` open, or Turbine's own client-level `readonly: true` fail-fast flag. Nothing can write here; route the write to your primary.
-- **`'rbac'`** — the database is writable but this connection's role may not write (`permission denied: role …`). Re-authenticating with a writer role may suffice.
+- **`'snapshot'`**, the database itself is read-only: a PowDB `--readonly` snapshot server, an embedded `{ readonly: true }` open, or Turbine's own client-level `readonly: true` fail-fast flag. Nothing can write here; route the write to your primary.
+- **`'rbac'`**, the database is writable but this connection's role may not write (`permission denied: role …`). Re-authenticating with a writer role may suffice.
 
 ```ts
 import { ReadOnlyError } from 'turbine-orm';
@@ -196,13 +196,13 @@ See [Read Replicas](/read-replicas) for the snapshot-serving pattern this suppor
 
 ## Safe error messages
 
-By default, `NotFoundError` messages include only the **keys** of the `where` clause — values are redacted so PII doesn't leak into logs (Sentry, Datadog, and friends).
+By default, `NotFoundError` messages include only the **keys** of the `where` clause, values are redacted so PII doesn't leak into logs (Sentry, Datadog, and friends).
 
 ```
 [turbine] findUniqueOrThrow on "users" found no record matching where: { id, email }
 ```
 
-The full `where` object is always available as `err.where` for programmatic access — only the human-readable message is redacted. Opt into verbose messages (useful in local development) by setting `errorMessages: 'verbose'` in your `TurbineConfig`, or by calling `setErrorMessageMode('verbose')` at startup.
+The full `where` object is always available as `err.where` for programmatic access, only the human-readable message is redacted. Opt into verbose messages (useful in local development) by setting `errorMessages: 'verbose'` in your `TurbineConfig`, or by calling `setErrorMessageMode('verbose')` at startup.
 
 ```ts
 const db = turbine({
@@ -213,6 +213,6 @@ const db = turbine({
 
 ## See also
 
-- **[API Reference](/queries)** — transactions, pipelines, and the queries that raise these errors.
-- **[Schema & Migrations](/schema)** — `MigrationError` fires here.
-- **[Database Engines](/engines)** — where `UnsupportedFeatureError` comes from and the per-engine capability matrix.
+- **[API Reference](/queries)**, transactions, pipelines, and the queries that raise these errors.
+- **[Schema & Migrations](/schema)**, `MigrationError` fires here.
+- **[Database Engines](/engines)**, where `UnsupportedFeatureError` comes from and the per-engine capability matrix.

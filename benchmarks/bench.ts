@@ -1,5 +1,5 @@
 /**
- * Turbine ORM Benchmark — vs Prisma 7 & Drizzle v2
+ * Turbine ORM Benchmark, vs Prisma 7 & Drizzle v2
  *
  * Setup:
  *   cd benchmarks
@@ -52,7 +52,7 @@ interface BenchResult {
 }
 
 async function measure(orm: string, fn: () => Promise<unknown>): Promise<BenchResult> {
-  // Warmup — primes connection pools and query plan caches
+  // Warmup, primes connection pools and query plan caches
   for (let i = 0; i < WARMUP; i++) await fn();
 
   // Collect samples
@@ -106,9 +106,9 @@ function printScenario(scenario: string, results: BenchResult[]) {
   const fastest = results.reduce((a, b) => (a.avg < b.avg ? a : b));
   for (const r of results) {
     if (r === fastest) {
-      console.log(`  ★ ${r.orm} — fastest`);
+      console.log(`  ★ ${r.orm}, fastest`);
     } else {
-      console.log(`    ${r.orm} — ${(r.avg / fastest.avg).toFixed(2)}x slower`);
+      console.log(`    ${r.orm}, ${(r.avg / fastest.avg).toFixed(2)}x slower`);
     }
   }
 }
@@ -142,7 +142,7 @@ function printMarkdownSummary() {
 
 async function main() {
   console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  Turbine ORM Benchmark — vs Prisma 7 & Drizzle v2          ║');
+  console.log('║  Turbine ORM Benchmark, vs Prisma 7 & Drizzle v2          ║');
   console.log(`║  Iterations: ${String(ITERATIONS).padEnd(4)} │ Warmup: ${String(WARMUP).padEnd(4)}                        ║`);
   console.log('╚══════════════════════════════════════════════════════════════╝');
 
@@ -150,16 +150,16 @@ async function main() {
 
   console.log('\nConnecting...');
 
-  // Turbine — uses its own internal pg.Pool
+  // Turbine, uses its own internal pg.Pool
   const turbine = new TurbineClient({ connectionString: DATABASE_URL, logging: false });
   await turbine.connect();
 
-  // Prisma 7 — adapter-pg pattern (no more Rust binary engine)
+  // Prisma 7, adapter-pg pattern (no more Rust binary engine)
   const prismaPool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
   const prismaAdapter = new PrismaPg(prismaPool);
   const prisma = new PrismaClient({ adapter: prismaAdapter });
 
-  // Drizzle — node-postgres driver with relational schema
+  // Drizzle, node-postgres driver with relational schema
   const drizzlePool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
   const drizzleDb = drizzle(drizzlePool, { schema });
 
@@ -178,7 +178,7 @@ async function main() {
       await measure('Prisma 7', () => prisma.user.findMany({ take: 100 })),
       await measure('Drizzle', () => drizzleDb.query.users.findMany({ limit: 100 })),
     ];
-    printScenario('findMany — 100 users (flat)', results);
+    printScenario('findMany, 100 users (flat)', results);
   }
 
   // ── Scenario 2: findMany L2 (users + posts) ──────────────
@@ -195,7 +195,7 @@ async function main() {
         drizzleDb.query.users.findMany({ limit: 50, with: { posts: true } }),
       ),
     ];
-    printScenario('findMany — 50 users + posts (L2 nested)', results);
+    printScenario('findMany, 50 users + posts (L2 nested)', results);
   }
 
   // ── Scenario 3: findMany L3 (users + posts + comments) ───
@@ -221,7 +221,7 @@ async function main() {
         }),
       ),
     ];
-    printScenario('findMany — 10 users → posts → comments (L3 nested)', results);
+    printScenario('findMany, 10 users → posts → comments (L3 nested)', results);
   }
 
   // ── Scenario 4: findUnique by PK ─────────────────────────
@@ -234,7 +234,7 @@ async function main() {
         drizzleDb.query.users.findFirst({ where: eq(schema.users.id, 1) }),
       ),
     ];
-    printScenario('findUnique — single user by PK', results);
+    printScenario('findUnique, single user by PK', results);
   }
 
   // ── Scenario 5: findUnique nested ────────────────────────
@@ -260,7 +260,7 @@ async function main() {
         }),
       ),
     ];
-    printScenario('findUnique — user + posts + comments (L3)', results);
+    printScenario('findUnique, user + posts + comments (L3)', results);
   }
 
   // ── Scenario 6: count ────────────────────────────────────
@@ -273,7 +273,7 @@ async function main() {
         drizzleDb.select({ value: drizzleCount() }).from(schema.users),
       ),
     ];
-    printScenario('count — all users', results);
+    printScenario('count, all users', results);
   }
 
   // ── Scenario 7: streaming 50K rows ───────────────────────
@@ -284,7 +284,7 @@ async function main() {
   // so the closest fair comparison is keyset pagination in a loop.
   //
   // Measured: wall-clock ms to drain the entire set. Not iterated via
-  // `measure()` because the work per call is ~1 second — we do 3 runs
+  // `measure()` because the work per call is ~1 second, we do 3 runs
   // and take the median.
 
   {
@@ -365,7 +365,7 @@ async function main() {
       await runStreamed('Prisma 7', prismaStream),
       await runStreamed('Drizzle', drizzleStream),
     ];
-    printScenario('stream — iterate 50K comments (batch 1000)', results);
+    printScenario('stream, iterate 50K comments (batch 1000)', results);
   }
 
   // ── Scenario 8: atomic counter ───────────────────────────
@@ -397,15 +397,15 @@ async function main() {
           .where(eq(schema.posts.id, TARGET_POST_ID)),
       ),
     ];
-    printScenario('atomic increment — posts.view_count + 1', results);
+    printScenario('atomic increment, posts.view_count + 1', results);
   }
 
-  // ── Scenario 9: pipeline — 5-query dashboard batch ──────
+  // ── Scenario 9: pipeline, 5-query dashboard batch ──────
   //
   // This is THE differentiator scenario. Turbine's pipeline uses real
   // Postgres extended-query protocol pipelining (single TCP flush, 1 RTT).
   // Prisma's $transaction([]) and Drizzle's db.transaction() are both
-  // serial — each query waits for a response before sending the next.
+  // serial, each query waits for a response before sending the next.
   // On a high-RTT connection (like Neon), the difference should be massive.
 
   {
@@ -438,10 +438,10 @@ async function main() {
         ]),
       ),
     ];
-    printScenario('pipeline — 5-query dashboard batch', results);
+    printScenario('pipeline, 5-query dashboard batch', results);
   }
 
-  // ── Scenario 10: hot path — 500× same findUnique ────────
+  // ── Scenario 10: hot path, 500× same findUnique ────────
   //
   // Tests prepared statement caching and SQL template reuse.
   // Same query shape, different param values. With prepared statements
@@ -467,7 +467,7 @@ async function main() {
         drizzleDb.query.users.findFirst({ where: eq(schema.users.id, id) }),
       ),
     ];
-    printScenario('hot findUnique — 500× same shape, rotating IDs', results);
+    printScenario('hot findUnique, 500× same shape, rotating IDs', results);
   }
 
   // ── Summary ──────────────────────────────────────────────

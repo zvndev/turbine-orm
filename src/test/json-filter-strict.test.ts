@@ -80,7 +80,7 @@ describe('JSON filter: an unrecognized operator is refused, never dropped', () =
   });
 
   it('THE BUG: an unknown operator no longer widens an AND by dropping a conjunct', () => {
-    // Previously: WHERE "id" = $1 — the JSON conjunct vanished and the query
+    // Previously: WHERE "id" = $1, the JSON conjunct vanished and the query
     // returned every row matching only the first term.
     assert.throws(
       () => q().buildFindMany({ where: { AND: [{ id: 1 }, { meta: { path: ['x'], bogus: 1 } }] } }),
@@ -139,7 +139,7 @@ describe('JSON filter: substring operators', () => {
     const { params } = q().buildFindMany({
       where: { meta: { path: ['n'], gt: 1, stringContains: 'a' } },
     });
-    // path, then the range value, then the LIKE pattern — one path param total.
+    // path, then the range value, then the LIKE pattern, one path param total.
     assert.deepEqual(params, [['n'], 1, '%a%']);
   });
 

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Self-relation regression tests
+ * turbine-orm, Self-relation regression tests
  *
  * A self-referencing FK (e.g. `categories.parent_id → categories.id`)
  * introspects to a belongsTo + a hasMany on the SAME table. The query builder
@@ -29,13 +29,13 @@ import type { RelationDef, SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// Build-only (no DB) — alias-collision regression
+// Build-only (no DB), alias-collision regression
 // ---------------------------------------------------------------------------
 
 /**
  * Mock schema: a single `categories` table that references itself.
- *   parent   — belongsTo (this.parent_id → categories.id)
- *   children — hasMany   (categories.parent_id → this.id)
+ *   parent  , belongsTo (this.parent_id → categories.id)
+ *   children, hasMany   (categories.parent_id → this.id)
  */
 function selfRelationSchema(): SchemaMetadata {
   const parent: RelationDef = {

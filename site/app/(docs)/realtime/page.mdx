@@ -7,7 +7,7 @@ export const metadata = {
 
 # Realtime (LISTEN / NOTIFY)
 
-Push events between processes through Postgres itself — no message broker, no extra service. Turbine wraps Postgres `LISTEN` / `NOTIFY` in two methods: `$listen` subscribes to a channel and `$notify` publishes to it.
+Push events between processes through Postgres itself, no message broker, no extra service. Turbine wraps Postgres `LISTEN` / `NOTIFY` in two methods: `$listen` subscribes to a channel and `$notify` publishes to it.
 
 This is ideal for cache invalidation, live dashboards, and worker fan-out where you already have a Postgres connection and don't want to stand up Redis or a queue.
 
@@ -29,7 +29,7 @@ const sub = await db.$listen('order_created', (payload) => {
 await db.$notify('order_created', JSON.stringify({ id: 1 }));
 ```
 
-`$notify` is a single round-trip — it runs `SELECT pg_notify($1, $2)` with the channel and payload both bound as parameters. The payload is optional and defaults to an empty string:
+`$notify` is a single round-trip, it runs `SELECT pg_notify($1, $2)` with the channel and payload both bound as parameters. The payload is optional and defaults to an empty string:
 
 ```ts
 await db.$notify('cache_invalidated'); // payload defaults to ''
@@ -55,12 +55,12 @@ All live subscriptions are also force-released when you call `db.disconnect()`, 
 
 ## Channel names
 
-Channel names are validated as plain identifiers and quoted before use — they're the one interpolated token in the generated SQL, so the validation is strict. Names with spaces, leading digits, dots, or other special characters throw `ValidationError` *before* any connection is touched.
+Channel names are validated as plain identifiers and quoted before use, they're the one interpolated token in the generated SQL, so the validation is strict. Names with spaces, leading digits, dots, or other special characters throw `ValidationError` *before* any connection is touched.
 
 ```ts
-await db.$notify('order created');  // throws ValidationError — space
-await db.$listen('1bad', () => {}); // throws ValidationError — leading digit
-await db.$notify('app.events');     // throws ValidationError — no dotted namespacing
+await db.$notify('order created');  // throws ValidationError, space
+await db.$listen('1bad', () => {}); // throws ValidationError, leading digit
+await db.$notify('app.events');     // throws ValidationError, no dotted namespacing
 ```
 
 ## Not available on serverless HTTP drivers
@@ -71,6 +71,6 @@ If you need realtime on the edge, run `$listen` from a long-lived process (a wor
 
 ## See also
 
-- **[Serverless & Edge](/serverless)** — which APIs work on HTTP drivers.
-- **[Transactions & Pipelines](/transactions)** — connection lifecycle and pooling.
-- **[Typed Errors](/errors)** — `ValidationError` (E003) and the full code table.
+- **[Serverless & Edge](/serverless)**, which APIs work on HTTP drivers.
+- **[Transactions & Pipelines](/transactions)**, connection lifecycle and pooling.
+- **[Typed Errors](/errors)**, `ValidationError` (E003) and the full code table.

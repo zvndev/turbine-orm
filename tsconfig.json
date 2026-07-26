@@ -9,7 +9,7 @@
     "declaration": true,
     // Maps are intentionally NOT published (see package.json "files" excludes).
     // Emitting them left every dist/*.js and *.d.ts with a //# sourceMappingURL
-    // comment pointing at a file absent from the tarball — a dangling reference
+    // comment pointing at a file absent from the tarball, a dangling reference
     // that Next.js/turbopack rejects ("Invalid source map ... payload ... null").
     // Keep them off so nothing references a map we don't ship. (#25)
     "declarationMap": false,

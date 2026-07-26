@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Pipeline execution
+ * turbine-orm, Pipeline execution
  *
  * Pipelines batch multiple independent queries into a single database round-trip.
  * Instead of N sequential awaits (N round-trips), you get 1 round-trip for all N queries.
@@ -133,12 +133,12 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     return [] as unknown as PipelineResults<T>;
   }
 
-  // Acquire a single client — reused for both capability check and execution
+  // Acquire a single client, reused for both capability check and execution
   const client = await pool.connect();
 
   try {
     if (supportsExtendedPipeline(client)) {
-      // Real pipeline path — uses extended-query protocol wire methods
+      // Real pipeline path, uses extended-query protocol wire methods
       const pipelineOptions: PipelineRunOptions = {
         transactional: options?.transactional ?? true,
         timeout: options?.timeout,
@@ -146,7 +146,7 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
       const results = await runPipelined(client, queries, pipelineOptions);
       return results as PipelineResults<T>;
     }
-    // Sequential fallback — reuses the same client
+    // Sequential fallback, reuses the same client
     return await runSequential(client, queries, options);
   } finally {
     client.release();

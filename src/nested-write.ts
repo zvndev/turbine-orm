@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Nested write engine
+ * turbine-orm, Nested write engine
  *
  * Tree-walking create/update that resolves relation fields in `data` into
  * batched SQL operations within a transaction. Supports create, connect,
@@ -8,7 +8,7 @@
  *
  * This module is imported by `query/builder.ts` when the `data` argument
  * of `create()` or `update()` contains relation fields. It never imports
- * `client.ts` directly — the transaction handle is passed in via
+ * `client.ts` directly, the transaction handle is passed in via
  * `NestedWriteContext`.
  */
 
@@ -349,7 +349,7 @@ const M2M_SUPPORTED_OPS = new Set(['connect', 'disconnect', 'set']);
  * On the core client the auto-created property accessors are CAMELCASED
  * (`db.userTags` for `user_tags`, see the `Object.defineProperty` loops in
  * client.ts), so `db["user_tags"]` is `undefined` for every snake_case junction
- * — which is every junction `turbine pull` produces over a hand-written join
+ * - which is every junction `turbine pull` produces over a hand-written join
  * table. `db.table("user_tags")` takes the raw table name and exists on both
  * TurbineClient and the TransactionClient handed to `$transaction`, so that is
  * the form to recommend.
@@ -407,7 +407,7 @@ interface JunctionPlan {
   /** Target-table field whose value goes into `targetField`. */
   targetKeyField: string;
   /**
-   * True when the junction declares the (source, target) PAIR unique — a
+   * True when the junction declares the (source, target) PAIR unique, a
    * two-column primary key, unique constraint, or full (non-partial) unique
    * index over exactly those two columns.
    *
@@ -655,9 +655,9 @@ const SKIP_DUPLICATES_FEATURE = 'createMany({ skipDuplicates: true })';
  * `createMany({ skipDuplicates })`, so the engines that refuse it pay for the
  * refusal once instead of on every connect.
  *
- * The capability is not reachable from here as a flag — the `Dialect` is private
+ * The capability is not reachable from here as a flag, the `Dialect` is private
  * to QueryInterface / TurbineClient and `NestedWriteContext` carries only the
- * schema and the transaction — so it is read from the engine's OWN structured
+ * schema and the transaction, so it is read from the engine's OWN structured
  * refusal (`UnsupportedFeatureError.feature`) rather than from a hardcoded
  * engine list that would drift. Both refusing engines throw while BUILDING the
  * statement, before anything is written, so the attempt is side-effect-free.
@@ -699,11 +699,11 @@ async function insertJunctionRowsSkippingDuplicates(
  *
  * 1. Junction constrains the pair AND the engine supports `skipDuplicates`
  *    (PostgreSQL, SQLite and MySQL: `ON CONFLICT DO NOTHING` / a no-op
- *    `ON DUPLICATE KEY UPDATE`) — one INSERT, no read. The engine resolves the
+ *    `ON DUPLICATE KEY UPDATE`), one INSERT, no read. The engine resolves the
  *    conflict, so two transactions connecting the same pair at the same time
  *    both succeed and one link row exists. This is the introspected path:
  *    every junction introspection can detect declares the pair unique.
- * 2. Otherwise — read this parent's existing link rows for exactly these targets
+ * 2. Otherwise, read this parent's existing link rows for exactly these targets
  *    and insert only the missing ones. Used when the engine refuses the option
  *    (SQL Server and PowDB have no single-statement skip-duplicates form and
  *    throw E017), and when the junction does NOT constrain the pair, where
@@ -907,7 +907,7 @@ export async function executeNestedCreate(
   }
 
   // belongsTo relations put the foreign key on the PARENT row, so they must be
-  // resolved BEFORE the parent is inserted — otherwise a NOT NULL FK column
+  // resolved BEFORE the parent is inserted, otherwise a NOT NULL FK column
   // fails on the initial INSERT. We resolve each belongsTo op (create/connect/
   // connectOrCreate) to its referenced row and fold the FK values into the
   // parent's own INSERT.
@@ -929,7 +929,7 @@ export async function executeNestedCreate(
     data: { ...scalars, ...belongsToFks },
   })) as Record<string, unknown>;
 
-  // Process hasMany / hasOne relations — their FK lives on the CHILD, so they
+  // Process hasMany / hasOne relations, their FK lives on the CHILD, so they
   // need the parent row to exist first.
   for (const [relName, ops] of Object.entries(relations)) {
     const rel = tableMeta.relations[relName]!;
@@ -1016,7 +1016,7 @@ export async function executeNestedUpdate(
     const rel = tableMeta.relations[relName]!;
 
     if (rel.type === 'hasMany' || rel.type === 'hasOne') {
-      // create, connect, connectOrCreate — same as nested create
+      // create, connect, connectOrCreate, same as nested create
       await processHasManyCreate(ctx, rel, ops, parentRow, depth, path, relName);
 
       // disconnect
@@ -1046,7 +1046,7 @@ export async function executeNestedUpdate(
     } else if (rel.type === 'belongsTo') {
       await processBelongsToCreate(ctx, rel, ops, parentRow, tableName, depth, path, relName);
 
-      // update (belongsTo — derive where from parent FK)
+      // update (belongsTo, derive where from parent FK)
       if (ops.update !== undefined) {
         await processBelongsToUpdate(ctx, rel, ops.update, parentRow, tableName);
       }
@@ -1126,7 +1126,7 @@ async function processHasManyCreate(
           await executeNestedCreate(ctx, rel.to, injected, depth + 1, [...path, relName]);
         }
       } else {
-        // Batch via createMany (UNNEST) — fast path
+        // Batch via createMany (UNNEST), fast path
         const injected = items.map((item) => injectForeignKey(item, rel, parentRow, ctx.schema));
         await ctx.tx.table(rel.to).createMany({ data: injected });
       }
@@ -1235,7 +1235,7 @@ async function processBelongsToCreate(
   const fks = normalizeKeyColumns(rel.foreignKey);
   const refs = normalizeKeyColumns(rel.referenceKey);
 
-  // create — insert the related row, then update parent's FK
+  // create, insert the related row, then update parent's FK
   if (ops.create !== undefined) {
     const items = toArray(ops.create as Record<string, unknown> | Record<string, unknown>[]);
     if (items.length > 0) {
@@ -1258,7 +1258,7 @@ async function processBelongsToCreate(
     }
   }
 
-  // connect — validate existence, update parent's FK
+  // connect, validate existence, update parent's FK
   if (ops.connect !== undefined) {
     const items = toArray(ops.connect as Record<string, unknown> | Record<string, unknown>[]);
     if (items.length > 0) {

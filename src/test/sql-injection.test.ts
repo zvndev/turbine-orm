@@ -1,7 +1,7 @@
 /**
  * SQL injection regression tests.
  *
- * These tests document — and lock down — the defense against hostile
+ * These tests document, and lock down, the defense against hostile
  * field names, operator names, orderBy keys, and relation names flowing
  * from user input into generated SQL. The defense is multi-layer:
  *
@@ -35,7 +35,7 @@ function schema(): SchemaMetadata {
   return { tables, enums: {} };
 }
 
-describe('SQL injection defense — hostile field names in WHERE', () => {
+describe('SQL injection defense, hostile field names in WHERE', () => {
   it('rejects a field name containing a SQL statement', () => {
     const q = makeQuery('users', schema());
     assert.throws(
@@ -62,7 +62,7 @@ describe('SQL injection defense — hostile field names in WHERE', () => {
   });
 });
 
-describe('SQL injection defense — hostile orderBy keys', () => {
+describe('SQL injection defense, hostile orderBy keys', () => {
   it('rejects an orderBy key containing a SQL fragment', () => {
     const q = makeQuery('users', schema());
     assert.throws(
@@ -74,7 +74,7 @@ describe('SQL injection defense — hostile orderBy keys', () => {
   it('rejects an orderBy direction that is not asc/desc', () => {
     const q = makeQuery('users', schema());
     // The direction path should not allow arbitrary strings to reach SQL.
-    // Non-standard directions either throw or fall through to ASC —
+    // Non-standard directions either throw or fall through to ASC -
     // critically, they MUST NOT reach SQL unquoted.
     const result = (() => {
       try {
@@ -93,7 +93,7 @@ describe('SQL injection defense — hostile orderBy keys', () => {
   });
 });
 
-describe('SQL injection defense — quoted identifier escaping', () => {
+describe('SQL injection defense, quoted identifier escaping', () => {
   it('a field name with an embedded double-quote, even if it somehow reaches quoteIdent, must not break out', async () => {
     // We can't directly reach quoteIdent's code path through the public API
     // with a hostile column name (metadata validation rejects it first),

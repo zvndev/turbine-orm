@@ -7,11 +7,11 @@ export const metadata = {
 
 # Database Engines
 
-Turbine is **Postgres-first**. `import { TurbineClient } from 'turbine-orm'` targets PostgreSQL, and the whole safety bundle — the read-only Studio, PII-safe errors, SQL-first migrations, pgvector, LISTEN/NOTIFY, RLS — is built around it. When you need a different database, the same typed API runs on **SQLite**, **MySQL 8**, and **SQL Server** through dedicated subpath exports — plus **PowDB**, a single-node embedded database with its own query language, behind the same `findMany` / `with` / `where` surface.
+Turbine is **Postgres-first**. `import { TurbineClient } from 'turbine-orm'` targets PostgreSQL, and the whole safety bundle, the read-only Studio, PII-safe errors, SQL-first migrations, pgvector, LISTEN/NOTIFY, RLS, is built around it. When you need a different database, the same typed API runs on **SQLite**, **MySQL 8**, and **SQL Server** through dedicated subpath exports, plus **PowDB**, a single-node embedded database with its own query language, behind the same `findMany` / `with` / `where` surface.
 
-Multi-engine support is *additive*, not a pivot. You write the same `findMany` / `with` / `where` / `create` API; Turbine's dialect seam swaps the SQL primitives underneath. The one promise that never changes: `npm install turbine-orm` pulls exactly one runtime dependency (`pg`). Each engine's driver is its own concern — SQLite needs nothing extra, MySQL / SQL Server / PowDB use **optional peer dependencies** you install only if you use them.
+Multi-engine support is *additive*, not a pivot. You write the same `findMany` / `with` / `where` / `create` API; Turbine's dialect seam swaps the SQL primitives underneath. The one promise that never changes: `npm install turbine-orm` pulls exactly one runtime dependency (`pg`). Each engine's driver is its own concern, SQLite needs nothing extra, MySQL / SQL Server / PowDB use **optional peer dependencies** you install only if you use them.
 
-Two of these engines run **in-process**, with no server to start: **SQLite** (always — there is no SQLite wire protocol) and **PowDB**, which uniquely offers *both* an in-process embedded mode *and* a networked client over the same data. The rest — PostgreSQL, MySQL, SQL Server — are networked.
+Two of these engines run **in-process**, with no server to start: **SQLite** (always. There is no SQLite wire protocol) and **PowDB**, which uniquely offers *both* an in-process embedded mode *and* a networked client over the same data. The rest, PostgreSQL, MySQL, SQL Server, are networked.
 
 > **The `turbine` CLI drives PostgreSQL only.** `turbine generate`, `turbine push`, and `turbine migrate` are Postgres-only today. Every other engine (SQLite, MySQL, SQL Server, PowDB) is **code-first and programmatic**: define your schema with `defineSchema`, derive runtime metadata with `schemaDefToMetadata`, and construct the client through the engine's factory. The typed query API is identical across all engines; only the schema/migration *tooling* stays on Postgres for now. Each dialect already emits its own migration-tracking SQL, so a per-engine runner is a future adapter, not a rewrite.
 
@@ -58,19 +58,19 @@ Every cell reflects the actual behavior of the engine's dialect. `✗ E017` mean
 | Array-column filters (`has`, `hasEvery`, …) | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 | `groupBy({ distinctOn })` | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 
-¹ SQLite is single-writer — one write transaction at a time; concurrent writers get `SQLITE_BUSY` (treated as retryable). WAL mode is enabled for file databases so readers do not block.
+¹ SQLite is single-writer, one write transaction at a time; concurrent writers get `SQLITE_BUSY` (treated as retryable). WAL mode is enabled for file databases so readers do not block.
 
-² Each engine ships a `DialectIntrospector`, so `introspect({ dialect })` reads the engine's own catalog (`PRAGMA` for SQLite, `information_schema` / `sys.*` for MySQL and SQL Server). The `turbine generate` CLI command itself is currently Postgres-only — point an engine factory at a programmatically introspected or hand-written `SCHEMA`.
+² Each engine ships a `DialectIntrospector`, so `introspect({ dialect })` reads the engine's own catalog (`PRAGMA` for SQLite, `information_schema` / `sys.*` for MySQL and SQL Server). The `turbine generate` CLI command itself is currently Postgres-only, point an engine factory at a programmatically introspected or hand-written `SCHEMA`.
 
 ³ The `turbine migrate` runner is currently Postgres-only. Each dialect already emits its own migration-tracking SQL, and MySQL / SQL Server expose advisory-lock primitives (`GET_LOCK`, `sp_getapplock`) for a future adapter; SQLite serializes migrations naturally as a single writer.
 
 ⁴ Optimistic locking throws `OptimisticLockError` on all four engines. On `RETURNING` / `OUTPUT` engines (PostgreSQL, SQLite, SQL Server) the conflict is a missing returned row; on MySQL (the `reselect` strategy) the conflict is detected from the version-checked UPDATE's affected-row count, so it raises identically.
 
-⁵ `findManyStream` works on every engine — it yields rows in `batchSize` batches and you can `break` early. Only PostgreSQL streams with a true server-side cursor (`DECLARE CURSOR`, constant memory regardless of result size); SQLite, MySQL, and SQL Server currently materialize the full result first, then yield it in batches. For very large exports, stream on Postgres or paginate with `limit` on the other engines.
+⁵ `findManyStream` works on every engine, it yields rows in `batchSize` batches and you can `break` early. Only PostgreSQL streams with a true server-side cursor (`DECLARE CURSOR`, constant memory regardless of result size); SQLite, MySQL, and SQL Server currently materialize the full result first, then yield it in batches. For very large exports, stream on Postgres or paginate with `limit` on the other engines.
 
 ## How writes return rows
 
-The biggest difference between engines is how a write surfaces the row it affected — Turbine's `resultStrategy` seam handles it so `create` / `update` / `delete` / `upsert` keep returning the full row everywhere:
+The biggest difference between engines is how a write surfaces the row it affected, Turbine's `resultStrategy` seam handles it so `create` / `update` / `delete` / `upsert` keep returning the full row everywhere:
 
 | Engine | `resultStrategy` | Mechanism |
 |---|---|---|
@@ -80,7 +80,7 @@ The biggest difference between engines is how a write surfaces the row it affect
 | SQL Server | `output` | `OUTPUT INSERTED.*` / `MERGE` in the same statement |
 | PowDB | `returning` | trailing `returning` keyword (`upsert` excepted, see below) |
 
-The one user-visible consequence: on MySQL, **`createMany` returns an empty array** (`[]`). The rows are inserted — MySQL just cannot return them safely in bulk, so re-query if you need them back.
+The one user-visible consequence: on MySQL, **`createMany` returns an empty array** (`[]`). The rows are inserted, MySQL just cannot return them safely in bulk, so re-query if you need them back.
 
 PowDB's `returning` keyword takes no column list, so it returns the whole row and Turbine applies any PII projection client-side. Its **`upsert`** is the one write that reselects: PowQL's upsert statement rejects `returning`, so Turbine runs the write and reads the row back by primary key (a composite-primary-key upsert does the lookup-or-write in a single flat transaction).
 
@@ -89,7 +89,7 @@ PowDB's `returning` keyword takes no column list, so it returns the whole row an
 The in-process engine for tests, edge demos, and a "try it in ten seconds" onboarding. It uses Node's built-in `node:sqlite` driver, so it adds **zero new dependencies**.
 
 ```bash
-npm install turbine-orm   # nothing else — node:sqlite is built in (Node >= 22.5)
+npm install turbine-orm   # nothing else, node:sqlite is built in (Node >= 22.5)
 ```
 
 ```ts
@@ -105,18 +105,18 @@ await db.disconnect();
 
 `turbineSqlite(target, schema, options?)` is **synchronous** and returns a `TurbineClient`. Pass a file path, `':memory:'`, or an open `DatabaseSync` (so you can seed and introspect it first, then reuse the same connection). Options:
 
-- `wal` — enable WAL journal mode for file databases (default `true`; ignored for `':memory:'`).
-- `busyTimeoutMs` — how long a writer waits on `SQLITE_BUSY` (default `5000`).
-- `foreignKeys` — enable `PRAGMA foreign_keys` enforcement (default `true`).
+- `wal`, enable WAL journal mode for file databases (default `true`; ignored for `':memory:'`).
+- `busyTimeoutMs`, how long a writer waits on `SQLITE_BUSY` (default `5000`).
+- `foreignKeys`, enable `PRAGMA foreign_keys` enforcement (default `true`).
 - plus `logging`, `defaultLimit`, `warnOnUnlimited`.
 
-**Driver:** `node:sqlite` `DatabaseSync` is the primary driver (Node ≥ 22.5; it emits a harmless `ExperimentalWarning`). For older Node, wrap a `better-sqlite3` handle in the same pool shape — it is a documented fallback, not bundled.
+**Driver:** `node:sqlite` `DatabaseSync` is the primary driver (Node ≥ 22.5; it emits a harmless `ExperimentalWarning`). For older Node, wrap a `better-sqlite3` handle in the same pool shape. It is a documented fallback, not bundled.
 
-**Caveats:** SQLite has no native `BOOLEAN` (0/1 integers) or `DATE` (text/integer) — Turbine binds booleans as 1/0 and `Date` values as ISO-8601 text, and coerces `TIMESTAMP` / `DATETIME` / `DATE` columns back to `Date`. Integers wider than `Number.MAX_SAFE_INTEGER` come back as strings, mirroring the Postgres `int8` policy. Case-insensitive matching uses `COLLATE NOCASE`, which is ASCII-only (no Unicode case folding).
+**Caveats:** SQLite has no native `BOOLEAN` (0/1 integers) or `DATE` (text/integer), Turbine binds booleans as 1/0 and `Date` values as ISO-8601 text, and coerces `TIMESTAMP` / `DATETIME` / `DATE` columns back to `Date`. Integers wider than `Number.MAX_SAFE_INTEGER` come back as strings, mirroring the Postgres `int8` policy. Case-insensitive matching uses `COLLATE NOCASE`, which is ASCII-only (no Unicode case folding).
 
 ## MySQL 8
 
-MySQL 8.0+ via the `mysql2` driver — the largest market after Postgres. `mysql2` is an **optional peer dependency**: install it only if you use this subpath.
+MySQL 8.0+ via the `mysql2` driver, the largest market after Postgres. `mysql2` is an **optional peer dependency**: install it only if you use this subpath.
 
 ```bash
 npm install turbine-orm mysql2
@@ -132,7 +132,7 @@ const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
 await db.disconnect();
 ```
 
-`turbineMysql(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` may be a connection string, a `mysql2` config object, or an existing `mysql2` pool (injection — you own its lifecycle and `disconnect()` becomes a no-op). When Turbine builds the pool it pins the correct `mysql2` flags (named placeholders, safe bignum, UTC dates, JSON-as-string), probes `SELECT VERSION()` to reject MariaDB and any MySQL older than 8.0, and `disconnect()` closes the pool it created. The only option is `connectionLimit` (default `10`), plus `logging` / `defaultLimit` / `warnOnUnlimited`.
+`turbineMysql(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` may be a connection string, a `mysql2` config object, or an existing `mysql2` pool (injection. You own its lifecycle and `disconnect()` becomes a no-op). When Turbine builds the pool it pins the correct `mysql2` flags (named placeholders, safe bignum, UTC dates, JSON-as-string), probes `SELECT VERSION()` to reject MariaDB and any MySQL older than 8.0, and `disconnect()` closes the pool it created. The only option is `connectionLimit` (default `10`), plus `logging` / `defaultLimit` / `warnOnUnlimited`.
 
 **Caveats:** MySQL has no `RETURNING`, so writes use the `reselect` strategy and **`createMany` returns `[]`** (re-query if you need the rows). Nested relations use `JSON_OBJECT` / `JSON_ARRAYAGG`; since `JSON_ARRAYAGG` has no inline `ORDER BY`, every ordered to-many relation goes through the inner-subquery rewrite. Case-insensitive matching uses `LOWER(col) LIKE LOWER(ref)`, which can defeat an index unless a functional/generated index exists. MySQL 8.0+ is required (5.7 lacks `JSON_ARRAYAGG`); MariaDB is unsupported.
 
@@ -154,36 +154,36 @@ const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
 await db.disconnect();
 ```
 
-`turbineMssql(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` may be a connection string, an `mssql` config object, or an existing pool (injection — `disconnect()` is a no-op). When Turbine builds the pool it probes `SERVERPROPERTY('ProductMajorVersion')` to reject any SQL Server older than 2016. The `schema` option sets the introspection / DDL schema (default `dbo`), plus `logging` / `defaultLimit` / `warnOnUnlimited`.
+`turbineMssql(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` may be a connection string, an `mssql` config object, or an existing pool (injection, `disconnect()` is a no-op). When Turbine builds the pool it probes `SERVERPROPERTY('ProductMajorVersion')` to reject any SQL Server older than 2016. The `schema` option sets the introspection / DDL schema (default `dbo`), plus `logging` / `defaultLimit` / `warnOnUnlimited`.
 
-**Caveats:** SQL Server has no `RETURNING` or `json_agg`. Writes return rows via `OUTPUT INSERTED.*` (and upserts via `MERGE … OUTPUT`); nested relations use a dedicated `FOR JSON PATH` correlated-subquery generator, wrapping to-many results in `ISNULL(…, '[]')` and embedding nested objects with `JSON_QUERY`. Paging is `ORDER BY … OFFSET … FETCH NEXT` (a stable order is injected when a query has none). `createMany` is capped at 1000 rows / 2100 parameters per statement (exceeding either throws a `ValidationError` — chunk it yourself). `MERGE` is not a substitute for a unique constraint, so keep the upsert conflict target backed by a real `UNIQUE` / `PK` index; the loser of a race surfaces as a typed `UniqueConstraintError`. `DISTINCT ON` is Postgres-only and is not translated (it throws `UnsupportedFeatureError` on every non-Postgres engine, not only SQL Server).
+**Caveats:** SQL Server has no `RETURNING` or `json_agg`. Writes return rows via `OUTPUT INSERTED.*` (and upserts via `MERGE … OUTPUT`); nested relations use a dedicated `FOR JSON PATH` correlated-subquery generator, wrapping to-many results in `ISNULL(…, '[]')` and embedding nested objects with `JSON_QUERY`. Paging is `ORDER BY … OFFSET … FETCH NEXT` (a stable order is injected when a query has none). `createMany` is capped at 1000 rows / 2100 parameters per statement (exceeding either throws a `ValidationError`, chunk it yourself). `MERGE` is not a substitute for a unique constraint, so keep the upsert conflict target backed by a real `UNIQUE` / `PK` index; the loser of a race surfaces as a typed `UniqueConstraintError`. `DISTINCT ON` is Postgres-only and is not translated (it throws `UnsupportedFeatureError` on every non-Postgres engine, not only SQL Server).
 
 ## PowDB
 
-[PowDB](https://github.com/zvndev/powdb) is a single-node embedded database with its **own query language, PowQL** — it is *not* SQL. Turbine talks to it through a parallel PowQL generator that exposes the same `findMany` / `with` / `where` / `create` / `aggregate` surface, so your application code is unchanged; only the import and the connection target differ. Because PowQL shares no syntax with `SELECT … FROM … WHERE`, PowDB sits beside the four SQL engines rather than inside their dialect matrix.
+[PowDB](https://github.com/zvndev/powdb) is a single-node embedded database with its **own query language, PowQL**. It is *not* SQL. Turbine talks to it through a parallel PowQL generator that exposes the same `findMany` / `with` / `where` / `create` / `aggregate` surface, so your application code is unchanged; only the import and the connection target differ. Because PowQL shares no syntax with `SELECT … FROM … WHERE`, PowDB sits beside the four SQL engines rather than inside their dialect matrix.
 
 PowDB is the one engine that runs **both ways from the same data**:
 
-- **Embedded** — in-process via the native addon `@zvndev/powdb-embedded` (no server, no socket). This is the local-first / SQLite-replacement story.
-- **Networked** — over a Unix socket or TCP via `@zvndev/powdb-client`, talking to a `powdb-server`.
+- **Embedded**, in-process via the native addon `@zvndev/powdb-embedded` (no server, no socket). This is the local-first / SQLite-replacement story.
+- **Networked**, over a Unix socket or TCP via `@zvndev/powdb-client`, talking to a `powdb-server`.
 
-Both are **optional peer dependencies** — `npm install turbine-orm` never pulls either; you install only the transport you use.
+Both are **optional peer dependencies**, `npm install turbine-orm` never pulls either; you install only the transport you use.
 
 ```bash
-# Embedded (in-process) — native addon, no server
+# Embedded (in-process), native addon, no server
 npm install turbine-orm @zvndev/powdb-embedded
 
-# Networked — client for a running powdb-server
+# Networked, client for a running powdb-server
 npm install turbine-orm @zvndev/powdb-client
 ```
 
 Schemas are code-first: define them with `defineSchema`, and `schemaDefToMetadata` (v0.30) derives the runtime metadata the client needs straight from that definition. As of v0.34 a programmatic introspector also exists: `introspectPowdbDatabase` (exported from `turbine-orm/powdb`) reads a live catalog via PowDB 0.10+'s `schema` / `describe` statements into `SchemaMetadata`. On **engine ≥ 0.19.1** it additionally reads declared entity links (`schema links`) and populates relations for the first time on PowDB; `defineSchema` still remains the recommended, relation-complete path (many-to-many junctions cannot be inferred from links, and `turbine generate` CLI support is not wired yet):
 
 ```ts
-// Embedded — in-process, opens a data directory. async; resolves to a TurbineClient.
+// Embedded, in-process, opens a data directory. async; resolves to a TurbineClient.
 import { turbinePowDB } from 'turbine-orm/powdb';
 import { schemaDefToMetadata } from 'turbine-orm';
-import { schema } from './schema.js'; // defineSchema({...}) — PowDB has no introspection
+import { schema } from './schema.js'; // defineSchema({...}), PowDB has no introspection
 
 const db = await turbinePowDB(
   { embedded: './data', syncMode: 'normal' },
@@ -195,7 +195,7 @@ await db.disconnect();
 ```
 
 ```ts
-// Networked — same API, talks to a running powdb-server.
+// Networked, same API, talks to a running powdb-server.
 import { turbinePowDB } from 'turbine-orm/powdb';
 import { schemaDefToMetadata } from 'turbine-orm';
 import { schema } from './schema.js';
@@ -207,13 +207,13 @@ See [`schemaDefToMetadata`](/schema#runtime-metadata-without-a-database--schemad
 
 `turbinePowDB(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` is either an embedded descriptor (`{ embedded: dir, syncMode?, memoryLimit? }` or an open embedded handle) or a networked target (`powdb://host:port` string, a config object, or an existing PowDB pool, injection, so `disconnect()` becomes a no-op). The networked path probes the server version and requires **PowDB ≥ 0.7.0** at runtime; the declared optional peer range in `package.json` is `>=0.7.1 <1.0.0`. The ESM-only `@zvndev/powdb-client` ≥ 0.9 loads correctly even from a CommonJS build (Turbine reaches it through a dynamic-import shim).
 
-### Embedded durability — `syncMode`
+### Embedded durability, `syncMode`
 
 The embedded addon lets Turbine choose how aggressively PowDB fsyncs, via `turbinePowDB({ embedded, syncMode })`:
 
-- **`'full'`** *(default)* — fsync on every commit. Safest; matches SQLite's default durability.
-- **`'normal'`** — fsync moved off the commit path. On OS crash / power loss you can lose a bounded window (≤ one fsync interval); a *process* crash (not the OS) still loses nothing thanks to WAL replay. This is the mode that makes embedded writes fast.
-- **`'off'`** — no fsync. For throwaway / test data only.
+- **`'full'`** *(default)*, fsync on every commit. Safest; matches SQLite's default durability.
+- **`'normal'`**, fsync moved off the commit path. On OS crash / power loss you can lose a bounded window (≤ one fsync interval); a *process* crash (not the OS) still loses nothing thanks to WAL replay. This is the mode that makes embedded writes fast.
+- **`'off'`**, no fsync. For throwaway / test data only.
 
 An optional `memoryLimit` (bytes) caps the embedded cache. `syncMode` / `memoryLimit` require the 0.7.1+ addon; on an older addon Turbine raises a clear `ConnectionError` rather than silently ignoring them.
 
@@ -242,29 +242,29 @@ Read all of this as per-op latency on a warm cache, a small dataset, and a singl
 
 PowDB is a younger, intentionally smaller engine, so Turbine's PowQL backend differs from the SQL path in a few honest ways:
 
-- **Nested `with` runs as one statement on engine 0.18+.** PowDB 0.18's **nested projections** let a PowQL projection field be a whole correlated child query, so Turbine compiles eligible `with` clauses straight into the parent statement — the same single-query shape its `json_agg` strategy gives Postgres — with per-parent `orderBy`/`limit` applied natively and childless parents kept. See the nested projections section below. On older engines (and for ineligible shapes such as **many-to-many through a junction table**) each relation level is a separate batched lookup (keys chunked at 1,000), and as of v0.35 `relationLoadStrategy: 'join'` can compile eligible top-level relations to native server-side PowQL joins. Output is identical on every path.
+- **Nested `with` runs as one statement on engine 0.18+.** PowDB 0.18's **nested projections** let a PowQL projection field be a whole correlated child query, so Turbine compiles eligible `with` clauses straight into the parent statement, the same single-query shape its `json_agg` strategy gives Postgres, with per-parent `orderBy`/`limit` applied natively and childless parents kept. See the nested projections section below. On older engines (and for ineligible shapes such as **many-to-many through a junction table**) each relation level is a separate batched lookup (keys chunked at 1,000), and as of v0.35 `relationLoadStrategy: 'join'` can compile eligible top-level relations to native server-side PowQL joins. Output is identical on every path.
 - **Primary keys can be server-assigned _or_ client-assigned.** Declare an `auto` int PK (`isGenerated`) and PowDB assigns a monotonic id on `create` (read back automatically); otherwise a defaulted string PK gets a client-generated UUID.
-- **Relation filters resolve to a literal list, not a subquery.** `where: { tags: { some } }` runs the inner predicate first and filters with `in (<keys>)` — one extra round-trip, but it sidesteps a PowDB engine quirk where a repeated `in (<subquery>)` of the same shape can return a stale cached result. Correct on every cardinality and nesting level.
-- **Nested writes run as one flat transaction.** `create`/`update` with relation ops (`create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert` on hasMany/hasOne/belongsTo) commit or roll back together. PowDB is single-writer with one global write lock, so top-level `$transaction` calls **queue FIFO** (as of v0.30) instead of failing — a second concurrent transaction waits for the first to finish rather than throwing. A **re-entrant / nested** `$transaction` still throws `UnsupportedFeatureError` immediately, since PowDB has no savepoints and waiting on the lock it already holds would deadlock. Cap the wait with `transactionQueueTimeoutMs` (default `30000`; `0` or `Infinity` waits forever) — on elapse the queued transaction rejects with `TimeoutError` (`TURBINE_E002`).
+- **Relation filters resolve to a literal list, not a subquery.** `where: { tags: { some } }` runs the inner predicate first and filters with `in (<keys>)`, one extra round-trip, but it sidesteps a PowDB engine quirk where a repeated `in (<subquery>)` of the same shape can return a stale cached result. Correct on every cardinality and nesting level.
+- **Nested writes run as one flat transaction.** `create`/`update` with relation ops (`create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert` on hasMany/hasOne/belongsTo) commit or roll back together. PowDB is single-writer with one global write lock, so top-level `$transaction` calls **queue FIFO** (as of v0.30) instead of failing, a second concurrent transaction waits for the first to finish rather than throwing. A **re-entrant / nested** `$transaction` still throws `UnsupportedFeatureError` immediately, since PowDB has no savepoints and waiting on the lock it already holds would deadlock. Cap the wait with `transactionQueueTimeoutMs` (default `30000`; `0` or `Infinity` waits forever), on elapse the queued transaction rejects with `TimeoutError` (`TURBINE_E002`).
 - **Schema is code-first.** Define schemas with `defineSchema`; `turbine migrate` is Postgres-only. (A programmatic `describe`-based introspector exists since v0.34; on engine ≥ 0.19.1 it also reads declared entity links into relations, see above.)
 - **Type mapping is narrowed.** PowDB stores `str` / `int` / `float` / `bool` / `json` (the `json` document type needs engine ≥ 0.12); Turbine never emits `uuid` / `datetime` / `bytes` on the wire, and maps `Date` to integer microseconds.
-- **Reserved PowQL words are quoted automatically.** A column named after a PowQL keyword — `type`, `order`, and the new PowDB 0.10 words `schema` / `describe` — is backtick-quoted in the generated PowQL, so reserved-word columns just work (PowDB ≥ 0.10).
+- **Reserved PowQL words are quoted automatically.** A column named after a PowQL keyword, `type`, `order`, and the new PowDB 0.10 words `schema` / `describe`, is backtick-quoted in the generated PowQL, so reserved-word columns just work (PowDB ≥ 0.10).
 - **Server-side timeouts surface as `TimeoutError`.** PowDB 0.10's server-side "transaction gate timeout" maps to `TimeoutError` (`TURBINE_E002`), matching the client-side `transactionQueueTimeoutMs` behavior above.
-- **Connection failures surface as `ConnectionError`.** As of v0.34, protocol-level failures (including the "received unexpected frame" shape a stale idle socket produces) map to `ConnectionError` (`TURBINE_E004`) with the original error as `.cause` — previously these surfaced as `ValidationError` (E003). An opt-in `retryStaleReads` replays a first-statement **read** once on that exact signature (never a write, never inside a transaction).
+- **Connection failures surface as `ConnectionError`.** As of v0.34, protocol-level failures (including the "received unexpected frame" shape a stale idle socket produces) map to `ConnectionError` (`TURBINE_E004`) with the original error as `.cause`, previously these surfaced as `ValidationError` (E003). An opt-in `retryStaleReads` replays a first-statement **read** once on that exact signature (never a write, never inside a transaction).
 
 ### JSON documents (PowDB ≥ 0.12 / 0.13)
 
 PowDB 0.12 added a native `json` document column type and 0.13 added path filters, path ordering, doc-field grouped aggregates, and doc-field expression indexes. Turbine 0.34 maps its existing JSON API onto them, so the same queries you write on Postgres `jsonb` run on PowDB (every feature is version-gated: an older engine throws a typed E017 with an upgrade hint, never a parse error):
 
-- **`JsonFilter` where-filters** — `where: { data: { path: ['ns', 'value'], gte: 5 } }` compiles to a PowQL path comparison with every segment and value bound as a typed parameter. A digit-only segment addresses an array index, matching the SQL engines. `equals: null` matches a JSON `null` **or** a missing key on PowDB. `contains` and pathless `equals` stay E017 (PowQL has no containment operator).
-- **JSON-path `orderBy` and `groupBy`** — path ordering (missing keys sort last in both directions, same as every other driver since v0.34) and JSON-path group keys / aggregate targets with the same alias and `orderBy` semantics as the SQL engines.
-- **Doc-field expression indexes** — declare them in `defineSchema` (`indexes: [{ docField: 'data', path: ['ns', 'value'] }]`) and `powqlSchemaDDL` emits the parenthesized `alter T add index (.data->"ns"->"value")` DDL (engine ≥ 0.13). Unique doc-field violations map to `UniqueConstraintError` (E008).
-- **Native typed wire on both transports** — on engine ≥ 0.13 the networked transport uses PowDB's lossless `queryNativeRaw` API, and as of v0.35 the **embedded** transport joins it: on addon ≥ 0.14 embedded queries run through `queryWithParams` (real positional parameter binding plus typed result cells), replacing the literal-materialization path older addons still use. On either transport a JSON `null`, a missing field, and the string `"null"` are all distinguishable end-to-end, and each result is coerced according to the wire that actually served it. Embedded `disconnect()` now performs a real checkpoint-flush close on addon ≥ 0.14.
-- **Equality is type-strict on JSON leaves.** PowQL's `=` never coerces across types: a JSON document holding `7.0` (float) does not match a filter binding the integer `7`, and strings never equal numbers. Turbine binds an integral JS number as an int and a fractional one as a float, so values written through Turbine round-trip correctly — but when filtering documents written by other tools, bind the type the document actually stores. (Stored scalar columns are softer: an int literal against a `float` column widens losslessly.)
+- **`JsonFilter` where-filters**, `where: { data: { path: ['ns', 'value'], gte: 5 } }` compiles to a PowQL path comparison with every segment and value bound as a typed parameter. A digit-only segment addresses an array index, matching the SQL engines. `equals: null` matches a JSON `null` **or** a missing key on PowDB. `contains` and pathless `equals` stay E017 (PowQL has no containment operator).
+- **JSON-path `orderBy` and `groupBy`**, path ordering (missing keys sort last in both directions, same as every other driver since v0.34) and JSON-path group keys / aggregate targets with the same alias and `orderBy` semantics as the SQL engines.
+- **Doc-field expression indexes**, declare them in `defineSchema` (`indexes: [{ docField: 'data', path: ['ns', 'value'] }]`) and `powqlSchemaDDL` emits the parenthesized `alter T add index (.data->"ns"->"value")` DDL (engine ≥ 0.13). Unique doc-field violations map to `UniqueConstraintError` (E008).
+- **Native typed wire on both transports**, on engine ≥ 0.13 the networked transport uses PowDB's lossless `queryNativeRaw` API, and as of v0.35 the **embedded** transport joins it: on addon ≥ 0.14 embedded queries run through `queryWithParams` (real positional parameter binding plus typed result cells), replacing the literal-materialization path older addons still use. On either transport a JSON `null`, a missing field, and the string `"null"` are all distinguishable end-to-end, and each result is coerced according to the wire that actually served it. Embedded `disconnect()` now performs a real checkpoint-flush close on addon ≥ 0.14.
+- **Equality is type-strict on JSON leaves.** PowQL's `=` never coerces across types: a JSON document holding `7.0` (float) does not match a filter binding the integer `7`, and strings never equal numbers. Turbine binds an integral JS number as an int and a fractional one as a float, so values written through Turbine round-trip correctly, but when filtering documents written by other tools, bind the type the document actually stores. (Stored scalar columns are softer: an int literal against a `float` column widens losslessly.)
 
 ### Nested projections: one-statement `with` (PowDB ≥ 0.18)
 
-PowDB 0.18 added **nested projections** (shaped results) to PowQL: a projection field can be a whole correlated child query, returning one row per parent with the matching children assembled into a native JSON array — no join fan-out, no client-side regrouping. On a ≥ 0.18 engine Turbine compiles eligible `with` clauses straight into the parent statement, making this the **default** relation path (it supersedes the batched loaders automatically; nothing to configure):
+PowDB 0.18 added **nested projections** (shaped results) to PowQL: a projection field can be a whole correlated child query, returning one row per parent with the matching children assembled into a native JSON array, no join fan-out, no client-side regrouping. On a ≥ 0.18 engine Turbine compiles eligible `with` clauses straight into the parent statement, making this the **default** relation path (it supersedes the batched loaders automatically; nothing to configure):
 
 ```ts
 // ONE PowQL statement: per-parent ordering and limit applied by the engine,
@@ -283,7 +283,7 @@ Ineligible shapes **silently fall back** to the batched loaders with identical o
 
 ### Native relation joins (PowDB ≥ 0.13)
 
-On engines below 0.18 (or with nesting opted out) PowDB relation loading runs the batched loaders described above. As of v0.35 you can opt eligible relations into **native server-side joins** instead — one hash-accelerated join statement per relation, no key lists, no 1,000-key chunking:
+On engines below 0.18 (or with nesting opted out) PowDB relation loading runs the batched loaders described above. As of v0.35 you can opt eligible relations into **native server-side joins** instead, one hash-accelerated join statement per relation, no key lists, no 1,000-key chunking:
 
 ```ts
 // Per query:
@@ -315,7 +315,7 @@ One divergence is **permanent by upstream design, documented rather than silentl
 
 ### Read-only snapshots and replicas (PowDB ≥ 0.14)
 
-PowDB 0.14 can serve a quiescent data directory **strictly read-only** — `powdb-server --readonly`, or embedded `Database.openReadOnly` — with any number of concurrent readers across processes. Turbine supports the pattern end to end:
+PowDB 0.14 can serve a quiescent data directory **strictly read-only**, `powdb-server --readonly`, or embedded `Database.openReadOnly`, with any number of concurrent readers across processes. Turbine supports the pattern end to end:
 
 ```ts
 // Embedded read-only snapshot (addon >= 0.14):
@@ -325,7 +325,7 @@ const replica = await turbinePowDB({ embedded: './snapshot', readonly: true }, s
 const replica = await turbinePowDB('powdb://replica-host:7070', schema, { readonly: true });
 ```
 
-Reads work unchanged. Any write is refused with a typed `ReadOnlyError` (`TURBINE_E018`) whose `reason` field distinguishes `'snapshot'` (nothing can write here — route writes to the primary) from `'rbac'` (this connection's role may not write). With the client-level `readonly: true` flag the refusal happens locally, before the wire; without it, the engine's refusal maps to the same error. Freshness is the snapshot cadence — this is snapshot serving, not streaming replication. See [Read Replicas](/read-replicas) for the routing pattern.
+Reads work unchanged. Any write is refused with a typed `ReadOnlyError` (`TURBINE_E018`) whose `reason` field distinguishes `'snapshot'` (nothing can write here, route writes to the primary) from `'rbac'` (this connection's role may not write). With the client-level `readonly: true` flag the refusal happens locally, before the wire; without it, the engine's refusal maps to the same error. Freshness is the snapshot cadence. This is snapshot serving, not streaming replication. See [Read Replicas](/read-replicas) for the routing pattern.
 
 One operational note on engine 0.16: PowDB 0.16 fixed a correctness bug in non-unique string indexes (values with embedded NUL bytes could interleave) with a new on-disk index format. A data directory written by an older engine upgrades automatically on its first **writable** open; a read-only open rebuilds the affected indexes in memory on every open until a writable open persists the upgrade. For snapshot fleets, run the snapshot through one writable open (or take snapshots from a 0.16 primary) so replicas skip the per-open rebuild. Turbine supports 0.16 as of v0.36.1; no query or API changes are involved.
 
@@ -333,29 +333,29 @@ PowDB 0.17 added a stable one-byte **error class** to every server error frame. 
 
 ### explain() and index guidance
 
-Every Turbine table accessor has `explain(args)` as of v0.35 — it runs the exact query `findMany` would compile through the engine's plan explainer and returns the plan lines (see [Queries](/queries#explain)). On PowDB this matters more than elsewhere: the planner picks indexes greedily using per-index statistics (engine ≥ 0.15), so **index the most selective column of your common conjunctions** and verify with `explain` that the intended index drives the scan. Plan text is engine-owned diagnostic output, not a stable API.
+Every Turbine table accessor has `explain(args)` as of v0.35, it runs the exact query `findMany` would compile through the engine's plan explainer and returns the plan lines (see [Queries](/queries#explain)). On PowDB this matters more than elsewhere: the planner picks indexes greedily using per-index statistics (engine ≥ 0.15), so **index the most selective column of your common conjunctions** and verify with `explain` that the intended index drives the scan. Plan text is engine-owned diagnostic output, not a stable API.
 
 ### Unsupported features → `TURBINE_E017`
 
 Beyond the Postgres-only trio every non-Postgres engine throws on (pgvector, LISTEN/NOTIFY, RLS `sessionContext`), PowDB throws `UnsupportedFeatureError` for the capabilities PowQL genuinely can't express:
 
-- **Filters:** array, full-text, and pgvector-distance filters; vector / distance ordering. (JSON path filters are supported on engine ≥ 0.12 — see the JSON documents section above; `contains` and pathless `equals` remain E017.)
-- **Composite keys via subqueries:** composite-key relation filters, composite-key nested reads, and composite-junction many-to-many — PowQL has no tuple-`in` (`(a, b) in (…)`). (A single-row `findUnique`/`upsert` on a composite PK works — it's plain `AND`-of-equalities.)
+- **Filters:** array, full-text, and pgvector-distance filters; vector / distance ordering. (JSON path filters are supported on engine ≥ 0.12, see the JSON documents section above; `contains` and pathless `equals` remain E017.)
+- **Composite keys via subqueries:** composite-key relation filters, composite-key nested reads, and composite-junction many-to-many, PowQL has no tuple-`in` (`(a, b) in (…)`). (A single-row `findUnique`/`upsert` on a composite PK works. It's plain `AND`-of-equalities.)
 - **Writes:** nested writes inside `createMany` / `upsert` (use `create` / `update`).
-- **Reads:** cursor pagination and `findManyStream` (no server-side cursor — page with `findMany({ limit, offset })`).
+- **Reads:** cursor pagination and `findManyStream` (no server-side cursor, page with `findMany({ limit, offset })`).
 
-Everything else works — `findMany` / `findUnique` / `findFirst`, `create` / `createMany` / `update` / `updateMany` / `delete` / `deleteMany` / `upsert` (composite PK included), atomic update operators, `count` / `aggregate` / `groupBy`, `where` operators, `orderBy` / `select` / `omit`, `with` for hasMany / belongsTo / hasOne **and many-to-many**, relation filters (`some` / `none` / `every`) on every cardinality, and nested writes in `create` / `update`.
+Everything else works, `findMany` / `findUnique` / `findFirst`, `create` / `createMany` / `update` / `updateMany` / `delete` / `deleteMany` / `upsert` (composite PK included), atomic update operators, `count` / `aggregate` / `groupBy`, `where` operators, `orderBy` / `select` / `omit`, `with` for hasMany / belongsTo / hasOne **and many-to-many**, relation filters (`some` / `none` / `every`) on every cardinality, and nested writes in `create` / `update`.
 
 ### Platform binaries (embedded)
 
-The embedded addon ships prebuilt binaries for **darwin-arm64** and **linux-glibc (x64 / arm64)**. On other platforms — musl/Alpine, Windows, Intel macOS — the addon builds from source at install. The **networked** transport has no such constraint: any platform can run `@zvndev/powdb-client` against a `powdb-server`.
+The embedded addon ships prebuilt binaries for **darwin-arm64** and **linux-glibc (x64 / arm64)**. On other platforms, musl/Alpine, Windows, Intel macOS, the addon builds from source at install. The **networked** transport has no such constraint: any platform can run `@zvndev/powdb-client` against a `powdb-server`.
 
 ## Postgres-compatible databases
 
-Distributed and managed databases that speak the **PostgreSQL wire protocol** — AlloyDB, TimescaleDB, Neon, Supabase, YugabyteDB, CockroachDB — are not separate engines. They run on the default Postgres path (some with a thin adapter for migration locking or introspection quirks). See [Database Compatibility](/compatibility) for that matrix; this page covers the first-class non-Postgres engines.
+Distributed and managed databases that speak the **PostgreSQL wire protocol**, AlloyDB, TimescaleDB, Neon, Supabase, YugabyteDB, CockroachDB, are not separate engines. They run on the default Postgres path (some with a thin adapter for migration locking or introspection quirks). See [Database Compatibility](/compatibility) for that matrix; this page covers the first-class non-Postgres engines.
 
 ## See also
 
-- **[Database Compatibility](/compatibility)** — PG-wire-compatible databases (CockroachDB, YugabyteDB, AlloyDB, …) and their adapters.
-- **[Typed Errors](/errors)** — `UnsupportedFeatureError` (`TURBINE_E017`) and the full error code reference.
-- **[Serverless & Edge](/serverless)** — driver injection for Neon, Vercel Postgres, and Cloudflare on the Postgres path.
+- **[Database Compatibility](/compatibility)**, PG-wire-compatible databases (CockroachDB, YugabyteDB, AlloyDB, …) and their adapters.
+- **[Typed Errors](/errors)**, `UnsupportedFeatureError` (`TURBINE_E017`) and the full error code reference.
+- **[Serverless & Edge](/serverless)**, driver injection for Neon, Vercel Postgres, and Cloudflare on the Postgres path.

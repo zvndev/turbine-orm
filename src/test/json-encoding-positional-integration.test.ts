@@ -1,10 +1,10 @@
 /**
- * turbine-orm — positional JSON encoding parity (integration)
+ * turbine-orm, positional JSON encoding parity (integration)
  *
  * Runs the SAME nested `with` queries under `jsonEncoding: 'object'` and
  * `jsonEncoding: 'positional'` against a real Postgres and asserts the parsed
  * results are deep-equal. This is the load-bearing guarantee: positional is a
- * pure wire-size optimization — flipping the flag must never change output
+ * pure wire-size optimization, flipping the flag must never change output
  * (dates, null to-one relations, orderBy+limit windows, select/omit all
  * included).
  *
@@ -12,7 +12,7 @@
  *
  *   DATABASE_URL=postgres://... npx tsx --test src/test/json-encoding-positional-integration.test.ts
  *
- * Gated by DATABASE_URL — absent, every test is reported skipped (never failed).
+ * Gated by DATABASE_URL, absent, every test is reported skipped (never failed).
  */
 
 import assert from 'node:assert/strict';

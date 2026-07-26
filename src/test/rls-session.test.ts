@@ -1,5 +1,5 @@
 /**
- * turbine-orm — RLS / session-context ($transaction sessionContext) tests
+ * turbine-orm, RLS / session-context ($transaction sessionContext) tests
  *
  * Two layers:
  *
@@ -15,7 +15,7 @@
  *     with a policy keyed on current_setting('app.current_tenant'), seed two
  *     tenants, and prove that inside
  *     $transaction(fn, { sessionContext: { 'app.current_tenant': 'A' } }) a
- *     SELECT returns ONLY tenant A's rows — and a different tenant value
+ *     SELECT returns ONLY tenant A's rows, and a different tenant value
  *     returns the other set. FORCE ROW LEVEL SECURITY is used so even the
  *     table owner / local superuser is subject to the policy.
  *
@@ -63,7 +63,7 @@ function makeCapturingPool() {
 }
 
 // ---------------------------------------------------------------------------
-// Unit — no DB
+// Unit, no DB
 // ---------------------------------------------------------------------------
 
 describe('rls session-context (unit)', () => {
@@ -109,7 +109,7 @@ describe('rls session-context (unit)', () => {
     await assert.rejects(
       () =>
         db.$transaction(async () => 'ok', {
-          // contains a quote + semicolon — clearly not a valid GUC identifier
+          // contains a quote + semicolon, clearly not a valid GUC identifier
           sessionContext: { 'app.tenant"; DROP TABLE x; --': 'A' },
         }),
       (err: unknown) => {
@@ -149,7 +149,7 @@ describe('rls session-context (unit)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Integration — needs DATABASE_URL
+// Integration, needs DATABASE_URL
 // ---------------------------------------------------------------------------
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -165,7 +165,7 @@ testFn('rls session-context integration', () => {
   const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
   let client: TurbineClient;
   let schema: SchemaMetadata;
-  // Constant identifier — baked literally into SQL strings below. Never user input.
+  // Constant identifier, baked literally into SQL strings below. Never user input.
   const TABLE = '_w3_rls_docs';
   // A NON-superuser, NON-BYPASSRLS role. The local connection role is a
   // superuser with rolbypassrls=true, which skips ALL row-level security
@@ -231,7 +231,7 @@ testFn('rls session-context integration', () => {
   // Helper: run a SELECT on the RLS table INSIDE a $transaction with the given
   // session context. We SET LOCAL ROLE to the NOBYPASSRLS role first (also
   // transaction-local, auto-resets on COMMIT) so RLS is actually enforced, then
-  // run the SELECT — both on the transaction's own connection, so the GUCs set
+  // run the SELECT, both on the transaction's own connection, so the GUCs set
   // by sessionContext apply.
   const selectTenants = (ctx?: Record<string, string>) =>
     client.$transaction(
@@ -265,7 +265,7 @@ testFn('rls session-context integration', () => {
   });
 
   it('the GUC auto-resets between transactions (is_local scoping)', async () => {
-    // Set A in one transaction, then B in the next — if is_local leaked onto
+    // Set A in one transaction, then B in the next, if is_local leaked onto
     // the pooled connection, the second txn might still see A.
     await client.$transaction(async () => 'ok', { sessionContext: { 'app.current_tenant': 'A' } });
     const rows = await selectTenants({ 'app.current_tenant': 'B' });

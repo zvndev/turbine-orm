@@ -1,9 +1,9 @@
 /**
- * turbine-orm — Migration system unit tests
+ * turbine-orm, Migration system unit tests
  *
  * Tests parseMigrationContent(), sanitizeName(), formatTimestamp(),
  * parseMigrationFilename(), listMigrationFiles(), createMigration(),
- * and getPendingMigrations() — all without a database.
+ * and getPendingMigrations(), all without a database.
  *
  * Run: node --test --experimental-strip-types src/test/migrate.test.ts
  */

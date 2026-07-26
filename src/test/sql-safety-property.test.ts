@@ -1,14 +1,14 @@
 /**
- * SQL safety — adversarial injection corpus (table-driven).
+ * SQL safety, adversarial injection corpus (table-driven).
  *
- * NOTE: despite the file name, this is NOT a property/fuzz test — there is no
+ * NOTE: despite the file name, this is NOT a property/fuzz test, there is no
  * random input generation. It is a fixed, hand-curated corpus of known
  * SQL-injection payloads iterated in a loop (a table-driven / parameterized
  * test). Each payload is fed through the query builder and we assert the
  * builder never string-interpolates it: the raw payload must not appear in the
  * generated SQL, and the value must instead show up in the `$N` params array.
  *
- * To strengthen coverage, add more real-world payloads to INJECTION_PAYLOADS —
+ * To strengthen coverage, add more real-world payloads to INJECTION_PAYLOADS -
  * keep it a deterministic, fixed list (do not add random generation, which
  * would make failures non-reproducible). Avoid payloads that are legitimate
  * substrings of the emitted SQL (e.g. a bare `$1` or `"users"`), since the
@@ -76,7 +76,7 @@ const INJECTION_PAYLOADS = [
   Array(10000).fill('A').join(''),
 ];
 
-describe('SQL safety — adversarial injection corpus (table-driven)', () => {
+describe('SQL safety, adversarial injection corpus (table-driven)', () => {
   it('user values never appear unparameterized in WHERE SQL', () => {
     const q = makeQuery('users', schema);
 

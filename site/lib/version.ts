@@ -1,5 +1,5 @@
 /**
- * GENERATED FILE — do not edit by hand.
+ * GENERATED FILE, do not edit by hand.
  *
  * Derived from the root package.json version at build time by
  * site/scripts/gen-version.mjs (runs as predev/prebuild). This is the single

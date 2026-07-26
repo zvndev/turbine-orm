@@ -1,5 +1,5 @@
 /**
- * SQL safety — seeded generative fuzz over identifier / LIKE / where equality paths.
+ * SQL safety, seeded generative fuzz over identifier / LIKE / where equality paths.
  *
  * Unlike the fixed adversarial corpus in `sql-safety-property.test.ts`, this suite
  * draws random inputs from a deterministic PRNG (mulberry32) so failures are
@@ -10,7 +10,7 @@
  *  2. Every value is present in the params array (as `$N` bind).
  *  3. Identifiers with quotes/spaces are still quoted via quoteIdent (no bare injection).
  *  4. The builder never throws on random string/number payloads (only ValidationError
- *     is acceptable, and only for deliberately malformed operator shapes — not used here).
+ *     is acceptable, and only for deliberately malformed operator shapes, not used here).
  */
 
 import assert from 'node:assert/strict';
@@ -19,7 +19,7 @@ import { quoteIdent } from '../query/utils.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
-/** Deterministic PRNG — same seed always yields the same sequence. */
+/** Deterministic PRNG, same seed always yields the same sequence. */
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
@@ -47,7 +47,7 @@ function randomString(rng: () => number, maxLen = 32): string {
 }
 
 function randomIdent(rng: () => number): string {
-  // Identifiers the schema might theoretically hold — include quote-y names.
+  // Identifiers the schema might theoretically hold, include quote-y names.
   const bases = ['id', 'name', 'email', 'user"name', 'order by', 'a.b', 'x'];
   if (rng() < 0.3) return pick(rng, bases);
   return randomString(rng, 12).replace(/\0/g, '');
@@ -69,7 +69,7 @@ const schema: SchemaMetadata = {
 const SEEDS = [1, 42, 2026, 0xdeadbeef, 99_001] as const;
 const CASES_PER_SEED = 200;
 
-describe('SQL safety — seeded generative fuzz', () => {
+describe('SQL safety, seeded generative fuzz', () => {
   it('quoteIdent never leaves metacharacters unescaped', () => {
     for (const seed of SEEDS) {
       const rng = mulberry32(seed);
@@ -121,7 +121,7 @@ describe('SQL safety — seeded generative fuzz', () => {
         const values: unknown[] = mode === 3 ? (where[field] as { in: string[] }).in : [value];
         for (const v of values) {
           if (typeof v === 'string' && v.length > 0) {
-            // LIKE patterns escape %/_/\ — so the raw string may not appear verbatim
+            // LIKE patterns escape %/_/\, so the raw string may not appear verbatim
             // in params either; assert the SQL does not embed the raw payload as a
             // string literal (single-quoted) and that params are non-empty.
             assert.ok(

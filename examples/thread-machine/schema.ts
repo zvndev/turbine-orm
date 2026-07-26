@@ -1,7 +1,7 @@
 import { defineSchema } from 'turbine-orm';
 
 /**
- * Thread Machine — a Hacker News-style schema that shows off deep typed `with`.
+ * Thread Machine, a Hacker News-style schema that shows off deep typed `with`.
  *
  * The whole point: a single `findMany` on `stories` pulls the full 4-level
  * graph (story → author, story → comments → author, story → comments →

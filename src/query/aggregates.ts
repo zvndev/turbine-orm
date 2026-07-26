@@ -95,7 +95,7 @@ export function buildGroupBy<T extends object>(
     : `${qi.q(qi.table)}${whereSql}`;
 
   // Group keys: plain columns and/or JSON-path keys. Output-name collisions
-  // are rejected up front — and the check runs over the EMITTED SQL output
+  // are rejected up front, and the check runs over the EMITTED SQL output
   // column names (snake_case column / JSON alias / `_agg_key` aggregate
   // alias), not just the given arg keys: the driver keeps only the LAST
   // duplicate field per row object, so a JSON alias equal to another key's
@@ -247,7 +247,7 @@ export function buildGroupBy<T extends object>(
 
   let sql = `SELECT ${selectExprs.join(', ')} FROM ${fromSql} GROUP BY ${groupExprs.join(', ')}`;
 
-  // HAVING — filter whole groups by their aggregate values.
+  // HAVING, filter whole groups by their aggregate values.
   // Appends to the same `params` array, so placeholders continue from the
   // WHERE clause's parameter positions (qi.p(params.length) below).
   if (args.having) {
@@ -552,7 +552,7 @@ export function buildDistinctOnSource<T extends object>(
  * throws {@link ValidationError} for unknown fields and `qi.q()` quotes via
  * the dialect, so no unvalidated identifier ever reaches the SQL string. Every
  * comparison value is pushed onto the shared `params` array and referenced by
- * a `$N` placeholder via {@link buildHavingNumericClauses} — there is no string
+ * a `$N` placeholder via {@link buildHavingNumericClauses}, there is no string
  * interpolation of user values.
  *
  * `jsonAggExprs` (from {@link buildGroupBy}) maps `alias:aggKey` to the
@@ -570,7 +570,7 @@ export function buildHavingClauses<T extends object>(
   const clauses: string[] = [];
 
   // Maps the per-field aggregate key to its SQL function name. The set of
-  // allowed keys is fixed here — any other key on a field's filter object is
+  // allowed keys is fixed here, any other key on a field's filter object is
   // rejected by ValidationError below (never interpolated).
   const aggFnByKey: Record<string, string> = {
     _sum: 'SUM',
@@ -598,7 +598,7 @@ export function buildHavingClauses<T extends object>(
     }
 
     // toColumn validates the field against schema metadata (throws
-    // ValidationError on unknown columns) and q() quotes the identifier — no
+    // ValidationError on unknown columns) and q() quotes the identifier, no
     // unvalidated identifier ever reaches the SQL string. Resolution is lazy:
     // a JSON-path aggregate alias is not a column, so it must not hit
     // toColumn when every aggregate under it resolves via `jsonAggExprs`.

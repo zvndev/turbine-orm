@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Strict operator validation tests
+ * turbine-orm, Strict operator validation tests
  *
  * Build-only tests (no DB) that verify TASK-2.2: passing a JSON or array
  * filter operator on a column whose type does not support it now throws
@@ -90,7 +90,7 @@ describe('strict operator validation', () => {
       );
     });
 
-    it('still allows `contains` on text columns (LIKE) — no false positive', () => {
+    it('still allows `contains` on text columns (LIKE), no false positive', () => {
       const q = makeQuery('posts', buildSchema());
       // `contains` overlaps between WhereOperator (LIKE) and JsonFilter; the
       // ambiguous case must continue to fall through to LIKE on text columns.
@@ -175,7 +175,7 @@ describe('strict operator validation', () => {
     it('throws on a misspelled operator instead of silently returning wrong rows', () => {
       const q = makeQuery('posts', buildSchema());
       // `startWith` is a typo for `startsWith`. The old behaviour fell through to
-      // `title = $1` with the operator object as the value — silently zero rows.
+      // `title = $1` with the operator object as the value, silently zero rows.
       assert.throws(
         () => q.buildFindMany({ where: { title: { startWith: 'x' } } as never }),
         (err: unknown) => {

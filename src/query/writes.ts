@@ -36,10 +36,10 @@ import * as whereMod from './where.js';
  *
  * Two value shapes need rewriting, both a JS `Date` on a temporal column:
  *
- * 1. A time-of-day column (`time` / `timetz`) — the driver serializes a `Date`
+ * 1. A time-of-day column (`time` / `timetz`), the driver serializes a `Date`
  *    as a full ISO timestamp with the process offset and Postgres answers
  *    `22007 invalid input syntax for type time`. Rewritten on every engine.
- * 2. A zone-less `date` / `timestamp` column on PostgreSQL — the driver's
+ * 2. A zone-less `date` / `timestamp` column on PostgreSQL, the driver's
  *    local-offset serialization stores the PROCESS's calendar fields, so in a
  *    non-UTC process the stored value is wrong and (because the read path
  *    interprets an offset-less value as UTC) does not round-trip. Rewritten to
@@ -73,7 +73,7 @@ export function coerceWriteValue(qi: BuilderCtx, key: string, value: unknown): u
  * PostgreSQL only: MySQL's `TIMESTAMP`/`DATETIME` and SQL Server's
  * `datetime2` are converted or bound by their own drivers, and MySQL in
  * particular reads a zone-less literal in the SESSION time zone, so a UTC
- * literal would be misread there. `utcTimestamps: false` opts out — it is the
+ * literal would be misread there. `utcTimestamps: false` opts out, it is the
  * same switch that turns off the UTC READ parsing, so the two stay symmetric.
  */
 function utcDateTimeWrites(qi: BuilderCtx): boolean {
@@ -189,7 +189,7 @@ export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateMa
   });
 
   // Use actual Postgres types for array casts in the default PostgreSQL dialect.
-  // Enum columns cast to `"EnumName"[]` — the generic text[] fallback would
+  // Enum columns cast to `"EnumName"[]`, the generic text[] fallback would
   // type the UNNEST output as text, which Postgres refuses to coerce to the
   // enum ("column X is of type Y but expression is of type text").
   const typeCasts = columns.map((col) => {
@@ -241,7 +241,7 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
   // members count as a real predicate.
   const userWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
   const lock = args.optimisticLock;
-  // The empty-`where` guard checks the USER predicate only — a global filter
+  // The empty-`where` guard checks the USER predicate only, a global filter
   // must never turn an unguarded mass update into an allowed one.
   const userHasPredicate = !whereMod.userPredicateIsEmpty(qi, userWhere) || !!lock;
   whereMod.assertMutationHasPredicate(qi, 'update', userHasPredicate ? ' WHERE x' : '', args.allowFullTableScan);
@@ -367,7 +367,7 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
             // Optimistic-lock conflict: the version-checked UPDATE matched no
             // row. The re-fetch below uses `where` WITHOUT the version
             // predicate, so it would return the stale row and silently mask
-            // the conflict — detect it from affected-rows here instead, to
+            // the conflict, detect it from affected-rows here instead, to
             // match the OptimisticLockError thrown on RETURNING/OUTPUT engines.
             if (lock && (writeResult.rowCount ?? 0) === 0) {
               throw new OptimisticLockError({
@@ -461,7 +461,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   // Enum columns get an explicit `::"EnumName"` cast (see enumTypeForColumn).
   const placeholders = createEntries.map(([k], i) => `${qi.p(i + 1)}${whereMod.enumCastSuffix(qi, qi.toColumn(k))}`);
 
-  // The conflict target comes from `where` keys — must be unique/PK columns
+  // The conflict target comes from `where` keys, must be unique/PK columns
   const conflictKeys = Object.keys(upsertWhere).filter((k) => upsertWhere[k] !== undefined);
   const conflictColumns = conflictKeys.map((k) => qi.toSqlColumn(k));
 
@@ -548,7 +548,7 @@ export function buildUpdateMany<T extends object>(
   >;
   // Nothing to SET: a no-op, for the same reason as `update` above (that path
   // has the full rationale). Reports `count: 0` because zero rows were
-  // modified — no statement is issued at all, so this is not the count of rows
+  // modified, no statement is issued at all, so this is not the count of rows
   // the predicate MATCHED.
   if (!Object.values(dataObj).some((v) => v !== undefined)) {
     return {
@@ -660,11 +660,11 @@ export function piiFields(_qi: BuilderCtx, meta: TableMetadata): string[] {
 
 /**
  * The `RETURNING` / `OUTPUT` selection for a write on this table. A table with
- * no PII column returns `'*'` (every column — byte-identical SQL to before);
+ * no PII column returns `'*'` (every column, byte-identical SQL to before);
  * a table WITH PII columns returns an explicit quoted list of every non-PII
  * column so the PII values never leave the database on a write. A PII-tagged
  * PRIMARY KEY column is kept in the projection regardless (the returned row
- * must stay addressable): tag sensitive data, not keys — a PII PK is
+ * must stay addressable): tag sensitive data, not keys, a PII PK is
  * documented out of scope for stripping. Writes accept no `select`/`includePii`
  * (unlike reads), so this is the whole write-return policy at the SQL level;
  * {@link parseWriteRow} remains as a defense-in-depth strip (a no-op once the
@@ -676,7 +676,7 @@ export function piiFields(_qi: BuilderCtx, meta: TableMetadata): string[] {
  * set to `now`, or the original object when the table has none.
  *
  * Prisma's `@updatedAt` has no turbine equivalent, so a migrated application
- * had to remember the field on every single update — and the value is usually
+ * had to remember the field on every single update, and the value is usually
  * load-bearing in the response body, so forgetting it is a silent staleness
  * bug rather than a crash. The tag is opt-in per column and never inferred
  * from a column's name, so a schema that does not use it emits byte-identical
@@ -764,7 +764,7 @@ export function assertNoGeneratedColumns(qi: BuilderCtx, data: Record<string, un
     if (col?.isGeneratedStored) {
       throw new ValidationError(
         `[turbine] Cannot ${operation} "${qi.table}": column "${key}" is a GENERATED ALWAYS AS (…) STORED ` +
-          'column whose value the database computes — remove it from your data.',
+          'column whose value the database computes, remove it from your data.',
       );
     }
   }
@@ -775,7 +775,7 @@ export function assertNoGeneratedColumns(qi: BuilderCtx, data: Record<string, un
  *
  * Supports plain values and atomic operator objects ({ set, increment,
  * decrement, multiply, divide }). An operator object is detected ONLY when
- * it has EXACTLY one key that is one of the 5 operator keys — this avoids
+ * it has EXACTLY one key that is one of the 5 operator keys, this avoids
  * misinterpreting JSON column values like `{ set: 'x' }` as operators
  * (real operator objects always have exactly one key, and a plain JSON
  * payload that happens to have a single `set` key is extremely unusual).

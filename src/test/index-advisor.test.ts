@@ -90,7 +90,7 @@ test('flags unindexed hasMany/hasOne FK probes and m2m junction keys', () => {
 test('belongsTo probes are covered by the target primary key', () => {
   const schema = makeSchema();
   const missing = findMissingRelationIndexes(schema);
-  // posts.author probes users(id) — covered by PK, so users never appears.
+  // posts.author probes users(id), covered by PK, so users never appears.
   assert.ok(!missing.some((m) => m.table === 'users'));
 });
 

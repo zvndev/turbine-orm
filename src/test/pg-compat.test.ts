@@ -142,7 +142,7 @@ function assertStandardPgSql(sql: string) {
   }
 
   // Should use double-quoted identifiers (standard SQL)
-  // Not asserting all identifiers are quoted — just that none use backticks
+  // Not asserting all identifiers are quoted, just that none use backticks
   assert.ok(!sql.includes('`'), 'SQL should not use backtick quoting (MySQL syntax)');
 
   // Should never contain raw user values (basic sanity check)

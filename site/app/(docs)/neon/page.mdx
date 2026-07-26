@@ -1,13 +1,13 @@
 export const metadata = {
   title: 'Turbine + Neon in 60 Seconds',
   description:
-    'Get Turbine ORM running on Neon in under a minute. Node.js, serverless, edge — one API, zero bloat.',
+    'Get Turbine ORM running on Neon in under a minute. Node.js, serverless, edge, one API, zero bloat.',
   alternates: { canonical: '/neon' },
 };
 
 # Turbine + Neon
 
-From zero to typed queries on Neon — Node.js or edge, same API.
+From zero to typed queries on Neon, Node.js or edge, same API.
 
 ## 1. Install
 
@@ -53,7 +53,7 @@ import { SCHEMA } from './generated/turbine/metadata';
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const db = turbineHttp(pool, SCHEMA);
 
-// Same API — works on Vercel Edge, Cloudflare Workers, etc.
+// Same API, works on Vercel Edge, Cloudflare Workers, etc.
 const users = await db.users.findMany({
   with: { posts: true },
 });
@@ -77,13 +77,13 @@ npx turbine migrate status
 ## Why Turbine on Neon?
 
 - **No WASM at all**: ~50 kB brotli on the edge, fits Cloudflare Workers' 1 MB limit (Prisma 7: ~1.6 MB TS/WASM query compiler)
-- **Single-query nested reads** — one SQL statement via `json_agg`, not N+1
-- **Pipeline batching** — N queries in 1 round-trip (critical for high-latency serverless)
-- **No adapter layer** — `turbineHttp(pool, SCHEMA)` with any pg-compatible driver
-- **SQL-first migrations** — no shadow database, no proprietary schema DSL
+- **Single-query nested reads**, one SQL statement via `json_agg`, not N+1
+- **Pipeline batching**, N queries in 1 round-trip (critical for high-latency serverless)
+- **No adapter layer**, `turbineHttp(pool, SCHEMA)` with any pg-compatible driver
+- **SQL-first migrations**, no shadow database, no proprietary schema DSL
 
 ## Next steps
 
-- **[Serverless & Edge](/serverless)** — full guide for Neon, Vercel Postgres, Cloudflare, Supabase
-- **[Transactions & Pipelines](/transactions)** — pipelines are the highest-leverage edge optimization
-- **[Quick Start](/quickstart)** — the complete getting-started walkthrough
+- **[Serverless & Edge](/serverless)**, full guide for Neon, Vercel Postgres, Cloudflare, Supabase
+- **[Transactions & Pipelines](/transactions)**, pipelines are the highest-leverage edge optimization
+- **[Quick Start](/quickstart)**, the complete getting-started walkthrough

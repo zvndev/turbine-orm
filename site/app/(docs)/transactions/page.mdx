@@ -9,12 +9,12 @@ export const metadata = {
 
 Two distinct tools that are often confused:
 
-- **`$transaction`** — ACID atomicity across multiple statements. One `BEGIN` / `COMMIT` pair, rollback on throw.
-- **`pipeline`** — throughput. N independent queries sent in one TCP round-trip via the Postgres extended-query protocol. Not atomic.
+- **`$transaction`**, ACID atomicity across multiple statements. One `BEGIN` / `COMMIT` pair, rollback on throw.
+- **`pipeline`**, throughput. N independent queries sent in one TCP round-trip via the Postgres extended-query protocol. Not atomic.
 
 Use transactions when you need all-or-nothing semantics. Use pipelines when you need latency.
 
-## $transaction — callback form
+## $transaction, callback form
 
 Pass a callback that receives a transactional client. Throw to roll back, return to commit.
 
@@ -33,23 +33,23 @@ const result = await db.$transaction(async (tx) => {
 // result is the User returned by the callback
 ```
 
-The `tx` client has the same surface as `db` — every table accessor, every method. Queries *must* use `tx`, not `db`, or they'll run on a different connection outside the transaction.
+The `tx` client has the same surface as `db`, every table accessor, every method. Queries *must* use `tx`, not `db`, or they'll run on a different connection outside the transaction.
 
 > **Note:** If the opening `BEGIN` itself fails, Turbine no longer fires a best-effort `ROLLBACK` afterward (fixed in v0.30). On single-handle engines like embedded PowDB, that stray rollback could tear down an unrelated open transaction; skipping it keeps a failed `BEGIN` from corrupting other work.
 
-## $transaction — batch form
+## $transaction, batch form
 
-Pass an array of `DeferredQuery` objects (the `build*` methods, same as [`pipeline`](#pipeline--n-queries-1-round-trip)) and `$transaction` runs them atomically on one connection — `BEGIN`, each query in order, `COMMIT` — returning a positionally-typed tuple of each query's result. Any error rolls the whole batch back and rethrows. Unlike a pipeline, this **is** atomic.
+Pass an array of `DeferredQuery` objects (the `build*` methods, same as [`pipeline`](#pipeline--n-queries-1-round-trip)) and `$transaction` runs them atomically on one connection, `BEGIN`, each query in order, `COMMIT`, returning a positionally-typed tuple of each query's result. Any error rolls the whole batch back and rethrows. Unlike a pipeline, this **is** atomic.
 
 ```ts
 const [user, postCount] = await db.$transaction([
   db.users.buildFindUnique({ where: { id: 1 } }),
   db.posts.buildCount({ where: { userId: 1 } }),
 ]);
-// user: User | null, postCount: number — all-or-nothing
+// user: User | null, postCount: number, all-or-nothing
 ```
 
-Use the batch form when you have a fixed set of independent statements that must succeed or fail together and you don't need a callback's control flow. An empty array resolves to `[]` without opening a transaction. The callback form above is unchanged — `$transaction` accepts either.
+Use the batch form when you have a fixed set of independent statements that must succeed or fail together and you don't need a callback's control flow. An empty array resolves to `[]` without opening a transaction. The callback form above is unchanged, `$transaction` accepts either.
 
 > **Batch form vs pipeline:** both take `DeferredQuery[]`. The [pipeline](#pipeline--n-queries-1-round-trip) optimizes for latency (one round-trip, **not** atomic); the batch `$transaction` optimizes for atomicity (`BEGIN`…`COMMIT`, rollback on any failure).
 
@@ -89,7 +89,7 @@ await db.$transaction(
 
 A query that exceeds the timeout throws `TimeoutError` (TURBINE_E002) and the transaction rolls back.
 
-## Nested transactions — real SAVEPOINTs
+## Nested transactions, real SAVEPOINTs
 
 Calling `$transaction` inside another `$transaction` opens a Postgres `SAVEPOINT`, not a no-op and not a new connection. The inner block can fail and recover independently:
 
@@ -125,14 +125,14 @@ const rows = await db.$transaction(
   async (tx) => tx.documents.findMany(),
   { sessionContext: { 'app.current_tenant': tenantId } },
 );
-// Only this tenant's documents come back — the policy did the filtering
+// Only this tenant's documents come back, the policy did the filtering
 ```
 
 Each entry is applied as `SELECT set_config(name, value, true)` right after `BEGIN`, so the setting is scoped to the transaction and resets automatically on commit or rollback. Values may be strings, numbers, or booleans (numbers and booleans are coerced to strings, since GUCs are text). An invalid setting name throws `ValidationError` and rolls the transaction back *before* any query runs.
 
 ### $withSession shorthand
 
-For a single-purpose session, `$withSession` skips the options object — pass the context first, then the callback:
+For a single-purpose session, `$withSession` skips the options object, pass the context first, then the callback:
 
 ```ts
 const rows = await db.$withSession(
@@ -145,7 +145,7 @@ const rows = await db.$withSession(
 
 ## Retryable errors
 
-Two error classes carry `readonly isRetryable = true as const` — so TypeScript narrows them and you don't need a runtime field check.
+Two error classes carry `readonly isRetryable = true as const`, so TypeScript narrows them and you don't need a runtime field check.
 
 | Code | Class | SQLSTATE |
 |---|---|---|
@@ -171,9 +171,9 @@ await withRetry(() =>
 
 The `as const` on `isRetryable` means `err.isRetryable` is the literal type `true` on those classes and never narrows to `false`, so your control flow type-checks without casts, whether you use the helper or write your own loop.
 
-## pipeline — N queries, 1 round-trip
+## pipeline, N queries, 1 round-trip
 
-A pipeline bundles independent queries and sends them together using the Postgres extended-query pipeline protocol. Each query gets its own parsed SQL, own params, own typed result. **No transactional semantics** — if query 3 fails, queries 1, 2, 4, 5 still ran.
+A pipeline bundles independent queries and sends them together using the Postgres extended-query pipeline protocol. Each query gets its own parsed SQL, own params, own typed result. **No transactional semantics**, if query 3 fails, queries 1, 2, 4, 5 still ran.
 
 ```ts
 const [user, posts, commentCount, orgs, latestLogin] = await db.pipeline([
@@ -185,7 +185,7 @@ const [user, posts, commentCount, orgs, latestLogin] = await db.pipeline([
 ]);
 ```
 
-Each `build*` method returns a `DeferredQuery<T>` — `{ sql, params, transform, tag }`. The pipeline driver writes them all to the wire, reads all responses, applies each `transform`.
+Each `build*` method returns a `DeferredQuery<T>`, `{ sql, params, transform, tag }`. The pipeline driver writes them all to the wire, reads all responses, applies each `transform`.
 
 Result type is a tuple that matches the input order and carries the per-query return type.
 
@@ -210,7 +210,7 @@ const results = await executePipeline(pool, queries, options);
 ## When pipeline loses
 
 - **You need atomicity.** Use `$transaction`.
-- **One query depends on another's result.** Pipeline queries must be independent — they're all submitted before any response is read.
+- **One query depends on another's result.** Pipeline queries must be independent, they're all submitted before any response is read.
 - **A query might fail.** `PipelineError` (TURBINE_E014) wraps partial-success cases; decide how you want to handle them.
 
 ## Batching inside a transaction
@@ -288,6 +288,6 @@ await db.$transaction(
 
 ## See also
 
-- **[Relations](/relations)** — reads that fan out via `with` vs `pipeline`.
-- **[Typed Errors](/errors)** — `DeadlockError`, `SerializationFailureError`, `TimeoutError`, `PipelineError`.
-- **[Serverless](/serverless)** — why pipelines matter more on the edge.
+- **[Relations](/relations)**, reads that fan out via `with` vs `pipeline`.
+- **[Typed Errors](/errors)**, `DeadlockError`, `SerializationFailureError`, `TimeoutError`, `PipelineError`.
+- **[Serverless](/serverless)**, why pipelines matter more on the edge.

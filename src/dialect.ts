@@ -1,5 +1,5 @@
 /**
- * turbine-orm — SQL dialect contract
+ * turbine-orm, SQL dialect contract
  *
  * Phase-1 seam for future database packages. The current package remains
  * PostgreSQL-native by default, but query generation now depends on this
@@ -90,7 +90,7 @@ export interface UpsertStatementInput {
   updateSetClauses: string[];
   /**
    * Optional SQL-ready predicate (no `WHERE` keyword) restricting the
-   * conflict-UPDATE to matching rows — used by global filters (soft-delete /
+   * conflict-UPDATE to matching rows, used by global filters (soft-delete /
    * multi-tenancy) so an upsert never resurrects/steals a row outside the
    * filter. Only honored by dialects that set
    * {@link Dialect.supportsUpsertUpdateWhere}; others must never receive it.
@@ -141,13 +141,13 @@ export interface CreateIndexStatementInput {
 /**
  * How a dialect surfaces the row(s) produced by an INSERT/UPDATE/DELETE/upsert.
  *
- *  - `'returning'` — a trailing `RETURNING *` clause returns the affected rows
+ *  - `'returning'`, a trailing `RETURNING *` clause returns the affected rows
  *    in the same statement (PostgreSQL, SQLite ≥ 3.35). The executor reads them
  *    directly from the statement result.
- *  - `'output'` — the statement itself emits the rows in a non-RETURNING shape
+ *  - `'output'`, the statement itself emits the rows in a non-RETURNING shape
  *    (SQL Server `OUTPUT INSERTED.*`). Executed exactly like `'returning'`: the
  *    rows come back on the statement result.
- *  - `'reselect'` — the engine cannot return rows from a write (MySQL). The
+ *  - `'reselect'`, the engine cannot return rows from a write (MySQL). The
  *    executor runs the write, then issues a follow-up `SELECT` (by primary
  *    key / unique / where predicate) to fetch the affected row(s). The build
  *    method supplies the {@link DeferredQuery} `reselect` plan that owns the
@@ -179,7 +179,7 @@ export interface OpenStreamOptions {
 }
 
 /**
- * Inputs for {@link Dialect.buildUpdateStatement} — full UPDATE assembly. Used by
+ * Inputs for {@link Dialect.buildUpdateStatement}, full UPDATE assembly. Used by
  * engines whose returning shape is injected MID-statement rather than as a trailing
  * clause (SQL Server `OUTPUT INSERTED.*` lands between `SET …` and `WHERE …`).
  */
@@ -195,7 +195,7 @@ export interface UpdateStatementInput {
 }
 
 /**
- * Inputs for {@link Dialect.buildDeleteStatement} — full DELETE assembly. SQL Server
+ * Inputs for {@link Dialect.buildDeleteStatement}, full DELETE assembly. SQL Server
  * injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and `WHERE …`.
  */
 export interface DeleteStatementInput {
@@ -208,10 +208,10 @@ export interface DeleteStatementInput {
 }
 
 /**
- * Inputs for {@link Dialect.buildLimitOffset} — the trailing pagination clause of an
+ * Inputs for {@link Dialect.buildLimitOffset}, the trailing pagination clause of an
  * outer SELECT. PostgreSQL/MySQL/SQLite use `LIMIT x [OFFSET y]`; SQL Server has no
  * `LIMIT` and uses `[ORDER BY …] OFFSET y ROWS [FETCH NEXT x ROWS ONLY]` (which
- * requires an ORDER BY — a stable default is injected when {@link hasOrderBy} is false).
+ * requires an ORDER BY, a stable default is injected when {@link hasOrderBy} is false).
  */
 export interface LimitOffsetInput {
   /** SQL-ready placeholder/literal for the row LIMIT, or undefined for no limit. */
@@ -228,13 +228,13 @@ export interface LimitOffsetInput {
  * `json_agg(json_build_object(...))` (SQL Server's `FOR JSON PATH` expresses the
  * object shape through the child SELECT's column ALIASES rather than an explicit
  * `JSON_OBJECT`, so it cannot be assembled from {@link Dialect.buildJsonObject} /
- * {@link Dialect.buildJsonArrayAgg} primitives — see {@link Dialect.buildRelationSubquery}).
+ * {@link Dialect.buildJsonArrayAgg} primitives, see {@link Dialect.buildRelationSubquery}).
  *
  * The query builder pre-resolves the parts that are engine-independent (alias,
  * select/omit-resolved columns, recursion + param threading) and hands them to the
  * dialect. **Param-push ordering contract:** the override MUST push values to
  * {@link params} in the same order the builder's collect path expects so the SQL
- * cache and pipeline batching stay in sync —
+ * cache and pipeline batching stay in sync -
  *   - to-many with `limit`/`orderBy` (the "wrap" path) and manyToMany:
  *     `buildWhere(...)` → push `limit` → `recurse(...)` for each nested relation;
  *   - everything else (to-one, unordered/unlimited to-many): `recurse(...)` for each
@@ -245,7 +245,7 @@ export interface RelationSubqueryContext {
   relDef: RelationDef;
   /** The `with` spec for this relation: `true`, or a {@link WithOptions} object. */
   spec: true | WithOptions;
-  /** Shared parameter array — push BOUND values here in the order described above. */
+  /** Shared parameter array, push BOUND values here in the order described above. */
   params: unknown[];
   /** Parent alias or table name (RAW identifier, not quoted) to correlate against. */
   parentRef: string;
@@ -305,12 +305,12 @@ export interface Dialect {
   buildJsonObject(pairs: [key: string, expr: string][]): string;
 
   /**
-   * Build a positional JSON ARRAY expression from ordered SQL expressions —
+   * Build a positional JSON ARRAY expression from ordered SQL expressions -
    * the key-less counterpart to {@link buildJsonObject} used by the opt-in
    * `jsonEncoding: 'positional'` mode. Emitting `json_build_array(v1, v2, …)`
    * instead of `json_build_object('k1', v1, …)` drops every repeated key name
    * from every nested object of every row (the decode side maps positions back
-   * to keys via a build-time shape descriptor). Postgres-only in v1 — other
+   * to keys via a build-time shape descriptor). Postgres-only in v1, other
    * engines never reach this because the builder gates positional encoding to
    * `dialect.name === 'postgresql'`, so the method is optional on the contract.
    */
@@ -356,7 +356,7 @@ export interface Dialect {
    * (a predicate on the conflict-UPDATE, e.g. Postgres `ON CONFLICT … DO UPDATE
    * SET … WHERE …`). Global filters only push a conflict-UPDATE predicate when
    * this is true, so engines whose upsert cannot express one (MySQL
-   * `ON DUPLICATE KEY UPDATE`) never receive an orphaned parameter. Optional —
+   * `ON DUPLICATE KEY UPDATE`) never receive an orphaned parameter. Optional -
    * absent is treated as `false`.
    */
   readonly supportsUpsertUpdateWhere?: boolean;
@@ -459,7 +459,7 @@ export interface Dialect {
    * grammar: PostgreSQL renders `numeric` as a JSON number, SQLite renders a
    * 64-bit INTEGER as one, and a JSON number is an IEEE double. So the same
    * column read at top level and read through a relation came back as
-   * different values, LOSSILY past 2^53 — and because `auto` picks between the
+   * different values, LOSSILY past 2^53, and because `auto` picks between the
    * join and batched strategies by row count, the same query could return
    * either. The fix is to carry the value as text and decode it back with the
    * engine's own rule, which is what this hook pairs up: `sql` must emit an
@@ -606,7 +606,7 @@ export interface Dialect {
 
   /**
    * Assemble a full UPDATE statement. Optional: omitted by engines whose returning
-   * shape is a trailing clause (PG/SQLite `RETURNING`, MySQL none) — the builder
+   * shape is a trailing clause (PG/SQLite `RETURNING`, MySQL none), the builder
    * falls back to `UPDATE <t> SET <set> <where><returningClause>`. SQL Server
    * implements this to inject `OUTPUT INSERTED.*` between `SET …` and `WHERE …`.
    */
@@ -622,7 +622,7 @@ export interface Dialect {
    * OVERRIDE nested-relation subquery generation entirely. Optional: when a dialect
    * omits it, the builder uses its native `json_agg(json_build_object(...))` path
    * (PG) routed through {@link buildJsonObject} / {@link buildJsonArrayAgg} /
-   * {@link wrapJsonSubresult} — so MySQL and SQLite, which only swap those
+   * {@link wrapJsonSubresult}, so MySQL and SQLite, which only swap those
    * primitives, produce identical output and never define this hook. SQL Server
    * defines it to emit `FOR JSON PATH` correlated subqueries (its JSON aggregate
    * is expressed through the child SELECT's column aliases, which does not map onto
@@ -645,7 +645,7 @@ export interface IntrospectOptions {
 
 /**
  * @deprecated Migration locking is owned by the {@link DatabaseAdapter} seam
- * (`src/adapters/index.ts` — `acquireLock`/`releaseLock`/`statementTimeout`),
+ * (`src/adapters/index.ts`, `acquireLock`/`releaseLock`/`statementTimeout`),
  * which is the single canonical locking seam. This interface was never
  * implemented or wired and is retained only for type back-compat; new engines
  * MUST provide a `DatabaseAdapter` instead. Will be removed in a future major.
@@ -915,7 +915,7 @@ export const postgresDialect: Dialect = {
   },
 
   buildSetSessionConfig(name: string, value: string): BuiltStatement {
-    // set_config(name, value, is_local=true) — the parameterizable,
+    // set_config(name, value, is_local=true), the parameterizable,
     // transaction-local equivalent of `SET LOCAL` (which rejects bind params).
     return {
       sql: `SELECT set_config(${this.paramPlaceholder(1)}, ${this.paramPlaceholder(2)}, true)`,

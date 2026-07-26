@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Error type hierarchy tests
+ * turbine-orm, Error type hierarchy tests
  *
  * Tests all custom error classes, their codes, properties, and inheritance.
  *
@@ -88,7 +88,7 @@ describe('NotFoundError', () => {
   });
 
   it('options object: builds Prisma-style message with table, where keys, operation (safe mode)', () => {
-    // Default mode is 'safe' — message should include where keys but NOT values.
+    // Default mode is 'safe', message should include where keys but NOT values.
     setErrorMessageMode('safe');
     const err = new NotFoundError({
       table: 'users',
@@ -283,7 +283,7 @@ describe('CircularRelationError', () => {
 // All error types: instanceof Error and instanceof TurbineError
 // ---------------------------------------------------------------------------
 
-describe('inheritance — all errors are instanceof Error and TurbineError', () => {
+describe('inheritance, all errors are instanceof Error and TurbineError', () => {
   const errors = [
     new TurbineError(TurbineErrorCode.NOT_FOUND, 'base'),
     new NotFoundError(),
@@ -434,7 +434,7 @@ describe('UniqueConstraintError', () => {
     assert.equal(err.cause, cause);
   });
 
-  it('does NOT append pg detail (which carries values) in safe mode — the default', () => {
+  it('does NOT append pg detail (which carries values) in safe mode, the default', () => {
     const prev = getErrorMessageMode();
     setErrorMessageMode('safe');
     try {
@@ -907,7 +907,7 @@ describe('SerializationFailureError', () => {
 // ---------------------------------------------------------------------------
 
 describe('NotFoundError redaction modes', () => {
-  // These tests mutate global mode — make sure to restore after each test.
+  // These tests mutate global mode, make sure to restore after each test.
   const original = getErrorMessageMode();
   const restore = () => setErrorMessageMode(original);
 

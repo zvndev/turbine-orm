@@ -1,5 +1,5 @@
 /**
- * turbine-orm — TurbineClient
+ * turbine-orm, TurbineClient
  *
  * The main entry point for the Turbine TypeScript SDK.
  * Manages connection pooling and provides typed table accessors.
@@ -140,7 +140,7 @@ export interface PgCompatPoolClient {
 
 /**
  * Minimal pg-compatible pool. Pass any driver that satisfies this interface
- * via `TurbineConfig.pool` — lets Turbine run on Neon HTTP, Vercel Postgres,
+ * via `TurbineConfig.pool`, lets Turbine run on Neon HTTP, Vercel Postgres,
  * Cloudflare Hyperdrive, or any other serverless Postgres driver.
  *
  * @example
@@ -156,17 +156,17 @@ export interface PgCompatPool {
   query<R = Record<string, unknown>>(text: string, values?: unknown[]): Promise<PgCompatQueryResult<R>>;
   connect(): Promise<PgCompatPoolClient>;
   end(): Promise<void>;
-  /** Optional — pools that expose stats (pg.Pool does; Neon HTTP does not) */
+  /** Optional, pools that expose stats (pg.Pool does; Neon HTTP does not) */
   readonly totalCount?: number;
   readonly idleCount?: number;
   readonly waitingCount?: number;
-  /** Optional — pg.Pool supports 'error' event; HTTP drivers typically do not */
+  /** Optional, pg.Pool supports 'error' event; HTTP drivers typically do not */
   on?(event: 'error', listener: (err: Error) => void): this;
 }
 
 /**
  * Driver-neutral seam. Bundles a pg-compatible connection pool with the SQL
- * {@link Dialect} that owns every piece of SQL text varying across engines —
+ * {@link Dialect} that owns every piece of SQL text varying across engines -
  * parameter placeholders, transaction-control keywords (BEGIN/COMMIT/ROLLBACK/
  * SAVEPOINT/isolation/set_config), streaming, and capability flags.
  *
@@ -228,7 +228,7 @@ export interface TurbineConfig {
    */
   warnOnUnlimited?: boolean | Record<string, boolean>;
   /**
-   * Interpret Postgres `timestamp` (without time zone) values as UTC — both
+   * Interpret Postgres `timestamp` (without time zone) values as UTC, both
    * at the driver level (OID 1114 type parser, registered only when Turbine
    * owns the pool) and when coercing nested-relation JSON dates. This is the
    * Prisma/Rails/Django convention and makes results independent of the
@@ -323,9 +323,9 @@ export interface TurbineConfig {
   /**
    * How nested-relation subqueries encode each row's JSON.
    *
-   *   - `'object'` (default) — `json_agg(json_build_object('key', v, …))`. Every
+   *   - `'object'` (default), `json_agg(json_build_object('key', v, …))`. Every
    *     key name is repeated in every nested object of every row.
-   *   - `'positional'` — `json_agg(json_build_array(v, …))`. Turbine knows the
+   *   - `'positional'`, `json_agg(json_build_array(v, …))`. Turbine knows the
    *     column order at build time, so it emits a key-less array and maps
    *     positions back to keys client-side. Same information, a fraction of the
    *     bytes on wide/deeply-nested `with` trees. Parsed output is byte-identical
@@ -387,16 +387,16 @@ export interface TurbineConfig {
    * `$transaction` bodies, `pipeline`, `raw`/`sql`, `$listen`/`$notify`, and
    * observability flushes always use the primary.
    *
-   *   - `string` entries are connection strings — Turbine constructs an owned
+   *   - `string` entries are connection strings, Turbine constructs an owned
    *     `pg.Pool` for each (same pool-tuning knobs as the primary, and the same
    *     one-time, constructor-gated type-parser registration). `disconnect()`
    *     closes them.
    *   - `PgCompatPool` entries are external pools (Neon, Vercel, a shared
-   *     `pg.Pool`) — Turbine registers no type parsers on them and never ends
+   *     `pg.Pool`), Turbine registers no type parsers on them and never ends
    *     them; the caller owns their lifecycle.
    *
    * Use `client.$primary()` to get a view of the client that pins every
-   * operation (reads included) to the primary — e.g. to read your own write
+   * operation (reads included) to the primary, e.g. to read your own write
    * without replication lag. Omitting `replicas` (or passing `[]`) leaves the
    * default single-pool path completely unchanged.
    */
@@ -404,8 +404,8 @@ export interface TurbineConfig {
   /**
    * Automatic WHERE filters applied to every query, keyed by table accessor
    * (`db[name]`). Each value is AND-merged into the compiled WHERE of every
-   * read and mutation on that table — and into every relation subquery that
-   * targets it — implementing soft-delete and multi-tenancy without repeating
+   * read and mutation on that table, and into every relation subquery that
+   * targets it, implementing soft-delete and multi-tenancy without repeating
    * the predicate at each call site.
    *
    *   - A `WhereClause` value is a static filter (e.g. `{ deletedAt: null }`).
@@ -454,7 +454,7 @@ export type Middleware = (params: MiddlewareParams, next: MiddlewareNext) => Pro
 // ---------------------------------------------------------------------------
 
 export interface TransactionOptions {
-  /** Timeout in ms — transaction will be rolled back if exceeded */
+  /** Timeout in ms, transaction will be rolled back if exceeded */
   timeout?: number;
   /** Isolation level for the transaction */
   isolationLevel?: 'ReadUncommitted' | 'ReadCommitted' | 'RepeatableRead' | 'Serializable';
@@ -464,7 +464,7 @@ export interface TransactionOptions {
    * `current_setting('app.current_tenant')`, and you set that value here so
    * every query inside the transaction sees it.
    *
-   * Each entry is applied via `SELECT set_config($1, $2, true)` — `is_local=true`
+   * Each entry is applied via `SELECT set_config($1, $2, true)`, `is_local=true`
    * scopes the value to this transaction, so it auto-resets on COMMIT/ROLLBACK
    * and never leaks onto the pooled connection. Both the name and value are
    * bound parameters (never interpolated); the GUC name is additionally
@@ -520,7 +520,7 @@ const READ_OPERATIONS: ReadonlySet<string> = new Set([
 /**
  * Internal marker on the config object that tells the `TurbineClient`
  * constructor to build a lightweight "primary-only" view sharing an existing
- * client's primary pool, dialect, query options, and middleware — instead of
+ * client's primary pool, dialect, query options, and middleware, instead of
  * creating a fresh pool. Produced solely by `$primary()`; never public.
  */
 const PRIMARY_VIEW = Symbol('turbine.primaryView');
@@ -530,7 +530,7 @@ interface PrimaryViewSeed {
 }
 
 // ---------------------------------------------------------------------------
-// TransactionClient — provides typed table accessors within a transaction
+// TransactionClient, provides typed table accessors within a transaction
 // ---------------------------------------------------------------------------
 
 /**
@@ -541,7 +541,7 @@ interface PrimaryViewSeed {
 export class TransactionClient {
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private savepointCounter = 0;
-  /** Active SQL dialect — owns savepoint keywords and raw-SQL placeholders. */
+  /** Active SQL dialect, owns savepoint keywords and raw-SQL placeholders. */
   private readonly dialect: Dialect;
 
   constructor(
@@ -674,7 +674,7 @@ export class TransactionClient {
 // ---------------------------------------------------------------------------
 
 export class TurbineClient {
-  /** The underlying pg.Pool — exposed for escape hatches */
+  /** The underlying pg.Pool, exposed for escape hatches */
   readonly pool: pg.Pool;
 
   /** The schema metadata this client was built from */
@@ -683,7 +683,7 @@ export class TurbineClient {
   private static int8ParserRegistered = false;
   private static utcTimestampParserRegistered = false;
   private readonly logging: boolean;
-  /** Active SQL dialect — owns transaction keywords, set_config, raw-SQL placeholders, capability flags. */
+  /** Active SQL dialect, owns transaction keywords, set_config, raw-SQL placeholders, capability flags. */
   private readonly dialect: Dialect;
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private readonly middlewares: Middleware[] = [];
@@ -692,7 +692,7 @@ export class TurbineClient {
   private readonly errorMessagesSafe: boolean;
   /** True when Turbine created the pool and is responsible for tearing it down */
   private readonly ownsPool: boolean = true;
-  /** Active LISTEN subscriptions — torn down on disconnect() so it never hangs */
+  /** Active LISTEN subscriptions, torn down on disconnect() so it never hangs */
   private readonly activeSubscriptions = new Set<ActiveSubscription>();
 
   /**
@@ -795,7 +795,7 @@ export class TurbineClient {
      */
     // Only register the int8 parser when the PRIMARY pool is Turbine-owned.
     // External pools (Neon HTTP, Vercel Postgres) may ship their own pg-types
-    // fork and rely on their own parser configuration — registration is
+    // fork and rely on their own parser configuration, registration is
     // process-global, so flipping it because a string replica exists alongside
     // an external primary would silently change the external primary's parsing
     // too. String replicas configured next to an external primary therefore
@@ -812,8 +812,8 @@ export class TurbineClient {
     // Parse `timestamp` (OID 1114) as UTC instead of server-local time. The
     // pg driver's default hands back a Date built in the process's local zone,
     // so the same row yields a different instant per deployment region. The
-    // ORM convention (Prisma, Rails, Django) — and the only interpretation
-    // that round-trips what Postgres stores — is UTC. Same ownership rule as
+    // ORM convention (Prisma, Rails, Django), and the only interpretation
+    // that round-trips what Postgres stores, is UTC. Same ownership rule as
     // the int8 parser: never mutate parser state on external pools.
     if (ownsAnyPool && config.utcTimestamps !== false && !TurbineClient.utcTimestampParserRegistered) {
       pg.types.setTypeParser(1114, (val: string) => new Date(`${val.replace(' ', 'T')}Z`));
@@ -862,18 +862,18 @@ export class TurbineClient {
       },
     };
 
-    // Apply NotFoundError message redaction mode (default: safe — values are
+    // Apply NotFoundError message redaction mode (default: safe, values are
     // stripped from messages to avoid leaking PII into error logs).
     if (config.errorMessages) {
       setErrorMessageMode(config.errorMessages);
     }
 
     if (config.pool) {
-      // External pool — use directly. Turbine doesn't manage its lifecycle.
+      // External pool, use directly. Turbine doesn't manage its lifecycle.
       this.pool = config.pool as unknown as pg.Pool;
       this.ownsPool = false;
       if (this.logging) {
-        console.log(`[turbine] Using external pool — ${Object.keys(schema.tables).length} tables`);
+        console.log(`[turbine] Using external pool, ${Object.keys(schema.tables).length} tables`);
       }
     } else {
       const poolConfig: pg.PoolConfig = {
@@ -922,7 +922,7 @@ export class TurbineClient {
 
       if (this.logging) {
         console.log(
-          `[turbine] Pool created — max ${poolConfig.max} connections, ${Object.keys(schema.tables).length} tables`,
+          `[turbine] Pool created, max ${poolConfig.max} connections, ${Object.keys(schema.tables).length} tables`,
         );
       }
     }
@@ -976,7 +976,7 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // Middleware — intercept all queries
+  // Middleware, intercept all queries
   // -------------------------------------------------------------------------
 
   /**
@@ -984,7 +984,7 @@ export class TurbineClient {
    *
    * Middleware can inspect and log query parameters, measure timing, and
    * transform the result returned by `next()`. Note: query SQL is generated
-   * BEFORE middleware runs — `params.args` is a read-only snapshot, and
+   * BEFORE middleware runs, `params.args` is a read-only snapshot, and
    * mutating it does NOT change the executed SQL. Cross-cutting filters
    * (e.g. soft deletes) belong in the query itself: pass an explicit
    * `where: { deletedAt: null }` or wrap the table accessor in a small helper.
@@ -999,7 +999,7 @@ export class TurbineClient {
    *   return result;
    * });
    *
-   * // Result transformation middleware — redact a field on the way out
+   * // Result transformation middleware, redact a field on the way out
    * db.$use(async (params, next) => {
    *   const result = await next(params);
    *   if (params.model === 'users' && Array.isArray(result)) {
@@ -1021,7 +1021,7 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // Event emitter — subscribe to query lifecycle events
+  // Event emitter, subscribe to query lifecycle events
   // -------------------------------------------------------------------------
 
   $on(_event: 'query', listener: QueryEventListener): void {
@@ -1033,7 +1033,7 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // Observability — automatic metrics collection
+  // Observability, automatic metrics collection
   // -------------------------------------------------------------------------
 
   private observeEngine?: ObserveEngine;
@@ -1057,17 +1057,17 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // Table accessor — creates QueryInterface for any table
+  // Table accessor, creates QueryInterface for any table
   // -------------------------------------------------------------------------
 
   /**
    * Get a QueryInterface for a table.
-   * Results are cached — calling `table('users')` twice returns the same instance.
+   * Results are cached, calling `table('users')` twice returns the same instance.
    *
    * When read replicas are configured, this returns a thin routing proxy: the
    * read-only operations in {@link READ_OPERATIONS} are dispatched to a
-   * round-robin replica-bound QueryInterface (so an entire read — base rows and
-   * any batched sub-queries — runs against a single consistent replica), while
+   * round-robin replica-bound QueryInterface (so an entire read, base rows and
+   * any batched sub-queries, runs against a single consistent replica), while
    * writes and every other member fall through to the primary-bound instance.
    * With no replicas the original single-pool instance is returned directly.
    */
@@ -1150,7 +1150,7 @@ export class TurbineClient {
   }
 
   /**
-   * Return a view of this client that pins EVERY operation — reads included —
+   * Return a view of this client that pins EVERY operation, reads included -
    * to the primary pool, bypassing replica routing. Use it to read your own
    * write without replication lag, or for any read that must see the latest
    * committed data.
@@ -1158,7 +1158,7 @@ export class TurbineClient {
    * The view shares the primary pool, schema, dialect, query options, and
    * middleware; it owns nothing, so its `disconnect()` is a no-op. When no
    * replicas are configured this simply returns the client itself (already
-   * primary-only). The view is cached — repeated calls return the same instance.
+   * primary-only). The view is cached, repeated calls return the same instance.
    *
    * @example
    * ```ts
@@ -1179,15 +1179,15 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // Pipeline — batch multiple queries into one round-trip
+  // Pipeline, batch multiple queries into one round-trip
   // -------------------------------------------------------------------------
 
   /**
    * Execute multiple queries in a single database round-trip.
    *
    * Two call styles:
-   *   - `db.pipeline(q1, q2, q3)` — rest params (backward-compatible)
-   *   - `db.pipeline([q1, q2, q3], { transactional: false })` — array + options
+   *   - `db.pipeline(q1, q2, q3)`, rest params (backward-compatible)
+   *   - `db.pipeline([q1, q2, q3], { transactional: false })`, array + options
    *
    * On pg.Pool-backed connections with TCP, this uses the real Postgres
    * extended-query pipeline protocol (one TCP flush, one round-trip).
@@ -1216,7 +1216,7 @@ export class TurbineClient {
     }
 
     if (this.logging) {
-      console.log(`[turbine] Pipeline: ${queries.length} queries — ${queries.map((q) => q.tag).join(', ')}`);
+      console.log(`[turbine] Pipeline: ${queries.length} queries, ${queries.map((q) => q.tag).join(', ')}`);
     }
     return executePipeline(this.pool, queries, options);
   }
@@ -1231,7 +1231,7 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // Raw SQL — tagged template literal escape hatch
+  // Raw SQL, tagged template literal escape hatch
   // -------------------------------------------------------------------------
 
   /**
@@ -1271,7 +1271,7 @@ export class TurbineClient {
   }
 
   /**
-   * Execute a **typed** raw SQL query — Turbine's answer to Prisma's TypedSQL.
+   * Execute a **typed** raw SQL query, Turbine's answer to Prisma's TypedSQL.
    *
    * Like {@link raw}, every interpolated `${value}` becomes a `$N` parameter
    * (never string-concatenated), so it is injection-safe by construction. The
@@ -1279,7 +1279,7 @@ export class TurbineClient {
    * returned {@link TypedSqlQuery} can be `await`ed directly for `T[]`, or
    * refined with `.one()` (→ `T | null`) or `.scalar<V>()` (→ `V | null`).
    *
-   * Rows are returned as-is — no snake→camel mapping (matching `raw()`). Alias
+   * Rows are returned as-is, no snake→camel mapping (matching `raw()`). Alias
    * columns in SQL if you want camelCase keys.
    *
    * @example
@@ -1309,7 +1309,7 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // Transaction support (raw — legacy)
+  // Transaction support (raw, legacy)
   // -------------------------------------------------------------------------
 
   /**
@@ -1329,7 +1329,7 @@ export class TurbineClient {
      * Only true once BEGIN has actually succeeded. If BEGIN itself throws
      * (e.g. a single-writer engine's transaction gate times out or rejects a
      * re-entrant begin), issuing a "best-effort" ROLLBACK would be a stray
-     * statement from a context that never opened a transaction — on a driver
+     * statement from a context that never opened a transaction, on a driver
      * with one shared engine handle (PowDB embedded) it would roll back a
      * DIFFERENT caller's open transaction.
      */
@@ -1350,7 +1350,7 @@ export class TurbineClient {
         try {
           await client.query(this.dialect.rollbackStatement());
         } catch {
-          // Best-effort rollback — the connection may have died mid-query.
+          // Best-effort rollback, the connection may have died mid-query.
         }
       }
       throw err;
@@ -1360,7 +1360,7 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // $transaction — Prisma-style typed transaction API
+  // $transaction, Prisma-style typed transaction API
   // -------------------------------------------------------------------------
 
   /**
@@ -1384,7 +1384,7 @@ export class TurbineClient {
    */
   $transaction<R>(fn: (tx: TransactionClient) => Promise<R>, options?: TransactionOptions): Promise<R>;
   /**
-   * Batch form — run a tuple of {@link DeferredQuery} objects (produced by the
+   * Batch form, run a tuple of {@link DeferredQuery} objects (produced by the
    * `build*()` methods, e.g. `db.users.buildFindMany(...)`) atomically inside a
    * single `BEGIN…COMMIT` on one connection. Returns a positionally-typed tuple
    * of each query's transformed result; any failure rolls the whole batch back.
@@ -1392,8 +1392,8 @@ export class TurbineClient {
    * Unlike {@link pipeline}, this never uses the extended-query pipeline
    * protocol. Statements run on the single transaction connection: strictly
    * sequentially by default (safe on every driver, including HTTP/serverless
-   * pools), or — when the checked-out connection advertises
-   * {@link PgCompatPoolClient.supportsPipelining} — dispatched in one write
+   * pools), or, when the checked-out connection advertises
+   * {@link PgCompatPoolClient.supportsPipelining}, dispatched in one write
    * burst with replies collected in order, saving a network round trip per
    * statement. Either way the failure contract is identical: the first
    * (lowest-index) failure aborts the batch and rolls everything back.
@@ -1432,15 +1432,15 @@ export class TurbineClient {
       try {
         client.release(err);
       } catch {
-        // pg may throw if the client is already released — swallow.
+        // pg may throw if the client is already released, swallow.
       }
     };
 
     let timedOut = false;
     /**
-     * Only true once BEGIN has actually succeeded. If BEGIN itself throws —
+     * Only true once BEGIN has actually succeeded. If BEGIN itself throws -
      * e.g. a single-writer engine's transaction gate times out in its FIFO
-     * queue or rejects a re-entrant begin (PowDB, E002/E017) — this context
+     * queue or rejects a re-entrant begin (PowDB, E002/E017), this context
      * never opened a transaction, so the catch below must NOT issue its
      * best-effort ROLLBACK: on a driver with one shared engine handle that
      * stray ROLLBACK would tear down a DIFFERENT caller's open transaction.
@@ -1448,7 +1448,7 @@ export class TurbineClient {
     let began = false;
 
     try {
-      // BEGIN with optional isolation level — the dialect owns the keyword and
+      // BEGIN with optional isolation level, the dialect owns the keyword and
       // BEGIN+isolation composition (Postgres appends ` ISOLATION LEVEL …`).
       const isolationSql = options?.isolationLevel ? ISOLATION_LEVELS[options.isolationLevel] : undefined;
       await client.query(this.dialect.beginStatement(isolationSql));
@@ -1458,8 +1458,8 @@ export class TurbineClient {
       // Order matters: BEGIN -> isolation level (above) -> set_config loop ->
       // user fn. Any error here propagates to the catch below and rolls back
       // like any other transaction failure. We use set_config(name, value,
-      // is_local=true) — the parameterizable, transaction-scoped equivalent of
-      // SET LOCAL — so both name and value are BOUND params, never interpolated.
+      // is_local=true), the parameterizable, transaction-scoped equivalent of
+      // SET LOCAL, so both name and value are BOUND params, never interpolated.
       if (options?.sessionContext) {
         if (!this.dialect.supportsRLS) {
           throw new UnsupportedFeatureError(
@@ -1471,7 +1471,7 @@ export class TurbineClient {
         for (const [name, value] of Object.entries(options.sessionContext)) {
           if (!GUC_NAME_REGEX.test(name)) {
             throw new ValidationError(
-              `[turbine] Invalid session-context GUC name "${name}" — must match ` +
+              `[turbine] Invalid session-context GUC name "${name}", must match ` +
                 '/^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$/ (optionally namespaced, e.g. "app.current_tenant")',
             );
           }
@@ -1513,7 +1513,7 @@ export class TurbineClient {
 
       if (timeout) {
         // Race between the function and a timeout. If the timeout fires we
-        // need to actually abort the in-flight query — otherwise the backend
+        // need to actually abort the in-flight query, otherwise the backend
         // keeps running until pg's own timeout, holding a pool slot the whole
         // time. The simplest reliable cancellation is to destroy the
         // connection: passing a truthy argument to client.release() tells the
@@ -1527,7 +1527,7 @@ export class TurbineClient {
             // Destroy the connection to abort the in-flight backend query.
             // We do this BEFORE rejecting so the socket is gone by the time
             // the caller's catch block runs.
-            releaseOnce(new Error('[turbine] Transaction timeout — connection destroyed'));
+            releaseOnce(new Error('[turbine] Transaction timeout, connection destroyed'));
             reject(new TimeoutError(timeout, 'Transaction'));
           }, timeout);
         });
@@ -1548,18 +1548,18 @@ export class TurbineClient {
 
       return result;
     } catch (err) {
-      // If the timeout fired we already destroyed the connection — issuing a
+      // If the timeout fired we already destroyed the connection, issuing a
       // ROLLBACK on a released client would throw "Client has already been
       // released". Skip the rollback in that case (the backend rolled back
       // when its socket was closed). Likewise skip it when BEGIN never
-      // succeeded (`began` false) — there is no transaction to roll back and
+      // succeeded (`began` false), there is no transaction to roll back and
       // the stray statement could hit another caller's transaction on a
       // shared-handle engine.
       if (began && !timedOut && !released) {
         try {
           await client.query(this.dialect.rollbackStatement());
         } catch {
-          // Best-effort rollback — the connection may have died mid-query.
+          // Best-effort rollback, the connection may have died mid-query.
         }
       }
       if (this.logging) {
@@ -1585,7 +1585,7 @@ export class TurbineClient {
    *     {@link PgCompatPoolClient.supportsPipelining} (its `query()` accepts
    *     concurrent calls and completes them in FIFO submission order), all
    *     statements are dispatched in one write burst and the replies are
-   *     collected in order — ~1 round trip plus server time. Only taken when
+   *     collected in order, ~1 round trip plus server time. Only taken when
    *     the dialect's writes surface rows directly (`resultStrategy` !==
    *     'reselect'): a reselect plan is itself a sequential write+read pair.
    *
@@ -1662,7 +1662,7 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // LISTEN / NOTIFY — Postgres realtime pub/sub
+  // LISTEN / NOTIFY, Postgres realtime pub/sub
   // -------------------------------------------------------------------------
 
   /**
@@ -1678,12 +1678,12 @@ export class TurbineClient {
    *
    * The channel name CANNOT be a bound parameter (`LISTEN $1` is a syntax
    * error), so it is validated against a strict identifier regex AND quoted via
-   * `quoteIdent` before interpolation — it is the only identifier this method
+   * `quoteIdent` before interpolation, it is the only identifier this method
    * places into SQL text.
    *
    * **Serverless caveat:** LISTEN needs a persistent connection that can push
    * async notifications. Stateless HTTP drivers (Neon HTTP, Vercel Postgres)
-   * cannot do this — `$listen` throws a `ConnectionError` rather than hang.
+   * cannot do this, `$listen` throws a `ConnectionError` rather than hang.
    * `$notify` works on every driver.
    *
    * @example
@@ -1721,7 +1721,7 @@ export class TurbineClient {
   /**
    * Send a Postgres NOTIFY on `channel` with an optional payload string.
    *
-   * Issued as `SELECT pg_notify($1, $2)` — both the channel and payload are
+   * Issued as `SELECT pg_notify($1, $2)`, both the channel and payload are
    * BOUND parameters (no quoting/injection concern). The channel is still
    * validated against the identifier regex for parity with `$listen` and to
    * catch typos loudly. Works on every driver, including serverless HTTP pools.
@@ -1751,7 +1751,7 @@ export class TurbineClient {
   }
 
   // -------------------------------------------------------------------------
-  // Retry — automatic retry for retryable errors (deadlock, serialization)
+  // Retry, automatic retry for retryable errors (deadlock, serialization)
   // -------------------------------------------------------------------------
 
   /**
@@ -1797,7 +1797,7 @@ export class TurbineClient {
    * Gracefully shut down the connection pool.
    *
    * If Turbine was given an external pool via `TurbineConfig.pool`, this
-   * method is a no-op — the caller is responsible for the pool's lifecycle.
+   * method is a no-op, the caller is responsible for the pool's lifecycle.
    */
   async disconnect(): Promise<void> {
     // Tear down any live LISTEN subscriptions first. Each holds a dedicated
@@ -1817,7 +1817,7 @@ export class TurbineClient {
     }
 
     // Close owned (string-configured) replica pools regardless of whether the
-    // primary is owned — external replica pools are left untouched (caller owns
+    // primary is owned, external replica pools are left untouched (caller owns
     // their lifecycle), same contract as an external primary.
     for (const replicaPool of this.ownedReplicaPools) {
       try {
@@ -1831,7 +1831,7 @@ export class TurbineClient {
 
     if (!this.ownsPool) {
       if (this.logging) {
-        console.log('[turbine] disconnect() skipped — external primary pool is not owned by Turbine');
+        console.log('[turbine] disconnect() skipped, external primary pool is not owned by Turbine');
       }
       return;
     }

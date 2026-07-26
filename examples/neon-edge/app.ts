@@ -3,8 +3,8 @@
  *
  * Demonstrates the `turbineHttp(pool, schema)` factory binding the
  * `@neondatabase/serverless` Pool to a Turbine schema. The same pattern
- * works on any other edge runtime — Cloudflare Workers, Deno Deploy,
- * Netlify Edge — because Turbine never opens a TCP socket itself.
+ * works on any other edge runtime, Cloudflare Workers, Deno Deploy,
+ * Netlify Edge, because Turbine never opens a TCP socket itself.
  *
  * Usage (Next.js app router):
  *   - Place this file at `app/api/users/route.ts`

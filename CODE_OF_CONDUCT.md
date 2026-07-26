@@ -40,10 +40,10 @@ Instances of abusive, harassing, or otherwise unacceptable behavior may be repor
 
 Maintainers will follow these Community Impact Guidelines in determining consequences:
 
-1. **Correction** — A private, written warning with clarity around the nature of the violation.
-2. **Warning** — A warning with consequences for continued behavior; no interaction with the people involved for a specified period.
-3. **Temporary ban** — A temporary ban from any sort of interaction or public communication with the community.
-4. **Permanent ban** — A permanent ban from any sort of public interaction within the community.
+1. **Correction**, A private, written warning with clarity around the nature of the violation.
+2. **Warning**, A warning with consequences for continued behavior; no interaction with the people involved for a specified period.
+3. **Temporary ban**, A temporary ban from any sort of interaction or public communication with the community.
+4. **Permanent ban**, A permanent ban from any sort of public interaction within the community.
 
 ## Attribution
 

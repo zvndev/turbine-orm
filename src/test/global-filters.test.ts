@@ -1,5 +1,5 @@
 /**
- * turbine-orm — global filters (soft-delete / multi-tenancy) — WS-G.
+ * turbine-orm, global filters (soft-delete / multi-tenancy), WS-G.
  *
  * Build-only SQL + param-alignment assertions via `makeQuery` (no DB), plus
  * client-level tests through recording mock pools that prove the filter reaches
@@ -9,7 +9,7 @@
  * Invariants under test:
  *   - the filter is AND-merged into the compiled WHERE of every read/mutation
  *   - it flows into relation subqueries (join + batched), relation filters,
- *     `_count`, and relation orderBy — with $N params never misaligned
+ *     `_count`, and relation orderBy, with $N params never misaligned
  *   - the empty-`where` guard checks the USER where, never the global filter
  *   - `skipGlobalFilters` (true / named tables) opts out
  *   - function filters are evaluated per build (per-request tenancy)
@@ -110,7 +110,7 @@ function schema(): SchemaMetadata {
   };
 }
 
-/** A soft-delete filter (`deletedAt: null`) — the parameterless canonical case. */
+/** A soft-delete filter (`deletedAt: null`), the parameterless canonical case. */
 const softDelete = { deletedAt: null };
 
 function qi(table: string, filters: QueryInterfaceOptions['globalFilters']) {
@@ -121,7 +121,7 @@ function qi(table: string, filters: QueryInterfaceOptions['globalFilters']) {
 // Reads
 // ---------------------------------------------------------------------------
 
-describe('global filters — reads', () => {
+describe('global filters, reads', () => {
   it('findMany AND-merges the filter into WHERE (no user where)', () => {
     const { sql, params } = qi('users', { users: softDelete }).buildFindMany();
     assert.match(sql, /WHERE "deleted_at" IS NULL/);
@@ -202,7 +202,7 @@ describe('global filters — reads', () => {
 // Mutations + empty-where guard interplay
 // ---------------------------------------------------------------------------
 
-describe('global filters — mutations', () => {
+describe('global filters, mutations', () => {
   it('update merges the filter into WHERE and keeps params aligned', () => {
     const { sql, params } = qi('users', { users: softDelete }).buildUpdate({
       where: { id: 1 },
@@ -268,10 +268,10 @@ describe('global filters — mutations', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Relations — join strategy
+// Relations, join strategy
 // ---------------------------------------------------------------------------
 
-describe('global filters — relation subqueries (join)', () => {
+describe('global filters, relation subqueries (join)', () => {
   it('hasMany subquery filters the target table', () => {
     const { sql, params } = qi('users', { posts: softDelete }).buildFindMany({ with: { posts: true } });
     // The correlated posts subquery must AND the target filter.
@@ -342,7 +342,7 @@ describe('global filters — relation subqueries (join)', () => {
 // Relation filters (some / none / every)
 // ---------------------------------------------------------------------------
 
-describe('global filters — relation filters', () => {
+describe('global filters, relation filters', () => {
   it('some: EXISTS domain is restricted by the target filter', () => {
     const { sql, params } = qi('users', { posts: softDelete }).buildFindMany({
       where: { posts: { some: { title: 'x' } } },
@@ -363,7 +363,7 @@ describe('global filters — relation filters', () => {
     const { sql, params } = qi('users', { posts: softDelete }).buildFindMany({
       where: { posts: { every: { title: 'x' } } },
     });
-    // gf ANDed into the domain, before NOT(filter) — "every non-deleted post matches".
+    // gf ANDed into the domain, before NOT(filter), "every non-deleted post matches".
     assert.match(sql, /NOT EXISTS \(SELECT 1 FROM "posts" WHERE .*"posts"\."deleted_at" IS NULL AND NOT \(/);
     assertParamsAligned(sql, params);
   });
@@ -398,7 +398,7 @@ describe('global filters — relation filters', () => {
 // SQL cache safety
 // ---------------------------------------------------------------------------
 
-describe('global filters — SQL cache', () => {
+describe('global filters, SQL cache', () => {
   it('two different filter SHAPES never collide on one cache entry', () => {
     let mode: 'null' | 'value' = 'null';
     const q = qi('users', {
@@ -416,7 +416,7 @@ describe('global filters — SQL cache', () => {
   it('cache HIT re-collects relation-subquery + _count gf params in build order', () => {
     // Build twice on ONE QI: the second call hits the SQL cache and rebuilds
     // params via the collect path only. A value gf in the subquery + _count is
-    // the desync-prone case — both builds must stay aligned and identical.
+    // the desync-prone case, both builds must stay aligned and identical.
     const q = qi('users', { posts: { title: { not: 'spam' } } });
     const args = {
       where: { id: 3 },
@@ -486,7 +486,7 @@ function makeRecordingPool(label: string, rows: Record<string, unknown>[] = []):
   return pool;
 }
 
-describe('global filters — client level', () => {
+describe('global filters, client level', () => {
   it('a configured filter reaches the wire on a plain read', async () => {
     const pool = makeRecordingPool('primary', [{ id: 1, name: 'x' }]);
     const db = new TurbineClient({ pool, globalFilters: { users: softDelete } }, schema());

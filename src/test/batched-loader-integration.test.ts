@@ -1,9 +1,9 @@
 /**
- * turbine-orm — Batched relation-loading integration tests
+ * turbine-orm, Batched relation-loading integration tests
  *
  * The core guarantee of `relationLoadStrategy: 'batched'` is that it returns a
- * result deeply-equal to the default `'join'` strategy — same keys, same order,
- * same Date coercion — only the number of SQL round-trips differs. These tests
+ * result deeply-equal to the default `'join'` strategy, same keys, same order,
+ * same Date coercion, only the number of SQL round-trips differs. These tests
  * run the SAME query under both strategies against a real Postgres and assert
  * `deepEqual`, across hasMany, belongsTo, nested `with`, and per-relation
  * where/orderBy/limit.
@@ -11,7 +11,7 @@
  * Run against a Postgres seeded by src/test/fixtures/seed.sql:
  *   DATABASE_URL=postgres://... npx tsx --test src/test/batched-loader-integration.test.ts
  *
- * Gated by DATABASE_URL — absent, every test reports as skipped (never failed).
+ * Gated by DATABASE_URL, absent, every test reports as skipped (never failed).
  *
  * NOTE: manyToMany and belongsTo-null / hasOne cases are covered by the no-DB
  * unit suite (batched-loader.test.ts) because the shared fixture has no junction
@@ -117,7 +117,7 @@ describe('batched-loader integration (join vs batched parity)', () => {
     // Find a belongsTo relation on posts (e.g. its user/org) from the schema.
     const postRels = schema.tables.posts?.relations ?? {};
     const belongsTo = Object.values(postRels).find((r: RelationDef) => r.type === 'belongsTo');
-    if (!belongsTo) return; // fixture without a belongsTo — nothing to assert
+    if (!belongsTo) return; // fixture without a belongsTo, nothing to assert
     await assertParity('posts', {
       orderBy: { id: 'asc' },
       limit: 20,

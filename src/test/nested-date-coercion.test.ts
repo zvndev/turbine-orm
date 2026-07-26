@@ -4,7 +4,7 @@
  * Top-level date columns are coerced to JS `Date` via `parseRow`'s snake_case
  * `dateColumns` set. Nested relation rows arrive from `json_build_object` with
  * camelCase keys, so they previously missed that lookup and leaked through as
- * raw PG timestamp STRINGS — `users[0].createdAt` was a `Date` but
+ * raw PG timestamp STRINGS, `users[0].createdAt` was a `Date` but
  * `users[0].posts[0].createdAt` was a string. The parity harness against Prisma
  * 7 / Drizzle surfaced this inconsistency. `parseRow` now also matches the
  * camelCase field name, and `parseNestedRow` recurses so coercion applies at
@@ -59,7 +59,7 @@ testFn('nested relation date columns are coerced to Date at every depth', () => 
     assert.ok(user.createdAt instanceof Date, 'L0 user.createdAt should be a Date');
     assert.ok(post.createdAt instanceof Date, 'L1 post.createdAt should be a Date (was a string)');
     assert.ok(comment.createdAt instanceof Date, 'L2 comment.createdAt should be a Date (was a string)');
-    // Same absolute instant, just a Date now — sanity check it parsed.
+    // Same absolute instant, just a Date now, sanity check it parsed.
     assert.ok((comment.createdAt as Date).getTime() > 0);
   });
 

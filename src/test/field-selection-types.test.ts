@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Type-level tests for `select` / `omit` key validation
+ * turbine-orm, Type-level tests for `select` / `omit` key validation
  *
  * A misspelled column in `select` / `omit` used to compile silently: the flag
  * map's type is INFERRED from the object literal, so `{ emial: true }` just
@@ -8,14 +8,14 @@
  * field of the entity to `never`, which turns the typo into a compile error at
  * the offending key while leaving legitimate flag maps untouched.
  *
- * IMPORTANT — what actually guards this file: `tsx`/esbuild strips types
+ * IMPORTANT, what actually guards this file: `tsx`/esbuild strips types
  * WITHOUT typechecking, so `npm run test:unit` runs it fine even if the
  * validation regresses. The REAL guard is `npm run typecheck`
  * (`tsc --noEmit --project tsconfig.test.json`), which re-includes `src/test`.
  * An unused `@ts-expect-error` is itself an error, so a regression that lets a
  * typo through fails the typecheck job.
  *
- * NOT covered here, deliberately: `where` — it has its own file now
+ * NOT covered here, deliberately: `where`, it has its own file now
  * (where-key-types.test.ts). `WhereClause<T>` used to carry a
  * `[relationName: string]: unknown` index signature (needed for relation
  * filters) which annihilated excess-property checking; it now takes the
@@ -130,7 +130,7 @@ void selectStillInfers;
 //
 //     Every legitimate orderBy form still compiles. Keying `OrderByObject` to
 //     `keyof T` would make it a mapped type with optional members, whose
-//     implicit index signature is `value | undefined` — no longer assignable to
+//     implicit index signature is `value | undefined`, no longer assignable to
 //     the open `OrderByClause` that the internal compilers (buildOrderBy,
 //     collectOrderByParams, orderByEntries) take. See the task note in the
 //     report: closing this needs a matching signature change in query/.

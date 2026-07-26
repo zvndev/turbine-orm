@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Relation filter field validation tests
+ * turbine-orm, Relation filter field validation tests
  *
  * Build-only tests (no DB) that verify unknown fields in relation filters
  * (some/every/none) throw a clear ValidationError instead of passing through

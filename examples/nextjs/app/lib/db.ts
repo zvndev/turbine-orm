@@ -5,12 +5,12 @@
  * `npx turbine generate`, the generator emits three files at
  * `generated/turbine/`:
  *
- *   - generated/turbine/index.ts     — typed `TurbineClient` subclass + `turbine()` factory
- *   - generated/turbine/types.ts     — entity interfaces (User, Post, Comment, ...)
- *   - generated/turbine/metadata.ts  — runtime SchemaMetadata
+ *   - generated/turbine/index.ts    , typed `TurbineClient` subclass + `turbine()` factory
+ *   - generated/turbine/types.ts    , entity interfaces (User, Post, Comment, ...)
+ *   - generated/turbine/metadata.ts , runtime SchemaMetadata
  *
  * Once generated you can import the typed factory and call `db.users.findMany(...)`
- * directly with full autocomplete and per-table types — no `db.table<T>('...')`
+ * directly with full autocomplete and per-table types, no `db.table<T>('...')`
  * lookups required.
  *
  * For this example we re-export the same shapes by hand so the code compiles

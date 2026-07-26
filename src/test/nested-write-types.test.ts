@@ -1,10 +1,10 @@
 /**
- * turbine-orm — Type-level tests for nested-write input typing
+ * turbine-orm, Type-level tests for nested-write input typing
  *
  * Verifies that `CreateArgs.data` / `UpdateArgs.data` accept relation keys
  * carrying nested write ops (`create` / `connect` / `connectOrCreate` in
  * create context, plus `disconnect` / `set` / `delete` / `update` / `upsert`
- * in update context) — matching exactly what the runtime nested-write engine
+ * in update context), matching exactly what the runtime nested-write engine
  * (src/nested-write.ts) supports. The relation keys come from the same
  * `RelationDescriptor` phantom-branded `*Relations` map that powers deep
  * `with`-clause inference, so typed clients get full IDE discovery with no
@@ -82,7 +82,7 @@ async function createOps() {
     // Scalar-only create still typechecks unchanged (back-compat).
     await users.create({ data: { email: 'a@b.com' } });
 
-    // Nested create — single object and array forms.
+    // Nested create, single object and array forms.
     await users.create({
       data: {
         email: 'a@b.com',
@@ -113,16 +113,16 @@ async function createOps() {
       },
     });
 
-    // @ts-expect-error — disconnect is an update-only op; invalid in create()
+    // @ts-expect-error, disconnect is an update-only op; invalid in create()
     await users.create({ data: { email: 'x', posts: { disconnect: [{ id: 1 }] } } });
 
-    // @ts-expect-error — unknown nested op key
+    // @ts-expect-error, unknown nested op key
     await users.create({ data: { email: 'x', posts: { konnect: [{ id: 1 }] } } });
 
-    // @ts-expect-error — nested create data must match the target entity
+    // @ts-expect-error, nested create data must match the target entity
     await users.create({ data: { email: 'x', posts: { create: { totallyBogus: true } } } });
 
-    // @ts-expect-error — untyped client (R = {}) keeps plain Partial<T> data
+    // @ts-expect-error, untyped client (R = {}) keeps plain Partial<T> data
     await untypedUsers.create({ data: { email: 'x', posts: { create: { title: 't' } } } });
   }
 }
@@ -162,10 +162,10 @@ async function updateOps() {
       data: { author: { update: { data: { email: 'moved@b.com' } } } },
     });
 
-    // @ts-expect-error — nested update op requires a `data` field
+    // @ts-expect-error, nested update op requires a `data` field
     await users.update({ where: { id: 1 }, data: { posts: { update: { where: { id: 8 } } } } });
 
-    // @ts-expect-error — upsert requires where + create + update
+    // @ts-expect-error, upsert requires where + create + update
     await users.update({ where: { id: 1 }, data: { posts: { upsert: { where: { id: 1 } } } } });
   }
 }

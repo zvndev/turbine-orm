@@ -1,5 +1,5 @@
 /**
- * turbine-orm — where-key-order cache regression suite
+ * turbine-orm, where-key-order cache regression suite
  *
  * The SQL template cache keys queries by a value-invariant FINGERPRINT that
  * sorts object keys (`fingerprintWhere`, `fingerprintAliasWhere`,
@@ -12,7 +12,7 @@
  *   findMany({ where: { age: 1, score: 2 } })   // warms cache: "age" = $1 AND "score" = $2
  *   findMany({ where: { score: 20, age: 10 } }) // cache hit:   params [20, 10]  ← age binds 20!
  *
- * Silent wrong rows — cross-tenant-leak class when the permuted fields are
+ * Silent wrong rows, cross-tenant-leak class when the permuted fields are
  * same-typed columns like tenantId/userId. Array members (OR/AND) remain
  * positional; only object-key enumeration is canonicalized.
  *
@@ -35,7 +35,7 @@ function assertParamsAligned(sql: string, params: unknown[]): void {
   const max = referenced.size ? Math.max(...referenced) : 0;
   assert.equal(max, params.length, `SQL references up to $${max} but got ${params.length} params: ${sql}`);
   for (let i = 1; i <= params.length; i++) {
-    assert.ok(referenced.has(i), `param $${i} is never referenced in SQL — orphaned param: ${sql}`);
+    assert.ok(referenced.has(i), `param $${i} is never referenced in SQL, orphaned param: ${sql}`);
   }
 }
 
@@ -243,7 +243,7 @@ describe('where-key-order: cache fingerprint vs build/collect canonical order', 
     assertParamsAligned(second.sql, second.params);
 
     // Relation aliases are allocated in canonical (sorted) relation order:
-    // posts → t0(+t0i), profile → t1 — independent of insertion order.
+    // posts → t0(+t0i), profile → t1, independent of insertion order.
     assert.equal(second.sql.indexOf('"posts"') < second.sql.indexOf('"profiles"'), true);
     const titleBind = boundValue(second.sql, second.params, /\."title" = \$(\d+)/);
     const bioBind = boundValue(second.sql, second.params, /\."bio" = \$(\d+)/);
@@ -342,7 +342,7 @@ describe('where-key-order: cache fingerprint vs build/collect canonical order', 
 
   it('SQL generation is deterministic regardless of literal key order (no cache involved)', () => {
     // Two fresh QueryInterfaces (separate caches) must emit identical SQL for
-    // permuted literals — canonical order, not first-writer-wins.
+    // permuted literals, canonical order, not first-writer-wins.
     const a = makeQuery('users', buildSchema());
     const b = makeQuery('users', buildSchema());
 

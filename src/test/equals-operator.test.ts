@@ -1,8 +1,8 @@
 /**
- * turbine-orm — `equals` operator tests (build-only, no DB)
+ * turbine-orm, `equals` operator tests (build-only, no DB)
  *
  * README and the site docs document `{ email: { equals: 'a@b.com' } }` as
- * explicit equality — the most common operator a migrating Prisma user types.
+ * explicit equality, the most common operator a migrating Prisma user types.
  * Before this fix, `equals` was only recognized as a JSONB filter key and
  * threw ValidationError on non-JSON columns. These tests pin the documented
  * contract:
@@ -32,7 +32,7 @@ function assertParamsAligned(sql: string, params: unknown[]): void {
   const max = referenced.size ? Math.max(...referenced) : 0;
   assert.equal(max, params.length, `SQL references up to $${max} but got ${params.length} params: ${sql}`);
   for (let i = 1; i <= params.length; i++) {
-    assert.ok(referenced.has(i), `param $${i} is never referenced in SQL — orphaned param: ${sql}`);
+    assert.ok(referenced.has(i), `param $${i} is never referenced in SQL, orphaned param: ${sql}`);
   }
 }
 

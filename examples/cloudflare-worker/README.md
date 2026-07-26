@@ -13,7 +13,7 @@ npx wrangler hyperdrive create turbine-db --connection-string="postgres://user:p
 # -> Copy the printed Hyperdrive ID into wrangler.toml
 
 # 3. Push the schema (run against the upstream database directly,
-#    not via Hyperdrive — pushing schema needs DDL which Hyperdrive proxies fine)
+#    not via Hyperdrive, pushing schema needs DDL which Hyperdrive proxies fine)
 DATABASE_URL="postgres://user:pass@host/db" npx turbine push --schema ./schema.ts
 
 # 4. Generate the typed client + runtime metadata
@@ -36,11 +36,11 @@ npm run deploy
 
 ## How it works
 
-Cloudflare Hyperdrive sits in front of any Postgres database and pools / caches connections at the edge. The binding gives you a `connectionString` you can hand directly to `pg.Pool`. Turbine then runs unchanged on top — no extra adapter, no HTTP fallback.
+Cloudflare Hyperdrive sits in front of any Postgres database and pools / caches connections at the edge. The binding gives you a `connectionString` you can hand directly to `pg.Pool`. Turbine then runs unchanged on top, no extra adapter, no HTTP fallback.
 
 ## Environment variables
 
 | Variable | Where | Description |
 |---|---|---|
 | `env.HYPERDRIVE.connectionString` | Worker runtime | Provided automatically by the Hyperdrive binding declared in `wrangler.toml` |
-| `DATABASE_URL` | Local CLI | Direct upstream Postgres URL — used by `turbine push` and `turbine generate` only |
+| `DATABASE_URL` | Local CLI | Direct upstream Postgres URL, used by `turbine push` and `turbine generate` only |

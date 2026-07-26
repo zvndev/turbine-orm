@@ -6,7 +6,7 @@
  *   - Prisma returns bigint PKs/FKs as JS `bigint`; Turbine and Drizzle (in
  *     `mode: 'number'`) return them as `number`.
  *   - All three return timestamps as `Date`, but structural equality on Date
- *     objects is fragile — we coerce to ISO strings.
+ *     objects is fragile, we coerce to ISO strings.
  *   - Relation arrays come back in arbitrary order across ORMs (and across
  *     query plans), so any array of rows is sorted by primary key.
  *   - Prisma/Drizzle may include extra relation keys or omit nulls; we strip
@@ -37,7 +37,7 @@ export function canon(value: unknown): unknown {
   // Timestamp string -> canonical ISO instant.
   // Turbine returns nested-relation date columns as PG JSON strings (e.g.
   // `...+00:00`) rather than Date objects (a documented Turbine cosmetic
-  // inconsistency — see README). Re-parsing collapses both renderings to the
+  // inconsistency, see README). Re-parsing collapses both renderings to the
   // same absolute instant so we compare the data, not the formatting.
   if (typeof value === 'string' && ISO_TS.test(value)) {
     const d = new Date(value);

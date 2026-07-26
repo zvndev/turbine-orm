@@ -7,11 +7,11 @@ export const metadata = {
 
 # Vector Search (pgvector)
 
-Rank rows by similarity to a query vector — for semantic search, recommendations, or RAG retrieval — without dropping to raw SQL. Turbine queries [pgvector](https://github.com/pgvector/pgvector) columns through the same `findMany` you already use, with `orderBy` for nearest-neighbor ranking and `where` for distance thresholds.
+Rank rows by similarity to a query vector, for semantic search, recommendations, or RAG retrieval, without dropping to raw SQL. Turbine queries [pgvector](https://github.com/pgvector/pgvector) columns through the same `findMany` you already use, with `orderBy` for nearest-neighbor ranking and `where` for distance thresholds.
 
 You need the `pgvector` extension installed and a `vector` column on your table. Everything else is ordinary Turbine.
 
-## KNN — order by distance
+## KNN, order by distance
 
 Pass a `distance` object on a `vector` column in `orderBy` to sort rows by their distance to a query vector. Add `limit` to take the closest *k* rows.
 
@@ -23,7 +23,7 @@ const similar = await db.items.findMany({
 // queryVector is a number[]; the 5 nearest rows, nearest-first
 ```
 
-`to` is a `number[]`. The default sort direction is `'asc'` — smallest distance first, i.e. nearest-first. To invert it, pass `direction: 'desc'`:
+`to` is a `number[]`. The default sort direction is `'asc'`, smallest distance first, i.e. nearest-first. To invert it, pass `direction: 'desc'`:
 
 ```ts
 const farthest = await db.items.findMany({
@@ -32,9 +32,9 @@ const farthest = await db.items.findMany({
 });
 ```
 
-This compiles to `ORDER BY "embedding" <=> $1::vector ASC` with the vector bound as a parameter — never interpolated.
+This compiles to `ORDER BY "embedding" <=> $1::vector ASC` with the vector bound as a parameter, never interpolated.
 
-## Distance filter — keep rows within a threshold
+## Distance filter, keep rows within a threshold
 
 Put the same `distance` object in `where` with a comparator to keep only rows inside (or outside) a distance threshold.
 
@@ -69,7 +69,7 @@ const results = await db.items.findMany({
 
 An unknown metric throws `ValidationError`. A `distance` op on a non-`vector` column also throws `ValidationError`.
 
-> **Note:** pg has no built-in parser for the `vector` type, so a fetched `vector` column comes back as a string literal like `'[1,2,3]'` unless you register a parser (for example via pgvector's own client helpers). Querying *by* distance works regardless — this only affects how the column value reads when you select it.
+> **Note:** pg has no built-in parser for the `vector` type, so a fetched `vector` column comes back as a string literal like `'[1,2,3]'` unless you register a parser (for example via pgvector's own client helpers). Querying *by* distance works regardless, this only affects how the column value reads when you select it.
 
 ## The exported types
 
@@ -133,7 +133,7 @@ Every value in a vector query is bound as a parameter, so hostile input can't es
 
 The task: the 10 nearest rows by cosine distance, filtered to a quality threshold, fully parameterized.
 
-**Turbine** — `distance` is a first-class `where` / `orderBy` operator on `vector` columns:
+**Turbine**, `distance` is a first-class `where` / `orderBy` operator on `vector` columns:
 
 ```ts
 const results = await db.items.findMany({
@@ -143,7 +143,7 @@ const results = await db.items.findMany({
 });
 ```
 
-**Prisma** — pgvector columns are `Unsupported("vector")` in the schema, so querying by distance means `$queryRaw` with the vector serialized to a string and cast by hand:
+**Prisma**, pgvector columns are `Unsupported("vector")` in the schema, so querying by distance means `$queryRaw` with the vector serialized to a string and cast by hand:
 
 ```ts
 const embedding = `[${queryVector.join(',')}]`;
@@ -159,7 +159,7 @@ const results = await prisma.$queryRaw<
 `;
 ```
 
-**Drizzle** — a native `vector` column type plus SQL expression helpers; the distance expression is built with `cosineDistance` and threaded through `where` / `orderBy`:
+**Drizzle**, a native `vector` column type plus SQL expression helpers; the distance expression is built with `cosineDistance` and threaded through `where` / `orderBy`:
 
 ```ts
 import { asc, cosineDistance, lt } from 'drizzle-orm';
@@ -178,6 +178,6 @@ All three run the same SQL. The difference is where the vector semantics live: i
 
 ## See also
 
-- **[API Reference](/queries)** — `findMany`, `where`, `orderBy`, and the full operator table.
-- **[Realtime](/realtime)** — `LISTEN` / `NOTIFY` pub/sub.
-- **[Relations](/relations)** — combine vector ranking with nested `with` loads.
+- **[API Reference](/queries)**, `findMany`, `where`, `orderBy`, and the full operator table.
+- **[Realtime](/realtime)**, `LISTEN` / `NOTIFY` pub/sub.
+- **[Relations](/relations)**, combine vector ranking with nested `with` loads.

@@ -1,5 +1,5 @@
 /**
- * turbine-orm/sqlite — in-process integration tests.
+ * turbine-orm/sqlite, in-process integration tests.
  *
  * These run in the normal `test:unit` lane (no DATABASE_URL, no container):
  * a `:memory:` SQLite database is created, seeded, introspected, and exercised
@@ -165,7 +165,7 @@ let schema: SchemaMetadata;
 let client: TurbineClient;
 
 beforeEach(() => {
-  if (!DatabaseSync) return; // Node < 22.5 — every test in this file is skipped.
+  if (!DatabaseSync) return; // Node < 22.5, every test in this file is skipped.
   db = new DatabaseSync(':memory:');
   db.exec('PRAGMA foreign_keys = ON');
   db.exec(SCHEMA_SQL);
@@ -176,11 +176,11 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  if (!DatabaseSync) return; // Node < 22.5 — no client was created.
+  if (!DatabaseSync) return; // Node < 22.5, no client was created.
   await client.disconnect();
 });
 
-describe('turbine-orm/sqlite — introspection', () => {
+describe('turbine-orm/sqlite, introspection', () => {
   it('discovers all tables, columns, and primary keys via PRAGMA', () => {
     assert.deepEqual(
       Object.keys(schema.tables).sort(),
@@ -219,7 +219,7 @@ describe('turbine-orm/sqlite — introspection', () => {
   });
 });
 
-describe('turbine-orm/sqlite — findMany / where / orderBy / limit / cursor', () => {
+describe('turbine-orm/sqlite, findMany / where / orderBy / limit / cursor', () => {
   it('findMany with equality + ordering + limit', async () => {
     const admins = await client
       .table<UserRow>('users')
@@ -269,7 +269,7 @@ describe('turbine-orm/sqlite — findMany / where / orderBy / limit / cursor', (
   });
 });
 
-describe('turbine-orm/sqlite — nested with (json() wrap proves real parsed tree)', () => {
+describe('turbine-orm/sqlite, nested with (json() wrap proves real parsed tree)', () => {
   it('hasMany → hasMany → belongsTo: deep tree is objects, not strings', async () => {
     const users = await client.table<UserRow>('users').findMany({
       where: { id: 1 },
@@ -292,7 +292,7 @@ describe('turbine-orm/sqlite — nested with (json() wrap proves real parsed tre
     assert.equal(typeof comment, 'object');
     assert.equal(typeof comment.body, 'string');
 
-    // Third level: belongsTo user nested under each comment — a real object.
+    // Third level: belongsTo user nested under each comment, a real object.
     assert.equal(typeof comment.user, 'object');
     assert.equal(typeof comment.user!.email, 'string');
 
@@ -327,7 +327,7 @@ describe('turbine-orm/sqlite — nested with (json() wrap proves real parsed tre
   });
 });
 
-describe('turbine-orm/sqlite — writes return real rows (RETURNING)', () => {
+describe('turbine-orm/sqlite, writes return real rows (RETURNING)', () => {
   it('create returns the inserted row with a generated id', async () => {
     const created = await client.table<UserRow>('users').create({
       data: { orgId: 2, email: 'new@example.com', name: 'New User', role: 'member' },
@@ -384,7 +384,7 @@ describe('turbine-orm/sqlite — writes return real rows (RETURNING)', () => {
   });
 });
 
-describe('turbine-orm/sqlite — count + aggregate (castAggregate hook)', () => {
+describe('turbine-orm/sqlite, count + aggregate (castAggregate hook)', () => {
   it('count returns a number (CAST not ::int)', async () => {
     // Untyped accessor: boolean where-value coerces to 1 in the driver.
     const n = await client.table('posts').count({ where: { published: true } });
@@ -415,7 +415,7 @@ describe('turbine-orm/sqlite — count + aggregate (castAggregate hook)', () => 
   });
 });
 
-describe('turbine-orm/sqlite — transactions + savepoints', () => {
+describe('turbine-orm/sqlite, transactions + savepoints', () => {
   it('commits a successful $transaction', async () => {
     await client.$transaction(async (tx) => {
       await tx.table<TagRow>('tags').create({ data: { name: 'committed' } });
@@ -445,7 +445,7 @@ describe('turbine-orm/sqlite — transactions + savepoints', () => {
           throw new Error('inner-fail');
         })
         .catch(() => {
-          /* swallow — only the SAVEPOINT should roll back */
+          /* swallow, only the SAVEPOINT should roll back */
         });
     });
     const outer = await client.table<TagRow>('tags').findMany({ where: { name: 'outer' } });
@@ -455,7 +455,7 @@ describe('turbine-orm/sqlite — transactions + savepoints', () => {
   });
 });
 
-describe('turbine-orm/sqlite — unsupported features throw UnsupportedFeatureError', () => {
+describe('turbine-orm/sqlite, unsupported features throw UnsupportedFeatureError', () => {
   it('pgvector distance ops throw', async () => {
     // biome-ignore lint/suspicious/noExplicitAny: exercising the vector orderBy surface
     const vectorArgs: any = { orderBy: { viewCount: { distance: { to: [1, 2, 3], metric: 'l2' } } } };
@@ -491,7 +491,7 @@ describe('turbine-orm/sqlite — unsupported features throw UnsupportedFeatureEr
   });
 });
 
-describe('turbine-orm/sqlite — constraint errors map to typed Turbine errors', () => {
+describe('turbine-orm/sqlite, constraint errors map to typed Turbine errors', () => {
   it('UNIQUE violation surfaces a typed error (E008)', async () => {
     await assert.rejects(
       client.table<UserRow>('users').create({ data: { orgId: 1, email: 'user1@example.com', name: 'Dup' } }),
@@ -500,7 +500,7 @@ describe('turbine-orm/sqlite — constraint errors map to typed Turbine errors',
   });
 });
 
-describe("turbine-orm/sqlite — relationLoadStrategy: 'flatten'", () => {
+describe("turbine-orm/sqlite, relationLoadStrategy: 'flatten'", () => {
   /** All three strategies must return byte-identical rows on SQLite too. */
   async function threeWay(args: Record<string, unknown>): Promise<string> {
     const join = await client.table('users').findMany({ ...args, relationLoadStrategy: 'join' } as never);

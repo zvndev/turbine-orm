@@ -1,11 +1,11 @@
 /**
- * turbine-orm — Typed raw SQL (`db.sql<T>`) tests
+ * turbine-orm, Typed raw SQL (`db.sql<T>`) tests
  *
  * Covers three things:
  *
  *  1. **Parameterization / injection safety (no DB needed).** Proves that
  *     interpolated template values become `$N` parameters and never reach the
- *     SQL text — even a malicious `"1; DROP TABLE users"` string is passed as a
+ *     SQL text, even a malicious `"1; DROP TABLE users"` string is passed as a
  *     bound parameter, not executed.
  *
  *  2. **Integration (needs DATABASE_URL).** Runs typed queries against the seed
@@ -46,17 +46,17 @@ async function typeChecks() {
     type Row = (typeof rows)[number];
     assertTrue<Equals<Row, { id: number; name: string }>>();
     assertTrue<Equals<Row['id'], number>>();
-    // @ts-expect-error — `nope` is not a field on the supplied row type
+    // @ts-expect-error, `nope` is not a field on the supplied row type
     void rows[0]!.nope;
 
     // .one() -> T | null
     const one = await db.sql<{ id: number; name: string }>`SELECT id, name FROM users WHERE id = ${1}`.one();
     assertTrue<Equals<typeof one, { id: number; name: string } | null>>();
-    // @ts-expect-error — must narrow null before access
+    // @ts-expect-error, must narrow null before access
     void one.id;
     if (one) {
       assertTrue<Equals<typeof one.name, string>>();
-      // @ts-expect-error — `missing` is not on the row type
+      // @ts-expect-error, `missing` is not on the row type
       void one.missing;
     }
 
@@ -197,7 +197,7 @@ testFn('typed-sql integration', () => {
   });
 
   it('.scalar() returns the first column of the first row', async () => {
-    // Hermetic literal — independent of how many rows other test files have
+    // Hermetic literal, independent of how many rows other test files have
     // inserted into the shared database.
     const total = await client.sql<{ n: number }>`
       SELECT 123::int AS n
@@ -223,7 +223,7 @@ testFn('typed-sql integration', () => {
     `;
     assert.equal(rows.length, 0); // no email matches the payload string
 
-    // The table must still exist and be queryable afterward — proof the DROP
+    // The table must still exist and be queryable afterward, proof the DROP
     // never executed. (Asserting a live query succeeds is robust to row counts
     // mutated by other test files sharing this database.)
     const alive = await client.sql<{ n: number }>`SELECT 1::int AS n FROM users LIMIT 1`.scalar<number>();

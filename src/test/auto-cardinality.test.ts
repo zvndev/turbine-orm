@@ -166,7 +166,7 @@ describe("'auto', to-one cardinality", () => {
 
   it('the default threshold is the assumed round trip divided by the per-row penalty', () => {
     // The three constants must stay algebraically consistent, and the derived
-    // default must reproduce the 1000 rows this heuristic has always shipped —
+    // default must reproduce the 1000 rows this heuristic has always shipped -
     // an unconfigured client must not silently change plans.
     assert.equal(
       AUTO_TO_ONE_JOIN_MAX_ROWS,

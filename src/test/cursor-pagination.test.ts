@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Cursor-based pagination tests
+ * turbine-orm, Cursor-based pagination tests
  *
  * Verifies the cursor implementation in query/builder.ts buildFindMany():
  *   1. cursor + asc order -> WHERE "id" > $N
@@ -10,7 +10,7 @@
  *   6. cursor without orderBy defaults to asc (> operator)
  *   7. Param ordering: where params, cursor params, limit params
  *
- * Build-only tests (no DB) — uses makeQuery() from helpers.
+ * Build-only tests (no DB), uses makeQuery() from helpers.
  *
  * Run: npx tsx --test src/test/cursor-pagination.test.ts
  */

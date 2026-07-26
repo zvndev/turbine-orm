@@ -1,4 +1,4 @@
-# Turbine ORM — Next.js Example
+# Turbine ORM, Next.js Example
 
 A minimal Next.js app demonstrating Turbine ORM with server-rendered pages, nested relations, and streaming.
 
@@ -27,7 +27,7 @@ Open [http://localhost:3000](http://localhost:3000).
 ## What it demonstrates
 
 - **Server Components** fetching data with Turbine (zero client JS for data)
-- **Deep typed `with` inference** — `users[0].posts[0].comments[0].body` autocompletes after a single `findMany`, no casts
+- **Deep typed `with` inference**, `users[0].posts[0].comments[0].body` autocompletes after a single `findMany`, no casts
 - **4-level deep object graph** on the user detail page (user → org + posts → comments) in one round-trip
 - **Streaming cursors** demo for constant-memory iteration over large result sets
 - **Graceful fallback** when no database is connected
@@ -44,15 +44,15 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ```
 app/
-  layout.tsx          — Nav + global layout
-  page.tsx            — Home page with code demos + live data
-  lib/db.ts           — Turbine client singleton + types
+  layout.tsx         , Nav + global layout
+  page.tsx           , Home page with code demos + live data
+  lib/db.ts          , Turbine client singleton + types
   components/
-    code-block.tsx    — Zero-dependency syntax highlighter
+    code-block.tsx   , Zero-dependency syntax highlighter
   users/
-    page.tsx          — User list (findMany + nested posts)
-    [id]/page.tsx     — User detail (findUnique + org + posts + comments)
+    page.tsx         , User list (findMany + nested posts)
+    [id]/page.tsx    , User detail (findUnique + org + posts + comments)
 turbine/
-  schema.ts           — Turbine schema definition
-  seed.ts             — Seed script with demo data
+  schema.ts          , Turbine schema definition
+  seed.ts            , Seed script with demo data
 ```

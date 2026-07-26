@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Schema builder tests
+ * turbine-orm, Schema builder tests
  *
  * Tests the schema definition API and SQL generation:
  *   1. Builds the benchmark schema using defineSchema + table + column
@@ -189,7 +189,7 @@ describe('defineSchema', () => {
 });
 
 // ---------------------------------------------------------------------------
-// schemaToSQL — DDL generation tests
+// schemaToSQL, DDL generation tests
 // ---------------------------------------------------------------------------
 
 describe('schemaToSQL', () => {
@@ -584,35 +584,35 @@ describe('defineSchema runtime type validation', () => {
 
 describe('DEFAULT value validation', () => {
   it('should accept valid default string literals', () => {
-    // "'active'" — single-quoted string
+    // "'active'", single-quoted string
     const schema1 = defineSchema({
       t: { id: { type: 'serial', primaryKey: true }, status: { type: 'text', default: "'active'" } },
     });
     const sql1 = schemaToSQL(schema1);
     assert.ok(sql1[0]!.includes("DEFAULT 'active'"), 'should accept single-quoted string');
 
-    // "'hello world'" — single-quoted string with space
+    // "'hello world'", single-quoted string with space
     const schema2 = defineSchema({
       t: { id: { type: 'serial', primaryKey: true }, msg: { type: 'text', default: "'hello world'" } },
     });
     const sql2 = schemaToSQL(schema2);
     assert.ok(sql2[0]!.includes("DEFAULT 'hello world'"), 'should accept string with spaces');
 
-    // 'now()' — function call
+    // 'now()', function call
     const schema3 = defineSchema({
       t: { id: { type: 'serial', primaryKey: true }, ts: { type: 'timestamp', default: 'now()' } },
     });
     const sql3 = schemaToSQL(schema3);
     assert.ok(sql3[0]!.includes('DEFAULT NOW()'), 'should accept now() function');
 
-    // '0' — numeric literal
+    // '0', numeric literal
     const schema4 = defineSchema({
       t: { id: { type: 'serial', primaryKey: true }, n: { type: 'integer', default: '0' } },
     });
     const sql4 = schemaToSQL(schema4);
     assert.ok(sql4[0]!.includes('DEFAULT 0'), 'should accept numeric zero');
 
-    // 'true' — boolean constant
+    // 'true', boolean constant
     const schema5 = defineSchema({
       t: { id: { type: 'serial', primaryKey: true }, b: { type: 'boolean', default: 'true' } },
     });
@@ -705,7 +705,7 @@ describe('DEFAULT value validation', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Edge cases (legacy builder format — still supported)
+// Edge cases (legacy builder format, still supported)
 // ---------------------------------------------------------------------------
 
 describe('edge cases', () => {
@@ -920,7 +920,7 @@ describe('camelCase table name normalization', () => {
       },
       apiKeyUsage: {
         id: { type: 'serial', primaryKey: true },
-        // User wrote a camelCase reference target — generator should resolve
+        // User wrote a camelCase reference target, generator should resolve
         // it to the snake_case DDL form when emitting REFERENCES.
         apiKeyId: { type: 'bigint', notNull: true, references: 'apiKeys.id' },
       },

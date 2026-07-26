@@ -1,5 +1,5 @@
 /**
- * optional-peer-import.cts — unit tests for the dual-build dynamic-import
+ * optional-peer-import.cts, unit tests for the dual-build dynamic-import
  * helper (T-5: `turbinePowDB` broken under CommonJS with ESM-only
  * `@zvndev/powdb-client` ≥ 0.9).
  *
@@ -19,7 +19,7 @@ describe('optional-peer-import', () => {
       join?: unknown;
       default?: { join?: unknown };
     };
-    // The loaders read named exports with a `default` interop fallback — both
+    // The loaders read named exports with a `default` interop fallback, both
     // shapes must expose the API.
     assert.equal(typeof (mod.join ?? mod.default?.join), 'function');
   });

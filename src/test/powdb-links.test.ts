@@ -1,5 +1,5 @@
 /**
- * turbine-orm/powdb — entity-links round (PowDB >= 0.19.1) build-only unit tests.
+ * turbine-orm/powdb, entity-links round (PowDB >= 0.19.1) build-only unit tests.
  *
  * Covers the link lane that does NOT need a live engine: the patch-aware
  * capability gates, `describe` link-row filtering, `schema links` -> relations
@@ -67,7 +67,7 @@ function table(name: string, columns: ColumnMetadata[], relations: Record<string
 }
 
 // order (child) belongsTo account (parent); account carries a bigint `balance`
-// column — a JSON nested block cannot carry it, so a `with: { account }` falls
+// column, a JSON nested block cannot carry it, so a `with: { account }` falls
 // to a loader today and becomes a scalar link path when a link is declared.
 const linkSchema: SchemaMetadata = {
   enums: {},
@@ -348,7 +348,7 @@ describe('powdb links: schema links populates relations', () => {
 // ---------------------------------------------------------------------------
 
 describe('powdb links: emitLinks DDL', () => {
-  it('is OFF by default — no `link` statements', () => {
+  it('is OFF by default, no `link` statements', () => {
     const stmts = powqlSchemaDDL(linkSchema);
     assert.ok(!stmts.some((s) => s.startsWith('link ')));
   });
@@ -500,7 +500,7 @@ describe('powdb links: applyPowdbLinks existence-check', () => {
     } finally {
       console.warn = orig;
     }
-    assert.equal(out.length, 0, 'nothing executed — both links already declared');
+    assert.equal(out.length, 0, 'nothing executed, both links already declared');
     assert.equal(executed.length, 0);
     assert.equal(warnings.length, 1, 'exactly one drift warning');
     assert.match(warnings[0]!, /different\s+endpoints/);

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — NULLS FIRST / NULLS LAST ordering (WS-A / A1)
+ * turbine-orm, NULLS FIRST / NULLS LAST ordering (WS-A / A1)
  *
  * Build-only SQL assertions (no DB) for the `OrderBySpec` (`{ sort, nulls }`)
  * form of orderBy values. Covers every place an OrderByClause is compiled:

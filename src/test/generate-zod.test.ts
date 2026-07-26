@@ -1,10 +1,10 @@
 /**
- * turbine-orm — WS-H / H1: `turbine generate --zod`
+ * turbine-orm, WS-H / H1: `turbine generate --zod`
  *
  * `generateZod()` emits a `zod.ts` file (importing the user-side `zod` dep;
  * never imported by library runtime code) with per-table `XSchema`,
  * `XCreateSchema`, and `XUpdateSchema` derived from column metadata. Pure string
- * assertions — no zod install needed to verify the generated source.
+ * assertions, no zod install needed to verify the generated source.
  *
  * Run: npx tsx --test src/test/generate-zod.test.ts
  */
@@ -57,7 +57,7 @@ const SCHEMA: SchemaMetadata = {
           isArray: true,
         }),
         col({ name: 'embedding', pgType: 'vector', dialectType: 'vector', tsType: 'number[]' }),
-        // GENERATED ALWAYS AS (...) STORED — omitted from Create/Update.
+        // GENERATED ALWAYS AS (...) STORED, omitted from Create/Update.
         col({
           name: 'search',
           pgType: 'tsvector',
@@ -93,7 +93,7 @@ const SCHEMA: SchemaMetadata = {
   },
 };
 
-describe('H1 — generateZod()', () => {
+describe('H1, generateZod()', () => {
   const out = generateZod(SCHEMA);
 
   it('imports zod (user-side dep)', () => {

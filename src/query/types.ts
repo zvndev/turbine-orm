@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Query builder types
+ * turbine-orm, Query builder types
  *
  * All exported type and interface definitions for the query builder module.
  */
@@ -130,7 +130,7 @@ export type WhereValue<V = unknown, F extends string = string> =
  * (`posts: { some: { comments: { some: ... } } }`) stays key-checked at depth.
  * It defaults to `{}` so the legacy single-generic spelling still works.
  */
-// biome-ignore lint/complexity/noBannedTypes: {} means "target relations unknown" — matches RelationDescriptor default
+// biome-ignore lint/complexity/noBannedTypes: {} means "target relations unknown", matches RelationDescriptor default
 export interface TypedRelationFilter<U, UR extends object = {}> {
   some?: WhereClause<U, UR>;
   every?: WhereClause<U, UR>;
@@ -143,7 +143,7 @@ export interface TypedRelationFilter<U, UR extends object = {}> {
  *
  * `VR` is the target entity's own relations map (see {@link TypedRelationFilter}).
  */
-// biome-ignore lint/complexity/noBannedTypes: {} means "target relations unknown" — matches RelationDescriptor default
+// biome-ignore lint/complexity/noBannedTypes: {} means "target relations unknown", matches RelationDescriptor default
 export interface TypedToOneFilter<V, VR extends object = {}> {
   is?: WhereClause<V, VR>;
   isNot?: WhereClause<V, VR>;
@@ -155,7 +155,7 @@ export interface TypedToOneFilter<V, VR extends object = {}> {
  * to-one relations take `is`/`isNot` or a bare sub-where (implicit `is`).
  *
  * Legacy generated shapes (`posts: Post[]`, `profile: Profile | null`) carry no
- * brand, so they degrade to `unknown` — the key is still recognised (no typo
+ * brand, so they degrade to `unknown`, the key is still recognised (no typo
  * false-positive) but its value is not checked.
  */
 type RelationWhereValue<Rel> =
@@ -171,7 +171,7 @@ type RelationWhereValue<Rel> =
  *
  * **Key checking.** Historically this type carried a
  * `[relationName: string]: unknown` index signature so relation filters
- * (`where: { posts: { some: ... } }`) would typecheck — the relation names are
+ * (`where: { posts: { some: ... } }`) would typecheck, the relation names are
  * NOT keys of the entity `T`. That index signature also annihilated
  * excess-property checking, so `where: { emial: 'x' }` compiled silently.
  *
@@ -185,7 +185,7 @@ type RelationWhereValue<Rel> =
  * clients, and any call site that does not thread the relations map) the type
  * degrades to exactly its historical permissive form.
  */
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export type WhereClause<T, R extends object = {}> = [keyof R] extends [never]
   ? LooseWhereClause<T>
   : StrictWhereClause<T, R>;
@@ -197,7 +197,7 @@ export type LooseWhereClause<T> = {
   OR?: LooseWhereClause<T>[];
   AND?: LooseWhereClause<T>[];
   NOT?: LooseWhereClause<T>;
-  /** Relation filters — keyed by relation name, value is { some, every, none } */
+  /** Relation filters, keyed by relation name, value is { some, every, none } */
   [relationName: string]: unknown;
 };
 
@@ -216,7 +216,7 @@ type StrictWhereClause<T, R extends object> = {
  * Client-level automatic WHERE filters, keyed by table accessor (the name used
  * in `db[name]` / `client.table(name)`). Each value is AND-merged into the
  * compiled WHERE of every read and mutation on that table, and into every
- * relation subquery that targets it — the mechanism behind soft-delete and
+ * relation subquery that targets it, the mechanism behind soft-delete and
  * multi-tenancy. A function value is evaluated at query-build time (per query),
  * so a closure over per-request state (e.g. the current tenant id) enables
  * request-scoped filters. `create`/`createMany` are never filtered.
@@ -231,7 +231,7 @@ export type GlobalFilters = {
  * global filter on the query's own table AND on every relation target it
  * touches; an array skips only the named table accessors (own table and/or
  * relation targets). Global filters never satisfy the empty-`where` guard for
- * `update`/`delete` — that guard always checks the user-supplied `where`.
+ * `update`/`delete`, that guard always checks the user-supplied `where`.
  */
 export type SkipGlobalFilters = true | readonly string[];
 
@@ -244,7 +244,7 @@ export type SkipGlobalFilters = true | readonly string[];
 export type WithCount = true | Record<string, true>;
 
 /**
- * Unparameterized with clause — accepts any relation name.
+ * Unparameterized with clause, accepts any relation name.
  * Used internally by the query builder at runtime.
  *
  * The reserved `_count` key (see {@link WithCount}) is also accepted at runtime;
@@ -263,10 +263,10 @@ export interface WithClause {
  *
  * For typed maps, each relation accepts either `true` (default include) or a
  * {@link WithOptions} object whose nested `with` is keyed against the relation
- * target's own relations interface — this is what enables deep
+ * target's own relations interface, this is what enables deep
  * `WithResult` inference.
  */
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional unconstrained default for generic inference
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", intentional unconstrained default for generic inference
 export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
   ? WithClause
   : {
@@ -279,7 +279,7 @@ export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
 /**
  * Options for an included relation.
  *
- * Generic over `NestedR` — the relations interface of the *target* entity —
+ * Generic over `NestedR`, the relations interface of the *target* entity -
  * so the nested `with` clause is autocompleted with the correct relation keys
  * and so {@link WithResult} can recursively infer the return type. Defaults to
  * `{}` (no relation suggestions) for callers that use the unparameterized
@@ -304,7 +304,7 @@ export type WithWhere<NestedT, NestedR extends object> = [unknown] extends [Nest
   ? Record<string, unknown>
   : WhereClause<NestedT & object, NestedR>;
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no nested relations" — using object would break WithResult inference
+// biome-ignore lint/complexity/noBannedTypes: {} means "no nested relations", using object would break WithResult inference
 export interface WithOptions<NestedR extends object = {}, NestedT = unknown> {
   with?: TypedWithClause<NestedR>;
   /** Filter the related rows. Keys are checked against the relation target when it is known (see {@link WithWhere}). */
@@ -323,7 +323,7 @@ export interface WithOptions<NestedR extends object = {}, NestedT = unknown> {
 }
 
 // ---------------------------------------------------------------------------
-// WithResult — compute return type based on included relations (recursive)
+// WithResult, compute return type based on included relations (recursive)
 // ---------------------------------------------------------------------------
 
 /**
@@ -331,9 +331,9 @@ export interface WithOptions<NestedR extends object = {}, NestedT = unknown> {
  * `with` clause inference work. It bundles three pieces of information that
  * `WithResult` needs to recurse through nested relations:
  *
- *  - `__target`     — the target entity type (e.g. `Post`)
- *  - `__cardinality`— `'many'` for hasMany, `'one'` for belongsTo / hasOne
- *  - `__relations`  — the target entity's relations interface (for further recursion)
+ *  - `__target`    , the target entity type (e.g. `Post`)
+ *  - `__cardinality`, `'many'` for hasMany, `'one'` for belongsTo / hasOne
+ *  - `__relations` , the target entity's relations interface (for further recursion)
  *
  * **Generator contract (Track 3):** the code generator emits `*Relations`
  * interfaces in the following shape so that `WithResult` can walk arbitrary
@@ -346,14 +346,14 @@ export interface WithOptions<NestedR extends object = {}, NestedT = unknown> {
  * }
  * ```
  *
- * The brand fields are phantom — they exist only for type inference and have
+ * The brand fields are phantom, they exist only for type inference and have
  * no runtime representation. The runtime always sees the parsed entity values
- * (arrays for hasMany, single object or null for belongsTo / hasOne) — see the
+ * (arrays for hasMany, single object or null for belongsTo / hasOne), see the
  * cardinality projection inside {@link WithResult}.
  *
  * **Backward compatibility:** legacy generated code emitted bare types
  * (`posts: Post[]`, `profile: Profile | null`). `WithResult` still accepts that
- * shape via a fallback branch — it just cannot recurse into nested `with` for
+ * shape via a fallback branch, it just cannot recurse into nested `with` for
  * those relations until the generator is updated.
  *
  * @typeParam Target      - The entity type the relation points at.
@@ -361,7 +361,7 @@ export interface WithOptions<NestedR extends object = {}, NestedT = unknown> {
  * @typeParam Relations   - The target entity's own `*Relations` interface, or
  *                          `{}` if the target has no relations of its own.
  */
-// biome-ignore lint/complexity/noBannedTypes: {} means target has no relations — intentional for code generator output
+// biome-ignore lint/complexity/noBannedTypes: {} means target has no relations, intentional for code generator output
 export interface RelationDescriptor<Target, Cardinality extends 'one' | 'many', Relations extends object = {}> {
   readonly __target?: Target;
   readonly __cardinality?: Cardinality;
@@ -407,7 +407,7 @@ type ApplyCardinality<Rel, Resolved> =
  *     deep nesting.
  *
  * **When `R` is `{}` (the default):** the recursion short-circuits and the
- * function returns plain `T` — preserving the existing untyped escape hatch
+ * function returns plain `T`, preserving the existing untyped escape hatch
  * for callers that have not generated typed clients.
  *
  * **When `R` does not contain the requested relations:** the unknown keys are
@@ -426,7 +426,7 @@ export type WithResult<T, R extends object, W> = [keyof R] extends [never]
   ? T
   : W extends object
     ? W extends { _count: infer C }
-      ? // `_count` requested — add the typed count object alongside any relations.
+      ? // `_count` requested, add the typed count object alongside any relations.
         WithRelationAdditions<T, R, W> & { _count: CountResult<C> }
       : WithRelationAdditions<T, R, W>
     : T;
@@ -440,15 +440,15 @@ type WithRelationAdditions<T, R extends object, W> = [keyof W & keyof R] extends
   ? T
   : T & {
       [K in keyof W & keyof R]: W[K] extends true
-        ? // Leaf inclusion — no further `with`. Project the relation's runtime shape.
+        ? // Leaf inclusion, no further `with`. Project the relation's runtime shape.
           ApplyCardinality<R[K], RelationTarget<R[K]>>
         : W[K] extends { with?: infer NestedW }
           ? NestedW extends object
-            ? // Recursive case — drill into the target's relations map.
+            ? // Recursive case, drill into the target's relations map.
               ApplyCardinality<R[K], WithResult<RelationTarget<R[K]>, RelationRelations<R[K]> & object, NestedW>>
-            : // `with` was passed but is not an object literal — treat as leaf.
+            : // `with` was passed but is not an object literal, treat as leaf.
               ApplyCardinality<R[K], RelationTarget<R[K]>>
-          : // `WithOptions` was passed without a nested `with` — treat as leaf.
+          : // `WithOptions` was passed without a nested `with`, treat as leaf.
             ApplyCardinality<R[K], RelationTarget<R[K]>>;
     };
 
@@ -509,7 +509,7 @@ export type OmitResult<T, O extends Record<string, boolean> | undefined> =
   O extends Record<string, boolean> ? Omit<T, Extract<keyof T, TrueKeys<O>>> : T;
 
 /**
- * Apply select or omit field narrowing to a base type. Select takes priority —
+ * Apply select or omit field narrowing to a base type. Select takes priority -
  * when both are provided, only select is applied (matching runtime behavior).
  */
 export type FieldResult<
@@ -536,7 +536,7 @@ export type QueryResult<
   ? O extends undefined
     ? WithResult<T, R, W>
     : O extends Record<string, boolean>
-      ? // `omit` narrows scalars only — a key the `with` clause populates stays in
+      ? // `omit` narrows scalars only, a key the `with` clause populates stays in
         // the result (relations are separate JSON subqueries at the SQL level).
         Omit<WithResult<T, R, W>, Exclude<Extract<keyof T, TrueKeys<O>>, keyof W>>
       : WithResult<T, R, W>
@@ -556,7 +556,7 @@ export type QueryResult<
 
 export interface FindUniqueArgs<
   T,
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches TypedWithClause default
   R extends object = {},
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,
@@ -583,7 +583,7 @@ export interface FindUniqueArgs<
 
 export interface FindManyArgs<
   T,
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches TypedWithClause default
   R extends object = {},
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,
@@ -644,7 +644,7 @@ export interface FindManyArgs<
 
 export interface FindManyStreamArgs<
   T,
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches TypedWithClause default
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches TypedWithClause default
   R extends object = {},
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,
@@ -666,7 +666,7 @@ export interface FindManyStreamArgs<
 
 export interface CreateArgs<
   T,
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
   R extends object = {},
 > {
   /**
@@ -692,7 +692,7 @@ export interface CreateManyArgs<T> {
  * `set` works on any type; `increment`, `decrement`, `multiply`, and `divide`
  * are only valid on numeric fields. They generate SQL like
  * `col = col + $n` (and the corresponding `-`, `*`, `/` variants) instead of
- * plain absolute assignments, so they are safe against concurrent writers —
+ * plain absolute assignments, so they are safe against concurrent writers -
  * the database performs the math atomically.
  *
  * @example
@@ -706,7 +706,7 @@ export type UpdateOperatorInput<V> =
   | (V extends number ? { divide: number } : never);
 
 /**
- * Update data — each field can be a plain value or an atomic operator object.
+ * Update data, each field can be a plain value or an atomic operator object.
  * Back-compatible with `Partial<T>`: plain values still typecheck unchanged.
  */
 export type UpdateInput<T> = {
@@ -715,7 +715,7 @@ export type UpdateInput<T> = {
 
 export interface UpdateArgs<
   T,
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
   R extends object = {},
 > {
   /** Row selector. Keys are checked against `T` and `R` (see {@link WhereClause}). */
@@ -730,14 +730,14 @@ export interface UpdateArgs<
   timeout?: number;
   /**
    * Opt in to running this mutation when `where` resolves to an empty
-   * predicate (e.g. `{}` or `{ id: undefined }`). Default `false` — an
+   * predicate (e.g. `{}` or `{ id: undefined }`). Default `false`, an
    * empty predicate throws `ValidationError` to catch the common case of
    * a filter value accidentally being `undefined`. Set this to `true` only
    * when an unconditional mutation is the intended behaviour.
    */
   allowFullTableScan?: boolean;
   /**
-   * Optimistic locking — prevents lost updates in concurrent scenarios.
+   * Optimistic locking, prevents lost updates in concurrent scenarios.
    * Specify the version field and its expected value. The update adds a
    * WHERE check on the version and auto-increments it. If the row was
    * modified by another transaction, throws `OptimisticLockError`.
@@ -758,7 +758,7 @@ export interface UpdateArgs<
   skipGlobalFilters?: SkipGlobalFilters;
 }
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface UpdateManyArgs<T, R extends object = {}> {
   where: WhereClause<T, R>;
   data: UpdateInput<T>;
@@ -770,7 +770,7 @@ export interface UpdateManyArgs<T, R extends object = {}> {
   skipGlobalFilters?: SkipGlobalFilters;
 }
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface DeleteArgs<T, R extends object = {}> {
   where: WhereClause<T, R>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
@@ -781,7 +781,7 @@ export interface DeleteArgs<T, R extends object = {}> {
   skipGlobalFilters?: SkipGlobalFilters;
 }
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface DeleteManyArgs<T, R extends object = {}> {
   where: WhereClause<T, R>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
@@ -792,7 +792,7 @@ export interface DeleteManyArgs<T, R extends object = {}> {
   skipGlobalFilters?: SkipGlobalFilters;
 }
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface UpsertArgs<T, R extends object = {}> {
   where: WhereClause<T, R>;
   create: Partial<T>;
@@ -821,14 +821,14 @@ export interface UpsertArgs<T, R extends object = {}> {
 // ---------------------------------------------------------------------------
 
 /** `connectOrCreate` op: connect to the row matching `where`, or create it. */
-// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface ConnectOrCreateOp<T, TR extends object = {}> {
   where: Partial<T>;
   create: CreateDataInput<T, TR>;
 }
 
 /** Nested write ops valid inside `create()` data for a relation field. */
-// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface NestedCreateOp<T, TR extends object = {}> {
   create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[];
   connect?: Partial<T> | Partial<T>[];
@@ -836,14 +836,14 @@ export interface NestedCreateOp<T, TR extends object = {}> {
 }
 
 /** A nested `update` op item: update the related row(s) matching `where`. `where` is optional for belongsTo relations (derived from the parent's FK). */
-// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface NestedUpdateOpItem<T, TR extends object = {}> {
   where?: Partial<T>;
   data: UpdateDataInput<T, TR>;
 }
 
 /** A nested `upsert` op item: update the row matching `where` or create it. */
-// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface NestedUpsertOpItem<T, TR extends object = {}> {
   where: Partial<T>;
   create: CreateDataInput<T, TR>;
@@ -851,7 +851,7 @@ export interface NestedUpsertOpItem<T, TR extends object = {}> {
 }
 
 /** Nested write ops valid inside `update()` data for a relation field. */
-// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations" — matches RelationDescriptor default
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface NestedUpdateOp<T, TR extends object = {}> {
   create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[];
   connect?: Partial<T> | Partial<T>[];
@@ -866,10 +866,10 @@ export interface NestedUpdateOp<T, TR extends object = {}> {
 /**
  * `create()` data input. When the relations map `R` is known (typed clients),
  * each relation name additionally accepts a {@link NestedCreateOp} for the
- * relation's target entity — recursively, via the target's own relations map.
+ * relation's target entity, recursively, via the target's own relations map.
  * When `R` is `{}` (untyped escape hatch) this collapses to plain `Partial<T>`.
  */
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export type CreateDataInput<T, R extends object = {}> = [keyof R] extends [never]
   ? Partial<T>
   : Partial<T> & {
@@ -882,14 +882,14 @@ export type CreateDataInput<T, R extends object = {}> = [keyof R] extends [never
  * update / upsert in addition to the create-context ops), and scalar fields
  * accept atomic {@link UpdateOperatorInput} objects.
  */
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export type UpdateDataInput<T, R extends object = {}> = [keyof R] extends [never]
   ? UpdateInput<T>
   : UpdateInput<T> & {
       [K in keyof R]?: NestedUpdateOp<RelationTarget<R[K]> & object, RelationRelations<R[K]> & object>;
     };
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface CountArgs<T, R extends object = {}> {
   where?: WhereClause<T, R>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
@@ -934,14 +934,14 @@ export interface HavingAggregateFilter {
 }
 
 /**
- * HAVING clause for `groupBy` — filters whole groups by their aggregate values
+ * HAVING clause for `groupBy`, filters whole groups by their aggregate values
  * (the SQL `HAVING` clause). Follows Prisma's shape: each aggregable field maps
  * to a {@link HavingAggregateFilter} (`field → aggregate → operator → value`),
  * and the special top-level `_count` key (no field) filters on `COUNT(*)`.
  *
  * Implemented as a mapped type so the special `_count` key can carry a
  * {@link HavingFilter} while every entity field carries a
- * {@link HavingAggregateFilter} — without the index-signature conflict an
+ * {@link HavingAggregateFilter}, without the index-signature conflict an
  * intersection type would produce when `T` is a broad `Record<string, unknown>`.
  *
  * @example
@@ -1060,7 +1060,7 @@ export interface GroupByOrderBy {
   [key: string]: OrderDirection | OrderBySpec | GroupByAggregateOrderBy | undefined;
 }
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface GroupByArgs<T, R extends object = {}> {
   /** Group keys: plain column field names and/or JSON-path keys ({@link JsonPathGroupKey}). */
   by: ((keyof T & string) | JsonPathGroupKey)[];
@@ -1192,7 +1192,7 @@ type GroupByCountPart<A> = A extends { _count: infer C }
   : { _count: number };
 
 /** Arguments for the standalone aggregate method */
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — matches QueryInterface default
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface AggregateArgs<T, R extends object = {}> {
   where?: WhereClause<T, R>;
   /**
@@ -1277,7 +1277,7 @@ export interface JsonFilter {
   hasKey?: string;
   /**
    * Greater-than comparison of the value at `path` (required). Numbers cast
-   * the extracted text to numeric — `(col #>> path)::numeric > $n` — while
+   * the extracted text to numeric, `(col #>> path)::numeric > $n`, while
    * strings compare as text.
    */
   gt?: number | string;
@@ -1329,7 +1329,7 @@ export interface TextSearchFilter {
 }
 
 // ---------------------------------------------------------------------------
-// pgvector — similarity search
+// pgvector, similarity search
 // ---------------------------------------------------------------------------
 
 /**
@@ -1339,7 +1339,7 @@ export interface TextSearchFilter {
  *  - `'cosine'` → `<=>` (cosine distance)
  *  - `'ip'`     → `<#>` (negative inner product)
  *
- * This is a fixed allow-list — a value outside it is rejected with a
+ * This is a fixed allow-list, a value outside it is rejected with a
  * `ValidationError` so a user-supplied string can never become a SQL operator.
  */
 export type VectorMetric = 'l2' | 'cosine' | 'ip';
@@ -1449,9 +1449,9 @@ export interface JsonPathOrderBy {
 /**
  * Ordering by a relation, keyed by the relation name in an {@link OrderByClause}:
  *
- *  - to-many (hasMany / manyToMany): `{ posts: { _count: 'desc' } }` — orders by
+ *  - to-many (hasMany / manyToMany): `{ posts: { _count: 'desc' } }`, orders by
  *    a correlated `COUNT(*)` of the related rows.
- *  - to-one (belongsTo / hasOne): `{ author: { name: 'asc' } }` — orders by a
+ *  - to-one (belongsTo / hasOne): `{ author: { name: 'asc' } }`, orders by a
  *    correlated scalar subquery on the target column (an {@link OrderBySpec} with
  *    `nulls` is accepted too).
  */

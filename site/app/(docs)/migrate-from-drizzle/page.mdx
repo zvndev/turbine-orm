@@ -109,7 +109,7 @@ const results = await db.select()
 ```
 
 ```ts
-// Turbine — operators are object keys, no imports needed
+// Turbine, operators are object keys, no imports needed
 const results = await db.users.findMany({
   where: { age: { gt: 18 }, name: { contains: 'smith' } },
 });
@@ -127,7 +127,7 @@ await db.update(posts)
 ```
 
 ```ts
-// Turbine — first-class operator syntax
+// Turbine, first-class operator syntax
 await db.posts.update({
   where: { id: 42 },
   data: { viewCount: { increment: 1 } },
@@ -166,7 +166,7 @@ await db.transaction(async (tx) => {
 ```
 
 ```ts
-// Turbine — nested transactions use SAVEPOINTs automatically
+// Turbine, nested transactions use SAVEPOINTs automatically
 await db.$transaction(async (tx) => {
   const user = await tx.users.create({ data: { email: 'a@b.c', name: 'A' } });
   await tx.posts.create({ data: { userId: user.id, title: 'Hi' } });
@@ -177,16 +177,16 @@ await db.$transaction(async (tx) => {
 
 | Feature | Drizzle | Turbine |
 |---|---|---|
-| Single-query nested relations | Yes — relational queries (RQBv2) | Yes, via `json_agg` — typed and date-coerced at any depth |
+| Single-query nested relations | Yes, relational queries (RQBv2) | Yes, via `json_agg`, typed and date-coerced at any depth |
 | Typed errors with codes | Generic Error (raw pg errors) | 16 error classes with SQLSTATE mapping |
 | Optimistic locking | Manual | Built-in `optimisticLock: { field, expected }` |
 | Retry with backoff | Manual | `withRetry()` + `isRetryable` errors |
 | Full-text search | Raw SQL | `{ search: 'query' }` operator |
-| Edge/serverless | Separate driver packages | `turbineHttp(pool, SCHEMA)` — any pg-compatible pool |
+| Edge/serverless | Separate driver packages | `turbineHttp(pool, SCHEMA)`, any pg-compatible pool |
 | Relation filters | Manual subquery | `where: { posts: { some: { published: true } } }` |
 | Pipeline batching | N/A | Multiple queries in one round-trip |
 | Schema introspection | External tools | `npx turbine pull` → full metadata |
-| Down migrations | None — `drizzle-kit drop` removed in v1 | SQL `-- DOWN` sections, checksummed |
+| Down migrations | None, `drizzle-kit drop` removed in v1 | SQL `-- DOWN` sections, checksummed |
 | Local Studio UI | Drizzle Studio (free; hosted Gateway paid) | `npx turbine studio` (free, read-only) |
 | Runtime deps | 0 (pg adapter separate) | 1 (`pg`) |
 | Select/omit type narrowing | Yes (via `.select()`) | Yes (via `select`/`omit` args) |
@@ -201,8 +201,8 @@ await db.$transaction(async (tx) => {
 ## Migration checklist
 
 1. `npm install turbine-orm && npm uninstall drizzle-orm @drizzle-team/drizzle-kit`
-2. Convert your `schema.ts` from `pgTable()` calls to `defineSchema()` — or run `npx turbine pull` against your live database.
-3. `npx turbine generate` — writes `./generated/turbine/{types,metadata,index}.ts`.
+2. Convert your `schema.ts` from `pgTable()` calls to `defineSchema()`, or run `npx turbine pull` against your live database.
+3. `npx turbine generate`, writes `./generated/turbine/{types,metadata,index}.ts`.
 4. Replace your Drizzle client:
    ```ts
    // Before
@@ -219,15 +219,15 @@ await db.$transaction(async (tx) => {
    - `db.update(table).set(...).where(...)` → `db.table.update({ where: { ... }, data: { ... } })`
    - `db.delete(table).where(...)` → `db.table.delete({ where: { ... } })`
    - `db.query.table.findMany({ with: ... })` → `db.table.findMany({ with: ... })` (nearly identical!)
-6. Remove operator imports (`eq`, `gt`, `like`, etc.) — Turbine uses object keys.
+6. Remove operator imports (`eq`, `gt`, `like`, etc.), Turbine uses object keys.
 7. Replace raw SQL: `sql\`...\`` → `db.raw\`...\``.
-8. Add error handling for typed errors (optional — they still extend `Error`).
+8. Add error handling for typed errors (optional, they still extend `Error`).
 9. Delete `drizzle.config.ts` and the `drizzle/` migrations directory once stable.
 
 ## See also
 
-- **[Quickstart](/quickstart)** — 5-minute setup guide.
-- **[Schema & Migrations](/schema)** — `defineSchema`, DDL, introspection.
-- **[Relations](/relations)** — one-to-many, many-to-many, nested queries.
-- **[Typed Errors](/errors)** — full hierarchy with SQLSTATE mapping.
-- **[Benchmarks](/benchmarks)** — Performance comparison vs Prisma and Drizzle.
+- **[Quickstart](/quickstart)**, 5-minute setup guide.
+- **[Schema & Migrations](/schema)**, `defineSchema`, DDL, introspection.
+- **[Relations](/relations)**, one-to-many, many-to-many, nested queries.
+- **[Typed Errors](/errors)**, full hierarchy with SQLSTATE mapping.
+- **[Benchmarks](/benchmarks)**, Performance comparison vs Prisma and Drizzle.

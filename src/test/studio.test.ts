@@ -1,5 +1,5 @@
 /**
- * Studio — unit tests for the HTTP API handlers (`/api/builder`,
+ * Studio, unit tests for the HTTP API handlers (`/api/builder`,
  * `/api/saved-queries`, `/api/tables/:name` with search).
  *
  * The API handler tests use an in-memory mock pool (same pattern as
@@ -33,7 +33,7 @@ import { mockTable } from './helpers.js';
 // Small helpers for exercising Studio's helper functions
 // ---------------------------------------------------------------------------
 
-describe('Studio — resolveColumnName', () => {
+describe('Studio, resolveColumnName', () => {
   it('returns the postgres column name when passed the snake name', () => {
     const table = mockTable('users', [
       { name: 'id', field: 'id' },
@@ -56,7 +56,7 @@ describe('Studio — resolveColumnName', () => {
   });
 });
 
-describe('Studio — isTextishType', () => {
+describe('Studio, isTextishType', () => {
   it('treats text, varchar, char, citext and uuid as searchable', () => {
     for (const t of ['text', 'varchar', 'character varying', 'char', 'character', 'citext', 'uuid']) {
       assert.equal(isTextishType(t), true, `${t} should be searchable`);
@@ -70,7 +70,7 @@ describe('Studio — isTextishType', () => {
   });
 });
 
-describe('Studio — escapeLikePattern', () => {
+describe('Studio, escapeLikePattern', () => {
   it('escapes LIKE wildcards literally', () => {
     assert.equal(escapeLikePattern('100%'), '100\\%');
     assert.equal(escapeLikePattern('foo_bar'), 'foo\\_bar');
@@ -217,10 +217,10 @@ function firstDataQuery(calls: QueryCall[]): QueryCall {
 }
 
 // ---------------------------------------------------------------------------
-// /api/builder — exercises QueryInterface.buildFindMany via the HTTP handler
+// /api/builder, exercises QueryInterface.buildFindMany via the HTTP handler
 // ---------------------------------------------------------------------------
 
-describe('Studio — apiBuilder', () => {
+describe('Studio, apiBuilder', () => {
   it('builds and runs a findMany-shaped query through the pool', async () => {
     const { pool, calls } = makePool([
       { rows: [] }, // BEGIN
@@ -282,10 +282,10 @@ describe('Studio — apiBuilder', () => {
 });
 
 // ---------------------------------------------------------------------------
-// /api/tables/:name?search=... — verify WHERE/ILIKE and param bindings
+// /api/tables/:name?search=..., verify WHERE/ILIKE and param bindings
 // ---------------------------------------------------------------------------
 
-describe('Studio — apiTableRows with search', () => {
+describe('Studio, apiTableRows with search', () => {
   it('builds an ILIKE WHERE across text columns and binds pattern at $3 for the main query', async () => {
     const { pool, calls } = makePool([
       { rows: [] }, // BEGIN
@@ -346,17 +346,17 @@ describe('Studio — apiTableRows with search', () => {
 });
 
 // ---------------------------------------------------------------------------
-// /api/saved-queries — round-trip create → list → delete → list-empty
+// /api/saved-queries, round-trip create → list → delete → list-empty
 // ---------------------------------------------------------------------------
 
-describe('Studio — saved queries round-trip', () => {
+describe('Studio, saved queries round-trip', () => {
   it('creates, lists, and deletes a saved query from a temp state dir', async () => {
     const tmp = mkdtempSync(join(tmpdir(), 'turbine-studio-'));
     try {
       const { pool } = makePool();
       const ctx = makeCtx(pool, tmp);
 
-      // List — should be empty before any writes.
+      // List, should be empty before any writes.
       {
         const { res, done } = makeRes();
         apiListSavedQueries(res, ctx, new URLSearchParams());
@@ -386,7 +386,7 @@ describe('Studio — saved queries round-trip', () => {
         createdId = data.query.id;
       }
 
-      // List — should now contain the saved query.
+      // List, should now contain the saved query.
       {
         const { res, done } = makeRes();
         apiListSavedQueries(res, ctx, new URLSearchParams());
@@ -414,7 +414,7 @@ describe('Studio — saved queries round-trip', () => {
         assert.equal(response.status, 200);
       }
 
-      // List — should be empty again.
+      // List, should be empty again.
       {
         const { res, done } = makeRes();
         apiListSavedQueries(res, ctx, new URLSearchParams());

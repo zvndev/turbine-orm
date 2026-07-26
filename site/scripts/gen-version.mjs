@@ -5,10 +5,10 @@
 //
 // In-repo builds read the root package.json and regenerate lib/version.ts.
 // Site-only build contexts (e.g. `vercel deploy` run from site/, which uploads
-// ONLY this directory — a real deploy failed with ENOENT on /vercel/package.json)
+// ONLY this directory, a real deploy failed with ENOENT on /vercel/package.json)
 // don't have the root manifest; there we keep the COMMITTED lib/version.ts,
 // which the last in-repo build already regenerated. A malformed root manifest
-// still fails loudly — only absence falls back.
+// still fails loudly, only absence falls back.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +30,7 @@ if (!version || typeof version !== 'string') {
 }
 
 const contents = `/**
- * GENERATED FILE — do not edit by hand.
+ * GENERATED FILE, do not edit by hand.
  *
  * Derived from the root package.json version at build time by
  * site/scripts/gen-version.mjs (runs as predev/prebuild). This is the single

@@ -1,11 +1,11 @@
 -- ============================================================================
--- turbine-orm — CI integration test seed
+-- turbine-orm, CI integration test seed
 -- ============================================================================
 --
 -- Provides the schema + minimal data the integration test suites
 -- (turbine.test.ts, comprehensive.test.ts, gaps.test.ts, integration-combinations.test.ts)
 -- expect to find. This is intentionally light: a handful of orgs/users/posts/
--- comments — just enough to exercise nested relations, cursor pagination,
+-- comments, just enough to exercise nested relations, cursor pagination,
 -- aggregates, and the JSONB / array operators.
 --
 -- Schema mirrors benchmarks/prisma/schema.prisma + the metadata/tags columns

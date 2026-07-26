@@ -1,5 +1,5 @@
 /**
- * Streaming CSV export — 100K orders with nested line items at constant memory.
+ * Streaming CSV export, 100K orders with nested line items at constant memory.
  *
  * The whole trick:
  *
@@ -9,7 +9,7 @@
  *   })) { ... }
  *
  * A PostgreSQL cursor streams rows in batches of 1,000. Nested relations
- * come along for the ride. The process heap stays flat the whole time —
+ * come along for the ride. The process heap stays flat the whole time -
  * we print the live high-water mark so you can watch it not move.
  *
  * Run with `npm start > orders.csv` and watch the stderr progress meter.
@@ -73,7 +73,7 @@ async function main() {
   console.error(`Wrote ${count.toLocaleString()} rows to ${outPath} in ${seconds.toFixed(1)}s`);
   console.error(`Peak heap: ${peakHeapMb} MB`);
   console.error();
-  console.error('Compare this against a naive findMany — that would load');
+  console.error('Compare this against a naive findMany, that would load');
   console.error('every order into memory before writing the first CSV row.');
 
   await db.disconnect();

@@ -1,7 +1,7 @@
 /**
  * Read-replica routing tests (WS-E).
  *
- * No database required — every pool is a mock {@link PgCompatPool} that records
+ * No database required, every pool is a mock {@link PgCompatPool} that records
  * which pool served each query/connect. The tests assert the routing matrix:
  *
  *   - reads outside a transaction round-robin across replicas
@@ -40,7 +40,7 @@ function extractSql(textOrConfig: string | { text: string }): string {
 /**
  * `pool.query()` returns a generic 1-row result so statement-level read/write
  * transforms don't throw. `connect()` clients return EMPTY rows so cursor
- * streams terminate immediately and pipeline/tx transforms stay harmless — we
+ * streams terminate immediately and pipeline/tx transforms stay harmless, we
  * only care that routing recorded the call before any transform ran.
  */
 function makeRecordingPool(label: string): RecordingPool {
@@ -97,15 +97,15 @@ function users(db: TurbineClient): any {
 }
 
 // ---------------------------------------------------------------------------
-// Zero replicas — today's behavior, no proxy
+// Zero replicas, today's behavior, no proxy
 // ---------------------------------------------------------------------------
 
-describe('read replicas — zero configured', () => {
+describe('read replicas, zero configured', () => {
   it('routes everything to primary and returns a plain (non-proxy) accessor', async () => {
     const primary = makeRecordingPool('primary');
     const db = new TurbineClient({ pool: primary }, schema);
 
-    // Same instance twice (existing table cache contract — a proxy would break this).
+    // Same instance twice (existing table cache contract, a proxy would break this).
     assert.equal(users(db), users(db));
 
     await users(db)
@@ -120,10 +120,10 @@ describe('read replicas — zero configured', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Read routing — round-robin across replicas
+// Read routing, round-robin across replicas
 // ---------------------------------------------------------------------------
 
-describe('read replicas — read routing', () => {
+describe('read replicas, read routing', () => {
   it('round-robins reads across replicas and never touches primary', async () => {
     const primary = makeRecordingPool('primary');
     const r0 = makeRecordingPool('r0');
@@ -192,10 +192,10 @@ describe('read replicas — read routing', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Write / non-read routing — always primary
+// Write / non-read routing, always primary
 // ---------------------------------------------------------------------------
 
-describe('read replicas — writes and non-reads stay on primary', () => {
+describe('read replicas, writes and non-reads stay on primary', () => {
   it('routes all writes to primary, never a replica', async () => {
     const primary = makeRecordingPool('primary');
     const r0 = makeRecordingPool('r0');
@@ -249,11 +249,11 @@ describe('read replicas — writes and non-reads stay on primary', () => {
     const db = new TurbineClient({ pool: primary, replicas: [r0] }, schema);
 
     await db.raw`SELECT 1`.catch(() => {});
-    // db.sql returns a TypedSqlQuery thenable — await it (no .catch on it).
+    // db.sql returns a TypedSqlQuery thenable, await it (no .catch on it).
     try {
       await db.sql`SELECT 1`;
     } catch {
-      // ignore — mock result shape may not satisfy the transform
+      // ignore, mock result shape may not satisfy the transform
     }
 
     assert.ok(primary.queries.length >= 2, 'raw + sql hit primary');
@@ -290,7 +290,7 @@ describe('read replicas — writes and non-reads stay on primary', () => {
 // $primary() escape hatch
 // ---------------------------------------------------------------------------
 
-describe('read replicas — $primary() escape', () => {
+describe('read replicas, $primary() escape', () => {
   it('pins reads to primary and caches the view instance', async () => {
     const primary = makeRecordingPool('primary');
     const r0 = makeRecordingPool('r0');
@@ -318,7 +318,7 @@ describe('read replicas — $primary() escape', () => {
 // disconnect() lifecycle
 // ---------------------------------------------------------------------------
 
-describe('read replicas — disconnect lifecycle', () => {
+describe('read replicas, disconnect lifecycle', () => {
   it('leaves external replica pools untouched (caller owns lifecycle)', async () => {
     const primary = makeRecordingPool('primary');
     const r0 = makeRecordingPool('r0');
@@ -335,7 +335,7 @@ describe('read replicas — disconnect lifecycle', () => {
   it('closes owned (string) replica pools without throwing', async () => {
     const primary = makeRecordingPool('primary');
     const db = new TurbineClient({ pool: primary, replicas: ['postgres://user:pass@127.0.0.1:5999/db'] }, schema);
-    // Owned pg.Pool is never connected (lazy) — end() on an idle pool resolves.
+    // Owned pg.Pool is never connected (lazy), end() on an idle pool resolves.
     await assert.doesNotReject(() => db.disconnect());
   });
 });

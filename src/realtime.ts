@@ -1,11 +1,11 @@
 /**
- * turbine-orm — LISTEN/NOTIFY realtime pub/sub
+ * turbine-orm, LISTEN/NOTIFY realtime pub/sub
  *
  * Postgres LISTEN/NOTIFY is a first-class realtime primitive that neither
  * Prisma nor Drizzle expose ergonomically. This module backs the thin
  * `$listen` / `$notify` methods on TurbineClient.
  *
- * Design — **one dedicated connection per subscription**:
+ * Design, **one dedicated connection per subscription**:
  *
  *   Each `$listen(channel, handler)` acquires its OWN long-lived client from
  *   the pool, runs `LISTEN "chan"`, and keeps that connection checked out for
@@ -13,7 +13,7 @@
  *   subscription owns its lifecycle, `unsubscribe()` cleanly UNLISTENs and
  *   releases exactly one connection, and there is no shared multiplexing
  *   state to reason about. The trade-off is one pool slot per active channel
- *   — for the handful of channels a typical app listens on, that's a fine
+ *   - for the handful of channels a typical app listens on, that's a fine
  *   price for clarity. (A future optimization could multiplex many channels
  *   over a single shared notification connection.)
  *
@@ -23,7 +23,7 @@
  *   notification messages back to the client. Stateless HTTP drivers
  *   (Neon HTTP, Vercel Postgres over fetch) cannot hold such a connection, so
  *   `$listen` will surface a clear error rather than hang. `$notify` works
- *   everywhere — it's a single round-trip `SELECT pg_notify(...)`.
+ *   everywhere, it's a single round-trip `SELECT pg_notify(...)`.
  */
 
 import type { PgCompatPool } from './client.js';
@@ -37,7 +37,7 @@ import { ConnectionError, ValidationError, wrapPgError } from './errors.js';
  * Strict Postgres identifier: a letter or underscore followed by letters,
  * digits, or underscores. Channel names CANNOT be parameterized in
  * LISTEN/UNLISTEN (`LISTEN $1` is a syntax error), so the channel is the one
- * place an identifier is interpolated into SQL — it MUST pass this regex AND
+ * place an identifier is interpolated into SQL, it MUST pass this regex AND
  * go through `quoteIdent` before reaching the SQL string.
  */
 const CHANNEL_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -49,7 +49,7 @@ const MAX_CHANNEL_LEN = 63;
  * Validate a LISTEN/NOTIFY channel name. Throws ValidationError on anything
  * that isn't a plain, reasonable-length SQL identifier. This is enforced for
  * BOTH `$listen` (where the channel is interpolated) and `$notify` (where the
- * channel is a bound param) — defensive parity, and it catches user typos
+ * channel is a bound param), defensive parity, and it catches user typos
  * loudly.
  */
 export function validateChannel(channel: string): void {
@@ -63,7 +63,7 @@ export function validateChannel(channel: string): void {
   }
   if (!CHANNEL_REGEX.test(channel)) {
     throw new ValidationError(
-      `[turbine] Invalid $listen/$notify channel "${channel}" — must match /^[A-Za-z_][A-Za-z0-9_]*$/ ` +
+      `[turbine] Invalid $listen/$notify channel "${channel}", must match /^[A-Za-z_][A-Za-z0-9_]*$/ ` +
         '(letters, digits, underscores; cannot start with a digit)',
     );
   }
@@ -85,7 +85,7 @@ export interface Subscription {
   readonly channel: string;
   /**
    * Stop listening: runs `UNLISTEN "chan"`, removes the notification listener,
-   * and releases the dedicated connection. Idempotent — safe to call twice.
+   * and releases the dedicated connection. Idempotent, safe to call twice.
    */
   unsubscribe(): Promise<void>;
 }
@@ -115,7 +115,7 @@ export interface ActiveSubscription extends Subscription {
  * Acquire a dedicated connection, run `LISTEN "channel"`, and wire the handler.
  *
  * @param pool        the pg-compatible pool to check a long-lived client out of
- * @param channel     channel name — MUST already be validated by the caller
+ * @param channel     channel name, MUST already be validated by the caller
  * @param quotedChannel  the channel run through quoteIdent (interpolated into SQL)
  * @param handler     called with each notification's payload
  * @param onClosed    invoked when the subscription releases, so the client can
@@ -136,7 +136,7 @@ export async function createSubscription(
   }
 
   // Verify the checked-out client can actually receive async notifications.
-  // Stateless HTTP drivers return a client with no `.on` — LISTEN would hang
+  // Stateless HTTP drivers return a client with no `.on`, LISTEN would hang
   // forever waiting for messages that can never arrive, so fail loudly now and
   // give the connection straight back.
   if (typeof client.on !== 'function') {

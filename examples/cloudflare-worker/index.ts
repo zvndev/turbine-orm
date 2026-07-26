@@ -3,7 +3,7 @@
  *
  * Hyperdrive exposes a `connectionString` on the binding that you feed
  * into the standard `pg` Pool. Turbine then runs on top via the
- * `turbineHttp(pool, schema)` factory — no extra runtime deps.
+ * `turbineHttp(pool, schema)` factory, no extra runtime deps.
  *
  * Workers note: `pg` runs in Workers via the `nodejs_compat` flag (see
  * wrangler.toml). For pure HTTP/edge environments without Hyperdrive
@@ -33,7 +33,7 @@ export default {
       const users = await db.users.findMany({ limit: 10 });
       return Response.json(users);
     } finally {
-      // Workers tear the isolate down after each request — release the
+      // Workers tear the isolate down after each request, release the
       // pool's TCP socket back to Hyperdrive so it can be reused.
       await pool.end();
     }

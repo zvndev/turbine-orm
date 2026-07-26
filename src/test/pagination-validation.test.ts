@@ -2,7 +2,7 @@
  * turbine-orm: LIMIT / OFFSET argument validation
  *
  * `Number(value)` on a non-numeric pagination argument yields NaN, which binds
- * as SQL NULL — and Postgres reads `LIMIT NULL` as "no limit at all". So
+ * as SQL NULL, and Postgres reads `LIMIT NULL` as "no limit at all". So
  * `findMany({ limit: '5; DROP TABLE users' })` used to compile to `LIMIT $1`
  * with `[null]`: a full-table read, silently. `skip` behaved the same way (the
  * OFFSET quietly disappeared). Both now throw ValidationError (E003).

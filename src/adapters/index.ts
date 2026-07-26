@@ -1,9 +1,9 @@
 /**
- * turbine-orm — Database adapter interface
+ * turbine-orm, Database adapter interface
  *
  * Adapters allow Turbine to work with PostgreSQL-compatible databases that
  * have subtle differences (e.g. CockroachDB, YugabyteDB). The default
- * behavior remains standard PostgreSQL — adapters only override specific
+ * behavior remains standard PostgreSQL, adapters only override specific
  * operations where compatibility gaps exist.
  *
  * @example
@@ -72,9 +72,9 @@ export interface DatabaseAdapter {
    * Generate the SQL to set a statement timeout within a transaction.
    * PostgreSQL uses `SELECT set_config('statement_timeout', $1, true)`.
    * CockroachDB uses `SELECT set_config('transaction_timeout', $1, true)` (v23.1+).
-   * (`SET LOCAL ... = $1` is a syntax error — SET takes no bind params.)
+   * (`SET LOCAL ... = $1` is a syntax error, SET takes no bind params.)
    *
-   * @param seconds — timeout in seconds
+   * @param seconds, timeout in seconds
    * @returns an object with the parameterized SQL and its bound values
    */
   statementTimeout?(seconds: number): { sql: string; params: unknown[] };
@@ -87,7 +87,7 @@ export interface DatabaseAdapter {
 }
 
 // ---------------------------------------------------------------------------
-// Default PostgreSQL adapter (no-op — standard behavior)
+// Default PostgreSQL adapter (no-op, standard behavior)
 // ---------------------------------------------------------------------------
 
 /**
@@ -107,7 +107,7 @@ export const postgresql: DatabaseAdapter = {
   },
 
   statementTimeout(seconds) {
-    // `SET LOCAL ... = $1` is a Postgres syntax error — SET does not accept
+    // `SET LOCAL ... = $1` is a Postgres syntax error, SET does not accept
     // bind parameters. `set_config(name, value, is_local=true)` is the
     // parameterizable, transaction-local equivalent.
     return { sql: `SELECT set_config('statement_timeout', $1, true)`, params: [`${seconds}s`] };
@@ -115,12 +115,12 @@ export const postgresql: DatabaseAdapter = {
 };
 
 // ---------------------------------------------------------------------------
-// AlloyDB — fully PostgreSQL-compatible, no adapter logic needed
+// AlloyDB, fully PostgreSQL-compatible, no adapter logic needed
 // ---------------------------------------------------------------------------
 
 /**
  * Google AlloyDB adapter. AlloyDB is PostgreSQL with Google's columnar storage
- * engine. It is wire-protocol and catalog-compatible — no adapter overrides
+ * engine. It is wire-protocol and catalog-compatible, no adapter overrides
  * are needed. All Turbine features (json_agg, advisory locks, introspection,
  * migrations) work identically to standard PostgreSQL.
  *
@@ -137,7 +137,7 @@ export const alloydb: DatabaseAdapter = {
 };
 
 // ---------------------------------------------------------------------------
-// TimescaleDB — PostgreSQL extension, fully compatible
+// TimescaleDB, PostgreSQL extension, fully compatible
 // ---------------------------------------------------------------------------
 
 /**

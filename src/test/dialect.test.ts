@@ -246,7 +246,7 @@ describe('Dialect contract', () => {
 
 // ---------------------------------------------------------------------------
 // A second non-PG fixture: a SQLite-ish dialect. Standardizes on "…" quoting
-// (so identifiers overlap with PG — its forbidden set excludes that), positional
+// (so identifiers overlap with PG, its forbidden set excludes that), positional
 // `?`, json_object/json_group_array with json()-wrapped nested subresults, and
 // aggSupportsInlineOrderBy=false (json_group_array has no ORDER BY argument).
 // ---------------------------------------------------------------------------
@@ -272,7 +272,7 @@ const sqliteishDialect: Dialect = {
   buildJsonArrayAgg: (jsonObjectExpr, orderBy) =>
     `COALESCE(json_group_array(json(${jsonObjectExpr}))${orderBy ? ` ${orderBy}` : ''}, json('[]'))`,
   // SQLite's json_group_array double-encodes nested objects, so each nested
-  // subresult is json()-wrapped — the whole point of the wrapJsonSubresult hook.
+  // subresult is json()-wrapped, the whole point of the wrapJsonSubresult hook.
   wrapJsonSubresult: (subquery, fallback) => `COALESCE(json((${subquery})), ${fallback})`,
   buildReturningClause: (selection = '*') => ` RETURNING ${selection}`,
   buildInsertStatement: (input) =>
@@ -301,7 +301,7 @@ const sqliteishDialect: Dialect = {
 };
 
 // ---------------------------------------------------------------------------
-// Conformance matrix — run the SAME build-only assertions against every
+// Conformance matrix, run the SAME build-only assertions against every
 // registered non-PG dialect and assert zero PostgreSQL tokens leak. PG itself
 // is exercised separately as a positive control (it SHOULD emit those tokens).
 // ---------------------------------------------------------------------------
@@ -387,7 +387,7 @@ const fixtures: ConformanceFixture[] = [
     quote: /"users"/,
   },
   {
-    // The REAL shipped sqliteDialect (turbine-orm/sqlite) — proves the production
+    // The REAL shipped sqliteDialect (turbine-orm/sqlite), proves the production
     // engine emits no Postgres leakage. Uses "…" + named `:pN` placeholders.
     label: 'sqlite (real)',
     dialect: sqliteDialect,
@@ -396,7 +396,7 @@ const fixtures: ConformanceFixture[] = [
     quote: /"users"/,
   },
   {
-    // The REAL shipped mysqlDialect (turbine-orm/mysql) — proves the production
+    // The REAL shipped mysqlDialect (turbine-orm/mysql), proves the production
     // engine emits no Postgres leakage. Uses backticks + named `:pN` placeholders,
     // no RETURNING / ON CONFLICT / UNNEST / ILIKE / array-IN.
     label: 'mysql (real)',
@@ -406,7 +406,7 @@ const fixtures: ConformanceFixture[] = [
     quote: /`users`/,
   },
   {
-    // The REAL shipped mssqlDialect (turbine-orm/mssql) — proves the production
+    // The REAL shipped mssqlDialect (turbine-orm/mssql), proves the production
     // engine emits no Postgres leakage. Uses `[…]` + named `@pN` placeholders, no
     // LIMIT (OFFSET/FETCH), no RETURNING (OUTPUT/MERGE), no json_agg (FOR JSON PATH).
     label: 'mssql (real)',
@@ -416,7 +416,7 @@ const fixtures: ConformanceFixture[] = [
     placeholder: /@p\d/,
     quote: /\[users\]/,
     // SQL Server wraps to-many in ISNULL((… FOR JSON PATH), '[]') and nests via
-    // JSON_QUERY — it does NOT route through wrapJsonSubresult/COALESCE.
+    // JSON_QUERY, it does NOT route through wrapJsonSubresult/COALESCE.
     nestedWrap: /ISNULL\(\(SELECT|JSON_QUERY/,
   },
 ];
@@ -516,7 +516,7 @@ describe('Dialect conformance matrix (no Postgres leakage)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Result-strategy keystone — exercise the 'reselect' and 'output' execute paths
+// Result-strategy keystone, exercise the 'reselect' and 'output' execute paths
 // with a MOCK driver. The PG 'returning' path stays the historical single-query
 // path (covered by the integration suite).
 // ---------------------------------------------------------------------------

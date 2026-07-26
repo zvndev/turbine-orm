@@ -1,7 +1,7 @@
 /**
  * Turbine + Supabase.
  *
- * Supabase is Postgres under the hood — use the standard `pg` driver
+ * Supabase is Postgres under the hood, use the standard `pg` driver
  * directly. No HTTP proxy, no PostgREST shim. Get the connection string
  * from Supabase Dashboard -> Project Settings -> Database -> Connection
  * String -> URI ("Use connection pooling" recommended for serverless).
@@ -20,7 +20,7 @@ async function main() {
       // (`*.pooler.supabase.com:6543`) presents Supabase's own CA chain,
       // which Node won't recognise out of the box. For production, prefer
       // pinning Supabase's CA explicitly via `ca: <pem string>` rather
-      // than disabling verification — see Supabase docs for the current
+      // than disabling verification, see Supabase docs for the current
       // root certificate.
       ssl: { rejectUnauthorized: false },
     },

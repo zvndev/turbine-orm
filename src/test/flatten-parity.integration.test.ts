@@ -1,5 +1,5 @@
 /**
- * turbine-orm — three-way relation-strategy equivalence: join / batched / flatten
+ * turbine-orm, three-way relation-strategy equivalence: join / batched / flatten
  *
  * The documented guarantee is that a relation-loading strategy changes the PLAN,
  * never the RESULT. `'flatten'` compiles an eligible to-one relation to a LEFT
@@ -269,7 +269,7 @@ describe('relation strategy equivalence: join / batched / flatten', () => {
   });
 
   it('parent where naming a column the joined table also has', async () => {
-    // `flatten_people.name` and `flatten_teams.name` collide by name — the
+    // `flatten_people.name` and `flatten_teams.name` collide by name, the
     // ambiguity regression this strategy has to be immune to.
     await assertThreeWay('flatten_people', {
       where: { name: 'Ada' },

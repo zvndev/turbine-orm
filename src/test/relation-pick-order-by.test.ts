@@ -206,7 +206,7 @@ describe('pick-row relation ordering: SQL generation', () => {
       orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title' } },
     } as never);
     assert.match(asc.sql, /LIMIT 1\) ASC NULLS LAST/);
-    // Postgres's own DESC default is NULLS FIRST — a "highest first" sort would
+    // Postgres's own DESC default is NULLS FIRST, a "highest first" sort would
     // put every parent with zero related rows at the top without this default.
     const desc = q.buildFindMany({
       orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', direction: 'desc' } },
@@ -250,7 +250,7 @@ describe('pick-row relation ordering: scope errors', () => {
 
   it('missing pick.orderBy throws E003 (determinism required)', () => {
     const q = makeQuery('instances', schema());
-    // `pick: {}` (no `orderBy` key at all) is not a pick shape — it falls
+    // `pick: {}` (no `orderBy` key at all) is not a pick shape, it falls
     // through to relation column ordering, where the to-many branch rejects it
     // while still pointing at the pick-row form.
     assert.throws(
@@ -367,7 +367,7 @@ describe('pick-row relation ordering: scope errors', () => {
     );
   });
 
-  it('`distinct` + ANY relation orderBy throws E003 (pick, _count, to-one) — never invalid SQL', () => {
+  it('`distinct` + ANY relation orderBy throws E003 (pick, _count, to-one), never invalid SQL', () => {
     // The distinct path re-orders in an outer wrapper where a correlated
     // relation subquery would reference the parent table out of scope: a
     // guaranteed "missing FROM-clause entry" Postgres crash without the guard.
@@ -446,7 +446,7 @@ describe('pick-row relation ordering: back-compat with target columns literally 
 describe('pick-row relation ordering: dialect gating', () => {
   it("JSON-path by binds a '$'-rooted JSONPath STRING param on SQLite/MySQL (never a JS array)", () => {
     // The non-Postgres pool shims JSON.stringify non-primitive params, so a raw
-    // array would reach json_extract/JSON_EXTRACT as '["title"]' — an invalid
+    // array would reach json_extract/JSON_EXTRACT as '["title"]', an invalid
     // path that fails at the driver. The path is encoded per dialect instead.
     const sqlite = makeQuery('instances', schema(), { dialect: sqliteDialect, sqlCache: false });
     const s = sqlite.buildFindMany({
@@ -572,7 +572,7 @@ describe('pick-row relation ordering: cache safety', () => {
     const desc = q.buildFindMany({
       orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', direction: 'desc' } },
     } as never);
-    // nulls: 'last' matches the default (NULLS LAST) — 'first' is the variant
+    // nulls: 'last' matches the default (NULLS LAST), 'first' is the variant
     // that must produce different SQL text.
     const nulls = q.buildFindMany({
       orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', nulls: 'first' } },
@@ -605,7 +605,7 @@ describe('pick-row relation ordering: cache safety', () => {
 
   it('multi-column to-one relation orderBy: swapped insertion order never shares one cached SQL', () => {
     // The rel() fingerprint used to SORT entries while the compile side emits
-    // insertion order — the second call was silently served the first call's
+    // insertion order, the second call was silently served the first call's
     // cached ORDER BY precedence (wrong row order, no error).
     const q = makeQuery('instances', schema());
     const a = q.buildFindMany({ orderBy: { owner: { name: 'asc', email: 'desc' } } } as never);
@@ -765,7 +765,7 @@ describe('pick-row relation ordering: integration', () => {
 
   it("direction 'desc' with nulls UNSET sorts parents with zero related rows LAST (default NULLS LAST)", async () => {
     const rel = versionsRelation();
-    // "Highest first" — without the NULLS LAST default, Postgres's DESC
+    // "Highest first", without the NULLS LAST default, Postgres's DESC
     // NULLS FIRST would put p4 (no versions) and p3 (NULL title) at the TOP.
     const rows = (await db.table(PARENTS).findMany({
       orderBy: {

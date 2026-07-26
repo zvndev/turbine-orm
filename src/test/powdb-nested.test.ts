@@ -100,7 +100,7 @@ const schema: SchemaMetadata = {
           foreignKey: 'user_id',
           referenceKey: 'id',
         },
-        // Named exactly like the app_user column `name` — its nested block key
+        // Named exactly like the app_user column `name`, its nested block key
         // would duplicate a projected parent column key, so it must stay on the
         // loaders.
         name: {

@@ -1,8 +1,8 @@
 /**
- * turbine-orm CLI — UI utilities
+ * turbine-orm CLI, UI utilities
  *
  * ANSI colors, spinners, box-drawing, and formatting helpers.
- * Zero dependencies — raw escape codes only.
+ * Zero dependencies, raw escape codes only.
  */
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — migrate deploy unit tests
+ * turbine-orm, migrate deploy unit tests
  *
  * Locks the production deploy contract without requiring a database.
  *

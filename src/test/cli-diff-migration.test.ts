@@ -1,10 +1,10 @@
 /**
- * turbine-orm — `migrate create --from-diff` body builder + `init` step planner.
+ * turbine-orm, `migrate create --from-diff` body builder + `init` step planner.
  *
  * Pure, DB-free unit tests for the two CLI improvements:
- *   1. buildDiffMigrationBody() — turns a schemaDiff() result into an annotated
+ *   1. buildDiffMigrationBody(), turns a schemaDiff() result into an annotated
  *      UP/DOWN migration body, flagging destructive statements.
- *   2. planInitSteps() — decides which init steps run / prompt / skip for a
+ *   2. planInitSteps(), decides which init steps run / prompt / skip for a
  *      given project state + flags, across all three modes.
  *
  * Run: npx tsx --test src/test/cli-diff-migration.test.ts
@@ -76,7 +76,7 @@ describe('buildDiffMigrationBody', () => {
     const body = buildDiffMigrationBody({
       statements: ['CREATE TABLE "t" ("id" serial PRIMARY KEY);'],
       reverseStatements: ['DROP TABLE IF EXISTS "t" CASCADE;'],
-      warnings: ['enum "role" has a removed value — not applied automatically'],
+      warnings: ['enum "role" has a removed value, not applied automatically'],
     });
     assert.ok(body.up.includes('-- NOTE: enum "role" has a removed value'));
   });
@@ -92,10 +92,10 @@ describe('buildDiffMigrationBody', () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseArgs — new flags
+// parseArgs, new flags
 // ---------------------------------------------------------------------------
 
-describe('parseArgs — migrate create --from-diff', () => {
+describe('parseArgs, migrate create --from-diff', () => {
   it('parses --from-diff', () => {
     const args = parseArgs(['migrate', 'create', 'sync', '--from-diff']);
     assert.equal(args.command, 'migrate');
@@ -110,7 +110,7 @@ describe('parseArgs — migrate create --from-diff', () => {
   });
 });
 
-describe('parseArgs — init flags', () => {
+describe('parseArgs, init flags', () => {
   it('parses --yes/-y and every --skip-* flag', () => {
     const a = parseArgs(['init', '--yes', '--skip-schema', '--skip-seed', '--skip-push', '--skip-generate']);
     assert.equal(a.yes, true);

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Atomic update operator tests
+ * turbine-orm, Atomic update operator tests
  *
  * Verifies Prisma-style atomic update operators on `update` and `updateMany`:
  *   - { set: V }                     → col = $n
@@ -44,7 +44,7 @@ function buildSchema(): SchemaMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Build-only tests — verify SQL shape and param numbering
+// 1. Build-only tests, verify SQL shape and param numbering
 // ---------------------------------------------------------------------------
 
 describe('update operators: SQL build (no DB)', () => {
@@ -146,7 +146,7 @@ describe('update operators: SQL build (no DB)', () => {
     const q = makeQuery('posts', buildSchema());
     const deferred = q.buildUpdate({
       where: { id: 1 },
-      // Plain JSONB payload — not an operator, even though it's an object
+      // Plain JSONB payload, not an operator, even though it's an object
       data: { metadata: { foo: 'bar', baz: 42 } as unknown as never },
     });
     // Should be an absolute SET, not a self-reference
@@ -158,7 +158,7 @@ describe('update operators: SQL build (no DB)', () => {
   it('multi-key object containing an operator key is still plain JSON', () => {
     const q = makeQuery('posts', buildSchema());
     // { increment: 1, foo: 2 } has a recognized operator key but also another
-    // key — real operator objects have EXACTLY one key, so this is JSON.
+    // key, real operator objects have EXACTLY one key, so this is JSON.
     const deferred = q.buildUpdate({
       where: { id: 1 },
       data: { metadata: { increment: 1, foo: 2 } as unknown as never },
@@ -224,7 +224,7 @@ describe('update operators: SQL build (no DB)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. Integration tests — require DATABASE_URL, run against real Postgres
+// 2. Integration tests, require DATABASE_URL, run against real Postgres
 // ---------------------------------------------------------------------------
 
 const DATABASE_URL = process.env.DATABASE_URL;

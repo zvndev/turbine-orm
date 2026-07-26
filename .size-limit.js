@@ -59,14 +59,14 @@ const nodePlatform = (config) => {
 // property is worth guarding, and this budget is what guards it.
 export default [
   {
-    name: "main entry — import { TurbineClient } from 'turbine-orm'",
+    name: "main entry, import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
     limit: '69 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
-    name: 'edge entry — turbine-orm/serverless (+ client graph)',
+    name: 'edge entry, turbine-orm/serverless (+ client graph)',
     // The shared client/query graph carries the multi-dialect seam (the
     // resultStrategy output/reselect executor branches + the additive relation /
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
@@ -77,29 +77,29 @@ export default [
     modifyEsbuildConfig: nodePlatform,
   },
   {
-    name: 'sqlite entry — turbine-orm/sqlite (node:sqlite + client graph)',
+    name: 'sqlite entry, turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
     limit: '56 kB',
     ignore: ['pg', 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
-    name: 'mysql entry — turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
+    name: 'mysql entry, turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
     path: 'dist/mysql.js',
     limit: '57 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
-    // it is never in the static graph — exclude it (and pg) from the footprint.
+    // it is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mysql2', 'mysql2/promise'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
-    name: 'mssql entry — turbine-orm/mssql (client graph; mssql lazy-loaded)',
+    name: 'mssql entry, turbine-orm/mssql (client graph; mssql lazy-loaded)',
     path: 'dist/mssql.js',
     // Slightly larger than the other engines: the FOR JSON PATH relation generator
     // and the INFORMATION_SCHEMA/sys introspector add real code (no extra deps).
     limit: '59 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
-    // is never in the static graph — exclude it (and pg) from the footprint.
+    // is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mssql'],
     modifyEsbuildConfig: nodePlatform,
   },

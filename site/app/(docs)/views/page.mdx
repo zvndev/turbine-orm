@@ -7,7 +7,7 @@ export const metadata = {
 
 # Views & Generated Columns
 
-Turbine can generate typed accessors for database views, and it understands `STORED` generated columns — computed by Postgres and never writable. Both are read-safe by construction: the type system and the query builder stop you from writing where a write is impossible.
+Turbine can generate typed accessors for database views, and it understands `STORED` generated columns, computed by Postgres and never writable. Both are read-safe by construction: the type system and the query builder stop you from writing where a write is impossible.
 
 ## Views
 
@@ -17,7 +17,7 @@ Pass `--include-views` to `generate` / `pull` and Turbine introspects views and 
 npx turbine pull --include-views
 ```
 
-Each view becomes a table in the generated metadata with `isView: true`. Codegen emits an entity type and read accessors for it — `findMany`, `findFirst`, `count`, `aggregate`, and so on — exactly like a base table:
+Each view becomes a table in the generated metadata with `isView: true`. Codegen emits an entity type and read accessors for it, `findMany`, `findFirst`, `count`, `aggregate`, and so on, exactly like a base table:
 
 ```ts
 // active_users is a Postgres VIEW
@@ -29,7 +29,7 @@ const active = await db.activeUsers.findMany({
 
 ### Views are read-only
 
-Every write builder refuses a view. `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, and `upsert` throw `ValidationError` (TURBINE_E003) — "cannot write to a view" — before any SQL runs:
+Every write builder refuses a view. `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, and `upsert` throw `ValidationError` (TURBINE_E003), "cannot write to a view", before any SQL runs:
 
 ```ts
 await db.activeUsers.create({ data: { name: 'x' } });
@@ -40,7 +40,7 @@ The guard is enforced at the query builder, so it holds on every engine, not jus
 
 ### Views without a primary key
 
-A view without a primary key can't be uniquely addressed, so its generated accessor omits the `findUnique` family. The type is `Omit<QueryInterface<T>, 'findUnique' | 'findUniqueOrThrow'>` — `findUnique` on a PK-less view is a compile error, not a runtime surprise. A view that does expose a unique/primary key keeps the full read surface.
+A view without a primary key can't be uniquely addressed, so its generated accessor omits the `findUnique` family. The type is `Omit<QueryInterface<T>, 'findUnique' | 'findUniqueOrThrow'>`, `findUnique` on a PK-less view is a compile error, not a runtime surprise. A view that does expose a unique/primary key keeps the full read surface.
 
 ## STORED generated columns
 
@@ -57,18 +57,18 @@ CREATE TABLE invoices (
 );
 ```
 
-### On read — present and typed
+### On read, present and typed
 
 `total` appears in the generated `Invoice` entity type and comes back on every read, just like any other column.
 
 ```ts
 const invoice = await db.invoices.findUnique({ where: { id: 1 } });
-invoice.total; // number — computed by Postgres
+invoice.total; // number, computed by Postgres
 ```
 
-### On write — omitted and rejected
+### On write, omitted and rejected
 
-`total` is omitted from the `InvoiceCreate` and `InvoiceUpdate` input types, so passing it is a compile error. If it reaches the builder at runtime anyway (say, from untyped data), `create`, `update`, and `upsert` throw `ValidationError` (TURBINE_E003) naming the column — before hitting Postgres:
+`total` is omitted from the `InvoiceCreate` and `InvoiceUpdate` input types, so passing it is a compile error. If it reaches the builder at runtime anyway (say, from untyped data), `create`, `update`, and `upsert` throw `ValidationError` (TURBINE_E003) naming the column, before hitting Postgres:
 
 ```ts
 await db.invoices.create({ data: { qty: 2, price: 3 } });
@@ -80,6 +80,6 @@ await db.invoices.create({ data: { qty: 2, price: 3, total: 6 } });
 
 ## See also
 
-- **[Schema & Migrations](/schema)** — introspection and the type mapping.
-- **[Zod Schemas](/zod)** — generated columns are dropped from Create/Update Zod schemas too.
-- **[Typed Errors](/errors)** — `ValidationError` (TURBINE_E003).
+- **[Schema & Migrations](/schema)**, introspection and the type mapping.
+- **[Zod Schemas](/zod)**, generated columns are dropped from Create/Update Zod schemas too.
+- **[Typed Errors](/errors)**, `ValidationError` (TURBINE_E003).

@@ -1,18 +1,18 @@
 /**
- * turbine-orm — v0.19.1 regression suite
+ * turbine-orm, v0.19.1 regression suite
  *
  * Covers four query-builder fixes found by the v0.19.0 post-release audit:
  *
  * 1. CACHE BYPASS: the unknown-operator guard ran only in buildWhereClause
  *    (cache-miss path). After any equality query warmed the SQL cache for a
  *    field set, a misspelled operator object went through collectWhereParams
- *    unguarded and executed `col = $1` with the object as the value — the
+ *    unguarded and executed `col = $1` with the object as the value, the
  *    exact silent-wrong-rows bug v0.19.0 headlined as fixed. The guard now
  *    runs on BOTH paths, and unmatched objects fingerprint distinctly from
  *    equality so they can never share a cache entry.
  *
  * 2. NESTED RELATION WHERE: buildRelationSubquery / buildManyToManySubquery
- *    treated every `with: { rel: { where } }` entry as bare equality —
+ *    treated every `with: { rel: { where } }` entry as bare equality -
  *    operator objects bound as values (silent wrong rows), OR/AND/NOT threw
  *    "Unknown column". Nested where now supports the full scalar surface.
  *
@@ -40,7 +40,7 @@ function assertParamsAligned(sql: string, params: unknown[]): void {
   const max = referenced.size ? Math.max(...referenced) : 0;
   assert.equal(max, params.length, `SQL references up to $${max} but got ${params.length} params: ${sql}`);
   for (let i = 1; i <= params.length; i++) {
-    assert.ok(referenced.has(i), `param $${i} is never referenced in SQL — orphaned param: ${sql}`);
+    assert.ok(referenced.has(i), `param $${i} is never referenced in SQL, orphaned param: ${sql}`);
   }
 }
 
@@ -123,7 +123,7 @@ describe('unknown-operator guard survives the SQL cache (H2)', () => {
     // Warm the cache with genuine equality on the same field set.
     const warm = q.buildFindMany({ where: { name: 'alice' } } as never);
     assert.deepEqual(warm.params, ['alice']);
-    // The misspelled operator must throw — not silently bind `{startWith: 'a'}`.
+    // The misspelled operator must throw, not silently bind `{startWith: 'a'}`.
     assert.throws(
       () => q.buildFindMany({ where: { name: { startWith: 'a' } } as never }),
       (err: unknown) => {
@@ -171,7 +171,7 @@ describe('unknown-operator guard survives the SQL cache (H2)', () => {
       () => q.buildFindMany({ where: { posts: { some: { title: { startWith: 'a' } } } } } as never),
       ValidationError,
     );
-    // warm with equality sub-where, then misspell — must still throw
+    // warm with equality sub-where, then misspell, must still throw
     q.buildFindMany({ where: { posts: { some: { title: 'hello' } } } } as never);
     assert.throws(
       () => q.buildFindMany({ where: { posts: { some: { title: { startWith: 'a' } } } } } as never),

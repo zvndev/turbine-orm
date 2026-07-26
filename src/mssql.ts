@@ -1,8 +1,8 @@
 /**
- * turbine-orm/mssql — Microsoft SQL Server engine (driver-injected, optional peer)
+ * turbine-orm/mssql, Microsoft SQL Server engine (driver-injected, optional peer)
  *
  * Binds Turbine to SQL Server 2016+ via the `mssql` driver (which wraps
- * `tedious`). `mssql` is **not** a root dependency — it is an **optional peer**:
+ * `tedious`). `mssql` is **not** a root dependency, it is an **optional peer**:
  * `npm i turbine-orm` pulls nothing extra, and only consumers who
  * `import 'turbine-orm/mssql'` install `mssql` themselves. The factory loads it
  * through a dynamic `import('mssql')` so importing this module never crashes when
@@ -33,14 +33,14 @@
  *     real JSON instead of being escaped as a string. `INCLUDE_NULL_VALUES`
  *     keeps NULL columns present (matching PostgreSQL `json_build_object`).
  *  3. **No `LIMIT`.** Paging is `ORDER BY … OFFSET n ROWS FETCH NEXT m ROWS ONLY`,
- *     which requires an ORDER BY — a stable `ORDER BY (SELECT NULL)` is injected
+ *     which requires an ORDER BY, a stable `ORDER BY (SELECT NULL)` is injected
  *     when the query has none (`Dialect.buildLimitOffset`).
  *
  * ## Named `@pN` placeholders (no positional `?`)
  *
  * `mssqlDialect.paramPlaceholder = (i) => '@p' + i`. The driver shim binds via
  * `request.input('p' + i, value)`, so binding is by NAME and independent of where
- * each placeholder lands in the SQL text — exactly the guarantee PostgreSQL's
+ * each placeholder lands in the SQL text, exactly the guarantee PostgreSQL's
  * numbered `$N` gives. (SQL Server is naturally named-param friendly, sidestepping
  * the positional-`?` mis-bind bug the SQLite/MySQL phases hit.)
  *
@@ -48,12 +48,12 @@
  *
  * - **Single query nested relations preserved** via `FOR JSON PATH` (SQL Server
  *   2016+). Ordered/limited to-many uses `ORDER BY … OFFSET/FETCH` inside the FOR
- *   JSON subquery (no inner-subquery rewrite needed — FOR JSON aggregates AFTER
+ *   JSON subquery (no inner-subquery rewrite needed, FOR JSON aggregates AFTER
  *   the row selection).
  * - **Result strategy `'output'`:** create/update/delete/upsert return their rows
  *   from the same statement. `createMany` returns the inserted rows via
  *   `OUTPUT INSERTED.*` on the multi-row VALUES insert (≤ 1000 rows / 2100 params
- *   per statement — exceeding either throws a clear `ValidationError`; chunk
+ *   per statement, exceeding either throws a clear `ValidationError`; chunk
  *   yourself or use single `create`s).
  * - **MERGE concurrency caveat:** `MERGE` is the upsert primitive; under high
  *   concurrency a `MERGE` can still race (it is NOT a substitute for a unique
@@ -62,20 +62,20 @@
  *   loser of a race.
  * - **Unsupported (throw `UnsupportedFeatureError`):** pgvector distance ops,
  *   LISTEN/NOTIFY (`$listen`/`$notify`), RLS `sessionContext` (sp_set_session_context
- *   exists but is connection-scoped, not transaction-local, so it is not wired —
+ *   exists but is connection-scoped, not transaction-local, so it is not wired -
  *   throws rather than silently leaking context across pooled connections).
  * - **Advisory-lock migration locking** is available in principle via
  *   `sp_getapplock`/`sp_releaseapplock` (`supportsAdvisoryLock = true`); the
  *   migrate CLI is still PostgreSQL-only, so this flag documents intent for a
  *   future adapter.
- * - **Case-insensitive matching** uses `LOWER(col) LIKE LOWER(ref)` — deterministic
+ * - **Case-insensitive matching** uses `LOWER(col) LIKE LOWER(ref)`, deterministic
  *   regardless of the column's collation (note this can defeat an index unless a
  *   computed/persisted `LOWER()` index exists).
  * - **bignum:** the shim applies the same safe-int policy Turbine uses for Postgres
  *   `int8` (number when it fits in 2^53, decimal string otherwise) WITHOUT mutating
  *   any global driver state. `DECIMAL`/`NUMERIC`/`MONEY` come back as strings;
  *   `BIT` binds/returns booleans.
- * - **`DISTINCT ON`** is PostgreSQL-only and is not translated — avoid `distinct`
+ * - **`DISTINCT ON`** is PostgreSQL-only and is not translated, avoid `distinct`
  *   on SQL Server.
  *
  * ## Example
@@ -203,7 +203,7 @@ interface MssqlModule {
 /**
  * Coerce an arbitrary JS value into something `mssql` can bind. `BIT` accepts JS
  * booleans directly; `undefined`/`null` → NULL; `bigint` follows the safe-int
- * policy (number when it fits in 2^53, else a decimal string — no precision
+ * policy (number when it fits in 2^53, else a decimal string, no precision
  * loss); `Date`/`Uint8Array` pass through; any remaining object/array → JSON text
  * (matches how Turbine already pre-serializes JSON filter / `IN`-list params).
  */
@@ -243,7 +243,7 @@ function shapeResult(result: MssqlQueryResult): { rows: Record<string, unknown>[
  * driver returns BIGINT as a string to avoid precision loss, so a BIGINT IDENTITY
  * `id` would otherwise surface as `'1'` instead of `1`. Values outside the safe
  * range are left as strings (same as the Postgres path). Nested relations are
- * unaffected — `FOR JSON PATH` already renders BIGINT as a JSON number.
+ * unaffected, `FOR JSON PATH` already renders BIGINT as a JSON number.
  */
 function coerceBigIntColumns(rows: Record<string, unknown>[], columns: MssqlColumnMeta | undefined): void {
   if (!columns || rows.length === 0) return;
@@ -318,7 +318,7 @@ function augmentMssqlError(err: unknown): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// Driver shim — wrap an `mssql` ConnectionPool as a PgCompatPool
+// Driver shim, wrap an `mssql` ConnectionPool as a PgCompatPool
 // ---------------------------------------------------------------------------
 
 /** pg-style query argument: a SQL string or a `{ text, values }` config object. */
@@ -375,12 +375,12 @@ class MssqlTxClient implements PgCompatPoolClient {
     const sql = rawSql.trim();
 
     // RELEASE SAVEPOINT has no SQL Server equivalent (savepoints auto-persist until
-    // the outer commit/rollback) — releaseSavepointStatement() returns '' → no-op.
+    // the outer commit/rollback), releaseSavepointStatement() returns '' → no-op.
     if (sql === '') return EMPTY_RESULT;
 
     // The dialect composes `SET TRANSACTION ISOLATION LEVEL …; BEGIN TRANSACTION`
     // (SQL Server cannot take an inline isolation level on BEGIN). Split and run
-    // the parts in order — same pattern as the MySQL shim. Gated on the exact
+    // the parts in order, same pattern as the MySQL shim. Gated on the exact
     // transaction-control prefix so no builder/user SQL is ever split.
     if (/^SET TRANSACTION ISOLATION LEVEL /i.test(sql) && sql.includes('; ')) {
       let last: ReturnType<typeof shapeResult> = EMPTY_RESULT;
@@ -442,7 +442,7 @@ class MssqlTxClient implements PgCompatPoolClient {
  * physical connection.
  */
 export class MssqlPool implements PgCompatPool {
-  /** The underlying `mssql` ConnectionPool — exposed as an escape hatch (seed / DDL / advanced ops). */
+  /** The underlying `mssql` ConnectionPool, exposed as an escape hatch (seed / DDL / advanced ops). */
   readonly pool: MssqlConnectionPool;
   private readonly sqlNS: MssqlModule;
   private closed = false;
@@ -526,7 +526,7 @@ function mssqlColumnType(type: string, maxLength?: number | null): string {
 }
 
 // ---------------------------------------------------------------------------
-// mssqlDialect — the full Dialect contract for SQL Server 2016+
+// mssqlDialect, the full Dialect contract for SQL Server 2016+
 // ---------------------------------------------------------------------------
 
 /**
@@ -643,7 +643,7 @@ export const mssqlDialect: Dialect = {
     return JSON.stringify(values ?? []);
   },
 
-  // OUTPUT replaces RETURNING — injected mid-statement by the statement builders,
+  // OUTPUT replaces RETURNING, injected mid-statement by the statement builders,
   // never as a trailing clause.
   buildReturningClause(): string {
     return '';
@@ -655,7 +655,7 @@ export const mssqlDialect: Dialect = {
   },
 
   buildBulkInsertStatement(input: BulkInsertStatementInput): { sql: string; params: unknown[] } {
-    // No UNNEST in SQL Server — emit multi-row VALUES with flattened, named `@pN`
+    // No UNNEST in SQL Server, emit multi-row VALUES with flattened, named `@pN`
     // placeholders. Enforce the engine's 1000-row / 2100-param statement limits.
     const rowCount = input.rowValues.length;
     const paramCount = input.rowValues.reduce((n, row) => n + row.length, 0);
@@ -694,7 +694,7 @@ export const mssqlDialect: Dialect = {
 
   buildUpsertStatement(input: UpsertStatementInput): string {
     // MERGE is the SQL Server upsert. The MERGE statement MUST end with `;`.
-    // CONCURRENCY CAVEAT: MERGE is not a substitute for a UNIQUE/PK constraint —
+    // CONCURRENCY CAVEAT: MERGE is not a substitute for a UNIQUE/PK constraint -
     // keep the conflict columns backed by one and rely on UniqueConstraintError
     // (2627/2601 → E008) for a concurrent loser.
     const on = input.conflictColumns.map((c) => `T.${c} = S.${c}`).join(' AND ');
@@ -712,7 +712,7 @@ export const mssqlDialect: Dialect = {
   },
 
   // UPDATE/DELETE inject OUTPUT mid-statement (between SET and WHERE / FROM and
-  // WHERE) — a trailing clause would be invalid T-SQL.
+  // WHERE), a trailing clause would be invalid T-SQL.
   buildUpdateStatement(input: UpdateStatementInput): string {
     const out = mssqlOutput(input.returning, 'INSERTED');
     return `UPDATE ${input.table} SET ${input.setClauses.join(', ')}${out}${input.whereSql}`;
@@ -723,7 +723,7 @@ export const mssqlDialect: Dialect = {
     return `DELETE FROM ${input.table}${out}${input.whereSql}`;
   },
 
-  // SQL Server has no LIMIT — emit OFFSET/FETCH, injecting a stable ORDER BY when
+  // SQL Server has no LIMIT, emit OFFSET/FETCH, injecting a stable ORDER BY when
   // the outer query has none (OFFSET/FETCH requires an ORDER BY).
   buildLimitOffset(input: LimitOffsetInput): string {
     const { limitPlaceholder, offsetPlaceholder, hasOrderBy } = input;
@@ -750,7 +750,7 @@ export const mssqlDialect: Dialect = {
 
   // SQL Server has no JSON_CONTAINS. Emulate "the JSON array column contains the
   // scalar value" via OPENJSON (documented `limited`: object-containment and deep
-  // paths are not supported — use a generated column + index for those).
+  // paths are not supported, use a generated column + index for those).
   buildJsonContains(column: string, paramRef: string): string {
     return `EXISTS (SELECT 1 FROM OPENJSON(${column}) WHERE [value] = ${paramRef})`;
   },
@@ -844,7 +844,7 @@ export const mssqlDialect: Dialect = {
   },
 
   releaseSavepointStatement(): string {
-    // SQL Server has no RELEASE SAVEPOINT — savepoints persist until the outer
+    // SQL Server has no RELEASE SAVEPOINT, savepoints persist until the outer
     // commit/rollback. The shim treats the empty statement as a no-op.
     return '';
   },
@@ -927,7 +927,7 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
    *
    * A column whose FOR JSON rendering diverges from the driver's own value is
    * wrapped by the dialect's {@link Dialect.jsonWireRule} cast, exactly as the
-   * shared `json_build_object` path does — this generator is an override, so it
+   * shared `json_build_object` path does, this generator is an override, so it
    * has to opt in explicitly or BIGINT silently loses precision and a binary
    * column arrives as base64 text.
    */
@@ -1131,7 +1131,7 @@ function buildForJsonManyToMany(dialect: Dialect, ctx: RelationSubqueryContext, 
 }
 
 // ---------------------------------------------------------------------------
-// Introspection — INFORMATION_SCHEMA + sys.* driven SchemaMetadata
+// Introspection, INFORMATION_SCHEMA + sys.* driven SchemaMetadata
 // ---------------------------------------------------------------------------
 
 /** Async executor that returns plain row objects for a parameterized (`@pN`) query. */
@@ -1152,7 +1152,7 @@ const num = (v: number | string | null | undefined): number => (typeof v === 'st
  * (`deriveEngineRelations` → `buildRelationsFromForeignKeys` +
  * `addAutoManyToManyRelations` in introspect.ts), so this engine derives
  * IDENTICAL relation names to `turbine generate` against Postgres for the
- * same logical schema — legacy-first naming, per-column disambiguation, and
+ * same logical schema, legacy-first naming, per-column disambiguation, and
  * collision resolution against scalar column fields included.
  */
 function buildRelationsFromForeignKeys(
@@ -1369,7 +1369,7 @@ export async function introspectMssqlWith(
     };
   }
 
-  // SQL Server has no first-class enum type — enums are CHECK constraints; left empty.
+  // SQL Server has no first-class enum type, enums are CHECK constraints; left empty.
   return { tables, enums: {} } satisfies SchemaMetadata;
 }
 
@@ -1440,7 +1440,7 @@ async function loadMssql(): Promise<MssqlModule> {
   let mod: { default?: MssqlModule } & Partial<MssqlModule>;
   try {
     // `mssql` ships no bundled type declarations (it needs @types/mssql, which
-    // Turbine deliberately does not depend on) — the structural MssqlModule
+    // Turbine deliberately does not depend on), the structural MssqlModule
     // above is our typed surface; the helper returns `unknown` so no TS7016.
     // Via the .cts helper so the CJS build keeps a path to a REAL dynamic
     // import() even if a future mssql major goes ESM-only (the CommonJS pass
@@ -1473,7 +1473,7 @@ function assertSupportedVersion(majorVersion: number): void {
 }
 
 // ---------------------------------------------------------------------------
-// turbineMssql — the public factory
+// turbineMssql, the public factory
 // ---------------------------------------------------------------------------
 
 /** Options for {@link turbineMssql}. Mirrors the relevant {@link TurbineConfig} fields. */
@@ -1496,7 +1496,7 @@ function isMssqlPool(x: unknown): x is MssqlConnectionPool {
  * Pass one of:
  *  - a connection string (`'mssql://sa:pass@host:1433/db'`),
  *  - an `mssql` config object (`{ server, user, password, database, options }`),
- *  - an existing `MssqlPool` (injection — you own its lifecycle, `disconnect()` is
+ *  - an existing `MssqlPool` (injection, you own its lifecycle, `disconnect()` is
  *    a no-op).
  *
  * When Turbine builds the pool (string/config), it probes

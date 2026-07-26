@@ -1,21 +1,21 @@
 export const metadata = {
   title: 'Seeding',
   description:
-    'Seed your database with TypeScript, JavaScript, or SQL in Turbine ORM — the defineSeed helper, file resolution order, and a CI-safe deploy-then-seed pipeline.',
+    'Seed your database with TypeScript, JavaScript, or SQL in Turbine ORM, the defineSeed helper, file resolution order, and a CI-safe deploy-then-seed pipeline.',
   alternates: { canonical: '/seeding' },
 };
 
 # Seeding
 
-`turbine seed` runs a seed file to populate your database. The file can be TypeScript, JavaScript, or SQL — Turbine picks the right runner for each. TypeScript seeds run through `tsx`, so there's no separate build step.
+`turbine seed` runs a seed file to populate your database. The file can be TypeScript, JavaScript, or SQL, Turbine picks the right runner for each. TypeScript seeds run through `tsx`, so there's no separate build step.
 
 ```bash
 npx turbine seed
 ```
 
-## `defineSeed` — TypeScript seeds
+## `defineSeed`, TypeScript seeds
 
-`defineSeed` wraps a function that receives a connected client. It reads `DATABASE_URL`, runs your function, and disconnects when it's done — you don't manage the connection lifecycle.
+`defineSeed` wraps a function that receives a connected client. It reads `DATABASE_URL`, runs your function, and disconnects when it's done. You don't manage the connection lifecycle.
 
 ```ts
 // seed.ts
@@ -30,7 +30,7 @@ export default defineSeed(async (db) => {
 });
 ```
 
-The `db` handed to the callback is a base client — use [`db.raw`](/queries#raw-sql) or [`db.sql`](/queries#typed-raw-sql--dbsqlt) for inserts. For fully typed table accessors, import your generated client instead and manage its lifecycle yourself:
+The `db` handed to the callback is a base client, use [`db.raw`](/queries#raw-sql) or [`db.sql`](/queries#typed-raw-sql--dbsqlt) for inserts. For fully typed table accessors, import your generated client instead and manage its lifecycle yourself:
 
 ```ts
 // seed.ts
@@ -52,8 +52,8 @@ Either file runs the same way: `npx turbine seed`.
 
 ## JavaScript and SQL seeds
 
-- **`.js`** — imported dynamically. If the default export is a function, Turbine calls it.
-- **`.sql`** — executed as raw SQL against the database.
+- **`.js`**, imported dynamically. If the default export is a function, Turbine calls it.
+- **`.sql`**, executed as raw SQL against the database.
 
 ```sql
 -- seed.sql
@@ -86,7 +86,7 @@ The root-level candidates stay first in the fallback order so an existing projec
 
 ## Seeding in CI/CD
 
-For automated environments, pair `migrate deploy` with `seed`. `migrate deploy` applies pending migrations non-interactively — it never prompts, so it's safe in a pipeline — then seed on top:
+For automated environments, pair `migrate deploy` with `seed`. `migrate deploy` applies pending migrations non-interactively, it never prompts, so it's safe in a pipeline, then seed on top:
 
 ```bash
 # CI: bring a fresh database up to date, then seed it
@@ -98,6 +98,6 @@ npx turbine seed
 
 ## See also
 
-- **[CLI](/cli)** — `turbine seed`, `turbine migrate deploy`, and every flag.
-- **[Schema & Migrations](/schema)** — the migration workflow seeds run on top of.
-- **[API Reference](/queries)** — `createMany`, `raw`, and `sql` for writing seed data.
+- **[CLI](/cli)**, `turbine seed`, `turbine migrate deploy`, and every flag.
+- **[Schema & Migrations](/schema)**, the migration workflow seeds run on top of.
+- **[API Reference](/queries)**, `createMany`, `raw`, and `sql` for writing seed data.

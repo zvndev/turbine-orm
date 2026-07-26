@@ -8,7 +8,7 @@
  *   - 50,000 comments
  *
  * Values are generated deterministically from a seeded counter so every
- * run is identical — no faker, no randomness, fair comparison.
+ * run is identical, no faker, no randomness, fair comparison.
  *
  * Run with:
  *   DATABASE_URL=... npx tsx seed-neon.ts
@@ -96,7 +96,7 @@ async function main() {
       ('Epsilon Studios', 'epsilon', 'free')
   `);
 
-  // Users — 1K, bulk UNNEST insert
+  // Users, 1K, bulk UNNEST insert
   console.log('  users...');
   {
     const orgIds: number[] = [];
@@ -116,7 +116,7 @@ async function main() {
     );
   }
 
-  // Posts — 10K, batched UNNEST
+  // Posts, 10K, batched UNNEST
   console.log('  posts...');
   {
     const BATCH = 2000;
@@ -150,7 +150,7 @@ async function main() {
     process.stdout.write('\n');
   }
 
-  // Comments — 50K, batched UNNEST
+  // Comments, 50K, batched UNNEST
   console.log('  comments...');
   {
     // Fetch post id range

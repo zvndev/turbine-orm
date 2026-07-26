@@ -94,14 +94,14 @@ const postgresFeatures = [
   {
     title: 'Vector search (pgvector)',
     description:
-      'KNN ranking and distance filters over vector columns — orderBy: { embedding: { distance: { to, metric: "cosine" } } }. l2 / cosine / inner-product, every value bound as a parameter.',
+      'KNN ranking and distance filters over vector columns, orderBy: { embedding: { distance: { to, metric: "cosine" } } }. l2 / cosine / inner-product, every value bound as a parameter.',
     href: '/vector',
     cta: 'Vector docs',
   },
   {
     title: 'Realtime (LISTEN / NOTIFY)',
     description:
-      'Postgres pub/sub with db.$listen(channel, handler) and db.$notify(channel, payload). No broker, no extra service — your database is the message bus.',
+      'Postgres pub/sub with db.$listen(channel, handler) and db.$notify(channel, payload). No broker, no extra service, your database is the message bus.',
     href: '/realtime',
     cta: 'Realtime docs',
   },
@@ -122,7 +122,7 @@ const postgresFeatures = [
   {
     title: 'Many-to-many, auto-detected',
     description:
-      'Pure junction tables are detected at generate time — db.posts.findMany({ with: { tags: true } }) just works. Self-relations too: a self-referencing FK gives you parent + children.',
+      'Pure junction tables are detected at generate time, db.posts.findMany({ with: { tags: true } }) just works. Self-relations too: a self-referencing FK gives you parent + children.',
     href: '/relations',
     cta: 'Relations docs',
   },

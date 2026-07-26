@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Event emitter ($on / $off) tests
+ * turbine-orm, Event emitter ($on / $off) tests
  *
  * Verifies that query events are emitted to registered listeners
  * and that error handling works correctly. No real database needed.

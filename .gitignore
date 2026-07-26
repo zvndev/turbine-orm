@@ -17,7 +17,7 @@ src/cli/studio-ui.generated.ts
 screenshots/
 studio-*.png
 
-# Internal docs — never public (strategy, sprint plans, agent specs, release ops)
+# Internal docs, never public (strategy, sprint plans, agent specs, release ops)
 docs/internal/
 AGENTS.md
 .private-terms

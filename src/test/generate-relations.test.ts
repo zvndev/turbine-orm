@@ -1,12 +1,12 @@
 /**
- * turbine-orm — Generator output regression test
+ * turbine-orm, Generator output regression test
  *
  * Pins the shape that `generateTypes()` emits for `*Relations` interfaces.
  * The recursive `WithResult` type only delivers deep `with`-clause inference
  * when the generator emits each relation as a `RelationDescriptor<Target,
  * Cardinality, TargetRelations>`. If the generator regresses to bare shapes
  * (`posts: Post[]`, `profile: Profile | null`), users running `turbine
- * generate` lose every level of nesting beyond the first — even though the
+ * generate` lose every level of nesting beyond the first, even though the
  * type machinery in query.ts still works in isolation.
  *
  * This test stops that regression by parsing the literal output string.
@@ -179,7 +179,7 @@ const SCHEMA: SchemaMetadata = {
       allColumns: ['id', 'post_id', 'body'],
       primaryKey: ['id'],
       uniqueColumns: [],
-      relations: {}, // leaf — exercises the `{}` fallback in RelationDescriptor
+      relations: {}, // leaf, exercises the `{}` fallback in RelationDescriptor
       indexes: [],
     },
     profiles: {
@@ -269,7 +269,7 @@ describe('generator: *Relations interface output', () => {
     // The new emitter wraps every member in `RelationDescriptor<...>`. If this
     // regression check fails, the generator has reverted and deep `with`
     // inference is broken end-to-end. Note: the per-relation `*With<Rel>`
-    // compat interfaces (e.g. `UserWithPosts`) DO still emit bare shapes —
+    // compat interfaces (e.g. `UserWithPosts`) DO still emit bare shapes -
     // we only check the Relations interface body here, not the whole file.
     const userRelations = extractInterfaceBody(out, 'UserRelations');
     assert.doesNotMatch(userRelations, /posts: Post\[\];/);

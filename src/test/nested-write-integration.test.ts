@@ -351,7 +351,7 @@ testFn('nested write integration tests', () => {
   });
 
   describe('non-nested create still works (fast path)', () => {
-    it('creates without nesting — no transaction overhead', async () => {
+    it('creates without nesting, no transaction overhead', async () => {
       const uniqueEmail = `fast-path-${Date.now()}@example.com`;
       const user = row(
         await db.table('users').create({

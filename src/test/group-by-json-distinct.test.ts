@@ -143,7 +143,7 @@ describe('groupBy JSON-path group keys', () => {
       /output name "created_at" .* collides/,
     );
     // Aggregate output aliases share the namespace: a plain-column _sum emits
-    // `_sum_<snake_col>` while a JSON-path _sum emits `_sum_<argKey>` — a
+    // `_sum_<snake_col>` while a JSON-path _sum emits `_sum_<argKey>`, a
     // camel/snake sibling pair lands on ONE output column and drops a value.
     assert.throws(
       () =>
@@ -405,7 +405,7 @@ describe('groupBy distinctOn row source', () => {
 // ---------------------------------------------------------------------------
 // Non-Postgres dialects: JSON paths bind as '$'-rooted JSONPath STRING params
 // (the pool shims JSON.stringify non-primitive params, so a raw array would
-// reach json_extract/JSON_EXTRACT/JSON_VALUE as '["x"]' — an invalid path
+// reach json_extract/JSON_EXTRACT/JSON_VALUE as '["x"]', an invalid path
 // that fails at the driver).
 // ---------------------------------------------------------------------------
 
@@ -594,7 +594,7 @@ describe('groupBy orderBy over result columns', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Live SQLite (node:sqlite, in-process — runs in the unit lane): the JSON-path
+// Live SQLite (node:sqlite, in-process, runs in the unit lane): the JSON-path
 // groupBy keys/aggregates, JSON-path orderBy, and JSON range filters must
 // actually EXECUTE on a non-Postgres engine, not just compile.
 // ---------------------------------------------------------------------------

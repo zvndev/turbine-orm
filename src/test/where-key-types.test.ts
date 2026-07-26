@@ -1,10 +1,10 @@
 /**
- * turbine-orm — Type-level tests for `where` key validation
+ * turbine-orm, Type-level tests for `where` key validation
  *
  * A misspelled column in `where` used to compile silently. `WhereClause<T>`
- * carried a `[relationName: string]: unknown` index signature — required so
+ * carried a `[relationName: string]: unknown` index signature, required so
  * relation filters (`where: { posts: { some: ... } }`) would typecheck, since
- * relation names are NOT keys of the entity — and an index signature
+ * relation names are NOT keys of the entity, and an index signature
  * annihilates excess-property checking for the whole object.
  *
  * The fix keys the relation side explicitly instead: `WhereClause<T, R>` takes
@@ -13,7 +13,7 @@
  * properties, and drops the index signature. Same for a relation `with`
  * block's own `where`, which is now keyed against the relation TARGET entity.
  *
- * IMPORTANT — what actually guards this file: `tsx`/esbuild strips types
+ * IMPORTANT, what actually guards this file: `tsx`/esbuild strips types
  * WITHOUT typechecking, so `npm run test:unit` runs it fine even if the
  * validation regresses. The REAL guard is `npm run typecheck`
  * (`tsc --noEmit --project tsconfig.test.json`), which re-includes `src/test`.
@@ -78,58 +78,58 @@ declare const posts: QueryInterface<Post, PostRelations>;
 // ---------------------------------------------------------------------------
 
 async function topLevelTypos(): Promise<void> {
-  // @ts-expect-error — 'emial' is not a column or relation of User
+  // @ts-expect-error, 'emial' is not a column or relation of User
   await users.findMany({ where: { emial: 'x' } });
 
-  // @ts-expect-error — unknown key inside AND
+  // @ts-expect-error, unknown key inside AND
   await users.findMany({ where: { AND: [{ emial: 'x' }] } });
 
-  // @ts-expect-error — unknown key inside OR
+  // @ts-expect-error, unknown key inside OR
   await users.findMany({ where: { OR: [{ id: 1 }, { emial: 'x' }] } });
 
-  // @ts-expect-error — unknown key inside NOT
+  // @ts-expect-error, unknown key inside NOT
   await users.findMany({ where: { NOT: { emial: 'x' } } });
 
-  // @ts-expect-error — 'postz' is not a relation of User
+  // @ts-expect-error, 'postz' is not a relation of User
   await users.findMany({ where: { postz: { some: { title: 'x' } } } });
 
-  // @ts-expect-error — typo one level down, inside a relation filter
+  // @ts-expect-error, typo one level down, inside a relation filter
   await users.findMany({ where: { posts: { some: { titel: 'x' } } } });
 
-  // @ts-expect-error — typo two levels down, inside a nested relation filter
+  // @ts-expect-error, typo two levels down, inside a nested relation filter
   await users.findMany({ where: { posts: { some: { comments: { some: { bodyy: 'x' } } } } } });
 
-  // @ts-expect-error — findUnique
+  // @ts-expect-error, findUnique
   await users.findUnique({ where: { emial: 'x' } });
 
-  // @ts-expect-error — findFirst
+  // @ts-expect-error, findFirst
   await users.findFirst({ where: { emial: 'x' } });
 
-  // @ts-expect-error — findUniqueOrThrow
+  // @ts-expect-error, findUniqueOrThrow
   await users.findUniqueOrThrow({ where: { emial: 'x' } });
 
-  // @ts-expect-error — findFirstOrThrow
+  // @ts-expect-error, findFirstOrThrow
   await users.findFirstOrThrow({ where: { emial: 'x' } });
 
-  // @ts-expect-error — update
+  // @ts-expect-error, update
   await users.update({ where: { emial: 'x' }, data: { email: 'y' } });
 
   // A wrong VALUE type on a real column was already caught, and still is.
-  // @ts-expect-error — email is a string column
+  // @ts-expect-error, email is a string column
   await users.findMany({ where: { email: 12345 } });
 }
 
 async function nestedWithTypos(): Promise<void> {
-  // @ts-expect-error — 'titel' is not a column or relation of Post
+  // @ts-expect-error, 'titel' is not a column or relation of Post
   await users.findMany({ with: { posts: { where: { titel: 'x' } } } });
 
-  // @ts-expect-error — typo in a DEEPLY nested relation `where`
+  // @ts-expect-error, typo in a DEEPLY nested relation `where`
   await users.findMany({ with: { posts: { with: { comments: { where: { bodyy: 'x' } } } } } });
 
-  // @ts-expect-error — typo inside a to-one relation's `where`
+  // @ts-expect-error, typo inside a to-one relation's `where`
   await users.findMany({ with: { posts: { with: { author: { where: { emial: 'x' } } } } } });
 
-  // @ts-expect-error — typo inside a relation filter used in a nested `where`
+  // @ts-expect-error, typo inside a relation filter used in a nested `where`
   await users.findMany({ with: { posts: { where: { comments: { some: { bodyy: 'x' } } } } } });
 }
 
@@ -242,25 +242,25 @@ async function backCompat(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function everyWhereBearingMethodTypos(): Promise<void> {
-  // @ts-expect-error — 'emial' is not a column or relation of User
+  // @ts-expect-error, 'emial' is not a column or relation of User
   await users.delete({ where: { emial: 'x' } });
 
-  // @ts-expect-error — 'emial' is not a column or relation of User
+  // @ts-expect-error, 'emial' is not a column or relation of User
   await users.upsert({ where: { emial: 'x' }, create: { email: 'a' }, update: {} });
 
-  // @ts-expect-error — 'emial' is not a column or relation of User
+  // @ts-expect-error, 'emial' is not a column or relation of User
   await users.updateMany({ where: { emial: 'x' }, data: { email: 'a' } });
 
-  // @ts-expect-error — 'emial' is not a column or relation of User
+  // @ts-expect-error, 'emial' is not a column or relation of User
   await users.deleteMany({ where: { emial: 'x' } });
 
-  // @ts-expect-error — 'emial' is not a column or relation of User
+  // @ts-expect-error, 'emial' is not a column or relation of User
   await users.count({ where: { emial: 'x' } });
 
-  // @ts-expect-error — 'emial' is not a column or relation of User
+  // @ts-expect-error, 'emial' is not a column or relation of User
   await users.aggregate({ where: { emial: 'x' }, _count: true });
 
-  // @ts-expect-error — 'emial' is not a column or relation of User
+  // @ts-expect-error, 'emial' is not a column or relation of User
   await users.groupBy({ by: ['email'], where: { emial: 'x' } });
 }
 

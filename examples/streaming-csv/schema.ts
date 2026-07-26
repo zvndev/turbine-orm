@@ -1,7 +1,7 @@
 import { defineSchema } from 'turbine-orm';
 
 /**
- * Streaming CSV demo — a tiny e-commerce order schema. The seed inserts
+ * Streaming CSV demo, a tiny e-commerce order schema. The seed inserts
  * 100K orders with 1-5 line items each (~300K rows total) so the streaming
  * export has something meaty to chew through while heap stays flat.
  */

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Schema metadata types
+ * turbine-orm, Schema metadata types
  *
  * These types represent the introspected database schema at runtime.
  * They're used by the query builder, code generator, and CLI.
@@ -78,7 +78,7 @@ export interface ColumnMetadata {
   /**
    * Schema the column's Postgres type lives in, recorded by introspection
    * ONLY when it differs from the introspected schema (and isn't a
-   * `pg_catalog` builtin) — e.g. an enum or domain owned by another schema.
+   * `pg_catalog` builtin), e.g. an enum or domain owned by another schema.
    * Consumers use it as a cross-schema guard: a same-named enum in another
    * schema must not receive this schema's `::"enum"` cast (search_path would
    * resolve it to the wrong type). Absent for same-schema types, builtins,
@@ -92,7 +92,7 @@ export interface ColumnMetadata {
   /** Whether the column has a DEFAULT, is serial, or is generated */
   hasDefault: boolean;
   /**
-   * Whether the **database server** generates this column's value on insert —
+   * Whether the **database server** generates this column's value on insert -
    * a `serial`/`BIGSERIAL` sequence, an `IDENTITY` column, or PowDB's `auto`
    * modifier. This is a strict subset of {@link hasDefault} (a server-generated
    * column always reports `hasDefault: true`), but unlike a client-side default
@@ -104,8 +104,8 @@ export interface ColumnMetadata {
   /**
    * True when this is a Postgres **`GENERATED ALWAYS AS (expr) STORED`** column
    * (`information_schema.columns.is_generated = 'ALWAYS'`). Distinct from
-   * {@link isGenerated} — which flags a server-*assigned* identity/serial value
-   * that a client MAY still override — a STORED generated column's value is
+   * {@link isGenerated}, which flags a server-*assigned* identity/serial value
+   * that a client MAY still override, a STORED generated column's value is
    * *computed from other columns* and can NEVER be supplied on insert/update
    * (Postgres rejects it). Codegen therefore omits it from `*Create`/`*Update`
    * input types, and the write builders reject any `data` containing it with a
@@ -179,10 +179,10 @@ export interface RelationDef {
    * For `manyToMany` relations only: the junction (join) table that links the
    * source and target tables. The subquery JOINs the target through this table.
    *
-   *   - `table`     — junction table name (snake_case).
-   *   - `sourceKey` — junction column(s) referencing the SOURCE table's
+   *   - `table`    , junction table name (snake_case).
+   *   - `sourceKey`, junction column(s) referencing the SOURCE table's
    *                   {@link referenceKey} (typically the source PK).
-   *   - `targetKey` — junction column(s) referencing the TARGET table's PK.
+   *   - `targetKey`, junction column(s) referencing the TARGET table's PK.
    *
    * Array forms support composite keys (paired positionally with the
    * referenced columns). Omitted for non-m2m relations.
@@ -260,7 +260,7 @@ const PG_TO_TS: Record<string, string> = {
   float4: 'number',
   float8: 'number',
   oid: 'number',
-  // Precision-sensitive — keep as string to avoid JS float issues
+  // Precision-sensitive, keep as string to avoid JS float issues
   numeric: 'string',
   money: 'string',
   // Boolean
@@ -301,9 +301,9 @@ const PG_TO_TS: Record<string, string> = {
   // TSVector
   tsvector: 'string',
   tsquery: 'string',
-  // pgvector — embeddings. Mapped to `number[]` for DX (the natural shape an app
+  // pgvector, embeddings. Mapped to `number[]` for DX (the natural shape an app
   // passes when inserting / comparing embeddings). NOTE: like `numeric` above,
-  // there is a runtime caveat — pg has no built-in parser for the `vector` type,
+  // there is a runtime caveat, pg has no built-in parser for the `vector` type,
   // so over the wire a fetched vector arrives as a string literal like
   // '[1,2,3]' unless the app registers its own parser (e.g. via pgvector's
   // `registerType`). Turbine never auto-registers one (no side-effecting type
@@ -323,7 +323,7 @@ const DATE_TYPES = new Set(['timestamptz', 'timestamp', 'date']);
  * `text`: the `text[]` fallback below then produces text-typed UNNEST output
  * and Postgres refuses the insert with `42804 column "x" is of type <t> but
  * expression is of type text`. `varchar` / `char` / `bpchar` deliberately keep
- * the `text[]` cast — `text` assignment-casts to all three, and pinning them
+ * the `text[]` cast, `text` assignment-casts to all three, and pinning them
  * would change already-emitted SQL for no behavioral gain.
  */
 const PG_TO_ARRAY: Record<string, string> = {
@@ -449,7 +449,7 @@ export function timeOfDayKind(dbType: string | undefined): 'time' | 'timetz' | n
  * driver's local-offset serialization is CORRECT for it (Postgres converts the
  * offset away). The two types here store the literal wall-clock fields they
  * are given, so binding a JS `Date` through the driver stores the process's
- * LOCAL calendar fields — in `America/Los_Angeles`, `2026-07-25T00:00:00Z`
+ * LOCAL calendar fields, in `America/Los_Angeles`, `2026-07-25T00:00:00Z`
  * lands as `2026-07-24 17:00:00`. The read path already interprets an
  * offset-less value as UTC (see `parseDbDate`), so the write path has to bind
  * the UTC components for the round trip to be stable.

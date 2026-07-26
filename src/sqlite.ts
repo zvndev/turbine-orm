@@ -1,16 +1,16 @@
 /**
- * turbine-orm/sqlite — zero-dependency SQLite engine
+ * turbine-orm/sqlite, zero-dependency SQLite engine
  *
  * Binds Turbine to SQLite via Node's built-in `node:sqlite` driver
  * (`DatabaseSync`), so SQLite is a **zero new dependency** engine: the root
  * package's runtime dependency stays exactly `pg`. This is the in-process
- * test / edge / "try it in 10 seconds" engine — `:memory:` databases run
+ * test / edge / "try it in 10 seconds" engine, `:memory:` databases run
  * entirely in-process with no service container.
  *
  * ## Driver
  *
  * - **Primary:** `node:sqlite` `DatabaseSync` (Node ≥ 22.5, experimental). Emits
- *   an `ExperimentalWarning` — harmless. No native build, no extra dependency.
+ *   an `ExperimentalWarning`, harmless. No native build, no extra dependency.
  * - **Fallback:** `better-sqlite3` for Node < 22.5. Not bundled and not required;
  *   wrap a `better-sqlite3` handle in the same `PgCompatPool` shape if needed.
  *
@@ -24,7 +24,7 @@
  *   WAL` is enabled for file databases to allow concurrent readers.
  * - **Unsupported (throw `UnsupportedFeatureError`):** pgvector distance ops,
  *   LISTEN/NOTIFY (`$listen` / `$notify`), RLS `sessionContext`. Advisory-lock
- *   migration locking is unavailable — SQLite is single-writer, so migrations
+ *   migration locking is unavailable, SQLite is single-writer, so migrations
  *   serialize naturally.
  * - **Type affinity caveats:** SQLite has no native `BOOLEAN` (0/1 integers) or
  *   `DATE` (TEXT/INTEGER). Booleans bind as 1/0; `Date` values bind as ISO-8601
@@ -34,7 +34,7 @@
  * - **Case-insensitive matching** uses `COLLATE NOCASE`, which is **ASCII-only**
  *   (no Unicode case folding).
  *
- * ## Example — `:memory:` database
+ * ## Example, `:memory:` database
  *
  * ```ts
  * import { turbineSqlite } from 'turbine-orm/sqlite';
@@ -77,7 +77,7 @@ import {
 } from './schema.js';
 
 // ---------------------------------------------------------------------------
-// Driver constructor — lazily loaded
+// Driver constructor, lazily loaded
 // ---------------------------------------------------------------------------
 
 /** The shape of `node:sqlite`'s `DatabaseSync` constructor. */
@@ -89,8 +89,8 @@ let cachedDatabaseSync: DatabaseSyncCtor | undefined;
  * Lazily load `node:sqlite`'s `DatabaseSync` constructor.
  *
  * `node:sqlite` is a built-in only on Node >= 22.5, so importing it at module
- * top-level would make `import 'turbine-orm/sqlite'` — and any module that
- * merely re-exports `sqliteDialect` (e.g. the dialect test suite) — throw
+ * top-level would make `import 'turbine-orm/sqlite'`, and any module that
+ * merely re-exports `sqliteDialect` (e.g. the dialect test suite), throw
  * `ERR_UNKNOWN_BUILTIN_MODULE` on Node 20. Deferring the require to the moment a
  * connection is actually opened keeps the dialect (pure SQL generation) usable
  * everywhere and scopes the Node-version requirement to `turbineSqlite()`.
@@ -113,7 +113,7 @@ function loadDatabaseSync(): DatabaseSyncCtor {
   }
   if (typeof ctor !== 'function') {
     throw new ConnectionError(
-      "[turbine] 'node:sqlite' loaded but did not export a DatabaseSync constructor — this Node build may lack SQLite support.",
+      "[turbine] 'node:sqlite' loaded but did not export a DatabaseSync constructor, this Node build may lack SQLite support.",
     );
   }
   cachedDatabaseSync = ctor;
@@ -153,7 +153,7 @@ function toSqliteParam(value: unknown): SqliteParam {
 /**
  * Normalize a single column value read from SQLite. With `setReadBigInts(true)`
  * every integer column comes back as a `bigint`; apply the same safe-integer
- * policy Turbine uses for Postgres `int8` — number when it fits in a JS safe
+ * policy Turbine uses for Postgres `int8`, number when it fits in a JS safe
  * integer, otherwise the decimal string to avoid precision loss. Never mutates
  * any global parser state (the policy lives entirely in this shim).
  */
@@ -199,7 +199,7 @@ function statementReturnsRows(sql: string): boolean {
  * recognizable SQLite error.
  *
  * `wrapPgError` is invoked downstream (in the query executor and the
- * transaction proxy), so we only annotate here — we never throw a `new`
+ * transaction proxy), so we only annotate here, we never throw a `new`
  * Turbine error from the driver itself.
  */
 function augmentSqliteError(err: unknown): unknown {
@@ -254,7 +254,7 @@ function augmentSqliteError(err: unknown): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// Driver shim — wrap a node:sqlite DatabaseSync as a PgCompatPool
+// Driver shim, wrap a node:sqlite DatabaseSync as a PgCompatPool
 // ---------------------------------------------------------------------------
 
 /** pg-style query argument: a SQL string or a `{ text, values }` config object. */
@@ -275,7 +275,7 @@ function normalizeQueryArgs(arg: QueryArg, values?: unknown[]): { text: string; 
 /**
  * Bind the positional `params[]` (in 1-indexed generation order) to the named
  * `:p1`, `:p2`, … placeholders the dialect emits. Mapping by NAME makes binding
- * independent of where each placeholder lands in the SQL text — the same
+ * independent of where each placeholder lands in the SQL text, the same
  * guarantee Postgres' numbered `$N` gives. Returns `undefined` when there are no
  * params so parameter-less statements (BEGIN/COMMIT/DDL) bind nothing.
  */
@@ -314,12 +314,12 @@ function runStatement(db: DatabaseSync, sql: string, values: unknown[]) {
 /**
  * A `PgCompatPool` backed by a single `node:sqlite` `DatabaseSync` connection.
  * SQLite is single-connection by nature (a `:memory:` database is per-handle),
- * so `connect()` hands back a client over the **same** handle — transactions
+ * so `connect()` hands back a client over the **same** handle, transactions
  * (`BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT` nesting) just run on it. Queries are
  * serialized; this is the documented single-writer model.
  */
 export class SqlitePool implements PgCompatPool {
-  /** The underlying `node:sqlite` handle — exposed as an escape hatch (seed/DDL). */
+  /** The underlying `node:sqlite` handle, exposed as an escape hatch (seed/DDL). */
   readonly db: DatabaseSync;
   private closed = false;
 
@@ -342,7 +342,7 @@ export class SqlitePool implements PgCompatPool {
         return runStatement(db, sql, params);
       },
       release: () => {
-        // Single shared connection — nothing to return to a pool.
+        // Single shared connection, nothing to return to a pool.
       },
     };
   }
@@ -397,7 +397,7 @@ function sqliteColumnAffinity(type: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// sqliteDialect — the full Dialect contract for SQLite
+// sqliteDialect, the full Dialect contract for SQLite
 // ---------------------------------------------------------------------------
 
 /**
@@ -436,7 +436,7 @@ export const sqliteDialect: Dialect = {
   emptyJsonArrayLiteral: "json('[]')",
   nullJsonLiteral: 'NULL',
 
-  // Named placeholders (`:p1`, `:p2`, …) — NOT positional `?`. Turbine pushes
+  // Named placeholders (`:p1`, `:p2`, …), NOT positional `?`. Turbine pushes
   // params in 1-indexed generation order but may EMIT them in a different SQL
   // text position (e.g. a `with`-relation LIMIT lands in the SELECT list, ahead
   // of the outer WHERE). Postgres reconciles this via numbered `$N`; positional
@@ -534,7 +534,7 @@ export const sqliteDialect: Dialect = {
   },
 
   buildBulkInsertStatement(input: BulkInsertStatementInput) {
-    // No UNNEST in SQLite — emit multi-row VALUES with flattened, named
+    // No UNNEST in SQLite, emit multi-row VALUES with flattened, named
     // placeholders (`:p1`, `:p2`, …) matching the flat param order.
     let n = 0;
     const placeholders = input.rowValues
@@ -562,13 +562,13 @@ export const sqliteDialect: Dialect = {
   },
 
   buildInsensitiveLike(column: string, paramRef: string): string {
-    // COLLATE NOCASE is ASCII-only (no Unicode case folding) — documented limit.
+    // COLLATE NOCASE is ASCII-only (no Unicode case folding), documented limit.
     return `${column} LIKE ${paramRef} COLLATE NOCASE`;
   },
 
   buildJsonContains(column: string, paramRef: string): string {
     // Emulated containment: true when any top-level JSON value equals the param.
-    // Limited vs Postgres `@>` (no deep/object containment) — jsonPathSupport='function'.
+    // Limited vs Postgres `@>` (no deep/object containment), jsonPathSupport='function'.
     return `EXISTS (SELECT 1 FROM json_each(${column}) WHERE json_each.value = ${paramRef})`;
   },
 
@@ -664,7 +664,7 @@ export const sqliteDialect: Dialect = {
 };
 
 // ---------------------------------------------------------------------------
-// Introspection — PRAGMA-driven SchemaMetadata
+// Introspection, PRAGMA-driven SchemaMetadata
 // ---------------------------------------------------------------------------
 
 interface PragmaColumn {
@@ -696,7 +696,7 @@ interface PragmaIndexColumn {
 }
 
 function pragma<T>(db: DatabaseSync, sql: string): T[] {
-  // PRAGMA / SELECT against sqlite_master — read-only, identifiers are SQLite
+  // PRAGMA / SELECT against sqlite_master, read-only, identifiers are SQLite
   // catalog names (never user input here), values normalized for safe ints.
   return db.prepare(sql).all().map(normalizeRow) as T[];
 }
@@ -816,7 +816,7 @@ export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: 
   // ----- Build relations from foreign keys (belongsTo + hasMany + m2m) -----
   // Delegated to the SHARED introspection pipeline (introspect.ts) so SQLite
   // derives IDENTICAL relation names to the Postgres introspector for the
-  // same logical schema — legacy-first naming, per-column disambiguation,
+  // same logical schema, legacy-first naming, per-column disambiguation,
   // collision resolution against scalar column fields, and the conservative
   // pure-junction manyToMany auto-detection included.
   const relationsByTable = deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable);
@@ -887,7 +887,7 @@ export async function introspectSqlite(options: IntrospectOptions): Promise<Sche
 }
 
 // ---------------------------------------------------------------------------
-// turbineSqlite — the public factory
+// turbineSqlite, the public factory
 // ---------------------------------------------------------------------------
 
 /** Options for {@link turbineSqlite}. Mirrors the relevant {@link TurbineConfig} fields. */
@@ -897,7 +897,7 @@ export interface TurbineSqliteOptions extends Pick<TurbineConfig, 'logging' | 'd
    * Ignored for `':memory:'`. Default: `true`.
    */
   wal?: boolean;
-  /** `PRAGMA busy_timeout` in ms — how long a writer waits on `SQLITE_BUSY`. Default: 5000. */
+  /** `PRAGMA busy_timeout` in ms, how long a writer waits on `SQLITE_BUSY`. Default: 5000. */
   busyTimeoutMs?: number;
   /** Enable `PRAGMA foreign_keys` enforcement. Default: `true`. */
   foreignKeys?: boolean;
@@ -917,7 +917,7 @@ function openSqliteDatabase(target: string, options: TurbineSqliteOptions): Data
     try {
       db.exec('PRAGMA journal_mode = WAL');
     } catch {
-      // Some filesystems (network mounts) reject WAL — fall back silently.
+      // Some filesystems (network mounts) reject WAL, fall back silently.
     }
   }
   return db;

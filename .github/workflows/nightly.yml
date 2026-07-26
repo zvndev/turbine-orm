@@ -88,7 +88,7 @@ jobs:
   # TURBINE_TEST_ENGINE=yugabytedb. Yugabyte's container is heavy and slow to
   # become ready in CI (the yugabyted bootstrap + YSQL init can take a couple
   # of minutes and is occasionally flaky on shared runners) and it never
-  # initialized successfully on per-PR runs — so it now runs nightly only, and
+  # initialized successfully on per-PR runs, so it now runs nightly only, and
   # stays continue-on-error: true so a failure is surfaced but blocks nothing.
   # YSQL is Postgres-wire-compatible on port 5433, default user `yugabyte` with
   # no password in the single-node image.
@@ -102,7 +102,7 @@ jobs:
         # Pinned (was :latest, which never booted on GitHub runners). This is
         # the v2.25 preview build tag from YugabyteDB's own Docker quickstart
         # docs. If it still fails to initialize, try a recent stable tag from
-        # https://hub.docker.com/r/yugabytedb/yugabyte/tags — the job is
+        # https://hub.docker.com/r/yugabytedb/yugabyte/tags, the job is
         # continue-on-error and nightly-only, so a bad tag can't block PRs.
         image: yugabytedb/yugabyte:2.25.0.0-b489
         # `bin/yugabyted start --background=false` runs the all-in-one node in

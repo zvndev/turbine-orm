@@ -348,16 +348,16 @@ describe('nested-write: executeNestedCreate', () => {
             email: 'x',
             bogus: { create: [{}] },
           }),
-        // "bogus" won't be detected as a relation — it'll go into scalars
+        // "bogus" won't be detected as a relation, it'll go into scalars
         // because it's not in tableMeta.relations. So it gets passed to
         // create() as scalar data without error.
-        // Actually wait — extractRelationFields checks key in tableMeta.relations,
+        // Actually wait, extractRelationFields checks key in tableMeta.relations,
         // so { create: [{}] } for key "bogus" would be a plain object but
         // "bogus" is NOT in relations. So it goes to scalars. No error.
         // Let's test that it's handled gracefully.
       )
       .catch(() => {
-        // This is expected to NOT throw from the nested write engine —
+        // This is expected to NOT throw from the nested write engine -
         // "bogus" goes to scalars. The DB would reject it instead.
       });
 
@@ -486,7 +486,7 @@ describe('nested-write: executeNestedUpdate', () => {
     assert.deepStrictEqual((deleteOp!.args as { where: Record<string, unknown> }).where, { id: 5, userId: 1 });
   });
 
-  it('supports set operation — disconnects all then connects new', async () => {
+  it('supports set operation, disconnects all then connects new', async () => {
     const { ctx, log } = makeMockCtx(schema);
 
     await executeNestedUpdate(

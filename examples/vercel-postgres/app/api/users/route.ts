@@ -10,7 +10,7 @@ import { createPool } from '@vercel/postgres';
 import { turbineHttp } from 'turbine-orm/serverless';
 // After running `npx turbine generate` from your project root, this file
 // exposes the introspected schema as `SCHEMA`. The relative path mirrors a
-// typical Next.js app-router layout — adjust to wherever your generated/
+// typical Next.js app-router layout, adjust to wherever your generated/
 // directory lives. (No `@/` alias is used so this file copy-pastes cleanly
 // without a tsconfig.json `paths` entry.)
 import { SCHEMA } from '../../../generated/turbine/metadata';

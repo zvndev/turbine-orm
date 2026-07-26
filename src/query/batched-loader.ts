@@ -1,19 +1,19 @@
 /**
- * turbine-orm — Batched relation loader (the `relationLoadStrategy: 'batched'` path)
+ * turbine-orm, Batched relation loader (the `relationLoadStrategy: 'batched'` path)
  *
  * ## Why this exists
  *
  * Turbine's default `with`-clause strategy resolves nested relations in ONE SQL
- * statement using correlated `json_agg(json_build_object(...))` subqueries — one
+ * statement using correlated `json_agg(json_build_object(...))` subqueries, one
  * probe per parent row (see `buildRelationSubquery` in builder.ts). That is the
  * right default: a single round-trip, and when the child FK columns are indexed
  * each probe is an index seek. But it degrades in two situations:
  *
- *   1. **Missing FK index** — a correlated probe per parent row becomes
+ *   1. **Missing FK index**, a correlated probe per parent row becomes
  *      N-parents × full-table-scan. A batched-loader ORM pays that missing index
  *      only ONCE (a single `WHERE fk = ANY($1)` seq-scan), which is why schemas
  *      migrated from those ORMs often lack the index the json_agg path needs.
- *   2. **Huge unpaginated result sets** — the JSON wire format
+ *   2. **Huge unpaginated result sets**, the JSON wire format
  *      (`json_build_object` per row, re-serialized inside `json_agg`) is heavy to
  *      encode/decode compared with flat rows.
  *
@@ -29,19 +29,19 @@
  *   - **Same executor / connection path.** Every follow-up query runs through the
  *     caller's own executor ({@link RelationLoadContext.exec}) and child query
  *     interfaces built on the caller's pool. Inside a `$transaction` that pool is
- *     the pinned-connection `txPool`, so batched loads join the transaction — no
+ *     the pinned-connection `txPool`, so batched loads join the transaction, no
  *     separate pool checkout per query.
  *   - **Identical output shape.** The stitched result is byte-for-byte the same
  *     shape the join strategy produces: relation arrays for hasMany/manyToMany
  *     (`[]` when empty), single-or-null for hasOne/belongsTo, with the same
- *     camelCase keys and Date coercion — because the child rows are parsed by the
+ *     camelCase keys and Date coercion, because the child rows are parsed by the
  *     very same `parseRow`/`buildFindMany` machinery via a child QueryInterface.
  *   - **Stitch keys never leak.** To stitch, the follow-up query must select the
  *     FK/PK it joins on even when the caller's `select`/`omit` excluded it; the
  *     loader adds those columns for the query and strips them from the returned
  *     entities afterwards ({@link includeKeysForBatching}).
  *
- * PowDB (powql.ts) has its own batched loaders for the same reasons — this is the
+ * PowDB (powql.ts) has its own batched loaders for the same reasons, this is the
  * clean Postgres/SQL implementation, deliberately NOT shared with PowQL.
  *
  * @module
@@ -57,7 +57,7 @@ import { ownLookup } from './utils.js';
 
 /**
  * Max parent keys per follow-up query. On Postgres the whole key set travels as
- * ONE array parameter (`= ANY($1)`), so this is not a bind-parameter limit — it
+ * ONE array parameter (`= ANY($1)`), so this is not a bind-parameter limit, it
  * only bounds planner/memory cost per statement. Keep it large: every extra
  * chunk is an extra network round-trip, and round-trips are exactly what the
  * batched strategy exists to minimize (a 9-chunk load was measured 2× slower
@@ -65,7 +65,7 @@ import { ownLookup } from './utils.js';
  */
 const MAX_RELATION_KEYS = 32_000;
 
-/** Nesting cap — parity with the join strategy's depth-10 guard. */
+/** Nesting cap, parity with the join strategy's depth-10 guard. */
 const MAX_DEPTH = 10;
 
 /**
@@ -165,7 +165,7 @@ export function defaultProjectionFields(
  *
  * Used both for the base query (parent keys) and each follow-up query (child
  * keys) so a caller's `select: { title: true }` on a relation still stitches even
- * though the FK was not requested — and the FK never appears in the output.
+ * though the FK was not requested, and the FK never appears in the output.
  */
 export function includeKeysForBatching(
   select: Record<string, boolean> | undefined,
@@ -191,7 +191,7 @@ export function includeKeysForBatching(
     for (const f of unique) {
       if (!next[f]) {
         next[f] = true;
-        strip.push(f); // not requested by the caller — added only to stitch
+        strip.push(f); // not requested by the caller, added only to stitch
       }
     }
     return { select: next, omit, strip };
@@ -246,7 +246,7 @@ export function neededParentKeyFields(parentMeta: TableMetadata, withClause: Wit
       continue;
     }
     const rel = ownLookup(parentMeta.relations, relName);
-    if (!rel) continue; // unknown relation — the join path throws; let the loader surface it
+    if (!rel) continue; // unknown relation, the join path throws; let the loader surface it
     for (const col of localKeyColumns(rel)) {
       fields.add(parentMeta.reverseColumnMap[col] ?? col);
     }
@@ -300,19 +300,19 @@ export function resolveCountRelations(parentMeta: TableMetadata, countSpec: With
   return out;
 }
 
-/** Stringified stitch key — robust to number/uuid/bigint type drift across a join. */
+/** Stringified stitch key, robust to number/uuid/bigint type drift across a join. */
 function keyOf(value: unknown): string {
   return String(value);
 }
 
 /**
- * Reject pick-row relation ordering anywhere inside a `with` tree's orderBy —
+ * Reject pick-row relation ordering anywhere inside a `with` tree's orderBy -
  * strategy parity with the join path, which throws this exact E003 at SQL
  * build time (`pickOrderNestedError` in builder.ts). Without this guard the
  * loaders would forward `options.orderBy` as the child reader's TOP-LEVEL
- * findMany orderBy, where the pick shape compiles fine — so the same query
+ * findMany orderBy, where the pick shape compiles fine, so the same query
  * would execute on 'batched' but throw on 'join'. Walks the whole tree up
- * front so acceptance never depends on which levels have rows — the batched
+ * front so acceptance never depends on which levels have rows, the batched
  * runners in builder.ts call this BEFORE the base query (a zero-row base
  * result must still reject, exactly like the join strategy's build-time throw).
  */
@@ -354,12 +354,12 @@ export async function loadRelationsBatched(
   if (parents.length === 0) return;
 
   // Sibling relations are independent (each writes only its own parent[relName]
-  // and reads only parent keys), so load them concurrently — on a pool that's
+  // and reads only parent keys), so load them concurrently, on a pool that's
   // real parallelism, inside a transaction pg queues them on the one connection.
   const loads: Promise<void>[] = [];
   for (const [relName, spec] of Object.entries(withClause)) {
     if (!spec) continue;
-    // Reserved `_count` key — one grouped COUNT(*) follow-up per counted relation.
+    // Reserved `_count` key, one grouped COUNT(*) follow-up per counted relation.
     if (relName === '_count') {
       loads.push(loadCounts(ctx, parents, spec as unknown as WithCount));
       continue;
@@ -402,7 +402,7 @@ async function loadToOneOrMany(
     throw new UnsupportedFeatureError(
       'composite-key batched relation loading',
       'relationLoadStrategy: "batched"',
-      `relation "${relName}" — use the default 'join' strategy for composite-key relations`,
+      `relation "${relName}", use the default 'join' strategy for composite-key relations`,
     );
   }
   const targetMeta = requireTable(ctx.schema, rel.to, relName);
@@ -510,7 +510,7 @@ async function loadManyToMany(
     throw new UnsupportedFeatureError(
       'composite-key batched manyToMany loading',
       'relationLoadStrategy: "batched"',
-      `relation "${relName}" — use the default 'join' strategy for composite-key m2m relations`,
+      `relation "${relName}", use the default 'join' strategy for composite-key m2m relations`,
     );
   }
   const sourceJCol = sourceJ[0]!;
@@ -628,7 +628,7 @@ async function loadManyToMany(
  * Load correlated `_count` values for the counted relations. One grouped
  * follow-up per relation (`SELECT key, COUNT(*) … WHERE key = ANY($1) GROUP BY
  * key`), attached onto each parent's `_count` object (0 when a parent has no
- * matching rows) — byte-identical to the join strategy's `_count` output.
+ * matching rows), byte-identical to the join strategy's `_count` output.
  */
 async function loadCounts(
   ctx: RelationLoadContext,
@@ -665,7 +665,7 @@ async function loadOneCount(
       throw new UnsupportedFeatureError(
         'composite-key batched _count',
         'relationLoadStrategy: "batched"',
-        `relation "${rel.name}" — use the default 'join' strategy for composite-key m2m _count`,
+        `relation "${rel.name}", use the default 'join' strategy for composite-key m2m _count`,
       );
     }
     parentKeyCol = sourceRef[0]!;
@@ -679,7 +679,7 @@ async function loadOneCount(
       throw new UnsupportedFeatureError(
         'composite-key batched _count',
         'relationLoadStrategy: "batched"',
-        `relation "${rel.name}" — use the default 'join' strategy for composite-key _count`,
+        `relation "${rel.name}", use the default 'join' strategy for composite-key _count`,
       );
     }
     parentKeyCol = rk[0]!;
@@ -700,7 +700,7 @@ async function loadOneCount(
     // two strategies return identical counts under a filter. hasMany filters
     // the counted table directly; m2m counts junction rows but restricts them
     // to junction rows whose TARGET survives the target table's filter via
-    // EXISTS — mirroring buildRelationCountExpr's EXISTS-on-target (which also
+    // EXISTS, mirroring buildRelationCountExpr's EXISTS-on-target (which also
     // skips the filter when the junction targetKey arity doesn't match the
     // target PK). Rendered after the $1 key array.
     let gf: { clause: string; params: unknown[] } | null = null;

@@ -1,11 +1,11 @@
 /**
- * turbine-orm — `pgArrayType` coverage (the `createMany` UNNEST cast)
+ * turbine-orm, `pgArrayType` coverage (the `createMany` UNNEST cast)
  *
  * `createMany` compiles to `UNNEST(ARRAY[...]::<arrtype>)`, and the cast comes
  * from `pgArrayType`. A type missing from that map falls back to `text[]`,
  * which Postgres accepts ONLY for types with an assignment cast from `text`.
  * For everything else the insert fails with
- * `42804 column "x" is of type <t> but expression is of type text` — that is
+ * `42804 column "x" is of type <t> but expression is of type text`, that is
  * exactly what happened to `time` / `timetz` (and, latently, to `interval`,
  * `money`, `cidr`, `macaddr`, ranges, `tsvector` and `vector`).
  *

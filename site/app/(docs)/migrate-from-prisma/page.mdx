@@ -28,7 +28,7 @@ One step is mandatory on either path before you benchmark: run `npx turbine doct
 
 This is the one migration step that bites people, so do it before you benchmark anything.
 
-**Prisma does not create an index on a relation's foreign key on Postgres** — a `@relation` scalar field is unindexed unless you add `@@index` yourself. Prisma gets away with it because it loads relations by **batching**: one `WHERE fk IN (ids)` query per relation, which pays a missing FK index only *once*. So most Prisma schemas quietly ship without FK indexes and never notice.
+**Prisma does not create an index on a relation's foreign key on Postgres**, a `@relation` scalar field is unindexed unless you add `@@index` yourself. Prisma gets away with it because it loads relations by **batching**: one `WHERE fk IN (ids)` query per relation, which pays a missing FK index only *once*. So most Prisma schemas quietly ship without FK indexes and never notice.
 
 Turbine's join plan probes the child table once per parent row with a **correlated subquery**. On an indexed FK that's an index seek per parent and it's fast. On an *unindexed* FK it's a full table scan per parent, which multiplies by the parent count. The same missing index that was invisible under Prisma becomes the whole query.
 
@@ -71,7 +71,7 @@ npx turbine doctor --fix
 
 ### If you can't add the index yet: pick a load strategy
 
-Until the index migration lands you can reproduce Prisma's loading pattern with `relationLoadStrategy: 'batched'` — one `WHERE fk = ANY(...)` follow-up per relation instead of a correlated probe. It pays a missing index only once, its output is **deep-equal** to the default, and it's the safe choice for a legacy schema mid-migration:
+Until the index migration lands you can reproduce Prisma's loading pattern with `relationLoadStrategy: 'batched'`, one `WHERE fk = ANY(...)` follow-up per relation instead of a correlated probe. It pays a missing index only once, its output is **deep-equal** to the default, and it's the safe choice for a legacy schema mid-migration:
 
 ```ts
 const db = new TurbineClient({
@@ -84,9 +84,9 @@ Turbine picks a strategy per relation unless you pin one:
 
 | `relationLoadStrategy` | What it does | When |
 |---|---|---|
-| `'auto'` *(default)* | Correlated join per relation, but falls back to a batched follow-up for any relation whose foreign key it can see is unindexed — so a missing index degrades **one** relation, not the whole query. Logs a once-per-relation note in development when the fallback engages. | Leave it. The best default for a schema you haven't fully indexed yet. |
+| `'auto'` *(default)* | Correlated join per relation, but falls back to a batched follow-up for any relation whose foreign key it can see is unindexed, so a missing index degrades **one** relation, not the whole query. Logs a once-per-relation note in development when the fallback engages. | Leave it. The best default for a schema you haven't fully indexed yet. |
 | `'join'` | Always the single-statement correlated `json_agg`: one round-trip for the whole `with` tree. | Every FK is indexed and you want one round-trip. |
-| `'batched'` | Always one flat `WHERE fk = ANY(...)` per relation, stitched in memory — Prisma's loading pattern. | Reproduce Prisma exactly, or a huge result set where flat rows beat nested JSON. |
+| `'batched'` | Always one flat `WHERE fk = ANY(...)` per relation, stitched in memory, Prisma's loading pattern. | Reproduce Prisma exactly, or a huge result set where flat rows beat nested JSON. |
 | `'flatten'` *(0.50)* | Compiles eligible **to-one** relations to a `LEFT JOIN` in the same statement: one round-trip, no correlated re-evaluation, no client-side stitching. Anything ineligible silently falls back to a correlated subquery. | One round-trip is a hard requirement and the relations are to-one. See [Load strategies](/relations#load-strategy-auto-join-batched-flatten) for the eligibility rules and where it loses to `'batched'`. |
 
 An explicit `'join'`, `'batched'` or `'flatten'` (at the client or on a single query) always wins over `'auto'`.
@@ -302,9 +302,9 @@ If you are doing a native port, this is the full mapping. Skip to [Side-by-side]
 | `data: { posts: { create: [...] } }` | `data: { posts: { create: [...] } }` | Nested writes map unchanged on to-one and one-to-many relations: `create` / `connect` / `connectOrCreate` on create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on update. One transaction, depth cap 10. **Many-to-many relations have no nested-write support**: those throw a `ValidationError` (write the junction rows directly in the same transaction). See [Nested writes](/nested-writes). |
 | `include: { _count: { select: { posts: true } } }` | `with: { _count: { posts: true } }` | No `select` wrapper. `_count: true` counts every to-many relation. |
 | `prisma.$queryRaw` | ``db.raw`...` `` | Typed form: ``db.sql<T>`...` `` returns `T[]` with `.one()` / `.scalar()`. |
-| `take: 10` | `take: 10` | Works as-is — `take` is an alias for `limit`. |
-| `cursor: { id: 99 }` | `cursor: { id: 99 }` | Keyset pagination, same shape. Turbine's cursor is **exclusive** — drop any `skip: 1`, and audit cursors that had no `skip` (see [Cursor pagination](#cursor-pagination)). |
-| `distinct: ['userId']` | `distinct: ['userId']` | Same — compiles to `DISTINCT ON`. |
+| `take: 10` | `take: 10` | Works as-is, `take` is an alias for `limit`. |
+| `cursor: { id: 99 }` | `cursor: { id: 99 }` | Keyset pagination, same shape. Turbine's cursor is **exclusive**, drop any `skip: 1`, and audit cursors that had no `skip` (see [Cursor pagination](#cursor-pagination)). |
+| `distinct: ['userId']` | `distinct: ['userId']` | Same, compiles to `DISTINCT ON`. |
 | `skip: 20` | `offset: 20` | Renamed. |
 
 ## Schema translation
@@ -354,7 +354,7 @@ export default defineSchema({
 });
 ```
 
-Relations aren't declared in Turbine — they're *inferred* from foreign keys. `posts.userId references 'users.id'` automatically yields `user` on `Post` and `posts` on `User`.
+Relations aren't declared in Turbine, they're *inferred* from foreign keys. `posts.userId references 'users.id'` automatically yields `user` on `Post` and `posts` on `User`.
 
 ## Side-by-side
 
@@ -371,7 +371,7 @@ const users = await prisma.user.findMany({
 ```
 
 ```ts
-// Turbine — top-level take works as-is; the nested take becomes limit
+// Turbine, top-level take works as-is; the nested take becomes limit
 const users = await db.users.findMany({
   where: { orgId: 1 },
   with: { posts: { orderBy: { createdAt: 'desc' }, limit: 5 } },
@@ -391,7 +391,7 @@ await prisma.post.update({
 ```
 
 ```ts
-// Turbine — identical
+// Turbine, identical
 await db.posts.update({
   where: { id: 42 },
   data: { viewCount: { increment: 1 } },
@@ -430,7 +430,7 @@ await prisma.user.upsert({
 ```
 
 ```ts
-// Turbine — identical
+// Turbine, identical
 await db.users.upsert({
   where: { email: 'a@b.c' },
   create: { email: 'a@b.c', name: 'A' },
@@ -448,7 +448,7 @@ const active = await prisma.user.findMany({
 ```
 
 ```ts
-// Turbine — identical
+// Turbine, identical
 const active = await db.users.findMany({
   where: { posts: { some: { published: true } } },
 });
@@ -467,10 +467,10 @@ const active = await db.users.findMany({
 
 ### Cursor pagination
 
-Turbine's cursor is **exclusive** — the anchor row is *not* returned — which is the natural keyset semantics (`WHERE pk > $cursor`) and kills Prisma's `skip: 1` boilerplate. Two rules when porting:
+Turbine's cursor is **exclusive**, the anchor row is *not* returned, which is the natural keyset semantics (`WHERE pk > $cursor`) and kills Prisma's `skip: 1` boilerplate. Two rules when porting:
 
 - **Prisma `cursor: { id }` + `skip: 1`** (the common exclusive idiom) becomes just `cursor: { id }`. Drop the `skip`.
-- **Prisma `cursor: { id }` with no `skip`** is *inclusive* — Prisma returns the anchor row. Ported verbatim to Turbine, that call silently loses the anchor row. If you relied on inclusive behavior, fetch the anchor separately, or start the cursor at the previous row.
+- **Prisma `cursor: { id }` with no `skip`** is *inclusive*, Prisma returns the anchor row. Ported verbatim to Turbine, that call silently loses the anchor row. If you relied on inclusive behavior, fetch the anchor separately, or start the cursor at the previous row.
 
 This is a conscious divergence, not a gap: exclusive keyset pagination composes cleanly with `orderBy` and needs no offset math.
 
@@ -478,11 +478,11 @@ This is a conscious divergence, not a gap: exclusive keyset pagination composes 
 
 Relation arrays have no guaranteed order unless you pass `orderBy` in the `with` block. Prisma makes no ordering guarantee either, but its batched loader usually surfaces insert/PK order, and apps quietly depend on it; under Turbine's `json_agg` loader (and the `'auto'` strategy's batched fallback) the order can differ. If any code relies on implicit child order, add `orderBy: { id: 'asc' }` (or the real sort key) to that `with` clause.
 
-If you want a stable default without annotating every relation, opt into `stableRelationOrder` — a client-wide or per-query flag that gives relation arrays a deterministic order. It is off by default, and a per-relation `orderBy` always wins over it.
+If you want a stable default without annotating every relation, opt into `stableRelationOrder`, a client-wide or per-query flag that gives relation arrays a deterministic order. It is off by default, and a per-relation `orderBy` always wins over it.
 
 ## Behaviors that match Prisma
 
-- **`timestamp` columns parse as UTC.** Turbine reads Postgres `timestamp` (without time zone) values as UTC — the same convention Prisma uses — so a migrated app gets **identical instants**, not values shifted by the server's local zone. (Opt out with `utcTimestamps: false` if you relied on local-time parsing.)
+- **`timestamp` columns parse as UTC.** Turbine reads Postgres `timestamp` (without time zone) values as UTC, the same convention Prisma uses, so a migrated app gets **identical instants**, not values shifted by the server's local zone. (Opt out with `utcTimestamps: false` if you relied on local-time parsing.)
 - **Paginated reads are ordered by the primary key.** Prisma appends an implicit `ORDER BY <primary key> ASC` to a `findMany` with `take` / `skip`; since 0.50 the adapter does the same (every column of a composite key, in declaration order). Without it, a ported paginated endpoint inherits an unordered `LIMIT`, which Postgres is free to answer with different rows as the heap changes, so a row can appear on two pages or on none. An explicit `orderBy` always wins, and a model with no primary key is left alone. There is no flag to turn this off: matching Prisma is the adapter's contract. Turbine core still emits a bare `LIMIT` unless you set [`implicitPkOrdering: true`](/queries#deterministic-pages-the-unordered-pagination-warning).
 - **Bare to-one relation filters work without `is`.** `where: { vendor: { name: { contains: 'x' } } }` filters by a to-one relation with no `is` wrapper, exactly like Prisma. `is: null` / `isNot: null` compile to `NOT EXISTS` / `EXISTS`.
 - **`time` columns through the compat adapter.** Postgres `time` values surface from `turbine-orm/prisma-compat` as a `Date` on 1970-01-01 UTC, Prisma's epoch-day convention, so `.getHours()`-style call sites keep working. Turbine core keeps the driver's raw `HH:MM:SS` string (a documented core-vs-Prisma difference).
@@ -494,27 +494,27 @@ If you want a stable default without annotating every relation, opt into `stable
 The steps below are the **native port**. If you are taking the adapter path instead, the short version is: install `turbine-orm`, run `npx turbine doctor --fix`, run `npx turbine migrate-from-prisma`, read `prisma-migration-report.md`, replace `new PrismaClient()` with `createPrismaCompatClient(db, PRISMA_MAP)`, and work through [what the adapter does not do](#what-the-adapter-does-not-do). Steps 1, 2, and 9 still apply.
 
 1. `npm install turbine-orm && npm uninstall @prisma/client prisma`.
-2. **Fix FK indexes before you benchmark.** Run `npx turbine doctor --fix` to add the indexes Prisma left off, then `npx turbine migrate up` — or set `relationLoadStrategy: 'batched'` on the client to reproduce Prisma's loading pattern until the migration lands (see [above](#before-anything-else-run-doctor)).
+2. **Fix FK indexes before you benchmark.** Run `npx turbine doctor --fix` to add the indexes Prisma left off, then `npx turbine migrate up`, or set `relationLoadStrategy: 'batched'` on the client to reproduce Prisma's loading pattern until the migration lands (see [above](#before-anything-else-run-doctor)).
 3. Write `schema.ts` mirroring your `.prisma` models (or run `npx turbine pull` to introspect your live DB).
-4. `npx turbine generate` — writes `./generated/turbine/{types,metadata,index}.ts`.
+4. `npx turbine generate`, writes `./generated/turbine/{types,metadata,index}.ts`.
 5. Rewrite the call sites. Nothing rewrites them for you: the compat adapter serves Prisma's surface at runtime, it does not edit source. Find/replace:
    - `prisma.` → `db.`
    - Singular model names → plural snake-camelCase table names (`prisma.user` → `db.users`)
    - `include:` → `with:`
    - `skip:` → `offset:`
    - `take:` stays as-is at the top level; inside a `with` block, rename it to `limit:`
-   - `cursor:` stays as-is, but delete any `skip: 1` next to it — and audit cursors that had *no* `skip`, since Turbine's cursor is exclusive (see [Cursor pagination](#cursor-pagination)).
+   - `cursor:` stays as-is, but delete any `skip: 1` next to it, and audit cursors that had *no* `skip`, since Turbine's cursor is exclusive (see [Cursor pagination](#cursor-pagination)).
 6. Replace `import { PrismaClient } from '@prisma/client'` with `import { turbine } from './generated/turbine'`.
-7. Port any raw SQL from `prisma.$queryRaw` to ``db.raw`SELECT ...` ``; for a typed result use ``db.sql<T>`SELECT ...` `` (the drop-in for Prisma's TypedSQL) — it returns `T[]` with `.one()` and `.scalar()`.
+7. Port any raw SQL from `prisma.$queryRaw` to ``db.raw`SELECT ...` ``; for a typed result use ``db.sql<T>`SELECT ...` `` (the drop-in for Prisma's TypedSQL), it returns `T[]` with `.one()` and `.scalar()`.
 8. Update your error-handling to the typed classes (or keep catching by message during transition).
 9. Delete `schema.prisma` and the `prisma/` directory once the build passes.
 
-> **Connection URL note.** If your Prisma `DATABASE_URL` carries `sslmode=require`, `pg` prints a `SECURITY WARNING` at every startup — that mode currently aliases full verification but will change meaning in `pg` v9. Pick one: `sslmode=verify-full` to keep full certificate verification (recommended when your provider's certs chain to a public CA, which covers most managed Postgres); `uselibpqcompat=true&sslmode=require` to opt into the future libpq semantics now (encryption without certificate verification); or drop `sslmode` from the URL and pass `ssl` config through the pool on `TurbineConfig`. Turbine doesn't rewrite the warning — it belongs to the driver, and the fix is the URL.
+> **Connection URL note.** If your Prisma `DATABASE_URL` carries `sslmode=require`, `pg` prints a `SECURITY WARNING` at every startup, that mode currently aliases full verification but will change meaning in `pg` v9. Pick one: `sslmode=verify-full` to keep full certificate verification (recommended when your provider's certs chain to a public CA, which covers most managed Postgres); `uselibpqcompat=true&sslmode=require` to opt into the future libpq semantics now (encryption without certificate verification); or drop `sslmode` from the URL and pass `ssl` config through the pool on `TurbineConfig`. Turbine doesn't rewrite the warning, it belongs to the driver, and the fix is the URL.
 
 ## See also
 
-- **[Schema & Migrations](/schema)** — `defineSchema`, DDL, introspection.
-- **[API Reference](/queries)** — every method, operator, option.
-- **[Relations](/relations)** — one-to-many, many-to-many, filters.
-- **[Typed Errors](/errors)** — full hierarchy with SQLSTATE mapping.
-- **[Serverless](/serverless)** — Neon, Vercel, Cloudflare Hyperdrive.
+- **[Schema & Migrations](/schema)**, `defineSchema`, DDL, introspection.
+- **[API Reference](/queries)**, every method, operator, option.
+- **[Relations](/relations)**, one-to-many, many-to-many, filters.
+- **[Typed Errors](/errors)**, full hierarchy with SQLSTATE mapping.
+- **[Serverless](/serverless)**, Neon, Vercel, Cloudflare Hyperdrive.

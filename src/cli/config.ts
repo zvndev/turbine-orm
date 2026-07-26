@@ -1,5 +1,5 @@
 /**
- * turbine-orm CLI — Configuration file support
+ * turbine-orm CLI, Configuration file support
  *
  * Loads turbine.config.ts (or .js/.mjs) via dynamic import.
  * Falls back to CLI args and environment variables.
@@ -80,7 +80,7 @@ export type TurbineConfig = TurbineCliConfig;
  * path rather than a Postgres schema name? `schema` is the Postgres namespace
  * to introspect (default `public`); the schema-builder file goes in `schemaFile`.
  * A value containing a path separator or a JS/TS extension is almost certainly a
- * mis-set `schemaFile` — introspecting `WHERE table_schema = './turbine/schema.ts'`
+ * mis-set `schemaFile`, introspecting `WHERE table_schema = './turbine/schema.ts'`
  * silently matches zero tables. Used by `turbine generate` to fail loudly.
  */
 export function looksLikeSchemaFilePath(schema: string): boolean {

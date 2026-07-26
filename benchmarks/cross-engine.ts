@@ -8,10 +8,10 @@
  *
  * Methodology (kept deliberately conventional, à la tinybench / drizzle-benchmarks):
  *   - one connection per engine (isolates engine latency, not pool concurrency)
- *   - a fixed, deterministic seed (no faker, no randomness — identical every run)
+ *   - a fixed, deterministic seed (no faker, no randomness, identical every run)
  *   - per-op warmup then N measured iterations; report p50/p95/p99/mean + ops/sec
  *   - identical schema + identical operations across engines; app-assigned integer
- *     PKs everywhere (the one shape all five engines share — PowDB has no
+ *     PKs everywhere (the one shape all five engines share, PowDB has no
  *     generated IDs, so auto-increment can't be the common denominator)
  *
  * Env knobs: USERS, POSTS_PER_USER, COMMENTS_PER_POST, ITERATIONS, WARMUP,
@@ -68,7 +68,7 @@ const ENGINES = (process.env.ENGINES ?? 'pg,sqlite,mysql,mssql,powdb').split(','
 // Schema (4 tables, app-assigned integer PKs, FK indexes)
 // ---------------------------------------------------------------------------
 
-// Map a column pgType to its Postgres array type — used by Turbine's createMany
+// Map a column pgType to its Postgres array type, used by Turbine's createMany
 // UNNEST path (Postgres only; other engines ignore pgArrayType).
 const PG_ARRAY: Record<string, string> = { int8: 'bigint[]', int4: 'integer[]', bool: 'boolean[]', text: 'text[]' };
 
@@ -431,10 +431,10 @@ const engines: Record<string, Engine> = {
     },
   },
   powdb_emb: {
-    // In-process embedded v0.7.1 (@zvndev/powdb-embedded). No server, no wire —
+    // In-process embedded v0.7.1 (@zvndev/powdb-embedded). No server, no wire -
     // the SQLite-shaped path. Single handle: DDL runs through db.raw() (NOT a
     // second Database.open on the same dir, which has no lock and would corrupt).
-    // syncMode:'normal' (0.7.1) moves fsync off the commit path — the knob that
+    // syncMode:'normal' (0.7.1) moves fsync off the commit path, the knob that
     // closes the embedded-write gap.
     name: `PowDB ${powdbEmbeddedVersion()} (embed·norm)`,
     async setup() {
@@ -475,7 +475,7 @@ async function main() {
   for (const key of ENGINES) {
     const engine = engines[key];
     if (!engine) {
-      console.log(`  ?? unknown engine "${key}" — skipping`);
+      console.log(`  ?? unknown engine "${key}", skipping`);
       continue;
     }
     process.stdout.write(`  ${engine.name.padEnd(22)} setup… `);
@@ -498,26 +498,26 @@ async function main() {
   // Report: one table per op, engines as columns.
   const ran = ENGINES.filter((k) => results[k]);
   const namePad = 30;
-  console.log(`\n${'='.repeat(80)}\nRESULTS — median (p50) latency in ms, lower is better\n${'='.repeat(80)}`);
+  console.log(`\n${'='.repeat(80)}\nRESULTS, median (p50) latency in ms, lower is better\n${'='.repeat(80)}`);
   const header = 'operation'.padEnd(namePad) + ran.map((k) => engines[k]!.name.split(' ')[0]!.padStart(12)).join('');
   console.log(header);
   console.log('-'.repeat(header.length));
   for (const op of OPS) {
-    const line = op.label.padEnd(namePad) + ran.map((k) => (results[k]![op.key]?.p50.toFixed(3) ?? '—').padStart(12)).join('');
+    const line = op.label.padEnd(namePad) + ran.map((k) => (results[k]![op.key]?.p50.toFixed(3) ?? '-').padStart(12)).join('');
     console.log(line);
   }
 
   console.log(`\np95 latency (ms):`);
   console.log('-'.repeat(header.length));
   for (const op of OPS) {
-    const line = op.label.padEnd(namePad) + ran.map((k) => (results[k]![op.key]?.p95.toFixed(3) ?? '—').padStart(12)).join('');
+    const line = op.label.padEnd(namePad) + ran.map((k) => (results[k]![op.key]?.p95.toFixed(3) ?? '-').padStart(12)).join('');
     console.log(line);
   }
 
   console.log(`\nthroughput (ops/sec, from mean):`);
   console.log('-'.repeat(header.length));
   for (const op of OPS) {
-    const line = op.label.padEnd(namePad) + ran.map((k) => (results[k]![op.key]?.ops.toFixed(0) ?? '—').padStart(12)).join('');
+    const line = op.label.padEnd(namePad) + ran.map((k) => (results[k]![op.key]?.ops.toFixed(0) ?? '-').padStart(12)).join('');
     console.log(line);
   }
 

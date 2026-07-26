@@ -1,5 +1,5 @@
 /**
- * turbine-orm — serverless/edge driver integration tests
+ * turbine-orm, serverless/edge driver integration tests
  *
  * Verifies that TurbineClient can be constructed with an external pg-compat
  * pool (the foundation of Neon HTTP / Vercel Postgres / Cloudflare support)
@@ -18,7 +18,7 @@ import { turbineHttp } from '../serverless.js';
 import { mockTable } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// Mock pg-compat pool — records all queries, returns programmed responses
+// Mock pg-compat pool, records all queries, returns programmed responses
 // ---------------------------------------------------------------------------
 
 interface QueryCall {
@@ -176,7 +176,7 @@ describe('turbineHttp / external pool integration', () => {
     assert.ok(db);
     // We don't import pg.types here, but the logic is: `!config.pool && !registered`.
     // Construction succeeding with a pool that has no .on('error') method is
-    // the behavioral proof — pg.Pool would have been instantiated and would
+    // the behavioral proof, pg.Pool would have been instantiated and would
     // call .on internally; that path is skipped.
   });
 
@@ -193,7 +193,7 @@ describe('turbineHttp / external pool integration', () => {
 // ---------------------------------------------------------------------------
 // Typed overload: turbineHttp<TClient>(pool, schema) returns the generated
 // client type so `db.users` etc. are visible to TS with no cast at the call
-// site — matching the TCP-path `turbine()` factory. See src/serverless.ts.
+// site, matching the TCP-path `turbine()` factory. See src/serverless.ts.
 // ---------------------------------------------------------------------------
 
 describe('turbineHttp / typed overload (generated accessors)', () => {
@@ -210,7 +210,7 @@ describe('turbineHttp / typed overload (generated accessors)', () => {
     }
 
     const { pool, calls } = createMockPool([{ rows: [{ id: 1, name: 'Alice', email: 'a@b.com' }] }]);
-    // No `as` cast at the call site — the type argument threads the accessors.
+    // No `as` cast at the call site, the type argument threads the accessors.
     const db = turbineHttp<GeneratedClient>(pool, buildSchema());
 
     // Static: `db.users` is the typed QueryInterface, not `unknown`/missing.
@@ -244,7 +244,7 @@ class TypeTestClient extends TurbineClient {
   declare readonly users: QueryInterface<TypeTestUser>;
 }
 
-// Referencing `declare const` values must stay inside a never-run function —
+// Referencing `declare const` values must stay inside a never-run function -
 // `declare const` emits no runtime binding.
 declare const _pool: PgCompatPool;
 declare const _schema: SchemaMetadata;
@@ -260,7 +260,7 @@ function _turbineHttpTypeChecks(): void {
   assertTrue<Equals<typeof untyped, TurbineClient>>();
 
   // 3. The base client does NOT expose generated accessors as typed members.
-  // @ts-expect-error — `users` is not declared on the base TurbineClient.
+  // @ts-expect-error, `users` is not declared on the base TurbineClient.
   untyped.users;
 }
 

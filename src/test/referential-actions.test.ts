@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Referential actions (WS-B / B1)
+ * turbine-orm, Referential actions (WS-B / B1)
  *
  * Code-first FK referential actions: `references` accepts the existing
  * 'table.column' string OR `{ target, onDelete?, onUpdate? }`. DDL emits
@@ -15,7 +15,7 @@ import { pgConfActionToReferential } from '../introspect.js';
 import { column, defineSchema, table } from '../schema-builder.js';
 import { referentialActionToSql, schemaToSQL } from '../schema-sql.js';
 
-describe('B1 — referentialActionToSql', () => {
+describe('B1, referentialActionToSql', () => {
   it('maps every ReferentialAction to its SQL keyword', () => {
     assert.equal(referentialActionToSql('cascade'), 'CASCADE');
     assert.equal(referentialActionToSql('restrict'), 'RESTRICT');
@@ -25,7 +25,7 @@ describe('B1 — referentialActionToSql', () => {
   });
 });
 
-describe('B1 — pgConfActionToReferential (introspection mapping)', () => {
+describe('B1, pgConfActionToReferential (introspection mapping)', () => {
   it('maps pg_constraint conf*type chars to actions', () => {
     assert.equal(pgConfActionToReferential('c'), 'cascade');
     assert.equal(pgConfActionToReferential('r'), 'restrict');
@@ -35,7 +35,7 @@ describe('B1 — pgConfActionToReferential (introspection mapping)', () => {
   });
 });
 
-describe('B1 — object references form in defineSchema', () => {
+describe('B1, object references form in defineSchema', () => {
   it('emits ON DELETE / ON UPDATE from { target, onDelete, onUpdate }', () => {
     const schema = defineSchema({
       users: { id: { type: 'serial', primaryKey: true } },
@@ -82,7 +82,7 @@ describe('B1 — object references form in defineSchema', () => {
   });
 });
 
-describe('B1 — fluent .references(target, opts)', () => {
+describe('B1, fluent .references(target, opts)', () => {
   it('legacy builder emits ON DELETE from opts', () => {
     const schema = defineSchema({
       users: table({ id: column.serial().primaryKey() }),

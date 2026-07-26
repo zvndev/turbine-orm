@@ -139,7 +139,7 @@ const TOOLS: ToolDefinition[] = [
   {
     name: 'explain_query',
     description:
-      'Run EXPLAIN (FORMAT JSON) for a schema-validated findMany query. Pass table + optional where/orderBy/limit/select — free-form SQL is rejected.',
+      'Run EXPLAIN (FORMAT JSON) for a schema-validated findMany query. Pass table + optional where/orderBy/limit/select, free-form SQL is rejected.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -414,7 +414,7 @@ async function doctorReport(ctx: McpContext): Promise<unknown> {
 }
 
 /**
- * EXPLAIN a schema-validated findMany query. Free-form SQL is never accepted —
+ * EXPLAIN a schema-validated findMany query. Free-form SQL is never accepted -
  * table/field identifiers are checked against introspected metadata and the
  * SELECT is compiled by QueryInterface (same stance as Studio `/api/builder`).
  */
@@ -463,7 +463,7 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
 
 /**
  * Extract the allowed findMany subset for explain_query (no `with` / raw SQL).
- * Returns a plain object cast at the buildFindMany call site — same pattern as Studio.
+ * Returns a plain object cast at the buildFindMany call site, same pattern as Studio.
  */
 function parseExplainFindManyArgs(args: JsonObject): FindManyArgs<Record<string, unknown>> {
   const findManyArgs: Record<string, unknown> = {};
@@ -801,7 +801,7 @@ export function buildRelations(
   for (const [tbl, cols] of columnsByTable) {
     columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
     // Enum-typed columns also report tsType 'unknown', but the generated type
-    // layer gives them a concrete union — only json/jsonb qualify as shadows.
+    // layer gives them a concrete union, only json/jsonb qualify as shadows.
     unknownTypedFieldsByTable.set(
       tbl,
       new Set(cols.filter((c) => isUnknownTsType(c.tsType) && !Object.hasOwn(enums, c.pgType)).map((c) => c.field)),

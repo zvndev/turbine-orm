@@ -2,13 +2,13 @@
 
 Five remaining demo ideas from the v0.7.1 brainstorm. The first three
 (Thread Machine, Streaming CSV, Clickstorm) already shipped as
-examples. These are the runners-up — each lands on a different
+examples. These are the runners-up, each lands on a different
 differentiator, stays under ~150 LOC, and never pitches generated SQL
 as the punchline.
 
 ---
 
-## Demo 4: Pipeline Dashboard — 8 queries, 1 round-trip
+## Demo 4: Pipeline Dashboard, 8 queries, 1 round-trip
 
 **Hook:** An admin dashboard loads 8 independent widgets (counts, top
 users, revenue, chart data, alerts, churn, signups, top plans) and the
@@ -36,13 +36,13 @@ const [users, orgs, revenue, signups, churn, topUsers, topPlans, alerts] =
 ```
 
 **Why not Prisma/Drizzle:** Prisma's `$transaction([...])` does serial
-queries in a BEGIN block — still N round-trips. Drizzle has no
+queries in a BEGIN block, still N round-trips. Drizzle has no
 equivalent. The only Postgres-native alternative today is raw SQL
 concatenation with `UNION ALL` hacks.
 
 ---
 
-## Demo 5: Edge Profile — sub-20ms user pages on Cloudflare Workers
+## Demo 5: Edge Profile, sub-20ms user pages on Cloudflare Workers
 
 **Hook:** Deploy a user profile page to Cloudflare Workers. First paint
 from Tokyo, Sydney, and São Paulo all come in under 20ms. The code is
@@ -76,7 +76,7 @@ import swap from the same generated client.
 
 ---
 
-## Demo 6: Double-Entry — a ledger that refuses to lose money
+## Demo 6: Double-Entry, a ledger that refuses to lose money
 
 **Hook:** A tiny bank-account demo: transfer $50 from Alice to Bob. Kill
 the process mid-transfer with `SIGKILL`. State is always balanced. The
@@ -110,21 +110,21 @@ async function transfer(from: number, to: number, cents: number) {
     ),
   );
 }
-// retryOnSerialization = 8 lines — it only catches `err.isRetryable`.
+// retryOnSerialization = 8 lines, it only catches `err.isRetryable`.
 ```
 
 **Why not Prisma/Drizzle:** Prisma throws a generic
-`PrismaClientKnownRequestError` with stringly-typed `code: 'P2034'` — no
+`PrismaClientKnownRequestError` with stringly-typed `code: 'P2034'`, no
 `isRetryable`. Drizzle surfaces raw pg errors and you grep SQL states
 by hand. Neither has a typed `SerializationFailureError` class.
 
 ---
 
-## Demo 7: Bulk Loader — CSV to 500K rows in 6 seconds
+## Demo 7: Bulk Loader, CSV to 500K rows in 6 seconds
 
 **Hook:** Drop a 500K-row CSV on the CLI. It streams in, batches via
 `createMany` UNNEST inserts, and finishes in ~6 seconds with a live
-progress bar. Hit Ctrl+C mid-import — the whole thing rolls back
+progress bar. Hit Ctrl+C mid-import, the whole thing rolls back
 cleanly thanks to the surrounding transaction.
 
 **Features:** `createMany` (UNNEST batch insert), `$transaction` with
@@ -154,16 +154,16 @@ await db.$transaction(async (tx) => {
 **Why not Prisma/Drizzle:** Prisma's `createMany` does multi-values
 INSERT but caps at ~1K rows per call and has no `skipDuplicates` with
 constraint-name reporting. Drizzle's `insert().values([...])` works but
-errors come back as raw pg objects — no typed `UniqueConstraintError`
+errors come back as raw pg objects, no typed `UniqueConstraintError`
 with `.constraint` to route on.
 
 ---
 
-## Demo 8: ShipIt — zero-downtime migration playground
+## Demo 8: ShipIt, zero-downtime migration playground
 
 **Hook:** Edit `schema.ts`, run `turbine migrate create --auto`, and the
 UP/DOWN SQL is already written. Apply it while a worker process keeps
-inserting — zero errors, zero manual SQL.
+inserting, zero errors, zero manual SQL.
 
 **Features:** `defineSchema()`, `schemaDiff()` auto-migration, checksum
 validation, `pg_try_advisory_lock` migration safety, `MigrationError`
@@ -174,7 +174,7 @@ typed error.
 
 **Centerpiece:**
 ```ts
-// turbine/schema.ts — before
+// turbine/schema.ts, before
 users: { id: { type: 'serial', primaryKey: true }, email: { type: 'text' } },
 // after: add `plan` column
 users: {
@@ -189,7 +189,7 @@ $ npx turbine migrate create add_plan --auto
 ```
 
 **Why not Prisma/Drizzle:** Prisma's `migrate dev` resets your DB if it
-detects drift — terrifying in practice. Drizzle Kit's auto-diff is good
+detects drift, terrifying in practice. Drizzle Kit's auto-diff is good
 but requires a separate `drizzle-kit` package and config file;
 Turbine's is a single CLI command from the same binary.
 
@@ -197,12 +197,12 @@ Turbine's is a single CLI command from the same binary.
 
 ## Priority order (if building more)
 
-1. **Pipeline Dashboard** — most visually dramatic ("1 round-trip"),
+1. **Pipeline Dashboard**, most visually dramatic ("1 round-trip"),
    showcases a differentiator no other ORM has.
-2. **Edge Profile** — hammers the edge/serverless story which is half
+2. **Edge Profile**, hammers the edge/serverless story which is half
    the v1 pitch. Doubles as real-world integration test for `turbineHttp`.
-3. **Double-Entry Ledger** — fintech audience is high-value and this
+3. **Double-Entry Ledger**, fintech audience is high-value and this
    shows off the full transaction story in one screen.
-4. **Bulk Loader** — solid but less unique (every ORM has *something* here).
-5. **Migration Playground** — most useful as documentation but hardest
+4. **Bulk Loader**, solid but less unique (every ORM has *something* here).
+5. **Migration Playground**, most useful as documentation but hardest
    to demo live without a screen recording.

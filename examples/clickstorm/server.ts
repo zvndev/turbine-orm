@@ -1,5 +1,5 @@
 /**
- * Clickstorm server — two routes that both increment the same counter.
+ * Clickstorm server, two routes that both increment the same counter.
  *
  *   POST /like/safe    → atomic:  { likesCount: { increment: 1 } }
  *   POST /like/unsafe  → naive:   findUnique + update({ set: current + 1 })
@@ -25,7 +25,7 @@ const POST_ID = 1;
 /**
  * Atomic path: compiles to
  *   UPDATE posts SET likes_count = likes_count + $1 WHERE id = $2
- * — race-free no matter how many concurrent callers hit it.
+ * - race-free no matter how many concurrent callers hit it.
  */
 async function likeSafe() {
   return withRetry(() =>
@@ -49,7 +49,7 @@ async function likeUnsafe() {
 }
 
 /**
- * Retry loop — only catches Turbine's typed retryable errors.
+ * Retry loop, only catches Turbine's typed retryable errors.
  * `isRetryable` is a `const` property on DeadlockError / SerializationFailureError,
  * so this is a clean discriminator instead of matching pg error code strings.
  */
@@ -106,10 +106,10 @@ const server = createServer(async (req, res) => {
 const PORT = Number(process.env.PORT ?? 3000);
 server.listen(PORT, () => {
   console.log(`Clickstorm server on http://localhost:${PORT}`);
-  console.log('  POST /like/safe    — atomic increment (race-free)');
-  console.log('  POST /like/unsafe  — read-modify-write (races)');
-  console.log('  GET  /count        — current likesCount');
-  console.log('  POST /reset        — zero the counter');
+  console.log('  POST /like/safe   , atomic increment (race-free)');
+  console.log('  POST /like/unsafe , read-modify-write (races)');
+  console.log('  GET  /count       , current likesCount');
+  console.log('  POST /reset       , zero the counter');
   console.log();
   console.log('Run `npm run storm` to fire the load test.');
 });

@@ -88,7 +88,7 @@ jobs:
   # Integration tests run against a real Postgres service container, exercised
   # across a version matrix (PG 14/15/16/17). The service is seeded from
   # src/test/fixtures/seed.sql before the test run, which provides the schema +
-  # a small fixture dataset (7 orgs / 8 users / 10 posts / 20 comments) — enough
+  # a small fixture dataset (7 orgs / 8 users / 10 posts / 20 comments), enough
   # to exercise nested relations, cursor pagination, JSONB / array operators,
   # and the streaming cursor API. Running the full suite on every supported
   # major version catches version-specific SQL/behavior regressions (e.g. the
@@ -140,13 +140,13 @@ jobs:
   # integration tests against it, proving the SQL the adapter emits is actually
   # accepted by a real CockroachDB server. CRDB listens on 26257 and (in
   # --insecure mode) authenticates the built-in `root` user with no password.
-  # This job GATES PRs — a CRDB-rejected statement is exactly the regression we
+  # This job GATES PRs, a CRDB-rejected statement is exactly the regression we
   # want to catch.
   # Real CockroachDB job: proves the cockroachdb adapter's set_config()
   # `transaction_timeout` SQL is accepted by a real CRDB server (not just a
   # mock). It runs studio-timeout-integration.test.ts with
   # TURBINE_TEST_ENGINE=cockroachdb so the CRDB-specific adapter SQL is the SQL
-  # actually sent over the wire. Hard gate — engine integration regressions fail the PR.
+  # actually sent over the wire. Hard gate, engine integration regressions fail the PR.
   cockroachdb-integration:
     name: cockroachdb-integration
     runs-on: ubuntu-latest
@@ -196,22 +196,22 @@ jobs:
       - name: Run engine-aware studio-timeout integration test against CockroachDB
         # TURBINE_TEST_ENGINE=cockroachdb makes the test send the cockroachdb
         # adapter's own `transaction_timeout` set_config() SQL over the live
-        # connection — the engine-specific path the mocked unit tests can't cover.
+        # connection, the engine-specific path the mocked unit tests can't cover.
         run: npx tsx --test src/test/studio-timeout-integration.test.ts
         env:
           DATABASE_URL: postgres://root@localhost:26257/turbine_test?sslmode=disable
           TURBINE_TEST_ENGINE: cockroachdb
 
-  # Real MySQL 8 job for the turbine-orm/mysql engine (Phase 2 — multi-dialect).
+  # Real MySQL 8 job for the turbine-orm/mysql engine (Phase 2, multi-dialect).
   # The mysql2 named-param driver + the `reselect` result strategy (no RETURNING)
   # and the information_schema introspector are only proven against a real server,
   # so this job spins a mysql:8 service container, sets MYSQL_URL, and runs
-  # src/test/mysql.test.ts — whose integration suite creates its own schema, seeds
+  # src/test/mysql.test.ts, whose integration suite creates its own schema, seeds
   # the fixture, dogfoods the introspector, and exercises findMany / nested-with /
   # create(reselect) / upsert / update / delete / transactions / typed errors.
   # Without MYSQL_URL (locally + the unit-tests job) those tests skip cleanly while
   # the build-only + mock-driver tests still run. mysql2 is a devDep, so `npm ci`
-  # installs it. Hard gate — engine integration regressions fail the PR.
+  # installs it. Hard gate, engine integration regressions fail the PR.
   mysql-integration:
     name: mysql-integration
     runs-on: ubuntu-latest
@@ -241,16 +241,16 @@ jobs:
         env:
           MYSQL_URL: mysql://root:root@127.0.0.1:3306/turbine_test
 
-  # Real SQL Server 2022 job for the turbine-orm/mssql engine (Phase 3 — multi-dialect).
+  # Real SQL Server 2022 job for the turbine-orm/mssql engine (Phase 3, multi-dialect).
   # The FOR JSON PATH nested-relation generator, the OUTPUT/MERGE result strategy, the
   # @pN named-param driver, and the INFORMATION_SCHEMA/sys introspector are only proven
   # against a real server, so this job spins an mssql/server:2022-latest service container,
-  # sets MSSQL_URL, and runs src/test/mssql.test.ts — whose integration suite creates its
+  # sets MSSQL_URL, and runs src/test/mssql.test.ts, whose integration suite creates its
   # own schema, seeds the fixture, dogfoods the introspector, and exercises findMany /
   # nested-with / create(output) / upsert(MERGE) / update / delete / transactions / typed
   # errors. Without MSSQL_URL (locally + the unit-tests job) those tests skip cleanly while
   # the build-only + mock-driver tests still run. mssql is a devDep, so `npm ci` installs
-  # it. Hard gate — engine integration regressions fail the PR.
+  # it. Hard gate, engine integration regressions fail the PR.
   mssql-integration:
     name: mssql-integration
     runs-on: ubuntu-latest
@@ -278,10 +278,10 @@ jobs:
       - run: npm ci
       # Create the test database with the same `mssql` driver the tests use
       # (already installed by `npm ci`) rather than a separate sqlcmd tools
-      # image — `mcr.microsoft.com/mssql-tools18:latest` has no published tag.
+      # image, `mcr.microsoft.com/mssql-tools18:latest` has no published tag.
       - name: Create the test database
         # Write the script into the repo root (the step's cwd) so `require('mssql')`
-        # resolves the package `npm ci` just installed — a /tmp script can't see
+        # resolves the package `npm ci` just installed, a /tmp script can't see
         # the workspace node_modules.
         run: |
           cat > create-mssql-db.cjs <<'EOF'
@@ -304,7 +304,7 @@ jobs:
         env:
           MSSQL_URL: mssql://sa:Turbine_Passw0rd!@127.0.0.1:1433/turbine_test
 
-  # Real PowDB job for the turbine-orm/powdb engine — runs the embedded napi
+  # Real PowDB job for the turbine-orm/powdb engine, runs the embedded napi
   # addon (@zvndev/powdb-embedded) IN-PROCESS, so there is NO service container
   # (unlike mysql/mssql/cockroachdb). The addon is a published npm package with a
   # Linux-glibc-x64 prebuilt binary, installed as a devDependency by `npm ci`, so
@@ -313,7 +313,7 @@ jobs:
   # transactions (commit/rollback + nested/re-entrant throw), chunked relation
   # loads, and the E017 guards against a real database. On a platform without a
   # prebuilt binary the suite's skipGate fires and every test skips cleanly, so
-  # `npm run test:unit` stays green without the addon. Hard gate — embedded PowDB integration must pass on every PR.
+  # `npm run test:unit` stays green without the addon. Hard gate, embedded PowDB integration must pass on every PR.
   powdb-integration:
     name: powdb-integration
     runs-on: ubuntu-latest
@@ -330,8 +330,8 @@ jobs:
   # NOTE: the YugabyteDB integration job used to live here, but its container
   # never initialized successfully on GitHub runners and burned ~6 minutes of
   # guaranteed red X on every PR/push. It now runs on a nightly schedule in
-  # nightly.yml (job: yugabytedb-integration) — same test, same
-  # continue-on-error — so per-PR CI stays green and fast.
+  # nightly.yml (job: yugabytedb-integration), same test, same
+  # continue-on-error, so per-PR CI stays green and fast.
 
   build:
     runs-on: ubuntu-latest
@@ -347,7 +347,7 @@ jobs:
         run: test -f dist/cjs/index.js && head -1 dist/cjs/index.js | grep -q '"use strict"'
       - name: Verify ESM output
         run: test -f dist/index.js
-      # Bundle size is gated by size-limit alone — it measures the REAL bundled
+      # Bundle size is gated by size-limit alone, it measures the REAL bundled
       # import graph (esbuild) of each public entry against the limits declared
       # in .size-limit.js (~31 kB main / ~22 kB edge, under 35/25 limits). This
       # replaces the previous hard-coded `npm pack` KB ceiling (which was stale
@@ -490,14 +490,14 @@ jobs:
         working-directory: ${{ env.SMOKE_DIR }}
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/serverless'); if (typeof m.turbineHttp !== 'function') { console.error('serverless subpath missing turbineHttp'); process.exit(1); } console.log('serverless subpath OK');"
-      - name: Verify mysql subpath import (mysql2 NOT installed — must not crash)
+      - name: Verify mysql subpath import (mysql2 NOT installed, must not crash)
         working-directory: ${{ env.SMOKE_DIR }}
         # mysql2 is an OPTIONAL peer; this temp project never installs it. Importing
         # turbine-orm/mysql and using mysqlDialect must work with mysql2 absent
         # (it is only loaded by the dynamic import inside turbineMysql()).
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/mysql'); if (m.mysqlDialect?.name !== 'mysql' || typeof m.turbineMysql !== 'function') { console.error('mysql subpath broken'); process.exit(1); } console.log('mysql subpath OK (no mysql2 needed to import)');"
-      - name: Verify mssql subpath import (mssql NOT installed — must not crash)
+      - name: Verify mssql subpath import (mssql NOT installed, must not crash)
         working-directory: ${{ env.SMOKE_DIR }}
         # mssql is an OPTIONAL peer; this temp project never installs it. Importing
         # turbine-orm/mssql and using mssqlDialect must work with mssql absent
@@ -509,7 +509,7 @@ jobs:
         working-directory: ${{ env.SMOKE_DIR }}
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/sqlite'); if (m.sqliteDialect?.name !== 'sqlite' || typeof m.turbineSqlite !== 'function') { console.error('sqlite subpath broken'); process.exit(1); } console.log('sqlite subpath OK');"
-      - name: Verify powdb subpath import (peers NOT installed — must not crash)
+      - name: Verify powdb subpath import (peers NOT installed, must not crash)
         working-directory: ${{ env.SMOKE_DIR }}
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/powdb'); if (typeof m.turbinePowDB !== 'function') { console.error('powdb subpath broken'); process.exit(1); } console.log('powdb subpath OK (no peer needed to import)');"
@@ -571,10 +571,10 @@ jobs:
       - run: npm ci
       # Hard gate: any HIGH or CRITICAL vulnerability in the PRODUCTION
       # dependency tree fails CI. (The prod tree is `pg` + `@types/pg`;
-      # currently 0 vulns, so this passes — and stays meaningful.)
+      # currently 0 vulns, so this passes, and stays meaningful.)
       - name: Audit production dependencies (blocking)
         run: npm audit --omit=dev --audit-level=high
-      # Full-tree audit (dev deps included) for visibility only — never blocks.
+      # Full-tree audit (dev deps included) for visibility only, never blocks.
       - name: Audit full tree including dev deps (non-blocking)
         run: npm audit --audit-level=high
         continue-on-error: true

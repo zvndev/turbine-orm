@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Empty-where mutation guard tests
+ * turbine-orm, Empty-where mutation guard tests
  *
  * Every mutation (`update`, `updateMany`, `delete`, `deleteMany`) must refuse
  * an empty predicate by default, throwing `ValidationError`. The guard only
@@ -288,7 +288,7 @@ describe('mutation guard: OR/AND all-undefined hardening', () => {
   });
 
   it('OR with at least one defined sub-condition still works (regression guard)', () => {
-    // Sanity check — make sure the hardening above didn't over-fire on the
+    // Sanity check, make sure the hardening above didn't over-fire on the
     // legitimate case where one OR branch resolves to a real predicate.
     const q = makeQuery('users', buildSchema());
     const deferred = q.buildUpdate({

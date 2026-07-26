@@ -25,8 +25,8 @@ const jetbrains = JetBrains_Mono({
 
 export const metadata: Metadata = {
   title: {
-    default: 'Turbine ORM — Postgres-native TypeScript ORM',
-    template: '%s — Turbine ORM',
+    default: 'Turbine ORM, Postgres-native TypeScript ORM',
+    template: '%s, Turbine ORM',
   },
   description:
     'Postgres-native TypeScript ORM built for a database with real rows in it: a read-only-by-default Studio, PII enforced in the emitted SQL, errors that carry keys not values, and destructive migrations that require consent. One dependency, edge-ready, deep type inference.',

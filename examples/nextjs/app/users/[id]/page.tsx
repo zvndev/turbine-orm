@@ -103,7 +103,7 @@ export default async function UserDetailPage({
             </summary>
             <div className="mt-4">
               <CodeBlock
-                title="Single query — user + org + posts + comments"
+                title="Single query, user + org + posts + comments"
                 code={`const user = await db.users.findUnique({
   where: { id: ${id} },
   with: {

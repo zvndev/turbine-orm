@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Deferred query + QueryInterface option types
+ * turbine-orm, Deferred query + QueryInterface option types
  *
  * Split from builder.ts so the class file focuses on SQL assembly / execution.
  */
@@ -31,7 +31,7 @@ export interface DeferredQuery<T> {
   preparedName?: string;
   /**
    * Execution plan for dialects whose {@link Dialect.resultStrategy} is
-   * `'reselect'` (no RETURNING — e.g. MySQL). Owns the statement ordering: it
+   * `'reselect'` (no RETURNING, e.g. MySQL). Owns the statement ordering: it
    * runs the write and the follow-up row-fetching SELECT(s) via `exec`, and
    * resolves the result whose rows {@link DeferredQuery.transform} consumes.
    * Absent for `'returning'`/`'output'` dialects (the statement returns its own
@@ -41,10 +41,10 @@ export interface DeferredQuery<T> {
 }
 
 // ---------------------------------------------------------------------------
-// QueryInterface — the object returned by db.users, db.posts, etc.
+// QueryInterface, the object returned by db.users, db.posts, etc.
 // ---------------------------------------------------------------------------
 
-/** Middleware function type — imported from client to avoid circular deps */
+/** Middleware function type, imported from client to avoid circular deps */
 export type MiddlewareFn = (
   params: { model: string; action: string; args: Record<string, unknown> },
   next: (params: { model: string; action: string; args: Record<string, unknown> }) => Promise<unknown>,
@@ -82,7 +82,7 @@ export interface QueryInterfaceOptions {
    * queries are surfaced loudly during development. Pass `false` to silence
    * the warning entirely (e.g. for CLI tooling that intentionally streams
    * full tables), or a per-table map (`{ userProfiles: false }`) to silence
-   * only the tables that intentionally read full sets — unlisted tables keep
+   * only the tables that intentionally read full sets, unlisted tables keep
    * the default. Map keys accept BOTH the camelCase accessor name
    * (`userProfiles`) and the snake_case table name (`user_profiles`); the
    * snake_case entry wins if both are present. Individual calls can also
@@ -209,7 +209,7 @@ export interface QueryInterfaceOptions {
   autoRoundTripMs?: number;
   /**
    * How nested-relation subqueries encode each row's JSON: `'object'` (default,
-   * `json_build_object`) or `'positional'` (`json_build_array`, key-less — see
+   * `json_build_object`) or `'positional'` (`json_build_array`, key-less, see
    * {@link Dialect.buildJsonArray}). Positional is Postgres-only in v1; a
    * `with` clause on any other dialect throws `UnsupportedFeatureError` (E017).
    */
@@ -221,7 +221,7 @@ export interface QueryInterfaceOptions {
    * {@link GlobalFilters}.
    */
   globalFilters?: GlobalFilters;
-  /** @internal Set by TransactionClient — signals that this QI runs inside an active transaction. */
+  /** @internal Set by TransactionClient, signals that this QI runs inside an active transaction. */
   _txScoped?: boolean;
   /** @internal Callback from TurbineClient for query event emission. */
   _onQuery?: (event: QueryEvent) => void;

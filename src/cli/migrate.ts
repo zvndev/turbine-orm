@@ -1,5 +1,5 @@
 /**
- * turbine-orm CLI — Migration system
+ * turbine-orm CLI, Migration system
  *
  * SQL-first migrations with UP/DOWN sections, tracked in _turbine_migrations.
  * Migration files are timestamp-prefixed .sql files.
@@ -33,7 +33,7 @@ export interface MigrationFile {
   path: string;
   /** Extracted name portion (e.g. "20260325120000_create_users") */
   name: string;
-  /** Timestamp prefix (e.g. "20260325120000") — YYYYMMDDHHMMSS */
+  /** Timestamp prefix (e.g. "20260325120000"), YYYYMMDDHHMMSS */
   timestamp: string;
 }
 
@@ -194,7 +194,7 @@ export function formatTimestamp(date: Date): string {
 }
 
 /**
- * Get pending migration files — those not yet applied.
+ * Get pending migration files, those not yet applied.
  * Returns files sorted by timestamp (ascending).
  */
 export function getPendingMigrations(migrationsDir: string, applied: string[]): MigrationFile[] {
@@ -786,7 +786,7 @@ ${autoContent.down}
 /**
  * Derive a Postgres advisory lock ID (positive int4) from the database name.
  *
- * Uses FNV-1a 32-bit hash — a well-known, stable, non-cryptographic hash with
+ * Uses FNV-1a 32-bit hash, a well-known, stable, non-cryptographic hash with
  * excellent distribution over short strings (database names are typically <64
  * chars). Chosen over alternatives because it's:
  *   - deterministic (same input → same output, across processes/machines)
@@ -946,7 +946,7 @@ export function formatChecksumMismatchError(mismatches: ChecksumMismatch[]): str
   const modified = mismatches.filter((m) => m.type === 'modified');
   const missing = mismatches.filter((m) => m.type === 'missing');
   const lines: string[] = [
-    '[turbine] Migration drift detected — refusing to apply pending migrations.',
+    '[turbine] Migration drift detected, refusing to apply pending migrations.',
     '',
     'Applied migrations should be immutable. The following files no longer match their applied state:',
     '',
@@ -968,7 +968,7 @@ export function formatChecksumMismatchError(mismatches: ChecksumMismatch[]): str
   if (missing.length > 0) {
     lines.push('     (deleted files cannot be rolled back: restore the file, then run `migrate down` if needed), OR');
   }
-  lines.push('  3. Pass `--allow-drift` to bypass this check (advanced — make sure you know what you are doing).');
+  lines.push('  3. Pass `--allow-drift` to bypass this check (advanced, make sure you know what you are doing).');
   return lines.join('\n');
 }
 
@@ -1046,7 +1046,7 @@ export async function inspectMigrationDeploy(
  * Features:
  * - Idempotent: running twice is safe (already-applied migrations are skipped)
  * - Advisory lock: prevents concurrent migration runs
- * - Checksum validation: detects modified migration files (BLOCKING — use
+ * - Checksum validation: detects modified migration files (BLOCKING, use
  *   `allowDrift: true` to bypass when intentionally rewriting history)
  * - Each migration runs in its own transaction
  *
@@ -1090,7 +1090,7 @@ export async function migrateUp(
     const adapter = options?.adapter;
     const gotLock = await acquireLock(client, lockId, adapter);
     if (!gotLock) {
-      throw new MigrationError('[turbine] Could not acquire migration lock — another migration is already running');
+      throw new MigrationError('[turbine] Could not acquire migration lock, another migration is already running');
     }
 
     try {
@@ -1135,7 +1135,7 @@ export async function migrateUp(
       // Data-loss gate: refuse to run pending migrations containing destructive
       // statements unless the caller has EXPLICITLY opted in. The CLI layers an
       // interactive typed confirmation on top of this; programmatic callers must
-      // pass `allowDestructive: true`. Safe-by-default is the whole point — a
+      // pass `allowDestructive: true`. Safe-by-default is the whole point, a
       // DROP TABLE should never run just because a file exists.
       if (!options?.allowDestructive && destructive.length > 0) {
         const lines = ['[turbine] Refusing to apply migrations containing DESTRUCTIVE statements:', ''];
@@ -1265,7 +1265,7 @@ export async function migrateDown(
     const adapter = options?.adapter;
     const gotLock = await acquireLock(client, lockId, adapter);
     if (!gotLock) {
-      throw new MigrationError('[turbine] Could not acquire migration lock — another migration is already running');
+      throw new MigrationError('[turbine] Could not acquire migration lock, another migration is already running');
     }
 
     try {
@@ -1279,10 +1279,10 @@ export async function migrateDown(
       const allFiles = listMigrationFiles(migrationsDir);
       const fileMap = new Map(allFiles.map((f) => [f.name, f]));
 
-      // Reverse order — rollback most recent first
+      // Reverse order, rollback most recent first
       const toRollback = applied.reverse().slice(0, options?.step ?? 1);
 
-      // Same data-loss gate as migrateUp — DOWN sections routinely contain
+      // Same data-loss gate as migrateUp, DOWN sections routinely contain
       // DROP TABLE (the legitimate reverse of a CREATE), which still destroys
       // every row written since the migration ran. Explicit opt-in required.
       if (!options?.allowDestructive) {

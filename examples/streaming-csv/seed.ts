@@ -33,7 +33,7 @@ async function seed() {
 
   await client.query('TRUNCATE line_items, orders, customers RESTART IDENTITY CASCADE');
 
-  // Customers — 1 per 50 orders, so ~2K for 100K orders
+  // Customers, 1 per 50 orders, so ~2K for 100K orders
   const numCustomers = Math.max(100, Math.floor(TARGET_ORDERS / 50));
   const emails = Array.from({ length: numCustomers }, (_, i) => `customer${i}@example.com`);
   const names = Array.from({ length: numCustomers }, (_, i) => `Customer ${i}`);
@@ -43,7 +43,7 @@ async function seed() {
   );
   console.log(`  customers: ${numCustomers.toLocaleString()}`);
 
-  // Orders — batch insert
+  // Orders, batch insert
   let orderIdCursor = 1;
   for (let offset = 0; offset < TARGET_ORDERS; offset += BATCH) {
     const size = Math.min(BATCH, TARGET_ORDERS - offset);
@@ -60,7 +60,7 @@ async function seed() {
       [customerIds, statuses, totals],
     );
 
-    // Line items — 1 to 5 per order in this batch
+    // Line items, 1 to 5 per order in this batch
     const orderIds: number[] = [];
     const productNames: string[] = [];
     const quantities: number[] = [];

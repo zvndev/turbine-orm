@@ -1,16 +1,16 @@
 /**
- * turbine-orm — Relation derivation from foreign keys (dogfood T-4)
+ * turbine-orm, Relation derivation from foreign keys (dogfood T-4)
  *
  * Unit tests for `buildRelationsFromForeignKeys()` / `relationNameFromColumn()`
- * — the pure naming core extracted from `introspect()` so the FK→relation
+ * - the pure naming core extracted from `introspect()` so the FK→relation
  * naming rules are testable without a database.
  *
  * Regression context (dogfood report): `model_instances` carries TWO
  * FK columns to `model_instance_versions` (`current_version_id`,
- * `published_version_id` — or Prisma-style quoted camelCase `currentVersionId`
+ * `published_version_id`, or Prisma-style quoted camelCase `currentVersionId`
  * / `publishedVersionId`). The old naming derived both belongsTo names from
  * the target table, so one clobbered the other, and camelCase `…Id` columns
- * were not suffix-stripped — the relation ended up with the SAME name as its
+ * were not suffix-stripped, the relation ended up with the SAME name as its
  * scalar FK column, shadowing it and generating types that failed
  * `tsc --strict` (TS2430/TS2322).
  *
@@ -71,7 +71,7 @@ describe('relationNameFromColumn', () => {
   });
 });
 
-describe('buildRelationsFromForeignKeys — single-FK back-compat naming', () => {
+describe('buildRelationsFromForeignKeys, single-FK back-compat naming', () => {
   it('keeps the historical target-table belongsTo / source-table hasMany names', () => {
     const [relations, warnings] = captureWarnings(() =>
       buildRelationsFromForeignKeys(
@@ -96,7 +96,7 @@ describe('buildRelationsFromForeignKeys — single-FK back-compat naming', () =>
   });
 });
 
-describe('buildRelationsFromForeignKeys — two FKs to the same target (T-4)', () => {
+describe('buildRelationsFromForeignKeys, two FKs to the same target (T-4)', () => {
   it('derives each belongsTo name from its own column (snake_case _id)', () => {
     const [relations, warnings] = captureWarnings(() =>
       buildRelationsFromForeignKeys(
@@ -142,10 +142,10 @@ describe('buildRelationsFromForeignKeys — two FKs to the same target (T-4)', (
   });
 
   it('strips camelCase Id suffixes so the relation never shadows the scalar FK field', () => {
-    // Prisma-ported schemas use quoted camelCase column names — the exact
+    // Prisma-ported schemas use quoted camelCase column names, the exact
     // reported failure: relation "currentVersionId" === column field
     // "currentVersionId", shadowing the scalar entirely. The belongsTo side
-    // legitimately changes (it was BROKEN — the legacy name collided with the
+    // legitimately changes (it was BROKEN, the legacy name collided with the
     // concrete-typed scalar), but the reverse hasMany side keeps the LEGACY
     // names (`modelInstancesByCurrentVersionId`): those were collision-free
     // and worked at runtime, so a regen must not rename them (N-1a).
@@ -165,7 +165,7 @@ describe('buildRelationsFromForeignKeys — two FKs to the same target (T-4)', (
 
     const instances = relations.get('model_instances')!;
     assert.deepEqual(Object.keys(instances).sort(), ['currentVersion', 'publishedVersion']);
-    // The scalar fields stay targetable — no relation carries their names.
+    // The scalar fields stay targetable, no relation carries their names.
     assert.equal(instances.currentVersionId, undefined);
     assert.equal(instances.publishedVersionId, undefined);
 
@@ -178,7 +178,7 @@ describe('buildRelationsFromForeignKeys — two FKs to the same target (T-4)', (
   });
 });
 
-describe('buildRelationsFromForeignKeys — collision fallback', () => {
+describe('buildRelationsFromForeignKeys, collision fallback', () => {
   it('suffixes deterministically and warns when the derived name collides with a column field', () => {
     // `current_version_id` strips to `currentVersion`, but the table ALSO has
     // a scalar column whose field is `currentVersion` → deterministic Rel suffix.
@@ -235,7 +235,7 @@ describe('buildRelationsFromForeignKeys — collision fallback', () => {
   });
 });
 
-describe('buildRelationsFromForeignKeys — composite FKs', () => {
+describe('buildRelationsFromForeignKeys, composite FKs', () => {
   it('uses the constraint name for composite same-target FKs and keeps array keys', () => {
     const [relations, warnings] = captureWarnings(() =>
       buildRelationsFromForeignKeys(
@@ -261,7 +261,7 @@ describe('buildRelationsFromForeignKeys — composite FKs', () => {
   });
 });
 
-describe('buildRelationsFromForeignKeys — referential actions', () => {
+describe('buildRelationsFromForeignKeys, referential actions', () => {
   it('threads onDelete/onUpdate from the constraint map, omitting no-action', () => {
     const relations = buildRelationsFromForeignKeys(
       [fk('posts', ['user_id'], 'users', ['id'], 'posts_user_id_fkey')],
@@ -278,16 +278,16 @@ describe('buildRelationsFromForeignKeys — referential actions', () => {
 });
 
 // ---------------------------------------------------------------------------
-// N-1 — legacy-first naming parity with main
+// N-1, legacy-first naming parity with main
 //
 // GOVERNING PRINCIPLE: never change a relation name that previously worked at
 // runtime. Each case below states whether the expected names are
-// LEGACY-PRESERVED (exactly what main generated — collision-free, worked) or
+// LEGACY-PRESERVED (exactly what main generated, collision-free, worked) or
 // LEGITIMATELY CHANGED (the legacy name collided with a concrete-typed scalar
 // column, i.e. the shape was BROKEN on main and the rename is the fix).
 // ---------------------------------------------------------------------------
 
-describe('buildRelationsFromForeignKeys — main-parity table (N-1)', () => {
+describe('buildRelationsFromForeignKeys, main-parity table (N-1)', () => {
   interface NamingCase {
     name: string;
     fks: ForeignKeyEntry[];
@@ -300,7 +300,7 @@ describe('buildRelationsFromForeignKeys — main-parity table (N-1)', () => {
 
   const cases: NamingCase[] = [
     {
-      // LEGACY-PRESERVED: the classic snake_case single-FK shape — identical
+      // LEGACY-PRESERVED: the classic snake_case single-FK shape, identical
       // on main and here.
       name: 'plain snake_case single FK (posts.user_id → users)',
       fks: [fk('posts', ['user_id'], 'users', ['id'], 'posts_user_id_fkey')],
@@ -309,7 +309,7 @@ describe('buildRelationsFromForeignKeys — main-parity table (N-1)', () => {
       expectedWarnings: 0,
     },
     {
-      // LEGACY-PRESERVED: two snake_case FKs to the same target — main's
+      // LEGACY-PRESERVED: two snake_case FKs to the same target, main's
       // per-column derivation was already collision-free.
       name: 'two snake_case FKs to the same target',
       fks: [
@@ -327,12 +327,12 @@ describe('buildRelationsFromForeignKeys — main-parity table (N-1)', () => {
       expectedWarnings: 0,
     },
     {
-      // MIXED — the the dogfood consumer camelCase two-FK regression shape (N-1a):
+      // MIXED, the the dogfood consumer camelCase two-FK regression shape (N-1a):
       //   belongsTo LEGITIMATELY CHANGED: main derived 'authorId'/'editorId',
       //   which SHADOWED the concrete scalar FK fields (broken types) → the
       //   modern Id-stripped names apply.
       //   hasMany LEGACY-PRESERVED: main derived 'blogPostsByAuthorId'/
-      //   'blogPostsByEditorId' — collision-free, worked at runtime; the
+      //   'blogPostsByEditorId', collision-free, worked at runtime; the
       //   branch had wrongly renamed them to 'blogPostsByAuthor'/'…Editor'.
       name: 'two camelCase-Id FKs (blogPosts.authorId/editorId → users)',
       fks: [
@@ -348,10 +348,10 @@ describe('buildRelationsFromForeignKeys — main-parity table (N-1)', () => {
     },
     {
       // LEGACY-PRESERVED: capitalized-snake FK columns. main derived
-      // belongsTo 'Author'/'Editor' (free — the column FIELDS are
+      // belongsTo 'Author'/'Editor' (free, the column FIELDS are
       // 'AuthorId'/'EditorId') and hasMany 'postsBy_Author'/'postsBy_Editor'
       // (snakeToCamel does not uppercase after '_A'). The branch had renamed
-      // the hasMany side to 'postsByAuthor' — a regression.
+      // the hasMany side to 'postsByAuthor', a regression.
       name: 'capitalized-snake FK columns (posts.Author_id/Editor_id → users)',
       fks: [
         fk('posts', ['Author_id'], 'users', ['id'], 'posts_Author_id_fkey'),
@@ -365,7 +365,7 @@ describe('buildRelationsFromForeignKeys — main-parity table (N-1)', () => {
       expectedWarnings: 0,
     },
     {
-      // MIXED — uppercase `_ID` suffix:
+      // MIXED, uppercase `_ID` suffix:
       //   belongsTo LEGITIMATELY CHANGED: main's case-SENSITIVE strip left
       //   'author_ID' intact, which equals the scalar column field
       //   (snakeToCamel('author_ID') === 'author_ID') → shadow, broken on
@@ -409,7 +409,7 @@ describe('buildRelationsFromForeignKeys — main-parity table (N-1)', () => {
   it('keeps a legacy belongsTo that shadows ONLY an unknown-typed (jsonb) column, with a warning (N-1b)', () => {
     // posts has a jsonb column `user` (tsType 'unknown') AND user_id → users.
     // On main the relation 'user' shadowed the column but COMPILED (`unknown`
-    // absorbs anything) and worked at runtime — regen must keep the name.
+    // absorbs anything) and worked at runtime, regen must keep the name.
     const [relations, warnings] = captureWarnings(() =>
       buildRelationsFromForeignKeys(
         [fk('posts', ['user_id'], 'users', ['id'], 'posts_user_id_fkey')],
@@ -450,10 +450,10 @@ describe('buildRelationsFromForeignKeys — main-parity table (N-1)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// N-2 — auto-m2m collision handling (shared addAutoManyToManyRelations)
+// N-2, auto-m2m collision handling (shared addAutoManyToManyRelations)
 // ---------------------------------------------------------------------------
 
-describe('addAutoManyToManyRelations — column-shadow handling (N-2)', () => {
+describe('addAutoManyToManyRelations, column-shadow handling (N-2)', () => {
   /** Junction fixture: post_tags(post_id, tag_id) linking posts ↔ tags. */
   function junctionSetup(extraPostFields: string[] = [], unknownPostFields: string[] = []) {
     const fks = [
@@ -634,7 +634,7 @@ describe('addAutoManyToManyRelations — column-shadow handling (N-2)', () => {
       ),
     );
     assert.deepEqual(warnings, []);
-    // The pre-existing hasMany won — untouched, no Rel-suffixed sibling.
+    // The pre-existing hasMany won, untouched, no Rel-suffixed sibling.
     assert.equal(relationsByTable.get('posts')!.tags!.type, 'hasMany');
     assert.equal(relationsByTable.get('posts')!.tagsRel, undefined);
   });

@@ -1,10 +1,10 @@
 /**
- * Turbine ORM — jsonEncoding: 'object' vs 'positional' payload benchmark
+ * Turbine ORM, jsonEncoding: 'object' vs 'positional' payload benchmark
  *
  * Turbine's `with` relations come back as `json_agg(json_build_object('k', v, …))`,
  * so every key name repeats in every nested object of every row. The opt-in
  * `positional` encoding emits `json_agg(json_build_array(v, …))` instead and maps
- * positions back to keys client-side — same information, far fewer bytes on
+ * positions back to keys client-side, same information, far fewer bytes on
  * wide/deeply-nested trees. This bench quantifies the win.
  *
  * It is SELF-CONTAINED: it creates + seeds its own throwaway tables, so any

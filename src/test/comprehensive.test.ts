@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Comprehensive integration test suite
+ * turbine-orm, Comprehensive integration test suite
  *
  * Tests every untested code path in query.ts and client.ts against a real Postgres.
  * Covers: select/omit, cursor pagination, distinct, upsert, updateMany, deleteMany,
@@ -925,7 +925,7 @@ testFn('comprehensive integration tests', () => {
         data: { email: testEmail, name: 'Skip Dup', orgId: 1, role: 'member' },
       });
 
-      // Try to insert again with skipDuplicates — should not throw
+      // Try to insert again with skipDuplicates, should not throw
       const result = await db.table('users').createMany({
         data: [
           { email: testEmail, name: 'Skip Dup', orgId: 1, role: 'member' },
@@ -1087,10 +1087,10 @@ testFn('comprehensive integration tests', () => {
       console.warn = (msg: string) => warnings.push(msg);
 
       const warnDb = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 2, warnOnUnlimited: true }, schema);
-      await warnDb.table('users').findMany({ limit: 10 }); // With limit — no warning
+      await warnDb.table('users').findMany({ limit: 10 }); // With limit, no warning
       assert.equal(warnings.length, 0);
 
-      await warnDb.table('users').findMany(); // Without limit — should warn
+      await warnDb.table('users').findMany(); // Without limit, should warn
       assert.ok(warnings.length > 0);
       assert.ok(warnings[0]!.includes('no limit'));
 
@@ -1454,7 +1454,7 @@ testFn('comprehensive integration tests', () => {
   describe('SQL cache', () => {
     it('repeated identical queries work correctly (cache hit path)', async () => {
       const q = db.table('users');
-      // Execute same query multiple times — exercises LRU cache
+      // Execute same query multiple times, exercises LRU cache
       const r1 = await q.findUnique({ where: { id: 1 } });
       const r2 = await q.findUnique({ where: { id: 1 } });
       const r3 = await q.findUnique({ where: { id: 2 } });
@@ -1472,7 +1472,7 @@ testFn('comprehensive integration tests', () => {
       const user = await db.table('users').findUnique({
         where: { id: 1, avatarUrl: null },
       });
-      // May or may not find a user depending on data — just should not throw
+      // May or may not find a user depending on data, just should not throw
       if (user) {
         assert.equal((user as Record<string, unknown>).avatarUrl, null);
       }

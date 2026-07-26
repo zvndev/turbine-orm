@@ -1,5 +1,5 @@
 /**
- * turbine-orm/mysql — two-tier tests.
+ * turbine-orm/mysql, two-tier tests.
  *
  *  1. **Build-only + mock-driver** (this lane, `test:unit`, NO DB): assert the
  *     real `mysqlDialect` emits MySQL SQL with zero Postgres-token leakage, and
@@ -27,7 +27,7 @@ import type { RelationDef, SchemaMetadata } from '../schema.js';
 import { mockTable, skipGate } from './helpers.js';
 
 // ===========================================================================
-// Tier 1a — build-only conformance (real mysqlDialect, no DB)
+// Tier 1a, build-only conformance (real mysqlDialect, no DB)
 // ===========================================================================
 
 const usersTable = mockTable(
@@ -79,7 +79,7 @@ function q(): QueryInterface<Record<string, unknown>> {
 const FORBIDDEN =
   /json_agg|json_build_object|::json|::int|::float|ILIKE|\$\d|"users"|"posts"|RETURNING|ON CONFLICT|UNNEST|= ANY|!= ALL/;
 
-describe('turbine-orm/mysql — dialect conformance (no Postgres leakage)', () => {
+describe('turbine-orm/mysql, dialect conformance (no Postgres leakage)', () => {
   it('placeholders are NAMED :pN (not positional ?) and identifiers are backticked', () => {
     const sql = q().buildFindMany({ where: { id: 1 }, limit: 1 }).sql;
     assert.match(sql, /:p\d/, 'must use named :pN placeholders');
@@ -92,7 +92,7 @@ describe('turbine-orm/mysql — dialect conformance (no Postgres leakage)', () =
     const d = q().buildFindMany({ where: { name: { contains: 'Ada', mode: 'insensitive' } }, limit: 5 });
     assert.match(d.sql, /LOWER\(`name`\) LIKE LOWER\(:p\d\) ESCAPE/);
     // LIMIT is an inline integer literal on MySQL (mysql2's binary protocol sends
-    // numbers as DOUBLE, which LIMIT rejects), NOT a :pN param — so it must not
+    // numbers as DOUBLE, which LIMIT rejects), NOT a :pN param, so it must not
     // appear in params.
     assert.match(d.sql, /LIMIT 5$/);
     assert.doesNotMatch(d.sql, /LIMIT :p\d/);
@@ -117,7 +117,7 @@ describe('turbine-orm/mysql — dialect conformance (no Postgres leakage)', () =
     const sql = q().buildFindMany({ with: { posts: { with: { author: true } } } }).sql;
     assert.match(sql, /JSON_ARRAYAGG/);
     // `id` is BIGINT in this fixture, and JSON_OBJECT would render it as a JSON
-    // number (an IEEE double) — measured to return 9007199254740992 for a stored
+    // number (an IEEE double), measured to return 9007199254740992 for a stored
     // 9007199254740993, while a top-level read and the batched loader both give
     // the exact string. So a bigint is carried as CHAR and decoded back with the
     // driver's own safe-integer policy. A non-divergent column is uncast.
@@ -252,7 +252,7 @@ describe('turbine-orm/mysql — dialect conformance (no Postgres leakage)', () =
 });
 
 // ===========================================================================
-// Tier 1b — mock-driver: prove the real MysqlPool binds NAMED params and the
+// Tier 1b, mock-driver: prove the real MysqlPool binds NAMED params and the
 // reselect flow issues write-then-SELECT with correct bindings (no MySQL server)
 // ===========================================================================
 
@@ -297,7 +297,7 @@ function reselectQuery(pool: MysqlPool): QueryInterface<Record<string, unknown>>
   );
 }
 
-describe('turbine-orm/mysql — MysqlPool binds NAMED placeholders', () => {
+describe('turbine-orm/mysql, MysqlPool binds NAMED placeholders', () => {
   it('converts positional params into a { p1, p2, ... } object via mysql2 execute()', async () => {
     const { pool, calls } = fakeMysql2({ rowsFor: () => [{ id: 5 }] });
     const mp = new MysqlPool(pool);
@@ -333,7 +333,7 @@ describe('turbine-orm/mysql — MysqlPool binds NAMED placeholders', () => {
   });
 });
 
-describe('turbine-orm/mysql — reselect result strategy (mock driver)', () => {
+describe('turbine-orm/mysql, reselect result strategy (mock driver)', () => {
   it('create: INSERT (no RETURNING) then SELECT by primary key, NAMED params bound', async () => {
     const { pool, calls } = fakeMysql2({ rowsFor: () => [{ id: 1, name: 'Ada' }] });
     const created = await reselectQuery(new MysqlPool(pool)).create({ data: { id: 1, name: 'Ada' } });
@@ -379,7 +379,7 @@ describe('turbine-orm/mysql — reselect result strategy (mock driver)', () => {
 
   it('optimistic-lock conflict (0 rows updated) throws OptimisticLockError, not the stale row', async () => {
     // reselect engines re-fetch by `where` WITHOUT the version predicate, so a
-    // version conflict must be detected from affected-rows — regression guard.
+    // version conflict must be detected from affected-rows, regression guard.
     const versioned: SchemaMetadata = {
       tables: {
         users: mockTable(
@@ -413,7 +413,7 @@ describe('turbine-orm/mysql — reselect result strategy (mock driver)', () => {
   });
 });
 
-describe('turbine-orm/mysql — introspector (mock executor)', () => {
+describe('turbine-orm/mysql, introspector (mock executor)', () => {
   it('maps information_schema rows into SchemaMetadata (columns, PK, FK relations, m2m, indexes, enums)', async () => {
     // Canned information_schema responses keyed by the leading table name.
     const exec: MysqlRowExecutor = async (sql) => {
@@ -516,7 +516,7 @@ function idx(t: string, name: string, nonUnique: number, c: string, seq: number)
 }
 
 // ===========================================================================
-// Tier 2 — real integration tests (gated on MYSQL_URL / MYSQL_TEST_URL)
+// Tier 2, real integration tests (gated on MYSQL_URL / MYSQL_TEST_URL)
 // ===========================================================================
 
 const MYSQL_URL = process.env.MYSQL_URL ?? process.env.MYSQL_TEST_URL ?? '';
@@ -635,7 +635,7 @@ interface TagRow {
   name: string;
 }
 
-describe('turbine-orm/mysql — integration (real MySQL 8)', () => {
+describe('turbine-orm/mysql, integration (real MySQL 8)', () => {
   // biome-ignore lint/suspicious/noExplicitAny: mysql2 pool is loaded dynamically only when gated on.
   let rawPool: any;
   let pool: MysqlPool;
@@ -662,7 +662,7 @@ describe('turbine-orm/mysql — integration (real MySQL 8)', () => {
     });
     // The 'connection' event yields the raw (callback) connection even on a
     // mysql2/promise pool, so `.catch()` on its non-thenable query() would throw
-    // "result of query that is not a promise" — use the callback form (mirrors
+    // "result of query that is not a promise", use the callback form (mirrors
     // the same fix in src/mysql.ts).
     rawPool.on('connection', (conn: { query: (s: string, cb: () => void) => void }) => {
       conn.query("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')", () => {});
@@ -812,7 +812,7 @@ describe('turbine-orm/mysql — integration (real MySQL 8)', () => {
 
   gate.it('createMany inserts rows; returns an empty array (no RETURNING, documented policy)', async () => {
     const result = await client.table('tags').createMany({ data: [{ name: 'alpha' }, { name: 'beta' }] });
-    assert.deepEqual(result, [], 'MySQL createMany returns [] — rows are still inserted');
+    assert.deepEqual(result, [], 'MySQL createMany returns [], rows are still inserted');
     const all = await client.table('tags').findMany({ where: { name: { in: ['alpha', 'beta'] } } });
     assert.equal(all.length, 2);
   });

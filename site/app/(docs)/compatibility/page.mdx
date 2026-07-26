@@ -7,11 +7,11 @@ export const metadata = {
 
 # Database Compatibility
 
-Turbine is built for PostgreSQL. Because it generates standard SQL (parameterized queries, `json_agg`, correlated subqueries), it also works with databases that speak the PostgreSQL wire protocol — and **this page is about those databases**, the ones that run on Turbine's default Postgres path (CockroachDB, YugabyteDB, AlloyDB, TimescaleDB, Neon, Supabase, and friends).
+Turbine is built for PostgreSQL. Because it generates standard SQL (parameterized queries, `json_agg`, correlated subqueries), it also works with databases that speak the PostgreSQL wire protocol, and **this page is about those databases**, the ones that run on Turbine's default Postgres path (CockroachDB, YugabyteDB, AlloyDB, TimescaleDB, Neon, Supabase, and friends).
 
-> Looking for **SQLite, MySQL, or SQL Server**? Those are first-class non-Postgres engines with their own SQL dialects, not wire-compatible Postgres — see **[Database Engines](/engines)** for setup and the per-engine capability matrix.
+> Looking for **SQLite, MySQL, or SQL Server**? Those are first-class non-Postgres engines with their own SQL dialects, not wire-compatible Postgres, see **[Database Engines](/engines)** for setup and the per-engine capability matrix.
 
-Turbine's internal `Dialect` seam routes query generation, DML, schema DDL, migration-tracking SQL, transactions, streaming, introspection, and TypeScript type mapping through a single contract — quoting, placeholders, JSON aggregation, DML (`RETURNING`, `UNNEST`, `ON CONFLICT`), column types, `CREATE TABLE`, indexes, and `_turbine_migrations` statements all flow through it. That seam is what makes the dedicated SQLite / MySQL / SQL Server engines possible without compromising the Postgres path. The PG-wire-compatible databases below need none of that machinery — they reuse the Postgres dialect directly, with at most a thin [adapter](/cli) for migration locking or catalog quirks.
+Turbine's internal `Dialect` seam routes query generation, DML, schema DDL, migration-tracking SQL, transactions, streaming, introspection, and TypeScript type mapping through a single contract, quoting, placeholders, JSON aggregation, DML (`RETURNING`, `UNNEST`, `ON CONFLICT`), column types, `CREATE TABLE`, indexes, and `_turbine_migrations` statements all flow through it. That seam is what makes the dedicated SQLite / MySQL / SQL Server engines possible without compromising the Postgres path. The PG-wire-compatible databases below need none of that machinery, they reuse the Postgres dialect directly, with at most a thin [adapter](/cli) for migration locking or catalog quirks.
 
 ## Compatibility Matrix
 
@@ -19,7 +19,7 @@ Turbine's internal `Dialect` seam routes query generation, DML, schema DDL, migr
 |---|---|---|---|
 | **PostgreSQL** 14+ (tested) | None (default) | Full | Native target. See the note below. |
 | **AlloyDB** | `alloydb` (no-op) | Full | Google's PG storage engine |
-| **TimescaleDB** | `timescale` (no-op) | Full | PG extension — hypertables introspect fine |
+| **TimescaleDB** | `timescale` (no-op) | Full | PG extension, hypertables introspect fine |
 | **Neon** | None | Full | Use `turbine-orm/serverless` for HTTP driver |
 | **Supabase** | None | Full | Standard Postgres, connect directly |
 | **YugabyteDB** | `yugabytedb` | Full | Distributed lock adapter for migrations |
@@ -29,7 +29,7 @@ Turbine's internal `Dialect` seam routes query generation, DML, schema DDL, migr
 
 ## AlloyDB
 
-[AlloyDB](https://cloud.google.com/alloydb) is Google Cloud's PostgreSQL-compatible database service. Under the hood it **is** PostgreSQL with a custom columnar storage engine — wire protocol, system catalogs, and SQL dialect are identical.
+[AlloyDB](https://cloud.google.com/alloydb) is Google Cloud's PostgreSQL-compatible database service. Under the hood it **is** PostgreSQL with a custom columnar storage engine, wire protocol, system catalogs, and SQL dialect are identical.
 
 **No adapter is needed.** Every Turbine feature works out of the box:
 
@@ -60,7 +60,7 @@ import { alloydb } from 'turbine-orm/adapters';
 // turbine.config.ts
 export default {
   url: process.env.ALLOYDB_URL,
-  adapter: alloydb, // purely documentation — no behavior changes
+  adapter: alloydb, // purely documentation, no behavior changes
 };
 ```
 
@@ -99,7 +99,7 @@ const rows = await db.sql<DailyViews>`
   ORDER BY day DESC
   LIMIT 30
 `;
-//    ^? DailyViews[]  — every ${value} becomes a $N param
+//    ^? DailyViews[] , every ${value} becomes a $N param
 ```
 
 ## YugabyteDB
@@ -150,7 +150,7 @@ const db = new TurbineClient({
 | Area | Difference | Impact |
 |---|---|---|
 | Advisory locks | Per-node, not cluster-wide | Use `yugabytedb` adapter for migrations |
-| Sequences | May have gaps under concurrent inserts | Cosmetic only — IDs are still unique |
+| Sequences | May have gaps under concurrent inserts | Cosmetic only, IDs are still unique |
 | `pg_class.reltuples` | May be stale or zero on new tables | Studio row counts may lag |
 | Index types | Hash indexes not supported | GIN, GiST, B-tree all work |
 
@@ -240,4 +240,4 @@ If your database speaks the PostgreSQL wire protocol and supports:
 
 Then Turbine will likely work out of the box. Connect using the standard `pg` driver and run `npx turbine generate` to verify introspection works.
 
-If you encounter issues with a specific PG-compatible database, [open an issue](https://github.com/zvndev/turbine-orm/issues) — adapters are straightforward to add.
+If you encounter issues with a specific PG-compatible database, [open an issue](https://github.com/zvndev/turbine-orm/issues), adapters are straightforward to add.

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — SQL cache + prepared statement unit tests
+ * turbine-orm, SQL cache + prepared statement unit tests
  *
  * Tests the fingerprinting, SQL template caching, and prepared statement name
  * derivation infrastructure WITHOUT a database connection.
@@ -105,7 +105,7 @@ describe('sqlToPreparedName', () => {
     assert.equal(name.length, 18);
   });
 
-  it('is deterministic — same SQL produces same name', () => {
+  it('is deterministic, same SQL produces same name', () => {
     const sql = 'SELECT * FROM users WHERE id = $1';
     assert.equal(sqlToPreparedName(sql), sqlToPreparedName(sql));
   });
@@ -525,7 +525,7 @@ describe('with-clause caching', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Param correctness — ensure params match SQL placeholders
+// Param correctness, ensure params match SQL placeholders
 // ---------------------------------------------------------------------------
 
 describe('param order correctness', () => {

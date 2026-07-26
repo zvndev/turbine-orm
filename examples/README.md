@@ -1,4 +1,4 @@
-# Turbine ORM — Examples
+# Turbine ORM, Examples
 
 Runnable demos for common hosts, drivers, and flagship features. Each subdirectory is self-contained (own `package.json` / README) unless noted.
 
@@ -18,7 +18,7 @@ npm run dogfood
 
 | Path | Description |
 |---|---|
-| [`nextjs/`](./nextjs/) | Minimal Next.js App Router app — SSR pages, nested relations, streaming. |
+| [`nextjs/`](./nextjs/) | Minimal Next.js App Router app, SSR pages, nested relations, streaming. |
 | [`neon-edge/`](./neon-edge/) | Edge runtime via `@neondatabase/serverless` (Vercel Edge, Cloudflare Workers, Deno Deploy, Netlify Edge). |
 | [`cloudflare-worker/`](./cloudflare-worker/) | Cloudflare Worker + Hyperdrive proxying Postgres through Turbine. |
 | [`vercel-postgres/`](./vercel-postgres/) | Next.js route handler on Vercel Postgres. |
@@ -34,9 +34,9 @@ npm run dogfood
 
 ## Backlog
 
-[`IDEAS.md`](./IDEAS.md) — remaining demo concepts from the v0.7.1 brainstorm.
+[`IDEAS.md`](./IDEAS.md), remaining demo concepts from the v0.7.1 brainstorm.
 
 ## Notes
 
 - Prefer each demo's own README for setup (`DATABASE_URL`, schema push, env vars).
-- There is no root `npm run examples` entry — the old `examples/examples.ts` target was removed; use `npm run dogfood` or run a subdirectory demo directly.
+- There is no root `npm run examples` entry, the old `examples/examples.ts` target was removed; use `npm run dogfood` or run a subdirectory demo directly.

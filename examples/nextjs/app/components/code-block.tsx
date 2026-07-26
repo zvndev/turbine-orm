@@ -1,5 +1,5 @@
 /**
- * Minimal syntax highlighter — no dependencies.
+ * Minimal syntax highlighter, no dependencies.
  * Handles TypeScript/SQL keywords, strings, comments, numbers.
  */
 

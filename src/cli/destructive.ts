@@ -36,7 +36,7 @@ export type DestructiveKind =
   | 'merge-delete';
 
 export interface DestructiveStatement {
-  /** The offending SQL statement (trimmed, possibly long — display truncated) */
+  /** The offending SQL statement (trimmed, possibly long, display truncated) */
   statement: string;
   kind: DestructiveKind;
   /** Best-effort extracted object name (table, schema, or table.column) */
@@ -166,7 +166,7 @@ interface Rule {
   also?: (stmt: string) => boolean;
 }
 
-/** Ordered rules — first match per statement wins. */
+/** Ordered rules, first match per statement wins. */
 const RULES: Rule[] = [
   {
     kind: 'drop-table',

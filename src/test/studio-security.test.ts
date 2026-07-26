@@ -1,5 +1,5 @@
 /**
- * Studio — security-perimeter tests for the HTTP dispatch layer.
+ * Studio, security-perimeter tests for the HTTP dispatch layer.
  *
  * The existing `studio.test.ts` calls the route handlers directly, bypassing
  * the dispatch perimeter (auth token, cross-origin refusal, rate limiting).
@@ -146,14 +146,14 @@ function makeCtx(pool: pg.Pool, stateDir: string): StudioContext {
   };
 }
 
-/** Any statement that could change data or schema — must never be emitted by Studio. */
+/** Any statement that could change data or schema, must never be emitted by Studio. */
 const MUTATING = /\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE)\b/i;
 
 // ---------------------------------------------------------------------------
-// Read-only guarantee — runs DB-less in `npm run test:unit`.
+// Read-only guarantee, runs DB-less in `npm run test:unit`.
 // ---------------------------------------------------------------------------
 
-describe('Studio security — read-only transaction guarantee (DB-less)', () => {
+describe('Studio security, read-only transaction guarantee (DB-less)', () => {
   it('apiBuilder opens BEGIN READ ONLY, commits, and emits no write', async () => {
     const { pool, calls } = makePool();
     const ctx = makeCtx(pool, tmpdir());
@@ -196,7 +196,7 @@ describe('Studio security — read-only transaction guarantee (DB-less)', () => 
 });
 
 // ---------------------------------------------------------------------------
-// HTTP dispatch perimeter — end-to-end against a real server.
+// HTTP dispatch perimeter, end-to-end against a real server.
 // Gated on DATABASE_URL because startStudio probes + introspects a live DB.
 // ---------------------------------------------------------------------------
 
@@ -223,7 +223,7 @@ interface SimpleResponse {
 }
 
 /**
- * Minimal GET via node:http with `agent: false` — every request uses a fresh,
+ * Minimal GET via node:http with `agent: false`, every request uses a fresh,
  * non-keep-alive connection that closes after the response, so the server's
  * `close()` in dispose never blocks on a pooled socket.
  */
@@ -241,7 +241,7 @@ function httpGet(url: string, headers: Record<string, string> = {}): Promise<Sim
   });
 }
 
-describe('Studio security — HTTP dispatch perimeter (end-to-end)', () => {
+describe('Studio security, HTTP dispatch perimeter (end-to-end)', () => {
   let handle: StudioHandle | undefined;
   let base = '';
   let token = '';

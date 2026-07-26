@@ -7,7 +7,7 @@ export const metadata = {
 
 # Relations
 
-Relations are inferred from foreign keys. `npx turbine pull` reads `information_schema` + `pg_catalog` and generates a `*Relations` interface for each table — with the target table, cardinality (`'one'` vs `'many'`), and the join keys baked into a phantom-branded `RelationDescriptor`. That brand is what powers deep `with` type inference.
+Relations are inferred from foreign keys. `npx turbine pull` reads `information_schema` + `pg_catalog` and generates a `*Relations` interface for each table, with the target table, cardinality (`'one'` vs `'many'`), and the join keys baked into a phantom-branded `RelationDescriptor`. That brand is what powers deep `with` type inference.
 
 You rarely declare a relation by hand. Define your foreign keys in `defineSchema()` (or let introspection read them) and the relation falls out.
 
@@ -35,7 +35,7 @@ export default defineSchema({
 const users = await db.users.findMany({
   with: { posts: true },
 });
-// users[0].posts is Post[] — never null, empty array if no rows
+// users[0].posts is Post[], never null, empty array if no rows
 ```
 
 `posts` arrives as `Post[]` on each user, `COALESCE`-d to `[]` so you never have to null-check a collection.
@@ -67,7 +67,7 @@ Without the `unique: true` on `profileId`, Turbine would infer `hasMany` on the 
 
 ## Many-to-many (auto-detected pure junctions)
 
-Turbine auto-detects **pure junction tables** during `generate` and gives both endpoints a flat many-to-many relation. A pure junction is a table whose primary key is exactly two single-column foreign keys and which carries no other columns — for example `posts_tags(post_id, tag_id)`.
+Turbine auto-detects **pure junction tables** during `generate` and gives both endpoints a flat many-to-many relation. A pure junction is a table whose primary key is exactly two single-column foreign keys and which carries no other columns, for example `posts_tags(post_id, tag_id)`.
 
 ```ts
 // schema.ts
@@ -86,7 +86,7 @@ postsTags: {
 },
 ```
 
-Load the related rows directly — no join-table hop:
+Load the related rows directly, no join-table hop:
 
 ```ts
 const posts = await db.posts.findMany({
@@ -104,11 +104,11 @@ const post = await db.posts.findFirst({
 });
 ```
 
-Under the hood Turbine JOINs the target through the junction table and correlates `junction.sourceKey = parent.referenceKey` — still one SQL statement, still `json_agg`.
+Under the hood Turbine JOINs the target through the junction table and correlates `junction.sourceKey = parent.referenceKey`, still one SQL statement, still `json_agg`.
 
 ### Junctions with a payload, or non-pure junctions
 
-A junction table that carries extra columns (a role, a timestamp, an "added by") is a first-class entity, so Turbine keeps it as an ordinary `hasMany` — that's by design. You query it the same way you'd query any relation: through the junction, with the join-table row available.
+A junction table that carries extra columns (a role, a timestamp, an "added by") is a first-class entity, so Turbine keeps it as an ordinary `hasMany`. That's by design. You query it the same way you'd query any relation: through the junction, with the join-table row available.
 
 ```ts
 memberships: {
@@ -128,7 +128,7 @@ const user = await db.users.findUnique({
     },
   },
 });
-// user.memberships[0].role  — the payload is right there
+// user.memberships[0].role , the payload is right there
 // user.memberships[0].organization.name
 
 // Want the flat list without the join-table rows? Flatten in code:
@@ -137,7 +137,7 @@ const orgs = user.memberships.map((m) => m.organization);
 
 ### Declaring a many-to-many by hand
 
-To get the flat m2m relation on a junction that *isn't* pure — or to wire one up explicitly — declare it in your code-first schema with `manyToMany`:
+To get the flat m2m relation on a junction that *isn't* pure, or to wire one up explicitly, declare it in your code-first schema with `manyToMany`:
 
 ```ts
 import { defineSchema } from 'turbine-orm';
@@ -185,7 +185,7 @@ The operations that would also have to write the *target* row (`create`, `connec
 
 ## Self-referential
 
-A self-referencing foreign key (a column on a table that references that same table's primary key) introspects to **both** a `belongsTo` and a `hasMany` on the table. Categories with a `parentId` pointing at another category, comments threaded under a parent comment, an org chart — they all work the same way, including nested trees.
+A self-referencing foreign key (a column on a table that references that same table's primary key) introspects to **both** a `belongsTo` and a `hasMany` on the table. Categories with a `parentId` pointing at another category, comments threaded under a parent comment, an org chart, they all work the same way, including nested trees.
 
 ```ts
 categories: {
@@ -211,13 +211,13 @@ const tree = await db.categories.findFirst({
 });
 ```
 
-When a table has a single self-referencing FK, Turbine auto-names the two relations after the table: the `belongsTo` takes the singular (`category`) and the `hasMany` takes the table name (`categories`). Rename them to `parent` / `children` in your code-first schema if you prefer — the examples above assume you have.
+When a table has a single self-referencing FK, Turbine auto-names the two relations after the table: the `belongsTo` takes the singular (`category`) and the `hasMany` takes the table name (`categories`). Rename them to `parent` / `children` in your code-first schema if you prefer, the examples above assume you have.
 
-Back-references like `posts -> user -> posts` are allowed too — Turbine detects cycles by tracking the recursion path, not by refusing to revisit a table. The depth cap (10) is the guardrail.
+Back-references like `posts -> user -> posts` are allowed too, Turbine detects cycles by tracking the recursion path, not by refusing to revisit a table. The depth cap (10) is the guardrail.
 
-## Nested with — what's available at every level
+## Nested with, what's available at every level
 
-At any level inside a `with` clause you can pass the same options `findMany` accepts (except pagination semantics differ — see below):
+At any level inside a `with` clause you can pass the same options `findMany` accepts (except pagination semantics differ, see below):
 
 ```ts
 await db.users.findMany({
@@ -239,12 +239,12 @@ await db.users.findMany({
 });
 ```
 
-- **`where`** — applies to the relation rows, not the parents.
-- **`orderBy` + `limit`** — applied *per parent* via an inner subquery wrapping. `LIMIT 5` means "5 posts per user," not "5 posts total."
-- **`select` / `omit`** — either one, not both. Picks/drops columns at this level.
-- **Further `with`** — recurses. Depth cap is 10; beyond that Turbine throws `CircularRelationError` (TURBINE_E007) with the full path trail.
+- **`where`**, applies to the relation rows, not the parents.
+- **`orderBy` + `limit`**, applied *per parent* via an inner subquery wrapping. `LIMIT 5` means "5 posts per user," not "5 posts total."
+- **`select` / `omit`**, either one, not both. Picks/drops columns at this level.
+- **Further `with`**, recurses. Depth cap is 10; beyond that Turbine throws `CircularRelationError` (TURBINE_E007) with the full path trail.
 
-> **Relation-array order is not guaranteed.** Without an explicit `orderBy`, a `with` relation comes back in whatever order the loader produces — `json_agg` injects no `ORDER BY`, and the `'auto'` / `'batched'` load strategies can order the same rows differently again. If any code depends on child order, add `orderBy` to that `with` block, or opt into the client-wide `stableRelationOrder` flag (a per-relation `orderBy` always wins over it).
+> **Relation-array order is not guaranteed.** Without an explicit `orderBy`, a `with` relation comes back in whatever order the loader produces, `json_agg` injects no `ORDER BY`, and the `'auto'` / `'batched'` load strategies can order the same rows differently again. If any code depends on child order, add `orderBy` to that `with` block, or opt into the client-wide `stableRelationOrder` flag (a per-relation `orderBy` always wins over it).
 
 ## Relation filters on the parent
 
@@ -267,11 +267,11 @@ await db.users.findMany({
 });
 ```
 
-These compile to `EXISTS` / `NOT EXISTS` subqueries — no relation data is returned, the join is pure filter.
+These compile to `EXISTS` / `NOT EXISTS` subqueries, no relation data is returned, the join is pure filter.
 
 ## Counting and ordering by relations
 
-You don't always need the related rows — sometimes you just need how many. Add `_count` to a `with` clause to get a count per to-many relation without loading the children:
+You don't always need the related rows, sometimes you just need how many. Add `_count` to a `with` clause to get a count per to-many relation without loading the children:
 
 ```ts
 const users = await db.users.findMany({
@@ -280,21 +280,21 @@ const users = await db.users.findMany({
 users[0]._count.posts; // 12
 ```
 
-You can also order a query by a relation — `{ posts: { _count: 'desc' } }` for a to-many count, or `{ author: { name: 'asc' } }` for a to-one target column. Both are covered in the API reference: [relation `_count`](/queries#counting-related-rows--_count) and [ordering by a relation](/queries#ordering-by-a-relation).
+You can also order a query by a relation, `{ posts: { _count: 'desc' } }` for a to-many count, or `{ author: { name: 'asc' } }` for a to-one target column. Both are covered in the API reference: [relation `_count`](/queries#counting-related-rows--_count) and [ordering by a relation](/queries#ordering-by-a-relation).
 
-## Payload size — when to prefer streaming
+## Payload size, when to prefer streaming
 
 The `json_agg` strategy materializes the full object graph in Postgres memory *before* serializing it over the wire. That's fine for bounded queries. It's not fine for unbounded ones.
 
 **Rule of thumb:** if the root `limit` is absent or > ~10k rows, or if a nested `with` has no `limit` on a `hasMany`, stop and reach for `findManyStream` instead.
 
 ```ts
-// Bad — materializes the whole users table + all their posts + all their comments in Postgres RAM
+// Bad, materializes the whole users table + all their posts + all their comments in Postgres RAM
 const all = await db.users.findMany({
   with: { posts: { with: { comments: true } } },
 });
 
-// Good — streams parents, loads relations per batch
+// Good, streams parents, loads relations per batch
 for await (const user of db.users.findManyStream({ batchSize: 500 })) {
   const posts = await db.posts.findMany({
     where: { userId: user.id },
@@ -306,7 +306,7 @@ for await (const user of db.users.findManyStream({ batchSize: 500 })) {
 
 Concrete numbers on a seeded dataset (5K users, 46K posts, 432K comments): the unbounded nested `findMany` above builds a ~180 MB JSON payload server-side before sending a byte. Postgres happily does it. Your Lambda's 512 MB budget does not.
 
-Nested `with` on the streaming API works too — Turbine opens a `DECLARE CURSOR` for the parent query and runs the nested subqueries per-batch:
+Nested `with` on the streaming API works too, Turbine opens a `DECLARE CURSOR` for the parent query and runs the nested subqueries per-batch:
 
 ```ts
 for await (const user of db.users.findManyStream({
@@ -322,7 +322,7 @@ for await (const user of db.users.findManyStream({
 Turbine emits a single correlated subquery per relation, not a `JOIN`. This means a `belongsTo` with 1,000 parents doesn't cartesian-explode against the child table:
 
 ```ts
-// 1,000 posts, each with its 1 author — one SQL statement, one pass over posts, one lookup per row
+// 1,000 posts, each with its 1 author, one SQL statement, one pass over posts, one lookup per row
 await db.posts.findMany({
   limit: 1000,
   with: { user: true },
@@ -341,7 +341,7 @@ FROM "posts"
 LIMIT 1000
 ```
 
-If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop to `db.raw` — Turbine's opinion on relation loading is correlated subqueries; reporting queries have different shape.
+If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop to `db.raw`, Turbine's opinion on relation loading is correlated subqueries; reporting queries have different shape.
 
 ## Load strategy: `auto`, `join`, `batched`, `flatten`
 
@@ -370,7 +370,7 @@ Relation `_count` follows the unindexed rule only, and likewise only on a large 
 
 The correlated-subquery strategy (`relationLoadStrategy: 'join'`) resolves an entire `with` tree in **one** SQL statement: a single round-trip, and an index seek per parent when the child FK is indexed. Two situations favor the alternative:
 
-- **A child FK column is unindexed.** A correlated probe per parent becomes N-parents × full-table-scan. Run [`npx turbine doctor`](/cli#turbine-doctor) to find these — but if you can't add the index yet, batched loading pays that missing index only once.
+- **A child FK column is unindexed.** A correlated probe per parent becomes N-parents × full-table-scan. Run [`npx turbine doctor`](/cli#turbine-doctor) to find these, but if you can't add the index yet, batched loading pays that missing index only once.
 - **Huge result sets.** Nested JSON (`json_build_object` per row, re-serialized inside `json_agg`) is heavier to encode and decode than flat rows.
 
 Opt in per query, or set a client-wide default:
@@ -391,9 +391,9 @@ const db = turbine({
 
 `'batched'` runs the base query without `json_agg` subqueries, then issues **one flat follow-up query per relation** (`WHERE fk = ANY($1)`, chunked at 32,000 keys) and stitches the children onto the parents in memory. D relation levels cost D extra round-trips instead of one, but each is a single indexed key-set lookup and the rows come back flat.
 
-The result is **deep-equal** to the join strategy — same shape, same camelCase keys, same `Date` coercion — so you can flip the flag without touching the rest of your code. It honors per-relation `where` / `select` / `omit` / `orderBy` and nested `with`. The per-relation `limit` is applied **client-side per parent** (a `LIMIT` on a batched `= ANY($1)` would cap total children, not children-per-parent). And it's **transaction-safe**: the follow-up queries run on the same pinned connection, so batched loads inside `$transaction` see the transaction's own writes.
+The result is **deep-equal** to the join strategy, same shape, same camelCase keys, same `Date` coercion, so you can flip the flag without touching the rest of your code. It honors per-relation `where` / `select` / `omit` / `orderBy` and nested `with`. The per-relation `limit` is applied **client-side per parent** (a `LIMIT` on a batched `= ANY($1)` would cap total children, not children-per-parent). And it's **transaction-safe**: the follow-up queries run on the same pinned connection, so batched loads inside `$transaction` see the transaction's own writes.
 
-> **Note.** Composite-key relations aren't supported by `'batched'` — use the `'join'` strategy for those (`'auto'` never batch-falls-back on a composite-key relation).
+> **Note.** Composite-key relations aren't supported by `'batched'`, use the `'join'` strategy for those (`'auto'` never batch-falls-back on a composite-key relation).
 
 ## `'flatten'`: to-one relations as a LEFT JOIN
 
@@ -469,7 +469,7 @@ So the honest pitch for `'flatten'` is: **one round-trip, transaction-trivial, n
 
 ## Lean JSON encoding
 
-With the join strategy, each nested row is a `json_build_object('id', …, 'title', …)` — every key name repeats in every row of every relation. For wide relations over large result sets that repetition dominates the wire payload. `jsonEncoding: 'positional'` (Postgres-only) drops the keys:
+With the join strategy, each nested row is a `json_build_object('id', …, 'title', …)`, every key name repeats in every row of every relation. For wide relations over large result sets that repetition dominates the wire payload. `jsonEncoding: 'positional'` (Postgres-only) drops the keys:
 
 ```ts
 const db = turbine({
@@ -478,9 +478,9 @@ const db = turbine({
 });
 ```
 
-Relation subqueries then emit `json_agg(json_build_array(…))` — a key-less array per row. Turbine knows the column order at build time, so it maps positions back to keys when parsing. The parsed output is **byte-identical** to the default `'object'` encoding; only the wire format changes.
+Relation subqueries then emit `json_agg(json_build_array(…))`, a key-less array per row. Turbine knows the column order at build time, so it maps positions back to keys when parsing. The parsed output is **byte-identical** to the default `'object'` encoding; only the wire format changes.
 
-Measured on a 14-column `hasMany` relation: **39% fewer wire bytes** and ~13% faster end-to-end `findMany`. The win grows with column count and result size. It composes with everything — `select` / `omit`, ordered and limited relations, `hasOne` / `belongsTo`, many-to-many, nested trees. (`relationLoadStrategy: 'batched'` bypasses it entirely — there's no JSON aggregation on that path.) Default is `'object'`, byte-unchanged.
+Measured on a 14-column `hasMany` relation: **39% fewer wire bytes** and ~13% faster end-to-end `findMany`. The win grows with column count and result size. It composes with everything, `select` / `omit`, ordered and limited relations, `hasOne` / `belongsTo`, many-to-many, nested trees. (`relationLoadStrategy: 'batched'` bypasses it entirely, there's no JSON aggregation on that path.) Default is `'object'`, byte-unchanged.
 
 ## SQL template cache size
 
@@ -497,7 +497,7 @@ Values are parameterized (`$1, $2, …`) and never fragment the cache, so this b
 
 ## See also
 
-- **[API Reference](/queries)** — every operator and option in `where`, `with`, `select`.
-- **[Transactions & Pipelines](/transactions)** — batching and atomic groups.
-- **[Serverless](/serverless)** — why `with` depth matters more on the edge.
-- **[Typed Errors](/errors)** — `RelationError` (E005) and `CircularRelationError` (E007).
+- **[API Reference](/queries)**, every operator and option in `where`, `with`, `select`.
+- **[Transactions & Pipelines](/transactions)**, batching and atomic groups.
+- **[Serverless](/serverless)**, why `with` depth matters more on the edge.
+- **[Typed Errors](/errors)**, `RelationError` (E005) and `CircularRelationError` (E007).

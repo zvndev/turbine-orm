@@ -1,9 +1,9 @@
 /**
- * schemaDefToMetadata() — defineSchema() → SchemaMetadata bridge.
+ * schemaDefToMetadata(), defineSchema() → SchemaMetadata bridge.
  *
  * Verifies that a code-first SchemaDef converts to the exact SchemaMetadata
  * shape that introspection + `turbine generate` would produce for the same
- * schema — the shape non-SQL engines (turbinePowDB) and TurbineClient consume.
+ * schema, the shape non-SQL engines (turbinePowDB) and TurbineClient consume.
  * All build-only, no database.
  */
 
@@ -60,7 +60,7 @@ function realisticDef() {
   );
 }
 
-describe('schemaDefToMetadata — full deep-equal against hand-written metadata', () => {
+describe('schemaDefToMetadata, full deep-equal against hand-written metadata', () => {
   it('converts a realistic schema to the exact generated-metadata shape', () => {
     const meta = schemaDefToMetadata(realisticDef());
 
@@ -310,7 +310,7 @@ describe('schemaDefToMetadata — full deep-equal against hand-written metadata'
     for (const t of Object.values(meta.tables)) assert.deepStrictEqual(t.indexes, []);
   });
 
-  it('is a pure function — input SchemaDef is not mutated', () => {
+  it('is a pure function, input SchemaDef is not mutated', () => {
     const def = realisticDef();
     const snapshot = JSON.stringify(def);
     schemaDefToMetadata(def);
@@ -319,10 +319,10 @@ describe('schemaDefToMetadata — full deep-equal against hand-written metadata'
 });
 
 // ---------------------------------------------------------------------------
-// FK disambiguation — two FKs to the same target (mirrors introspection)
+// FK disambiguation, two FKs to the same target (mirrors introspection)
 // ---------------------------------------------------------------------------
 
-describe('schemaDefToMetadata — relation naming', () => {
+describe('schemaDefToMetadata, relation naming', () => {
   it('disambiguates multiple FKs to the same target by FK column name', () => {
     const def = defineSchema({
       users: { id: { type: 'serial', primaryKey: true } },
@@ -396,12 +396,12 @@ describe('schemaDefToMetadata — relation naming', () => {
 });
 
 // ---------------------------------------------------------------------------
-// QueryInterface compatibility — the converted metadata must drive the real
+// QueryInterface compatibility, the converted metadata must drive the real
 // SQL builder, with-clause relations included (this is the PowDB use case:
 // SchemaMetadata consumers that never saw a live database).
 // ---------------------------------------------------------------------------
 
-describe('schemaDefToMetadata — QueryInterface integration (build-only)', () => {
+describe('schemaDefToMetadata, QueryInterface integration (build-only)', () => {
   const meta: SchemaMetadata = schemaDefToMetadata(realisticDef());
 
   it('builds a findMany with a hasMany with-clause over converted metadata', () => {
@@ -443,7 +443,7 @@ describe('schemaDefToMetadata — QueryInterface integration (build-only)', () =
 });
 
 // ---------------------------------------------------------------------------
-// N-4 — shared naming/collision resolution (parity with introspection)
+// N-4, shared naming/collision resolution (parity with introspection)
 // ---------------------------------------------------------------------------
 
 /** Run fn while capturing console.warn calls; returns [result, warnings]. */
@@ -460,7 +460,7 @@ function captureWarnings<T>(fn: () => T): [T, string[]] {
   }
 }
 
-describe('schemaDefToMetadata — collision guard parity with introspection (N-4)', () => {
+describe('schemaDefToMetadata, collision guard parity with introspection (N-4)', () => {
   it('renames a belongsTo that would shadow a concrete scalar column (posts.user text + userId FK)', () => {
     // The verified repro: relation 'user' shadowed the scalar text column, so
     // `where: { user: { contains: 'bob' } }` threw E003 at runtime. The shared
@@ -482,7 +482,7 @@ describe('schemaDefToMetadata — collision guard parity with introspection (N-4
     assert.equal(warnings.length, 1);
     assert.match(warnings[0]!, /userRel/);
 
-    // The scalar column stays targetable through the real SQL builder — the
+    // The scalar column stays targetable through the real SQL builder, the
     // reviewer's exact failing call now compiles into a LIKE filter.
     const q = makeQuery('posts', meta);
     const deferred = q.buildFindMany({ where: { user: { contains: 'bob' } } as never });
@@ -511,7 +511,7 @@ describe('schemaDefToMetadata — collision guard parity with introspection (N-4
 
   it('sibling clobber: two FKs to the same target deriving the same name BOTH survive with correct bindings', () => {
     // Old Pass 3 derived 'sponsor' for BOTH sponsorId (strip) and sponsor
-    // (no suffix) — the second silently overwrote the first, and the survivor
+    // (no suffix), the second silently overwrote the first, and the survivor
     // bound whichever FK came last. Now both survive under distinct names,
     // each bound to its own FK column.
     const def = defineSchema({
@@ -570,7 +570,7 @@ describe('schemaDefToMetadata — collision guard parity with introspection (N-4
   });
 });
 
-describe('schemaDefToMetadata — relation-name parity with buildRelationsFromForeignKeys (N-4)', () => {
+describe('schemaDefToMetadata, relation-name parity with buildRelationsFromForeignKeys (N-4)', () => {
   it('derives IDENTICAL names to introspection-shaped FK entries for the divergent shapes', () => {
     // One logical schema exercising: (1) the posts.user/userId shadow shape,
     // (2) the the dogfood consumer two-FKs-to-one-target shape, (3) a pure junction m2m.

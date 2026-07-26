@@ -10,7 +10,7 @@
  *
  * Every user-supplied key lookup now goes through `Object.hasOwn` (via the
  * `ownLookup` helper), so these keys are rejected with the normal
- * unknown-column E003 message — in `where`, `orderBy`, and `select`, and in the
+ * unknown-column E003 message, in `where`, `orderBy`, and `select`, and in the
  * nested-write `data` classifier.
  */
 

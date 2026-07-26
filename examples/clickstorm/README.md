@@ -1,7 +1,7 @@
-# Clickstorm — atomic updates vs the race
+# Clickstorm, atomic updates vs the race
 
 A minimal "like button" demo that proves why atomic update operators
-matter. Two routes, same database, same pool — the atomic path survives
+matter. Two routes, same database, same pool, the atomic path survives
 10,000 concurrent clicks intact, the read-modify-write path loses 20–60%
 of them to the classic lost-update race.
 
@@ -21,7 +21,7 @@ await db.posts.update({
 ```
 
 Plus: a clean retry loop that uses Turbine's typed `DeadlockError` /
-`SerializationFailureError` with `isRetryable` as a const discriminator —
+`SerializationFailureError` with `isRetryable` as a const discriminator -
 no stringly-typed pg error code matching.
 
 ## Setup
@@ -61,7 +61,7 @@ npm run storm
 ```
 
 The exact "lost" number varies by pool size, hardware, and Postgres
-isolation level — but the atomic path is always exact and the naive path
+isolation level, but the atomic path is always exact and the naive path
 always loses a large chunk.
 
 ## What it shows off
@@ -70,17 +70,17 @@ always loses a large chunk.
 |---|---|
 | **Atomic update operators** | `{ likesCount: { increment: 1 } }` in `likeSafe()` |
 | **Typed Postgres errors** | `DeadlockError`, `SerializationFailureError` with `readonly isRetryable = true` |
-| **Clean retry loop** | `withRetry()` — 10 lines, no pg error-code parsing |
-| **Race-free concurrency** | The proof is in the counter — side-by-side the atomic path always wins |
+| **Clean retry loop** | `withRetry()`, 10 lines, no pg error-code parsing |
+| **Race-free concurrency** | The proof is in the counter, side-by-side the atomic path always wins |
 
 ## Why this is hard elsewhere
 
 - **Prisma:** Supports `{ increment }` but surfaces retryable errors as
   `PrismaClientKnownRequestError` with stringly-typed `code: 'P2034'`.
-  No `isRetryable` const — you end up with a switch on error codes.
+  No `isRetryable` const, you end up with a switch on error codes.
 - **Drizzle:** You have to drop to raw SQL fragments (`sql\`likes_count + 1\``)
   to get the race-free path, which defeats type inference on that column.
-- **Kysely:** Same story as Drizzle — raw SQL fragments for the increment.
+- **Kysely:** Same story as Drizzle, raw SQL fragments for the increment.
 
 ## Files
 
@@ -88,5 +88,5 @@ always loses a large chunk.
 |---|---|
 | `schema.ts` | One table, one counter column |
 | `seed.ts` | Creates the single post that gets hammered |
-| `server.ts` | HTTP server — `/like/safe`, `/like/unsafe`, `/count`, `/reset` |
-| `storm.ts` | Load generator — fires N concurrent clicks at each route |
+| `server.ts` | HTTP server, `/like/safe`, `/like/unsafe`, `/count`, `/reset` |
+| `storm.ts` | Load generator, fires N concurrent clicks at each route |
