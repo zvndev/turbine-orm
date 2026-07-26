@@ -608,6 +608,120 @@ export function buildJsonPathOrderEntry(
 }
 
 /**
+ * Order by a column reached through TWO OR MORE to-one relation hops, e.g.
+ * `orderBy: { model: { category: { name: 'asc' } } }`.
+ *
+ * One hop already compiled to a correlated scalar subquery; each additional
+ * hop is added to that same subquery as an INNER JOIN, so the whole chain is
+ * one subquery with one `LIMIT 1` regardless of depth:
+ *
+ *   (SELECT t1."name"
+ *      FROM "models" t0
+ *      JOIN "categories" t1 ON t1."id" = t0."category_id"
+ *     WHERE t0."id" = "versions"."model_id"
+ *     LIMIT 1) ASC
+ *
+ * Every hop must be to-one. A to-many hop has no single value to order by, so
+ * it is refused rather than silently picking an arbitrary row (`{ pick, by }`
+ * exists for that, deliberately, because it forces the caller to say WHICH
+ * row). Each hop's target global filter is applied to its join condition, so
+ * ordering never keys off a soft-deleted or other-tenant row.
+ */
+function buildChainedToOneOrderBy(
+  qi: BuilderCtx,
+  head: { relName: string; relDef: RelationDef; alias: string; correlation: string },
+  nextRelName: string,
+  nextValue: Record<string, unknown>,
+  params?: unknown[],
+): string {
+  const joins: string[] = [];
+  let currentMeta = qi.schema.tables[head.relDef.to];
+  let currentAlias = head.alias;
+  let hop = 0;
+  let relName = nextRelName;
+  let value = nextValue;
+  const path = [head.relName];
+
+  // Walk the chain, emitting one JOIN per hop, until the value stops being a
+  // relation object. Bounded by the same depth cap as nested `with`.
+  for (;;) {
+    if (!currentMeta) throw new RelationError(`[turbine] Unknown relation target in orderBy chain "${path.join('.')}"`);
+    const relDef = ownLookup(currentMeta.relations, relName);
+    if (!relDef) {
+      throw new ValidationError(
+        `[turbine] Unknown relation "${relName}" in orderBy on relation "${path.join('.')}" ` +
+          `(table "${currentMeta.name}"). Available: ${Object.keys(currentMeta.relations).join(', ') || '(none)'}.`,
+      );
+    }
+    if (relDef.type !== 'belongsTo' && relDef.type !== 'hasOne') {
+      throw new ValidationError(
+        `[turbine] orderBy cannot traverse the to-many relation "${relName}" on "${currentMeta.name}" ` +
+          `(path "${path.concat(relName).join('.')}"): a to-many relation has no single value to order by. ` +
+          `Use a pick-row ordering ({ pick, by }) at the top level, or order by "_count".`,
+      );
+    }
+    if (++hop > MAX_ORDER_BY_RELATION_HOPS) {
+      throw new CircularRelationError(path.concat(relName));
+    }
+
+    const nextMeta = qi.schema.tables[relDef.to];
+    if (!nextMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}" in orderBy`);
+    const nextAlias = `${head.alias}c${hop}`;
+    const on =
+      relDef.type === 'belongsTo'
+        ? qi.dialect.buildCorrelation(nextAlias, relDef.referenceKey, currentAlias, relDef.foreignKey)
+        : qi.dialect.buildCorrelation(nextAlias, relDef.foreignKey, currentAlias, relDef.referenceKey);
+    let onSql = on;
+    if (params) {
+      const gf = whereMod.targetGlobalFilterAlias(qi, relDef.to, nextAlias, params);
+      if (gf) onSql += ` AND ${gf}`;
+    }
+    joins.push(`JOIN ${qi.q(relDef.to)} ${nextAlias} ON ${onSql}`);
+
+    path.push(relName);
+    currentMeta = nextMeta;
+    currentAlias = nextAlias;
+
+    // Exactly one key per level, as with the single-hop form.
+    const entries = Object.entries(value);
+    if (entries.length !== 1) {
+      throw new ValidationError(
+        `[turbine] orderBy on relation "${path.join('.')}" needs exactly one key per level ` +
+          `(got: ${entries.map(([k]) => k).join(', ') || '(empty)'}).`,
+      );
+    }
+    const [key, entryValue] = entries[0]!;
+    if (ownLookup(currentMeta.relations, key) && isRelationOrderByValue(qi, entryValue)) {
+      relName = key;
+      value = entryValue as Record<string, unknown>;
+      continue;
+    }
+
+    // Terminal: a column on the last table in the chain.
+    const snakeCol = ownLookup(currentMeta.columnMap, key) ?? camelToSnake(key);
+    if (!currentMeta.allColumns.includes(snakeCol)) {
+      throw new ValidationError(
+        `[turbine] Unknown column "${key}" in orderBy on relation "${path.join('.')}" (table "${currentMeta.name}").`,
+      );
+    }
+    const { dir, nulls } = normalizeOrderBy(entryValue as OrderDirection | OrderBySpec);
+    let where = head.correlation;
+    if (params) {
+      const gf = whereMod.targetGlobalFilterAlias(qi, head.relDef.to, head.alias, params);
+      if (gf) where += ` AND ${gf}`;
+    }
+    const from = `${qi.q(head.relDef.to)} ${head.alias} ${joins.join(' ')}`;
+    return (
+      `(SELECT ${currentAlias}.${qi.q(snakeCol)} FROM ${from} WHERE ${where}${qi.limitOneClause()}) ` +
+      `${dir}${nullsSuffix(qi, nulls)}`
+    );
+  }
+}
+
+/** Depth cap for a chained relation orderBy, mirroring the nested-`with` cap. */
+const MAX_ORDER_BY_RELATION_HOPS = 10;
+
+/**
  * Compile a relation ordering term. For a to-many relation the only allowed
  * key is `_count`, which becomes a correlated `COUNT(*)` subquery. For a
  * to-one relation each entry names a target column and becomes a correlated
@@ -690,12 +804,31 @@ export function buildRelationOrderBy(
   }
   return entries
     .map(([col, dirValue]) => {
+      // A nested relation: `orderBy: { model: { category: { name: 'asc' } } }`.
+      // Each further to-one hop becomes a JOIN inside the SAME correlated
+      // subquery rather than another level of nesting, so an N-hop chain still
+      // costs one subquery.
+      const nestedRel = ownLookup(targetMeta.relations, col);
+      if (nestedRel && isRelationOrderByValue(qi, dirValue)) {
+        return buildChainedToOneOrderBy(
+          qi,
+          { relName, relDef, alias, correlation },
+          col,
+          dirValue as Record<string, unknown>,
+          params,
+        );
+      }
+
       // columnMap-first resolution (camelToSnake fallback): mirrors the
       // scalar orderBy path so camelCase-named DB columns resolve here too.
       const snakeCol = ownLookup(targetMeta.columnMap, col) ?? camelToSnake(col);
       if (!targetMeta.allColumns.includes(snakeCol)) {
+        const relationHint = ownLookup(targetMeta.relations, col)
+          ? ` "${col}" is a relation on "${relDef.to}": order by one of ITS columns, e.g. ` +
+            `{ ${relName}: { ${col}: { <column>: 'asc' } } }.`
+          : '';
         throw new ValidationError(
-          `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").`,
+          `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").${relationHint}`,
         );
       }
       const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
