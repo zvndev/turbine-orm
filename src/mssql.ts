@@ -102,6 +102,7 @@ import {
   type DialectIntrospector,
   type InsertStatementInput,
   type IntrospectOptions,
+  type JsonWireRule,
   type LimitOffsetInput,
   postgresDialect,
   type RelationSubqueryContext,
@@ -600,6 +601,31 @@ export const mssqlDialect: Dialect = {
   },
 
   // SQL Server aggregate casts: COUNT → INT, AVG/float → FLOAT.
+  jsonWireRule(columnType: string): JsonWireRule | undefined {
+    const t = columnType.toLowerCase();
+
+    // FOR JSON PATH renders BIGINT as a JSON number, which is an IEEE double:
+    // a stored 9007199254740993 came back 9007199254740992 through the join
+    // strategy, while a top-level read and the batched loader both returned
+    // the exact decimal string. The tedious driver returns BIGINT as a STRING
+    // unconditionally (verified for both small and large values), so carrying
+    // text and keeping it reproduces the driver exactly.
+    if (t === 'bigint') {
+      return { sql: (ref) => `CAST(${ref} AS NVARCHAR(50))`, decode: (value) => value };
+    }
+
+    // Binary columns come out of FOR JSON PATH as BASE64 text ("AQL/") rather
+    // than bytes. Style 2 converts to bare hex, which rebuilds exactly.
+    if (t === 'binary' || t === 'varbinary' || t === 'image') {
+      return {
+        sql: (ref) => `CONVERT(VARCHAR(MAX), ${ref}, 2)`,
+        decode: (value) => (typeof value === 'string' ? Uint8Array.from(Buffer.from(value, 'hex')) : value),
+      };
+    }
+
+    return undefined;
+  },
+
   castAggregate(expr: string, target: 'int' | 'float'): string {
     return `CAST(${expr} AS ${target === 'int' ? 'INT' : 'FLOAT'})`;
   },
@@ -896,11 +922,22 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
   const hasOrder = orderEntries.length > 0;
   const hasLimit = spec !== true && spec.limit !== undefined;
 
-  /** `<alias>.<col> AS [<field>]` selection for the FOR JSON object keys. */
+  /**
+   * `<alias>.<col> AS [<field>]` selection for the FOR JSON object keys.
+   *
+   * A column whose FOR JSON rendering diverges from the driver's own value is
+   * wrapped by the dialect's {@link Dialect.jsonWireRule} cast, exactly as the
+   * shared `json_build_object` path does — this generator is an override, so it
+   * has to opt in explicitly or BIGINT silently loses precision and a binary
+   * column arrives as base64 text.
+   */
   const colSelect = (a: string): string[] =>
     targetColumns.map((col) => {
       const field = targetMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-      return `${a}.${q(col)} AS ${q(field)}`;
+      const ref = `${a}.${q(col)}`;
+      const type = targetMeta.pgTypes?.[col];
+      const expr = (type && dialect.jsonWireRule?.(type)?.sql(ref)) ?? ref;
+      return `${expr} AS ${q(field)}`;
     });
 
   /** Build nested relations as `JSON_QUERY((<subquery>)) AS [<name>]` columns (pushes their params). */
