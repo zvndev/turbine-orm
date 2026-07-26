@@ -1,5 +1,5 @@
 /**
- * turbine-orm — YugabyteDB adapter
+ * turbine-orm, YugabyteDB adapter
  *
  * YugabyteDB is a distributed SQL database that speaks the PostgreSQL wire
  * protocol. It supports most PostgreSQL features including json_agg,
@@ -7,28 +7,28 @@
  *
  * Key differences from PostgreSQL that this adapter addresses:
  *
- * 1. **Advisory locks are per-node** — `pg_try_advisory_lock()` is supported
+ * 1. **Advisory locks are per-node**, `pg_try_advisory_lock()` is supported
  *    but only scoped to the tserver node handling the connection. In a
  *    multi-node cluster, two concurrent `turbine migrate` runs routed to
  *    different nodes would both acquire the "same" advisory lock. This adapter
  *    provides a table-based distributed lock using `SELECT FOR UPDATE NOWAIT`
  *    which is cluster-wide via YugabyteDB's distributed transactions.
  *
- * 2. **Sequences may have gaps** — YugabyteDB uses distributed sequences.
+ * 2. **Sequences may have gaps**, YugabyteDB uses distributed sequences.
  *    SERIAL/BIGSERIAL columns work correctly but may produce non-contiguous
  *    IDs under concurrent inserts. This is purely cosmetic and does not affect
  *    Turbine's behavior.
  *
- * 3. **pg_catalog** — Mostly complete. `pg_indexes`, `pg_type`, `pg_enum`,
+ * 3. **pg_catalog**, Mostly complete. `pg_indexes`, `pg_type`, `pg_enum`,
  *    `information_schema.columns` all work. Row estimate via `pg_class.reltuples`
  *    may be stale or zero on recently created tables (YugabyteDB's stats
  *    collection is asynchronous). This adapter provides an override that
  *    falls back to `yb_table_properties` when available.
  *
  * Features that work identically to PostgreSQL (no adapter override needed):
- * - `json_agg` / `json_build_object` — fully supported
- * - Correlated subqueries — fully supported
- * - `COALESCE`, `LIMIT`, `OFFSET`, `ORDER BY` — fully supported
+ * - `json_agg` / `json_build_object`, fully supported
+ * - Correlated subqueries, fully supported
+ * - `COALESCE`, `LIMIT`, `OFFSET`, `ORDER BY`, fully supported
  * - `information_schema` for table/column/constraint introspection
  * - Extended query protocol (parameterized queries, pipeline batching)
  * - Transactions with `SAVEPOINT` (nested transactions)
@@ -122,7 +122,7 @@ export const yugabytedb: DatabaseAdapter = {
         `UPDATE "${LOCK_TABLE}" SET acquired_at = now(), acquired_by = current_user WHERE lock_id = $1`,
         [lockId],
       );
-      // Leave the transaction open — lock is held until releaseLock()
+      // Leave the transaction open, lock is held until releaseLock()
       return true;
     } catch (err: unknown) {
       const pgErr = err as { code?: string };
@@ -135,7 +135,7 @@ export const yugabytedb: DatabaseAdapter = {
         }
         return false;
       }
-      // Any other error — rollback and re-throw
+      // Any other error, rollback and re-throw
       try {
         await client.query('ROLLBACK');
       } catch {
@@ -150,7 +150,7 @@ export const yugabytedb: DatabaseAdapter = {
     try {
       await client.query('COMMIT');
     } catch {
-      // If commit fails, try rollback — either way the lock is released
+      // If commit fails, try rollback, either way the lock is released
       try {
         await client.query('ROLLBACK');
       } catch {

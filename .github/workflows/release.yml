@@ -9,7 +9,7 @@ name: Release
 #      (Settings → Secrets and variables → Actions → New repository secret)
 #
 # Usage:
-#   npm version patch   # or minor / major — bumps package.json and creates a git tag
+#   npm version patch   # or minor / major, bumps package.json and creates a git tag
 #   git push --follow-tags
 #
 # The workflow runs lint → typecheck → unit tests → build, then the release
@@ -73,14 +73,14 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Bundle size gate — size-limit is the single source of truth (same check
+      # Bundle size gate, size-limit is the single source of truth (same check
       # CI runs). Measures the bundled import graph against .size-limit.js limits
       # (~31 kB main / ~22 kB edge, under 35/25 ceilings). Replaces the previous
       # stale hard-coded 150 kB tarball check that never matched reality.
       - name: Verify bundle sizes
         run: npx size-limit
 
-  # Postgres integration gate — mirrors ci.yml's integration-tests but pinned to
+  # Postgres integration gate, mirrors ci.yml's integration-tests but pinned to
   # a single representative major (16). Seeds src/test/fixtures/seed.sql, then
   # runs the full DB-backed suite so a tag can never publish SQL that a real
   # Postgres rejects. The 14/15/16/17 matrix stays in ci.yml on push.
@@ -118,7 +118,7 @@ jobs:
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
 
-  # Packed-tarball smoke gate — mirrors ci.yml's pack-smoke. Installs the real
+  # Packed-tarball smoke gate, mirrors ci.yml's pack-smoke. Installs the real
   # `npm pack` output into a clean temp project and verifies the published
   # package surface (ESM import, CJS require, CLI bin, and every subpath export)
   # so a tag can never publish a broken exports map or missing dist file.
@@ -323,7 +323,7 @@ jobs:
               exit 1
             fi
           else
-            # workflow_dispatch — create tag if it doesn't exist
+            # workflow_dispatch, create tag if it doesn't exist
             if ! git rev-parse "v$PKG_VERSION" >/dev/null 2>&1; then
               git tag "v$PKG_VERSION"
               git push origin "v$PKG_VERSION"
@@ -342,7 +342,7 @@ jobs:
         run: |
           PKG_VERSION=$(jq -r .version package.json)
           if npm view "turbine-orm@$PKG_VERSION" version >/dev/null 2>&1; then
-            echo "already=true >> note: turbine-orm@$PKG_VERSION already on npm — skipping publish"
+            echo "already=true >> note: turbine-orm@$PKG_VERSION already on npm, skipping publish"
             echo "already=true" >> "$GITHUB_OUTPUT"
           else
             echo "already=false" >> "$GITHUB_OUTPUT"
@@ -389,6 +389,6 @@ jobs:
           npx turbine --version | grep -F "$PKG_VERSION"
           echo "Post-publish smoke test passed for turbine-orm@$PKG_VERSION"
 
-      - name: Dry run — verify package
+      - name: Dry run, verify package
         if: ${{ github.event.inputs.dry_run == 'true' }}
         run: npm pack --dry-run

@@ -1,5 +1,5 @@
 /**
- * turbine-orm CLI — Configuration file support
+ * turbine-orm CLI, Configuration file support
  *
  * Loads turbine.config.ts (or .js/.mjs) via dynamic import.
  * Falls back to CLI args and environment variables.
@@ -24,6 +24,15 @@ export interface TurbineCliConfig {
   include?: string[];
   /** Tables to exclude */
   exclude?: string[];
+  /**
+   * Rename derived relations, as `{ table: { derivedName: desiredName } }`.
+   *
+   * Relation names are composed by introspection (a database does not name its
+   * relationships), so two foreign keys to the same table produce names nobody
+   * would predict, and a port from another ORM that named them differently has
+   * to hand-edit every call site. A typo here is an error, not a silent no-op.
+   */
+  relationNames?: Record<string, Record<string, string>>;
   /**
    * Extension for the generated `index.ts` sibling imports (F3):
    * `'js'` (`./types.js`), `'none'` (`./types`), or `'auto'` (default:
@@ -80,7 +89,7 @@ export type TurbineConfig = TurbineCliConfig;
  * path rather than a Postgres schema name? `schema` is the Postgres namespace
  * to introspect (default `public`); the schema-builder file goes in `schemaFile`.
  * A value containing a path separator or a JS/TS extension is almost certainly a
- * mis-set `schemaFile` — introspecting `WHERE table_schema = './turbine/schema.ts'`
+ * mis-set `schemaFile`, introspecting `WHERE table_schema = './turbine/schema.ts'`
  * silently matches zero tables. Used by `turbine generate` to fail loudly.
  */
 export function looksLikeSchemaFilePath(schema: string): boolean {
@@ -270,6 +279,8 @@ export interface ResolvedConfig {
   keepColumnNames: boolean;
   /** Resolved opt-out of the unique-FK → hasOne introspection flip (F2). */
   legacyToManyUniques: boolean;
+  /** Resolved derived-relation rename map, or undefined when none is declared. */
+  relationNames?: Record<string, Record<string, string>>;
 }
 
 export interface CliOverrides {
@@ -293,6 +304,7 @@ export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverri
     out: overrides.out ?? fileConfig.out ?? './generated/turbine',
     schema: overrides.schema ?? fileConfig.schema ?? 'public',
     include: overrides.include ?? fileConfig.include ?? [],
+    relationNames: fileConfig.relationNames,
     exclude: overrides.exclude ?? fileConfig.exclude ?? [],
     migrationsDir: fileConfig.migrationsDir ?? './turbine/migrations',
     // `seedFile` is canonical (what the docs and `turbine init` use); `seed` is a

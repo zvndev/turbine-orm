@@ -26,7 +26,7 @@ npm start
 ## Deploy
 
 The site deploys to the Vercel project `zvn-dev/turbine-docs` (the canonical
-home of `https://turbineorm.dev`). The main thread handles the deploy — see
+home of `https://turbineorm.dev`). The main thread handles the deploy, see
 `AGENTS.md` at the repo root for the current flow. Typically:
 
 ```bash
@@ -68,4 +68,4 @@ Code blocks are highlighted by [rehype-pretty-code](https://rehype-pretty.pages.
 - Tailwind CSS 3
 - `@next/mdx` + `@mdx-js/react`
 - `rehype-pretty-code` + Shiki for syntax highlighting
-- `next/font/google` — Geist Mono (headings + code) and Inter (body)
+- `next/font/google`, Geist Mono (headings + code) and Inter (body)

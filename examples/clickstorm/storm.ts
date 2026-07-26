@@ -1,5 +1,5 @@
 /**
- * Load generator — fires N concurrent requests at /like/safe and /like/unsafe
+ * Load generator, fires N concurrent requests at /like/safe and /like/unsafe
  * in sequence, then reports how many clicks survived.
  *
  * Expected result: /like/safe lands exactly N. /like/unsafe loses 20-60%

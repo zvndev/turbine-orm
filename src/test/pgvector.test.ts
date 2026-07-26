@@ -1,5 +1,5 @@
 /**
- * turbine-orm — pgvector similarity search tests
+ * turbine-orm, pgvector similarity search tests
  *
  * Covers two things:
  *
@@ -16,7 +16,7 @@
  *
  *  2. **Integration (DATABASE_URL-gated AND extension-gated).** pgvector may not
  *     be installed; without DATABASE_URL the tests register as skipped via
- *     skipGate(), and `t.skip()` covers a missing extension — never failed.
+ *     skipGate(), and `t.skip()` covers a missing extension, never failed.
  *
  * Run: npx tsx --test src/test/pgvector.test.ts
  */
@@ -31,7 +31,7 @@ import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// Build-only (no DB) — PRIMARY gate
+// Build-only (no DB), PRIMARY gate
 // ---------------------------------------------------------------------------
 
 /** A schema with an `items` table that has an `embedding` vector column. */
@@ -48,7 +48,7 @@ function qi() {
   return makeQuery('items', vectorSchema());
 }
 
-describe('pgvector — build-only', () => {
+describe('pgvector, build-only', () => {
   it('KNN orderBy emits "<=> $1::vector ASC" and binds the [...] string; LIMIT is separate', () => {
     const q = qi();
     const { sql, params } = q.buildFindMany({
@@ -184,7 +184,7 @@ describe('pgvector — build-only', () => {
       ValidationError,
     );
     // Even if a build somehow produced SQL, the payload must not be present.
-    // (Build threw, so there is no SQL — assert via a guarded re-run.)
+    // (Build threw, so there is no SQL, assert via a guarded re-run.)
     let leaked = false;
     try {
       const { sql } = q.buildFindMany({
@@ -255,7 +255,7 @@ if (SKIP_DB) {
 // it and skip individual probes inside `it` when the extension is unavailable.
 const dbDescribe = describe;
 
-dbDescribe('pgvector — integration', () => {
+dbDescribe('pgvector, integration', () => {
   // Without DATABASE_URL these tests register as skipped (visible in the
   // reporter summary) and the before/after hooks become no-ops.
   const { it, before, after } = skipGate(SKIP_DB, 'DATABASE_URL not set');

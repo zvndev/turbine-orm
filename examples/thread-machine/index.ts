@@ -1,5 +1,5 @@
 /**
- * Thread Machine — deep typed `with` inference in one query.
+ * Thread Machine, deep typed `with` inference in one query.
  *
  * This is the whole demo:
  *
@@ -11,7 +11,7 @@
  *          ^Story  ^Comment   ^Reply    ^User   ^string
  *
  * Try it yourself: hover any property in your editor. The whole tree is
- * inferred from the `with` clause — not from manual type assertions, not
+ * inferred from the `with` clause, not from manual type assertions, not
  * from a separate relations declaration file.
  *
  * Run with `npm start`.
@@ -54,7 +54,7 @@ async function main() {
   console.log();
 
   // The payoff: every property below autocompletes in your editor.
-  // Try it — put your cursor on `handle`, `body`, anything.
+  // Try it, put your cursor on `handle`, `body`, anything.
   for (const story of stories) {
     console.log(`\x1b[1m${story.score}  ${story.title}\x1b[0m`);
     console.log(`        by @${story.author.handle} · ${story.author.karma} karma`);

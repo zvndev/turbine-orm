@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Observability module tests
+ * turbine-orm, Observability module tests
  *
  * Tests the in-memory buffer, percentile calculation, flush logic,
  * and event listener wiring. No real database needed.

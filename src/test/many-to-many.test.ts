@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Many-to-many (junction table) tests
+ * turbine-orm, Many-to-many (junction table) tests
  *
  * Three layers:
  *
@@ -27,12 +27,12 @@ import type { RelationDef, SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// Build-only (no DB) — m2m JOIN-through-junction SQL
+// Build-only (no DB), m2m JOIN-through-junction SQL
 // ---------------------------------------------------------------------------
 
 /**
  * Mock schema: posts <-> tags through posts_tags(post_id, tag_id).
- *   posts.tags — manyToMany through posts_tags
+ *   posts.tags, manyToMany through posts_tags
  */
 function m2mSchema(): SchemaMetadata {
   const tagsRel: RelationDef = {
@@ -196,7 +196,7 @@ testFn('many-to-many integration', () => {
         PRIMARY KEY (post_id, tag_id)
       )
     `;
-    // A junction-with-PAYLOAD table — two FKs but an extra `note` column. The
+    // A junction-with-PAYLOAD table, two FKs but an extra `note` column. The
     // heuristic must NOT treat this as a pure junction (it's a first-class
     // entity), so no manyToMany relation should be auto-detected from it.
     await setup.sql`
@@ -251,7 +251,7 @@ testFn('many-to-many integration', () => {
   it('does NOT auto-detect m2m through a junction carrying payload columns', () => {
     // _t2b_payload_link has two FKs (post_id, tag_id) but ALSO a `note` column,
     // so it is a first-class entity, not a pure junction. The conservative
-    // heuristic must skip it — posts/tags get NO m2m routed through it.
+    // heuristic must skip it, posts/tags get NO m2m routed through it.
     const posts = schema.tables._t2b_posts!;
     const tags = schema.tables._t2b_tags!;
     const viaPayload = [...Object.values(posts.relations), ...Object.values(tags.relations)].find(

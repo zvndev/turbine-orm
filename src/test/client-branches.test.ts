@@ -1,15 +1,15 @@
 /**
- * turbine-orm — TurbineClient branch coverage tests
+ * turbine-orm, TurbineClient branch coverage tests
  *
  * Covers branch paths in src/client.ts not exercised by client-coverage.test.ts:
  *   1. Transaction isolation levels (ReadCommitted, RepeatableRead, Serializable)
- *   2. Nested transactions — SAVEPOINT/RELEASE/ROLLBACK TO with depth
- *   3. $use middleware chain — multiple middlewares compose in order
- *   4. External pool mode — disconnect() is a no-op
- *   5. Logging mode — console output on key operations
- *   6. withRetry utility — retryable errors, non-retryable, max attempts
+ *   2. Nested transactions, SAVEPOINT/RELEASE/ROLLBACK TO with depth
+ *   3. $use middleware chain, multiple middlewares compose in order
+ *   4. External pool mode, disconnect() is a no-op
+ *   5. Logging mode, console output on key operations
+ *   6. withRetry utility, retryable errors, non-retryable, max attempts
  *
- * No real database required — uses mock pool.
+ * No real database required, uses mock pool.
  *
  * Run: npx tsx --test src/test/client-branches.test.ts
  */
@@ -79,7 +79,7 @@ function buildSchema(): SchemaMetadata {
 // 1. Transaction isolation levels
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient.$transaction — isolation levels', () => {
+describe('TurbineClient.$transaction, isolation levels', () => {
   it('ReadCommitted sends correct BEGIN SQL', async () => {
     const { pool, calls } = createMockPool();
     const db = new TurbineClient({ pool }, buildSchema());
@@ -125,7 +125,7 @@ describe('TurbineClient.$transaction — isolation levels', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 1b. Failed BEGIN — no stray ROLLBACK (adversarial-review regression)
+// 1b. Failed BEGIN, no stray ROLLBACK (adversarial-review regression)
 // ---------------------------------------------------------------------------
 //
 // If BEGIN itself throws (e.g. a single-writer engine's transaction gate times
@@ -158,7 +158,7 @@ const createBeginFailPool = (): { pool: PgCompatPool; calls: QueryCall[] } => {
   return { pool, calls };
 };
 
-describe('TurbineClient — failed BEGIN issues no stray ROLLBACK', () => {
+describe('TurbineClient, failed BEGIN issues no stray ROLLBACK', () => {
   it('$transaction: BEGIN failure propagates and sends NO rollback', async () => {
     const { pool, calls } = createBeginFailPool();
     const db = new TurbineClient({ pool }, buildSchema());
@@ -217,10 +217,10 @@ describe('TurbineClient — failed BEGIN issues no stray ROLLBACK', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. Nested transactions — SAVEPOINT / RELEASE / ROLLBACK TO
+// 2. Nested transactions, SAVEPOINT / RELEASE / ROLLBACK TO
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient.$transaction — nested savepoints (branch coverage)', () => {
+describe('TurbineClient.$transaction, nested savepoints (branch coverage)', () => {
   it('SAVEPOINT is created and RELEASE on success', async () => {
     const { pool, calls } = createMockPool();
     const db = new TurbineClient({ pool }, buildSchema());
@@ -282,10 +282,10 @@ describe('TurbineClient.$transaction — nested savepoints (branch coverage)', (
 });
 
 // ---------------------------------------------------------------------------
-// 3. $use middleware chain — multiple middlewares execute in order
+// 3. $use middleware chain, multiple middlewares execute in order
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient.$use — middleware chain (branch coverage)', () => {
+describe('TurbineClient.$use, middleware chain (branch coverage)', () => {
   it('three middlewares execute in registration order with correct nesting', async () => {
     const { pool } = createMockPool();
     const db = new TurbineClient({ pool }, buildSchema());
@@ -338,10 +338,10 @@ describe('TurbineClient.$use — middleware chain (branch coverage)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. External pool mode — disconnect() is a no-op
+// 4. External pool mode, disconnect() is a no-op
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient — external pool mode (branch coverage)', () => {
+describe('TurbineClient, external pool mode (branch coverage)', () => {
   it('disconnect() does not call pool.end()', async () => {
     const { pool, ended } = createMockPool();
     const db = new TurbineClient({ pool }, buildSchema());
@@ -383,10 +383,10 @@ describe('TurbineClient — external pool mode (branch coverage)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Logging mode — console output
+// 5. Logging mode, console output
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient — logging mode (branch coverage)', () => {
+describe('TurbineClient, logging mode (branch coverage)', () => {
   it('logging: true logs on external pool creation', () => {
     const logs: string[] = [];
     const origLog = console.log;
@@ -467,10 +467,10 @@ describe('TurbineClient — logging mode (branch coverage)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. withRetry utility — retryable, non-retryable, max attempts
+// 6. withRetry utility, retryable, non-retryable, max attempts
 // ---------------------------------------------------------------------------
 
-describe('withRetry — branch coverage', () => {
+describe('withRetry, branch coverage', () => {
   it('retries on isRetryable error and succeeds', async () => {
     let attempt = 0;
     const result = await withRetry(

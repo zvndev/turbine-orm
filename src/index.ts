@@ -1,7 +1,7 @@
 /**
  * turbine-orm
  *
- * Turbine TypeScript SDK — type-safe Postgres queries with nested relations
+ * Turbine TypeScript SDK, type-safe Postgres queries with nested relations
  * and pipeline batching. Feels like Prisma, runs at raw-SQL speed.
  *
  * @example
@@ -198,7 +198,7 @@ export {
   type WithOrderByObject,
   type WithResult,
 } from './query/index.js';
-// Realtime — LISTEN/NOTIFY pub/sub
+// Realtime, LISTEN/NOTIFY pub/sub
 export { type ActiveSubscription, type NotificationHandler, type Subscription, validateChannel } from './realtime.js';
 // Schema metadata types
 export type {
@@ -225,7 +225,7 @@ export {
   snakeToPascal,
   withDbFieldNames,
 } from './schema.js';
-// Schema builder — define schemas in TypeScript
+// Schema builder, define schemas in TypeScript
 export {
   applyManyToManyRelations,
   type CheckDef,
@@ -245,12 +245,12 @@ export {
   type SchemaDef,
   type SchemaIndexDef,
   type TableDef,
-  // Legacy compat (deprecated — use object format with defineSchema)
+  // Legacy compat (deprecated, use object format with defineSchema)
   table,
 } from './schema-builder.js';
-// Schema metadata bridge — defineSchema() → SchemaMetadata without a live DB
+// Schema metadata bridge, defineSchema() → SchemaMetadata without a live DB
 export { schemaDefToMetadata } from './schema-metadata.js';
-// Schema SQL — generate DDL, diff, and push
+// Schema SQL, generate DDL, diff, and push
 export {
   type AlterColumnDef,
   type AlterDef,
@@ -267,5 +267,5 @@ export {
 export { type DefinedSeed, defineSeed, type SeedFunction } from './seed.js';
 // Serverless / edge factory
 export { type TurbineHttpOptions, turbineHttp } from './serverless.js';
-// Typed raw SQL — Turbine's TypedSQL escape hatch
+// Typed raw SQL, Turbine's TypedSQL escape hatch
 export { buildTypedSql, TypedSqlQuery } from './typed-sql.js';

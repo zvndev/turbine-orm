@@ -1,5 +1,5 @@
 /**
- * turbine-orm — High-priority gap tests
+ * turbine-orm, High-priority gap tests
  *
  * Targeted second pass after comprehensive.test.ts. Each test fills a gap
  * identified in docs/internal/TEST-MATRIX.md that wasn't already covered. Focus areas:
@@ -77,7 +77,7 @@ testFn('high-priority gap tests', () => {
     });
 
     it('orderBy on nullable column does not crash', async () => {
-      // last_login_at has nulls — Postgres default NULLS LAST for ASC
+      // last_login_at has nulls, Postgres default NULLS LAST for ASC
       const users = await db.table('users').findMany({
         limit: 5,
         orderBy: { lastLoginAt: 'asc' },
@@ -532,8 +532,8 @@ testFn('high-priority gap tests', () => {
       // Snapshot all 10 counts inside one RepeatableRead transaction so concurrent
       // test files creating/deleting users (constraint tests, comprehensive tests)
       // can't race the "all equal" assertion. The point of this test is that
-      // concurrent count() calls return a consistent number — not isolation
-      // against external writers — so a stable snapshot is the right guarantee.
+      // concurrent count() calls return a consistent number, not isolation
+      // against external writers, so a stable snapshot is the right guarantee.
       await db.$transaction(
         async (tx) => {
           const promises = Array.from({ length: 10 }, () => tx.table('users').count());

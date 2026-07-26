@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Full-text search filter tests
+ * turbine-orm, Full-text search filter tests
  *
  * Tests the TextSearchFilter integration with the WHERE clause builder.
  * Verifies correct SQL generation with to_tsvector/to_tsquery, custom configs,

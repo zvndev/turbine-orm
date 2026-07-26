@@ -27,8 +27,8 @@ export interface GatedRunners {
  *
  * When `skip` is false this returns the real node:test runners, so behavior is
  * byte-for-byte identical to importing them directly. When `skip` is true it
- * returns an `it` that registers every test with `{ skip: reason }` — the
- * reporter counts them as skipped instead of silently omitting them — and
+ * returns an `it` that registers every test with `{ skip: reason }`, the
+ * reporter counts them as skipped instead of silently omitting them, and
  * no-op `before`/`after` hooks so suite setup never touches the database.
  */
 export function skipGate(skip: boolean, reason: string): GatedRunners {

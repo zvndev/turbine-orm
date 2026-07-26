@@ -1,5 +1,5 @@
 /**
- * turbine-orm — `is` and `isNot` relation filter tests
+ * turbine-orm, `is` and `isNot` relation filter tests
  *
  * Build-only tests (no DB) that verify the `is` and `isNot` relation filters
  * generate correct EXISTS / NOT EXISTS SQL, matching Prisma's semantics for

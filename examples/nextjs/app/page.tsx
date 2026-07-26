@@ -51,7 +51,7 @@ export default async function Home() {
 
           <p className="mt-6 text-lg text-zinc-500 leading-relaxed max-w-xl mx-auto">
             Deep nested object graphs in one round-trip. Streaming cursors,
-            typed errors, pipeline batching. Runs anywhere <code className="text-zinc-700 bg-zinc-100 px-1.5 py-0.5 rounded text-sm font-mono">pg</code> runs —
+            typed errors, pipeline batching. Runs anywhere <code className="text-zinc-700 bg-zinc-100 px-1.5 py-0.5 rounded text-sm font-mono">pg</code> runs -
             Neon, Vercel, Cloudflare, Supabase.
           </p>
 
@@ -74,7 +74,7 @@ export default async function Home() {
         <div className="max-w-5xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-4">
           <FeatureCard
             title="Deep typed nesting"
-            description="users[0].posts[0].comments[0].author — autocompletes the full chain. Inferred from your with clause, not asserted."
+            description="users[0].posts[0].comments[0].author, autocompletes the full chain. Inferred from your with clause, not asserted."
           />
           <FeatureCard
             title="Edge & serverless"
@@ -95,7 +95,7 @@ export default async function Home() {
               See it in action
             </h2>
             <p className="mt-2 text-zinc-500">
-              This page is server-rendered with Turbine. The result on the right comes from the query on the left — fully typed, no casts.
+              This page is server-rendered with Turbine. The result on the right comes from the query on the left, fully typed, no casts.
             </p>
           </div>
 

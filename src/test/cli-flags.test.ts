@@ -1,5 +1,5 @@
 /**
- * turbine-orm — CLI flag regression guard
+ * turbine-orm, CLI flag regression guard
  *
  * Static smoke test that reads `src/cli/index.ts` as text and asserts that
  * the public CLI flags are still wired up. Catches accidental deletion of
@@ -8,7 +8,7 @@
  * Also unit-tests `parseArgs` / `isLoopbackHost` for the Studio/Observe
  * `--allow-remote` hard-fail gate (Track 2).
  *
- * This is a regression guard, not a fuzz test — we do NOT spawn the CLI
+ * This is a regression guard, not a fuzz test, we do NOT spawn the CLI
  * binary. Spawning would require a prior `npm run build` and coupling this
  * unit test to the build artifact, which `test:unit` must stay free of.
  *
@@ -46,7 +46,7 @@ describe('CLI flag regression guard', () => {
     // Track 1 ships `src/cli/studio.ts` with --port/--host/--no-open support.
     // Until that module lands in this worktree, the studio command is still a
     // placeholder and these flags are intentionally absent. Once studio.ts is
-    // in place, the flags MUST be handled by parseArgs() — this assertion is
+    // in place, the flags MUST be handled by parseArgs(), this assertion is
     // the regression guard that locks that invariant in.
     if (!existsSync(STUDIO_MODULE)) return; // pre-merge: skip
     const source = readFileSync(CLI_INDEX, 'utf-8');
@@ -108,7 +108,7 @@ describe('isLoopbackHost', () => {
   });
 });
 
-describe('parseArgs — studio / observe flags', () => {
+describe('parseArgs, studio / observe flags', () => {
   it('parses --allow-remote as a boolean flag', () => {
     const args = parseArgs(['studio', '--allow-remote', '--host', '0.0.0.0']);
     assert.equal(args.command, 'studio');
@@ -132,7 +132,7 @@ describe('parseArgs — studio / observe flags', () => {
   });
 });
 
-describe('parseArgs — generate flags (T-8b)', () => {
+describe('parseArgs, generate flags (T-8b)', () => {
   it('parses --no-timestamp as a boolean flag', () => {
     const args = parseArgs(['generate', '--no-timestamp']);
     assert.equal(args.command, 'generate');

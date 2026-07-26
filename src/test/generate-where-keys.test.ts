@@ -1,5 +1,5 @@
 /**
- * turbine-orm — `where` key validation, end to end through the code generator
+ * turbine-orm, `where` key validation, end to end through the code generator
  *
  * where-key-types.test.ts pins the TYPES against hand-written mock entities.
  * This test pins the GENERATOR: it builds a schema with columns, relations in
@@ -7,8 +7,8 @@
  * `generateTypes` / `generateMetadata` / `generateIndex`, then compiles the
  * output against the current source with a usage file full of `@ts-expect-error`
  * typos. An unused `@ts-expect-error` is itself an error, so if the emitted
- * `*Relations` map ever stops reaching `QueryInterface<T, R>` — the single
- * thing that makes `where` key-checkable — `tsc` fails here.
+ * `*Relations` map ever stops reaching `QueryInterface<T, R>`, the single
+ * thing that makes `where` key-checkable, `tsc` fails here.
  *
  * No new generator emission was needed for the fix: the generator has emitted
  * `*Relations` (with the `RelationDescriptor` brand) and threaded it into the
@@ -183,7 +183,7 @@ describe('generator emission keeps `where` key-checkable', () => {
     assert.match(types, /export interface BookRelations \{/);
     assert.match(types, /author: RelationDescriptor<Author, 'one', AuthorRelations>;/);
 
-    // The relations map must reach the table accessor's second type argument —
+    // The relations map must reach the table accessor's second type argument -
     // that is the ONLY thing that makes `where` keys checkable.
     assert.match(index, /readonly authors: QueryInterface<Author, AuthorRelations>/);
     assert.match(index, /readonly books: QueryInterface<Book, BookRelations>/);

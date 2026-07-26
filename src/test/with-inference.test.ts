@@ -1,13 +1,13 @@
 /**
- * turbine-orm — Type-level tests for deep `with` clause inference
+ * turbine-orm, Type-level tests for deep `with` clause inference
  *
  * These tests verify that {@link WithResult} correctly threads relation types
  * through arbitrarily nested `with` clauses. They are pure compile-time checks
- * — the assertions are TypeScript type equalities, not runtime values.
+ * - the assertions are TypeScript type equalities, not runtime values.
  *
- * IMPORTANT — what actually guards this file: `tsx`/esbuild strips types
+ * IMPORTANT, what actually guards this file: `tsx`/esbuild strips types
  * WITHOUT typechecking, so `tsx --test` (and therefore `npm run test:unit`)
- * runs this file fine even if `with` inference has regressed — a broken type
+ * runs this file fine even if `with` inference has regressed, a broken type
  * assertion would pass silently in the test runner. The REAL guard is the
  * separate `npm run typecheck` job, which runs
  * `tsc --noEmit --project tsconfig.test.json`. That config re-includes
@@ -158,7 +158,7 @@ assertTrue<Equals<LegacySingle['posts'], Post[]>>();
 // 8. End-to-end: calling findMany / findUnique / findFirst on a typed
 //    QueryInterface returns the correctly-inferred nested shape.
 //
-//    These assertions are the real-world path — they exercise the exact
+//    These assertions are the real-world path, they exercise the exact
 //    signature users see when they write `db.users.findMany({ with: ... })`.
 //    If this block fails to typecheck, `with` inference is broken at the
 //    *call site*, not in WithResult itself.
@@ -176,7 +176,7 @@ declare const users: QueryInterface<User, UserRelations>;
 // Note: we pass `<{}>` explicitly here because `ReturnType<typeof fn>` on a
 // generic function substitutes the constraint (`TypedWithClause<R>`), not the
 // default (`{}`). In real user code, calling `users.findMany()` without type
-// args does infer `W = {}` correctly — that path is exercised in section 9.
+// args does infer `W = {}` correctly, that path is exercised in section 9.
 // biome-ignore lint/complexity/noBannedTypes: testing exact {} generic default inference behavior
 type PlainList = AwaitedArrayOf<ReturnType<typeof users.findMany<{}>>>;
 assertTrue<Equals<PlainList, User>>();
@@ -200,7 +200,7 @@ assertTrue<Equals<ThreeFmComment['author'], Author | null>>();
 
 // --- findUnique (single nullable result) ---
 type UniqRes = AwaitedOf<ReturnType<typeof users.findUnique<{ posts: true }>>>;
-// findUnique returns `WithResult<...> | null` — narrow to the non-null branch.
+// findUnique returns `WithResult<...> | null`, narrow to the non-null branch.
 type UniqResNonNull = NonNullable<UniqRes>;
 assertTrue<Equals<UniqResNonNull['posts'], Post[]>>();
 
@@ -217,18 +217,18 @@ assertTrue<Equals<UniqOrThrowRes['posts'], Post[]>>();
 // 9. Call-site literal inference: passing a `with` literal directly to
 //    findMany (without explicit type arguments) should still produce a
 //    correctly-inferred return type. This is the shape users actually
-//    write — explicit generics would be a regression in ergonomics.
+//    write, explicit generics would be a regression in ergonomics.
 // ---------------------------------------------------------------------------
 
 // We call the method and capture the inferred return type via `typeof`.
 // TypeScript evaluates this at compile time even though it's in a type
-// position — no runtime invocation happens because the expression is
+// position, no runtime invocation happens because the expression is
 // guarded by `false`.
 async function callSiteInference() {
   // Using `0 as 1` guard so the body is unreachable at runtime but TS still
   // typechecks the calls for us.
   if (false as boolean) {
-    // Plain call — no with. Should collapse to plain `User`.
+    // Plain call, no with. Should collapse to plain `User`.
     const plain = await users.findMany();
     type PlainItem = (typeof plain)[number];
     assertTrue<Equals<PlainItem, User>>();
@@ -263,17 +263,17 @@ void callSiteInference;
 import type { QueryResult } from '../query/index.js';
 
 // --- Select narrows to only selected fields ---
-// biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — testing select/omit narrowing with empty relations
+// biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", testing select/omit narrowing with empty relations
 type SelectId = QueryResult<User, UserRelations, {}, { id: true }, undefined>;
 assertTrue<Equals<SelectId, Pick<User, 'id'>>>();
 
 // --- Select with multiple fields ---
-// biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — testing select/omit narrowing with empty relations
+// biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", testing select/omit narrowing with empty relations
 type SelectBoth = QueryResult<User, UserRelations, {}, { id: true; email: true }, undefined>;
 assertTrue<Equals<SelectBoth, User>>();
 
 // --- Omit removes specified fields ---
-// biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — testing select/omit narrowing with empty relations
+// biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", testing select/omit narrowing with empty relations
 type OmitEmail = QueryResult<User, UserRelations, {}, undefined, { email: true }>;
 assertTrue<Equals<OmitEmail, Omit<User, 'email'>>>();
 
@@ -325,7 +325,7 @@ void selectOmitCallSite;
 //     Generated entity interfaces (and hand-written ones mirroring them) often
 //     declare relations as optional props (`posts?: Post[]`). The with-key is
 //     then also a `keyof T`, so the select-Pick's `Exclude<keyof WithResult,
-//     keyof T>` no longer surfaces it — the relation must be unioned back in
+//     keyof T>` no longer surfaces it, the relation must be unioned back in
 //     from `keyof W` or select+with silently drops it from the result TYPE
 //     (runtime always carries it).
 // ---------------------------------------------------------------------------

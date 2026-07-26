@@ -1,9 +1,9 @@
 /**
- * turbine-orm — WS-H / H3 + H4 integration (real Postgres catalog)
+ * turbine-orm, WS-H / H3 + H4 integration (real Postgres catalog)
  *
  * Creates a table with a STORED generated column, a view, and a materialized
  * view, then asserts introspection flags them correctly and that writes to the
- * view / generated column are rejected. Gated by DATABASE_URL — absent, every
+ * view / generated column are rejected. Gated by DATABASE_URL, absent, every
  * test reports as skipped (never failed).
  *
  * Run: DATABASE_URL=postgres://... npx tsx --test src/test/views-generated-integration.test.ts

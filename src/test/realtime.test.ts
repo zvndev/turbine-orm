@@ -1,5 +1,5 @@
 /**
- * turbine-orm — LISTEN/NOTIFY ($listen / $notify) tests
+ * turbine-orm, LISTEN/NOTIFY ($listen / $notify) tests
  *
  * Two layers:
  *
@@ -37,7 +37,7 @@ const MOCK_SCHEMA: SchemaMetadata = {
 };
 
 // ---------------------------------------------------------------------------
-// Unit — no DB
+// Unit, no DB
 // ---------------------------------------------------------------------------
 
 describe('realtime validation (unit)', () => {
@@ -149,7 +149,7 @@ describe('$listen (unit)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Integration — needs DATABASE_URL
+// Integration, needs DATABASE_URL
 // ---------------------------------------------------------------------------
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -213,7 +213,7 @@ testFn('realtime integration (LISTEN/NOTIFY)', () => {
   it('disconnect() does not hang with an open subscription', async () => {
     const local = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 2 }, schema);
     await local.$listen('w3_test_chan3', () => {});
-    // Intentionally do NOT unsubscribe — disconnect() must force-release it.
+    // Intentionally do NOT unsubscribe, disconnect() must force-release it.
     await local.disconnect();
     assert.ok(true, 'disconnect() resolved without hanging');
   });

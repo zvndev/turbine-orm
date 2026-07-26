@@ -1,11 +1,11 @@
 /**
- * turbine-orm — four-way relation VALUE fidelity: top-level / join / batched / flatten
+ * turbine-orm, four-way relation VALUE fidelity: top-level / join / batched / flatten
  *
  * A relation-loading strategy changes the PLAN, never the RESULT. That
  * guarantee used to hold for row SHAPE but not for cell VALUES: the `'join'`
  * strategy reads a relation through `json_agg(json_build_object(...))`, so its
  * cells are whatever `JSON.parse` makes of Postgres's JSON rendering, while
- * every other read path — a plain top-level row, `'batched'`, `'flatten'` —
+ * every other read path, a plain top-level row, `'batched'`, `'flatten'` -
  * gets the pg driver's representation of the very same column.
  *
  * For most types those coincide. For the families pinned below they did not,
@@ -22,7 +22,7 @@
  * traffic volume is not a documentable quirk.
  *
  * The target is the DRIVER's representation, because a top-level read of the
- * column already returns it — `join` was the single outlier, not the other
+ * column already returns it, `join` was the single outlier, not the other
  * three. Each case therefore asserts all four paths agree on both the value
  * AND its runtime type, with the top-level read as the reference.
  *
@@ -283,7 +283,7 @@ describe('relation value fidelity: top-level / join / batched / flatten', () => 
   });
 
   it('int8 above MAX_SAFE_INTEGER survives the join path intact', () => {
-    const exact = '9007199254740993'; // 2^53 + 1 — the smallest int a double cannot hold
+    const exact = '9007199254740993'; // 2^53 + 1, the smallest int a double cannot hold
     assert.equal(topLevel[0]!.cBigint, exact, 'reference: the driver falls back to a string past 2^53');
     for (const strategy of ['join', 'batched', 'flatten'] as const) {
       assert.equal(
@@ -378,7 +378,7 @@ describe('relation value fidelity: top-level / join / batched / flatten', () => 
   });
 
   it('a table with no divergent column emits byte-identical SQL', async () => {
-    // fid_kids is (int8 pk, int8 fk, text) — the int8s DO get the cast, so use
+    // fid_kids is (int8 pk, int8 fk, text), the int8s DO get the cast, so use
     // the reverse check: the text column must be untouched.
     const built = db.table('fid_kids').buildFindMany({ with: {} } as never);
     assert.ok(!built.sql.includes('"label"::text'), 'a text column must never be cast');

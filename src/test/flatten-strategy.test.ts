@@ -1,5 +1,5 @@
 /**
- * turbine-orm — `relationLoadStrategy: 'flatten'` (build-only, no DB)
+ * turbine-orm, `relationLoadStrategy: 'flatten'` (build-only, no DB)
  *
  * `'flatten'` compiles an eligible TO-ONE relation to a `LEFT JOIN` with a
  * prefixed scalar projection instead of a correlated `json_build_object`
@@ -219,7 +219,7 @@ function bothStrategies(args: any, table = 'users', schema: SchemaMetadata = bui
 // SQL shape
 // ---------------------------------------------------------------------------
 
-describe("relationLoadStrategy: 'flatten' — SQL shape", () => {
+describe("relationLoadStrategy: 'flatten', SQL shape", () => {
   it('compiles a belongsTo to a LEFT JOIN with a prefixed projection', () => {
     const sql = sqlFor({ with: { org: true }, ...FLATTEN });
     assert.match(sql, /FROM "orgs" f0s\) f0 ON f0\."f0__\$c0" = "users"\."org_id"/);
@@ -318,7 +318,7 @@ describe("relationLoadStrategy: 'flatten' — SQL shape", () => {
 // Eligibility / fallback
 // ---------------------------------------------------------------------------
 
-describe("relationLoadStrategy: 'flatten' — fallback rules", () => {
+describe("relationLoadStrategy: 'flatten', fallback rules", () => {
   /** Assert the shape compiles to EXACTLY the default-strategy statement. */
   // biome-ignore lint/suspicious/noExplicitAny: build-only helper
   function assertFallsBack(args: any, schema: SchemaMetadata = buildSchema(), options?: any) {
@@ -329,7 +329,7 @@ describe("relationLoadStrategy: 'flatten' — fallback rules", () => {
   }
 
   it('FAN-OUT GUARD: a belongsTo whose target key is not provably unique falls back', () => {
-    // `cities.code` has only a non-unique index — joining on it would multiply
+    // `cities.code` has only a non-unique index, joining on it would multiply
     // parent rows. Must stay a correlated subquery.
     assertFallsBack({ with: { city: true } });
   });
@@ -452,7 +452,7 @@ describe("relationLoadStrategy: 'flatten' — fallback rules", () => {
 // SQL-template cache
 // ---------------------------------------------------------------------------
 
-describe("relationLoadStrategy: 'flatten' — fallback is announced, not silent", () => {
+describe("relationLoadStrategy: 'flatten', fallback is announced, not silent", () => {
   /**
    * An explicitly requested strategy that quietly does not engage is
    * indistinguishable from one that does nothing: the query succeeds and the
@@ -568,7 +568,7 @@ describe("relationLoadStrategy: 'flatten' — fallback is announced, not silent"
   });
 });
 
-describe("relationLoadStrategy: 'flatten' — SQL cache isolation", () => {
+describe("relationLoadStrategy: 'flatten', SQL cache isolation", () => {
   it('join- and flatten-planned queries never share a cache entry', () => {
     const { join, flatten, joinAgain, flattenAgain } = bothStrategies({ with: { org: true } });
     assert.notEqual(join.sql, flatten.sql);
@@ -596,7 +596,7 @@ describe("relationLoadStrategy: 'flatten' — SQL cache isolation", () => {
 // Row assembly
 // ---------------------------------------------------------------------------
 
-describe("relationLoadStrategy: 'flatten' — row assembly", () => {
+describe("relationLoadStrategy: 'flatten', row assembly", () => {
   // biome-ignore lint/suspicious/noExplicitAny: synthetic driver result
   function run(args: any, rows: Record<string, unknown>[]): unknown[] {
     const d = makeQuery('users', buildSchema()).buildFindMany(args);
@@ -741,7 +741,7 @@ describe("relationLoadStrategy: 'flatten' — row assembly", () => {
 // PII contract
 // ---------------------------------------------------------------------------
 
-describe("relationLoadStrategy: 'flatten' — PII contract", () => {
+describe("relationLoadStrategy: 'flatten', PII contract", () => {
   it('a PII correlation key is used as a predicate only and never projected', () => {
     const sql = sqlFor({ with: { account: true }, ...FLATTEN });
     assert.match(sql, /FROM "accounts" f0s\) f0 ON f0\."f0__\$c0" = "users"\."account_email"/);

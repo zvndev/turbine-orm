@@ -13,10 +13,10 @@ npm install
 ## Running Tests
 
 ```bash
-# Unit tests — no database needed
+# Unit tests, no database needed
 npm run test:unit
 
-# Integration tests — spin up a throwaway Postgres + seed it, then run everything
+# Integration tests, spin up a throwaway Postgres + seed it, then run everything
 ./scripts/seed-test-db.sh
 DATABASE_URL=postgres://turbine:turbine@localhost:54329/turbine_test npm test
 ```
@@ -55,31 +55,31 @@ npm run typecheck  # Type checking only
 
 ```
 src/
-  client.ts         — Connection pool, transactions, middleware
-  query/            — SQL generation, split into submodules:
-    types.ts          — Public query arg types
-    utils.ts          — quoteIdent, escapeLike, LRUCache
-    filters.ts        — Where-filter type guards + shape fingerprints
-    builder.ts        — QueryInterface: WHERE, DML, json_agg nesting
-    batched-loader.ts — relationLoadStrategy: 'batched'
-    index.ts          — Barrel re-export
-  dialect.ts        — Multi-engine Dialect contract (Postgres default)
-  sqlite.ts / mysql.ts / mssql.ts / powdb.ts — engine entrypoints
-  nested-write.ts   — Tree-walking nested create/update engine
-  schema.ts         — Type definitions, PG-to-TS mapping
-  schema-builder.ts — defineSchema() API
-  schema-sql.ts     — DDL generation, diff, push
-  introspect.ts     — Database schema introspection
-  generate.ts       — TypeScript code generation
-  pipeline.ts       — Batch query execution
-  observe.ts        — Observability / query metrics
-  serverless.ts     — Edge/serverless driver binding (turbineHttp)
-  adapters/         — Dialect adapters (CockroachDB, YugabyteDB, …)
-  errors.ts         — Typed TurbineError hierarchy (E001–E017)
-  cli/              — CLI commands (init, generate, migrate, studio, etc.)
+  client.ts        , Connection pool, transactions, middleware
+  query/           , SQL generation, split into submodules:
+    types.ts         , Public query arg types
+    utils.ts         , quoteIdent, escapeLike, LRUCache
+    filters.ts       , Where-filter type guards + shape fingerprints
+    builder.ts       , QueryInterface: WHERE, DML, json_agg nesting
+    batched-loader.ts, relationLoadStrategy: 'batched'
+    index.ts         , Barrel re-export
+  dialect.ts       , Multi-engine Dialect contract (Postgres default)
+  sqlite.ts / mysql.ts / mssql.ts / powdb.ts, engine entrypoints
+  nested-write.ts  , Tree-walking nested create/update engine
+  schema.ts        , Type definitions, PG-to-TS mapping
+  schema-builder.ts, defineSchema() API
+  schema-sql.ts    , DDL generation, diff, push
+  introspect.ts    , Database schema introspection
+  generate.ts      , TypeScript code generation
+  pipeline.ts      , Batch query execution
+  observe.ts       , Observability / query metrics
+  serverless.ts    , Edge/serverless driver binding (turbineHttp)
+  adapters/        , Dialect adapters (CockroachDB, YugabyteDB, …)
+  errors.ts        , Typed TurbineError hierarchy (E001–E017)
+  cli/             , CLI commands (init, generate, migrate, studio, etc.)
 ```
 
-The query builder (`query/builder.ts`) is the core — it generates `json_agg` + `json_build_object` subqueries for nested relations, resolving entire object graphs in a single SQL statement. Filter-shape detection lives in `query/filters.ts`.
+The query builder (`query/builder.ts`) is the core, it generates `json_agg` + `json_build_object` subqueries for nested relations, resolving entire object graphs in a single SQL statement. Filter-shape detection lives in `query/filters.ts`.
 
 ## Reporting Bugs
 

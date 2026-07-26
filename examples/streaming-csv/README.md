@@ -1,8 +1,8 @@
-# Streaming CSV — server-side cursors through nested `with`
+# Streaming CSV, server-side cursors through nested `with`
 
 Export 100,000 shipped orders (with their customer and line items) to CSV
 while the Node.js heap stays flat. The demo prints a live progress meter
-showing row count, throughput, and peak heap — you should see the heap
+showing row count, throughput, and peak heap, you should see the heap
 settle in the ~60–90MB range and stay there regardless of dataset size.
 
 > **On performance.** Turbine's optimized streaming (speculative first
@@ -19,13 +19,13 @@ for await (const order of db.orders.findManyStream({
   batchSize: 1000,
   with: { customer: true, lineItems: true },
 })) {
-  out.write(toCsvRow(order)); // order.customer.email — typed through
+  out.write(toCsvRow(order)); // order.customer.email, typed through
 }
 ```
 
 Under the hood this uses a PostgreSQL `DECLARE CURSOR` / `FETCH` loop on a
 dedicated pooled connection. The cursor is closed and the connection
-released automatically — even if you `break` early or throw.
+released automatically, even if you `break` early or throw.
 
 ## Setup
 
@@ -38,7 +38,7 @@ export DATABASE_URL="postgres://localhost/streaming_csv"
 createdb streaming_csv
 
 # 3. Push schema, seed 100K orders, generate typed client
-#    (takes ~20 seconds — set ORDERS=10000 for a quicker loop)
+#    (takes ~20 seconds, set ORDERS=10000 for a quicker loop)
 npm run setup
 
 # 4. Run the export
@@ -51,9 +51,9 @@ Progress meter is on **stderr** so you can redirect **stdout** to a file.
 
 | Feature | Where |
 |---|---|
-| **`findManyStream` with nested `with`** | The main loop — customer + lineItems stream with the parent rows |
-| **Cursor batching** | `batchSize: 1000` — one `FETCH 1000` per round-trip, not per row |
-| **Constant memory** | Heap tracked in the progress meter — stays flat for any dataset size |
+| **`findManyStream` with nested `with`** | The main loop, customer + lineItems stream with the parent rows |
+| **Cursor batching** | `batchSize: 1000`, one `FETCH 1000` per round-trip, not per row |
+| **Constant memory** | Heap tracked in the progress meter, stays flat for any dataset size |
 | **Typed projection** | `order.customer.email` / `order.lineItems[0].productName` both autocomplete |
 | **Automatic cleanup** | Cursor + transaction close on early `break`, error, or normal completion |
 
@@ -61,7 +61,7 @@ Progress meter is on **stderr** so you can redirect **stdout** to a file.
 
 - **Prisma:** No native cursor streaming primitive. Keyset pagination
   (`take: 1000, cursor: { id: lastId }, orderBy: { id: 'asc' }`) works
-  and is actually *faster* for drain-all workloads — but it only works
+  and is actually *faster* for drain-all workloads, but it only works
   correctly when `orderBy` is on a unique, monotonic column, and
   `break`ing out mid-stream just stops the loop (no deterministic
   cleanup). You also write the paging state machine yourself.
@@ -75,6 +75,6 @@ Progress meter is on **stderr** so you can redirect **stdout** to a file.
 
 | File | What it is |
 |---|---|
-| `schema.ts` | `defineSchema(...)` — customers, orders, line_items |
+| `schema.ts` | `defineSchema(...)`, customers, orders, line_items |
 | `seed.ts` | Bulk-inserts 100K orders via `UNNEST` (configurable via `ORDERS` env) |
-| `index.ts` | The demo — streams to CSV with a live progress meter |
+| `index.ts` | The demo, streams to CSV with a live progress meter |

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Pipeline submittable tests
+ * turbine-orm, Pipeline submittable tests
  *
  * Tests the real pipeline protocol state machine using a fake Connection
  * EventEmitter that simulates Postgres backend responses.
@@ -77,7 +77,7 @@ class FakeConnection extends EventEmitter {
     };
   }
 
-  // Wire protocol methods — just record calls and queue responses
+  // Wire protocol methods, just record calls and queue responses
   parse(query: { text: string; name?: string }) {
     this.messages.push({ type: 'parse', args: [query] });
     this.queueResponse(() => this.emit('parseComplete'));
@@ -94,7 +94,7 @@ class FakeConnection extends EventEmitter {
     // We'll emit noData for BEGIN/COMMIT and rowDescription for real queries
     const m = msg as { type: string; name?: string };
     if (m.type === 'P') {
-      // Queue nothing here — we'll handle it in the execute response setup
+      // Queue nothing here, we'll handle it in the execute response setup
     }
   }
 
@@ -302,7 +302,7 @@ describe('supportsExtendedPipeline', () => {
   });
 });
 
-describe('runPipelined — transactional mode', () => {
+describe('runPipelined, transactional mode', () => {
   it('sends BEGIN + queries + COMMIT + single Sync in one cork/uncork window', async () => {
     const { client, connection } = createFakeClient();
 
@@ -410,7 +410,7 @@ describe('runPipelined — transactional mode', () => {
   });
 });
 
-describe('runPipelined — non-transactional mode', () => {
+describe('runPipelined, non-transactional mode', () => {
   it('sends one Sync per query (no BEGIN/COMMIT)', async () => {
     const { client, connection } = createFakeClient();
 
@@ -453,7 +453,7 @@ describe('runPipelined — non-transactional mode', () => {
   });
 });
 
-describe('runPipelined — error handling', () => {
+describe('runPipelined, error handling', () => {
   it('rejects with the first error in transactional mode', async () => {
     const { client, connection } = createFakeClient();
 

@@ -30,7 +30,7 @@ curl http://localhost:3000/api/users
 | File | What it is |
 |---|---|
 | `schema.ts` | `defineSchema(...)` source of truth |
-| `app/api/users/route.ts` | App router GET handler. `runtime = 'edge'` — runs on Vercel Edge. |
+| `app/api/users/route.ts` | App router GET handler. `runtime = 'edge'`, runs on Vercel Edge. |
 
 ## Environment variables
 

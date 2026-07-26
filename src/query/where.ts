@@ -25,7 +25,9 @@ import {
   isJsonFilter,
   isUnmatchedPlainObject,
   isWhereOperator,
+  JSON_FILTER_KEYS,
   JSON_RANGE_OPERATORS,
+  JSON_STRING_OPERATORS,
   VECTOR_DISTANCE_COMPARATORS,
   VECTOR_METRIC_OPERATORS,
   validateTextSearchConfig,
@@ -145,7 +147,7 @@ interface ColumnRefContext {
    * The operator's own RAW (unquoted) column name. The `column` argument the
    * operator builders receive is already quoted on the build side and raw on
    * the collect side, so the temporal bind rewrite resolves the column's type
-   * from here instead — the one value both sides pass identically.
+   * from here instead, the one value both sides pass identically.
    */
   rawColumn: string;
 }
@@ -157,7 +159,7 @@ interface ColumnRefContext {
  * `with`-clause `where` filters (against a per-subquery alias, `t0.col`) compile
  * an arbitrary target table's where against a column qualifier. They differ ONLY
  * in that qualifier, the correlation parent handed to `buildRelationFilter`, and
- * the unknown-column error wording — so a single scoped build/collect/fingerprint
+ * the unknown-column error wording, so a single scoped build/collect/fingerprint
  * trio, driven by the SAME canonical {@link walkWhere} the top level uses, serves
  * both. See `buildScopedWhere` / `collectScopedWhereParams` / `fingerprintScopedWhere`.
  */
@@ -166,7 +168,7 @@ interface WhereScope {
   meta: TableMetadata;
   /** The target table name (used for host binding + error messages). */
   table: string;
-  /** SQL prefix before `q(col)` — `"target".` for EXISTS sub-wheres, `t0.` for aliases. */
+  /** SQL prefix before `q(col)`, `"target".` for EXISTS sub-wheres, `t0.` for aliases. */
   qualifier: string;
   /** The `parentTable` correlation argument for nested `buildRelationFilter` calls. */
   relationParent: string;
@@ -349,7 +351,7 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
  * Param-collect mirror of {@link buildRelationFilter} for one relation-filter
  * object (`{ some/every/none/is/isNot }`, already normalized). Pushes, per
  * present branch and in the canonical order some→none→every→is→isNot, the
- * branch's sub-where params THEN the target table's global-filter params —
+ * branch's sub-where params THEN the target table's global-filter params -
  * exactly the order buildRelationFilter emits. When no global filter applies
  * the gf calls are no-ops, so this stays byte-identical to the pre-0.28 path.
  * Shared by every collect site that mirrors buildRelationFilter
@@ -372,7 +374,7 @@ export function collectRelationFilterParams(
   }
   if (filterObj.every !== undefined && filterObj.every !== null) {
     // gf is only emitted (build) when the `every` sub-where compiles to a
-    // filter — otherwise `every` is trivially true and no subquery is built.
+    // filter, otherwise `every` is trivially true and no subquery is built.
     if (buildSubWhereForRelation(qi, target, filterObj.every as Record<string, unknown>, []) !== null) {
       collectRelFilterParams(qi, target, filterObj.every as Record<string, unknown>, params);
       collectTargetGlobalFilterExists(qi, target, params);
@@ -443,6 +445,7 @@ export function collectOperatorParams(
  * comparison values in {@link JSON_RANGE_OPERATORS} order.
  */
 export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, params: unknown[], column: string): void {
+  assertJsonFilterKeys(filter, column);
   let pathPushed = false;
   const pushPathOnce = (): void => {
     if (!pathPushed) {
@@ -467,6 +470,10 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
   for (const { value } of jsonRangeEntries(qi, filter, column)) {
     pushPathOnce();
     params.push(value);
+  }
+  for (const { pattern, value } of jsonStringEntries(filter, column)) {
+    pushPathOnce();
+    params.push(pattern(escapeLike(value)));
   }
 }
 
@@ -530,7 +537,7 @@ export function resolveGlobalFilter(
   if (resolved === null || resolved === undefined) return null;
   const obj = resolved as Record<string, unknown>;
   // An all-undefined filter (e.g. `{ tenantId: undefined }`) contributes
-  // nothing — treat it as absent so it never emits a dangling clause.
+  // nothing, treat it as absent so it never emits a dangling clause.
   if (Object.keys(obj).every((k) => obj[k] === undefined)) return null;
   return obj;
 }
@@ -575,7 +582,7 @@ export function collectTargetGlobalFilterAlias(qi: BuilderCtx, targetTable: stri
 
 /**
  * SQL clause for `targetTable`'s global filter rendered against the bare
- * (unaliased) table name — the form used inside relation-filter `EXISTS`
+ * (unaliased) table name, the form used inside relation-filter `EXISTS`
  * subqueries. Pushes its params; `''` when none. Mirror:
  * {@link collectTargetGlobalFilterExists}.
  */
@@ -636,7 +643,7 @@ export function globalFilterCacheSegment(qi: BuilderCtx): string {
 /**
  * True when the USER-supplied `where` compiles to no predicate (`{}`,
  * `{ id: undefined }`, `{ OR: [{ a: undefined }] }`, …). This is the exact
- * signal the empty-`where` guard needs — the compiled emptiness, NOT the
+ * signal the empty-`where` guard needs, the compiled emptiness, NOT the
  * fingerprint (which is non-empty for an all-undefined `OR`/`AND`). It ignores
  * any configured global filter, so a global filter never lets an unguarded
  * mass mutation through.
@@ -775,7 +782,7 @@ export function buildScalarClause(
 }
 
 /**
- * A {@link WhereHost} with no relations — used to fingerprint a sub-where
+ * A {@link WhereHost} with no relations, used to fingerprint a sub-where
  * whose target table is unknown (`schema.tables[t]` miss). `walkWhere` reads
  * only `tableMeta.relations`, so every key falls to the scalar path, matching
  * the pre-unification `meta?.relations` short-circuit.
@@ -835,7 +842,7 @@ export function aliasWhereScope(qi: BuilderCtx, targetTable: string, meta: Table
 /**
  * Compile a scoped sub-where to SQL. Serves BOTH the relation-filter EXISTS
  * body ({@link buildSubWhereForRelation}) and the relation `with`-clause
- * `where` ({@link buildAliasWhere}) — the emitted SQL is byte-identical to the
+ * `where` ({@link buildAliasWhere}), the emitted SQL is byte-identical to the
  * former hand-mirrored walkers, since it renders the same clauses in the same
  * ({@link walkWhere}-canonical) key order.
  */
@@ -879,8 +886,8 @@ export function buildScopedWhere(
  * Emit the SQL clause(s) for one scalar key of a scoped sub-where. Reproduces
  * the null / JSON / array / operator / equality fall-through both former
  * walkers shared (relation sub-wheres and alias wheres carry no vector or
- * text-search scalar surface, so — unlike the top-level {@link buildScalarClause}
- * — those shapes are not special-cased here and keep their historical
+ * text-search scalar surface, so, unlike the top-level {@link buildScalarClause}
+ * - those shapes are not special-cased here and keep their historical
  * equality-guard behavior).
  */
 export function buildScopedScalarClause(
@@ -1129,7 +1136,7 @@ export function buildRelationFilter(
   // DOMAIN of correlated rows in EVERY branch: `some`/`none`/`is`/`isNot`
   // ignore filtered-out rows, and `every` quantifies over only the surviving
   // rows ("every NON-deleted related row matches P"). It is ANDed into the
-  // correlation and its params pushed AFTER the per-branch filter — mirrored
+  // correlation and its params pushed AFTER the per-branch filter, mirrored
   // exactly in collectWhereParams' relation-filter branch. `qt` is the bare
   // target table, matching the `FROM ${qt}` here (see targetGlobalFilterExists).
   const gfAnd = (): string => {
@@ -1166,11 +1173,11 @@ export function buildRelationFilter(
       const gf = gfAnd();
       clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gf} AND NOT (${filterClause}))`);
     } else {
-      // "every" with empty filter = true (all match trivially) — gf irrelevant.
+      // "every" with empty filter = true (all match trivially), gf irrelevant.
     }
   }
 
-  // "is": EXISTS — for to-one relations (same SQL as "some").
+  // "is": EXISTS, for to-one relations (same SQL as "some").
   // `is: null` = "no related row" (Prisma semantics) → NOT EXISTS.
   if (filterObj.is !== undefined) {
     if (filterObj.is === null) {
@@ -1183,7 +1190,7 @@ export function buildRelationFilter(
     }
   }
 
-  // "isNot": NOT EXISTS — for to-one relations (same SQL as "none").
+  // "isNot": NOT EXISTS, for to-one relations (same SQL as "none").
   // `isNot: null` = "a related row exists" → EXISTS.
   if (filterObj.isNot !== undefined) {
     if (filterObj.isNot === null) {
@@ -1231,7 +1238,7 @@ export function pgTypeForColumn(_qi: BuilderCtx, meta: TableMetadata, column: st
  * the UTC-component literal, so a predicate matches the value a write of the
  * same `Date` stored.
  *
- * This is a VALUE transform only — it never changes the emitted SQL — so the
+ * This is a VALUE transform only, it never changes the emitted SQL, so the
  * SQL-template cache is unaffected, and it is applied on the cache-hit
  * param-collect path as well as the build path.
  *
@@ -1255,13 +1262,13 @@ export function coerceWhereOperand(qi: BuilderCtx, meta: TableMetadata, column: 
  * Introspection stores each column's `udt_name` in `pgTypes` and every
  * database enum in `schema.enums` (typname → labels); a column whose type
  * matches an enum key needs an explicit `::"EnumName"` cast on its write
- * binds — bulk-insert forms like `UNNEST($1::text[])` otherwise type the
+ * binds, bulk-insert forms like `UNNEST($1::text[])` otherwise type the
  * value as text and Postgres refuses the implicit text→enum coercion
  * ("column X is of type Y but expression is of type text").
  *
  * Postgres-only by construction: gated on the active dialect being
  * `postgresql` AND on `schema.enums` having entries (only PG introspection
- * produces them — `defineSchema` and the other engines leave it empty), so
+ * produces them, `defineSchema` and the other engines leave it empty), so
  * SQLite/MySQL/MSSQL/PowDB output is byte-identical.
  */
 export function enumTypeForColumn(qi: BuilderCtx, column: string): string | null {
@@ -1270,7 +1277,7 @@ export function enumTypeForColumn(qi: BuilderCtx, column: string): string | null
   if (!enums) return null;
   // Cross-schema guard (N-5): introspection records pgTypeSchema ONLY when
   // the column's type lives OUTSIDE the introspected schema. A same-named
-  // enum in another schema must not get this schema's cast — search_path
+  // enum in another schema must not get this schema's cast, search_path
   // would resolve `::"status"` to the wrong type. Skipping the cast restores
   // the pre-cast behavior for such columns. Columns without pgTypeSchema
   // (same-schema types, defineSchema/legacy metadata) keep the cast.
@@ -1322,7 +1329,7 @@ export function assertBindableEqualityValue(
 /**
  * Build the user-supplied `where` filter of a relation `with` clause against
  * the relation's table alias. Supports the same scalar surface as the
- * top-level WHERE builder — equality, IS NULL, operator objects (incl.
+ * top-level WHERE builder, equality, IS NULL, operator objects (incl.
  * `mode: 'insensitive'`), and OR/AND/NOT combinators. Unknown operator
  * objects throw via {@link assertBindableEqualityValue}.
  *
@@ -1356,7 +1363,7 @@ export function collectAliasWhereParams(
 /**
  * Value-invariant, shape-aware fingerprint for a relation `with` clause's
  * `where` filter. Must distinguish every SQL shape {@link buildAliasWhere}
- * can emit — equality vs null vs operator sets vs combinators — or two
+ * can emit, equality vs null vs operator sets vs combinators, or two
  * differently-shaped wheres would share one cached SQL string.
  */
 export function fingerprintAliasWhere(qi: BuilderCtx, where: Record<string, unknown>, targetTable?: string): string {
@@ -1496,20 +1503,19 @@ export function buildOperatorClauses(
     params.push(qi.inParam(cv(op.notIn)));
     clauses.push(qi.inClause(column, qi.p(params.length), true));
   }
-  const buildLikeClause = (paramRef: string) =>
-    op.mode === 'insensitive' ? qi.dialect.buildInsensitiveLike(column, paramRef) : `${column} LIKE ${paramRef}`;
+  const insensitive = op.mode === 'insensitive';
 
   if (op.contains !== undefined) {
     params.push(`%${escapeLike(op.contains)}%`);
-    clauses.push(`${buildLikeClause(qi.p(params.length))} ESCAPE '\\'`);
+    clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
   }
   if (op.startsWith !== undefined) {
     params.push(`${escapeLike(op.startsWith)}%`);
-    clauses.push(`${buildLikeClause(qi.p(params.length))} ESCAPE '\\'`);
+    clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
   }
   if (op.endsWith !== undefined) {
     params.push(`%${escapeLike(op.endsWith)}`);
-    clauses.push(`${buildLikeClause(qi.p(params.length))} ESCAPE '\\'`);
+    clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
   }
 
   return clauses;
@@ -1554,7 +1560,7 @@ export function requireArrayColumns(qi: BuilderCtx): void {
  * Resolve a {@link VectorMetric} to its pgvector distance operator from a
  * fixed allow-list, validating the target column is actually a `vector`
  * column. Throws {@link ValidationError} for an unknown metric or a
- * non-vector column — a user-supplied string can never become a SQL operator.
+ * non-vector column, a user-supplied string can never become a SQL operator.
  */
 export function vectorOperator(qi: BuilderCtx, field: string, rawColumn: string, metric: string): string {
   if (!qi.dialect.supportsVector) {
@@ -1625,8 +1631,8 @@ export function pushVectorParam(
 }
 
 /**
- * Prisma-compat: a plain object on a to-one relation key —
- * `where: { vendor: { name: { contains: 'x' } } }` — is an implicit `is`
+ * Prisma-compat: a plain object on a to-one relation key -
+ * `where: { vendor: { name: { contains: 'x' } } }`, is an implicit `is`
  * filter. Normalize it to `{ is: obj }` so all downstream handling (SQL,
  * params, fingerprint) sees one canonical shape. To-many relations still
  * require an explicit `some`/`every`/`none` (a bare object there is
@@ -1654,7 +1660,7 @@ export function normalizeRelationFilter(
  * Case-insensitive json/jsonb column-type check. Postgres reports lowercase
  * udt_names, but SQLite/MySQL introspection surfaces the DECLARED type
  * (e.g. `JSON`), so every JSON-feature gate compares through this predicate
- * — build and collect sides alike, keeping the SQL-cache lockstep.
+ * - build and collect sides alike, keeping the SQL-cache lockstep.
  */
 export function isJsonColumnType(_qi: BuilderCtx, colType: string): boolean {
   const t = colType.toLowerCase();
@@ -1694,9 +1700,107 @@ export function getArrayElementType(_qi: BuilderCtx, pgType: string): string {
  * JSON filter, in the fixed {@link JSON_RANGE_OPERATORS} order. Shared by
  * the SQL-build path ({@link buildJsonFilterClauses}) and the cache-hit
  * param-collect path ({@link collectJsonFilterParams}) so both always agree
- * on which params are pushed — and both throw identically for invalid
+ * on which params are pushed, and both throw identically for invalid
  * shapes, so a warmed cache can never skip validation.
  */
+/**
+ * One LIKE comparison, honoring `mode: 'insensitive'` through the dialect and
+ * always carrying the `ESCAPE '\'` clause that pairs with {@link escapeLike}.
+ *
+ * Shared by the scalar `contains` / `startsWith` / `endsWith` operators and by
+ * the JSON substring operators, so the two can never drift into escaping their
+ * operands the same way but comparing them differently.
+ */
+function buildLikeClause(qi: BuilderCtx, column: string, paramRef: string, insensitive: boolean): string {
+  const base = insensitive ? qi.dialect.buildInsensitiveLike(column, paramRef) : `${column} LIKE ${paramRef}`;
+  return `${base} ESCAPE '\\'`;
+}
+
+/**
+ * Refuse a {@link JsonFilter} carrying a key that is not a JSON operator, and
+ * refuse a filter that selects a `path` but never compares it.
+ *
+ * Both shapes used to compile to NOTHING. `buildJsonFilterClauses` only ever
+ * emitted a clause for a key it recognized, so `{ path: ['title'],
+ * string_contains: 'x' }`, the Prisma spelling, and an easy typo besides -
+ * produced an empty clause list, the predicate vanished, and the query
+ * returned EVERY row. Inside an `AND` it silently dropped that conjunct, so a
+ * tenant scope written this way widened to the whole table. The equivalent
+ * typo on a scalar column has always thrown; this closes the inconsistency.
+ *
+ * Called from both the SQL-build path and the cache-hit param-collect path, so
+ * a warmed SQL cache cannot skip the check.
+ */
+export function assertJsonFilterKeys(filter: JsonFilter, column: string): void {
+  const obj = filter as Record<string, unknown>;
+  const present = Object.keys(obj).filter((k) => obj[k] !== undefined);
+
+  for (const key of present) {
+    if (JSON_FILTER_KEYS.has(key)) continue;
+    const suggestion = JSON_PRISMA_SPELLINGS[key];
+    throw new ValidationError(
+      `[turbine] Unknown JSON filter operator "${key}" on ${column}.` +
+        (suggestion ? ` Did you mean \`${suggestion}\`?` : '') +
+        ` Supported operators: ${[...JSON_FILTER_KEYS].sort().join(', ')}.`,
+    );
+  }
+
+  // `mode` and `path` are modifiers, not comparisons: a filter made only of
+  // those compares nothing, which is exactly the silent no-op shape above.
+  if (present.length > 0 && present.every((k) => k === 'path' || k === 'mode')) {
+    throw new ValidationError(
+      `[turbine] JSON filter on ${column} selects a \`path\` but has no comparison. ` +
+        `Add one of: ${[...JSON_FILTER_KEYS]
+          .filter((k) => k !== 'path' && k !== 'mode')
+          .sort()
+          .join(', ')}.`,
+    );
+  }
+}
+
+/**
+ * The Prisma spelling of each JSON operator, so a migrator who writes the
+ * name they already know gets told the turbine one instead of a bare list.
+ */
+const JSON_PRISMA_SPELLINGS: Record<string, string> = {
+  string_contains: 'stringContains',
+  string_starts_with: 'stringStartsWith',
+  string_ends_with: 'stringEndsWith',
+  array_contains: 'contains',
+  startsWith: 'stringStartsWith',
+  endsWith: 'stringEndsWith',
+};
+
+/**
+ * Validate and enumerate the substring comparisons on a JSON filter, in the
+ * fixed {@link JSON_STRING_OPERATORS} order. Shared by the build and collect
+ * paths exactly like {@link jsonRangeEntries}, so both agree on the params
+ * pushed and both throw identically on an invalid shape.
+ */
+export function jsonStringEntries(
+  filter: JsonFilter,
+  column: string,
+): { op: string; pattern: (escaped: string) => string; value: string }[] {
+  const entries: { op: string; pattern: (escaped: string) => string; value: string }[] = [];
+  for (const [op, pattern] of Object.entries(JSON_STRING_OPERATORS)) {
+    const value = (filter as Record<string, unknown>)[op];
+    if (value === undefined) continue;
+    if (filter.path === undefined) {
+      throw new ValidationError(
+        `[turbine] JSON operator '${op}' on ${column} requires a \`path\` ` +
+          `(e.g. { path: ['meta', 'title'], ${op}: ${JSON.stringify(value)} }).`,
+      );
+    }
+    if (typeof value !== 'string') {
+      throw new ValidationError(
+        `[turbine] JSON operator '${op}' on ${column} requires a string, got ${JSON.stringify(value)}.`,
+      );
+    }
+    entries.push({ op, pattern, value });
+  }
+  return entries;
+}
+
 export function jsonRangeEntries(
   _qi: BuilderCtx,
   filter: JsonFilter,
@@ -1740,6 +1844,7 @@ export function buildJsonFilterClauses(
   filter: JsonFilter,
   params: unknown[],
 ): string[] {
+  assertJsonFilterKeys(filter, column);
   const clauses: string[] = [];
 
   // Lazily bind the path once; reuse the same $N in every extraction clause.
@@ -1785,18 +1890,27 @@ export function buildJsonFilterClauses(
     clauses.push(`${lhs} ${sqlOp} ${qi.p(params.length)}`);
   }
 
+  // Substring comparisons on the extracted path. The operand is LIKE-escaped
+  // exactly like the scalar `contains` family, so a value containing `%` or
+  // `_` matches literally instead of turning into a wildcard.
+  for (const { pattern, value } of jsonStringEntries(filter, column)) {
+    const extract = pathExtract();
+    params.push(pattern(escapeLike(value)));
+    clauses.push(buildLikeClause(qi, extract, qi.p(params.length), filter.mode === 'insensitive'));
+  }
+
   return clauses;
 }
 
 /**
  * Bind value for a JSON path parameter, encoded per dialect. PostgreSQL's
- * `#>>` takes a `text[]` (the segments as strings — or `nativeForm` when the
+ * `#>>` takes a `text[]` (the segments as strings, or `nativeForm` when the
  * caller has a specific native binding, e.g. JsonFilter's raw path array).
  * Every other engine's JSON function (`json_extract` / `JSON_EXTRACT` /
  * `JSON_VALUE`) takes a `'$'`-rooted JSONPath STRING: binding the raw array
  * would arrive as `'["a"]'` (the driver shims JSON.stringify non-primitive
  * params) and fail at runtime with the engine's bad-JSON-path error. The
- * encoded path stays a bound parameter — never spliced into SQL text — so
+ * encoded path stays a bound parameter, never spliced into SQL text, so
  * the build/collect param mirrors stay in lockstep and injection-safe.
  */
 export function jsonPathParam(qi: BuilderCtx, path: readonly (string | number)[], nativeForm?: unknown): unknown {
@@ -1810,7 +1924,7 @@ export function jsonPathParam(qi: BuilderCtx, path: readonly (string | number)[]
 
 /**
  * Cast an extracted JSON path text value to a numeric type for range
- * comparison. PostgreSQL uses `(expr)::numeric` (exact — the right way to
+ * comparison. PostgreSQL uses `(expr)::numeric` (exact, the right way to
  * compare JSON numbers, and `::float` would lose precision on big ints);
  * other dialects route through {@link Dialect.castAggregate} (SQLite/MySQL/
  * SQL Server have no `::` operator) as a float cast.

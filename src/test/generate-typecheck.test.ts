@@ -1,12 +1,12 @@
 /**
- * turbine-orm — Generated output must TYPECHECK against the library it ships with
+ * turbine-orm, Generated output must TYPECHECK against the library it ships with
  *
  * Regression test for the v0.28.x "incorrectly extends" break: the base
  * `TurbineClient.$transaction` gained a batch-array overload in v0.26, but the
  * generator's interface-merge for the typed client kept emitting only the
  * callback signature. A merged interface member must be compatible with the
  * base class member ON ITS OWN (TS2415), so every `turbine generate` output
- * failed `tsc` in user projects — while this repo's own string-pin tests
+ * failed `tsc` in user projects, while this repo's own string-pin tests
  * stayed green, because the template still matched itself.
  *
  * String pins can't catch template ↔ client-type drift; only compiling the
@@ -77,7 +77,7 @@ const MODEL_INSTANCES = table(
   'model_instances',
   [
     col('id', 'int8', 'number', { hasDefault: true }),
-    // Prisma-style quoted camelCase FK columns — both point at model_instance_versions.
+    // Prisma-style quoted camelCase FK columns, both point at model_instance_versions.
     col('currentVersionId', 'int8', 'number | null', { nullable: true }),
     col('publishedVersionId', 'int8', 'number | null', { nullable: true }),
     // Scalar column whose field equals the stripped relation name of
@@ -157,7 +157,7 @@ type AssertOne<T extends RelationDescriptor<ModelInstanceVersion, 'one', ModelIn
 export type _one = AssertOne<PublishedVersionRel>;
 
 // The reverse hasMany side gets one distinct relation per FK column. These
-// keep main's LEGACY derivation (the raw column with '_by_' composition —
+// keep main's LEGACY derivation (the raw column with '_by_' composition -
 // collision-free, so it must survive a regen unchanged; N-1a).
 export type ByCurrent = ModelInstanceVersionRelations['modelInstancesByCurrentVersionId'];
 export type ByPublished = ModelInstanceVersionRelations['modelInstancesByPublishedVersionId'];
@@ -228,7 +228,7 @@ describe('generated client typechecks against the shipped client types', () => {
             target: 'ES2022',
             module: 'NodeNext',
             moduleResolution: 'NodeNext',
-            // Compile the generated output against the CURRENT source types —
+            // Compile the generated output against the CURRENT source types -
             // this is exactly what drifts when the client class changes shape.
             paths: { 'turbine-orm': [join(repoRoot, 'src', 'index.ts')] },
           },

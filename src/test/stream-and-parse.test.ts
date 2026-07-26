@@ -1,5 +1,5 @@
 /**
- * turbine-orm — findManyStream fast-path + parseNestedRow short-circuit tests
+ * turbine-orm, findManyStream fast-path + parseNestedRow short-circuit tests
  *
  * Unit tests (no DB) verifying:
  *   A) findManyStream speculative fast-path avoids cursor for small results

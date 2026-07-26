@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { makeQuery, mockTable } from './helpers.js';
 
-// hasOne: the FK lives on the TARGET (child) side — exactly like hasMany but
+// hasOne: the FK lives on the TARGET (child) side, exactly like hasMany but
 // unique. The with-subquery must correlate alias.fk = parent.pk, NOT the
 // belongsTo direction (alias.pk = parent.fk), which silently compares the
 // wrong columns (found dogfooding: uuid = character varying).

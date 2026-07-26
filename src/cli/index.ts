@@ -3,21 +3,21 @@
  * turbine-orm CLI
  *
  * Commands:
- *   turbine init                  — Initialize a Turbine project
- *   turbine generate | pull       — Introspect database and generate TypeScript types
+ *   turbine init                 , Initialize a Turbine project
+ *   turbine generate | pull      , Introspect database and generate TypeScript types
  *   turbine migrate-from-prisma   - Parse a schema.prisma and emit a Prisma->Turbine name map + report
  *   turbine push                  - Apply schema-builder definitions to database (destructive ops gated)
  *   turbine migrate create <name> - Create a new SQL migration file (--auto | --from-diff | --recipe <name>)
- *   turbine migrate up            — Apply pending migrations
- *   turbine migrate deploy        — Apply pending migrations without prompts
- *   turbine migrate down          — Rollback last migration
- *   turbine migrate status        — Show migration status
- *   turbine seed                  — Run seed file
- *   turbine status                — Show schema summary
+ *   turbine migrate up           , Apply pending migrations
+ *   turbine migrate deploy       , Apply pending migrations without prompts
+ *   turbine migrate down         , Rollback last migration
+ *   turbine migrate status       , Show migration status
+ *   turbine seed                 , Run seed file
+ *   turbine status               , Show schema summary
  *   turbine doctor                - Cost-aware missing-FK-index triage (--fix, --json, --no-concurrently, --unused, --audit)
  *   turbine studio                : Launch local read-only web UI (--demo for a seeded sample DB)
- *   turbine mcp                   — Start read-only MCP server over JSON-RPC stdio
- *   turbine observe               — Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
+ *   turbine mcp                  , Start read-only MCP server over JSON-RPC stdio
+ *   turbine observe              , Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
  *
  * Usage:
  *   DATABASE_URL=postgres://... npx turbine generate
@@ -140,7 +140,7 @@ import {
 } from './ui.js';
 
 // ---------------------------------------------------------------------------
-// Argument parsing (zero deps — just process.argv)
+// Argument parsing (zero deps, just process.argv)
 // ---------------------------------------------------------------------------
 
 export interface CliArgs {
@@ -409,7 +409,7 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
 }
 
 // ---------------------------------------------------------------------------
-// TypeScript loader — user-facing error helper
+// TypeScript loader, user-facing error helper
 // ---------------------------------------------------------------------------
 
 /**
@@ -427,7 +427,7 @@ function failMissingTsLoader(filePath: string, reason: 'missing' | 'unsupported'
     );
   } else if (reason === 'failed') {
     // tsx IS installed but registering its loader threw. Report the real
-    // cause — telling the user to install tsx here would be a misdiagnosis.
+    // cause, telling the user to install tsx here would be a misdiagnosis.
     console.log(`  ${dim('tsx is installed, but registering its TypeScript loader failed:')}`);
     newline();
     console.log(`    ${getTsLoaderError() ?? '(unknown error)'}`);
@@ -1096,6 +1096,7 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<voi
       schema: config.schema,
       include: config.include.length ? config.include : undefined,
       exclude: config.exclude.length ? config.exclude : undefined,
+      relationNames: config.relationNames,
     });
     spinner.succeed(`Found ${bold(String(Object.keys(schema.tables).length))} tables`);
 
@@ -1443,7 +1444,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   const startTime = performance.now();
 
   // Guard: `schema` is the Postgres NAMESPACE to introspect (default `public`),
-  // NOT the path to your schema-builder file — that goes in `schemaFile`. If the
+  // NOT the path to your schema-builder file, that goes in `schemaFile`. If the
   // configured `schema` looks like a file path, introspection would silently
   // match zero tables and emit an empty client. Fail loudly instead.
   if (!args.allowEmpty && looksLikeSchemaFilePath(config.schema)) {
@@ -1456,7 +1457,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     newline();
     console.log(`  ${dim('Fix your')} ${cyan('turbine.config.ts')}${dim(':')}`);
     console.log(
-      `    ${green('schema:')} ${cyan("'public'")}${dim(",       // or omit — introspects the 'public' schema")}`,
+      `    ${green('schema:')} ${cyan("'public'")}${dim(",       // or omit, introspects the 'public' schema")}`,
     );
     console.log(
       `    ${green('schemaFile:')} ${cyan(`'${config.schema}'`)}${dim(', // your defineSchema() file (used by `turbine push`)')}`,
@@ -1483,6 +1484,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     schema: config.schema,
     include: config.include.length ? config.include : undefined,
     exclude: config.exclude.length ? config.exclude : undefined,
+    relationNames: config.relationNames,
     includeViews: args.includeViews,
     legacyToManyUniques: config.legacyToManyUniques,
     onDefaultTableExclusion: (tables) => skippedInternalTables.push(...tables),
@@ -1508,7 +1510,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   // instead of silently emitting an empty typed client.
   if (tableNames.length === 0 && !args.allowEmpty) {
     newline();
-    error(`Introspection matched 0 tables in schema ${cyan(config.schema)} — refusing to generate an empty client.`);
+    error(`Introspection matched 0 tables in schema ${cyan(config.schema)}, refusing to generate an empty client.`);
     newline();
     console.log(`  ${dim('Common causes:')}`);
     console.log(
@@ -1519,7 +1521,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     );
     console.log(`    ${dim('•')} ${cyan('include')}/${cyan('exclude')} ${dim('filtered out every table.')}`);
     console.log(
-      `    ${dim('•')} ${dim('The database has no tables yet — run')} ${cyan('turbine push')} ${dim('or a migration first.')}`,
+      `    ${dim('•')} ${dim('The database has no tables yet, run')} ${cyan('turbine push')} ${dim('or a migration first.')}`,
     );
     newline();
     console.log(
@@ -1694,6 +1696,7 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
       includeViews: true,
       // Inherit the shared bookkeeping-table exclusions (Turbine + Prisma).
       exclude: [...new Set([...config.exclude, ...DEFAULT_EXCLUDED_TABLES])],
+      relationNames: config.relationNames,
     });
     spinner.succeed(`Introspected ${bold(String(Object.keys(schemaMeta.tables).length))} tables`);
   }
@@ -1853,7 +1856,7 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
   }
 
   if (args.dryRun) {
-    info('Dry run — no changes applied.');
+    info('Dry run, no changes applied.');
     newline();
     return;
   }
@@ -1907,7 +1910,7 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
 
   if (!sub || sub === 'help') {
     banner();
-    console.log(`  ${bold('turbine migrate')} ${dim('— SQL-first migration system')}`);
+    console.log(`  ${bold('turbine migrate')} ${dim(', SQL-first migration system')}`);
     newline();
     console.log(`  ${bold('Commands:')}`);
     console.log(`    ${cyan('create <name>')}             Create a new migration file`);
@@ -2228,17 +2231,17 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
     return;
   }
 
-  // Big, loud warning when bypassing drift detection — this is a deliberately
+  // Big, loud warning when bypassing drift detection, this is a deliberately
   // dangerous operation and the user should see it on every invocation.
   if (args.allowDrift) {
-    warn('--allow-drift is set — checksum validation is DISABLED for this run.');
+    warn('--allow-drift is set, checksum validation is DISABLED for this run.');
     console.log(`  ${dim('Applied migrations may have been modified or deleted on disk.')}`);
     console.log(`  ${dim('Proceed only if you are intentionally rewriting migration history.')}`);
     newline();
   }
 
   if (args.allowDestructive) {
-    warn('--allow-destructive is set — data-destroying statements in migrations WILL run.');
+    warn('--allow-destructive is set, data-destroying statements in migrations WILL run.');
     newline();
   }
 
@@ -2268,7 +2271,7 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
     if (!isDestructiveRefusal(err)) throw err;
     spinner.stop();
     if (!(await confirmDestructive((err as Error).message))) {
-      error('Aborted — no migrations were applied and no data was touched.');
+      error('Aborted, no migrations were applied and no data was touched.');
       newline();
       process.exit(1);
     }
@@ -2441,7 +2444,7 @@ function isDestructiveRefusal(err: unknown): boolean {
  *   1. show the full itemized report (statement kinds + targets),
  *   2. require typing the literal phrase `destroy my data`,
  *   3. require a final explicit `yes`.
- * Non-interactive shells (CI, pipes) can never pass this — they must use the
+ * Non-interactive shells (CI, pipes) can never pass this, they must use the
  * explicit `--allow-destructive` flag instead. Anything but exact answers aborts.
  */
 async function confirmDestructive(report: string): Promise<boolean> {
@@ -2465,7 +2468,7 @@ async function confirmDestructive(report: string): Promise<boolean> {
     const phrase = await rl.question(`  Type ${bold('destroy my data')} to continue, anything else to abort: `);
     if (phrase.trim() !== 'destroy my data') return false;
     const finalAnswer = await rl.question(
-      `  Final confirmation — apply the destructive statements above? Type ${bold('yes')}: `,
+      `  Final confirmation, apply the destructive statements above? Type ${bold('yes')}: `,
     );
     return finalAnswer.trim() === 'yes';
   } finally {
@@ -2493,7 +2496,7 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
     if (!isDestructiveRefusal(err)) throw err;
     spinner.stop();
     if (!(await confirmDestructive((err as Error).message))) {
-      error('Aborted — nothing was rolled back and no data was touched.');
+      error('Aborted, nothing was rolled back and no data was touched.');
       newline();
       process.exit(1);
     }
@@ -2599,7 +2602,7 @@ async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise
               .replace('T', ' ')
               .replace(/\.\d+Z$/, ' UTC'),
           )
-        : dim('—'),
+        : dim('-'),
     ];
   });
 
@@ -2642,7 +2645,7 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
   try {
     if (plan.kind === 'tsx') {
       if (!canResolveTsx()) {
-        throw new Error('TypeScript seed files require tsx — install tsx or use seed.js/seed.sql.');
+        throw new Error('TypeScript seed files require tsx, install tsx or use seed.js/seed.sql.');
       }
       // The seed runs in a child process, so we cannot observe its callback
       // directly. Hand it a sentinel path: `defineSeed`'s runner writes the file
@@ -2757,6 +2760,7 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
     schema: config.schema,
     include: config.include.length ? config.include : undefined,
     exclude: config.exclude.length ? config.exclude : undefined,
+    relationNames: config.relationNames,
   });
 
   const tableNames = Object.keys(schema.tables);
@@ -2808,7 +2812,7 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
-// Command: doctor — relation/index health check
+// Command: doctor, relation/index health check
 // ---------------------------------------------------------------------------
 
 /** A topology finding paired with its cost-aware score. */
@@ -3349,7 +3353,7 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Command: studio — local read-only web UI
+// Command: studio, local read-only web UI
 // ---------------------------------------------------------------------------
 
 async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
@@ -3369,7 +3373,7 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
   }
 
   // Non-loopback binds require an explicit --allow-remote opt-in. Studio has
-  // only a random session token — exposing it on a LAN interface is foot-gun
+  // only a random session token, exposing it on a LAN interface is foot-gun
   // territory, so we refuse rather than warn-and-proceed.
   if (!isLoopbackHost(host)) {
     if (!args.allowRemote) {
@@ -3382,7 +3386,7 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
     }
     console.log(
       warn(
-        `Studio is binding to ${yellow(host)} — this is NOT loopback. ` +
+        `Studio is binding to ${yellow(host)}, this is NOT loopback. ` +
           `Anyone on your network who can reach this port + guess the session token can read your database.`,
       ),
     );
@@ -3511,7 +3515,7 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Command: mcp — read-only JSON-RPC stdio server
+// Command: mcp, read-only JSON-RPC stdio server
 // ---------------------------------------------------------------------------
 
 async function cmdMcp(_args: CliArgs, config: ResolvedConfig): Promise<void> {
@@ -3565,7 +3569,7 @@ async function cmdObserve(args: CliArgs): Promise<void> {
     }
     console.log(
       warn(
-        `Observe is binding to ${yellow(host)} — this is NOT loopback. ` +
+        `Observe is binding to ${yellow(host)}, this is NOT loopback. ` +
           `Anyone on your network who can reach this port + guess the session token can read your metrics.`,
       ),
     );
@@ -3585,7 +3589,7 @@ async function cmdObserve(args: CliArgs): Promise<void> {
   console.log(
     box(
       [
-        `${bold('Turbine Observe')}  ${dim('— query metrics dashboard')}`,
+        `${bold('Turbine Observe')}  ${dim(', query metrics dashboard')}`,
         '',
         `  ${cyan('URL:')}  ${bold(handle.url)}`,
         '',
@@ -3638,7 +3642,7 @@ function showSubcommandHelp(command: string): boolean {
 
 function showInitHelp(): void {
   banner();
-  console.log(`  ${bold('turbine init')} — Initialize a Turbine project`);
+  console.log(`  ${bold('turbine init')}, Initialize a Turbine project`);
   newline();
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine init ${dim('[options]')}`);
@@ -3664,16 +3668,16 @@ function showInitHelp(): void {
 
 function showGenerateHelp(): void {
   banner();
-  console.log(`  ${bold('turbine generate')} — Introspect database and generate TypeScript types`);
+  console.log(`  ${bold('turbine generate')}, Introspect database and generate TypeScript types`);
   newline();
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine generate ${dim('[options]')}`);
   newline();
   console.log(`  Connects to your database, reads the schema, and generates:`);
-  console.log(`    ${dim('•')} ${cyan('types.ts')}    — Entity interfaces, Create/Update input types`);
-  console.log(`    ${dim('•')} ${cyan('metadata.ts')} — Runtime schema metadata`);
-  console.log(`    ${dim('•')} ${cyan('index.ts')}    — Configured client with typed table accessors`);
-  console.log(`    ${dim('•')} ${cyan('zod.ts')}      — Zod schemas ${dim('(with --zod)')}`);
+  console.log(`    ${dim('•')} ${cyan('types.ts')}   , Entity interfaces, Create/Update input types`);
+  console.log(`    ${dim('•')} ${cyan('metadata.ts')}, Runtime schema metadata`);
+  console.log(`    ${dim('•')} ${cyan('index.ts')}   , Configured client with typed table accessors`);
+  console.log(`    ${dim('•')} ${cyan('zod.ts')}     , Zod schemas ${dim('(with --zod)')}`);
   newline();
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);
@@ -3741,7 +3745,7 @@ function showMigrateFromPrismaHelp(): void {
 
 function showPushHelp(): void {
   banner();
-  console.log(`  ${bold('turbine push')} — Apply schema-builder definitions to database`);
+  console.log(`  ${bold('turbine push')}, Apply schema-builder definitions to database`);
   newline();
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine push ${dim('[options]')}`);
@@ -3761,7 +3765,7 @@ function showPushHelp(): void {
 
 function showMigrateHelp(): void {
   banner();
-  console.log(`  ${bold('turbine migrate')} — SQL migration management`);
+  console.log(`  ${bold('turbine migrate')}, SQL migration management`);
   newline();
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine migrate ${cyan('<subcommand>')} ${dim('[options]')}`);
@@ -3784,7 +3788,7 @@ function showMigrateHelp(): void {
   );
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
   console.log(`    ${cyan('--dry-run')}         Show SQL without executing`);
-  console.log(`    ${cyan('--allow-drift')}     Bypass checksum validation ${dim('(migrate up only — advanced)')}`);
+  console.log(`    ${cyan('--allow-drift')}     Bypass checksum validation ${dim('(migrate up only, advanced)')}`);
   console.log(
     `    ${cyan('--allow-destructive')} Run data-destroying migration statements without the interactive confirm`,
   );
@@ -3804,7 +3808,7 @@ function showMigrateHelp(): void {
 
 function showSeedHelp(): void {
   banner();
-  console.log(`  ${bold('turbine seed')} — Run seed file`);
+  console.log(`  ${bold('turbine seed')}, Run seed file`);
   newline();
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine seed ${dim('[options]')}`);
@@ -3823,7 +3827,7 @@ function showSeedHelp(): void {
 
 function showStatusHelp(): void {
   banner();
-  console.log(`  ${bold('turbine status')} — Show database schema summary`);
+  console.log(`  ${bold('turbine status')}, Show database schema summary`);
   newline();
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine status ${dim('[options]')}`);
@@ -3839,7 +3843,7 @@ function showStatusHelp(): void {
 
 function showMcpHelp(): void {
   banner();
-  console.log(`  ${bold('turbine mcp')} — Start read-only MCP server over stdio`);
+  console.log(`  ${bold('turbine mcp')}, Start read-only MCP server over stdio`);
   newline();
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine mcp ${dim('[options]')}`);

@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'CLI',
   description:
-    'Every Turbine ORM CLI command — init, pull, push, migrate, seed, status, doctor — with flags and examples.',
+    'Every Turbine ORM CLI command, init, pull, push, migrate, seed, status, doctor, with flags and examples.',
   alternates: { canonical: '/cli' },
 };
 
@@ -88,9 +88,9 @@ npx turbine pull --schema inventory
 
 Reads `information_schema` + `pg_catalog` and writes three files to the output directory:
 
-- `types.ts` — entity interfaces, `Create` / `Update` inputs, relation-included helpers
-- `metadata.ts` — runtime `SchemaMetadata` constant (column maps, relations, indexes)
-- `index.ts` — typed `TurbineClient` subclass + `turbine()` factory
+- `types.ts`, entity interfaces, `Create` / `Update` inputs, relation-included helpers
+- `metadata.ts`, runtime `SchemaMetadata` constant (column maps, relations, indexes)
+- `index.ts`, typed `TurbineClient` subclass + `turbine()` factory
 
 ### `--zod`
 
@@ -120,7 +120,7 @@ Every generated file carries a `Generated at: <ISO timestamp>` header, which cha
 npx turbine generate --no-timestamp
 ```
 
-Useful when generated code is committed to source control or checked in CI — a `generate` that changes nothing leaves the tree clean.
+Useful when generated code is committed to source control or checked in CI, a `generate` that changes nothing leaves the tree clean.
 
 ### `--import-ext <mode>`
 
@@ -144,6 +144,35 @@ npx turbine generate --legacy-to-many-uniques
 
 restores the pre-0.41 `hasMany` output while you port the affected call sites. It is also settable as `legacyToManyUniques: true` in `turbine.config.ts`, and it only affects what introspection emits, never runtime behavior.
 
+### Renaming derived relations, `relationNames`
+
+A database does not name its relationships, so introspection composes a name from the foreign key. Two foreign keys pointing at the same table produce names nobody would guess:
+
+```
+messages.sender_id    -> people.msgsBySender
+messages.recipient_id -> people.msgsByRecipient
+```
+
+A codebase migrating from another ORM already has names for these, chosen by different rules, so every call site would have to be hand-edited. Declare the mapping once instead (new in v0.51):
+
+```ts
+// turbine.config.ts
+export default {
+  relationNames: {
+    people: {
+      msgsBySender: 'sentMessages',
+      msgsByRecipient: 'receivedMessages',
+    },
+  },
+};
+```
+
+`turbine generate` then emits `sentMessages` / `receivedMessages` everywhere, in the metadata and the types alike, and they work in `where`, `with`, and `orderBy` like any other relation.
+
+A typo is an **error, not a silent no-op**: an unknown table, an unknown source relation, or a target name that would shadow a column fails the command with `TURBINE_E003`, listing the names that do exist. Ignoring a bad mapping would break the very call sites it was written to fix, and it would break them at runtime rather than at `generate` time.
+
+> Not sure what a relation ended up called? Query it wrong once. The unknown-field error lists the table's relations alongside its columns and suggests the closest match.
+
 ## `turbine push`
 
 Apply your `defineSchema()` output directly to the database. The fast path for local development.
@@ -166,7 +195,7 @@ npx turbine push --allow-destructive   # apply data-destroying schema changes
 Create a new migration file.
 
 ```bash
-# Blank migration — write SQL manually
+# Blank migration, write SQL manually
 npx turbine migrate create add_users_table
 
 # Auto-generate from diff between defineSchema() and live DB
@@ -225,14 +254,14 @@ ignored, and structure-only drops (`DROP INDEX`, `DROP CONSTRAINT`, `DROP TRIGGE
 not flagged.
 
 When a destructive statement is found, Turbine **refuses to run anything** and prints an
-itemized report. To proceed you must either confirm interactively — typing the literal
-phrase `destroy my data`, then `yes` — or pass `--allow-destructive` explicitly
+itemized report. To proceed you must either confirm interactively, typing the literal
+phrase `destroy my data`, then `yes`, or pass `--allow-destructive` explicitly
 (required in CI and other non-interactive shells). Programmatic callers of
 `migrateUp`/`migrateDown` opt in with `allowDestructive: true`.
 
 ## `turbine migrate deploy`
 
-Apply pending migrations non-interactively — the command for CI/CD and production deploys. Unlike `migrate up`, `deploy` never prompts, so it works with no TTY.
+Apply pending migrations non-interactively, the command for CI/CD and production deploys. Unlike `migrate up`, `deploy` never prompts, so it works with no TTY.
 
 ```bash
 npx turbine migrate deploy
@@ -295,9 +324,9 @@ npx turbine seed --verbose
 
 Turbine resolves the seed from the `seedFile` field in `turbine.config.ts` (the pre-0.50 spelling `seed` is still accepted as an alias), or the first default candidate found: `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, then `turbine/seed.sql`. Each extension has its own runner:
 
-- **`.ts`** — run with `npx tsx` (no build step). Export a `defineSeed(fn)` or run inserts directly.
-- **`.js`** — imported dynamically; a default-export function is called.
-- **`.sql`** — executed as raw SQL.
+- **`.ts`**, run with `npx tsx` (no build step). Export a `defineSeed(fn)` or run inserts directly.
+- **`.js`**, imported dynamically; a default-export function is called.
+- **`.sql`**, executed as raw SQL.
 
 ```ts
 // seed.ts
@@ -318,7 +347,7 @@ Show the current database connection, schema summary, and generated client locat
 npx turbine status
 ```
 
-Outputs the detected database name, host, Postgres version, table count, and the path to the generated client — handy for verifying CI environments.
+Outputs the detected database name, host, Postgres version, table count, and the path to the generated client, handy for verifying CI environments.
 
 ## `turbine doctor`
 
@@ -462,19 +491,19 @@ npx turbine studio --port 5173 --no-open
 # npx turbine studio --host 0.0.0.0 --allow-remote
 ```
 
-Three tabs: a visual `findMany` **Query** builder with a live Copy-TS preview (no raw-SQL surface at all), **Data** browsing, and **Schema** inspection — all inside `BEGIN READ ONLY` with loopback binding and per-process token auth.
+Three tabs: a visual `findMany` **Query** builder with a live Copy-TS preview (no raw-SQL surface at all), **Data** browsing, and **Schema** inspection, all inside `BEGIN READ ONLY` with loopback binding and per-process token auth.
 
 Studio has its own page covering the builder, saved queries, every flag, and the full security model: **[Studio](/studio)**.
 
 ## `turbine mcp`
 
-Start a read-only [Model Context Protocol](https://modelcontextprotocol.io) server so AI agents (Claude Code, Cursor) can inspect your database safely. Speaks JSON-RPC 2.0 over stdio; exposes read-only tools only — no writes, no raw SQL.
+Start a read-only [Model Context Protocol](https://modelcontextprotocol.io) server so AI agents (Claude Code, Cursor) can inspect your database safely. Speaks JSON-RPC 2.0 over stdio; exposes read-only tools only, no writes, no raw SQL.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
 ```
 
-Six tools: `schema_overview`, `table_detail`, `migrate_status`, `doctor_report`, `explain_query` (schema-validated findMany-style args only — no free-form SQL), and `sample_rows` (≤ 50 rows). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
+Six tools: `schema_overview`, `table_detail`, `migrate_status`, `doctor_report`, `explain_query` (schema-validated findMany-style args only, no free-form SQL), and `sample_rows` (≤ 50 rows). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
 
 Full setup, tool reference, and Claude Code / Cursor config: **[MCP Server](/mcp)**.
 
@@ -516,5 +545,5 @@ export default config;
 
 ## See also
 
-- **[Schema & Migrations](/schema)** — the full migration workflow with code examples.
-- **[Quick Start](/quickstart)** — end-to-end walkthrough from `init` to first query.
+- **[Schema & Migrations](/schema)**, the full migration workflow with code examples.
+- **[Quick Start](/quickstart)**, end-to-end walkthrough from `init` to first query.

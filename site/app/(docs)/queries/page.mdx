@@ -7,7 +7,7 @@ export const metadata = {
 
 # API Reference
 
-Every query method, operator, and API surface Turbine exposes. Generated clients attach `db.<table>` accessors with the full API below — the examples use `db.users` and `db.posts` but any introspected table works identically.
+Every query method, operator, and API surface Turbine exposes. Generated clients attach `db.<table>` accessors with the full API below, the examples use `db.users` and `db.posts` but any introspected table works identically.
 
 ## findMany
 
@@ -45,11 +45,11 @@ The entire object graph resolves in one SQL statement. `users[0].posts[0].commen
 When `warnOnUnlimited` is enabled, a `findMany` with no `limit` / `take` / `cursor` logs a one-time warning. Silence it for a query you know is bounded by passing `warnOnUnlimited: false` on the call:
 
 ```ts
-// This one is fine — a tiny lookup table
+// This one is fine, a tiny lookup table
 const roles = await db.roles.findMany({ warnOnUnlimited: false });
 ```
 
-You can also set it per table on the client — `warnOnUnlimited: { userProfiles: false }` (accessor or `snake_case` keys) — leaving the warning on everywhere else. Precedence is per-call, then per-table, then the global boolean.
+You can also set it per table on the client, `warnOnUnlimited: { userProfiles: false }` (accessor or `snake_case` keys), leaving the warning on everywhere else. Precedence is per-call, then per-table, then the global boolean.
 
 ### Deterministic pages: the unordered-pagination warning
 
@@ -77,7 +77,7 @@ It is **off by default in core**, deliberately: turning it on adds an `ORDER BY`
 
 ### select / omit
 
-Pick or drop columns at the query level. Either one — not both.
+Pick or drop columns at the query level. Either one, not both.
 
 ```ts
 // Only return id and email
@@ -146,19 +146,19 @@ await db.users.aggregate({ _count: true, where: { email: { endsWith: '@acme.com'
 
 Writes enforce the same boundary at the SQL level. A write against a table with PII columns (`create`, `createMany`, `update`, `delete`, `upsert`, and nested writes) returns an explicit non-PII projection instead of `RETURNING *`: `RETURNING "id", "name", ...` on Postgres and SQLite, the follow-up `SELECT` on MySQL, and `OUTPUT INSERTED.…` / `OUTPUT DELETED.…` on SQL Server all list only the non-PII columns. You may still write PII values freely (they are persisted); they simply never cross the wire back to your application unrequested. A PII-tagged primary key is kept in the projection anyway, so the returned row stays addressable. Tables with no PII columns keep `RETURNING *` byte-for-byte. (PowDB is the one exception: its `returning` keyword accepts no column list, so PII is stripped client-side from the returned row there; the upsert path reselects by PK through the non-PII read projection.)
 
-### Pagination — `limit` / `take`, `offset`, `cursor`
+### Pagination, `limit` / `take`, `offset`, `cursor`
 
-Offset pagination uses `limit` + `offset`. `take` is a Prisma-compatible alias for `limit` — when both are passed, `take` wins (`take ?? limit`):
+Offset pagination uses `limit` + `offset`. `take` is a Prisma-compatible alias for `limit`, when both are passed, `take` wins (`take ?? limit`):
 
 ```ts
 const page2 = await db.posts.findMany({
   orderBy: { id: 'asc' },
-  limit: 20,   // or take: 20 — same thing
+  limit: 20,   // or take: 20, same thing
   offset: 20,
 });
 ```
 
-For deep pagination, `cursor` is the keyset alternative: pass the column values of the last row you saw, and Turbine adds a comparison per cursor field — `column > value` for ascending order, `column < value` for descending (taken from `orderBy`; defaults to ascending). The cursor row itself is **excluded**, so the next page starts immediately after it:
+For deep pagination, `cursor` is the keyset alternative: pass the column values of the last row you saw, and Turbine adds a comparison per cursor field, `column > value` for ascending order, `column < value` for descending (taken from `orderBy`; defaults to ascending). The cursor row itself is **excluded**, so the next page starts immediately after it:
 
 ```ts
 const firstPage = await db.posts.findMany({
@@ -173,7 +173,7 @@ const nextPage = await db.posts.findMany({
 });
 ```
 
-Multiple cursor fields combine with `AND`. Use a unique (or unique-in-combination) column in `cursor` + `orderBy` so the ordering is total — that's what makes keyset pagination skip-free and index-friendly at any depth, where `OFFSET 100000` still scans the skipped rows.
+Multiple cursor fields combine with `AND`. Use a unique (or unique-in-combination) column in `cursor` + `orderBy` so the ordering is total. That's what makes keyset pagination skip-free and index-friendly at any depth, where `OFFSET 100000` still scans the skipped rows.
 
 ### distinct
 
@@ -187,9 +187,9 @@ const sample = await db.posts.findMany({
 });
 ```
 
-Per `DISTINCT ON` semantics, which row survives per group is governed by `orderBy` — sort by the distinct fields first, then by whatever should decide the winner within each group.
+Per `DISTINCT ON` semantics, which row survives per group is governed by `orderBy`, sort by the distinct fields first, then by whatever should decide the winner within each group.
 
-### Ordering — direction and NULLS placement
+### Ordering, direction and NULLS placement
 
 `orderBy` maps fields to a direction. A plain `'asc'` or `'desc'` works everywhere. To control where `NULL` values land, pass a spec object instead:
 
@@ -216,13 +216,13 @@ orderBy: [{ createdAt: 'desc' }, { id: 'asc' }]
 
 Both forms accept `{ sort, nulls }` specs and produce byte-identical SQL for the same key order. The array form works everywhere an `orderBy` is accepted: `findMany`, a `with` relation, and `groupBy`.
 
-`{ sort, nulls }` applies everywhere an `orderBy` is compiled — top-level queries, `groupBy`, and the inner subquery of a `with` relation.
+`{ sort, nulls }` applies everywhere an `orderBy` is compiled, top-level queries, `groupBy`, and the inner subquery of a `with` relation.
 
 > **Pitfall:** `NULLS FIRST` / `NULLS LAST` is a PostgreSQL and SQLite feature. On MySQL and SQL Server, explicit nulls placement throws `UnsupportedFeatureError` (TURBINE_E017) rather than emitting broken SQL. Plain `'asc'` / `'desc'` works on every engine.
 
 ### Ordering by a relation
 
-Order a query by an aggregate of its related rows. For a **to-many** relation the only key is `_count` — Turbine adds a correlated `COUNT(*)` subquery:
+Order a query by an aggregate of its related rows. For a **to-many** relation the only key is `_count`, Turbine adds a correlated `COUNT(*)` subquery:
 
 ```ts
 // Users, most posts first
@@ -231,7 +231,7 @@ const users = await db.users.findMany({
 });
 ```
 
-For a **to-one** relation, order by a column on the target — a correlated scalar subquery, `{ sort, nulls }` supported:
+For a **to-one** relation, order by a column on the target, a correlated scalar subquery, `{ sort, nulls }` supported:
 
 ```ts
 // Posts, ordered by their author's name
@@ -240,7 +240,24 @@ const posts = await db.posts.findMany({
 });
 ```
 
+Since v0.51 the chain can be **more than one hop long**, as long as every hop is to-one:
+
+```ts
+// Versions, ordered by the name of their model's category
+const versions = await db.versions.findMany({
+  orderBy: { model: { category: { name: 'asc' } } },
+});
+```
+
+Each extra hop becomes an INNER JOIN inside the *same* correlated subquery, so an N-hop chain still costs one subquery with one `LIMIT 1`, not N levels of nesting. Every hop applies its target's global filter to the join condition, so ordering never keys off a soft-deleted or other-tenant row.
+
+A **to-many** hop mid-chain is refused rather than silently picking an arbitrary row: it has no single value to order by. Use a pick-row ordering (`{ pick, by }`) or `_count` instead.
+
 Relation ordering adds no bound parameters. An unknown relation throws `RelationError` (TURBINE_E005); a non-`_count` key on a to-many relation, or an unknown column on a to-one relation, throws `ValidationError` (TURBINE_E003).
+
+<Callout type="note" title="New in 0.51">
+`orderBy` keys are now checked at **compile time** against the table's columns and relations, the way `where` has been since 0.50. `orderBy: { nmae: 'asc' }` is a type error rather than a runtime `TURBINE_E003`. The same check now applies to a `with` block's `select`, `omit` and `orderBy`, each scoped to that relation's target rather than the parent. A clause built dynamically (`Record<string, 'asc' | 'desc'>`) still assigns, and an untyped `db.table(name)` keeps the open escape hatch.
+</Callout>
 
 ## findUnique / findUniqueOrThrow
 
@@ -294,7 +311,7 @@ const newUser = await db.users.create({
 
 ## createMany
 
-Batch insert with a single `INSERT ... UNNEST(...)` — not N separate inserts.
+Batch insert with a single `INSERT ... UNNEST(...)`, not N separate inserts.
 
 ```ts
 const users = await db.users.createMany({
@@ -334,7 +351,7 @@ await db.posts.update({
     likesCount: { decrement: 1 },
     score: { multiply: 2 },
     rank: { divide: 2 },
-    title: { set: 'New title' }, // explicit set — same as a literal
+    title: { set: 'New title' }, // explicit set, same as a literal
   },
 });
 ```
@@ -351,11 +368,11 @@ await db.users.deleteMany({
 });
 ```
 
-Empty `where` (or `where: {}`) throws `ValidationError` — Turbine blocks accidental mass deletes. Pass `{ allowFullTableScan: true }` if you really mean it.
+Empty `where` (or `where: {}`) throws `ValidationError`, Turbine blocks accidental mass deletes. Pass `{ allowFullTableScan: true }` if you really mean it.
 
 ## upsert
 
-Insert a row or update it if a row matching the `where` clause already exists. Uses PostgreSQL's `INSERT ... ON CONFLICT ... DO UPDATE` under the hood — atomic, no race conditions.
+Insert a row or update it if a row matching the `where` clause already exists. Uses PostgreSQL's `INSERT ... ON CONFLICT ... DO UPDATE` under the hood, atomic, no race conditions.
 
 The `where` keys determine the conflict target (must be unique or primary key columns). If no matching row exists, `create` is inserted. If a row matches, `update` is applied.
 
@@ -522,7 +539,7 @@ The row source becomes `SELECT DISTINCT ON ("instance_id") ... ORDER BY "instanc
 
 ### Filtering groups with HAVING
 
-A `where` clause filters rows *before* grouping. A `having` clause filters the resulting groups *after* — by their aggregates. Every comparison value is parameterized.
+A `where` clause filters rows *before* grouping. A `having` clause filters the resulting groups *after*, by their aggregates. Every comparison value is parameterized.
 
 ```ts
 // Users with more than one post
@@ -540,7 +557,7 @@ const popular = await db.posts.groupBy({
 });
 ```
 
-Filter on the group row count with `_count`, or on a column aggregate with `{ column: { _sum | _avg | _min | _max: { ... } } }`. The available operators are `gt`, `gte`, `lt`, `lte`, `in`, and `notIn` — a bare number is shorthand for equality. Multiple `having` predicates combine with `AND`:
+Filter on the group row count with `_count`, or on a column aggregate with `{ column: { _sum | _avg | _min | _max: { ... } } }`. The available operators are `gt`, `gte`, `lt`, `lte`, `in`, and `notIn`, a bare number is shorthand for equality. Multiple `having` predicates combine with `AND`:
 
 ```ts
 // Groups with > 1 row AND a summed view count <= 500
@@ -569,7 +586,7 @@ for await (const user of db.users.findManyStream({
 }
 ```
 
-Under the hood Turbine issues a speculative `LIMIT batchSize + 1` first fetch — if the result fits in one batch, rows are yielded directly without `DECLARE CURSOR` overhead. Larger result sets escalate to a cursor. Safe to `break` early; the cursor and connection are cleaned up deterministically.
+Under the hood Turbine issues a speculative `LIMIT batchSize + 1` first fetch, if the result fits in one batch, rows are yielded directly without `DECLARE CURSOR` overhead. Larger result sets escalate to a cursor. Safe to `break` early; the cursor and connection are cleaned up deterministically.
 
 ## WHERE operators
 
@@ -681,8 +698,11 @@ Filter into a JSON document with a `JsonFilter`. `path` drills into nested keys 
 | `contains` | jsonb containment (`@>`) | `where: { data: { contains: { active: true } } }` |
 | `hasKey` | Top-level key exists (`?`) | `where: { data: { hasKey: 'meta' } }` |
 | `gt` / `gte` / `lt` / `lte` | Range-compare the value at `path` | `where: { data: { path: ['rating'], gte: 4 } }` |
+| `stringContains` | Substring match on the text at `path` | `where: { data: { path: ['title'], stringContains: 'orm' } }` |
+| `stringStartsWith` / `stringEndsWith` | Prefix / suffix match on the text at `path` | `where: { data: { path: ['slug'], stringStartsWith: 'v2-' } }` |
+| `mode` | `'insensitive'` for the three substring operators | `where: { data: { path: ['title'], stringContains: 'ORM', mode: 'insensitive' } }` |
 
-The range operators (`gt` / `gte` / `lt` / `lte`, new in v0.30) require `path`. A numeric value casts the extracted text — `(col #>> path)::numeric >= $n` — while a string value compares as text:
+The range operators (`gt` / `gte` / `lt` / `lte`, new in v0.30) require `path`. A numeric value casts the extracted text, `(col #>> path)::numeric >= $n`, while a string value compares as text:
 
 ```ts
 // Products rated 4 or higher, read out of a jsonb column
@@ -691,11 +711,26 @@ const topRated = await db.products.findMany({
 });
 ```
 
-> **Note:** A bare `{ gt: 5 }` with no `path` on a jsonb column is the plain column comparison, not a JSON test — reach for `path` whenever you mean "the value inside the document."
+> **Note:** A bare `{ gt: 5 }` with no `path` on a jsonb column is the plain column comparison, not a JSON test, reach for `path` whenever you mean "the value inside the document."
+
+The three substring operators (new in v0.51) are the JSON counterpart of the scalar `contains` / `startsWith` / `endsWith`, and they all require `path`. They are deliberately **not** spelled `contains`, because on a JSON column `contains` already means whole-document jsonb containment (`@>`) and means something entirely different. The operand is LIKE-escaped, so `%` and `_` match literally.
+
+```ts
+// Rows whose jsonb `title` contains "orm", case-insensitively
+const matches = await db.docs.findMany({
+  where: { data: { path: ['title'], stringContains: 'orm', mode: 'insensitive' } },
+});
+```
+
+<Callout type="warning">
+**Unknown JSON operators are refused (changed in v0.51).** A key that is not in the table above, and a `path` with no comparison at all, now raise `ValidationError` (`TURBINE_E003`).
+
+Before v0.51 both shapes compiled to **no predicate at all**, so the query silently returned *every row of the table*, and inside an `AND` the offending term simply vanished, widening the result. Prisma's spelling `string_contains` was the common way to hit it; the error now names the turbine operator to use instead. The same typo on a scalar column has always thrown, so this only closes an inconsistency, but it is a runtime behavior change: a query that appeared to "work" may now error, which means it was returning the wrong rows.
+</Callout>
 
 ### Column-to-column comparison
 
-Compare a column against **another column of the same table** by passing `{ col: 'field' }` to `equals`, `not`, `gt`, `gte`, `lt`, or `lte` (new in v0.31). The referenced column is compiled into the SQL — no value is bound:
+Compare a column against **another column of the same table** by passing `{ col: 'field' }` to `equals`, `not`, `gt`, `gte`, `lt`, or `lte` (new in v0.31). The referenced column is compiled into the SQL, no value is bound:
 
 ```ts
 // Instances whose published version lags behind the draft
@@ -705,7 +740,7 @@ const stale = await db.modelInstances.findMany({
 // → WHERE "current_version_id" <> "published_version_id"
 ```
 
-An unknown referenced field throws `ValidationError` (`TURBINE_E003`), and `mode: 'insensitive'` cannot be combined with a column reference. On `json`/`jsonb` columns an `equals` object is always a JSON value (containment), never a column reference — use `path` filters for JSON tests.
+An unknown referenced field throws `ValidationError` (`TURBINE_E003`), and `mode: 'insensitive'` cannot be combined with a column reference. On `json`/`jsonb` columns an `equals` object is always a JSON value (containment), never a column reference, use `path` filters for JSON tests.
 
 ### Ordering by a JSON path
 
@@ -763,7 +798,7 @@ Filter parent rows by predicates on their child rows.
 | `every` | Every related row matches | `where: { posts: { every: { published: true } } }` |
 | `none` | No related row matches | `where: { posts: { none: { published: false } } }` |
 
-Any operator above — including JSON filters — composes inside `some` / `every` / `none`. As of v0.30, a JSON filter nested in a relation filter (or in a `with` relation's `where`) compiles correctly; earlier versions silently degraded it to a broken equality that matched nothing.
+Any operator above, including JSON filters, composes inside `some` / `every` / `none`. As of v0.30, a JSON filter nested in a relation filter (or in a `with` relation's `where`) compiles correctly; earlier versions silently degraded it to a broken equality that matched nothing.
 
 ```ts
 // Users who own at least one product rated 4+
@@ -806,9 +841,9 @@ const users = await db.users.findMany({
 });
 ```
 
-Nesting depth is capped at 10 — beyond that, Turbine throws `CircularRelationError` (TURBINE_E007) with the full relation path.
+Nesting depth is capped at 10, beyond that, Turbine throws `CircularRelationError` (TURBINE_E007) with the full relation path.
 
-### Counting related rows — `_count`
+### Counting related rows, `_count`
 
 Add `_count` to a `with` clause to get the number of related rows without loading them. Each counted to-many relation becomes a correlated `COUNT(*)` scalar subquery, assembled into a `_count` object on each row:
 
@@ -826,7 +861,7 @@ const authors = await db.users.findMany({
 authors[0]._count.posts; // 12
 ```
 
-`_count` coexists with real relation subqueries — `with: { posts: true, _count: { posts: true } }` loads the posts *and* counts them. It applies to `hasMany` and `manyToMany` (via the junction) relations; used on a to-one relation it throws `ValidationError` (TURBINE_E003), and an unknown relation throws `RelationError` (TURBINE_E005). The result type carries `_count` as `{ [relation]: number }`, so `users[0]._count.posts` is typed.
+`_count` coexists with real relation subqueries, `with: { posts: true, _count: { posts: true } }` loads the posts *and* counts them. It applies to `hasMany` and `manyToMany` (via the junction) relations; used on a to-one relation it throws `ValidationError` (TURBINE_E003), and an unknown relation throws `RelationError` (TURBINE_E005). The result type carries `_count` as `{ [relation]: number }`, so `users[0]._count.posts` is typed.
 
 ## Transactions
 
@@ -852,7 +887,7 @@ await db.$transaction(
   },
   {
     isolationLevel: 'Serializable',
-    timeout: 5000, // ms — destroys the connection on expiry
+    timeout: 5000, // ms, destroys the connection on expiry
   },
 );
 ```
@@ -871,11 +906,11 @@ const [user, postCount, recentPosts] = await db.pipeline([
 ]);
 ```
 
-The `build*` methods return `DeferredQuery` objects — generated SQL + params + a transform — without executing. `pipeline()` sends every statement in one TCP flush (parse/bind/execute/sync) and runs each transform on the result.
+The `build*` methods return `DeferredQuery` objects, generated SQL + params + a transform, without executing. `pipeline()` sends every statement in one TCP flush (parse/bind/execute/sync) and runs each transform on the result.
 
 ### Non-transactional pipelines
 
-By default, pipelines run inside a transaction — any failure rolls back the batch. Opt out for error-isolated execution:
+By default, pipelines run inside a transaction, any failure rolls back the batch. Opt out for error-isolated execution:
 
 ```ts
 try {
@@ -999,7 +1034,7 @@ db.users.cacheStats();
 
 ## Middleware
 
-`db.$use(fn)` registers a middleware that wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()` — but it cannot change the query itself.
+`db.$use(fn)` registers a middleware that wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()`, but it cannot change the query itself.
 
 ```ts
 // Query timing
@@ -1010,7 +1045,7 @@ db.$use(async (params, next) => {
   return result;
 });
 
-// Result transformation — redact a field on the way out
+// Result transformation, redact a field on the way out
 db.$use(async (params, next) => {
   const result = await next(params);
   if (params.model === 'users' && Array.isArray(result)) {
@@ -1020,9 +1055,9 @@ db.$use(async (params, next) => {
 });
 ```
 
-> **Warning:** `params.args` is a read-only snapshot — mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
+> **Warning:** `params.args` is a read-only snapshot, mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
 
-Because middleware can't rewrite queries, cross-cutting filters like **soft deletes** belong in the query itself — either explicitly or via a small scoped helper:
+Because middleware can't rewrite queries, cross-cutting filters like **soft deletes** belong in the query itself, either explicitly or via a small scoped helper:
 
 ```ts
 import type { WhereClause } from 'turbine-orm';
@@ -1039,7 +1074,7 @@ const rows = await activeUsers({ orgId: 1 });
 
 ## explain
 
-Every table accessor has `explain(args)` (since v0.35): it compiles the exact statement `findMany(args)` would run, executes it through the engine's plan explainer, and returns the plan as `string[]` lines. Use it to verify that the query the ORM actually emits hits the index you expect — no dropping to raw needed.
+Every table accessor has `explain(args)` (since v0.35): it compiles the exact statement `findMany(args)` would run, executes it through the engine's plan explainer, and returns the plan as `string[]` lines. Use it to verify that the query the ORM actually emits hits the index you expect, no dropping to raw needed.
 
 ```ts
 const plan = await db.posts.explain({
@@ -1051,7 +1086,7 @@ const plan = await db.posts.explain({
 
 Engine mapping: PostgreSQL (and CockroachDB / YugabyteDB) use `EXPLAIN`, SQLite uses `EXPLAIN QUERY PLAN`, MySQL uses `EXPLAIN`, and PowDB uses its native `explain` (which since PowDB 0.14 shows the lowered, executed plan, with selectivity estimates on 0.15+). SQL Server has no in-band explain and throws a typed `UnsupportedFeatureError` (`TURBINE_E017`).
 
-Two caveats: plan **text** is engine-owned diagnostic output — match on node names if you must parse it, never on exact layout — and middleware does not run for `explain` (the rows are plan text, not entities).
+Two caveats: plan **text** is engine-owned diagnostic output, match on node names if you must parse it, never on exact layout, and middleware does not run for `explain` (the rows are plan text, not entities).
 
 ## Raw SQL
 
@@ -1065,11 +1100,11 @@ const stats = await db.raw<{ day: Date; count: number }>`
 `;
 ```
 
-Parameters from `${}` interpolations become `$1, $2, ...` — never string-interpolated into the SQL text.
+Parameters from `${}` interpolations become `$1, $2, ...`, never string-interpolated into the SQL text.
 
-## Typed raw SQL — `db.sql<T>`
+## Typed raw SQL, `db.sql<T>`
 
-`db.sql<T>` is the typed escape hatch: you supply the row shape and get a thenable query with `.one()` and `.scalar()` helpers. Like `db.raw`, every `${value}` is bound as a `$N` parameter — injection is impossible even with hostile input. Unlike `db.raw`, you choose the result shape and get the convenience helpers.
+`db.sql<T>` is the typed escape hatch: you supply the row shape and get a thenable query with `.one()` and `.scalar()` helpers. Like `db.raw`, every `${value}` is bound as a `$N` parameter, injection is impossible even with hostile input. Unlike `db.raw`, you choose the result shape and get the convenience helpers.
 
 ```ts
 // Awaiting the query returns T[]
@@ -1104,6 +1139,6 @@ Reach for `db.sql<T>` when you want a hand-written query with a known return typ
 
 ## See also
 
-- **[Typed Errors](/errors)** — every error code and the retry patterns.
-- **[Schema & Migrations](/schema)** — code-first schemas and SQL migrations.
-- **[Benchmarks](/benchmarks)** — the numbers behind the query planner.
+- **[Typed Errors](/errors)**, every error code and the retry patterns.
+- **[Schema & Migrations](/schema)**, code-first schemas and SQL migrations.
+- **[Benchmarks](/benchmarks)**, the numbers behind the query planner.

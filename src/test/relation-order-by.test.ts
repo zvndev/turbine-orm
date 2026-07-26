@@ -1,5 +1,5 @@
 /**
- * turbine-orm — relation orderBy (WS-A / A3)
+ * turbine-orm, relation orderBy (WS-A / A3)
  *
  * Build-only SQL assertions for ordering a findMany by a related count
  * (`{ posts: { _count: 'desc' } }`, to-many → correlated COUNT(*) subquery) or a
@@ -91,7 +91,7 @@ function schema(): SchemaMetadata {
   };
 }
 
-describe('relation orderBy — to-many _count', () => {
+describe('relation orderBy, to-many _count', () => {
   it('hasMany _count → correlated COUNT(*) subquery', () => {
     const q = makeQuery('users', schema());
     const { sql, params } = q.buildFindMany({ orderBy: { posts: { _count: 'desc' } } } as never);
@@ -117,7 +117,7 @@ describe('relation orderBy — to-many _count', () => {
   });
 });
 
-describe('relation orderBy — to-one column', () => {
+describe('relation orderBy, to-one column', () => {
   it('belongsTo column → correlated scalar subquery', () => {
     const q = makeQuery('posts', schema());
     const { sql, params } = q.buildFindMany({ orderBy: { author: { name: 'asc' } } } as never);
@@ -140,7 +140,7 @@ describe('relation orderBy — to-one column', () => {
   });
 });
 
-describe('relation orderBy — validation & mixing', () => {
+describe('relation orderBy, validation & mixing', () => {
   it('throws RelationError (E005) for an unknown relation', () => {
     const q = makeQuery('users', schema());
     assert.throws(() => q.buildFindMany({ orderBy: { bogus: { _count: 'desc' } } } as never), RelationError);

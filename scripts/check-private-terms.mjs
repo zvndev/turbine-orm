@@ -2,7 +2,7 @@
 /**
  * Pre-commit guard: block commits whose staged content contains any term
  * listed in the repo-local `.private-terms` file (one term per line, `#`
- * comments allowed). The terms file is gitignored — it never ships — so the
+ * comments allowed). The terms file is gitignored, it never ships, so the
  * blocklist itself stays private. No terms file → no-op, so clones and CI
  * are unaffected.
  */
@@ -29,7 +29,7 @@ for (const file of staged) {
   try {
     content = execSync(`git show :"${file}"`, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   } catch {
-    continue; // binary or unreadable — skip
+    continue; // binary or unreadable, skip
   }
   const lower = content.toLowerCase();
   for (const term of terms) {
@@ -40,7 +40,7 @@ for (const file of staged) {
 }
 
 if (hits.length) {
-  console.error('\ncommit blocked — staged content contains private terms:\n');
+  console.error('\ncommit blocked, staged content contains private terms:\n');
   for (const h of hits) console.error(`  ${h}`);
   console.error('\nRemove or rephrase before committing (see .private-terms).\n');
   process.exit(1);

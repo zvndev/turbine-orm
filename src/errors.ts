@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Error types
+ * turbine-orm, Error types
  *
  * Typed errors with error codes for programmatic handling.
  * All Turbine errors extend TurbineError which includes a `code` property.
@@ -59,7 +59,7 @@ export class TurbineError extends Error {
  *
  * Defaults to `'safe'` to avoid leaking PII into error logs (Sentry, Datadog,
  * etc.). The full `where` object is always available as `err.where` for
- * programmatic access — only the human-readable message is redacted.
+ * programmatic access, only the human-readable message is redacted.
  *
  * Set via `setErrorMessageMode('verbose')` or by constructing TurbineClient
  * with `{ errorMessages: 'verbose' }`.
@@ -169,7 +169,7 @@ export class NotFoundError extends TurbineError {
           message?: string;
         },
   ) {
-    // Back-compat: string argument (or undefined) — replicate legacy behavior.
+    // Back-compat: string argument (or undefined), replicate legacy behavior.
     if (typeof input === 'string' || input === undefined) {
       super(TurbineErrorCode.NOT_FOUND, input ?? 'Record not found');
       this.name = 'NotFoundError';
@@ -307,7 +307,7 @@ export class UniqueConstraintError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only — the structured
+      // message carries keys/constraint/column names only, the structured
       // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
       // the full detail for programmatic use.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
@@ -342,7 +342,7 @@ export class ForeignKeyError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only — the structured
+      // message carries keys/constraint/column names only, the structured
       // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
       // the full detail for programmatic use.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
@@ -376,7 +376,7 @@ export class NotNullViolationError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only — the structured
+      // message carries keys/constraint/column names only, the structured
       // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
       // the full detail for programmatic use.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
@@ -392,7 +392,7 @@ export class NotNullViolationError extends TurbineError {
 /**
  * Thrown when Postgres detects a deadlock (pg code 40P01).
  *
- * This error is **retryable** — when caught, callers can safely retry the
+ * This error is **retryable**, when caught, callers can safely retry the
  * transaction (typically with backoff). Catch it explicitly:
  *
  * ```ts
@@ -431,9 +431,9 @@ export class DeadlockError extends TurbineError {
 
 /**
  * Thrown when a Serializable transaction fails due to a serialization
- * conflict (pg code 40001 — `could not serialize access due to ...`).
+ * conflict (pg code 40001, `could not serialize access due to ...`).
  *
- * This error is **retryable** — by Postgres documentation, the recommended
+ * This error is **retryable**, by Postgres documentation, the recommended
  * response is to re-run the entire transaction. Catch it explicitly:
  *
  * ```ts
@@ -490,7 +490,7 @@ export class CheckConstraintError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only — the structured
+      // message carries keys/constraint/column names only, the structured
       // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
       // the full detail for programmatic use.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
@@ -523,7 +523,7 @@ export class ExclusionConstraintError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only — the structured
+      // message carries keys/constraint/column names only, the structured
       // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
       // the full detail for programmatic use.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
@@ -602,7 +602,7 @@ export class OptimisticLockError extends TurbineError {
   constructor(opts: { table: string; versionField: string; expectedVersion: unknown }) {
     super(
       TurbineErrorCode.OPTIMISTIC_LOCK,
-      `[turbine] Optimistic lock failed on "${opts.table}" — ` +
+      `[turbine] Optimistic lock failed on "${opts.table}", ` +
         `expected ${opts.versionField} = ${opts.expectedVersion} but row was modified by another transaction`,
     );
     this.name = 'OptimisticLockError';

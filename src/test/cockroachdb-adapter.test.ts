@@ -1,5 +1,5 @@
 /**
- * turbine-orm — CockroachDB adapter unit tests
+ * turbine-orm, CockroachDB adapter unit tests
  *
  * Verifies the adapter's lock mechanism SQL, introspection overrides,
  * statement timeout generation, and lock behavior using mocked clients.

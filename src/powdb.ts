@@ -1,5 +1,5 @@
 /**
- * turbine-orm/powdb — Turbine's PowDB / PowQL backend.
+ * turbine-orm/powdb, Turbine's PowDB / PowQL backend.
  *
  * PowDB is a single-node embedded database with its own query language, **PowQL**
  * (not SQL), reached over `@zvndev/powdb-client`'s binary TCP protocol. PowDB is a
@@ -10,26 +10,26 @@
  *
  * PowDB realities shape the design (all verified firsthand against a live
  * `powdb-server` / the embedded addon, see `docs/internal/strategy/powdb-parity-matrix.md`):
- *   - **`RETURNING` (since 0.7.0)** — `create/createMany/update/delete` append the
+ *   - **`RETURNING` (since 0.7.0)**, `create/createMany/update/delete` append the
  *     trailing `returning` keyword (`RETURNING *`, all columns) and read the
  *     affected rows back in one round-trip. `upsert` is the lone exception (its
  *     statement rejects `returning`) and reselects by primary key.
- *   - **No generated IDs** — the app must supply every value → Turbine generates a
+ *   - **No generated IDs**, the app must supply every value → Turbine generates a
  *     client-side UUID for the primary key when it has a default.
  *   - **`uuid`/`datetime`/`bytes` columns can't hold client-supplied values** (no
  *     literal, no working cast on the wire) → Turbine maps everything onto the four
  *     writable types (`str`/`int`/`float`/`bool`); `Date` → `int` epoch micros;
  *     `string` PKs hold UUID strings.
- *   - **No JSON aggregation / link navigation** — single-query nested `with` is
+ *   - **No JSON aggregation / link navigation**, single-query nested `with` is
  *     impossible → it degrades to batched N+1 loaders (Phase B).
- *   - **Single global write lock; no savepoints/isolation** — nested
+ *   - **Single global write lock; no savepoints/isolation**, nested
  *     transactions / isolation / vector / LISTEN-NOTIFY / RLS throw.
  *     Independent concurrent `db.$transaction` calls do NOT throw: they queue
  *     FIFO on a pool-level gate and run one at a time (see {@link PowdbTxGate}).
- *     Only a *re-entrant* transaction — a `db.$transaction` opened from inside
+ *     Only a *re-entrant* transaction, a `db.$transaction` opened from inside
  *     an active transaction callback's async context, which queueing would
- *     deadlock — fails fast with E017.
- *   - **The wire protocol pipelines** — `@zvndev/powdb-client` writes each
+ *     deadlock, fails fast with E017.
+ *   - **The wire protocol pipelines**, `@zvndev/powdb-client` writes each
  *     request frame immediately and matches replies FIFO, so multiple queries
  *     may be in flight on one connection. {@link PowdbPool}'s checked-out
  *     clients advertise `supportsPipelining`, which lets the batch
@@ -102,9 +102,9 @@ import { type ColumnMetadata, normalizeKeyColumns, type SchemaMetadata, type Tab
 export const powdbDialect: Dialect = {
   ...postgresDialect,
   name: 'powdb',
-  // `resultStrategy` is decorative for PowDB — PowqlInterface owns its own write
+  // `resultStrategy` is decorative for PowDB, PowqlInterface owns its own write
   // path and never reads it. Set to 'returning' for honesty: writes use PowDB
-  // 0.7.0's trailing `returning` keyword (upsert excepted — see PowqlInterface).
+  // 0.7.0's trailing `returning` keyword (upsert excepted, see PowqlInterface).
   resultStrategy: 'returning',
   supportsReturning: true,
   supportsVector: false,
@@ -121,7 +121,7 @@ export const powdbDialect: Dialect = {
   beginStatement: () => 'begin',
   commitStatement: () => 'commit',
   rollbackStatement: () => 'rollback',
-  // PowDB has no savepoints — a nested `tx.$transaction` would emit one and PowDB
+  // PowDB has no savepoints, a nested `tx.$transaction` would emit one and PowDB
   // rejects it with a cryptic parse error. Throw a clear typed error instead.
   // These run synchronously in TransactionClient.$transaction before any query,
   // so the nested call fails fast with no partial DB state.
@@ -130,18 +130,18 @@ export const powdbDialect: Dialect = {
   rollbackToSavepointStatement: throwNoNestedTransaction,
 };
 
-/** Reject any savepoint (nested-transaction) operation — PowDB is single-writer. */
+/** Reject any savepoint (nested-transaction) operation, PowDB is single-writer. */
 function throwNoNestedTransaction(): never {
   throw new UnsupportedFeatureError(
     'nested transactions',
     'powdb',
-    'PowDB is single-writer — it has one global write lock and no savepoints. ' +
+    'PowDB is single-writer, it has one global write lock and no savepoints. ' +
       'Complete the open transaction before starting another; do not nest `$transaction` calls.',
   );
 }
 
 // ---------------------------------------------------------------------------
-// PowDB client surface (the subset we bind — see @zvndev/powdb-client)
+// PowDB client surface (the subset we bind, see @zvndev/powdb-client)
 // ---------------------------------------------------------------------------
 
 /** A single value PowDB accepts as a positional `$N` parameter. */
@@ -238,7 +238,7 @@ interface PowdbModule {
   isPowDBError?(err: unknown): err is { code: string; message: string };
 }
 
-/** Connection options for {@link turbinePowDB} — host/port, not a connection string. */
+/** Connection options for {@link turbinePowDB}, host/port, not a connection string. */
 export interface PowdbConnOptions {
   host: string;
   port: number;
@@ -290,7 +290,7 @@ export function parsePowdbUrl(connectionString: string): PowdbConnOptions {
  */
 export function assertSupportedPowdbVersion(version: string | undefined): void {
   const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? '').trim());
-  if (!m) return; // unknown / non-semver — don't block
+  if (!m) return; // unknown / non-semver, don't block
   const [major, minor] = [Number(m[1]), Number(m[2])];
   // 0.7.0 is the floor; >= 0.7 (or any 1.x+) passes.
   if (major > 0 || (major === 0 && minor >= 7)) return;
@@ -324,7 +324,7 @@ export interface PowdbCapabilities {
   /** ≥ 0.13: server-side joins, hash-accelerated and bounded. */
   serverJoins: boolean;
   /**
-   * ≥ 0.18: nested projections (shaped results) — a projection field may be a
+   * ≥ 0.18: nested projections (shaped results), a projection field may be a
    * whole correlated child query returning a per-parent JSON array. When set,
    * eligible `with` clauses compile into the parent statement instead of the
    * batched loaders.
@@ -509,7 +509,7 @@ export function requireCapability(caps: PowdbCapabilities, key: PowdbFeatureKey,
 }
 
 // ---------------------------------------------------------------------------
-// Type mapping — Turbine schema type → PowQL DDL type, and value coercion
+// Type mapping, Turbine schema type → PowQL DDL type, and value coercion
 // ---------------------------------------------------------------------------
 
 /**
@@ -552,7 +552,7 @@ export function isJsonColumn(col: ColumnMetadata): boolean {
 export function powqlColumnType(col: ColumnMetadata): PowqlType {
   if (col.isArray) {
     throw new ValidationError(
-      `[turbine] Column "${col.name}" is an array — PowDB has no array type. Arrays are unsupported on the PowDB backend.`,
+      `[turbine] Column "${col.name}" is an array, PowDB has no array type. Arrays are unsupported on the PowDB backend.`,
     );
   }
   if (isJsonColumn(col)) return 'json';
@@ -564,7 +564,7 @@ export function powqlColumnType(col: ColumnMetadata): PowqlType {
   if (ts === 'string') return 'str';
   if (ts === 'Buffer' || ts === 'Uint8Array') {
     throw new ValidationError(
-      `[turbine] Column "${col.name}" is binary — PowDB cannot store client-supplied bytes on the wire. Use a string (e.g. base64) instead.`,
+      `[turbine] Column "${col.name}" is binary, PowDB cannot store client-supplied bytes on the wire. Use a string (e.g. base64) instead.`,
     );
   }
   return 'str';
@@ -591,7 +591,7 @@ function isDateColumn(col: ColumnMetadata): boolean {
  * synthesizing a client-side value for it.
  */
 /**
- * PowQL reserved words — the v0.10 lexer keyword table from POWQL.md's
+ * PowQL reserved words, the v0.10 lexer keyword table from POWQL.md's
  * "Reserved Words and Quoting" section, including the v0.10 additions
  * `schema` and `describe`. Keyword matching is case-sensitive in the lexer,
  * so only the exact lowercase form collides.
@@ -697,7 +697,7 @@ const POWQL_BARE_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /**
  * Backtick-quote an identifier when PowQL would otherwise lex it as a keyword
  * (or when it contains characters outside the bare-identifier grammar).
- * Applied only in bare-identifier positions — DDL type/field names, index DDL,
+ * Applied only in bare-identifier positions, DDL type/field names, index DDL,
  * and `insert`/`update`/`upsert` assignment targets. Dotted references
  * (`.col` in filters/projections/ordering) bypass keyword lookup on every
  * engine version and deliberately stay bare for ≤0.9 compatibility. Backticks
@@ -809,7 +809,7 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
   const stmts: string[] = [];
   for (const meta of Object.values(schema.tables)) {
     const pkSet = new Set(meta.primaryKey);
-    // PowDB's `unique` is single-column only — there is no composite-unique
+    // PowDB's `unique` is single-column only, there is no composite-unique
     // constraint (`add unique` takes one `.column`). So the per-field `unique`
     // modifier is emitted only for a single-column PK; a composite PK (e.g. a
     // m2m junction's `(source_id, target_id)`) marks its columns `required` but
@@ -962,7 +962,7 @@ export async function applyPowdbLinks(
 
 /**
  * Read the live `schema links` listing into {@link PowdbDesiredLink} rows (owner,
- * name, target, localKey, targetKey; cardinality is dropped — it is derived, not
+ * name, target, localKey, targetKey; cardinality is dropped, it is derived, not
  * a DDL input). An empty catalog returns `[]`, never an error. Naming edge: a
  * table literally named `links` is described with `describe links`, but the
  * link LISTING is the contextual keyword form `schema links`.
@@ -1154,7 +1154,7 @@ export function rowToEntity(
  * So we always run the unique-constraint and message-shape checks first (they
  * fire for both transports and extract detail like constraint / column names),
  * then classify by the typed wire error class (`.wireErrorClass`, networked
- * server >= 0.17 — accurate even when the server sanitized the message text),
+ * server >= 0.17, accurate even when the server sanitized the message text),
  * then fall through to the networked `.code` switch.
  */
 export function wrapPowdbError(err: unknown): Error {
@@ -1162,12 +1162,12 @@ export function wrapPowdbError(err: unknown): Error {
   const e = err as { code?: string; message?: string };
   const msg = e.message ?? 'unknown PowDB error';
 
-  // Unique-constraint — message-based on both transports.
+  // Unique-constraint, message-based on both transports.
   if (/unique (constraint|expression index) violation/i.test(msg)) {
     const m = /on\s+\S+\.(\w+)/i.exec(msg);
     return new UniqueConstraintError({ constraint: m?.[1], cause: err as Error });
   }
-  // NOT NULL — "column 'x' is required but no value was provided". Map on BOTH
+  // NOT NULL, "column 'x' is required but no value was provided". Map on BOTH
   // transports (the networked path used to collapse this into E003).
   if (/required|not[- ]?null|no value/i.test(msg)) {
     const m = /column ['"]?(\w+)['"]?/i.exec(msg);
@@ -1289,11 +1289,11 @@ export function wrapPowdbError(err: unknown): Error {
   const wireClass = (err as { wireErrorClass?: unknown }).wireErrorClass;
   if (typeof wireClass === 'number') {
     switch (wireClass) {
-      case 3: // timeout (per-query budget, gate wait, idle timeout) — retryable
+      case 3: // timeout (per-query budget, gate wait, idle timeout), retryable
         return new TimeoutError(0, 'PowDB query', { message: `[turbine] PowDB ${msg}`, cause: err });
-      case 4: // limit_exceeded (memory / size budget) — a query-shape defect
+      case 4: // limit_exceeded (memory / size budget), a query-shape defect
         return new ValidationError(`[turbine] PowDB resource limit exceeded: ${msg}`);
-      case 5: // readonly_refused — the snapshot-serving routing signal
+      case 5: // readonly_refused, the snapshot-serving routing signal
         return new ReadOnlyError(`PowDB refused a write on a read-only database: ${msg}.`, {
           cause: err,
           reason: 'snapshot',
@@ -1303,17 +1303,17 @@ export function wrapPowdbError(err: unknown): Error {
           `[turbine] PowDB authentication failed: ${msg} (check the user / password / dbName for this connection).`,
           { cause: err },
         );
-      case 7: // rate_limited (repeated bad auth) — connection-establishment class
+      case 7: // rate_limited (repeated bad auth), connection-establishment class
         return new ConnectionError(
           `[turbine] PowDB rate-limited this address after repeated failed authentication: ${msg}. Wait before retrying.`,
           { cause: err },
         );
       case 8: {
-        // constraint_violation — today that is always a unique index
+        // constraint_violation, today that is always a unique index
         const m = /on\s+\S+\.(\w+)/i.exec(msg);
         return new UniqueConstraintError({ constraint: m?.[1], cause: err as Error });
       }
-      case 9: // cancelled (issuing client disconnected) — final, never retry
+      case 9: // cancelled (issuing client disconnected), final, never retry
         return new ConnectionError(`[turbine] PowDB query cancelled by client disconnect: ${msg}`, { cause: err });
       case 1: // parse
       case 2: // execution
@@ -1371,7 +1371,7 @@ export function isStaleFramePowdbError(err: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Driver shim — wrap @zvndev/powdb-client as a PgCompatPool
+// Driver shim, wrap @zvndev/powdb-client as a PgCompatPool
 // ---------------------------------------------------------------------------
 
 type QueryArg = string | { name?: string; text: string; values?: unknown[] };
@@ -1403,20 +1403,20 @@ function txControl(powql: string): 'begin' | 'commit' | 'rollback' | null {
  * the write lock the outer transaction holds), and on the networked transport
  * it would block a fresh pooled connection on the lock forever. This guard
  * converts that hang into a fast, typed error. Independent concurrent
- * transactions do NOT hit this — they queue FIFO on {@link PowdbTxGate}.
+ * transactions do NOT hit this, they queue FIFO on {@link PowdbTxGate}.
  */
 function reentrantTransactionError(): UnsupportedFeatureError {
   return new UnsupportedFeatureError(
     're-entrant transactions',
     'powdb',
-    'PowDB is single-writer — a transaction opened from inside an active transaction callback would deadlock ' +
+    'PowDB is single-writer, a transaction opened from inside an active transaction callback would deadlock ' +
       'on the write lock the open transaction holds. Use the `tx` client the callback receives, or start the ' +
       'second transaction after the first completes. (Independent concurrent transactions queue automatically.)',
   );
 }
 
 // ---------------------------------------------------------------------------
-// Single-writer transaction gate — FIFO queueing + re-entrancy detection
+// Single-writer transaction gate, FIFO queueing + re-entrancy detection
 // ---------------------------------------------------------------------------
 
 /**
@@ -1448,10 +1448,10 @@ const RELEASE_ROLLBACK_TIMEOUT_MS = 2_000;
 interface PowdbTxContext {
   /** The gate (one per pool) whose transaction this context belongs to. */
   readonly gate: PowdbTxGate;
-  /** Flips once the transaction commits / rolls back / is torn down — a later `begin` in the same context is then fine. */
+  /** Flips once the transaction commits / rolls back / is torn down, a later `begin` in the same context is then fine. */
   done: boolean;
   /**
-   * The marker that was already in scope when this transaction began — i.e.
+   * The marker that was already in scope when this transaction began, i.e.
    * the enclosing transaction, possibly on a DIFFERENT pool. AsyncLocalStorage
    * holds ONE value per store, so without this link a cross-pool nesting
    * (dbA tx → dbB tx → dbA begin) would let dbB's marker shadow dbA's and the
@@ -1487,8 +1487,8 @@ interface PowdbTxHold {
  * (and the embedded engine rejects it with a raw parse error).
  *
  * `acquire()` is called (synchronously, see below) for every `begin`:
- *   - a **re-entrant** `begin` — issued from inside an active transaction's
- *     async context, detected via {@link powdbTxStorage} — throws E017
+ *   - a **re-entrant** `begin`, issued from inside an active transaction's
+ *     async context, detected via {@link powdbTxStorage}, throws E017
  *     immediately. Queueing it can never succeed: the open transaction cannot
  *     commit while its callback awaits the queued one.
  *   - an **independent** `begin` waits its FIFO turn, bounded by the queue
@@ -1526,7 +1526,7 @@ interface PowdbTxHold {
  * paths that may start transactions from unmarked contexts.
  */
 class PowdbTxGate {
-  /** Tail of the FIFO queue — resolves once every earlier transaction has finished. */
+  /** Tail of the FIFO queue, resolves once every earlier transaction has finished. */
   private tail: Promise<void> = Promise.resolve();
 
   constructor(private readonly queueTimeoutMs: number) {}
@@ -1542,11 +1542,11 @@ class PowdbTxGate {
   async acquire(): Promise<PowdbTxHold> {
     // Walk the WHOLE marker chain, not just the innermost marker: with two
     // pools, dbA-tx → dbB-tx → dbA-begin leaves dbB's marker innermost, but
-    // the dbA ancestor is still open — queueing the inner dbA begin behind it
+    // the dbA ancestor is still open, queueing the inner dbA begin behind it
     // would deadlock. Any live ancestor on this gate ⇒ re-entrant E017.
     // Prune completed heads first (`done` never flips back) so sequential
-    // transactions issued from one long-lived context do not chain — and leak
-    // — unboundedly; what remains is bounded by real nesting depth.
+    // transactions issued from one long-lived context do not chain, and leak
+    // - unboundedly; what remains is bounded by real nesting depth.
     let parent = powdbTxStorage.getStore();
     while (parent?.done) parent = parent.parent;
     for (let c: PowdbTxContext | undefined = parent; c !== undefined; c = c.parent) {
@@ -1747,7 +1747,7 @@ export class PowdbPool implements PgCompatPool {
    * Pool-level single-writer gate. PowDB holds one global write lock, so at
    * most one transaction may be open across the whole pool. Concurrent
    * `begin`s queue FIFO on the gate (instead of checking out a second
-   * connection and blocking on the lock forever — the networked hang);
+   * connection and blocking on the lock forever, the networked hang);
    * re-entrant `begin`s throw E017 (see {@link PowdbTxGate}).
    */
   private readonly txGate: PowdbTxGate;
@@ -1812,7 +1812,7 @@ export class PowdbPool implements PgCompatPool {
     if ((ctl === 'commit' || ctl === 'rollback') && this.poolHold === null) {
       // No gate hold → our `begin` never ran (gate timeout / re-entrant
       // E017 / no begin at all). Never forward a stray commit/rollback to
-      // the engine — PowDB is single-writer, so it could only ever end a
+      // the engine, PowDB is single-writer, so it could only ever end a
       // DIFFERENT caller's open transaction. Empty success instead.
       return { rows: [], rowCount: 0, fields: [] };
     }
@@ -1835,11 +1835,11 @@ export class PowdbPool implements PgCompatPool {
   /**
    * Typed guard mirroring {@link PowdbEmbeddedPool}: after `end()` the driver
    * pool throws a raw `Error('pool closed')` that {@link wrapPowdbError}
-   * cannot classify — surface the same ConnectionError on both transports.
+   * cannot classify, surface the same ConnectionError on both transports.
    */
   private assertOpen(): void {
     if (this.closed) {
-      throw new ConnectionError('[turbine] The PowDB pool is closed — disconnect() was already called on this client.');
+      throw new ConnectionError('[turbine] The PowDB pool is closed, disconnect() was already called on this client.');
     }
   }
 
@@ -1862,7 +1862,7 @@ export class PowdbPool implements PgCompatPool {
       // lets the batch `$transaction([...])` path dispatch all statements in
       // one write burst instead of paying a round trip per statement. Safe
       // for the batch's rollback contract because a failed statement leaves
-      // the engine's transaction open (no aborted state, no auto-rollback) —
+      // the engine's transaction open (no aborted state, no auto-rollback) -
       // later pipelined statements execute inside the same still-open
       // transaction and the final `rollback` discards every effect. (The
       // batch path awaits `begin` before dispatching the burst, so the gate
@@ -1880,7 +1880,7 @@ export class PowdbPool implements PgCompatPool {
           hold = await this.txGate.acquire();
         }
         if ((ctl === 'commit' || ctl === 'rollback') && hold === null) {
-          // This connection never acquired the gate — its `begin` never ran
+          // This connection never acquired the gate, its `begin` never ran
           // (gate timeout / re-entrant E017). A stray commit/rollback must
           // never reach the single-writer engine, where it could only end a
           // DIFFERENT caller's open transaction. Empty success instead.
@@ -1914,7 +1914,7 @@ export class PowdbPool implements PgCompatPool {
       },
       release: (err?: Error | boolean) => {
         // Releasing this connection ends its transaction scope. pg semantics:
-        // a truthy `err` means "destroy, don't re-idle" — client.ts's
+        // a truthy `err` means "destroy, don't re-idle", client.ts's
         // $transaction timeout path relies on that to keep an abandoned
         // callback's connection out of the pool. Additionally, an OPEN hold
         // here means the tx begun on this connection never saw commit/rollback
@@ -1923,7 +1923,7 @@ export class PowdbPool implements PgCompatPool {
         // server-side transaction ends (destroying the socket alone leaves it
         // open until the server's idle timeout), THEN hand the gate to the
         // next queued transaction. If the rollback fails or times out the
-        // connection is treated as broken and destroyed. Never throws — a
+        // connection is treated as broken and destroyed. Never throws, a
         // teardown error must not mask the transaction's real outcome.
         const openHold = hold;
         hold = null;
@@ -1975,7 +1975,7 @@ export class PowdbPool implements PgCompatPool {
 }
 
 // ---------------------------------------------------------------------------
-// Embedded driver — wrap @zvndev/powdb-embedded as a PgCompatPool
+// Embedded driver, wrap @zvndev/powdb-embedded as a PgCompatPool
 // ---------------------------------------------------------------------------
 
 /** The embedded addon's result shape (matches {@link PowdbResult} but with optional fields). */
@@ -2003,7 +2003,7 @@ interface EmbeddedDatabase {
   querySql(sql: string): EmbeddedQueryResult;
   queryReadonly(powql: string): EmbeddedQueryResult;
   isPoisoned(): boolean;
-  /** WAL durability selector — `@zvndev/powdb-embedded` ≥ 0.7.1. */
+  /** WAL durability selector, `@zvndev/powdb-embedded` ≥ 0.7.1. */
   setSyncMode?(mode: string): void;
   /**
    * Lossless typed native wire (`@zvndev/powdb-embedded` ≥ 0.14). All optional
@@ -2022,7 +2022,7 @@ interface EmbeddedDatabase {
 interface EmbeddedModule {
   Database: {
     open(dir: string): EmbeddedDatabase;
-    /** Open with a per-query memory budget — `@zvndev/powdb-embedded` ≥ 0.7.1. */
+    /** Open with a per-query memory budget, `@zvndev/powdb-embedded` ≥ 0.7.1. */
     openWithMemoryLimit?(dir: string, limitBytes: number): EmbeddedDatabase;
     /**
      * Open a read-only handle for snapshot serving (`@zvndev/powdb-embedded` ≥
@@ -2050,14 +2050,14 @@ function normalizeEmbeddedResult(r: EmbeddedQueryResult): PowdbResult {
 
 /**
  * Encode a JS value as a **PowQL literal** for the embedded driver, which takes
- * no params array — `$N` placeholders must be materialized into the query text.
+ * no params array, `$N` placeholders must be materialized into the query text.
  *
  * This is the single place Turbine builds PowQL text from a value, so it is the
  * security-critical surface. String encoding matches PowDB's lexer
  * (`crates/query/src/lexer.rs`) exactly: a string literal is `"…"`, and inside
  * it the lexer recognizes only the escapes `\"`, `\\`, `\n`, `\t` (any other
- * `\x` drops the backslash and keeps `x`; every non-`\`/non-`"` char — raw
- * newlines, CR, unicode — is taken literally). So we escape `\` → `\\` and
+ * `\x` drops the backslash and keeps `x`; every non-`\`/non-`"` char, raw
+ * newlines, CR, unicode, is taken literally). So we escape `\` → `\\` and
  * `"` → `\"` (the only breakout vectors), render `\n`/`\t` as their recognized
  * escapes, and leave everything else raw. Verified against the real engine:
  * quotes, backslashes, `$N`, `"); drop … --`, raw CR, and emoji all round-trip
@@ -2149,7 +2149,7 @@ function powqlNumberText(n: number): string {
  * `git diff v0.19.0 v0.19.1 -- crates/query/src/lexer.rs` is empty (the bare-dotted-path
  * hard error is parser-level, not tokenization), so this ceiling stays `'0.19'`. The
  * guard in {@link PowdbEmbeddedPool.exec} compares major.minor only, so `'0.19'`
- * already covers every 0.19.x patch — no bump is needed for 0.19.1.
+ * already covers every 0.19.x patch, no bump is needed for 0.19.1.
  */
 export const POWQL_LEXER_TESTED_CEILING = '0.19';
 
@@ -2176,7 +2176,7 @@ function encodePowqlString(s: string, position?: string): string {
     else if (ch === '"') out += '\\"';
     else if (ch === '\n') out += '\\n';
     else if (ch === '\t') out += '\\t';
-    else out += ch; // raw — the lexer takes any other char literally (incl. CR, unicode)
+    else out += ch; // raw, the lexer takes any other char literally (incl. CR, unicode)
   }
   return `${out}"`;
 }
@@ -2184,7 +2184,7 @@ function encodePowqlString(s: string, position?: string): string {
 /**
  * Substitute every `$N` placeholder in a generator-produced PowQL template with
  * the encoded literal of `params[N-1]`. Safe because the template is produced by
- * {@link PowqlInterface} and contains **no** user string literals — the only
+ * {@link PowqlInterface} and contains **no** user string literals, the only
  * `$<digits>` tokens are genuine positional placeholders, so a single scan
  * cannot accidentally rewrite a `$N` that is itself part of a value (values are
  * params, never inlined into the template by the generator).
@@ -2215,7 +2215,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
   private closed = false;
   /**
    * Single-writer gate. The embedded engine is one handle with one global
-   * write lock — only one transaction may be open at a time. A re-entrant
+   * write lock, only one transaction may be open at a time. A re-entrant
    * `begin` (a fresh top-level `db.$transaction` opened inside an open one's
    * callback) would otherwise hit PowDB's raw "already in a transaction"
    * parse error; the gate surfaces a typed E017 instead, while INDEPENDENT
@@ -2333,13 +2333,13 @@ export class PowdbEmbeddedPool implements PgCompatPool {
       }
     }
     if ((ctl === 'commit' || ctl === 'rollback') && holdRef.hold === null) {
-      // This context never acquired the gate — its `begin` never ran (the
+      // This context never acquired the gate, its `begin` never ran (the
       // gate timed out / threw re-entrant E017, or no begin was issued at
       // all). The engine is ONE shared handle: forwarding this stray
       // commit/rollback would hit whatever transaction ANOTHER caller has
       // open on it (live-reproduced: a best-effort ROLLBACK after a failed
       // begin silently discarded a concurrent transaction's writes). Swallow
-      // it as an empty success instead — there is nothing of ours to end.
+      // it as an empty success instead, there is nothing of ours to end.
       return { rows: [], rowCount: 0, fields: [] };
     }
     try {
@@ -2365,7 +2365,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
   }
 
   async connect(): Promise<PgCompatPoolClient> {
-    // Single in-process handle — the "client" shares the one Database; tx
+    // Single in-process handle, the "client" shares the one Database; tx
     // keywords run serially on it. Each checked-out client scopes its own
     // gate hold so release() only ever finishes ITS transaction.
     const holdRef: { hold: PowdbTxHold | null } = { hold: null };
@@ -2383,7 +2383,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
       },
       release: () => {
         // End-of-scope safety net (see PowdbPool.connect()): a tx torn down
-        // without an explicit commit/rollback must not wedge the queue — and
+        // without an explicit commit/rollback must not wedge the queue, and
         // on the ONE shared embedded handle its open engine transaction must
         // actually be rolled back before the gate moves on, or the next
         // transaction's work interleaves into it. run() owns the
@@ -2418,7 +2418,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
 }
 
 // ---------------------------------------------------------------------------
-// PowqlInterface — the PowQL query generator (Phase A: flat CRUD via returning)
+// PowqlInterface, the PowQL query generator (Phase A: flat CRUD via returning)
 // ---------------------------------------------------------------------------
 
 // `describe`-based introspection (programmatic API; see powdb-introspect.ts).
@@ -2430,7 +2430,7 @@ export {
 export { PowqlInterface } from './powql.js';
 
 // ---------------------------------------------------------------------------
-// turbinePowDB — the public factory
+// turbinePowDB, the public factory
 // ---------------------------------------------------------------------------
 
 /** Options for {@link turbinePowDB}. */
@@ -2455,7 +2455,7 @@ export interface TurbinePowdbOptions
    * `0` / `Infinity` = wait without limit). Independent concurrent
    * transactions queue and run one at a time; only a re-entrant
    * `db.$transaction` (opened inside an active transaction callback) throws
-   * E017 — queueing that shape would deadlock.
+   * E017, queueing that shape would deadlock.
    *
    * Ignored when you inject an already-constructed {@link PowdbPool} (it carries
    * its own {@link PowdbPoolOptions}); set it on that pool's constructor instead.
@@ -2512,7 +2512,7 @@ export interface TurbinePowdbOptions
 }
 
 /**
- * Selects the **embedded** transport — an in-process `@zvndev/powdb-embedded`
+ * Selects the **embedded** transport, an in-process `@zvndev/powdb-embedded`
  * database at the given data directory (no server, no socket). The value is the
  * data dir path. Preview: Full-durability checkpoint-bound; built binaries ship
  * for macOS (arm64/x64) and Unix-glibc only (Intel-mac/musl/Windows fall back to
@@ -2521,7 +2521,7 @@ export interface TurbinePowdbOptions
  * @example
  * ```ts
  * const db = await turbinePowDB({ embedded: '/var/data/app.powdb' }, SCHEMA);
- * // Faster writes (fsync off the commit path, bounded-loss) — requires addon >= 0.7.1:
+ * // Faster writes (fsync off the commit path, bounded-loss), requires addon >= 0.7.1:
  * const fast = await turbinePowDB({ embedded: '/var/data/app.powdb', syncMode: 'normal' }, SCHEMA);
  * ```
  */
@@ -2529,7 +2529,7 @@ export interface TurbinePowdbEmbeddedTarget {
   embedded: string;
   /**
    * WAL durability for the embedded engine (requires `@zvndev/powdb-embedded` ≥ 0.7.1):
-   * `'full'` (default — fsync per commit), `'normal'` (fsync off the commit path,
+   * `'full'` (default, fsync per commit), `'normal'` (fsync off the commit path,
    * ~15–40× faster writes, bounded loss on OS crash/power loss), `'off'` (bench-only).
    */
   syncMode?: 'full' | 'normal' | 'off';
@@ -2554,12 +2554,12 @@ export interface TurbinePowdbEmbeddedTarget {
 async function loadPowdb(): Promise<PowdbModule> {
   try {
     // Via the .cts helper so the CJS build keeps a path to a REAL dynamic
-    // import() — @zvndev/powdb-client ≥ 0.9 is ESM-only, and the CommonJS
+    // import(), @zvndev/powdb-client ≥ 0.9 is ESM-only, and the CommonJS
     // pass transpiles a plain `import()` here into an unusable `require()`.
     return (await importOptionalPeer('@zvndev/powdb-client')) as unknown as PowdbModule;
   } catch (err) {
     throw new ConnectionError(
-      "[turbine] turbine-orm/powdb requires the optional peer dependency '@zvndev/powdb-client'. Install it: npm i @zvndev/powdb-client — " +
+      "[turbine] turbine-orm/powdb requires the optional peer dependency '@zvndev/powdb-client'. Install it: npm i @zvndev/powdb-client, " +
         'or construct the PowDB pool yourself and inject it: turbinePowDB(pool, schema). ' +
         `(${(err as Error).message})`,
     );
@@ -2568,7 +2568,7 @@ async function loadPowdb(): Promise<PowdbModule> {
 
 /**
  * Dynamically load `@zvndev/powdb-embedded` (the in-process napi addon). Kept out
- * of the static import graph — `import 'turbine-orm/powdb'` never pulls it. A
+ * of the static import graph, `import 'turbine-orm/powdb'` never pulls it. A
  * missing package or an unsupported platform (Intel-mac/musl/Windows ship no
  * prebuilt binary) throws a clear {@link ConnectionError} pointing at the
  * from-source `npm run build` fallback.
@@ -2576,7 +2576,7 @@ async function loadPowdb(): Promise<PowdbModule> {
 async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
   let mod: EmbeddedModule;
   try {
-    // Via the .cts helper — keeps a real dynamic import() available to the
+    // Via the .cts helper, keeps a real dynamic import() available to the
     // CJS build in case a future addon version ships ESM-only (see loadPowdb).
     mod = (await importOptionalPeer('@zvndev/powdb-embedded')) as unknown as EmbeddedModule;
   } catch (err) {
@@ -2584,14 +2584,14 @@ async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
       "[turbine] turbine-orm/powdb embedded mode requires the optional peer '@zvndev/powdb-embedded'. " +
         'Install it: npm i @zvndev/powdb-embedded. If install succeeded but loading failed, your platform has no ' +
         'prebuilt binary (prebuilts ship for macOS arm64/x64 and Linux glibc x64/arm64; Intel-mac/musl/Windows ' +
-        'build from source) — build it with `npm run build` in the addon, then retry. You can also construct the ' +
+        'build from source), build it with `npm run build` in the addon, then retry. You can also construct the ' +
         'pool yourself and inject it: turbinePowDB(pool, schema). ' +
         `(${(err as Error).message})`,
     );
   }
   if (!mod || typeof mod.Database?.open !== 'function') {
     throw new ConnectionError(
-      "[turbine] '@zvndev/powdb-embedded' loaded but did not export Database.open — the installed version is " +
+      "[turbine] '@zvndev/powdb-embedded' loaded but did not export Database.open, the installed version is " +
         'likely incompatible (turbine-orm/powdb embedded requires @zvndev/powdb-embedded ^0.7.0).',
     );
   }
@@ -2692,7 +2692,7 @@ async function openEmbeddedPool(
  *   - an `{ embedded: <data-dir> }` object → an in-process
  *     `@zvndev/powdb-embedded` database (no server);
  *   - an already-constructed `@zvndev/powdb-client` `Pool` or {@link PowdbPool}
- *     (injection — you own its lifecycle and `disconnect()` is a no-op).
+ *     (injection, you own its lifecycle and `disconnect()` is a no-op).
  *
  * On the networked transport the server version is probed and a clear
  * {@link ConnectionError} is thrown if it is older than {@link MIN_POWDB_VERSION}
@@ -2782,7 +2782,7 @@ export async function turbinePowDB(
     patch.disconnect = close;
     patch.end = close;
   } else {
-    // Injected pool — the caller owns its lifecycle.
+    // Injected pool, the caller owns its lifecycle.
     (client as { disconnect: () => Promise<void> }).disconnect = async () => {};
   }
   return client;

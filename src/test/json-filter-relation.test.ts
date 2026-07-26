@@ -1,11 +1,11 @@
 /**
- * turbine-orm — JsonFilter / ArrayFilter inside relation filters (T-1)
+ * turbine-orm, JsonFilter / ArrayFilter inside relation filters (T-1)
  *
  * Regression tests for the dogfood bug where a JsonFilter on a jsonb column
  * inside a relation `some`/`every`/`none` sub-where was silently dropped:
  * `buildSubWhereForRelation` never checked `isJsonFilter`, so the filter
  * object fell through to the equality branch and bound as a jsonb equality
- * value — compiling to `t."data" = $N` (matches nothing) instead of the
+ * value, compiling to `t."data" = $N` (matches nothing) instead of the
  * `#>>` path extraction the identical top-level filter produces.
  *
  * Also covers the SQL-cache lockstep requirement: the same findMany run
@@ -246,7 +246,7 @@ describe('JsonFilter inside relation filters (T-1)', () => {
     });
   });
 
-  describe('with.where (relation subquery filter) — same bug class', () => {
+  describe('with.where (relation subquery filter), same bug class', () => {
     it('JsonFilter in a with.where compiles against the relation alias', () => {
       const q = makeQuery('model_instances', buildSchema());
       const d = q.buildFindMany({

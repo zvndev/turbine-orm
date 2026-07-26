@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Where-filter type guards and shape helpers
+ * turbine-orm, Where-filter type guards and shape helpers
  *
  * Pure detection / fingerprint utilities used by the query builder's WHERE
  * compiler. Kept out of builder.ts so the class file stays about SQL assembly
@@ -43,7 +43,7 @@ export function isWhereOperator(value: unknown): value is WhereOperator {
 
 /**
  * True for a *plain object literal* that reached an equality fallthrough
- * without matching any known filter shape — the misspelled-operator case.
+ * without matching any known filter shape, the misspelled-operator case.
  * Class instances (Buffer for bytea, Decimal wrappers, ...) are legitimate
  * bind values and return false, as do arrays and Dates.
  */
@@ -76,7 +76,7 @@ export function isColumnRef(value: unknown): value is ColumnRef {
 /**
  * Fingerprint the SHAPE of a where-operator object. Null-valued `equals` /
  * `not` compile to parameterless `IS NULL` / `IS NOT NULL` (different SQL, no
- * param pushed), so null-ness is part of the shape — without it a cache entry
+ * param pushed), so null-ness is part of the shape, without it a cache entry
  * warmed by `{ not: 5 }` would serve `{ not: null }` with a desynced param list.
  *
  * Column references ({@link ColumnRef}) compile the referenced column into the
@@ -103,7 +103,7 @@ export function fingerprintOperatorShape(value: WhereOperator): string {
 /**
  * Guard for the value of an `equals` operator reaching the plain-equality
  * operator path. A plain object literal can only legitimately be an equality
- * value on a json/jsonb column — and those route to the JSONB filter branch
+ * value on a json/jsonb column, and those route to the JSONB filter branch
  * BEFORE the operator branch, so any plain object that reaches here is a
  * mistake (e.g. `{ equals: { foo: 1 } }` on a text column). Shared by the
  * SQL-build path and the cache-hit param-collect path so a warmed cache can
@@ -123,7 +123,7 @@ export function assertBindableEqualsOperand(value: unknown, column: string): voi
  * cache fingerprint. The SQL-build and cache-hit param-collect paths MUST
  * enumerate object keys in this exact order: fingerprints sort keys, so two
  * where clauses with the same fields in different insertion order share one
- * cache entry — if build/collect iterated insertion order, the cached SQL's
+ * cache entry, if build/collect iterated insertion order, the cached SQL's
  * `$N` placeholders would bind the wrong values (cross-tenant-leak class).
  * Array order (OR/AND members) is positional and is never sorted.
  */
@@ -140,10 +140,15 @@ export function sortedEntries<V>(obj: Record<string, V>): [string, V][] {
 // Atomic-update / JSONB / Array / text-search / vector key sets
 // ---------------------------------------------------------------------------
 
-/** Known atomic-update operator keys — used to detect operator objects vs plain JSON values */
+/** Known atomic-update operator keys, used to detect operator objects vs plain JSON values */
 export const UPDATE_OPERATOR_KEYS = new Set<string>(['set', 'increment', 'decrement', 'multiply', 'divide']);
 
-/** Known JSONB operator keys */
+/**
+ * Known JSONB operator keys. `stringContains` / `stringStartsWith` /
+ * `stringEndsWith` are appended below, once {@link JSON_STRING_OPERATORS} is
+ * declared: they have no `WhereOperator` counterpart, so their presence is an
+ * unambiguous JSON-filter signal.
+ */
 export const JSONB_OPERATOR_KEYS = new Set<string>(['path', 'equals', 'contains', 'hasKey']);
 
 /**
@@ -163,23 +168,74 @@ export const JSON_RANGE_OPERATORS: Record<'gt' | 'gte' | 'lt' | 'lte', string> =
 };
 
 /**
+ * JSON substring operators → the LIKE pattern each one builds around its
+ * escaped operand, in the FIXED order the build and collect paths iterate
+ * them. These compare the TEXT at `path` (which every one of them requires),
+ * so they are the JSON counterpart of the scalar `contains` / `startsWith` /
+ * `endsWith` operators rather than of jsonb containment.
+ *
+ * They are deliberately NOT named `contains` / `startsWith` / `endsWith`:
+ * `contains` on a JSON column already means whole-document containment
+ * (`@>`), and silently changing that would break every existing caller.
+ */
+export const JSON_STRING_OPERATORS: Record<
+  'stringContains' | 'stringStartsWith' | 'stringEndsWith',
+  (escaped: string) => string
+> = {
+  stringContains: (escaped) => `%${escaped}%`,
+  stringStartsWith: (escaped) => `${escaped}%`,
+  stringEndsWith: (escaped) => `%${escaped}`,
+};
+
+/**
+ * Every key a {@link JsonFilter} may carry. Used by the strict-key check so an
+ * unrecognized operator is REFUSED rather than dropped.
+ *
+ * This existed as tribal knowledge spread across `buildJsonFilterClauses` and
+ * `collectJsonFilterParams`: each simply ignored what it did not recognize, so
+ * `{ path: ['title'], string_contains: 'x' }` (the Prisma spelling) compiled to
+ * no predicate at all and returned every row of the table. The scalar operator
+ * path has always thrown on an unknown key; this set is what lets the JSON path
+ * behave the same way.
+ */
+for (const k of Object.keys(JSON_STRING_OPERATORS)) JSONB_OPERATOR_KEYS.add(k);
+
+export const JSON_FILTER_KEYS: ReadonlySet<string> = new Set<string>([
+  'path',
+  'equals',
+  'contains',
+  'hasKey',
+  'mode',
+  ...Object.keys(JSON_RANGE_OPERATORS),
+  ...Object.keys(JSON_STRING_OPERATORS),
+]);
+
+/**
  * Value-invariant shape fingerprint for a {@link JsonFilter}. Range operators
  * are annotated with the comparison value's kind (`#n` numeric / `#s` string)
- * because a numeric comparison compiles to a `::numeric` cast — a different
- * SQL text than the text comparison — so the two must never share a cached
- * SQL entry.
+ * because a numeric comparison compiles to a `::numeric` cast, a different
+ * SQL text than the text comparison, so the two must never share a cached
+ * SQL entry. `mode` is part of the shape for the same reason: it selects
+ * between `LIKE` and the dialect's case-insensitive form, which is different
+ * SQL text.
  */
 export function fingerprintJsonFilterShape(filter: JsonFilter): string {
   const obj = filter as Record<string, unknown>;
   const parts = Object.keys(obj)
     .filter((k) => obj[k] !== undefined)
     .sort()
-    .map((k) => (k in JSON_RANGE_OPERATORS ? `${k}#${typeof obj[k] === 'number' ? 'n' : 's'}` : k));
+    .map((k) => {
+      if (k in JSON_RANGE_OPERATORS) return `${k}#${typeof obj[k] === 'number' ? 'n' : 's'}`;
+      // `mode` carries its VALUE, not just its presence: 'insensitive' and any
+      // other spelling select different SQL, so they must not share an entry.
+      if (k === 'mode') return `mode#${String(obj[k])}`;
+      return k;
+    });
   return `json(${parts.join(',')})`;
 }
 
 /**
- * JSONB operator keys that are *unique* to {@link JsonFilter} — they cannot
+ * JSONB operator keys that are *unique* to {@link JsonFilter}, they cannot
  * appear in any other where-filter shape, so the presence of one of these is
  * an unambiguous signal that the user meant a JSON filter. Used by the
  * strict-validation path so that `{ contains: 'foo' }` (which is also a valid
@@ -187,7 +243,7 @@ export function fingerprintJsonFilterShape(filter: JsonFilter): string {
  * set: on non-JSON columns it is a plain equality operator (`WhereOperator`),
  * so it must fall through instead of throwing.
  */
-export const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'hasKey']);
+export const JSONB_UNIQUE_KEYS = new Set<string>(['path', 'hasKey', ...Object.keys(JSON_STRING_OPERATORS)]);
 
 /** Check if a value is a JSONB filter object */
 export function isJsonFilter(value: unknown): value is JsonFilter {

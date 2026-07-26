@@ -1,6 +1,6 @@
 /**
  * Unit tests for the batched relation-loading strategy (relationLoadStrategy:
- * 'batched'). No database — a fake pg-compatible pool records every SQL string
+ * 'batched'). No database, a fake pg-compatible pool records every SQL string
  * and returns canned rows, so we can assert both the generated SQL shape (base
  * query has no json_agg; follow-ups use `= ANY($1)`) and the client-side
  * stitching, end to end through the real QueryInterface.
@@ -181,7 +181,7 @@ const CANNED = {
   ],
 };
 
-describe('batched relation loading — SQL shape', () => {
+describe('batched relation loading, SQL shape', () => {
   it('base query has no json_agg and no relation subquery', async () => {
     const { pool, calls } = makeFakePool(CANNED);
     await usersQi(pool, CANNED).findMany({ with: { posts: true } });
@@ -239,7 +239,7 @@ describe('batched relation loading — SQL shape', () => {
     assert.match(followUp.sql, /"title" = \$/);
     // orderBy pushed down so groups come back sorted
     assert.match(followUp.sql, /ORDER BY .*"title" DESC/);
-    // select applied — and the stitch key (user_id) auto-added to the projection
+    // select applied, and the stitch key (user_id) auto-added to the projection
     assert.match(followUp.sql, /"title"/);
     assert.match(followUp.sql, /"user_id"/);
   });
@@ -295,7 +295,7 @@ describe('batched relation loading — SQL shape', () => {
   });
 });
 
-describe('batched relation loading — stitching', () => {
+describe('batched relation loading, stitching', () => {
   it('groups hasMany children by FK and attaches arrays ([] when empty)', async () => {
     const { pool } = makeFakePool({ ...CANNED, posts: [{ id: 10, user_id: 1, title: 'p1' }] });
     const res = (await usersQi(pool, CANNED).findMany({ with: { posts: true } })) as Record<string, unknown>[];
@@ -351,7 +351,7 @@ describe('batched relation loading — stitching', () => {
   });
 });
 
-describe('batched relation loading — strategy precedence', () => {
+describe('batched relation loading, strategy precedence', () => {
   it('client config default is used when no per-query override', async () => {
     const { pool, calls } = makeFakePool(CANNED);
     await usersQi(pool, CANNED).findMany({ with: { posts: true } });
@@ -387,7 +387,7 @@ describe('batched relation loading — strategy precedence', () => {
   });
 });
 
-describe('batched relation loading — nested pick-row orderBy parity with join', () => {
+describe('batched relation loading, nested pick-row orderBy parity with join', () => {
   const pickOrder = { author: { pick: { orderBy: { name: 'desc' } }, by: 'name' } };
 
   it('throws the IDENTICAL E003 the join strategy throws (strategy parity)', async () => {

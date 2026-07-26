@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Query builder barrel
+ * turbine-orm, Query builder barrel
  *
  * Re-exports every public symbol from the query submodules so that
  * `import { … } from './query/index.js'` is a drop-in replacement for the

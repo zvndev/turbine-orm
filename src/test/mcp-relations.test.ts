@@ -1,9 +1,9 @@
 /**
- * turbine-orm — `turbine mcp` relation-naming parity (N-3)
+ * turbine-orm, `turbine mcp` relation-naming parity (N-3)
  *
  * The MCP server introspects the database itself (it cannot assume generated
  * metadata exists), so its relation derivation MUST match `turbine generate`
- * exactly — otherwise the MCP schema tools describe relations that don't
+ * exactly, otherwise the MCP schema tools describe relations that don't
  * exist on the generated client (and vice versa). mcp.ts previously carried a
  * stale local copy of a retired naming scheme; it now delegates to the shared
  * builder in introspect.ts. This suite pins the parity for the shapes where
@@ -138,7 +138,7 @@ function introspectDerived(): Map<string, Record<string, unknown>> {
   return rels;
 }
 
-describe('turbine mcp — relation naming matches turbine generate (N-3)', () => {
+describe('turbine mcp, relation naming matches turbine generate (N-3)', () => {
   it('derives deep-equal relation maps for the divergent fixture', () => {
     const mcpDerived = silenced(() => buildRelations(TABLES, COLUMNS, PKS, FK_ROWS));
     const generateDerived = silenced(() => introspectDerived());

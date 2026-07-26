@@ -1,8 +1,8 @@
-# Using Turbine ORM — full DX reference
+# Using Turbine ORM, full DX reference
 
-**Scope:** everything a user needs to do to use Turbine end-to-end — install, define a schema, query, write, transact, batch, stream, handle errors, migrate, and deploy to the edge.
+**Scope:** everything a user needs to do to use Turbine end-to-end, install, define a schema, query, write, transact, batch, stream, handle errors, migrate, and deploy to the edge.
 
-**Why this doc exists:** it's also a **reference for building a PowQL-native TypeScript client with a similar DX**. Every section lists the DX pattern, the API shape, and a *port note* — what changes if your underlying store isn't Postgres. If you're building the PowDB TS client, read the port notes.
+**Why this doc exists:** it's also a **reference for building a PowQL-native TypeScript client with a similar DX**. Every section lists the DX pattern, the API shape, and a *port note*, what changes if your underlying store isn't Postgres. If you're building the PowDB TS client, read the port notes.
 
 ---
 
@@ -20,7 +20,7 @@ One runtime dependency: `pg`. Ships both ESM (`dist/`) and CJS (`dist/cjs/`). Se
 
 The `turbine` CLI loads your `turbine.config.ts` and `turbine/schema.ts` files directly, so a fresh project (e.g. straight out of `create-next-app`) needs two things before the first `turbine` command:
 
-1. **`tsx` installed** — Turbine keeps it out of its own dependencies (it's a heavy dev tool many projects already have). Without it, loading a `.ts` config/schema fails:
+1. **`tsx` installed**, Turbine keeps it out of its own dependencies (it's a heavy dev tool many projects already have). Without it, loading a `.ts` config/schema fails:
 
    ```
    ✖ Cannot load TypeScript file: turbine.config.ts
@@ -39,13 +39,13 @@ The `turbine` CLI loads your `turbine.config.ts` and `turbine/schema.ts` files d
 
 ```
 project/
-├── turbine.config.ts          # CLI config — DB URL, output path, schema path
+├── turbine.config.ts          # CLI config, DB URL, output path, schema path
 ├── turbine/
-│   └── schema.ts              # defineSchema() — source of truth
+│   └── schema.ts              # defineSchema(), source of truth
 ├── generated/
 │   └── turbine/               # emitted by `npx turbine generate`
 │       ├── types.ts           # entity + Create + Update + Relations types
-│       ├── metadata.ts        # runtime SchemaMetadata — edge-safe
+│       ├── metadata.ts        # runtime SchemaMetadata, edge-safe
 │       └── index.ts           # typed TurbineClient + turbine() factory
 ├── migrations/
 │   └── 20260410143022_init.sql
@@ -62,9 +62,9 @@ export default {
   url: process.env.DATABASE_URL,
   out: './generated/turbine',
   // `schema` is the Postgres schema NAME to introspect. Omit it to use `public`.
-  // It is NOT the path to your schema file — that goes in `schemaFile` below.
+  // It is NOT the path to your schema file, that goes in `schemaFile` below.
   schema: 'public',
-  // Your defineSchema() file — consumed by `turbine push` and `migrate --auto`.
+  // Your defineSchema() file, consumed by `turbine push` and `migrate --auto`.
   schemaFile: './turbine/schema.ts',
   migrationsDir: './migrations',
 } satisfies TurbineConfig;
@@ -72,9 +72,9 @@ export default {
 
 > `TurbineConfig` is an alias for `TurbineCliConfig`; either import name works.
 >
-> **`schema` vs `schemaFile` — the #1 config mistake.** `schema` is the Postgres namespace name (`public` by default). The path to your `defineSchema()` file is `schemaFile`. If you put the file path in `schema`, `turbine generate` introspects a schema that doesn't exist, matches zero tables, and (as of 0.24.0) **errors** instead of silently emitting an empty client. Field is `migrationsDir`, not `migrations`.
+> **`schema` vs `schemaFile`, the #1 config mistake.** `schema` is the Postgres namespace name (`public` by default). The path to your `defineSchema()` file is `schemaFile`. If you put the file path in `schema`, `turbine generate` introspects a schema that doesn't exist, matches zero tables, and (as of 0.24.0) **errors** instead of silently emitting an empty client. Field is `migrationsDir`, not `migrations`.
 
-**Port note for PowDB TS client:** mirror the `turbine.config.ts` concept — one config file that points at the DB, schema source, output dir, migrations dir. Users expect this shape.
+**Port note for PowDB TS client:** mirror the `turbine.config.ts` concept, one config file that points at the DB, schema source, output dir, migrations dir. Users expect this shape.
 
 ---
 
@@ -129,12 +129,12 @@ export default defineSchema({
 | `primaryKey: [...]` | Table-level composite PK. |
 | `unique: true` | UNIQUE constraint. |
 | `notNull: true` | NOT NULL. |
-| `default: '...'` | Raw SQL default — quoted text values need their own quotes: `'member'`. Function calls like `now()` are passed through. |
+| `default: '...'` | Raw SQL default, quoted text values need their own quotes: `'member'`. Function calls like `now()` are passed through. |
 | `references: 'table.column'` | Foreign key. Infers the relation direction. |
 | `check: '...'` | CHECK constraint expression. |
 | `index: true \| { using: 'gin' \| 'gist' }` | Index. |
 
-> **Auto-increment keys — `serial` vs `bigserial` (changed in 0.24.0).** `serial` now emits `SERIAL` (int4). Its values fit in a JS `number` and pg returns them as numbers, so the generated `number` type is accurate end-to-end. For 64-bit keys use `bigserial` (int8) — but note that int8 values above `Number.MAX_SAFE_INTEGER` (2^53−1) come back over the wire as **strings** to avoid precision loss, even though the generated type says `number`. Reach for `bigserial` only when you actually expect to exceed ~9 quadrillion rows. Existing databases whose `serial` columns were created as `BIGSERIAL` before 0.24.0 are left alone — `turbine push` never auto-narrows a live column's integer width.
+> **Auto-increment keys, `serial` vs `bigserial` (changed in 0.24.0).** `serial` now emits `SERIAL` (int4). Its values fit in a JS `number` and pg returns them as numbers, so the generated `number` type is accurate end-to-end. For 64-bit keys use `bigserial` (int8), but note that int8 values above `Number.MAX_SAFE_INTEGER` (2^53−1) come back over the wire as **strings** to avoid precision loss, even though the generated type says `number`. Reach for `bigserial` only when you actually expect to exceed ~9 quadrillion rows. Existing databases whose `serial` columns were created as `BIGSERIAL` before 0.24.0 are left alone, `turbine push` never auto-narrows a live column's integer width.
 
 ### DB-first: introspect
 
@@ -148,15 +148,15 @@ Reads `information_schema` + `pg_catalog`, emits the same three files as code-fi
 
 Three files in `./generated/turbine/`:
 
-1. **`types.ts`** — for each table:
-   - `User` — the full entity interface (PascalCase, singularized).
-   - `UserCreate` — optional PK / default / nullable; required otherwise. What you pass to `create({ data })`.
-   - `UserUpdate` — all non-PK fields optional. What you pass to `update({ data })`.
-   - `UserRelations` — phantom-branded relation descriptors. Feeds deep `with` inference.
-2. **`metadata.ts`** — runtime `SchemaMetadata`. Pure data — no imports, edge-safe.
-3. **`index.ts`** — `TurbineClient` subclass with `declare readonly users: TableApi<User, UserRelations>` + `turbine(config)` factory.
+1. **`types.ts`**, for each table:
+   - `User`, the full entity interface (PascalCase, singularized).
+   - `UserCreate`, optional PK / default / nullable; required otherwise. What you pass to `create({ data })`.
+   - `UserUpdate`, all non-PK fields optional. What you pass to `update({ data })`.
+   - `UserRelations`, phantom-branded relation descriptors. Feeds deep `with` inference.
+2. **`metadata.ts`**, runtime `SchemaMetadata`. Pure data, no imports, edge-safe.
+3. **`index.ts`**, `TurbineClient` subclass with `declare readonly users: TableApi<User, UserRelations>` + `turbine(config)` factory.
 
-**Port note:** PowDB TS client should emit the same three-file split. Entity interfaces + `*Create` / `*Update` / `*Relations` types + runtime metadata + a typed client factory. The phantom-brand technique on `*Relations` is what enables deep type inference — port it verbatim.
+**Port note:** PowDB TS client should emit the same three-file split. Entity interfaces + `*Create` / `*Update` / `*Relations` types + runtime metadata + a typed client factory. The phantom-brand technique on `*Relations` is what enables deep type inference, port it verbatim.
 
 ---
 
@@ -188,13 +188,13 @@ import { Pool } from '@neondatabase/serverless';
 const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
 
 // Pass the generated client type to get the same typed accessors the TCP
-// `turbine()` factory gives you — `db.users`, `db.posts`, … — with no cast.
+// `turbine()` factory gives you, `db.users`, `db.posts`, …, with no cast.
 export const db = turbineHttp<TurbineClient>(pool, schema);
 
 const users = await db.users.findMany({ limit: 10 }); // fully typed
 ```
 
-Same surface, same types: `db.users.findMany()` is identical code across transports. If you omit the `<TurbineClient>` type argument, `turbineHttp` returns the base client and you reach tables via `db.table('users')` — the untyped escape hatch stays backward-compatible. On external pools, `db.disconnect()` is a no-op — the caller owns lifecycle.
+Same surface, same types: `db.users.findMany()` is identical code across transports. If you omit the `<TurbineClient>` type argument, `turbineHttp` returns the base client and you reach tables via `db.table('users')`, the untyped escape hatch stays backward-compatible. On external pools, `db.disconnect()` is a no-op, the caller owns lifecycle.
 
 ### Middleware
 
@@ -207,13 +207,13 @@ db.$use(async (params, next) => {
 });
 ```
 
-Middleware runs *after* SQL generation — it sees the params, not the SQL — and can inspect/log/transform. Can't rewrite SQL.
+Middleware runs *after* SQL generation, it sees the params, not the SQL, and can inspect/log/transform. Can't rewrite SQL.
 
 **Port note:** the `$use` lifecycle hook pattern is widely-understood (Prisma, Mongoose). Recommend porting. Run the middleware stack against the *parsed* query, not the generated wire command, so middleware is dialect-independent.
 
 ---
 
-## 3. Querying — reads
+## 3. Querying, reads
 
 ### `findMany`
 
@@ -239,7 +239,7 @@ const user = await db.users.findUnique({ where: { id: 42 } });
 // User | null
 
 const user2 = await db.users.findUniqueOrThrow({ where: { email: 'a@b.c' } });
-// User — throws NotFoundError (TURBINE_E001) if missing
+// User, throws NotFoundError (TURBINE_E001) if missing
 ```
 
 Composite PK:
@@ -301,7 +301,7 @@ All operators:
 
 ```ts
 where: {
-  // Equality — the default
+  // Equality, the default
   role: 'admin',
 
   // Null / not null
@@ -343,13 +343,13 @@ where: {
 }
 ```
 
-**Port note for PowDB:** PowQL uses a different filter syntax (`filter .age > 25`). The *user-facing* `where` object shape is worth keeping — it's what Prisma / Drizzle / Turbine users expect. Translate the object into PowQL pipelines under the hood. Don't expose PowQL syntax at the TS layer.
+**Port note for PowDB:** PowQL uses a different filter syntax (`filter .age > 25`). The *user-facing* `where` object shape is worth keeping, it's what Prisma / Drizzle / Turbine users expect. Translate the object into PowQL pipelines under the hood. Don't expose PowQL syntax at the TS layer.
 
 ---
 
-## 5. Nested relations — `with`
+## 5. Nested relations, `with`
 
-Same shape regardless of depth. Each level accepts every `findMany` option except `offset` (pagination across nested collections is generally wrong — if you need it, lift to a separate query).
+Same shape regardless of depth. Each level accepts every `findMany` option except `offset` (pagination across nested collections is generally wrong, if you need it, lift to a separate query).
 
 ```ts
 const users = await db.users.findMany({
@@ -409,7 +409,7 @@ const user = await db.users.create({
 // returns User
 ```
 
-`data` is typed as `UserCreate` — PK, default-having, and nullable fields optional; everything else required.
+`data` is typed as `UserCreate`, PK, default-having, and nullable fields optional; everything else required.
 
 ### `createMany`
 
@@ -420,7 +420,7 @@ const { count } = await db.users.createMany({
     { email: 'd@e.f', name: 'D' },
   ],
 });
-// Single INSERT ... UNNEST — one round-trip regardless of row count
+// Single INSERT ... UNNEST, one round-trip regardless of row count
 ```
 
 ### `update`
@@ -442,7 +442,7 @@ await db.posts.update({
     // also: decrement, multiply, divide, set
   },
 });
-// Generates: view_count = view_count + $1 — race-free, no extra round-trip
+// Generates: view_count = view_count + $1, race-free, no extra round-trip
 ```
 
 ### `updateMany`
@@ -479,7 +479,7 @@ await db.users.upsert({
 // INSERT ... ON CONFLICT DO UPDATE
 ```
 
-**Port note:** keep the `upsert` shape identical — it's the only way to get race-free "create or update" without a transaction. PowDB equivalents will need similar atomic primitives in PowQL or a transaction-wrapped fallback documented clearly.
+**Port note:** keep the `upsert` shape identical, it's the only way to get race-free "create or update" without a transaction. PowDB equivalents will need similar atomic primitives in PowQL or a transaction-wrapped fallback documented clearly.
 
 ### Nested writes
 
@@ -570,14 +570,14 @@ try {
   await db.$transaction(/* ... */);
 } catch (err) {
   if (err instanceof DeadlockError || err instanceof SerializationFailureError) {
-    // err.isRetryable is `true as const` — TypeScript narrows here
+    // err.isRetryable is `true as const`, TypeScript narrows here
     // retry with exponential backoff
   }
   throw err;
 }
 ```
 
-**Port note:** the `isRetryable = true as const` pattern matters more than it looks. Users' retry loops stay well-typed because the literal type never widens. Port this exactly — don't use a plain `readonly isRetryable: boolean`.
+**Port note:** the `isRetryable = true as const` pattern matters more than it looks. Users' retry loops stay well-typed because the literal type never widens. Port this exactly, don't use a plain `readonly isRetryable: boolean`.
 
 ---
 
@@ -595,19 +595,19 @@ const [user, posts, count] = await db.pipeline([
 
 `db.pipeline()` also accepts rest params (`db.pipeline(q1, q2, q3)`), and the array form takes an options object: `db.pipeline([q1, q2], { transactional: false })`.
 
-Each `build*` method returns `DeferredQuery<T>` — `{ sql, params, transform, tag }`. The pipeline driver writes them all, reads all responses, applies each `transform`.
+Each `build*` method returns `DeferredQuery<T>`, `{ sql, params, transform, tag }`. The pipeline driver writes them all, reads all responses, applies each `transform`.
 
 **Use when:** dashboard loads, edge fan-out reads, independent widget queries.
 
 **Don't use when:** one query depends on another's result (pipeline queries must be independent). For interdependent writes with mid-transaction reads, use `$transaction`.
 
-**Port note:** pipelining maps to different primitives across stores. For PowDB, consider whether PowQL supports a batch-submit mode — if so, expose it as `pipeline()` with the same deferred-query shape. If not, document that `pipeline()` on PowDB falls back to sequential and skip it for now.
+**Port note:** pipelining maps to different primitives across stores. For PowDB, consider whether PowQL supports a batch-submit mode, if so, expose it as `pipeline()` with the same deferred-query shape. If not, document that `pipeline()` on PowDB falls back to sequential and skip it for now.
 
 ---
 
 ## 9. Streaming
 
-For large result sets — uses `DECLARE CURSOR` under the hood, with a speculative first fetch so small results don't pay the cursor overhead.
+For large result sets, uses `DECLARE CURSOR` under the hood, with a speculative first fetch so small results don't pay the cursor overhead.
 
 ```ts
 for await (const user of db.users.findManyStream({
@@ -629,7 +629,7 @@ for await (const user of db.users.findManyStream({
 }
 ```
 
-Clean early-break semantics — cursor is closed even on exception.
+Clean early-break semantics, cursor is closed even on exception.
 
 **Port note:** async iteration is the right API shape for streaming in TS. Match it regardless of underlying cursor mechanics.
 
@@ -655,7 +655,7 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-Typed errors still apply — a unique-violation in raw SQL surfaces as `UniqueConstraintError` via `wrapPgError()`.
+Typed errors still apply, a unique-violation in raw SQL surfaces as `UniqueConstraintError` via `wrapPgError()`.
 
 ---
 
@@ -676,8 +676,8 @@ All errors extend `TurbineError` with a `code: TurbineErrorCode` discriminant.
 | E009 | `ForeignKeyError` | PG 23503 |
 | E010 | `NotNullViolationError` | PG 23502 |
 | E011 | `CheckConstraintError` | PG 23514 |
-| E012 | `DeadlockError` | PG 40P01 — `isRetryable: true` |
-| E013 | `SerializationFailureError` | PG 40001 — `isRetryable: true` |
+| E012 | `DeadlockError` | PG 40P01, `isRetryable: true` |
+| E013 | `SerializationFailureError` | PG 40001, `isRetryable: true` |
 | E014 | `PipelineError` | One or more pipeline queries failed |
 | E015 | `OptimisticLockError` | Version mismatch on an `optimisticLock` update |
 | E016 | `ExclusionConstraintError` | PG 23P01 |
@@ -755,13 +755,13 @@ DROP TABLE "users";
 
 **Tracking:** `_turbine_migrations` table stores `(timestamp, name, checksum, applied_at)`. SHA-256 checksums detect post-hoc edits to applied migrations.
 
-**Concurrency:** `pg_try_advisory_lock()` keyed on DB name — two `migrate up` processes at once → second exits cleanly.
+**Concurrency:** `pg_try_advisory_lock()` keyed on DB name, two `migrate up` processes at once → second exits cleanly.
 
 **Transaction:** each migration runs in its own `BEGIN` / `COMMIT`. Partial failure → clean rollback.
 
 **Auto-diff:** `migrate create <name> --auto` runs `schemaDiff()` (compares `defineSchema` output against live DB via `introspect`) and writes the DDL delta. Always review before committing.
 
-**Port note:** SQL-first migration files are the right default — plain text, diffable, fits any DB. For PowDB, replace the SQL parser with a PowQL parser, keep the rest (UP/DOWN split, checksum, advisory lock equivalent, per-migration transaction). The `_turbine_migrations` schema is trivially portable.
+**Port note:** SQL-first migration files are the right default, plain text, diffable, fits any DB. For PowDB, replace the SQL parser with a PowQL parser, keep the rest (UP/DOWN split, checksum, advisory lock equivalent, per-migration transaction). The `_turbine_migrations` schema is trivially portable.
 
 ---
 
@@ -836,7 +836,7 @@ With Node's built-in `node:test`, pass `{ skip }` to each test instead. In this 
 
 ### Node production
 
-- [ ] `connectionString` from env — never commit it.
+- [ ] `connectionString` from env, never commit it.
 - [ ] Pool `max` sized to `(db_max_connections - reserved) / app_instances`.
 - [ ] `statement_timeout` at DB level (belt) + per-transaction (suspenders).
 - [ ] Migrations run as a separate step, not on app boot.
@@ -857,13 +857,13 @@ With Node's built-in `node:test`, pass `{ skip }` to each test instead. In this 
 
 - **Lazy loading.** Every field is explicit. If you want `user.posts` you write `with: { posts: true }`. This is a feature; it keeps query costs visible.
 - **Model classes.** Rows are plain objects. No `user.save()`, no `user.$prisma`, no decorators. Plays well with JSON, serializers, validation libraries.
-- **Automatic soft-delete.** Use middleware if you want it — `$use` can rewrite `findMany` to add `deletedAt: null`. Baking it in would hide it.
+- **Automatic soft-delete.** Use middleware if you want it, `$use` can rewrite `findMany` to add `deletedAt: null`. Baking it in would hide it.
 - **Multi-database at runtime.** One `TurbineClient` = one pool = one DB. For multi-tenancy, create multiple clients.
 - **Hooks on entity mutation.** Use middleware for cross-cutting concerns. Entity-lifecycle hooks encourage spaghetti.
 
 ---
 
-## 18. What to port to a PowDB TS client — summary
+## 18. What to port to a PowDB TS client, summary
 
 The API shapes that matter most, in rough priority:
 
@@ -875,7 +875,7 @@ The API shapes that matter most, in rough priority:
 6. **Empty-where guard on `updateMany` / `deleteMany`.** Has saved more production data than any feature I can name.
 7. **Typed error hierarchy with `code` discriminants + `isRetryable` literal type.** Retry loops stay well-typed.
 8. **Callback-style `$transaction` with nested savepoint-equivalents.** If PowDB has transactions, mirror this shape.
-9. **Pipeline batching — if the underlying protocol supports batch-submit.** Edge runtime killer feature.
+9. **Pipeline batching, if the underlying protocol supports batch-submit.** Edge runtime killer feature.
 10. **Async-iterator streaming.** Right shape for TS, regardless of cursor mechanics.
 11. **Built-in read-only Studio with the five security rules above.** Local DX + DBA-approvable.
 12. **CLI with config file + env var + flag precedence.** Users expect this.
@@ -883,10 +883,10 @@ The API shapes that matter most, in rough priority:
 
 The things you can skip without much regret:
 
-- A full introspect-from-live-DB layer — ship code-first first, introspect later.
-- Code-generation that emits a `TurbineClient` subclass — a factory function with inferred generics works fine.
-- Middleware — nice to have, not v1 critical.
-- Aggregate / groupBy — niche, ship it when someone asks.
+- A full introspect-from-live-DB layer, ship code-first first, introspect later.
+- Code-generation that emits a `TurbineClient` subclass, a factory function with inferred generics works fine.
+- Middleware, nice to have, not v1 critical.
+- Aggregate / groupBy, niche, ship it when someone asks.
 
 ---
 

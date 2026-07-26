@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Relation `limit` parameter alignment
+ * turbine-orm, Relation `limit` parameter alignment
  *
  * Regression test for the bug where a `with` clause on a to-one relation
  * (belongsTo / hasOne) that carried a `limit` pushed a parameter into the
@@ -8,7 +8,7 @@
  * query with "could not determine data type of parameter $N".
  *
  * To-one relations always return a single row, so `limit` is meaningless and
- * must be ignored entirely — no param, no placeholder.
+ * must be ignored entirely, no param, no placeholder.
  */
 
 import assert from 'node:assert/strict';
@@ -25,11 +25,11 @@ function assertParamsAligned(sql: string, params: unknown[]): void {
   }
   const max = referenced.size ? Math.max(...referenced) : 0;
   // No gaps: every index 1..max appears (an orphaned $1 with the outer LIMIT at
-  // $2 would leave a gap if $1 were missing — but the real bug is the reverse:
+  // $2 would leave a gap if $1 were missing, but the real bug is the reverse:
   // params has an entry whose placeholder is absent). Assert both directions.
   assert.equal(max, params.length, `SQL references up to $${max} but got ${params.length} params: ${sql}`);
   for (let i = 1; i <= params.length; i++) {
-    assert.ok(referenced.has(i), `param $${i} is never referenced in SQL — orphaned param: ${sql}`);
+    assert.ok(referenced.has(i), `param $${i} is never referenced in SQL, orphaned param: ${sql}`);
   }
 }
 

@@ -1,18 +1,18 @@
 export const metadata = {
   title: 'Turbine + BataDB in 60 Seconds',
   description:
-    'Get Turbine ORM running on BataDB — the serverless Postgres platform with branching and scale-to-zero. Node.js, serverless, edge — one API, zero glue.',
+    'Get Turbine ORM running on BataDB, the serverless Postgres platform with branching and scale-to-zero. Node.js, serverless, edge, one API, zero glue.',
   alternates: { canonical: '/batadb' },
 };
 
 # Turbine + BataDB
 
-From zero to typed queries on [BataDB](https://batadata.com) — a Postgres-wire-compatible serverless platform with instant branching and scale-to-zero. Because BataDB speaks the Postgres wire, Turbine runs against it with **zero glue**, and the same typed query code works whether you connect over a long-lived TCP pool or over SQL-over-HTTP from the edge.
+From zero to typed queries on [BataDB](https://batadata.com), a Postgres-wire-compatible serverless platform with instant branching and scale-to-zero. Because BataDB speaks the Postgres wire, Turbine runs against it with **zero glue**, and the same typed query code works whether you connect over a long-lived TCP pool or over SQL-over-HTTP from the edge.
 
 ## 1. Install
 
 ```bash
-npm install turbine-orm            # the ORM — one runtime dep (pg)
+npm install turbine-orm            # the ORM, one runtime dep (pg)
 npm install @batadata/serverless   # only for the edge / HTTP transport
 ```
 
@@ -31,7 +31,7 @@ Generation reads the catalog over **TCP**, so the branch's compute must be runni
 
 ## 3. Connect (Node.js / long-running server)
 
-For traditional Node.js servers, Express, Fastify, or any worker or job — Turbine owns the pool and you get the full feature set: nested `json_agg` reads, transactions, streaming cursors, `LISTEN`/`NOTIFY`, pgvector, RLS.
+For traditional Node.js servers, Express, Fastify, or any worker or job, Turbine owns the pool and you get the full feature set: nested `json_agg` reads, transactions, streaming cursors, `LISTEN`/`NOTIFY`, pgvector, RLS.
 
 ```ts
 import { turbine } from './generated/turbine';
@@ -47,7 +47,7 @@ const authors = await db.authors.findMany({
 });
 ```
 
-The generated `turbine()` factory returns a typed `TurbineClient` subclass — every column, operator, and relation is autocompleted and inferred.
+The generated `turbine()` factory returns a typed `TurbineClient` subclass, every column, operator, and relation is autocompleted and inferred.
 
 ## 4. Connect (Serverless / Edge)
 
@@ -59,14 +59,14 @@ import { turbineHttp } from 'turbine-orm/serverless';
 import { SCHEMA } from './generated/turbine/metadata';
 
 const pool = new Pool({
-  apiKey: process.env.BATA_API_KEY,      // bata_… — routes + authorizes the request
+  apiKey: process.env.BATA_API_KEY,      // bata_…, routes + authorizes the request
   projectId: process.env.BATA_PROJECT_ID,
-  branchId: process.env.BATA_BRANCH_ID,  // optional — defaults to the primary branch
+  branchId: process.env.BATA_BRANCH_ID,  // optional, defaults to the primary branch
 });
 
 const db = turbineHttp(pool, SCHEMA);
 
-// Same API — including the nested json_agg read — works unchanged over HTTP:
+// Same API, including the nested json_agg read, works unchanged over HTTP:
 const authors = await db.authors.findMany({
   where: { name: 'Ada Lovelace' },
   with: { posts: true },
@@ -91,13 +91,13 @@ npx turbine migrate status
 
 ## Pooled vs. direct endpoint, SSL
 
-- **`…db.batadata.com`** — direct endpoint, one connection per client. Use it for `turbine generate` and for the Node.js / worker path above.
-- **`…-pooler.db.batadata.com`** — pooled endpoint (PgBouncer). Use it for many short-lived connections or serverless that bypasses the HTTP driver.
+- **`…db.batadata.com`**, direct endpoint, one connection per client. Use it for `turbine generate` and for the Node.js / worker path above.
+- **`…-pooler.db.batadata.com`**, pooled endpoint (PgBouncer). Use it for many short-lived connections or serverless that bypasses the HTTP driver.
 - Always use TLS. `sslmode=require` is the minimum; pin `sslmode=verify-full` (with a CA) for the strongest guarantee, or `uselibpqcompat=true&sslmode=require` for libpq parity. Recent `pg` versions warn that `require` will adopt `verify-full` semantics in a future major.
 
 ## Caveats over HTTP
 
-SQL-over-HTTP is **stateless** — one transaction per request — so anything that needs a held session is unavailable on the HTTP transport. Turbine fails **loud** with a typed error rather than running non-atomic SQL:
+SQL-over-HTTP is **stateless**, one transaction per request, so anything that needs a held session is unavailable on the HTTP transport. Turbine fails **loud** with a typed error rather than running non-atomic SQL:
 
 | Capability | Edge / HTTP (`turbineHttp`) | Direct (`turbine({ connectionString })`) |
 |---|:---:|:---:|
@@ -113,17 +113,17 @@ Run transactional work, streaming, and realtime on a server or worker over the *
 ## Why Turbine on BataDB?
 
 - **No WASM at all**: ~50 kB brotli on the edge, fits Cloudflare Workers' 1 MB limit (Prisma 7: ~1.6 MB TS/WASM query compiler)
-- **Single-query nested reads** — one SQL statement via `json_agg`, not N+1
-- **Pipeline batching** — N queries in 1 round-trip, which matters most on high-latency serverless
-- **No adapter layer** — `turbineHttp(pool, SCHEMA)` with any pg-compatible driver, including `@batadata/serverless`
-- **SQL-first migrations** — no shadow database, no proprietary schema DSL
+- **Single-query nested reads**, one SQL statement via `json_agg`, not N+1
+- **Pipeline batching**, N queries in 1 round-trip, which matters most on high-latency serverless
+- **No adapter layer**, `turbineHttp(pool, SCHEMA)` with any pg-compatible driver, including `@batadata/serverless`
+- **SQL-first migrations**, no shadow database, no proprietary schema DSL
 
-BataDB also offers **scale-to-zero** and **instant branching**. Turbine's pipelining and single-query nested reads cut the number of round trips a request makes — and fewer round trips pairs naturally with wake-on-connect, since a cold compute pays its wake cost once rather than once per query. (Branching is a BataDB feature; Turbine just runs the same typed code against whichever branch your connection string points at.)
+BataDB also offers **scale-to-zero** and **instant branching**. Turbine's pipelining and single-query nested reads cut the number of round trips a request makes, and fewer round trips pairs naturally with wake-on-connect, since a cold compute pays its wake cost once rather than once per query. (Branching is a BataDB feature; Turbine just runs the same typed code against whichever branch your connection string points at.)
 
 ## Next steps
 
-- **[Migrate from Drizzle](/migrate-from-drizzle)** — your BataDB connection string and `turbine generate` are the only BataDB-specific pieces
-- **[Migrate from Prisma](/migrate-from-prisma)** — same typed API, no WASM engine on the edge
-- **[Serverless & Edge](/serverless)** — the full `turbineHttp` guide and `PgCompatPool` contract
-- **[Transactions & Pipelines](/transactions)** — pipelines are the highest-leverage edge optimization
-- **[Typed Errors](/errors)** — the errors you get when you reach for a session-only feature over HTTP
+- **[Migrate from Drizzle](/migrate-from-drizzle)**, your BataDB connection string and `turbine generate` are the only BataDB-specific pieces
+- **[Migrate from Prisma](/migrate-from-prisma)**, same typed API, no WASM engine on the edge
+- **[Serverless & Edge](/serverless)**, the full `turbineHttp` guide and `PgCompatPool` contract
+- **[Transactions & Pipelines](/transactions)**, pipelines are the highest-leverage edge optimization
+- **[Typed Errors](/errors)**, the errors you get when you reach for a session-only feature over HTTP

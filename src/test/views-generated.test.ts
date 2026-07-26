@@ -1,10 +1,10 @@
 /**
- * turbine-orm — WS-H / H4: views as read-only entities
+ * turbine-orm, WS-H / H4: views as read-only entities
  *
  * With `includeViews`, views and materialized views are introspected as
  * `TableMetadata` with `isView: true`. Codegen emits entity types + accessors;
  * a no-PK view is excluded from the `findUnique`-family accessor types. Every
- * write builder throws `ValidationError` (E003) "cannot write to a view". Pure —
+ * write builder throws `ValidationError` (E003) "cannot write to a view". Pure -
  * no DB.
  *
  * Run: npx tsx --test src/test/views-generated.test.ts
@@ -62,7 +62,7 @@ const activeUsers: TableMetadata = {
 
 const SCHEMA: SchemaMetadata = { tables: { users, active_users: activeUsers }, enums: {} };
 
-describe('H4 — codegen for views', () => {
+describe('H4, codegen for views', () => {
   it('emits an entity type for the view', () => {
     const types = generateTypes(SCHEMA);
     assert.match(types, /export interface ActiveUser \{/);
@@ -85,7 +85,7 @@ describe('H4 — codegen for views', () => {
   });
 });
 
-describe('H4 — write builders reject views (E003)', () => {
+describe('H4, write builders reject views (E003)', () => {
   const view = makeQuery('active_users', SCHEMA);
 
   const isViewError = (err: unknown) =>

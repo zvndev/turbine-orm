@@ -1,8 +1,8 @@
 /**
- * PowqlInterface — Turbine's PowQL query generator (the PowDB analogue of
+ * PowqlInterface, Turbine's PowQL query generator (the PowDB analogue of
  * {@link QueryInterface}). It exposes the same public method surface as the SQL
- * `QueryInterface` (`findMany`, `create`, `update`, …) but emits **PowQL** — a
- * pipeline language, not SQL — executed through {@link PowdbPool}.
+ * `QueryInterface` (`findMany`, `create`, `update`, …) but emits **PowQL**, a
+ * pipeline language, not SQL, executed through {@link PowdbPool}.
  *
  * It is a *parallel* implementation rather than a `Dialect` of the SQL builder:
  * PowQL's grammar (`T filter <e> order <k> { .col }`) shares no surface with
@@ -14,14 +14,14 @@
  * server):
  *   - `create`/`createMany`/`update`/`delete` use PowDB 0.7.0's trailing
  *     `returning` keyword (`RETURNING *`, all columns) to surface affected rows
- *     in one round-trip. `upsert` is the lone exception — its statement does not
+ *     in one round-trip. `upsert` is the lone exception, its statement does not
  *     accept `returning`, so it reselects the row by PK (a composite-PK upsert
  *     reselects-or-writes inside one flat transaction).
  *   - The PK is server-assigned when the column is `isGenerated` (PowDB's `auto`
- *     int — read back via `returning`); otherwise a defaulted **string** PK is
+ *     int, read back via `returning`); otherwise a defaulted **string** PK is
  *     generated client-side (UUID).
- *   - `with` (nested relations) uses **batched N+1 loaders** — D round-trips for
- *     depth D, not one query — including manyToMany (junction → targets).
+ *   - `with` (nested relations) uses **batched N+1 loaders**, D round-trips for
+ *     depth D, not one query, including manyToMany (junction → targets).
  *   - **Relation filters** (`some`/`none`/`every`, all cardinalities incl. m2m)
  *     are resolved client-side to a literal `in (…)` list, never an IN-subquery:
  *     PowDB's executor caches a subquery's result by plan shape and would return
@@ -30,7 +30,7 @@
  *     shared nested-write engine as one flat top-level transaction (PowDB is
  *     single-writer, no savepoints).
  *   - pgvector / JSON / array filters and cursor streaming throw
- *     {@link UnsupportedFeatureError} (E017) — they have no PowDB equivalent.
+ *     {@link UnsupportedFeatureError} (E017), they have no PowDB equivalent.
  *
  * @module
  */
@@ -85,6 +85,7 @@ import type {
   WhereClause,
 } from './query/types.js';
 import { escapeLike } from './query/utils.js';
+import { assertJsonFilterKeys, jsonStringEntries } from './query/where.js';
 import {
   type ColumnMetadata,
   normalizeKeyColumns,
@@ -152,7 +153,7 @@ interface PowqlParentContext<T> {
  * compile-side inputs for its `name: Target as tN filter … { … }` block plus
  * everything the post-execution attach pass needs to shape the JSON children
  * back into typed entities. Built by {@link PowqlInterface.planNestedRelation}
- * (which returns `null` for any ineligible shape — a silent loader fallback,
+ * (which returns `null` for any ineligible shape, a silent loader fallback,
  * never an error) and consumed by {@link PowqlInterface.buildNestedBlock} /
  * {@link PowqlInterface.attachNestedRows}.
  */
@@ -191,7 +192,7 @@ interface LinkSnapshotRow {
  * relation before compiling to it. Keyed on the pool object identity so every
  * table interface over the same connection shares one snapshot; a WeakMap lets a
  * discarded pool's snapshot be collected. A fetch failure caches `[]` (a missing
- * listing means "no verifiable links" — a silent fallback to loaders, never an
+ * listing means "no verifiable links", a silent fallback to loaders, never an
  * error).
  */
 const LINK_SNAPSHOT_CACHE = new WeakMap<object, Promise<LinkSnapshotRow[]>>();
@@ -202,7 +203,7 @@ const LINK_SNAPSHOT_CACHE = new WeakMap<object, Promise<LinkSnapshotRow[]>>();
  * block cannot carry, compiled to alias-qualified scalar link paths
  * (`t0.<linkName>.<col>`) on the parent statement instead of a per-relation
  * loader. Each projected child column rides its own native typed cell (that is
- * the whole point — a scalar hop returns a native cell, so bigint/bytes survive),
+ * the whole point, a scalar hop returns a native cell, so bigint/bytes survive),
  * reconstructed into the child entity by {@link PowqlInterface.attachLinkRows}.
  */
 interface LinkPathPlan {
@@ -366,8 +367,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * Render a value for a write *assignment* (`col := …`). Every value — float
-   * columns included — is sent as a positional `$N` param. PowDB ≥ 0.7.0 fixed
+   * Render a value for a write *assignment* (`col := …`). Every value, float
+   * columns included, is sent as a positional `$N` param. PowDB ≥ 0.7.0 fixed
    * the int→float UPDATE coercion bug (`score := $n` with an integer param now
    * reads back the integer value, not the raw i64 bits), so the float-literal
    * inlining workaround Turbine carried for ≤ 0.6.2 is gone. Marks the column as
@@ -400,7 +401,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return this.pool.capabilities ?? ALL_POWDB_CAPABILITIES;
   }
 
-  /** A predicate that is always false — the empty-`in` / contradiction sentinel. */
+  /** A predicate that is always false, the empty-`in` / contradiction sentinel. */
   private alwaysFalse(): string {
     const pk = this.meta.primaryKey[0] ?? this.meta.columns[0]?.name;
     return `(.${pk} is null and .${pk} is not null)`;
@@ -437,7 +438,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         if (sub) parts.push(`not (${sub})`);
       } else if (this.meta.relations[key]) {
         // Relation filters are pre-resolved to scalar in/notIn by
-        // resolveRelationFilters() before buildWhere runs — reaching here means
+        // resolveRelationFilters() before buildWhere runs, reaching here means
         // a caller skipped that step (an internal bug, not user error).
         throw new ValidationError(
           `[turbine] internal: relation filter "${key}" reached buildWhere unresolved (missing resolveRelationFilters()).`,
@@ -471,7 +472,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
     rejectUnsupportedFilter(op, field);
     if (!Object.keys(op).some((k) => OPERATOR_KEYS.has(k))) {
-      // A bare object that is not an operator set — equality by value.
+      // A bare object that is not an operator set, equality by value.
       return `${ref} = ${this.param(value, params)}`;
     }
     const insensitive = op.mode === 'insensitive';
@@ -570,6 +571,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * by the empty-where guard.
    */
   private buildJsonPathCondition(col: ColumnMetadata, filter: JsonFilter, params: unknown[], alias?: string): string {
+    // Same strict-key check as the SQL path. Without it an unrecognized
+    // operator compiled to zero conditions and the predicate silently
+    // disappeared, returning every row (see assertJsonFilterKeys).
+    assertJsonFilterKeys(filter, col.name);
     const conds: string[] = [];
     // Bind the path segments at most once and reuse the expression string across
     // equals + range comparisons (they share the same `path`).
@@ -628,7 +633,23 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       conds.push(`${pathP()} ${powOp} ${this.param(v, params)}`);
     }
 
-    if (!conds.length) return '';
+    // Substring comparisons against the text at `path`, in the same fixed
+    // order as the SQL path. PowQL has `like`, so these compile natively.
+    for (const { pattern, value } of jsonStringEntries(filter, col.name)) {
+      const insensitive = filter.mode === 'insensitive';
+      const lhs = insensitive ? `lower(${pathP()})` : pathP();
+      conds.push(`${lhs} like ${this.bindLike(pattern(escapeLike(value)), params, insensitive)}`);
+    }
+
+    // Every reachable shape now emits a condition or throws: assertJsonFilterKeys
+    // rejects a filter that compares nothing, so an empty list here would be a
+    // generator bug rather than a user error, and must not silently widen the
+    // query the way it used to.
+    if (!conds.length) {
+      throw new ValidationError(
+        `[turbine] internal: JSON filter on "${col.name}" compiled to no condition. This is a bug in turbine-orm.`,
+      );
+    }
     return conds.length > 1 ? `(${conds.join(' and ')})` : conds[0]!;
   }
 
@@ -644,7 +665,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return insensitive ? `lower(${ph})` : ph;
   }
 
-  /** `lhs [not] in ($1, $2, …)` — empty list collapses to a constant. */
+  /** `lhs [not] in ($1, $2, …)`, empty list collapses to a constant. */
   private buildInList(
     lhs: string,
     values: unknown[],
@@ -678,7 +699,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * so a second subquery of the same shape with a different value returns the
    * first one's stale rows (reproduced live on the embedded engine; the
    * single-statement literal `in (list)` form is always correct). Resolving
-   * client-side trades extra round-trips for correctness, and recurses — nested
+   * client-side trades extra round-trips for correctness, and recurses, nested
    * relation filters in the inner predicate resolve when the target query runs.
    */
   private async resolveRelationFilters(
@@ -728,7 +749,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       throw new UnsupportedFeatureError(
         'composite-key relation filters',
         'PowDB',
-        `relation "${rel.name}" uses a composite key — PowQL has no tuple-\`in\` to express it`,
+        `relation "${rel.name}" uses a composite key, PowQL has no tuple-\`in\` to express it`,
       );
     }
     const targetMeta = this.schema.tables[rel.to];
@@ -775,7 +796,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       throw new UnsupportedFeatureError(
         'composite-key manyToMany filters',
         'PowDB',
-        `relation "${rel.name}" — PowQL has no tuple-\`in\` for composite junction/target keys`,
+        `relation "${rel.name}", PowQL has no tuple-\`in\` for composite junction/target keys`,
       );
     }
     const sourceJCol = sourceJ[0]!;
@@ -794,7 +815,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       } as unknown as FindManyArgs<object>);
       return [...new Set(rows.map((r) => (r as Record<string, unknown>)[targetPkField]).filter((v) => v != null))];
     };
-    // Junction source keys linking any of `targetPks` (literal IN-list — never a subquery).
+    // Junction source keys linking any of `targetPks` (literal IN-list, never a subquery).
     const sourcesForTargets = async (targetPks: unknown[]): Promise<unknown[]> => {
       if (!targetPks.length) return [];
       const out = new Set<unknown>();
@@ -954,7 +975,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           }
           return `${this.ref(field, alias)} ${spec.sort === 'desc' ? 'desc' : 'asc'}`;
         }
-        // Name the actual feature in the refusal — a pick-row ordering
+        // Name the actual feature in the refusal, a pick-row ordering
         // reported as "vector / distance ordering" sends users hunting for
         // pgvector docs. Everything else stays E017 on PowDB.
         const feature = isRelationPickOrderBy(dir)
@@ -1171,8 +1192,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    *
    * When the engine supports nested projections (>= 0.18) and the strategy
    * does not opt out, eligible `with` relations compile INTO this statement as
-   * nested-projection blocks (`nestedPlans`) — one round-trip for the whole
-   * shape — and only the ineligible remainder (`residualWith`) goes to the
+   * nested-projection blocks (`nestedPlans`), one round-trip for the whole
+   * shape, and only the ineligible remainder (`residualWith`) goes to the
    * post-execution loaders. Without nesting the emitted PowQL is byte-identical
    * to the pre-0.18 output (no alias, `.col` refs).
    */
@@ -1356,7 +1377,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   // -------------------------------------------------------------------------
-  // Nested relations — batched N+1 loaders (hasMany / hasOne / belongsTo)
+  // Nested relations, batched N+1 loaders (hasMany / hasOne / belongsTo)
   // -------------------------------------------------------------------------
 
   /**
@@ -1491,7 +1512,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * manyToMany nested read — a three-hop batched loader (no `json_agg`/join
+   * manyToMany nested read, a three-hop batched loader (no `json_agg`/join
    * pushdown): (1) read the junction rows for all parents in `sourceKey in (…)`
    * chunks, (2) read the target rows for the collected `targetKey`s, (3) stitch
    * each parent → its junction rows → its targets in memory. Mirrors the
@@ -1518,7 +1539,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       throw new UnsupportedFeatureError(
         'composite-key manyToMany',
         'PowDB',
-        `relation "${relName}" — PowQL has no tuple-\`in\`, so composite junction/target keys can't be loaded`,
+        `relation "${relName}", PowQL has no tuple-\`in\`, so composite junction/target keys can't be loaded`,
       );
     }
     const sourceJCol = sourceJ[0]!;
@@ -2027,7 +2048,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   /**
    * Shape the nested JSON children back into typed entities on every parent
    * row. The nested field arrives as a decoded JSON array on the native wire
-   * (or JSON text on the legacy wire — parsed here); its values are real JSON
+   * (or JSON text on the legacy wire, parsed here); its values are real JSON
    * types, so each child object goes through the NATIVE coercion policy
    * (`rowToEntity(…, true)`: a date column's micros number becomes a `Date`, a
    * json column's document passes through, a str `"null"` stays a string).
@@ -2128,7 +2149,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * must stay on the loaders (ALWAYS a silent fallback with identical output).
    *
    * SCOPED TIGHT: this fires ONLY for a to-one relation whose child projection
-   * includes a bigint/bytes column — exactly the case a JSON nested block cannot
+   * includes a bigint/bytes column, exactly the case a JSON nested block cannot
    * carry, so nested projections have already fallen back to a per-relation loader
    * (`planNestedRelation` returned `null` for the same shape). Cases nested
    * projections DO serve keep nested projections: link-bearing statements are
@@ -2136,9 +2157,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * link path would regress a hot path for no gain. Requires: single-column
    * belongsTo; no relation `with` / `where` / `distinct` / `orderBy` /
    * `limit` / `offset` (a scalar path has no per-hop filter/order and cannot
-   * reproduce those — such inputs stay on the loader for exact parity); a link
+   * reproduce those, such inputs stay on the loader for exact parity); a link
    * name and all projected columns that are bare identifiers (a quoted segment in
-   * a dotted link path is outside the verified spelling — fall back); and a
+   * a dotted link path is outside the verified spelling, fall back); and a
    * DECLARED link that verifiably matches (`findMatchingLink`).
    */
   private async planLinkPathRelation(
@@ -2176,7 +2197,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
     if (!hasCarrierBlockedCol) return null;
 
-    // All cheap checks passed: NOW fetch (and cache) the link snapshot — never
+    // All cheap checks passed: NOW fetch (and cache) the link snapshot, never
     // before, so a query with no link-path candidate issues no `schema links`.
     const link = this.findMatchingLink(await this.linksSnapshot(), rel);
     if (!link) return null;
@@ -2207,7 +2228,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   /**
    * Reconstruct each link-path relation's child entity from its flat hop fields
-   * and attach it under the relation name — output indistinguishable from the
+   * and attach it under the relation name, output indistinguishable from the
    * loader (same keys, same coercions). Presence: the target PK cell arriving
    * Empty (a null/dangling FK at the hop) means no linked row → `null`, matching
    * the loader's `matches[0] ?? null`. Otherwise the gathered snake cells go
@@ -2237,7 +2258,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   // -------------------------------------------------------------------------
-  // Writes (reselect — PowDB has no RETURNING)
+  // Writes (reselect, PowDB has no RETURNING)
   // -------------------------------------------------------------------------
 
   /** Split `data` into scalar assignments; reject relation (nested-write) keys. */
@@ -2249,7 +2270,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         throw new UnsupportedFeatureError(
           'nested writes',
           'PowDB',
-          `relation "${field}" — nested writes need create()/update(), not createMany()/upsert()`,
+          `relation "${field}", nested writes need create()/update(), not createMany()/upsert()`,
         );
       }
       out.push({ col: this.column(field), value });
@@ -2260,8 +2281,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   /**
    * Fill in a client-generated UUID for a defaulted **string** PK that wasn't
    * supplied. A server-generated PK ({@link ColumnMetadata.isGenerated}, e.g. an
-   * `int` column with PowDB's `auto` modifier) is left untouched — PowDB assigns
-   * it and the trailing `returning` reads it back — as is any non-string PK.
+   * `int` column with PowDB's `auto` modifier) is left untouched, PowDB assigns
+   * it and the trailing `returning` reads it back, as is any non-string PK.
    */
   private applyPkDefault(data: Record<string, unknown>): Record<string, unknown> {
     const out = { ...data };
@@ -2281,7 +2302,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * The table name as a PowQL type reference — backtick-quoted when it is a
+   * The table name as a PowQL type reference, backtick-quoted when it is a
    * reserved word (e.g. a table named `order`). Used in every emitted
    * statement; plain `this.table` stays in error messages.
    */
@@ -2392,7 +2413,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         throw new UnsupportedFeatureError(
           'nested writes',
           'PowDB',
-          `relation "${field}" — nested writes need create()/update(), not updateMany()/upsert()`,
+          `relation "${field}", nested writes need create()/update(), not updateMany()/upsert()`,
         );
       }
       const colMeta = this.column(field);
@@ -2418,11 +2439,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   // -------------------------------------------------------------------------
-  // Nested writes — create/update whose `data` carries relation ops (create,
+  // Nested writes, create/update whose `data` carries relation ops (create,
   // connect, connectOrCreate, disconnect, set, delete, update, upsert). Reuses
   // the engine-agnostic nested-write engine (it only needs ctx.schema + the
   // table accessors PowqlInterface already provides). Runs as ONE flat top-level
-  // PowDB transaction — single global write lock, no savepoints, so the whole
+  // PowDB transaction, single global write lock, no savepoints, so the whole
   // tree commits or rolls back together (mirrors the SQL path's coverage:
   // hasMany / hasOne / belongsTo; manyToMany nested writes are not handled by
   // the shared engine on any backend).
@@ -2473,9 +2494,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         // the transaction-scoped proxy pool (see createTxPool).
         this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
       );
-      const ctx: NestedWriteContext = { schema: this.schema, tx: tx as unknown as NestedWriteContext['tx'] };
+      const ctx: NestedWriteContext = {
+        schema: this.schema,
+        tx: tx as unknown as NestedWriteContext['tx'],
+        scopedConnect: this.options?.scopedConnect === true,
+      };
       // Plant the single-writer re-entrancy marker for the implicit tx's
-      // subtree (same seam TurbineClient.$transaction uses) — user code that
+      // subtree (same seam TurbineClient.$transaction uses), user code that
       // fires db.$transaction from inside (e.g. $use middleware around a
       // nested-write child op) must fast-fail E017, not queue into deadlock.
       const wrap = (client as { wrapTransactionCallback?: <T>(f: () => Promise<T>) => Promise<T> })
@@ -2484,14 +2509,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       await client.query(d?.commitStatement?.() ?? 'commit');
       return result;
     } catch (err) {
-      // Only roll back a transaction we actually opened — a failed BEGIN
+      // Only roll back a transaction we actually opened, a failed BEGIN
       // (queue timeout, re-entrancy E017) must not emit a stray ROLLBACK that
       // could land inside another transaction on a shared engine handle.
       if (began) {
         try {
           await client.query(d?.rollbackStatement?.() ?? 'rollback');
         } catch {
-          /* best-effort — the connection may be gone */
+          /* best-effort, the connection may be gone */
         }
       }
       throw err;
@@ -2516,7 +2541,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
       const where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, false, 'delete');
-      // `returning` hands back the deleted row(s) — no separate pre-image reselect needed.
+      // `returning` hands back the deleted row(s), no separate pre-image reselect needed.
       const { rows, native } = await this.exec(
         `${this.qt} filter ${where} delete returning`,
         params,
@@ -2620,7 +2645,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
     return this.withMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
-      // One scalar query per aggregate — PowDB's bare-projection aggregate is broken.
+      // One scalar query per aggregate, PowDB's bare-projection aggregate is broken.
       const result: AggregateResult<T> = {};
       const filterParams: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
@@ -3042,7 +3067,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   // Streaming / unsupported
   // -------------------------------------------------------------------------
 
-  // biome-ignore lint/correctness/useYield: intentionally throws before yielding — PowDB has no server cursor.
+  // biome-ignore lint/correctness/useYield: intentionally throws before yielding, PowDB has no server cursor.
   async *findManyStream(): AsyncGenerator<T> {
     throw new UnsupportedFeatureError(
       'cursor streaming (findManyStream)',
@@ -3052,7 +3077,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   // -------------------------------------------------------------------------
-  // Reselect helper (upsert only — PowDB's upsert has no `returning`)
+  // Reselect helper (upsert only, PowDB's upsert has no `returning`)
   // -------------------------------------------------------------------------
 
   /** Reselect a single row by its single-column primary key value. */
@@ -3067,12 +3092,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * Empty-where guard — blocks accidental whole-table writes. Mirrors the SQL
+   * Empty-where guard, blocks accidental whole-table writes. Mirrors the SQL
    * path's `assertMutationHasPredicate` (query/builder.ts): it gates on the
    * *compiled* PowQL filter fragment, NOT the shape of the `where` object. A
-   * `where` whose conditions all evaporate during compilation — `{}`,
+   * `where` whose conditions all evaporate during compilation, `{}`,
    * `{ id: undefined }`, `{ OR: [] }`, `{ AND: [] }`, `{ NOT: {} }`,
-   * `{ OR: [{ f: undefined }] }` — compiles to the empty string and is refused,
+   * `{ OR: [{ f: undefined }] }`, compiles to the empty string and is refused,
    * because emitting a filter-less write would hit every row.
    */
   private assertCompiledWhere(compiledWhere: string, allow: boolean | undefined, action: string): void {

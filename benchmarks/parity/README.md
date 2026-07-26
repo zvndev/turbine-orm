@@ -1,4 +1,4 @@
-# Turbine ORM — Correctness Parity Harness
+# Turbine ORM, Correctness Parity Harness
 
 Proves that **Turbine returns results identical to Prisma 7 and Drizzle** across a
 matrix of query scenarios, all run against the *same* deterministically-seeded
@@ -30,7 +30,7 @@ createdb turbine_parity
 export DATABASE_URL="postgres://$USER@localhost:5432/turbine_parity"
 
 cd benchmarks
-npx prisma generate          # once — generates the Prisma client from prisma/schema.prisma
+npx prisma generate          # once, generates the Prisma client from prisma/schema.prisma
 
 # Seed the small deterministic dataset, then run the matrix:
 npm run parity
@@ -48,7 +48,7 @@ Exit code `0` = full parity; non-zero = at least one mismatch (details printed).
 
 ## The dataset
 
-`seed.ts` loads a **small, fully deterministic** fixture — parity needs
+`seed.ts` loads a **small, fully deterministic** fixture, parity needs
 determinism, not scale:
 
 - 4 organizations, 20 users, 100 posts (5/user), 300 comments (3/post)
@@ -83,7 +83,7 @@ These are documented in `run.ts` / `normalize.ts` at the point they're handled.
    This machine's Postgres runs with `timezone = America/New_York`. For
    `TIMESTAMPTZ` columns, Turbine (node-postgres) and Drizzle (node-postgres) both
    decode the value to the correct absolute instant regardless of session timezone
-   — e.g. `2025-01-01 08:47:00-05` → `2025-01-01T13:47:00.000Z`.
+   - e.g. `2025-01-01 08:47:00-05` → `2025-01-01T13:47:00.000Z`.
    Prisma's driver adapter instead renders the *wall-clock* time and labels it
    UTC, yielding `…T08:47:00.000Z` (off by the session offset). **Turbine's instant
    is the correct one.** To compare data rather than this Prisma rendering
@@ -98,7 +98,7 @@ These are documented in `run.ts` / `normalize.ts` at the point they're handled.
    collapses any ISO-8601 timestamp string and any `Date` to one canonical
    `toISOString()` instant before comparing, so genuine instant differences are
    still caught (verified). **Flagged for the PM as a minor consistency
-   nit — not fixed here (parity harness must not edit `src/`).**
+   nit, not fixed here (parity harness must not edit `src/`).**
 
 3. **bigint representation.** Prisma returns `BIGINT` PKs/FKs as JS `bigint`;
    Turbine and Drizzle return `number`. Normalised to `number` everywhere.
@@ -112,6 +112,6 @@ These are documented in `run.ts` / `normalize.ts` at the point they're handled.
 
 ## Files
 
-- `seed.ts` — deterministic schema + data loader.
-- `normalize.ts` — canonicalisation helpers (`canon`, `rows`, `row`, `tree`, `pick`).
-- `run.ts` — scenario definitions, runner, and PASS/FAIL matrix.
+- `seed.ts`, deterministic schema + data loader.
+- `normalize.ts`, canonicalisation helpers (`canon`, `rows`, `row`, `tree`, `pick`).
+- `run.ts`, scenario definitions, runner, and PASS/FAIL matrix.

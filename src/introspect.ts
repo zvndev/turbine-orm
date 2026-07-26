@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Schema introspection
+ * turbine-orm, Schema introspection
  *
  * Connects to a live Postgres database, reads information_schema + pg_catalog,
  * and produces a SchemaMetadata object describing every table, column, relation,
@@ -10,6 +10,7 @@
 
 import pg from 'pg';
 import { type Dialect, postgresDialect } from './dialect.js';
+import { ValidationError } from './errors.js';
 import {
   type CheckMetadata,
   type ColumnMetadata,
@@ -149,7 +150,7 @@ const SQL_CHECKS = `
     AND n.nspname = $1
 `;
 
-// Views (relkind 'v') — column metadata comes free from information_schema.columns.
+// Views (relkind 'v'), column metadata comes free from information_schema.columns.
 const SQL_VIEWS = `
   SELECT table_name
   FROM information_schema.views
@@ -157,7 +158,7 @@ const SQL_VIEWS = `
   ORDER BY table_name
 `;
 
-// Materialized views (relkind 'm') — NOT in information_schema; read from pg_catalog.
+// Materialized views (relkind 'm'), NOT in information_schema; read from pg_catalog.
 const SQL_MATVIEWS = `
   SELECT matviewname AS table_name
   FROM pg_matviews
@@ -165,7 +166,7 @@ const SQL_MATVIEWS = `
   ORDER BY matviewname
 `;
 
-// Materialized-view columns — information_schema.columns omits matviews, so pull
+// Materialized-view columns, information_schema.columns omits matviews, so pull
 // them from pg_attribute. Aliased to mirror SQL_COLUMNS so the same row-mapping
 // applies (array types surface as data_type 'ARRAY' + a '_'-prefixed udt_name).
 const SQL_MATVIEW_COLUMNS = `
@@ -284,6 +285,15 @@ export interface IntrospectOptions {
   /** Tables to exclude (default: none). Applied after include. */
   exclude?: string[];
   /**
+   * Rename derived relations, as `{ table: { derivedName: desiredName } }`.
+   *
+   * Relation names are composed by introspection (the database does not name
+   * relationships), so a port from another ORM that named them differently has
+   * to touch every call site. Declaring the mapping here makes it mechanical.
+   * A typo is an error, not a silent no-op: see {@link applyRelationRenames}.
+   */
+  relationNames?: Record<string, Record<string, string>>;
+  /**
    * Also introspect **views** and **materialized views** as read-only
    * {@link TableMetadata} entries (`isView: true`). Off by default. Write
    * builders reject views (E003); a view without a primary key is excluded from
@@ -327,11 +337,75 @@ export interface IntrospectOptions {
 export async function introspect(options: IntrospectOptions): Promise<SchemaMetadata> {
   const dialect = options.dialect ?? postgresDialect;
   const introspector = dialect.introspector;
-  if (introspector) {
-    return introspector.introspect(options);
+  const schema = introspector
+    ? await introspector.introspect(options)
+    : // Dialects without an introspector fall back to the Postgres catalog reader.
+      await introspectPostgresCatalog(options);
+  // Applied here rather than inside each introspector so every engine gets it.
+  return options.relationNames ? applyRelationRenames(schema, options.relationNames) : schema;
+}
+
+/**
+ * Rename introspected relations, per table, from the name turbine derived to
+ * the name the caller wants.
+ *
+ * Relation names are DERIVED, not declared: the database has no name for a
+ * foreign key's relationship, so introspection composes one, and two foreign
+ * keys pointing at the same table produce composed names (`msgsBySender`,
+ * `msgsByRecipient`) that nobody would predict. A codebase migrating from
+ * another ORM already has names for these, chosen by different rules, so every
+ * call site has to be hand-edited. This map turns that into a mechanical
+ * mapping done once in the config.
+ *
+ * Renames are validated rather than best-effort: an unknown table or an
+ * unknown source relation is an ERROR, because silently ignoring a typo here
+ * means the call sites it was supposed to fix break at runtime instead.
+ */
+export function applyRelationRenames(
+  schema: SchemaMetadata,
+  renames: Record<string, Record<string, string>>,
+): SchemaMetadata {
+  const tables: Record<string, TableMetadata> = { ...schema.tables };
+
+  for (const [table, mapping] of Object.entries(renames)) {
+    const meta = tables[table];
+    if (!meta) {
+      throw new ValidationError(
+        `[turbine] relationNames: unknown table "${table}". Known tables: ${Object.keys(tables).join(', ')}.`,
+      );
+    }
+    const relations: Record<string, RelationDef> = { ...meta.relations };
+    const columnFields = new Set(Object.values(meta.columnMap));
+
+    for (const [from, to] of Object.entries(mapping)) {
+      if (!Object.hasOwn(relations, from)) {
+        throw new ValidationError(
+          `[turbine] relationNames: table "${table}" has no relation "${from}". ` +
+            `Derived relations: ${Object.keys(relations).join(', ') || '(none)'}.`,
+        );
+      }
+      if (from === to) continue;
+      if (Object.hasOwn(relations, to)) {
+        throw new ValidationError(
+          `[turbine] relationNames: cannot rename "${table}.${from}" to "${to}", that relation already exists.`,
+        );
+      }
+      if (columnFields.has(to)) {
+        throw new ValidationError(
+          `[turbine] relationNames: cannot rename "${table}.${from}" to "${to}", a column on "${table}" ` +
+            `already uses that field name, and a relation must never shadow a column.`,
+        );
+      }
+      const def = relations[from]!;
+      delete relations[from];
+      // `RelationDef.name` is the relation's own identity, so it moves with it.
+      relations[to] = { ...def, name: to };
+    }
+
+    tables[table] = { ...meta, relations };
   }
-  // Dialects without an introspector fall back to the Postgres catalog reader.
-  return introspectPostgresCatalog(options);
+
+  return { ...schema, tables };
 }
 
 /**
@@ -442,7 +516,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         isGenerated:
           (typeof row.column_default === 'string' && row.column_default.includes('nextval(')) ||
           row.is_identity === 'YES',
-        // GENERATED ALWAYS AS (expr) STORED — computed by the database, never
+        // GENERATED ALWAYS AS (expr) STORED, computed by the database, never
         // writable. Distinct from isGenerated (serial/identity, which a client
         // MAY override). is_generated is 'ALWAYS' for STORED columns, else 'NEVER'.
         isGeneratedStored: row.is_generated === 'ALWAYS',
@@ -454,7 +528,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         maxLength: row.character_maximum_length ?? undefined,
         // Record the type's schema ONLY when it lives outside the introspected
         // schema (and isn't a pg_catalog builtin). A same-named enum in another
-        // schema must NOT get this schema's `::"enum"` cast — search_path would
+        // schema must NOT get this schema's `::"enum"` cast, search_path would
         // resolve the cast to the wrong type (see enumTypeForColumn). Omitting
         // it for the common case keeps generated metadata byte-identical.
         ...(typeof row.udt_schema === 'string' && row.udt_schema !== schema && row.udt_schema !== 'pg_catalog'
@@ -557,13 +631,13 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     // per-FK-column when several FKs point at the same target, and every name
     // is collision-checked against the table's scalar column fields so a
     // relation can never shadow a column (which generated unsound types and
-    // made both surfaces unusable — dogfood T-4).
+    // made both surfaces unusable, dogfood T-4).
     const columnFieldsByTable = new Map<string, Set<string>>();
     const unknownTypedFieldsByTable = new Map<string, Set<string>>();
     for (const [tbl, cols] of columnsByTable) {
       columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
       // Enum-typed columns also report tsType 'unknown' here, but generate.ts
-      // gives them a concrete union type — a shadow of one was type-broken on
+      // gives them a concrete union type, a shadow of one was type-broken on
       // main, so only genuine json/jsonb columns qualify as historical shadows.
       unknownTypedFieldsByTable.set(
         tbl,
@@ -595,14 +669,14 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     //   1. J's primary key is exactly two columns.
     //   2. J has exactly two FKs, each single-column.
     //   3. Each FK's source column is one of J's two PK columns (the PK *is* the
-    //      two FK columns — no surrogate PK, no extra identity).
+    //      two FK columns, no surrogate PK, no extra identity).
     //   4. The two FKs target two DISTINCT tables (A and B).
     //   5. J has no columns beyond those two FK/PK columns (no payload columns
     //      like `grade` or `created_at`).
     //
     // For such a J linking A and B we ADD a `manyToMany` relation on A → B and
     // symmetrically on B → A, both routed `through` J. The existing belongsTo /
-    // hasMany relations derived from J's FKs are left untouched — this block
+    // hasMany relations derived from J's FKs are left untouched, this block
     // never removes or renames anything. Naming/collision handling lives in the
     // shared addAutoManyToManyRelations helper.
     //
@@ -754,7 +828,7 @@ export function stripCheckWrapper(def: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Relation derivation from foreign keys (pure — unit-testable without a DB)
+// Relation derivation from foreign keys (pure, unit-testable without a DB)
 // ---------------------------------------------------------------------------
 
 /** A foreign-key constraint grouped by constraint name (composite FKs carry column arrays). */
@@ -768,7 +842,7 @@ export interface ForeignKeyEntry {
 
 /**
  * Derive a belongsTo relation name from its FK column. Strips a trailing
- * `_id` (snake_case) or `Id` (camelCase column names — common in Prisma-ported
+ * `_id` (snake_case) or `Id` (camelCase column names, common in Prisma-ported
  * schemas where columns are quoted camelCase identifiers), then camelCases:
  * `current_version_id` and `currentVersionId` both yield `currentVersion`.
  * Stripping is what keeps the scalar FK field (`currentVersionId`) targetable
@@ -884,7 +958,7 @@ export function detectUniqueForeignKeySets(
 /**
  * Resolve a derived relation name against the names already taken on the
  * table (scalar column fields + previously assigned relations). On collision,
- * applies a deterministic `Rel` / `Rel2` / `Rel3`… suffix and warns — a
+ * applies a deterministic `Rel` / `Rel2` / `Rel3`… suffix and warns, a
  * colliding name would otherwise shadow a column field and generate types
  * that fail `tsc --strict` (TS2430/TS2322).
  */
@@ -893,14 +967,14 @@ function resolveRelationNameCollision(candidate: string, taken: Set<string>, tab
   let name = `${candidate}Rel`;
   for (let i = 2; taken.has(name); i++) name = `${candidate}Rel${i}`;
   console.warn(
-    `[turbine] Relation name "${candidate}" on table "${table}" (from ${source}) collides with an existing column or relation — using "${name}" instead.`,
+    `[turbine] Relation name "${candidate}" on table "${table}" (from ${source}) collides with an existing column or relation, using "${name}" instead.`,
   );
   return name;
 }
 
 /**
  * Build the belongsTo/hasMany relation maps for every table from its foreign
- * keys. Naming rules (LEGACY-FIRST — a relation name that previously worked at
+ * keys. Naming rules (LEGACY-FIRST, a relation name that previously worked at
  * runtime must never change out from under a regenerating app):
  *
  *   1. First compute the historical derivation exactly as it shipped before
@@ -908,7 +982,7 @@ function resolveRelationNameCollision(candidate: string, taken: Set<string>, tab
  *      suffix (`snakeToCamel(col.replace(/_id$/, ''))` when several FKs point
  *      at the same target, else the singularized target table), and hasMany is
  *      `snakeToCamel(`${source}_by_${strippedColumn}`)` (else the source
- *      table). If that legacy name is free, KEEP IT — even when it looks odd
+ *      table). If that legacy name is free, KEEP IT, even when it looks odd
  *      (`blogPostsByAuthorId`, `postsBy_Author`): those names were collision-
  *      free and worked, so regenerating must not rename them.
  *   2. If the legacy name collides ONLY with a scalar column whose tsType is
@@ -917,17 +991,17 @@ function resolveRelationNameCollision(candidate: string, taken: Set<string>, tab
  *      relation payload; generate.ts's typeSafeRelations omits the relation
  *      from the type layer).
  *   3. On a genuine collision (concrete-typed column shadow, or a previously
- *      assigned relation), fall back to the modern derivation — the `_id`/`Id`
+ *      assigned relation), fall back to the modern derivation, the `_id`/`Id`
  *      case-insensitive strip of {@link relationNameFromColumn} plus the
- *      `By`-composed reverse name — which fixes the camelCase-FK shadowing
+ *      `By`-composed reverse name, which fixes the camelCase-FK shadowing
  *      shapes that were actually BROKEN before (relation name === scalar FK
  *      field → unusable types).
  *   4. Last resort: deterministic `Rel`/`Rel2` suffix + warning.
  *
- * @param columnFieldsByTable camelCase column *fields* per table — used to
+ * @param columnFieldsByTable camelCase column *fields* per table, used to
  *   guarantee relations never shadow concrete-typed scalar columns.
  * @param unknownTypedFieldsByTable subset of the column fields whose tsType is
- *   `unknown` (json/jsonb) — legacy shadows of these are preserved (rule 2).
+ *   `unknown` (json/jsonb), legacy shadows of these are preserved (rule 2).
  * @param uniqueSetsByTable when provided (F2), the child-table column sets that
  *   guarantee at-most-one row (PK + unique constraints + plain unique indexes,
  *   from {@link detectUniqueForeignKeySets}). A reverse relation whose FK column
@@ -964,7 +1038,7 @@ export function buildRelationsFromForeignKeys(
     }
     return taken;
   };
-  // Relation names actually assigned so far (as opposed to column fields) —
+  // Relation names actually assigned so far (as opposed to column fields) -
   // needed to tell "collides only with a column" apart from "collides with an
   // already-assigned relation" for the legacy-shadow-preserving rule.
   const assignedByTable = new Map<string, Set<string>>();
@@ -977,17 +1051,17 @@ export function buildRelationsFromForeignKeys(
     return assigned;
   };
 
-  /** Legacy-first name resolution — see the naming rules in the JSDoc above. */
+  /** Legacy-first name resolution, see the naming rules in the JSDoc above. */
   const resolveName = (legacy: string, modern: string | null, table: string, source: string): string => {
     const taken = takenFor(table);
     if (!taken.has(legacy)) return legacy;
     // Historical json/jsonb shadow: previously worked at runtime AND compiled
-    // (tsType `unknown` absorbs the relation payload). Keep the name, warn —
+    // (tsType `unknown` absorbs the relation payload). Keep the name, warn -
     // typeSafeRelations() keeps the generated type layer sound.
     if (!assignedFor(table).has(legacy) && unknownTypedFieldsByTable?.get(table)?.has(legacy)) {
       console.warn(
         `[turbine] Relation "${legacy}" on table "${table}" (from ${source}) shadows the json/jsonb column ` +
-          `"${legacy}" — keeping the historical name for runtime compatibility; the relation is omitted from ` +
+          `"${legacy}", keeping the historical name for runtime compatibility; the relation is omitted from ` +
           `the generated types. Rename the column to expose it.`,
       );
       return legacy;
@@ -1006,7 +1080,7 @@ export function buildRelationsFromForeignKeys(
     const foreignKey = singleColumn ? fk.sourceColumns[0]! : fk.sourceColumns;
     const referenceKey = fk.targetColumns.length === 1 ? fk.targetColumns[0]! : fk.targetColumns;
 
-    // Composite FKs have no single column to derive from — fall back to the
+    // Composite FKs have no single column to derive from, fall back to the
     // constraint name (with the usual fk_/-_fkey affixes stripped).
     const constraintBase = fk.constraintName.replace(/^fk_/, '').replace(/_fkey$/, '');
 
@@ -1125,7 +1199,7 @@ export function addAutoManyToManyRelations(
   uniqueIndexColsByTable?: Map<string, string[][]>,
 ): void {
   for (const tableName of tableNames) {
-    // FKs whose source is this table — both must be single-column.
+    // FKs whose source is this table, both must be single-column.
     const tableFks = foreignKeys.filter((fk) => fk.sourceTable === tableName);
     if (tableFks.length !== 2) continue;
     if (tableFks.some((fk) => fk.sourceColumns.length !== 1)) continue;
@@ -1172,10 +1246,10 @@ export function addAutoManyToManyRelations(
       const columnFields = columnFieldsByTable?.get(sourceTbl);
       if (columnFields?.has(relName)) {
         if (unknownTypedFieldsByTable?.get(sourceTbl)?.has(relName)) {
-          // Historical json/jsonb shadow — worked at runtime, compiled fine.
+          // Historical json/jsonb shadow, worked at runtime, compiled fine.
           console.warn(
             `[turbine] Relation "${relName}" on table "${sourceTbl}" (junction ${tableName}) shadows the ` +
-              `json/jsonb column "${relName}" — keeping the historical name for runtime compatibility; ` +
+              `json/jsonb column "${relName}", keeping the historical name for runtime compatibility; ` +
               `the relation is omitted from the generated types.`,
           );
         } else {
@@ -1211,7 +1285,7 @@ export function addAutoManyToManyRelations(
  * MSSQL): filters the FK list to the introspected table set, seeds the
  * taken-name / json-shadow maps from the engine's column metadata, and runs
  * the SAME `buildRelationsFromForeignKeys` + `addAutoManyToManyRelations`
- * pipeline as the Postgres introspector — so every engine derives identical
+ * pipeline as the Postgres introspector, so every engine derives identical
  * relation names for the same logical schema (the engines previously carried
  * stale copies of a retired naming scheme).
  */

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — relation `_count` in `with` (WS-A / A2)
+ * turbine-orm, relation `_count` in `with` (WS-A / A2)
  *
  * Build-only SQL + transform assertions for the join strategy, plus a fake-pool
  * run of the batched strategy asserting byte-identical `_count` output. `_count`
@@ -83,7 +83,7 @@ function schema(): SchemaMetadata {
   };
 }
 
-describe('relation _count — join strategy SQL', () => {
+describe('relation _count, join strategy SQL', () => {
   it('_count: true counts every to-many relation (hasMany + m2m), never to-one', () => {
     const q = makeQuery('users', schema());
     const { sql, params } = q.buildFindMany({ with: { _count: true } } as never);
@@ -140,7 +140,7 @@ describe('relation _count — join strategy SQL', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Batched strategy — byte-identical _count output (fake pool)
+// Batched strategy, byte-identical _count output (fake pool)
 // ---------------------------------------------------------------------------
 
 interface Call {
@@ -173,7 +173,7 @@ function usersQi(pool: unknown, strategy: 'join' | 'batched') {
   );
 }
 
-describe('relation _count — batched strategy', () => {
+describe('relation _count, batched strategy', () => {
   it('base query has no count subquery; count comes from a grouped follow-up', async () => {
     const { pool, calls } = makeFakePool({
       users: [
@@ -265,7 +265,7 @@ function usersQiFiltered(pool: unknown, strategy: 'join' | 'batched', globalFilt
   );
 }
 
-describe('relation _count — global filters', () => {
+describe('relation _count, global filters', () => {
   it('batched hasMany _count ANDs the target filter into the grouped follow-up', async () => {
     const { pool, calls } = makeFakePool({
       users: [{ id: 1, name: 'alice' }],
@@ -295,7 +295,7 @@ describe('relation _count — global filters', () => {
   });
 
   it('batched m2m _count matches the join strategy under a target filter', () => {
-    // Join: EXISTS-on-target inside the junction count subquery — same semantics.
+    // Join: EXISTS-on-target inside the junction count subquery, same semantics.
     const q = usersQiFiltered(makeFakePool({}).pool, 'join', { orgs: { name: { not: 'closed' } } });
     const { sql, params } = q.buildFindMany({ with: { _count: { orgs: true } } } as never);
     assert.match(
@@ -326,7 +326,7 @@ describe('relation _count — global filters', () => {
         throw new Error('request-scoped: no tenant in context');
       },
     });
-    // users query touches posts (_count) but never profiles — must still build.
+    // users query touches posts (_count) but never profiles, must still build.
     const { sql } = q.buildFindMany({ with: { _count: { posts: true } } } as never);
     assert.match(sql, /_count__posts/);
   });

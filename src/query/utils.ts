@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Query builder utilities
+ * turbine-orm, Query builder utilities
  *
  * Standalone utility functions and classes used by the query builder.
  */
@@ -8,7 +8,7 @@ import pg from 'pg';
 import { localDateTimeKind, timeOfDayKind } from '../schema.js';
 
 // ---------------------------------------------------------------------------
-// Identifier quoting — prevents SQL injection via table/column names
+// Identifier quoting, prevents SQL injection via table/column names
 // ---------------------------------------------------------------------------
 
 /**
@@ -29,7 +29,7 @@ export function quoteIdent(name: string): string {
  * relations, reverseColumnMap). These are constructed as plain objects, so a
  * bare `map[key]` for a user-supplied field name like "constructor",
  * "toString", or "__proto__" returns an inherited member from
- * `Object.prototype` — a truthy value that slips past validation and produces a
+ * `Object.prototype`, a truthy value that slips past validation and produces a
  * cryptic `TypeError` instead of a clean `ValidationError`. Returns `undefined`
  * unless `key` is an OWN enumerable/non-enumerable property.
  */
@@ -54,7 +54,7 @@ export function escapeLike(value: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// LRU cache — bounded SQL template cache to prevent memory leaks
+// LRU cache, bounded SQL template cache to prevent memory leaks
 // ---------------------------------------------------------------------------
 
 /**
@@ -124,7 +124,7 @@ export function fnv1a64Hex(s: string): string {
 
 /**
  * Derive a prepared-statement name from a SQL string.
- * Format: `t_<16hex>` — always 18 chars, well under NAMEDATALEN (63).
+ * Format: `t_<16hex>`, always 18 chars, well under NAMEDATALEN (63).
  *
  * @internal Exported for testing only.
  */
@@ -132,7 +132,7 @@ export function sqlToPreparedName(sql: string): string {
   return `t_${fnv1a64Hex(sql)}`;
 }
 
-/** Known operator keys — used to detect operator objects vs plain values */
+/** Known operator keys, used to detect operator objects vs plain values */
 export const OPERATOR_KEYS = new Set<string>([
   'equals',
   'gt',
@@ -250,8 +250,8 @@ export function temporalBindKind(dbType: string | undefined, utcDateTimes = true
  * per-element rewrite is what a `time[]` column needs, and matches the scalar
  * case rather than silently binding an ISO timestamp).
  *
- * Everything else — every non-Date, every non-temporal column, and every
- * `timestamptz` column — is returned by IDENTITY, so this is a byte-for-byte
+ * Everything else, every non-Date, every non-temporal column, and every
+ * `timestamptz` column, is returned by IDENTITY, so this is a byte-for-byte
  * no-op outside the shapes above.
  */
 export function coerceTemporalValue(dbType: string | undefined, value: unknown, utcDateTimes = true): unknown {
@@ -292,13 +292,13 @@ const TZ_SUFFIX_RE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
 /**
  * Parse a database date-time string deterministically.
  *
- * Postgres `timestamp` (without time zone) values arrive with no offset —
+ * Postgres `timestamp` (without time zone) values arrive with no offset -
  * both from the driver and from `json_agg`/`json_build_object` subquery JSON
  * (`2026-07-07T17:15:41.896`). JavaScript's `new Date()` interprets such
  * strings in the SERVER'S LOCAL TIME ZONE, so the same row parses to a
  * different instant depending on where the code runs. The universal ORM
  * convention (Prisma, Rails, Django) is to treat offset-less timestamps as
- * UTC — that is also the only interpretation that round-trips: Postgres
+ * UTC, that is also the only interpretation that round-trips: Postgres
  * stores exactly the wall-clock fields you sent.
  *
  * Strings that carry an explicit offset (`timestamptz` output) are parsed
@@ -306,11 +306,11 @@ const TZ_SUFFIX_RE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
  */
 export function parseDbDate(value: string): Date {
   // Date-only values (`2026-07-07`, from `date` columns in json_agg output)
-  // have no time to zone-pin — and their `-07` tail must not be read as an
+  // have no time to zone-pin, and their `-07` tail must not be read as an
   // offset. JS parses bare ISO dates as UTC midnight already.
   if (!value.includes(':')) return new Date(value);
   if (TZ_SUFFIX_RE.test(value)) {
-    // JS Date can't parse colon-less (`-0430`) or bare-hour (`+02`) offsets —
+    // JS Date can't parse colon-less (`-0430`) or bare-hour (`+02`) offsets -
     // normalize both to `±HH:MM`. Postgres emits the bare-hour form for
     // whole-hour zones in some text outputs.
     return new Date(value.replace(/([+-]\d{2})(\d{2})$/, '$1:$2').replace(/([+-]\d{2})$/, '$1:00'));
@@ -330,7 +330,7 @@ export function parseDbDate(value: string): Date {
  * Why this table exists: the `'join'` strategy reads a relation through
  * `json_agg(json_build_object(...))`, so its values are whatever
  * `JSON.parse` makes of Postgres's JSON rendering. Every other read path in
- * the library — a top-level row, `'batched'`, `'flatten'` — reads the column
+ * the library, a top-level row, `'batched'`, `'flatten'`, reads the column
  * through the driver and gets the driver's representation. Measured against
  * PostgreSQL 17, those two disagree for exactly the families below, which
  * made the SAME query return a different JS type depending on which plan ran
@@ -349,7 +349,7 @@ export function parseDbDate(value: string): Date {
  *   circle       { x, y, radius }             '<(1,2),3>' (string)
  *
  * The array forms diverge the same way, plus `_timestamp`/`_timestamptz`
- * (driver: `Date[]`; JSON: `string[]`) — the scalar `timestamp` /
+ * (driver: `Date[]`; JSON: `string[]`), the scalar `timestamp` /
  * `timestamptz` are deliberately ABSENT because the existing `dateColumns`
  * coercion in `parseRow` already lands them on the driver's value, and they
  * are the hottest column type in a typical schema (no reason to add a cast to
@@ -407,4 +407,82 @@ export function jsonWireCoercionOid(pgType: string | undefined): number | undefi
 export function coerceJsonWireValue(oid: number, value: unknown): unknown {
   if (typeof value !== 'string') return value;
   return pg.types.getTypeParser(oid, 'text')(value);
+}
+
+// ---------------------------------------------------------------------------
+// Unknown-field diagnostics
+// ---------------------------------------------------------------------------
+
+/**
+ * Case-insensitive closeness of `candidate` to `input`, higher is better,
+ * 0 meaning "not worth suggesting". Deliberately tiny: this runs only on the
+ * error path, and its whole job is to turn a guessed name into the real one.
+ *
+ * Substring containment is scored ABOVE edit distance because the real-world
+ * miss is a longer, more descriptive guess than the actual name (`modelVersions`
+ * for a relation turbine derived as `versions`), where the edit distance is
+ * large but the containment is exact.
+ */
+function nameCloseness(input: string, candidate: string): number {
+  const a = input.toLowerCase();
+  const b = candidate.toLowerCase();
+  if (a === b) return 1000;
+  if (a.includes(b) || b.includes(a)) return 500 + Math.min(a.length, b.length);
+  // Levenshtein, bounded: only near-misses are worth suggesting.
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  let prev = Array.from({ length: cols }, (_, j) => j);
+  for (let i = 1; i < rows; i++) {
+    const cur = [i];
+    for (let j = 1; j < cols; j++) {
+      cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  const distance = prev[cols - 1]!;
+  const limit = Math.max(2, Math.floor(Math.max(a.length, b.length) / 3));
+  return distance <= limit ? 100 - distance : 0;
+}
+
+/** The closest name in `candidates` to `input`, or null when none is close. */
+export function closestName(input: string, candidates: Iterable<string>): string | null {
+  let best: string | null = null;
+  let bestScore = 0;
+  for (const c of candidates) {
+    const score = nameCloseness(input, c);
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/**
+ * The "unknown field" error text, listing RELATIONS as well as columns.
+ *
+ * The message used to read `Known fields: id, name.` and nothing else. That is
+ * actively misleading when the key was a relation name: relation filters ARE
+ * valid in a `where`, so a user who guessed the wrong relation name concluded
+ * from this message that turbine cannot filter by relations at all. Relation
+ * names are frequently guessed wrong because introspection derives them, and
+ * two foreign keys to one table produce names (`msgsBySender`) that no one
+ * would predict.
+ */
+export function unknownFieldMessage(
+  table: string,
+  field: string,
+  meta: { columnMap: Record<string, string>; relations?: Record<string, unknown> },
+): string {
+  const columns = Object.keys(meta.columnMap);
+  const relations = Object.keys(meta.relations ?? {});
+  const suggestion = closestName(field, [...columns, ...relations]);
+  const didYouMean = suggestion
+    ? ` Did you mean "${suggestion}"${relations.includes(suggestion) ? ' (a relation)' : ''}?`
+    : '';
+  return (
+    `[turbine] Unknown field "${field}" on table "${table}".${didYouMean}` +
+    ` Known columns: ${columns.join(', ') || '(none)'}.` +
+    (relations.length ? ` Known relations (valid in \`where\` and \`with\`): ${relations.join(', ')}.` : '')
+  );
 }

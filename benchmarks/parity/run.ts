@@ -1,5 +1,5 @@
 /**
- * Turbine ORM — Correctness Parity Harness
+ * Turbine ORM, Correctness Parity Harness
  *
  * Proves Turbine produces results IDENTICAL to Prisma 7 and Drizzle across a
  * scenario matrix, querying the SAME deterministically-seeded dataset.
@@ -7,7 +7,7 @@
  * For each scenario we:
  *   1. Run the same logical query through Turbine, Prisma, and Drizzle.
  *   2. Normalise every result (camelCase keys, dates -> ISO, bigint -> number,
- *      arrays sorted by PK, ORM-specific extra keys stripped) — see normalize.ts.
+ *      arrays sorted by PK, ORM-specific extra keys stripped), see normalize.ts.
  *   3. assert.deepEqual Turbine-vs-Prisma and Turbine-vs-Drizzle.
  *
  * Prints a per-scenario PASS/FAIL matrix and exits non-zero on any mismatch.
@@ -46,10 +46,10 @@ const DATABASE_URL =
  * Why: this repo's local Postgres runs with `timezone = America/New_York`.
  * For `TIMESTAMPTZ` columns, Turbine (node-postgres) and Drizzle (node-postgres)
  * both decode the value to the correct absolute instant regardless of session
- * timezone — e.g. `2025-01-01 08:47:00-05` → `2025-01-01T13:47:00.000Z`.
+ * timezone, e.g. `2025-01-01 08:47:00-05` → `2025-01-01T13:47:00.000Z`.
  *
  * Prisma 7's `@prisma/adapter-pg`, however, renders the value using the
- * session's WALL-CLOCK time and then labels that Date as UTC — yielding
+ * session's WALL-CLOCK time and then labels that Date as UTC, yielding
  * `2025-01-01T08:47:00.000Z` (off by the session's UTC offset). This is a
  * Prisma driver-adapter rendering artifact, NOT a Turbine bug: Turbine's
  * instant is the correct one. Pinning every session to UTC makes the
@@ -71,17 +71,17 @@ interface Scenario {
   name: string;
   /** Group label for the printed matrix. */
   group: string;
-  /** Turbine implementation — required. */
+  /** Turbine implementation, required. */
   turbine: () => Promise<unknown>;
-  /** Prisma impl — omit if Prisma cannot express the scenario. */
+  /** Prisma impl, omit if Prisma cannot express the scenario. */
   prisma?: () => Promise<unknown>;
-  /** Drizzle impl — omit if Drizzle cannot express the scenario. */
+  /** Drizzle impl, omit if Drizzle cannot express the scenario. */
   drizzle?: () => Promise<unknown>;
   /** Normaliser applied to every ORM's raw result before comparison. */
   normalize: (raw: unknown) => unknown;
   /**
    * Marks a scenario where an incumbent's RESULT SHAPE legitimately differs and
-   * is normalised to a common form — documents intentional divergence.
+   * is normalised to a common form, documents intentional divergence.
    */
   note?: string;
 }
@@ -143,7 +143,7 @@ function shortDiff(err: Error): string {
 
 async function main() {
   console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  Turbine ORM — Correctness Parity vs Prisma 7 & Drizzle      ║');
+  console.log('║  Turbine ORM, Correctness Parity vs Prisma 7 & Drizzle      ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
   // Turbine: use its OWN pool (connectionString) so it registers the int8
@@ -182,7 +182,7 @@ async function main() {
   // ===== Group: findMany flat =====
   scenarios.push({
     group: 'findMany',
-    name: 'findMany — all users (flat)',
+    name: 'findMany, all users (flat)',
     turbine: () => turbine.users.findMany(),
     prisma: () => prisma.user.findMany(),
     drizzle: () => db.query.users.findMany(),
@@ -191,7 +191,7 @@ async function main() {
 
   scenarios.push({
     group: 'findMany',
-    name: 'findMany — all posts (flat)',
+    name: 'findMany, all posts (flat)',
     turbine: () => turbine.posts.findMany(),
     prisma: () => prisma.post.findMany(),
     drizzle: () => db.query.posts.findMany(),
@@ -201,7 +201,7 @@ async function main() {
   // ===== Group: findUnique =====
   scenarios.push({
     group: 'findUnique',
-    name: 'findUnique — user by PK',
+    name: 'findUnique, user by PK',
     turbine: () => turbine.users.findUnique({ where: { id: 7 } }),
     prisma: () => prisma.user.findUnique({ where: { id: BigInt(7) } }),
     drizzle: () => db.query.users.findFirst({ where: eq(schema.users.id, 7) }),
@@ -210,7 +210,7 @@ async function main() {
 
   scenarios.push({
     group: 'findUnique',
-    name: 'findUnique — post by PK',
+    name: 'findUnique, post by PK',
     turbine: () => turbine.posts.findUnique({ where: { id: 42 } }),
     prisma: () => prisma.post.findUnique({ where: { id: BigInt(42) } }),
     drizzle: () => db.query.posts.findFirst({ where: eq(schema.posts.id, 42) }),
@@ -226,7 +226,7 @@ async function main() {
     };
     scenarios.push({
       group: 'nested',
-      name: 'nested D1 — users → posts',
+      name: 'nested D1, users → posts',
       turbine: () => turbine.users.findMany({ with: { posts: true } }),
       prisma: () => prisma.user.findMany({ include: { posts: true } }),
       drizzle: () => db.query.users.findMany({ with: { posts: true } }),
@@ -250,7 +250,7 @@ async function main() {
     };
     scenarios.push({
       group: 'nested',
-      name: 'nested D2 — users → posts → comments',
+      name: 'nested D2, users → posts → comments',
       turbine: () =>
         turbine.users.findMany({ with: { posts: { with: { comments: true } } } }),
       prisma: () =>
@@ -286,7 +286,7 @@ async function main() {
     // Limit to a single user to keep the tree small but exercise the back-ref.
     scenarios.push({
       group: 'nested',
-      name: 'nested D3 — user → posts → comments → author',
+      name: 'nested D3, user → posts → comments → author',
       turbine: () =>
         turbine.users.findMany({
           where: { id: 3 },
@@ -314,7 +314,7 @@ async function main() {
     };
     scenarios.push({
       group: 'nested',
-      name: 'nested belongsTo — post → user',
+      name: 'nested belongsTo, post → user',
       turbine: () => turbine.posts.findMany({ where: { id: { in: [1, 2, 3] } }, with: { user: true } }),
       prisma: () => prisma.post.findMany({ where: { id: { in: [1, 2, 3].map(BigInt) } }, include: { user: true } }),
       drizzle: () => db.query.posts.findMany({ where: inArray(schema.posts.id, [1, 2, 3]), with: { user: true } }),
@@ -325,7 +325,7 @@ async function main() {
   // ===== Group: where operators =====
   scenarios.push({
     group: 'where',
-    name: 'where equals — role = admin',
+    name: 'where equals, role = admin',
     turbine: () => turbine.users.findMany({ where: { role: 'admin' } }),
     prisma: () => prisma.user.findMany({ where: { role: 'admin' } }),
     drizzle: () => db.query.users.findMany({ where: eq(schema.users.role, 'admin') }),
@@ -334,7 +334,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where not — role != member',
+    name: 'where not, role != member',
     turbine: () => turbine.users.findMany({ where: { role: { not: 'member' } } }),
     prisma: () => prisma.user.findMany({ where: { role: { not: 'member' } } }),
     drizzle: () => db.query.users.findMany({ where: ne(schema.users.role, 'member') }),
@@ -343,7 +343,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where null — avatarUrl IS NULL',
+    name: 'where null, avatarUrl IS NULL',
     turbine: () => turbine.users.findMany({ where: { avatarUrl: null } }),
     prisma: () => prisma.user.findMany({ where: { avatarUrl: null } }),
     drizzle: () => db.query.users.findMany({ where: sql`${schema.users.avatarUrl} IS NULL` }),
@@ -352,7 +352,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where in — id IN (2,4,6,8)',
+    name: 'where in, id IN (2,4,6,8)',
     turbine: () => turbine.users.findMany({ where: { id: { in: [2, 4, 6, 8] } } }),
     prisma: () => prisma.user.findMany({ where: { id: { in: [2, 4, 6, 8].map(BigInt) } } }),
     drizzle: () => db.query.users.findMany({ where: inArray(schema.users.id, [2, 4, 6, 8]) }),
@@ -361,7 +361,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where notIn — id NOT IN (1..15)',
+    name: 'where notIn, id NOT IN (1..15)',
     turbine: () => turbine.users.findMany({ where: { id: { notIn: range(1, 15) } } }),
     prisma: () => prisma.user.findMany({ where: { id: { notIn: range(1, 15).map(BigInt) } } }),
     drizzle: () => db.query.users.findMany({ where: notInArray(schema.users.id, range(1, 15)) }),
@@ -370,7 +370,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where gt — viewCount > 250',
+    name: 'where gt, viewCount > 250',
     turbine: () => turbine.posts.findMany({ where: { viewCount: { gt: 250 } } }),
     prisma: () => prisma.post.findMany({ where: { viewCount: { gt: 250 } } }),
     drizzle: () => db.query.posts.findMany({ where: gt(schema.posts.viewCount, 250) }),
@@ -379,7 +379,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where gte/lte — 100 ≤ viewCount ≤ 200',
+    name: 'where gte/lte, 100 ≤ viewCount ≤ 200',
     turbine: () => turbine.posts.findMany({ where: { viewCount: { gte: 100, lte: 200 } } }),
     prisma: () => prisma.post.findMany({ where: { viewCount: { gte: 100, lte: 200 } } }),
     drizzle: () =>
@@ -391,7 +391,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where lt — viewCount < 50',
+    name: 'where lt, viewCount < 50',
     turbine: () => turbine.posts.findMany({ where: { viewCount: { lt: 50 } } }),
     prisma: () => prisma.post.findMany({ where: { viewCount: { lt: 50 } } }),
     drizzle: () => db.query.posts.findMany({ where: lt(schema.posts.viewCount, 50) }),
@@ -400,7 +400,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where contains — name contains "Smith"',
+    name: 'where contains, name contains "Smith"',
     turbine: () => turbine.users.findMany({ where: { name: { contains: 'Smith' } } }),
     prisma: () => prisma.user.findMany({ where: { name: { contains: 'Smith' } } }),
     drizzle: () => db.query.users.findMany({ where: like(schema.users.name, '%Smith%') }),
@@ -409,7 +409,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where startsWith — name startsWith "Alice"',
+    name: 'where startsWith, name startsWith "Alice"',
     turbine: () => turbine.users.findMany({ where: { name: { startsWith: 'Alice' } } }),
     prisma: () => prisma.user.findMany({ where: { name: { startsWith: 'Alice' } } }),
     drizzle: () => db.query.users.findMany({ where: like(schema.users.name, 'Alice%') }),
@@ -418,7 +418,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where endsWith — name endsWith "Brown"',
+    name: 'where endsWith, name endsWith "Brown"',
     turbine: () => turbine.users.findMany({ where: { name: { endsWith: 'Brown' } } }),
     prisma: () => prisma.user.findMany({ where: { name: { endsWith: 'Brown' } } }),
     drizzle: () => db.query.users.findMany({ where: like(schema.users.name, '%Brown') }),
@@ -427,7 +427,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where contains insensitive — name ~* "williams"',
+    name: 'where contains insensitive, name ~* "williams"',
     turbine: () =>
       turbine.users.findMany({ where: { name: { contains: 'williams', mode: 'insensitive' } } }),
     prisma: () =>
@@ -438,7 +438,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where AND — role=member AND orgId=1',
+    name: 'where AND, role=member AND orgId=1',
     turbine: () => turbine.users.findMany({ where: { AND: [{ role: 'member' }, { orgId: 1 }] } }),
     prisma: () => prisma.user.findMany({ where: { AND: [{ role: 'member' }, { orgId: BigInt(1) }] } }),
     drizzle: () =>
@@ -450,7 +450,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where OR — role=admin OR role=editor',
+    name: 'where OR, role=admin OR role=editor',
     turbine: () => turbine.users.findMany({ where: { OR: [{ role: 'admin' }, { role: 'editor' }] } }),
     prisma: () => prisma.user.findMany({ where: { OR: [{ role: 'admin' }, { role: 'editor' }] } }),
     drizzle: () =>
@@ -462,7 +462,7 @@ async function main() {
 
   scenarios.push({
     group: 'where',
-    name: 'where NOT — NOT(role=member)',
+    name: 'where NOT, NOT(role=member)',
     turbine: () => turbine.users.findMany({ where: { NOT: { role: 'member' } } }),
     prisma: () => prisma.user.findMany({ where: { NOT: { role: 'member' } } }),
     drizzle: () => db.query.users.findMany({ where: not(eq(schema.users.role, 'member')) }),
@@ -472,7 +472,7 @@ async function main() {
   // ===== Group: orderBy + limit =====
   scenarios.push({
     group: 'orderBy',
-    name: 'orderBy asc + limit — top 5 users by id',
+    name: 'orderBy asc + limit, top 5 users by id',
     turbine: () => turbine.users.findMany({ orderBy: { id: 'asc' }, limit: 5 }),
     prisma: () => prisma.user.findMany({ orderBy: { id: 'asc' }, take: 5 }),
     drizzle: () => db.query.users.findMany({ orderBy: asc(schema.users.id), limit: 5 }),
@@ -484,7 +484,7 @@ async function main() {
 
   scenarios.push({
     group: 'orderBy',
-    name: 'orderBy desc + limit — top 5 posts by viewCount',
+    name: 'orderBy desc + limit, top 5 posts by viewCount',
     turbine: () => turbine.posts.findMany({ orderBy: { viewCount: 'desc' }, limit: 5 }),
     prisma: () => prisma.post.findMany({ orderBy: { viewCount: 'desc' }, take: 5 }),
     drizzle: () => db.query.posts.findMany({ orderBy: desc(schema.posts.viewCount), limit: 5 }),
@@ -495,7 +495,7 @@ async function main() {
   // ===== Group: pagination (limit/offset) =====
   scenarios.push({
     group: 'pagination',
-    name: 'pagination — users ordered by id, offset 5 limit 5',
+    name: 'pagination, users ordered by id, offset 5 limit 5',
     turbine: () => turbine.users.findMany({ orderBy: { id: 'asc' }, offset: 5, limit: 5 }),
     prisma: () => prisma.user.findMany({ orderBy: { id: 'asc' }, skip: 5, take: 5 }),
     drizzle: () => db.query.users.findMany({ orderBy: asc(schema.users.id), offset: 5, limit: 5 }),
@@ -505,7 +505,7 @@ async function main() {
   // ===== Group: count =====
   scenarios.push({
     group: 'count',
-    name: 'count — all users',
+    name: 'count, all users',
     turbine: () => turbine.users.count(),
     prisma: () => prisma.user.count(),
     drizzle: async () => (await db.select({ v: dCount() }).from(schema.users))[0]!.v,
@@ -514,7 +514,7 @@ async function main() {
 
   scenarios.push({
     group: 'count',
-    name: 'count — posts where published=true',
+    name: 'count, posts where published=true',
     turbine: () => turbine.posts.count({ where: { published: true } }),
     prisma: () => prisma.post.count({ where: { published: true } }),
     drizzle: async () =>
@@ -524,11 +524,11 @@ async function main() {
 
   // ===== Group: aggregate =====
   // Turbine returns { _sum: { viewCount }, _avg: {...}, ... }. Prisma matches
-  // that shape exactly. Drizzle has no aggregate sugar — we build the same
+  // that shape exactly. Drizzle has no aggregate sugar, we build the same
   // shape from a raw select and normalise all three to a common object.
   scenarios.push({
     group: 'aggregate',
-    name: 'aggregate — posts sum/avg/min/max(viewCount)',
+    name: 'aggregate, posts sum/avg/min/max(viewCount)',
     turbine: () =>
       turbine.posts.aggregate({
         _sum: { viewCount: true },
@@ -581,7 +581,7 @@ async function main() {
 
   scenarios.push({
     group: 'aggregate',
-    name: 'aggregate — filtered sum (published posts)',
+    name: 'aggregate, filtered sum (published posts)',
     turbine: () =>
       turbine.posts.aggregate({ where: { published: true }, _sum: { viewCount: true } }),
     prisma: () =>
@@ -608,7 +608,7 @@ async function main() {
     };
     scenarios.push({
       group: 'nested',
-      name: 'nested orderBy+limit — users → top-2 posts by id desc',
+      name: 'nested orderBy+limit, users → top-2 posts by id desc',
       turbine: () =>
         turbine.users.findMany({
           where: { id: { in: [1, 2, 3] } },
@@ -638,7 +638,7 @@ async function main() {
   // prove Turbine's ORDER BY produces the same SEQUENCE as the incumbents.
   const orderChecks: Outcome[] = [];
   {
-    const o: Outcome = { scenario: 'ordering seq — posts by viewCount desc, id asc (top 8)', group: 'orderBy', prisma: 'N/A', drizzle: 'N/A' };
+    const o: Outcome = { scenario: 'ordering seq, posts by viewCount desc, id asc (top 8)', group: 'orderBy', prisma: 'N/A', drizzle: 'N/A' };
     const t = (await turbine.posts.findMany({ orderBy: { viewCount: 'desc' }, limit: 8 })) as Array<Record<string, unknown>>;
     // Turbine single-key order has DB-defined tiebreak; compare id-sequence
     // only where viewCount is strictly monotonic. We instead compare the
@@ -658,7 +658,7 @@ async function main() {
     orderChecks.push(o);
   }
   {
-    const o: Outcome = { scenario: 'ordering seq — users by name asc (id sequence)', group: 'orderBy', prisma: 'N/A', drizzle: 'N/A' };
+    const o: Outcome = { scenario: 'ordering seq, users by name asc (id sequence)', group: 'orderBy', prisma: 'N/A', drizzle: 'N/A' };
     const idSeq = (list: Array<Record<string, unknown>>) => list.map((u) => Number(u['id']));
     const t = (await turbine.users.findMany({ orderBy: { name: 'asc' } })) as Array<Record<string, unknown>>;
     // name has no dup pairs that also tie on the DB default? names can repeat
@@ -738,7 +738,7 @@ function printMatrix() {
       console.log(line(`▸ ${o.group}`, '', ''));
       lastGroup = o.group;
     }
-    const mark = (s: string) => (s === 'PASS' ? '  PASS   ' : s === 'FAIL' ? '  FAIL ✗ ' : '   —     ');
+    const mark = (s: string) => (s === 'PASS' ? '  PASS   ' : s === 'FAIL' ? '  FAIL ✗ ' : '  ,     ');
     console.log(line(`  ${o.scenario}`.slice(0, W), mark(o.prisma), mark(o.drizzle)));
   }
   console.log(`└─${'─'.repeat(W)}─┴─${'─'.repeat(9)}─┴─${'─'.repeat(9)}─┘`);

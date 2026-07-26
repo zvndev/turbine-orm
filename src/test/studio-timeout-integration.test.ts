@@ -3,7 +3,7 @@
  * REAL database engine.
  *
  * Studio (and the adapters) previously issued `SET LOCAL statement_timeout = $1`,
- * which Postgres rejects — `SET` does not accept bind parameters, so every
+ * which Postgres rejects, `SET` does not accept bind parameters, so every
  * Studio query 500'd with `syntax error at or near "$1"` on plain Postgres.
  * The unit tests mocked the pool and never sent the SQL to a real server, so
  * the bug shipped green. This test runs the ACTUAL adapter timeout SQL against a
@@ -12,7 +12,7 @@
  * Engine-aware: set TURBINE_TEST_ENGINE to `postgres` (default), `cockroachdb`,
  * or `yugabytedb`. CI points each real-engine job at the matching adapter so the
  * engine-SPECIFIC timeout SQL (e.g. CockroachDB's `transaction_timeout`) is
- * actually executed against that engine — not just asserted as a string.
+ * actually executed against that engine, not just asserted as a string.
  *
  * Run: DATABASE_URL=... TURBINE_TEST_ENGINE=cockroachdb npx tsx --test src/test/studio-timeout-integration.test.ts
  */
@@ -55,7 +55,7 @@ testFn(`statement-timeout SQL executes on a real engine (${ENGINE})`, () => {
     try {
       const { sql, params } = adapter.statementTimeout!(30);
       // Plain BEGIN (not `BEGIN READ ONLY`, which CockroachDB rejects as a
-      // single statement) — we are validating the timeout SQL, not read-only.
+      // single statement), we are validating the timeout SQL, not read-only.
       await client.query('BEGIN');
       // With the old `SET ... = $1` form this throws a bind-param syntax error
       // on every engine. set_config() is the parameterizable, txn-local form.

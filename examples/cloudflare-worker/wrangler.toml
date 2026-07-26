@@ -3,7 +3,7 @@ main = "index.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Hyperdrive binding — replace with your own Hyperdrive ID from
+# Hyperdrive binding, replace with your own Hyperdrive ID from
 # `wrangler hyperdrive create`. The binding exposes
 # `env.HYPERDRIVE.connectionString` which `pg.Pool` consumes directly.
 [[hyperdrive]]

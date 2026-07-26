@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Schema SQL Generator
+ * turbine-orm, Schema SQL Generator
  *
  * Converts a SchemaDef (from defineSchema) into executable DDL statements.
  * Also provides diff and push commands for syncing schema to a live database.
@@ -25,7 +25,7 @@ export interface SchemaSqlOptions {
   /**
    * How to handle the pgvector extension when the schema contains a `vector`
    * column. `'auto'` (default) prepends `CREATE EXTENSION IF NOT EXISTS vector;`
-   * — appropriate for `push`. `'manual'` emits a leading comment only, so the
+   * - appropriate for `push`. `'manual'` emits a leading comment only, so the
    * generated `.sql` migration doesn't silently require superuser privileges.
    */
   extensions?: 'auto' | 'manual';
@@ -55,7 +55,7 @@ function quoteEnumLabel(label: string): string {
 /**
  * Whether a resolved column type is an auto-increment pseudo-type (SERIAL /
  * BIGSERIAL). These carry an implicit sequence default and NOT NULL, and their
- * underlying integer width (int4 vs int8) is never auto-migrated by diff — a
+ * underlying integer width (int4 vs int8) is never auto-migrated by diff, a
  * width change on a live PK is destructive and must be done by hand.
  */
 function isSerialType(type: string): boolean {
@@ -80,7 +80,7 @@ function generateCreateEnumType(enumName: string, labels: readonly string[], dia
 
 /**
  * Resolve the DDL type token for a column: an enum type name, a `vector(n)`
- * literal, or the dialect's scalar type — with a trailing `[]` for arrays.
+ * literal, or the dialect's scalar type, with a trailing `[]` for arrays.
  *
  * `vectorDimensions` is the one number interpolated into the type token, so it
  * is validated here as a positive integer within pgvector's limit rather than
@@ -106,7 +106,7 @@ function resolveDdlType(config: ColumnConfig, dialect: Dialect, columnName: stri
 }
 
 // ---------------------------------------------------------------------------
-// SQL Generation — SchemaDef → CREATE TABLE statements
+// SQL Generation, SchemaDef → CREATE TABLE statements
 // ---------------------------------------------------------------------------
 
 /**
@@ -124,7 +124,7 @@ export function schemaToSQL(schema: SchemaDef, options?: SchemaSqlOptions): stri
   const sorted = topologicalSort(schema);
   const resolveRef = makeRefResolver(schema);
 
-  // pgvector extension line — only when a vector column exists. Postgres-only:
+  // pgvector extension line, only when a vector column exists. Postgres-only:
   // a dialect that can't do pgvector must not silently emit broken DDL.
   if (schemaHasVectorColumn(schema)) {
     if (!dialect.supportsVector) {
@@ -215,7 +215,7 @@ function topologicalSort(schema: SchemaDef): string[] {
   function visit(name: string): void {
     if (resolved.has(name)) return;
     if (visiting.has(name)) {
-      // Circular reference — just add it
+      // Circular reference, just add it
       return;
     }
     visiting.add(name);
@@ -307,7 +307,7 @@ function generateColumnDef(
 ): string {
   const snakeName = camelToSnake(fieldName);
 
-  // NOT NULL — serial types are implicitly NOT NULL, but explicit is fine.
+  // NOT NULL, serial types are implicitly NOT NULL, but explicit is fine.
   // A column is NOT NULL if:
   //   1. Explicitly marked .notNull(), OR
   //   2. Is a serial (BIGSERIAL implies NOT NULL), OR
@@ -323,7 +323,7 @@ function generateColumnDef(
     defaultValue = normalizeDefault(config.defaultValue);
   }
 
-  // REFERENCES — resolve the raw table name through the optional resolver so
+  // REFERENCES, resolve the raw table name through the optional resolver so
   // both camelCase accessor names and snake_case DDL names work.
   let references: { table: string; column: string } | undefined;
   if (config.referencesTarget) {
@@ -560,7 +560,7 @@ function generateDeclaredIndexes(table: TableDef, dialect: Dialect = postgresDia
 }
 
 // ---------------------------------------------------------------------------
-// Schema Diff — compare SchemaDef against a live database
+// Schema Diff, compare SchemaDef against a live database
 // ---------------------------------------------------------------------------
 
 export interface AlterColumnDef {
@@ -591,11 +591,11 @@ export interface AlterDef {
 }
 
 export interface DiffResult {
-  /** Tables that exist in schema but not in DB — need CREATE TABLE */
+  /** Tables that exist in schema but not in DB, need CREATE TABLE */
   create: TableDef[];
-  /** Tables that exist in both but differ — need ALTER TABLE */
+  /** Tables that exist in both but differ, need ALTER TABLE */
   alter: AlterDef[];
-  /** Table names that exist in DB but not in schema — would need DROP TABLE */
+  /** Table names that exist in DB but not in schema, would need DROP TABLE */
   drop: string[];
   /** SQL statements to execute the diff (UP direction) */
   statements: string[];
@@ -604,13 +604,13 @@ export interface DiffResult {
   /**
    * Human-readable warnings for changes the diff detected but refuses to apply
    * automatically because they are destructive or otherwise unsafe (enum value
-   * removal/reorder, etc.). Never executed — surfaced for the operator.
+   * removal/reorder, etc.). Never executed, surfaced for the operator.
    */
   warnings?: string[];
 }
 
 // ---------------------------------------------------------------------------
-// Pure diff helpers (no DB) — unit-testable decision logic reused by schemaDiff
+// Pure diff helpers (no DB), unit-testable decision logic reused by schemaDiff
 // ---------------------------------------------------------------------------
 
 /** A FK's current referential actions as read from the DB. */
@@ -647,7 +647,7 @@ export function buildAddForeignKeyStatement(
 
 /**
  * Decide whether a FK's referential actions changed. When they differ, returns
- * the DROP + ADD CONSTRAINT statements (and their reverse) — Postgres has no
+ * the DROP + ADD CONSTRAINT statements (and their reverse), Postgres has no
  * `ALTER CONSTRAINT` for referential actions, so drop-and-recreate is the only
  * path. Returns null when the actions already match.
  */
@@ -687,7 +687,7 @@ export function diffReferentialAction(
 /**
  * Compute append-only enum value changes. Returns `ALTER TYPE ... ADD VALUE`
  * statements for labels present in the schema but not the DB (in order), plus a
- * destructive warning for any DB label the schema dropped or any reorder —
+ * destructive warning for any DB label the schema dropped or any reorder -
  * Postgres cannot remove or reorder enum values without recreating the type.
  */
 export function diffEnumValues(
@@ -709,7 +709,7 @@ export function diffEnumValues(
   if (removed.length > 0) {
     warnings.push(
       `Enum "${enumName}": labels [${removed.join(', ')}] exist in the database but not the schema. ` +
-        `Postgres cannot remove enum values in place — recreate the type manually if intended.`,
+        `Postgres cannot remove enum values in place, recreate the type manually if intended.`,
     );
   }
   return { statements, warnings };
@@ -739,7 +739,7 @@ export interface CheckSpec {
  * Diff a table's CHECK constraints (matched by name). Adds constraints missing
  * from the DB, drops DB constraints absent from the schema, and drop+adds when a
  * same-named constraint's expression changed. Expression comparison is a naive
- * whitespace-insensitive match — semantically-equal-but-different-spelled
+ * whitespace-insensitive match, semantically-equal-but-different-spelled
  * expressions may re-emit (documented; harmless drop+add).
  */
 export function diffCheckConstraints(
@@ -978,7 +978,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         result.statements.push(...fkIndexes);
         // User-declared indexes on a brand-new table (reversed by the DROP TABLE).
         result.statements.push(...generateDeclaredIndexes(tableDef, dialect));
-        // Reverse: DROP TABLE (with indexes — they drop automatically)
+        // Reverse: DROP TABLE (with indexes, they drop automatically)
         result.reverseStatements.unshift(`DROP TABLE IF EXISTS ${dialect.quoteIdentifier(ddlName)} CASCADE;`);
       }
     }
@@ -1006,7 +1006,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         const dbCol = dbCols[snakeName];
 
         if (!dbCol) {
-          // Column exists in schema but not in DB — ADD COLUMN
+          // Column exists in schema but not in DB, ADD COLUMN
           const colDef = generateColumnDef(fieldName, config, resolveRef, dialect);
           const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ADD COLUMN ${colDef};`;
           const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP COLUMN ${dialect.quoteIdentifier(snakeName)};`;
@@ -1020,10 +1020,10 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         // underlying int4/int8 width must never be auto-altered on a live table
         // (a downcast on a PK loses data / breaks the sequence). This also
         // preserves back-compat for DBs whose `serial` columns were created as
-        // BIGSERIAL (int8) before 0.24.0 — `push` won't try to shrink them.
+        // BIGSERIAL (int8) before 0.24.0, `push` won't try to shrink them.
         const expectedUdt = schemaTypeToUdt(config);
         if (expectedUdt && !isSerialType(config.type) && dbCol.udtName !== expectedUdt) {
-          // resolveDdlType handles enum names, vector(n), arrays, and VARCHAR(n) —
+          // resolveDdlType handles enum names, vector(n), arrays, and VARCHAR(n) -
           // config.type alone would emit the internal ENUM/VECTOR sentinels here.
           const sqlType = resolveDdlType(config, dialect, snakeName);
           const oldSqlType = udtToSqlType(dbCol.udtName, dbCol.maxLength);
@@ -1086,7 +1086,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
           }
         }
 
-        // Check UNIQUE constraint mismatch (skip PKs — they're implicitly unique)
+        // Check UNIQUE constraint mismatch (skip PKs, they're implicitly unique)
         if (!config.isPrimaryKey) {
           const hasDbUnique = snakeName in tableUniques;
           const wantsUnique = config.isUnique === true;
@@ -1140,7 +1140,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         if (!config.referencesTarget) continue;
         const snakeName = camelToSnake(fieldName);
         const dbFk = tableFks[snakeName];
-        if (!dbFk) continue; // FK not present in DB yet (or composite) — skip
+        if (!dbFk) continue; // FK not present in DB yet (or composite), skip
         const change = diffReferentialAction(
           tableName,
           dbFk,
@@ -1160,7 +1160,7 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       // inline checks carry auto-generated names the code-first schema never
       // sees), and we do NOT drop+add on expression mismatch: pg_get_constraintdef
       // canonicalizes expressions (casts, ANY(ARRAY[...]) rewrites), so authored
-      // text almost never string-matches the stored form — comparing would emit a
+      // text almost never string-matches the stored form, comparing would emit a
       // spurious full-table-revalidating drop+add on every diff. An apparent
       // mismatch surfaces as a warning instead; rename the constraint to
       // intentionally replace its expression. Unnamed schema checks are skipped
@@ -1342,7 +1342,7 @@ function defaultsMatch(schemaDefault: string, dbDefault: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Schema Push — execute the diff against a live database
+// Schema Push, execute the diff against a live database
 // ---------------------------------------------------------------------------
 
 /**

@@ -9,8 +9,8 @@ export const metadata = {
 
 Turbine supports two schema workflows:
 
-- **Code-first** — declare tables with `defineSchema(...)` in TypeScript, then `push` or auto-diff migrations.
-- **Introspection** — point Turbine at an existing database and generate a typed client from `information_schema`.
+- **Code-first**, declare tables with `defineSchema(...)` in TypeScript, then `push` or auto-diff migrations.
+- **Introspection**, point Turbine at an existing database and generate a typed client from `information_schema`.
 
 Both workflows emit the same generated types (`types.ts`, `metadata.ts`, `index.ts`) so you can mix them freely.
 
@@ -79,7 +79,7 @@ posts: {
 // REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE RESTRICT
 ```
 
-Supported actions: `'cascade'`, `'restrict'`, `'set null'`, `'set default'`, `'no action'`. Omit a clause to leave it at the SQL default (`NO ACTION`). The plain string form is unchanged — it emits no action clauses. Introspection reads existing actions back from `pg_constraint`, so a `pull` round-trips them and `migrate create --auto` detects action changes.
+Supported actions: `'cascade'`, `'restrict'`, `'set null'`, `'set default'`, `'no action'`. Omit a clause to leave it at the SQL default (`NO ACTION`). The plain string form is unchanged, it emits no action clauses. Introspection reads existing actions back from `pg_constraint`, so a `pull` round-trips them and `migrate create --auto` detects action changes.
 
 ### Enums
 
@@ -99,7 +99,7 @@ export default defineSchema(
 
 DDL emits `CREATE TYPE "post_status" AS ENUM ('draft', 'published', 'archived')` before the tables that use it, and the column is typed `"post_status"`. Enum columns generate a string-literal union in `types.ts` (`'draft' | 'published' | 'archived'`).
 
-Writes to an enum column get an explicit `::"post_status"` cast on every path (`create`, `createMany`, `update`, `upsert`), driven by the introspected metadata and schema-qualified so it is safe across schemas. This is automatic and needs no code change — it removes the `column is of type post_status but expression is of type text` error that `createMany` could hit before v0.30.
+Writes to an enum column get an explicit `::"post_status"` cast on every path (`create`, `createMany`, `update`, `upsert`), driven by the introspected metadata and schema-qualified so it is safe across schemas. This is automatic and needs no code change, it removes the `column is of type post_status but expression is of type text` error that `createMany` could hit before v0.30.
 
 ### Array columns
 
@@ -112,7 +112,7 @@ posts: {
 }
 ```
 
-Array columns map to `T[]` in generated types and support the [array WHERE operators](/queries#array-columns) — `has`, `hasEvery`, `hasSome`.
+Array columns map to `T[]` in generated types and support the [array WHERE operators](/queries#array-columns), `has`, `hasEvery`, `hasSome`.
 
 ### Vector columns
 
@@ -180,9 +180,33 @@ A PII column is **excluded from default projections**. It comes back only when y
 
 The tag flows through the whole stack: [`turbine studio`](/studio) redacts PII cells in its Data and Query views by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type so it tells the truth about default absence. Studio and the [MCP server](/mcp) build their schema by introspecting the live database, which carries no tags, so they read the tags out of the generated metadata in your `out` directory: run `turbine generate` after tagging, or they will have nothing to redact. Studio says which it found at startup rather than leaving you to assume. The tag is a **code-first declaration only**: introspection never auto-tags a column as PII, so tagging is always a deliberate choice you make in `defineSchema`.
 
-### Runtime metadata without a database — `schemaDefToMetadata`
+### Auto-updated timestamps, `updatedAt`
 
-The runtime `SchemaMetadata` a client needs normally comes from `turbine generate` (which reads a live database). `schemaDefToMetadata(def)` derives the same object directly from a `defineSchema` result — no connection, no codegen step:
+Tag a column with `updatedAt: true` (or `.updatedAt()` on the fluent builder) and every `update` that does not name it explicitly sets it to the current time. This is the equivalent of Prisma's `@updatedAt`.
+
+```ts
+const posts = defineSchema({
+  posts: {
+    id: { type: 'serial', primaryKey: true },
+    title: { type: 'text', notNull: true },
+    updatedAt: { type: 'timestamptz', notNull: true, default: 'now()', updatedAt: true },
+  },
+});
+
+// No `updatedAt` in the payload: it is filled in for you.
+await db.posts.update({ where: { id: 1 }, data: { title: 'new title' } });
+
+// An explicit value always wins, including an explicit null.
+await db.posts.update({ where: { id: 1 }, data: { title: 'x', updatedAt: pinned } });
+```
+
+The timestamp is generated client-side (as Prisma does), so it flows through the same UTC coercion as any other bound `Date` and lands correctly on every engine. It applies to `update` and `updateMany`, never to `create`, where a column default is the right tool.
+
+Like `pii`, this is a **code-first declaration only**, and deliberately never inferred from a column's name. An application that already manages its own `updated_at` would otherwise have its writes silently changed by an upgrade. A schema with no tagged column emits byte-identical SQL.
+
+### Runtime metadata without a database, `schemaDefToMetadata`
+
+The runtime `SchemaMetadata` a client needs normally comes from `turbine generate` (which reads a live database). `schemaDefToMetadata(def)` derives the same object directly from a `defineSchema` result, no connection, no codegen step:
 
 ```ts
 import { defineSchema, schemaDefToMetadata } from 'turbine-orm';
@@ -191,7 +215,7 @@ const schema = defineSchema({ /* ... */ });
 const metadata = schemaDefToMetadata(schema);
 ```
 
-This is the code-first path for engines with no wire introspection — most notably PowDB, where you can now hand a `defineSchema` straight to the factory instead of writing metadata by hand:
+This is the code-first path for engines with no wire introspection, most notably PowDB, where you can now hand a `defineSchema` straight to the factory instead of writing metadata by hand:
 
 ```ts
 import { turbinePowDB } from 'turbine-orm/powdb';
@@ -211,7 +235,7 @@ npx turbine push --dry-run
 npx turbine push
 ```
 
-`push` is the fast path for development — it diffs your `defineSchema` output against the live database and applies the difference directly. For production, use migrations.
+`push` is the fast path for development, it diffs your `defineSchema` output against the live database and applies the difference directly. For production, use migrations.
 
 ### Programmatic: `schemaToSQL` and `schemaPush`
 
@@ -246,7 +270,7 @@ Turbine migrations are plain `.sql` files with `-- UP` and `-- DOWN` sections. T
 ### Create a migration
 
 ```bash
-# Blank migration — write SQL manually
+# Blank migration, write SQL manually
 npx turbine migrate create add_users_table
 
 # Auto-generate from the diff between defineSchema() and the live database
@@ -332,13 +356,13 @@ Turbine reads `information_schema` and `pg_catalog` to discover:
 
 Pass `--include-views` to also introspect views and materialized views as read-only entities. See [Views & Generated Columns](/views).
 
-> **Note:** When a derived relation name would collide with a scalar column — e.g. a `currentVersionId` foreign key producing a relation that shadowed the `currentVersion` field — v0.30 disambiguates the relation name instead of overwriting the column. Names that were already collision-free are preserved, so regenerating an existing, working schema does not rename its relations. The `turbine mcp` server and the SQLite / MySQL / SQL Server introspectors share the same naming logic.
+> **Note:** When a derived relation name would collide with a scalar column, e.g. a `currentVersionId` foreign key producing a relation that shadowed the `currentVersion` field, v0.30 disambiguates the relation name instead of overwriting the column. Names that were already collision-free are preserved, so regenerating an existing, working schema does not rename its relations. The `turbine mcp` server and the SQLite / MySQL / SQL Server introspectors share the same naming logic.
 
 Three files land in `./generated/turbine/`:
 
-- **`types.ts`** — entity interfaces (singularized PascalCase), `*Create` types, `*Update` types, and relation-included `*With*` types.
-- **`metadata.ts`** — runtime `SchemaMetadata` with column maps, relations, and indexes. Needed for `turbineHttp()` in edge runtimes.
-- **`index.ts`** — a `TurbineClient` subclass with typed `declare readonly` table accessors, plus a `turbine()` factory function.
+- **`types.ts`**, entity interfaces (singularized PascalCase), `*Create` types, `*Update` types, and relation-included `*With*` types.
+- **`metadata.ts`**, runtime `SchemaMetadata` with column maps, relations, and indexes. Needed for `turbineHttp()` in edge runtimes.
+- **`index.ts`**, a `TurbineClient` subclass with typed `declare readonly` table accessors, plus a `turbine()` factory function.
 
 ## Type mapping
 
@@ -348,7 +372,7 @@ Turbine maps Postgres types to TypeScript:
 |---|---|---|
 | `int2`, `int4`, `float4`, `float8` | `number` | Standard numeric types |
 | `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` are returned as `string` to avoid precision loss |
-| `numeric`, `money` | `string` | Arbitrary precision — kept as string to avoid JS float issues |
+| `numeric`, `money` | `string` | Arbitrary precision, kept as string to avoid JS float issues |
 | `text`, `varchar`, `uuid`, `citext` | `string` | |
 | `timestamptz`, `timestamp`, `date` | `Date` | |
 | `time`, `timetz` | `string` on read, `string \| Date` on write | No date part, so never coerced to a `Date` on read. See [Time-of-day columns](#time-of-day-columns-time-and-timetz) |
@@ -384,6 +408,6 @@ The coercion runs on every write path (`create`, `createMany`, `upsert`, and the
 
 ## See also
 
-- **[CLI](/cli)** — every migration command with examples.
-- **[API Reference](/queries)** — how to query the tables you just defined.
-- **[Typed Errors](/errors)** — including `MigrationError` (TURBINE_E006).
+- **[CLI](/cli)**, every migration command with examples.
+- **[API Reference](/queries)**, how to query the tables you just defined.
+- **[Typed Errors](/errors)**, including `MigrationError` (TURBINE_E006).

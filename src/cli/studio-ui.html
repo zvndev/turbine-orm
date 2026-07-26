@@ -278,8 +278,8 @@
     }
     /* An author `display` rule (every bar and banner below is a flex row) beats
        the user-agent `[hidden] { display: none }`, so restate it here: the whole
-       UI gates optional strips — the link bar, filter bar, selection bar, and
-       the write / PII / demo banners — on the `hidden` property. */
+       UI gates optional strips, the link bar, filter bar, selection bar, and
+       the write / PII / demo banners, on the `hidden` property. */
     [hidden] {
       display: none !important;
     }
@@ -922,7 +922,7 @@
       font-weight: 500;
       color: var(--text-dim);
       font-size: 11px;
-      /* Column names render verbatim (created_at, not CREATED_AT) — casing is
+      /* Column names render verbatim (created_at, not CREATED_AT), casing is
          schema information, never cosmetic. */
       letter-spacing: 0.03em;
       white-space: nowrap;
@@ -1999,7 +1999,7 @@
           <span>Jump to…</span>
           <span class="kbd">⌘K</span>
         </button>
-        <span class="header-meta" id="headerMeta">—</span>
+        <span class="header-meta" id="headerMeta">-</span>
         <div class="conn" id="conn">
           <span class="conn-dot" id="connDot"></span>
           <span id="connLabel">connecting</span>
@@ -2014,7 +2014,7 @@
           <div class="sidebar-title">
             <span>schema</span>
           </div>
-          <div class="sidebar-meta" id="sidebarMeta">—</div>
+          <div class="sidebar-meta" id="sidebarMeta">-</div>
         </div>
         <div class="sidebar-search">
           <svg class="sidebar-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -2079,7 +2079,7 @@
         <section class="pane" id="pane-data" role="tabpanel">
           <div class="pane-header">
             <div class="pane-title">
-              <h1 id="dataTitle">—</h1>
+              <h1 id="dataTitle">-</h1>
               <span class="muted" id="dataTotal"></span>
             </div>
             <div class="toolbar">
@@ -2137,7 +2137,7 @@
           <div class="data-wrap">
             <div class="data-scroll" id="dataScroll"></div>
             <div class="data-footer">
-              <span id="dataRange">—</span>
+              <span id="dataRange">-</span>
               <div class="pagination">
                 <span class="page-size">
                   <label for="pageSize">Rows</label>
@@ -2150,7 +2150,7 @@
                   </select>
                 </span>
                 <button class="btn btn-sm" id="pagePrev">← Prev</button>
-                <span id="pageIndicator">—</span>
+                <span id="pageIndicator">-</span>
                 <button class="btn btn-sm" id="pageNext">Next →</button>
               </div>
             </div>
@@ -2161,7 +2161,7 @@
         <section class="pane" id="pane-schema" role="tabpanel">
           <div class="pane-header">
             <div class="pane-title">
-              <h1 id="schemaTitle">—</h1>
+              <h1 id="schemaTitle">-</h1>
               <span class="muted" id="schemaSub"></span>
             </div>
           </div>
@@ -2174,7 +2174,7 @@
           <div class="pane-header">
             <div class="pane-title">
               <h1>Query</h1>
-              <span class="muted" id="builderSub">Visual findMany composer — no SQL required</span>
+              <span class="muted" id="builderSub">Visual findMany composer, no SQL required</span>
             </div>
             <div class="toolbar">
               <button class="btn btn-primary" id="builderRun">
@@ -2443,7 +2443,7 @@
           let msg = (body && body.error) || res.statusText || 'Request failed';
           if (res.status === 429) {
             const after = (body && body.retryAfter) || res.headers.get('Retry-After');
-            msg = 'Rate limited — retry in ' + (after ? after + 's' : 'a moment');
+            msg = 'Rate limited, retry in ' + (after ? after + 's' : 'a moment');
           }
           const err = new Error(msg);
           err.status = res.status;
@@ -2535,7 +2535,7 @@
     const $ = (sel, root) => (root || document).querySelector(sel);
     const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
-    // SVG elements need the SVG namespace — document.createElement('svg')
+    // SVG elements need the SVG namespace, document.createElement('svg')
     // yields an inert HTMLUnknownElement that never renders.
     const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'ellipse', 'line', 'polyline', 'polygon', 'g']);
 
@@ -2582,7 +2582,7 @@
     }
 
     function formatCount(n) {
-      if (n == null) return '—';
+      if (n == null) return '-';
       if (n < 1000) return String(n);
       if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0).replace(/\.0$/, '') + 'k';
       if (n < 1_000_000_000) return (n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0).replace(/\.0$/, '') + 'M';
@@ -2599,7 +2599,7 @@
 
 
     function formatNumber(n) {
-      if (n == null) return '—';
+      if (n == null) return '-';
       return Number(n).toLocaleString();
     }
 
@@ -2901,7 +2901,7 @@
     // The server derives every link from relation metadata and omits any whose
     // columns are currently PII-redacted, so the UI only has to follow them.
     // A jump is just the normal table view with one equals filter applied, so
-    // it reuses the Data tab's own loading, paging, and filter-bar plumbing —
+    // it reuses the Data tab's own loading, paging, and filter-bar plumbing -
     // and the filter is a real filter row the user can delete.
     // =====================================================================
     const Nav = {
@@ -3067,12 +3067,12 @@
       render() {
         const t = State.currentTable;
         if (!t) {
-          $('#dataTitle').textContent = '—';
+          $('#dataTitle').textContent = '-';
           $('#dataTotal').textContent = '';
           $('#dataScroll').innerHTML = '<div class="empty">Select a table to browse data.</div>';
           $('#dataLinkBar').hidden = true;
-          $('#dataRange').textContent = '—';
-          $('#pageIndicator').textContent = '—';
+          $('#dataRange').textContent = '-';
+          $('#pageIndicator').textContent = '-';
           return;
         }
         $('#dataTitle').textContent = t.name;
@@ -3092,8 +3092,8 @@
               document.createTextNode(State.data.error),
             ])
           );
-          $('#dataRange').textContent = '—';
-          $('#pageIndicator').textContent = '—';
+          $('#dataRange').textContent = '-';
+          $('#pageIndicator').textContent = '-';
           return;
         }
 
@@ -3134,7 +3134,7 @@
             ])
           );
           $('#dataRange').textContent = '0 of 0';
-          $('#pageIndicator').textContent = '—';
+          $('#pageIndicator').textContent = '-';
           return;
         }
 
@@ -3427,7 +3427,7 @@
     // Data-tab per-column filter bar
     // =====================================================================
     const FilterBar = {
-      // Columns eligible for filtering (redacted PII columns are excluded —
+      // Columns eligible for filtering (redacted PII columns are excluded -
       // the server refuses them, so don't offer them).
       columns() {
         const t = State.currentTable;
@@ -3587,7 +3587,7 @@
     }, 260);
 
     // =====================================================================
-    // Export (current page or selection) — JSON / CSV, copy or download
+    // Export (current page or selection), JSON / CSV, copy or download
     // =====================================================================
     const Exporter = {
       scope() {
@@ -3983,7 +3983,7 @@
         const t = State.currentTable;
         const host = $('#schemaScroll');
         if (!t) {
-          $('#schemaTitle').textContent = '—';
+          $('#schemaTitle').textContent = '-';
           $('#schemaSub').textContent = '';
           host.innerHTML = '<div class="empty">Select a table to inspect its schema.</div>';
           return;
@@ -4013,8 +4013,8 @@
               }),
             ])
           );
-          tr.appendChild(el('td', {}, [el('span', { class: 'col-ts', text: c.tsType || '—' })]));
-          tr.appendChild(el('td', {}, [el('span', { class: 'col-pg', text: c.pgType || '—' })]));
+          tr.appendChild(el('td', {}, [el('span', { class: 'col-ts', text: c.tsType || '-' })]));
+          tr.appendChild(el('td', {}, [el('span', { class: 'col-pg', text: c.pgType || '-' })]));
           const attrs = el('td');
           if (c.isPrimaryKey) attrs.appendChild(el('span', { class: 'badge pk', text: 'PK' }));
           if (!c.nullable) attrs.appendChild(el('span', { class: 'badge nn', text: 'NOT NULL' }));
@@ -4049,7 +4049,7 @@
               el('td', {}, [
                 el('span', {
                   class: 'col-pg',
-                  text: (r.foreignKey || '—') + ' → ' + (r.referenceKey || '—'),
+                  text: (r.foreignKey || '-') + ' → ' + (r.referenceKey || '-'),
                 }),
               ])
             );
@@ -4311,7 +4311,7 @@
           el('div', { class: 'builder-section-title' }, [el('h3', { text: 'with (relations)' })])
         );
         const rels = tableMeta.relations || [];
-        // Depth guard — the engine caps `with` nesting at depth 10
+        // Depth guard, the engine caps `with` nesting at depth 10
         // (CircularRelationError). Stop offering deeper expansion before then so
         // the UI can never compose a query the engine will reject.
         if (path.length >= 8) {
@@ -4373,7 +4373,7 @@
             if (!targetMeta) {
               body.appendChild(el('div', { class: 'field-hint', text: 'Unknown target table ' + rel.to }));
             } else {
-              // Same controls as the top level, applied to this relation's args —
+              // Same controls as the top level, applied to this relation's args -
               // this is the recursive drill-down: pick its fields, filter it, order
               // it, and expand its own relations to arbitrary depth.
               // orderBy/limit only apply to to-many relations; a belongsTo/hasOne
@@ -4401,7 +4401,7 @@
         const row = el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 120px 100px', gap: '8px' } });
 
         const colSel = el('select', { class: 'builder-select' });
-        colSel.appendChild(el('option', { value: '', text: '— none —' }));
+        colSel.appendChild(el('option', { value: '', text: ', none, ' }));
         for (const c of tableMeta.columns) {
           const opt = el('option', { value: c.name, text: c.name });
           if (args.orderBy && args.orderBy.column === c.name) opt.selected = true;
@@ -4607,7 +4607,7 @@
       updateRunButton() {
         const ok = BuilderPane.validate();
         $('#builderRun').disabled = !ok;
-        // Surface WHY Run is disabled — a grayed-out button with no explanation
+        // Surface WHY Run is disabled, a grayed-out button with no explanation
         // is a dead end.
         const box = $('#builderValidation');
         const msgs = Object.values(State.builder.validation);
@@ -5046,7 +5046,7 @@
         try {
           return JSON.parse(raw);
         } catch (err) {
-          throw new Error('Column "' + col.name + '": invalid JSON — ' + err.message);
+          throw new Error('Column "' + col.name + '": invalid JSON, ' + err.message);
         }
       }
       if (isNumericType(ts)) {
@@ -5117,11 +5117,11 @@
           let input;
           if (enumValues && enumValues.length) {
             input = el('select', {});
-            input.appendChild(el('option', { value: '', text: '— unset —' }));
+            input.appendChild(el('option', { value: '', text: ', unset, ' }));
             for (const ev of enumValues) input.appendChild(el('option', { value: ev, text: ev }));
           } else if (ts.indexOf('boolean') === 0) {
             input = el('select', {});
-            input.appendChild(el('option', { value: '', text: '— unset —' }));
+            input.appendChild(el('option', { value: '', text: ', unset, ' }));
             input.appendChild(el('option', { value: 'true', text: 'true' }));
             input.appendChild(el('option', { value: 'false', text: 'false' }));
           } else {
@@ -5258,7 +5258,7 @@
       bind() {
         $('#savePromptConfirm').addEventListener('click', async () => {
           const name = $('#savePromptName').value.trim();
-          // The table is locked to the builder's table — the composed args only
+          // The table is locked to the builder's table, the composed args only
           // make sense against it.
           const table = State.savePrompt.fixedTable || $('#savePromptTable').value;
           if (!name || !table) {
@@ -5411,7 +5411,7 @@
           Palette.open();
           return;
         }
-        // Cmd+Enter runs the builder query (works from inside inputs too — the
+        // Cmd+Enter runs the builder query (works from inside inputs too, the
         // most common flow is typing a value and hitting Run).
         if (cmd && e.key === 'Enter') {
           e.preventDefault();
@@ -5539,7 +5539,7 @@
         $('#sidebarMeta').textContent = meta;
 
         if (reloadOnly) {
-          // A live reload (demo mode toggle, Shift+R): keep the user's place —
+          // A live reload (demo mode toggle, Shift+R): keep the user's place -
           // current tab, table, composed builder query, filters, selection.
           // Re-point currentTable at the fresh metadata object and re-render;
           // re-fetch whatever the active tab is showing so redaction/write
@@ -5553,7 +5553,7 @@
           if (State.currentTab === 'data' && State.currentTable) DataPane.loadAndRender();
           if (State.currentTab === 'builder' && State.builder.result) {
             // Results were fetched under the previous mode (e.g. different PII
-            // redaction) — re-run so what's on screen is always truthful.
+            // redaction), re-run so what's on screen is always truthful.
             BuilderPane.run();
           }
           SavedQueries.refresh();
@@ -5587,9 +5587,9 @@
         $('#connDot').classList.add('err');
         $('#connLabel').textContent = 'offline';
         $('#headerMeta').textContent = 'connection failed';
-        $('#sidebarMeta').textContent = '—';
+        $('#sidebarMeta').textContent = '-';
         // Surface the failure on EVERY pane (whichever tab is active) with a
-        // retry affordance — a schema-load failure must never strand the UI on
+        // retry affordance, a schema-load failure must never strand the UI on
         // an eternal "Loading schema…".
         const renderBootError = (host) => {
           host.innerHTML = '';

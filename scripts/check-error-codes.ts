@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * Error code enforcement — verifies all thrown errors in src/ use
+ * Error code enforcement, verifies all thrown errors in src/ use
  * known TurbineError subclasses from src/errors.ts.
  *
  * Run: tsx scripts/check-error-codes.ts
@@ -81,7 +81,7 @@ for (const file of files) {
   const isCliFile = relPath.includes('/cli/');
   const isErrorsFile = relPath.endsWith('src/errors.ts');
   // Generator and schema tooling files are invoked via the CLI, not at
-  // query runtime — allow standard Error the same way we allow it in CLI code.
+  // query runtime, allow standard Error the same way we allow it in CLI code.
   const isToolingFile =
     relPath.endsWith('generate.ts') ||
     relPath.endsWith('schema-builder.ts') ||

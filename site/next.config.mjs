@@ -8,7 +8,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Tracing root must match what the Vercel builder treats as the deploy root:
 // the builder resolves the .next output RELATIVE to this path. Git-connected
 // deploys clone the whole repo (/vercel/path0) and build in path0/site, so
-// the root is the repo root — pinning it to site/ made the builder lstat
+// the root is the repo root, pinning it to site/ made the builder lstat
 // /vercel/path0/.next (ENOENT, failed deploy). Site-only CLI uploads have no
 // root manifest; there the app dir itself is the root.
 const repoRoot = resolve(__dirname, '..');

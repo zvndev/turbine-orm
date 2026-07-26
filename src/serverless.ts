@@ -1,5 +1,5 @@
 /**
- * turbine-orm/serverless — edge / serverless driver integration
+ * turbine-orm/serverless, edge / serverless driver integration
  *
  * Turbine runs on any Postgres driver that speaks the node-postgres API.
  * This module exposes a thin factory (`turbineHttp`) that binds an external
@@ -12,12 +12,12 @@
  * Any driver whose `Pool` satisfies `PgCompatPool` will work. The ones
  * below are verified:
  *
- * - **Neon** (`@neondatabase/serverless`) — HTTP and WebSocket transports
- * - **Vercel Postgres** (`@vercel/postgres`) — wraps Neon
- * - **Cloudflare Hyperdrive** — exposes a pg-compatible driver
- * - **Supabase** — use the regular `pg` package; Supabase is Postgres-native
+ * - **Neon** (`@neondatabase/serverless`), HTTP and WebSocket transports
+ * - **Vercel Postgres** (`@vercel/postgres`), wraps Neon
+ * - **Cloudflare Hyperdrive**, exposes a pg-compatible driver
+ * - **Supabase**, use the regular `pg` package; Supabase is Postgres-native
  *
- * Turbine does NOT bundle any of these — install whichever you need and
+ * Turbine does NOT bundle any of these, install whichever you need and
  * pass its pool directly.
  *
  * ## Limitations over HTTP
@@ -27,9 +27,9 @@
  *   If you call these on an HTTP pool the underlying driver will error.
  * - **LISTEN/NOTIFY** is not available over HTTP.
  * - **Transactions** are supported but each transaction holds an HTTP
- *   connection for its duration — keep them short.
+ *   connection for its duration, keep them short.
  *
- * ## Example — Neon on Vercel Edge
+ * ## Example, Neon on Vercel Edge
  *
  * ```ts
  * // app/api/users/route.ts
@@ -48,7 +48,7 @@
  * }
  * ```
  *
- * ## Example — Supabase (direct Postgres, no HTTP proxy needed)
+ * ## Example, Supabase (direct Postgres, no HTTP proxy needed)
  *
  * ```ts
  * import { TurbineClient } from 'turbine-orm';
@@ -60,7 +60,7 @@
  * }, SCHEMA);
  * ```
  *
- * ## Example — Cloudflare Workers
+ * ## Example, Cloudflare Workers
  *
  * ```ts
  * // Use the Neon HTTP driver which works in Workers runtime
@@ -96,14 +96,14 @@ export interface TurbineHttpOptions extends Pick<TurbineConfig, 'logging' | 'def
  *
  * Use this for serverless/edge environments where Turbine should NOT
  * manage its own `pg.Pool`. The caller retains ownership of the pool's
- * lifecycle — `db.disconnect()` is a no-op.
+ * lifecycle, `db.disconnect()` is a no-op.
  *
  * ## Typed table accessors
  *
  * By default `turbineHttp` returns the base {@link TurbineClient}, so you
  * reach tables through `db.table('users')`. To get the *generated*, fully
- * typed accessors (`db.users.findMany()`) — identical to what the TCP-path
- * `turbine()` factory gives you — pass your generated client type as the
+ * typed accessors (`db.users.findMany()`), identical to what the TCP-path
+ * `turbine()` factory gives you, pass your generated client type as the
  * `TClient` type argument. The runtime object is the same; the generated
  * subclass only adds `declare readonly` accessor typings, and the base
  * constructor already creates those accessors at runtime for every table in
@@ -120,7 +120,7 @@ export interface TurbineHttpOptions extends Pick<TurbineConfig, 'logging' | 'def
  * @param options - Optional logging / defaultLimit / warnOnUnlimited
  * @returns A TurbineClient instance (typed as `TClient`)
  *
- * @example Untyped (back-compat) — reach tables via `db.table(...)`
+ * @example Untyped (back-compat), reach tables via `db.table(...)`
  * ```ts
  * import { Pool } from '@neondatabase/serverless';
  * import { turbineHttp } from 'turbine-orm/serverless';
@@ -131,7 +131,7 @@ export interface TurbineHttpOptions extends Pick<TurbineConfig, 'logging' | 'def
  * const users = await db.table('users').findMany({ limit: 10 });
  * ```
  *
- * @example Typed — generated accessors, identical to the TCP client
+ * @example Typed, generated accessors, identical to the TCP client
  * ```ts
  * import { Pool } from '@neondatabase/serverless';
  * import { turbineHttp } from 'turbine-orm/serverless';
@@ -151,6 +151,6 @@ export function turbineHttp<TClient extends TurbineClient = TurbineClient>(
   // The generated subclass only layers `declare readonly` accessor typings
   // over the base client; the base constructor materializes those same
   // accessors at runtime (Object.defineProperty per schema table). So the
-  // returned instance genuinely has TClient's shape — the assertion is safe.
+  // returned instance genuinely has TClient's shape, the assertion is safe.
   return new TurbineClient({ pool, ...options }, schema) as TClient;
 }

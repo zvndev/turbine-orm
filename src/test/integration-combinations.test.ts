@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Combined-feature integration tests
+ * turbine-orm, Combined-feature integration tests
  *
  * Exercises four combinations that the rest of the integration suites only
  * cover individually:
@@ -13,7 +13,7 @@
  *
  *   DATABASE_URL=postgres://... npx tsx --test src/test/integration-combinations.test.ts
  *
- * The whole suite is gated by DATABASE_URL — when it's absent every test is
+ * The whole suite is gated by DATABASE_URL, when it's absent every test is
  * reported as skipped, never failed, so unit-only test runs stay green.
  */
 
@@ -25,7 +25,7 @@ import type { SchemaMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// Setup — same gating pattern as turbine.test.ts / comprehensive.test.ts
+// Setup, same gating pattern as turbine.test.ts / comprehensive.test.ts
 // ---------------------------------------------------------------------------
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -42,7 +42,7 @@ let schema: SchemaMetadata;
 const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
 const testFn = describe;
 
-// Local cast helper — keeps type assertions short and readable
+// Local cast helper, keeps type assertions short and readable
 const row = (r: unknown): Record<string, unknown> => r as Record<string, unknown>;
 
 testFn('integration-combinations', () => {
@@ -90,7 +90,7 @@ testFn('integration-combinations', () => {
         }
       }
 
-      // Page 2 — cursor on the last id from page 1
+      // Page 2, cursor on the last id from page 1
       const lastId = row(page1[page1.length - 1]!).id as number;
       const page2 = await db.table('users').findMany({
         cursor: { id: lastId },
@@ -128,7 +128,7 @@ testFn('integration-combinations', () => {
   });
 
   // -------------------------------------------------------------------------
-  // 2. pipeline batching — findMany + count + findUnique in one round-trip
+  // 2. pipeline batching, findMany + count + findUnique in one round-trip
   // -------------------------------------------------------------------------
 
   describe('pipeline batching', () => {
@@ -136,7 +136,7 @@ testFn('integration-combinations', () => {
       const users = db.table<{ id: number; name: string }>('users');
       const posts = db.table<{ id: number; title: string; published: boolean }>('posts');
 
-      // db.pipeline takes spread DeferredQuery<>, not an array — see
+      // db.pipeline takes spread DeferredQuery<>, not an array, see
       // TurbineClient.pipeline (client.ts ~line 443).
       const [recentPosts, postCount, firstUser] = await db.pipeline(
         posts.buildFindMany({ orderBy: { id: 'desc' }, limit: 5 }),
@@ -185,7 +185,7 @@ testFn('integration-combinations', () => {
         })) as Record<string, unknown>;
         createdOrgId = outer.id as number;
 
-        // Inner SAVEPOINT — must throw to trigger ROLLBACK TO SAVEPOINT.
+        // Inner SAVEPOINT, must throw to trigger ROLLBACK TO SAVEPOINT.
         // The outer transaction is unaffected and should still commit.
         await tx
           .$transaction(async (innerTx) => {
@@ -232,7 +232,7 @@ testFn('integration-combinations', () => {
       const seen: Array<{ id: number; postsLen: number }> = [];
 
       // batchSize: 2 forces the stream through more than one FETCH cycle on
-      // any seed with > 2 users — exercises the inner loop in findManyStream.
+      // any seed with > 2 users, exercises the inner loop in findManyStream.
       for await (const user of db.table('users').findManyStream({
         orderBy: { id: 'asc' },
         with: { posts: { orderBy: { id: 'asc' } } },
@@ -243,7 +243,7 @@ testFn('integration-combinations', () => {
         assert.ok(Array.isArray(posts), 'streamed user should have a posts array (json_agg)');
         seen.push({ id: u.id as number, postsLen: posts.length });
 
-        // Early break — must release the cursor connection cleanly.
+        // Early break, must release the cursor connection cleanly.
         if (seen.length >= 3) break;
       }
 

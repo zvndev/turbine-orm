@@ -1,9 +1,9 @@
 /**
- * turbine-orm — Extended column types (WS-B / B2–B5)
+ * turbine-orm, Extended column types (WS-B / B2–B5)
  *
  * Code-first enums, array columns, pgvector columns, and CHECK constraints:
  * DDL emission, schema-level enum declarations, and the vector extension
- * handling. Pure unit tests — no database required.
+ * handling. Pure unit tests, no database required.
  *
  * Run: npx tsx --test src/test/column-types-extended.test.ts
  */
@@ -15,10 +15,10 @@ import { defineSchema } from '../schema-builder.js';
 import { schemaToSQL, schemaToSQLString } from '../schema-sql.js';
 
 // ---------------------------------------------------------------------------
-// B2 — enums code-first
+// B2, enums code-first
 // ---------------------------------------------------------------------------
 
-describe('B2 — enum column types + schema-level enum declarations', () => {
+describe('B2, enum column types + schema-level enum declarations', () => {
   const schema = defineSchema(
     {
       posts: {
@@ -55,10 +55,10 @@ describe('B2 — enum column types + schema-level enum declarations', () => {
 });
 
 // ---------------------------------------------------------------------------
-// B3 — array columns
+// B3, array columns
 // ---------------------------------------------------------------------------
 
-describe('B3 — array columns', () => {
+describe('B3, array columns', () => {
   it('array: true emits type[] DDL', () => {
     const schema = defineSchema({
       posts: {
@@ -80,10 +80,10 @@ describe('B3 — array columns', () => {
 });
 
 // ---------------------------------------------------------------------------
-// B4 — vector columns
+// B4, vector columns
 // ---------------------------------------------------------------------------
 
-describe('B4 — vector columns', () => {
+describe('B4, vector columns', () => {
   it('vector column emits vector(n) DDL', () => {
     const schema = defineSchema({
       docs: {
@@ -151,10 +151,10 @@ describe('B4 — vector columns', () => {
 });
 
 // ---------------------------------------------------------------------------
-// B5 — check constraints
+// B5, check constraints
 // ---------------------------------------------------------------------------
 
-describe('B5 — check constraints', () => {
+describe('B5, check constraints', () => {
   it('column-level check emits inline CHECK (expr)', () => {
     const schema = defineSchema({
       products: {

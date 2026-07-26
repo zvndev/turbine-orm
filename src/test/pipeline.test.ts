@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Pipeline execution tests
+ * turbine-orm, Pipeline execution tests
  *
  * Verifies `executePipeline` against a mock pg-compat pool:
  *   - acquires a single connection

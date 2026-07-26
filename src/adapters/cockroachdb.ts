@@ -1,20 +1,20 @@
 /**
- * turbine-orm — CockroachDB adapter
+ * turbine-orm, CockroachDB adapter
  *
  * CockroachDB speaks the PostgreSQL wire protocol but has key differences:
  *
- * 1. **No advisory locks** — `pg_try_advisory_lock()` is not supported.
+ * 1. **No advisory locks**, `pg_try_advisory_lock()` is not supported.
  *    This adapter uses a `_turbine_lock` table with `SELECT FOR UPDATE NOWAIT`
  *    as a concurrency mechanism for migrations.
  *
- * 2. **No `SET LOCAL statement_timeout`** — CockroachDB uses
+ * 2. **No `SET LOCAL statement_timeout`**, CockroachDB uses
  *    `SET transaction_timeout` (v23.1+) for per-transaction time limits.
  *
- * 3. **`pg_indexes` view** — CockroachDB supports `pg_indexes` since v22.1
+ * 3. **`pg_indexes` view**, CockroachDB supports `pg_indexes` since v22.1
  *    but the `indexdef` column may not match Postgres exactly. We use
  *    `SHOW INDEXES` as a more reliable alternative.
  *
- * 4. **`pg_class.reltuples`** — Not reliable in CockroachDB. We use
+ * 4. **`pg_class.reltuples`**, Not reliable in CockroachDB. We use
  *    `crdb_internal.table_row_statistics` for row estimates.
  *
  * Known limitations with Turbine on CockroachDB:
@@ -78,7 +78,7 @@ const SQL_INDEXES_CRDB = `
 
 /**
  * Row estimates using crdb_internal. Falls back gracefully if the view
- * doesn't exist (permissions issue) — returns 0 rows in that case.
+ * doesn't exist (permissions issue), returns 0 rows in that case.
  */
 const SQL_ROW_ESTIMATES_CRDB = `
   SELECT
@@ -92,7 +92,7 @@ const SQL_ROW_ESTIMATES_CRDB = `
 `;
 
 /**
- * Enum introspection — CockroachDB supports pg_type/pg_enum since v20.2.
+ * Enum introspection, CockroachDB supports pg_type/pg_enum since v20.2.
  * The standard query works, but we include it explicitly so the override
  * mechanism is complete.
  */
@@ -123,7 +123,7 @@ export const cockroachdb: DatabaseAdapter = {
     // Insert the lock row if it doesn't exist (idempotent)
     await client.query(`INSERT INTO "${LOCK_TABLE}" (lock_id) VALUES ($1) ON CONFLICT (lock_id) DO NOTHING`, [lockId]);
 
-    // Try to acquire the row lock with NOWAIT — fails immediately if held
+    // Try to acquire the row lock with NOWAIT, fails immediately if held
     try {
       await client.query('BEGIN');
       await client.query(`SELECT lock_id FROM "${LOCK_TABLE}" WHERE lock_id = $1 FOR UPDATE NOWAIT`, [lockId]);
@@ -132,7 +132,7 @@ export const cockroachdb: DatabaseAdapter = {
         `UPDATE "${LOCK_TABLE}" SET acquired_at = now(), acquired_by = current_user WHERE lock_id = $1`,
         [lockId],
       );
-      // Note: we leave the transaction OPEN — the lock is held until
+      // Note: we leave the transaction OPEN, the lock is held until
       // releaseLock() commits or rolls back.
       return true;
     } catch (err: unknown) {
@@ -146,7 +146,7 @@ export const cockroachdb: DatabaseAdapter = {
         }
         return false;
       }
-      // Any other error — rollback and re-throw
+      // Any other error, rollback and re-throw
       try {
         await client.query('ROLLBACK');
       } catch {

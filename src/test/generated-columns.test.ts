@@ -1,10 +1,10 @@
 /**
- * turbine-orm — WS-H / H3: STORED generated columns
+ * turbine-orm, WS-H / H3: STORED generated columns
  *
  * `GENERATED ALWAYS AS (expr) STORED` columns (`isGeneratedStored`) are
  * computed by Postgres and can never be written. Codegen omits them from
  * `*Create`/`*Update` input types, and the create/update/upsert builders reject
- * any `data` containing one with a `ValidationError` (E003). Pure — no DB.
+ * any `data` containing one with a `ValidationError` (E003). Pure, no DB.
  *
  * Run: npx tsx --test src/test/generated-columns.test.ts
  */
@@ -56,7 +56,7 @@ const invoices: TableMetadata = {
 
 const SCHEMA: SchemaMetadata = { tables: { invoices }, enums: {} };
 
-describe('H3 — codegen omits STORED generated columns', () => {
+describe('H3, codegen omits STORED generated columns', () => {
   const out = generateTypes(SCHEMA);
 
   it('keeps the generated column in the entity type', () => {
@@ -77,7 +77,7 @@ describe('H3 — codegen omits STORED generated columns', () => {
   });
 });
 
-describe('H3 — write builders reject STORED generated columns (E003)', () => {
+describe('H3, write builders reject STORED generated columns (E003)', () => {
   const qi = makeQuery('invoices', SCHEMA);
 
   it('create rejects data with a generated column', () => {

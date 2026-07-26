@@ -1,8 +1,8 @@
 /**
- * turbine-orm/mysql — MySQL 8 engine (driver-injected, optional peer)
+ * turbine-orm/mysql, MySQL 8 engine (driver-injected, optional peer)
  *
  * Binds Turbine to MySQL 8 via the `mysql2` driver. `mysql2` is **not** a root
- * dependency — it is an **optional peer**: `npm i turbine-orm` pulls nothing
+ * dependency, it is an **optional peer**: `npm i turbine-orm` pulls nothing
  * extra, and only consumers who `import 'turbine-orm/mysql'` install `mysql2`
  * themselves. The factory loads it through a dynamic `import('mysql2/promise')`
  * so importing this module never crashes when `mysql2` is absent for a consumer
@@ -21,7 +21,7 @@
  *     (e.g. a `with`-relation `LIMIT` lands in the SELECT list, ahead of the
  *     outer `WHERE`). Postgres reconciles this via numbered `$N`; positional `?`
  *     silently mis-binds. So `mysqlDialect` uses **mysql2 named placeholders**
- *     (`:p1`, `:p2`, …) and the driver shim binds via a `{ p1, p2, … }` object —
+ *     (`:p1`, `:p2`, …) and the driver shim binds via a `{ p1, p2, … }` object -
  *     exactly mirroring `$N` semantics regardless of text order. (See
  *     `turbine-orm/sqlite` for the same fix.)
  *
@@ -42,10 +42,10 @@
  * - **Advisory-lock migration locking** is available in principle via
  *   `GET_LOCK`/`RELEASE_LOCK` (`supportsAdvisoryLock = true`); the migrate CLI is
  *   still PostgreSQL-only, so this flag documents intent for a future adapter.
- * - **Case-insensitive matching** uses `LOWER(col) LIKE LOWER(ref)` — note this
+ * - **Case-insensitive matching** uses `LOWER(col) LIKE LOWER(ref)`, note this
  *   can defeat indexes unless a functional/generated index exists.
  * - **bignum:** mysql2 is configured `supportBigNumbers:true, bigNumberStrings:false`
- *   — the same safe-int policy Turbine uses for Postgres `int8` (number when it
+ *   - the same safe-int policy Turbine uses for Postgres `int8` (number when it
  *   fits, decimal string otherwise). `DECIMAL` comes back as a string; `TINYINT(1)`
  *   binds booleans as 1/0. No global parser state is mutated.
  * - **Version:** MySQL **8.0+** required (5.7 lacks `JSON_ARRAYAGG`); MariaDB is
@@ -75,6 +75,7 @@ import {
   type DialectIntrospector,
   type InsertStatementInput,
   type IntrospectOptions,
+  type JsonWireRule,
   postgresDialect,
   type StreamableConnection,
   type UpsertStatementInput,
@@ -158,7 +159,7 @@ function toMysqlParam(value: unknown): MysqlParam {
 /**
  * Bind the positional `params[]` (in 1-indexed generation order) to the named
  * `:p1`, `:p2`, … placeholders the dialect emits. Mapping by NAME makes binding
- * independent of where each placeholder lands in the SQL text — the same
+ * independent of where each placeholder lands in the SQL text, the same
  * guarantee Postgres' numbered `$N` gives. Returns `undefined` for parameter-less
  * statements (BEGIN/COMMIT/DDL) so they bind nothing.
  */
@@ -199,7 +200,7 @@ function shapeResult(result: unknown): {
  * deadlock / lock-wait-timeout become retryable (E012/E013). The original mysql2
  * error (with its real message) is preserved as the wrapped error's `.cause`
  * downstream. Returns the value unchanged when it is not a recognizable mysql2
- * error. We only annotate here — `wrapPgError` (invoked downstream in the query
+ * error. We only annotate here, `wrapPgError` (invoked downstream in the query
  * executor / transaction proxy) does the actual translation.
  */
 function augmentMysqlError(err: unknown): unknown {
@@ -255,7 +256,7 @@ function augmentMysqlError(err: unknown): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// Driver shim — wrap a mysql2 pool as a PgCompatPool
+// Driver shim, wrap a mysql2 pool as a PgCompatPool
 // ---------------------------------------------------------------------------
 
 /** pg-style query argument: a SQL string or a `{ text, values }` config object. */
@@ -293,7 +294,7 @@ async function execOne(
  * emits `SET TRANSACTION ISOLATION LEVEL <level>; START TRANSACTION`. mysql2 runs
  * one statement per call (multi-statements stay OFF by design), so split exactly
  * that dialect-generated compound and run the parts in order. Gated on the precise
- * transaction-control prefix — the query builder never emits `SET TRANSACTION
+ * transaction-control prefix, the query builder never emits `SET TRANSACTION
  * ISOLATION LEVEL`, so no builder/user SQL is ever split.
  */
 async function runOnConnection(
@@ -319,7 +320,7 @@ async function runOnConnection(
  * `SAVEPOINT` nesting all run on the same physical connection.
  */
 export class MysqlPool implements PgCompatPool {
-  /** The underlying mysql2 pool — exposed as an escape hatch (seed / DDL / advanced ops). */
+  /** The underlying mysql2 pool, exposed as an escape hatch (seed / DDL / advanced ops). */
   readonly pool: Mysql2Pool;
   private closed = false;
 
@@ -410,12 +411,12 @@ function mysqlColumnType(type: string, maxLength?: number | null): string {
 }
 
 // ---------------------------------------------------------------------------
-// mysqlDialect — the full Dialect contract for MySQL 8
+// mysqlDialect, the full Dialect contract for MySQL 8
 // ---------------------------------------------------------------------------
 
 /**
  * MySQL 8 implementation of the {@link Dialect} contract. Backtick identifier
- * quoting, named `:pN` placeholders (NOT positional `?` — see the module
+ * quoting, named `:pN` placeholders (NOT positional `?`, see the module
  * docstring), `JSON_OBJECT` / `JSON_ARRAYAGG` for the single-query nested
  * relation engine (`CAST(… AS JSON)`-wrapped nested subresults), no `RETURNING`
  * (`resultStrategy = 'reselect'`), `INSERT … ON DUPLICATE KEY UPDATE` upserts,
@@ -460,7 +461,7 @@ export const mysqlDialect: Dialect = {
   emptyJsonArrayLiteral: 'JSON_ARRAY()',
   nullJsonLiteral: 'NULL',
 
-  // Named placeholders (`:p1`, `:p2`, …) — NOT positional `?`. Turbine pushes
+  // Named placeholders (`:p1`, `:p2`, …), NOT positional `?`. Turbine pushes
   // params in 1-indexed generation order but may EMIT them in a different SQL
   // text position; positional `?` mis-binds. mysql2 named parameters bind by
   // name, so `:pN` ↔ `params[N-1]` mirrors Postgres' `$N` regardless of text
@@ -502,7 +503,7 @@ export const mysqlDialect: Dialect = {
    * Wrap a nested correlated subquery for embedding inside a parent `JSON_OBJECT`.
    * MySQL double-encodes a scalar subquery result as a JSON *string* unless it is
    * explicitly typed JSON, so `CAST((subquery) AS JSON)` forces the nested value
-   * to be embedded as real JSON (objects/arrays), not a quoted string — the same
+   * to be embedded as real JSON (objects/arrays), not a quoted string, the same
    * intent as SQLite's `json(...)` wrap. The fallback (`JSON_ARRAY()` / `NULL`) is
    * already JSON-typed.
    */
@@ -512,6 +513,43 @@ export const mysqlDialect: Dialect = {
 
   // MySQL aggregate casts: COUNT → SIGNED (BIGINT, comes back as a JS number when
   // safe), AVG/float → DECIMAL (string, the aggregate transform Number()-coerces).
+  jsonWireRule(columnType: string): JsonWireRule | undefined {
+    const t = columnType.toLowerCase();
+
+    // JSON_OBJECT renders these as JSON numbers, which are IEEE doubles, so a
+    // relation read through the join strategy disagreed with a top-level read
+    // and with the batched loader, LOSSILY. Measured: BIGINT 9007199254740993
+    // came back 9007199254740992, and DECIMAL '1000.50' came back 1000.5.
+    // mysql2 hands both back as STRINGS at top level (supportBigNumbers, and
+    // DECIMAL is always a string), so carry the text and keep it.
+    if (t === 'bigint') {
+      return {
+        sql: (ref) => `CAST(${ref} AS CHAR)`,
+        decode: (value) => {
+          // Same policy as the driver's supportBigNumbers/bigNumberStrings:false.
+          if (typeof value !== 'string' || !/^-?\d+$/.test(value)) return value;
+          const asNumber = Number(value);
+          return Number.isSafeInteger(asNumber) ? asNumber : value;
+        },
+      };
+    }
+    if (t === 'decimal' || t === 'numeric') {
+      return { sql: (ref) => `CAST(${ref} AS CHAR)`, decode: (value) => value };
+    }
+
+    // Binary columns are worse than lossy: JSON_OBJECT emits MySQL's internal
+    // `base64:type15:…` marker string, so the caller got that text instead of
+    // bytes. Carry hex and rebuild the buffer.
+    if (t === 'binary' || t === 'varbinary' || t.endsWith('blob')) {
+      return {
+        sql: (ref) => `HEX(${ref})`,
+        decode: (value) => (typeof value === 'string' ? Uint8Array.from(Buffer.from(value, 'hex')) : value),
+      };
+    }
+
+    return undefined;
+  },
+
   castAggregate(expr: string, target: 'int' | 'float'): string {
     return `CAST(${expr} AS ${target === 'int' ? 'SIGNED' : 'DECIMAL(65,30)'})`;
   },
@@ -530,7 +568,7 @@ export const mysqlDialect: Dialect = {
     return JSON.stringify(values ?? []);
   },
 
-  // No RETURNING — resultStrategy 'reselect' re-fetches the row.
+  // No RETURNING, resultStrategy 'reselect' re-fetches the row.
   buildReturningClause(): string {
     return '';
   },
@@ -540,7 +578,7 @@ export const mysqlDialect: Dialect = {
   },
 
   buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement {
-    // No UNNEST in MySQL — emit multi-row VALUES with flattened, named
+    // No UNNEST in MySQL, emit multi-row VALUES with flattened, named
     // placeholders (`:p1`, `:p2`, …) matching the flat param order.
     let n = 0;
     const placeholders = input.rowValues
@@ -556,7 +594,7 @@ export const mysqlDialect: Dialect = {
   },
 
   buildUpsertStatement(input: UpsertStatementInput): string {
-    // MySQL ignores the explicit conflict target — ON DUPLICATE KEY UPDATE keys
+    // MySQL ignores the explicit conflict target, ON DUPLICATE KEY UPDATE keys
     // off the table's PK/unique indexes. The `where`-derived conflictColumns
     // (input.conflictColumns) must therefore correspond to a real unique/PK index
     // for the upsert to target the intended row (plan §4 / R9).
@@ -688,7 +726,7 @@ export const mysqlDialect: Dialect = {
 };
 
 // ---------------------------------------------------------------------------
-// Introspection — information_schema-driven SchemaMetadata
+// Introspection, information_schema-driven SchemaMetadata
 // ---------------------------------------------------------------------------
 
 /** Async executor that returns plain row objects for a parameterized query. */
@@ -738,7 +776,7 @@ interface FKEntry {
  * (`deriveEngineRelations` → `buildRelationsFromForeignKeys` +
  * `addAutoManyToManyRelations` in introspect.ts), so this engine derives
  * IDENTICAL relation names to `turbine generate` against Postgres for the
- * same logical schema — legacy-first naming, per-column disambiguation, and
+ * same logical schema, legacy-first naming, per-column disambiguation, and
  * collision resolution against scalar column fields included.
  */
 function buildRelationsFromForeignKeys(
@@ -955,10 +993,14 @@ export async function introspectMysql(options: IntrospectOptions): Promise<Schem
     }
     if (!schemaName) {
       throw new ConnectionError(
-        '[turbine] Could not determine the MySQL database to introspect — pass a database in the connection string or a `schema` option.',
+        '[turbine] Could not determine the MySQL database to introspect, pass a database in the connection string or a `schema` option.',
       );
     }
-    return introspectMysqlWith(exec, schemaName, { include: options.include, exclude: options.exclude });
+    // `await` is LOAD-BEARING, not stylistic: `return somePromise` inside a
+    // try/finally runs the finally BEFORE the promise settles, so `pool.end()`
+    // closed the pool out from under every introspection query and the whole
+    // call failed with mysql2's "Pool is closed".
+    return await introspectMysqlWith(exec, schemaName, { include: options.include, exclude: options.exclude });
   } finally {
     await pool.end();
   }
@@ -970,7 +1012,7 @@ export async function introspectMysql(options: IntrospectOptions): Promise<Schem
 
 /** mysql2 connection flags Turbine pins for correct behavior. */
 const MYSQL_DRIVER_FLAGS = {
-  // Named placeholders (`:pN`) — see paramPlaceholder + toNamedBinding.
+  // Named placeholders (`:pN`), see paramPlaceholder + toNamedBinding.
   namedPlaceholders: true,
   // Safe-int policy matching Postgres int8: number when it fits, decimal string
   // otherwise. DECIMAL always comes back as a string. No global state mutated.
@@ -1062,7 +1104,7 @@ function assertSupportedVersion(version: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// turbineMysql — the public factory
+// turbineMysql, the public factory
 // ---------------------------------------------------------------------------
 
 /** Options for {@link turbineMysql}. Mirrors the relevant {@link TurbineConfig} fields. */
@@ -1086,7 +1128,7 @@ function isMysql2Pool(x: unknown): x is Mysql2Pool {
  * Pass one of:
  *  - a connection string (`'mysql://user:pass@host:3306/db'`),
  *  - a mysql2 connection config object (`{ host, user, password, database }`), or
- *  - an existing mysql2 pool / {@link MysqlPool} (injection — you own its lifecycle,
+ *  - an existing mysql2 pool / {@link MysqlPool} (injection, you own its lifecycle,
  *    `disconnect()` is a no-op, advanced config like SSL lives here).
  *
  * When Turbine builds the pool (string/config), it pins the correct mysql2 flags
@@ -1121,12 +1163,12 @@ export async function turbineMysql(
     });
     // Every NEW physical connection: disable backslash string escaping so the
     // builder's `LIKE … ESCAPE '\'` clause (a single literal backslash) is valid
-    // MySQL — by default MySQL would parse `'\'` as an escaped quote (syntax
+    // MySQL, by default MySQL would parse `'\'` as an escaped quote (syntax
     // error). This also makes string-literal semantics match Postgres. Turbine
     // parameterizes every value, so no behavior depends on backslash escaping.
     //
     // NOTE: even on a `mysql2/promise` pool, the 'connection' event yields the
-    // *raw* (callback-style) connection — its `.query()` returns a non-thenable
+    // *raw* (callback-style) connection, its `.query()` returns a non-thenable
     // `Query`, so `.catch()`/`await` on it throws "result of query that is not a
     // promise". Use the callback form here (fire-and-forget): if the SET fails we
     // fall back to MySQL's default escaping, harmless since every value is a param.

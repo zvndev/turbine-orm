@@ -28,7 +28,7 @@ npm start
 | File | What it is |
 |---|---|
 | `schema.ts` | `defineSchema(...)` source of truth |
-| `index.ts` | Standalone script — opens a `TurbineClient`, runs `db.users.findMany`, prints results |
+| `index.ts` | Standalone script, opens a `TurbineClient`, runs `db.users.findMany`, prints results |
 
 ## Environment variables
 
@@ -38,4 +38,4 @@ npm start
 
 ## Notes
 
-Supabase serves Postgres directly — there is no HTTP fallback. Use the regular `TurbineClient` with `ssl: { rejectUnauthorized: false }` to accept Supabase's managed TLS certificate. For long-running processes use the direct (5432) URL; for serverless functions use the pooled (6543) URL.
+Supabase serves Postgres directly, there is no HTTP fallback. Use the regular `TurbineClient` with `ssl: { rejectUnauthorized: false }` to accept Supabase's managed TLS certificate. For long-running processes use the direct (5432) URL; for serverless functions use the pooled (6543) URL.

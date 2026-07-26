@@ -1,5 +1,5 @@
 /**
- * turbine-orm — temporal write/predicate bind serialization
+ * turbine-orm, temporal write/predicate bind serialization
  *
  * Two distinct problems are covered here, both a JS `Date` bound against a
  * temporal column:
@@ -11,7 +11,7 @@
  *    WHERE path narrow it to the UTC time of day, matching Prisma.
  * 2. ZONE-LESS date / timestamp. The driver serializes a `Date` with the
  *    PROCESS's offset, so in a non-UTC process a `timestamp` column stores the
- *    local calendar fields — and since the read path parses an offset-less
+ *    local calendar fields, and since the read path parses an offset-less
  *    value as UTC, the value does not round-trip. Both paths bind the UTC
  *    components instead.
  *
@@ -32,7 +32,7 @@ import { localDateTimeKind, timeOfDayKind } from '../schema.js';
 import { sqliteDialect } from '../sqlite.js';
 import { makeQuery, mockTable } from './helpers.js';
 
-/** 09:00 UTC — the exact value from the reported failure. */
+/** 09:00 UTC, the exact value from the reported failure. */
 const NINE_AM_UTC = new Date('1970-01-01T09:00:00Z');
 const NINE_AM_UTC_MS = new Date('1970-01-01T09:00:00.250Z');
 const A_TIMESTAMP = new Date('2026-07-25T09:00:00Z');
@@ -179,7 +179,7 @@ describe('createMany: Date on a temporal column', () => {
   it('casts the UNNEST array to the column type, not text[]', () => {
     // The bug: PG_TO_ARRAY had no `time` entry, so this emitted `$1::text[]`
     // and Postgres answered `42804 column "time" is of type time without time
-    // zone but expression is of type text` — the params were already correct.
+    // zone but expression is of type text`, the params were already correct.
     const d = q().buildCreateMany({
       data: [
         { time: NINE_AM_UTC, createdAt: A_TIMESTAMP },
@@ -216,7 +216,7 @@ describe('update: Date on a time column', () => {
 
   it('binds it the same way on a warmed SQL-cache hit', () => {
     // The params of a cache HIT come from collectSetParams, a separate walker
-    // from buildSetClause — both must narrow, or the second call regresses.
+    // from buildSetClause, both must narrow, or the second call regresses.
     const qi = q();
     qi.buildUpdate({ where: { id: 7 }, data: { time: NINE_AM_UTC } });
     const d = qi.buildUpdate({ where: { id: 8 }, data: { time: NINE_AM_UTC } });
@@ -369,7 +369,7 @@ describe('where: Date on a temporal column', () => {
     assert.equal(second.sql, first.sql);
   });
 
-  it('is a value transform only — the SQL is unchanged by the rewrite', () => {
+  it('is a value transform only, the SQL is unchanged by the rewrite', () => {
     const withDate = q().buildFindMany({ where: { time: NINE_AM_UTC } });
     const withString = q().buildFindMany({ where: { time: '09:00:00' } });
     assert.equal(withDate.sql, withString.sql);

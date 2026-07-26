@@ -1,12 +1,12 @@
 /**
- * turbine-orm — Unlimited findMany warning tests
+ * turbine-orm, Unlimited findMany warning tests
  *
  * Verifies TASK-2.3: calling `findMany()` without an explicit `limit`/`take`
  * triggers a one-time `console.warn` per table. The warning is on by default
  * (`warnOnUnlimited` defaults to `true`) and can be silenced by passing
  * `warnOnUnlimited: false` in the QueryInterface options.
  *
- * Build-only tests — uses a stub pool that resolves with an empty result so
+ * Build-only tests, uses a stub pool that resolves with an empty result so
  * `findMany()` can be invoked without a real database.
  */
 
@@ -87,7 +87,7 @@ describe('findMany unlimited-query warning', () => {
     assert.equal(unlimitedOnly(warnings).length, 0);
   });
 
-  it('dedupes — warns at most once per table per QueryInterface', async () => {
+  it('dedupes, warns at most once per table per QueryInterface', async () => {
     const q = new QueryInterface(stubPool(), 'users', buildSchema());
     const warnings = await captureWarnings(async () => {
       await q.findMany();
@@ -159,13 +159,13 @@ describe('findMany unlimited-query warning', () => {
 });
 
 // ---------------------------------------------------------------------------
-// N-6 — per-table map accepts BOTH key forms (snake_case table name AND
+// N-6, per-table map accepts BOTH key forms (snake_case table name AND
 // camelCase accessor). Client accessors are camelCase (db.userProfiles), so
 // accessor-keyed maps silently no-oped when the map was matched against the
 // snake_case table name only.
 // ---------------------------------------------------------------------------
 
-describe('findMany unlimited-query warning — multi-word table key forms (N-6)', () => {
+describe('findMany unlimited-query warning, multi-word table key forms (N-6)', () => {
   function multiWordSchema(): SchemaMetadata {
     const tables: Record<string, TableMetadata> = {};
     tables.user_profiles = mockTable('user_profiles', [

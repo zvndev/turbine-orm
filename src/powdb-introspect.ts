@@ -1,5 +1,5 @@
 /**
- * turbine-orm/powdb — `describe`-based introspection.
+ * turbine-orm/powdb, `describe`-based introspection.
  *
  * PowDB exposes its catalog through two ordinary rows-returning statements
  * (keywords since engine 0.10):

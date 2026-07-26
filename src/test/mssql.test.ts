@@ -1,5 +1,5 @@
 /**
- * turbine-orm/mssql — two-tier tests.
+ * turbine-orm/mssql, two-tier tests.
  *
  *  1. **Build-only + mock-driver** (this lane, `test:unit`, NO DB): assert the
  *     real `mssqlDialect` emits SQL Server SQL with zero Postgres-token leakage
@@ -29,7 +29,7 @@ import type { RelationDef, SchemaMetadata } from '../schema.js';
 import { mockTable, skipGate } from './helpers.js';
 
 // ===========================================================================
-// Tier 1a — build-only conformance (real mssqlDialect, no DB)
+// Tier 1a, build-only conformance (real mssqlDialect, no DB)
 // ===========================================================================
 
 const usersTable = mockTable(
@@ -83,7 +83,7 @@ function q(): QueryInterface<Record<string, unknown>> {
 const FORBIDDEN =
   /json_agg|json_build_object|::json|::int|::float|ILIKE|\$\d|"users"|"posts"|`users`|`posts`|RETURNING|ON CONFLICT|UNNEST|= ANY|!= ALL|\bLIMIT\b/;
 
-describe('turbine-orm/mssql — dialect conformance (no Postgres leakage)', () => {
+describe('turbine-orm/mssql, dialect conformance (no Postgres leakage)', () => {
   it('placeholders are NAMED @pN (not positional ? or $N) and identifiers are bracketed', () => {
     const sql = q().buildFindMany({ where: { id: 1 }, limit: 1 }).sql;
     assert.match(sql, /@p\d/, 'must use named @pN placeholders');
@@ -283,7 +283,7 @@ describe('turbine-orm/mssql — dialect conformance (no Postgres leakage)', () =
 });
 
 // ===========================================================================
-// Tier 1b — mock-driver: prove the real MssqlPool binds @pN inputs and the
+// Tier 1b, mock-driver: prove the real MssqlPool binds @pN inputs and the
 // 'output' result strategy returns the row from OUTPUT INSERTED.* in ONE
 // statement (no SQL Server server needed).
 // ===========================================================================
@@ -373,7 +373,7 @@ function mssqlQuery(pool: MssqlPool): QueryInterface<Record<string, unknown>> {
   );
 }
 
-describe('turbine-orm/mssql — MssqlPool binds @pN inputs', () => {
+describe('turbine-orm/mssql, MssqlPool binds @pN inputs', () => {
   it('binds positional params into request.input(pN, value) by name', async () => {
     const { pool, sqlNS, calls } = fakeMssql({ rowsFor: () => [{ id: 5 }] });
     const mp = new MssqlPool(pool, sqlNS);
@@ -407,7 +407,7 @@ describe('turbine-orm/mssql — MssqlPool binds @pN inputs', () => {
   });
 });
 
-describe('turbine-orm/mssql — output result strategy (mock driver)', () => {
+describe('turbine-orm/mssql, output result strategy (mock driver)', () => {
   it('create: single INSERT … OUTPUT INSERTED.* returns the row in ONE statement (no reselect)', async () => {
     const { pool, sqlNS, calls } = fakeMssql({
       rowsFor: (sql) => (/^INSERT/.test(sql) ? [{ id: 7, name: 'Grace' }] : []),
@@ -476,10 +476,10 @@ describe('turbine-orm/mssql — output result strategy (mock driver)', () => {
 });
 
 // ===========================================================================
-// Tier 1c — introspector (mock executor)
+// Tier 1c, introspector (mock executor)
 // ===========================================================================
 
-describe('turbine-orm/mssql — introspector (mock executor)', () => {
+describe('turbine-orm/mssql, introspector (mock executor)', () => {
   it('maps INFORMATION_SCHEMA + sys.* rows into SchemaMetadata (columns, PK, FK relations, m2m, indexes)', async () => {
     const exec: MssqlRowExecutor = async (sql) => {
       if (/INFORMATION_SCHEMA\.TABLES/.test(sql))
@@ -582,7 +582,7 @@ function idx(t: string, name: string, isUnique: number, c: string, seq: number) 
 }
 
 // ===========================================================================
-// Tier 2 — real integration tests (gated on MSSQL_URL)
+// Tier 2, real integration tests (gated on MSSQL_URL)
 // ===========================================================================
 
 const MSSQL_URL = process.env.MSSQL_URL ?? process.env.MSSQL_TEST_URL ?? '';
@@ -695,7 +695,7 @@ interface PostRow {
   tags?: { id: number; name: string }[];
 }
 
-describe('turbine-orm/mssql — integration (real SQL Server)', () => {
+describe('turbine-orm/mssql, integration (real SQL Server)', () => {
   // biome-ignore lint/suspicious/noExplicitAny: mssql pool loaded dynamically only when gated on.
   let rawPool: any;
   let pool: MssqlPool;
@@ -704,7 +704,7 @@ describe('turbine-orm/mssql — integration (real SQL Server)', () => {
   let dbSchema: SchemaMetadata;
 
   gate.before(async () => {
-    // `mssql` ships no bundled types — widen the specifier so tsc treats it as
+    // `mssql` ships no bundled types, widen the specifier so tsc treats it as
     // `any` (TS7016) without @types/mssql. This path only runs when gated on.
     const mssqlSpecifier: string = 'mssql';
     // biome-ignore lint/suspicious/noExplicitAny: dynamic mssql import only on the gated path

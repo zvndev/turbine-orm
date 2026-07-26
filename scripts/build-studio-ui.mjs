@@ -39,7 +39,7 @@ try {
   if (err && err.code === 'ENOENT') {
     console.error(`build-studio-ui: source file not found at ${inputPath}`);
     console.error('The designer-authored Studio HTML must exist before the build step runs.');
-    console.error('If you are building from a published tarball, this script should not run —');
+    console.error('If you are building from a published tarball, this script should not run, ');
     console.error('the generated file is shipped pre-built. Run from a git checkout instead.');
     process.exit(1);
   }

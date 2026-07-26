@@ -1,5 +1,5 @@
 /**
- * turbine-orm — dogfood demo
+ * turbine-orm, dogfood demo
  *
  * Exercises every feature shipped in the v0.18 line end-to-end against a real
  * Postgres, so you can SEE them work (not just read tests):
@@ -29,8 +29,8 @@ import { TurbineClient } from '../src/client.js';
 const DATABASE_URL =
   process.env.DATABASE_URL ?? 'postgres://macbookpro-kirby@localhost:5432/turbine_demo';
 
-const ok = (label: string, detail = '') => console.log(`  \x1b[32m✓\x1b[0m ${label}${detail ? ` — ${detail}` : ''}`);
-const skip = (label: string, why: string) => console.log(`  \x1b[33m- ${label} — skipped (${why})\x1b[0m`);
+const ok = (label: string, detail = '') => console.log(`  \x1b[32m✓\x1b[0m ${label}${detail ? `, ${detail}` : ''}`);
+const skip = (label: string, why: string) => console.log(`  \x1b[33m- ${label}, skipped (${why})\x1b[0m`);
 const head = (s: string) => console.log(`\n\x1b[1m${s}\x1b[0m`);
 
 async function setupSchema(): Promise<boolean> {
@@ -85,7 +85,7 @@ async function setupSchema(): Promise<boolean> {
         ('a','[1,0,0]'),('b','[0,1,0]'),('c','[0.9,0.1,0]'),('d','[0,0,1]')`);
       hasVector = true;
     } catch {
-      /* pgvector not installed — demo will skip the vector section */
+      /* pgvector not installed, demo will skip the vector section */
     }
   } finally {
     await c.end();

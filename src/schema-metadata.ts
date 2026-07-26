@@ -1,9 +1,9 @@
 /**
- * turbine-orm — defineSchema() → SchemaMetadata bridge
+ * turbine-orm, defineSchema() → SchemaMetadata bridge
  *
  * Converts a code-first {@link SchemaDef} (the output of `defineSchema()`)
  * into the runtime {@link SchemaMetadata} shape that the query builder,
- * `TurbineClient`, and the non-SQL engines consume — without touching a
+ * `TurbineClient`, and the non-SQL engines consume, without touching a
  * live database.
  *
  * Why this exists: the historical converter path (`introspect()` +
@@ -104,7 +104,7 @@ function udtName(config: ColumnConfig): string {
   return DDL_TO_UDT[config.type];
 }
 
-/** Server-generated (sequence-backed) types — pg's `nextval(...)` default. */
+/** Server-generated (sequence-backed) types, pg's `nextval(...)` default. */
 function isSerialType(type: ColumnType): boolean {
   return type === 'SERIAL' || type === 'BIGSERIAL';
 }
@@ -133,7 +133,7 @@ interface ResolvedFk {
 
 /**
  * Resolve the raw column part of a `references: 'table.column'` target to a
- * snake_case column name — accepting either the camelCase field name or the
+ * snake_case column name, accepting either the camelCase field name or the
  * snake_case DDL name, mirroring how schema-sql.ts accepts both table forms.
  */
 function resolveColumnName(raw: string, target: ResolvedTable | undefined): string {
@@ -216,7 +216,7 @@ function mapIndexes(tableDef: TableDef, declared: readonly SchemaIndexDef[] | un
 /**
  * Convert a code-first {@link SchemaDef} into runtime {@link SchemaMetadata}.
  *
- * Pure function — no database connection, no side effects, input untouched.
+ * Pure function, no database connection, no side effects, input untouched.
  * The output is shaped identically to the `SCHEMA` constant `turbine generate`
  * emits from introspection, so it can be handed to any consumer that expects
  * introspected metadata: `new TurbineClient(config, metadata)`,
@@ -250,7 +250,7 @@ function mapIndexes(tableDef: TableDef, declared: readonly SchemaIndexDef[] | un
 export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
   // ----- Pass 1: resolve every table's snake_case names for FK lookups -----
   // Lookup accepts the accessor key (camelCase), the DDL name (snake_case),
-  // and the explicit `accessor` field — same tolerance as schema-sql.ts.
+  // and the explicit `accessor` field, same tolerance as schema-sql.ts.
   const lookup = new Map<string, ResolvedTable>();
   for (const [key, tableDef] of Object.entries(def.tables)) {
     const fieldToColumn = new Map<string, string>();
@@ -274,7 +274,7 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
       const parts = config.referencesTarget.split('.');
       if (parts.length !== 2) continue;
       const target = lookup.get(parts[0]!);
-      // Reference to a table outside this SchemaDef — skip, exactly like
+      // Reference to a table outside this SchemaDef, skip, exactly like
       // introspection skips FKs whose target is excluded from the table set.
       if (!target) continue;
       foreignKeys.push({
@@ -296,14 +296,14 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
   // catalog: legacy-first naming, per-column disambiguation for several FKs to
   // the same target, and collision resolution against scalar column fields
   // (json/jsonb `unknown`-typed shadows keep the historical name). The old
-  // local reimplementation had NO collision guard — `posts.user` (text) +
+  // local reimplementation had NO collision guard, `posts.user` (text) +
   // `userId references users.id` produced a relation `user` that shadowed the
   // scalar, and two FKs deriving the same name silently clobbered each other
   // (N-4).
   //
   // Constraint names are synthesized in pg's default `<table>_<column>_fkey`
   // form; they only feed the referential-action lookup and composite-FK
-  // naming (never hit here — `references:` is single-column by design).
+  // naming (never hit here, `references:` is single-column by design).
   const fkEntries: ForeignKeyEntry[] = [];
   const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
   for (const fk of foreignKeys) {

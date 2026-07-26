@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Turbine ORM — Next.js Example',
+  title: 'Turbine ORM, Next.js Example',
   description: 'Postgres-native TypeScript ORM with single-query nested relations',
 };
 

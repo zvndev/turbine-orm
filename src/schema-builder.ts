@@ -1,8 +1,8 @@
 /**
- * turbine-orm — Schema Builder
+ * turbine-orm, Schema Builder
  *
  * TypeScript-first schema definition API. Define your database schema
- * as plain objects — no method chaining, no DSL. Fully type-checked,
+ * as plain objects, no method chaining, no DSL. Fully type-checked,
  * JSON-serializable, and easy to read.
  *
  * @example
@@ -23,7 +23,7 @@
  * ```
  */
 
-// Type-only import — erased at runtime, so it cannot introduce a circular
+// Type-only import, erased at runtime, so it cannot introduce a circular
 // runtime dependency (the local `camelToSnakeLocal` copy avoids that for the
 // value-level helper).
 import type { ReferentialAction, RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
@@ -31,13 +31,13 @@ import type { ReferentialAction, RelationDef, SchemaMetadata, TableMetadata } fr
 export type { ReferentialAction } from './schema.js';
 
 // ---------------------------------------------------------------------------
-// Column types — lowercase shorthand mapped to Postgres types
+// Column types, lowercase shorthand mapped to Postgres types
 // ---------------------------------------------------------------------------
 
 /** Shorthand type names that map to Postgres column types */
 export type ColumnTypeName =
-  | 'serial' // SERIAL (int4) — auto-increment PK that stays a JS `number`
-  | 'bigserial' // BIGSERIAL (int8) — 64-bit auto-increment; large values read back as string
+  | 'serial' // SERIAL (int4), auto-increment PK that stays a JS `number`
+  | 'bigserial' // BIGSERIAL (int8), 64-bit auto-increment; large values read back as string
   | 'bigint' // BIGINT
   | 'integer' // INTEGER
   | 'smallint' // SMALLINT
@@ -60,7 +60,7 @@ export type ColumnTypeName =
 /** Maps shorthand names to actual Postgres type strings */
 const TYPE_MAP: Record<ColumnTypeName, string> = {
   // `serial` maps to SERIAL (int4). Its values fit in a JS `number` and pg
-  // returns them as numbers — so the generated `number` type is accurate.
+  // returns them as numbers, so the generated `number` type is accurate.
   // For 64-bit auto-increment keys use `bigserial` (int8), noting that values
   // above Number.MAX_SAFE_INTEGER read back as string. (Changed in 0.24.0;
   // `serial` previously emitted BIGSERIAL.)
@@ -72,7 +72,7 @@ const TYPE_MAP: Record<ColumnTypeName, string> = {
   text: 'TEXT',
   varchar: 'VARCHAR',
   boolean: 'BOOLEAN',
-  // `timestamp` is an honest alias for TIMESTAMPTZ (timezone-aware) — Turbine
+  // `timestamp` is an honest alias for TIMESTAMPTZ (timezone-aware), Turbine
   // has always emitted TIMESTAMPTZ for it. `timestamptz` is the explicit spelling.
   timestamp: 'TIMESTAMPTZ',
   timestamptz: 'TIMESTAMPTZ',
@@ -86,14 +86,14 @@ const TYPE_MAP: Record<ColumnTypeName, string> = {
   double: 'DOUBLE PRECISION',
   numeric: 'NUMERIC',
   bytea: 'BYTEA',
-  // Sentinels — the real DDL type is derived from `enumName` / `dimensions`
+  // Sentinels, the real DDL type is derived from `enumName` / `dimensions`
   // in schema-sql.ts, never from these placeholders.
   enum: 'ENUM',
   vector: 'VECTOR',
 };
 
 // ---------------------------------------------------------------------------
-// Column definition — the user-facing type
+// Column definition, the user-facing type
 // ---------------------------------------------------------------------------
 
 /** Foreign key reference with optional referential actions. */
@@ -127,9 +127,9 @@ export interface ColumnDef {
   references?: string | ReferenceDef;
   /** Max length for varchar columns */
   maxLength?: number;
-  /** Enum type name — required when `type: 'enum'`. */
+  /** Enum type name, required when `type: 'enum'`. */
   enumName?: string;
-  /** pgvector dimension count — required when `type: 'vector'`. */
+  /** pgvector dimension count, required when `type: 'vector'`. */
   dimensions?: number;
   /** When true, the column is an array of `type` (e.g. `text[]`). */
   array?: boolean;
@@ -144,10 +144,17 @@ export interface ColumnDef {
    * `includePii: true`) and redacted by Studio. Introspection never auto-tags PII.
    */
   pii?: boolean;
+  /**
+   * Set this column to the current time on every `update` that does not name
+   * it explicitly (Prisma's `@updatedAt`). Opt-in per column and never
+   * inferred from the column name: see
+   * {@link import('./schema.js').ColumnMetadata.updatedAt}.
+   */
+  updatedAt?: boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Internal ColumnConfig — used by schema-sql.ts
+// Internal ColumnConfig, used by schema-sql.ts
 // ---------------------------------------------------------------------------
 
 /** Postgres-level column type (uppercase, as used in DDL) */
@@ -194,6 +201,8 @@ export interface ColumnConfig {
   check: string | null;
   /** Whether this column is tagged as PII (personally identifiable information). */
   pii: boolean;
+  /** Whether this column is auto-set to the current time on update. */
+  updatedAt: boolean;
 }
 
 /** Convert a user-facing ColumnDef to the internal ColumnConfig */
@@ -236,6 +245,7 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
     isArray: def.array ?? false,
     check: def.check ?? null,
     pii: def.pii ?? false,
+    updatedAt: def.updatedAt ?? false,
   };
 }
 
@@ -248,7 +258,7 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
  *
  * Auto-detecting m2m from a junction table is intentionally conservative (a
  * junction with payload columns is treated as a first-class entity, not a join
- * table — see `introspect.ts`). This declaration lets users opt in to an m2m
+ * table, see `introspect.ts`). This declaration lets users opt in to an m2m
  * relation explicitly, mirroring how Prisma/Drizzle require an explicit
  * `@relation` / `relation()` for join tables.
  *
@@ -347,7 +357,7 @@ export interface TableDef {
   /**
    * Optional composite primary key. When present, takes precedence over any
    * column-level `primaryKey: true` flags. Column names listed here are the
-   * camelCase JS-facing field names — they will be converted to snake_case
+   * camelCase JS-facing field names, they will be converted to snake_case
    * when emitted as a `PRIMARY KEY (...)` table constraint.
    */
   primaryKey?: readonly string[];
@@ -514,7 +524,7 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
 
       // Validate composite PK references real columns and clear column-level PKs
       // for those columns so we don't double-emit `PRIMARY KEY` clauses.
-      // Composite PK members are implicitly NOT NULL — preserve that even
+      // Composite PK members are implicitly NOT NULL, preserve that even
       // when the user clears the column-level `primaryKey: true` flag.
       if (pk && pk.length > 0) {
         for (const colName of pk) {
@@ -525,7 +535,7 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
             );
           }
           // A composite PK at the table level supersedes any column-level
-          // `primaryKey: true` flag — silently clear it so DDL emission
+          // `primaryKey: true` flag, silently clear it so DDL emission
           // produces a single, valid table-level PRIMARY KEY constraint.
           // Force NOT NULL since PK columns can never be nullable.
           const c = columns[colName];
@@ -560,7 +570,7 @@ function camelToSnakeLocal(s: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy compat — ColumnBuilder still works for existing code
+// Legacy compat, ColumnBuilder still works for existing code
 // ---------------------------------------------------------------------------
 
 export class ColumnBuilder {
@@ -583,6 +593,7 @@ export class ColumnBuilder {
       isArray: false,
       check: null,
       pii: false,
+      updatedAt: false,
     };
   }
 
@@ -695,6 +706,11 @@ export class ColumnBuilder {
     this._config.pii = true;
     return this;
   }
+  /** Auto-set this column to the current time on every update. Prisma's `@updatedAt`. */
+  updatedAt(): this {
+    this._config.updatedAt = true;
+    return this;
+  }
   array(): this {
     this._config.isArray = true;
     return this;
@@ -727,7 +743,7 @@ type ColumnProxy = {
     | 'bytea']: () => ColumnBuilder;
 } & { varchar: (length: number) => ColumnBuilder };
 
-/** Nullary (no-arg) type methods on ColumnBuilder — everything except varchar */
+/** Nullary (no-arg) type methods on ColumnBuilder, everything except varchar */
 type NullaryColumnType = Exclude<keyof ColumnProxy, 'varchar'>;
 
 /** Type guard: is `prop` a known nullary ColumnBuilder type method? */
@@ -789,7 +805,7 @@ export function table(columns: Record<string, ColumnBuilder>): TableDef {
  *
  * This is the runtime bridge for the code-first m2m API: `defineSchema` only
  * produces DDL, so after `introspect()`ing the live database you call this to
- * attach the m2m relations you declared. It is PURELY ADDITIVE — existing
+ * attach the m2m relations you declared. It is PURELY ADDITIVE, existing
  * belongsTo/hasMany/hasOne relations are preserved, and a declared relation is
  * skipped (not overwritten) if its name already exists on the source table.
  *
@@ -827,7 +843,7 @@ export function applyManyToManyRelations(meta: SchemaMetadata, def: SchemaDef): 
     if (!tableDef.manyToMany || tableDef.manyToMany.length === 0) continue;
     const sourceTable = tableDef.name;
     const sourceMeta = tables[sourceTable];
-    if (!sourceMeta) continue; // table not present in introspected metadata — skip
+    if (!sourceMeta) continue; // table not present in introspected metadata, skip
 
     const relations: Record<string, RelationDef> = { ...sourceMeta.relations };
     for (const m of tableDef.manyToMany) {

@@ -8,7 +8,7 @@ Most query layers are designed for the shape of a laptop database: empty, dispos
 npm install turbine-orm
 ```
 
-**Full docs: [turbineorm.dev](https://turbineorm.dev)** — [Quick Start](https://turbineorm.dev/quickstart) · [API Reference](https://turbineorm.dev/queries) · [Relations](https://turbineorm.dev/relations) · [Transactions & Pipelines](https://turbineorm.dev/transactions) · [Serverless & Edge](https://turbineorm.dev/serverless) · [Typed Errors](https://turbineorm.dev/errors) · [Benchmarks](https://turbineorm.dev/benchmarks)
+**Full docs: [turbineorm.dev](https://turbineorm.dev)**, [Quick Start](https://turbineorm.dev/quickstart) · [API Reference](https://turbineorm.dev/queries) · [Relations](https://turbineorm.dev/relations) · [Transactions & Pipelines](https://turbineorm.dev/transactions) · [Serverless & Edge](https://turbineorm.dev/serverless) · [Typed Errors](https://turbineorm.dev/errors) · [Benchmarks](https://turbineorm.dev/benchmarks)
 
 ## Why Turbine?
 
@@ -151,7 +151,7 @@ const user = await db.users.findUnique({
 
 ### Many-to-many relations
 
-Turbine auto-detects pure junction tables during `generate` — a table whose primary key is exactly two single-column foreign keys and which carries no other columns (e.g. `posts_tags(post_id, tag_id)`). Both endpoints gain a many-to-many relation you can load like any other:
+Turbine auto-detects pure junction tables during `generate`, a table whose primary key is exactly two single-column foreign keys and which carries no other columns (e.g. `posts_tags(post_id, tag_id)`). Both endpoints gain a many-to-many relation you can load like any other:
 
 ```typescript
 const posts = await db.posts.findMany({
@@ -165,7 +165,7 @@ const post = await db.posts.findFirst({
 });
 ```
 
-A junction table that carries extra columns (a "payload") is treated as a first-class entity, so it stays an ordinary `hasMany` — that's by design. For those, or for any junction you want to wire up by hand, declare the relation explicitly in your code-first schema:
+A junction table that carries extra columns (a "payload") is treated as a first-class entity, so it stays an ordinary `hasMany`. That's by design. For those, or for any junction you want to wire up by hand, declare the relation explicitly in your code-first schema:
 
 ```typescript
 import { defineSchema } from 'turbine-orm';
@@ -205,7 +205,7 @@ The other nested operations (`create`, `connectOrCreate`, `update`, `upsert`, `d
 
 ### Self-relations
 
-A self-referencing foreign key (e.g. `categories.parent_id → categories.id`) introspects to a `belongsTo` *and* a `hasMany` on the same table, so parent and child queries just work — including nested trees:
+A self-referencing foreign key (e.g. `categories.parent_id → categories.id`) introspects to a `belongsTo` *and* a `hasMany` on the same table, so parent and child queries just work, including nested trees:
 
 ```typescript
 // A category with its parent and its children
@@ -267,7 +267,7 @@ const deleted = await db.users.delete({
 For race-free counter updates, pass an operator object instead of a literal. Turbine generates `col = col + $n` style SQL so concurrent updates are safe.
 
 ```typescript
-// Atomic increment — no read-modify-write race
+// Atomic increment, no read-modify-write race
 await db.posts.update({
   where: { id: 1 },
   data: { viewCount: { increment: 1 } },
@@ -325,7 +325,7 @@ const stats = await db.raw<{ day: Date; count: number }>`
 
 ### Typed raw SQL (`db.sql<T>`)
 
-`db.sql<T>` is the typed escape hatch: you supply the row shape and get a thenable query with `.one()` and `.scalar()` helpers. Every `${value}` is bound as a `$N` parameter — never interpolated — so injection isn't possible even with hostile input.
+`db.sql<T>` is the typed escape hatch: you supply the row shape and get a thenable query with `.one()` and `.scalar()` helpers. Every `${value}` is bound as a `$N` parameter, never interpolated, so injection isn't possible even with hostile input.
 
 ```typescript
 // Awaiting the query returns T[]
@@ -360,7 +360,7 @@ const users = await db.users.findMany({
 ### Streaming large result sets
 
 ```typescript
-// Stream rows using PostgreSQL cursors — constant memory, no matter how many rows
+// Stream rows using PostgreSQL cursors, constant memory, no matter how many rows
 for await (const user of db.users.findManyStream({
   where: { orgId: 1 },
   batchSize: 500,       // internal FETCH batch size (default: 1000)
@@ -371,7 +371,7 @@ for await (const user of db.users.findManyStream({
 }
 ```
 
-Uses `DECLARE CURSOR` under the hood — rows are fetched in batches on a dedicated connection, parsed individually, and yielded via `AsyncGenerator`. Safe to `break` early; the cursor and connection are cleaned up automatically.
+Uses `DECLARE CURSOR` under the hood, rows are fetched in batches on a dedicated connection, parsed individually, and yielded via `AsyncGenerator`. Safe to `break` early; the cursor and connection are cleaned up automatically.
 
 ### Query timeout
 
@@ -406,17 +406,17 @@ const db = turbine({
   // relation). Override per query on findMany/findFirst/findUnique.
   relationLoadStrategy: 'auto',
   // 'positional' (Postgres-only) drops repeated JSON keys from relation
-  // subqueries — ~39% fewer wire bytes on wide relations, byte-identical output.
+  // subqueries, ~39% fewer wire bytes on wide relations, byte-identical output.
   // Default 'object'.
   jsonEncoding: 'object',
-  // Parse `timestamp` (without time zone) as UTC — the Prisma/Rails/Django
-  // convention — so results don't shift with the server's local zone.
+  // Parse `timestamp` (without time zone) as UTC, the Prisma/Rails/Django
+  // convention, so results don't shift with the server's local zone.
   // Default true; set false for the legacy local-time interpretation.
   utcTimestamps: true,
 });
 ```
 
-Run `npx turbine doctor` to catch relations whose child-side FK lacks a covering index — the correlated-subquery strategy probes the child once per parent row, so a missing FK index costs a full scan per parent.
+Run `npx turbine doctor` to catch relations whose child-side FK lacks a covering index, the correlated-subquery strategy probes the child once per parent row, so a missing FK index costs a full scan per parent.
 
 ### Pool and statement configuration
 
@@ -467,7 +467,7 @@ Use `db.pipeline(...)` when the queries are independent and you want one round-t
 
 ### Middleware
 
-Middleware wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()` — but it cannot change the query itself.
+Middleware wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()`, but it cannot change the query itself.
 
 ```typescript
 // Query timing
@@ -478,7 +478,7 @@ db.$use(async (params, next) => {
   return result;
 });
 
-// Result transformation — redact a field on the way out
+// Result transformation, redact a field on the way out
 db.$use(async (params, next) => {
   const result = await next(params);
   if (params.model === 'users' && Array.isArray(result)) {
@@ -488,7 +488,7 @@ db.$use(async (params, next) => {
 });
 ```
 
-> **Warning:** `params.args` is a read-only snapshot — mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
+> **Warning:** `params.args` is a read-only snapshot, mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
 
 Middleware can't rewrite queries, so cross-cutting predicates like **soft deletes** and **multi-tenancy** belong to [global filters](https://turbineorm.dev/global-filters) instead. A global filter is a `WhereClause` that Turbine `AND`-merges into the compiled `WHERE` of every query on a table: reads, the relation subqueries that target it, and the predicate of `update` / `delete` / `upsert`. `create` and `createMany` are never filtered, since a new row has nothing to scope.
 
@@ -598,13 +598,13 @@ await db.$notify('order_created', JSON.stringify({ id: 1 }));
 await sub.unsubscribe();
 ```
 
-`$listen` holds a dedicated connection open for the lifetime of the subscription, so it requires a real persistent pool — it is not available over serverless HTTP drivers. `$notify` is a single round-trip and works everywhere. Channel names are validated as plain identifiers; the payload is always bound as a parameter.
+`$listen` holds a dedicated connection open for the lifetime of the subscription, so it requires a real persistent pool. It is not available over serverless HTTP drivers. `$notify` is a single round-trip and works everywhere. Channel names are validated as plain identifiers; the payload is always bound as a parameter.
 
 ## Vector search (pgvector)
 
 Query a `vector` column for nearest neighbors. Requires the [pgvector](https://github.com/pgvector/pgvector) extension and a `vector` column on your table.
 
-**KNN ranking** — order by distance to a query vector and take the closest rows:
+**KNN ranking**, order by distance to a query vector and take the closest rows:
 
 ```typescript
 const similar = await db.items.findMany({
@@ -614,7 +614,7 @@ const similar = await db.items.findMany({
 // queryVector is a number[]; nearest-first by default (direction: 'desc' to invert)
 ```
 
-**Distance filter** — keep only rows within a distance threshold:
+**Distance filter**, keep only rows within a distance threshold:
 
 ```typescript
 const close = await db.items.findMany({
@@ -622,7 +622,7 @@ const close = await db.items.findMany({
 });
 ```
 
-`metric` selects the pgvector operator: `'l2'` → `<->` (Euclidean), `'cosine'` → `<=>` (cosine distance), `'ip'` → `<#>` (negative inner product). Distance filters accept `lt`, `lte`, `gt`, and `gte`. The query vector is always bound as `$n::vector` — never interpolated.
+`metric` selects the pgvector operator: `'l2'` → `<->` (Euclidean), `'cosine'` → `<=>` (cosine distance), `'ip'` → `<#>` (negative inner product). Distance filters accept `lt`, `lte`, `gt`, and `gte`. The query vector is always bound as `$n::vector`, never interpolated.
 
 > **Note:** pg has no built-in parser for the `vector` type, so a fetched `vector` column comes back as a string literal like `'[1,2,3]'` unless you register a parser (e.g. via pgvector's own client helpers). Querying by distance works regardless.
 
@@ -663,7 +663,7 @@ Every operator supported by the `where` clause. Operators compose freely with `A
 | `endsWith` | Suffix match (`LIKE %v`) | `where: { email: { endsWith: '@acme.com' } }` |
 | `mode: 'insensitive'` | Switch any string operator to `ILIKE` | `where: { title: { contains: 'SQL', mode: 'insensitive' } }` |
 
-LIKE wildcards in user input are escaped automatically — `%`, `_`, and `\` are treated as literals.
+LIKE wildcards in user input are escaped automatically, `%`, `_`, and `\` are treated as literals.
 
 ### Relation filters
 
@@ -780,8 +780,8 @@ npx turbine migrate status
 ```
 
 **Destructive migrations require explicit confirmation.** If a pending migration (or a DOWN
-section being rolled back) contains data-destroying SQL — `DROP TABLE`, `DROP COLUMN`,
-`TRUNCATE`, `DELETE FROM`, `UPDATE` without `WHERE`, `ALTER COLUMN … TYPE` — Turbine refuses
+section being rolled back) contains data-destroying SQL, `DROP TABLE`, `DROP COLUMN`,
+`TRUNCATE`, `DELETE FROM`, `UPDATE` without `WHERE`, `ALTER COLUMN … TYPE`, Turbine refuses
 to run it and prints an itemized report. Interactively you must type `destroy my data` and
 then `yes`; in CI you must pass `--allow-destructive`. A refused batch applies nothing.
 
@@ -800,8 +800,8 @@ npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 **Features**
 
 - **Query / Data / Schema tabs.** Compose queries visually, browse rows, and inspect tables and relations.
-- **ORM-native query composer.** The Query tab builds a real `findMany` — drill into relations (`with`) to any depth, pick fields (`select`/`omit`), add filters (`where`), `orderBy`, and `limit` at every level — with a live TypeScript preview of the exact call to copy into your codebase.
-- **Saved queries.** Named builder queries persisted to `.turbine/studio-queries.json` — share them across runs without committing them.
+- **ORM-native query composer.** The Query tab builds a real `findMany`, drill into relations (`with`) to any depth, pick fields (`select`/`omit`), add filters (`where`), `orderBy`, and `limit` at every level, with a live TypeScript preview of the exact call to copy into your codebase.
+- **Saved queries.** Named builder queries persisted to `.turbine/studio-queries.json`, share them across runs without committing them.
 - **Cmd+K command palette.** Jump to any table, tab, or saved query in one keystroke.
 - **Full-text search across rows.** The Data tab supports substring search across every text column of the current table.
 - **PII redaction.** Columns tagged `pii: true` in the schema render as a redaction placeholder in every tab. `--show-pii` reveals them, with a loud startup warning. Tags are a code-first declaration (introspection never infers one), so Studio reads them from the generated metadata in your `out` directory; if it finds none it says so at startup rather than implying a protection it cannot apply.
@@ -817,22 +817,22 @@ npx turbine studio --port 5173 --host 127.0.0.1 --no-open
 
 ## Observability
 
-Built-in query metrics with zero new dependencies. `$observe` buffers per-query timings in memory and flushes **per-minute aggregates** — count, avg, p50, p95, p99, and error count per `model:action` — to a `_turbine_metrics` table in a **separate database**, over its own 1-connection pool so metrics writes never contend with your application pool.
+Built-in query metrics with zero new dependencies. `$observe` buffers per-query timings in memory and flushes **per-minute aggregates**, count, avg, p50, p95, p99, and error count per `model:action`, to a `_turbine_metrics` table in a **separate database**, over its own 1-connection pool so metrics writes never contend with your application pool.
 
 ```typescript
 const handle = await db.$observe({
   connectionString: process.env.TURBINE_OBSERVE_URL!, // metrics DB (not your app DB)
   flushIntervalMs: 60_000, // default: 60s
-  retentionDays: 30,       // default: 30 — older buckets are pruned on flush
+  retentionDays: 30,       // default: 30, older buckets are pruned on flush
 });
 
 // Later, to flush remaining metrics and close the metrics pool
 await handle.stop();
 ```
 
-`$observe` creates the `_turbine_metrics` table if it doesn't exist. Flushes are fire-and-forget (`INSERT ... ON CONFLICT` additive merge) and never throw into your application. If the `TURBINE_OBSERVE_URL` environment variable is set, the client starts observing automatically on construction — no code needed.
+`$observe` creates the `_turbine_metrics` table if it doesn't exist. Flushes are fire-and-forget (`INSERT ... ON CONFLICT` additive merge) and never throw into your application. If the `TURBINE_OBSERVE_URL` environment variable is set, the client starts observing automatically on construction, no code needed.
 
-For your own instrumentation, subscribe to query events with `$on('query')` — each event carries `sql`, `params`, `duration` (ms), `model`, `action`, `rows`, `timestamp`, and `error` (if the query failed):
+For your own instrumentation, subscribe to query events with `$on('query')`, each event carries `sql`, `params`, `duration` (ms), `model`, `action`, `rows`, `timestamp`, and `error` (if the query failed):
 
 ```typescript
 db.$on('query', (e) => {
@@ -853,7 +853,7 @@ Same security model as Studio: loopback by default, non-loopback refused without
 
 ## Serverless / Edge
 
-Turbine's core is driver-agnostic: pass any pg-compatible pool to `TurbineConfig.pool` (or use the `turbineHttp()` factory) and Turbine runs on **Vercel Edge**, **Cloudflare Workers**, **Deno Deploy**, **Netlify Edge**, or any other environment where a direct TCP connection is unavailable. No new dependencies — install whichever driver you already use.
+Turbine's core is driver-agnostic: pass any pg-compatible pool to `TurbineConfig.pool` (or use the `turbineHttp()` factory) and Turbine runs on **Vercel Edge**, **Cloudflare Workers**, **Deno Deploy**, **Netlify Edge**, or any other environment where a direct TCP connection is unavailable. No new dependencies, install whichever driver you already use.
 
 ### Neon Serverless (HTTP / WebSocket)
 
@@ -888,7 +888,7 @@ const pool = createPool({ connectionString: process.env.POSTGRES_URL });
 const db = turbineHttp(pool, SCHEMA);
 ```
 
-### Supabase (direct Postgres — no HTTP proxy needed)
+### Supabase (direct Postgres, no HTTP proxy needed)
 
 ```ts
 import { TurbineClient } from 'turbine-orm';
@@ -921,27 +921,27 @@ export default {
 
 - **Streaming cursors** (`findManyStream`) require `DECLARE CURSOR`, which most HTTP drivers don't support. Use `findMany` with `limit` + pagination instead.
 - **LISTEN/NOTIFY** is not available over HTTP.
-- Transactions work but hold an HTTP connection for their duration — keep them short.
+- Transactions work but hold an HTTP connection for their duration, keep them short.
 
 When Turbine receives an external pool, `db.disconnect()` is a no-op: the caller owns the pool's lifecycle.
 
 ## Database engines
 
-Turbine is **Postgres-first** — `import { TurbineClient } from 'turbine-orm'` targets PostgreSQL, and the safety bundle above is built around it. When you need another database, the same typed API runs on **SQLite**, **MySQL 8**, and **SQL Server** through subpath exports — plus **PowDB**, a single-node embedded database with its own query language (PowQL). Multi-engine is *additive*, not a pivot: pick the engine that fits, keep the same `findMany` / `with` / `where` API.
+Turbine is **Postgres-first**, `import { TurbineClient } from 'turbine-orm'` targets PostgreSQL, and the safety bundle above is built around it. When you need another database, the same typed API runs on **SQLite**, **MySQL 8**, and **SQL Server** through subpath exports, plus **PowDB**, a single-node embedded database with its own query language (PowQL). Multi-engine is *additive*, not a pivot: pick the engine that fits, keep the same `findMany` / `with` / `where` API.
 
-Two engines run **in-process** (no server): **SQLite** (always — there is no SQLite wire protocol) and **PowDB**, which uniquely runs *both* in-process (embedded) *and* over a network client against the same data. The root install stays one dependency (`pg`). Each engine's driver is its own concern: SQLite needs nothing (Node's built-in `node:sqlite`), while MySQL, SQL Server, and PowDB use **optional peer dependencies** you install only if you use them.
+Two engines run **in-process** (no server): **SQLite** (always. There is no SQLite wire protocol) and **PowDB**, which uniquely runs *both* in-process (embedded) *and* over a network client against the same data. The root install stays one dependency (`pg`). Each engine's driver is its own concern: SQLite needs nothing (Node's built-in `node:sqlite`), while MySQL, SQL Server, and PowDB use **optional peer dependencies** you install only if you use them.
 
 ```bash
-# SQLite — zero extra deps (Node >= 22.5, built-in node:sqlite)
+# SQLite, zero extra deps (Node >= 22.5, built-in node:sqlite)
 npm install turbine-orm
 
-# MySQL 8 — optional peer
+# MySQL 8, optional peer
 npm install turbine-orm mysql2
 
-# SQL Server 2016+ — optional peer
+# SQL Server 2016+, optional peer
 npm install turbine-orm mssql
 
-# PowDB — optional peer; embedded (in-process) or networked transport
+# PowDB, optional peer; embedded (in-process) or networked transport
 npm install turbine-orm @zvndev/powdb-embedded   # in-process
 npm install turbine-orm @zvndev/powdb-client     # networked
 ```
@@ -949,7 +949,7 @@ npm install turbine-orm @zvndev/powdb-client     # networked
 Each engine ships a factory that returns the same `TurbineClient`:
 
 ```ts
-// SQLite — synchronous; pass a file path, ':memory:', or an open DatabaseSync
+// SQLite, synchronous; pass a file path, ':memory:', or an open DatabaseSync
 import { turbineSqlite } from 'turbine-orm/sqlite';
 import { SCHEMA } from './generated/turbine/metadata.js';
 
@@ -958,7 +958,7 @@ const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
 ```
 
 ```ts
-// MySQL 8 — async; connection string, mysql2 config, or an existing mysql2 pool
+// MySQL 8, async; connection string, mysql2 config, or an existing mysql2 pool
 import { turbineMysql } from 'turbine-orm/mysql';
 import { SCHEMA } from './generated/turbine/metadata.js';
 
@@ -966,7 +966,7 @@ const db = await turbineMysql('mysql://user:pass@localhost:3306/app', SCHEMA);
 ```
 
 ```ts
-// SQL Server 2016+ — async; connection string, mssql config, or an existing pool
+// SQL Server 2016+, async; connection string, mssql config, or an existing pool
 import { turbineMssql } from 'turbine-orm/mssql';
 import { SCHEMA } from './generated/turbine/metadata.js';
 
@@ -974,7 +974,7 @@ const db = await turbineMssql('mssql://sa:Passw0rd!@localhost:1433/app', SCHEMA)
 ```
 
 ```ts
-// PowDB — async; embedded (in-process) or networked. Schema is code-defined.
+// PowDB, async; embedded (in-process) or networked. Schema is code-defined.
 import { turbinePowDB } from 'turbine-orm/powdb';
 import { schemaDefToMetadata } from 'turbine-orm';
 import { schema } from './schema.js'; // defineSchema({...})
@@ -1021,9 +1021,9 @@ Everything is honest about what ports and what doesn't. Features marked **PG-onl
 
 ✗ E017 = throws `UnsupportedFeatureError`. The full matrix (atomic updates, introspection, optimistic locking, per-cell mechanics) is on [turbineorm.dev/engines](https://turbineorm.dev/engines).
 
-**Engine notes:** SQLite uses `RETURNING` (≥ 3.35) just like Postgres. MySQL has no `RETURNING`, so writes re-`SELECT` the affected row and **`createMany` returns `[]`** (the rows ARE inserted — re-query if you need them). SQL Server returns rows via `OUTPUT`/`MERGE`; `DISTINCT ON` is Postgres-only. Only Postgres streams via a true cursor (constant memory); the other engines' `findManyStream` materializes the result then yields it in batches. Optimistic locking throws `OptimisticLockError` on all engines (on MySQL the conflict is detected from the version-checked UPDATE's affected-row count). The `turbine` CLI (`generate`, `migrate`) is currently PostgreSQL-only — point the engine factories at a hand-written or programmatically introspected `SCHEMA`.
+**Engine notes:** SQLite uses `RETURNING` (≥ 3.35) just like Postgres. MySQL has no `RETURNING`, so writes re-`SELECT` the affected row and **`createMany` returns `[]`** (the rows ARE inserted, re-query if you need them). SQL Server returns rows via `OUTPUT`/`MERGE`; `DISTINCT ON` is Postgres-only. Only Postgres streams via a true cursor (constant memory); the other engines' `findManyStream` materializes the result then yields it in batches. Optimistic locking throws `OptimisticLockError` on all engines (on MySQL the conflict is detected from the version-checked UPDATE's affected-row count). The `turbine` CLI (`generate`, `migrate`) is currently PostgreSQL-only, point the engine factories at a hand-written or programmatically introspected `SCHEMA`.
 
-**PowDB** speaks its own non-SQL query language (PowQL), so it sits outside the SQL matrix above. Writes use a trailing **`returning`** keyword (upsert reselects by PK). PKs are server-assigned `auto` ints **or** client UUIDs. Nested relations run as **one statement** on engine 0.18+ (PowQL nested projections — per-parent order/limit, childless parents kept, the same single-query shape as Postgres `json_agg`); older engines and ineligible shapes (many-to-many via the junction) load client-side with identical output. Nested writes cover hasMany/hasOne/belongsTo, and route through the same shared nested-write engine as the SQL engines, so the many-to-many `connect` / `disconnect` / `set` junction writes added in 0.50 apply here too (they are ordinary reads and writes on the junction table); the remaining many-to-many operations throw `ValidationError`. Transactions are single-writer: concurrent `$transaction` calls queue FIFO (bounded by `transactionQueueTimeoutMs`); nested/re-entrant transactions throw typed errors (no savepoints). Schema is code-first via `defineSchema` — `schemaDefToMetadata()` bridges it to any engine that needs runtime metadata, and a programmatic `describe`-based introspector exists since 0.34 (relations excluded). JSON documents are first-class on engine 0.12+: `JsonFilter` where-filters, JSON-path `orderBy`/`groupBy`, doc-field expression indexes, and a lossless native wire (0.13+) that keeps JSON `null`, missing fields, and the string `"null"` distinct. Embedded `syncMode: 'normal'` moves fsync off the commit path; the networked transport runs the same data over a socket. Cursor streaming and the Postgres-only trio (pgvector / LISTEN/NOTIFY / RLS session GUCs) throw `UnsupportedFeatureError`. Full details: **[turbineorm.dev/engines#powdb](https://turbineorm.dev/engines#powdb)**.
+**PowDB** speaks its own non-SQL query language (PowQL), so it sits outside the SQL matrix above. Writes use a trailing **`returning`** keyword (upsert reselects by PK). PKs are server-assigned `auto` ints **or** client UUIDs. Nested relations run as **one statement** on engine 0.18+ (PowQL nested projections, per-parent order/limit, childless parents kept, the same single-query shape as Postgres `json_agg`); older engines and ineligible shapes (many-to-many via the junction) load client-side with identical output. Nested writes cover hasMany/hasOne/belongsTo, and route through the same shared nested-write engine as the SQL engines, so the many-to-many `connect` / `disconnect` / `set` junction writes added in 0.50 apply here too (they are ordinary reads and writes on the junction table); the remaining many-to-many operations throw `ValidationError`. Transactions are single-writer: concurrent `$transaction` calls queue FIFO (bounded by `transactionQueueTimeoutMs`); nested/re-entrant transactions throw typed errors (no savepoints). Schema is code-first via `defineSchema`, `schemaDefToMetadata()` bridges it to any engine that needs runtime metadata, and a programmatic `describe`-based introspector exists since 0.34 (relations excluded). JSON documents are first-class on engine 0.12+: `JsonFilter` where-filters, JSON-path `orderBy`/`groupBy`, doc-field expression indexes, and a lossless native wire (0.13+) that keeps JSON `null`, missing fields, and the string `"null"` distinct. Embedded `syncMode: 'normal'` moves fsync off the commit path; the networked transport runs the same data over a socket. Cursor streaming and the Postgres-only trio (pgvector / LISTEN/NOTIFY / RLS session GUCs) throw `UnsupportedFeatureError`. Full details: **[turbineorm.dev/engines#powdb](https://turbineorm.dev/engines#powdb)**.
 
 Full setup, signatures, and the complete support matrix: **[turbineorm.dev/engines](https://turbineorm.dev/engines)**.
 
@@ -1050,7 +1050,7 @@ Priority order: CLI flags > environment variables (`DATABASE_URL`) > config file
 
 ## How It Works
 
-Turbine resolves nested relations the same way Prisma 7 and Drizzle do: correlated subqueries with `json_agg` + `json_build_object`, evaluated by PostgreSQL in a single round-trip. No N+1, no client-side stitching, no separate queries per relation. The `with` clause is fully type-inferred end-to-end — write `db.users.findMany({ with: { posts: { with: { comments: { with: { author: true } } } } } })` and `users[0].posts[0].comments[0].author.name` autocompletes with zero manual annotation.
+Turbine resolves nested relations the same way Prisma 7 and Drizzle do: correlated subqueries with `json_agg` + `json_build_object`, evaluated by PostgreSQL in a single round-trip. No N+1, no client-side stitching, no separate queries per relation. The `with` clause is fully type-inferred end-to-end, write `db.users.findMany({ with: { posts: { with: { comments: { with: { author: true } } } } } })` and `users[0].posts[0].comments[0].author.name` autocompletes with zero manual annotation.
 
 The query strategy is table stakes now. What isn't table stakes: the one-dependency, no-WASM footprint, the read-only Studio your DBA will approve, the error messages that never leak PII, and the SQL-first migrations with SHA-256 drift detection. See [Why Turbine?](#why-turbine) for the full breakdown.
 
@@ -1062,7 +1062,7 @@ Turbine maps Postgres types to TypeScript:
 |---|---|---|
 | `int2`, `int4`, `float4`, `float8` | `number` | Standard numeric types |
 | `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` (2^53 - 1) are returned as `string` at runtime to avoid precision loss. This affects < 0.01% of use cases (auto-increment IDs, counts, etc. are all safe). |
-| `numeric`, `money` | `string` | Arbitrary precision — kept as string to avoid JS float issues |
+| `numeric`, `money` | `string` | Arbitrary precision, kept as string to avoid JS float issues |
 | `text`, `varchar`, `uuid`, `citext` | `string` | |
 | `timestamptz`, `timestamp`, `date` | `Date` | `timestamp` (without time zone) is parsed as UTC by default (Prisma/Rails/Django convention), so the same row yields the same instant in every region. Opt out with `utcTimestamps: false`. |
 | `boolean` | `boolean` | |
@@ -1093,43 +1093,43 @@ Reading the table: no engine binary and no WASM, just one runtime dependency (`p
 
 *Competitor columns are re-verified against competitor releases on a fixed schedule. Last checked July 2026, against Prisma 7 and Drizzle 0.45. Features marked Preview or beta may change, and bundle sizes move release to release.*
 
-**A note on Kysely.** Kysely's [`jsonArrayFrom` / `jsonObjectFrom`](https://kysely.dev/docs/recipes/relations) relations recipe builds nested results with the same correlated-subquery-plus-JSON approach Turbine uses — good evidence the pattern is the right one. The gap is in what the driver can no longer see once rows are aggregated into JSON: nested fields lose their column types, so a `Date` inside a `jsonArrayFrom` result is typed `Date` but arrives as a **string** at runtime ([kysely-org/kysely#482](https://github.com/kysely-org/kysely/issues/482)), and the nesting isn't type-checked at depth. Turbine's `WithResult` inference types the whole tree, and `parseNestedRow` re-applies date coercion (and snake→camel mapping) to every nested row — so `users[0].posts[0].createdAt` is an actual `Date`, at any depth, with no plugin to wire up.
+**A note on Kysely.** Kysely's [`jsonArrayFrom` / `jsonObjectFrom`](https://kysely.dev/docs/recipes/relations) relations recipe builds nested results with the same correlated-subquery-plus-JSON approach Turbine uses, good evidence the pattern is the right one. The gap is in what the driver can no longer see once rows are aggregated into JSON: nested fields lose their column types, so a `Date` inside a `jsonArrayFrom` result is typed `Date` but arrives as a **string** at runtime ([kysely-org/kysely#482](https://github.com/kysely-org/kysely/issues/482)), and the nesting isn't type-checked at depth. Turbine's `WithResult` inference types the whole tree, and `parseNestedRow` re-applies date coercion (and snake→camel mapping) to every nested row, so `users[0].posts[0].createdAt` is an actual `Date`, at any depth, with no plugin to wire up.
 
 ## Limitations
 
 Turbine is focused and opinionated. Here's what it doesn't do:
 
-- **Postgres-first.** PostgreSQL is the default and primary target — going deep on one database is what enables the safety bundle and the edge-runtime story. SQLite, MySQL 8, and SQL Server engines are available as additive subpath exports (see [Database engines](#database-engines)), but several flagship features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`, full-text `search`, array-column filters, `groupBy({ distinctOn })`) are Postgres-only and throw `UnsupportedFeatureError` elsewhere.
-- **Full-text search** is available via a `search` filter — `where: { title: { search: 'hello & world', config: 'english' } }` compiles to a parameterized `to_tsvector(...) @@ to_tsquery(...)`. PostgreSQL only: the other engines throw `UnsupportedFeatureError` (`TURBINE_E017`) rather than degrade to a `LIKE`. For advanced ranking (`ts_rank`, weighted vectors) use `db.raw`.
-- **Large nested result sets.** Nested results are materialized server-side in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause — or stream the parents with `findManyStream` and resolve children per-row.
+- **Postgres-first.** PostgreSQL is the default and primary target, going deep on one database is what enables the safety bundle and the edge-runtime story. SQLite, MySQL 8, and SQL Server engines are available as additive subpath exports (see [Database engines](#database-engines)), but several flagship features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`, full-text `search`, array-column filters, `groupBy({ distinctOn })`) are Postgres-only and throw `UnsupportedFeatureError` elsewhere.
+- **Full-text search** is available via a `search` filter, `where: { title: { search: 'hello & world', config: 'english' } }` compiles to a parameterized `to_tsvector(...) @@ to_tsquery(...)`. PostgreSQL only: the other engines throw `UnsupportedFeatureError` (`TURBINE_E017`) rather than degrade to a `LIKE`. For advanced ranking (`ts_rank`, weighted vectors) use `db.raw`.
+- **Large nested result sets.** Nested results are materialized server-side in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause, or stream the parents with `findManyStream` and resolve children per-row.
 
 ## Examples
 
 **Feature demos**
 
-- **[Thread Machine](./examples/thread-machine/)** — HN clone rendered from a single `findMany`. 4-level object graph (stories → comments → replies → author), every property autocompletes through the chain
-- **[Streaming CSV](./examples/streaming-csv/)** — Export 100K orders + line items to CSV with constant memory. PostgreSQL cursors, live heap meter, nested `with` inside `findManyStream`
-- **[Clickstorm](./examples/clickstorm/)** — Side-by-side atomic-increment vs read-modify-write load test. 10K concurrent clicks. The atomic path wins every time
+- **[Thread Machine](./examples/thread-machine/)**, HN clone rendered from a single `findMany`. 4-level object graph (stories → comments → replies → author), every property autocompletes through the chain
+- **[Streaming CSV](./examples/streaming-csv/)**, Export 100K orders + line items to CSV with constant memory. PostgreSQL cursors, live heap meter, nested `with` inside `findManyStream`
+- **[Clickstorm](./examples/clickstorm/)**, Side-by-side atomic-increment vs read-modify-write load test. 10K concurrent clicks. The atomic path wins every time
 
 **Runtime targets**
 
-- **[Next.js](./examples/nextjs/)** — Server-rendered app with nested relations, streaming, and live code demos
-- **[Neon Edge](./examples/neon-edge/)** — Vercel Edge route handler talking to Neon over HTTP via `@neondatabase/serverless`
-- **[Vercel Postgres](./examples/vercel-postgres/)** — Next.js app router route handler on `@vercel/postgres`
-- **[Cloudflare Worker](./examples/cloudflare-worker/)** — Worker `fetch` handler with `pg` over Cloudflare Hyperdrive
-- **[Supabase](./examples/supabase/)** — Standalone script over the standard `pg` driver against Supabase
+- **[Next.js](./examples/nextjs/)**, Server-rendered app with nested relations, streaming, and live code demos
+- **[Neon Edge](./examples/neon-edge/)**, Vercel Edge route handler talking to Neon over HTTP via `@neondatabase/serverless`
+- **[Vercel Postgres](./examples/vercel-postgres/)**, Next.js app router route handler on `@vercel/postgres`
+- **[Cloudflare Worker](./examples/cloudflare-worker/)**, Worker `fetch` handler with `pg` over Cloudflare Hyperdrive
+- **[Supabase](./examples/supabase/)**, Standalone script over the standard `pg` driver against Supabase
 
 ## Guides
 
-- **[Quick Start](https://turbineorm.dev/quickstart)** — zero-to-first-query in five minutes
-- **[API Reference](https://turbineorm.dev/queries)** — every `findMany` / `findUnique` / `create` / `update` / `delete` option, the full operator table, and `pipeline()` semantics
-- **[Relations](https://turbineorm.dev/relations)** — deep `with` clause, nested options, relation filters (`some` / `every` / `none`), payload-size guidance
-- **[Transactions & Pipelines](https://turbineorm.dev/transactions)** — isolation levels, nested SAVEPOINTs, retry loops for `DeadlockError` and `SerializationFailureError`
-- **[Schema & Migrations](https://turbineorm.dev/schema)** — `defineSchema()`, auto-diff migrations, checksum validation
-- **[Serverless & Edge](https://turbineorm.dev/serverless)** — Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase walkthroughs
-- **[CLI](https://turbineorm.dev/cli)** — every command, flag, and config option
-- **[Typed Errors](https://turbineorm.dev/errors)** — error code reference, `wrapPgError()` translation, retry patterns
-- **[Migrating from Prisma](https://turbineorm.dev/migrate-from-prisma)** — API mapping table, side-by-side `findMany`, and notes on the differences
+- **[Quick Start](https://turbineorm.dev/quickstart)**, zero-to-first-query in five minutes
+- **[API Reference](https://turbineorm.dev/queries)**, every `findMany` / `findUnique` / `create` / `update` / `delete` option, the full operator table, and `pipeline()` semantics
+- **[Relations](https://turbineorm.dev/relations)**, deep `with` clause, nested options, relation filters (`some` / `every` / `none`), payload-size guidance
+- **[Transactions & Pipelines](https://turbineorm.dev/transactions)**, isolation levels, nested SAVEPOINTs, retry loops for `DeadlockError` and `SerializationFailureError`
+- **[Schema & Migrations](https://turbineorm.dev/schema)**, `defineSchema()`, auto-diff migrations, checksum validation
+- **[Serverless & Edge](https://turbineorm.dev/serverless)**, Neon, Vercel Postgres, Cloudflare Hyperdrive, Supabase walkthroughs
+- **[CLI](https://turbineorm.dev/cli)**, every command, flag, and config option
+- **[Typed Errors](https://turbineorm.dev/errors)**, error code reference, `wrapPgError()` translation, retry patterns
+- **[Migrating from Prisma](https://turbineorm.dev/migrate-from-prisma)**, API mapping table, side-by-side `findMany`, and notes on the differences
 
 ## Requirements
 

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — schemaDiff() coverage tests
+ * turbine-orm, schemaDiff() coverage tests
  *
  * Tests the schema diff and reverse (DOWN) migration generation logic.
  * Since schemaDiff() requires a live Postgres connection, these tests use
@@ -38,10 +38,10 @@ import {
 import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// WS-B pure diff helpers (no DB) — referential actions, enums, checks
+// WS-B pure diff helpers (no DB), referential actions, enums, checks
 // ---------------------------------------------------------------------------
 
-describe('B1 — diffReferentialAction (pure)', () => {
+describe('B1, diffReferentialAction (pure)', () => {
   const db: DbForeignKey = {
     constraintName: 'posts_user_id_fkey',
     column: 'user_id',
@@ -75,7 +75,7 @@ describe('B1 — diffReferentialAction (pure)', () => {
   });
 });
 
-describe('B2 — diffEnumValues (pure)', () => {
+describe('B2, diffEnumValues (pure)', () => {
   it('appends new labels in order via ALTER TYPE ADD VALUE', () => {
     const { statements, warnings } = diffEnumValues(
       'post_status',
@@ -100,7 +100,7 @@ describe('B2 — diffEnumValues (pure)', () => {
   });
 });
 
-describe('B5 — diffCheckConstraints (pure)', () => {
+describe('B5, diffCheckConstraints (pure)', () => {
   it('adds a named check missing from the DB', () => {
     const { statements } = diffCheckConstraints('products', [{ name: 'price_pos', expression: 'price >= 0' }], []);
     assert.deepEqual(statements, [`ALTER TABLE "products" ADD CONSTRAINT "price_pos" CHECK (price >= 0);`]);
@@ -136,7 +136,7 @@ describe('B5 — diffCheckConstraints (pure)', () => {
 // Unit tests: schemaToSQL patterns for CREATE TABLE (UP) and DROP TABLE (DOWN)
 // ---------------------------------------------------------------------------
 
-describe('schemaDiff patterns — add table (CREATE TABLE UP, DROP TABLE DOWN)', () => {
+describe('schemaDiff patterns, add table (CREATE TABLE UP, DROP TABLE DOWN)', () => {
   it('new table generates CREATE TABLE with all columns', () => {
     const schema = defineSchema({
       accounts: {
@@ -187,7 +187,7 @@ describe('schemaDiff patterns — add table (CREATE TABLE UP, DROP TABLE DOWN)',
   });
 });
 
-describe('schemaDiff patterns — remove table (DROP TABLE UP, CREATE TABLE DOWN)', () => {
+describe('schemaDiff patterns, remove table (DROP TABLE UP, CREATE TABLE DOWN)', () => {
   it('drop pattern is identified correctly in diff results', () => {
     // When a table exists in DB but not in schema, schemaDiff puts it in result.drop[]
     // The code at line 429-431 does NOT auto-generate DROP statements (for safety)
@@ -197,7 +197,7 @@ describe('schemaDiff patterns — remove table (DROP TABLE UP, CREATE TABLE DOWN
   });
 });
 
-describe('schemaDiff patterns — add column (ALTER TABLE ADD COLUMN UP, DROP COLUMN DOWN)', () => {
+describe('schemaDiff patterns, add column (ALTER TABLE ADD COLUMN UP, DROP COLUMN DOWN)', () => {
   it('ADD COLUMN generates correct SQL format', () => {
     // Pattern from schema-sql.ts line 452:
     // ALTER TABLE "table" ADD COLUMN "col" TYPE [constraints];
@@ -241,7 +241,7 @@ describe('schemaDiff patterns — add column (ALTER TABLE ADD COLUMN UP, DROP CO
   });
 });
 
-describe('schemaDiff patterns — remove column (DROP COLUMN UP)', () => {
+describe('schemaDiff patterns, remove column (DROP COLUMN UP)', () => {
   it('DROP COLUMN SQL format', () => {
     // Pattern from schema-sql.ts line 553:
     // ALTER TABLE "table" DROP COLUMN "col";
@@ -251,12 +251,12 @@ describe('schemaDiff patterns — remove column (DROP COLUMN UP)', () => {
 
   it('reverse of DROP COLUMN is a comment (cannot auto-reverse)', () => {
     // From line 554: reverseSql is a comment because we can't know the column type
-    const reverseSql = `-- Cannot auto-reverse DROP COLUMN for "legacy_field" — add it back manually`;
+    const reverseSql = `-- Cannot auto-reverse DROP COLUMN for "legacy_field", add it back manually`;
     assert.match(reverseSql, /Cannot auto-reverse DROP COLUMN/);
   });
 });
 
-describe('schemaDiff patterns — modify column type (ALTER COLUMN TYPE)', () => {
+describe('schemaDiff patterns, modify column type (ALTER COLUMN TYPE)', () => {
   it('ALTER COLUMN TYPE generates USING cast', () => {
     // Pattern from schema-sql.ts line 465:
     // ALTER TABLE "t" ALTER COLUMN "c" TYPE VARCHAR(255) USING "c"::VARCHAR(255);
@@ -274,7 +274,7 @@ describe('schemaDiff patterns — modify column type (ALTER COLUMN TYPE)', () =>
   });
 });
 
-describe('schemaDiff patterns — add/remove unique constraint', () => {
+describe('schemaDiff patterns, add/remove unique constraint', () => {
   it('ADD CONSTRAINT UNIQUE format', () => {
     // Pattern from schema-sql.ts line 531:
     const tableName = 'users';
@@ -300,7 +300,7 @@ describe('schemaDiff patterns — add/remove unique constraint', () => {
   });
 });
 
-describe('schemaDiff patterns — change nullable (SET/DROP NOT NULL)', () => {
+describe('schemaDiff patterns, change nullable (SET/DROP NOT NULL)', () => {
   it('SET NOT NULL format', () => {
     // Pattern from schema-sql.ts line 476:
     const upSQL = `ALTER TABLE "users" ALTER COLUMN "name" SET NOT NULL;`;
@@ -319,7 +319,7 @@ describe('schemaDiff patterns — change nullable (SET/DROP NOT NULL)', () => {
   });
 });
 
-describe('schemaDiff patterns — add/remove default value', () => {
+describe('schemaDiff patterns, add/remove default value', () => {
   it('SET DEFAULT format', () => {
     // Pattern from schema-sql.ts line 498:
     const upSQL = `ALTER TABLE "users" ALTER COLUMN "role" SET DEFAULT 'member';`;
@@ -338,7 +338,7 @@ describe('schemaDiff patterns — add/remove default value', () => {
   });
 });
 
-describe('schemaDiff patterns — no changes (identical schemas)', () => {
+describe('schemaDiff patterns, no changes (identical schemas)', () => {
   it('same schema generates identical SQL', () => {
     const schema1 = defineSchema({
       users: {
@@ -358,7 +358,7 @@ describe('schemaDiff patterns — no changes (identical schemas)', () => {
   });
 });
 
-describe('schemaDiff patterns — add/remove FK indexes', () => {
+describe('schemaDiff patterns, add/remove FK indexes', () => {
   it('FK column generates CREATE INDEX in create path', () => {
     const schema = defineSchema({
       teams: {
@@ -386,14 +386,14 @@ describe('schemaDiff patterns — add/remove FK indexes', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Integration tests — only run when DATABASE_URL is available
+// Integration tests, only run when DATABASE_URL is available
 // ---------------------------------------------------------------------------
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
 const integrationDescribe = describe;
 
-integrationDescribe('schemaDiff() integration — live database', () => {
+integrationDescribe('schemaDiff() integration, live database', () => {
   // Without DATABASE_URL these tests register as skipped (visible in the
   // reporter summary) and the before/after hooks become no-ops.
   const { it, before, after } = skipGate(!DATABASE_URL, 'DATABASE_URL not set');
@@ -471,10 +471,10 @@ integrationDescribe('schemaDiff() integration — live database', () => {
 });
 
 // ---------------------------------------------------------------------------
-// WS-B round-trip integration — defineSchema → push → diff = empty
+// WS-B round-trip integration, defineSchema → push → diff = empty
 // ---------------------------------------------------------------------------
 
-describe('WS-B round-trip — extended features push then diff clean', () => {
+describe('WS-B round-trip, extended features push then diff clean', () => {
   const { it, before, after } = skipGate(!DATABASE_URL, 'DATABASE_URL not set');
 
   // Unique names so we never collide with (or clobber) real public tables.
@@ -571,7 +571,7 @@ describe('WS-B round-trip — extended features push then diff clean', () => {
 // DiffResult structural validation (always runs)
 // ---------------------------------------------------------------------------
 
-describe('DiffResult structure — type contract validation', () => {
+describe('DiffResult structure, type contract validation', () => {
   it('AlterColumnDef actions cover all diff operations', () => {
     // Verify the expected actions from schema-sql.ts
     const validActions = [
@@ -657,7 +657,7 @@ describe('DiffResult structure — type contract validation', () => {
 // schemaToSQL output correctness for diff scenarios
 // ---------------------------------------------------------------------------
 
-describe('schemaToSQL — diff-relevant DDL patterns', () => {
+describe('schemaToSQL, diff-relevant DDL patterns', () => {
   it('column with all modifiers produces correct DDL', () => {
     const schema = defineSchema({
       items: {
@@ -744,10 +744,10 @@ describe('schemaToSQL — diff-relevant DDL patterns', () => {
 });
 
 // ---------------------------------------------------------------------------
-// schemaToSQL — reverse direction patterns (what DOWN migrations look like)
+// schemaToSQL, reverse direction patterns (what DOWN migrations look like)
 // ---------------------------------------------------------------------------
 
-describe('schemaDiff reverse statement patterns — comprehensive', () => {
+describe('schemaDiff reverse statement patterns, comprehensive', () => {
   it('CREATE TABLE reverse follows DROP TABLE IF EXISTS pattern', () => {
     // For each table in create[], the reverse is:
     // DROP TABLE IF EXISTS "table_name" CASCADE;

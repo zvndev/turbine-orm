@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Composite foreign key tests
+ * turbine-orm, Composite foreign key tests
  *
  * Verifies that:
  * 1. Single-column FKs continue to work exactly as before (regression guard)
@@ -60,7 +60,7 @@ describe('normalizeKeyColumns', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Single-column FK regression — query builder still generates correct SQL
+// Single-column FK regression, query builder still generates correct SQL
 // ---------------------------------------------------------------------------
 
 describe('single-column FK relation subquery (regression)', () => {
@@ -121,7 +121,7 @@ describe('single-column FK relation subquery (regression)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Multi-column (composite) FK — query builder generates AND-joined correlation
+// Multi-column (composite) FK, query builder generates AND-joined correlation
 // ---------------------------------------------------------------------------
 
 describe('composite FK relation subquery', () => {

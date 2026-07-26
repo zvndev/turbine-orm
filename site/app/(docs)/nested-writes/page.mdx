@@ -7,13 +7,13 @@ export const metadata = {
 
 # Nested Writes
 
-A nested write resolves relation fields in your `data` argument into the right INSERTs, UPDATEs, and DELETEs — so you can build or mutate a whole object graph in one `create()` or `update()` call instead of orchestrating the statements by hand.
+A nested write resolves relation fields in your `data` argument into the right INSERTs, UPDATEs, and DELETEs, so you can build or mutate a whole object graph in one `create()` or `update()` call instead of orchestrating the statements by hand.
 
-The whole tree is written inside **one transaction** (all-or-nothing) and walked **depth-first, capped at depth 10** — past that Turbine throws `CircularRelationError` ([E007](/errors)). After the write completes, Turbine reads the row back with the touched relations populated, so the return value is the full tree.
+The whole tree is written inside **one transaction** (all-or-nothing) and walked **depth-first, capped at depth 10**, past that Turbine throws `CircularRelationError` ([E007](/errors)). After the write completes, Turbine reads the row back with the touched relations populated, so the return value is the full tree.
 
 ## When it triggers
 
-A key in `data` is treated as a nested write when it matches a relation name and its value is a plain object (not `null`, not an array, not a `Date`). Everything else is a scalar column. No flag to flip — relation fields just work.
+A key in `data` is treated as a nested write when it matches a relation name and its value is a plain object (not `null`, not an array, not a `Date`). Everything else is a scalar column. No flag to flip, relation fields just work.
 
 The examples below assume this shape:
 
@@ -41,7 +41,7 @@ The examples below assume this shape:
 
 ## Create context
 
-### create — insert and link
+### create, insert and link
 
 `create` accepts a single object or an array. For a `hasMany`/`hasOne` relation the parent is inserted first, then the children inherit the parent's primary key as their foreign key.
 
@@ -56,7 +56,7 @@ const user = await db.users.create({
   },
 });
 
-// user.posts is populated — the tree is read back after the write
+// user.posts is populated, the tree is read back after the write
 ```
 
 For a `hasOne` relation the shape is the same, just a single object:
@@ -72,7 +72,7 @@ await db.users.create({
 });
 ```
 
-### belongsTo create — link the parent
+### belongsTo create, link the parent
 
 For a `belongsTo` relation the foreign key lives on the row you're creating, so Turbine resolves the related row **before** the parent INSERT and folds its key in. That means a `NOT NULL` FK column is satisfied on the first insert.
 
@@ -87,7 +87,7 @@ await db.users.create({
 });
 ```
 
-### connect — link existing rows
+### connect, link existing rows
 
 `connect` takes a `where` (one object or an array) that must match existing rows. If a target doesn't exist, Turbine throws `ValidationError`.
 
@@ -99,13 +99,30 @@ await db.users.create({
       connect: [{ id: 10 }, { id: 11 }],
     },
     organization: {
-      connect: { id: 1 }, // belongsTo — sets users.org_id
+      connect: { id: 1 }, // belongsTo, sets users.org_id
     },
   },
 });
 ```
 
-### connectOrCreate — connect or insert
+#### Connecting a row someone else owns, `scopedConnect`
+
+`connect: { id: 42 }` on a to-many relation means "make row 42 mine", and by default it does exactly that: if another parent currently owns row 42, the row is **taken from them**. That is the intended behavior for an admin tool moving records around, and a cross-tenant write primitive for any handler that forwards a client-supplied id into a nested connect.
+
+Set `scopedConnect: true` on the client to close it:
+
+```ts
+const db = turbine({ connectionString: process.env.DATABASE_URL, scopedConnect: true });
+
+// Refused with ValidationError (TURBINE_E003): post 42 belongs to another user.
+await db.users.update({ where: { id: 7 }, data: { posts: { connect: { id: 42 } } } });
+```
+
+With the flag on, a connect succeeds when the child is **unowned** (its foreign key is null) or **already owned by this parent** (an idempotent re-connect), and is refused otherwise. Re-parenting then has to be an explicit update, which is the point: it stops being something a request body can do by accident.
+
+It is off by default because it changes the outcome of writes that currently succeed. It applies to `hasMany` and `hasOne` only: a `belongsTo` connect points the row being written at a parent and takes nothing from anyone, and a many-to-many connect adds a junction row rather than moving one.
+
+### connectOrCreate, connect or insert
 
 Each item is `{ where, create }`: Turbine looks up `where`, links it if found, otherwise inserts the `create` payload (with the FK injected for `hasMany`/`hasOne`).
 
@@ -159,9 +176,9 @@ await db.users.update({
 });
 ```
 
-### disconnect — null the foreign key
+### disconnect, null the foreign key
 
-`disconnect` sets the child's foreign key to `NULL`. The FK column **must be nullable** — otherwise Turbine throws `ValidationError` telling you to use `delete` instead.
+`disconnect` sets the child's foreign key to `NULL`. The FK column **must be nullable**, otherwise Turbine throws `ValidationError` telling you to use `delete` instead.
 
 ```ts
 await db.users.update({
@@ -185,7 +202,7 @@ await db.users.update({
 });
 ```
 
-### set — replace the whole collection
+### set, replace the whole collection
 
 `set` takes an array and makes the relation contain exactly those rows: every current child is disconnected, then the listed rows are connected. `hasMany`/`hasOne` only.
 
@@ -200,7 +217,7 @@ await db.users.update({
 });
 ```
 
-### delete — remove related rows
+### delete, remove related rows
 
 ```ts
 await db.users.update({
@@ -213,9 +230,9 @@ await db.users.update({
 });
 ```
 
-### update — patch related rows
+### update, patch related rows
 
-Each item is `{ where, data }`. For `belongsTo`, `where` is optional — Turbine derives it from the parent's foreign key.
+Each item is `{ where, data }`. For `belongsTo`, `where` is optional, Turbine derives it from the parent's foreign key.
 
 ```ts
 await db.users.update({
@@ -231,7 +248,7 @@ await db.users.update({
 });
 ```
 
-### upsert — update or insert
+### upsert, update or insert
 
 Each item is `{ where, create, update }`: update the row matching `where`, or create it if it doesn't exist.
 
@@ -344,7 +361,7 @@ Since 0.50 the [prisma-compat](/migrate-from-prisma) client exposes the same jun
 
 ## See also
 
-- **[Relations](/relations)** — how `hasMany` / `hasOne` / `belongsTo` are inferred and read.
-- **[Transactions & Pipelines](/transactions)** — the transaction that wraps every nested write.
-- **[Typed Errors](/errors)** — `ValidationError`, `CircularRelationError`, and the constraint errors a write can raise.
-- **[API Reference](/queries)** — `create`, `update`, and the full query surface.
+- **[Relations](/relations)**, how `hasMany` / `hasOne` / `belongsTo` are inferred and read.
+- **[Transactions & Pipelines](/transactions)**, the transaction that wraps every nested write.
+- **[Typed Errors](/errors)**, `ValidationError`, `CircularRelationError`, and the constraint errors a write can raise.
+- **[API Reference](/queries)**, `create`, `update`, and the full query surface.

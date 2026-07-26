@@ -1,14 +1,14 @@
 /**
- * turbine-orm — Query builder
+ * turbine-orm, Query builder
  *
  * Each table accessor (db.users, db.posts, etc.) returns a QueryInterface<T>
  * that builds parameterized SQL and executes it through the connection pool.
  *
  * Nested relations use json_build_object + json_agg subqueries for single-query
- * resolution — a PostgreSQL-native approach that eliminates N+1 query patterns.
+ * resolution, a PostgreSQL-native approach that eliminates N+1 query patterns.
  *
  * Schema-driven: all column names, types, and relations come from introspected
- * metadata — nothing is hardcoded.
+ * metadata, nothing is hardcoded.
  */
 
 import type pg from 'pg';
@@ -76,7 +76,14 @@ import type {
   WithOptions,
   WithOrderByObject,
 } from './types.js';
-import { LRUCache, ownLookup, parseDbDate, type SqlCacheEntry, sqlToPreparedName } from './utils.js';
+import {
+  LRUCache,
+  ownLookup,
+  parseDbDate,
+  type SqlCacheEntry,
+  sqlToPreparedName,
+  unknownFieldMessage,
+} from './utils.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -211,7 +218,7 @@ export const AUTO_TO_ONE_JOIN_ROWS_MAX = 100_000;
  * accurate when the workload is cheap queries, but the workload being planned
  * for here is precisely the expensive one: in the verification sweep the ring
  * filled with 10-17ms relation queries, the estimate inflated, and `'auto'`
- * held an 8,000-row query on the join plan — 1.30x slower than the better plan,
+ * held an 8,000-row query on the join plan, 1.30x slower than the better plan,
  * WORSE than the fixed constant it replaced. Capping the median against a
  * multiple of the floor mitigates it but turns the whole thing into a pair of
  * magic numbers tuned against two synthetic links, which is the same mistake as
@@ -351,7 +358,7 @@ export type {
 
 import type { DeferredQuery, MiddlewareFn, QueryInterfaceOptions, ReselectExecutor } from './deferred.js';
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known" — intentional for untyped table access
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", intentional for untyped table access
 export class QueryInterface<T extends object, R extends object = {}> {
   private readonly tableMeta: TableMetadata;
   /**
@@ -372,6 +379,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly middlewares: MiddlewareFn[];
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
+  private readonly scopedConnect: boolean;
   private readonly utcTimestamps: boolean;
   private readonly preparedStatementsEnabled: boolean;
   /**
@@ -419,7 +427,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly globalFilters?: GlobalFilters;
   /**
    * Tracks tables that have already triggered an unlimited-query warning so
-   * the user is not spammed once per row. Per-instance state — each
+   * the user is not spammed once per row. Per-instance state, each
    * QueryInterface is bound to a single table, so this set will only ever
    * contain at most one entry, but using a Set keeps the API consistent with
    * the audit's "Set<string>" guidance and leaves room for future
@@ -436,7 +444,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly columnArrayTypeMap: Map<string, string>;
   /**
    * Columns whose type lives in a DIFFERENT schema than the introspected one
-   * (ColumnMetadata.pgTypeSchema is recorded only in that case) — such columns
+   * (ColumnMetadata.pgTypeSchema is recorded only in that case), such columns
    * must never receive this schema's `::"enum"` cast (see enumTypeForColumn).
    */
   private readonly crossSchemaTypeColumns: Set<string>;
@@ -453,7 +461,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** True when this QI runs inside an active transaction (set via _txScoped option). */
   private readonly txScoped: boolean;
 
-  /** Original options reference — forwarded to child QIs in nested writes. */
+  /** Original options reference, forwarded to child QIs in nested writes. */
   private readonly options?: QueryInterfaceOptions;
 
   /** Set by executeWithMiddleware so queryWithTimeout can include it in events. */
@@ -472,7 +480,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /**
    * The active query's `skipGlobalFilters` opt-out, set at the top of each
    * `build*` method and read deep in the (synchronous) SQL-build + param-collect
-   * tree — so relation subqueries, relation filters, `_count`, and relation
+   * tree, so relation subqueries, relation filters, `_count`, and relation
    * `orderBy` all see it without threading it through dozens of signatures.
    * Only load-bearing when {@link globalFilters} is configured; build+collect are
    * synchronous per call, so this transient is never observed across an await.
@@ -525,8 +533,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `warnOnUnlimited: false`, per table with `warnOnUnlimited: { users:
     // false }` (unlisted tables keep the default), or per call via
     // `findMany({ warnOnUnlimited: false })`.
-    // Per-table maps accept BOTH key forms — the snake_case table name
-    // (`user_profiles`) and the camelCase accessor (`userProfiles`) — since
+    // Per-table maps accept BOTH key forms, the snake_case table name
+    // (`user_profiles`) and the camelCase accessor (`userProfiles`), since
     // users naturally key by the accessor they type everywhere else. The
     // snake_case entry wins when both are present.
     const warnOpt = options?.warnOnUnlimited;
@@ -534,6 +542,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       typeof warnOpt === 'object' && warnOpt !== null
         ? (warnOpt[table] ?? warnOpt[snakeToCamel(table)]) !== false
         : warnOpt !== false;
+    this.scopedConnect = options?.scopedConnect === true;
     this.utcTimestamps = options?.utcTimestamps !== false;
     this.preparedStatementsEnabled = options?.preparedStatements ?? true;
     // SQL template cache capacity. `sqlCacheSize: 0` disables caching entirely
@@ -654,7 +663,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * SQLite use ` LIMIT <ph>` and/or ` OFFSET <ph>`. SQL Server has no `LIMIT`, so
    * its dialect implements {@link Dialect.buildLimitOffset} to emit
    * `[ORDER BY (SELECT NULL)] OFFSET <off> ROWS [FETCH NEXT <lim> ROWS ONLY]`.
-   * Param-push order (limit before offset) is owned by the caller and unchanged —
+   * Param-push order (limit before offset) is owned by the caller and unchanged -
    * this only varies the SQL text, so PG output stays byte-identical.
    */
   private buildPagination(limitPh: string | undefined, offsetPh: string | undefined, hasOrderBy: boolean): string {
@@ -1114,7 +1123,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * join for a to-one relation.
    *
    * Resolution order:
-   *   1. an explicit `autoToOneJoinMaxRows` — an instruction, used verbatim
+   *   1. an explicit `autoToOneJoinMaxRows`, an instruction, used verbatim
    *      (no clamping: the caller has measured their own workload);
    *   2. the configured `autoRoundTripMs` divided by
    *      {@link AUTO_JOIN_PENALTY_MS_PER_ROW}, clamped to
@@ -1128,7 +1137,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * put, so any single constant is wrong for someone by more than the margin it
    * is trying to save. Placing the switch AT the break-even is also what removes
    * the old cliff: two plans that cost the same at the boundary make the regret
-   * there ~1.0x, rising only as the true row count moves away from it — where
+   * there ~1.0x, rising only as the true row count moves away from it, where
    * the previous fixed 1000 put its WORST case (1.44x measured) immediately
    * below its own switch point.
    *
@@ -1306,7 +1315,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Build the {@link RelationLoadContext} the batched loader needs, closing over
    * this interface's pool/dialect/executor. Child readers are constructed on the
    * SAME pool (so they join an active transaction) with `defaultLimit` cleared
-   * and unlimited-warnings silenced — a relation load must fetch every matching
+   * and unlimited-warnings silenced, a relation load must fetch every matching
    * child, and the per-relation `limit` is applied client-side by the loader.
    */
   private batchedContext(
@@ -1583,7 +1592,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): Promise<pg.QueryResult> {
     const start = performance.now();
     const action = this.currentAction;
-    // Build the query argument — use object form with `name` for prepared
+    // Build the query argument, use object form with `name` for prepared
     // statements, or the plain (text, values) form otherwise.
     const usePrepared = preparedName && this.preparedStatementsEnabled;
     const exec = usePrepared
@@ -1639,7 +1648,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    *
    *   - `'returning'` / `'output'`: the statement returns its own affected rows
    *     (`RETURNING *` / `OUTPUT INSERTED.*`). Byte-identical to the historical
-   *     single `queryWithTimeout` + `transform(result)` path — the PostgreSQL
+   *     single `queryWithTimeout` + `transform(result)` path, the PostgreSQL
    *     route is unchanged.
    *   - `'reselect'`: the engine cannot return rows from a write, so the build
    *     method attached a {@link DeferredQuery.reselect} plan that runs the
@@ -1704,7 +1713,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    *
    * Middleware can inspect and log query parameters, measure timing, and
    * transform the result returned by `next()`. Note: query SQL is generated
-   * BEFORE middleware runs — `params.args` is a read-only snapshot, and
+   * BEFORE middleware runs, `params.args` is a read-only snapshot, and
    * mutating it does NOT change the executed SQL. Cross-cutting filters
    * (e.g. soft deletes) belong in the query itself: pass an explicit
    * `where: { deletedAt: null }` or wrap the table accessor in a small helper.
@@ -1728,7 +1737,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const mw = this.middlewares[index++]!;
         return mw(p, next);
       }
-      // End of chain — execute the actual query
+      // End of chain, execute the actual query
       return executor();
     };
 
@@ -1740,7 +1749,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async findUnique<
-    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -1797,10 +1806,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return entity as T;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindUnique<W extends TypedWithClause<R> = {}>(
-    args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T | null> {
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+  buildFindUnique<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
     this.currentSkip = args.skipGlobalFilters;
     // Prisma compound-unique selector expansion (before global-filter merge and
     // fingerprinting, so the cache only ever sees the canonical expanded where).
@@ -1834,7 +1846,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const params: unknown[] = [];
 
     // Check if all where values are simple (plain equality, no operators/null/OR).
-    // Keys are sorted to match fingerprintWhere — insertion order here would let
+    // Keys are sorted to match fingerprintWhere, insertion order here would let
     // permuted where literals share a cache entry with misaligned params.
     const whereKeys = Object.keys(whereObj)
       .filter((k) => whereObj[k] !== undefined)
@@ -1873,7 +1885,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         params,
         transform: (result) => {
           const row = result.rows[0];
-          return row ? (this.parseRow(row, this.table) as T) : null;
+          return row ? (this.parseRow(row, this.table) as unknown as QueryResult<T, R, W, S, O>) : null;
         },
         tag: `${this.table}.findUnique`,
         preparedName: entry.name,
@@ -1900,7 +1912,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         params,
         transform: (result) => {
           const row = result.rows[0];
-          return row ? (this.parseRow(row, this.table) as T) : null;
+          return row ? (this.parseRow(row, this.table) as unknown as QueryResult<T, R, W, S, O>) : null;
         },
         tag: `${this.table}.findUnique`,
         preparedName: entry.name,
@@ -1940,7 +1952,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       params,
       transform: (result) => {
         const row = result.rows[0];
-        return row ? (parseWith(row) as T) : null;
+        return row ? (parseWith(row) as unknown as QueryResult<T, R, W, S, O>) : null;
       },
       tag: `${this.table}.findUnique`,
       preparedName: entry.name,
@@ -1952,7 +1964,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async findMany<
-    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -1966,7 +1978,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const depth = this.measureWithDepth(args.with as WithClause);
         if (depth > 5 && shouldWarnOnce(WARN_NS.deepWith, this.table)) {
           console.warn(
-            `[turbine] Deep with clause (depth ${depth}) on "${this.tableMeta.name}" — ` +
+            `[turbine] Deep with clause (depth ${depth}) on "${this.tableMeta.name}", ` +
               'consider splitting into separate queries for better performance.',
           );
         }
@@ -1982,7 +1994,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           if (split) return this.runAutoSplit(args as unknown as FindManyArgs<T>, split, false) as Promise<T[]>;
         }
       }
-      const deferred = this.buildFindMany(args);
+      const deferred = this.buildFindMany(args as unknown as FindManyArgs<T, R, W, S, O>);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
       return deferred.transform(result);
     }) as Promise<QueryResult<T, R, W, S, O>[]>;
@@ -2077,12 +2089,52 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (this.defaultLimit !== undefined) return;
     const hasExplicitLimit = args?.limit !== undefined || args?.take !== undefined || args?.cursor !== undefined;
     if (hasExplicitLimit) return;
+    if (this.whereMatchesAtMostOneRow((args as { where?: unknown } | undefined)?.where)) return;
     if (this.warnedTables.has(this.table)) return;
     this.warnedTables.add(this.table);
     console.warn(
       `[turbine] warning: findMany on "${this.table}" has no limit: this will fetch every row. ` +
         'Pass `limit`, or silence with `warnOnUnlimited: false` (per call, per table, or in config).',
     );
+  }
+
+  /**
+   * Whether `where` can match at most one row, because it pins every column of
+   * the primary key or of some unique column set to a literal value.
+   *
+   * The unlimited-read warning is about accidentally fetching a whole table,
+   * so firing it on `findMany({ where: { id: 1 } })` is noise: that query is
+   * bounded by a uniqueness constraint just as firmly as by a `limit`, and a
+   * warning that cries wolf on correct code trains people to disable it.
+   *
+   * Deliberately conservative. Only DIRECT equality on a literal counts: an
+   * operator object (`{ id: { in: [...] } }`, `{ id: { gt: 1 } }`) can match
+   * many rows, and any `OR` / `NOT` / relation filter can widen the result, so
+   * anything that is not a plain scalar equality leaves the warning in place.
+   * A compound-unique SELECTOR (`{ orgId_userId: {...} }`) is expanded first,
+   * so both spellings are recognized.
+   */
+  private whereMatchesAtMostOneRow(where: unknown): boolean {
+    if (where === null || typeof where !== 'object' || Array.isArray(where)) return false;
+    const expanded = expandCompoundUniqueWhere(this.tableMeta, where as Record<string, unknown>);
+
+    const pinned = new Set<string>();
+    for (const [field, value] of Object.entries(expanded)) {
+      if (value === undefined) continue;
+      // A plain scalar (or a Date) is an equality. `null` is NOT: `col IS NULL`
+      // is not a uniqueness match, since SQL uniqueness permits many nulls.
+      const isScalarEquality =
+        value !== null && (typeof value !== 'object' || value instanceof Date) && typeof value !== 'function';
+      if (!isScalarEquality) return false;
+      const column = ownLookup(this.tableMeta.columnMap, field);
+      if (!column) return false;
+      pinned.add(column);
+    }
+    if (pinned.size === 0) return false;
+
+    const covers = (columns: string[] | undefined): boolean =>
+      !!columns && columns.length > 0 && columns.every((c) => pinned.has(c));
+    return covers(this.tableMeta.primaryKey) || (this.tableMeta.uniqueColumns ?? []).some(covers);
   }
 
   /**
@@ -2100,10 +2152,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return maxDepth;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindMany<W extends TypedWithClause<R> = {}>(
-    args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T[]> {
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+  buildFindMany<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>[]> {
     this.currentSkip = args?.skipGlobalFilters;
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations BEFORE fingerprinting, so the two orderings get distinct cache
@@ -2132,7 +2187,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // path re-orders in an outer wrapper (`... AS "<table>_distinct" ORDER BY
     // <userOrder>`) where a correlated relation subquery (pick-row, `_count`,
     // to-one relation ordering) would reference the parent table name out of
-    // scope — a guaranteed "missing FROM-clause entry" crash on Postgres.
+    // scope, a guaranteed "missing FROM-clause entry" crash on Postgres.
     // Checked BEFORE the SQL cache so build and warm-cache paths throw
     // identically (same rule as the vector guard inside the distinct branch).
     if (args?.distinct && args.distinct.length > 0 && args.orderBy) {
@@ -2195,7 +2250,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // own cache-key segment: a cached no-PII statement must never serve an
     // `includePii` call, nor vice versa.
     // `relationLoadStrategy: 'flatten'` compiles eligible to-one relations to
-    // LEFT JOINs instead of correlated subqueries — a completely different
+    // LEFT JOINs instead of correlated subqueries, a completely different
     // statement for the same `with` shape, which `withFp` (strategy-blind)
     // does not distinguish. So the plan gets its own cache-key segment, exactly
     // like `pii=`: a join-planned template must never serve a flatten-planned
@@ -2262,7 +2317,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // where → cursor order (the collect path mirrors this exactly).
       let tail = freshWhereSql;
       if (args?.cursor) {
-        // Sorted (canonical) order — MUST match cursorFp and the cache-hit collect below.
+        // Sorted (canonical) order, MUST match cursorFp and the cache-hit collect below.
         const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
         if (cursorEntries.length > 0) {
           // Resolve the seek direction per cursor field from the flattened
@@ -2313,7 +2368,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${relationJoins.join('')}${lateralJoins.join('')}${tail}${orderBySql}`;
       }
 
-      // Pagination — push params in the same order the collect path mirrors
+      // Pagination, push params in the same order the collect path mirrors
       // (limit before offset); the SQL TEXT shape is dialect-owned via
       // buildPagination (PG: ` LIMIT $n`/` OFFSET $n`; SQL Server: OFFSET/FETCH).
       let limitPh: string | undefined;
@@ -2339,7 +2394,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.with) {
       this.collectWithParams(args.with as WithClause, params, undefined, flattenPlan);
     }
-    // 3. Cursor params — sorted (canonical) order, matching cursorFp and the build path.
+    // 3. Cursor params, sorted (canonical) order, matching cursorFp and the build path.
     if (args?.cursor) {
       const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
       for (const [, v] of cursorEntries) {
@@ -2347,11 +2402,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
       }
     }
     // 4. ORDER BY params (vector KNN ordering binds a `$n::vector` query vector).
-    //    Mirrors buildOrderBy's push order — between cursor and LIMIT.
+    //    Mirrors buildOrderBy's push order, between cursor and LIMIT.
     if (args?.orderBy) {
       this.collectOrderByParams(args.orderBy, params);
     }
-    // 5. LIMIT param — skipped when the dialect inlines pagination (build path
+    // 5. LIMIT param, skipped when the dialect inlines pagination (build path
     //    mirrors via paginationRef → no placeholder, no param).
     if (effectiveLimit !== undefined && !this.dialect.inlineLimitOffset) {
       // Validate here too: on a cache HIT the build path never runs, and a
@@ -2359,7 +2414,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // i.e. no limit at all).
       params.push(this.paginationValue(effectiveLimit, 'limit'));
     }
-    // 6. OFFSET param — same inline gate as LIMIT above.
+    // 6. OFFSET param, same inline gate as LIMIT above.
     if (args?.offset !== undefined && !this.dialect.inlineLimitOffset) {
       params.push(this.paginationValue(args.offset, 'skip/offset'));
     }
@@ -2372,14 +2427,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
       sql: entry.sql,
       params,
       transform: (result) =>
-        result.rows.map((row) => (parseWith ? (parseWith(row) as T) : (this.parseRow(row, this.table) as T))),
+        result.rows.map(
+          (row) =>
+            (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as unknown as QueryResult<T, R, W, S, O>,
+        ),
       tag: `${this.table}.findMany`,
       preparedName: entry.name,
     };
   }
 
   // -------------------------------------------------------------------------
-  // findManyStream — async iterable using PostgreSQL cursors
+  // findManyStream, async iterable using PostgreSQL cursors
   // -------------------------------------------------------------------------
 
   /**
@@ -2415,7 +2473,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * ```
    */
   async *findManyStream<
-    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -2424,8 +2482,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const hasRelations = !!args?.with;
     // Build the positional-aware relation parser once for the whole stream.
     // Same flatten plan buildFindMany compiles below. The plan is a pure
-    // function of the schema, the `with` shape and `includePii` — never of
-    // `limit` — so the batch-size override the speculative fetch applies cannot
+    // function of the schema, the `with` shape and `includePii`, never of
+    // `limit`, so the batch-size override the speculative fetch applies cannot
     // change it, and the stream's parser matches the emitted SQL.
     const streamFlattenPlan = hasRelations ? this.planFlatten(args, args?.includePii === true) : null;
     const parseWith = hasRelations
@@ -2452,7 +2510,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     );
 
     if (speculativeResult.rows.length <= batchSize) {
-      // Small drain — yield all rows and return, no cursor needed
+      // Small drain, yield all rows and return, no cursor needed
       for (const row of speculativeResult.rows) {
         yield (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as QueryResult<T, R, W, S, O>;
       }
@@ -2460,7 +2518,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     // --- Overflow: fall back to cursor path from scratch ---
-    const deferred = this.buildFindMany(args);
+    const deferred = this.buildFindMany(args as unknown as FindManyArgs<T, R, W, S, O>);
 
     // Acquire a dedicated connection: cursors require a single connection in a
     // transaction. The dialect owns the streaming SQL (Postgres: BEGIN → DECLARE
@@ -2494,11 +2552,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // findFirst — like findMany but returns a single row or null
+  // findFirst, like findMany but returns a single row or null
   // -------------------------------------------------------------------------
 
   async findFirst<
-    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -2530,19 +2588,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<QueryResult<T, R, W, S, O> | null>;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindFirst<W extends TypedWithClause<R> = {}>(
-    args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T | null> {
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+  buildFindFirst<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
     // Reuse findMany's SQL builder but force LIMIT 1
-    const findManyArgs = { ...args, limit: 1 } as FindManyArgs<
-      T,
-      R,
-      W,
-      Record<string, boolean> | undefined,
-      Record<string, boolean> | undefined
-    >;
-    const deferred = this.buildFindMany(findManyArgs);
+    const findManyArgs = { ...args, limit: 1 } as FindManyArgs<T, R, W, S, O>;
+    const deferred = this.buildFindMany<W, S, O>(findManyArgs);
 
     return {
       sql: deferred.sql,
@@ -2556,11 +2611,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // findFirstOrThrow — like findFirst but throws if no record found
+  // findFirstOrThrow, like findFirst but throws if no record found
   // -------------------------------------------------------------------------
 
   async findFirstOrThrow<
-    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -2572,10 +2627,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<QueryResult<T, R, W, S, O>>;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindFirstOrThrow<W extends TypedWithClause<R> = {}>(
-    args?: FindManyArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T> {
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+  buildFindFirstOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>> {
     const inner = this.buildFindFirst(args);
 
     return {
@@ -2597,11 +2655,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // findUniqueOrThrow — like findUnique but throws if no record found
+  // findUniqueOrThrow, like findUnique but throws if no record found
   // -------------------------------------------------------------------------
 
   async findUniqueOrThrow<
-    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -2613,10 +2671,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<QueryResult<T, R, W, S, O>>;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause" — matches TypedWithClause default
-  buildFindUniqueOrThrow<W extends TypedWithClause<R> = {}>(
-    args: FindUniqueArgs<T, R, W, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
-  ): DeferredQuery<T> {
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+  buildFindUniqueOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>> {
     const inner = this.buildFindUnique(args);
 
     return {
@@ -2652,7 +2713,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // createMany — uses UNNEST for performance
+  // createMany, uses UNNEST for performance
   // -------------------------------------------------------------------------
 
   async createMany(args: CreateManyArgs<T>): Promise<T[]> {
@@ -2732,7 +2793,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
       );
       // biome-ignore lint/suspicious/noExplicitAny: TransactionClient satisfies NestedWriteContext['tx'] at runtime
-      const ctx: NestedWriteContext = { schema: this.schema, tx: tx as any };
+      const ctx: NestedWriteContext = { schema: this.schema, tx: tx as any, scopedConnect: this.scopedConnect };
       const result = await fn(ctx);
       await client.query(this.dialect.commitStatement());
       return result;
@@ -2782,7 +2843,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // upsert — INSERT ... ON CONFLICT ... DO UPDATE
+  // upsert, INSERT ... ON CONFLICT ... DO UPDATE
   // -------------------------------------------------------------------------
 
   async upsert(args: UpsertArgs<T, R>): Promise<T> {
@@ -2793,7 +2854,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // updateMany — UPDATE ... WHERE ... returning count
+  // updateMany, UPDATE ... WHERE ... returning count
   // -------------------------------------------------------------------------
 
   async updateMany(args: UpdateManyArgs<T, R>): Promise<{ count: number }> {
@@ -2805,7 +2866,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // deleteMany — DELETE ... WHERE ... returning count
+  // deleteMany, DELETE ... WHERE ... returning count
   // -------------------------------------------------------------------------
 
   async deleteMany(args: DeleteManyArgs<T, R>): Promise<{ count: number }> {
@@ -2892,7 +2953,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // aggregate — standalone aggregation without groupBy
+  // aggregate, standalone aggregation without groupBy
   // -------------------------------------------------------------------------
 
   async aggregate(args: AggregateArgs<T, R>): Promise<AggregateResult<T>> {
@@ -3094,7 +3155,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Fall back to camelToSnake ONLY if that snake_cased name also exists as a
     // real column on the table. This preserves the convenience of writing
     // `userId` when the schema exposes `user_id` under an unusual field name,
-    // but rejects arbitrary strings — closing the defense-in-depth gap for
+    // but rejects arbitrary strings, closing the defense-in-depth gap for
     // SQL injection and catching typos like `where: { emial: 'x' }` with a
     // clear error instead of a cryptic Postgres "column does not exist".
     const snake = camelToSnake(field);
@@ -3104,10 +3165,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (this.tableMeta.allColumns?.includes(snake)) {
       return snake;
     }
-    throw new ValidationError(
-      `[turbine] Unknown field "${field}" on table "${this.table}". ` +
-        `Known fields: ${Object.keys(this.tableMeta.columnMap).join(', ') || '(none)'}.`,
-    );
+    throw new ValidationError(unknownFieldMessage(this.table, field, this.tableMeta));
   }
 
   /** Convert camelCase field name to a double-quoted SQL identifier */
@@ -3116,7 +3174,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // =========================================================================
-  // Fingerprinting — value-invariant shape keys for SQL cache lookup
+  // Fingerprinting, value-invariant shape keys for SQL cache lookup
   // =========================================================================
 
   // ---------------------------------------------------------------------------
@@ -3237,7 +3295,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // Global filters (soft-delete / multi-tenancy — WS-G)
+  // Global filters (soft-delete / multi-tenancy, WS-G)
   //
   // A configured global filter for a table is AND-merged into the compiled WHERE
   // of every query on that table (via {@link mergeGlobalFilter}, so the merge is
@@ -3245,13 +3303,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // subquery targeting it (rendered at build time against the subquery's alias/
   // table by the `*GlobalFilterAlias`/`*GlobalFilterExists` helpers, with the
   // shape folded into the SQL-cache key via {@link globalFilterCacheSegment}).
-  // Function filters are evaluated per resolve — at query-build time — enabling
+  // Function filters are evaluated per resolve, at query-build time, enabling
   // per-request tenancy via a closure. They must return a STABLE shape (same
   // keys/operators); only values may vary between calls.
   // -------------------------------------------------------------------------
 
   // -------------------------------------------------------------------------
-  // Scoped (non-top-level) WHERE compilation — relation EXISTS sub-wheres and
+  // Scoped (non-top-level) WHERE compilation, relation EXISTS sub-wheres and
   // relation `with`-clause `where`s. All three consumers below drive the SAME
   // canonical `walkWhere` the top level uses (bound to the SCOPE's target
   // table), so their key order + combinator structure + relation detection can
@@ -3269,12 +3327,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /**
    * Build ORDER BY clause from an object.
    *
-   * Each value is either a plain direction (`'asc'`/`'desc'`) or — for pgvector
-   * columns — a `{ distance: { to, metric, direction? } }` KNN ordering object.
+   * Each value is either a plain direction (`'asc'`/`'desc'`) or, for pgvector
+   * columns, a `{ distance: { to, metric, direction? } }` KNN ordering object.
    * Vector ordering binds the query vector as a `$n::vector` param, so a `params`
    * array MUST be supplied when a vector ordering may be present (top-level
    * findMany path). When `params` is omitted (groupBy / relation path) a vector
-   * ordering throws — KNN ordering is only supported at the top level.
+   * ordering throws, KNN ordering is only supported at the top level.
    */
 
   // -------------------------------------------------------------------------
@@ -3312,7 +3370,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // columns (`date[]`, `timestamp[]`, `timestamptz[]`), for which the
         // driver already hands back a `Date[]`. Coercing it ran
         // `new Date(String(theArray))` and replaced the whole array with a
-        // single Invalid Date — the column was unreadable on every strategy.
+        // single Invalid Date, the column was unreadable on every strategy.
         // The join strategy's string arrays are handled upstream instead, by
         // the JSON-wire decode in relations.ts.
         if (
@@ -3345,7 +3403,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // name. The builder knows the exact column order, so it records a recursive
   // RelationShape during SQL generation; the transform decodes each positional
   // array back into the object representation the object-encoding would have
-  // produced, then hands it to parseNestedRow — so parsed output is byte-
+  // produced, then hands it to parseNestedRow, so parsed output is byte-
   // identical to the object path (same dates, same snake→camel, same recursion).
   // -------------------------------------------------------------------------
 

@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Typed raw SQL (Turbine's answer to Prisma's TypedSQL)
+ * turbine-orm, Typed raw SQL (Turbine's answer to Prisma's TypedSQL)
  *
  * `client.raw()` returns untyped rows. This module adds a *typed* escape hatch:
  * a generic tagged template where the caller supplies the row shape, and the
@@ -9,13 +9,13 @@
  * Design goals & guarantees:
  *
  *  1. **Compile-time only types.** `T` is supplied by the caller and never
- *     validated at runtime — exactly like Prisma's TypedSQL and the existing
+ *     validated at runtime, exactly like Prisma's TypedSQL and the existing
  *     `raw<T>()`. Postgres still returns whatever the SQL selects; the generic
  *     is a convenience for autocomplete and downstream type-checking.
  *
  *  2. **Mandatory parameterization.** Only the *static* string segments of the
  *     template literal ever reach the SQL text. Every interpolated `${value}`
- *     becomes a `$N` placeholder and is passed in the params array — it is
+ *     becomes a `$N` placeholder and is passed in the params array, it is
  *     impossible to string-concatenate a value into the query through this API.
  *     This is the whole point of the tagged-template shape: the literal segments
  *     are frozen by the compiler (`TemplateStringsArray`), and the only way to
@@ -92,7 +92,7 @@ export function buildTypedSql(
  * `await`ed directly to get `T[]`, or refined via `.one()` / `.scalar()` first.
  *
  * The query is executed lazily and exactly once per terminal call (`then`,
- * `one`, `scalar`). Each terminal method runs the query independently — this is
+ * `one`, `scalar`). Each terminal method runs the query independently, this is
  * an escape hatch, not a cached query object, so don't call two terminals on
  * the same builder expecting a single round-trip; build a fresh template each
  * time (the common pattern is `await db.sql\`...\`` inline).
@@ -121,7 +121,7 @@ export class TypedSqlQuery<T extends Record<string, unknown>> implements Promise
   /**
    * PromiseLike implementation: `await db.sql<T>\`...\`` resolves to `T[]`.
    */
-  // biome-ignore lint/suspicious/noThenProperty: intentional thenable — this IS the PromiseLike contract that makes `await db.sql\`...\`` resolve to rows
+  // biome-ignore lint/suspicious/noThenProperty: intentional thenable, this IS the PromiseLike contract that makes `await db.sql\`...\`` resolve to rows
   then<TResult1 = T[], TResult2 = never>(
     onfulfilled?: ((value: T[]) => TResult1 | PromiseLike<TResult1>) | null,
     onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,

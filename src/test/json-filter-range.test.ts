@@ -1,8 +1,8 @@
 /**
- * turbine-orm — JsonFilter range operators gt/gte/lt/lte (T-2)
+ * turbine-orm, JsonFilter range operators gt/gte/lt/lte (T-2)
  *
- * Numbers cast the `#>>` path extraction to numeric —
- * `("col" #>> $1::text[])::numeric > $2` — while strings compare as text.
+ * Numbers cast the `#>>` path extraction to numeric -
+ * `("col" #>> $1::text[])::numeric > $2`, while strings compare as text.
  * The `path` param is bound once and its placeholder shared by every clause
  * that extracts it. All range ops require `path`.
  *

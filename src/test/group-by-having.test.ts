@@ -1,8 +1,8 @@
 /**
- * turbine-orm — groupBy `having` clause tests
+ * turbine-orm, groupBy `having` clause tests
  *
  * Build-only (no DB) tests verify the generated HAVING SQL is correct and that
- * every comparison value is parameterized ($N) — no user value is ever
+ * every comparison value is parameterized ($N), no user value is ever
  * interpolated into the SQL string. Security tests assert that a malicious
  * column or operator throws ValidationError instead of reaching the query.
  *
@@ -45,7 +45,7 @@ function buildSchema(): SchemaMetadata {
 // Build-only SQL tests
 // ---------------------------------------------------------------------------
 
-describe('groupBy having — SQL generation', () => {
+describe('groupBy having, SQL generation', () => {
   it('emits HAVING COUNT(*) > $1 with the value parameterized', () => {
     const q = makeQuery<Post>('posts', buildSchema());
     const { sql, params } = q.buildGroupBy({
@@ -127,7 +127,7 @@ describe('groupBy having — SQL generation', () => {
     assert.deepEqual(params, [[1, 2, 3]]);
   });
 
-  it('no values are interpolated — the SQL string contains no raw numbers from the filter', () => {
+  it('no values are interpolated, the SQL string contains no raw numbers from the filter', () => {
     const q = makeQuery<Post>('posts', buildSchema());
     const { sql } = q.buildGroupBy({
       by: ['published'],
@@ -138,10 +138,10 @@ describe('groupBy having — SQL generation', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Security tests — malicious input must throw, never interpolate
+// Security tests, malicious input must throw, never interpolate
 // ---------------------------------------------------------------------------
 
-describe('groupBy having — security', () => {
+describe('groupBy having, security', () => {
   it('rejects an unknown column inside a having aggregate with ValidationError', () => {
     const q = makeQuery<Post>('posts', buildSchema());
     assert.throws(
@@ -204,7 +204,7 @@ if (SKIP) {
 
 const testFn = describe;
 
-testFn('groupBy having — integration', () => {
+testFn('groupBy having, integration', () => {
   // Without DATABASE_URL these tests register as skipped (visible in the
   // reporter summary) and the before/after hooks become no-ops.
   const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');

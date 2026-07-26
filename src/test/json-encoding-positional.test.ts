@@ -3,7 +3,7 @@
  *
  * These are build-only (no DB): they assert the generated SQL shape and drive
  * each DeferredQuery's transform with hand-built pg result rows (relation columns
- * arrive from pg as JSON strings). The core guarantee is PARITY — the positional
+ * arrive from pg as JSON strings). The core guarantee is PARITY, the positional
  * transform must produce output byte-identical to the object transform for the
  * equivalent input, so a caller can flip the flag without any result change.
  */
@@ -115,7 +115,7 @@ test('positional transform is byte-identical to object transform (nested many + 
     },
     { id: 2, name: 'Bob', posts: '[]', profile: null },
   ];
-  // Positional payload — column order per shape: posts=[id,userId,title,comments],
+  // Positional payload, column order per shape: posts=[id,userId,title,comments],
   // comments=[id,body], profile=[id,bio]. Same information, key-less.
   const posRows = [
     {

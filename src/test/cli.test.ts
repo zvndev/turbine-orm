@@ -1,8 +1,8 @@
 /**
- * turbine-orm — CLI unit tests
+ * turbine-orm, CLI unit tests
  *
  * Tests config template generation, config file resolution, migration parsing,
- * and UI utility functions — all without a database.
+ * and UI utility functions, all without a database.
  *
  * Run: npx tsx --test src/test/cli.test.ts
  */
@@ -31,7 +31,7 @@ import { parseMigrationContent } from '../cli/migrate.js';
 import { box, redactUrl, stripAnsi, table } from '../cli/ui.js';
 
 // ---------------------------------------------------------------------------
-// CLI config — configTemplate()
+// CLI config, configTemplate()
 // ---------------------------------------------------------------------------
 
 describe('CLI config', () => {
@@ -80,7 +80,7 @@ describe('CLI config', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // CLI config — findConfigFile()
+  // CLI config, findConfigFile()
   // ---------------------------------------------------------------------------
 
   describe('findConfigFile()', () => {
@@ -125,7 +125,7 @@ describe('CLI config', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // CLI config — loadConfig()
+  // CLI config, loadConfig()
   // ---------------------------------------------------------------------------
 
   describe('loadConfig()', () => {
@@ -392,7 +392,7 @@ describe('CLI config', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // CLI config — resolveConfig()
+  // CLI config, resolveConfig()
   // ---------------------------------------------------------------------------
 
   describe('resolveConfig()', () => {
@@ -476,7 +476,7 @@ describe('CLI config', () => {
   });
 
   // -------------------------------------------------------------------------
-  // looksLikeSchemaFilePath() — the `schema` vs `schemaFile` collision guard.
+  // looksLikeSchemaFilePath(), the `schema` vs `schemaFile` collision guard.
   // Regression for #28 item 1: a user who puts the schema FILE path in the
   // `schema` field (a Postgres namespace name) would silently generate an empty
   // client. `turbine generate` uses this to fail loudly instead.
@@ -519,7 +519,7 @@ describe('CLI config', () => {
 });
 
 // ---------------------------------------------------------------------------
-// CLI migration parsing — parseMigrationContent() (supplemental tests)
+// CLI migration parsing, parseMigrationContent() (supplemental tests)
 // ---------------------------------------------------------------------------
 
 describe('CLI migration parsing', () => {
@@ -647,7 +647,7 @@ describe('CLI UI utilities', () => {
     it('redacts special characters in password', () => {
       const url = 'postgres://admin:p@ssw0rd!@host:5432/db';
       const result = redactUrl(url);
-      // The regex replaces :password@ — stops at first @
+      // The regex replaces :password@, stops at first @
       assert.ok(result.includes(':***@'));
       assert.ok(!result.includes('p@ssw0rd'));
     });
@@ -854,7 +854,7 @@ describe('CLI TypeScript loader', () => {
       assert.equal(canResolveTsx(failingResolver), false);
     });
 
-    it('returns true (or false — environment-dependent) when called with no resolver', () => {
+    it('returns true (or false, environment-dependent) when called with no resolver', () => {
       // We cannot reliably assert true/false because the test runs inside the
       // turbine-orm dev environment where tsx IS installed (it is a devDep),
       // but downstream consumers may not have it. We can at least assert that
@@ -882,13 +882,13 @@ describe('CLI TypeScript loader', () => {
       );
     });
 
-    it('is idempotent — second call returns "already" when first registered', async () => {
+    it('is idempotent, second call returns "already" when first registered', async () => {
       _resetTsLoaderStateForTests();
       const first = await registerTsLoader();
       // If the first call could register (or had already registered), the
       // second call must report "already". If the first call returned
       // 'missing' / 'unsupported', we cannot assert idempotency the same way
-      // — the helper will keep retrying.
+      // - the helper will keep retrying.
       if (first === 'registered' || first === 'already') {
         const second = await registerTsLoader();
         assert.equal(second, 'already');
@@ -908,7 +908,7 @@ describe('CLI TypeScript loader', () => {
         const status = await registerTsLoader();
         // tsx is NOT resolvable from an empty tmp dir, so we expect 'missing'.
         // (If the dev machine has a global tsx symlinked, the test environment
-        // would still see it as 'registered' — we soften the assertion.)
+        // would still see it as 'registered', we soften the assertion.)
         assert.ok(
           status === 'missing' || status === 'registered' || status === 'already',
           `unexpected status: ${status}`,
@@ -923,14 +923,14 @@ describe('CLI TypeScript loader', () => {
 });
 
 // ---------------------------------------------------------------------------
-// `turbine generate` — silent-empty-client guard (#28 item 1), end-to-end.
+// `turbine generate`, silent-empty-client guard (#28 item 1), end-to-end.
 //
 // Runs the real CLI through Node's tsx import hook in a temp dir (no DB needed
-// — the guard fires before any connection). Asserts a non-zero exit and an
+// - the guard fires before any connection). Asserts a non-zero exit and an
 // actionable message.
 // ---------------------------------------------------------------------------
 
-describe('turbine generate — empty-client guard (#28)', () => {
+describe('turbine generate, empty-client guard (#28)', () => {
   const repoRoot = process.cwd();
   const tsxPackage = resolve(repoRoot, 'node_modules/tsx');
   const tsxLoader = pathToFileURL(resolve(repoRoot, 'node_modules/tsx/dist/loader.mjs')).href;

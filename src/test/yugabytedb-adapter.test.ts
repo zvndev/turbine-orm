@@ -187,7 +187,7 @@ describe('yugabytedb adapter', () => {
   });
 
   describe('statementTimeout', () => {
-    it('uses set_config(statement_timeout, …, is_local) — SET LOCAL cannot take a bind param', () => {
+    it('uses set_config(statement_timeout, …, is_local), SET LOCAL cannot take a bind param', () => {
       const result = yugabytedb.statementTimeout!(30);
       assert.equal(result.sql, "SELECT set_config('statement_timeout', $1, true)");
       assert.deepEqual(result.params, ['30s']);

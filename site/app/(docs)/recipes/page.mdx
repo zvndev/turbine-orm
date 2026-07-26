@@ -7,11 +7,11 @@ export const metadata = {
 
 # Framework Integration
 
-Drop-in patterns for wiring Turbine into a real app. Each one is small on purpose — Turbine is just a client you create once and call from your handlers.
+Drop-in patterns for wiring Turbine into a real app. Each one is small on purpose, Turbine is just a client you create once and call from your handlers.
 
-## Next.js — singleton client + Route Handler
+## Next.js, singleton client + Route Handler
 
-Create the client **once** and reuse it. In development, Next.js hot-reload re-evaluates modules, which would otherwise leak a new connection pool on every save — stash the instance on `globalThis` to survive reloads.
+Create the client **once** and reuse it. In development, Next.js hot-reload re-evaluates modules, which would otherwise leak a new connection pool on every save, stash the instance on `globalThis` to survive reloads.
 
 ```ts
 // lib/db.ts
@@ -27,7 +27,7 @@ export const db =
 if (process.env.NODE_ENV !== 'production') globalForDb.db = db;
 ```
 
-Then import that `db` from any Route Handler. Don't call `db.disconnect()` per request — the pool is long-lived and shared.
+Then import that `db` from any Route Handler. Don't call `db.disconnect()` per request, the pool is long-lived and shared.
 
 ```ts
 // app/api/users/route.ts
@@ -56,9 +56,9 @@ export async function POST(req: Request) {
 }
 ```
 
-> Running on a serverless or edge runtime instead of the Node server? Bind an external HTTP pool with `turbineHttp` — see **[Serverless & Edge](/serverless)**.
+> Running on a serverless or edge runtime instead of the Node server? Bind an external HTTP pool with `turbineHttp`, see **[Serverless & Edge](/serverless)**.
 
-## Express — request handler
+## Express, request handler
 
 Create the client at startup, pass errors to `next(err)` so your error middleware can map typed Turbine errors to status codes, and disconnect on shutdown.
 
@@ -103,7 +103,7 @@ app.use((err, _req, res, _next) => {
 
 const server = app.listen(3000);
 
-// Graceful shutdown — drain the pool.
+// Graceful shutdown, drain the pool.
 process.on('SIGTERM', async () => {
   server.close();
   await db.disconnect();
@@ -126,11 +126,11 @@ CREATE POLICY tenant_isolation ON documents
   USING (tenant_id = current_setting('app.current_tenant', true)::int);
 ```
 
-Make sure your application connects as a role that is subject to RLS — the table owner bypasses policies unless you also `ALTER TABLE documents FORCE ROW LEVEL SECURITY`, and superusers always bypass them.
+Make sure your application connects as a role that is subject to RLS, the table owner bypasses policies unless you also `ALTER TABLE documents FORCE ROW LEVEL SECURITY`, and superusers always bypass them.
 
 ### 2. Set the tenant per request
 
-`$withSession(context, fn)` opens a transaction, applies each entry as `SELECT set_config(name, value, true)` (transaction-local) right after `BEGIN`, then runs your callback. Every query inside sees only the matching rows — and the setting resets automatically on commit or rollback.
+`$withSession(context, fn)` opens a transaction, applies each entry as `SELECT set_config(name, value, true)` (transaction-local) right after `BEGIN`, then runs your callback. Every query inside sees only the matching rows, and the setting resets automatically on commit or rollback.
 
 ```ts
 import { db } from '@/lib/db';
@@ -178,11 +178,11 @@ export async function GET(req: Request) {
 }
 ```
 
-The query layer never has to remember to filter by tenant — the policy does it, every time.
+The query layer never has to remember to filter by tenant, the policy does it, every time.
 
 ## See also
 
-- **[Transactions & Pipelines](/transactions)** — `$transaction`, `$withSession`, isolation levels, and `sessionContext` in depth.
-- **[Serverless & Edge](/serverless)** — the singleton pattern adapted for edge runtimes via `turbineHttp`.
-- **[Typed Errors](/errors)** — mapping Turbine errors to HTTP responses.
-- **[Quick Start](/quickstart)** — generating the typed client these recipes import.
+- **[Transactions & Pipelines](/transactions)**, `$transaction`, `$withSession`, isolation levels, and `sessionContext` in depth.
+- **[Serverless & Edge](/serverless)**, the singleton pattern adapted for edge runtimes via `turbineHttp`.
+- **[Typed Errors](/errors)**, mapping Turbine errors to HTTP responses.
+- **[Quick Start](/quickstart)**, generating the typed client these recipes import.

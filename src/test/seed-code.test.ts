@@ -1,5 +1,5 @@
 /**
- * turbine-orm — seed-as-code unit tests
+ * turbine-orm, seed-as-code unit tests
  *
  * Run: npx tsx --test src/test/seed-code.test.ts
  */

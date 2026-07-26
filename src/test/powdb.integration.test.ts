@@ -1,6 +1,6 @@
 /**
- * turbine-orm/powdb — LIVE integration tests through the REAL in-process
- * `@zvndev/powdb-embedded` napi addon (no server, no socket — runs anywhere the
+ * turbine-orm/powdb, LIVE integration tests through the REAL in-process
+ * `@zvndev/powdb-embedded` napi addon (no server, no socket, runs anywhere the
  * prebuilt binary loads).
  *
  * The whole suite is gated on the addon loading: on a platform without a
@@ -50,7 +50,7 @@ import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from 
 import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// Addon availability gate — skip cleanly when the prebuilt binary is absent.
+// Addon availability gate, skip cleanly when the prebuilt binary is absent.
 // ---------------------------------------------------------------------------
 
 let embeddedAvailable = false;
@@ -63,7 +63,7 @@ try {
 const { it } = skipGate(!embeddedAvailable, 'requires @zvndev/powdb-embedded (no prebuilt binary on this platform)');
 
 // ---------------------------------------------------------------------------
-// Schema fixture — column order deliberately ≠ the order writes pass args, so
+// Schema fixture, column order deliberately ≠ the order writes pass args, so
 // the RETURNING round-trip proves columns are matched by name, not position.
 // ---------------------------------------------------------------------------
 
@@ -117,7 +117,7 @@ function makeTable(
 const schema: SchemaMetadata = {
   enums: {},
   tables: {
-    // Column order: id, email, name, age, score, created_at — writes below pass
+    // Column order: id, email, name, age, score, created_at, writes below pass
     // them in a DIFFERENT order, exercising name-keyed RETURNING.
     app_user: makeTable(
       'app_user',
@@ -162,7 +162,7 @@ const schema: SchemaMetadata = {
 };
 
 // ---------------------------------------------------------------------------
-// Per-test harness — fresh data dir + schema DDL, torn down after.
+// Per-test harness, fresh data dir + schema DDL, torn down after.
 // ---------------------------------------------------------------------------
 
 // biome-ignore lint/suspicious/noExplicitAny: TurbineClient table accessors are dynamically typed at this seam.
@@ -263,7 +263,7 @@ describe('powdb integration (embedded)', () => {
   it('create/findUnique round-trips columns by NAME despite arg order ≠ schema order', async () => {
     await withDb(async (db) => {
       const created = await db.table('app_user').create({
-        // arg order: age, email, score, name — NOT the schema column order
+        // arg order: age, email, score, name, NOT the schema column order
         data: { age: 42, email: 'ada@x', score: 9.5, name: 'Ada' },
       });
       assert.equal(created.email, 'ada@x');
@@ -299,17 +299,17 @@ describe('powdb integration (embedded)', () => {
   it('maps unique / not-null / type-mismatch errors to typed Turbine errors', async () => {
     await withDb(async (db) => {
       await db.table('app_user').create({ data: { id: 'dup', email: 'dup@x', name: 'Dup' } });
-      // unique — same PK
+      // unique, same PK
       await assert.rejects(
         () => db.table('app_user').create({ data: { id: 'dup', email: 'dup2@x', name: 'X' } }),
         UniqueConstraintError,
       );
-      // not-null — omit required email
+      // not-null, omit required email
       await assert.rejects(
         () => db.table('app_user').create({ data: { name: 'NoEmail' } as never }),
         NotNullViolationError,
       );
-      // type mismatch — string into an int column
+      // type mismatch, string into an int column
       await assert.rejects(
         () => db.table('app_user').create({ data: { email: 'z@x', age: 'not-a-number' } as never }),
         ValidationError,
@@ -461,7 +461,7 @@ describe('powdb integration (embedded)', () => {
   it('REVIEW 1: a queued tx timing out (E002) never rolls back the OTHER open transaction', async () => {
     // Live-reproduced corruption shape: tx2's begin times out in the FIFO
     // queue, its $transaction catch used to fire a best-effort ROLLBACK that
-    // the embedded pool forwarded to the ONE shared handle — discarding tx1's
+    // the embedded pool forwarded to the ONE shared handle, discarding tx1's
     // first write, autocommitting its second, and failing its COMMIT (E003).
     const dir = mkdtempSync(join(tmpdir(), 'powdb-it-gate-'));
     const db: DB = await turbinePowDB({ embedded: dir }, schema, {
@@ -490,7 +490,7 @@ describe('powdb integration (embedded)', () => {
       const reason = (r2 as PromiseRejectedResult).reason;
       assert.ok(reason instanceof TimeoutError, `tx2 error must be TimeoutError, got: ${reason}`);
       assert.equal(reason.code, 'TURBINE_E002');
-      // BOTH tx1 rows present — the repro had A silently discarded and B autocommitted.
+      // BOTH tx1 rows present, the repro had A silently discarded and B autocommitted.
       assert.ok(await db.table('app_user').findUnique({ where: { email: 'atomic-a@x' } }), 'tx1 first write kept');
       assert.ok(await db.table('app_user').findUnique({ where: { email: 'atomic-b@x' } }), 'tx1 second write kept');
       assert.equal(await db.table('app_user').findUnique({ where: { email: 'late@x' } }), null, 'tx2 wrote nothing');
@@ -526,7 +526,7 @@ describe('powdb integration (embedded)', () => {
     });
   });
 
-  it('REVIEW 2: cross-pool nesting — inner re-entrant begin on the OUTER pool throws E017 instantly', async () => {
+  it('REVIEW 2: cross-pool nesting, inner re-entrant begin on the OUTER pool throws E017 instantly', async () => {
     // dbA tx → dbB tx → dbA tx. dbB's ALS marker used to SHADOW dbA's
     // (single-slot store), so the inner dbA begin queued behind dbA's own
     // open transaction and deadlocked until the queue timeout. The chained
@@ -567,7 +567,7 @@ describe('powdb integration (embedded)', () => {
   });
 
   it('REVIEW 2: plain single-pool re-entrancy still throws E017 instantly (fast path kept)', async () => {
-    // withDb's default queue timeout is 30s — a regression that queues the
+    // withDb's default queue timeout is 30s, a regression that queues the
     // re-entrant begin instead of throwing would blow this timing bound.
     await withDb(async (db) => {
       const start = Date.now();
@@ -596,7 +596,7 @@ describe('powdb integration (embedded)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Phase B (v0.23.0) — auto/server-generated PKs, manyToMany reads + filters,
+// Phase B (v0.23.0), auto/server-generated PKs, manyToMany reads + filters,
 // nested writes, composite-key upsert. Own schema (auto-int PKs + a junction).
 // These exercise the live engine; the relation-filter cases also guard the
 // PowDB subquery-result-cache bug (Turbine resolves filters to literal lists).
@@ -687,7 +687,7 @@ async function withPb(fn: (db: DB) => Promise<void>): Promise<void> {
 }
 
 describe('powdb integration: Phase B', () => {
-  it('auto/server-generated int PK — create/createMany assign monotonic ids', async () => {
+  it('auto/server-generated int PK, create/createMany assign monotonic ids', async () => {
     await withPb(async (db) => {
       const a = await db.table('member').create({ data: { name: 'Ada' } });
       const b = await db.table('member').create({ data: { name: 'Bob' } });
@@ -699,7 +699,7 @@ describe('powdb integration: Phase B', () => {
     });
   });
 
-  it('manyToMany nested reads — junction loader stitches targets (empty array, not null)', async () => {
+  it('manyToMany nested reads, junction loader stitches targets (empty array, not null)', async () => {
     await withPb(async (db) => {
       const ada = await db.table('member').create({ data: { name: 'Ada' } });
       const bob = await db.table('member').create({ data: { name: 'Bob' } });
@@ -726,7 +726,7 @@ describe('powdb integration: Phase B', () => {
     });
   });
 
-  it('manyToMany relation filters — some/none/every resolve correctly and DETERMINISTICALLY', async () => {
+  it('manyToMany relation filters, some/none/every resolve correctly and DETERMINISTICALLY', async () => {
     await withPb(async (db) => {
       const ada = await db.table('member').create({ data: { name: 'Ada' } });
       const bob = await db.table('member').create({ data: { name: 'Bob' } });
@@ -745,7 +745,7 @@ describe('powdb integration: Phase B', () => {
           .map((r) => r.name)
           .sort()
           .join(',');
-      // Run red BEFORE blue — the pre-cache-bug ordering that returned stale rows.
+      // Run red BEFORE blue, the pre-cache-bug ordering that returned stale rows.
       assert.equal(names(await db.table('member').findMany({ where: { tags: { some: { label: 'red' } } } })), 'Ada');
       assert.equal(
         names(await db.table('member').findMany({ where: { tags: { some: { label: 'blue' } } } })),
@@ -784,7 +784,7 @@ describe('powdb integration: Phase B', () => {
     });
   });
 
-  it('nested writes — hasMany create + belongsTo create/connect, atomic rollback on failure', async () => {
+  it('nested writes, hasMany create + belongsTo create/connect, atomic rollback on failure', async () => {
     await withPb(async (db) => {
       const eve = await db
         .table('member')
@@ -812,7 +812,7 @@ describe('powdb integration: Phase B', () => {
     });
   });
 
-  it('composite-key upsert — insert then update branch, exactly one row', async () => {
+  it('composite-key upsert, insert then update branch, exactly one row', async () => {
     await withPb(async (db) => {
       const ins = await db.table('pscore').upsert({
         where: { memberId: 1, tagId: 2 },
@@ -1640,11 +1640,11 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
   // A networked unique violation now arrives with the typed wire error class 8
   // (constraint_violation) on the raw driver error. wrapPowdbError maps it to
   // UniqueConstraintError (E008) via the message family first, so the class byte
-  // is asserted on the preserved `.cause` — this locks the 0.18.1 upstream fix
+  // is asserted on the preserved `.cause`, this locks the 0.18.1 upstream fix
   // (storage-raised unique violations surface class 8, not class 0/internal).
   // The class byte is a server >= 0.18.1 feature, so this soft-skips against an
   // older server pointed at by POWDB_URL (the E008 mapping itself holds via the
-  // message family on every server version — see the embedded error-mapping test).
+  // message family on every server version, see the embedded error-mapping test).
   liveIt(
     'a networked unique violation carries wireErrorClass 8 and maps to UniqueConstraintError (E008)',
     async (tc) => {
@@ -1956,7 +1956,7 @@ describe('powdb integration (embedded): NUL bytes in non-unique indexed strings 
 });
 
 // ---------------------------------------------------------------------------
-// Nested projections (shaped results, PowDB >= 0.18) — live through the addon.
+// Nested projections (shaped results, PowDB >= 0.18), live through the addon.
 // Gated separately: CI on a 0.17 addon skips these cleanly (the capability is
 // version-derived), a >= 0.18 addon runs them against the real engine.
 // ---------------------------------------------------------------------------
@@ -2291,7 +2291,7 @@ describe('powdb integration (embedded): entity links (0.19 catalog v7)', () => {
 
 // ---------------------------------------------------------------------------
 // PowDB >= 0.19.1: link introspection, scalar link paths (bigint child), and
-// the existence-checked emitLinks apply path — live through the embedded addon.
+// the existence-checked emitLinks apply path, live through the embedded addon.
 // lp_account.balance is a bigint (int8) column: a JSON nested block cannot carry
 // it, so `with: { account }` falls to a loader today and becomes a scalar link
 // path here, the exact narrow case this round adopts. Parity (loader vs link

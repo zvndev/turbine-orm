@@ -1,9 +1,9 @@
 /**
- * turbine-orm — Postgres enum column write casts (T-3)
+ * turbine-orm, Postgres enum column write casts (T-3)
  *
  * Dogfood bug: inserting into a table with a PG enum column failed with
  * `column "type" is of type "FieldType" but expression is of type text`.
- * Mechanism: createMany's bulk-insert form is `UNNEST($1::text[], ...)` —
+ * Mechanism: createMany's bulk-insert form is `UNNEST($1::text[], ...)` -
  * the generic text[] cast types the value as text, and Postgres refuses the
  * implicit text→enum coercion (plain `VALUES ($1)` lets PG infer, but any
  * form that materializes the param as text defeats inference).
@@ -112,7 +112,7 @@ describe('Postgres enum write casts (T-3)', () => {
   });
 
   it('non-postgresql dialects never emit the cast even with enums metadata', () => {
-    // Same SQL surface as Postgres but a different dialect name — the gate is
+    // Same SQL surface as Postgres but a different dialect name, the gate is
     // the name, so no enum cast may appear.
     const fakeDialect = { ...postgresDialect, name: 'sqlite' } as unknown as Dialect;
     const q = makeQuery('fields', buildSchema(), { dialect: fakeDialect });
@@ -133,18 +133,18 @@ describe('Postgres enum write casts (T-3)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// N-5 — cross-schema enum false positive
+// N-5, cross-schema enum false positive
 //
 // A column typed `other_schema.status` shares its NAME with an enum
 // introspected from the target schema. Introspection records
 // `pgTypeSchema: 'other_schema'` on such columns (and ONLY such columns);
-// the builder must then SKIP the cast — `::"status"` would resolve through
+// the builder must then SKIP the cast, `::"status"` would resolve through
 // search_path to the WRONG type and break writes that worked before casts
 // existed. Same-schema / defineSchema / legacy metadata (no pgTypeSchema)
 // keep the cast.
 // ---------------------------------------------------------------------------
 
-describe('Postgres enum write casts — cross-schema guard (N-5)', () => {
+describe('Postgres enum write casts, cross-schema guard (N-5)', () => {
   function crossSchemaSchema(): SchemaMetadata {
     const tables: Record<string, TableMetadata> = {};
     tables.fields = mockTable('fields', [
@@ -152,7 +152,7 @@ describe('Postgres enum write casts — cross-schema guard (N-5)', () => {
       { name: 'title', field: 'title', pgType: 'text' },
       { name: 'status', field: 'status', pgType: 'status' },
     ]);
-    // Mark the column's type as living in ANOTHER schema — exactly what
+    // Mark the column's type as living in ANOTHER schema, exactly what
     // introspection records for `other_schema.status`.
     const statusCol = tables.fields.columns.find((c) => c.name === 'status')!;
     statusCol.pgTypeSchema = 'other_schema';

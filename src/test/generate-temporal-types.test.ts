@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Codegen coverage for the temporal column types
+ * turbine-orm, Codegen coverage for the temporal column types
  *
  * A `time` column must be distinguishable from a `timestamp` column in the
  * GENERATED metadata, because the write path narrows a JS `Date` to a
@@ -11,7 +11,7 @@
  * Covers both metadata sources: an introspected `SchemaMetadata` and the
  * code-first `defineSchema` path (via `schemaDefToMetadata`).
  *
- * Pure — no database.
+ * Pure, no database.
  *
  * Run: npx tsx --test src/test/generate-temporal-types.test.ts
  */
@@ -84,7 +84,7 @@ const SCHEMA: SchemaMetadata = {
   },
 };
 
-describe('generateMetadata — temporal column types', () => {
+describe('generateMetadata, temporal column types', () => {
   const out = generateMetadata(SCHEMA);
 
   it('emits every temporal type verbatim in dialectTypes and pgTypes', () => {
@@ -110,7 +110,7 @@ describe('generateMetadata — temporal column types', () => {
   });
 });
 
-describe('generateTypes — temporal column types', () => {
+describe('generateTypes, temporal column types', () => {
   const out = generateTypes(SCHEMA);
 
   it('reads a time column back as a string', () => {
@@ -142,7 +142,7 @@ describe('generateTypes — temporal column types', () => {
   });
 });
 
-describe('code-first defineSchema — temporal column types', () => {
+describe('code-first defineSchema, temporal column types', () => {
   /**
    * The code-first builder has no `time` / `timetz` column type today (its
    * temporal types are `timestamp`/`timestamptz` and `date`), so a time column
@@ -171,7 +171,7 @@ describe('code-first defineSchema — temporal column types', () => {
   });
 });
 
-describe('generateZod — temporal column types', () => {
+describe('generateZod, temporal column types', () => {
   const out = generateZod(SCHEMA);
   const section = (start: string, end?: string) => out.slice(out.indexOf(start), end ? out.indexOf(end) : undefined);
 
@@ -211,7 +211,7 @@ describe('generateZod — temporal column types', () => {
   });
 });
 
-describe('array time columns — codegen widening', () => {
+describe('array time columns, codegen widening', () => {
   const ARRAY_SCHEMA: SchemaMetadata = {
     enums: {},
     tables: {
@@ -235,7 +235,7 @@ describe('array time columns — codegen widening', () => {
     },
   };
 
-  it('widens the write input to (string | Date)[] — the bind rewrite is element-wise', () => {
+  it('widens the write input to (string | Date)[], the bind rewrite is element-wise', () => {
     const out = generateTypes(ARRAY_SCHEMA);
     assert.match(out, /windows: string\[\];/); // row type unchanged
     const create = out.slice(out.indexOf('SlotCreate'), out.indexOf('SlotUpdate'));

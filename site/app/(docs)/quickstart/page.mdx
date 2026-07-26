@@ -65,7 +65,7 @@ export default config;
 ```
 
 > **`schema` vs `schemaFile`:**  
-> - **`schema`** is the **Postgres schema name** (the namespace — almost always `'public'`).  
+> - **`schema`** is the **Postgres schema name** (the namespace, almost always `'public'`).  
 > - **`schemaFile`** is the **path** to your `defineSchema()` TypeScript file (used by `turbine push` and auto-diff migrations).  
 >  
 > Never put a file path in `schema`. A value like `'./turbine/schema.ts'` makes introspection look for `WHERE table_schema = './turbine/schema.ts'`, which matches zero tables. Put the path in `schemaFile` only.
@@ -74,7 +74,7 @@ export default config;
 
 After `init`, pick the path that matches your database.
 
-### Path A — Existing tables
+### Path A, Existing tables
 
 If the database already has tables, introspect them and emit a fully-typed client:
 
@@ -83,11 +83,11 @@ npx turbine generate
 # or: npx turbine pull
 ```
 
-### Path B — Empty database
+### Path B, Empty database
 
 If the database is empty (or you want to own the schema in TypeScript first), define tables, push them, then generate:
 
-1. Edit `turbine/schema.ts` with `defineSchema(...)` — see [Schema & Migrations](/schema).
+1. Edit `turbine/schema.ts` with `defineSchema(...)`, see [Schema & Migrations](/schema).
 2. Apply it to the database:
 
 ```bash
@@ -100,15 +100,15 @@ npx turbine push
 npx turbine generate
 ```
 
-`push` is the fast local path. For production, prefer SQL migrations (`turbine migrate`) instead of push — details on the [schema page](/schema).
+`push` is the fast local path. For production, prefer SQL migrations (`turbine migrate`) instead of push, details on the [schema page](/schema).
 
 ### What gets written
 
 Either path writes three files to `./generated/turbine/` (or your config `out`):
 
-- `types.ts` — entity interfaces and `Create` / `Update` input types
-- `metadata.ts` — runtime schema metadata
-- `index.ts` — a typed `TurbineClient` subclass with table accessors
+- `types.ts`, entity interfaces and `Create` / `Update` input types
+- `metadata.ts`, runtime schema metadata
+- `index.ts`, a typed `TurbineClient` subclass with table accessors
 
 ## 5. Your first query
 
@@ -137,7 +137,7 @@ await db.disconnect();
 > `process.loadEnvFile()` at startup. Any framework that already loads `.env`
 > (Next.js, etc.) works too.
 
-`db.users` is typed — autocompletion surfaces every column, every operator, every relation. `users[0].createdAt` is a `Date`, `users[0].email` is a `string`, everything is inferred from the generated types.
+`db.users` is typed, autocompletion surfaces every column, every operator, every relation. `users[0].createdAt` is a `Date`, `users[0].email` is a `string`, everything is inferred from the generated types.
 
 ## 6. Add nested relations
 
@@ -161,13 +161,13 @@ Turbine compiles the `with` clause to a single SQL statement using PostgreSQL's 
 
 ## Next steps
 
-- **[Vector Search](/vector)** — typed pgvector KNN ranking and distance filters, no raw SQL.
-- **[Realtime](/realtime)** — Postgres LISTEN/NOTIFY pub/sub with `$listen` / `$notify`.
-- **[Transactions & RLS Sessions](/transactions)** — SAVEPOINTs, isolation levels, and `sessionContext` for Row-Level Security multi-tenancy.
-- **[Studio](/studio)** — a local, read-only database UI: `npx turbine studio`.
-- **[Observability](/observability)** — query lifecycle events and built-in metrics aggregation.
-- **[API Reference](/queries)** — every query method, WHERE operator, and nested `with` option.
-- **[Schema & Migrations](/schema)** — define your schema in TypeScript and ship migrations.
-- **[Database Engines](/engines)** — SQLite, MySQL, SQL Server, and PowDB behind the same typed API.
-- **[CLI](/cli)** — every command with examples.
+- **[Vector Search](/vector)**, typed pgvector KNN ranking and distance filters, no raw SQL.
+- **[Realtime](/realtime)**, Postgres LISTEN/NOTIFY pub/sub with `$listen` / `$notify`.
+- **[Transactions & RLS Sessions](/transactions)**, SAVEPOINTs, isolation levels, and `sessionContext` for Row-Level Security multi-tenancy.
+- **[Studio](/studio)**, a local, read-only database UI: `npx turbine studio`.
+- **[Observability](/observability)**, query lifecycle events and built-in metrics aggregation.
+- **[API Reference](/queries)**, every query method, WHERE operator, and nested `with` option.
+- **[Schema & Migrations](/schema)**, define your schema in TypeScript and ship migrations.
+- **[Database Engines](/engines)**, SQLite, MySQL, SQL Server, and PowDB behind the same typed API.
+- **[CLI](/cli)**, every command with examples.
 - **[Benchmarks](/benchmarks)**: honest numbers against Prisma 7 and Drizzle 0.45 on a local PostgreSQL 17 database.

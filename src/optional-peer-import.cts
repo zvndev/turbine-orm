@@ -1,6 +1,6 @@
 /**
  * True dynamic `import()` for the optional peer dependencies (`mysql2`,
- * `mssql`, `@zvndev/powdb-client`, `@zvndev/powdb-embedded`) — safe in BOTH
+ * `mssql`, `@zvndev/powdb-client`, `@zvndev/powdb-embedded`), safe in BOTH
  * build outputs, including for peers that are ESM-only.
  *
  * THE PROBLEM THIS FILE SOLVES (the `@zvndev/powdb-client` ≥ 0.9 CJS break):
@@ -8,7 +8,7 @@
  * peers stay out of the static graph. The ESM build (`tsconfig.json`, module
  * NodeNext) emits that `import()` verbatim. The CJS build (`tsconfig.cjs.json`,
  * module CommonJS) however TRANSPILES `import()` into
- * `Promise.resolve().then(() => require(...))` — and `require()` of an
+ * `Promise.resolve().then(() => require(...))`, and `require()` of an
  * ESM-only package (no `require` export condition, e.g. powdb-client ≥ 0.9)
  * throws `ERR_PACKAGE_PATH_NOT_EXPORTED`, breaking every CJS consumer.
  *
@@ -17,18 +17,18 @@
  * says `"type": "module"`, so NodeNext would classify every `.ts` source as
  * ESM and emit ESM into dist/cjs). A `.cts` file is the escape hatch: it is
  * CommonJS-format by extension regardless of package `type`, so under the ESM
- * pass (NodeNext) it compiles to `dist/optional-peer-import.cjs` — a CommonJS
+ * pass (NodeNext) it compiles to `dist/optional-peer-import.cjs`, a CommonJS
  * file whose `import()` SURVIVES transpilation (NodeNext preserves dynamic
  * import in CJS files precisely because it is the only way CJS can load ESM).
  *
  * That gives the published package two copies of this module:
- *   - `dist/optional-peer-import.cjs`      (ESM pass, NodeNext)  — real `import()`
- *   - `dist/cjs/optional-peer-import.cjs`  (CJS pass, CommonJS)  — lowered to `require()`
+ *   - `dist/optional-peer-import.cjs`      (ESM pass, NodeNext) , real `import()`
+ *   - `dist/cjs/optional-peer-import.cjs`  (CJS pass, CommonJS) , lowered to `require()`
  *
  * The lowered copy works fine for CJS-loadable peers (`mysql2`, `mssql`, older
  * powdb peers). When it hits an ESM-only peer, the `require()` fails with a
  * recognizable code and this function falls back to delegating the load to the
- * sibling NodeNext copy one directory up (`../optional-peer-import.cjs`) —
+ * sibling NodeNext copy one directory up (`../optional-peer-import.cjs`) -
  * which is a plain CommonJS file (loadable by `require()` on every supported
  * Node) whose real `import()` then loads the ESM peer. The ESM-pass copy has
  * no such sibling; its lazy `require` throws and the original error surfaces,
@@ -62,7 +62,7 @@ function isEsmOnlyLoadError(err: unknown): boolean {
  * transpilation (see the module doc comment).
  *
  * @param specifier bare package specifier (e.g. `'@zvndev/powdb-client'`).
- * @param allowEsmFallback internal recursion guard — the delegated call passes
+ * @param allowEsmFallback internal recursion guard, the delegated call passes
  *   `false` so a failure in the sibling copy can never bounce back.
  */
 async function importOptionalPeer(specifier: string, allowEsmFallback = true): Promise<unknown> {

@@ -13,6 +13,7 @@
  * the findMany/findUnique execute assembly.
  */
 
+import type { JsonWireRule } from '../dialect.js';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { missingIndexForRelation } from '../index-advisor.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
@@ -37,7 +38,7 @@ import type {
   WithCount,
   WithOptions,
 } from './types.js';
-import { coerceJsonWireValue, jsonWireCoercionOid, ownLookup } from './utils.js';
+import { ownLookup } from './utils.js';
 import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -48,11 +49,11 @@ import * as writesMod from './writes.js';
  * generation (see {@link buildRelationShape}) and consumed by the
  * transform to map key-less positional arrays back to keyed objects.
  *
- * - `keys` — camelCase field names in emitted array position, INCLUDING nested
+ * - `keys`, camelCase field names in emitted array position, INCLUDING nested
  *   relation slots (a nested relation occupies one more position after the
  *   scalar columns, in `sortedEntries(with)` order).
- * - `nested` — sub-shape for each key in `keys` that is itself a relation slot.
- * - `cardinality` — `'one'` (belongsTo/hasOne, a single positional array or
+ * - `nested`, sub-shape for each key in `keys` that is itself a relation slot.
+ * - `cardinality`, `'one'` (belongsTo/hasOne, a single positional array or
  *   null) vs `'many'` (an array of positional arrays).
  */
 export interface RelationShape {
@@ -74,7 +75,7 @@ export function resolveColumns(
   if (select) {
     // An array here means a caller wrote `select: ['id', 'name']` (Drizzle/SQL
     // style) instead of the object shape. Object.entries() would iterate the
-    // numeric indices and throw a cryptic `Unknown field "0"` — catch it early
+    // numeric indices and throw a cryptic `Unknown field "0"`, catch it early
     // with an actionable message.
     if (Array.isArray(select)) {
       throw new ValidationError(
@@ -130,7 +131,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
   for (const relName of relNames) {
     const spec = withClause[relName];
     if (!spec) continue;
-    // Reserved `_count` key — fingerprint by the selected relation set so
+    // Reserved `_count` key, fingerprint by the selected relation set so
     // `_count: true` and `_count: { posts: true }` never share a cache entry.
     if (relName === '_count') {
       const c = spec as unknown as WithCount;
@@ -235,7 +236,7 @@ export function collectWithParams(
     collectRelationSubqueryParams(qi, relDef, relSpec, params, table ?? qi.table);
   }
 
-  // `_count` global-filter params — mirror buildSelectWithRelations, which
+  // `_count` global-filter params, mirror buildSelectWithRelations, which
   // appends the count subqueries (and any target-filter params) AFTER every
   // relation subquery, in resolveCountRelations order.
   const countSpec = (withClause as { _count?: WithCount })._count;
@@ -315,16 +316,16 @@ export function collectRelationSubqueryParams(
     collectRelationOrderParams(qi, targetTable, targetMeta, relOrderEntries, params);
   }
 
-  // where params — mirrors buildAliasWhere push order
+  // where params, mirrors buildAliasWhere push order
   if (spec.where) {
     whereMod.collectAliasWhereParams(qi, targetTable, targetMeta, spec.where as Record<string, unknown>, params);
   }
 
-  // Global filter on the target — mirrors targetGlobalFilterAlias in
+  // Global filter on the target, mirrors targetGlobalFilterAlias in
   // buildRelationSubquery (pushed after spec.where, before limit).
   whereMod.collectTargetGlobalFilterAlias(qi, targetTable, params);
 
-  // limit param — only hasMany parameterizes its limit (mirrors
+  // limit param, only hasMany parameterizes its limit (mirrors
   // buildRelationSubquery). belongsTo/hasOne ignore limit (always LIMIT 1), so
   // pushing one here would orphan a param and desync the collect path.
   // `limit: 0` pushes (LIMIT 0 is honored), so check !== undefined.
@@ -346,7 +347,7 @@ export function collectRelationSubqueryParams(
  * Value-shape fingerprint for a single orderBy entry, so two queries whose
  * ORDER BY differs only in nulls placement, vector metric, or relation-count
  * vs relation-column never collide on one cached SQL string. Captures the
- * SQL-shaping bits (direction, nulls, metric, relation keys) — never values.
+ * SQL-shaping bits (direction, nulls, metric, relation keys), never values.
  */
 export function orderByEntryFingerprint(qi: BuilderCtx, d: unknown, targetTable?: string): string {
   // Vector KNN ordering changes the emitted operator by metric and adds a
@@ -392,7 +393,7 @@ export function orderByEntryFingerprint(qi: BuilderCtx, d: unknown, targetTable?
     // emits one ORDER BY term per entry in Object.entries order, so entry
     // order is SQL-shaping precedence. A sorted fingerprint made
     // `{ name: 'asc', email: 'desc' }` and the swapped literal share one
-    // cached SQL string — silently mis-ordered results on a warm cache.
+    // cached SQL string, silently mis-ordered results on a warm cache.
     return `rel(${Object.entries(d as Record<string, unknown>)
       .map(([k, v]) => `${k}=${orderByEntryFingerprint(qi, v)}`)
       .join(',')})`;
@@ -467,7 +468,7 @@ export function buildOrderBy(
         );
       }
 
-      // Scalar column ordering — a plain direction or an OrderBySpec (nulls).
+      // Scalar column ordering, a plain direction or an OrderBySpec (nulls).
       if (meta && !(key in meta.columnMap)) {
         throw new ValidationError(
           `[turbine] Unknown field "${key}" in orderBy on table "${qi.table}". ` +
@@ -498,7 +499,7 @@ export function isRelationOrderByValue(_qi: BuilderCtx, value: unknown): boolean
 
 /**
  * Render the ` NULLS FIRST` / ` NULLS LAST` suffix for a column ordering.
- * Only PostgreSQL and SQLite support the `NULLS FIRST/LAST` grammar — on any
+ * Only PostgreSQL and SQLite support the `NULLS FIRST/LAST` grammar, on any
  * other engine a caller asking for explicit nulls placement gets a clear
  * {@link UnsupportedFeatureError} (E017) instead of broken SQL.
  */
@@ -608,6 +609,120 @@ export function buildJsonPathOrderEntry(
 }
 
 /**
+ * Order by a column reached through TWO OR MORE to-one relation hops, e.g.
+ * `orderBy: { model: { category: { name: 'asc' } } }`.
+ *
+ * One hop already compiled to a correlated scalar subquery; each additional
+ * hop is added to that same subquery as an INNER JOIN, so the whole chain is
+ * one subquery with one `LIMIT 1` regardless of depth:
+ *
+ *   (SELECT t1."name"
+ *      FROM "models" t0
+ *      JOIN "categories" t1 ON t1."id" = t0."category_id"
+ *     WHERE t0."id" = "versions"."model_id"
+ *     LIMIT 1) ASC
+ *
+ * Every hop must be to-one. A to-many hop has no single value to order by, so
+ * it is refused rather than silently picking an arbitrary row (`{ pick, by }`
+ * exists for that, deliberately, because it forces the caller to say WHICH
+ * row). Each hop's target global filter is applied to its join condition, so
+ * ordering never keys off a soft-deleted or other-tenant row.
+ */
+function buildChainedToOneOrderBy(
+  qi: BuilderCtx,
+  head: { relName: string; relDef: RelationDef; alias: string; correlation: string },
+  nextRelName: string,
+  nextValue: Record<string, unknown>,
+  params?: unknown[],
+): string {
+  const joins: string[] = [];
+  let currentMeta = qi.schema.tables[head.relDef.to];
+  let currentAlias = head.alias;
+  let hop = 0;
+  let relName = nextRelName;
+  let value = nextValue;
+  const path = [head.relName];
+
+  // Walk the chain, emitting one JOIN per hop, until the value stops being a
+  // relation object. Bounded by the same depth cap as nested `with`.
+  for (;;) {
+    if (!currentMeta) throw new RelationError(`[turbine] Unknown relation target in orderBy chain "${path.join('.')}"`);
+    const relDef = ownLookup(currentMeta.relations, relName);
+    if (!relDef) {
+      throw new ValidationError(
+        `[turbine] Unknown relation "${relName}" in orderBy on relation "${path.join('.')}" ` +
+          `(table "${currentMeta.name}"). Available: ${Object.keys(currentMeta.relations).join(', ') || '(none)'}.`,
+      );
+    }
+    if (relDef.type !== 'belongsTo' && relDef.type !== 'hasOne') {
+      throw new ValidationError(
+        `[turbine] orderBy cannot traverse the to-many relation "${relName}" on "${currentMeta.name}" ` +
+          `(path "${path.concat(relName).join('.')}"): a to-many relation has no single value to order by. ` +
+          `Use a pick-row ordering ({ pick, by }) at the top level, or order by "_count".`,
+      );
+    }
+    if (++hop > MAX_ORDER_BY_RELATION_HOPS) {
+      throw new CircularRelationError(path.concat(relName));
+    }
+
+    const nextMeta = qi.schema.tables[relDef.to];
+    if (!nextMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}" in orderBy`);
+    const nextAlias = `${head.alias}c${hop}`;
+    const on =
+      relDef.type === 'belongsTo'
+        ? qi.dialect.buildCorrelation(nextAlias, relDef.referenceKey, currentAlias, relDef.foreignKey)
+        : qi.dialect.buildCorrelation(nextAlias, relDef.foreignKey, currentAlias, relDef.referenceKey);
+    let onSql = on;
+    if (params) {
+      const gf = whereMod.targetGlobalFilterAlias(qi, relDef.to, nextAlias, params);
+      if (gf) onSql += ` AND ${gf}`;
+    }
+    joins.push(`JOIN ${qi.q(relDef.to)} ${nextAlias} ON ${onSql}`);
+
+    path.push(relName);
+    currentMeta = nextMeta;
+    currentAlias = nextAlias;
+
+    // Exactly one key per level, as with the single-hop form.
+    const entries = Object.entries(value);
+    if (entries.length !== 1) {
+      throw new ValidationError(
+        `[turbine] orderBy on relation "${path.join('.')}" needs exactly one key per level ` +
+          `(got: ${entries.map(([k]) => k).join(', ') || '(empty)'}).`,
+      );
+    }
+    const [key, entryValue] = entries[0]!;
+    if (ownLookup(currentMeta.relations, key) && isRelationOrderByValue(qi, entryValue)) {
+      relName = key;
+      value = entryValue as Record<string, unknown>;
+      continue;
+    }
+
+    // Terminal: a column on the last table in the chain.
+    const snakeCol = ownLookup(currentMeta.columnMap, key) ?? camelToSnake(key);
+    if (!currentMeta.allColumns.includes(snakeCol)) {
+      throw new ValidationError(
+        `[turbine] Unknown column "${key}" in orderBy on relation "${path.join('.')}" (table "${currentMeta.name}").`,
+      );
+    }
+    const { dir, nulls } = normalizeOrderBy(entryValue as OrderDirection | OrderBySpec);
+    let where = head.correlation;
+    if (params) {
+      const gf = whereMod.targetGlobalFilterAlias(qi, head.relDef.to, head.alias, params);
+      if (gf) where += ` AND ${gf}`;
+    }
+    const from = `${qi.q(head.relDef.to)} ${head.alias} ${joins.join(' ')}`;
+    return (
+      `(SELECT ${currentAlias}.${qi.q(snakeCol)} FROM ${from} WHERE ${where}${qi.limitOneClause()}) ` +
+      `${dir}${nullsSuffix(qi, nulls)}`
+    );
+  }
+}
+
+/** Depth cap for a chained relation orderBy, mirroring the nested-`with` cap. */
+const MAX_ORDER_BY_RELATION_HOPS = 10;
+
+/**
  * Compile a relation ordering term. For a to-many relation the only allowed
  * key is `_count`, which becomes a correlated `COUNT(*)` subquery. For a
  * to-one relation each entry names a target column and becomes a correlated
@@ -690,16 +805,35 @@ export function buildRelationOrderBy(
   }
   return entries
     .map(([col, dirValue]) => {
+      // A nested relation: `orderBy: { model: { category: { name: 'asc' } } }`.
+      // Each further to-one hop becomes a JOIN inside the SAME correlated
+      // subquery rather than another level of nesting, so an N-hop chain still
+      // costs one subquery.
+      const nestedRel = ownLookup(targetMeta.relations, col);
+      if (nestedRel && isRelationOrderByValue(qi, dirValue)) {
+        return buildChainedToOneOrderBy(
+          qi,
+          { relName, relDef, alias, correlation },
+          col,
+          dirValue as Record<string, unknown>,
+          params,
+        );
+      }
+
       // columnMap-first resolution (camelToSnake fallback): mirrors the
       // scalar orderBy path so camelCase-named DB columns resolve here too.
       const snakeCol = ownLookup(targetMeta.columnMap, col) ?? camelToSnake(col);
       if (!targetMeta.allColumns.includes(snakeCol)) {
+        const relationHint = ownLookup(targetMeta.relations, col)
+          ? ` "${col}" is a relation on "${relDef.to}": order by one of ITS columns, e.g. ` +
+            `{ ${relName}: { ${col}: { <column>: 'asc' } } }.`
+          : '';
         throw new ValidationError(
-          `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").`,
+          `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").${relationHint}`,
         );
       }
       const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
-      // Target's global filter applies here too — otherwise ordering keys off
+      // Target's global filter applies here too, otherwise ordering keys off
       // a soft-deleted / other-tenant related row's value (matches the with
       // subquery semantics for belongsTo/hasOne).
       let where = correlation;
@@ -1162,7 +1296,7 @@ export function collectManyToManyTargetGlobalFilter(qi: BuilderCtx, relDef: Rela
 /**
  * Param-collect mirror of {@link buildRelationCountExpr}'s global-filter
  * params (hasMany direct filter, or manyToMany EXISTS-on-target). Only pushes
- * when a filter applies — no-op otherwise.
+ * when a filter applies, no-op otherwise.
  */
 export function collectRelationCountParams(qi: BuilderCtx, relDef: RelationDef, params: unknown[]): void {
   if (relDef.type === 'manyToMany') {
@@ -1333,7 +1467,7 @@ export function buildJsonRow(qi: BuilderCtx, jsonPairs: [key: string, expr: stri
 // `json_build_object` renders a handful of Postgres types as something other
 // than the value the driver hands back for the same column, so the 'join'
 // strategy used to disagree with a top-level read, with 'batched', and with
-// 'flatten' — losing precision outright on numeric and int8. The two halves of
+// 'flatten', losing precision outright on numeric and int8. The two halves of
 // the fix live here and must stay in lockstep:
 //
 //   SQL side   jsonScalarPairs() emits `alias."col"::text` for a divergent
@@ -1347,9 +1481,16 @@ export function buildJsonRow(qi: BuilderCtx, jsonPairs: [key: string, expr: stri
 // json_build_object nor share this divergence set.
 // ---------------------------------------------------------------------------
 
-/** True when this query's engine gets the JSON-wire cast/decode treatment. */
-function usesJsonWireCoercion(qi: BuilderCtx): boolean {
-  return qi.dialect.name === 'postgresql';
+/**
+ * The JSON-wire rule for one column, or undefined when its JSON rendering
+ * already matches the driver. Routed entirely through the dialect, so each
+ * engine states its own divergence set (see {@link Dialect.jsonWireRule}); a
+ * dialect that omits the hook keeps the pre-0.51 no-cast behavior.
+ */
+function jsonWireRuleFor(qi: BuilderCtx, meta: TableMetadata, col: string): JsonWireRule | undefined {
+  const type = meta.pgTypes?.[col];
+  if (!type) return undefined;
+  return qi.dialect.jsonWireRule?.(type);
 }
 
 /**
@@ -1359,8 +1500,7 @@ function usesJsonWireCoercion(qi: BuilderCtx): boolean {
  */
 function jsonScalarExpr(qi: BuilderCtx, targetMeta: TableMetadata, col: string, ref: string): string {
   const expr = `${ref}.${qi.q(col)}`;
-  if (!usesJsonWireCoercion(qi)) return expr;
-  return jsonWireCoercionOid(targetMeta.pgTypes?.[col]) === undefined ? expr : `${expr}::text`;
+  return jsonWireRuleFor(qi, targetMeta, col)?.sql(expr) ?? expr;
 }
 
 /**
@@ -1390,9 +1530,9 @@ function jsonScalarPairs(
  * Held in a WeakMap rather than on the ctx so the cache dies with the
  * QueryInterface and no shared interface has to grow a field for it.
  */
-const jsonWireFieldCache = new WeakMap<BuilderCtx, Map<string, Map<string, number> | null>>();
+const jsonWireFieldCache = new WeakMap<BuilderCtx, Map<string, Map<string, JsonWireRule> | null>>();
 
-function jsonWireFields(qi: BuilderCtx, table: string, meta: TableMetadata): Map<string, number> | null {
+function jsonWireFields(qi: BuilderCtx, table: string, meta: TableMetadata): Map<string, JsonWireRule> | null {
   let byTable = jsonWireFieldCache.get(qi);
   if (!byTable) {
     byTable = new Map();
@@ -1401,15 +1541,12 @@ function jsonWireFields(qi: BuilderCtx, table: string, meta: TableMetadata): Map
   const cached = byTable.get(table);
   if (cached !== undefined) return cached;
 
-  let fields: Map<string, number> | null = null;
-  const pgTypes = meta.pgTypes;
-  if (pgTypes) {
-    for (const col of meta.allColumns) {
-      const oid = jsonWireCoercionOid(pgTypes[col]);
-      if (oid === undefined) continue;
-      if (fields === null) fields = new Map();
-      fields.set(meta.reverseColumnMap[col] ?? snakeToCamel(col), oid);
-    }
+  let fields: Map<string, JsonWireRule> | null = null;
+  for (const col of meta.allColumns) {
+    const rule = jsonWireRuleFor(qi, meta, col);
+    if (rule === undefined) continue;
+    if (fields === null) fields = new Map();
+    fields.set(meta.reverseColumnMap[col] ?? snakeToCamel(col), rule);
   }
   byTable.set(table, fields);
   return fields;
@@ -1426,7 +1563,6 @@ function decodeJsonWireRow(
   table: string,
   meta: TableMetadata,
 ): Record<string, unknown> {
-  if (!usesJsonWireCoercion(qi)) return row;
   const fields = jsonWireFields(qi, table, meta);
   if (fields === null) return row;
   // Copy-on-first-write rather than mutating in place: the row can be a
@@ -1434,11 +1570,11 @@ function decodeJsonWireRow(
   // be holding. Measured against an in-place variant on a 20K-child-row join the
   // two were indistinguishable, so the copy is free insurance.
   let decoded: Record<string, unknown> | undefined;
-  for (const [field, oid] of fields) {
+  for (const [field, rule] of fields) {
     const raw = row[field];
     if (typeof raw !== 'string') continue;
     if (decoded === undefined) decoded = { ...row };
-    decoded[field] = coerceJsonWireValue(oid, raw);
+    decoded[field] = rule.decode(raw);
   }
   return decoded ?? row;
 }
@@ -1522,7 +1658,7 @@ export function makeNestedParser(
 /**
  * Return a shallow copy of a top-level row with each relation column decoded
  * from its positional array(s) into the object representation. Only relation
- * columns are positional — base scalar columns stay object-keyed — so the
+ * columns are positional, base scalar columns stay object-keyed, so the
  * result is exactly what the object encoding would have handed parseNestedRow.
  */
 export function decodePositionalRelations(
@@ -1575,7 +1711,7 @@ export function decodePositionalObject(qi: BuilderCtx, arr: unknown, shape: Rela
 }
 
 // ---------------------------------------------------------------------------
-// relationLoadStrategy: 'flatten' — to-one relations compiled as LEFT JOINs
+// relationLoadStrategy: 'flatten', to-one relations compiled as LEFT JOINs
 // ---------------------------------------------------------------------------
 
 /**
@@ -1592,7 +1728,7 @@ const FLATTEN_ALIAS_PREFIX = 'f';
  * The top-level `WHERE` and `ORDER BY` reference the parent's columns
  * UNQUALIFIED (`WHERE "name" = $1`). A bare `LEFT JOIN "orgs" f0` puts a second
  * table in scope, so any column name the two tables share ("id", "name",
- * "created_at" — i.e. most of them) turns those references ambiguous and
+ * "created_at", i.e. most of them) turns those references ambiguous and
  * Postgres rejects the statement. Qualifying the parent's references is not an
  * option here: they are compiled by the shared WHERE walk, which is scope-blind
  * by design.
@@ -1662,7 +1798,7 @@ export interface FlattenNode {
   alias: string;
   /** Alias of the real target table inside the derived table (`f0s`). */
   srcAlias: string;
-  /** Target-side correlation columns (provably unique — see {@link provableUniqueTargetKey}). */
+  /** Target-side correlation columns (provably unique, see {@link provableUniqueTargetKey}). */
   keyColumns: string[];
   /**
    * Match discriminator. A top-level node projects the constant `1` (its
@@ -1771,13 +1907,13 @@ export function provableUniqueTargetKey(relDef: RelationDef, targetMeta: TableMe
  *
  * A relation is ELIGIBLE when all of the following hold:
  *   1. it is `belongsTo` or `hasOne` AND its target-side correlation columns are
- *      provably unique ({@link provableUniqueTargetKey}) — the row-multiplication
+ *      provably unique ({@link provableUniqueTargetKey}), the row-multiplication
  *      guard;
  *   2. its spec declares no `limit` and no `orderBy` (both are no-ops over a
  *      single matching row, but refusing them keeps the emitted SQL and the
  *      param stream trivially equivalent);
  *   3. its nested `with` names only real relations and no reserved `_count`
- *      (nested `_count` is unsupported on every strategy — falling back lets the
+ *      (nested `_count` is unsupported on every strategy, falling back lets the
  *      subquery path raise the same error);
  *   4. the depth cap is not reached, so a too-deep chain still raises
  *      {@link CircularRelationError} from the subquery path instead of silently
@@ -1942,7 +2078,7 @@ function warnFlattenFallback(table: string, rejects: readonly FlattenReject[]): 
  * it emits today, down to the cache key).
  *
  * The plan is a pure function of the schema, the `with` clause shape and
- * `includePii` — never of any bound value — so the build path, the cache-hit
+ * `includePii`, never of any bound value, so the build path, the cache-hit
  * param-collect path and the row assembler can each recompute it and agree.
  */
 export function planFlattenWith(
@@ -2320,8 +2456,8 @@ export function buildSelectWithRelations(
   const meta = qi.schema.tables[table];
   if (!meta) throw new ValidationError(`[turbine] Unknown table "${table}"`);
 
-  // Positional JSON encoding is Postgres-only in v1. Gate here — the single
-  // entry point for every `with` clause — so no engine ever emits the
+  // Positional JSON encoding is Postgres-only in v1. Gate here, the single
+  // entry point for every `with` clause, so no engine ever emits the
   // json_build_array shape its dialect can't produce (and mssql's FOR JSON
   // override path is never reached with positional active).
   if (qi.jsonEncoding === 'positional' && qi.dialect.name !== 'postgresql') {
@@ -2488,7 +2624,7 @@ export function buildRelationSubquery(
 
   const targetTable = relDef.to;
 
-  // Hard depth cap — the `with` clause is a finite JSON structure so users can't
+  // Hard depth cap, the `with` clause is a finite JSON structure so users can't
   // create true infinite recursion, but extremely deep nesting (10+ levels) produces
   // unmanageably large SQL. Back-references (e.g. posts → user → posts) are allowed
   // since they are legitimate queries (Prisma supports the same pattern).
@@ -2514,7 +2650,7 @@ export function buildRelationSubquery(
       if (miss && shouldWarnOnce(WARN_NS.unindexedRelation, warnKey)) {
         console.warn(
           `[turbine] Relation "${relDef.name}" on "${relDef.from}" probes ` +
-            `"${miss.table}"(${miss.columns.join(', ')}) which has no covering index — ` +
+            `"${miss.table}"(${miss.columns.join(', ')}) which has no covering index, ` +
             `each parent row scans the full table. Fix: ${miss.createSql}; ` +
             'or run `npx turbine doctor` for a full report.',
         );
@@ -2573,7 +2709,7 @@ export function buildRelationSubquery(
   // Determine if this hasMany will take the wrapped subquery path (LIMIT or ORDER BY).
   // When wrapping, nested relations are built in the wrapped path referencing innerAlias,
   // so we must NOT build them here (they would push orphaned params).
-  // An orderBy with no defined entries (`orderBy: {}`) is treated as absent —
+  // An orderBy with no defined entries (`orderBy: {}`) is treated as absent -
   // it must neither trigger the wrap (dropping nested relations) nor render a
   // dangling `ORDER BY `. `limit: 0` is meaningful (LIMIT 0) and DOES wrap.
   const relOrderEntries =
@@ -2601,7 +2737,7 @@ export function buildRelationSubquery(
     );
   }
 
-  // Nested relations — only in the non-wrapped path (wrapped path builds them separately)
+  // Nested relations, only in the non-wrapped path (wrapped path builds them separately)
   if (!willWrap && spec !== true && spec.with) {
     for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
       const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
@@ -2631,7 +2767,7 @@ export function buildRelationSubquery(
 
   const jsonObj = buildJsonRow(qi, jsonPairs);
 
-  // Quote parent ref — can be a table name or auto-generated alias
+  // Quote parent ref, can be a table name or auto-generated alias
   const qParent = qi.q(parentRef);
   const qTarget = qi.q(targetTable);
 
@@ -2644,10 +2780,10 @@ export function buildRelationSubquery(
     orderClause = buildRelationOrderClause(qi, targetTable, targetMeta, alias, relOrderEntries, params);
   }
 
-  // Build WHERE — correlate to parent via parentRef (alias or table name).
+  // Build WHERE, correlate to parent via parentRef (alias or table name).
   // For hasMany/hasOne: TARGET has the FK (RelationDef.foreignKey is always
   // the child-side column), so alias.fk = parentRef.pk. hasOne is just
-  // hasMany with a unique FK — treating it like belongsTo here silently
+  // hasMany with a unique FK, treating it like belongsTo here silently
   // correlated the wrong columns (caught dogfooding: uuid = varchar).
   // For belongsTo: SOURCE has the FK, so alias.pk = parentRef.fk (reversed).
   // Supports composite foreign keys (string[]) via buildCorrelation.
@@ -2658,7 +2794,7 @@ export function buildRelationSubquery(
     whereClause = qi.dialect.buildCorrelation(alias, relDef.foreignKey, qParent, relDef.referenceKey);
   }
 
-  // Additional filters — full scalar where surface (equality, null, operator
+  // Additional filters, full scalar where surface (equality, null, operator
   // objects, OR/AND/NOT), properly parameterized against this alias.
   if (spec !== true && spec.where) {
     const extra = whereMod.buildAliasWhere(
@@ -2672,13 +2808,13 @@ export function buildRelationSubquery(
     if (extra) whereClause += ` AND ${extra}`;
   }
 
-  // Global filter on the target table (soft-delete / tenancy) — AND-merged so
+  // Global filter on the target table (soft-delete / tenancy), AND-merged so
   // a `with` never surfaces filtered-out child rows. Pushed AFTER spec.where,
   // mirrored by collectRelationSubqueryParams.
   const gfExtra = whereMod.targetGlobalFilterAlias(qi, targetTable, alias, params);
   if (gfExtra) whereClause += ` AND ${gfExtra}`;
 
-  // LIMIT — only meaningful for hasMany. A belongsTo / hasOne subquery returns
+  // LIMIT, only meaningful for hasMany. A belongsTo / hasOne subquery returns
   // a single row (literal `LIMIT 1` below), so a `spec.limit` here must NOT push
   // a parameter: doing so orphans an untyped `$N` that the SQL never references,
   // which Postgres rejects with "could not determine data type of parameter $N"
@@ -2697,7 +2833,7 @@ export function buildRelationSubquery(
       // Rewrite: SELECT json_agg(json_build_object(...)) FROM (SELECT * FROM table WHERE ... ORDER BY ... LIMIT N) AS alias
       // Inner SELECT always needs all columns for WHERE/ORDER to work; json_build_object filters later
       const innerSql = `SELECT ${targetMeta.allColumns.map((c) => `${alias}.${qi.q(c)}`).join(', ')} FROM ${qTarget} ${alias} WHERE ${whereClause}${orderClause}${limitClause}`;
-      // For the json_build_object, reference the inner alias — only include resolved columns
+      // For the json_build_object, reference the inner alias, only include resolved columns
       const innerJsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, innerAlias);
       // Build nested relation subqueries referencing innerAlias
       if (spec !== true && spec.with) {
@@ -2730,7 +2866,7 @@ export function buildRelationSubquery(
     }
     // Inline ORDER BY only when the dialect's array-agg supports it (PG). For
     // hasMany this path is reached only when there is no orderClause, so the
-    // argument is `undefined` either way — keeping PG output byte-identical.
+    // argument is `undefined` either way, keeping PG output byte-identical.
     const inlineOrder = qi.dialect.aggSupportsInlineOrderBy ? orderClause.trim() || undefined : undefined;
     return `SELECT ${qi.dialect.buildJsonArrayAgg(jsonObj, inlineOrder)} FROM ${qTarget} ${alias} WHERE ${whereClause}`;
   }
@@ -2790,7 +2926,7 @@ export function buildManyToManySubquery(
   // JOIN: junction.targetKey = target.<targetPK>. Composite keys pair positionally.
   const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
   // The target PK is the column(s) the junction's targetKey references. An empty
-  // introspected PK means we cannot know what to JOIN on — fail loudly rather than
+  // introspected PK means we cannot know what to JOIN on, fail loudly rather than
   // silently guessing `id` and generating a wrong JOIN.
   if (targetMeta.primaryKey.length === 0) {
     throw new ValidationError(
@@ -2832,7 +2968,7 @@ export function buildManyToManySubquery(
     orderClause = buildRelationOrderClause(qi, targetTable, targetMeta, talias, relOrderEntries, params);
   }
 
-  // Additional WHERE filters on the target — full scalar where surface,
+  // Additional WHERE filters on the target, full scalar where surface,
   // properly parameterized against the target alias.
   if (spec !== true && spec.where) {
     const extra = whereMod.buildAliasWhere(
@@ -2851,7 +2987,7 @@ export function buildManyToManySubquery(
   const gfExtra = whereMod.targetGlobalFilterAlias(qi, targetTable, talias, params);
   if (gfExtra) whereClause += ` AND ${gfExtra}`;
 
-  // LIMIT — `limit: 0` is honored (LIMIT 0 → empty array)
+  // LIMIT, `limit: 0` is honored (LIMIT 0 → empty array)
   let limitClause = '';
   if (spec !== true && spec.limit !== undefined) {
     limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params, 'relation limit')}`;

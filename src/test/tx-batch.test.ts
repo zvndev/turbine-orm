@@ -1,5 +1,5 @@
 /**
- * turbine-orm — WS-H / H2: batch `$transaction(DeferredQuery[])` overload
+ * turbine-orm, WS-H / H2: batch `$transaction(DeferredQuery[])` overload
  *
  * The array overload runs a tuple of DeferredQuery objects atomically inside a
  * single BEGIN…COMMIT on ONE connection and returns a positionally-typed tuple
@@ -77,7 +77,7 @@ function q(sql: string, params: unknown[], tag: string): DeferredQuery<number> {
   };
 }
 
-describe('H2 — $transaction(DeferredQuery[]) batch overload', () => {
+describe('H2, $transaction(DeferredQuery[]) batch overload', () => {
   it('runs BEGIN, each query, then COMMIT on a single connection', async () => {
     const mock = recordingPool({
       results: {
@@ -165,7 +165,7 @@ describe('H2 — $transaction(DeferredQuery[]) batch overload', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Pipelined batch — drivers whose pool client sets `supportsPipelining` get
+// Pipelined batch, drivers whose pool client sets `supportsPipelining` get
 // all statements dispatched in one write burst, replies collected in order.
 // ---------------------------------------------------------------------------
 
@@ -184,7 +184,7 @@ interface PendingReply {
  * A mock pool whose single client advertises `supportsPipelining` and records
  * the exact dispatch order. Transaction-control statements resolve
  * immediately; every other statement stays pending until the test releases it
- * via `reply()`/`fail()` — so assertions about "dispatched before any reply"
+ * via `reply()`/`fail()`, so assertions about "dispatched before any reply"
  * are exact, never timing-based.
  */
 function pipeliningPool() {
@@ -239,7 +239,7 @@ function pipeliningPool() {
   };
 }
 
-describe('H2 — pipelined batch on a supportsPipelining client', () => {
+describe('H2, pipelined batch on a supportsPipelining client', () => {
   it('dispatches every statement before any reply arrives (single write burst)', async () => {
     const mock = pipeliningPool();
     const db = new TurbineClient({ pool: mock.pool }, SCHEMA);
@@ -284,12 +284,12 @@ describe('H2 — pipelined batch on a supportsPipelining client', () => {
 
     mock.reply('S1', 1);
     mock.fail('S2');
-    // ROLLBACK must wait for S3's reply too — the batch drains all in-flight
+    // ROLLBACK must wait for S3's reply too, the batch drains all in-flight
     // statements before surfacing the error.
     await drainMicrotasks();
     assert.ok(!mock.dispatched.includes('ROLLBACK'), 'no ROLLBACK while a statement is still in flight');
 
-    mock.fail('S3'); // both fail — the FIRST (lowest-index) error must win
+    mock.fail('S3'); // both fail, the FIRST (lowest-index) error must win
 
     await assert.rejects(batch, /boom: S2/);
     assert.equal(mock.dispatched.at(-1), 'ROLLBACK');

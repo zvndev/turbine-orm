@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Integration test suite
+ * turbine-orm, Integration test suite
  *
  * Tests against a real Postgres database (seeded with 5K users, 46K posts, 432K comments).
  * Covers: CRUD, nested relations (L2-L4), pagination, filtering, ordering,
@@ -234,7 +234,7 @@ testFn('turbine integration tests', () => {
     });
 
     it('returns null with no args (empty table scenario handled)', async () => {
-      // findFirst with no args should still work — returns first row
+      // findFirst with no args should still work, returns first row
       const orgs = db.table<{ id: number }>('organizations');
       const org = await orgs.findFirst();
       assert.ok(org, 'should find an organization');
@@ -281,7 +281,7 @@ testFn('turbine integration tests', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Nested relations (json_agg) — THE core feature
+  // Nested relations (json_agg), THE core feature
   // ---------------------------------------------------------------------------
 
   describe('nested relations (json_agg)', () => {
@@ -924,11 +924,11 @@ testFn('turbine integration tests', () => {
   });
 
   // ===========================================================================
-  // Sprint 2 — New features
+  // Sprint 2, New features
   // ===========================================================================
 
   // ---------------------------------------------------------------------------
-  // 1. $transaction — Prisma-style typed transaction API
+  // 1. $transaction, Prisma-style typed transaction API
   // ---------------------------------------------------------------------------
 
   describe('$transaction (typed)', () => {
@@ -977,7 +977,7 @@ testFn('turbine integration tests', () => {
       await db.$transaction(async (tx) => {
         const orgs = tx.table<{ id: number; name: string; slug: string }>('organizations');
 
-        // Outer insert — should survive
+        // Outer insert, should survive
         await orgs.create({ data: { name: 'Outer Org', slug: slug1 } });
 
         // Nested transaction that fails
@@ -988,7 +988,7 @@ testFn('turbine integration tests', () => {
             throw new Error('inner rollback');
           });
         } catch {
-          // Expected — inner rolled back
+          // Expected, inner rolled back
         }
       });
 
@@ -1800,7 +1800,7 @@ testFn('turbine integration tests', () => {
   });
 
   // ===========================================================================
-  // Sprint 3 — Dev2 features
+  // Sprint 3, Dev2 features
   // ===========================================================================
 
   // ---------------------------------------------------------------------------
@@ -2350,7 +2350,7 @@ testFn('turbine integration tests', () => {
     });
   });
   // ---------------------------------------------------------------------------
-  // findManyStream — cursor-based streaming
+  // findManyStream, cursor-based streaming
   // ---------------------------------------------------------------------------
 
   describe('findManyStream', () => {
@@ -2387,7 +2387,7 @@ testFn('turbine integration tests', () => {
         if (count >= 3) break;
       }
       assert.equal(count, 3, 'should stop after break');
-      // Verify pool is not leaked — subsequent query should work
+      // Verify pool is not leaked, subsequent query should work
       const check = await users.findMany({ limit: 1 });
       assert.ok(check.length === 1, 'pool should still work after early termination');
     });

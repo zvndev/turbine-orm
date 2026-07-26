@@ -8,7 +8,7 @@ import { migrateDown, migrateUp } from '../cli/migrate.js';
 import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
-// Scanner — pure unit tests
+// Scanner, pure unit tests
 // ---------------------------------------------------------------------------
 
 test('flags every destructive statement kind', () => {
@@ -225,7 +225,7 @@ test('multi-statement files report each offender once', () => {
 });
 
 // ---------------------------------------------------------------------------
-// migrate up/down gate — integration (local scratch database ONLY; the suite
+// migrate up/down gate, integration (local scratch database ONLY; the suite
 // is skipped entirely unless DATABASE_URL is set by the runner)
 // ---------------------------------------------------------------------------
 
@@ -252,12 +252,12 @@ gated.it('migrateUp refuses destructive migrations by default, applies with allo
       join(dir, '20260101000000_create_widgets.sql'),
       '-- UP\nCREATE TABLE _turbine_guard_widgets (id serial PRIMARY KEY, name text);\n\n-- DOWN\nDROP TABLE _turbine_guard_widgets;\n',
     );
-    // First file is safe — applies fine.
+    // First file is safe, applies fine.
     const first = await migrateUp(DB_URL!, dir);
     assert.equal(first.applied.length, 1);
     assert.equal(first.errors.length, 0);
 
-    // Second file is destructive — must be refused by default...
+    // Second file is destructive, must be refused by default...
     writeFileSync(
       join(dir, '20260101000001_drop_widgets.sql'),
       '-- UP\nDROP TABLE _turbine_guard_widgets;\n\n-- DOWN\n-- nothing\n',
@@ -284,7 +284,7 @@ gated.it('migrateDown refuses destructive DOWN sections by default', async () =>
     const up = await migrateUp(DB_URL!, dir);
     assert.equal(up.applied.length, 1);
 
-    // DOWN contains DROP TABLE — refused by default, succeeds with the opt-in.
+    // DOWN contains DROP TABLE, refused by default, succeeds with the opt-in.
     await assert.rejects(() => migrateDown(DB_URL!, dir), /DESTRUCTIVE/);
     const down = await migrateDown(DB_URL!, dir, { allowDestructive: true });
     assert.equal(down.rolledBack.length, 1);

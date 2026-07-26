@@ -1,5 +1,5 @@
 /**
- * turbine-orm — TurbineClient coverage tests
+ * turbine-orm, TurbineClient coverage tests
  *
  * Covers previously untested paths in src/client.ts:
  *   1. Middleware chain execution ($use)
@@ -9,7 +9,7 @@
  *   5. Pool stats
  *   6. Nested transactions (SAVEPOINTs)
  *
- * No real database required — uses mock pool pattern from serverless.test.ts.
+ * No real database required, uses mock pool pattern from serverless.test.ts.
  *
  * Run: npx tsx --test src/test/client-coverage.test.ts
  */
@@ -158,7 +158,7 @@ function at(calls: QueryCall[], i: number): QueryCall {
 // 1. Middleware chain execution
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient.$use() — middleware chain', () => {
+describe('TurbineClient.$use(), middleware chain', () => {
   it('runs beforeQuery middleware in registration order', async () => {
     const { pool, calls } = createMockPool([{ rows: [{ id: 1, name: 'Alice', email: 'a@b.com' }] }]);
     const db = new TurbineClient({ pool }, buildSchema());
@@ -220,7 +220,7 @@ describe('TurbineClient.$use() — middleware chain', () => {
     assert.equal(capturedAction, 'findMany');
   });
 
-  it('middleware onError pattern — catches and rethrows', async () => {
+  it('middleware onError pattern, catches and rethrows', async () => {
     const failingPool: PgCompatPool = {
       async query() {
         throw new Error('query exploded');
@@ -264,7 +264,7 @@ describe('TurbineClient.$use() — middleware chain', () => {
       return next(params);
     });
 
-    // Access table after middleware — should be a new instance
+    // Access table after middleware, should be a new instance
     const tableRef2 = db.table('users');
     assert.notStrictEqual(tableRef1, tableRef2, 'table cache should be cleared after $use');
 
@@ -370,7 +370,7 @@ describe('TurbineClient.$transaction timeout', () => {
 // 3. External pool lifecycle
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient — external pool lifecycle', () => {
+describe('TurbineClient, external pool lifecycle', () => {
   it('disconnect() is a no-op for external pools', async () => {
     const { pool, ended } = createMockPool();
     const db = new TurbineClient({ pool }, buildSchema());
@@ -416,7 +416,7 @@ describe('TurbineClient — external pool lifecycle', () => {
 // 4. Raw SQL tagged template
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient.raw — tagged template literal', () => {
+describe('TurbineClient.raw, tagged template literal', () => {
   it('generates parameterized SQL from tagged template', async () => {
     const { pool, calls } = createMockPool([{ rows: [{ count: 42 }] }]);
     const db = new TurbineClient({ pool }, buildSchema());
@@ -489,7 +489,7 @@ describe('TurbineClient.raw — tagged template literal', () => {
 // 5. Pool stats
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient.stats — pool statistics', () => {
+describe('TurbineClient.stats, pool statistics', () => {
   it('exposes pool stats when pool provides them', () => {
     const { pool } = createMockPool();
     const db = new TurbineClient({ pool }, buildSchema());
@@ -524,7 +524,7 @@ describe('TurbineClient.stats — pool statistics', () => {
 // 6. Nested transactions (SAVEPOINTs)
 // ---------------------------------------------------------------------------
 
-describe('TurbineClient.$transaction — nested SAVEPOINTs', () => {
+describe('TurbineClient.$transaction, nested SAVEPOINTs', () => {
   it('uses SAVEPOINT for nested $transaction calls', async () => {
     const { pool, calls } = createMockPool([
       { rows: [] }, // BEGIN
@@ -571,7 +571,7 @@ describe('TurbineClient.$transaction — nested SAVEPOINTs', () => {
           throw new Error('inner failure');
         });
       } catch {
-        // Swallow the inner error — outer tx continues
+        // Swallow the inner error, outer tx continues
       }
     });
 
@@ -613,7 +613,7 @@ describe('TurbineClient.$transaction — nested SAVEPOINTs', () => {
 // 7. Transaction raw SQL within TransactionClient
 // ---------------------------------------------------------------------------
 
-describe('TransactionClient.raw — tagged template within transaction', () => {
+describe('TransactionClient.raw, tagged template within transaction', () => {
   it('executes raw SQL through the transaction client', async () => {
     const { pool, calls } = createMockPool([
       { rows: [] }, // BEGIN
@@ -639,7 +639,7 @@ describe('TransactionClient.raw — tagged template within transaction', () => {
 // 8. TransactionClient table accessor caching
 // ---------------------------------------------------------------------------
 
-describe('TransactionClient — table accessor', () => {
+describe('TransactionClient, table accessor', () => {
   it('caches table() references within a transaction', async () => {
     const { pool } = createMockPool([
       { rows: [] }, // BEGIN

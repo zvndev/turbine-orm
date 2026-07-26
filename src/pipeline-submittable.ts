@@ -1,5 +1,5 @@
 /**
- * turbine-orm — Real Postgres pipeline protocol implementation
+ * turbine-orm, Real Postgres pipeline protocol implementation
  *
  * Uses the pg extended-query protocol wire methods (parse/bind/describe/execute/sync)
  * exposed on pg.Client's Connection object to send multiple queries in a single
@@ -28,7 +28,7 @@ import type { DeferredQuery } from './query/index.js';
 // Types for pg internals we interact with
 // ---------------------------------------------------------------------------
 
-/** The pg Connection object — an EventEmitter with wire-protocol methods */
+/** The pg Connection object, an EventEmitter with wire-protocol methods */
 export interface PgConnection extends EventEmitter {
   stream: {
     cork?: () => void;
@@ -188,7 +188,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
       results.push(new Result(undefined, client._types));
     }
 
-    // commandComplete counter — tracks position across all commands
+    // commandComplete counter, tracks position across all commands
     let commandIndex = 0;
 
     // readyForQuery counter
@@ -280,7 +280,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
         return;
       }
 
-      // All succeeded — transform results
+      // All succeeded, transform results
       try {
         const transformed: unknown[] = [];
         for (let i = 0; i < queries.length; i++) {
@@ -298,7 +298,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     // -----------------------------------------------------------------------
 
     function onParseComplete(): void {
-      // No action needed — anonymous prepared statements
+      // No action needed, anonymous prepared statements
     }
 
     function onBindComplete(): void {
@@ -306,7 +306,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     }
 
     function onNoData(): void {
-      // DML without RETURNING — no RowDescription follows. Fine.
+      // DML without RETURNING, no RowDescription follows. Fine.
     }
 
     function onRowDescription(msg: { fields: Array<{ name: string; dataTypeID: number; format?: string }> }): void {
@@ -415,7 +415,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     }
 
     // -----------------------------------------------------------------------
-    // Send protocol messages — all in one TCP flush
+    // Send protocol messages, all in one TCP flush
     // -----------------------------------------------------------------------
 
     try {
