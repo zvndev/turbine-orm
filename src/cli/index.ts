@@ -1096,6 +1096,7 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<voi
       schema: config.schema,
       include: config.include.length ? config.include : undefined,
       exclude: config.exclude.length ? config.exclude : undefined,
+      relationNames: config.relationNames,
     });
     spinner.succeed(`Found ${bold(String(Object.keys(schema.tables).length))} tables`);
 
@@ -1483,6 +1484,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     schema: config.schema,
     include: config.include.length ? config.include : undefined,
     exclude: config.exclude.length ? config.exclude : undefined,
+    relationNames: config.relationNames,
     includeViews: args.includeViews,
     legacyToManyUniques: config.legacyToManyUniques,
     onDefaultTableExclusion: (tables) => skippedInternalTables.push(...tables),
@@ -1694,6 +1696,7 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
       includeViews: true,
       // Inherit the shared bookkeeping-table exclusions (Turbine + Prisma).
       exclude: [...new Set([...config.exclude, ...DEFAULT_EXCLUDED_TABLES])],
+      relationNames: config.relationNames,
     });
     spinner.succeed(`Introspected ${bold(String(Object.keys(schemaMeta.tables).length))} tables`);
   }
@@ -2757,6 +2760,7 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
     schema: config.schema,
     include: config.include.length ? config.include : undefined,
     exclude: config.exclude.length ? config.exclude : undefined,
+    relationNames: config.relationNames,
   });
 
   const tableNames = Object.keys(schema.tables);

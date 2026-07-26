@@ -25,6 +25,15 @@ export interface TurbineCliConfig {
   /** Tables to exclude */
   exclude?: string[];
   /**
+   * Rename derived relations, as `{ table: { derivedName: desiredName } }`.
+   *
+   * Relation names are composed by introspection (a database does not name its
+   * relationships), so two foreign keys to the same table produce names nobody
+   * would predict, and a port from another ORM that named them differently has
+   * to hand-edit every call site. A typo here is an error, not a silent no-op.
+   */
+  relationNames?: Record<string, Record<string, string>>;
+  /**
    * Extension for the generated `index.ts` sibling imports (F3):
    * `'js'` (`./types.js`), `'none'` (`./types`), or `'auto'` (default:
    * tsconfig-detected, falling back to `'js'`).
@@ -270,6 +279,8 @@ export interface ResolvedConfig {
   keepColumnNames: boolean;
   /** Resolved opt-out of the unique-FK → hasOne introspection flip (F2). */
   legacyToManyUniques: boolean;
+  /** Resolved derived-relation rename map, or undefined when none is declared. */
+  relationNames?: Record<string, Record<string, string>>;
 }
 
 export interface CliOverrides {
@@ -293,6 +304,7 @@ export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverri
     out: overrides.out ?? fileConfig.out ?? './generated/turbine',
     schema: overrides.schema ?? fileConfig.schema ?? 'public',
     include: overrides.include ?? fileConfig.include ?? [],
+    relationNames: fileConfig.relationNames,
     exclude: overrides.exclude ?? fileConfig.exclude ?? [],
     migrationsDir: fileConfig.migrationsDir ?? './turbine/migrations',
     // `seedFile` is canonical (what the docs and `turbine init` use); `seed` is a
