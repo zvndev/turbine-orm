@@ -25,7 +25,10 @@
  *  , the un-awaited delegate calls defer to Turbine's `build*()` methods and
  *   run atomically through the core batch `$transaction([...])` path.
  * - **Raw SQL**: `$queryRaw` / `$executeRaw` tagged templates (with
- *   `Prisma.sql`-style nested-fragment flattening) and the `*Unsafe` variants.
+ *   `Prisma.sql`-style nested-fragment flattening) and the `*Unsafe` variants,
+ *   on the client AND on the transaction client, where they run on the
+ *   transaction's own connection so a mixed raw + delegate `$transaction` stays
+ *   atomic.
  * - **Result reshaping**: `_count` objects keyed back to Prisma relation names,
  *   and to-one relations surfaced as `object | null`.
  *
@@ -87,6 +90,7 @@
 // `TurbineClient` for first-class consumer DX.
 import type { TurbineClient } from './client.js';
 import { TurbineError, TurbineErrorCode, UnsupportedFeatureError, ValidationError, wrapPgError } from './errors.js';
+import { createManyShapeRuns } from './nested-write.js';
 import type { DeferredQuery } from './query/index.js';
 import { shouldWarnOnce } from './query/warn-registry.js';
 import type { PrismaCompatMap, PrismaModelMap, RelationDef, SchemaMetadata } from './schema.js';
@@ -134,6 +138,15 @@ export interface CompatQueryInterface {
 /** A transaction-scoped client handed to a `$transaction(callback)`. */
 export interface CompatTransactionClient {
   table(name: string): CompatQueryInterface;
+  /**
+   * Execute a prebuilt `(text, params)` statement on the TRANSACTION's own
+   * connection (core `TransactionClient.rawQuery`). It is what backs the
+   * transaction-scoped `$queryRaw` / `$executeRaw`; without it those methods
+   * would have to reach around the transaction to the pool, which silently
+   * breaks atomicity. Optional only so a test stub can omit it: when it is
+   * absent the raw methods throw instead of escaping the transaction.
+   */
+  rawQuery?(text: string, params?: readonly unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
 }
 
 /** The minimal `TurbineClient` surface the adapter consumes. */
@@ -147,7 +160,22 @@ export interface CompatTurbineClient extends CompatTransactionClient {
 // Prisma.sql-style raw fragments (local, minimal, never imports @prisma/client)
 // ---------------------------------------------------------------------------
 
-const SQL_FRAGMENT = Symbol.for('turbine.prismaCompat.sqlFragment');
+/**
+ * Brand marking an object as a raw-SQL fragment whose `strings` are spliced
+ * VERBATIM into the emitted statement (see `flattenTemplate`). Deliberately a
+ * module-private `Symbol()` and NOT `Symbol.for(...)`: a registry symbol is
+ * reachable by name from anywhere in the process, so any dependency could mint
+ * an object that flattens as trusted SQL. With a private symbol the only way to
+ * obtain a fragment is to call `Prisma.sql` / `Prisma.join` / `Prisma.raw` from
+ * this module.
+ *
+ * The fragment check is fail-CLOSED: an object that does not carry this exact
+ * symbol is bound as a `$N` parameter, never spliced. That is also what makes
+ * the (contrived) dual-package case safe rather than dangerous, a fragment
+ * built by the ESM copy of this module and executed by the CJS copy binds as a
+ * parameter instead of composing.
+ */
+const SQL_FRAGMENT = Symbol('turbine.prismaCompat.sqlFragment');
 
 /** A composable SQL fragment, the local stand-in for `Prisma.Sql`. */
 export interface Sql {
@@ -1168,8 +1196,22 @@ export interface PrismaModelDelegate<M extends PrismaModelTypes> {
   groupBy(args: Args): Promise<Record<string, unknown>[]>;
 }
 
+/**
+ * The four Prisma raw-SQL methods. Present on BOTH the client and the
+ * transaction-scoped client, exactly as in Prisma, so a migrated call site that
+ * mixes `$transaction` with raw SQL keeps working, and the raw statement runs on
+ * the transaction's own connection.
+ */
+export interface PrismaCompatRawSurface {
+  $queryRaw<T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]>;
+  $queryRawUnsafe<T = unknown>(sql: string, ...params: unknown[]): Promise<T[]>;
+  $executeRaw(strings: TemplateStringsArray, ...values: unknown[]): Promise<number>;
+  $executeRawUnsafe(sql: string, ...params: unknown[]): Promise<number>;
+}
+
 /** The client-level surface (`$transaction` / raw), added to the model map. */
-export interface PrismaCompatClientBase<S extends Record<string, PrismaModelTypes> = Record<string, PrismaModelTypes>> {
+export interface PrismaCompatClientBase<S extends Record<string, PrismaModelTypes> = Record<string, PrismaModelTypes>>
+  extends PrismaCompatRawSurface {
   $transaction<R>(
     fn: (tx: PrismaCompatTransactionClient<S>) => Promise<R>,
     options?: PrismaCompatTxOptions,
@@ -1177,10 +1219,6 @@ export interface PrismaCompatClientBase<S extends Record<string, PrismaModelType
   $transaction<P extends readonly PromiseLike<unknown>[]>(
     promises: readonly [...P],
   ): Promise<{ [K in keyof P]: Awaited<P[K]> }>;
-  $queryRaw<T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]>;
-  $queryRawUnsafe<T = unknown>(sql: string, ...params: unknown[]): Promise<T[]>;
-  $executeRaw(strings: TemplateStringsArray, ...values: unknown[]): Promise<number>;
-  $executeRawUnsafe(sql: string, ...params: unknown[]): Promise<number>;
   $connect(): Promise<void>;
   $disconnect(): Promise<void>;
 }
@@ -1192,12 +1230,20 @@ export interface PrismaCompatTxOptions {
   maxWait?: number;
 }
 
-/** The transaction-scoped client handed to a `$transaction(callback)`. */
+/**
+ * The transaction-scoped client handed to a `$transaction(callback)`: a model
+ * delegate per Prisma model (under both spellings, as on the client) plus the
+ * raw-SQL surface, every one of them bound to the transaction's connection.
+ * Prisma's transaction client has no `$transaction` / `$connect` /
+ * `$disconnect`, and neither does this one.
+ */
 export type PrismaCompatTransactionClient<
   S extends Record<string, PrismaModelTypes> = Record<string, PrismaModelTypes>,
 > = {
   [K in keyof S]: PrismaModelDelegate<S[K]>;
-};
+} & {
+  [K in keyof S as Uncapitalize<K & string>]: PrismaModelDelegate<S[K]>;
+} & PrismaCompatRawSurface;
 
 /**
  * The full typed compat client: a model delegate per Prisma model name, plus the
@@ -1339,6 +1385,45 @@ async function upsertLookupFirst(qi: CompatQueryInterface, t: Args): Promise<unk
   return qi.create({ data: t.create });
 }
 
+/**
+ * The row shapes a translated `createMany` has to insert, as contiguous runs
+ * that each name the same fields (see {@link createManyShapeRuns}).
+ *
+ * Prisma accepts rows of DIFFERENT shapes in one `createMany` and emits a single
+ * INSERT over the UNION of the named columns, binding its own schema-level
+ * `@default` for a field a row omits and `null` for one it has no default for
+ * (verified against @prisma/client 7.9.0 on PostgreSQL 16). Core `createMany`
+ * refuses a mixed batch instead, because it has no per-cell DEFAULT form on
+ * every engine and would otherwise write NULL over the column's default. Runs
+ * bridge the two: one core `createMany` per run, all of them inside one
+ * transaction, so a ported call site keeps working and the `{ count }` it gets
+ * back is the number of rows actually inserted.
+ *
+ * The one place this is not byte-for-byte Prisma is a column whose DEFAULT lives
+ * in the DATABASE and not in the Prisma schema: Prisma binds null there and
+ * loses the default, a run lets the column default apply. Prisma's own answer is
+ * the lossy one, so the divergence only ever adds back a value the caller never
+ * asked to overwrite.
+ */
+function createManyRunsOf(t: Args): Record<string, unknown>[][] {
+  return createManyShapeRuns((Array.isArray(t.data) ? t.data : []) as Record<string, unknown>[]);
+}
+
+/** One core `createMany` per run, in order, summing Prisma's `{ count }`. */
+async function createManyByRun(
+  qi: CompatQueryInterface,
+  t: Args,
+  runs: Record<string, unknown>[][],
+): Promise<{ count: number }> {
+  let count = 0;
+  for (const run of runs) {
+    const args: Args = { data: run };
+    if (t.skipDuplicates) args.skipDuplicates = true;
+    count += (await qi.createMany(args)).length;
+  }
+  return { count };
+}
+
 /** Runs `fn` atomically with a tx-bound table lookup (opens a tx, or reuses the ambient one). */
 type RunInTx = <T>(fn: (table: (name: string) => CompatQueryInterface) => Promise<T>) => Promise<T>;
 
@@ -1463,8 +1548,23 @@ function makeDelegate(
           if ((args as Args).skipDuplicates) t.skipDuplicates = true;
           return t;
         },
-        (qi, t) => qi.createMany(t).then((r) => ({ count: (r as unknown[]).length })),
-        { build: (qi, t) => qi.buildCreateMany(t), reshape: (raw) => ({ count: (raw as unknown[]).length }) },
+        (qi, t) => {
+          // Rows that all name the same fields are one statement, exactly as
+          // before. A mixed batch, which Prisma accepts, becomes one createMany
+          // per contiguous same-shape run inside ONE transaction, so the call
+          // stays all-or-nothing and the count is the total actually inserted.
+          const runs = createManyRunsOf(t);
+          if (runs.length <= 1) return qi.createMany(t).then((r) => ({ count: (r as unknown[]).length }));
+          return runInTx((table) => createManyByRun(table(mm.table), t, runs));
+        },
+        {
+          build: (qi, t) => qi.buildCreateMany(t),
+          reshape: (raw) => ({ count: (raw as unknown[]).length }),
+          // A mixed batch is more than one statement, so the array
+          // $transaction([...]) form runs the whole array sequentially in a tx.
+          nested: (t) => createManyRunsOf(t).length > 1,
+          execInTx: (table, t) => createManyByRun(table(mm.table), t, createManyRunsOf(t)),
+        },
       ) as unknown as Promise<{ count: number }>,
     update: (args) =>
       defer(
@@ -1634,6 +1734,35 @@ function flattenTemplate(
   return { text, params };
 }
 
+/** Runs one prebuilt statement and returns the driver's rows + affected count. */
+type RawExecutor = (text: string, params: unknown[]) => Promise<{ rows: unknown[]; rowCount: number | null }>;
+
+/**
+ * Build the four Prisma raw methods over ONE executor. Both the client-level and
+ * the transaction-scoped surfaces come from this function, so they cannot drift:
+ * same fragment flattening, same placeholder generation, same return shapes
+ * (`$queryRaw` → rows, `$executeRaw` → affected-row count). The only difference
+ * is which connection the executor runs on.
+ */
+function makeRawSurface(exec: RawExecutor, ph: (n: number) => string): PrismaCompatRawSurface {
+  return {
+    $queryRaw: async <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]> => {
+      const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
+      return (await exec(text, params)).rows as T[];
+    },
+    $queryRawUnsafe: async <T = unknown>(sql: string, ...params: unknown[]): Promise<T[]> => {
+      return (await exec(sql, params)).rows as T[];
+    },
+    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]): Promise<number> => {
+      const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
+      return (await exec(text, params)).rowCount ?? 0;
+    },
+    $executeRawUnsafe: async (sql: string, ...params: unknown[]): Promise<number> => {
+      return (await exec(sql, params)).rowCount ?? 0;
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // createPrismaCompatClient
 // ---------------------------------------------------------------------------
@@ -1692,22 +1821,29 @@ function junctionModels(ctx: Ctx, map: PrismaCompatMap, tableToModel: Map<string
     const alias = prismaPropertyAlias(model);
     if (alias) seen.add(alias);
   }
+  // Junction names already registered by an earlier relation. A many-to-many
+  // pair is normally DECLARED ON BOTH SIDES, so the same junction table is
+  // reached twice; the second visit must be a silent no-op, not a collision (it
+  // would be colliding with its own registration).
+  const registered = new Set<string>();
   for (const table of Object.values(ctx.schema.tables)) {
     for (const rel of Object.values(table.relations ?? {})) {
       if (rel.type !== 'manyToMany') continue;
       const name = rel.through?.table;
       if (!name || !ctx.schema.tables[name] || tableToModel.has(name)) continue;
+      if (registered.has(name)) continue;
       if (seen.has(name)) {
         if (process.env.NODE_ENV !== 'production' && shouldWarnOnce(JUNCTION_WARN_NS, name)) {
           console.warn(
             `[turbine] prisma-compat: the many-to-many junction table "${name}" collides with an ` +
               'existing client member of the same name, so no junction accessor was created for it. ' +
-              'Reach its rows through $queryRaw / $executeRaw, or through the owning model relation.',
+              'Reach its rows through the owning model relation (a nested connect / disconnect / set on the ' +
+              'related model), or through $queryRaw / $executeRaw.',
           );
         }
         continue;
       }
-      seen.add(name);
+      registered.add(name);
       out.push([name, { table: name, accessor: name, fields: {}, relations: {}, compoundUniques: {} }]);
     }
   }
@@ -1780,13 +1916,41 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
 
   const ph = placeholderOf(db);
 
-  const runRaw = async (text: string, params: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }> => {
+  const runRaw: RawExecutor = async (text, params) => {
     try {
       return await poolOf(db).query(text, params);
     } catch (err) {
       throw decorate(wrapPgError(err), ctx.options.prismaErrorCodes);
     }
   };
+
+  /**
+   * The same executor bound to a transaction's OWN connection. A raw statement
+   * that quietly ran on a pool connection would leave the caller unable to tell
+   * that its writes were outside the transaction, so a transaction client that
+   * cannot execute raw SQL refuses rather than falling back to the pool.
+   * `wrapPgError` is idempotent (it returns an already-typed TurbineError
+   * untouched), so the error shape matches the pool path exactly.
+   */
+  const txRunRaw =
+    (tx: CompatTransactionClient): RawExecutor =>
+    async (text, params) => {
+      if (typeof tx.rawQuery !== 'function') {
+        throw decorate(
+          new ValidationError(
+            '[turbine] prisma-compat: raw SQL inside $transaction needs a transaction client that can execute it ' +
+              '(core TransactionClient.rawQuery). Refusing to run the statement on a pool connection, which would ' +
+              'silently place it outside the transaction.',
+          ),
+          ctx.options.prismaErrorCodes,
+        );
+      }
+      try {
+        return await tx.rawQuery(text, params);
+      } catch (err) {
+        throw decorate(wrapPgError(err), ctx.options.prismaErrorCodes);
+      }
+    };
 
   const base: PrismaCompatClientBase = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1841,24 +2005,17 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
             txDelegates[alias] = txDelegates[prismaModel]!;
           }
         }
-        return fn(txDelegates as unknown as PrismaCompatTransactionClient);
+        // Raw SQL on the transaction's own connection. Prisma's tx client
+        // carries these four, and code that mixes `$transaction` with raw SQL is
+        // the common case in a migrated codebase. No model can shadow them: a
+        // Prisma model name cannot start with `$`, and junction accessors skip
+        // every CLIENT_RESERVED_KEYS name.
+        const txClient: Record<string, unknown> = { ...txDelegates, ...makeRawSurface(txRunRaw(tx), ph) };
+        return fn(txClient as unknown as PrismaCompatTransactionClient);
       }, txOptions);
     }) as PrismaCompatClientBase['$transaction'],
 
-    $queryRaw: async <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]> => {
-      const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
-      return (await runRaw(text, params)).rows as T[];
-    },
-    $queryRawUnsafe: async <T = unknown>(sql: string, ...params: unknown[]): Promise<T[]> => {
-      return (await runRaw(sql, params)).rows as T[];
-    },
-    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]): Promise<number> => {
-      const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
-      return (await runRaw(text, params)).rowCount ?? 0;
-    },
-    $executeRawUnsafe: async (sql: string, ...params: unknown[]): Promise<number> => {
-      return (await runRaw(sql, params)).rowCount ?? 0;
-    },
+    ...makeRawSurface(runRaw, ph),
     $connect: async () => {},
     $disconnect: async () => {},
   };

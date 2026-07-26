@@ -45,7 +45,16 @@
  *     round-trip; only plain `unique`/`index` columns appear in `indexes`.
  *   - `datetime` / `uuid` / `bytes` columns map to read-oriented TS types
  *     (`Date` / `string` / `Uint8Array`). Turbine never emits those PowQL types
- *     on write, so writing to such a column may not round-trip.
+ *     on write, so writing to such a column may not round-trip. This introspector
+ *     is the ONLY producer of `dialectType: 'datetime'` metadata, and a predicate
+ *     on such a column is version-gated: comparing it against the integer
+ *     microseconds Turbine binds was silently wrong below engine 0.20, so those
+ *     predicates raise a typed E017 there rather than being answered wrongly (see
+ *     `PowdbCapabilities.datetimeCompare`). The `in` / `not in` list forms are
+ *     still wrong upstream at 0.20, so Turbine never emits one for such a column:
+ *     it compiles to the equality chain the engine answers correctly, bounded by
+ *     `MAX_POWQL_DATETIME_TERMS`. Reads, ordering, grouping and null checks on
+ *     the column are unaffected.
  *
  * v1 is a PROGRAMMATIC API (exported from `turbine-orm/powdb`); the CLI's
  * `turbine generate` still defaults to Postgres. Routing a `powdb://` URL

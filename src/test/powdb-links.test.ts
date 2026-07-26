@@ -185,11 +185,11 @@ describe('powdb links: patch-aware capability gates', () => {
   it('the E017 hint names the 0.19.1 floor for both new lanes', () => {
     assert.throws(
       () => requireCapability(capabilitiesFromVersion('0.19.0'), 'linkPaths', 'scalar link paths'),
-      /scalar link paths requires PowDB >= 0\.19\.1/,
+      /scalar link paths is unsupported.*Requires PowDB >= 0\.19\.1/s,
     );
     assert.throws(
       () => requireCapability(capabilitiesFromVersion('0.19.0'), 'linkIntrospection', 'link introspection'),
-      /link introspection requires PowDB >= 0\.19\.1/,
+      /link introspection is unsupported.*Requires PowDB >= 0\.19\.1/s,
     );
   });
 

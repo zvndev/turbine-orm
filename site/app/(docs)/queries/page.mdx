@@ -38,7 +38,7 @@ const users = await db.users.findMany({
 });
 ```
 
-The entire object graph resolves in one SQL statement. `users[0].posts[0].comments[0]` is fully typed.
+The entire object graph resolves in one SQL statement under `relationLoadStrategy: 'join'`, and `users[0].posts[0].comments[0]` is fully typed either way. On the `'auto'` default (since 0.41) Turbine may move an individual relation to a follow-up statement when the join plan would be the slower one, most often an unindexed correlation column or a to-one relation over an unbounded parent set. The rows are identical whichever plan runs; see [Load strategies](/relations#load-strategy-auto-join-batched-flatten) for the rules and how to pin one.
 
 ### Silencing the unlimited-query warning
 
@@ -309,9 +309,32 @@ const newUser = await db.users.create({
 });
 ```
 
+### Inserting a row of pure defaults
+
+`data: {}` (or a `data` whose every field is `undefined`) names no column, and inserts a row in which every column takes its database default:
+
+```ts
+// INSERT INTO "events" DEFAULT VALUES RETURNING *
+const event = await db.events.create({ data: {} });
+```
+
+This is easy to reach honestly: a handler that assembles its payload from optional request fields produces `{}` when the request supplied none of them. Turbine inserts the defaults row rather than failing, which is what it used to do (a `42601` syntax error from `INSERT INTO t () VALUES ()`).
+
+A table with no usable defaults still fails, correctly, with the database's own NOT NULL violation (`NotNullViolationError`, TURBINE_E010). Nothing pre-empts that.
+
+<Callout type="warning" title="The bulk form is not portable">
+`create({ data: {} })` works on every engine. The multi-row form does not, because `INSERT ... DEFAULT VALUES` is single-row only in most dialects:
+
+- **PostgreSQL** emits `INSERT INTO t SELECT FROM generate_series(1, N)` and supports any row count.
+- **MySQL** repeats its empty `VALUES ()` tuple and supports any row count, *except* with `skipDuplicates: true`: `ON DUPLICATE KEY UPDATE` needs a column to assign and there is none, so that combination throws `UnsupportedFeatureError` (TURBINE_E017).
+- **SQLite** and **SQL Server** throw `UnsupportedFeatureError` (TURBINE_E017) for a `createMany` of more than one all-defaults row. Issue one `create({ data: {} })` per row.
+
+Also note that `createMany` takes its column list from the **first** row, so every row must name the same fields. See [uniform rows](#createmany) below.
+</Callout>
+
 ## createMany
 
-Batch insert with a single `INSERT ... UNNEST(...)`, not N separate inserts.
+Batch insert with a single `INSERT ... UNNEST(...)`, not N separate inserts. (The one exception is a batch of pure defaults, see [above](#inserting-a-row-of-pure-defaults): with no columns to unnest, Postgres emits `INSERT INTO t SELECT FROM generate_series(1, N)` instead.)
 
 ```ts
 const users = await db.users.createMany({
@@ -322,6 +345,12 @@ const users = await db.users.createMany({
   ],
 });
 ```
+
+<Callout type="warning" title="Every row must name the same fields">
+`createMany` compiles **one** statement, and its column list comes from the first row. A row that disagrees loses data silently in both directions: a field the first row names and a later row omits is bound as `NULL`, overwriting that column's declared default, and a field only a later row names is not in the column list at all, so its value never reaches the database.
+
+Turbine therefore refuses the ragged call with a `ValidationError` (`TURBINE_E003`) naming the offending row index and the differing columns, on **every** engine including PowDB (PowQL could express ragged rows, but accepting them there would make a working call fail on every other engine). A field explicitly set to `undefined` counts as omitted, exactly as it does in `create`. Supply the field on every row, or split the call into one `createMany` per field set.
+</Callout>
 
 ## update / updateMany
 
@@ -845,7 +874,7 @@ Nesting depth is capped at 10, beyond that, Turbine throws `CircularRelationErro
 
 ### Counting related rows, `_count`
 
-Add `_count` to a `with` clause to get the number of related rows without loading them. Each counted to-many relation becomes a correlated `COUNT(*)` scalar subquery, assembled into a `_count` object on each row:
+Add `_count` to a `with` clause to get the number of related rows without loading them, assembled into a `_count` object on each row:
 
 ```ts
 // Count every to-many relation of the table
@@ -860,6 +889,8 @@ const authors = await db.users.findMany({
 });
 authors[0]._count.posts; // 12
 ```
+
+There are two plans, and the load strategy picks between them. Under `relationLoadStrategy: 'join'` each counted relation is an inline correlated `COUNT(*)` scalar subquery in the same statement, re-evaluated once per parent row. Under the `'auto'` default, a count whose correlation column has no covering index moves to one grouped `COUNT(*) ... GROUP BY fk` follow-up statement from **two** parent rows upward, because the inline form would otherwise scan the child table once per parent. Only a query bounded at a single row (`findUnique`, `findFirst`, `limit: 1`) keeps an unindexed count inline. The numbers are the same either way; the [load-strategy rules](/relations#load-strategy-auto-join-batched-flatten) carry the measured difference.
 
 `_count` coexists with real relation subqueries, `with: { posts: true, _count: { posts: true } }` loads the posts *and* counts them. It applies to `hasMany` and `manyToMany` (via the junction) relations; used on a to-one relation it throws `ValidationError` (TURBINE_E003), and an unknown relation throws `RelationError` (TURBINE_E005). The result type carries `_count` as `{ [relation]: number }`, so `users[0]._count.posts` is typed.
 

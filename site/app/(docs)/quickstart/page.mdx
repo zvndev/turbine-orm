@@ -153,11 +153,11 @@ const usersWithPosts = await db.users.findMany({
   },
 });
 
-// Single SQL statement, one round-trip, fully typed all the way down:
+// One statement, one round-trip, fully typed all the way down:
 usersWithPosts[0].posts[0].comments[0].author;
 ```
 
-Turbine compiles the `with` clause to a single SQL statement using PostgreSQL's `json_agg` and correlated subqueries. No client-side stitching, no N+1, no extra round-trips.
+Turbine compiles the `with` clause to a single SQL statement using PostgreSQL's `json_agg` and correlated subqueries. No client-side stitching, no N+1. The default `'auto'` strategy keeps that plan unless it can prove the join would be the slower one for a particular relation (an unindexed correlation column, say), in which case it moves that one relation to a follow-up statement and returns identical rows. Pin `relationLoadStrategy: 'join'` for the single statement unconditionally, see [Load strategies](/relations#load-strategy-auto-join-batched-flatten).
 
 ## Next steps
 

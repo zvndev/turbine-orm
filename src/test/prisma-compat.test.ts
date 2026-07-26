@@ -136,12 +136,27 @@ interface SpyCall {
   args: Any;
 }
 
-/** A recording client: captures translated args, returns canned rows. */
+interface RawCall {
+  /** 'pool' = the client-level connection, 'tx' = the transaction's own connection. */
+  on: 'pool' | 'tx';
+  text: string;
+  params: unknown[];
+}
+
+/**
+ * A recording client: captures translated args, returns canned rows.
+ *
+ * `txRawQuery: false` builds a transaction client WITHOUT `rawQuery`, the shape
+ * a stub (or a future non-core transaction source) has; the adapter must refuse
+ * raw SQL there rather than fall back to the pool.
+ */
 function spyDb(
   schema: SchemaMetadata,
   results: Record<string, unknown> = {},
-): { db: CompatTurbineClient; calls: SpyCall[] } {
+  opts: { txRawQuery?: boolean } = {},
+): { db: CompatTurbineClient; calls: SpyCall[]; raw: RawCall[] } {
   const calls: SpyCall[] = [];
+  const raw: RawCall[] = [];
   const qi = (table: string): Any =>
     new Proxy(
       {},
@@ -170,7 +185,10 @@ function spyDb(
     schema,
     table: qi,
     pool: {
-      query: async (sql: string, params: unknown[]) => ({ rows: [{ sql, params }], rowCount: 7 }),
+      query: async (sql: string, params: unknown[]) => {
+        raw.push({ on: 'pool', text: sql, params });
+        return { rows: [{ sql, params }], rowCount: 7 };
+      },
     },
     dialect: { paramPlaceholder: (n: number) => `$${n}` },
     $transaction: (arg: Any, _opts?: Any) => {
@@ -178,10 +196,17 @@ function spyDb(
         // Return each deferred's transformed (canned) result.
         return Promise.resolve(arg.map((d: Any) => d.transform(null)));
       }
-      return arg({ table: qi });
+      const tx: Any = { table: qi };
+      if (opts.txRawQuery !== false) {
+        tx.rawQuery = async (text: string, params: unknown[] = []) => {
+          raw.push({ on: 'tx', text, params });
+          return { rows: [{ text, params }], rowCount: 3 };
+        };
+      }
+      return arg(tx);
     },
   };
-  return { db: db as unknown as CompatTurbineClient, calls };
+  return { db: db as unknown as CompatTurbineClient, calls, raw };
 }
 
 /** Pull the lazy batchable and build the underlying Turbine args/DeferredQuery. */
@@ -904,6 +929,120 @@ describe('prisma-compat, raw SQL', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Raw SQL inside $transaction (must run on the transaction's own connection)
+// ---------------------------------------------------------------------------
+
+describe('prisma-compat, raw SQL inside $transaction', () => {
+  it('exposes the same four raw methods Prisma puts on a transaction client', async () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(spyDb(schema).db, map);
+    const kinds = await compat.$transaction(async (tx: Any) => ({
+      queryRaw: typeof tx.$queryRaw,
+      queryRawUnsafe: typeof tx.$queryRawUnsafe,
+      executeRaw: typeof tx.$executeRaw,
+      executeRawUnsafe: typeof tx.$executeRawUnsafe,
+    }));
+    assert.deepEqual(kinds, {
+      queryRaw: 'function',
+      queryRawUnsafe: 'function',
+      executeRaw: 'function',
+      executeRawUnsafe: 'function',
+    });
+  });
+
+  it('routes every raw call to the transaction connection, never the pool', async () => {
+    const { schema, map } = fixture();
+    const { db, raw } = spyDb(schema);
+    const compat = mkCompat(db, map);
+
+    await compat.$transaction(async (tx: Any) => {
+      await tx.$queryRaw`SELECT * FROM users WHERE id = ${1}`;
+      await tx.$queryRawUnsafe('SELECT 2');
+      await tx.$executeRaw`UPDATE users SET name = ${'z'}`;
+      await tx.$executeRawUnsafe('DELETE FROM users');
+    });
+
+    assert.equal(raw.length, 4);
+    assert.deepEqual(
+      raw.map((r) => r.on),
+      ['tx', 'tx', 'tx', 'tx'],
+      'no raw statement escaped to a pool connection',
+    );
+  });
+
+  it('flattens templates and Prisma.sql fragments exactly as the client-level surface does', async () => {
+    const { schema, map } = fixture();
+    const { db, raw } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    const cond = Prisma.sql`id = ${1} AND name = ${'x'}`;
+
+    await compat.$queryRaw`SELECT * FROM users WHERE ${cond} LIMIT ${10}`;
+    const rows = await compat.$transaction(
+      async (tx: Any) => (await tx.$queryRaw`SELECT * FROM users WHERE ${cond} LIMIT ${10}`) as Any[],
+    );
+
+    assert.equal(raw[1]!.on, 'tx');
+    assert.equal(raw[1]!.text, raw[0]!.text, 'same placeholder generation on both surfaces');
+    assert.deepEqual(raw[1]!.params, raw[0]!.params);
+    assert.deepEqual(rows[0], { text: raw[1]!.text, params: raw[1]!.params }, '$queryRaw returns the rows');
+  });
+
+  it('$executeRaw inside a transaction returns the affected row count', async () => {
+    const { schema, map } = fixture();
+    const compat = mkCompat(spyDb(schema).db, map);
+    const n = await compat.$transaction(async (tx: Any) => tx.$executeRaw`UPDATE users SET name = ${'y'}`);
+    assert.equal(n, 3, 'the transaction connection rowCount, not the pool stub 7');
+  });
+
+  it('decorates a driver error with the Prisma code, as the client-level surface does', async () => {
+    const { schema, map } = fixture();
+    const { db } = spyDb(schema);
+    const original = (db as Any).$transaction;
+    (db as Any).$transaction = (arg: Any) =>
+      original(async (tx: Any) => {
+        tx.rawQuery = () => Promise.reject(Object.assign(new Error('dup'), { code: '23505' }));
+        return arg(tx);
+      });
+    const compat = mkCompat(db, map, { prismaErrorCodes: true });
+    await assert.rejects(
+      () => compat.$transaction(async (tx: Any) => tx.$executeRawUnsafe('INSERT INTO users VALUES (1)')),
+      (e: Any) => e.code === 'P2002',
+    );
+  });
+
+  it('refuses raw SQL rather than escaping to the pool when the tx cannot execute it', async () => {
+    const { schema, map } = fixture();
+    const { db, raw } = spyDb(schema, {}, { txRawQuery: false });
+    const compat = mkCompat(db, map);
+    await assert.rejects(
+      () => compat.$transaction(async (tx: Any) => tx.$queryRawUnsafe('SELECT 1')),
+      (e: Any) => e instanceof TurbineError && e.code === TurbineErrorCode.VALIDATION,
+    );
+    assert.equal(raw.length, 0, 'nothing ran on the pool');
+  });
+
+  it('a model delegate and a raw statement share one transaction client', async () => {
+    const { schema, map } = fixture();
+    const { db, calls, raw } = spyDb(schema);
+    const compat = mkCompat(db, map);
+
+    await compat.$transaction(async (tx: Any) => {
+      await tx.User.create({ data: { email: 'a@b.c' } });
+      await tx.$executeRawUnsafe('UPDATE users SET name = $1', 'z');
+      await tx.user.count();
+    });
+
+    assert.deepEqual(
+      calls.map((c) => c.method),
+      ['create', 'count'],
+      'delegates ran, under both spellings',
+    );
+    assert.equal(raw.length, 1);
+    assert.equal(raw[0]!.on, 'tx');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Options: stablePkOrder + prismaErrorCodes
 // ---------------------------------------------------------------------------
 
@@ -974,6 +1113,34 @@ function m2mFixture(): { schema: SchemaMetadata; map: PrismaCompatMap } {
   // Prisma has no model for an implicit junction: `map.models` deliberately
   // stays without one, which is exactly the gap under test.
   map.models.Post!.relations.tags = { name: 'tags', cardinality: 'many' };
+  return { schema, map };
+}
+
+/**
+ * The m2m fixture with the relation DECLARED ON BOTH SIDES, which is what
+ * introspection actually produces (and what code-first schemas write). The same
+ * junction table is therefore reached twice while building junction accessors.
+ */
+function twoSidedM2mFixture(): { schema: SchemaMetadata; map: PrismaCompatMap } {
+  const { schema, map } = m2mFixture();
+  schema.tables.tags!.relations = {
+    posts: {
+      type: 'manyToMany',
+      name: 'posts',
+      from: 'tags',
+      to: 'posts',
+      foreignKey: 'id',
+      referenceKey: 'id',
+      through: { table: '_PostToTag', sourceKey: 'tag_id', targetKey: 'post_id' },
+    },
+  };
+  map.models.Tag = {
+    table: 'tags',
+    accessor: 'tags',
+    fields: { id: 'id', label: 'label' },
+    relations: { posts: { name: 'posts', cardinality: 'many' } },
+    compoundUniques: {},
+  };
   return { schema, map };
 }
 
@@ -1097,6 +1264,22 @@ describe('prisma-compat, junction table accessors', () => {
     assert.equal(await compat.$transaction(async () => 'ran'), 'ran');
   });
 
+  it('a two-sided m2m declaration warns not at all and yields one working accessor', async () => {
+    // The junction is reached once per side of the pair. The second visit finds
+    // the name already registered, which is its OWN registration, not a
+    // collision with another client member: warning there is a false positive.
+    const { schema, map } = twoSidedM2mFixture();
+    resetWarnOnce('prismaCompatJunction');
+    const warnings: string[] = [];
+    const { db, calls } = spyDb(schema);
+    const compat = silenceWarnings(() => mkCompat(db, map), warnings) as Any;
+
+    assert.deepEqual(warnings, [], 'no collision warning for a junction that registered fine');
+    assert.equal(typeof compat._PostToTag, 'object', 'the accessor exists');
+    await compat._PostToTag.create({ data: { postId: 1, tagId: 2 } });
+    assert.equal(calls[calls.length - 1]!.table, '_PostToTag', 'and it is functional');
+  });
+
   it('warns once when a junction accessor is dropped on a name collision', () => {
     const { schema, map } = renameJunction(m2mFixture(), 'user');
     resetWarnOnce('prismaCompatJunction');
@@ -1105,6 +1288,25 @@ describe('prisma-compat, junction table accessors', () => {
     silenceWarnings(() => mkCompat(spyDb(schema).db, map), warnings);
     assert.equal(warnings.length, 1, 'once per junction name, not once per client');
     assert.match(warnings[0]!, /junction table "user" collides/);
+  });
+
+  it('a genuine collision on a two-sided m2m still warns exactly once', () => {
+    const fx = twoSidedM2mFixture();
+    const junction = fx.schema.tables._PostToTag!;
+    junction.name = 'user';
+    delete fx.schema.tables._PostToTag;
+    fx.schema.tables.user = junction;
+    fx.schema.tables.posts!.relations.tags!.through!.table = 'user';
+    fx.schema.tables.tags!.relations.posts!.through!.table = 'user';
+
+    resetWarnOnce('prismaCompatJunction');
+    const warnings: string[] = [];
+    const compat = silenceWarnings(() => mkCompat(spyDb(fx.schema).db, fx.map), warnings) as Any;
+
+    assert.equal(warnings.length, 1, 'one warning, not one per side of the pair');
+    assert.match(warnings[0]!, /junction table "user" collides/);
+    assert.match(warnings[0]!, /owning model relation/);
+    assert.equal(compat.user, compat.User, 'the colliding member is untouched');
   });
 
   it('the client exposes no non-delegate key outside CLIENT_RESERVED_KEYS', () => {

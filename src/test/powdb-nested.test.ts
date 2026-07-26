@@ -383,6 +383,36 @@ describe('powdb nested projections: attach + coercion', () => {
     assert.equal((post.publishedAt as Date).getTime(), micros / 1000);
   });
 
+  it('coerces a date child that arrived as a micros STRING (the real wire shape)', async () => {
+    // Microseconds run past `Number.MAX_SAFE_INTEGER`'s comfortable decimal
+    // range, so the engine renders a nested block's datetime cells as JSON
+    // STRINGS. Before they were parsed here, a nested `with` handed back the raw
+    // micros text while the batched loader and the native join both handed back
+    // a Date: three answers for one relation, on the DEFAULT read path.
+    const micros = Date.UTC(2025, 2, 3, 10) * 1000;
+    const mock = mockPool({
+      rows: [
+        {
+          id: '1',
+          name: 'Ada',
+          age: 36,
+          posts: [{ id: 'p1', author_id: '1', title: 'T', views: 7, published_at: String(micros) }],
+        },
+      ],
+    });
+    const users = await qi(mock).findMany({ with: { posts: true } });
+    const post = (users[0] as { posts: Record<string, unknown>[] }).posts[0]!;
+    assert.ok(post.publishedAt instanceof Date, 'micros string became a Date');
+    assert.equal((post.publishedAt as Date).toISOString(), '2025-03-03T10:00:00.000Z');
+    // A non-numeric string on a date column is left exactly as it arrived.
+    const odd = mockPool({
+      rows: [{ id: '1', name: 'Ada', age: 36, posts: [{ id: 'p1', published_at: 'not-a-timestamp' }] }],
+    });
+    const oddPost = ((await qi(odd).findMany({ with: { posts: true } }))[0] as { posts: Record<string, unknown>[] })
+      .posts[0]!;
+    assert.equal(oddPost.publishedAt, 'not-a-timestamp');
+  });
+
   it('parses a legacy-wire JSON text cell', async () => {
     const mock = mockPool({
       rows: [{ id: '1', name: 'Ada', age: 36, posts: '[{"id":"p1","author_id":"1","title":"T","views":null}]' }],

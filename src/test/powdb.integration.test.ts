@@ -46,6 +46,7 @@ import {
   powqlSchemaDDL,
   turbinePowDB,
 } from '../powdb.js';
+import { MAX_POWQL_DATETIME_TERMS } from '../powql.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
 
@@ -2415,6 +2416,438 @@ describe('powdb integration (embedded): 0.19.1 link introspection + scalar link 
         (e: unknown) => e instanceof ValidationError,
         'aggregate over a link projection is a ValidationError',
       );
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PowDB 0.20 correctness round, live through the addon.
+//
+// The load-bearing one is the `datetime` lane. Turbine binds a JS `Date` as an
+// integer count of microseconds, and PowDB writes a timestamp literal as a plain
+// integer, so every predicate on a `datetime` column is a `DateTime` vs `Int`
+// comparison. Below engine 0.20 that pairing was unhandled and compared TYPE
+// TAGS instead of values, so the answer was silently wrong; 0.20 compares
+// microseconds on every path. These tests pin the CORRECT answers on 0.20 and,
+// where the wrong behavior is still reachable, prove it is refused rather than
+// returned.
+//
+// Turbine's own DDL never emits a `datetime` column (a `Date` column becomes
+// PowQL `int` epoch micros), so the fixture provisions one with raw PowQL, which
+// is exactly the shape `introspectPowdbDatabase` reports for a table created
+// outside Turbine.
+// ---------------------------------------------------------------------------
+
+let embedded020 = false;
+try {
+  const req = createRequire(import.meta.url);
+  const pkg = JSON.parse(readFileSync(req.resolve('@zvndev/powdb-embedded/package.json'), 'utf8')) as {
+    version?: string;
+  };
+  embedded020 = embeddedAvailable && capabilitiesFromVersion(pkg.version).datetimeCompare;
+} catch {
+  embedded020 = false;
+}
+const { it: v020It } = skipGate(!embedded020, 'requires @zvndev/powdb-embedded >= 0.20 (datetime comparison fix)');
+
+/**
+ * `dt_event.ts` is a NATIVE PowDB `datetime`; `dt_event.n` holds the identical
+ * microsecond values in a plain `int` column. Every datetime assertion below has
+ * that int column as its control: if a datetime answer disagrees with the int
+ * answer, the engine is comparing something other than the timestamp value.
+ */
+const dtSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    dt_event: makeTable('dt_event', [
+      col('id', 'id', 'number', 'int4'),
+      col('ts', 'ts', 'Date', 'datetime', { dialectType: 'datetime', nullable: true }),
+      col('n', 'n', 'number', 'int8', { nullable: true }),
+      col('label', 'label', 'string', 'text', { nullable: true }),
+    ]),
+  },
+};
+
+const DT_EARLY = new Date('2024-01-01T00:00:00.000Z');
+const DT_LATE = new Date('2026-06-15T12:30:00.000Z');
+const DT_MID = new Date('2025-01-01T00:00:00.000Z');
+
+async function withDatetimeDb(fn: (db: DB) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'powdb-dt-it-'));
+  const db: DB = await turbinePowDB({ embedded: dir }, dtSchema, { warnOnUnlimited: false });
+  try {
+    // Raw DDL: `powqlSchemaDDL` would emit `ts: int` (Turbine never writes the
+    // datetime type), and an int column would not exercise the bug at all.
+    await db.raw(['type dt_event {\n required unique id: int,\n ts: datetime,\n n: int,\n label: str\n}']);
+    await db.dtEvent.create({ data: { id: 1, ts: DT_EARLY, n: DT_EARLY.getTime() * 1000, label: 'early' } });
+    await db.dtEvent.create({ data: { id: 2, ts: DT_LATE, n: DT_LATE.getTime() * 1000, label: 'late' } });
+    await db.raw(['insert dt_event { id := 3 }']); // no ts, no n, no label: a missing value
+    await fn(db);
+  } finally {
+    await db.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('powdb integration (embedded): 0.20 datetime comparisons', () => {
+  v020It('range, equality and reversed comparisons on a datetime column match the int control', async () => {
+    await withDatetimeDb(async (db) => {
+      const ids = async (where: Record<string, unknown>) =>
+        (await db.dtEvent.findMany({ where, orderBy: { id: 'asc' } })).map((r: { id: number }) => r.id);
+
+      // Below 0.20 each of these was wrong in a DIFFERENT direction: `gt` matched
+      // every non-null row (2 ids, not 1), `equals` matched none, and `lt`
+      // matched none, because a DateTime always sorted above an Int whatever the
+      // timestamps were.
+      assert.deepEqual(await ids({ ts: { gt: DT_MID } }), [2], 'gt selects only the later row');
+      assert.deepEqual(await ids({ ts: { lt: DT_MID } }), [1], 'lt selects only the earlier row');
+      assert.deepEqual(await ids({ ts: DT_LATE }), [2], 'equality selects exactly the matching row');
+      assert.deepEqual(await ids({ ts: { not: DT_LATE } }), [1], 'not excludes the match AND the missing row');
+      assert.deepEqual(await ids({ ts: { gte: DT_EARLY, lte: DT_LATE } }), [1, 2], 'a closed range spans both');
+
+      // The int control column holds the identical microsecond values, so every
+      // datetime answer above must equal its int answer exactly.
+      for (const [dtWhere, intWhere] of [
+        [{ ts: { gt: DT_MID } }, { n: { gt: DT_MID.getTime() * 1000 } }],
+        [{ ts: { lt: DT_MID } }, { n: { lt: DT_MID.getTime() * 1000 } }],
+        [{ ts: DT_LATE }, { n: DT_LATE.getTime() * 1000 }],
+      ] as const) {
+        assert.deepEqual(await ids(dtWhere), await ids(intWhere), 'datetime answer equals the int-column answer');
+      }
+    });
+  });
+
+  v020It('null checks and ordering on a datetime column are unaffected by the gate', async () => {
+    await withDatetimeDb(async (db) => {
+      // `is null` / `is not null` compare no literal, so they were correct on
+      // every engine version and are never refused.
+      const missing = await db.dtEvent.findMany({ where: { ts: null } });
+      assert.deepEqual(
+        missing.map((r: { id: number }) => r.id),
+        [3],
+      );
+      const present = await db.dtEvent.findMany({ where: { ts: { not: null } }, orderBy: { ts: 'desc' } });
+      assert.deepEqual(
+        present.map((r: { id: number }) => r.id),
+        [2, 1],
+        'ordering compares datetimes against each other and was always correct',
+      );
+      // The read path still hands back real Dates.
+      assert.ok(present[0].ts instanceof Date);
+      assert.equal((present[0].ts as Date).getTime(), DT_LATE.getTime());
+    });
+  });
+
+  v020It('`in` / `notIn` on a datetime column answer correctly via the equality chain', async () => {
+    await withDatetimeDb(async (db) => {
+      const ids = async (where: Record<string, unknown>) =>
+        (await db.dtEvent.findMany({ where, orderBy: { id: 'asc' } })).map((r: { id: number }) => r.id);
+      // The engine's own `in` list is still wrong (canary below), so Turbine
+      // never emits one for a datetime column: it expands to `(= or = …)`, which
+      // 0.20 answers correctly. These must equal the int control exactly.
+      assert.deepEqual(await ids({ ts: { in: [DT_EARLY, DT_LATE] } }), [1, 2]);
+      assert.deepEqual(await ids({ ts: { in: [DT_LATE] } }), [2]);
+      assert.deepEqual(await ids({ ts: { notIn: [DT_EARLY] } }), [2], 'notIn excludes the match AND the missing row');
+      const micros = [DT_EARLY.getTime() * 1000, DT_LATE.getTime() * 1000];
+      assert.deepEqual(await ids({ ts: { in: [DT_EARLY, DT_LATE] } }), await ids({ n: { in: micros } }));
+      assert.deepEqual(await ids({ ts: { notIn: [DT_EARLY] } }), await ids({ n: { notIn: [micros[0]!] } }));
+      // An EMPTY list compares nothing (it compiles to a constant and is never
+      // sent), so it keeps its SQL-parity meaning.
+      assert.deepEqual(await db.dtEvent.findMany({ where: { ts: { in: [] } } }), []);
+
+      // A list wider than the chain budget is a typed E017 that says so, rather
+      // than a chain the engine's nesting budget rejects.
+      const many = Array.from({ length: MAX_POWQL_DATETIME_TERMS + 1 }, (_, i) => new Date(DT_MID.getTime() + i));
+      await assert.rejects(
+        db.dtEvent.findMany({ where: { ts: { in: many } } }),
+        (e: unknown) => e instanceof UnsupportedFeatureError && /equality chain/.test((e as Error).message),
+      );
+
+      // CANARY for the upstream gap the expansion exists for: raw PowQL proves
+      // the engine still answers a datetime `in` list wrongly, while the
+      // identical list against the int control column answers correctly. When
+      // upstream extends the 0.20 fix to the list forms this test FAILS, which is
+      // the signal to drop the expansion (and its term cap) above.
+      const dtRows = await db.raw([`dt_event filter .ts in (${micros.join(', ')}) { .id }`]);
+      const intRows = await db.raw([`dt_event filter .n in (${micros.join(', ')}) { .id }`]);
+      assert.equal(intRows.length, 2, 'the int control column matches both rows');
+      assert.equal(dtRows.length, 0, 'upstream: a datetime `in` list still matches nothing');
+    });
+  });
+
+  v020It('a pre-0.20 engine gets a typed E017, not silently wrong rows', async () => {
+    // The gate is capability-driven, so pinning the capabilities to 0.19.1
+    // reproduces exactly what a user on the previous engine now sees: a refusal
+    // naming the column and the version floor, instead of the wrong row set that
+    // engine would have returned (`gt` matched every non-null row, `=` none).
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-dt-old-it-'));
+    const db: DB = await turbinePowDB({ embedded: dir }, dtSchema, {
+      warnOnUnlimited: false,
+      assumeEngineVersion: '0.19.1',
+    });
+    try {
+      await db.raw(['type dt_event {\n required unique id: int,\n ts: datetime,\n n: int,\n label: str\n}']);
+      // ONE gate covers the whole family, whatever spelling reached it: the `in`
+      // form is an equality chain by the time it would run, so it is refused by
+      // the same rule rather than by a separate `in`-only one.
+      for (const where of [{ ts: { gt: DT_MID } }, { ts: DT_MID }, { ts: { in: [DT_MID] } }]) {
+        await assert.rejects(
+          db.dtEvent.findMany({ where }),
+          (e: unknown) =>
+            e instanceof UnsupportedFeatureError &&
+            /comparisons on the PowDB datetime column "ts"/.test((e as Error).message) &&
+            /Requires PowDB >= 0\.20/.test((e as Error).message) &&
+            /nested `with`/.test((e as Error).message),
+          'a datetime comparison on a 0.19 engine is refused with an upgrade hint and the path that works',
+        );
+      }
+      // A plain `int` column carrying the same micros is NOT gated: it was always
+      // correct, on every engine version.
+      assert.deepEqual(await db.dtEvent.findMany({ where: { n: { gt: DT_MID.getTime() * 1000 } } }), []);
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('powdb integration (embedded): 0.20 behavior changes', () => {
+  v020It('per-field `_count` counts non-null values; `_count: true` still counts rows', async () => {
+    await withDatetimeDb(async (db) => {
+      // Row 3 has no `label`, so the two numbers genuinely differ. Below 0.20 the
+      // engine ignored the projection and returned 3 for BOTH, silently
+      // disagreeing with every SQL engine on a NULLABLE column.
+      const agg = await db.dtEvent.aggregate({ _count: { label: true } });
+      assert.equal((agg._count as Record<string, number>).label, 2, 'counts non-null labels');
+      const rows = await db.dtEvent.aggregate({ _count: true });
+      assert.equal(rows._count, 3, 'count(T) is still a row count');
+      assert.equal(await db.dtEvent.count(), 3);
+      // A NOT NULL column: the two numbers are the same by construction, which is
+      // exactly why the pre-0.20 gate below lets it through.
+      const pk = await db.dtEvent.aggregate({ _count: { id: true } });
+      assert.equal((pk._count as Record<string, number>).id, 3);
+    });
+  });
+
+  v020It('the pre-0.20 `_count` gate refuses a NULLABLE column only', async () => {
+    // The regression this pins: gating the whole per-field `_count` feature took
+    // a CORRECT, working call away from every user on the engine line
+    // turbine-orm shipped against, because on a NOT NULL column the row count
+    // the old engine returned IS the non-null count.
+    const dir = mkdtempSync(join(tmpdir(), 'powdb-count-old-it-'));
+    const db: DB = await turbinePowDB({ embedded: dir }, dtSchema, {
+      warnOnUnlimited: false,
+      assumeEngineVersion: '0.19.1',
+    });
+    try {
+      await db.raw(['type dt_event {\n required unique id: int,\n ts: datetime,\n n: int,\n label: str\n}']);
+      await db.raw(['insert dt_event { id := 1, label := "a" }']);
+      await db.raw(['insert dt_event { id := 2 }']);
+      await assert.rejects(
+        db.dtEvent.aggregate({ _count: { label: true } }),
+        (e: unknown) =>
+          e instanceof UnsupportedFeatureError &&
+          /nullable column "label"/.test((e as Error).message) &&
+          /Requires PowDB >= 0\.20/.test((e as Error).message),
+        'the nullable column is where the old engine actually disagreed',
+      );
+      // NOT NULL: served, and the number is right (the addon really is 0.20 here,
+      // only the capabilities are pinned, so the count is the true non-null count
+      // which equals the row count either way).
+      const agg = await db.dtEvent.aggregate({ _count: { id: true } });
+      assert.deepEqual(agg._count, { id: 2 });
+      assert.equal((await db.dtEvent.aggregate({ _count: true }))._count, 2);
+    } finally {
+      await db.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  v020It('limit 0 returns no rows and a negative limit / offset is refused', async () => {
+    await withDatetimeDb(async (db) => {
+      // Answered client-side: PowDB's projection fast path returned ONE row for
+      // `limit 0` below 0.20, so this is correct on every engine version.
+      assert.deepEqual(await db.dtEvent.findMany({ limit: 0 }), []);
+      assert.deepEqual(await db.dtEvent.groupBy({ by: ['label'], limit: 0 }), []);
+      // A negative limit wrapped to usize::MAX below 0.20 and returned EVERY row.
+      await assert.rejects(
+        db.dtEvent.findMany({ limit: -1 }),
+        (e: unknown) => e instanceof ValidationError && /`limit` must not be negative/.test((e as Error).message),
+      );
+      await assert.rejects(
+        db.dtEvent.findMany({ offset: -5 }),
+        (e: unknown) => e instanceof ValidationError && /`offset` must not be negative/.test((e as Error).message),
+      );
+    });
+  });
+
+  v020It('the new engine refusals map to typed errors naming the column', async () => {
+    await withDatetimeDb(async (db) => {
+      // Unknown column in a filter (0.20 turned this from a silent NULL, which
+      // made `filter .agee = null` match EVERY row, into an error). Turbine
+      // validates its own metadata first, so reach the engine through raw PowQL.
+      await assert.rejects(
+        db.raw(['dt_event filter .agee = 1 { .id }']),
+        (e: unknown) => e instanceof ValidationError && /"agee"/.test((e as Error).message),
+        'unknown column is a ValidationError naming the column',
+      );
+      // Type-mismatched comparison (0.20 turned this from "true for every row"
+      // into an error).
+      await assert.rejects(
+        db.raw(['dt_event filter .label > 25 { .id }']),
+        (e: unknown) => e instanceof ValidationError && /"label"/.test((e as Error).message),
+        'type-mismatched comparison is a ValidationError naming the column',
+      );
+      // Operator-chain nesting budget (the 0.20 DoS fix): a machine-built
+      // predicate with very many `or` terms is rejected, and the mapped message
+      // has to say what to do about it.
+      const chain = Array.from({ length: 200 }, (_, i) => `.id = ${i + 1}`).join(' or ');
+      await assert.rejects(
+        db.raw([`dt_event filter ${chain} { .id }`]),
+        (e: unknown) => e instanceof ValidationError && /Split a large `OR` \/ `AND` array/.test((e as Error).message),
+        'a too-long operator chain is a ValidationError with a split-it hint',
+      );
+      // A literal `in` list is ONE flat node, not a chain, so the same term count
+      // is accepted. This is what keeps Turbine's relation-key chunking safe.
+      const list = Array.from({ length: 200 }, (_, i) => i + 1).join(', ');
+      assert.equal((await db.raw([`dt_event filter .id in (${list}) { .id }`])).length, 3);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A relation whose correlation column is a NATIVE `datetime` on both sides.
+//
+// This is the shape that made the SAME relation refused through one load
+// strategy and served through another: relation filters and the batched loaders
+// compare the key against a bound timestamp (a key `in` list), while nested
+// projections and native joins correlate column to column and never do. Every
+// path has to give the same answer now.
+//
+// `kid.cts` is a second, non-correlation datetime column: it is what a child row
+// carries back, so it also pins the nested-projection coercion (children ride a
+// JSON array, where micros arrive as a STRING).
+// ---------------------------------------------------------------------------
+
+const dtRelSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    dt_parent: makeTable(
+      'dt_parent',
+      [
+        col('id', 'id', 'number', 'int4'),
+        col('ts', 'ts', 'Date', 'datetime', { dialectType: 'datetime', nullable: true }),
+      ],
+      {
+        kids: { type: 'hasMany', name: 'kids', from: 'dt_parent', to: 'dt_kid', foreignKey: 'pts', referenceKey: 'ts' },
+      },
+    ),
+    dt_kid: makeTable('dt_kid', [
+      col('id', 'id', 'number', 'int4'),
+      col('pts', 'pts', 'Date', 'datetime', { dialectType: 'datetime', nullable: true }),
+      col('cts', 'cts', 'Date', 'datetime', { dialectType: 'datetime', nullable: true }),
+      col('tag', 'tag', 'string', 'text', { nullable: true }),
+    ]),
+  },
+};
+
+async function withDatetimeRelDb(fn: (db: DB) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'powdb-dtrel-it-'));
+  const db: DB = await turbinePowDB({ embedded: dir }, dtRelSchema, { warnOnUnlimited: false });
+  try {
+    await db.raw(['type dt_parent {\n required unique id: int,\n ts: datetime\n}']);
+    await db.raw(['type dt_kid {\n required unique id: int,\n pts: datetime,\n cts: datetime,\n tag: str\n}']);
+    await db.dtParent.create({ data: { id: 1, ts: DT_EARLY } });
+    await db.dtParent.create({ data: { id: 2, ts: DT_LATE } });
+    await db.dtKid.create({ data: { id: 10, pts: DT_EARLY, cts: DT_MID, tag: 'k' } });
+    await fn(db);
+  } finally {
+    await db.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('powdb integration (embedded): a datetime relation key answers the same on every strategy', () => {
+  v020It('relation filter, batched loader, nested projection and join all agree', async () => {
+    await withDatetimeRelDb(async (db) => {
+      // The relation FILTER compiles to a key comparison on the parent. It used
+      // to be a typed refusal while the sibling `with` below happily served the
+      // same relation.
+      const filtered = await db.dtParent.findMany({ where: { kids: { some: { tag: 'k' } } } });
+      assert.deepEqual(
+        filtered.map((p: { id: number }) => p.id),
+        [1],
+        'the relation filter selects the parent whose timestamp a child points at',
+      );
+      assert.deepEqual(await db.dtParent.findMany({ where: { kids: { none: { tag: 'k' } } } }), [
+        { id: 2, ts: DT_LATE },
+      ]);
+
+      // Every load strategy returns the identical tree.
+      const shapes = [];
+      for (const args of [
+        { with: { kids: true }, orderBy: { id: 'asc' } }, // default: nested projections
+        { with: { kids: true }, orderBy: { id: 'asc' }, relationLoadStrategy: 'batched' },
+        { with: { kids: true }, orderBy: { id: 'asc' }, relationLoadStrategy: 'join' },
+      ] as const) {
+        shapes.push(await db.dtParent.findMany(args));
+      }
+      for (const rows of shapes) {
+        assert.equal(rows.length, 2);
+        assert.equal(rows[0].kids.length, 1, 'the datetime-keyed child stitched');
+        assert.equal(rows[0].kids[0].id, 10);
+        assert.deepEqual(rows[1].kids, [], 'the childless parent keeps []');
+        // The child's own datetime column comes back as a real Date on every
+        // path: the nested-projection block sends micros as a JSON STRING, which
+        // used to reach the caller unparsed while the other two paths gave Dates.
+        assert.ok(rows[0].kids[0].cts instanceof Date, 'child datetime is a Date');
+        assert.equal((rows[0].kids[0].cts as Date).getTime(), DT_MID.getTime());
+        assert.ok(rows[0].ts instanceof Date);
+      }
+    });
+  });
+
+  v020It('the batched loader chunks datetime keys to the chain budget', async () => {
+    await withDatetimeRelDb(async (db) => {
+      // More parents than one chain can carry: the loader must split the key set
+      // rather than build a chain the engine's nesting budget rejects.
+      const extra = MAX_POWQL_DATETIME_TERMS + 5;
+      for (let i = 0; i < extra; i++) {
+        await db.dtParent.create({ data: { id: 100 + i, ts: new Date(DT_MID.getTime() + i * 1000) } });
+      }
+      const rows = await db.dtParent.findMany({ relationLoadStrategy: 'batched', with: { kids: true } });
+      assert.equal(rows.length, extra + 2);
+      const withKids = rows.filter((p: { kids: unknown[] }) => p.kids.length > 0);
+      assert.deepEqual(
+        withKids.map((p: { id: number }) => p.id),
+        [1],
+        'only the parent a child points at gets one, across chunk boundaries',
+      );
+    });
+  });
+});
+
+describe('powdb integration (embedded): empty and ragged createMany rows', () => {
+  it('inserts rows of pure defaults and refuses a ragged row set', async () => {
+    await withDatetimeRelDb(async (db) => {
+      // A row naming no column at all is a legitimate insert (PowQL takes an
+      // empty body), matching every SQL engine's DEFAULT VALUES form. The
+      // client-side PK default fills the id in where the schema declares one; on
+      // this fixture the PK is caller-supplied, so name it.
+      const both = await db.dtKid.createMany({ data: [{ id: 20 }, { id: 21 }] });
+      assert.equal(both.length, 2);
+
+      // Ragged rows are a typed E003 naming the offending row, exactly as on the
+      // SQL engines. PowQL itself would insert them (each tuple carries its own
+      // column list), but accepting the shape here alone would make a later move
+      // to Postgres a hard error found in production.
+      await assert.rejects(
+        db.dtKid.createMany({ data: [{ id: 30 }, { id: 31, tag: 'x' }] }),
+        (e: unknown) =>
+          e instanceof ValidationError &&
+          /row 1 supplies "tag", which the first row does not/.test((e as Error).message),
+      );
+      assert.equal(await db.dtKid.count({ where: { id: { gte: 30 } } }), 0, 'nothing was inserted');
     });
   });
 });

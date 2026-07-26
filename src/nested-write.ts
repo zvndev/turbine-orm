@@ -159,6 +159,72 @@ export function injectForeignKey(
   return result;
 }
 
+/**
+ * Split rows destined for `createMany` into CONTIGUOUS runs that each name the
+ * same fields.
+ *
+ * `createMany` compiles ONE statement whose column list comes from the first
+ * row, so it refuses a batch whose rows disagree about which fields they name
+ * (`assertUniformCreateManyRows` in query/writes.ts): a field a later row omits
+ * would be bound as NULL over that column's default, and a field only a later
+ * row names would be dropped. Rows that arrive as ordinary user input, a nested
+ * `create: [...]` array or a Prisma-shaped `createMany` on the compat layer, are
+ * allowed to mix shapes, so the caller splits the batch instead of refusing it
+ * and issues one `createMany` per run. Every run is internally uniform, so the
+ * refusal still stands where it matters and none of the corruption it exists to
+ * stop becomes reachable.
+ *
+ * Runs are CONTIGUOUS rather than grouped by shape across the whole array: one
+ * statement inserted the rows in array order, and running contiguous runs in
+ * order keeps that, so generated keys stay ascending with the caller's array.
+ * Grouping non-adjacent rows would batch harder (`A B A B` in two statements
+ * rather than four) at the cost of reordering rows, which is observable through
+ * any server-assigned sequence.
+ *
+ * A uniform array, the overwhelmingly common shape, yields exactly one run
+ * holding the ORIGINAL array, so the caller makes the one call it always made.
+ *
+ * A key whose value is `undefined` is not named, matching `definedKeys` in
+ * query/writes.ts (and single-row `create`).
+ *
+ * @internal shared by the nested-write batch path and turbine-orm/prisma-compat.
+ */
+export function createManyShapeRuns<T extends Record<string, unknown>>(rows: T[]): T[][] {
+  if (rows.length === 0) return [];
+  const runs: T[][] = [];
+  let current: T[] = [];
+  let currentShape = '';
+  for (const row of rows) {
+    const shape = rowShapeKey(row);
+    if (current.length === 0) {
+      currentShape = shape;
+    } else if (shape !== currentShape) {
+      runs.push(current);
+      current = [];
+      currentShape = shape;
+    }
+    current.push(row);
+  }
+  runs.push(current);
+  // One run means every row agreed: hand back the caller's own array so the
+  // resulting call is indistinguishable from the ungrouped one.
+  return runs.length === 1 ? [rows] : runs;
+}
+
+/**
+ * Order-independent identity of the fields a row names. Each key is written
+ * length-prefixed so no delimiter can appear inside one: a property name may
+ * legally contain any character at all, so a plain join would let two distinct
+ * key sets collide on the same string.
+ */
+function rowShapeKey(row: Record<string, unknown>): string {
+  return Object.keys(row)
+    .filter((k) => row[k] !== undefined)
+    .sort()
+    .map((k) => `${k.length}:${k}`)
+    .join(',');
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -1126,9 +1192,20 @@ async function processHasManyCreate(
           await executeNestedCreate(ctx, rel.to, injected, depth + 1, [...path, relName]);
         }
       } else {
-        // Batch via createMany (UNNEST), fast path
+        // Batch via createMany (UNNEST), fast path.
+        //
+        // A nested `create: [...]` array is ordinary user input and may
+        // legitimately mix row shapes (`[{ title }, { title, published }]`),
+        // which one createMany cannot express, see createManyShapeRuns. Split
+        // it into contiguous same-shape runs and issue one createMany per run:
+        // every run stays uniform, so an omitted field takes its column default
+        // instead of being written as NULL, and the rows still reach the
+        // database in the caller's array order exactly as the single statement
+        // put them there. A uniform array is one run and one identical call.
         const injected = items.map((item) => injectForeignKey(item, rel, parentRow, ctx.schema));
-        await ctx.tx.table(rel.to).createMany({ data: injected });
+        for (const run of createManyShapeRuns(injected)) {
+          await ctx.tx.table(rel.to).createMany({ data: run });
+        }
       }
     }
   }

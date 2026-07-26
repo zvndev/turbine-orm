@@ -232,6 +232,55 @@ export const AUTO_TO_ONE_JOIN_ROWS_MAX = 100_000;
  * plan and never the result.
  */
 
+/**
+ * The smallest plan-time parent-row bound at which `'auto'` moves a relation
+ * `_count` on a PROVEN-UNINDEXED probe to the grouped follow-up. Deliberately
+ * 2, i.e. "everything except a parent set provably bounded at one row".
+ *
+ * `_count` does NOT share the to-one break-even formula above, because its two
+ * plans do not differ by a small per-row penalty. Writing S for one scan of the
+ * child table and RTT for a round trip:
+ *
+ *     inline(N)  = N x S        (a correlated COUNT(*) per parent row; see
+ *                                buildRelationCountExpr in relations.ts, the
+ *                                inline form is NOT a grouped scan)
+ *     batched(N) = S + RTT      (one `COUNT(*) ... GROUP BY fk` follow-up)
+ *
+ * so the crossover sits at `N = 1 + RTT/S` and, decisively, the two regrets are
+ * not comparable in kind:
+ *
+ *   - choosing batched when inline would have won costs at most RTT, once, and
+ *     ONLY at N = 1 (at N = 1 the difference is exactly RTT, and it shrinks to
+ *     zero immediately after);
+ *   - choosing inline when batched would have won costs (N - 1) x S, which is
+ *     unbounded in the parent count.
+ *
+ * Measured on an UNINDEXED FK (PostgreSQL 16, 200K-row child table, 10K-row
+ * parent table, median of 11 interleaved reps per point, loopback;
+ * benchmarks/bench-count-strategy.ts):
+ *
+ *   parents      1      2      3      5     20     100     1000    10000
+ *   inline    4.3ms  8.3ms 12.3ms 20.1ms 79.2ms 417.5ms   3.06s   31.06s
+ *   batched   5.2ms  4.8ms  4.8ms  5.2ms  6.1ms  11.5ms   9.9ms   28.4ms
+ *   winner   inline batched batched batched batched batched batched batched
+ *   ratio     1.22x  1.73x  2.54x  3.84x 13.05x  36.42x 310.92x 1093.35x
+ *
+ * Inline wins exactly one cell, by 0.9ms, then loses the next by 1.73x and the
+ * last by 1093x. A skewed child distribution (half the rows on ten parents)
+ * moves nothing: same crossover at 2, same 1179x at 10,000. So the useful
+ * threshold is not a tunable row count, it is the one row where inline provably
+ * cannot lose. There is deliberately no config knob: the entire regret this rule
+ * can produce is one round trip, which is less than any knob would be worth, and
+ * `relationLoadStrategy: 'join'` already forces the single-statement plan.
+ *
+ * This applies ONLY to a probe the introspected index metadata PROVES unindexed.
+ * An INDEXED `_count` stays inline at every size measured (inline wins 1.30x to
+ * 2.06x from 1 to 10,000 parents, because the per-parent subquery collapses to
+ * an index-only scan costing ~0.001ms), and the partition below never demotes
+ * it.
+ */
+export const AUTO_COUNT_BATCH_MIN_PARENT_ROWS = 2;
+
 /** One relation that `'auto'` moved off the join plan, with the reason (dev note). */
 interface AutoEngaged {
   relation: string;
@@ -572,14 +621,39 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.options = options;
 
     // Pre-compute column type lookup maps (TASK-26)
+    //
+    // Metadata can carry a column's database type in EITHER of two places: on
+    // the column entry (`dialectType` / `pgType`, what introspection and
+    // `turbine generate` emit) or in the table-level `dialectTypes` / `pgTypes`
+    // maps. Reading only the column entry is not a harmless miss for metadata
+    // that populates just the table-level maps: an unresolved type makes
+    // `coerceWriteValue` return a bound `Date` by identity, so a zone-less
+    // `date` / `timestamp` column stores the PROCESS's local calendar fields
+    // (and, because the read path pins UTC, a turbine-only round trip hides
+    // it). Consult both, column entry first. This costs one extra own-property
+    // lookup per column ONCE per QueryInterface, nothing per query.
     this.columnPgTypeMap = new Map();
     this.columnArrayTypeMap = new Map();
     this.crossSchemaTypeColumns = new Set();
+    const tableDialectTypes = this.tableMeta.dialectTypes;
+    const tablePgTypes = this.tableMeta.pgTypes;
     for (const col of this.tableMeta.columns) {
-      this.columnPgTypeMap.set(col.name, col.dialectType ?? col.pgType);
-      this.columnArrayTypeMap.set(col.name, col.arrayType ?? col.pgArrayType);
+      const dbType =
+        col.dialectType ??
+        col.pgType ??
+        (tableDialectTypes && ownLookup(tableDialectTypes, col.name)) ??
+        (tablePgTypes && ownLookup(tablePgTypes, col.name));
+      if (dbType !== undefined) this.columnPgTypeMap.set(col.name, dbType);
+      // The array map has the same shape of gap, but TableMetadata carries NO
+      // table-level array-type map (only `dialectTypes` / `pgTypes`), so there
+      // is nothing to fall back to. Deriving one from the resolved base type
+      // would invent an UNNEST cast the metadata never declared, so the column
+      // entry stays the only source.
+      const arrayType = col.arrayType ?? col.pgArrayType;
+      if (arrayType !== undefined) this.columnArrayTypeMap.set(col.name, arrayType);
       if (col.pgTypeSchema !== undefined) this.crossSchemaTypeColumns.add(col.name);
     }
+    this.warnUntypedColumns();
 
     // Bind the shared WHERE-walk view once. `tableMeta` is immutable after this
     // point; the method wrappers forward to the (private) instance methods so
@@ -605,6 +679,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
       scopedHostCache: this.scopedHostCache,
       columnPgTypeMap: this.columnPgTypeMap,
       columnArrayTypeMap: this.columnArrayTypeMap,
+      // The `utcTimestamps: false` opt-out has to reach the write/where web:
+      // omitting it here left `qi.utcTimestamps` undefined for the whole
+      // module, where `!== false` reads as opted IN, so the write side ignored
+      // the flag and rewrote binds the caller had opted out of.
+      //
+      // This half of the flag is PER CLIENT. The read half is not: it is the
+      // pg OID 1114 type parser, which `pg.types.setTypeParser` installs once
+      // per process. Two clients in one process therefore cannot hold
+      // different values, and TurbineClient refuses the second one rather than
+      // building a client whose writes and reads disagree (see
+      // `assertUtcTimestampsAgree` in client.ts).
+      utcTimestamps: this.utcTimestamps,
       crossSchemaTypeColumns: this.crossSchemaTypeColumns,
       get currentSkip(): SkipGlobalFilters | undefined {
         return self.currentSkip;
@@ -636,6 +722,71 @@ export class QueryInterface<T extends object, R extends object = {}> {
       paginationRef: (value: unknown, params: unknown[], arg: string) => this.paginationRef(value, params, arg),
       paginationValue: (value: unknown, arg: string) => this.paginationValue(value, arg),
     };
+  }
+
+  /**
+   * Dev-only, once per table: the columns whose database type is absent from
+   * BOTH the column entry and the table-level type maps, the residual case
+   * after the two-source resolution above.
+   *
+   * The set is deliberately every untyped column, not the `dateColumns`
+   * members. An unresolved type is precisely the state in which Turbine cannot
+   * say WHICH kind of column it is, so restricting the scan to `dateColumns`
+   * got it wrong in both directions: that set carries `timestamptz` (whose
+   * bind was never affected, since binding the `Date` is the correct thing to
+   * do for it) and omits `time` / `timetz` entirely (deliberately, see
+   * `timeOfDayKind` in schema.ts), which is the one kind that fails LOUDLY
+   * rather than silently. The message therefore names the columns and states
+   * what each kind does, rather than asserting a kind it cannot know.
+   *
+   * What is actually at stake per kind, all of it `coerceWriteValue` returning
+   * the bound `Date` by identity for want of a type:
+   *   - zone-less `date` / `timestamp`: the driver serializes with the
+   *     PROCESS's offset, so the column stores local calendar fields. Nothing
+   *     surfaces at runtime, and a turbine-only round trip reads the same value
+   *     back (the read path shifts by the same offset), so only an outside
+   *     reader sees the drift.
+   *   - `time` / `timetz`: the driver serializes a full ISO timestamp, which
+   *     Postgres rejects with `22007 invalid input syntax for type time`.
+   *   - `timestamptz` and every non-temporal type: unaffected.
+   *
+   * PostgreSQL only: the UTC bind rewrite is Postgres-gated (see
+   * `utcDateTimeWrites` in writes.ts), so on the other engines a missing type
+   * changes nothing about how a `Date` is bound. Suppressed under
+   * `NODE_ENV=production` like the other dev diagnostics and deduped through
+   * the shared registry, so a hot table logs one line for the process.
+   *
+   * Cannot throw on odd metadata: it walks `tableMeta.columns`, the array the
+   * constructor loop above has already iterated (and that client.ts validates
+   * as an array), never `dateColumns`, which is a `Set` in every first-party
+   * metadata path but arrives as a plain object from JSON-round-tripped
+   * metadata. A dev-only diagnostic that crashes a shape production would serve
+   * is worse than the bug it reports.
+   */
+  private warnUntypedColumns(): void {
+    if (process.env.NODE_ENV === 'production') return;
+    if (this.dialect.name !== 'postgresql') return;
+    const untyped: string[] = [];
+    for (const col of this.tableMeta.columns) {
+      if (this.columnPgTypeMap.get(col.name) === undefined) untyped.push(col.name);
+    }
+    if (untyped.length === 0) return;
+    if (!shouldWarnOnce(WARN_NS.untypedDateColumn, this.table)) return;
+    // Bound the line on a wide table: the fix is per table, not per column, so
+    // the first few names are enough to recognize the metadata that produced it.
+    const MAX_NAMED = 12;
+    const named = untyped.slice(0, MAX_NAMED).join(', ');
+    const rest = untyped.length > MAX_NAMED ? ` (+${untyped.length - MAX_NAMED} more)` : '';
+    console.warn(
+      `[turbine] table "${this.table}": no database type in metadata for column(s) ${named}${rest} (neither the ` +
+        "column entry's `dialectType`/`pgType` nor the table-level `dialectTypes`/`pgTypes` map). Turbine cannot " +
+        'tell which of them are zone-less, so a `Date` written to one is bound by the driver as-is: right for ' +
+        "`timestamptz`, but a zone-less `date`/`timestamp` column then stores the PROCESS's local calendar fields " +
+        'rather than UTC (silently, since the read path shifts back by the same offset), and a `time`/`timetz` ' +
+        'column rejects the value outright (`22007 invalid input syntax for type time`). Columns whose type IS ' +
+        'resolved, every `timestamptz` among them, are unaffected. Regenerate the metadata with ' +
+        '`npx turbine generate`, or set the column types in your `defineSchema` definition.',
+    );
   }
 
   /** Quote an identifier through the active SQL dialect. */
@@ -1114,8 +1265,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * `findFirst` pass `false` explicitly (their parent set is one row).
    */
   private autoParentSetLarge(args?: { limit?: number; take?: number }): boolean {
-    const limit = args?.take ?? args?.limit ?? this.defaultLimit;
-    return limit === undefined || limit > this.autoToOneThreshold();
+    const bound = this.autoParentBound(args);
+    return bound === undefined || bound > this.autoToOneThreshold();
+  }
+
+  /**
+   * The plan-time UPPER BOUND on the parent-row count, or `undefined` when the
+   * query is unbounded. This is the raw number behind
+   * {@link autoParentSetLarge}; the `_count` rule needs the number itself
+   * because its threshold ({@link AUTO_COUNT_BATCH_MIN_PARENT_ROWS}) is two
+   * rows rather than the to-one break-even. `findUnique` / `findFirst` pass `1`
+   * directly: their parent set is one row as a matter of the statement's shape,
+   * not an estimate.
+   */
+  private autoParentBound(args?: { limit?: number; take?: number }): number | undefined {
+    return args?.take ?? args?.limit ?? this.defaultLimit;
   }
 
   /**
@@ -1162,13 +1326,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
    *
    * Everything else (indexed to-many, composite-key, unknown) stays in `joinWith`
    * (byte-identical join). The reserved `_count` key falls back on rule 1 only,
-   * and only for a large parent set: an inline `_count` is one correlated
-   * `COUNT(*)` per parent row, so the grouped follow-up wins exactly when there
-   * are many parents, while for a handful of parents the extra round-trip costs
-   * more than the repeated (small) scans. Also returns the engaged relations for
-   * the dev note.
+   * and on its OWN size rule: an inline `_count` is one correlated `COUNT(*)`
+   * per parent row over an unindexed child table, so the grouped follow-up wins
+   * from {@link AUTO_COUNT_BATCH_MIN_PARENT_ROWS} parent rows upward and inline
+   * is preferred only when the parent set is provably bounded below that. Also
+   * returns the engaged relations for the dev note.
    */
-  private partitionWithForAuto(withClause: WithClause, parentSetLarge: boolean): AutoSplit {
+  private partitionWithForAuto(
+    withClause: WithClause,
+    parentSetLarge: boolean,
+    parentBound: number | undefined,
+  ): AutoSplit {
     const hasIndexInfo = schemaHasIndexInfo(this.schema);
     const joinWith: WithClause = {};
     const batchedWith: WithClause = {};
@@ -1177,7 +1345,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (!spec) continue;
       if (key === '_count') {
         const cv = this.autoCountVerdict(spec as unknown as WithCount, this.tableMeta);
-        if (hasIndexInfo && parentSetLarge && cv.unindexed && cv.eligible) {
+        const countWorthBatching = parentBound === undefined || parentBound >= AUTO_COUNT_BATCH_MIN_PARENT_ROWS;
+        if (hasIndexInfo && countWorthBatching && cv.unindexed && cv.eligible) {
           batchedWith[key] = spec;
           engaged.push({ relation: '_count', reason: 'unindexed', miss: cv.miss });
         } else {
@@ -1214,7 +1383,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * to batched. Returns `null` (→ run the plain join path, byte-identical, same
    * cache keys) when nothing qualifies.
    */
-  private planAuto(withArg: WithClause, stableFlag: boolean | undefined, parentSetLarge: boolean): AutoSplit | null {
+  private planAuto(
+    withArg: WithClause,
+    stableFlag: boolean | undefined,
+    parentSetLarge: boolean,
+    parentBound: number | undefined,
+  ): AutoSplit | null {
     // Without DB-backed index info (code-first / defineSchema-only) no probe can
     // be PROVEN unindexed; the to-one cardinality rule does not depend on index
     // metadata, so it still applies.
@@ -1222,7 +1396,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const withClause = this.resolveStableOrder(stableFlag)
       ? this.applyStableRelationOrder(withArg, this.table)
       : withArg;
-    const split = this.partitionWithForAuto(withClause, parentSetLarge);
+    const split = this.partitionWithForAuto(withClause, parentSetLarge, parentBound);
     if (Object.keys(split.batchedWith).length === 0) return null;
     return split;
   }
@@ -1244,8 +1418,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const probe = e.miss
         ? `probe "${e.miss.table}"(${e.miss.columns.join(', ')}) has no covering index`
         : 'a probe in its subtree has no covering index';
+      // The `_count` case is the one people read as a needless demotion, because
+      // the follow-up statement is a grouped COUNT and the inline form looks
+      // like it would be one too. It is not: state the shape it replaced.
+      const why =
+        e.relation === '_count'
+          ? ' The inline form is one correlated COUNT(*) re-evaluated per parent row, so on an unindexed ' +
+            `probe it is one full scan of "${e.miss?.table ?? 'the child table'}" per parent row; the ` +
+            'follow-up is one grouped scan for the whole page.'
+          : '';
       console.warn(
-        `[turbine] auto strategy: relation "${e.relation}" on "${this.table}" loads batched (${probe}). ` +
+        `[turbine] auto strategy: relation "${e.relation}" on "${this.table}" loads batched (${probe}).${why} ` +
           "Create the covering index (or set `relationLoadStrategy: 'join'` to force the single-statement " +
           'plan); run `npx turbine doctor` for the exact CREATE INDEX SQL.',
       );
@@ -1760,8 +1943,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
         if (strategy === 'batched') return this.runFindUniqueBatched(args as unknown as FindUniqueArgs<T>);
         if (strategy === 'auto') {
           // findUnique's parent set is a single row: the join plan's correlated
-          // subqueries run once, so the cardinality rule never applies here.
-          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false);
+          // subqueries run once, so the cardinality rule never applies here, and
+          // an inline `_count` is one scan against the batched plan's one scan
+          // plus a round trip.
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false, 1);
           if (split) return this.runAutoSplit(args as unknown as FindUniqueArgs<T>, split, true);
         }
       }
@@ -1990,7 +2175,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
         if (strategy === 'batched') return this.runFindManyBatched(args as unknown as FindManyArgs<T>);
         if (strategy === 'auto') {
-          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, this.autoParentSetLarge(args));
+          const split = this.planAuto(
+            args.with as WithClause,
+            args.stableRelationOrder,
+            this.autoParentSetLarge(args),
+            this.autoParentBound(args),
+          );
           if (split) return this.runAutoSplit(args as unknown as FindManyArgs<T>, split, false) as Promise<T[]>;
         }
       }
@@ -2571,7 +2761,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
         if (strategy === 'auto') {
           // findFirst is findMany + LIMIT 1: a one-row parent set.
-          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false);
+          const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false, 1);
           if (split) {
             const rows = (await this.runAutoSplit(
               { ...args, limit: 1 } as unknown as FindManyArgs<T>,

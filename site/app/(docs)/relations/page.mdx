@@ -245,6 +245,8 @@ await db.users.findMany({
 - **Further `with`**, recurses. Depth cap is 10; beyond that Turbine throws `CircularRelationError` (TURBINE_E007) with the full path trail.
 
 > **Relation-array order is not guaranteed.** Without an explicit `orderBy`, a `with` relation comes back in whatever order the loader produces, `json_agg` injects no `ORDER BY`, and the `'auto'` / `'batched'` load strategies can order the same rows differently again. If any code depends on child order, add `orderBy` to that `with` block, or opt into the client-wide `stableRelationOrder` flag (a per-relation `orderBy` always wins over it).
+>
+> That is about the order of **rows inside** a relation array, which is a different axis from the order of **keys on the returned object**. Key order is deterministic on its own, with or without `stableRelationOrder`: the `'batched'` and `'auto'` strategies run their follow-up statements concurrently, so completion order is a race, and every relation key and every `_count` entry is therefore seeded up front in the order the join plan emits it, before any load runs. The same query serializes to the same JSON under every strategy.
 
 ## Relation filters on the parent
 
@@ -368,9 +370,23 @@ The unindexed rule needs index metadata that came from the database, so a `defin
 
 Both rules only ever move a relation that the batched loader can actually handle. Composite-key relations, and relations whose subtree the loader cannot express, always stay in the join. Engagement is visible: a once-per-relation dev note naming the reason, and query events carry `strategy: 'auto-batched'`.
 
-Relation `_count` follows the unindexed rule only, and likewise only on a large parent set: a grouped `COUNT(*) ... GROUP BY fk` scans the child table once either way, so on a bounded query the follow-up round-trip costs more than it saves.
+Relation `_count` follows the unindexed rule only, but on its own size rule, and that rule is far more aggressive than the two above.
 
-> **Tuning note.** The two rules are heuristics: the real parent count is unknown until the base query runs, and `limit` is the only bound available at plan time. If profiling disagrees with the choice, raise or lower `autoToOneJoinMaxRows`, or pin `relationLoadStrategy` on that query. On endpoints that fan out to very large child sets (megabyte-scale JSON per request), the batched loader's flat rows can beat the join plan even with healthy indexes and a small parent set, so `'batched'` is still worth pinning there.
+The reason is the shape of an inline `_count`. It is **not** a grouped scan. It compiles to a correlated scalar `COUNT(*)` subquery that the database re-evaluates once per parent row, so with no covering index on the child's correlation column you pay one full child-table scan **per parent**. The batched follow-up is the grouped form (`COUNT(*) ... GROUP BY fk`) and pays that scan **once** for the whole page. That is the difference, and it compounds linearly with the parent count:
+
+| parent rows | inline `_count` | batched `_count` | |
+|--:|--:|--:|:--|
+| 30 | 123.8 ms | 9.6 ms | 12.9x |
+| 1,000 | 3.06 s | 9.9 ms | 311x |
+| 10,000 | 31.06 s | 28.4 ms | 1,093x |
+
+Measured on a 200,000-row child table with an unindexed FK. `EXPLAIN (ANALYZE, BUFFERS)` at 30 parents reads 50,013 buffers inline against 1,727 batched, with `loops=30` on the child scan and `Rows Removed by Filter: 199980` on each one.
+
+So `auto` moves an unindexed `_count` to the follow-up statement from **two** parent rows upward. Only a parent set provably bounded at one row keeps it inline: `findUnique`, `findFirst`, and any query carrying `limit: 1` / `take: 1`. `autoToOneJoinMaxRows` does not influence `_count` at all.
+
+Two ways to keep `_count` in the single statement: add the covering index the correlation needs (`npx turbine doctor` names it, which is the fix worth making either way), or pin `relationLoadStrategy: 'join'` on that query.
+
+> **Tuning note.** The two cardinality/indexing rules above are heuristics: the real parent count is unknown until the base query runs, and `limit` is the only bound available at plan time. If profiling disagrees with the choice, raise or lower `autoToOneJoinMaxRows` (which governs the to-one rule only), or pin `relationLoadStrategy` on that query. On endpoints that fan out to very large child sets (megabyte-scale JSON per request), the batched loader's flat rows can beat the join plan even with healthy indexes and a small parent set, so `'batched'` is still worth pinning there.
 
 <Callout type="note" title="Upgrading to 0.50">
   The to-one cardinality rule changes which plan an existing unbounded query

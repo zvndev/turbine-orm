@@ -36,9 +36,39 @@ interface QueryEvent {
 }
 ```
 
-**Params are PII-safe by default.** With the default `errorMessages: 'safe'` client config, every entry in `event.params` is replaced with `'[REDACTED]'` before listeners see it. You get the SQL shape and timing without user data flowing into your logs. Set `errorMessages: 'verbose'` to receive raw values. A listener that throws never breaks the query; the error is swallowed (logged when `logging: true`).
+A listener that throws never breaks the query; the error is swallowed (logged when `logging: true`).
 
 `$on` differs from [middleware](/queries#middleware): middleware wraps the call, it can observe args and transform results (it cannot change the query); `$on` is a passive tap that fires after execution with the final SQL, timing, and outcome.
+
+### Seeing the parameter values, `logQueryParams`
+
+**Params are redacted by default.** Every entry of `event.params` is replaced with `'[REDACTED]'` before any listener sees it, so you get the SQL shape and the timing without user data flowing into a log sink. This is a production-safety default, and it is deliberate: a query log is one of the easiest ways to leak email addresses, tokens, and anything else you bind into a `where`.
+
+```ts
+db.$on('query', (e) => console.log(e.sql, e.params));
+
+await db.users.findUnique({ where: { email: 'alice@example.com' } });
+// SELECT * FROM "users" WHERE "email" = $1 LIMIT 1   [ '[REDACTED]' ]
+```
+
+To see the real parameter values instead of `[REDACTED]`, opt in with `logQueryParams: true` on the client:
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  logQueryParams: process.env.NODE_ENV !== 'production',
+});
+
+// SELECT * FROM "users" WHERE "email" = $1 LIMIT 1   [ 'alice@example.com' ]
+```
+
+Only `event.params` changes. The SQL, timing, model, action, and row count are identical either way, so a listener written against redacted events keeps working.
+
+<Callout type="note" title="Relationship to `errorMessages`">
+Before this option existed the switch was [`errorMessages: 'verbose'`](/errors#safe-error-messages), which is not a name anyone searches for when they want to see query params. It still works, and it still reveals params, so nothing that relies on it breaks. `logQueryParams` is an alias resolved from a single value, not a second switch: when you set it, it decides; when you leave it unset, `errorMessages` decides exactly as before.
+
+The combination that was previously unreachable is `logQueryParams: true` with the default `errorMessages: 'safe'`: query events carry real values while `NotFoundError` messages stay redacted.
+</Callout>
 
 ## Metrics, `db.$observe()`
 

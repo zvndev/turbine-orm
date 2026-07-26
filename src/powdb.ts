@@ -356,9 +356,69 @@ export interface PowdbCapabilities {
    * ALL_POWDB_CAPABILITIES: it must only light up behind a real version probe.
    */
   linkPaths: boolean;
+  /**
+   * ≥ 0.20: a comparison between a `datetime` column and an integer timestamp
+   * literal evaluates as microseconds. Below 0.20 that pairing was unhandled and
+   * fell back to comparing TYPE TAGS (every DateTime sorted above every Int), so
+   * `>` matched every non-null row, `=` and `<` matched none, and the answer
+   * additionally depended on whether the column carried an index. Turbine binds
+   * a JS `Date` as int micros, so that is exactly the shape it emits: every
+   * datetime predicate was silently wrong on an older engine.
+   *
+   * The `in` / `not in` LIST form is a separate, still-open engine bug that 0.20
+   * did NOT fix, so this flag does not unlock it: a datetime `in` list is
+   * COMPILED AWAY into the equality chain the engine does answer correctly (see
+   * `PowqlInterface.buildInList`). That expansion needs working binary
+   * comparisons, so it too sits behind this flag.
+   *
+   * Predominantly a refusal gate, but the `in` rewrite makes it a (bounded)
+   * generation flip as well. It stays ON in {@link ALL_POWDB_CAPABILITIES}
+   * anyway: with the flag OFF the datetime paths do not fall back to some other
+   * SQL, they refuse outright, so a hand-constructed pool defaulting to OFF
+   * would break datetime queries that work rather than protect anything.
+   */
+  datetimeCompare: boolean;
+  /**
+   * ≥ 0.20: `count(T { .col })` counts non-null values of `.col` (SQL's
+   * `COUNT(col)`), which is what Turbine's per-field `_count` means. Below 0.20
+   * both frontends ignored the projection and returned the ROW count, so
+   * `aggregate({ _count: { field: true } })` silently disagreed with every SQL
+   * engine on a nullable column. `count(T)` / `_count: true` is unaffected on
+   * every version. Refusal-only gate (the emitted PowQL does not change).
+   */
+  projectedCountNonNull: boolean;
   /** Networked only: server ≥ 0.13 AND the client exposes `queryNativeRaw`. */
   nativeRaw: boolean;
 }
+
+/**
+ * PowQL's parser bounds the SHAPE of the AST it produces, not just its own
+ * recursion: an `and` / `or` chain is parsed iteratively but re-wraps its
+ * accumulator once per term, so a flat chain counts against the same 64-level
+ * nesting budget as nested parentheses (PowDB 0.20 security fix, an unbounded
+ * chain overflowed the stack in a later recursive walk).
+ *
+ * The practical ceiling for a Turbine-generated predicate is therefore around
+ * **63 terms in one `OR` / `AND` array at the top level**, and fewer inside a
+ * nested projection block (measured: 63 flat, 61 one level of parens deep),
+ * because the budget is shared with whatever depth the predicate sits at.
+ * Turbine does NOT pre-check this client-side: the true remaining budget
+ * depends on the engine's parse depth at that point, so a client-side estimate
+ * would refuse valid queries. The engine's refusal is mapped to a typed
+ * {@link ValidationError} with a split-the-array hint instead (see
+ * {@link wrapPowdbError}).
+ *
+ * A literal `in (a, b, c, …)` list is a single flat node, NOT a chain, so it
+ * does not count against the budget (verified to 5,000 elements). Turbine's
+ * relation-key chunking (`MAX_RELATION_KEYS`) is unaffected.
+ *
+ * The one exception is a key list on a PowDB-native `datetime` column, which
+ * cannot use the list form at all (the engine still compares it by type tag) and
+ * is expanded into exactly such a chain. Those lists ARE pre-checked and chunked,
+ * against a deliberately conservative cap, see `MAX_POWQL_DATETIME_TERMS` in
+ * powql.ts.
+ */
+export const POWQL_MAX_NESTING_DEPTH = 64;
 
 /** The feature-gate capability keys (everything except the version/nativeRaw metadata). */
 type PowdbFeatureKey =
@@ -369,7 +429,9 @@ type PowdbFeatureKey =
   | 'nestedProjections'
   | 'entityLinks'
   | 'linkIntrospection'
-  | 'linkPaths';
+  | 'linkPaths'
+  | 'datetimeCompare'
+  | 'projectedCountNonNull';
 
 /**
  * Minimum engine version each gated feature needs, for the E017 hint text.
@@ -388,6 +450,8 @@ const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
   entityLinks: '0.19',
   linkIntrospection: '0.19.1',
   linkPaths: '0.19.1',
+  datetimeCompare: '0.20',
+  projectedCountNonNull: '0.20',
 };
 
 /**
@@ -407,6 +471,14 @@ const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
  * projections), and `linkIntrospection` is only meaningful once genuinely
  * probed, so both must come from a real version resolution, never a bare
  * construction.
+ * `datetimeCompare` / `projectedCountNonNull` stay ON here for the same
+ * trusted-caller reason as `jsonDocs` and `serverJoins`. Neither is a fallback
+ * gate: with the flag OFF the affected query is REFUSED, not served by some
+ * other statement, so defaulting them off would break working queries rather
+ * than protect anything. Every path that can learn the engine version
+ * (`turbinePowDB`, embedded or networked) resolves them from a real probe; this
+ * fallback only covers a hand-constructed or injected pool, whose owner is
+ * asserting the engine is current.
  */
 export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   engineVersion: null,
@@ -418,6 +490,8 @@ export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
   entityLinks: false,
   linkIntrospection: false,
   linkPaths: false,
+  datetimeCompare: true,
+  projectedCountNonNull: true,
   nativeRaw: false,
 };
 
@@ -469,6 +543,8 @@ export function capabilitiesFromVersion(
       entityLinks: false,
       linkIntrospection: false,
       linkPaths: false,
+      datetimeCompare: false,
+      projectedCountNonNull: false,
       nativeRaw: false,
     };
   }
@@ -485,6 +561,8 @@ export function capabilitiesFromVersion(
     // never 0.19.0.
     linkIntrospection: atLeastVersion(sem, 0, 19, 1),
     linkPaths: atLeastVersion(sem, 0, 19, 1),
+    datetimeCompare: atLeastVersion(sem, 0, 20),
+    projectedCountNonNull: atLeastVersion(sem, 0, 20),
     nativeRaw: Boolean(opts.hasNativeRaw) && atLeastVersion(sem, 0, 13),
   };
 }
@@ -493,8 +571,23 @@ export function capabilitiesFromVersion(
  * Throw a version-hinting {@link UnsupportedFeatureError} (E017) when a gated
  * PowQL feature is used on an engine that does not support it. Keeps old engines
  * getting clean typed errors instead of raw PowQL parse failures.
+ *
+ * The error's first sentence already names the feature (`<feature> is
+ * unsupported on "PowDB".`), so the hint says "Requires PowDB >= x" rather than
+ * repeating the label: a long feature description read twice in one message
+ * (`per-field \`_count\` … is unsupported … per-field \`_count\` … requires …`)
+ * buries the version floor that is the actionable part.
+ *
+ * `extra` appends one more sentence for gates that have a workaround worth
+ * naming (e.g. the read path that answers the same query without the gated
+ * comparison).
  */
-export function requireCapability(caps: PowdbCapabilities, key: PowdbFeatureKey, feature: string): void {
+export function requireCapability(
+  caps: PowdbCapabilities,
+  key: PowdbFeatureKey,
+  feature: string,
+  extra?: string,
+): void {
   if (caps[key]) return;
   const min = POWDB_FEATURE_MIN_VERSION[key];
   const reported = caps.engineVersion
@@ -503,8 +596,8 @@ export function requireCapability(caps: PowdbCapabilities, key: PowdbFeatureKey,
   throw new UnsupportedFeatureError(
     feature,
     'PowDB',
-    `${feature} requires PowDB >= ${min}; ${reported}. Upgrade powdb-server / @zvndev/powdb-embedded ` +
-      '(or pass `assumeEngineVersion` if the version cannot be detected).',
+    `Requires PowDB >= ${min}; ${reported}. Upgrade powdb-server / @zvndev/powdb-embedded ` +
+      `(or pass \`assumeEngineVersion\` if the version cannot be detected).${extra ? ` ${extra}` : ''}`,
   );
 }
 
@@ -579,6 +672,26 @@ function isFloatColumn(col: ColumnMetadata): boolean {
 /** Is a column stored as `int` epoch micros but surfaced as a JS `Date`? */
 function isDateColumn(col: ColumnMetadata): boolean {
   return col.tsType.replace(/\s*\|\s*null$/i, '').trim() === 'Date';
+}
+
+/**
+ * Is this column stored in PowDB's NATIVE `datetime` type (as opposed to the
+ * `int` epoch micros Turbine's own DDL emits for a `Date` column)?
+ *
+ * Only the literal PowQL type name counts. `powqlColumnType` never returns
+ * `datetime`, so a Turbine-provisioned table can never have one; the shapes that
+ * do are a table created outside Turbine and read back through
+ * `introspectPowdbDatabase` (which maps `datetime` → `{ tsType: 'Date',
+ * dialectType: 'datetime' }`), or hand-written metadata declaring it. Deliberately
+ * strict: a Postgres-sourced `timestamptz` column is DDL'd as PowQL `int`, so it
+ * is NOT a PowDB datetime and must not be caught here.
+ *
+ * Matters because comparing a datetime column against the integer timestamp
+ * literal Turbine binds was silently wrong below engine 0.20 (see
+ * {@link PowdbCapabilities.datetimeCompare}).
+ */
+export function isPowdbDatetimeColumn(col: ColumnMetadata): boolean {
+  return (col.dialectType ?? col.pgType ?? '').toLowerCase() === 'datetime';
 }
 
 /**
@@ -929,7 +1042,7 @@ export async function applyPowdbLinks(
     requireCapability(caps, 'linkIntrospection', 'PowDB `schema links` introspection');
   }
   const existing = await listPowdbLinks(exec);
-  const byOwnerName = new Map(existing.map((l) => [`${l.owner} ${l.name}`, l]));
+  const byOwnerName = new Map(existing.map((l) => [`${l.owner}\u0000${l.name}`, l]));
   const desired = deriveDesiredLinks(schema, (owner, name) => {
     if (shouldWarnOnce(WARN_NS.powdbLinks, `collide:${owner}.${name}`)) {
       console.warn(
@@ -940,7 +1053,7 @@ export async function applyPowdbLinks(
   });
   const executed: string[] = [];
   for (const link of desired) {
-    const found = byOwnerName.get(`${link.owner} ${link.name}`);
+    const found = byOwnerName.get(`${link.owner}\u0000${link.name}`);
     if (found) {
       const same =
         found.target === link.target && found.localKey === link.localKey && found.targetKey === link.targetKey;
@@ -1086,12 +1199,21 @@ export function coerceValue(raw: string, col: ColumnMetadata): unknown {
  * str `"null"` stays the string `"null"` (fixes the legacy-wire wart on the
  * native transport). `datetime`-shaped cells (int micros) become `Date`; a
  * bigint on a `number` column follows the int8 safe-integer policy.
+ *
+ * A date cell can also arrive as a DIGIT STRING: a nested-projection block's
+ * children ride a JSON array, and micros exceed `Number.MAX_SAFE_INTEGER`'s
+ * decimal comfort, so the engine renders them as a JSON string. Before that
+ * string was parsed here, a nested `with` handed back the raw micros text while
+ * the batched loader and the native join both handed back a `Date` (the same
+ * relation, three answers). Only an all-digit string is parsed; any other text
+ * on a date column passes through untouched.
  */
 export function coerceNativeValue(value: unknown, col: ColumnMetadata): unknown {
   if (value === undefined || value === null) return null;
   if (isDateColumn(col)) {
     if (typeof value === 'bigint') return new Date(Number(value) / 1000);
     if (typeof value === 'number') return new Date(value / 1000);
+    if (typeof value === 'string' && /^-?\d+$/.test(value)) return new Date(Number(value) / 1000);
     return value;
   }
   const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
@@ -1274,6 +1396,86 @@ export function wrapPowdbError(err: unknown): Error {
   // raw user PowQL string; mapping them keeps that path typed.
   if (/is ambiguous in a projection|aggregates over a nested or link projection/i.test(msg)) {
     return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
+  }
+  // Corrupt storage → ConnectionError (E004). PowDB 0.20 verifies page checksums
+  // at table-OPEN time and fails closed (previously the open scan skipped the bad
+  // page and the failure surfaced later, on the read that touched it). This is a
+  // data-integrity / availability failure, not a query defect, so it joins the
+  // connection families ABOVE the generic validation regexes (whose `StorageError`
+  // token would otherwise class it E003). There is no salvage mode: restoring
+  // from a backup is the documented recovery, so say so.
+  if (/page corrupt|catalog corrupt|corrupt heap superblock|CRC32 mismatch/i.test(msg)) {
+    return new ConnectionError(
+      `[turbine] PowDB refused to open a corrupt data directory: ${msg}. PowDB verifies page checksums on open ` +
+        'and fails closed rather than serving partial data; there is no skip-corrupt-pages mode, so recover by ' +
+        'restoring the directory from a backup.',
+      { cause: err },
+    );
+  }
+  // Unknown column → ValidationError (E003), naming the column. PowDB 0.20 turned
+  // an unknown column in `filter` / a projection from a silent NULL into an error
+  // (the old behavior made `count(T filter .agee = null)` match every row, so a
+  // delete on that predicate emptied the table). Turbine validates field names
+  // against its own metadata first, so reaching here means the runtime metadata
+  // has drifted from the live catalog.
+  {
+    const m = /column '([^']+)' not found(?: in table '([^']+)')?/i.exec(msg);
+    if (m) {
+      const where = m[2] ? ` on table "${m[2]}"` : '';
+      return new ValidationError(
+        `[turbine] PowDB rejected column "${m[1]}"${where}: it does not exist in the live catalog. ` +
+          'The schema metadata Turbine is using has drifted from the database; re-derive it ' +
+          '(`schemaDefToMetadata` / `introspectPowdbDatabase`) or apply the missing DDL. ' +
+          `(engine: ${msg})`,
+      );
+    }
+  }
+  // Type-mismatched comparison → ValidationError (E003), naming the column. Also
+  // new in 0.20: comparing e.g. a `str` column against an integer literal used to
+  // evaluate true for every row. Runs before the generic `type mismatch` regex
+  // below so the column name and the fix survive into the message.
+  {
+    const m = /type mismatch for column '([^']+)': expected ([^,]+), got (\w+)/i.exec(msg);
+    if (m) {
+      return new ValidationError(
+        `[turbine] PowDB rejected a comparison on column "${m[1]}": the column is ${m[2]} but the bound value is ` +
+          `${m[3]}. PowQL never coerces across types in a comparison (before engine 0.20 this silently matched ` +
+          "every row), so bind a value of the column's own type.",
+      );
+    }
+  }
+  // Operator-chain / nesting budget → ValidationError (E003) with the actual fix.
+  // PowDB 0.20 counts flat `and` / `or` chains against the same 64-level budget as
+  // nested parentheses, so a machine-built predicate with very many terms is now
+  // rejected outright (see POWQL_MAX_NESTING_DEPTH).
+  if (/nesting depth exceeds maximum/i.test(msg)) {
+    return new ValidationError(
+      `[turbine] PowDB rejected the query: ${msg}. PowQL bounds the shape of the predicate tree, and a flat ` +
+        `\`OR\` / \`AND\` array counts one level per term (roughly ${POWQL_MAX_NESTING_DEPTH - 1} terms at the top ` +
+        'level, fewer inside a nested `with` block). Split a large `OR` / `AND` array into several queries and ' +
+        'merge the results, or express it as a single `in` list, which is one flat node and does not count ' +
+        'against the budget.',
+    );
+  }
+  // Negative limit / offset → ValidationError (E003). Turbine validates these
+  // client-side before emitting, so this is the backstop for a raw PowQL string.
+  if (/(limit|offset) must not be negative/i.test(msg)) {
+    return new ValidationError(
+      `[turbine] PowDB rejected the query: ${msg}. Pass a non-negative \`limit\` / \`offset\` ` +
+        '(before engine 0.20 a negative limit was ignored and returned every row).',
+    );
+  }
+  // Client-side result-frame cell cap (`@zvndev/powdb-client` >= 0.20 rejects a
+  // declared result shape over 2,000,000 cells before decoding it, so a hostile or
+  // MITM'd server cannot force a multi-gigabyte allocation). It is a plain driver
+  // Error with no code, so match the message and give the caller the two real
+  // remedies instead of letting it fall through untyped.
+  if (/result too large: \d+ cells/i.test(msg)) {
+    return new ValidationError(
+      `[turbine] PowDB result too large to decode: ${msg}. The client caps one result frame at 2,000,000 cells ` +
+        '(rows x columns). Page the query with `limit` / `offset`, or narrow the row with `select` so each row ' +
+        'carries fewer columns.',
+    );
   }
 
   // Typed wire error class (networked, server >= 0.17): the client surfaces the
@@ -2147,11 +2349,19 @@ function powqlNumberText(n: number): string {
  * pre-existing tokens, so the tokenization / escape surface this ceiling guards is
  * unmoved. The 0.19.1 link-introspection / link-path round is likewise lexer-neutral:
  * `git diff v0.19.0 v0.19.1 -- crates/query/src/lexer.rs` is empty (the bare-dotted-path
- * hard error is parser-level, not tokenization), so this ceiling stays `'0.19'`. The
- * guard in {@link PowdbEmbeddedPool.exec} compares major.minor only, so `'0.19'`
- * already covers every 0.19.x patch, no bump is needed for 0.19.1.
+ * hard error is parser-level, not tokenization). The guard in
+ * {@link PowdbEmbeddedPool.exec} compares major.minor only, so one entry covers every
+ * patch of a line.
+ *
+ * Verification for the 0.20 line: `git diff v0.19.1 v0.20.0 -- crates/query/src/lexer.rs
+ * crates/query/src/token.rs` is EMPTY, both files are byte-identical. Everything 0.20
+ * changed in the query crate is downstream of tokenization: the operator-chain nesting
+ * budget and the count-projection lift are in `parser.rs`, and the unknown-column /
+ * type-mismatch / negative-limit refusals are a new executor validation pass
+ * (`executor/plan_exec/validate.rs`). No new escape sequence, so the escaper's contract
+ * is unmoved and the ceiling advances to `'0.20'`.
  */
-export const POWQL_LEXER_TESTED_CEILING = '0.19';
+export const POWQL_LEXER_TESTED_CEILING = '0.20';
 
 /**
  * Escape a string into a PowQL `"…"` literal, matching the engine lexer's

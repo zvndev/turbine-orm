@@ -180,6 +180,49 @@ describe('$on / $off event emitter', () => {
     assert.ok(events[0]!.params.some((p) => p === 1));
   });
 
+  it('logQueryParams: true reveals params while error messages stay safe', async () => {
+    const pool = createMockPool([{ id: 1, name: 'Alice', email: 'a@b.com' }]);
+    const db = new TurbineClient({ pool, errorMessages: 'safe', logQueryParams: true }, createSchema());
+
+    const events: QueryEvent[] = [];
+    db.$on('query', (e) => events.push(e));
+
+    await db.table('users').findUnique({ where: { id: 1 } });
+
+    assert.equal(events.length, 1);
+    assert.ok(events[0]!.params.some((p) => p === 1));
+  });
+
+  it('logQueryParams: false redacts even under errorMessages verbose', async () => {
+    const pool = createMockPool([{ id: 1, name: 'Alice', email: 'a@b.com' }]);
+    const db = new TurbineClient({ pool, errorMessages: 'verbose', logQueryParams: false }, createSchema());
+
+    const events: QueryEvent[] = [];
+    db.$on('query', (e) => events.push(e));
+
+    await db.table('users').findUnique({ where: { id: 1 } });
+
+    assert.equal(events.length, 1);
+    assert.ok(events[0]!.params.every((p) => p === '[REDACTED]'));
+  });
+
+  it('omitting logQueryParams leaves errorMessages in charge', async () => {
+    const schema = createSchema();
+    const safe = new TurbineClient({ pool: createMockPool(), errorMessages: 'safe' }, schema);
+    const verbose = new TurbineClient({ pool: createMockPool(), errorMessages: 'verbose' }, schema);
+
+    const safeEvents: QueryEvent[] = [];
+    const verboseEvents: QueryEvent[] = [];
+    safe.$on('query', (e) => safeEvents.push(e));
+    verbose.$on('query', (e) => verboseEvents.push(e));
+
+    await safe.table('users').findUnique({ where: { id: 1 } });
+    await verbose.table('users').findUnique({ where: { id: 1 } });
+
+    assert.ok(safeEvents[0]!.params.every((p) => p === '[REDACTED]'));
+    assert.ok(verboseEvents[0]!.params.some((p) => p === 1));
+  });
+
   it('QueryEvent has correct shape', async () => {
     const pool = createMockPool([{ id: 1, name: 'Alice', email: 'a@b.com' }]);
     const db = new TurbineClient({ pool, errorMessages: 'verbose' }, createSchema());

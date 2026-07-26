@@ -105,11 +105,37 @@ await db.users.create({
 });
 ```
 
-#### Connecting a row someone else owns, `scopedConnect`
+### Connecting a row someone else owns, `scopedConnect`
 
-`connect: { id: 42 }` on a to-many relation means "make row 42 mine", and by default it does exactly that: if another parent currently owns row 42, the row is **taken from them**. That is the intended behavior for an admin tool moving records around, and a cross-tenant write primitive for any handler that forwards a client-supplied id into a nested connect.
+`connect: { id: 42 }` on a to-many relation means "make row 42 mine", and by default it does exactly that: if another parent currently owns row 42, the row is **taken from them**. That is the intended behavior for an admin tool moving records around. It is also a cross-tenant write primitive in any handler that forwards a client-supplied id into a nested connect.
 
-Set `scopedConnect: true` on the client to close it:
+#### The shape that is exposed
+
+This handler is the whole vulnerability. It has an authorization check, and the check is on the wrong row:
+
+```ts
+// POST /api/collections/:id/items   { itemIds: [42] }
+app.post('/api/collections/:id/items', async (req, res) => {
+  const collection = await db.collections.findUnique({ where: { id: req.params.id } });
+  if (collection.ownerId !== req.user.id) return res.sendStatus(403);
+
+  await db.collections.update({
+    where: { id: collection.id },
+    data: { items: { connect: req.body.itemIds.map((id) => ({ id })) } },
+  });
+  res.sendStatus(204);
+});
+```
+
+The caller owns the collection, so the check passes. Nothing checks who owns item 42. The `connect` rewrites `items.collection_id`, so an attacker who can guess or enumerate ids moves **another tenant's rows into their own collection**, reads them back through their own authorized endpoints, and the victim's rows simply disappear from the victim's list. There is no error, no log line, and one statement did it.
+
+`connectOrCreate` is the same primitive: when the lookup finds an existing row, it connects it.
+
+The complete fix is to authorize the child rows too (`where: { id: { in: itemIds }, ownerId: req.user.id }` before connecting). `scopedConnect` is the backstop for the handlers you have not audited yet.
+
+#### The config
+
+Set `scopedConnect: true` on the client:
 
 ```ts
 const db = turbine({ connectionString: process.env.DATABASE_URL, scopedConnect: true });
@@ -120,7 +146,22 @@ await db.users.update({ where: { id: 7 }, data: { posts: { connect: { id: 42 } }
 
 With the flag on, a connect succeeds when the child is **unowned** (its foreign key is null) or **already owned by this parent** (an idempotent re-connect), and is refused otherwise. Re-parenting then has to be an explicit update, which is the point: it stops being something a request body can do by accident.
 
-It is off by default because it changes the outcome of writes that currently succeed. It applies to `hasMany` and `hasOne` only: a `belongsTo` connect points the row being written at a parent and takes nothing from anyone, and a many-to-many connect adds a junction row rather than moving one.
+It is off by default because it changes the outcome of writes that currently succeed. Turn it on in a non-production environment first and run your test suite: anything that legitimately re-parents will start throwing, and that is the list of call sites you need to rewrite as explicit updates.
+
+#### What it covers, and what it does not
+
+The check compares the child's current foreign key against the parent's reference value, so it only exists where a connect **rewrites a foreign key**:
+
+| Relation | Covered | Why |
+|---|---|---|
+| `hasMany` | Yes | The connect sets the child's FK to this parent, taking the row from whoever held it. |
+| `hasOne` | Yes | Same rewrite, one row. |
+| `belongsTo` | Not applicable | The connect points the row **being written** at a parent. It takes nothing from anyone, and the row it changes is the one you already authorized. |
+| Many-to-many | **No** | The connect inserts a junction row rather than moving one, so there is no foreign key to compare and nothing is taken from the other side. |
+
+Read the many-to-many row carefully: nothing is *taken*, but a junction row still links another tenant's row into your caller's parent, so the caller can now read it through the relation. `scopedConnect` does not close that. Authorize the child ids in the handler.
+
+Composite foreign keys are covered: every column of the key is compared, and values are normalized to a primitive first, so a bigint FK read back as a string cannot look like a mismatch against the number the parent write returned.
 
 ### connectOrCreate, connect or insert
 

@@ -3216,7 +3216,7 @@
       rowKey(row) {
         const t = State.currentTable;
         const pks = (t && t.primaryKey) || [];
-        if (pks.length) return pks.map((k) => String(row[k])).join(' ');
+        if (pks.length) return pks.map((k) => String(row[k])).join('\u0000');
         return JSON.stringify(row);
       },
 

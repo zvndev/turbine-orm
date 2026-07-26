@@ -12,7 +12,7 @@
  */
 
 import type { ReturningSelection } from '../dialect.js';
-import { NotFoundError, OptimisticLockError, ValidationError } from '../errors.js';
+import { NotFoundError, OptimisticLockError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
 import { camelToSnake, snakeToCamel } from '../schema.js';
 import { expandCompoundUniqueWhere } from './compound-unique.js';
@@ -96,6 +96,41 @@ export function buildReselectByWhere(
   return { sql: `SELECT ${writeReselectSelection(qi)} FROM ${qi.q(qi.table)}${where}`, params };
 }
 
+/**
+ * Build the all-defaults INSERT for a `data` that names no column, via the
+ * dialect's `buildDefaultValuesInsertStatement` hook.
+ *
+ * `INSERT INTO t () VALUES ()` (what the column-driven builders render for an
+ * empty `data`) is a syntax error everywhere but MySQL, and the correct
+ * statement differs per engine, so the shape lives behind the dialect seam.
+ * `{}` is easy to reach honestly, a handler that assembles its payload from
+ * optional request fields produces it on a request that supplied none of them,
+ * so the row of pure defaults is inserted and returned rather than crashing.
+ * The empty-`update` no-op in {@link buildUpdate} has the same rationale.
+ *
+ * A table with no usable defaults still fails, correctly, with the database's
+ * own NOT NULL violation (E010): nothing here pre-empts that.
+ *
+ * A dialect predating the hook raises E017 rather than emitting SQL its engine
+ * will reject.
+ */
+function buildDefaultValuesInsert(qi: BuilderCtx, rowCount: number, skipDuplicates?: boolean): string {
+  const build = qi.dialect.buildDefaultValuesInsertStatement;
+  if (!build) {
+    throw new UnsupportedFeatureError(
+      'create/createMany with an empty data object',
+      qi.dialect.name,
+      'This dialect has no all-defaults INSERT form; name at least one column in `data`.',
+    );
+  }
+  return build.call(qi.dialect, {
+    table: qi.q(qi.table),
+    rowCount,
+    skipDuplicates,
+    returning: writeReturningColumns(qi),
+  });
+}
+
 export function buildCreate<T extends object>(qi: BuilderCtx, args: CreateArgs<T>): DeferredQuery<T> {
   assertWritable(qi, 'create');
   assertNoGeneratedColumns(qi, args.data as Record<string, unknown>, 'create');
@@ -105,12 +140,16 @@ export function buildCreate<T extends object>(qi: BuilderCtx, args: CreateArgs<T
   // Enum columns get an explicit `::"EnumName"` cast (see enumTypeForColumn).
   const placeholders = entries.map(([k], i) => `${qi.p(i + 1)}${whereMod.enumCastSuffix(qi, qi.toColumn(k))}`);
 
-  const sql = qi.dialect.buildInsertStatement({
-    table: qi.q(qi.table),
-    columns,
-    valuePlaceholders: placeholders,
-    returning: writeReturningColumns(qi),
-  });
+  // `data: {}` (or all-undefined) names no column: insert a row of defaults.
+  const sql =
+    entries.length === 0
+      ? buildDefaultValuesInsert(qi, 1)
+      : qi.dialect.buildInsertStatement({
+          table: qi.q(qi.table),
+          columns,
+          valuePlaceholders: placeholders,
+          returning: writeReturningColumns(qi),
+        });
 
   return {
     sql,
@@ -164,6 +203,71 @@ export function makeCreateReselect<T extends object>(
   };
 }
 
+/**
+ * The fields a write's `data` object actually names.
+ *
+ * A key whose value is `undefined` is NOT named: single-row {@link buildCreate}
+ * filters those out of its column list, so the column takes its declared
+ * default. `createMany` reads its rows through this same helper, so
+ * `{ n: undefined }` and `{}` mean the identical thing on both paths.
+ */
+function definedKeys(row: Record<string, unknown>): string[] {
+  return Object.keys(row).filter((k) => row[k] !== undefined);
+}
+
+/**
+ * Refuse a `createMany` whose rows do not all name the SAME fields.
+ *
+ * `createMany` compiles ONE statement, and its column list is taken from the
+ * first row alone, so a row that disagrees with the first row loses data in
+ * both directions and silently:
+ *
+ * - a field the first row names and a later row OMITS is bound as NULL,
+ *   overwriting that column's declared default (and failing outright on a NOT
+ *   NULL column that has one);
+ * - a field only a LATER row names is not in the column list at all, so its
+ *   value never reaches the database.
+ *
+ * Neither shape is expressible as a single statement on every engine. The
+ * row-major `VALUES` form can carry a per-cell `DEFAULT` keyword on
+ * PostgreSQL, MySQL and SQL Server, but SQLite has no such grammar (`VALUES
+ * (1, DEFAULT)` is a parse error there), and adopting it would also drop
+ * PostgreSQL off the column-major `UNNEST` form that binds one array per
+ * column rather than one placeholder per cell. So the honest answer is a
+ * refusal that names the offending row and its differing columns.
+ *
+ * A single row is trivially uniform, and rows that all name the same fields
+ * (the overwhelmingly common shape) cost one `Object.keys` pass and emit
+ * byte-identical SQL.
+ */
+function assertUniformCreateManyRows(qi: BuilderCtx, rows: Record<string, unknown>[], firstKeys: string[]): void {
+  const expected = new Set(firstKeys);
+  for (let i = 1; i < rows.length; i++) {
+    const rowKeys = definedKeys(rows[i]!);
+    const unexpected = rowKeys.filter((k) => !expected.has(k));
+    // No stranger and the same count means the same set (object keys are unique).
+    if (unexpected.length === 0 && rowKeys.length === expected.size) continue;
+    const present = new Set(rowKeys);
+    const missing = firstKeys.filter((k) => !present.has(k));
+    const parts: string[] = [];
+    if (missing.length > 0) parts.push(`does not supply ${quoteList(missing)}`);
+    if (unexpected.length > 0) parts.push(`supplies ${quoteList(unexpected)}, which the first row does not`);
+    throw new ValidationError(
+      `[turbine] createMany on "${qi.table}": row ${i} ${parts.join(' and ')}. ` +
+        'Every row must supply the same fields: createMany builds ONE statement whose column list comes from the ' +
+        "first row, so a field a later row omits would be written as NULL over that column's default, and a field " +
+        'only a later row names would be dropped. Supply the field explicitly on every row (a field set to ' +
+        '`undefined` counts as omitted, exactly as it does in `create`), or split the call into one createMany per ' +
+        'row shape.',
+    );
+  }
+}
+
+/** `a, b` → `"a", "b"`, for the field lists in {@link assertUniformCreateManyRows}. */
+function quoteList(fields: string[]): string {
+  return fields.map((f) => `"${f}"`).join(', ');
+}
+
 export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateManyArgs<T>): DeferredQuery<T[]> {
   const qt = qi.q(qi.table);
   if (args.data.length === 0) {
@@ -180,7 +284,21 @@ export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateMa
     assertNoGeneratedColumns(qi, row as Record<string, unknown>, 'createMany');
   }
 
-  const keys = Object.keys(args.data[0]!).filter((k) => (args.data[0] as Record<string, unknown>)[k] !== undefined);
+  const keys = definedKeys(args.data[0] as Record<string, unknown>);
+  assertUniformCreateManyRows(qi, args.data as Record<string, unknown>[], keys);
+
+  // No column named by the first row: every row is pure defaults (the bulk
+  // counterpart of `create({ data: {} })`, see buildDefaultValuesInsert). The
+  // uniformity check above has already established that EVERY row is empty.
+  if (keys.length === 0) {
+    return {
+      sql: buildDefaultValuesInsert(qi, args.data.length, args.skipDuplicates),
+      params: [],
+      transform: (result) => result.rows.map((row) => parseWriteRow(qi, row) as T),
+      tag: `${qi.table}.createMany`,
+    };
+  }
+
   const columns = keys.map((k) => qi.toColumn(k));
 
   const rowValues = args.data.map((row) => {

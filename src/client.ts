@@ -233,7 +233,19 @@ export interface TurbineConfig {
    * owns the pool) and when coercing nested-relation JSON dates. This is the
    * Prisma/Rails/Django convention and makes results independent of the
    * server's local time zone. Default: `true`. Set `false` for the legacy
-   * local-time interpretation.
+   * local-time interpretation, which also turns off the matching WRITE-side
+   * rewrite (a bound `Date` on a zone-less `date` / `timestamp` column is then
+   * serialized by the driver in the process's zone).
+   *
+   * PER PROCESS, NOT PER CLIENT. The read half is a pg type parser, and
+   * `pg.types.setTypeParser` installs one parser per OID for the whole
+   * process. The first Turbine-owned client settles it for every later one, so
+   * constructing a second client with the OPPOSITE value throws a
+   * `ValidationError` rather than handing back a client whose writes and reads
+   * disagree. Give every client in the process the same value, or isolate the
+   * odd one in its own process. Clients on an EXTERNAL pool never register a
+   * parser and never take part in the check: they inherit whatever parser
+   * configuration the caller's driver has.
    */
   utcTimestamps?: boolean;
   /**
@@ -350,6 +362,23 @@ export interface TurbineConfig {
    * programmatic access regardless of mode.
    */
   errorMessages?: ErrorMessageMode;
+  /**
+   * Whether `$on('query')` listeners receive the real bound parameter values.
+   *
+   * Off by default: every entry of `event.params` is replaced with
+   * `'[REDACTED]'` before any listener sees it, so query logs cannot carry
+   * user data into a log sink.
+   *
+   * This is an alias with a discoverable name, NOT a second switch. The
+   * redaction has always been governed by {@link errorMessages}, which nobody
+   * looks under when they want to see query params. Resolution order, single
+   * source of truth: when `logQueryParams` is set it decides; otherwise
+   * `errorMessages: 'verbose'` reveals params exactly as it did before. So
+   * `logQueryParams: true` with `errorMessages: 'safe'` shows params in query
+   * events while keeping error MESSAGES redacted, which is the combination
+   * that was previously unreachable.
+   */
+  logQueryParams?: boolean;
   /**
    * Enable prepared statements. Queries are submitted with `{ name, text, values }`
    * to the pg driver, which caches the parse+plan on the server per connection.
@@ -632,6 +661,42 @@ export class TransactionClient {
   }
 
   /**
+   * @internal The `turbine-orm/prisma-compat` adapter's transaction seam. NOT
+   * application API: use {@link raw}, whose tagged template makes concatenating
+   * a value into the SQL text impossible. This method takes the SQL text as a
+   * plain string, so the escaping discipline moves to the caller, which is
+   * exactly the property the typed-SQL escape hatch exists to remove. It is
+   * documented and kept structurally stable only because the compat adapter
+   * detects it by shape (`typeof tx.rawQuery === 'function'`) and refuses to
+   * run compat raw SQL on a pool connection when it is missing.
+   *
+   * Execute an already-parameterized statement on THIS transaction's own
+   * connection, returning the driver's `{ rows, rowCount }` pair. It differs
+   * from {@link raw} in two ways the adapter needs: it takes a prebuilt
+   * `(text, params)` pair rather than a tagged template (the placeholder
+   * numbering is the caller's, so nested `Prisma.sql` fragments can be
+   * flattened first), and it surfaces `rowCount` so an `$executeRaw`-style call
+   * can report affected rows.
+   *
+   * The statement runs on the transaction's dedicated connection, so it is
+   * inside the same BEGIN/COMMIT (and any active SAVEPOINT) as every other
+   * statement in the callback. Driver errors are translated by `wrapPgError`,
+   * exactly as pool-scoped and table-scoped queries are. Like {@link raw}, it
+   * emits no `$on('query')` event and runs no middleware.
+   */
+  async rawQuery<T extends object = Record<string, unknown>>(
+    text: string,
+    params: readonly unknown[] = [],
+  ): Promise<{ rows: T[]; rowCount: number | null }> {
+    try {
+      const result = await this.client.query(text, params as unknown[]);
+      return { rows: result.rows as T[], rowCount: result.rowCount };
+    } catch (err) {
+      throw wrapPgError(err);
+    }
+  }
+
+  /**
    * Create a pool-like wrapper around the transaction client.
    * This allows QueryInterface to work with the transaction connection
    * without knowing it's in a transaction.
@@ -681,7 +746,19 @@ export class TurbineClient {
   readonly schema: SchemaMetadata;
 
   private static int8ParserRegistered = false;
-  private static utcTimestampParserRegistered = false;
+  /**
+   * The `utcTimestamps` value the FIRST Turbine-owned pool in this process
+   * settled the OID 1114 read parser on, or `undefined` while no Turbine-owned
+   * client has been constructed yet.
+   *
+   * `pg.types.setTypeParser` is process-global by nature: there is one parser
+   * per OID for the whole pg module, so the READ side of `utcTimestamps` cannot
+   * be per client the way the WRITE side is. Recording the settled value (not
+   * just "registered yes/no") is what lets the constructor detect a second
+   * client asking for the opposite and refuse it, instead of handing back a
+   * client whose reads and writes disagree. See {@link assertUtcTimestampsAgree}.
+   */
+  private static utcTimestampParserMode: boolean | undefined;
   private readonly logging: boolean;
   /** Active SQL dialect, owns transaction keywords, set_config, raw-SQL placeholders, capability flags. */
   private readonly dialect: Dialect;
@@ -690,6 +767,8 @@ export class TurbineClient {
   private readonly queryListeners = new Set<QueryEventListener>();
   private queryOptions: QueryInterfaceOptions;
   private readonly errorMessagesSafe: boolean;
+  /** Whether `$on('query')` events carry real params (see `logQueryParams`). */
+  private readonly queryParamsVisible: boolean;
   /** True when Turbine created the pool and is responsible for tearing it down */
   private readonly ownsPool: boolean = true;
   /** Active LISTEN subscriptions, torn down on disconnect() so it never hangs */
@@ -727,6 +806,7 @@ export class TurbineClient {
       this.logging = parent.logging;
       this.dialect = parent.dialect;
       this.errorMessagesSafe = parent.errorMessagesSafe;
+      this.queryParamsVisible = parent.queryParamsVisible;
       this.queryOptions = parent.queryOptions;
       this.middlewares = parent.middlewares; // shared reference: $use on parent flows through
       this.pool = parent.pool;
@@ -815,9 +895,18 @@ export class TurbineClient {
     // ORM convention (Prisma, Rails, Django), and the only interpretation
     // that round-trips what Postgres stores, is UTC. Same ownership rule as
     // the int8 parser: never mutate parser state on external pools.
-    if (ownsAnyPool && config.utcTimestamps !== false && !TurbineClient.utcTimestampParserRegistered) {
-      pg.types.setTypeParser(1114, (val: string) => new Date(`${val.replace(' ', 'T')}Z`));
-      TurbineClient.utcTimestampParserRegistered = true;
+    //
+    // Read registration is process-global and one-shot; the WRITE side of the
+    // same flag is per client (query/writes.ts). Two clients disagreeing about
+    // it therefore cannot both be served, so the disagreement is refused here
+    // rather than resolved silently into a client that does not round-trip.
+    if (ownsAnyPool) {
+      const wantUtcTimestamps = config.utcTimestamps !== false;
+      TurbineClient.assertUtcTimestampsAgree(wantUtcTimestamps);
+      if (wantUtcTimestamps && TurbineClient.utcTimestampParserMode === undefined) {
+        pg.types.setTypeParser(1114, (val: string) => new Date(`${val.replace(' ', 'T')}Z`));
+      }
+      TurbineClient.utcTimestampParserMode = wantUtcTimestamps;
     }
 
     this.logging = config.logging ?? false;
@@ -827,6 +916,10 @@ export class TurbineClient {
     const envDisablePrepared = typeof process !== 'undefined' && process.env?.TURBINE_DISABLE_PREPARED === '1';
 
     this.errorMessagesSafe = (config.errorMessages ?? 'safe') === 'safe';
+    // Query-event param visibility. One derived boolean, so the two config
+    // spellings can never disagree: `logQueryParams` wins when set, otherwise
+    // `errorMessages` keeps deciding exactly as it always has.
+    this.queryParamsVisible = config.logQueryParams ?? !this.errorMessagesSafe;
 
     this.queryOptions = {
       defaultLimit: config.defaultLimit,
@@ -851,7 +944,7 @@ export class TurbineClient {
         .queryInterfaceFactory,
       _onQuery: (event: QueryEvent) => {
         if (this.queryListeners.size === 0) return;
-        const emitted = this.errorMessagesSafe ? { ...event, params: event.params.map(() => '[REDACTED]') } : event;
+        const emitted = this.queryParamsVisible ? event : { ...event, params: event.params.map(() => '[REDACTED]') };
         for (const listener of this.queryListeners) {
           try {
             listener(emitted);
@@ -973,6 +1066,54 @@ export class TurbineClient {
     if (observeUrl) {
       this.$observe({ connectionString: observeUrl }).catch(() => {});
     }
+  }
+
+  /**
+   * Refuse a `utcTimestamps` value that contradicts the one the process-global
+   * OID 1114 read parser was already settled on.
+   *
+   * The flag has two halves. The WRITE half is per client: a bound `Date` on a
+   * zone-less `date` / `timestamp` column is rewritten to a UTC literal unless
+   * the owning client opted out (`coerceWriteValue` in query/writes.ts). The
+   * READ half is the pg type parser for OID 1114, and `pg.types.setTypeParser`
+   * installs ONE parser per OID for the whole process, shared by every pool,
+   * every raw query, and any other library using the same pg module. There is
+   * no per-pool parser hook to bind it to, and moving the coercion into
+   * `parseRow` instead would leave every non-ORM read (raw SQL, `client.sql`,
+   * a caller's own `pool.query`) on the driver's value while changing the
+   * default path's output type, so the read half stays process-wide.
+   *
+   * That makes the mixed shape unserveable rather than merely awkward: the
+   * second client would write local calendar fields and read them back as UTC
+   * (or the reverse), so its own round trip is off by the process offset.
+   * A client that silently does not round-trip is the worst of the three
+   * outcomes, so construction fails with the two ways out.
+   *
+   * Only Turbine-owned pools take part. An external pool (Neon, Vercel
+   * Postgres, Hyperdrive) inherits the caller's parser configuration and
+   * Turbine never registers on its behalf, so it has no read half to contradict.
+   */
+  private static assertUtcTimestampsAgree(want: boolean): void {
+    const settled = TurbineClient.utcTimestampParserMode;
+    if (settled === undefined || settled === want) return;
+    throw new ValidationError(
+      `[turbine] utcTimestamps: ${want} conflicts with utcTimestamps: ${settled}, which an earlier TurbineClient ` +
+        'in this process already applied. The timestamp READ parser (pg OID 1114) is process-global, so it cannot ' +
+        'differ per client, while the WRITE side is per client. Serving both values would give this client a ' +
+        `${want ? 'UTC write' : 'local write'} and a ${settled ? 'UTC read' : 'local read'}, so every zone-less ` +
+        '`timestamp` it writes would read back shifted by the process offset. Give every TurbineClient in this ' +
+        'process the same `utcTimestamps` value, or run the odd one out in its own process.',
+    );
+  }
+
+  /**
+   * @internal Test-only: forget the process-global `utcTimestamps` decision so
+   * one process can exercise both mismatch directions. It does NOT restore the
+   * pg parser (parser registration is not reversible), so reads stay on
+   * whichever parser was installed first.
+   */
+  static resetUtcTimestampsForTests(): void {
+    TurbineClient.utcTimestampParserMode = undefined;
   }
 
   // -------------------------------------------------------------------------

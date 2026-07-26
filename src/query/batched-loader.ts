@@ -36,6 +36,13 @@
  *     (`[]` when empty), single-or-null for hasOne/belongsTo, with the same
  *     camelCase keys and Date coercion, because the child rows are parsed by the
  *     very same `parseRow`/`buildFindMany` machinery via a child QueryInterface.
+ *   - **Identical KEY ORDER.** Object key order is observable output: callers
+ *     `JSON.stringify` results into HTTP bodies, ETags and cache keys. The
+ *     follow-up queries run concurrently, so the completion order of two sibling
+ *     relations is a race; every relation key (and every `_count` entry) is
+ *     therefore SEEDED up front in the order the join plan emits it, and the
+ *     concurrent loads only overwrite already-existing keys. See
+ *     {@link seedRelationKeys}.
  *   - **Stitch keys never leak.** To stitch, the follow-up query must select the
  *     FK/PK it joins on even when the caller's `select`/`omit` excluded it; the
  *     loader adds those columns for the query and strips them from the returned
@@ -51,7 +58,7 @@ import type pg from 'pg';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableMetadata } from '../schema.js';
 import type { ReselectExecutor } from './builder.js';
-import { isRelationPickOrderBy } from './filters.js';
+import { isRelationPickOrderBy, sortedEntries } from './filters.js';
 import type { SkipGlobalFilters, WithClause, WithCount, WithOptions } from './types.js';
 import { ownLookup } from './utils.js';
 
@@ -353,17 +360,12 @@ export async function loadRelationsBatched(
   if (depth === 0) rejectNestedPickOrder(withClause);
   if (parents.length === 0) return;
 
-  // Sibling relations are independent (each writes only its own parent[relName]
-  // and reads only parent keys), so load them concurrently, on a pool that's
-  // real parallelism, inside a transaction pg queues them on the one connection.
-  const loads: Promise<void>[] = [];
-  for (const [relName, spec] of Object.entries(withClause)) {
-    if (!spec) continue;
-    // Reserved `_count` key, one grouped COUNT(*) follow-up per counted relation.
-    if (relName === '_count') {
-      loads.push(loadCounts(ctx, parents, spec as unknown as WithCount));
-      continue;
-    }
+  // Resolve the relations to load in the SAME order the join plan emits their
+  // columns (`sortedEntries` in buildSelectWithRelations), with the reserved
+  // `_count` key last.
+  const resolved: { relName: string; rel: RelationDef; options: WithOptions }[] = [];
+  for (const [relName, spec] of sortedEntries(withClause as Record<string, unknown>)) {
+    if (!spec || relName === '_count') continue;
     const rel = ownLookup(ctx.parentMeta.relations, relName);
     if (!rel) {
       throw new ValidationError(
@@ -371,15 +373,89 @@ export async function loadRelationsBatched(
           `Available: ${Object.keys(ctx.parentMeta.relations).join(', ')}`,
       );
     }
-    const options: WithOptions = spec === true ? {} : (spec as WithOptions);
+    resolved.push({ relName, rel, options: spec === true ? {} : (spec as WithOptions) });
+  }
+  // A falsy `_count` opts out, exactly like a falsy relation spec.
+  const countSpec = (withClause as { _count?: WithCount })._count;
+  const hasCount = Boolean(countSpec);
 
+  // Fix key order BEFORE anything is awaited: the loads below all write their
+  // key on completion, and completion order is a race between concurrent
+  // statements.
+  seedRelationKeys(parents, ctx.parentMeta, resolved, hasCount);
+
+  // Sibling relations are independent (each writes only its own parent[relName]
+  // and reads only parent keys), so load them concurrently, on a pool that's
+  // real parallelism, inside a transaction pg queues them on the one connection.
+  const loads: Promise<void>[] = [];
+  for (const { relName, rel, options } of resolved) {
     loads.push(
       rel.type === 'manyToMany'
         ? loadManyToMany(ctx, parents, rel, relName, options, timeout, depth, path)
         : loadToOneOrMany(ctx, parents, rel, relName, options, timeout, depth, path),
     );
   }
+  // Reserved `_count` key, one grouped COUNT(*) follow-up per counted relation.
+  if (hasCount) loads.push(loadCounts(ctx, parents, countSpec as WithCount));
   await Promise.all(loads);
+}
+
+/**
+ * Give every relation key its final POSITION on each parent row before the
+ * concurrent follow-up queries start, so the stitched object serializes to the
+ * same bytes on every run and matches the join strategy.
+ *
+ * The reference order is the join plan's SELECT list: base columns, then the
+ * relation columns in sorted `with` order, then the `_count__<rel>` scalars
+ * (which `parseNestedRow` folds into a `_count` object appended last). A key
+ * that is already present is re-inserted rather than seeded: under the `'auto'`
+ * split some relations arrive resolved by the join plan and the rest are loaded
+ * here, and only a re-insert can interleave the two sets into one canonical
+ * order. Base (non-relation) columns are never touched.
+ */
+function seedRelationKeys(
+  parents: Record<string, unknown>[],
+  parentMeta: TableMetadata,
+  resolved: { relName: string; rel: RelationDef; options: WithOptions }[],
+  hasCount: boolean,
+): void {
+  // Placeholder per relation: the value an empty load produces, so a seeded key
+  // is never a shape the caller could not otherwise see.
+  const seeds = new Map<string, 'one' | 'many' | 'present'>();
+  for (const { relName, rel } of resolved) {
+    seeds.set(relName, rel.type === 'belongsTo' || rel.type === 'hasOne' ? 'one' : 'many');
+  }
+  // Relations the join plan already resolved onto these rows (the `'auto'`
+  // split's residual join). Rows all come from one query, so one row's shape
+  // answers for the batch.
+  const sample = parents[0] as Record<string, unknown> | undefined;
+  if (sample) {
+    for (const relName of Object.keys(parentMeta.relations)) {
+      // Already resolved by the join plan: it needs a position, never a
+      // placeholder, so it is re-inserted rather than overwritten.
+      if (!seeds.has(relName) && Object.hasOwn(sample, relName)) seeds.set(relName, 'present');
+    }
+  }
+  const ordered = [...seeds.keys()].sort();
+  const countPresent = hasCount || (sample !== undefined && Object.hasOwn(sample, '_count'));
+  if (ordered.length === 0 && !countPresent) return;
+
+  for (const parent of parents) {
+    for (const relName of ordered) {
+      if (Object.hasOwn(parent, relName)) {
+        // Re-insert so this key sits in canonical order, value untouched.
+        const existing = parent[relName];
+        delete parent[relName];
+        parent[relName] = existing;
+      } else {
+        parent[relName] = seeds.get(relName) === 'many' ? [] : null;
+      }
+    }
+    if (!countPresent) continue;
+    const existingCount = Object.hasOwn(parent, '_count') ? parent._count : undefined;
+    delete parent._count;
+    parent._count = existingCount ?? {};
+  }
 }
 
 /**
@@ -628,7 +704,10 @@ async function loadManyToMany(
  * Load correlated `_count` values for the counted relations. One grouped
  * follow-up per relation (`SELECT key, COUNT(*) … WHERE key = ANY($1) GROUP BY
  * key`), attached onto each parent's `_count` object (0 when a parent has no
- * matching rows), byte-identical to the join strategy's `_count` output.
+ * matching rows), byte-identical to the join strategy's `_count` output,
+ * INCLUDING key order: the join plan emits its `_count__<rel>` columns in
+ * `resolveCountRelations` order, so every key is seeded here in that same order
+ * before the concurrent counts run and can only be overwritten in place.
  */
 async function loadCounts(
   ctx: RelationLoadContext,
@@ -636,10 +715,15 @@ async function loadCounts(
   countSpec: WithCount,
 ): Promise<void> {
   const rels = resolveCountRelations(ctx.parentMeta, countSpec);
-  // Initialise every parent's `_count` up-front so the concurrent per-relation
-  // loads below (each writing its own key) never race on the object creation.
+  // Initialise every parent's `_count` up-front, and seed every counted
+  // relation's key in `resolveCountRelations` order, so the concurrent
+  // per-relation loads below only ever overwrite a key that already exists.
+  // Without the seeded keys, insertion order is whichever COUNT statement
+  // finishes first and the same query serializes differently run to run.
   for (const parent of parents) {
     if (parent._count === undefined) parent._count = {};
+    const counts = parent._count as Record<string, number>;
+    for (const rel of rels) counts[rel.name] = 0;
   }
   await Promise.all(rels.map((rel) => loadOneCount(ctx, parents, rel)));
 }

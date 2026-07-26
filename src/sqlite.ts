@@ -48,13 +48,14 @@
 
 import { createRequire } from 'node:module';
 import type { DatabaseSync } from 'node:sqlite';
-import { type PgCompatPool, type PgCompatPoolClient, TurbineClient, type TurbineConfig } from './client.js';
+import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
 import {
   type BulkInsertStatementInput,
   type ColumnDefinitionInput,
   type ColumnTypeInput,
   type CreateIndexStatementInput,
   type CreateTableStatementInput,
+  type DefaultValuesInsertStatementInput,
   type Dialect,
   type DialectIntrospector,
   type InsertStatementInput,
@@ -65,7 +66,8 @@ import {
   type StreamableConnection,
   type UpsertStatementInput,
 } from './dialect.js';
-import { ConnectionError } from './errors.js';
+import type { EngineClientConfig } from './engine-config.js';
+import { ConnectionError, UnsupportedFeatureError } from './errors.js';
 import { applyTableFilters, deriveEngineRelations } from './introspect.js';
 import {
   type ColumnMetadata,
@@ -549,6 +551,22 @@ export const sqliteDialect: Dialect = {
     };
   },
 
+  buildDefaultValuesInsertStatement(input: DefaultValuesInsertStatementInput): string {
+    // SQLite's `DEFAULT VALUES` inserts exactly one row and the engine accepts
+    // neither `VALUES (DEFAULT, …)` nor MySQL's empty `VALUES ()` tuple, so
+    // there is no multi-row all-defaults statement to emit.
+    if (input.rowCount !== 1) {
+      throw new UnsupportedFeatureError(
+        `createMany with ${input.rowCount} empty data rows`,
+        'sqlite',
+        'SQLite INSERT … DEFAULT VALUES inserts a single row and has no multi-row form; ' +
+          'issue one create({ data: {} }) per row.',
+      );
+    }
+    const conflict = input.skipDuplicates ? ' ON CONFLICT DO NOTHING' : '';
+    return `INSERT INTO ${input.table} DEFAULT VALUES${conflict}${this.buildReturningClause(input.returning)}`;
+  },
+
   buildUpsertStatement(input: UpsertStatementInput): string {
     return (
       `INSERT INTO ${input.table} (${input.insertColumns.join(', ')}) VALUES (${input.valuePlaceholders.join(', ')})` +
@@ -890,8 +908,12 @@ export async function introspectSqlite(options: IntrospectOptions): Promise<Sche
 // turbineSqlite, the public factory
 // ---------------------------------------------------------------------------
 
-/** Options for {@link turbineSqlite}. Mirrors the relevant {@link TurbineConfig} fields. */
-export interface TurbineSqliteOptions extends Pick<TurbineConfig, 'logging' | 'defaultLimit' | 'warnOnUnlimited'> {
+/**
+ * Options for {@link turbineSqlite}: every client-level {@link TurbineConfig}
+ * field the engine can honour (see {@link EngineClientConfig}) plus the SQLite
+ * pragmas below.
+ */
+export interface TurbineSqliteOptions extends EngineClientConfig {
   /**
    * Enable WAL journal mode for file databases (better read concurrency).
    * Ignored for `':memory:'`. Default: `true`.
@@ -933,7 +955,8 @@ function openSqliteDatabase(target: string, options: TurbineSqliteOptions): Data
  *
  * @param target  A SQLite file path, `':memory:'`, or an open `DatabaseSync`.
  * @param schema  Introspected or hand-written {@link SchemaMetadata}.
- * @param options Optional pragmas + logging / defaultLimit / warnOnUnlimited.
+ * @param options Optional SQLite pragmas plus any client-level
+ *                {@link TurbineConfig} field (see {@link EngineClientConfig}).
  *
  * @example
  * ```ts
@@ -948,14 +971,16 @@ export function turbineSqlite(
 ): TurbineClient {
   const db = typeof target === 'string' ? openSqliteDatabase(target, options) : target;
   const pool = new SqlitePool(db);
+  // Everything that is not a SQLite pragma is client config and rides through
+  // untouched, so a new TurbineConfig option works here the day it lands. The
+  // engine-owned keys come last, so no caller can unbind the dialect.
+  const { wal: _wal, busyTimeoutMs: _busyTimeoutMs, foreignKeys: _foreignKeys, ...clientConfig } = options;
   return new TurbineClient(
     {
+      ...clientConfig,
       pool,
       dialect: sqliteDialect,
       preparedStatements: false,
-      logging: options.logging,
-      defaultLimit: options.defaultLimit,
-      warnOnUnlimited: options.warnOnUnlimited,
     },
     schema,
   );
