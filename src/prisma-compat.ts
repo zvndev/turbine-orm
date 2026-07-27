@@ -37,7 +37,15 @@
  * These cannot be faithfully translated and are not attempted; each throws or is
  * documented rather than silently returning wrong data:
  *
- * - `$extends` / client extensions, `$use` with Prisma's middleware param shape.
+ * - **`$extends` beyond `client` + `model`.** Client extensions ARE supported for
+ *   those two components (plus the `Prisma.defineExtension` callback form), and
+ *   return a new client whose delegates, `$transaction` and raw surface all
+ *   survive. The `query` (interception) and `result` (computed fields)
+ *   components, and any component this adapter does not recognize, throw an
+ *   {@link UnsupportedFeatureError} naming the component AT `$extends` TIME
+ *   rather than being accepted and quietly not applied.
+ * - `$use` with Prisma's middleware param shape (Turbine's own `client.$use` is
+ *   the supported interception seam).
  * - `instanceof PrismaClientKnownRequestError`, `.meta`/message byte parity
  *   (opt into `prismaErrorCodes` for a `.code` like `P2002`, without pretending
  *   `instanceof` identity).
@@ -230,6 +238,23 @@ export const Prisma = {
   },
   /** An empty fragment. */
   empty: makeSql([''], []) as Sql,
+  /**
+   * The extension context of `this` inside a client / model extension method.
+   * Turbine binds extension members directly onto the client and delegate
+   * objects, so the context IS `this`; the identity function exists so migrated
+   * `Prisma.getExtensionContext(this).$name` call sites keep working.
+   */
+  getExtensionContext<T>(that: T): T {
+    return that;
+  },
+  /**
+   * Type-preserving passthrough for `Prisma.defineExtension(ext)`. Prisma uses
+   * it purely for inference; the value is returned unchanged, so both the object
+   * and the callback form reach `$extends` intact.
+   */
+  defineExtension<E>(ext: E): E {
+    return ext;
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -1209,7 +1234,53 @@ export interface PrismaCompatRawSurface {
   $executeRawUnsafe(sql: string, ...params: unknown[]): Promise<number>;
 }
 
-/** The client-level surface (`$transaction` / raw), added to the model map. */
+/**
+ * A Prisma client extension, restricted to the two components this adapter can
+ * honour faithfully.
+ *
+ * `client` members land on the returned client; `model` members land on the
+ * named model's delegate (under BOTH spellings), with `$allModels` applying to
+ * every delegate. The `query` and `result` components are declared `never` so
+ * passing one is a compile error, and {@link PrismaCompatClient.$extends} also
+ * refuses them at runtime with an {@link UnsupportedFeatureError} naming the
+ * component: an extension that was accepted and then quietly not applied would
+ * be far worse than one that is refused.
+ */
+export interface PrismaCompatExtension {
+  /** Optional extension name, accepted and otherwise unused (as in Prisma). */
+  name?: string;
+  /** Extra client-level members, e.g. `{ $healthCheck() { … } }`. */
+  client?: Record<string, unknown>;
+  /** Extra delegate members per Prisma model name, plus `$allModels`. */
+  model?: Record<string, Record<string, unknown>>;
+  /** Not supported, see {@link PrismaCompatExtension}. */
+  query?: never;
+  /** Not supported, see {@link PrismaCompatExtension}. */
+  result?: never;
+  /** Any other component is refused at runtime by name. */
+  [component: string]: unknown;
+}
+
+/** Members an extension contributes to the delegate for Prisma model `K`. */
+type ModelMembersOf<M, K extends string> = (K extends keyof M ? M[K] : unknown) &
+  (Uncapitalize<K> extends keyof M ? M[Uncapitalize<K>] : unknown) &
+  ('$allModels' extends keyof M ? M['$allModels'] : unknown);
+
+type ExtraModelMembers<E, K extends string> = E extends { model: infer M } ? ModelMembersOf<M, K> : unknown;
+
+/**
+ * The client {@link PrismaCompatClient.$extends} returns: the same surface with
+ * the extension's `client` members on the client and its `model` members on
+ * every matching delegate (both spellings).
+ */
+export type PrismaCompatExtendedClient<S extends Record<string, PrismaModelTypes>, E> = {
+  [K in keyof S]: PrismaModelDelegate<S[K]> & ExtraModelMembers<E, K & string>;
+} & {
+  [K in keyof S as Uncapitalize<K & string>]: PrismaModelDelegate<S[K]> & ExtraModelMembers<E, K & string>;
+} & PrismaCompatClientBase<S> &
+  (E extends { client: infer C } ? C : unknown);
+
+/** The client-level surface (`$transaction` / raw / `$extends`), added to the model map. */
 export interface PrismaCompatClientBase<S extends Record<string, PrismaModelTypes> = Record<string, PrismaModelTypes>>
   extends PrismaCompatRawSurface {
   $transaction<R>(
@@ -1219,6 +1290,20 @@ export interface PrismaCompatClientBase<S extends Record<string, PrismaModelType
   $transaction<P extends readonly PromiseLike<unknown>[]>(
     promises: readonly [...P],
   ): Promise<{ [K in keyof P]: Awaited<P[K]> }>;
+  /**
+   * Prisma's callback form (`Prisma.defineExtension((client) => …)`): the
+   * function is called with this client and its return value is the result,
+   * exactly as in Prisma. Declared first so a function argument never matches
+   * the all-optional object overload below.
+   */
+  $extends<R>(extension: (client: PrismaCompatClient<S>) => R): R;
+  /**
+   * Extend the client with a {@link PrismaCompatExtension}. Returns a NEW client
+   * (this one is untouched) carrying the extension's `client` and `model`
+   * members; the returned client is itself extendable. `query` and `result`
+   * extensions throw, see {@link PrismaCompatExtension}.
+   */
+  $extends<E extends PrismaCompatExtension>(extension: E): PrismaCompatExtendedClient<S, E>;
   $connect(): Promise<void>;
   $disconnect(): Promise<void>;
 }
@@ -1776,6 +1861,7 @@ function makeRawSurface(exec: RawExecutor, ph: (n: number) => string): PrismaCom
  */
 const CLIENT_RESERVED_KEY_MAP: Record<keyof PrismaCompatClientBase, true> = {
   $transaction: true,
+  $extends: true,
   $queryRaw: true,
   $queryRawUnsafe: true,
   $executeRaw: true,
@@ -1850,6 +1936,144 @@ function junctionModels(ctx: Ctx, map: PrismaCompatMap, tableToModel: Map<string
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// $extends, client extensions
+// ---------------------------------------------------------------------------
+
+/** The `model` key whose members apply to every delegate. */
+const ALL_MODELS = '$allModels';
+
+/**
+ * Why each unsupported extension component is refused, and what to do instead.
+ * Both are refused AT `$extends` TIME, not at the first query, so the failure is
+ * a full message at boot rather than a surprise mid-request.
+ */
+const UNSUPPORTED_COMPONENTS: Record<string, { feature: string; hint: string }> = {
+  query: {
+    feature: '$extends `query` (query interception)',
+    hint: [
+      'Use the core middleware seam instead: `client.$use((params, next) => ...)` sees every query, or',
+      'wrap the call site; `$allOperations` hooks have no equivalent.',
+      'The `client` and `model` components ARE supported.',
+    ].join(' '),
+  },
+  result: {
+    feature: '$extends `result` (computed fields)',
+    hint: [
+      'Prisma implements it by rewriting the projection to satisfy `needs` and stripping the injected',
+      'columns back out at every nesting level, which cannot be done safely on top of the PII projection',
+      'rules (a `needs` field on a pii-tagged column would arrive undefined and the computed value would',
+      'be silently wrong). Compute the field in application code, or add a generated column so it comes',
+      'back as a real column. The `client` and `model` components ARE supported.',
+    ].join(' '),
+  },
+};
+
+/** Accumulated, already-validated extension members for one client. */
+interface ExtensionState {
+  /** Extra client-level members. */
+  client: Record<string, unknown>;
+  /** Prisma model name (canonical) -> extra delegate members. */
+  model: Map<string, Record<string, unknown>>;
+  /** Members applied to EVERY delegate (`$allModels`). */
+  allModels: Record<string, unknown>;
+}
+
+const EMPTY_EXTENSIONS: ExtensionState = { client: {}, model: new Map(), allModels: {} };
+
+/**
+ * Validate one extension against the client's real shape and fold it into a NEW
+ * {@link ExtensionState} (the previous one is never mutated, so the client
+ * `$extends` was called on keeps working unchanged).
+ *
+ * Everything this adapter cannot honour throws here: an unsupported component
+ * ({@link UNSUPPORTED_COMPONENTS}), a component name we do not recognize at all
+ * (`@prisma/extension-accelerate`, Pulse, read replicas, ...), a `client` member
+ * that would shadow a delegate or a client-level method, or a `model` key that
+ * names no model in the map. Extension-over-extension overrides are allowed and
+ * last-wins, as in Prisma.
+ *
+ * @param modelKeys - every accepted `model` key spelling -> canonical model name.
+ * @param clientKeys - names already taken on the client (delegates + reserved).
+ */
+function applyExtension(
+  prev: ExtensionState,
+  ext: PrismaCompatExtension,
+  modelKeys: Map<string, string>,
+  clientKeys: ReadonlySet<string>,
+): ExtensionState {
+  if (typeof ext !== 'object' || ext === null) {
+    throw new ValidationError(
+      '[turbine] prisma-compat: $extends expects an extension object or a function ' +
+        `(Prisma.defineExtension callback form), received ${ext === null ? 'null' : typeof ext}.`,
+    );
+  }
+  for (const [component, value] of Object.entries(ext)) {
+    if (component === 'name' || component === 'client' || component === 'model') continue;
+    // An explicitly-undefined component asked for nothing (a spread of a partial
+    // extension object), so there is nothing to refuse.
+    if (value === undefined) continue;
+    const known = UNSUPPORTED_COMPONENTS[component];
+    throw new UnsupportedFeatureError(
+      known?.feature ?? `$extends extension component "${component}"`,
+      'prisma-compat',
+      known?.hint ??
+        'Only the `client` and `model` components are supported (Accelerate / Pulse / read-replica ' +
+          'extensions are not).',
+    );
+  }
+
+  const client = { ...prev.client };
+  for (const [name, member] of Object.entries(ext.client ?? {})) {
+    if (clientKeys.has(name)) {
+      throw new ValidationError(
+        `[turbine] prisma-compat: $extends \`client\` member "${name}" would shadow an existing client ` +
+          'member (a model delegate or a client-level method). Rename it.',
+      );
+    }
+    client[name] = member;
+  }
+
+  const model = new Map(prev.model);
+  const allModels = { ...prev.allModels };
+  for (const [key, members] of Object.entries(ext.model ?? {})) {
+    if (key === ALL_MODELS) {
+      Object.assign(allModels, members);
+      continue;
+    }
+    const canonical = modelKeys.get(key);
+    if (!canonical) {
+      throw new ValidationError(
+        `[turbine] prisma-compat: $extends \`model\` key "${key}" is not a model on this client. ` +
+          `Known models: ${[...new Set(modelKeys.values())].sort().join(', ') || '(none)'}.`,
+      );
+    }
+    model.set(canonical, { ...(model.get(canonical) ?? {}), ...members });
+  }
+
+  return { client, model, allModels };
+}
+
+/**
+ * Overlay an extension's members on one delegate. Returns the delegate itself
+ * when the extension contributes nothing to it, so an unextended client and an
+ * extended one that only adds `client` members share the exact same delegates.
+ *
+ * The members are copied onto a shallow copy, so `this` inside an extension
+ * method is the extended delegate (what `Prisma.getExtensionContext(this)`
+ * returns), and `$name` carries the Prisma model name as Prisma's model context
+ * does.
+ */
+function extendDelegate(
+  delegate: PrismaModelDelegate<PrismaModelTypes>,
+  prismaModel: string,
+  exts: ExtensionState,
+): PrismaModelDelegate<PrismaModelTypes> {
+  const own = exts.model.get(prismaModel);
+  if (!own && Object.keys(exts.allModels).length === 0) return delegate;
+  return Object.assign({ $name: prismaModel }, delegate, exts.allModels, own ?? {});
+}
+
 /**
  * Create a PrismaClient-surface adapter over a {@link TurbineClient}, driven by a
  * {@link PrismaCompatMap} (the `prisma-map.ts` that `turbine
@@ -1900,10 +2124,22 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
     ...junctionModels(ctx, map, tableToModel),
   ];
 
+  // Every spelling a `$extends` `model` key may use -> the canonical model name.
+  // Canonical names are registered first so a model can never lose its own key
+  // to another model's lowercased alias.
+  const modelKeys = new Map<string, string>();
+  for (const [prismaModel] of delegateModels) modelKeys.set(prismaModel, prismaModel);
+  for (const [prismaModel] of delegateModels) {
+    const alias = prismaPropertyAlias(prismaModel);
+    if (alias && !modelKeys.has(alias)) modelKeys.set(alias, prismaModel);
+  }
+  // Names a `$extends` `client` member must not shadow.
+  const clientKeys = new Set<string>([...CLIENT_RESERVED_KEYS, ...modelKeys.keys()]);
+
   // Delegates bound to the base client (each call reads db.table(...) lazily).
-  const delegates = new Map<string, PrismaModelDelegate<PrismaModelTypes>>();
+  const baseDelegates = new Map<string, PrismaModelDelegate<PrismaModelTypes>>();
   for (const [prismaModel, mm] of delegateModels) {
-    delegates.set(
+    baseDelegates.set(
       prismaModel,
       makeDelegate(
         ctx,
@@ -1952,85 +2188,124 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
       }
     };
 
-  const base: PrismaCompatClientBase = {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    $transaction: ((arg: unknown, txOptions?: PrismaCompatTxOptions): Promise<unknown> => {
-      // Array (lazy batch) form. Wrapped so validation/build errors REJECT the
-      // returned promise (Prisma's $transaction is always thenable) rather than
-      // throwing synchronously.
-      if (Array.isArray(arg)) {
-        return (async () => {
-          try {
-            const batchables = arg.map((p, i) => {
-              const b = batchableOf(p);
-              if (!b) {
-                throw new ValidationError(
-                  `[turbine] prisma-compat: $transaction([...]) item ${i} is not a lazy model call. Pass un-awaited delegate calls (e.g. prisma.User.create(...)).`,
-                );
-              }
-              return b;
-            });
-            // Nested write data (or a lookup-first upsert) cannot run as a
-            // single deferred statement. Prisma's array form still supports
-            // those, so fall back to running the WHOLE array sequentially
-            // inside one transaction; ordering and atomicity are preserved.
-            if (batchables.some((b) => b.nested())) {
-              return await db.$transaction(async (tx) => {
-                const out: unknown[] = [];
-                for (const b of batchables) out.push(await b.execInTx((n) => tx.table(n)));
-                return out;
-              }, txOptions);
-            }
-            const deferreds = batchables.map((b) => b.build());
-            const results = (await db.$transaction(deferreds)) as unknown[];
-            return results.map((raw, i) => batchables[i]!.reshape(raw));
-          } catch (err) {
-            throw decorate(err, ctx.options.prismaErrorCodes);
-          }
-        })();
-      }
-      // Callback form: hand the user a compat client bound to the tx connection.
-      const fn = arg as (tx: PrismaCompatTransactionClient) => Promise<unknown>;
-      return db.$transaction((tx: CompatTransactionClient) => {
-        const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
-        for (const [prismaModel, mm] of delegateModels) {
-          txDelegates[prismaModel] = makeDelegate(
-            ctx,
-            mm,
-            () => tx.table(mm.table),
-            (fn) => fn((n) => tx.table(n)),
-          );
-          const alias = prismaPropertyAlias(prismaModel);
-          if (alias && !(alias in map.models) && !(alias in txDelegates)) {
-            txDelegates[alias] = txDelegates[prismaModel]!;
-          }
-        }
-        // Raw SQL on the transaction's own connection. Prisma's tx client
-        // carries these four, and code that mixes `$transaction` with raw SQL is
-        // the common case in a migrated codebase. No model can shadow them: a
-        // Prisma model name cannot start with `$`, and junction accessors skip
-        // every CLIENT_RESERVED_KEYS name.
-        const txClient: Record<string, unknown> = { ...txDelegates, ...makeRawSurface(txRunRaw(tx), ph) };
-        return fn(txClient as unknown as PrismaCompatTransactionClient);
-      }, txOptions);
-    }) as PrismaCompatClientBase['$transaction'],
+  /**
+   * Assemble one client for a set of already-validated extensions. `$extends`
+   * calls this again with a folded {@link ExtensionState}, so an extended client
+   * is a genuinely NEW object built by the SAME path: delegates (extended),
+   * `$transaction` (whose tx-scoped delegates get the same `model` members, the
+   * one place a naive implementation would silently diverge), the raw surface,
+   * and `$extends` itself, which is why extending stays chainable.
+   *
+   * Client-level `client` members are deliberately NOT copied onto the
+   * transaction client: such a member usually closes over the base client, so
+   * reaching it through `tx` would silently run its queries OUTSIDE the
+   * transaction. Absent, it is a TypeError at the call site instead.
+   */
+  const build = (exts: ExtensionState): PrismaCompatClient<S> => {
+    // Delegates bound to the base client, extended where the extension has
+    // members for them. `baseDelegates` is built ONCE (outside), so a client
+    // whose extension only adds `client` members shares the very same delegate
+    // objects: extending costs nothing on the query path.
+    const delegates = new Map<string, PrismaModelDelegate<PrismaModelTypes>>();
+    for (const [prismaModel, delegate] of baseDelegates) {
+      delegates.set(prismaModel, extendDelegate(delegate, prismaModel, exts));
+    }
 
-    ...makeRawSurface(runRaw, ph),
-    $connect: async () => {},
-    $disconnect: async () => {},
+    const base: PrismaCompatClientBase = {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      $transaction: ((arg: unknown, txOptions?: PrismaCompatTxOptions): Promise<unknown> => {
+        // Array (lazy batch) form. Wrapped so validation/build errors REJECT the
+        // returned promise (Prisma's $transaction is always thenable) rather than
+        // throwing synchronously.
+        if (Array.isArray(arg)) {
+          return (async () => {
+            try {
+              const batchables = arg.map((p, i) => {
+                const b = batchableOf(p);
+                if (!b) {
+                  throw new ValidationError(
+                    `[turbine] prisma-compat: $transaction([...]) item ${i} is not a lazy model call. Pass un-awaited delegate calls (e.g. prisma.User.create(...)).`,
+                  );
+                }
+                return b;
+              });
+              // Nested write data (or a lookup-first upsert) cannot run as a
+              // single deferred statement. Prisma's array form still supports
+              // those, so fall back to running the WHOLE array sequentially
+              // inside one transaction; ordering and atomicity are preserved.
+              if (batchables.some((b) => b.nested())) {
+                return await db.$transaction(async (tx) => {
+                  const out: unknown[] = [];
+                  for (const b of batchables) out.push(await b.execInTx((n) => tx.table(n)));
+                  return out;
+                }, txOptions);
+              }
+              const deferreds = batchables.map((b) => b.build());
+              const results = (await db.$transaction(deferreds)) as unknown[];
+              return results.map((raw, i) => batchables[i]!.reshape(raw));
+            } catch (err) {
+              throw decorate(err, ctx.options.prismaErrorCodes);
+            }
+          })();
+        }
+        // Callback form: hand the user a compat client bound to the tx connection.
+        const fn = arg as (tx: PrismaCompatTransactionClient) => Promise<unknown>;
+        return db.$transaction((tx: CompatTransactionClient) => {
+          const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
+          for (const [prismaModel, mm] of delegateModels) {
+            txDelegates[prismaModel] = extendDelegate(
+              makeDelegate(
+                ctx,
+                mm,
+                () => tx.table(mm.table),
+                (fn) => fn((n) => tx.table(n)),
+              ),
+              prismaModel,
+              exts,
+            );
+            const alias = prismaPropertyAlias(prismaModel);
+            if (alias && !(alias in map.models) && !(alias in txDelegates)) {
+              txDelegates[alias] = txDelegates[prismaModel]!;
+            }
+          }
+          // Raw SQL on the transaction's own connection. Prisma's tx client
+          // carries these four, and code that mixes `$transaction` with raw SQL is
+          // the common case in a migrated codebase. No model can shadow them: a
+          // Prisma model name cannot start with `$`, and junction accessors skip
+          // every CLIENT_RESERVED_KEYS name.
+          const txClient: Record<string, unknown> = { ...txDelegates, ...makeRawSurface(txRunRaw(tx), ph) };
+          return fn(txClient as unknown as PrismaCompatTransactionClient);
+        }, txOptions);
+      }) as PrismaCompatClientBase['$transaction'],
+
+      $extends: ((extension: unknown): unknown => {
+        // Prisma's callback form: `client.$extends(fn)` IS `fn(client)`.
+        if (typeof extension === 'function') return (extension as (c: unknown) => unknown)(result);
+        return build(applyExtension(exts, extension as PrismaCompatExtension, modelKeys, clientKeys));
+      }) as PrismaCompatClientBase['$extends'],
+
+      ...makeRawSurface(runRaw, ph),
+      $connect: async () => {},
+      $disconnect: async () => {},
+    };
+
+    // Assemble the result: model delegates keyed by Prisma model name, plus the
+    // client-level base methods. A plain object suffices, every model is a known
+    // key from the map, so no dynamic-access proxy is needed.
+    const result: Record<string, unknown> = { ...base };
+    for (const [prismaModel, delegate] of delegates) result[prismaModel] = delegate;
+    // Prisma-spelling aliases (`prisma.user` for `model User`). Skipped when the
+    // lowercased name is itself a model or already taken (never shadow a real key).
+    for (const [prismaModel, delegate] of delegates) {
+      const alias = prismaPropertyAlias(prismaModel);
+      if (alias && !(alias in result)) result[alias] = delegate;
+    }
+    // Extension `client` members last: every name was checked against the real
+    // client keys in applyExtension, so this can never overwrite a delegate.
+    Object.assign(result, exts.client);
+
+    return result as unknown as PrismaCompatClient<S>;
   };
 
-  // Assemble the result: model delegates keyed by Prisma model name, plus the
-  // client-level base methods. A plain object suffices, every model is a known
-  // key from the map, so no dynamic-access proxy is needed.
-  const result: Record<string, unknown> = { ...base };
-  for (const [prismaModel, delegate] of delegates) result[prismaModel] = delegate;
-  // Prisma-spelling aliases (`prisma.user` for `model User`). Skipped when the
-  // lowercased name is itself a model or already taken (never shadow a real key).
-  for (const [prismaModel, delegate] of delegates) {
-    const alias = prismaPropertyAlias(prismaModel);
-    if (alias && !(alias in result)) result[alias] = delegate;
-  }
-
-  return result as unknown as PrismaCompatClient<S>;
+  return build(EMPTY_EXTENSIONS);
 }

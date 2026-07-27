@@ -183,6 +183,11 @@ describe("relationLoadStrategy: 'auto', observability", () => {
     assert.equal(autoNotes.length, 1, 'once-per-relation');
     assert.match(autoNotes[0]!, /relation "posts" on "users" loads batched/);
     assert.match(autoNotes[0]!, /relationLoadStrategy: 'join'/);
+    // The note must name the MECHANISM, not just the condition: naming only
+    // "no covering index" is what lets a reader read the fallback as a bug.
+    assert.match(autoNotes[0]!, /correlated subquery re-evaluated once per parent row/);
+    assert.match(autoNotes[0]!, /one full scan of "posts" per parent row/);
+    assert.match(autoNotes[0]!, /scans it once for the whole page/);
   });
 
   it('is silent under NODE_ENV=production', async () => {

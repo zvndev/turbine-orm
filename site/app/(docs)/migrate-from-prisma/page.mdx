@@ -213,11 +213,70 @@ Two options. `prismaErrorCodes: true` sets `.code` on thrown `TurbineError`s to 
 
 One Turbine-only argument passes straight through: `includePii: true` on a read, a `groupBy`, or an `aggregate`. Prisma has no PII concept, so if your schema tags columns `pii: true` this is the only way a compat call site can ask for them (or run a `groupBy` keyed on one). Everything else about the tag behaves exactly as it does on the native API.
 
+### Client extensions: `$extends`
+
+<Callout type="note" title="New in 0.53">
+  The `client` and `model` extension components are supported, in both the object
+  form and the `Prisma.defineExtension` form. `query` and `result` are refused at
+  `$extends` time.
+</Callout>
+
+`$extends` returns a **new** client. The one you called it on keeps working unchanged, and the returned client is itself extendable, so chains work as they do in Prisma:
+
+```ts
+const extended = prisma.$extends({
+  name: 'helpers',
+  client: {
+    async $healthCheck() {
+      return true;
+    },
+  },
+  model: {
+    User: {
+      async findByEmail(email: string) {
+        return prisma.User.findFirst({ where: { email } });
+      },
+    },
+    $allModels: {
+      async countAll() {
+        return 0;
+      },
+    },
+  },
+});
+
+await extended.$healthCheck();
+await extended.User.findByEmail('a@b.com');
+await extended.post.countAll();   // $allModels member, lowercase spelling
+```
+
+Four details are worth knowing:
+
+- **Both delegate spellings get the members.** A `model` key may be the Prisma model name (`User`) or its lowercased client property (`user`); either way the members land on the single delegate both names resolve to. `$allModels` applies to every delegate.
+- **`this` is the extended delegate.** Members are copied onto a shallow copy, so `this` inside an extension method is the delegate plus the extension's own members, and it carries `$name` (the Prisma model name) at runtime. `Prisma.getExtensionContext(that)` is exported and is the identity function, so migrated call sites keep working. `$name` is runtime-only: the delegate type does not declare it, so reading it inside a member needs a cast (`(this as unknown as { $name: string }).$name`).
+- **`model` members survive `$transaction`.** The delegates handed to a `$transaction` callback are extended with the same members, which is the one place a naive implementation silently diverges.
+- **`client` members are deliberately *not* on the transaction client.** Such a member usually closes over the base client, so reaching it through `tx` would run its queries **outside** the transaction. Absent, it is a `TypeError` at the call site instead of a silent correctness bug.
+
+The callback form is Prisma's, unchanged: `prisma.$extends(fn)` is `fn(prisma)`. `Prisma.defineExtension` is a type-preserving passthrough, so both spellings reach `$extends` intact.
+
+**What throws, and when.** Everything the adapter cannot honour is refused at `$extends` time, not at the first query, so a wrong assumption fails at boot with a full explanation:
+
+| Component | Result |
+|---|---|
+| `client`, `model` | Supported |
+| `query` (interception) | `UnsupportedFeatureError` (`TURBINE_E017`), pointing at `client.$use` on the underlying `TurbineClient` as the interception seam. `$allOperations` has no equivalent |
+| `result` (computed fields) | `UnsupportedFeatureError` (`TURBINE_E017`). Prisma implements it by rewriting the projection to satisfy `needs` and stripping the injected columns back out at every nesting level, which cannot be done safely on top of the PII projection rules: a `needs` field on a `pii`-tagged column would arrive `undefined` and the computed value would be silently wrong. Compute it in application code, or add a generated column |
+| Anything else (Accelerate, Pulse, read-replica extensions) | `UnsupportedFeatureError` naming the component |
+
+`query` and `result` are also declared `never` on the extension type, so passing one is a compile error before it is ever a runtime one.
+
+Two more shapes throw `ValidationError` (`TURBINE_E003`): a `client` member whose name would shadow a delegate or a client-level method, and a `model` key that names no model on this client (the message lists the known models).
+
 ### What the adapter does *not* do
 
 Read this before you commit to the adapter path. These are verified against the implementation, not aspirational.
 
-**Absent entirely.** `$use`, `$on`, and `$extends` are not implemented and are not present on the returned object. Calling one is a plain `TypeError: prisma.$use is not a function`, not a typed Turbine error. Turbine's own middleware is `db.$use` on the underlying `TurbineClient`, with different semantics: it runs *after* SQL generation and cannot rewrite a query. Client extensions have no equivalent at all.
+**Absent entirely.** `$use` and `$on` are not implemented and are not present on the returned object. Calling one is a plain `TypeError: prisma.$use is not a function`, not a typed Turbine error. Turbine's own middleware is `db.$use` on the underlying `TurbineClient`, with different semantics: it runs *after* SQL generation and cannot rewrite a query. `$extends` **is** implemented for two of Prisma's four components, see [Client extensions](#client-extensions-extends) below.
 
 **Present but inert.** `$connect()` and `$disconnect()` exist and resolve immediately without doing anything. The `TurbineClient` owns the pool, so shut down with `db.disconnect()`, not `prisma.$disconnect()`. A migration that relies on `$disconnect()` closing connections (tests, serverless teardown) will leak the pool.
 

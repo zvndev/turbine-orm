@@ -76,9 +76,17 @@ describe('prototype keys: HAVING aggregate lookup', () => {
   for (const key of POLLUTED_KEYS) {
     it(`having: { id: { ${key}: … } } throws ValidationError`, () => {
       const q = makeQuery('users', schema());
+      // A key the aggregate map does not OWN is read as a scalar filter on the
+      // grouped value, so both routes out of the lookup must stay typed.
+      // `id` is not a group key here: the scalar-having guard refuses it.
       assert.throws(
         () => q.buildGroupBy({ by: ['role'], having: { id: { [key]: { gt: 1 } } } } as never),
-        (err) => assertTyped(err, 'validation', 'Unknown aggregate'),
+        (err) => assertTyped(err, 'validation', 'group keys'),
+      );
+      // Grouped by `id`, the key is a scalar operator, and misses that set too.
+      assert.throws(
+        () => q.buildGroupBy({ by: ['id'], having: { id: { [key]: { gt: 1 } } } } as never),
+        (err) => assertTyped(err, 'validation', `"${key}"`),
       );
     });
   }

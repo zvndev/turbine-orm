@@ -13,15 +13,21 @@ import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
 import { snakeToCamel } from '../schema.js';
 import type { DeferredQuery } from './deferred.js';
-import { isJsonPathOrderBy, isVectorOrderBy, normalizeOrderBy, orderByEntries } from './filters.js';
+import {
+  isJsonPathOrderBy,
+  isUnmatchedPlainObject,
+  isVectorOrderBy,
+  isWhereOperator,
+  normalizeOrderBy,
+  orderByEntries,
+} from './filters.js';
 import type {
   AggregateArgs,
   AggregateResult,
   GroupByArgs,
   GroupByOrderBy,
   HavingClause,
-  HavingFilter,
-  HavingNumericOperator,
+  HavingComparisonOperator,
   JsonPathAggregateTarget,
   OrderBySpec,
   OrderDirection,
@@ -114,6 +120,12 @@ export function buildGroupBy<T extends object>(
   // expression (including any already-bound JSON-path placeholder, reused
   // exactly like HAVING since ORDER BY is appended after all other params).
   const byOrderExprs = new Map<string, string>();
+  // The group-key set a `having` SCALAR filter may reference, keyed the same
+  // way (by-field name / JSON group-key alias). Separate from `byOrderExprs`
+  // because HAVING needs to know HOW the key is addressed: a plain by-field
+  // routes through the shared WHERE compiler by field name, a JSON group key
+  // re-emits its extract expression. See {@link buildHavingClauses}.
+  const havingGroupKeys = new Map<string, HavingGroupKey>();
   const usedResultKeys = new Set<string>();
   const claimResultKey = (key: string, what: string): void => {
     if (key === '_count' || usedResultKeys.has(key)) {
@@ -137,6 +149,7 @@ export function buildGroupBy<T extends object>(
       selectExprs.push(qi.q(col));
       byReaders.push({ resultKey: entry, rowKey: col, raw: false });
       byOrderExprs.set(entry, qi.q(col));
+      havingGroupKeys.set(entry, { kind: 'column', field: entry });
     } else {
       const col = resolveJsonPathTarget(qi, 'group key', entry.field, entry.path);
       assertAggregatePiiOptIn(qi.table, meta, entry.field, col, 'groupBy JSON `by` key', args.includePii);
@@ -151,6 +164,9 @@ export function buildGroupBy<T extends object>(
       // ORDER BY by this JSON alias re-emits the extract expression (with its
       // already-bound $n): the same reuse HAVING does for JSON aggregates.
       byOrderExprs.set(alias, extract);
+      // Parenthesized: a scalar having predicate appends comparison / IS NULL
+      // operators to this expression, and the extract is emitted bare here.
+      havingGroupKeys.set(alias, { kind: 'expr', expr: `(${extract})`, label: `JSON group key "${alias}"` });
     }
   }
 
@@ -251,7 +267,7 @@ export function buildGroupBy<T extends object>(
   // Appends to the same `params` array, so placeholders continue from the
   // WHERE clause's parameter positions (qi.p(params.length) below).
   if (args.having) {
-    const havingClauses = buildHavingClauses(qi, args.having, params, jsonAggExprs);
+    const havingClauses = buildHavingClauses(qi, args.having, params, jsonAggExprs, havingGroupKeys);
     if (havingClauses.length > 0) {
       sql += ` HAVING ${havingClauses.join(' AND ')}`;
     }
@@ -545,57 +561,86 @@ export function buildDistinctOnSource<T extends object>(
 }
 
 /**
+ * Maps a per-field aggregate key to its SQL function name. The set of allowed
+ * keys is fixed here: any OTHER underscore-prefixed key on a field's filter
+ * object is rejected by {@link ValidationError} (never interpolated), and every
+ * non-underscore key is a scalar operator on the grouped value itself.
+ */
+const HAVING_AGGREGATE_FNS: Record<string, string> = {
+  _sum: 'SUM',
+  _avg: 'AVG',
+  _min: 'MIN',
+  _max: 'MAX',
+  _count: 'COUNT',
+};
+
+/**
+ * How one groupBy group key is addressed from a `having` SCALAR filter: a
+ * plain `by` column (compiled by the shared WHERE machinery, by field name) or
+ * a JSON-path group key (its SELECT/GROUP BY extract expression, re-emitted
+ * verbatim with its already-bound path placeholder).
+ */
+export type HavingGroupKey = { kind: 'column'; field: string } | { kind: 'expr'; expr: string; label: string };
+
+/**
  * Build the SQL fragments for a {@link HavingClause}.
+ *
+ * A field entry carries an AGGREGATE filter (`{ _sum: { gt: 100 } }`), a
+ * SCALAR filter on the grouped value itself (`{ not: null }`, `{ in: [...] }`,
+ * or a bare value as equality shorthand), or both in one object (ANDed,
+ * scalar first). `AND` / `OR` / `NOT` combine predicates at any depth.
  *
  * Each aggregate expression (`COUNT(*)`, `SUM("col")`, etc.) is constructed
  * from a **schema-validated, quoted** column identifier: `qi.toColumn()`
  * throws {@link ValidationError} for unknown fields and `qi.q()` quotes via
  * the dialect, so no unvalidated identifier ever reaches the SQL string. Every
  * comparison value is pushed onto the shared `params` array and referenced by
- * a `$N` placeholder via {@link buildHavingNumericClauses}, there is no string
- * interpolation of user values.
+ * a `$N` placeholder via {@link buildHavingNumericClauses} (aggregates) or the
+ * shared WHERE compiler (scalars), there is no string interpolation of user
+ * values.
  *
  * `jsonAggExprs` (from {@link buildGroupBy}) maps `alias:aggKey` to the
  * exact aggregate expression a JSON-path aggregate emitted in SELECT
  * (including its already-bound path placeholder), so HAVING on a JSON-path
  * aggregate alias reuses the same expression instead of resolving the alias
- * as a column.
+ * as a column. `groupKeys` is the resolved `by` key set (see
+ * {@link HavingGroupKey}): a scalar filter is legal ONLY on a group key,
+ * because a non-grouped column cannot be referenced in HAVING at all.
  */
 export function buildHavingClauses<T extends object>(
   qi: BuilderCtx,
   having: HavingClause<T>,
   params: unknown[],
   jsonAggExprs?: Map<string, string>,
+  groupKeys?: Map<string, HavingGroupKey>,
 ): string[] {
   const clauses: string[] = [];
-
-  // Maps the per-field aggregate key to its SQL function name. The set of
-  // allowed keys is fixed here, any other key on a field's filter object is
-  // rejected by ValidationError below (never interpolated).
-  const aggFnByKey: Record<string, string> = {
-    _sum: 'SUM',
-    _avg: 'AVG',
-    _min: 'MIN',
-    _max: 'MAX',
-    _count: 'COUNT',
-  };
 
   for (const [key, value] of Object.entries(having)) {
     if (value === undefined) continue;
 
     // Top-level `_count` (no field) → COUNT(*) for the whole group.
     if (key === '_count') {
-      clauses.push(...buildHavingNumericClauses(qi, 'COUNT(*)', value as HavingFilter, params));
+      clauses.push(...buildHavingNumericClauses(qi, 'COUNT(*)', value, params));
       continue;
     }
 
-    // Otherwise `key` is a field name mapping to a per-aggregate filter object.
-    if (typeof value !== 'object' || value === null) {
-      throw new ValidationError(
-        `[turbine] Invalid having filter for field "${key}" on table "${qi.table}": ` +
-          `expected an aggregate object like { _sum: { gt: 100 } }.`,
-      );
+    // AND / OR / NOT, mixing scalar and aggregate predicates at any depth.
+    if (key === 'AND' || key === 'OR' || key === 'NOT') {
+      clauses.push(...buildHavingCombinator(qi, key, value, params, jsonAggExprs, groupKeys));
+      continue;
     }
+
+    // Otherwise `key` is a field name. Split its aggregate keys from its
+    // scalar operator keys: everything the fixed aggregate map does not name
+    // filters the grouped value itself.
+    const { aggEntries, scalarFilter } = splitHavingField(qi, key, value);
+
+    if (scalarFilter !== undefined) {
+      clauses.push(...buildHavingScalarClauses(qi, key, scalarFilter, params, groupKeys));
+    }
+
+    if (aggEntries.length === 0) continue;
 
     // toColumn validates the field against schema metadata (throws
     // ValidationError on unknown columns) and q() quotes the identifier, no
@@ -608,20 +653,9 @@ export function buildHavingClauses<T extends object>(
       return quotedCol;
     };
 
-    for (const [aggKey, filter] of Object.entries(value as Record<string, HavingFilter>)) {
-      if (filter === undefined) continue;
-      // ownLookup, not a bare index: an inherited Object.prototype member
-      // ("constructor", "toString", …) would otherwise resolve to a truthy
-      // builtin and be spliced into the HAVING clause as its source text.
-      const fn = ownLookup(aggFnByKey, aggKey);
-      if (!fn) {
-        throw new ValidationError(
-          `[turbine] Unknown aggregate "${aggKey}" in having for field "${key}" on table "${qi.table}". ` +
-            `Supported: ${Object.keys(aggFnByKey).join(', ')}.`,
-        );
-      }
-      const expr = jsonAggExprs?.get(`${key}:${aggKey}`) ?? `${fn}(${columnExpr()})`;
-      clauses.push(...buildHavingNumericClauses(qi, expr, filter, params));
+    for (const agg of aggEntries) {
+      const expr = jsonAggExprs?.get(`${key}:${agg.key}`) ?? `${agg.fn}(${columnExpr()})`;
+      clauses.push(...buildHavingNumericClauses(qi, expr, agg.filter, params));
     }
   }
 
@@ -629,29 +663,164 @@ export function buildHavingClauses<T extends object>(
 }
 
 /**
- * Convert a single having filter into one or more parameterized SQL
- * comparisons against the given aggregate expression. A bare number is
- * shorthand for equality. Unknown operator keys throw {@link ValidationError}.
+ * Partition one `having` field entry into its aggregate filters and its scalar
+ * filter. A non-object value (or an object naming no aggregate key) is scalar
+ * in full, so the whole value keeps its original shape (operator object, JSON
+ * filter, bare value, `null`). An unknown UNDERSCORE-prefixed key is a
+ * misspelled aggregate, not a scalar operator, and throws E003 naming it.
  */
-export function buildHavingNumericClauses(
+function splitHavingField(
   qi: BuilderCtx,
-  expr: string,
-  filter: HavingFilter,
+  field: string,
+  value: unknown,
+): { aggEntries: { key: string; fn: string; filter: unknown }[]; scalarFilter: unknown } {
+  if (!isUnmatchedPlainObject(value)) return { aggEntries: [], scalarFilter: value };
+
+  const aggEntries: { key: string; fn: string; filter: unknown }[] = [];
+  const scalarKeys: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (v === undefined) continue;
+    // ownLookup, not a bare index: an inherited Object.prototype member
+    // ("constructor", "toString", …) would otherwise resolve to a truthy
+    // builtin and be spliced into the HAVING clause as its source text.
+    const fn = ownLookup(HAVING_AGGREGATE_FNS, k);
+    if (fn) {
+      aggEntries.push({ key: k, fn, filter: v });
+    } else if (k.startsWith('_')) {
+      throw new ValidationError(
+        `[turbine] Unknown aggregate "${k}" in having for field "${field}" on table "${qi.table}". ` +
+          `Supported: ${Object.keys(HAVING_AGGREGATE_FNS).join(', ')}.`,
+      );
+    } else {
+      scalarKeys[k] = v;
+    }
+  }
+
+  if (aggEntries.length === 0) return { aggEntries, scalarFilter: value };
+  return { aggEntries, scalarFilter: Object.keys(scalarKeys).length > 0 ? scalarKeys : undefined };
+}
+
+/**
+ * Compile a `having` AND / OR / NOT branch. Each condition is a nested
+ * {@link HavingClause}; its own clauses are ANDed (parenthesized when there is
+ * more than one) before being combined. `AND` contributes its parts directly
+ * (the caller ANDs them), mirroring {@link buildWhereClause}'s combinator
+ * shapes so HAVING and WHERE read the same way.
+ */
+function buildHavingCombinator<T extends object>(
+  qi: BuilderCtx,
+  key: 'AND' | 'OR' | 'NOT',
+  value: unknown,
   params: unknown[],
+  jsonAggExprs?: Map<string, string>,
+  groupKeys?: Map<string, HavingGroupKey>,
 ): string[] {
-  // Bare number → equality.
-  if (typeof filter === 'number') {
+  const conditions = Array.isArray(value) ? value : [value];
+  const parts: string[] = [];
+  for (const condition of conditions) {
+    if (!isUnmatchedPlainObject(condition)) {
+      throw new ValidationError(
+        `[turbine] Invalid having "${key}" on table "${qi.table}": expected ` +
+          `${key === 'OR' ? 'an array of having objects' : 'a having object (or an array of them)'}.`,
+      );
+    }
+    const sub = buildHavingClauses(qi, condition as HavingClause<T>, params, jsonAggExprs, groupKeys);
+    if (sub.length === 0) continue;
+    parts.push(sub.length === 1 ? sub[0]! : `(${sub.join(' AND ')})`);
+  }
+  if (parts.length === 0) return [];
+  if (key === 'AND') return parts;
+  if (key === 'OR') return [`(${parts.join(' OR ')})`];
+  return [`NOT (${parts.join(' AND ')})`];
+}
+
+/**
+ * Compile a SCALAR `having` filter: a predicate on the GROUPED value itself,
+ * as Prisma's groupBy allows (`having: { typeId: { not: null } }` →
+ * `HAVING "type_id" IS NOT NULL`).
+ *
+ * Placement is always HAVING, never WHERE. For a group key the two are
+ * result-equivalent (the value is constant within the group), but a scalar
+ * predicate ORed with an aggregate one is only expressible in HAVING, so one
+ * placement covers every shape and matches Prisma's emitted SQL.
+ *
+ * The field MUST be one of the `by` group keys: a predicate on any other
+ * column cannot appear in HAVING (Postgres answers "column must appear in the
+ * GROUP BY clause"), so it throws {@link ValidationError} E003 pointing at
+ * `where` / `by` / an aggregate filter instead of emitting invalid SQL.
+ *
+ * A plain by-column routes through the shared WHERE compiler
+ * ({@link whereMod.buildScalarClause}), so the operator set, enum casts, LIKE
+ * escaping, `mode: 'insensitive'`, and the dialect IN-clause form are
+ * inherited rather than reimplemented. A JSON-path group key compiles against
+ * its re-emitted extract expression.
+ */
+function buildHavingScalarClauses(
+  qi: BuilderCtx,
+  field: string,
+  value: unknown,
+  params: unknown[],
+  groupKeys: Map<string, HavingGroupKey> | undefined,
+): string[] {
+  const ref = groupKeys?.get(field);
+  if (!ref) {
+    const known = groupKeys ? [...groupKeys.keys()] : [];
+    throw new ValidationError(
+      `[turbine] having on "${field}" (table "${qi.table}") filters the grouped value itself, but ` +
+        `"${field}" is not one of the \`by\` group keys [${known.join(', ') || 'none'}]. A predicate on a ` +
+        'non-grouped column cannot go in HAVING: move it to `where` (it filters rows, not groups), add ' +
+        `"${field}" to \`by\`, or filter an aggregate of it instead (e.g. { ${field}: { _count: { gt: 0 } } }).`,
+    );
+  }
+
+  const clauses: string[] = [];
+  if (ref.kind === 'column') {
+    whereMod.buildScalarClause(qi, ref.field, value, params, clauses);
+    return clauses;
+  }
+
+  // JSON-path group key: the extract expression IS the group key, so it can
+  // carry a predicate in HAVING. It is not a column, so the column-typed
+  // surface (enum casts, temporal rewrites, column references) does not apply.
+  if (value === null) {
+    clauses.push(`${ref.expr} IS NULL`);
+  } else if (isWhereOperator(value)) {
+    clauses.push(...whereMod.buildOperatorClauses(qi, ref.expr, value, params));
+  } else if (isUnmatchedPlainObject(value)) {
+    throw new ValidationError(
+      `[turbine] Unknown operator${Object.keys(value as object).length > 1 ? 's' : ''} ` +
+        `${Object.keys(value as object)
+          .map((k) => `"${k}"`)
+          .join(', ')} on ${ref.label} in having for table "${qi.table}".`,
+    );
+  } else {
+    params.push(value);
+    clauses.push(`${ref.expr} = ${qi.p(params.length)}`);
+  }
+  return clauses;
+}
+
+/**
+ * Convert a single having aggregate filter into one or more parameterized SQL
+ * comparisons against the given aggregate expression. A bare value is
+ * shorthand for equality. Operands are not numeric-only: `_min` / `_max`
+ * return a stored cell, so `MIN("title") > 'm'` is as valid as
+ * `SUM("views") > 10`. Unknown operator keys throw {@link ValidationError}.
+ */
+export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: unknown, params: unknown[]): string[] {
+  if (filter === null) {
+    throw new ValidationError(
+      `[turbine] Invalid having filter on "${expr}" for table "${qi.table}": expected a value or operator object.`,
+    );
+  }
+
+  // Bare value (number, string, boolean, Date, …) → equality.
+  if (typeof filter !== 'object' || filter instanceof Date) {
     params.push(filter);
     return [`${expr} = ${qi.p(params.length)}`];
   }
 
-  if (typeof filter !== 'object' || filter === null) {
-    throw new ValidationError(
-      `[turbine] Invalid having filter on "${expr}" for table "${qi.table}": expected a number or operator object.`,
-    );
-  }
-
-  const op = filter as HavingNumericOperator;
+  const op = filter as HavingComparisonOperator<unknown>;
   const allowedKeys = new Set(['equals', 'not', 'gt', 'gte', 'lt', 'lte', 'in', 'notIn']);
   for (const k of Object.keys(op)) {
     if (!allowedKeys.has(k)) {

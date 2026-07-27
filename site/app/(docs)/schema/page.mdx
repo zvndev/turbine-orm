@@ -398,12 +398,17 @@ Why UTC and not the process's local zone: it is what Prisma does with a `DateTim
 
 The coercion runs on every write path (`create`, `createMany`, `upsert`, and the `update` `set` clause), on the cached-template path as well as the first build. Widening the input type is the only type change, so existing code still compiles.
 
-<Callout type="warning" title="Reads still take a string">
-  This is a write-path coercion only. A `Date` in a `where`, `orderBy`, or
-  `having` clause on a `time` / `timetz` column is **not** narrowed: it is bound
-  as a full timestamp and Postgres rejects it (`22007 invalid input syntax for
-  type time`). Compare with a string there: `where: { startsAt: { gte:
-  '09:00:00' } }`.
+<Callout type="warning" title="One place still takes a string: aggregate `having`">
+  A `Date` compared against a `time` / `timetz` column is narrowed the same way
+  in a `where` clause (`WHERE "starts_at" >= $1` binds `'09:00:00'`), including
+  the `findUnique` equality fast path since v0.53, and in a scalar `having`
+  predicate on a `groupBy` group key.
+
+  It is **not** narrowed inside an *aggregate* `having` filter
+  (`having: { startsAt: { _min: { gte: someDate } } }`). That operand is compared
+  against `MIN("starts_at")`, not against the column, and it is bound as a full
+  timestamp, which Postgres rejects with `22007 invalid input syntax for type
+  time`. Pass a string there: `{ _min: { gte: '09:00:00' } }`.
 </Callout>
 
 ## See also

@@ -5,7 +5,7 @@
  */
 
 import pg from 'pg';
-import { localDateTimeKind, timeOfDayKind } from '../schema.js';
+import { camelToSnake, localDateTimeKind, timeOfDayKind } from '../schema.js';
 
 // ---------------------------------------------------------------------------
 // Identifier quoting, prevents SQL injection via table/column names
@@ -35,6 +35,45 @@ export function quoteIdent(name: string): string {
  */
 export function ownLookup<T>(map: Record<string, T>, key: string): T | undefined {
   return Object.hasOwn(map, key) ? map[key] : undefined;
+}
+
+/** The metadata a key needs to be resolved to a column. `TableMetadata` fits. */
+export interface ColumnNameSource {
+  columnMap: Record<string, string>;
+  reverseColumnMap?: Record<string, string>;
+  allColumns?: string[];
+}
+
+/**
+ * Resolve a user-supplied key to its unquoted column name, or `undefined` when
+ * the key names no column on the table.
+ *
+ * THE key-resolution rule, in one place. `QueryInterface.toColumn` is this
+ * function plus the E003 throw, so every SQL builder resolves keys through it,
+ * and the value-side passes (write coercion, the `updatedAt` injector, the
+ * nested-write foreign-key merge) call it directly rather than re-deriving the
+ * rule. They used to read `columnMap` alone, which knows only the FIELD
+ * spelling, so a key spelled as the snake_case COLUMN, which the SQL builders
+ * accept and which is the natural spelling on an introspected schema, produced
+ * correct SQL with an unprocessed value: byte-identical statement, silently
+ * different bound param.
+ *
+ * The rule: the field map first, else `camelToSnake(key)` accepted ONLY when
+ * that name is a real column. `camelToSnake` is idempotent on an already-snake
+ * string, which is what makes the column spelling legal; arbitrary strings
+ * still fail to resolve, so identifier validation is unchanged.
+ *
+ * Prototype-safe: both maps are plain objects, so a key like "constructor" or
+ * "__proto__" would otherwise return an inherited member and pass for a column
+ * name (see {@link ownLookup}).
+ */
+export function resolveColumnName(meta: ColumnNameSource, key: string): string | undefined {
+  const mapped = ownLookup(meta.columnMap, key);
+  if (mapped) return mapped;
+  const snake = camelToSnake(key);
+  if (meta.reverseColumnMap && ownLookup(meta.reverseColumnMap, snake)) return snake;
+  if (meta.allColumns?.includes(snake)) return snake;
+  return undefined;
 }
 
 /**

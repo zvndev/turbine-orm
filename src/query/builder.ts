@@ -23,7 +23,7 @@ import {
   type NestedWriteContext,
 } from '../nested-write.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
-import { camelToSnake, normalizeKeyColumns, snakeToCamel } from '../schema.js';
+import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import * as aggMod from './aggregates.js';
 import {
   type BatchedChildReader,
@@ -80,6 +80,7 @@ import {
   LRUCache,
   ownLookup,
   parseDbDate,
+  resolveColumnName,
   type SqlCacheEntry,
   sqlToPreparedName,
   unknownFieldMessage,
@@ -780,12 +781,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     console.warn(
       `[turbine] table "${this.table}": no database type in metadata for column(s) ${named}${rest} (neither the ` +
         "column entry's `dialectType`/`pgType` nor the table-level `dialectTypes`/`pgTypes` map). Turbine cannot " +
-        'tell which of them are zone-less, so a `Date` written to one is bound by the driver as-is: right for ' +
-        "`timestamptz`, but a zone-less `date`/`timestamp` column then stores the PROCESS's local calendar fields " +
-        'rather than UTC (silently, since the read path shifts back by the same offset), and a `time`/`timetz` ' +
-        'column rejects the value outright (`22007 invalid input syntax for type time`). Columns whose type IS ' +
-        'resolved, every `timestamptz` among them, are unaffected. Regenerate the metadata with ' +
-        '`npx turbine generate`, or set the column types in your `defineSchema` definition.',
+        'tell which of them are zone-less, so it skips the UTC bind rewrite and a `Date` goes to the driver ' +
+        "as-is: right for `timestamptz`, but a zone-less `date`/`timestamp` then stores the PROCESS's local " +
+        'calendar fields rather than UTC (silently, since the read path shifts back by the same offset), and a ' +
+        '`time`/`timetz` column rejects the value outright (`22007 invalid input syntax for type time`). ' +
+        'Columns whose type IS resolved, every `timestamptz` among them, are unaffected. Fix: regenerate with ' +
+        '`npx turbine generate`, or set the column types in `defineSchema`.',
     );
   }
 
@@ -1401,7 +1402,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return split;
   }
 
-  /** Dev-only once-per-relation note that `'auto'` engaged the batched fallback. */
+  /**
+   * Dev-only once-per-relation note that `'auto'` engaged the batched fallback.
+   *
+   * Both lines follow the same four parts: the CONDITION that tripped the rule,
+   * the MECHANISM (which plan shape was replaced by which, and what that costs),
+   * the fix, and the escape hatch. Naming only the condition is what lets a
+   * reader build a wrong model of the mechanism and read a correct optimization
+   * as a bug, so the mechanism sentence is not optional.
+   */
   private emitAutoNotes(engaged: AutoEngaged[]): void {
     if (process.env.NODE_ENV === 'production') return;
     for (const e of engaged) {
@@ -1409,24 +1418,32 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (e.reason === 'to-one-cardinality') {
         console.warn(
           `[turbine] auto strategy: to-one relation "${e.relation}" on "${this.table}" loads batched ` +
-            `(the query is unbounded or its limit exceeds ${this.autoToOneThreshold()} rows, and a correlated ` +
-            'to-one subquery is re-evaluated per parent row). Bound the query with a smaller `limit`, tune ' +
-            "`autoToOneJoinMaxRows`, or set `relationLoadStrategy: 'join'` to force the single-statement plan.",
+            `(the query is unbounded or its limit exceeds ${this.autoToOneThreshold()} rows). On the join plan ` +
+            'a to-one relation is a correlated subquery the engine re-evaluates once per parent row, a per-row ' +
+            'cost that stands even on a unique index; batched replaces it with ONE follow-up statement ' +
+            '(`key = ANY(...)` for the whole page), so it trades that per-row cost for a single extra round ' +
+            'trip. Bound the query with a smaller `limit`, tune `autoToOneJoinMaxRows` (the break-even is ' +
+            "round-trip time / per-row cost), or set `relationLoadStrategy: 'join'` to force the " +
+            'single-statement plan.',
         );
         continue;
       }
       const probe = e.miss
         ? `probe "${e.miss.table}"(${e.miss.columns.join(', ')}) has no covering index`
         : 'a probe in its subtree has no covering index';
-      // The `_count` case is the one people read as a needless demotion, because
-      // the follow-up statement is a grouped COUNT and the inline form looks
-      // like it would be one too. It is not: state the shape it replaced.
+      const child = e.miss?.table ?? 'the child table';
+      // Say which shape was replaced, not just the condition. The `_count` case
+      // is the one people read as a needless demotion, because the follow-up
+      // statement is a grouped COUNT and the inline form looks like it would be
+      // one too. It is not.
       const why =
         e.relation === '_count'
           ? ' The inline form is one correlated COUNT(*) re-evaluated per parent row, so on an unindexed ' +
-            `probe it is one full scan of "${e.miss?.table ?? 'the child table'}" per parent row; the ` +
-            'follow-up is one grouped scan for the whole page.'
-          : '';
+            `probe it is one full scan of "${child}" per parent row; the follow-up is one grouped scan for ` +
+            'the whole page.'
+          : ' On the join plan that relation is a correlated subquery re-evaluated once per parent row, so an ' +
+            `unindexed probe is one full scan of "${child}" per parent row; the batched follow-up scans it ` +
+            'once for the whole page.';
       console.warn(
         `[turbine] auto strategy: relation "${e.relation}" on "${this.table}" loads batched (${probe}).${why} ` +
           "Create the covering index (or set `relationLoadStrategy: 'join'` to force the single-statement " +
@@ -2045,12 +2062,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return v !== null && !isWhereOperator(v) && !ownLookup(this.tableMeta.relations, k);
       });
 
-    // Simple path: plain equality, no operators/null/OR
+    // Simple path: plain equality, no operators/null/OR.
+    //
+    // This path pushes its own params instead of going through
+    // `buildWhereClause`, so every VALUE transform the general walker applies
+    // has to be mirrored here or the two paths disagree on the same predicate.
+    // `coerceWhereOperand` is the one that matters: without it a `Date` keyed on
+    // a zone-less `date`/`timestamp`/`time` column binds raw, and a row that
+    // `findFirst` matches, `findUnique` silently misses. It is a value-only
+    // transform, so the emitted SQL and the cache key are untouched.
     if (!args.with && isSimpleWhere) {
+      const coerce = (k: string, v: unknown): unknown =>
+        whereMod.coerceWhereOperand(this.ctx, this.tableMeta, this.toColumn(k), v);
       const buildSql = (freshParams: unknown[]): string => {
         const qt = this.q(this.table);
         const whereClauses = whereKeys.map((k, i) => {
-          freshParams.push(whereObj[k]);
+          freshParams.push(coerce(k, whereObj[k]));
           return `${this.toSqlColumn(k)} = ${this.p(i + 1)}`;
         });
         const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
@@ -2059,9 +2086,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       };
       const entry = this.acquireSql(ck, buildSql);
 
-      // Collect params (same order as build)
+      // Collect params (same order and same coercion as build)
       for (const k of whereKeys) {
-        params.push(whereObj[k]);
+        params.push(coerce(k, whereObj[k]));
       }
       this.crossCheckCache('findUnique', ck, entry, buildSql, params);
 
@@ -2163,8 +2190,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const depth = this.measureWithDepth(args.with as WithClause);
         if (depth > 5 && shouldWarnOnce(WARN_NS.deepWith, this.table)) {
           console.warn(
-            `[turbine] Deep with clause (depth ${depth}) on "${this.tableMeta.name}", ` +
-              'consider splitting into separate queries for better performance.',
+            `[turbine] Deep with clause (depth ${depth}) on "${this.tableMeta.name}": every level is a ` +
+              'correlated subquery the engine re-evaluates once per row of the level above, so the work ' +
+              'multiplies down the tree and the whole subtree is built as JSON inside each parent row. Split ' +
+              "into separate queries, or use `relationLoadStrategy: 'batched'` (one flat statement per " +
+              'relation, no per-parent re-evaluation). Dev-only: silent under `NODE_ENV=production`.',
           );
         }
       }
@@ -2283,8 +2313,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (this.warnedTables.has(this.table)) return;
     this.warnedTables.add(this.table);
     console.warn(
-      `[turbine] warning: findMany on "${this.table}" has no limit: this will fetch every row. ` +
-        'Pass `limit`, or silence with `warnOnUnlimited: false` (per call, per table, or in config).',
+      `[turbine] warning: findMany on "${this.table}" has no limit: the statement is emitted with no row limit, ` +
+        'so the engine returns every matching row and the driver materializes all of them as objects before ' +
+        'this call resolves (the cost grows with the table, not with the rows you use). Pass `limit`/`take`, ' +
+        'or set `defaultLimit` in the client config; silence with `warnOnUnlimited: false` (per call, per ' +
+        'table, or in config).',
     );
   }
 
@@ -3334,27 +3367,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
     );
   }
 
-  /** Convert camelCase field name to snake_case column name (unquoted, for non-SQL uses) */
+  /**
+   * Convert a field name to its snake_case column name (unquoted, for non-SQL
+   * uses), throwing E003 when the key names no column.
+   *
+   * The resolution rule itself lives in {@link resolveColumnName} (query/utils.ts)
+   * so the value-side passes that must NOT throw, write coercion above all, can
+   * share it instead of re-deriving it. Accepting `camelToSnake(field)` only
+   * when it is a real column preserves the convenience of writing `userId` when
+   * the schema exposes `user_id` under an unusual field name (and of writing the
+   * column name outright), while rejecting arbitrary strings, closing the
+   * defense-in-depth gap for SQL injection and catching typos like
+   * `where: { emial: 'x' }` with a clear error instead of a cryptic Postgres
+   * "column does not exist".
+   */
   private toColumn(field: string): string {
-    // Prototype-safe lookup: a plain-object `columnMap` would otherwise return
-    // an inherited member (e.g. Object.prototype.constructor) for a field named
-    // "constructor" / "toString" / "__proto__", bypassing the unknown-field
-    // check below and returning a non-string as the column name.
-    const mapped = ownLookup(this.tableMeta.columnMap, field);
-    if (mapped) return mapped;
-    // Fall back to camelToSnake ONLY if that snake_cased name also exists as a
-    // real column on the table. This preserves the convenience of writing
-    // `userId` when the schema exposes `user_id` under an unusual field name,
-    // but rejects arbitrary strings, closing the defense-in-depth gap for
-    // SQL injection and catching typos like `where: { emial: 'x' }` with a
-    // clear error instead of a cryptic Postgres "column does not exist".
-    const snake = camelToSnake(field);
-    if (this.tableMeta.reverseColumnMap && ownLookup(this.tableMeta.reverseColumnMap, snake)) {
-      return snake;
-    }
-    if (this.tableMeta.allColumns?.includes(snake)) {
-      return snake;
-    }
+    const column = resolveColumnName(this.tableMeta, field);
+    if (column) return column;
     throw new ValidationError(unknownFieldMessage(this.table, field, this.tableMeta));
   }
 

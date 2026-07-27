@@ -25,12 +25,23 @@ src/
   query/           , The heart, split into submodules:
     types.ts       , All public query arg types (~785 LOC): WhereClause, WithClause,
                       FindManyArgs, RelationDescriptor, WithResult, UpdateOperatorInput,
-                      AggregateArgs, JsonFilter, ArrayFilter, HavingClause (groupBy
-                      aggregate filtering), VectorFilter/VectorOrderBy (pgvector distance
-                      ops), etc.
+                      AggregateArgs, JsonFilter, ArrayFilter, HavingClause /
+                      HavingFieldFilter (0.53: a groupBy `having` field entry is
+                      `(HavingAggregateFilter & WhereOperator) | WhereValue`, so an
+                      aggregate filter AND a scalar filter on the grouped value can
+                      share one object; plus AND/OR/NOT at any depth. _min/_max
+                      operands are the column's own type, not numeric-only),
+                      VectorFilter/VectorOrderBy (pgvector distance ops), etc.
     utils.ts       , Pure utility functions (~130 LOC): quoteIdent(), escapeLike(),
                       LRUCache (1K entry cap), fnv1a64Hex(), sqlToPreparedName(),
-                      OPERATOR_KEYS constant.
+                      OPERATOR_KEYS constant, resolveColumnName() (0.53: THE
+                      key->column rule in one place, field map first then
+                      camelToSnake validated against the reverse map/allColumns.
+                      `toColumn` is it plus the E003 throw, and the value-side
+                      passes (write coercion, updatedAt injector, nested-write FK
+                      merge) call it directly; they used to read columnMap alone, so
+                      a snake_case COLUMN key produced identical SQL with an
+                      uncoerced value).
     filters.ts     , Where-filter type guards + shape fingerprints (isWhereOperator,
                       isJsonFilter/isArrayFilter/isVectorFilter, sortedKeys/sortedEntries,
                       normalizeOrderBy). Kept out of builder.ts so the class stays about
@@ -74,10 +85,24 @@ src/
                       the client-level global-filter helpers. Owns the `BuilderCtx`
                       interface. Depends on nothing else in query/ (relation filters build
                       EXISTS inline), so it is the base module the others build on.
-    aggregates.ts   - buildAggregate + buildGroupBy and helpers (~760 LOC): HAVING clauses,
+    aggregates.ts   - buildAggregate + buildGroupBy and helpers (~900 LOC): HAVING clauses,
                       groupBy ordering, DISTINCT-ON sources, JSON-path aggregate targets.
                       Reuses where.ts for WHERE compilation; shared orderBy / row-parse
-                      primitives stay class-resident via the ctx.
+                      primitives stay class-resident via the ctx. HAVING (0.53) is
+                      three pieces around buildHavingClauses: splitHavingField
+                      partitions one field entry into aggregate keys (the fixed
+                      HAVING_AGGREGATE_FNS map; an unknown `_`-prefixed key is a
+                      misspelled aggregate → E003) and scalar operator keys;
+                      buildHavingScalarClauses compiles the scalar half against the
+                      `havingGroupKeys` map buildGroupBy fills while walking `by`
+                      (HavingGroupKey = {kind:'column', field} → whereMod.
+                      buildScalarClause, so the whole WHERE operator surface is
+                      inherited, or {kind:'expr'} → the JSON group key's re-emitted
+                      parenthesized extract), and a field that is NOT a `by` key
+                      throws E003 rather than emitting SQL the engine rejects;
+                      buildHavingCombinator does AND/OR/NOT recursively, mirroring
+                      buildWhereClause's shapes. buildHavingNumericClauses is
+                      operand-type-agnostic now (equals/not/gt/gte/lt/lte/in/notIn).
     writes.ts       - Mutation SQL builders (~750 LOC): create / createMany / update /
                       delete / upsert / updateMany / deleteMany plus the write-projection
                       helpers (writeReturningColumns / writeReselectSelection / parseWriteRow,
@@ -109,7 +134,15 @@ src/
     warn-registry.ts, Process-wide once-only dev-warn registry (0.41) keyed on a
                       globalThis Symbol.for('turbine.warnOnce.registry') so multi-instance
                       and dual-package (ESM+CJS) setups never double-warn; WARN_ONCE_CAP=500.
-                      Namespaces: FK-advisor notes, deep-with, 'auto' strategy engagement.
+                      Namespaces: FK-advisor notes, deep-with, 'auto' strategy engagement,
+                      unordered-page, PowDB link DDL skips, 'flatten' fallbacks, and
+                      unknownConfigKey (0.53: client.ts warnUnknownConfigKeys checks every
+                      key on the config object against TURBINE_CONFIG_KEYS and warns once
+                      per key name outside production, with suggestConfigKey's correction,
+                      closestName first then a camel-word-subsequence pass so `logParams`
+                      still suggests `logQueryParams`; `url`/`schema`/queryInterfaceFactory
+                      are exempt, and the whole check is try/caught so a diagnostic can
+                      never fail a constructor).
 
     index.ts       , Barrel re-export (~65 LOC). All imports use `./query/index.js`.
 
@@ -447,7 +480,7 @@ src/
                       Hyperdrive, etc.). Pure TypeScript shim, no extra runtime deps.
                       Published as the `turbine-orm/serverless` subpath export.
 
-  prisma-compat.ts , `turbine-orm/prisma-compat` subpath (0.41, ~1.5K LOC): typed
+  prisma-compat.ts , `turbine-orm/prisma-compat` subpath (0.41, ~2.3K LOC): typed
                       PrismaClient-surface adapter over TurbineClient, driven by the
                       PrismaCompatMap that `turbine migrate-from-prisma` emits. Model
                       delegates under BOTH the Prisma model name (compat.User) and
@@ -458,8 +491,26 @@ src/
                       reshaping, to-one array→object|null. $transaction in callback AND
                       lazy-array-batching forms, $queryRaw/$executeRaw (+Unsafe) with
                       Prisma.sql-style fragments, createMany skipDuplicates → core
-                      ON CONFLICT DO NOTHING (E017 on mssql/powdb). Pure shim: zero new
-                      deps, never imported by core.
+                      ON CONFLICT DO NOTHING (E017 on mssql/powdb). $extends (0.53):
+                      the `client` + `model` components only, object form AND the
+                      Prisma.defineExtension callback form (`$extends(fn)` IS
+                      `fn(client)`). applyExtension folds a validated extension into a
+                      NEW immutable ExtensionState and `build(exts)` reassembles a whole
+                      new client by the same path, so extending is chainable and the
+                      tx-scoped delegates get the same `model` members (client members
+                      deliberately do NOT: they usually close over the base client, so
+                      reaching one through `tx` would run outside the txn). extendDelegate
+                      returns the SAME delegate object when an extension contributes
+                      nothing to it (zero query-path cost) and otherwise Object.assign's
+                      onto a shallow copy carrying `$name`. `query`/`result` are typed
+                      `never` AND throw E017 at $extends time with the alternative
+                      (`client.$use` / compute in app code or a generated column;
+                      `result` cannot be layered on the PII projection rules); any
+                      unrecognized component (Accelerate/Pulse/replicas) throws by name.
+                      A `client` member shadowing a delegate or CLIENT_RESERVED_KEYS, or a
+                      `model` key naming no model, throws E003. `Prisma.getExtensionContext`
+                      is the identity function; `$name` is runtime-only, not on the type.
+                      Pure shim: zero new deps, never imported by core.
 
   typed-sql.ts     , Typed raw SQL escape hatch (Turbine's TypedSQL). buildTypedSql()
                       turns a tagged template into a parameterized (sql, params) pair -

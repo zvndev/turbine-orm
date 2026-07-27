@@ -102,6 +102,13 @@ export const WARN_NS = {
   /** PowDB `emitLinks` DDL skips (name/column collision, endpoint drift). */
   powdbLinks: 'powdbLinks',
   /**
+   * A key on the object passed as `TurbineConfig` that is not part of the
+   * config surface (client.ts `warnUnknownConfigKeys`). Keyed on the unknown
+   * key name, so a process that builds many clients from the same misspelled
+   * config says it once.
+   */
+  unknownConfigKey: 'unknownConfigKey',
+  /**
    * `relationLoadStrategy: 'flatten'` was asked for but a relation stayed on the
    * correlated-subquery path (relations.ts `planFlattenWith`, builder.ts
    * `planFlatten`). An explicitly requested strategy that quietly does not
