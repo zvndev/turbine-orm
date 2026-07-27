@@ -446,6 +446,7 @@ export const mysqlDialect: Dialect = {
   // MySQL 8.0.14+ supports LATERAL, but the opt-in lateral pick plan stays
   // Postgres-only in this release (flipping it on is a one-line change + tests).
   supportsLateralJoin: false,
+  supportsPlanCacheMode: false,
   // GET_LOCK / RELEASE_LOCK exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // Plain `EXPLAIN` (one row of tabular plan columns) works on every supported

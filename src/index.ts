@@ -44,6 +44,7 @@ export {
   type PgCompatPool,
   type PgCompatPoolClient,
   type PgCompatQueryResult,
+  type PlanCacheMode,
   type RetryOptions,
   TransactionClient,
   type TransactionOptions,

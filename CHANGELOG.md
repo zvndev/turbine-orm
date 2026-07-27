@@ -1,5 +1,147 @@
 # Changelog
 
+## 0.54.0 (2026-07-27)
+
+### Breaking
+
+- **Postgres `date` columns now read back at UTC midnight, not the process's
+  local midnight.** A `date` is a calendar day with no time zone, but the pg
+  driver's default parser builds the JS `Date` from the process's LOCAL zone,
+  so the stored day `2026-07-21` came back as `2026-07-20T22:00:00Z` in
+  `Europe/Berlin` and `2026-07-20T15:00:00Z` in `Asia/Tokyo`: the wrong calendar
+  day everywhere east of UTC. West of UTC the calendar day happened to be right,
+  which is why this survived so long. The write side already rendered a bound
+  `Date` from its UTC components, so the two halves disagreed, and east of UTC
+  every read-modify-write cycle on a `date` column moved the STORED day one day
+  earlier and kept going. Turbine now registers a UTC parser for OID 1082 under
+  the existing `utcTimestamps` flag, alongside the `timestamp` (1114) parser it
+  has always registered, and `infinity` / `-infinity` / BC dates / five-digit
+  years keep the driver's own values.
+
+  What changes for you: the calendar day is unchanged in a UTC-rendered form,
+  but the EPOCH VALUE moves by your process's UTC offset. `getTime()`,
+  `toISOString()` and `JSON.stringify(row)` change, so API payloads, exports and
+  golden-file tests containing a `date` column change text. Code that reads
+  LOCAL components off a `date` (`toLocaleDateString()`, `date-fns`/`dayjs`
+  `format('yyyy-MM-dd')`) was correct by accident west of UTC and now reads the
+  previous evening: format in UTC instead (`toISOString().slice(0, 10)`).
+  Nothing stored in the database changes, no emitted SQL changes, and a process
+  running in UTC is byte-identical. Opt out with `utcTimestamps: false`, which
+  also reverts the write half.
+
+  Scope: `pg.types.setTypeParser` is process-global, so constructing a
+  TurbineClient on a Turbine-owned pool changes `date`, `date[]` and
+  `timestamp[]` parsing for EVERY consumer of the same `pg` module in that
+  process, including a second ORM, a query builder, or your own hand-written
+  `pool.query` reporting code. That was already true of `timestamp` (OID 1114)
+  and `int8`; this release widens the set to OIDs 1114, 1082, 1115 and 1182.
+  Clients on an EXTERNAL pool never TRIGGER registration and a process
+  containing only external-pool clients is untouched, but they read through the
+  parsers an owned client installed, so they are not exempt from the effect. For
+  that reason the `utcTimestamps` agreement check (which refuses a second client
+  asking for the opposite value) now covers external-pool clients too: an
+  external-pool client with `utcTimestamps: false` next to an owned client
+  reading UTC would write local `date` literals and read UTC ones, which is the
+  read-modify-write drift described above. That pairing now throws
+  `ValidationError` (E003) at construction instead of corrupting stored days.
+
+  Cross-engine, this REMOVES a divergence rather than creating one: SQLite,
+  MySQL, SQL Server and PowDB already returned UTC midnight for a `date`
+  column. Postgres was the outlier.
+
+- **`date[]` and `timestamp[]` now agree with their scalar forms.** Postgres
+  array OIDs do not inherit their element type's parser, so `timestamp[]` (OID
+  1115) has been returning local-zone Dates ever since the scalar `timestamp`
+  parser shipped, disagreeing with the `timestamp` column next to it in the same
+  row. Both array OIDs (1115 and 1182) are now registered alongside their
+  scalars, so scalar and array can no longer settle on different
+  interpretations.
+
+### Fixed
+
+- **`infinity` / `-infinity` in a `timestamp` or `date` column no longer reads
+  as an `Invalid Date`.** There were two independent bugs here, one behind the
+  other, and fixing only the first would have changed nothing an ORM caller
+  could see.
+
+  At the driver level, the OID 1114 parser built its Date from the wire text
+  directly, so `'infinity'` became `'infinityZ'` and then an `Invalid Date`. It
+  now delegates every shape that is not a plain `YYYY-MM-DD HH:MM:SS[.ffffff]`
+  to the driver's own parser, the way the new `date` parser already did, and
+  keeps the driver's `Infinity` / `-Infinity`. Same for the new `timestamp[]`
+  parser, which would otherwise have taken the defect to arrays as well. BC
+  timestamps and five-digit years, which are not ISO-8601 parseable either, now
+  come back as Dates rather than `Invalid Date`.
+
+  Above it, `parseRow` re-coerced any non-`Date`, non-array value on a
+  date-typed column, so it took the driver's number `Infinity` and ran
+  `parseDbDate(String(Infinity))` = `parseDbDate('Infinity')`, reintroducing the
+  Invalid Date on every scalar read path (top-level, join relations and batched
+  relations alike). Arrays escaped only because they took an earlier branch,
+  which is why the array form looked correct while every scalar read was not.
+  Both halves are fixed, and the regression test asserts through `findMany`
+  against a live database rather than through the parser, because a test at the
+  parser seam passes while the ORM is still broken.
+
+- **`turbine studio` renders zone-less `date` / `timestamp` cells the way the
+  application reads them.** Studio builds its own raw pool and never constructs
+  a `TurbineClient`, so it kept the driver's local-zone parsers: east of UTC a
+  `date` cell displayed as the previous evening while the app reading the same
+  row saw UTC midnight, and in `--write` mode that displayed value is what an
+  edit echoes back into the column. It now registers the same UTC parsers, from
+  one shared helper so the registrations cannot drift. `turbine mcp`, which also
+  builds a raw pool and serializes sampled rows, gets the same treatment.
+
+### Added
+
+- **`PlanCacheMode` is exported from the package index**, so the option's type
+  can be named directly instead of through
+  `NonNullable<TurbineConfig['planCacheMode']>`.
+
+- **`planCacheMode` client option** (`'auto' | 'force_custom_plan' |
+  'force_generic_plan'`, Postgres only). PostgreSQL promotes a named prepared
+  statement to a generic plan on its sixth execution, and a generic plan is
+  costed blind to the bound values. A predicate whose selectivity varies wildly
+  per value (the canonical case is a `tenant_id` equality on a shared table,
+  where one value matches a handful of rows and another matches most of them) is
+  then planned for the average value and never reverts, so a sparse tenant can
+  be locked onto a plan chosen for a dense one. `planCacheMode:
+  'force_custom_plan'` pins the backend's choice and removes that cliff.
+
+  Which statements this reaches, measured rather than assumed: `count()` on such
+  a predicate is promoted after five executions and is controlled by the option.
+  `findMany` / `findFirst` bind `LIMIT $n`, and a parameterized limit denies the
+  planner the limit fraction that makes a skewed plan look cheap, so those are
+  much less exposed. Treat it as a targeted remedy for a statement measurably
+  slower after its fifth execution, not a general speed-up.
+
+  Applied as a connection parameter (`options=-c plan_cache_mode=...`) when the
+  pool opens a connection, so it is in force for that connection's first
+  statement and for every checkout, `$transaction`, stream and pipeline on it,
+  and it cannot race the caller's first query. The default is `undefined`, in
+  which case Turbine issues nothing and behaviour is byte-identical to before.
+  The value is a closed enum validated at construction (a GUC value cannot be a
+  bind parameter, so the enum check is the boundary); anything else throws
+  `ValidationError` (E003). Engines whose dialect does not report the new
+  `supportsPlanCacheMode` capability throw `UnsupportedFeatureError` (E017). On
+  an externally supplied pool, where the caller owns connection lifecycle,
+  it is a documented no-op with a dev-mode warning, the same ownership rule the
+  type parsers follow; Turbine-owned string `replicas` on that same client are
+  Turbine's own connections and do get it, which the warning says.
+
+  Two limits worth knowing before you enable it. The capability flag can only
+  speak for the dialect: a Postgres wire-compatible engine driven through the
+  default dialect (CockroachDB, YugabyteDB, a pre-12 PostgreSQL) has no
+  `plan_cache_mode`, and refuses the connection parameter itself with
+  `unrecognized configuration parameter` rather than raising E017. And behind a
+  connection pooler that filters startup parameters (PgBouncer's
+  `ignore_startup_parameters`), set the GUC on the role instead
+  (`ALTER ROLE ... SET plan_cache_mode = ...`). Where the option is unset,
+  nothing is sent and nothing changes. An existing `PGOPTIONS` or a
+  `?options=...` already on the connection string is preserved and appended to,
+  never replaced.
+
+
 ## 0.53.0 (2026-07-27)
 
 The release that finally finds the bug 0.50 and 0.52 both aimed at and missed.

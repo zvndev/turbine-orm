@@ -83,6 +83,12 @@ Turbine closes this per engine: divergent columns are carried through the JSON l
 
 Postgres was fixed in 0.50; the other three in 0.51. If you read a bigint, decimal, or binary column through a relation before then, the values you get back change with the upgrade, to the correct ones.
 
+### Zone-less `date` and `timestamp` agree across engines
+
+A `date` is a calendar day with no zone, so the driver has to pick an instant for it. SQLite, MySQL, SQL Server and PowDB all pick UTC midnight. PostgreSQL's driver picked the process's **local** midnight, so the same stored day came back as a different `Date` per engine and per deployment region: `2026-07-21` read as `2026-07-20T22:00:00.000Z` in `Europe/Berlin` and as `2026-07-20T15:00:00.000Z` in `Asia/Tokyo`, against `2026-07-21T00:00:00.000Z` everywhere else.
+
+Since v0.54 Postgres reads UTC midnight too, under the same `utcTimestamps` flag that already governed `timestamp`, so all five engines agree. This is a **silent behaviour change** for a Postgres app not running in UTC: the calendar day is unchanged, the epoch value moves by your process's UTC offset. See [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc) for what to check before upgrading.
+
 ## How writes return rows
 
 The biggest difference between engines is how a write surfaces the row it affected, Turbine's `resultStrategy` seam handles it so `create` / `update` / `delete` / `upsert` keep returning the full row everywhere:

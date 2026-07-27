@@ -41,7 +41,22 @@ src/
                       passes (write coercion, updatedAt injector, nested-write FK
                       merge) call it directly; they used to read columnMap alone, so
                       a snake_case COLUMN key produced identical SQL with an
-                      uncoerced value).
+                      uncoerced value). Also the zone-less temporal READ parsers
+                      (0.54): `registerUtcTemporalParsers()` is the one place OIDs
+                      1114/1082/1115/1182 get registered (client.ts, cli/studio.ts,
+                      cli/mcp.ts all call it, so the registrations cannot drift),
+                      built from `createUtcTimestampParser(fallback)` /
+                      `createUtcDateParser(fallback)` and `createPgArrayParser(element)`
+                      over pg's arrayParser. Both scalar parsers are regex-driven and
+                      DELEGATE anything not a plain `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` to
+                      the parser they replace (captured via getTypeParser BEFORE
+                      registration), which is what keeps `infinity`/`-infinity` from
+                      becoming an Invalid Date; they assemble via setUTCFullYear so 2-3
+                      digit and 5-digit years and ` BC` are not silently remapped.
+                      `parseUtcTimestampText` stays for known-shape callers only.
+                      pg-types' shipped .d.ts omits array OIDs from its setTypeParser
+                      enum and types arrayParser loosely, so both are retyped locally
+                      (comment says so); no dependency added.
     filters.ts     , Where-filter type guards + shape fingerprints (isWhereOperator,
                       isJsonFilter/isArrayFilter/isVectorFilter, sortedKeys/sortedEntries,
                       normalizeOrderBy). Kept out of builder.ts so the class stays about
@@ -175,9 +190,41 @@ src/
                       proven-unindexed correlation columns, event tag 'auto-batched',
                       composite-key/unknown relations always stay join), `jsonEncoding: 'object' |
                       'positional'` (Postgres-only lean `json_build_array` wire encoding for
-                      `with` subqueries), and `utcTimestamps` (default true, registers the
-                      OID 1114 parser, only for Turbine-owned pools, so offset-less `timestamp`
-                      values parse as UTC; see parseDbDate in query/utils.ts).
+                      `with` subqueries), and `utcTimestamps` (default true; see parseDbDate
+                      in query/utils.ts). 0.54 widened the read half of `utcTimestamps` from
+                      OID 1114 alone to the whole zone-less temporal set, 1114 `timestamp`,
+                      1082 `date`, 1115 `timestamp[]`, 1182 `date[]`, via the shared
+                      `registerUtcTemporalParsers()` in query/utils.ts (cli/studio.ts and
+                      cli/mcp.ts build raw pools and call the SAME helper, so a Studio cell
+                      cannot render a different instant than the app reads). `date` therefore
+                      reads at UTC midnight instead of the process's local midnight: a silent
+                      EPOCH-value change for any process not running in UTC, and the fix for a
+                      read-modify-write loop that walked the stored day backwards east of UTC
+                      (the write half already rendered UTC components). Two statics now, not
+                      one: `utcTimestampParserMode` is settled by EVERY client (external pools
+                      included, since registration is process-global and they read through it,
+                      so they take part in `assertUtcTimestampsAgree`), while
+                      `utcTimestampParsersRegistered` gates the actual registration to
+                      Turbine-OWNED pools. Also `planCacheMode: 'auto' | 'force_custom_plan' |
+                      'force_generic_plan'` (0.54, Postgres-only, unset by default = nothing
+                      emitted): pins the backend's custom-vs-generic plan choice, since PG
+                      promotes a NAMED prepared statement to a value-blind generic plan on its
+                      sixth execution and never reverts, which is wrong for a skewed predicate
+                      (`count()` is the Turbine shape exposed; `findMany`/`findFirst` bind
+                      `LIMIT $n` and are much less so). Applied as the `options=-c
+                      plan_cache_mode=...` CONNECTION PARAMETER via `withPlanCacheMode`, never
+                      a post-checkout `SET` (pg hands the client to the waiting caller in the
+                      same tick it emits 'connect', so a `SET` there races the caller's first
+                      query through pg's deprecated same-client queueing); a `?options=` on
+                      the connection string or `PGOPTIONS` is APPENDED to, never replaced,
+                      because pg's ConnectionParameters lets the URL win. Validated against the
+                      frozen `PLAN_CACHE_MODES` at construction (a GUC value cannot be a bind
+                      param, so the closed enum IS the injection boundary, and the emitted
+                      literal is the matched MEMBER, never the caller's string), gated on the
+                      `supportsPlanCacheMode` dialect flag (E017), owned pools + owned string
+                      `replicas` only (external pool = no-op + one dev warning). ALL config
+                      validation now runs BEFORE any process-global side effect, so a throwing
+                      constructor cannot leave the parser mode settled.
 
   adapters/        , Database adapter layer (~530 LOC) for Postgres-compatible engines.
                       cockroachdb.ts + yugabytedb.ts override the operations with
@@ -203,7 +250,12 @@ src/
                         (`begin/commit/rollback/savepoint/buildSetSessionConfig`).
                       • Capability flags, `supportsReturning`, `supportsVector`,
                         `supportsListenNotify`, `supportsRLS`, `supportsAdvisoryLock`,
-                        `supportsILike`, `aggSupportsInlineOrderBy`, `jsonPathSupport`.
+                        `supportsILike`, `aggSupportsInlineOrderBy`, `jsonPathSupport`,
+                        `supportsPlanCacheMode` (0.54, Postgres true / every other engine
+                        explicitly false since they spread postgresDialect; it speaks for the
+                        DIALECT, not the server, so a wire-compatible engine on
+                        postgresDialect with no `plan_cache_mode` is accepted here and
+                        refuses the connection parameter itself instead of raising E017).
                         Builders/client throw `UnsupportedFeatureError` (E017) when a flag
                         is false instead of emitting broken SQL.
                       • Additive hooks, `wrapJsonSubresult` (SQLite `json(...)`, MSSQL
@@ -606,7 +658,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 **Migration system** (`cli/migrate.ts`): SQL-first migrations stored as timestamp-prefixed `.sql` files with `-- UP` and `-- DOWN` sections. Tracked in a `_turbine_migrations` table with SHA-256 checksums. Uses `pg_try_advisory_lock()` to prevent concurrent migration runs. Each migration runs in its own transaction. Checksum validation detects modified migration files. Destructive statements (both `migrate up`/`down` and, since 0.36, `push`) require a two-step typed confirmation (`destroy my data` then `yes`) or `--allow-destructive`. `migrate create <name> --recipe backfill` (0.36) scaffolds the sanctioned two-phase type-change pattern from the MIGRATION_RECIPES registry (fully commented: nullable add → batched keyed UPDATE → SET NOT NULL → atomic rename swap); `--recipe` without a name errors.
 
-**Studio** (`cli/studio.ts`): Local web UI served over Node's built-in `http` module, no new runtime deps, read-only by default. ORM-native since v0.19: there is NO raw-SQL surface. The Query tab (default) is a visual `findMany` builder; `POST /api/builder` validates every identifier (table/relation/field/orderBy) against the introspected schema and compiles the args with `QueryInterface.buildFindMany` (`sqlCache: false`, all values as `$N` params). Saved queries are builder-kind only, legacy raw-SQL entries are dropped on load with a console notice. Binds `127.0.0.1` by default (warns loudly on non-loopback hosts), authenticates via a random 24-byte hex token (constant-time check on every `/api/*` route), per-session rate limiting (100 req/60s), refuses cross-origin requests, and ships nonce-based CSP + security headers (`script-src 'self' 'nonce-...'`, no unsafe-inline in script-src since 0.36; style-src keeps it; `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`). Every read runs inside `BEGIN READ ONLY` with `SELECT set_config('statement_timeout', $1, true)` (NOT `SET LOCAL ... = $1`, which Postgres rejects, that was the 0.17.0 critical bug) and `set_config('search_path', $1, true)` pinned to the configured `--schema`. **Write mode (0.36, `--write`; bulk since 0.38):** `/api/row/update|insert|delete` POST routes exist ONLY when writable (404 otherwise, deliberately not 403); each rebuilds the predicate from the FULL primary key alone via `extractPkWhere` (extra where keys dropped, operator objects refused, PK-addressed by construction), validates table/columns against metadata, compiles via buildUpdate/buildCreate/buildDelete (`sqlCache: false`), runs in a plain BEGIN txn with the same parameterized timeout + search_path, and requires a matching `Origin` (absent OR mismatched → 403). insert/delete also accept `rows: [...]` (MAX_BULK_ROWS=500): per-row validation up front, one statement per row in ONE all-or-nothing txn (any no-match → ROLLBACK + 404); bulk update refused; predicate-based mutations never exist. Views and PK-less tables refused. Loud startup warning + persistent red WRITE MODE banner. **PII redaction:** PII-tagged cells are redacted SERVER-SIDE ("•• redacted ••") before serialization, table rows, builder rows, nested `with` rows (redactBuilderRows walks the tree against each relation's target table), and the post-write echo; redacted columns are also excluded from the Data-tab ILIKE search OR-set, orderBy, AND the per-column `filters` param (even isNull, null-ness is an oracle too; parseTableFilters 400s). The Data tab's `filters` (JSON array, max 10, ops equals/not/contains/gt/gte/lt/lte/isNull/notNull) compile via a param-counter buildWhere shared with search, engine-aware placeholders. `--show-pii` reveals (terminal warning + persistent PII SHOWN banner). DB-less perimeter tests drive the exported `handleRequest` (src/test/studio-write.test.ts). **Demo mode (0.37, `--demo`):** boots with NO DATABASE_URL against a seeded in-memory store (`cli/studio-demo.ts`: DEMO_SCHEMA users/posts/comments/orgs with pii-tagged email/phone + deterministic seed) backed by the sqlite engine over `node:sqlite` `:memory:` (Node >= 22.5, dynamic import with a clear error). `StudioContext.demo` + `dialect` branch the few PG-isms (pg_class counts → COUNT(*), ILIKE → LOWER LIKE, no BEGIN READ ONLY/set_config/search_path, `:pN` placeholders, `parseDemoRelationRows` re-parses sqlite's JSON-string relation columns); `POST /api/demo/mode` (demo-only, token+Origin gated) flips ctx.writable/ctx.showPii live for the UI's two toggle pills; boots read-only + redacted; each launch pristine, nothing persisted (saved queries too: demo routes them to ctx.memorySavedQueries, never .turbine/studio-queries.json, and never reads the real file). Postgres path byte-identical when off; tests in src/test/studio-demo.test.ts drive the REAL in-memory store through handleRequest. UI is an embedded single-file HTML/CSS/JS (`studio-ui.html`, prebuilt into `studio-ui.generated.ts` by `npm run gen:studio`) with Query / Data / Schema tabs matching the turbineorm.dev dark theme.
+**Studio** (`cli/studio.ts`): Local web UI served over Node's built-in `http` module, no new runtime deps, read-only by default. ORM-native since v0.19: there is NO raw-SQL surface. The Query tab (default) is a visual `findMany` builder; `POST /api/builder` validates every identifier (table/relation/field/orderBy) against the introspected schema and compiles the args with `QueryInterface.buildFindMany` (`sqlCache: false`, all values as `$N` params). Saved queries are builder-kind only, legacy raw-SQL entries are dropped on load with a console notice. Binds `127.0.0.1` by default (warns loudly on non-loopback hosts), authenticates via a random 24-byte hex token (constant-time check on every `/api/*` route), per-session rate limiting (100 req/60s), refuses cross-origin requests, and ships nonce-based CSP + security headers (`script-src 'self' 'nonce-...'`, no unsafe-inline in script-src since 0.36; style-src keeps it; `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`). Every read runs inside `BEGIN READ ONLY` with `SELECT set_config('statement_timeout', $1, true)` (NOT `SET LOCAL ... = $1`, which Postgres rejects, that was the 0.17.0 critical bug) and `set_config('search_path', $1, true)` pinned to the configured `--schema`. **Write mode (0.36, `--write`; bulk since 0.38):** `/api/row/update|insert|delete` POST routes exist ONLY when writable (404 otherwise, deliberately not 403); each rebuilds the predicate from the FULL primary key alone via `extractPkWhere` (extra where keys dropped, operator objects refused, PK-addressed by construction), validates table/columns against metadata, compiles via buildUpdate/buildCreate/buildDelete (`sqlCache: false`), runs in a plain BEGIN txn with the same parameterized timeout + search_path, and requires a matching `Origin` (absent OR mismatched → 403). insert/delete also accept `rows: [...]` (MAX_BULK_ROWS=500): per-row validation up front, one statement per row in ONE all-or-nothing txn (any no-match → ROLLBACK + 404); bulk update refused; predicate-based mutations never exist. Views and PK-less tables refused. Loud startup warning + persistent red WRITE MODE banner. **PII redaction:** PII-tagged cells are redacted SERVER-SIDE ("•• redacted ••") before serialization, table rows, builder rows, nested `with` rows (redactBuilderRows walks the tree against each relation's target table), and the post-write echo; redacted columns are also excluded from the Data-tab ILIKE search OR-set, orderBy, AND the per-column `filters` param (even isNull, null-ness is an oracle too; parseTableFilters 400s). The Data tab's `filters` (JSON array, max 10, ops equals/not/contains/gt/gte/lt/lte/isNull/notNull) compile via a param-counter buildWhere shared with search, engine-aware placeholders. `--show-pii` reveals (terminal warning + persistent PII SHOWN banner). DB-less perimeter tests drive the exported `handleRequest` (src/test/studio-write.test.ts). **Temporal parity (0.54):** Studio builds a RAW pg pool and never constructs a TurbineClient, so it used to keep the driver's local-zone parsers and render a `date` cell as the previous evening east of UTC, which in `--write` is also the value an edit echoes BACK into the column; the Postgres path (never demo, which is sqlite) now calls `registerUtcTemporalParsers()` from query/utils.ts, the same helper client.ts uses. `cli/mcp.ts` does the same for its sampled rows. **Demo mode (0.37, `--demo`):** boots with NO DATABASE_URL against a seeded in-memory store (`cli/studio-demo.ts`: DEMO_SCHEMA users/posts/comments/orgs with pii-tagged email/phone + deterministic seed) backed by the sqlite engine over `node:sqlite` `:memory:` (Node >= 22.5, dynamic import with a clear error). `StudioContext.demo` + `dialect` branch the few PG-isms (pg_class counts → COUNT(*), ILIKE → LOWER LIKE, no BEGIN READ ONLY/set_config/search_path, `:pN` placeholders, `parseDemoRelationRows` re-parses sqlite's JSON-string relation columns); `POST /api/demo/mode` (demo-only, token+Origin gated) flips ctx.writable/ctx.showPii live for the UI's two toggle pills; boots read-only + redacted; each launch pristine, nothing persisted (saved queries too: demo routes them to ctx.memorySavedQueries, never .turbine/studio-queries.json, and never reads the real file). Postgres path byte-identical when off; tests in src/test/studio-demo.test.ts drive the REAL in-memory store through handleRequest. UI is an embedded single-file HTML/CSS/JS (`studio-ui.html`, prebuilt into `studio-ui.generated.ts` by `npm run gen:studio`) with Query / Data / Schema tabs matching the turbineorm.dev dark theme.
 
 **UI module** (`cli/ui.ts`): Terminal formatting helpers, colors, spinners, tables, boxes. Imported throughout CLI but never by library code.
 

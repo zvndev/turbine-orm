@@ -78,6 +78,8 @@ Because the builder speaks ORM args instead of SQL, the server can validate ever
 
 Both tabs go through the same parameterized query path as the builder; reads stay inside `BEGIN READ ONLY` even in write mode.
 
+Zone-less temporal cells render the way your application reads them. Studio builds its own pool rather than a `TurbineClient`, and before v0.54 it kept the pg driver's local-zone parsers, so east of UTC a `date` cell displayed the previous evening while the app reading that same row saw UTC midnight. In `--write` mode the displayed value is also what an edit echoes back into the column, so the mismatch could shift a stored day. Studio now registers the same UTC parsers the client does (`timestamp`, `date` and their array forms), from one shared helper so the two cannot drift. `turbine mcp` gets the same treatment for the rows it samples. See [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc).
+
 ## Write mode (`--write`)
 
 By default there is nothing to opt out of: the write endpoints are not registered, requests to them 404, and every transaction is read-only at the database level. Passing `--write` changes that for a single launch:

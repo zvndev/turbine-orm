@@ -686,7 +686,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // the flag and rewrote binds the caller had opted out of.
       //
       // This half of the flag is PER CLIENT. The read half is not: it is the
-      // pg OID 1114 type parser, which `pg.types.setTypeParser` installs once
+      // pg type parsers for OIDs 1114 / 1082 / 1115 / 1182, which
+      // `pg.types.setTypeParser` installs once
       // per process. Two clients in one process therefore cannot hold
       // different values, and TurbineClient refuses the second one rather than
       // building a client whose writes and reads disagree (see
@@ -3592,11 +3593,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // single Invalid Date, the column was unreadable on every strategy.
         // The join strategy's string arrays are handled upstream instead, by
         // the JSON-wire decode in relations.ts.
+        //
+        // A NUMBER is excluded for the same reason: the driver returns the
+        // JS numbers `Infinity` / `-Infinity` for the Postgres `infinity` /
+        // `-infinity` timestamp values, and re-coercing one ran
+        // `parseDbDate(String(Infinity))` = `parseDbDate('Infinity')`, which
+        // is an Invalid Date that JSON-encodes as null. The array form escaped
+        // this only because it took the branch above.
         if (
           (dateCols.has(col) || camelDateFields.has(field)) &&
           value !== null &&
           !(value instanceof Date) &&
-          !Array.isArray(value)
+          !Array.isArray(value) &&
+          typeof value !== 'number'
         ) {
           // Offset-less strings (Postgres `timestamp`, json_agg output) are
           // pinned to UTC so results don't depend on the server's time zone.

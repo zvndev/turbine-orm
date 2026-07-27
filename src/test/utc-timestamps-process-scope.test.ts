@@ -4,9 +4,11 @@
  * The flag has two halves that live in different places. The WRITE half is per
  * client (a bound `Date` on a zone-less `date` / `timestamp` column is rewritten
  * to a UTC literal, see `coerceWriteValue` in query/writes.ts). The READ half is
- * the pg OID 1114 type parser, and `pg.types.setTypeParser` installs ONE parser
- * per OID for the whole process, so the first Turbine-owned client settles it
- * for every later one.
+ * the pg type parsers for the zone-less temporal OIDs (1114, 1082, 1115, 1182),
+ * and `pg.types.setTypeParser` installs ONE parser per OID for the whole
+ * process, so the first client settles it for every later one. Only a
+ * Turbine-OWNED pool registers the parsers, but every client reads through
+ * them, so every client takes part in the agreement check.
  *
  * Before this guard, a process holding a DEFAULT client and a
  * `utcTimestamps: false` client gave the second one local-time writes and UTC
@@ -20,6 +22,7 @@
 
 import assert from 'node:assert/strict';
 import { afterEach, describe, it } from 'node:test';
+import pg from 'pg';
 import type { PgCompatPool } from '../client.js';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
@@ -97,13 +100,30 @@ describe('utcTimestamps conflicts between clients in one process', () => {
     assert.equal(clients.length, 2);
   });
 
-  it('leaves external-pool clients out of it, in both directions', () => {
-    // Turbine never registers a parser for a pool it does not own (the caller's
-    // driver owns that configuration), so such a client has no read half to
-    // contradict and settles nothing for the clients that follow.
-    make(false, true);
+  it('holds external-pool clients to the same decision', () => {
+    // Turbine never REGISTERS a parser for a pool it does not own (the caller's
+    // driver owns that configuration), but registration is process-global, so
+    // an external-pool client still READS through whatever an owned client
+    // installed. Left out of the check it would write local `date` literals
+    // while reading UTC ones, which walks the stored calendar day backwards one
+    // day per read-modify-write cycle. So it takes part, in both directions.
     make(true, true);
-    make();
-    assert.throws(() => make(false), /conflicts/);
+    assert.throws(() => make(false, true), /utcTimestamps: false conflicts with utcTimestamps: true/);
+    assert.throws(() => make(false), /utcTimestamps: false conflicts with utcTimestamps: true/);
+    assert.doesNotThrow(() => make());
+  });
+
+  it('an external-pool client settles the value for a later owned one', () => {
+    make(false, true);
+    assert.throws(() => make(true), /utcTimestamps: true conflicts with utcTimestamps: false/);
+    assert.doesNotThrow(() => make(false));
+  });
+
+  it('a process holding only external-pool clients still registers nothing', () => {
+    // The check is about agreement; it does not turn an external pool into an
+    // owned one. Asserted on an OID Turbine otherwise never touches.
+    const before = (pg.types.getTypeParser as unknown as (oid: number, f: 'text') => unknown)(1083, 'text');
+    make(true, true);
+    assert.equal((pg.types.getTypeParser as unknown as (oid: number, f: 'text') => unknown)(1083, 'text'), before);
   });
 });

@@ -521,6 +521,106 @@ const db = turbine({
 
 Values are parameterized (`$1, $2, …`) and never fragment the cache, so this bounds distinct query **shapes**. The default is `1000`: raise it for apps with a very large surface of query shapes to lift the hit rate at the cost of memory, or lower it to cap memory. `sqlCacheSize: 0` disables caching entirely (identical to `sqlCache: false`).
 
+## The generic-plan cliff: `planCacheMode`
+
+This one is not about relations, but it has the same shape as the strategy rules above: a condition you can state, a mechanism that explains it, a fix, and an escape hatch. It is also the tuning knob people reach for last, because the symptom looks like nothing you did.
+
+### The condition
+
+A query is fast the first few times you run it and then, with no deploy, no data change and no different arguments, becomes **orders of magnitude slower and stays that way** for the life of the connection. Restarting the process fixes it until it happens again. It typically shows up on one tenant, one customer or one account, while the same endpoint stays fast for everyone else.
+
+You are exposed when all of these hold:
+
+- You are on **PostgreSQL 12 or newer** with **named prepared statements** on. Turbine defaults `preparedStatements: true` on a pool it owns.
+- The statement carries a predicate whose **selectivity swings by orders of magnitude across the bound values**. The canonical case is a shared multi-tenant table with a `tenant_id` equality, where one tenant owns a few hundred rows and another owns most of the table.
+- The statement runs at least six times on the same connection.
+
+### The mechanism
+
+PostgreSQL caches the plan for a **named** prepared statement. For the first five executions it builds a **custom plan**: it re-plans using the actual bound values, so a sparse `tenant_id` gets an index seek and a dense one gets a scan. From the **sixth** execution the backend may switch to a **generic plan**, planned once with no knowledge of the values, and compare its cost against the average custom-plan cost. If the generic plan wins that comparison it is kept, and the statement **never reverts**, for as long as the connection lives.
+
+A generic plan is not wrong on average, which is the trap. It is wrong for the values that are not average. If the planner assumes the "typical" tenant, the sparse tenant inherits a plan built for a dense one.
+
+The measured shape, on a 358,000-row table with skewed tenants, one connection, ordered-with-limit lookup for the sparse tenant. Execution times in milliseconds:
+
+| `planCacheMode` | exec 1 | 2 | 3 | 4 | 5 | **6** | 7 | 8 | 9 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| unset (backend default) | 2.0 | 0.4 | 0.2 | 0.2 | 0.2 | **365.4** | 346.1 | 338.7 | 337.1 |
+| `'force_custom_plan'` | 1.0 | 0.3 | 0.2 | 0.2 | 0.2 | **0.2** | 0.2 | 0.2 | 0.3 |
+| `'force_generic_plan'` | 357.5 | 344.3 | 336.1 | 334.6 | 338.1 | **342.7** | 345.7 | 363.4 | 341.1 |
+
+The cliff lands exactly on execution six, and `'force_generic_plan'` reproduces it from execution one, which is what confirms the mechanism rather than a cache-warming coincidence. The same query against a **dense** tenant is flat at ~0.2 ms in every row of that table: the generic plan is the right plan for that one.
+
+### How to diagnose it
+
+Three checks, in increasing order of effort.
+
+**1. The one-line test.** On a session that reproduces the slowness, run the statement six or more times, then:
+
+```sql
+SET plan_cache_mode = force_custom_plan;
+```
+
+and run it again on that same session. If the query snaps back to its first-execution speed, you have found it. `SET plan_cache_mode = auto;` puts it back.
+
+**2. The backend's own counters.** `pg_prepared_statements` tracks the split per statement, so you do not have to infer it from timings:
+
+```sql
+SELECT name, generic_plans, custom_plans FROM pg_prepared_statements;
+```
+
+In the run above, the default gave `custom_plans = 5` with `generic_plans` climbing after that; `force_custom_plan` gave `custom_plans = 9, generic_plans = 0`. A statement with a growing `generic_plans` and a stalled `custom_plans` is one that has been promoted.
+
+**3. `EXPLAIN`, on the prepared statement, not on the literal SQL.** `EXPLAIN SELECT …` with your values written in gives you a custom plan by construction and will look fine. Prepare the statement and `EXPLAIN (ANALYZE, BUFFERS) EXECUTE …` it instead, six times, and compare the plan before and after promotion. What you are looking for is the selective predicate **moving out of the index condition and into a filter**. In the run above:
+
+- **Custom plan:** index-only scan on the tenant index with a top-N sort, estimated cost 25.34, actual 0.14 ms.
+- **Generic plan:** a backward index scan on the ordering column with `tenant_id` demoted to a **filter**, estimated cost 3.32 (cheaper on paper, which is why it won), actual 461 ms, with `Rows Removed by Filter: 357550`.
+
+A large `Rows Removed by Filter` on a column you have an index for is the signature.
+
+### The fix
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  planCacheMode: 'force_custom_plan',
+});
+```
+
+`'force_custom_plan'` tells the backend to re-plan on every execution, so the plan always sees the values. You pay the planning cost each time (microseconds for a simple statement, and the parse is still cached), and you get rid of the cliff.
+
+Turbine applies it as a **connection parameter** (`options=-c plan_cache_mode=…`) as the pool opens a connection, not as a `SET` issued after checkout. It is therefore in force for that connection's very first statement, for every later checkout, `$transaction`, stream and pipeline on it, and it cannot race your first query. An existing `PGOPTIONS` or a `?options=…` already on the connection string is appended to, never replaced. Unset (the default) Turbine sends nothing at all, and behaviour is byte-identical to previous versions.
+
+The other two values are diagnostic more than prescriptive: `'auto'` states the backend default explicitly, and `'force_generic_plan'` is how you prove the pathology exists (or measure the opposite case, a statement where planning cost dominates and the generic plan is genuinely the one you want).
+
+### What this actually reaches in Turbine
+
+Stated narrowly, because it was measured rather than assumed. The numbers above come from a named prepared statement over the client's own pool, and the option demonstrably reaches every connection the client hands out. What it does **not** do is make every Turbine query vulnerable in the first place:
+
+- **`count()` is the exposed shape.** It compiles to `SELECT COUNT(*) FROM t WHERE …` with the predicate parameterized and nothing else, so a skewed predicate is exactly the promotion candidate described above.
+- **`findMany` / `findFirst` are much less exposed**, because they bind the limit as a parameter (`LIMIT $n`). A parameterized limit denies the planner the limit fraction that makes the ordered-scan plan look cheap, and the same query shape driven through `findFirst` stayed flat across all nine executions in the run above.
+
+So treat `planCacheMode` as a targeted remedy for a statement you have **measured** getting slower after its fifth execution, not as a general speed-up. Setting it globally on a workload with no skew buys you nothing and costs you a re-plan per execution.
+
+### The blunter alternative: `preparedStatements: false`
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  preparedStatements: false,
+});
+```
+
+With prepared statements off, Turbine submits `{ text, values }` instead of `{ name, text, values }`. There is no named statement, so there is no cached plan to promote, so the cliff cannot happen. It is also the setting you already need behind a transaction-pooling proxy.
+
+Be clear about what it costs. The plan cache is not the only thing you give up: the backend re-parses and re-plans **every execution of every statement**, for the whole application, not just the skewed one. `planCacheMode: 'force_custom_plan'` gives up the plan half and keeps the parse half, and only where you asked for it. Reach for `preparedStatements: false` when you want it for the pooler reason anyway, or as a fast global mitigation while you find the statement, and prefer `planCacheMode` as the durable fix.
+
+### Three scope limits
+
+- **External pools.** Turbine never opens those connections, so the option is a no-op there, with a dev-mode warning. Set the GUC in the driver's own connection setup instead. Turbine-owned string `replicas` on that same client **are** Turbine's connections and do get it, which splits the policy between reads and writes, so the warning names them when they exist.
+- **Postgres wire-compatible engines.** The capability flag speaks for the dialect, not for the server. CockroachDB, YugabyteDB and pre-12 PostgreSQL run through the default Postgres dialect and have no `plan_cache_mode`, so they reject the connection parameter itself with `unrecognized configuration parameter` rather than raising `TURBINE_E017`. Leave it unset there. A non-Postgres engine (SQLite, MySQL, SQL Server, PowDB) does throw `UnsupportedFeatureError` (`TURBINE_E017`) at construction, and any value outside the three throws `ValidationError` (`TURBINE_E003`).
+- **Connection poolers.** The GUC travels as a connection-time startup parameter, and a pooler may refuse to pass it through (PgBouncer's `ignore_startup_parameters`). Set it on the role there instead: `ALTER ROLE app_user SET plan_cache_mode = 'force_custom_plan';`.
+
 ## See also
 
 - **[API Reference](/queries)**, every operator and option in `where`, `with`, `select`.
