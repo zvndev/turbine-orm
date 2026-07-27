@@ -414,6 +414,15 @@ export interface Dialect {
    * setting (`SET plan_cache_mode = auto | force_custom_plan |
    * force_generic_plan`). Gates the opt-in `planCacheMode` client option.
    *
+   * It ALSO gates the per-query `forceCustomPlan` read option, which uses a
+   * different mechanism (it withholds the prepared-statement name, so the
+   * driver re-parses the statement on every execution and the counter that
+   * generic-plan promotion depends on never reaches its threshold) but
+   * asks the identical capability question: does this engine have a PostgreSQL
+   * plan cache whose generic-plan promotion is worth pinning? An engine that
+   * answers no cannot honour either option, so both refuse on the same flag
+   * rather than on two flags that could never disagree.
+   *
    * A capability flag rather than a `dialect.name === 'postgresql'` test, for
    * the same reason every other refusal here is one: the setting is a property
    * of the PostgreSQL PLAN CACHE, not of the SQL string, so a

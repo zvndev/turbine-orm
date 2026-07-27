@@ -108,4 +108,55 @@ describe('pg type parser overwrite detection', () => {
     assert.doesNotMatch(int8[0]!, /utcTimestamps/);
     assert.match(int8[0]!, /no opt-out for this OID/);
   });
+
+  it('fires under NODE_ENV=production, because import order is what production changes', () => {
+    // Deliberately NOT dev-only, matching the temporal-infinity warning. A
+    // parser overwrite is decided by which module calls setTypeParser last, and
+    // evaluation order is precisely what differs between a dev process and a
+    // bundled / lazily imported production one. A process can therefore be
+    // clean in dev and wrong in production from import order alone, so the case
+    // that matters most was the case that used to be silent.
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      resetWarnOnce(WARN_NS.parserOverwrite);
+      setParser(1114, (text: string) => `custom:${text}`);
+      const warnings = captureWarnings(() => warnParserOverwrite(1114, 'timestamp'));
+      assert.equal(warnings.length, 1, `expected the warning under production, got ${warnings.length}`);
+      assert.match(warnings[0]!, /OID 1114 \(timestamp\)/);
+      // The message must not still claim it is dev-only.
+      assert.doesNotMatch(warnings[0]!, /Dev-only/);
+      assert.match(warnings[0]!, /fires under `NODE_ENV=production` too/);
+
+      // Still once per OID per process, production included.
+      const second = captureWarnings(() => warnParserOverwrite(1114, 'timestamp'));
+      assert.deepEqual(second, []);
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previous;
+    }
+  });
+
+  it('stays silent under production when the parser is still the driver default', () => {
+    // The production change widens WHEN the warning is allowed to fire, not
+    // WHAT it fires on: an untouched OID is still not a warning.
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      resetWarnOnce(WARN_NS.parserOverwrite);
+      // Earlier tests in this file already replaced the process-global `date`
+      // parser, so put a parser back that BEHAVES like pg's default (and is not
+      // tagged as Turbine's own, which has its own early return). That is the
+      // state the detector reports as "still the default".
+      setParser(1082, (text: string) => {
+        const [y, m, d] = text.split('-').map(Number);
+        return new Date(y!, m! - 1, d!);
+      });
+      const warnings = captureWarnings(() => warnParserOverwrite(1082, 'date'));
+      assert.deepEqual(warnings, []);
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previous;
+    }
+  });
 });

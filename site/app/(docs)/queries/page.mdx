@@ -1125,6 +1125,8 @@ const db = turbine({
 
 Where a pg-style alias exists, the explicit Turbine field wins when both are set.
 
+`planCacheMode` is a connection parameter, so it cannot say *custom here, `auto` there*. The **read arg** `forceCustomPlan: true` covers that one case: on `findMany` / `findUnique` / `findFirst` / `count` / `aggregate` / `groupBy` it sends that single statement unnamed, so the driver re-parses it every execution and it is always planned with the real values. It is refused with `ValidationError` on a client pinned to `'force_generic_plan'`, which governs unnamed statements too, and throws `UnsupportedFeatureError` (`TURBINE_E017`) on a non-Postgres engine. See [the per-query lever](/relations#a-per-query-lever-forcecustomplan).
+
 ### Unknown options warn (new in v0.53)
 
 A JavaScript object has no schema, so a key that is not a config field used to be silently ignored. That makes a wrong guess indistinguishable from a broken feature: you set `logParams`, nothing happens, and you conclude query parameters cannot be logged rather than that the option is spelled `logQueryParams`.

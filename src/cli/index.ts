@@ -14,7 +14,7 @@
  *   turbine migrate status       , Show migration status
  *   turbine seed                 , Run seed file
  *   turbine status               , Show schema summary
- *   turbine doctor                - Cost-aware missing-FK-index triage (--fix, --json, --no-concurrently, --unused, --audit)
+ *   turbine doctor                - Index + cached-plan triage (--fix, --json, --no-concurrently, --unused, --audit, --no-plan-divergence)
  *   turbine studio                : Launch local read-only web UI (--demo for a seeded sample DB)
  *   turbine mcp                  , Start read-only MCP server over JSON-RPC stdio
  *   turbine observe              , Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
@@ -68,6 +68,12 @@ import {
   type UnusedIndex,
 } from '../index-stats.js';
 import { introspect } from '../introspect.js';
+import {
+  collectDivergenceCandidateColumns,
+  findPlanDivergence,
+  PLAN_DIVERGENCE_THRESHOLDS,
+  type PlanDivergenceReport,
+} from '../plan-divergence.js';
 import type { SchemaMetadata } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
@@ -178,6 +184,8 @@ export interface CliArgs {
   minScans?: number;
   /** `doctor --metrics-url <url>`: read _turbine_metrics for the table-heat boost from a separate DB. */
   metricsUrl?: string;
+  /** `doctor --no-plan-divergence`: skip the cached-plan divergence section (and its pg_stats read). */
+  noPlanDivergence?: boolean;
   // init flags
   /** `init --yes`/`-y`: accept every step's default non-interactively. */
   yes?: boolean;
@@ -320,6 +328,9 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
       case '--metrics-url':
         result.metricsUrl = next;
         i++;
+        break;
+      case '--no-plan-divergence':
+        result.noPlanDivergence = true;
         break;
       case '--zod':
         result.zod = true;
@@ -2882,7 +2893,6 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
 
   // Collect live statistics. The collector reads whole-schema indexes (for
   // invalid-index detection) plus per-table stats + probed-column null_frac.
-  const probedTables = [...new Set(missing.map((m) => m.table))];
   const probedColumns: ProbedColumn[] = [];
   for (const m of missing) {
     if (m.columns.length === 1 && m.columns[0] !== undefined) {
@@ -2890,13 +2900,22 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
     }
   }
 
+  // Plan-divergence candidates are the columns that ARE indexed, so their tables
+  // are usually disjoint from the missing-index set: both lists feed the same
+  // one-connection snapshot rather than opening a second read.
+  const divergenceOn = args.noPlanDivergence !== true;
+  const divergenceColumns = divergenceOn ? collectDivergenceCandidateColumns(schema) : [];
+  const probedTables = [...new Set(missing.map((m) => m.table))];
+  const statsTables = [...new Set([...probedTables, ...divergenceColumns.map((c) => c.table)])];
+
   let snapshot: StatsSnapshot;
   try {
     snapshot = await collectStatsSnapshot({
       connectionString: url,
       schema: config.schema,
-      tables: probedTables,
+      tables: statsTables,
       columns: probedColumns,
+      distributionColumns: divergenceColumns,
     });
   } catch (err) {
     snapshot = {
@@ -2940,10 +2959,23 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
 
   const subtract: DoctorSubtractReport = { unusedRan, auditRan, minScans, unused, redundant, audit };
 
+  // Plan divergence has its OWN freshness gate. The cost tiers require a
+  // trustworthy stats_reset age because they normalize write counters by it;
+  // this check reads no counter, only pg_stats, whose freshness is ANALYZE. A
+  // cluster with a NULL stats_reset (the default) must still get the check.
+  const divergence: PlanDivergenceReport =
+    divergenceOn && snapshot.available
+      ? findPlanDivergence(schema, snapshot)
+      : { findings: [], notices: [], candidatesConsidered: 0 };
+
   if (jsonMode) {
     spinner?.stop();
     console.log(
-      JSON.stringify(buildDoctorJson({ schema, findings, invalid, snapshot, usable, heat, subtract, args }), null, 2),
+      JSON.stringify(
+        buildDoctorJson({ schema, findings, invalid, snapshot, usable, heat, subtract, divergence, args }),
+        null,
+        2,
+      ),
     );
     return;
   }
@@ -2957,6 +2989,7 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
     usable,
     heat,
     subtract,
+    divergence,
     args,
     config,
   });
@@ -2997,6 +3030,7 @@ function buildDoctorJson(ctx: {
   usable: boolean;
   heat: TableHeatResult;
   subtract: DoctorSubtractReport;
+  divergence: PlanDivergenceReport;
   args: CliArgs;
 }): Record<string, unknown> {
   const concurrently = ctx.args.noConcurrently !== true;
@@ -3045,6 +3079,10 @@ function buildDoctorJson(ctx: {
   out.redundant = ctx.subtract.unusedRan ? ctx.subtract.redundant : [];
   out.audit = ctx.subtract.auditRan ? ctx.subtract.audit : [];
   out.invalid = ctx.invalid;
+  // Always an array, never absent: a consumer must not have to write `?? []`
+  // just because the section was skipped or found nothing.
+  out.planDivergence = ctx.divergence.findings;
+  out.planDivergenceNotices = ctx.divergence.notices;
   return out;
 }
 
@@ -3057,15 +3095,16 @@ async function renderDoctorHuman(ctx: {
   usable: boolean;
   heat: TableHeatResult;
   subtract: DoctorSubtractReport;
+  divergence: PlanDivergenceReport;
   args: CliArgs;
   config: ResolvedConfig;
 }): Promise<void> {
-  const { spinner, schema, findings, invalid, snapshot, usable, heat, subtract, args, config } = ctx;
+  const { spinner, schema, findings, invalid, snapshot, usable, heat, subtract, divergence, args, config } = ctx;
 
   spinner.succeed(`Scanned ${bold(String(Object.keys(schema.tables).length))} tables`);
 
   const subtractRan = subtract.unusedRan || subtract.auditRan;
-  const nothingToAdd = findings.length === 0 && invalid.length === 0;
+  const nothingToAdd = findings.length === 0 && invalid.length === 0 && divergence.findings.length === 0;
   const nothingToSubtract =
     subtract.unused.length === 0 && subtract.redundant.length === 0 && subtract.audit.length === 0;
 
@@ -3100,6 +3139,7 @@ async function renderDoctorHuman(ctx: {
   }
 
   renderInvalidIndexes(invalid);
+  renderPlanDivergence(divergence);
 
   if (subtract.unusedRan) {
     renderUnusedIndexes(subtract.unused, subtract.minScans, snapshot);
@@ -3300,6 +3340,119 @@ function renderInvalidIndexes(invalid: ReturnType<typeof findInvalidIndexes>): v
       `  ${red(symbols.warning)} ${bold(cyan(idx.table))} ${dim(`(${idx.columns.join(', ') || '?'})`)}  ${gray(idx.indexName)}`,
     );
     console.log(`    ${dim(symbols.teeEnd)} ${green(idx.dropSql)}`);
+    newline();
+  }
+}
+
+/** Round to a whole number and group it, for the divergence report's estimates. */
+function divInt(n: number): string {
+  if (!Number.isFinite(n)) return 'unbounded';
+  return Math.round(n).toLocaleString('en-US');
+}
+
+/**
+ * The plan-divergence section: columns whose value distribution can flip a
+ * cached plan. Finding-only by design, there is no `--fix` for it: the fix is
+ * application code (scope the plan-cache mode to the affected reads), and the
+ * index that looks like a fix is measured NOT to be one.
+ */
+function renderPlanDivergence(divergence: PlanDivergenceReport): void {
+  const { findings, notices } = divergence;
+  if (findings.length === 0 && notices.length === 0) return;
+
+  if (findings.length > 0) {
+    warn(`${bold(String(findings.length))} column(s) whose value distribution can flip a cached plan`);
+    newline();
+    console.log(
+      `  ${dim('Postgres may promote a named prepared statement to a GENERIC plan from its sixth execution,')}`,
+    );
+    console.log(`  ${dim('but only when the generic plan is not ESTIMATED to cost more than the average custom')}`);
+    console.log(`  ${dim('plan. A generic plan cannot see your values: it estimates "col = $1" as rows /')}`);
+    console.log(`  ${dim('n_distinct and an unknown LIMIT as 10% of the child estimate. When those defaults')}`);
+    console.log(`  ${dim('land on the other side of a plan boundary from the real value, the plan flips.')}`);
+    newline();
+  }
+
+  for (const f of findings) {
+    console.log(`  ${yellow(symbols.warning)} ${bold(cyan(`${f.table}.${f.column}`))}  ${gray('SPARSE-VALUE FLIP')}`);
+    console.log(
+      `    ${dim(symbols.tee)} generic estimate ${bold(divInt(f.genericEstimate))} rows ${dim(`(${divInt(f.rows)} rows / ${divInt(f.distinctValues)} distinct values)`)}`,
+    );
+    console.log(
+      `    ${dim(symbols.tee)} rarest value bucket ${bold(divInt(f.rarestBucket))} rows ${dim('(pg_stats most_common_freqs / residual bucket)')}`,
+    );
+    console.log(
+      `    ${dim(symbols.tee)} crossover ${bold(divInt(f.crossoverRows))} rows ${dim(`(sqrt(limit ${f.assumedLimit} x ${divInt(f.pages)} pages); ${divInt(f.crossoverRowsWide)} at limit ${f.thresholds.wideLimit})`)}`,
+    );
+    const analyzed =
+      f.lastAnalyze === null
+        ? 'last ANALYZE unknown'
+        : `last analyzed ${Math.max(0, Math.round((Date.now() - f.lastAnalyze.getTime()) / 86_400_000))}d ago`;
+    console.log(
+      `    ${dim(symbols.tee)} ${dim(`values below the crossover: ${divInt(f.valuesBelowCrossover)} of ${divInt(f.distinctValues)}, correlation ${f.correlation.toFixed(2)}, ${analyzed}`)}`,
+    );
+    console.log(
+      `    ${dim(symbols.tee)} for such a value the generic plan walks ~${bold(divInt(f.walkPages))} of ${divInt(f.pages)} pages ${dim(`(${Math.round(f.walkFraction * 100)}% of the table)`)}`,
+    );
+    console.log(`      ${dim(`for reads shaped WHERE ${f.column} = $1 ORDER BY ${f.orderColumn} LIMIT $n,`)}`);
+    console.log(`      ${dim("where the custom plan reads only that value's own rows.")}`);
+    console.log(
+      `    ${dim(symbols.tee)} ${dim('No amplification figure is printed, deliberately. This models how many rows a')}`,
+    );
+    console.log(`      ${dim('value has, not WHERE they sit in the heap, and the second half can move the')}`);
+    console.log(`      ${dim('real cost by an order of magnitude. Measure it instead:')}`);
+    console.log(`    ${dim(symbols.teeEnd)} ${dim('confirm with YOUR values before changing anything:')}`);
+    for (const line of f.diagnosticSql.split('\n')) {
+      console.log(`      ${green(line)}`);
+    }
+    newline();
+  }
+
+  if (findings.length > 0) {
+    console.log(`  ${bold('What to do, in order:')}`);
+    console.log(`    1. Check that this shape is promoted AT ALL. Step 1 of the block above: while`);
+    console.log(`       ${dim('generic_plans is 0, Postgres is planning with your real values and there is nothing')}`);
+    console.log(`       ${dim('to fix. A finding is exposure, not an incident, and many shapes never promote.')}`);
+    console.log(`    2. If it does promote, compare the two plans. Both SETs matter: without them a`);
+    console.log(`       ${dim('repeated seq scan resumes where the last one stopped and a catastrophic case reads')}`);
+    console.log(`       ${dim('as harmless.')}`);
+    console.log(`    3. If the flip is real, scope the fix to those reads:`);
+    const first = findings[0]!;
+    console.log(
+      `       ${cyan(`db.${first.table}.findMany({ where: { ${first.columnField}: value }, orderBy: { ${first.orderColumnField}: 'asc' },`)}`,
+    );
+    console.log(`       ${cyan(`                     limit: 20, forceCustomPlan: true })`)}`);
+    console.log(`       ${dim('That withholds the prepared-statement NAME for that one query, so the driver')}`);
+    console.log(`       ${dim('re-parses it every execution and it is always planned with the real values. No')}`);
+    console.log(`       ${dim('GUC, no SET LOCAL, no transaction, no extra round trip.')}`);
+    console.log(`    4. Do NOT set planCacheMode on the client to fix this. There are measured shapes`);
+    console.log(`       ${dim('where a generic plan is dramatically better (an unordered LIMIT over a value whose')}`);
+    console.log(`       ${dim('rows are packed at the end of the heap: 4,262 buffers custom vs 71 generic on a')}`);
+    console.log(`       ${dim('reproducible fixture). A custom plan is not automatically the better plan.')}`);
+    console.log(`    5. A composite index on (${first.column}, ${first.orderColumn}) makes the GOOD plan better. It`);
+    console.log(
+      `       ${dim('does NOT stop the generic plan from choosing the other one, and it can widen the gap.')}`,
+    );
+    console.log(`       ${dim('Add it for the custom-plan win, not as a fix for this finding.')}`);
+    newline();
+    console.log(`  ${dim('This finding is derived from statistics, not from your traffic: it says the DISTRIBUTION')}`);
+    console.log(`  ${dim('admits a damaging flip, not that a query is running one today. It models ONE shape,')}`);
+    console.log(`  ${dim('the rare value that loses its bitmap plan. It cannot see where a value physically')}`);
+    console.log(`  ${dim('sits in the heap, so a clean report is not evidence of immunity.')}`);
+    console.log(
+      `  ${dim(`Gates: the wrong plan must walk >= ${PLAN_DIVERGENCE_THRESHOLDS.minWalkPages} pages and >= ${Math.round(PLAN_DIVERGENCE_THRESHOLDS.minWalkFraction * 100)}% of the table, at an assumed`)}`,
+    );
+    console.log(
+      `  ${dim(`LIMIT ${PLAN_DIVERGENCE_THRESHOLDS.assumedLimit}. ${divergence.candidatesConsidered} column(s) were scored. Skip this section with --no-plan-divergence.`)}`,
+    );
+    newline();
+  }
+
+  if (notices.length > 0) {
+    console.log(`  ${dim('Not scored for cached-plan divergence (statistics missing):')}`);
+    for (const n of notices) {
+      console.log(`    ${dim(`- ${n.table}.${n.column}: ${n.reason}`)}`);
+    }
     newline();
   }
 }
@@ -3886,7 +4039,7 @@ function showHelp(): void {
   console.log(`    ${cyan('seed')}               Run seed file`);
   console.log(`    ${cyan('status')} ${dim('| info')}      Show schema summary`);
   console.log(
-    `    ${cyan('doctor')}             Cost-aware missing-FK-index triage ${dim('(--fix, --json, --unused, --audit)')}`,
+    `    ${cyan('doctor')}             Index + cached-plan triage ${dim('(--fix, --json, --unused, --audit)')}`,
   );
   console.log(
     `    ${cyan('studio')}             Launch local read-only web UI ${dim('(--write for writes, --demo for a sample DB)')}`,

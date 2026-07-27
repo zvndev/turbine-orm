@@ -136,6 +136,15 @@ export interface QueryInterfaceOptions {
    */
   preparedStatements?: boolean;
   /**
+   * The client-level `plan_cache_mode` this interface's connections were opened
+   * with, forwarded from `TurbineConfig.planCacheMode` purely so the per-query
+   * `forceCustomPlan` option can REFUSE the one combination it cannot honour
+   * (`'force_generic_plan'`, see `preparedNameFor` in builder.ts). Nothing else
+   * reads it, and it is never emitted into SQL: the setting itself travels as a
+   * connection parameter, set by client.ts when it opens the pool.
+   */
+  planCacheMode?: 'auto' | 'force_custom_plan' | 'force_generic_plan';
+  /**
    * Enable the SQL template cache. When true, repeated queries with the
    * same shape (same keys, operators, relations, different values) reuse
    * cached SQL text instead of rebuilding from scratch.

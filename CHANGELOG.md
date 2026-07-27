@@ -1,5 +1,202 @@
 # Changelog
 
+## 0.56.0 (2026-07-27)
+
+### Added
+
+- **`forceCustomPlan`, a per-query lever for the generic-plan cliff.** 0.55.0
+  added the client-level `planCacheMode`, which is a connection parameter and
+  therefore cannot say "custom here, `auto` there". `forceCustomPlan?: boolean`
+  now sits on `FindManyArgs`, `FindUniqueArgs`, `CountArgs`, `AggregateArgs` and
+  `GroupByArgs` (so `findMany` / `findUnique` / `findFirst` / the `OrThrow`
+  forms / `count` / `aggregate` / `groupBy`, the streaming read, and the batched
+  strategy's relation follow-ups):
+
+  ```ts
+  db.orders.findMany({
+    where: { tenantId },
+    orderBy: { id: 'asc' },
+    limit: 20,
+    forceCustomPlan: true,
+  });
+  ```
+
+  `true` sends that one statement UNNAMED. State the mechanism carefully,
+  because the tempting one-liner is wrong: PostgreSQL does NOT treat an unnamed
+  statement as a one-shot plan that never enters the plan cache. It builds and
+  saves a `CachedPlanSource` for it too. The option works one level up, in the
+  driver: node-postgres only skips `Parse` for a statement it has already parsed
+  BY NAME, so an unnamed statement is re-parsed on every execution, each `Parse`
+  replaces the unnamed cached plan source with a fresh one whose custom-plan
+  counter is zero, and the five-execution threshold that precedes promotion is
+  never reached. No GUC, no `SET LOCAL`, no transaction, no extra round trip.
+
+  Measured on the SQL Turbine itself emits (`LIMIT $n` included), 12 executions
+  over one pooled connection: by default the statement is cached and promoted
+  (`generic_plans = 7, custom_plans = 5`) and reads 26,802 buffers on a sparse
+  tenant; with the option there is no entry in `pg_prepared_statements` at all
+  and it reads 132.
+
+  The fixture, so those two numbers can be checked rather than taken on trust
+  (`synchronize_seqscans` and `max_parallel_workers_per_gather` off, as with
+  every plan comparison here):
+
+  ```sql
+  CREATE TABLE t (id serial PRIMARY KEY, tenant_id int NOT NULL, pad text);
+  -- 60 tenants over 200,000 rows, and the sparse tenant inserted LAST so its
+  -- rows sit at the end of the heap: the ordered primary-key walk the generic
+  -- plan chooses has to cross the whole table before it finds one.
+  INSERT INTO t (tenant_id, pad)
+    SELECT 2 + (g % 59), repeat('x', 180) FROM generate_series(1, 199900) g;
+  INSERT INTO t (tenant_id, pad)
+    SELECT 1, repeat('x', 180) FROM generate_series(1, 100) g;
+  CREATE INDEX ON t (tenant_id);
+  ANALYZE t;
+  -- then, at LIMIT 100:
+  --   SELECT * FROM t WHERE tenant_id = $1 ORDER BY id LIMIT $2
+  ```
+
+  Precedence, stated exactly because one of the four cases is the opposite of
+  what the mechanism suggests. Client unset or `'auto'`: honoured, and this is
+  what the option is for. Client `'force_custom_plan'`: redundant, harmless.
+  Client `'force_generic_plan'`: **REFUSED**, `ValidationError` (E003) naming
+  both settings. That was measured, not reasoned about: five executions of one
+  unnamed statement read 19,107 buffers with that setting in force and 55 with
+  the same connection set back to `auto`, so withholding the name buys nothing
+  against it and accepting the flag would report a guarantee the next execution
+  breaks. Omitted or `false` is byte-identical to 0.55.0 and does not opt out of
+  a client-level setting. With `preparedStatements: false` every statement is
+  already unnamed, so it is a no-op for plan choice. SQLite / MySQL / SQL Server
+  / PowDB throw `UnsupportedFeatureError` (E017): an engine with no PostgreSQL
+  plan cache cannot make this guarantee.
+
+  There is deliberately no per-query `planCacheMode` three-value enum.
+  `force_generic_plan` is a property of a CACHED plan and the only per-query
+  lever is keeping a statement out of the cache, which can only ever mean
+  custom, so an enum would promise a direction the mechanism cannot deliver.
+
+  Not covered, and stated rather than left to be discovered: writes
+  (`updateMany` / `deleteMany` can hit the same cliff) do not take it. It is a
+  read arg.
+
+- **`turbine doctor` detects the distribution that admits the flip.** A new
+  finding-only section (skip with `--no-plan-divergence`; `planDivergence` and
+  `planDivergenceNotices` in `--json`) scores every column doctor already knows
+  about, relation probe columns and leading index columns, against `pg_stats`.
+
+  The shape it models is narrow on purpose: `WHERE col = $1 ORDER BY <other
+  indexed column> LIMIT $n`, where `rows / n_distinct` (what a generic plan
+  assumes an equality matches) sits ABOVE the plan boundary while some real
+  values sit far below it. The boundary is `sqrt(limit x relpages)`, where an
+  ordered index scan's `limit / matching` share of the pages equals a bitmap
+  scan's own; measured flip points track it. Each finding prints the statistics
+  behind it and HOW MANY PAGES the wrong plan walks, plus a copy-pasteable
+  diagnostic block whose FIRST step is
+  `SELECT generic_plans, custom_plans FROM pg_prepared_statements`, because a
+  finding describes exposure and not an incident: `auto` promotes only when the
+  generic plan is not estimated to cost more than the average custom plan, and
+  on many of these shapes it is, so nothing is ever promoted. The block ends by
+  resetting `plan_cache_mode`, `synchronize_seqscans` and
+  `max_parallel_workers_per_gather` so a paste does not leave a session pinned.
+
+  It deliberately prints no amplification multiplier, and it deliberately does
+  not model the opposite direction (a physically clustered dominant value). A
+  rule for that direction was written and then REMOVED after measurement: on
+  live fixtures it was wrong more often than right and twice it was wrong with
+  the SIGN INVERTED, predicting "at least 16,032x" and "at least 2,675x" on
+  columns where the generic plan was in fact 10x and 105x BETTER, so acting on
+  it would have made those reads dramatically slower. The reason is structural
+  rather than a bad constant: whether that flip helps or hurts turns on WHERE in
+  the heap the dominant band sits, and `pg_stats.correlation` is identical
+  whether it sits at the head or the tail. The same blind spot bounds what
+  remains, so a clean report is stated as not being evidence of immunity.
+
+  There is no `--fix`. The remedy is application code (`forceCustomPlan` on the
+  affected reads), and the index that looks like a fix is measured not to be
+  one: a composite index on `(col, order_col)` makes the GOOD plan better
+  without stopping the generic plan from choosing the other one.
+
+### Corrected
+
+- **The 0.55.0 `ORDER BY` correction overcorrected.** 0.55.0 refuted "an
+  `ORDER BY` is the necessary co-factor" with a 430x case that has no ordering
+  and no limit, and that refutation stands. But it was published on its own, and
+  read alone it says ordering does not matter, which misleads in the other
+  direction. Both halves are true. On a real multi-tenant schema swept table by
+  table, EVERY divergent shape was `WHERE tenant = $1 ORDER BY id ASC LIMIT $2`
+  and every shape without an ordering measured 1.00x. The mechanism is plain: an
+  `ORDER BY` on a DIFFERENT indexed column hands the planner a second plan it
+  can run away with, and a generic estimate on the wrong side of that boundary
+  is what makes it take it. So: not necessary in general (do not conclude your
+  unordered reads are safe), and still the strongest single predictor in
+  practice, which is why the new `doctor` check models exactly that shape. The
+  0.55.0 entry is left as published; this is the correction to it.
+
+- **A custom plan is not automatically the better plan, with the fixture.**
+  Nothing shipped previously said otherwise, but `planCacheMode:
+  'force_custom_plan'` read as strictly safe, and it is not. Reproduced on
+  PostgreSQL 16.14, `synchronize_seqscans` off, parallelism off:
+
+  ```sql
+  CREATE TABLE ev (id bigserial PRIMARY KEY, tenant_id int NOT NULL, pad text);
+  -- head of the heap: 320,000 rows over 799 tenants in RANDOM physical order
+  INSERT INTO ev (tenant_id, pad)
+    SELECT t, repeat('x', 60)
+    FROM (SELECT ((g % 800) + 1) AS t FROM generate_series(1, 320000) g
+          ORDER BY random()) s
+    WHERE t <> 400;
+  -- tail of the heap: the dense tenant's 80,000 rows, inserted LAST
+  INSERT INTO ev (tenant_id, pad)
+    SELECT 400, repeat('x', 60) FROM generate_series(1, 80000) g;
+  CREATE INDEX ev_tenant_idx ON ev (tenant_id);
+  ANALYZE ev;   -- relpages 5334, n_distinct 800, correlation 0.004
+  PREPARE q(int, int) AS SELECT * FROM ev WHERE tenant_id = $1 LIMIT $2;
+  ```
+
+  | `plan_cache_mode` | plan | buffers |
+  |---|---|---|
+  | `force_custom_plan` | Seq Scan | 4,262 |
+  | `force_generic_plan` | Bitmap Heap Scan | 71 |
+
+  60x, with no `ORDER BY` anywhere. The custom planner knows tenant 400 is 20%
+  of the table, so with `LIMIT 20` it prices a sequential scan as nearly free on
+  the assumption it stops almost immediately. It is right about HOW MANY rows
+  match and wrong about WHERE they are: they are all at the end of the heap, so
+  it reads 319,600 non-matching rows first. Re-insert the identical rows in
+  random physical order and the effect vanishes and reverses (custom 2 buffers,
+  generic in the seventies, the exact figure moving with the index leaf-page
+  count on each rebuild): the variable is physical CLUSTERING, not selectivity.
+
+  Read the comparison carefully, because the loose version of this claim is
+  itself wrong. That is 60x against `force_generic_plan`, NOT against the
+  default. On that fixture `plan_cache_mode = auto` never promotes (after nine
+  executions `generic_plans = 0, custom_plans = 9`, because the generic plan's
+  estimated cost 157 is far above the average custom cost 2.59 and `auto` only
+  promotes when generic is not worse), and its plan is byte-identical to
+  `force_custom_plan`'s. The honest claim is "there exists a shape where
+  `force_generic_plan` is 60x better than both the default and a forced custom
+  plan", not "forcing a custom plan is a 60x regression".
+
+- **The parser-overwrite warning now fires under `NODE_ENV=production` too.**
+  It was dev-only. `temporalInfinity`'s warning already fires in production
+  deliberately, because production is where the destructive write commits, and
+  the same argument applies here with more force: a parser overwrite is decided
+  by which module calls `setTypeParser` LAST, and evaluation order is precisely
+  what differs between a dev process and a bundled or lazily imported production
+  one. A process can be clean in dev and wrong in production purely from import
+  order, which made the case where it matters most the case where it was silent.
+  Cost is bounded: once per OID per process, at client construction, only when a
+  third party's non-default parser is actually being replaced. The message no
+  longer claims to be dev-only and states why it fires.
+
+### Fixed
+
+- The `forceCustomPlan` integration suite took its `before` / `after` hooks from
+  `node:test` directly while gating only its tests, so on a machine with no
+  `DATABASE_URL` the setup hook still opened a pool with an undefined connection
+  string and `npm run test:unit` exited non-zero. Hooks now come from the same
+  gate as the tests, which is what the sibling suites already did.
+
 ## 0.55.0 (2026-07-27)
 
 ### Corrected
