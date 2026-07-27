@@ -169,6 +169,27 @@ src/
                       (`missingIndexForRelation`, gated on `schemaHasIndexInfo` to avoid
                       false positives on `defineSchema`-only metadata).
 
+  plan-divergence.ts, Cached-plan divergence advisor (0.56), doctor's third question about a
+                      probe column: "this column IS indexed, and its distribution makes a
+                      NAMED prepared statement's generic plan unsafe". Pure (no pg import, no
+                      EXPLAIN): reads relpages/reltuples plus the pg_stats row collected by
+                      index-stats.ts (`StatsSnapshot.columnStats`, gated on
+                      `options.distributionColumns`) and scores ONE shape,
+                      `WHERE col = $1 ORDER BY <other indexed column> LIMIT $n`, where the
+                      generic estimate `rows / n_distinct` sits ABOVE the plan boundary
+                      `crossoverRows = sqrt(limit x relpages)` while real values sit below it.
+                      Gates: the wrong plan must walk >= `minWalkPages` (50) AND >=
+                      `minWalkFraction` (10%) of the table. Findings carry the diagnostic SQL
+                      whose FIRST step reads `pg_prepared_statements.generic_plans` (a finding
+                      is EXPOSURE, not an incident: `auto` promotes only when the generic plan
+                      is not estimated to cost more, which on many of these shapes it is).
+                      DELIBERATELY not modelled: the opposite (dense, physically clustered)
+                      direction. A second rule for it existed and was removed after live
+                      measurement inverted its SIGN twice; the discriminator is where in the
+                      heap a value's rows sit and no pg_stats input carries that. No `--fix`,
+                      and it gates on ANALYZE freshness (last_analyze), never on the
+                      `stats_reset` counter gate the cost tiers use.
+
   client.ts        , TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
                       ($transaction with SAVEPOINTs for nesting, isolation levels, timeouts,
@@ -610,6 +631,8 @@ The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (
 
 ## Type System
 
+**Per-query plan control** (0.56): `forceCustomPlan?: boolean` on `FindManyArgs` / `FindUniqueArgs` / `CountArgs` / `AggregateArgs` / `GroupByArgs` sends that one statement UNNAMED, resolved at the single execute seam `preparedNameFor` in builder.ts (never per builder: the flag changes no SQL text). The mechanism is the DRIVER's, not a backend one: node-postgres skips `Parse` only for a statement already parsed BY NAME, so an unnamed statement is re-parsed every execution, the unnamed `CachedPlanSource` is replaced each time, and the custom-plan counter never reaches the promotion threshold. It is REFUSED (E003) against a client-level `planCacheMode: 'force_generic_plan'` (measured: that setting governs unnamed statements too), and E017 on any dialect without `supportsPlanCacheMode` plus `PowqlInterface.assertNoForceCustomPlan` for PowDB. Read arg only, writes do not take it.
+
 **Query arg types** (query/types.ts): `WhereClause<T>` supports equality, null checks, operators (`gt`, `gte`, `lt`, `lte`, `not`, `in`, `notIn`, `contains`, `startsWith`, `endsWith`), `mode: 'insensitive'` for ILIKE, `OR`/`AND`/`NOT` combinators, and relation filters (`some`/`every`/`none`). `WithClause` maps relation names to `true | WithOptions`. `WithOptions` supports nested `with`, `where`, `orderBy`, `limit`, `select`, and `omit`.
 
 **Atomic updates** (query/types.ts): `UpdateOperatorInput<V>` supports `set`, `increment`, `decrement`, `multiply`, `divide` for numeric fields. These generate `col = col + $n` style SQL for concurrent safety.
@@ -652,7 +675,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 
 ## CLI Architecture
 
-The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`.
+The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration; cached-plan divergence section → `plan-divergence.ts`, finding-only, `--no-plan-divergence` skips it and its pg_stats read), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`.
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.mts` / `.js` / `.mjs`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 

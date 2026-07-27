@@ -375,7 +375,22 @@ export interface TurbineConfig {
    * Default `undefined`: Turbine issues NOTHING and the backend keeps its own
    * default (`auto`), byte-identical to not setting the option.
    *
-   * SESSION-LEVEL, NOT PER QUERY. It is applied as a connection parameter
+   * SESSION-LEVEL. THE PER-QUERY LEVER IS A DIFFERENT, NARROWER ONE. This
+   * option is a connection parameter and cannot be unset for a single query, so
+   * a client-wide value cannot express "custom here, `auto` there". The read
+   * option `forceCustomPlan: true` covers that case, and only that case: it
+   * withholds the prepared-statement NAME for one query, and because the driver
+   * re-parses an unnamed statement on every execution, the counter that
+   * promotion depends on is reset before it is ever reached. That
+   * mechanism can only ever mean custom, so there is deliberately no per-query
+   * `force_generic_plan`; that direction stays here, at the connection. The two
+   * do NOT compose in the other order either: `'force_generic_plan'` set here
+   * governs unnamed statements as well as named ones (measured), so a
+   * per-query `forceCustomPlan: true` cannot escape it and is REFUSED with
+   * `ValidationError` (E003) instead of silently doing nothing. Leave this
+   * option unset (or `'auto'`) if any query needs the per-query lever.
+   *
+   * IT IS APPLIED as a connection parameter
    * (`options=-c plan_cache_mode=...`) when the pool opens a connection, so it
    * is in force for that connection's very first statement and persists for its
    * whole life: every pooled checkout, `$transaction`, stream and pipeline on
@@ -1276,6 +1291,10 @@ export class TurbineClient {
       jsonEncoding: config.jsonEncoding,
       globalFilters: config.globalFilters,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
+      // Forwarded so a per-query `forceCustomPlan` can refuse the combination
+      // this client's own connections would silently defeat, see the
+      // `planCacheMode` note on QueryInterfaceOptions.
+      planCacheMode,
       sqlCache: config.sqlCache ?? true,
       sqlCacheSize: config.sqlCacheSize,
       dialect: config.dialect,

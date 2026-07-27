@@ -436,6 +436,26 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * callers short-circuit it, because PowDB's projection fast path returned ONE
    * row for `limit 0` below 0.20.
    */
+  /**
+   * Refuse the per-query `forceCustomPlan` read option.
+   *
+   * `FindManyArgs.forceCustomPlan` documents an `UnsupportedFeatureError` on any
+   * engine with no PostgreSQL plan cache, and PowDB is one: it is not a
+   * `Dialect` at all, so it never reaches the SQL builder's own refusal at
+   * `preparedNameFor`. Without this the flag would be silently ignored here,
+   * which is precisely the "reports a guarantee that was never made" failure the
+   * option's refusal exists to prevent.
+   */
+  private assertNoForceCustomPlan(args: { forceCustomPlan?: boolean } | undefined): void {
+    if (args?.forceCustomPlan !== true) return;
+    throw new UnsupportedFeatureError(
+      'The forceCustomPlan query option',
+      'powdb',
+      'Forcing a per-query custom plan means keeping the statement out of the PostgreSQL plan cache, and PowDB ' +
+        'has no such cache to keep it out of. Remove the option, or set it only on PostgreSQL queries.',
+    );
+  }
+
   private assertPagination(limit: number | undefined, offset: number | undefined, context: string): void {
     for (const [name, value] of [
       ['limit', limit],
@@ -1359,6 +1379,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   // -------------------------------------------------------------------------
 
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
+    this.assertNoForceCustomPlan(args);
     return this.withMiddleware('findMany', args as unknown as Record<string, unknown>, async () => {
       // `limit: 0` means "no rows" (SQL `LIMIT 0`), and answering it client-side
       // is correct on every engine version: PowDB's projection fast path returned
@@ -1531,6 +1552,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
+    this.assertNoForceCustomPlan(args);
     // Prisma compound-unique selector → column conjunction (engine parity with
     // the SQL findUnique family; pure metadata, so this is a one-line adoption).
     if (args.where) {
@@ -1553,6 +1575,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
+    this.assertNoForceCustomPlan(args);
     return this.withMiddleware('findFirst', args as unknown as Record<string, unknown>, async () => {
       const { rows, native, nestedPlans, linkPlans, residualWith } = await this.runFind(
         { ...args, limit: 1 } as FindManyArgs<T>,
@@ -2901,6 +2924,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   // -------------------------------------------------------------------------
 
   async count(args: CountArgs<T> = {}): Promise<number> {
+    this.assertNoForceCustomPlan(args);
     return this.withMiddleware('count', (args ?? {}) as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
@@ -2945,6 +2969,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
+    this.assertNoForceCustomPlan(args);
     return this.withMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       // One scalar query per aggregate, PowDB's bare-projection aggregate is broken.
       const result: AggregateResult<T> = {};
@@ -2996,6 +3021,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
+    this.assertNoForceCustomPlan(args);
     return this.withMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       // DISTINCT ON has no PowQL equivalent (no DISTINCT ON row source).
       if (args.distinctOn) {

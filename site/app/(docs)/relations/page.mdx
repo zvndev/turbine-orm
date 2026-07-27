@@ -626,10 +626,85 @@ That inverts the ranking the old text gave, and it is the practical takeaway:
 - **The sixth execution is a ceiling, not a trigger.** `auto` promotes only when the generic plan's *estimated* cost is not worse than the average custom cost. Check `pg_prepared_statements.generic_plans` to see whether a statement is actually on a generic plan; plenty never are.
 - **The shape that gets promoted unprompted has no limit.** In the same session, the limited form of that predicate was never promoted at all (`generic_plans = 0, custom_plans = 8`), because its substituted row count made the generic plan look *more* expensive. `count()` and an **unlimited** `findMany` both compile to the pure parameterized-predicate shape that promotes on its own, so look at those first.
 - **A limited `findMany` gives the planner two unknowns instead of one**, the predicate value and the limit count, and either alone can flip the plan shape. More unknowns is not the same as more damage.
-- **Neither an `ORDER BY` nor any limit is required** for a generic plan to be catastrophically worse than a custom one. The 430x case above has none of them.
+- **Neither an `ORDER BY` nor any limit is required** for a generic plan to be catastrophically worse than a custom one. The 430x case above has none of them, and neither does the inverted case further down this page.
+- **But in practice, `ORDER BY` is still the strongest single predictor.** That is not a contradiction, and 0.55.0's wording overcorrected by giving only the refutation. On a real multi-tenant schema swept table by table, **every** divergent shape found was `WHERE tenant = $1 ORDER BY id ASC LIMIT $2` and every shape without an ordering measured 1.00x. The reason is mechanical: an `ORDER BY` on a *different* indexed column hands the planner a second plan it can run away with, and a generic estimate on the wrong side of that boundary is what makes it take it. So: not necessary in general (do not conclude your unordered reads are safe), and the first place to look in practice. `doctor`'s divergence check models exactly this shape for that reason, and says so.
 - **`implicitPkOrdering` is off by default in core**, so a default `findMany({ where, limit })` emits `SELECT … WHERE … LIMIT $2` with no `ORDER BY` at all. `turbine-orm/prisma-compat` defaults it on. Switching it on adds an ordering a generic plan can walk the whole table in, which is worth knowing, but it is your choice to make and nothing about it changes here.
 
 So treat `planCacheMode` as a targeted remedy for a statement you have **measured** getting slower after its fifth execution, not as a general speed-up, and measure with `plan_cache_mode = force_generic_plan` against `force_custom_plan` rather than reasoning about which query shapes ought to be safe. Setting it globally on a workload with no skew buys you nothing and costs you a re-plan per execution. One measurement hazard: `synchronize_seqscans` is on by default and makes a repeated seq scan resume where the last one stopped, which reported an 8,000-buffer scan as 4 buffers until it was turned off.
+
+### A per-query lever: `forceCustomPlan`
+
+`planCacheMode` is a connection parameter, so it cannot express *custom here, `auto` there*. Since 0.56.0 the read args carry a per-query opt-in that can:
+
+```ts
+const rows = await db.orders.findMany({
+  where: { tenantId },
+  orderBy: { id: 'asc' },
+  limit: 20,
+  forceCustomPlan: true,
+});
+```
+
+It is available on `findMany`, `findUnique`, `findFirst` (and the `OrThrow` forms), `count`, `aggregate`, `groupBy`, the streaming read, and the batched strategy's relation follow-ups. It is a **read** arg: writes do not take it.
+
+**How it works, stated as the mechanism really is.** `true` sends that one statement **unnamed**. It is *not* true that PostgreSQL treats an unnamed statement as a one-shot plan that never enters the plan cache; the backend builds and saves a `CachedPlanSource` for it too. It works one level up, in the driver: node-postgres only skips `Parse` for a statement it has already parsed **by name**, so an unnamed statement is re-parsed on every execution, each `Parse` replaces the unnamed cached plan source with a fresh one whose custom-plan counter is zero, and the five-execution threshold that precedes promotion is never reached. No GUC, no `SET LOCAL`, no transaction, no extra round trip.
+
+**Precedence, because one of these is the opposite of what the mechanism suggests.**
+
+| client `planCacheMode` | `forceCustomPlan: true` |
+| --- | --- |
+| unset (default) or `'auto'` | honoured; this is what it is for |
+| `'force_custom_plan'` | redundant, harmless |
+| `'force_generic_plan'` | **refused** with `ValidationError` (`TURBINE_E003`) |
+
+The refusal is not pedantry. That setting governs the unnamed statement as well as a named one, measured: five executions of the same unnamed statement read 19,107 buffers with it in force and 55 with the same connection set back to `auto`. Withholding the name buys nothing against it, so Turbine names both settings and asks you to change one rather than reporting a guarantee the next execution breaks. Turbine can only see the setting *it* applied: a `plan_cache_mode` installed by your own `SET`, by `ALTER ROLE`, or by a pooler is invisible here and is not refused.
+
+Omitting it, or `false`, is byte-identical to previous versions and does **not** opt back out of a client-level setting. With `preparedStatements: false` every statement is already unnamed, so it is a no-op for plan choice. On SQLite, MySQL, SQL Server and PowDB it throws `UnsupportedFeatureError` (`TURBINE_E017`): an engine with no PostgreSQL plan cache cannot make this guarantee.
+
+**What it costs.** Planning happens on every execution instead of once. On a flat read that is in the noise, and an unnamed statement also skips the extra round trip a named one needs on its first execution. It grows with the size of the statement: a deep `with` tree is a much larger plan to rebuild each time. Turn it on where a flip is the risk, not everywhere.
+
+### A custom plan is not automatically the better plan
+
+This is the counterexample, and it is here so nobody reads `force_custom_plan` as strictly safe. Reproduced on PostgreSQL 16.14 with `synchronize_seqscans` off and parallelism disabled:
+
+```sql
+CREATE TABLE ev (id bigserial PRIMARY KEY, tenant_id int NOT NULL, pad text);
+
+-- head of the heap: 320,000 rows over 799 small tenants, in RANDOM physical order
+INSERT INTO ev (tenant_id, pad)
+  SELECT t, repeat('x', 60)
+  FROM (SELECT ((g % 800) + 1) AS t FROM generate_series(1, 320000) g
+        ORDER BY random()) s
+  WHERE t <> 400;
+
+-- tail of the heap: the dense tenant's 80,000 rows, inserted LAST
+INSERT INTO ev (tenant_id, pad)
+  SELECT 400, repeat('x', 60) FROM generate_series(1, 80000) g;
+
+CREATE INDEX ev_tenant_idx ON ev (tenant_id);
+ANALYZE ev;   -- relpages 5334, n_distinct 800, correlation 0.004
+
+PREPARE q(int, int) AS SELECT * FROM ev WHERE tenant_id = $1 LIMIT $2;
+```
+
+| `plan_cache_mode` | plan | buffers |
+| --- | --- | --- |
+| `force_custom_plan` | Seq Scan | **4,262** |
+| `force_generic_plan` | Bitmap Heap Scan | **71** |
+
+60x, with no `ORDER BY` anywhere. The custom planner knows tenant 400 is 20% of the table, so with `LIMIT 20` it prices a sequential scan as nearly free on the assumption it will stop almost immediately. It is right about **how many** rows match and wrong about **where they are**: they are all at the end of the heap, so it reads 319,600 non-matching rows first. The generic plan, unable to see the value, estimates 500 rows, takes the bitmap path, and touches one heap block. Re-insert the identical rows in random physical order and the effect vanishes and reverses (custom 2 buffers, generic in the seventies, the exact figure moving with the index leaf-page count on each rebuild): the variable is physical **clustering**, not selectivity.
+
+<Callout type="warning" title="Read the comparison carefully">
+This is 60x **against `force_generic_plan`**, not against the default. On that fixture `plan_cache_mode = auto` never promotes: after nine executions `pg_prepared_statements` reports `generic_plans = 0, custom_plans = 9`, because the generic plan's *estimated* cost (157) is far above the average custom cost (2.59) and `auto` only promotes when generic is not worse. `auto`'s plan is byte-identical to `force_custom_plan`'s. So the honest claim is *there exists a shape where `force_generic_plan` is 60x better than both the default and a forced custom plan*, **not** *forcing a custom plan is a 60x regression*. It is not a regression against the default here; it simply cannot reach the good plan, and neither can the default.
+</Callout>
+
+The practical consequence is the same either way: this is why `forceCustomPlan` is per query and why `planCacheMode: 'force_custom_plan'` is not a blanket recommendation.
+
+### When to reach for this
+
+Recommended, now that five divergent cells across four tables have been measured on one real schema: **a multi-tenant reader on a shared table** with a skewed tenant column, paginating with `ORDER BY <pk> LIMIT $n`. That is the shape that diverges, that `doctor` detects, and that `forceCustomPlan` fixes without touching anything else. Run `turbine doctor`, confirm with `pg_prepared_statements.generic_plans` and the `EXPLAIN` pair it prints, and scope the option to the reads it named.
+
+Not recommended as a global setting. Setting `planCacheMode` client-wide on a workload with no skew buys nothing, costs a re-plan per execution, and on the shape above it is the wrong direction outright.
 
 ### The blunter alternative: `preparedStatements: false`
 

@@ -98,6 +98,12 @@ export interface TableStats {
   table: string;
   /** pg_class.reltuples. 0 or -1 means never-analyzed → treated as UNKNOWN (null rows). */
   reltuples: number;
+  /**
+   * pg_class.relpages. The SIZE input the plan-divergence crossover is computed
+   * from (a plan boundary tracks pages relative to the LIMIT, not rows).
+   * Absent when the pg_class read degraded; 0 means never analyzed.
+   */
+  relpages?: number;
   /** pg_stat_user_tables.n_live_tup, a cross-check for reltuples. */
   nLiveTup?: number;
   nTupIns?: number;
@@ -112,6 +118,13 @@ export interface TableStats {
   tableSizeBytes?: number;
   /** Count of indexes already on the table (pg_index). */
   existingIndexCount?: number;
+  /**
+   * The later of pg_stat_user_tables.last_analyze / last_autoanalyze: when the
+   * planner's column statistics were last refreshed. This, NOT stats_reset, is
+   * the freshness that matters for anything read out of pg_stats. Null when
+   * never analyzed; absent when the pg_stat read degraded.
+   */
+  lastAnalyze?: Date | null;
 }
 
 /**
@@ -149,6 +162,28 @@ export interface IndexStat {
 }
 
 /**
+ * The value distribution of one column, read from pg_stats with
+ * `inherited = false`. Consumed by the plan-divergence advisor, which needs to
+ * reproduce the planner's OWN estimates rather than approximate them.
+ */
+export interface ColumnDistribution {
+  table: string;
+  column: string;
+  /**
+   * pg_stats.n_distinct, RAW: a positive value is a count, a negative value is a
+   * fraction of the row count. Kept undecoded so the consumer decodes it exactly
+   * the way the planner does. 0 means the column was never analyzed.
+   */
+  nDistinct: number;
+  /** pg_stats.correlation, signed. NULL for types with no ordering. */
+  correlation: number | null;
+  /** pg_stats.most_common_freqs, or null when the column has no MCV list. */
+  mostCommonFreqs: number[] | null;
+  /** cardinality(most_common_vals): how many values the MCV list actually covers. */
+  mcvCount: number;
+}
+
+/**
  * A point-in-time read of the statistics the triage needs. Every part is
  * optional at the field level so the pure scorer degrades honestly.
  */
@@ -165,6 +200,13 @@ export interface StatsSnapshot {
   indexes: IndexStat[];
   /** null_frac per probed column, keyed `table.column`. */
   nullFrac: Record<string, number>;
+  /**
+   * Value distribution per candidate column, keyed `table.column`. Optional at
+   * the snapshot level: a caller that never asked for distribution statistics
+   * (or whose pg_stats read degraded) leaves it absent, and the plan-divergence
+   * advisor reports that as a suppressed candidate rather than scoring a guess.
+   */
+  columnStats?: Record<string, ColumnDistribution>;
   /** Per-signal degradation notices (privileges, catalog gaps, timeouts). */
   notices: string[];
 }
@@ -178,6 +220,7 @@ export function emptyStatsSnapshot(notices: string[] = []): StatsSnapshot {
     tables: {},
     indexes: [],
     nullFrac: {},
+    columnStats: {},
     notices,
   };
 }
@@ -770,6 +813,11 @@ export interface CollectSnapshotOptions {
   tables: string[];
   /** Columns to read null_frac for (single-column probes). */
   columns: ProbedColumn[];
+  /**
+   * Columns to read the full value distribution for (n_distinct, correlation,
+   * MCV frequencies). One extra pg_stats query; empty skips it entirely.
+   */
+  distributionColumns?: ProbedColumn[];
   /** statement_timeout for each catalog read. Default 5000ms. */
   statementTimeoutMs?: number;
 }
@@ -834,9 +882,11 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
       seq_scan: string;
       seq_tup_read: string;
       n_live_tup: string;
+      last_analyze: Date | null;
     }>(
       'pg_stat_user_tables',
-      `SELECT relname, n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd, seq_scan, seq_tup_read, n_live_tup
+      `SELECT relname, n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd, seq_scan, seq_tup_read, n_live_tup,
+              greatest(last_analyze, last_autoanalyze) AS last_analyze
          FROM pg_stat_user_tables
         WHERE schemaname = $1 AND relname = ANY($2)`,
       [options.schema, options.tables],
@@ -846,6 +896,7 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
     const classRows = await run<{
       relname: string;
       reltuples: string;
+      relpages: string;
       total_size: string;
       table_size: string;
       index_count: string;
@@ -853,6 +904,7 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
       'pg_class size',
       `SELECT c.relname,
               c.reltuples::bigint::text AS reltuples,
+              c.relpages::bigint::text AS relpages,
               pg_total_relation_size(c.oid)::text AS total_size,
               pg_relation_size(c.oid)::text AS table_size,
               (SELECT count(*) FROM pg_index i WHERE i.indrelid = c.oid)::text AS index_count
@@ -878,6 +930,7 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
       for (const row of classRows) {
         const s = ensure(row.relname);
         s.reltuples = Number(row.reltuples);
+        s.relpages = Number(row.relpages);
         s.totalSizeBytes = Number(row.total_size);
         s.tableSizeBytes = Number(row.table_size);
         s.existingIndexCount = Number(row.index_count);
@@ -894,6 +947,7 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
         s.seqScan = Number(row.seq_scan);
         s.seqTupRead = Number(row.seq_tup_read);
         s.nLiveTup = Number(row.n_live_tup);
+        s.lastAnalyze = row.last_analyze == null ? null : new Date(row.last_analyze);
       }
     }
 
@@ -979,6 +1033,53 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
         for (const row of nullRows) {
           snapshot.nullFrac[`${row.tablename}.${row.attname}`] = Number(row.null_frac);
         }
+      }
+    }
+
+    // --- value distribution for divergence candidates (pg_stats) -----------
+    const distCols = options.distributionColumns ?? [];
+    if (distCols.length > 0) {
+      // `inherited = false` is required: on a partitioned parent the inherited
+      // row describes the whole tree, and a per-partition plan is not chosen
+      // from it. most_common_vals is an anyarray, so its cardinality is read
+      // through a text[] cast (array_length on anyarray cannot resolve a type).
+      const distRows = await run<{
+        tablename: string;
+        attname: string;
+        n_distinct: string;
+        correlation: string | null;
+        most_common_freqs: number[] | null;
+        mcv_count: string | null;
+      }>(
+        'pg_stats.distribution',
+        `SELECT s.tablename, s.attname,
+                s.n_distinct::text AS n_distinct,
+                s.correlation::text AS correlation,
+                s.most_common_freqs,
+                coalesce(array_length(s.most_common_vals::text::text[], 1), 0)::text AS mcv_count
+           FROM pg_stats s
+           JOIN unnest($2::text[], $3::text[]) AS probe(t, c)
+             ON probe.t = s.tablename AND probe.c = s.attname
+          WHERE s.schemaname = $1 AND s.inherited = false`,
+        [options.schema, distCols.map((c) => c.table), distCols.map((c) => c.column)],
+      );
+      if (distRows) {
+        const byKey: Record<string, ColumnDistribution> = snapshot.columnStats ?? {};
+        for (const row of distRows) {
+          byKey[`${row.tablename}.${row.attname}`] = {
+            table: row.tablename,
+            column: row.attname,
+            nDistinct: Number(row.n_distinct),
+            correlation: row.correlation == null ? null : Number(row.correlation),
+            mostCommonFreqs: row.most_common_freqs == null ? null : row.most_common_freqs.map(Number),
+            mcvCount: row.mcv_count == null ? 0 : Number(row.mcv_count),
+          };
+        }
+        snapshot.columnStats = byKey;
+      } else {
+        // The read failed (privileges, catalog gap). Leave columnStats absent so
+        // the advisor suppresses every candidate instead of scoring zeros.
+        snapshot.columnStats = undefined;
       }
     }
   } finally {

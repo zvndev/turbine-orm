@@ -36,6 +36,7 @@ Commands:
   doctor --json                  Machine-readable report (schemaVersion 1)
   doctor --unused                Report never-scanned + redundant indexes (no auto-drop)
   doctor --audit                 Unused report scoped to doctor's own suggestions
+  doctor --no-plan-divergence    Skip the cached-plan divergence section
   migrate-from-prisma            Map a schema.prisma onto Turbine (report + typed name map)
   migrate-from-prisma --no-db    Parse-only: write the report without resolving names
   studio                         Launch local read-only Studio web UI
@@ -425,9 +426,31 @@ npx turbine doctor --unused --json           # additive: adds unused/redundant/i
 
 `--audit` is the `--unused` never-scanned machinery scoped to doctor's own previously-suggested indexes (the `idx_<table>_<cols>` names `doctor --fix` emits). It frames the output as: *doctor previously suggested these indexes; N have never been scanned since the stats reset (age printed); consider dropping.* Because those names are truncated to Postgres's 63-byte identifier limit, the matcher compares truncated names and flags any post-truncation collision between different column sets as **ambiguous** rather than issuing a confident verdict.
 
+### The cached-plan divergence check
+
+`doctor` also scores every column it already knows about (relation probe columns and leading index columns) for a distribution that can flip a **cached plan**, and prints a separate section for it. Skip it with `--no-plan-divergence`; it adds one `pg_stats` read.
+
+The shape it models is narrow on purpose: a read shaped `WHERE col = $1 ORDER BY <other indexed column> LIMIT $n`, where `rows / n_distinct` (what a generic plan assumes `col = $1` matches) sits **above** the plan boundary while some real values sit far below it. For those values a promoted generic plan keeps the ordered index scan and has to walk a large fraction of the table before it accumulates one page of matches, where a custom plan takes a bitmap scan over the value's own rows. The boundary itself is `sqrt(limit x relpages)`, which is where an ordered scan's `limit / matching` share of the pages equals a bitmap scan's own; measured flip points track it within 13 to 26% across two orders of magnitude of limit. Both halves of that derivation assume the matching rows are **scattered** through the heap, so on a clustered column there is no flip at any limit and the crossover does not describe the table. That is the same blind spot as the rest of the check: treat a crossover as a reason to run the diagnostic block, never as a measurement.
+
+Each finding prints the statistics behind it (rows, distinct values, the generic estimate, the rarest bucket, the crossover at limit 20 and at limit 1000, correlation, and the last ANALYZE) plus **how many pages the wrong plan walks** and what fraction of the table that is. It deliberately does **not** print an amplification multiplier: the check can see how many rows a value has, not where they physically sit in the heap, and the second half moves the real cost by an order of magnitude.
+
+Every finding ships a copy-pasteable diagnostic block, and its first step is not an `EXPLAIN`:
+
+```sql
+SELECT generic_plans, custom_plans FROM pg_prepared_statements WHERE name = 'turbine_divergence';
+```
+
+A finding describes **exposure, not an incident**. `auto` promotes only when the generic plan's *estimated* cost is not worse than the average custom cost, and on many of these shapes it is worse, so the backend never promotes at all and there is nothing to fix. While `generic_plans` is 0 you are already getting custom plans. Only when it is climbing do the two `EXPLAIN`s below it mean anything. The block ends by resetting `plan_cache_mode`, `synchronize_seqscans` and `max_parallel_workers_per_gather` so a paste does not leave your session pinned.
+
+There is no `--fix`. The remedy is application code ([`forceCustomPlan`](/relations#a-per-query-lever-forcecustomplan) on the affected reads), and the index that looks like a fix is measured not to be one: a composite index on `(col, order_col)` makes the *good* plan better without stopping the generic plan from choosing the other one.
+
+<Callout type="warning" title="What it cannot see">
+This check reads the value distribution, not the physical layout. It models one direction (a rare value that loses its bitmap plan) and deliberately does not model the opposite one (a physically clustered dominant value). A rule for that direction was written, measured against live fixtures, and **removed**: whether that flip helps or hurts turns on where in the heap the dominant band sits, `pg_stats.correlation` is identical whether it sits at the head or the tail, and the rule predicted the wrong *sign* on real tables. A clean report is not evidence of immunity.
+</Callout>
+
 ### `--json`
 
-`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, workload-heat availability, and any degradation notices. The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added. The `unused`, `redundant`, `audit`, and `invalid` arrays are ALWAYS present: they are empty when the corresponding scan did not run, and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`) so the key set never varies by flag. Each unused-index entry also carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the human-readable `caveat` string, so a consumer never has to parse prose.
+`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, workload-heat availability, and any degradation notices. `planDivergence` and `planDivergenceNotices` are always present as arrays (empty when the check found nothing or was skipped). The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added. The `unused`, `redundant`, `audit`, and `invalid` arrays are ALWAYS present: they are empty when the corresponding scan did not run, and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`) so the key set never varies by flag. Each unused-index entry also carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the human-readable `caveat` string, so a consumer never has to parse prose.
 
 ### Where this fits
 

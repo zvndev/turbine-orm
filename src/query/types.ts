@@ -620,6 +620,8 @@ export interface FindUniqueArgs<
   skipGlobalFilters?: SkipGlobalFilters;
   /** Include PII-tagged columns in the result. See {@link FindManyArgs.includePii}. */
   includePii?: boolean;
+  /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
+  forceCustomPlan?: boolean;
 }
 
 export interface FindManyArgs<
@@ -681,6 +683,138 @@ export interface FindManyArgs<
    * always allowed regardless of this flag (the reference is explicit).
    */
   includePii?: boolean;
+  /**
+   * Plan THIS query with its actual parameter values, every execution.
+   * PostgreSQL only (see the refusal below).
+   *
+   * WHY IT EXISTS. Turbine executes through a NAMED prepared statement, which
+   * enters the backend's plan cache, and from the sixth execution onward
+   * PostgreSQL may replace the per-execution plan with a single GENERIC plan
+   * (whenever the generic plan's estimated cost is not worse than the average
+   * custom cost). A generic plan substitutes a default for every value it
+   * cannot see: an unknown equality gets `rows / n_distinct`, an unknown range
+   * gets a third of the table, an unknown LIKE gets 0.5%, and an unknown LIMIT
+   * gets 10% of its child node's estimate. When one of those defaults lands on
+   * the other side of a plan boundary from the real value, the plan SHAPE
+   * flips, and the flip can be catastrophic. It fails in both directions: a
+   * default above the truth and a default below it are both capable of it, so
+   * "the tenant with few rows" is not the predictor.
+   *
+   * WHAT IT DOES, stated as the mechanism really is rather than as the tempting
+   * one-liner. `true` sends this one statement UNNAMED. It is NOT true that
+   * PostgreSQL treats an unnamed statement as a one-shot plan that never enters
+   * the plan cache: `exec_parse_message` builds a `CachedPlanSource` and calls
+   * `SaveCachedPlan` on it for the unnamed statement too (it is kept in
+   * `unnamed_stmt_psrc`). The reason the option works is one level up, in the
+   * DRIVER: node-postgres only skips Parse for a statement it has already
+   * parsed BY NAME (`Query.hasBeenParsed` is `this.name && ...`), so an unnamed
+   * statement is re-Parsed on every execution. Each Parse replaces the unnamed
+   * entry with a fresh `CachedPlanSource` whose custom-plan counter starts at
+   * zero, so the five-execution threshold that precedes promotion is never
+   * reached and every execution is planned with the real parameter values.
+   *
+   * That distinction matters in practice: the guarantee is a property of the
+   * driver's behaviour plus the backend's promotion rule, not a special
+   * one-shot plan class, which is exactly why a connection pinned to
+   * `force_generic_plan` still overrides it (see PRECEDENCE below).
+   *
+   * Nothing is set on the session, no `SET` is emitted, no transaction is
+   * opened, and no extra round trip is added.
+   *
+   * WHAT IT CANNOT DO, and why this is a boolean rather than the client-level
+   * three-value {@link TurbineConfig.planCacheMode}: the generic direction is
+   * NOT expressible per query. `force_generic_plan` is a property of a CACHED
+   * plan, and the only per-query lever here is keeping the statement out of the
+   * cache, which can only ever mean "custom". A per-query
+   * `planCacheMode: 'force_generic_plan'` would be a promise this mechanism
+   * cannot keep, so the option is named for the one thing it does.
+   *
+   * PRECEDENCE over the client-level `planCacheMode`, which is a connection
+   * parameter and cannot be unset for one query. Stated exactly, because one of
+   * these four is the opposite of what the mechanism suggests:
+   *   - Client on the default (`planCacheMode` unset) or `'auto'`: this is what
+   *     the option is FOR. `auto` is the only mode in which promotion to a
+   *     generic plan happens, and the re-Parse described above resets the
+   *     counter that promotion depends on before it can ever be reached.
+   *   - Client on `'force_custom_plan'`: redundant and harmless, both routes
+   *     plan with the real values.
+   *   - Client on `'force_generic_plan'`: REFUSED, with `ValidationError`
+   *     (E003). It does NOT win. That setting governs the unnamed statement's
+   *     cached plan source as well as a named one (measured on PostgreSQL 16.14: five executions
+   *     of the same unnamed statement read 19,107 buffers under the setting and
+   *     55 with the connection back on `auto`), so withholding the name buys
+   *     nothing against it and the query would be planned generically anyway.
+   *     Rather than report a guarantee it cannot keep, Turbine refuses the
+   *     combination and says which of the two settings to change. Only the
+   *     setting TURBINE applied is visible: a `plan_cache_mode` installed by a
+   *     caller's `SET`, `ALTER ROLE`, or a pooler cannot be seen or refused.
+   *   - `false` / omitted changes nothing. It does not opt back out of a
+   *     client-level setting, it simply leaves that setting in charge.
+   *   - With the client-level `preparedStatements: false`, every statement is
+   *     already unnamed, so this option is a no-op for plan choice.
+   *
+   * COST, and it has two halves.
+   *
+   * The first is planning. The statement is parsed and planned on every
+   * execution instead of once. On a flat read that is in the noise (an unnamed
+   * statement also skips the extra Parse/Describe round trip a named one needs
+   * on its first execution, so it can even come out ahead). It grows with the
+   * size of the statement: a deep `with` tree is a much larger plan, and
+   * re-planning it per execution is a measurable share of a fast query's
+   * latency. Turn it on where a plan flip is the risk, not everywhere.
+   *
+   * The second is the one nobody expects: A CUSTOM PLAN IS NOT ALWAYS THE
+   * BETTER PLAN. There are real shapes where the generic plan's ignorance is
+   * what saves it, and forcing a custom plan forecloses that. Reproduced on
+   * PostgreSQL 16.14, `synchronize_seqscans` off, parallel workers off:
+   *
+   * ```sql
+   * CREATE TABLE ev (id bigserial PRIMARY KEY, tenant_id int NOT NULL, pad text);
+   * -- 320,000 rows over 800 tenants, inserted in RANDOM physical order
+   * INSERT INTO ev (tenant_id, pad)
+   *   SELECT t, repeat('x', 60)
+   *   FROM (SELECT ((g % 800) + 1) AS t FROM generate_series(1, 320000) g
+   *         ORDER BY random()) s
+   *   WHERE t <> 400;
+   * -- then tenant 400's 80,000 rows LAST, so they all sit past everything above
+   * INSERT INTO ev (tenant_id, pad)
+   *   SELECT 400, repeat('x', 60) FROM generate_series(1, 80000) g;
+   * CREATE INDEX ev_tenant_idx ON ev (tenant_id);
+   * ANALYZE ev;   -- relpages 5334, n_distinct 800, correlation 0.004
+   *
+   * PREPARE q(int, int) AS SELECT * FROM ev WHERE tenant_id = $1 LIMIT $2;
+   * -- force_custom_plan : Seq Scan,          Buffers: shared hit=4262
+   * -- force_generic_plan: Bitmap Heap Scan,  Buffers: shared hit=71
+   * ```
+   *
+   * 60x, with no `ORDER BY` anywhere. The custom planner knows tenant 400 is
+   * 20% of the table, so with `LIMIT 20` it prices a sequential scan as
+   * essentially free on the assumption it will stop almost immediately. It is
+   * right about how MANY rows match and wrong about WHERE they are: they are
+   * all at the end of the heap, so it reads 319,600 non-matching rows first.
+   * The generic plan, unable to see the value, estimates 500 rows, takes the
+   * bitmap path, and touches one heap block. Re-insert the identical rows in
+   * random physical order and the effect vanishes and reverses (custom 2
+   * buffers, generic 66): physical CLUSTERING is the variable, not selectivity.
+   *
+   * Read that carefully before treating it as an argument against this option.
+   * On that shape `plan_cache_mode = auto` never promotes (the generic plan's
+   * ESTIMATED cost is far higher than the average custom cost, which is exactly
+   * the condition under which `auto` refuses), so the default already produces
+   * the 4,262-buffer plan and `forceCustomPlan` costs nothing against it. The
+   * honest statement is that a generic plan is 60x better there than either the
+   * default or this option, and only an explicit client-level
+   * `planCacheMode: 'force_generic_plan'` can reach it. The reason to scope
+   * this option per query is still real: it is a targeted remedy for a measured
+   * flip, not a setting to turn on globally.
+   *
+   * NON-POSTGRESQL ENGINES. `true` throws {@link UnsupportedFeatureError}
+   * (E017), the same refusal the client-level option gives: an engine with no
+   * PostgreSQL plan cache has no cached generic plan to keep this query out of,
+   * so silently accepting the flag would report a guarantee that was never
+   * made. Omitting it (or `false`) is accepted everywhere.
+   */
+  forceCustomPlan?: boolean;
 }
 
 export interface FindManyStreamArgs<
@@ -937,6 +1071,8 @@ export interface CountArgs<T, R extends object = {}> {
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
+  /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
+  forceCustomPlan?: boolean;
 }
 
 /**
@@ -1190,6 +1326,8 @@ export interface GroupByArgs<T, R extends object = {}> {
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
+  /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
+  forceCustomPlan?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,6 +1428,8 @@ export interface AggregateArgs<T, R extends object = {}> {
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
+  /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
+  forceCustomPlan?: boolean;
 }
 
 /** Result type for aggregate queries */

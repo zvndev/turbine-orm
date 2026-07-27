@@ -620,9 +620,22 @@ export function isDefaultTextParser(oid: number, parser: (text: string) => unkno
  * the origin of, and the resulting bug is order-dependent: which reading wins
  * depends on module evaluation order, which lazy route imports make unstable
  * between requests. So say it out loud, once.
+ *
+ * NOT DEV-ONLY. It used to go quiet under `NODE_ENV=production`, along with
+ * every other dev warning, and that was the wrong rule for THIS one, for the
+ * same reason the temporal-infinity warning (builder.ts `warnTemporalInfinity`)
+ * is not dev-only either. A parser overwrite is ORDER-DEPENDENT: which module
+ * calls `setTypeParser` last decides the reading, and evaluation order is
+ * exactly what differs between a dev process (eager imports, one route
+ * exercised at a time) and a production one (bundled or lazily imported routes,
+ * warmed in whatever order traffic arrives). So a process can be clean in dev
+ * and wrong in production purely from import order, which makes production the
+ * case that matters MOST, and it was the case that was silent. The cost is
+ * bounded to the point of irrelevance: once per OID per process, at client
+ * construction, and only when somebody else's non-default parser is actually
+ * being replaced.
  */
 export function warnParserOverwrite(oid: number, typeName: string): void {
-  if (process.env.NODE_ENV === 'production') return;
   const getParser = pg.types.getTypeParser as unknown as (oid: number, format: 'text') => (value: string) => unknown;
   const current = getParser(oid, 'text');
   // Turbine's own earlier registration is not a third party's expectation.
@@ -640,7 +653,9 @@ export function warnParserOverwrite(oid: number, typeName: string): void {
       'process, and Turbine is replacing it. `pg.types.setTypeParser` is process-global and takes effect ' +
       'immediately for EVERY pg.Pool in the process, including pools that already exist and are already ' +
       'querying, so whatever set that parser will now read this column differently. If yours should win, ' +
-      `register it AFTER constructing the client.${remedy} Dev-only: silent under \`NODE_ENV=production\`.`,
+      `register it AFTER constructing the client.${remedy} This warning fires under \`NODE_ENV=production\` ` +
+      'too: which parser wins depends on module evaluation order, so a process can be clean in dev and wrong ' +
+      'in production from import order alone.',
   );
 }
 

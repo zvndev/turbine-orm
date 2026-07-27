@@ -1524,12 +1524,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const deferred = single
         ? this.buildFindUnique(baseArgs as Parameters<QueryInterface<T, R>['buildFindUnique']>[0])
         : this.buildFindMany(baseArgs as Parameters<QueryInterface<T, R>['buildFindMany']>[0]);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+      const result = await this.queryWithTimeout(
+        deferred.sql,
+        deferred.params,
+        args.timeout,
+        this.preparedNameFor(args, deferred.preparedName),
+      );
       const rows = deferred.transform(result) as Record<string, unknown>[] | Record<string, unknown> | null;
       const entities = single ? (rows ? [rows as Record<string, unknown>] : []) : (rows as Record<string, unknown>[]);
       if (entities.length > 0) {
         await loadRelationsBatched(
-          this.batchedContext(args.timeout, skip, args.includePii === true),
+          this.batchedContext(args.timeout, skip, args.includePii === true, args.forceCustomPlan === true),
           entities,
           batchedWith,
           args.timeout,
@@ -1553,6 +1558,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     timeout: number | undefined,
     skip: SkipGlobalFilters | undefined,
     includePii: boolean,
+    forceCustomPlan = false,
   ): RelationLoadContext {
     const childOptions: QueryInterfaceOptions = {
       ...this.options,
@@ -1564,7 +1570,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       schema: this.schema,
       makeChild: (table: string): BatchedChildReader =>
         new QueryInterface<object>(this.pool, table, this.schema, [], childOptions) as unknown as BatchedChildReader,
-      exec: (sql, params, preparedName) => this.queryWithTimeout(sql, params, timeout, preparedName),
+      // The per-query `forceCustomPlan` opt-in covers the relation follow-ups
+      // too: a batched load re-issues the SAME tenant-shaped predicate one
+      // level down, so leaving those named would keep exactly the plan-cache
+      // exposure the caller asked to be rid of.
+      exec: (sql, params, preparedName) =>
+        this.queryWithTimeout(sql, params, timeout, this.preparedNameFor({ forceCustomPlan }, preparedName)),
       quote: (name) => this.q(name),
       buildInClause: (expr, paramRef, negated) => this.inClause(expr, paramRef, negated),
       inClauseParam: (values) => this.inParam(values),
@@ -1614,11 +1625,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const { baseArgs, strip } = this.prepareBatchedBase(args, withClause);
     // baseArgs.with is always undefined here; the cast just bridges the R generic.
     const deferred = this.buildFindMany(baseArgs as Parameters<QueryInterface<T, R>['buildFindMany']>[0]);
-    const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+    const result = await this.queryWithTimeout(
+      deferred.sql,
+      deferred.params,
+      args.timeout,
+      this.preparedNameFor(args, deferred.preparedName),
+    );
     const entities = deferred.transform(result) as Record<string, unknown>[];
     if (entities.length > 0) {
       await loadRelationsBatched(
-        this.batchedContext(args.timeout, skip, args.includePii === true),
+        this.batchedContext(args.timeout, skip, args.includePii === true, args.forceCustomPlan === true),
         entities,
         withClause,
         args.timeout,
@@ -1811,6 +1827,78 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Resolve the prepared-statement name a read should execute under, honouring
+   * the per-query {@link FindManyArgs.forceCustomPlan} opt-in.
+   *
+   * `forceCustomPlan: true` returns `undefined`, which sends the statement
+   * UNNAMED. The mechanism is NOT "PostgreSQL treats an unnamed statement as a
+   * one-shot plan that never enters the plan cache": the backend builds and
+   * saves a `CachedPlanSource` for the unnamed statement too. It works because
+   * node-postgres only skips Parse for a statement it has already parsed BY
+   * NAME (`Query.hasBeenParsed` is `this.name && connection.parsedStatements[this.name]`),
+   * so an unnamed statement is re-Parsed on every execution, each Parse
+   * replaces the unnamed cached plan source with a fresh one whose custom-plan
+   * counter is zero, and the five-execution threshold that precedes promotion
+   * is never reached. Every execution is therefore planned with the real
+   * parameter values.
+   *
+   * No GUC is set, no `SET LOCAL` is emitted, no transaction is opened, and no
+   * extra round trip is added, which is exactly why the opt-in can be per query
+   * while the client-level `planCacheMode` (a connection parameter) cannot be.
+   *
+   * The refusal is deliberately here, at the one seam every read execution
+   * passes through, rather than in each build method: the flag changes NOTHING
+   * about the SQL text, so a build-time check would have had to be repeated in
+   * every builder and could still be bypassed by a hand-executed
+   * `DeferredQuery`.
+   *
+   * Engines whose dialect does not report {@link Dialect.supportsPlanCacheMode}
+   * throw {@link UnsupportedFeatureError} (E017): the flag names a PostgreSQL
+   * plan-cache guarantee, and an engine with no such cache cannot make it.
+   * The same flag left unset (or `false`) is accepted everywhere.
+   *
+   * THE ONE COMBINATION THAT IS REFUSED RATHER THAN HONOURED. A client-level
+   * `planCacheMode: 'force_generic_plan'` DEFEATS this option, and that was
+   * MEASURED rather than reasoned about: on PostgreSQL 16.14, five executions
+   * of one unnamed statement read 19,107 buffers with that setting in force and
+   * 55 buffers with the same connection set back to `auto`, against 19,107 for
+   * the named statement. So the setting governs the unnamed statement too, and
+   * withholding the name buys nothing against it. Accepting the flag there
+   * would report a guarantee the very next execution breaks, so the
+   * contradiction throws {@link ValidationError} (E003) naming both settings.
+   * Turbine can only see the setting IT applied: a `plan_cache_mode` installed
+   * by the caller's own `SET`, by `ALTER ROLE`, or by a pooler is invisible
+   * here and is not refused.
+   */
+  private preparedNameFor(
+    args: { forceCustomPlan?: boolean } | undefined,
+    name: string | undefined,
+  ): string | undefined {
+    if (args?.forceCustomPlan !== true) return name;
+    if (this.dialect.supportsPlanCacheMode !== true) {
+      throw new UnsupportedFeatureError(
+        'The forceCustomPlan query option',
+        this.dialect.name,
+        'Forcing a per-query custom plan means keeping the statement out of the PostgreSQL plan cache, and this ' +
+          'engine has no such cache to keep it out of. Remove the option, or set it only on PostgreSQL queries.',
+      );
+    }
+    if (this.options?.planCacheMode === 'force_generic_plan') {
+      throw new ValidationError(
+        '[turbine] forceCustomPlan: true cannot be honoured on a client configured with ' +
+          "planCacheMode: 'force_generic_plan'. That setting is a connection parameter and it governs UNNAMED " +
+          'statements as well as named ones, so the mechanism this option uses (withholding the ' +
+          'prepared-statement name, so the driver re-parses the statement on every execution and it is planned ' +
+          'with its real values) is ' +
+          'overridden by it and the query would be planned generically anyway. Leave the client on the default ' +
+          '(`planCacheMode` unset, or `auto`) and force the custom plan per query: that is the combination that ' +
+          'expresses "custom here, auto there".',
+      );
+    }
+    return undefined;
+  }
+
+  /**
    * Execute a pool.query with an optional timeout.
    * If timeout is set, races the query against a timer and rejects on expiry.
    * pg driver errors are translated to typed Turbine errors via wrapPgError.
@@ -1999,7 +2087,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
       const deferred = this.buildFindUnique(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+      const result = await this.queryWithTimeout(
+        deferred.sql,
+        deferred.params,
+        args.timeout,
+        this.preparedNameFor(args, deferred.preparedName),
+      );
       return deferred.transform(result);
     }) as Promise<QueryResult<T, R, W, S, O> | null>;
   }
@@ -2026,11 +2119,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
     );
     const baseArgs = { ...args, with: undefined, select: proj.select, omit: proj.omit } as unknown as FindUniqueArgs<T>;
     const deferred = this.buildFindUnique(baseArgs as Parameters<QueryInterface<T, R>['buildFindUnique']>[0]);
-    const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+    const result = await this.queryWithTimeout(
+      deferred.sql,
+      deferred.params,
+      args.timeout,
+      this.preparedNameFor(args, deferred.preparedName),
+    );
     const entity = deferred.transform(result) as Record<string, unknown> | null;
     if (!entity) return null;
     await loadRelationsBatched(
-      this.batchedContext(args.timeout, args.skipGlobalFilters, args.includePii === true),
+      this.batchedContext(
+        args.timeout,
+        args.skipGlobalFilters,
+        args.includePii === true,
+        args.forceCustomPlan === true,
+      ),
       [entity],
       withClause,
       args.timeout,
@@ -2246,7 +2349,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
       const deferred = this.buildFindMany(args as unknown as FindManyArgs<T, R, W, S, O>);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
+      const result = await this.queryWithTimeout(
+        deferred.sql,
+        deferred.params,
+        args?.timeout,
+        this.preparedNameFor(args, deferred.preparedName),
+      );
       return deferred.transform(result);
     }) as Promise<QueryResult<T, R, W, S, O>[]>;
   }
@@ -2757,10 +2865,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
     >);
 
     this.currentAction = 'findManyStream';
+    // Streaming is ALREADY immune to the generic-plan cliff: the speculative
+    // fetch has never passed a prepared name, and the cursor path runs through
+    // DECLARE, so neither statement enters the plan cache. `preparedNameFor` is
+    // still called with no name so that `forceCustomPlan: true` is VALIDATED on
+    // an engine that cannot honour it here either, rather than being quietly
+    // satisfied by an accident of this code path.
     const speculativeResult = await this.queryWithTimeout(
       speculativeDeferred.sql,
       speculativeDeferred.params,
       args?.timeout,
+      this.preparedNameFor(args, undefined),
     );
 
     if (speculativeResult.rows.length <= batchSize) {
@@ -2837,7 +2952,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
       const deferred = this.buildFindFirst(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
+      const result = await this.queryWithTimeout(
+        deferred.sql,
+        deferred.params,
+        args?.timeout,
+        this.preparedNameFor(args, deferred.preparedName),
+      );
       return deferred.transform(result);
     }) as Promise<QueryResult<T, R, W, S, O> | null>;
   }
@@ -2876,7 +2996,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
     return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirstOrThrow(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
+      const result = await this.queryWithTimeout(
+        deferred.sql,
+        deferred.params,
+        args?.timeout,
+        this.preparedNameFor(args, deferred.preparedName),
+      );
       return deferred.transform(result);
     }) as Promise<QueryResult<T, R, W, S, O>>;
   }
@@ -2920,7 +3045,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
     return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUniqueOrThrow(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+      const result = await this.queryWithTimeout(
+        deferred.sql,
+        deferred.params,
+        args.timeout,
+        this.preparedNameFor(args, deferred.preparedName),
+      );
       return deferred.transform(result);
     }) as Promise<QueryResult<T, R, W, S, O>>;
   }
@@ -3138,7 +3268,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async count(args?: CountArgs<T, R>): Promise<number> {
     return this.executeWithMiddleware('count', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildCount(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args?.timeout, deferred.preparedName);
+      const result = await this.queryWithTimeout(
+        deferred.sql,
+        deferred.params,
+        args?.timeout,
+        this.preparedNameFor(args, deferred.preparedName),
+      );
       return deferred.transform(result);
     });
   }
@@ -3189,7 +3324,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async groupBy<A extends GroupByArgs<T, R>>(args: A): Promise<GroupByResult<T, A>[]> {
     return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildGroupBy(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+      const result = await this.queryWithTimeout(
+        deferred.sql,
+        deferred.params,
+        args.timeout,
+        this.preparedNameFor(args, deferred.preparedName),
+      );
       return deferred.transform(result) as GroupByResult<T, A>[];
     });
   }
@@ -3213,7 +3353,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async aggregate(args: AggregateArgs<T, R>): Promise<AggregateResult<T>> {
     return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildAggregate(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
+      const result = await this.queryWithTimeout(
+        deferred.sql,
+        deferred.params,
+        args.timeout,
+        this.preparedNameFor(args, deferred.preparedName),
+      );
       return deferred.transform(result);
     });
   }
