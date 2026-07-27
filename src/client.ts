@@ -43,7 +43,8 @@ import {
   type QueryInterfaceOptions,
   type RelationLoadStrategy,
 } from './query/index.js';
-import { quoteIdent } from './query/utils.js';
+import { closestName, quoteIdent } from './query/utils.js';
+import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import {
   type ActiveSubscription,
   createSubscription,
@@ -459,6 +460,153 @@ export interface TurbineConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Unknown-config-key diagnostics
+// ---------------------------------------------------------------------------
+
+/**
+ * Every `TurbineConfig` key, as runtime data. TypeScript erases the interface,
+ * so the key set has to exist as a value; `Record<keyof TurbineConfig, true>`
+ * makes the compiler own it in BOTH directions: a field added to the interface
+ * fails typecheck until it is listed here, and a key listed here that is not a
+ * field fails as an excess property. So this can never drift into warning about
+ * a real option.
+ */
+const TURBINE_CONFIG_KEYS: Record<keyof TurbineConfig, true> = {
+  pool: true,
+  connectionString: true,
+  host: true,
+  port: true,
+  database: true,
+  user: true,
+  password: true,
+  ssl: true,
+  poolSize: true,
+  idleTimeoutMs: true,
+  connectionTimeoutMs: true,
+  max: true,
+  idleTimeoutMillis: true,
+  connectionTimeoutMillis: true,
+  logging: true,
+  defaultLimit: true,
+  warnOnUnlimited: true,
+  utcTimestamps: true,
+  scopedConnect: true,
+  relationLoadStrategy: true,
+  stableRelationOrder: true,
+  implicitPkOrdering: true,
+  autoToOneJoinMaxRows: true,
+  autoRoundTripMs: true,
+  jsonEncoding: true,
+  errorMessages: true,
+  logQueryParams: true,
+  preparedStatements: true,
+  sqlCache: true,
+  sqlCacheSize: true,
+  dialect: true,
+  replicas: true,
+  globalFilters: true,
+};
+
+/**
+ * {@link TURBINE_CONFIG_KEYS} as a lookup. A `Set` rather than an `in` test on
+ * the record, so an inherited `Object.prototype` name (`toString`, `constructor`)
+ * is treated as the unknown key it is.
+ */
+const CONFIG_KEY_SET: ReadonlySet<string> = new Set(Object.keys(TURBINE_CONFIG_KEYS));
+
+/**
+ * Keys that are legitimately present on a config object but are not public
+ * `TurbineConfig` fields:
+ *
+ *   - `queryInterfaceFactory`: the non-SQL-backend seam. `turbinePowDB` sets it
+ *     through a cast so `table()` builds a `PowqlInterface`; it is `@internal`,
+ *     deliberately absent from the public interface, and must not warn.
+ *   - `schema`: `turbine.config.*` files carry a Postgres schema NAME for the
+ *     CLI, and that same object is routinely spread into the client factory.
+ *     The client ignores it (its schema metadata is the second argument), and
+ *     shouting about a documented CLI field would be pure noise.
+ *   - `url`: the connection-string spelling used by the CLI config and by the
+ *     engine factories' first argument. Same story as `schema`.
+ */
+const NON_CONFIG_KEYS: ReadonlySet<string> = new Set(['queryInterfaceFactory', 'schema', 'url']);
+
+/** camelCase name → its lowercased words (`logQueryParams` → log, query, params). */
+function camelWords(name: string): string[] {
+  return name
+    .split(/(?=[A-Z])/)
+    .map((w) => w.toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * The real config key `key` most likely meant, or null when nothing is close.
+ *
+ * {@link closestName} (the same helper the unknown-COLUMN message uses) decides
+ * first, so both diagnostics rank near-misses identically. It is bounded by edit
+ * distance, which covers typos but not the miss this warning exists for: a
+ * guessed name that omits a whole word. `logParams` is five edits from
+ * `logQueryParams`, past the bound, yet it names the same words in the same
+ * order, so a second pass accepts a candidate whose camelCase words CONTAIN the
+ * guess's words in order, preferring the one that adds fewest words.
+ */
+function suggestConfigKey(key: string): string | null {
+  const direct = closestName(key, CONFIG_KEY_SET);
+  if (direct) return direct;
+  const wanted = camelWords(key);
+  if (wanted.length < 2) return null;
+  let best: string | null = null;
+  let bestExtra = Number.POSITIVE_INFINITY;
+  for (const candidate of CONFIG_KEY_SET) {
+    const words = camelWords(candidate);
+    if (words.length <= wanted.length) continue;
+    let i = 0;
+    for (const w of words) if (w === wanted[i]) i++;
+    if (i !== wanted.length) continue;
+    const extra = words.length - wanted.length;
+    if (extra < bestExtra) {
+      bestExtra = extra;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+/**
+ * Dev-mode notice for a key on the config object that is not part of the config
+ * surface.
+ *
+ * An unknown key is silently ignored (JavaScript objects have no schema), which
+ * makes a typo or a wrong guess indistinguishable from a broken feature: a
+ * caller who wants query parameters in `$on('query')` events and reaches for a
+ * plausible-sounding `logParams` sees nothing happen and concludes the feature
+ * does not work, rather than that the option is spelled `logQueryParams`.
+ *
+ * Deliberately a warning, never an error. An app compiled against a NEWER
+ * turbine that passes a key this version has not heard of must keep running,
+ * and the whole check is wrapped so that a hostile / exotic config object
+ * (a Proxy whose `ownKeys` throws) cannot take down the constructor either.
+ * Dev-only (`NODE_ENV !== 'production'`) and once per key per process, like the
+ * other advisory diagnostics.
+ */
+function warnUnknownConfigKeys(config: TurbineConfig): void {
+  if (process.env.NODE_ENV === 'production') return;
+  try {
+    for (const key of Object.keys(config)) {
+      if (CONFIG_KEY_SET.has(key) || NON_CONFIG_KEYS.has(key)) continue;
+      if (!shouldWarnOnce(WARN_NS.unknownConfigKey, key)) continue;
+      const suggestion = suggestConfigKey(key);
+      console.warn(
+        `[turbine] Unknown option "${key}" in the config passed to TurbineClient, it is ignored.` +
+          (suggestion ? ` Did you mean "${suggestion}"?` : ''),
+      );
+    }
+  } catch {
+    // Key enumeration is the only thing that can fail here, and a diagnostic
+    // must never be the reason a client fails to construct.
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Middleware types
 // ---------------------------------------------------------------------------
 
@@ -858,6 +1006,9 @@ export class TurbineClient {
       }
       break;
     }
+    // Name any key on the config object that is not part of the config surface
+    // (dev only, once per key, never throws). See warnUnknownConfigKeys.
+    warnUnknownConfigKeys(config);
     /**
      * Parse int8 (bigint, OID 20) as JavaScript number instead of string.
      * Safe for values up to Number.MAX_SAFE_INTEGER (9,007,199,254,740,991).

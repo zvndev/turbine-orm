@@ -402,6 +402,63 @@ describe('where: Date on a temporal column', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 6b. findUnique's simple-where fast path
+// ---------------------------------------------------------------------------
+
+/**
+ * `findUnique` compiles a plain all-equality where through its OWN param
+ * pusher rather than `buildWhereClause`, so a value transform added to the
+ * general walker does not reach it. The two paths must bind identically or a
+ * `Date` keyed on a zone-less column matches through `findFirst` and misses
+ * through `findUnique` on the very same predicate: no error, an empty result.
+ *
+ * The fast path has a build pusher AND a separate cache-hit collector, so each
+ * assertion runs twice against one QueryInterface.
+ */
+describe('findUnique fast path: temporal binds agree with the general path', () => {
+  const WHERE = { createdAt: A_TIMESTAMP };
+
+  it('binds the UTC-component literal on a zone-less timestamp column', () => {
+    const qi = q();
+    const built = qi.buildFindUnique({ where: WHERE });
+    assert.deepEqual(built.params, [A_TIMESTAMP_LITERAL]);
+    // Warmed cache hit: the collector is a second, separate walk.
+    assert.deepEqual(qi.buildFindUnique({ where: WHERE }).params, [A_TIMESTAMP_LITERAL]);
+  });
+
+  it('binds a time-of-day literal on a time column', () => {
+    const qi = q();
+    assert.deepEqual(qi.buildFindUnique({ where: { time: NINE_AM_UTC } }).params, ['09:00:00']);
+    assert.deepEqual(qi.buildFindUnique({ where: { time: NINE_AM_UTC } }).params, ['09:00:00']);
+  });
+
+  it('binds exactly what findFirst binds for the same predicate', () => {
+    const unique = q().buildFindUnique({ where: { createdAt: A_TIMESTAMP, onDate: A_TIMESTAMP } });
+    // findFirst appends its own LIMIT param, which is not part of the where.
+    const first = q().buildFindFirst({ where: { createdAt: A_TIMESTAMP, onDate: A_TIMESTAMP } });
+    assert.deepEqual(unique.params, first.params.slice(0, unique.params.length));
+    assert.deepEqual(unique.params, [A_TIMESTAMP_LITERAL, A_DATE_LITERAL]);
+  });
+
+  it('REGRESSION: timestamptz and non-temporal keys are still bound by identity', () => {
+    const qi = q();
+    // The fast path binds its keys in SORTED order: label, then updatedAt.
+    const built = qi.buildFindUnique({ where: { updatedAt: A_TIMESTAMP, label: 'x' } });
+    assert.equal(built.params[0], 'x');
+    assert.equal(built.params[1], A_TIMESTAMP);
+    const hit = qi.buildFindUnique({ where: { updatedAt: A_TIMESTAMP, label: 'x' } });
+    assert.equal(hit.params[1], A_TIMESTAMP);
+    assert.equal(hit.sql, built.sql);
+  });
+
+  it('is a value transform only: the SQL is unchanged by the rewrite', () => {
+    const withDate = q().buildFindUnique({ where: { time: NINE_AM_UTC } });
+    const withString = q().buildFindUnique({ where: { time: '09:00:00' } });
+    assert.equal(withDate.sql, withString.sql);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 7. Scoping of the zone-less rewrite: opt-out and non-PostgreSQL engines
 // ---------------------------------------------------------------------------
 

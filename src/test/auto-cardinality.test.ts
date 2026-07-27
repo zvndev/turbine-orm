@@ -293,6 +293,12 @@ describe("'auto', to-one cardinality", () => {
     assert.equal(notes.length, 1, 'once per relation');
     assert.match(notes[0]!, /"order" on "order_items" loads batched/);
     assert.match(notes[0]!, /1000 rows/);
+    // The rule is a cardinality trade, not an index complaint: the note has to
+    // say which plan shape it replaced and what that buys, or the reader
+    // reaches for an index that would not have changed the decision.
+    assert.match(notes[0]!, /re-evaluates once per parent row/);
+    assert.match(notes[0]!, /even on a unique index/);
+    assert.match(notes[0]!, /single extra round trip/);
   });
 
   it('does not tag events for the bounded (join) plan', async () => {

@@ -20,6 +20,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
+import { resolveColumnName } from './query/utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { normalizeKeyColumns } from './schema.js';
 
@@ -153,10 +154,57 @@ export function injectForeignKey(
     const refCol = refs[i]!;
     const refField = schema.tables[relation.from]?.reverseColumnMap[refCol] ?? refCol;
     const fkField = childTable?.reverseColumnMap[fkCol] ?? fkCol;
-    result[fkField] = parentRow[refField];
+    assignByColumn(result, childTable, fkField, parentRow[refField]);
   }
 
   return result;
+}
+
+/**
+ * Set `field` on `target`, first dropping any OTHER key that names the SAME
+ * column.
+ *
+ * The engine always writes the canonical FIELD spelling, while a caller's own
+ * `data` may legally spell the same column its snake_case way (the write
+ * builders resolve both). Overwriting only the identical key left both in the
+ * object, and the INSERT/UPDATE then named one column twice, which PostgreSQL
+ * refuses (42701 "specified more than once"). Dropping the alias makes the
+ * column spelling behave exactly as the field spelling always did: the value the
+ * relation dictates wins.
+ *
+ * Only SCALAR keys are droppable. A relation is resolved to a column by the very
+ * same rule (nothing stops a schema from naming a relation the way a column is
+ * spelled), but a relation key carries a nested write rather than a value, so
+ * dropping it would discard the whole operation silently, a strictly worse
+ * outcome than the duplicate-column error this drop exists to prevent. The
+ * relation-shape test matches {@link splitData}, so a key routed to `relations`
+ * there is never treated as an alias here.
+ */
+function assignByColumn(
+  target: Record<string, unknown>,
+  meta: TableMetadata | undefined,
+  field: string,
+  value: unknown,
+): void {
+  const column = meta && resolveColumnName(meta, field);
+  if (column) {
+    for (const key of Object.keys(target)) {
+      if (key === field || isRelationEntry(meta, key, target[key])) continue;
+      if (resolveColumnName(meta, key) === column) delete target[key];
+    }
+  }
+  target[field] = value;
+}
+
+/** Does `key` name a relation on `meta` AND carry a nested-write payload? */
+function isRelationEntry(meta: TableMetadata, key: string, value: unknown): boolean {
+  return (
+    Object.hasOwn(meta.relations, key) &&
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    !(value instanceof Date)
+  );
 }
 
 /**
@@ -990,10 +1038,15 @@ export async function executeNestedCreate(
     }
   }
 
-  // Insert the parent row (scalars + resolved belongsTo foreign keys)
-  const parentRow = (await ctx.tx.table(tableName).create({
-    data: { ...scalars, ...belongsToFks },
-  })) as Record<string, unknown>;
+  // Insert the parent row (scalars + resolved belongsTo foreign keys). The
+  // resolved keys win over a caller-supplied value for the same column under
+  // either spelling (see assignByColumn), so `{ authorId: 1, author: { connect } }`
+  // and `{ author_id: 1, author: { connect } }` both take the connected row.
+  const parentData: Record<string, unknown> = { ...scalars };
+  for (const [field, value] of Object.entries(belongsToFks)) {
+    assignByColumn(parentData, tableMeta, field, value);
+  }
+  const parentRow = (await ctx.tx.table(tableName).create({ data: parentData })) as Record<string, unknown>;
 
   // Process hasMany / hasOne relations, their FK lives on the CHILD, so they
   // need the parent row to exist first.

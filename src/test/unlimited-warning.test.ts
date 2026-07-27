@@ -61,6 +61,10 @@ describe('findMany unlimited-query warning', () => {
     assert.match(warnings[0]!, /findMany on "users"/);
     assert.match(warnings[0]!, /no limit/);
     assert.match(warnings[0]!, /warnOnUnlimited: false/);
+    // Condition, mechanism, fix, escape hatch: "this will fetch every row" left
+    // the memory cost implicit, which is the part that actually bites.
+    assert.match(warnings[0]!, /materializes all of them as objects/);
+    assert.match(warnings[0]!, /defaultLimit/);
   });
 
   it('does NOT warn when limit is provided', async () => {

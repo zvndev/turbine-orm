@@ -284,6 +284,19 @@ const row = await db.memberships.findUnique({
 });
 ```
 
+<Callout type="note" title="Fixed in 0.53: findUnique could miss a row findFirst found">
+  A `findUnique` whose `where` is plain equality compiles through a fast path
+  that builds its own parameter list instead of walking the general `where`
+  compiler. That path bound its operands raw, so a `Date` compared against a
+  zone-less `date` / `timestamp` / `time` column was not rewritten the way the
+  general walker rewrites it. The same predicate against the same row therefore
+  matched through `findFirst` and returned `null` through `findUnique`, with no
+  error to notice.
+
+  Both the build path and the cache-hit collector now apply the same coercion.
+  It is a value-only fix: the emitted SQL and the cache key are unchanged.
+</Callout>
+
 ## findFirst / findFirstOrThrow
 
 First matching row by the given `where` + `orderBy`. Non-unique lookups.
@@ -331,6 +344,20 @@ A table with no usable defaults still fails, correctly, with the database's own 
 
 Also note that `createMany` takes its column list from the **first** row, so every row must name the same fields. See [uniform rows](#createmany) below.
 </Callout>
+
+### Field names and column names resolve identically
+
+A key in `data`, `where`, `orderBy`, or `select` may be spelled as the **field** name (`lastRun`) or as the underlying **column** name (`last_run`). Both spellings have always compiled to the same SQL, and since v0.53 both are guaranteed to be processed the same way as well:
+
+```ts
+// Identical statement, and identical bound value.
+await db.jobs.update({ where: { id: 1 }, data: { lastRun: new Date() } });
+await db.jobs.update({ where: { id: 1 }, data: { last_run: new Date() } });
+```
+
+That guarantee used to hold for the statement only. The SQL builders accepted both spellings, but the per-column value pass resolved keys through the field map alone, so a column-name key skipped it: `{ last_run: date }` produced correct SQL carrying an unprocessed value. On a zone-less `date` / `timestamp` / `time` column that meant the UTC rewrite never ran and the process's local calendar fields were stored, with no error anywhere. Both resolvers are now the same function.
+
+The column spelling is the natural one on an introspected schema, so if you have been writing it, check any zone-less temporal column written that way before upgrading; the value a fresh write stores changes to the correct one.
 
 ## createMany
 
@@ -568,7 +595,7 @@ The row source becomes `SELECT DISTINCT ON ("instance_id") ... ORDER BY "instanc
 
 ### Filtering groups with HAVING
 
-A `where` clause filters rows *before* grouping. A `having` clause filters the resulting groups *after*, by their aggregates. Every comparison value is parameterized.
+A `where` clause filters rows *before* grouping. A `having` clause filters the resulting groups *after*. Every comparison value is parameterized.
 
 ```ts
 // Users with more than one post
@@ -586,7 +613,7 @@ const popular = await db.posts.groupBy({
 });
 ```
 
-Filter on the group row count with `_count`, or on a column aggregate with `{ column: { _sum | _avg | _min | _max: { ... } } }`. The available operators are `gt`, `gte`, `lt`, `lte`, `in`, and `notIn`, a bare number is shorthand for equality. Multiple `having` predicates combine with `AND`:
+Filter on the group row count with the top-level `_count`, or on a column aggregate with `{ column: { _sum | _avg | _min | _max: { ... } } }`. Aggregate operators are `equals`, `not`, `gt`, `gte`, `lt`, `lte`, `in`, and `notIn`; a bare value is shorthand for equality. Multiple `having` predicates combine with `AND`:
 
 ```ts
 // Groups with > 1 row AND a summed view count <= 500
@@ -597,6 +624,75 @@ const niche = await db.posts.groupBy({
   having: { _count: { gt: 1 }, viewCount: { _sum: { lte: 500 } } },
 });
 ```
+
+`_min` / `_max` operands are **not** numeric-only. Those two return a stored cell, so comparing one against the column's own type is as valid as comparing a sum against a number:
+
+```ts
+const lateAlphabetically = await db.posts.groupBy({
+  by: ['userId'],
+  _min: { title: true },
+  having: { title: { _min: { gt: 'm' } } },
+});
+// ... HAVING MIN("title") > $1
+```
+
+#### Filtering on the grouped value (new in v0.53)
+
+A field entry also accepts a filter on the **grouped value itself**, not just on an aggregate of it. This is Prisma's `having` shape, and it is what you want for the common "drop the NULL group" case:
+
+```ts
+const byType = await db.posts.groupBy({
+  by: ['typeId'],
+  _count: true,
+  having: { typeId: { not: null }, _count: { gt: 1 } },
+});
+// ... GROUP BY "type_id" HAVING "type_id" IS NOT NULL AND COUNT(*) > $1
+```
+
+A bare value is equality shorthand, and both forms may appear in the same object (they are `AND`ed):
+
+```ts
+await db.posts.groupBy({ by: ['published'], _count: true, having: { published: true } });
+// ... HAVING "published" = $1
+
+await db.posts.groupBy({
+  by: ['status'],
+  _sum: { viewCount: true },
+  having: { status: { startsWith: 'pub' }, viewCount: { _sum: { gte: 100 } } },
+});
+// ... HAVING "status" LIKE $1 ESCAPE '\' AND SUM("view_count") >= $2
+```
+
+Scalar predicates compile through the same machinery as `where`, so the whole [WHERE operator](#where-operators) surface is available: `in` / `notIn`, `contains` / `startsWith` / `endsWith` with `mode: 'insensitive'`, JSON and array filters, LIKE escaping, and each engine's own `IN` form. Grouping by a JSON path works too, keyed by the group-key alias.
+
+<Callout type="warning" title="A scalar filter is only legal on a `by` column">
+  `HAVING` can only reference a grouped column, so a scalar filter on anything
+  else throws a `ValidationError` (`TURBINE_E003`) naming the column and listing
+  the `by` keys, rather than emitting SQL the database rejects. If the predicate
+  is meant to select **rows**, it belongs in `where`; if it is meant to select
+  **groups**, add the column to `by` or filter an aggregate of it.
+</Callout>
+
+#### `AND` / `OR` / `NOT`
+
+Scalar and aggregate predicates combine at any depth:
+
+```ts
+const interesting = await db.posts.groupBy({
+  by: ['status'],
+  _count: true,
+  _sum: { viewCount: true },
+  having: {
+    OR: [
+      { _count: { gt: 100 } },
+      { AND: [{ status: 'draft' }, { viewCount: { _sum: { gt: 1000 } } }] },
+    ],
+  },
+});
+// ... HAVING (COUNT(*) > $1 OR ("status" = $2 AND SUM("view_count") > $3))
+```
+
+`AND` and `NOT` take either one `having` object or an array of them; `OR` takes an array. The shapes match the `where` combinators, so the two clauses read the same way.
 
 `HAVING` is emitted after `GROUP BY` and before `ORDER BY`, and its parameters continue the same numbering as any `where` params.
 
@@ -1023,6 +1119,20 @@ const db = turbine({
 | `autoToOneJoinMaxRows` | `1000` | Parent-row ceiling for the [`'auto'` strategy's to-one rule](/relations#load-strategy-auto-join-batched-flatten): a `belongsTo` / `hasOne` include stays in the single-statement join when the query's `limit` bounds the parent set at or under this value, and loads batched when the query is unbounded or bounded above it. Only consulted under `'auto'`. |
 
 Where a pg-style alias exists, the explicit Turbine field wins when both are set.
+
+### Unknown options warn (new in v0.53)
+
+A JavaScript object has no schema, so a key that is not a config field used to be silently ignored. That makes a wrong guess indistinguishable from a broken feature: you set `logParams`, nothing happens, and you conclude query parameters cannot be logged rather than that the option is spelled `logQueryParams`.
+
+Every key on the config object is now checked against the config surface, and an unrecognized one logs a one-time warning with the nearest real option:
+
+```txt
+[turbine] Unknown option "logParams" in the config passed to TurbineClient, it is ignored. Did you mean "logQueryParams"?
+```
+
+The suggestion covers plain typos and the case a typo check alone misses: a guess that leaves out a whole word (`logParams` is five edits from `logQueryParams`, but it names the same words in the same order).
+
+It is deliberately a warning, never an error, so an app compiled against a newer Turbine that passes an option this version has not heard of keeps running. It fires once per key name per process, is silent under `NODE_ENV=production`, and the whole check is wrapped so that no config object can turn a diagnostic into a failed constructor. `url` and `schema` never warn: `turbine.config.*` files carry both for the CLI, and that object is routinely spread into the client factory.
 
 <Callout type="warning" title="preparedStatements behind a connection pooler">
   With prepared statements on, the named statement is prepared on **one backend

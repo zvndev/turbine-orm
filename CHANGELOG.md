@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.53.0 (2026-07-27)
+
+The release that finally finds the bug 0.50 and 0.52 both aimed at and missed.
+Three consecutive releases fixed something real in the temporal write path, and
+the reported symptom survived every one of them, because the defect was never in
+the coercion itself. It was in which spelling of a key reaches it.
+
+- **A write whose data key is spelled as the COLUMN name skipped every value
+  coercion.** Turbine resolves a data key to a column in two places, and they
+  did not agree. The SQL builder's `toColumn` accepts both the field name and
+  the snake_case column name (it falls back to `camelToSnake` validated against
+  the reverse map). The write-value coercion resolved the same key through
+  `columnMap` alone, which maps field name to column name and knows nothing
+  about the column spelling. So `{ last_run: date }` produced correct SQL with a
+  completely uncoerced value, while `{ lastRun: date }` was correct. The
+  temporal rewrite was the visible casualty (a zone-less column stored the
+  process's local calendar fields), but the gap was total: array casts,
+  JSON encoding, every per-column transform was skipped on that path. Both
+  callers now share one `resolveColumnName` resolver, so the value a column
+  receives no longer depends on how its key was spelled.
+- **`findUnique` could return `null` for a row that `findFirst` finds.** The
+  simple-where fast path pushed operands straight onto the params array while
+  the general where walker routed them through `coerceWhereOperand`. On a
+  zone-less `timestamp` / `date` / `time` column that is the same defect as
+  above, on the read side: the same predicate against the same row found it one
+  way and missed it the other, with no error. Both the build path and the
+  cache-hit collector now coerce. The emitted SQL and the cache key are
+  unchanged, so this is a value-only fix.
+- **An unknown key in the client config was silently ignored.** `logParams`,
+  `redactParams`, and every other near-miss did nothing at all, which reads as
+  "the option is on and has no effect" rather than "the option does not exist".
+  Unknown keys now warn once per key name (outside production) with a suggested
+  correction, including the subsequence case that plain edit distance misses
+  (`logParams` suggests `logQueryParams`).
+
+### Added
+
+- **Scalar `having` filters, and `AND` / `OR` / `NOT` inside `having`.** A
+  `groupBy` field entry previously accepted only an aggregate filter
+  (`{ _sum: { gt: 100 } }`). It now also accepts a filter on the grouped value
+  itself (`{ typeId: { not: null } }`, `{ status: { in: ['a', 'b'] } }`, or a
+  bare value as equality shorthand), matching Prisma, and both forms may appear
+  in the same object, ANDed. A scalar filter is legal only on a column listed in
+  `by`, since a non-grouped column cannot be referenced in `HAVING` at all;
+  anything else throws `ValidationError` (E003) naming the column instead of
+  emitting SQL the database will reject. `_min` / `_max` are no longer typed as
+  numeric-only either, because they return a stored cell: `MIN(title) > 'm'` is
+  as valid as `MIN(views) > 10`.
+- **`$extends` on `prisma-compat`.** The client and model extension components,
+  in both the object and `Prisma.defineExtension` callback forms, returning a
+  new client rather than mutating the existing one. `result` and `query`
+  components are refused AT `$extends` time with an explanation and the
+  alternative, rather than being accepted and silently ignored at the first
+  query.
+
+### Changed
+
+- **The relation-strategy and unbounded-read warnings state the mechanism, not
+  just the condition.** Every one of them now follows the same shape: what
+  triggered it, why that costs what it costs, the fix, and the escape hatch. The
+  `auto` to-one demotion said only that no covering index was found, which reads
+  as a bug report about a missing index when the decision is a cardinality
+  trade that stands even on a unique index. The `_count` demotion did not say
+  that an inline `_count` is a correlated subquery re-evaluated once per parent
+  row. The unbounded-read warning said the query "will fetch every row" and left
+  the memory cost implicit, which is the part that actually bites.
+
 ## 0.52.0 (2026-07-26)
 
 A correctness release, and an unusually self-critical one. Two of its four

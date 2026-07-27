@@ -940,24 +940,31 @@ export interface CountArgs<T, R extends object = {}> {
 }
 
 /**
- * Numeric comparison operators usable inside a `having` filter. A bare number
+ * Comparison operators usable inside a `having` aggregate filter. A bare value
  * is shorthand for equality (`COUNT(*) = $n`); the operator object supports
- * range and inequality comparisons. Mirrors the numeric subset of
+ * range and inequality comparisons. Mirrors the comparison subset of
  * {@link WhereOperator} so the same SQL machinery can be reused.
+ *
+ * `V` is the operand type: `number` for `_sum` / `_avg` / `_count`, the
+ * column's own type for `_min` / `_max` (those return a stored cell, so
+ * `MIN("title") > 'm'` is as valid as `MIN("views") > 10`).
  */
-export interface HavingNumericOperator {
-  equals?: number;
-  not?: number;
-  gt?: number;
-  gte?: number;
-  lt?: number;
-  lte?: number;
-  in?: number[];
-  notIn?: number[];
+export interface HavingComparisonOperator<V = number> {
+  equals?: V;
+  not?: V;
+  gt?: V;
+  gte?: V;
+  lt?: V;
+  lte?: V;
+  in?: V[];
+  notIn?: V[];
 }
 
-/** A single having predicate value: a bare number (equality) or an operator object. */
-export type HavingFilter = number | HavingNumericOperator;
+/** The number-operand spelling, kept as the historical public name. */
+export type HavingNumericOperator = HavingComparisonOperator<number>;
+
+/** A single having predicate value: a bare value (equality) or an operator object. */
+export type HavingFilter<V = number> = V | HavingComparisonOperator<V>;
 
 /**
  * Per-field aggregate filters inside a {@link HavingClause}. Each aggregate
@@ -966,34 +973,54 @@ export type HavingFilter = number | HavingNumericOperator;
  * @example
  *   viewCount: { _sum: { gt: 100 }, _avg: { lte: 50 } }
  */
-export interface HavingAggregateFilter {
+export interface HavingAggregateFilter<V = unknown> {
   _sum?: HavingFilter;
   _avg?: HavingFilter;
-  _min?: HavingFilter;
-  _max?: HavingFilter;
+  _min?: HavingFilter<V>;
+  _max?: HavingFilter<V>;
   _count?: HavingFilter;
 }
 
 /**
- * HAVING clause for `groupBy`, filters whole groups by their aggregate values
- * (the SQL `HAVING` clause). Follows Prisma's shape: each aggregable field maps
- * to a {@link HavingAggregateFilter} (`field → aggregate → operator → value`),
- * and the special top-level `_count` key (no field) filters on `COUNT(*)`.
+ * One field entry of a {@link HavingClause}. Following Prisma, a field accepts
+ * BOTH an aggregate filter (`{ _sum: { gt: 100 } }`) and a scalar filter on the
+ * grouped value itself (`{ not: null }`, `{ in: ['a', 'b'] }`, or a bare value
+ * as equality shorthand), including both in the same object, which are ANDed.
  *
- * Implemented as a mapped type so the special `_count` key can carry a
- * {@link HavingFilter} while every entity field carries a
- * {@link HavingAggregateFilter}, without the index-signature conflict an
- * intersection type would produce when `T` is a broad `Record<string, unknown>`.
+ * A scalar filter is only legal on a column listed in `by`: the group's value
+ * is constant within the group, so it compiles into HAVING against the bare
+ * group key. On any other column it throws {@link ValidationError} E003, since
+ * a non-grouped column cannot be referenced in HAVING at all.
+ */
+export type HavingFieldFilter<V = unknown> = (HavingAggregateFilter<V> & WhereOperator<V>) | WhereValue<V>;
+
+/**
+ * HAVING clause for `groupBy`, filters whole groups by their aggregate values
+ * and by the grouped values themselves (the SQL `HAVING` clause). Follows
+ * Prisma's shape: each field maps to a {@link HavingFieldFilter}, the special
+ * top-level `_count` key (no field) filters on `COUNT(*)`, and `AND` / `OR` /
+ * `NOT` combine predicates at any depth.
+ *
+ * Implemented as a mapped type so the special keys can carry their own value
+ * types while every entity field carries a {@link HavingFieldFilter}, without
+ * the index-signature conflict an intersection type would produce when `T` is
+ * a broad `Record<string, unknown>`.
  *
  * @example
  *   // groups with more than 5 rows whose summed viewCount is at least 100
  *   having: { _count: { gt: 5 }, viewCount: { _sum: { gte: 100 } } }
+ * @example
+ *   // by: ['typeId'] , drop the NULL group, keep busy groups
+ *   having: { typeId: { not: null }, _count: { gt: 1 } }
  */
 export type HavingClause<T> = {
   /** Filter on `COUNT(*)` for the whole group. */
   _count?: HavingFilter;
+  AND?: HavingClause<T> | HavingClause<T>[];
+  OR?: HavingClause<T>[];
+  NOT?: HavingClause<T> | HavingClause<T>[];
 } & {
-  [K in keyof T & string]?: HavingAggregateFilter;
+  [K in keyof T & string]?: HavingFieldFilter<T[K]>;
 };
 
 /**
