@@ -33,7 +33,7 @@ import type {
   OrderDirection,
   WhereClause,
 } from './types.js';
-import { ownLookup } from './utils.js';
+import { isTemporalInfinity, ownLookup } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 
@@ -358,11 +358,13 @@ export function buildGroupBy<T extends object>(
             hasAvgs = true;
           } else if (rawKey.startsWith('_min_')) {
             const j = jsonAgg(rawKey);
-            minObj[fieldFor(rawKey, rawKey.slice(5))] = j?.numeric && rawValue !== null ? Number(rawValue) : rawValue;
+            minObj[fieldFor(rawKey, rawKey.slice(5))] =
+              j?.numeric && rawValue !== null ? Number(rawValue) : temporalAggValue(qi, rawKey.slice(5), rawValue);
             hasMins = true;
           } else if (rawKey.startsWith('_max_')) {
             const j = jsonAgg(rawKey);
-            maxObj[fieldFor(rawKey, rawKey.slice(5))] = j?.numeric && rawValue !== null ? Number(rawValue) : rawValue;
+            maxObj[fieldFor(rawKey, rawKey.slice(5))] =
+              j?.numeric && rawValue !== null ? Number(rawValue) : temporalAggValue(qi, rawKey.slice(5), rawValue);
             hasMaxs = true;
           }
         }
@@ -867,6 +869,35 @@ export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: 
   return clauses;
 }
 
+/**
+ * `_min` / `_max` over a TEMPORAL column, aligned with the row parser.
+ *
+ * These two are the only aggregates that hand back a row's stored cell rather
+ * than something computed across rows, so they are the only ones that can carry
+ * a Postgres `infinity`. They are assembled from the RAW row (a Date must stay
+ * a Date, and `parseRow`'s snake→camel mapping would collide with the `_min_`
+ * alias), so the infinity mapping has to be applied here too. Without it
+ * `aggregate({ _max: { ts: true } })` would return the driver's `Infinity`
+ * while `findMany` returned `null` for the very same value.
+ *
+ * Gated on the column being temporal, so a numeric `_max` is untouched, and on
+ * the client's `temporalInfinity` reading, so it cannot disagree with the rows
+ * `findMany` returns for the same column. An absent reading resolves to the
+ * default, `'preserve'`, exactly as it does in the row parser.
+ *
+ * Note what the opt-in `'null'` reading then means for `_max` on a table that
+ * plainly has rows: `null` is the same value an empty table and an all-NULL
+ * column return, so `_min` can report a real date while `_max` reports
+ * "nothing" (documented, and one of the reasons `'null'` is not the default).
+ */
+function temporalAggValue(qi: BuilderCtx, col: string, value: unknown): unknown {
+  if (!qi.tableMeta.dateColumns.has(col)) return value;
+  if (!isTemporalInfinity(value)) return value;
+  if (qi.temporalInfinity === 'null') return null;
+  if (typeof value === 'number') return value;
+  return value === '-infinity' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY;
+}
+
 export function buildAggregate<T extends object>(
   qi: BuilderCtx,
   args: AggregateArgs<T>,
@@ -1021,12 +1052,12 @@ export function buildAggregate<T extends object>(
         } else if (key.startsWith('_min_')) {
           const col = key.slice(5);
           const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-          minObj[field] = val;
+          minObj[field] = temporalAggValue(qi, col, val);
           hasMins = true;
         } else if (key.startsWith('_max_')) {
           const col = key.slice(5);
           const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-          maxObj[field] = val;
+          maxObj[field] = temporalAggValue(qi, col, val);
           hasMaxs = true;
         }
       }

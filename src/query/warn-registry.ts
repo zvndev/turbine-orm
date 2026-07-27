@@ -126,6 +126,20 @@ export const WARN_NS = {
    */
   untypedDateColumn: 'untypedDateColumn',
   /**
+   * A stored temporal `infinity` / `-infinity` was actually read, and
+   * `temporalInfinity` was left unset, so the row parser describes the reading
+   * in force (builder.ts `warnTemporalInfinity`). Keyed on `table.column`, so a
+   * table with two such columns says it once for each and a million rows say it
+   * once in total.
+   */
+  temporalInfinity: 'temporalInfinity',
+  /**
+   * Turbine replaced a pg text parser that was NOT on the driver default, i.e.
+   * something else in the process had already customized that OID (utils.ts
+   * `warnParserOverwrite`). Keyed on the OID.
+   */
+  parserOverwrite: 'parserOverwrite',
+  /**
    * `planCacheMode` was set on a client given an EXTERNAL pool, where Turbine
    * runs no connection setup, so the option is a no-op (client.ts constructor).
    * Keyed on the requested mode.
