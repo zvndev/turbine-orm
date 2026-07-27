@@ -179,6 +179,7 @@ export {
   type RelationPickOrderBy,
   type SelectResult,
   type SkipGlobalFilters,
+  type TemporalInfinityReading,
   type TextSearchFilter,
   type TypedWithClause,
   type UpdateArgs,

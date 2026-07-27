@@ -77,6 +77,7 @@ import type {
   WithOrderByObject,
 } from './types.js';
 import {
+  isTemporalInfinity,
   LRUCache,
   ownLookup,
   parseDbDate,
@@ -404,9 +405,16 @@ export type {
   QueryEventListener,
   QueryInterfaceOptions,
   ReselectExecutor,
+  TemporalInfinityReading,
 } from './deferred.js';
 
-import type { DeferredQuery, MiddlewareFn, QueryInterfaceOptions, ReselectExecutor } from './deferred.js';
+import type {
+  DeferredQuery,
+  MiddlewareFn,
+  QueryInterfaceOptions,
+  ReselectExecutor,
+  TemporalInfinityReading,
+} from './deferred.js';
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", intentional for untyped table access
 export class QueryInterface<T extends object, R extends object = {}> {
@@ -431,6 +439,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly warnOnUnlimited: boolean;
   private readonly scopedConnect: boolean;
   private readonly utcTimestamps: boolean;
+  /**
+   * How a Postgres temporal `infinity` / `-infinity` is handed back:
+   * `'preserve'` (default) or `'null'`. See {@link TemporalInfinityReading}
+   * for the trade, and {@link parseRow} for where it is applied.
+   */
+  private readonly temporalInfinity: TemporalInfinityReading;
+  /** Whether `temporalInfinity` was left unset, i.e. the warning still applies. */
+  private readonly warnTemporalInfinityUnset: boolean;
   private readonly preparedStatementsEnabled: boolean;
   /**
    * Whether the SQL template cache is active. Set once in the constructor.
@@ -594,6 +610,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
         : warnOpt !== false;
     this.scopedConnect = options?.scopedConnect === true;
     this.utcTimestamps = options?.utcTimestamps !== false;
+    // Unset resolves to `'preserve'`. `'null'` destroys data: it makes a stored
+    // infinity indistinguishable from a stored NULL, so the ordinary
+    // read-modify-write (`update({ data: { ...row } })`) stores SQL NULL over a
+    // nullable temporal column and the infinity is gone with no error, measured
+    // on a live server. A lossy default is the wrong price for a nicer
+    // `JSON.stringify`, so the lossless reading is the default and `'null'`
+    // stays available as an explicit opt-in.
+    this.temporalInfinity = options?.temporalInfinity === 'null' ? 'null' : 'preserve';
+    // The warning exists to surface an UNACKNOWLEDGED trade. Naming either
+    // reading in the config is the acknowledgement, so it stops.
+    this.warnTemporalInfinityUnset = options?.temporalInfinity === undefined;
     this.preparedStatementsEnabled = options?.preparedStatements ?? true;
     // SQL template cache capacity. `sqlCacheSize: 0` disables caching entirely
     // (mirrors `sqlCache: false`); any positive integer sets the LRU bound;
@@ -693,6 +720,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // building a client whose writes and reads disagree (see
       // `assertUtcTimestampsAgree` in client.ts).
       utcTimestamps: this.utcTimestamps,
+      // Reaches aggregates.ts, where `_min` / `_max` are assembled from the raw
+      // row and so need the same infinity reading as `parseRow`.
+      temporalInfinity: this.temporalInfinity,
       crossSchemaTypeColumns: this.crossSchemaTypeColumns,
       get currentSkip(): SkipGlobalFilters | undefined {
         return self.currentSkip;
@@ -3567,6 +3597,87 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * dates the same way top-level rows do.
    */
 
+  /**
+   * Say ONCE per `table.field` that a stored temporal `infinity` was actually
+   * read, and describe the reading the caller is getting. JavaScript has no
+   * `Date` for either infinity, so BOTH readings cost something and a caller
+   * whose rows carry the value needs to know which cost they are paying.
+   *
+   * Under the default `'preserve'` the value comes back as the JS number
+   * `Infinity` / `-Infinity` on a field the generated types declare as `Date`,
+   * so `.toISOString()` / `.getTime()` throw a TypeError on exactly those rows
+   * and `JSON.stringify` still renders them `null` (JSON has no infinity
+   * literal). That is the price of the reading being LOSSLESS: the number binds
+   * straight back, so a read-modify-write stores `infinity` again. The
+   * alternative, `'null'`, is silently destructive, which is why it is not the
+   * default and why the warning names it as a deliberate choice rather than a
+   * recommendation.
+   *
+   * ONLY WHEN THE OPTION WAS LEFT UNSET. Naming a reading in the config, either
+   * one, is the acknowledgement, and the warning exists to surface an
+   * unacknowledged trade rather than to nag.
+   *
+   * NOT DEV-ONLY, unlike every other warning in this codebase, and deliberately
+   * so. Production is exactly where a destructive write commits and where the
+   * row cannot be recovered afterwards, so a warning that goes quiet under
+   * `NODE_ENV=production` is silent in the only place it matters. The cost is
+   * bounded to the point of irrelevance: once per process per field, and only
+   * on a row that actually held an infinity.
+   *
+   * KEYED ON THE FIELD, not the row key: top-level rows arrive snake_case and
+   * nested `json_build_object` rows arrive camelCase, so keying on the raw key
+   * warned twice for one column.
+   */
+  private warnTemporalInfinity(table: string, field: string): void {
+    if (!this.warnTemporalInfinityUnset) return;
+    if (!shouldWarnOnce(WARN_NS.temporalInfinity, `${table}.${field}`)) return;
+    console.warn(
+      `[turbine] ${table}.${field} holds the Postgres value \`infinity\` (or \`-infinity\`). JavaScript has ` +
+        'no Date for it, so it reads as the JS number `Infinity` / `-Infinity` on a field the generated ' +
+        'types declare as `Date`: `.toISOString()` and `.getTime()` throw a TypeError on these rows, and ' +
+        '`JSON.stringify` still renders them null because JSON has no infinity literal. The number is the ' +
+        'lossless reading, though: it binds straight back, so writing a row you just read stores `infinity` ' +
+        'again. Two more things this column can no longer do: `where: { col: null }` still means IS NULL and ' +
+        "does NOT match these rows (filter them with `{ col: 'infinity' }`), and `groupBy` / `distinct` " +
+        "cannot tell infinity, -infinity and NULL apart. Set `temporalInfinity: 'preserve'` to confirm this " +
+        "reading and silence the warning, or `'null'` to read null instead, accepting that a stored " +
+        'infinity then looks exactly like a stored NULL and a read-modify-write over a nullable column ' +
+        'stores SQL NULL, destroying the value with no error.',
+    );
+  }
+
+  /**
+   * Apply the configured reading to the infinity elements of a temporal ARRAY
+   * value, returning the original array by identity when there are none (the
+   * overwhelmingly common case, so no per-row allocation on ordinary data).
+   */
+  private mapArrayTemporalInfinity(value: unknown[], table: string, field: string): unknown[] {
+    let hit = false;
+    for (let i = 0; i < value.length; i++) {
+      if (isTemporalInfinity(value[i])) {
+        hit = true;
+        break;
+      }
+    }
+    if (!hit) return value;
+    this.warnTemporalInfinity(table, field);
+    return value.map((el) => (isTemporalInfinity(el) ? this.readTemporalInfinity(el) : el));
+  }
+
+  /**
+   * The configured reading of one infinity value: the JS number (`'preserve'`,
+   * the default) or `null`. Under `'preserve'` the JSON-wire STRING form
+   * (`"infinity"`, what the join and positional strategies see) is normalized
+   * to the number too, so the reading is identical on every strategy; 0.54
+   * shipped the number on some paths and an Invalid Date on others, which is
+   * the bug that made a single reading necessary in the first place.
+   */
+  private readTemporalInfinity(value: unknown): unknown {
+    if (this.temporalInfinity === 'null') return null;
+    if (typeof value === 'number') return value;
+    return value === '-infinity' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY;
+  }
+
   private parseRow(row: Record<string, unknown>, table: string): Record<string, unknown> {
     const parsed: Record<string, unknown> = {};
     const meta = this.schema.tables[table];
@@ -3585,31 +3696,45 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const value = row[col];
         const field = reverseMap[col] ?? col; // fall back to raw col name, not regex
         // Top-level rows are snake_case (dateCols); nested rows are camelCase (camelDateFields).
-        //
-        // An ARRAY value is excluded: `dateColumns` includes array-of-date
-        // columns (`date[]`, `timestamp[]`, `timestamptz[]`), for which the
-        // driver already hands back a `Date[]`. Coercing it ran
-        // `new Date(String(theArray))` and replaced the whole array with a
-        // single Invalid Date, the column was unreadable on every strategy.
-        // The join strategy's string arrays are handled upstream instead, by
-        // the JSON-wire decode in relations.ts.
-        //
-        // A NUMBER is excluded for the same reason: the driver returns the
-        // JS numbers `Infinity` / `-Infinity` for the Postgres `infinity` /
-        // `-infinity` timestamp values, and re-coercing one ran
-        // `parseDbDate(String(Infinity))` = `parseDbDate('Infinity')`, which
-        // is an Invalid Date that JSON-encodes as null. The array form escaped
-        // this only because it took the branch above.
-        if (
-          (dateCols.has(col) || camelDateFields.has(field)) &&
-          value !== null &&
-          !(value instanceof Date) &&
-          !Array.isArray(value) &&
-          typeof value !== 'number'
-        ) {
-          // Offset-less strings (Postgres `timestamp`, json_agg output) are
-          // pinned to UTC so results don't depend on the server's time zone.
-          parsed[field] = this.utcTimestamps ? parseDbDate(String(value)) : new Date(value as string);
+        if ((dateCols.has(col) || camelDateFields.has(field)) && value !== null && !(value instanceof Date)) {
+          if (isTemporalInfinity(value)) {
+            // Postgres `infinity` / `-infinity`. No JS Date means either, so
+            // both readings cost something and the default is the one that is
+            // not lossy. `'preserve'` hands back the JS number, which breaks
+            // the declared `Date` type at runtime (`.toISOString()` throws) and
+            // still serializes as null because JSON has no infinity literal,
+            // but binds straight back, so a read-modify-write stores `infinity`
+            // again. `'null'` reads nicer and DESTROYS the value on that same
+            // write, because a stored infinity and a stored NULL become
+            // indistinguishable. Whichever is configured, it is the SAME on
+            // every read strategy: the driver hands back the number,
+            // `json_build_object` hands back the string "infinity", and both
+            // land here (see `isTemporalInfinity`).
+            //
+            // The warning below fires once per column when the option was left
+            // unset, on a row that actually held an infinity, and describes the
+            // reading in force rather than gating on which one it is.
+            this.warnTemporalInfinity(table, field);
+            parsed[field] = this.readTemporalInfinity(value);
+          } else if (Array.isArray(value)) {
+            // `dateColumns` includes array-of-date columns (`date[]`,
+            // `timestamp[]`, `timestamptz[]`), for which the driver already
+            // hands back a `Date[]`. Coercing the array itself ran
+            // `new Date(String(theArray))` and replaced the whole column with
+            // one Invalid Date. Its ELEMENTS get the same infinity mapping as a
+            // scalar (same declared element type, same JSON rendering);
+            // everything else is passed through by identity.
+            parsed[field] = this.mapArrayTemporalInfinity(value, table, field);
+          } else if (typeof value === 'number') {
+            // Any other number on a date column is left alone rather than run
+            // through `parseDbDate(String(n))`, which would produce an Invalid
+            // Date.
+            parsed[field] = value;
+          } else {
+            // Offset-less strings (Postgres `timestamp`, json_agg output) are
+            // pinned to UTC so results don't depend on the server's time zone.
+            parsed[field] = this.utcTimestamps ? parseDbDate(String(value)) : new Date(value as string);
+          }
         } else {
           parsed[field] = value;
         }

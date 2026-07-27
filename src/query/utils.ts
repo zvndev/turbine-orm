@@ -6,6 +6,7 @@
 
 import pg from 'pg';
 import { camelToSnake, localDateTimeKind, timeOfDayKind } from '../schema.js';
+import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 
 // ---------------------------------------------------------------------------
 // Identifier quoting, prevents SQL injection via table/column names
@@ -358,6 +359,42 @@ export function parseDbDate(value: string): Date {
   return new Date(`${value.replace(' ', 'T')}Z`);
 }
 
+/**
+ * Is `value` one of the two representations a Postgres temporal `infinity` /
+ * `-infinity` reaches the ORM row parser in?
+ *
+ * TWO representations, because a temporal column is read two different ways
+ * and they disagree on the wire:
+ *
+ *   driver          the pg text parser for `timestamp` / `date` does not
+ *                   recognise the word, so it falls through to the driver's own
+ *                   parser, which returns the JS NUMBERS `Infinity` /
+ *                   `-Infinity`. This is what a top-level row, the batched and
+ *                   flatten strategies, a write `RETURNING` projection and a
+ *                   `groupBy` key all see.
+ *   JSON wire       `json_build_object` renders the same value as the STRING
+ *                   `"infinity"`, and scalar `timestamp` / `timestamptz` are
+ *                   deliberately absent from {@link JSON_WIRE_COERCION_OIDS},
+ *                   so no driver parser runs over it. This is what the `'join'`
+ *                   strategy and the positional encoding see.
+ *
+ * Both are normalized in one place ({@link QueryInterface}'s row parser), to
+ * whichever reading `temporalInfinity` selects (the JS number by default, or
+ * `null`), so the same stored value cannot read differently depending on which
+ * plan the query happened to take. The string form is only ever consulted for a column
+ * the schema says is temporal, so a `text` column holding the word "infinity"
+ * is untouched.
+ *
+ * Not dialect-gated. Postgres is the only engine with an infinite temporal
+ * value, but the row parser is engine-shared and the alternative reading on the
+ * other engines (a stray `'infinity'` string becoming an Invalid Date) is not
+ * one worth preserving.
+ */
+export function isTemporalInfinity(value: unknown): boolean {
+  if (typeof value === 'number') return value === Number.POSITIVE_INFINITY || value === Number.NEGATIVE_INFINITY;
+  return value === 'infinity' || value === '-infinity';
+}
+
 // ---------------------------------------------------------------------------
 // Driver type parsers for the zone-less temporal OIDs
 // ---------------------------------------------------------------------------
@@ -488,6 +525,126 @@ export function createPgArrayParser(element: (text: string) => unknown): (text: 
 }
 
 /**
+ * A canonical wire value per OID, plus the JS value pg's OWN default text
+ * parser produces from it, used to tell "still on the driver default" from
+ * "somebody else already customized this OID" (see
+ * {@link isDefaultTextParser}).
+ *
+ * The expected values are computed from LOCAL date components on purpose: pg's
+ * default for the zone-less temporal OIDs builds its `Date` in the process's
+ * zone (that is the reading `utcTimestamps` exists to replace), so the
+ * expectation has to be computed the same way in whatever zone the process runs.
+ */
+const DEFAULT_PARSER_PROBES: Readonly<Record<number, { text: string; expected: () => unknown }>> = {
+  20: { text: '9007199254740993', expected: () => '9007199254740993' },
+  1082: { text: '2020-01-02', expected: () => new Date(2020, 0, 2) },
+  1114: { text: '2020-01-02 03:04:05', expected: () => new Date(2020, 0, 2, 3, 4, 5) },
+  1115: { text: '{"2020-01-02 03:04:05"}', expected: () => [new Date(2020, 0, 2, 3, 4, 5)] },
+  1182: { text: '{2020-01-02}', expected: () => [new Date(2020, 0, 2)] },
+};
+
+/**
+ * Marks a text parser as one TURBINE installed, so a later registration in the
+ * same process (a client plus `turbine studio`, ESM plus CJS copies of this
+ * module) does not report Turbine's own parser as "somebody else's". A
+ * `Symbol.for` key, for the same cross-copy-identity reason the warn registry
+ * uses one.
+ */
+const TURBINE_PARSER = Symbol.for('turbine.typeParser');
+
+/** The OIDs the `utcTimestamps` flag governs, and so the ones it can opt out of. */
+const TEMPORAL_PARSER_OIDS: ReadonlySet<number> = new Set([1114, 1082, 1115, 1182]);
+
+/** Tag `parser` as Turbine's own and return it (see {@link TURBINE_PARSER}). */
+export function markTurbineParser<F extends (text: string) => unknown>(parser: F): F {
+  (parser as unknown as Record<symbol, unknown>)[TURBINE_PARSER] = true;
+  return parser;
+}
+
+/** Comparable rendering of a parser result (Date by instant, array by element). */
+function parserResultSignature(value: unknown): string {
+  if (value === null || value === undefined) return String(value);
+  if (value instanceof Date) return `date:${value.getTime()}`;
+  if (Array.isArray(value)) return `[${value.map(parserResultSignature).join(',')}]`;
+  return `${typeof value}:${String(value)}`;
+}
+
+/**
+ * Is the parser currently registered for `oid` still pg's own default?
+ *
+ * DETECTED BY BEHAVIOUR, NOT BY IDENTITY, and deliberately so. `pg-types` keeps
+ * its default parser table private: `getTypeParser` hands back whatever is
+ * registered NOW, and there is no exported way to ask what the default WAS, so
+ * a function-identity comparison would need a deep import of a file the package
+ * does not publish as an entry point. Instead this runs the registered parser
+ * over a canonical wire value and compares the result with what pg's default
+ * produces for it.
+ *
+ * What that buys and what it costs, stated honestly:
+ *   - Every parser that behaves OBSERVABLY differently on the probe value is
+ *     detected, which is the case worth warning about (someone else's reading
+ *     is about to be replaced by Turbine's).
+ *   - A replacement that is observably EQUIVALENT on the probe is reported as
+ *     the default and draws no warning. That is a false negative, and an
+ *     acceptable one: if it agrees with the default here it is not a reading
+ *     anybody would notice Turbine overwriting.
+ *   - A parser that THROWS on the probe is reported as non-default; pg's own
+ *     never throws on a valid value of its type.
+ *   - An OID with no probe entry is reported as default (never warn on a guess).
+ *
+ * The registered parser is invoked once, on a synthetic value, at client
+ * construction. A decode parser with side effects would be surprising, and pg's
+ * own have none.
+ */
+export function isDefaultTextParser(oid: number, parser: (text: string) => unknown): boolean {
+  const probe = DEFAULT_PARSER_PROBES[oid];
+  if (!probe) return true;
+  try {
+    return parserResultSignature(parser(probe.text)) === parserResultSignature(probe.expected());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Warn ONCE per OID when Turbine is about to replace a text parser that is not
+ * pg's default, i.e. when some other module in the process has already
+ * customized it.
+ *
+ * `pg.types.setTypeParser` is process-global and retroactive: it changes how
+ * every `pg.Pool` in the process decodes that OID, including pools that were
+ * constructed and were already querying before the Turbine client existed. When
+ * the OID was still on pg's default that is the documented, intended trade (the
+ * whole point of `utcTimestamps`). When somebody else had already installed
+ * their own reading, Turbine is silently rewriting an expectation it cannot see
+ * the origin of, and the resulting bug is order-dependent: which reading wins
+ * depends on module evaluation order, which lazy route imports make unstable
+ * between requests. So say it out loud, once.
+ */
+export function warnParserOverwrite(oid: number, typeName: string): void {
+  if (process.env.NODE_ENV === 'production') return;
+  const getParser = pg.types.getTypeParser as unknown as (oid: number, format: 'text') => (value: string) => unknown;
+  const current = getParser(oid, 'text');
+  // Turbine's own earlier registration is not a third party's expectation.
+  if ((current as unknown as Record<symbol, unknown>)[TURBINE_PARSER]) return;
+  if (isDefaultTextParser(oid, current)) return;
+  if (!shouldWarnOnce(WARN_NS.parserOverwrite, String(oid))) return;
+  // The `utcTimestamps: false` opt-out only governs the four TEMPORAL OIDs.
+  // Offering it as the remedy for int8 (20) would name a setting that does
+  // nothing for the OID being warned about; that registration has no opt-out.
+  const remedy = TEMPORAL_PARSER_OIDS.has(oid)
+    ? ' `utcTimestamps: false` leaves the four temporal OIDs (1114, 1082, 1115, 1182) alone entirely.'
+    : ' There is no opt-out for this OID: Turbine registers it so bigint values come back as numbers.';
+  console.warn(
+    `[turbine] pg type parser for OID ${oid} (${typeName}) was already customized by something else in this ` +
+      'process, and Turbine is replacing it. `pg.types.setTypeParser` is process-global and takes effect ' +
+      'immediately for EVERY pg.Pool in the process, including pools that already exist and are already ' +
+      'querying, so whatever set that parser will now read this column differently. If yours should win, ' +
+      `register it AFTER constructing the client.${remedy} Dev-only: silent under \`NODE_ENV=production\`.`,
+  );
+}
+
+/**
  * Register the UTC readings of the four zone-less temporal OIDs on the pg
  * module: `timestamp` (1114), `date` (1082) and their array forms (1115, 1182).
  *
@@ -502,6 +659,11 @@ export function createPgArrayParser(element: (text: string) => unknown): (text: 
  * Each fallback is read BEFORE its parser is installed, so an unrecognised wire
  * value (`infinity`, and whatever a future server adds) still reaches the
  * driver's own parser.
+ *
+ * Registration is RETROACTIVE for the whole process, pools included that were
+ * created and are already querying (there is one parser table, and it is read
+ * per row at decode time, not captured per pool). If any of the four OIDs is
+ * already on a NON-default parser, {@link warnParserOverwrite} says so once.
  */
 export function registerUtcTemporalParsers(): void {
   // pg-types declares get/setTypeParser over its own OID enum, which lists the
@@ -509,15 +671,19 @@ export function registerUtcTemporalParsers(): void {
   // retyped over a plain number rather than the incomplete enum.
   const getParser = pg.types.getTypeParser as unknown as (oid: number, format: 'text') => (value: string) => unknown;
   const setParser = pg.types.setTypeParser as unknown as (oid: number, parse: (value: string) => unknown) => void;
+  warnParserOverwrite(1114, 'timestamp');
+  warnParserOverwrite(1082, 'date');
+  warnParserOverwrite(1115, 'timestamp[]');
+  warnParserOverwrite(1182, 'date[]');
   const parseDate = createUtcDateParser(getParser(1082, 'text'));
   const parseTimestamp = createUtcTimestampParser(getParser(1114, 'text'));
-  setParser(1114, parseTimestamp);
-  setParser(1082, parseDate);
+  setParser(1114, markTurbineParser(parseTimestamp));
+  setParser(1082, markTurbineParser(parseDate));
   // Array OIDs do not inherit their element parser, so `date[]` / `timestamp[]`
   // would otherwise keep returning local-zone Dates while the scalar columns
   // beside them returned UTC ones.
-  setParser(1182, createPgArrayParser(parseDate));
-  setParser(1115, createPgArrayParser(parseTimestamp));
+  setParser(1182, markTurbineParser(createPgArrayParser(parseDate)));
+  setParser(1115, markTurbineParser(createPgArrayParser(parseTimestamp)));
 }
 
 // ---------------------------------------------------------------------------

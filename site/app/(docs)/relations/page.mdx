@@ -595,12 +595,41 @@ The other two values are diagnostic more than prescriptive: `'auto'` states the 
 
 ### What this actually reaches in Turbine
 
-Stated narrowly, because it was measured rather than assumed. The numbers above come from a named prepared statement over the client's own pool, and the option demonstrably reaches every connection the client hands out. What it does **not** do is make every Turbine query vulnerable in the first place:
+The numbers above come from a named prepared statement over the client's own pool, and the option demonstrably reaches every connection the client hands out.
 
-- **`count()` is the exposed shape.** It compiles to `SELECT COUNT(*) FROM t WHERE …` with the predicate parameterized and nothing else, so a skewed predicate is exactly the promotion candidate described above.
-- **`findMany` / `findFirst` are much less exposed**, because they bind the limit as a parameter (`LIMIT $n`). A parameterized limit denies the planner the limit fraction that makes the ordered-scan plan look cheap, and the same query shape driven through `findFirst` stayed flat across all nine executions in the run above.
+<Callout type="warning" title="Correction to what this page said in 0.54">
+It claimed that "`findMany` / `findFirst` are much less exposed, because they bind the limit as a parameter (`LIMIT $n`). A parameterized limit denies the planner the limit fraction that makes the ordered-scan plan look cheap." That is false, and if you read it and concluded your paginated reads were safe, they are not. PostgreSQL does not deny the planner a limit fraction for a bound limit: it **substitutes a default of 10% of the child node's own row estimate**, which is a different wrong number, wrong in both directions.
+</Callout>
 
-So treat `planCacheMode` as a targeted remedy for a statement you have **measured** getting slower after its fifth execution, not as a general speed-up. Setting it globally on a workload with no skew buys you nothing and costs you a re-plan per execution.
+What is actually true, measured on PostgreSQL 16 with `synchronize_seqscans` off and parallelism disabled. Both fixtures are described here so you can rebuild them.
+
+**The substituted defaults.** 400,000 rows, `k = id % 104` so `n_distinct` is exactly 104, a btree on `k`, under `force_generic_plan`:
+
+| statement | generic estimate | rule |
+| --- | --- | --- |
+| `WHERE k = $1` | 3846 rows | `rows / n_distinct` = 400000/104 |
+| `WHERE k > $1` | 133333 rows | 1/3 of the table |
+| `WHERE t LIKE $1` | 2000 rows | 0.5% of the table |
+| `WHERE k = $1 LIMIT $2` | `Limit` 385 rows | 10% of the 3846-row child |
+| `WHERE id = $1 LIMIT $2` | `Limit` 1 row | the 10% fraction clamps at 1 |
+
+A generic plan substitutes a default for **every** value it cannot see, and each unknown alone can flip the plan shape. Two conditions on the 10% are easy to miss: it clamps at one row, so it is not always an overestimate, and an unknown `OFFSET` triggers the same substitution **on its own** even when the limit is a constant. `LIMIT 20 OFFSET $2` estimated its 20 rows correctly but costed a 385-row prefix as startup, and picked a different plan shape from the same query with no offset. Turbine binds both (`… LIMIT $2 OFFSET $3`), so a paginated read has no constant-limit escape, and in that fixture the constant-limit form was the one that chose a seq scan anyway.
+
+**What actually goes wrong, and when.** Two 200,000-row tables joined on an indexed key, with a predicate matching 190,000 rows for one value and one row for the rest (`n_distinct` sampled at roughly 1,600, an ANALYZE estimate that varies on rebuild), for `SELECT count(*) FROM j JOIN jc ON jc.j_id = j.id WHERE j.k2 = $1`. No `LIMIT`, no `OFFSET`, no `ORDER BY` anywhere:
+
+- custom plan: hash join, **1,770 shared buffers**
+- generic plan: nested loop (the ~1,600-way estimate makes 190,000 inner lookups look cheap), **761,002 shared buffers**, a **430x** difference
+- and it is promoted under the **default** `plan_cache_mode = auto`: `pg_prepared_statements` reports `generic_plans = 2, custom_plans = 5` after seven executions
+
+That inverts the ranking the old text gave, and it is the practical takeaway:
+
+- **The sixth execution is a ceiling, not a trigger.** `auto` promotes only when the generic plan's *estimated* cost is not worse than the average custom cost. Check `pg_prepared_statements.generic_plans` to see whether a statement is actually on a generic plan; plenty never are.
+- **The shape that gets promoted unprompted has no limit.** In the same session, the limited form of that predicate was never promoted at all (`generic_plans = 0, custom_plans = 8`), because its substituted row count made the generic plan look *more* expensive. `count()` and an **unlimited** `findMany` both compile to the pure parameterized-predicate shape that promotes on its own, so look at those first.
+- **A limited `findMany` gives the planner two unknowns instead of one**, the predicate value and the limit count, and either alone can flip the plan shape. More unknowns is not the same as more damage.
+- **Neither an `ORDER BY` nor any limit is required** for a generic plan to be catastrophically worse than a custom one. The 430x case above has none of them.
+- **`implicitPkOrdering` is off by default in core**, so a default `findMany({ where, limit })` emits `SELECT … WHERE … LIMIT $2` with no `ORDER BY` at all. `turbine-orm/prisma-compat` defaults it on. Switching it on adds an ordering a generic plan can walk the whole table in, which is worth knowing, but it is your choice to make and nothing about it changes here.
+
+So treat `planCacheMode` as a targeted remedy for a statement you have **measured** getting slower after its fifth execution, not as a general speed-up, and measure with `plan_cache_mode = force_generic_plan` against `force_custom_plan` rather than reasoning about which query shapes ought to be safe. Setting it globally on a workload with no skew buys you nothing and costs you a re-plan per execution. One measurement hazard: `synchronize_seqscans` is on by default and makes a repeated seq scan resume where the last one stopped, which reported an 8,000-buffer scan as 4 buffers until it was turned off.
 
 ### The blunter alternative: `preparedStatements: false`
 

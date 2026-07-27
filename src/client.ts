@@ -42,8 +42,15 @@ import {
   QueryInterface,
   type QueryInterfaceOptions,
   type RelationLoadStrategy,
+  type TemporalInfinityReading,
 } from './query/index.js';
-import { closestName, quoteIdent, registerUtcTemporalParsers } from './query/utils.js';
+import {
+  closestName,
+  markTurbineParser,
+  quoteIdent,
+  registerUtcTemporalParsers,
+  warnParserOverwrite,
+} from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import {
   type ActiveSubscription,
@@ -265,11 +272,21 @@ export interface TurbineConfig {
    * rewrite (a bound `Date` on a zone-less `date` / `timestamp` column is then
    * serialized by the driver in the process's zone).
    *
-   * PER PROCESS, NOT PER CLIENT. The read half is a pg type parser, and
-   * `pg.types.setTypeParser` installs one parser per OID for the whole
-   * process. The first client settles it for every later one, so constructing
-   * a second client with the OPPOSITE value throws a `ValidationError` rather
-   * than handing back a client whose writes and reads disagree. Give every
+   * PER PROCESS, NOT PER CLIENT, AND RETROACTIVE. The read half is a pg type
+   * parser, and `pg.types.setTypeParser` installs one parser per OID for the
+   * whole process. There is ONE parser table and it is consulted per row at
+   * decode time, so registration also changes POOLS THAT ALREADY EXIST AND ARE
+   * ALREADY QUERYING: the same `pg.Pool` running the same query returns
+   * different values before and after a Turbine client is constructed
+   * somewhere else in the process. With lazy route imports that ordering is
+   * not stable between requests, so a reporting job on its own pool can return
+   * different days depending on what has been imported yet. When the OID was
+   * still on the driver's default that is the intended trade; when something
+   * else had already customized it, Turbine says so once (dev-only, see
+   * `warnParserOverwrite`). The first client settles it for every later one, so
+   * constructing a second client with the OPPOSITE value throws a
+   * `ValidationError` rather than handing back a client whose writes and reads
+   * disagree. Give every
    * client in the process the same value, or isolate the odd one in its own
    * process. A client on an EXTERNAL pool never REGISTERS a parser (it inherits
    * whatever configuration the caller's driver has, so a process containing
@@ -281,26 +298,79 @@ export interface TurbineConfig {
    */
   utcTimestamps?: boolean;
   /**
+   * How a Postgres temporal `infinity` / `-infinity` is handed back:
+   * `'preserve'` (the default, the JS numbers `Infinity` / `-Infinity`) or
+   * `'null'`. See {@link TemporalInfinityReading} for the full trade.
+   *
+   * There is no JS `Date` for either value, so both readings are wrong in some
+   * way and the option is which way. `'preserve'` is LOSSLESS: binding the
+   * number back stores `infinity` again, so a read-modify-write
+   * (`update({ data: { ...row } })`) round-trips. Its cost is a number on a
+   * `Date`-typed field, so `row.validUntil.toISOString()` throws a TypeError on
+   * exactly those rows, and `JSON.stringify` still renders the value `null`.
+   * `'null'` matches what `JSON.stringify` already produced and keeps the
+   * field's declared `Date | null` type honest, at the cost of DATA LOSS: a
+   * stored `infinity` and a stored NULL become indistinguishable, so that same
+   * read-modify-write writes SQL NULL and destroys the value with no error.
+   * The default is the reading that cannot lose a value.
+   *
+   * Unlike 0.54, which returned the number on some read strategies and an
+   * Invalid Date on others, BOTH readings here are identical on every
+   * strategy, every write projection, `groupBy` keys and `_min` / `_max`.
+   *
+   * Leaving the option unset selects `'preserve'` AND enables a one-time
+   * warning (per process, per field, not silenced by `NODE_ENV=production`) the
+   * first time a stored infinity is actually read, describing that reading and
+   * both escapes. Naming either reading explicitly silences it.
+   */
+  temporalInfinity?: TemporalInfinityReading;
+  /**
    * Pin `plan_cache_mode` on every connection this client opens, fixing how the
    * PostgreSQL backend chooses between a custom plan (re-planned per parameter
    * set) and a generic plan (planned once, blind to the values).
    *
    * Why it exists: Turbine sends NAMED prepared statements by default on a pool
-   * it owns, and PostgreSQL promotes a named statement to a generic plan after
-   * five executions. A generic plan is planned for the AVERAGE parameter, so a
+   * it owns, and PostgreSQL MAY promote a named statement to a generic plan
+   * after five executions (see the ceiling note below: it promotes only when
+   * the generic plan's estimated cost is not worse than the average custom
+   * cost). A generic plan is planned for the AVERAGE parameter, so a
    * predicate whose selectivity varies wildly per value (the canonical case is a
    * `tenant_id` / `user_id` equality on a shared table, where one value matches
    * a handful of rows and another matches most of them) is planned blind to the
    * value it will actually get, and it never reverts. `'force_custom_plan'`
    * removes that, at the cost of re-planning each execution.
    *
-   * Scope, measured rather than assumed: it applies to the statements Turbine
-   * itself promotes. `count()` on such a predicate is promoted after five
-   * executions and is controlled by this option; `findMany` / `findFirst` bind
-   * `LIMIT $n`, and a parameterized limit denies the planner the limit fraction
-   * that makes a skewed plan look cheap, so those are much less exposed. Treat
-   * the option as a targeted remedy for a plan that is measurably worse after
-   * its fifth execution, not a general speed-up.
+   * Scope. It applies to the statements Turbine itself promotes, which is any
+   * of them: `count()`, `findMany` and `findFirst` alike. CORRECTION TO THE
+   * 0.54.0 TEXT, which claimed `findMany` / `findFirst` were "much less
+   * exposed" because they bind `LIMIT $n`: that was false. PostgreSQL does not
+   * deny the planner a limit fraction for a bound limit, it SUBSTITUTES a
+   * default of 10% of the child node's own row estimate (clamped at one row),
+   * which is simply a different wrong number. An unknown `OFFSET` triggers the
+   * same substitution on its own even when the limit is a constant, and a
+   * paginated Turbine read binds both.
+   *
+   * Two things the sentence above this one glosses over. The sixth execution
+   * is a CEILING, not a trigger: `auto` promotes only when the generic plan's
+   * ESTIMATED cost is not worse than the average custom cost, so plenty of
+   * statements are never promoted at all (`pg_prepared_statements.generic_plans`
+   * is how you tell). And the shape that gets promoted unprompted is the one
+   * with NO limit: measured on a skewed join predicate, the unlimited statement
+   * promoted under the default `auto` and ran a nested loop at 430x the buffers
+   * of the custom plan, while the same predicate under `LIMIT $n` was never
+   * promoted across eight executions, because its substituted row count made
+   * the generic plan look MORE expensive. A limited `findMany` gives the
+   * planner two unknowns instead of one, which is not the same thing as more
+   * damage.
+   *
+   * `implicitPkOrdering` is OFF by default in core, so a default `findMany`
+   * emits no `ORDER BY` at all; switching it on adds an ordering a generic plan
+   * can walk the whole table in.
+   *
+   * Treat the option as a targeted remedy for a plan that is measurably worse
+   * after its fifth execution, not a general speed-up, and measure with
+   * `plan_cache_mode = force_generic_plan` versus `force_custom_plan` rather
+   * than reasoning about which query shapes "should" be safe.
    *
    * Default `undefined`: Turbine issues NOTHING and the backend keeps its own
    * default (`auto`), byte-identical to not setting the option.
@@ -578,6 +648,7 @@ const TURBINE_CONFIG_KEYS: Record<keyof TurbineConfig, true> = {
   defaultLimit: true,
   warnOnUnlimited: true,
   utcTimestamps: true,
+  temporalInfinity: true,
   planCacheMode: true,
   scopedConnect: true,
   relationLoadStrategy: true,
@@ -1141,10 +1212,14 @@ export class TurbineClient {
     // constructor-gated by the static flags, so it happens at most once.
     const ownsAnyPool = !config.pool;
     if (ownsAnyPool && !TurbineClient.int8ParserRegistered) {
-      pg.types.setTypeParser(20, (val: string) => {
-        const n = Number(val);
-        return Number.isSafeInteger(n) ? n : val;
-      });
+      warnParserOverwrite(20, 'int8');
+      pg.types.setTypeParser(
+        20,
+        markTurbineParser((val: string) => {
+          const n = Number(val);
+          return Number.isSafeInteger(n) ? n : val;
+        }),
+      );
       TurbineClient.int8ParserRegistered = true;
     }
     // Parse the zone-less temporal types (`timestamp` OID 1114, `date` OID
@@ -1191,6 +1266,7 @@ export class TurbineClient {
       defaultLimit: config.defaultLimit,
       warnOnUnlimited: config.warnOnUnlimited,
       utcTimestamps: config.utcTimestamps,
+      temporalInfinity: TurbineClient.resolveTemporalInfinity(config.temporalInfinity),
       scopedConnect: config.scopedConnect,
       relationLoadStrategy: config.relationLoadStrategy,
       stableRelationOrder: config.stableRelationOrder,
@@ -1380,6 +1456,27 @@ export class TurbineClient {
    *     `UnsupportedFeatureError` (E017), in the same style as the other
    *     capability refusals.
    */
+  /**
+   * Validate the `temporalInfinity` reading. A closed two-value enum, checked
+   * at construction so a typo (`'preserved'`, `'raw'`) fails loudly rather than
+   * silently falling back to the default reading the caller was trying to
+   * change.
+   */
+  private static resolveTemporalInfinity(
+    value: TemporalInfinityReading | undefined,
+  ): TemporalInfinityReading | undefined {
+    if (value === undefined) return undefined;
+    if (value !== 'null' && value !== 'preserve') {
+      throw new ValidationError(
+        `Invalid temporalInfinity: ${JSON.stringify(value)}. Expected 'preserve' (default: read a Postgres ` +
+          'temporal `infinity` as the JS number `Infinity` / `-Infinity`, which round-trips through a write ' +
+          "but breaks the declared `Date` type) or 'null' (read it as null, which serializes cleanly but " +
+          'makes it indistinguishable from a stored NULL, so a read-modify-write destroys the value).',
+      );
+    }
+    return value;
+  }
+
   private static resolvePlanCacheMode(mode: unknown, dialect: Dialect): PlanCacheMode | undefined {
     if (mode === undefined || mode === null) return undefined;
     const matched = PLAN_CACHE_MODES.find((m) => m === mode);

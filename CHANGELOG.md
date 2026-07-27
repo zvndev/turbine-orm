@@ -1,5 +1,265 @@
 # Changelog
 
+## 0.55.0 (2026-07-27)
+
+### Corrected
+
+- **The 0.54.0 note about `planCacheMode` and `findMany` was false, and it told
+  readers they were safe when they were not.** It said, in the changelog, in the
+  README, on the docs site and in the `planCacheMode` JSDoc that ships in the
+  published `.d.ts`: "`findMany` / `findFirst` bind `LIMIT $n`, and a
+  parameterized limit denies the planner the limit fraction that makes a skewed
+  plan look cheap, so those are much less exposed." PostgreSQL denies nothing.
+  For an unknown `LIMIT` it SUBSTITUTES a default fraction, 10% of the child
+  node's own row estimate, and that is not protection, it is a different wrong
+  number, wrong in BOTH directions: too generous when the real limit is under
+  10% of the matching rows, too stingy when it is over. Anyone who read the old
+  text and concluded a paginated `findMany` did not need looking at was misled.
+
+  What is actually true. Everything below is a number reproduced on
+  PostgreSQL 16 on two fixtures small enough to rebuild, both stated so you can
+  check them rather than take them on trust. `synchronize_seqscans` off and
+  `max_parallel_workers_per_gather = 0` throughout (the first of those matters:
+  it is on by default and makes a repeated seq scan resume where the last one
+  stopped, which reported one 8,000-buffer scan below as 4 buffers until it was
+  turned off).
+
+  FIXTURE 1, the substituted defaults. 400,000 rows, `k = id % 104` so
+  `n_distinct` is exactly 104, a btree on `k`, under `force_generic_plan`:
+
+  | statement | generic estimate | rule |
+  |---|---|---|
+  | `WHERE k = $1` | 3846 rows | `rows / n_distinct` = 400000/104 |
+  | `WHERE k > $1` | 133333 rows | 1/3 of the table |
+  | `WHERE t LIKE $1` | 2000 rows | 0.5% of the table |
+  | `WHERE k = $1 LIMIT $2` | `Limit` 385 rows | 10% of the 3846-row child |
+  | `WHERE id = $1 LIMIT $2` | `Limit` 1 row | the 10% fraction clamps at 1 row |
+
+  Two conditions on that 10% that are easy to miss, and the second one is the
+  one Turbine walks into. It clamps at one row, so it is not always an
+  overestimate. And an unknown `OFFSET` triggers the same substitution ON ITS
+  OWN, even when the limit is a constant: `LIMIT 20 OFFSET $2` estimated 20 rows
+  correctly but costed a 385-row prefix as its startup, and picked a DIFFERENT
+  plan shape from the same query with no offset. Turbine binds both
+  (`... LIMIT $2 OFFSET $3`), so a paginated read has
+  no constant-limit escape. And note the direction: in that fixture the
+  constant-limit form is the one that chose a seq scan, so "make the limit a
+  literal" is not a fix either.
+
+  FIXTURE 2, what actually goes wrong, and when. Two 200,000-row tables joined
+  on an indexed key, with a skewed predicate (`k2` matches 190,000 rows for one
+  value and one row for the rest; `n_distinct` sampled at roughly 1,600, which
+  is an ANALYZE estimate and varies on rebuild), for the statement
+  `SELECT count(*) FROM j JOIN jc ON jc.j_id = j.id WHERE j.k2 = $1`. NO LIMIT,
+  no `OFFSET`, no `ORDER BY` anywhere in it:
+
+  - custom plan: hash join, **1,770 shared buffers**
+  - generic plan: nested loop (the ~1,600-way estimate makes 190,000 inner
+    lookups look cheap), **761,002 shared buffers**, a 430x difference
+  - and it PROMOTES under the default `plan_cache_mode = auto`:
+    `pg_prepared_statements` reports `generic_plans = 2, custom_plans = 5` after
+    seven executions
+
+  That is the correction that matters most, because it inverts the ranking the
+  0.54 text gave. The shape that bites you unprompted is the one with NO limit
+  at all, because `auto` promotes only when the generic plan's ESTIMATED cost is
+  not worse than the average custom cost, and this generic plan underestimates
+  itself. A `LIMIT $n` frequently makes the generic plan look MORE expensive
+  rather than less (its substituted row count is larger than the real one), and
+  the limited statement in the same session was never promoted at all:
+  `generic_plans = 0, custom_plans = 8` across eight executions.
+
+  So the honest reading of `findMany` against `count()` is neither the 0.54
+  claim nor its mirror image. A limited `findMany` gives the planner two things
+  it cannot see instead of one (the predicate value and the limit count) and
+  either alone can flip the plan shape, but MORE unknowns is not the same as
+  more damage: the extra unknown often keeps the statement on custom plans.
+  Measured, both `count()` and an UNLIMITED `findMany` compile to the pure
+  parameterized-predicate shape that promotes on its own, and that is the shape
+  to look at first.
+
+  A note on the shapes we cannot show you. Earlier drafts of this entry carried
+  further figures (a 2040x seq-scan case, an 858x correlated-column case, an
+  early-termination cliff) whose fixtures were not written down and which did
+  not reproduce on rebuild. They are gone rather than restated: publishing an
+  unfalsifiable number in the entry that exists to correct one would be the same
+  mistake. What survives from them is the qualitative point, which does hold on
+  fixture 2 above: neither an `ORDER BY` nor any limit is required for a
+  generic plan to be catastrophically worse than a custom one.
+
+  Two corrections to the correction, so it is not overstated in the other
+  direction:
+
+  - **The sixth execution is a ceiling, not a trigger.** `auto` does not promote
+    unconditionally on execution six; it promotes when the generic plan's
+    estimated cost is not worse than the average custom cost, which for many
+    statements is never. The README and the `planCacheMode` JSDoc said "promotes
+    on its sixth execution" flatly, and now say this.
+  - **`implicitPkOrdering` is OFF by default in core.** An earlier draft of this
+    entry described it as a default Turbine supplies, which is wrong: a default
+    `findMany({ where, limit })` emits `SELECT ... WHERE ... LIMIT $2` with no
+    `ORDER BY` at all. The option is opt-in (`turbine-orm/prisma-compat`
+    defaults it on, core does not), and turning it ON adds an ordering a generic
+    plan can walk the whole table in. Nothing about the option changes here.
+
+  The short rule: a plan-cached statement with any parameter can diverge; no
+  shape of limit, bound or constant, protects you; and the promotion decision
+  turns on the generic plan's own estimate, not on your query's shape. Measure
+  with `plan_cache_mode = force_generic_plan` versus `force_custom_plan`, and
+  check `pg_prepared_statements.generic_plans` to see whether a statement is
+  actually being promoted under the default.
+
+  Nothing about `planCacheMode` itself changes in this release. It still does
+  what it did; the guidance around it was wrong.
+
+- **The 0.54.0 `infinity` note overclaimed its own coverage.** It said the fix
+  landed "on top-level, join relations and batched relations alike". It did not
+  reach the join strategy: `json_build_object` renders an infinite timestamp as
+  the string `"infinity"`, which no driver parser sees, so the join and
+  positional paths kept returning an Invalid Date while the batched path
+  returned a number, for the same row of the same query. Fixed below.
+
+### Breaking
+
+- **`infinity` / `-infinity` in a temporal column now read as the JS numbers
+  `Infinity` / `-Infinity` on EVERY read strategy.** 0.54.0 stopped them
+  becoming an Invalid Date on some paths and not others: the driver hands back a
+  number, but `json_build_object` renders the same value as the string
+  `"infinity"`, which no driver parser sees, so the join and positional
+  strategies kept returning an Invalid Date while the batched and top-level
+  paths returned a number, for the same row of the same query. Both forms are
+  now normalized in ONE place, the ORM row parser, so the same stored value
+  cannot read differently depending on which plan the query took.
+
+  That normalization is what changes on upgrade. If you read infinity-bearing
+  rows through a `with` clause (the join strategy, or the positional wire
+  encoding), you were getting an Invalid Date and you now get the number.
+  Everywhere else the value is what 0.54.0 already gave you.
+
+  Applied in ONE place, so top-level reads, `findUnique` / `findFirst`,
+  streaming, the join / batched / flatten strategies, the positional encoding,
+  write `RETURNING` / reselect / `OUTPUT` projections and `groupBy` keys all take
+  the same reading. `_min` / `_max` are mapped at their own assembly sites for
+  the same reason (they hand back a stored cell, so they can carry the value;
+  `_count` / `_sum` / `_avg` cannot). Array elements map too, so a `timestamp[]`
+  reads `[Infinity, -Infinity]` rather than two Invalid Dates. Nothing is
+  registered with `pg.types.setTypeParser` for this: the driver parsers are
+  untouched, so raw SQL, `client.sql` and other libraries on the same `pg` keep
+  the driver's value.
+
+  **Why the number and not `null`.** `null` is the nicer-looking reading, and it
+  was the one this release originally shipped with. It is also lossy, which a
+  default may not be. Measured on PostgreSQL 16, on a nullable `timestamp`
+  column holding `infinity`, with `valid_until::text` read back through a raw
+  `pg` client:
+
+  ```ts
+  const row = await db.leases.findUnique({ where: { id } });
+  await db.leases.update({ where: { id }, data: { ...row, note } });
+  // reading the number: valid_until::text is still "infinity"
+  // reading null:       valid_until::text is NULL, and nothing said so
+  ```
+
+  Under a `null` reading a stored `infinity` and a stored NULL are
+  indistinguishable, so that write, the single commonest write shape there is,
+  destroys the value with no error. The complaint the `null` reading answered is
+  a real one, that `JSON.stringify` renders the number as `null` while the
+  declared type says `Date`, but a lossy default is the wrong price for a
+  cleaner JSON encoding. On a NOT NULL column the same write would at least fail
+  loudly with `NotNullViolationError` (E010); on the nullable columns where
+  `expires_at` / `valid_until` actually live, it is silent.
+
+  **What the default costs you, stated plainly.** The generated types declare
+  the field `Date`, and it hands back a `number`, so on exactly the rows holding
+  an infinity:
+
+  - `row.validUntil.toISOString()` and `.getTime()` throw a `TypeError`. Guard
+    with `typeof row.validUntil === 'number'` (or `Number.isFinite`) before
+    calling a `Date` method on a column that can hold one.
+  - `JSON.stringify` still renders the value `null`, because JSON has no
+    infinity literal. The API response is unchanged from 0.54.0 and from the
+    Invalid Date before it.
+  - `where: { col: null }` still compiles to `IS NULL` and does NOT match these
+    rows. Filter them with `where: { col: 'infinity' }`. Compiling `null` to
+    also match `infinity` would silently change every null predicate on every
+    temporal column, which is far worse.
+
+  **A one-time warning, and it is not dev-only.** When `temporalInfinity` is
+  left unset and a stored infinity is actually read, Turbine says so once per
+  process per field, naming the table and column, describing the reading and
+  both escapes. Unlike every other Turbine warning it is NOT silenced by
+  `NODE_ENV=production`, because production is where a `Date` method throws on
+  live traffic and where a destructive write under the opt-in would commit. It
+  costs one `console.warn` per field, and only on a row that actually held an
+  infinity. Naming either reading in the config silences it: the warning exists
+  to surface an unacknowledged trade, not to nag.
+
+  Cross-engine: Postgres is the only engine that can produce an infinite
+  temporal value (SQLite has none, MySQL and SQL Server have bounded datetime
+  domains, PowDB stores micros). The row parser is engine-shared and is not
+  dialect-gated, so the one visible effect elsewhere is that a stray
+  `'infinity'` string on a date-typed column reads as the number instead of an
+  Invalid Date.
+
+### Added
+
+- **`temporalInfinity` client option** (`'preserve' | 'null'`, exported as
+  `TemporalInfinityReading`). `'preserve'` is the default described above and
+  naming it explicitly silences the warning. `'null'` opts into reading a stored
+  infinity as `null` instead: `JSON.stringify` is then honest about what the
+  value became, the declared `Date | null` type holds so no method call throws,
+  and `groupBy` / `distinct` / `_min` / `_max` take the same reading as the rows.
+  Its cost is the data loss above, and three consequences worth spelling out
+  before you choose it:
+
+  - **`groupBy` keys stop being unique.** `GROUP BY` returns one row per
+    distinct stored value and the ORM then relabels `infinity`, `-infinity` and
+    SQL NULL all as `null`, so three rows holding those three values come back
+    as three groups keyed `null`. Anything building a `Map` or
+    `Object.fromEntries` off the group value keeps one of the three counts.
+    `distinct: ['col']` has the same shape.
+  - **`+infinity` and `-infinity` collapse into each other**, not just into
+    NULL. On a `valid_until` column that puts "never expires" and "expired
+    forever" in the same bucket.
+  - **`_max` can return `null` on a table that plainly has rows.** With
+    `2026-01-01`, `2026-06-01` and `infinity` stored, `aggregate` reports
+    `_min: 2026-01-01, _max: null, _count: 3`, and `_max: null` is the same
+    value an empty table returns.
+
+  Reach for `'null'` when the rows are read-only in your code path and the
+  declared type contract matters more than the stored value; rows read under it
+  must not be written back. Both readings are identical on every read strategy,
+  every write projection, `groupBy` keys and `_min` / `_max`, and the write path
+  is untouched by either, so `'infinity'` / `'-infinity'` / `Infinity` /
+  `-Infinity` all remain bindable and a value read as `null` is still
+  recoverable if you know what it held. Anything outside the two values throws
+  `ValidationError` (E003) at construction.
+
+- **A one-time dev warning when Turbine overwrites a pg type parser that
+  somebody else already customized.** `pg.types.setTypeParser` is
+  process-global, which was documented; what was not is that it is
+  RETROACTIVE. There is one parser table and it is consulted per row at decode
+  time, so registration changes how every `pg.Pool` in the process decodes that
+  OID, INCLUDING POOLS THAT ALREADY EXIST AND ARE ALREADY QUERYING. Same pool,
+  same query, only a Turbine client construction in between (TZ=Asia/Tokyo):
+  `date` went from `2026-07-20T15:00:00.000Z` to `2026-07-21T00:00:00.000Z`.
+  The failure that creates is order-dependent and invisible: a reporting job
+  reading through its own pool returns different days depending on whether some
+  unrelated module has constructed a Turbine client yet, and with lazy route
+  imports that ordering is not stable between requests. Turbine now says so
+  once per OID (1114, 1082, 1115, 1182 and int8's 20) when the parser it is
+  about to replace is not the driver's default. Detection is BEHAVIOURAL, not
+  by function identity: `pg-types` keeps its default table private, so the
+  registered parser is run over a canonical wire value and compared with what
+  the default produces for it. That catches every parser that behaves
+  observably differently, and deliberately stays silent about one that is
+  observably equivalent. Turbine's own parsers are tagged, so a second
+  registration in the same process (a client plus `turbine studio`, an ESM plus
+  CJS copy) never reports itself. Dev-only, silent under `NODE_ENV=production`.
+  The process-global notes in the README, the `utcTimestamps` JSDoc and the
+  docs site now say "including pools that already exist and are already
+  querying" instead of leaving it to inference.
+
 ## 0.54.0 (2026-07-27)
 
 ### Breaking
@@ -83,6 +343,13 @@
   against a live database rather than through the parser, because a test at the
   parser seam passes while the ORM is still broken.
 
+  > **The coverage claim above is wrong on two counts**, annotated rather than
+  > rewritten. The join and positional strategies were NOT fixed (they see the
+  > JSON string `"infinity"`, not the driver's number, and kept returning an
+  > Invalid Date), and the reading this shipped, the number `Infinity` on a
+  > field declared `Date`, was itself a defect. Both are addressed in 0.55.0,
+  > where the value reads as `null`.
+
 - **`turbine studio` renders zone-less `date` / `timestamp` cells the way the
   application reads them.** Studio builds its own raw pool and never constructs
   a `TurbineClient`, so it kept the driver's local-zone parsers: east of UTC a
@@ -114,6 +381,15 @@
   planner the limit fraction that makes a skewed plan look cheap, so those are
   much less exposed. Treat it as a targeted remedy for a statement measurably
   slower after its fifth execution, not a general speed-up.
+
+  > **The two sentences about `LIMIT $n` above are FALSE.** Left in place
+  > because released history is not rewritten, annotated because acting on them
+  > leaves a real query unprotected. A bound limit does not deny the planner a
+  > limit fraction, it substitutes a default of 10% of the child row estimate,
+  > and an unknown `OFFSET` triggers the same substitution even when the limit
+  > is a constant. Nor is the sixth execution a trigger: `auto` promotes only
+  > when the generic plan's estimated cost is not worse than the average custom
+  > cost. See the 0.55.0 entry for the measured rule and the fixtures.
 
   Applied as a connection parameter (`options=-c plan_cache_mode=...`) when the
   pool opens a connection, so it is in force for that connection's first

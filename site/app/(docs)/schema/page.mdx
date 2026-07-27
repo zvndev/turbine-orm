@@ -431,7 +431,14 @@ The write half was already UTC, which is what made the old read half a correctne
   `pg.types.setTypeParser` installs one parser per OID for the whole `pg`
   module, so a Turbine-owned pool changes `date` / `timestamp` parsing for every
   consumer of that module in the process, including a second ORM or your own
-  `pool.query` reporting code. The first client settles the value, and a later
+  `pool.query` reporting code. It is **retroactive**: there is one parser table,
+  read per row at decode time, so this reaches pools that **already exist and
+  are already querying**, not only pools created afterwards. The same pool
+  running the same query returns different values before and after some
+  unrelated module constructs a Turbine client, and lazy route imports make that
+  ordering unstable between requests. If something else had already customized
+  the OID, Turbine emits a one-time dev warning instead of replacing it
+  silently. The first client settles the value, and a later
   client asking for the **opposite** one throws `ValidationError`
   (`TURBINE_E003`) at construction rather than reading and writing in different
   zones. Give every client in the process the same value, or isolate the odd one
@@ -448,6 +455,58 @@ The write half was already UTC, which is what made the old read half a correctne
   always returned for a `date`. Postgres was the outlier, and this closes the
   divergence rather than creating one.
 </Callout>
+
+### `infinity` and `-infinity`
+
+Postgres accepts `infinity` and `-infinity` in `date`, `timestamp` and `timestamptz` columns, usually to model "no end date" without a nullable column. **Turbine reads both as the JS numbers `Infinity` / `-Infinity` by default**, identically on every read strategy.
+
+There is no JavaScript `Date` that means either value, so every available reading is wrong in some way: an `Invalid Date` is silent and `NaN` everywhere; `null` reads cleanly but is indistinguishable from a stored `NULL`; the number breaks the field's declared `Date` type at runtime. The default is the only one of the three that cannot **lose** the value.
+
+Since v0.55 the reading is applied in one place, the ORM row parser, so top-level reads, `findUnique` / `findFirst`, streaming, the join / batched / flatten strategies, the positional wire encoding, write `RETURNING` / reselect / `OUTPUT` projections, `groupBy` keys and `_min` / `_max` all agree. v0.54 did not: `json_build_object` renders the value as the string `"infinity"`, which no driver parser ever sees, so a `with` clause returned an `Invalid Date` while the same row read at the top level returned the number.
+
+<Callout type="warning" title="Why the number, and not the nicer-looking `null`">
+  Because `null` silently destroys data. Under a `null` reading a stored
+  `infinity` and a stored `NULL` are indistinguishable, so the commonest write
+  shape there is, `const row = await db.leases.findUnique(...)` then
+  `db.leases.update({ where, data: { ...row, note } })`, stores SQL `NULL` over
+  a nullable temporal column and the `infinity` is gone with no error. Measured
+  on PostgreSQL 16 with `valid_until::text` read back through a raw `pg` client:
+  the default reading leaves `"infinity"`, the `null` reading leaves `NULL`.
+
+  The complaint `null` answers is real, `JSON.stringify` renders the number as
+  `null` while the declared type says `Date`, but a lossy default is the wrong
+  price for a cleaner JSON encoding. On a `NOT NULL` column that write would at
+  least fail loudly with `NotNullViolationError` (`TURBINE_E010`); on the
+  nullable columns where `expiresAt` / `validUntil` actually live, it is silent.
+
+  Turbine emits a one-time warning naming the table and field the first time a
+  stored infinity is read, describing the reading and both escapes. Unlike every
+  other Turbine warning it is **not** silenced by `NODE_ENV=production`, because
+  production is where a `Date` method throws on live traffic. Naming either
+  reading in the config silences it.
+</Callout>
+
+What the default costs, on exactly the rows that hold an infinity:
+
+- **`Date` methods throw.** The generated type says `Date` and the value is a `number`, so `row.validUntil.toISOString()` and `.getTime()` raise a `TypeError`. Guard with `typeof row.validUntil === 'number'` (or `Number.isFinite`) before calling a `Date` method on a column that can hold one.
+- **`JSON.stringify` still renders `null`**, because JSON has no infinity literal. Your API response is unchanged from v0.54 and from the `Invalid Date` before it.
+- **`where: { validUntil: null }` still compiles to `IS NULL`** and does **not** match these rows. Filter them with `where: { validUntil: 'infinity' }`. Making `null` match both would silently change every null predicate on every temporal column.
+
+#### `temporalInfinity: 'null'`
+
+```ts
+const db = turbine({ connectionString: process.env.DATABASE_URL, temporalInfinity: 'null' });
+```
+
+Reads a stored infinity as `null` instead. `JSON.stringify` is then honest about what the value became, the declared `Date | null` type of a nullable column holds so no method call throws, and every read strategy agrees just as it does under the default. The cost is the data loss above, plus three consequences worth knowing before you choose it:
+
+- **`groupBy` keys stop being unique.** `GROUP BY` returns one row per distinct stored value, and the ORM then labels `infinity`, `-infinity` and SQL `NULL` all as `null`. Three rows holding those three values come back as three groups keyed `null`, so a `Map` or `Object.fromEntries` built off the group value keeps one of the three counts. `distinct: ['col']` has the same shape.
+- **`+infinity` and `-infinity` collapse into each other**, not only into `NULL`. On a `validUntil` column that puts "never expires" and "expired forever" in the same bucket.
+- **`_max` can be `null` on a table that plainly has rows.** With `2026-01-01`, `2026-06-01` and `infinity` stored, `aggregate` reports `_min: 2026-01-01`, `_max: null`, `_count: 3`, and `_max: null` is the same value an empty table returns.
+
+Pick `'null'` when the rows are read-only in that code path and the declared type contract matters more than the stored value; rows read under it must not be written back. Pick the default when anything reads a row and writes it again, which is most code.
+
+The write path is untouched by either reading, so `'infinity'` / `'-infinity'` / `Infinity` / `-Infinity` all remain bindable and a value read as `null` is still recoverable if you know what it held.
 
 ### Time-of-day columns: `time` and `timetz`
 

@@ -16,6 +16,7 @@ import type { Dialect } from '../dialect.js';
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { camelToSnake, normalizeKeyColumns } from '../schema.js';
+import type { TemporalInfinityReading } from './deferred.js';
 import {
   assertBindableEqualsOperand,
   findArrayUniqueKey,
@@ -79,6 +80,13 @@ export interface BuilderCtx {
    * `timestamp` columns (see `coerceWriteValue` in writes.ts).
    */
   readonly utcTimestamps?: boolean;
+  /**
+   * The client's `temporalInfinity` reading (`'preserve'` default, `'null'`).
+   * Read by aggregates.ts, where `_min` / `_max` are assembled from the raw row
+   * and so cannot go through `parseRow`. Optional so a hand-built ctx keeps the
+   * default.
+   */
+  readonly temporalInfinity?: TemporalInfinityReading;
   readonly crossSchemaTypeColumns: Set<string>;
   /**
    * The active query's `skipGlobalFilters` opt-out. A live getter/setter over

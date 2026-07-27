@@ -12,6 +12,18 @@
  * Zone behaviour is asserted in CHILD PROCESSES, because `TZ` is read once at
  * process start and cannot be flipped from inside a test.
  *
+ * The `infinity` / `-infinity` cases below assert that the DRIVER parsers keep
+ * delegating those values to pg's own parser, which returns the JS numbers
+ * `Infinity` / `-Infinity`. That is deliberate and must not be "fixed" here:
+ * temporal infinity is normalized one level up, in the ORM row parser, so that
+ * the JSON-wire string form (`"infinity"`, which no driver parser ever sees)
+ * and this number form land on the same value under either `temporalInfinity`
+ * reading. If one of these assertions starts failing, the mapping has been put
+ * in the global pg parser, where it would rewrite what every other consumer of
+ * the same `pg` module reads. See
+ * src/test/temporal-infinity-reading.integration.test.ts for the
+ * public-surface contract.
+ *
  * Run: npx tsx --test src/test/utc-date-parser.test.ts
  */
 

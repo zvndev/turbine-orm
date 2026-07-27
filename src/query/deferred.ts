@@ -44,6 +44,37 @@ export interface DeferredQuery<T> {
 // QueryInterface, the object returned by db.users, db.posts, etc.
 // ---------------------------------------------------------------------------
 
+/**
+ * How the ORM hands back a Postgres temporal `infinity` / `-infinity`.
+ *
+ * JavaScript has no `Date` for either value, so every available reading is
+ * wrong in some way and the choice is which way:
+ *
+ *   `'preserve'`  the default. The JS numbers `Infinity` / `-Infinity`,
+ *                 normalized to the same value on EVERY read strategy (the
+ *                 join and positional paths see the JSON string `"infinity"`
+ *                 and are mapped to the number, which is what 0.54 got wrong).
+ *                 LOSSLESS: binding the number back to a temporal column
+ *                 stores `infinity` again, so `update({ data: { ...row } })`
+ *                 round-trips. THE COST: the field's declared type is `Date`,
+ *                 so `row.validUntil.toISOString()` throws a TypeError on
+ *                 those rows, and `JSON.stringify` still renders the value
+ *                 `null`.
+ *   `'null'`      opt-in. Matches what a caller serializing the row already
+ *                 saw (`JSON.stringify` renders every other candidate as null
+ *                 too) and is permitted by the declared type of a nullable
+ *                 column, so no method call throws. THE COST is data loss: a
+ *                 stored `infinity` and a stored NULL become
+ *                 indistinguishable, so a read-modify-write over a nullable
+ *                 column (`update({ data: { ...row } })`) writes SQL NULL and
+ *                 the infinity is gone, with no error.
+ *
+ * The default is the reading that cannot lose a value. Pick `'null'` when the
+ * declared type contract matters more than the stored value, knowing that rows
+ * read under it must not be written back.
+ */
+export type TemporalInfinityReading = 'null' | 'preserve';
+
 /** Middleware function type, imported from client to avoid circular deps */
 export type MiddlewareFn = (
   params: { model: string; action: string; args: Record<string, unknown> },
@@ -149,6 +180,11 @@ export interface QueryInterfaceOptions {
    * the pre-0.26 behavior (JS local-time interpretation).
    */
   utcTimestamps?: boolean;
+  /**
+   * How a Postgres temporal `infinity` / `-infinity` is handed back. See
+   * {@link TemporalInfinityReading}. Default `'preserve'`.
+   */
+  temporalInfinity?: TemporalInfinityReading;
   /**
    * Client-level default relation-loading strategy for `with` clauses; a
    * per-query `relationLoadStrategy` arg overrides it. On SQL engines the default

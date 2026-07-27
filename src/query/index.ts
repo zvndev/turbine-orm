@@ -114,6 +114,7 @@ export type {
   QueryEventListener,
   QueryInterfaceOptions,
   ReselectExecutor,
+  TemporalInfinityReading,
 } from './builder.js';
 export {
   AUTO_ASSUMED_ROUND_TRIP_MS,
