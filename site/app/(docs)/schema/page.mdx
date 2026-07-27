@@ -374,13 +374,80 @@ Turbine maps Postgres types to TypeScript:
 | `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` are returned as `string` to avoid precision loss |
 | `numeric`, `money` | `string` | Arbitrary precision, kept as string to avoid JS float issues |
 | `text`, `varchar`, `uuid`, `citext` | `string` | |
-| `timestamptz`, `timestamp`, `date` | `Date` | |
+| `timestamptz` | `Date` | Carries a zone on the wire, so the instant is unambiguous |
+| `timestamp`, `date` | `Date` | Zone-less. Read as UTC, not as the process's local zone. See [Zone-less columns](#zone-less-columns-timestamp-and-date-read-as-utc) |
 | `time`, `timetz` | `string` on read, `string \| Date` on write | No date part, so never coerced to a `Date` on read. See [Time-of-day columns](#time-of-day-columns-time-and-timetz) |
 | `interval` | `string` | |
 | `boolean` | `boolean` | |
 | `json`, `jsonb` | `unknown` | |
 | `bytea` | `Buffer` | |
-| Array types | `T[]` | `_text` → `string[]` |
+| Array types | `T[]` | `_text` → `string[]`. `date[]` and `timestamp[]` follow their scalar forms |
+
+### Zone-less columns: `timestamp` and `date` read as UTC
+
+A `timestamptz` carries its offset on the wire, so there is nothing to decide. A `timestamp` (without time zone) and a `date` do not: the database hands over `2026-07-21 09:30:00` or `2026-07-21` and something has to choose which instant that is. The pg driver's own answer is *the process's local zone*, which makes the same stored row a different `Date` in every deployment region.
+
+Turbine's answer is UTC, the same convention Prisma, Rails and Django use. It is applied as pg type parsers on OIDs 1114 (`timestamp`), 1082 (`date`) and their array forms 1115 / 1182, and to the dates coerced out of nested-relation JSON, so every read path agrees.
+
+```ts
+// Stored: date '2026-07-21'. Process running in Europe/Berlin (UTC+2).
+const job = await db.jobs.findUniqueOrThrow({ where: { id: 1 } });
+
+job.runOn.toISOString();          // '2026-07-21T00:00:00.000Z'
+job.runOn.toISOString().slice(0, 10); // '2026-07-21'  <- format a date like this
+```
+
+<Callout type="warning" title="date reads changed in v0.54, and the change is silent">
+  Before v0.54 the `date` parser was the driver's, so a stored `2026-07-21` came
+  back as **local** midnight: epoch `2026-07-20T22:00:00.000Z` in
+  `Europe/Berlin` (UTC+2) and `2026-07-20T15:00:00.000Z` in `Asia/Tokyo`
+  (UTC+9), the wrong calendar day everywhere east of UTC. It now reads
+  `2026-07-21T00:00:00.000Z` everywhere. The calendar day the value denotes is
+  unchanged; the **epoch value** moves by your process's UTC offset, so
+  `getTime()`, `toISOString()` and `JSON.stringify(row)` change, and API
+  payloads, exports and golden files containing a `date` column change text.
+
+  West of UTC the old behaviour produced the right calendar day by accident,
+  which is why this went unnoticed: `2026-07-21` in `America/New_York` (UTC-4)
+  parsed to `2026-07-21T04:00:00.000Z`, and `toLocaleDateString()` on it read
+  back `7/21/2026`. That same call now reads `7/20/2026`, because UTC midnight
+  is the previous evening locally. **Format a `date` in UTC**
+  (`toISOString().slice(0, 10)`), never with local-component helpers
+  (`toLocaleDateString()`, `getDate()`, `date-fns` / `dayjs` `format('yyyy-MM-dd')`).
+
+  Nothing stored in the database changes, no emitted SQL changes, and a process
+  running in UTC is byte-identical before and after.
+</Callout>
+
+The write half was already UTC, which is what made the old read half a correctness bug rather than a preference. Binding a `Date` to a zone-less column renders its **UTC** components, so east of UTC every read-modify-write cycle on a `date` moved the stored day one day earlier and kept going: read `2026-07-21` as `2026-07-20T22:00Z`, write it back as `2026-07-20`, read that as `2026-07-19T22:00Z`, and so on. A row could also fail to find itself: `where: { runOn: row.runOn }` matched nothing.
+
+`date[]` and `timestamp[]` now follow their scalars. Postgres array OIDs do not inherit an element type's parser, so a `timestamp[]` used to come back in the local zone while the `timestamp` column beside it in the same row came back in UTC. Both array OIDs are registered alongside their scalars, so scalar and array cannot settle differently.
+
+<Callout type="note" title="This is a process-wide setting, not a per-client one">
+  `utcTimestamps: false` opts out, and it reverts **both** halves: reads go back
+  to the local zone and writes bind local-calendar literals. Two things to know
+  before setting it.
+
+  `pg.types.setTypeParser` installs one parser per OID for the whole `pg`
+  module, so a Turbine-owned pool changes `date` / `timestamp` parsing for every
+  consumer of that module in the process, including a second ORM or your own
+  `pool.query` reporting code. The first client settles the value, and a later
+  client asking for the **opposite** one throws `ValidationError`
+  (`TURBINE_E003`) at construction rather than reading and writing in different
+  zones. Give every client in the process the same value, or isolate the odd one
+  in its own process.
+
+  A client on an **external pool** (`pool: …`, `turbineHttp()`) never triggers
+  registration, so a process holding only those keeps whatever the caller's
+  driver set up. It is not exempt from the effect, though: registration is
+  process-global, so once an owned client has installed the parsers an
+  external-pool client reads through them too. That is why it takes part in the
+  agreement check as well.
+
+  Cross-engine, UTC midnight is what SQLite, MySQL, SQL Server and PowDB have
+  always returned for a `date`. Postgres was the outlier, and this closes the
+  divergence rather than creating one.
+</Callout>
 
 ### Time-of-day columns: `time` and `timetz`
 

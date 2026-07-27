@@ -359,6 +359,168 @@ export function parseDbDate(value: string): Date {
 }
 
 // ---------------------------------------------------------------------------
+// Driver type parsers for the zone-less temporal OIDs
+// ---------------------------------------------------------------------------
+
+/**
+ * A Postgres `date` wire value: `YYYY-MM-DD`, optionally with more than four
+ * year digits, optionally suffixed ` BC`. Anything else (`infinity`,
+ * `-infinity`, and any shape a future server adds) is deliberately NOT matched
+ * so it falls through to the driver's own parser untouched.
+ */
+const PG_DATE_TEXT_RE = /^(\d{4,})-(\d{2})-(\d{2})( BC)?$/;
+
+/**
+ * Build the driver parser for Postgres `date` (OID 1082) that reads a
+ * zone-less calendar day as **UTC midnight**.
+ *
+ * The pg default builds the Date from the process's LOCAL zone, so the stored
+ * calendar day `2026-07-21` comes back as `2026-07-20T22:00:00Z` in
+ * `Europe/Berlin` and `2026-07-20T15:00:00Z` in `Asia/Tokyo`: the wrong
+ * calendar day everywhere east of UTC, and the wrong instant everywhere except
+ * UTC itself. It is also the exact mirror-image of the WRITE side, which
+ * already renders a bound `Date` from its UTC components
+ * ({@link toLocalDateTimeLiteral}), so today a read-modify-write cycle on a
+ * `date` column east of UTC walks the stored day one day earlier per cycle.
+ * This is the missing read half of `utcTimestamps`, matching what
+ * {@link parseDbDate} already does for the JSON path and what the OID 1114
+ * parser already does for `timestamp`.
+ *
+ * `fallback` is the parser this one REPLACES, and it must be captured with
+ * `pg.types.getTypeParser(1082, 'text')` BEFORE registration (reading it after
+ * would hand back this function and recurse forever). It keeps `infinity` /
+ * `-infinity` on the driver's `Infinity` / `-Infinity`.
+ *
+ * `setUTCFullYear` rather than the `Date` constructor, so a two-or-three-digit
+ * year is not silently mapped into the 1900s, and ` BC` maps to the
+ * astronomical year (`0044 BC` → -43) the way the driver's own parser does.
+ */
+export function createUtcDateParser(fallback: (text: string) => unknown): (text: string) => unknown {
+  return (text: string): unknown => {
+    const m = PG_DATE_TEXT_RE.exec(text);
+    if (!m) return fallback(text);
+    const year = m[4] ? -(Number(m[1]) - 1) : Number(m[1]);
+    const date = new Date(0);
+    date.setUTCFullYear(year, Number(m[2]) - 1, Number(m[3]));
+    date.setUTCHours(0, 0, 0, 0);
+    return date;
+  };
+}
+
+/**
+ * A Postgres `timestamp` (without time zone) wire value:
+ * `YYYY-MM-DD HH:MM:SS`, optionally with more than four year digits, optional
+ * fractional seconds, optional ` BC`. As with {@link PG_DATE_TEXT_RE},
+ * `infinity` / `-infinity` and any shape a future server adds deliberately do
+ * NOT match, so they fall through to the driver's own parser untouched.
+ */
+const PG_TIMESTAMP_TEXT_RE = /^(\d{4,})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?( BC)?$/;
+
+/**
+ * Build the driver parser for Postgres `timestamp` (OID 1114) that reads an
+ * offset-less date-time as UTC. Also lifted to the `_timestamp` array OID
+ * (1115), so the scalar and the array can never settle on different
+ * interpretations.
+ *
+ * `fallback` is the parser this one REPLACES and must be captured with
+ * `pg.types.getTypeParser(1114, 'text')` BEFORE registration (see
+ * {@link createUtcDateParser}). It is what keeps `infinity` / `-infinity` on
+ * the driver's `Infinity` / `-Infinity`: the earlier
+ * `new Date(text.replace(' ', 'T') + 'Z')` form turned `'infinity'` into
+ * `'infinityZ'` and so into an `Invalid Date` that flowed on silently.
+ *
+ * Component assembly rather than `Date` string parsing, for the same reason as
+ * the `date` parser: a year outside four digits and a ` BC` suffix are not
+ * parseable as ISO-8601 and would otherwise also become `Invalid Date`.
+ * Fractional seconds are truncated to milliseconds, which is what
+ * `Date`-string parsing did too.
+ */
+export function createUtcTimestampParser(fallback: (text: string) => unknown): (text: string) => unknown {
+  return (text: string): unknown => {
+    const m = PG_TIMESTAMP_TEXT_RE.exec(text);
+    if (!m) return fallback(text);
+    const year = m[8] ? -(Number(m[1]) - 1) : Number(m[1]);
+    const ms = m[7] ? Number(m[7].slice(0, 3).padEnd(3, '0')) : 0;
+    const date = new Date(0);
+    date.setUTCFullYear(year, Number(m[2]) - 1, Number(m[3]));
+    date.setUTCHours(Number(m[4]), Number(m[5]), Number(m[6]), ms);
+    return date;
+  };
+}
+
+/**
+ * The offset-less-timestamp-as-UTC reading, with no fallback: `text` must be a
+ * plain `YYYY-MM-DD HH:MM:SS[.ffffff]`. Used where the input shape is already
+ * known (tests, JSON-wire coercion); the DRIVER parser is
+ * {@link createUtcTimestampParser}, which delegates everything else.
+ */
+export function parseUtcTimestampText(text: string): Date {
+  return new Date(`${text.replace(' ', 'T')}Z`);
+}
+
+/**
+ * The shape of `pg.types.arrayParser` at RUNTIME. The bundled `pg-types`
+ * declaration file types it as a plain function, which it has not been for
+ * years (it is the `postgres-array` module, `{ create(source, transform) }`),
+ * so the cast below is a declaration fix, not a type escape.
+ */
+type PgArrayParserModule = {
+  create(source: string, transform: (entry: string) => unknown): { parse(): unknown[] };
+};
+
+/**
+ * Lift an element parser to the matching Postgres array OID.
+ *
+ * Array OIDs do NOT inherit their element type's parser: registering a parser
+ * for `date` (1082) leaves `date[]` (1182) on the driver's default, so the same
+ * value read from a scalar column and from an array column would disagree by
+ * the process offset. Every scalar temporal parser Turbine registers is
+ * therefore registered in its array form too.
+ *
+ * `pg.types.arrayParser` is a public member of the `pg` module (it is what the
+ * driver's own `_text` / `_date` parsers are built from), so this adds no
+ * dependency. NULL elements stay `null` and are never handed to `element`.
+ */
+export function createPgArrayParser(element: (text: string) => unknown): (text: string) => unknown[] {
+  const arrayParser = pg.types.arrayParser as unknown as PgArrayParserModule;
+  return (text: string): unknown[] =>
+    arrayParser.create(text, (entry) => (entry === null || entry === undefined ? null : element(entry))).parse();
+}
+
+/**
+ * Register the UTC readings of the four zone-less temporal OIDs on the pg
+ * module: `timestamp` (1114), `date` (1082) and their array forms (1115, 1182).
+ *
+ * ONE place, because `pg.types.setTypeParser` is process-global and the pairing
+ * matters: registering a scalar without its array form, or a `date` without the
+ * `timestamp` beside it, produces two columns of the same row disagreeing about
+ * what the same wire text means. Both callers are processes Turbine owns the
+ * pg module in: `TurbineClient` on a pool it created (never on an external
+ * pool, whose parser configuration belongs to the caller), and `turbine studio`,
+ * which builds a raw pool of its own and must render what the application sees.
+ *
+ * Each fallback is read BEFORE its parser is installed, so an unrecognised wire
+ * value (`infinity`, and whatever a future server adds) still reaches the
+ * driver's own parser.
+ */
+export function registerUtcTemporalParsers(): void {
+  // pg-types declares get/setTypeParser over its own OID enum, which lists the
+  // scalar types only. The array OIDs are just as real, so both calls are
+  // retyped over a plain number rather than the incomplete enum.
+  const getParser = pg.types.getTypeParser as unknown as (oid: number, format: 'text') => (value: string) => unknown;
+  const setParser = pg.types.setTypeParser as unknown as (oid: number, parse: (value: string) => unknown) => void;
+  const parseDate = createUtcDateParser(getParser(1082, 'text'));
+  const parseTimestamp = createUtcTimestampParser(getParser(1114, 'text'));
+  setParser(1114, parseTimestamp);
+  setParser(1082, parseDate);
+  // Array OIDs do not inherit their element parser, so `date[]` / `timestamp[]`
+  // would otherwise keep returning local-zone Dates while the scalar columns
+  // beside them returned UTC ones.
+  setParser(1182, createPgArrayParser(parseDate));
+  setParser(1115, createPgArrayParser(parseTimestamp));
+}
+
+// ---------------------------------------------------------------------------
 // JSON-wire value coercion (relationLoadStrategy: 'join')
 // ---------------------------------------------------------------------------
 
@@ -382,7 +544,7 @@ export function parseDbDate(value: string): Date {
  *   numeric      '1000.50'   (string)         1000.5    (number, LOSSY)
  *   int8         '9007199254740993'           9007199254740992 (LOSSY)
  *   bytea        Buffer                       '\xdeadbeef' (string)
- *   date         Date (local midnight)        Date (UTC midnight, off by tz)
+ *   date         Date (UTC midnight)          Date (UTC midnight, by coincidence)
  *   interval     { days, hours, … }           '1 day 02:03:04' (string)
  *   point        { x, y }                     '(1,2)'   (string)
  *   circle       { x, y, radius }             '<(1,2),3>' (string)

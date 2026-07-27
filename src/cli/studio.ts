@@ -52,7 +52,7 @@ import type { CreateArgs, DeleteArgs, FindManyArgs, UpdateArgs } from '../query/
 import { QueryInterface, quoteIdent } from '../query/index.js';
 // `ownLookup` is not re-exported from the query barrel, so it is imported from
 // its defining leaf module rather than duplicated here.
-import { ownLookup } from '../query/utils.js';
+import { ownLookup, registerUtcTemporalParsers } from '../query/utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
@@ -192,6 +192,16 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     // the shared execution path (which issues this before each query) uniform.
     statementTimeout = { sql: 'SELECT 1', params: [] };
   } else {
+    // Read zone-less `date` / `timestamp` values as UTC, exactly as
+    // TurbineClient does on a pool it owns. Studio builds a raw pg.Pool and
+    // never constructs a TurbineClient, so without this the viewer renders a
+    // `date` cell at the CLI process's local midnight while the application
+    // reading the same row through Turbine sees UTC midnight: the previous
+    // evening east of UTC. It also matters for `--write`, where the cell the
+    // UI echoes back is what gets stored. The CLI process is Turbine's own, so
+    // there is no foreign pg consumer to disturb, and the parsers are
+    // registered before the first query runs.
+    registerUtcTemporalParsers();
     // pg.Pool satisfies the PgCompatPool contract (same as the external-pool
     // seam in client.ts); the cast keeps one typed pool field for both modes.
     pool = new pg.Pool({

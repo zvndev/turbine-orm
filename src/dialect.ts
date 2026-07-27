@@ -410,6 +410,31 @@ export interface Dialect {
   readonly supportsAdvisoryLock: boolean;
 
   /**
+   * Whether this dialect/engine understands the `plan_cache_mode` session
+   * setting (`SET plan_cache_mode = auto | force_custom_plan |
+   * force_generic_plan`). Gates the opt-in `planCacheMode` client option.
+   *
+   * A capability flag rather than a `dialect.name === 'postgresql'` test, for
+   * the same reason every other refusal here is one: the setting is a property
+   * of the PostgreSQL PLAN CACHE, not of the SQL string, so a
+   * Postgres-compatible dialect that grows one can opt in without editing
+   * client.ts, and one that has the wire protocol but not the plan cache
+   * (which is why it is not simply inherited) can leave it off. Optional:
+   * absent is treated as `false`, so every engine that predates the flag keeps
+   * throwing {@link UnsupportedFeatureError} (E017).
+   *
+   * The flag speaks for the DIALECT, not for the server on the other end. A
+   * Postgres wire-compatible engine driven through `postgresDialect`
+   * (CockroachDB, YugabyteDB, or a pre-12 PostgreSQL) reports `true` here and
+   * will instead be refused by the server itself with `unrecognized
+   * configuration parameter` when the connection is opened. Turbine has no
+   * client-level seam that identifies those engines (`DatabaseAdapter` is a
+   * CLI/migration concern and defines no dialect), and the same is already true
+   * of the other Postgres-only capabilities on this dialect.
+   */
+  readonly supportsPlanCacheMode?: boolean;
+
+  /**
    * Whether this dialect supports `LEFT JOIN LATERAL (...) ON true` in the FROM
    * clause. Gates the opt-in `plan: 'lateral'` pick-row ordering. Optional:
    * absent is treated as `false`, so only dialects that set it true admit the
@@ -707,6 +732,7 @@ export const postgresDialect: Dialect = {
   supportsListenNotify: true,
   supportsRLS: true,
   supportsAdvisoryLock: true,
+  supportsPlanCacheMode: true,
   supportsLateralJoin: true,
   explainQuery: { prefix: 'EXPLAIN' },
 

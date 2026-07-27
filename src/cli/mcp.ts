@@ -12,6 +12,7 @@ import {
 } from '../introspect.js';
 import type { FindManyArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
+import { registerUtcTemporalParsers } from '../query/utils.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -177,6 +178,11 @@ const TOOLS: ToolDefinition[] = [
 export function startMcpServer(options: McpServerOptions, transport: McpTransport = {}): McpServerHandle {
   const input = transport.input ?? process.stdin;
   const output = transport.output ?? process.stdout;
+  // Read zone-less `date` / `timestamp` values as UTC, as TurbineClient does on
+  // a pool it owns. This server builds its own raw pool, so without it a
+  // `date` sampled here is serialized at the CLI process's local midnight while
+  // the application reading the same row through Turbine sees UTC midnight.
+  registerUtcTemporalParsers();
   const ctx: McpContext = {
     options,
     pool: new pg.Pool({ connectionString: options.url, max: 2, idleTimeoutMillis: 10_000 }),

@@ -428,6 +428,7 @@ export const sqliteDialect: Dialect = {
   supportsAdvisoryLock: false,
   // No FROM-clause LATERAL: the opt-in lateral pick plan is Postgres-only.
   supportsLateralJoin: false,
+  supportsPlanCacheMode: false,
   // SQLite explains a compiled query with `EXPLAIN QUERY PLAN` (four columns:
   // id, parent, notused, detail), overriding the inherited Postgres `EXPLAIN`.
   explainQuery: { prefix: 'EXPLAIN QUERY PLAN' },

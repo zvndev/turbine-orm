@@ -125,4 +125,10 @@ export const WARN_NS = {
    * the offenders, not one per column. The namespace name is historical.
    */
   untypedDateColumn: 'untypedDateColumn',
+  /**
+   * `planCacheMode` was set on a client given an EXTERNAL pool, where Turbine
+   * runs no connection setup, so the option is a no-op (client.ts constructor).
+   * Keyed on the requested mode.
+   */
+  planCacheModeIgnored: 'planCacheModeIgnored',
 } as const;

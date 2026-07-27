@@ -579,6 +579,7 @@ export const mssqlDialect: Dialect = {
   // SQL Server has OUTER APPLY, not FROM-clause LATERAL: the lateral pick plan
   // is Postgres-only (out of scope here).
   supportsLateralJoin: false,
+  supportsPlanCacheMode: false,
   // sp_getapplock / sp_releaseapplock exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // No in-band EXPLAIN: SQL Server's SHOWPLAN is a session toggle

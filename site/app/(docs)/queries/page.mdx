@@ -1104,6 +1104,8 @@ const db = turbine({
   preparedStatements: true,
   sqlCache: true,
   sqlCacheSize: 1000,
+  // Postgres only, opt-in. Unset by default, and Turbine then sends nothing.
+  // planCacheMode: 'force_custom_plan',
 });
 ```
 
@@ -1116,6 +1118,8 @@ const db = turbine({
 | `sqlCache` | `true` | The per-table SQL template cache. Setting `false` is the kill switch. |
 | `sqlCacheSize` | `1000` | How many distinct query **shapes** each table's LRU retains. Values are parameterized, so they never fragment the cache. `0` is equivalent to `sqlCache: false`; a negative value falls back to the default. |
 | `implicitPkOrdering` | `false` | Order a paginating `findMany` that declares no `orderBy` by the primary key ascending, making its pages [deterministic](#deterministic-pages-the-unordered-pagination-warning). An explicit `orderBy` wins; PK-less tables, `cursor` and `distinct` shapes are untouched. Off by default because switching it on rewrites SQL an existing application already emits. |
+| `planCacheMode` | unset (Turbine sends nothing) | **Postgres only.** Pin `plan_cache_mode` on every connection this client opens: `'auto'`, `'force_custom_plan'`, `'force_generic_plan'`. The remedy for [the generic-plan cliff](/relations#the-generic-plan-cliff-plancachemode). Any other value throws `ValidationError` at construction; a non-Postgres engine throws `UnsupportedFeatureError` (`TURBINE_E017`). |
+| `utcTimestamps` | `true` | Read and write zone-less `timestamp` / `date` columns as UTC rather than in the process's local zone. `date` joined the read half in v0.54, which changes the epoch value a `date` returns west and east of UTC alike. See [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc). Process-wide, not per client. |
 | `autoToOneJoinMaxRows` | `1000` | Parent-row ceiling for the [`'auto'` strategy's to-one rule](/relations#load-strategy-auto-join-batched-flatten): a `belongsTo` / `hasOne` include stays in the single-statement join when the query's `limit` bounds the parent set at or under this value, and loads batched when the query is unbounded or bounded above it. Only consulted under `'auto'`. |
 
 Where a pg-style alias exists, the explicit Turbine field wins when both are set.
@@ -1133,6 +1137,34 @@ Every key on the config object is now checked against the config surface, and an
 The suggestion covers plain typos and the case a typo check alone misses: a guess that leaves out a whole word (`logParams` is five edits from `logQueryParams`, but it names the same words in the same order).
 
 It is deliberately a warning, never an error, so an app compiled against a newer Turbine that passes an option this version has not heard of keeps running. It fires once per key name per process, is silent under `NODE_ENV=production`, and the whole check is wrapped so that no config object can turn a diagnostic into a failed constructor. `url` and `schema` never warn: `turbine.config.*` files carry both for the CLI, and that object is routinely spread into the client factory.
+
+<Callout type="note" title="planCacheMode: when a query gets slower on its sixth execution">
+  PostgreSQL promotes a **named** prepared statement to a generic plan after
+  five executions, and a generic plan is costed blind to the bound values. On a
+  predicate whose selectivity swings per value (a `tenant_id` equality on a
+  shared table, where one value matches a handful of rows and another matches
+  most of them), the statement gets planned for the average value and never
+  reverts. `planCacheMode: 'force_custom_plan'` re-plans every execution and
+  removes that cliff.
+
+  Turbine applies it as a **connection parameter** (`options=-c
+  plan_cache_mode=...`) as the pool opens a connection, not as a `SET` after
+  checkout, so it is in force for that connection's very first statement and for
+  every checkout, `$transaction`, stream and pipeline on it, and it cannot race
+  your first query. An existing `PGOPTIONS` or `?options=...` on the connection
+  string is appended to, never replaced. Unset (the default), Turbine sends
+  nothing at all.
+
+  Reach for it against a measurement, not on principle, and read
+  [the generic-plan cliff](/relations#the-generic-plan-cliff-plancachemode)
+  first: it has the measured before/after, how to confirm the diagnosis with one
+  `SET` and with `pg_prepared_statements`, what the promoted plan looks like in
+  `EXPLAIN`, which Turbine methods are actually exposed (`count()` is; `findMany`
+  / `findFirst` bind `LIMIT $n` and are much less so), what
+  `preparedStatements: false` costs as the blunter alternative, and the three
+  scope limits (external pools, Postgres wire-compatible engines, connection
+  poolers).
+</Callout>
 
 <Callout type="warning" title="preparedStatements behind a connection pooler">
   With prepared statements on, the named statement is prepared on **one backend

@@ -43,7 +43,7 @@ import {
   type QueryInterfaceOptions,
   type RelationLoadStrategy,
 } from './query/index.js';
-import { closestName, quoteIdent } from './query/utils.js';
+import { closestName, quoteIdent, registerUtcTemporalParsers } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import {
   type ActiveSubscription,
@@ -184,6 +184,30 @@ export interface TurbineDriver {
   readonly dialect: Dialect;
 }
 
+/**
+ * The values PostgreSQL's `plan_cache_mode` accepts. See
+ * {@link TurbineConfig.planCacheMode}.
+ */
+export type PlanCacheMode = 'auto' | 'force_custom_plan' | 'force_generic_plan';
+
+/**
+ * The accepted `plan_cache_mode` values, as a runtime set.
+ *
+ * A GUC name/value pair cannot be a bind parameter (`SET plan_cache_mode = $1`
+ * is a syntax error), so the emitted statement necessarily contains a literal.
+ * This CLOSED SET is therefore the entire safety boundary: the statement is
+ * built from the matched MEMBER of this set, never from the caller's string,
+ * so no input a caller can supply reaches the SQL text even if it compares
+ * equal under some looser rule. Anything not in the set is refused at
+ * construction. Module-private and frozen, so the set itself is not a mutation
+ * target either.
+ */
+const PLAN_CACHE_MODES: readonly PlanCacheMode[] = Object.freeze([
+  'auto',
+  'force_custom_plan',
+  'force_generic_plan',
+] as const);
+
 export interface TurbineConfig {
   /**
    * An external pg-compatible pool. Use this to plug in serverless drivers
@@ -230,8 +254,11 @@ export interface TurbineConfig {
   warnOnUnlimited?: boolean | Record<string, boolean>;
   /**
    * Interpret Postgres `timestamp` (without time zone) values as UTC, both
-   * at the driver level (OID 1114 type parser, registered only when Turbine
-   * owns the pool) and when coercing nested-relation JSON dates. This is the
+   * at the driver level (type parsers for OIDs 1114 `timestamp`, 1082 `date`,
+   * and their array forms 1115 / 1182, registered only when Turbine owns the
+   * pool) and when coercing nested-relation JSON dates. A `date` column is
+   * zone-less too, so it reads back as UTC midnight rather than the process's
+   * local midnight. This is the
    * Prisma/Rails/Django convention and makes results independent of the
    * server's local time zone. Default: `true`. Set `false` for the legacy
    * local-time interpretation, which also turns off the matching WRITE-side
@@ -240,15 +267,76 @@ export interface TurbineConfig {
    *
    * PER PROCESS, NOT PER CLIENT. The read half is a pg type parser, and
    * `pg.types.setTypeParser` installs one parser per OID for the whole
-   * process. The first Turbine-owned client settles it for every later one, so
-   * constructing a second client with the OPPOSITE value throws a
-   * `ValidationError` rather than handing back a client whose writes and reads
-   * disagree. Give every client in the process the same value, or isolate the
-   * odd one in its own process. Clients on an EXTERNAL pool never register a
-   * parser and never take part in the check: they inherit whatever parser
-   * configuration the caller's driver has.
+   * process. The first client settles it for every later one, so constructing
+   * a second client with the OPPOSITE value throws a `ValidationError` rather
+   * than handing back a client whose writes and reads disagree. Give every
+   * client in the process the same value, or isolate the odd one in its own
+   * process. A client on an EXTERNAL pool never REGISTERS a parser (it inherits
+   * whatever configuration the caller's driver has, so a process containing
+   * only external-pool clients is untouched), but it does take part in the
+   * agreement check: registration is process-global, so once a Turbine-owned
+   * client has installed the parsers an external-pool client reads through them
+   * too, and a disagreeing one would write local `date` literals while reading
+   * UTC.
    */
   utcTimestamps?: boolean;
+  /**
+   * Pin `plan_cache_mode` on every connection this client opens, fixing how the
+   * PostgreSQL backend chooses between a custom plan (re-planned per parameter
+   * set) and a generic plan (planned once, blind to the values).
+   *
+   * Why it exists: Turbine sends NAMED prepared statements by default on a pool
+   * it owns, and PostgreSQL promotes a named statement to a generic plan after
+   * five executions. A generic plan is planned for the AVERAGE parameter, so a
+   * predicate whose selectivity varies wildly per value (the canonical case is a
+   * `tenant_id` / `user_id` equality on a shared table, where one value matches
+   * a handful of rows and another matches most of them) is planned blind to the
+   * value it will actually get, and it never reverts. `'force_custom_plan'`
+   * removes that, at the cost of re-planning each execution.
+   *
+   * Scope, measured rather than assumed: it applies to the statements Turbine
+   * itself promotes. `count()` on such a predicate is promoted after five
+   * executions and is controlled by this option; `findMany` / `findFirst` bind
+   * `LIMIT $n`, and a parameterized limit denies the planner the limit fraction
+   * that makes a skewed plan look cheap, so those are much less exposed. Treat
+   * the option as a targeted remedy for a plan that is measurably worse after
+   * its fifth execution, not a general speed-up.
+   *
+   * Default `undefined`: Turbine issues NOTHING and the backend keeps its own
+   * default (`auto`), byte-identical to not setting the option.
+   *
+   * SESSION-LEVEL, NOT PER QUERY. It is applied as a connection parameter
+   * (`options=-c plan_cache_mode=...`) when the pool opens a connection, so it
+   * is in force for that connection's very first statement and persists for its
+   * whole life: every pooled checkout, `$transaction`, stream and pipeline on
+   * that connection inherits it, and it is NOT reset between checkouts. A
+   * caller's own `SET` / `SET LOCAL` still overrides it for that session or
+   * transaction, exactly as it would over any other session default.
+   *
+   * POSTGRES-ONLY. Engines whose dialect does not report
+   * `supportsPlanCacheMode` throw {@link UnsupportedFeatureError} (E017) at
+   * construction. The capability flag can only speak for the DIALECT, though,
+   * and `plan_cache_mode` is PostgreSQL 12+: a Postgres wire-compatible engine
+   * driven through the default `postgresDialect` (CockroachDB, YugabyteDB, an
+   * older server) has no such setting, and rejects the connection parameter
+   * itself with `unrecognized configuration parameter` at the first checkout
+   * rather than with E017. Leave the option unset on those.
+   *
+   * EXTERNAL POOLS ARE NOT TOUCHED. When the caller supplies `pool`, they own
+   * connection lifecycle, and Turbine has no hook that runs on their
+   * connections without also mutating a pool it does not own. Same rule as the
+   * type parsers above. The option is then a no-op on that pool, with a
+   * dev-mode warning; a serverless/HTTP driver should set the GUC in its own
+   * connection setup. Turbine-OWNED string `replicas` are still Turbine's own
+   * connections and do get it, even next to an external primary, so setting it
+   * in that shape splits the policy between reads and writes.
+   *
+   * BEHIND A CONNECTION POOLER, the GUC travels as a connection-time `options`
+   * startup parameter, which a pooler may refuse to pass through (PgBouncer's
+   * `ignore_startup_parameters`). Set it on the role or server there
+   * (`ALTER ROLE ... SET plan_cache_mode = ...`) instead.
+   */
+  planCacheMode?: PlanCacheMode;
   /**
    * Refuse a nested `connect` / `connectOrCreate` that would re-parent a
    * to-many child already owned by a different parent. Off by default,
@@ -490,6 +578,7 @@ const TURBINE_CONFIG_KEYS: Record<keyof TurbineConfig, true> = {
   defaultLimit: true,
   warnOnUnlimited: true,
   utcTimestamps: true,
+  planCacheMode: true,
   scopedConnect: true,
   relationLoadStrategy: true,
   stableRelationOrder: true,
@@ -895,21 +984,33 @@ export class TurbineClient {
 
   private static int8ParserRegistered = false;
   /**
-   * The `utcTimestamps` value the FIRST Turbine-owned pool in this process
-   * settled the OID 1114 read parser on, or `undefined` while no Turbine-owned
-   * client has been constructed yet.
+   * The `utcTimestamps` value the FIRST TurbineClient in this process settled
+   * on, or `undefined` while none has been constructed yet.
    *
    * `pg.types.setTypeParser` is process-global by nature: there is one parser
    * per OID for the whole pg module, so the READ side of `utcTimestamps` cannot
    * be per client the way the WRITE side is. Recording the settled value (not
    * just "registered yes/no") is what lets the constructor detect a second
    * client asking for the opposite and refuse it, instead of handing back a
-   * client whose reads and writes disagree. See {@link assertUtcTimestampsAgree}.
+   * client whose reads and writes disagree. Every client records it, including
+   * one on an external pool, which registers nothing but still READS through
+   * whatever an owned client in the same process installed. See
+   * {@link assertUtcTimestampsAgree}.
    */
   private static utcTimestampParserMode: boolean | undefined;
+  /**
+   * Whether the zone-less temporal read parsers (OIDs 1114, 1082, 1115, 1182)
+   * have actually been installed. Separate from
+   * {@link utcTimestampParserMode}, which every client settles: only an OWNED
+   * pool registers, so a client on an external pool must not make a later
+   * owned client skip registration.
+   */
+  private static utcTimestampParsersRegistered = false;
   private readonly logging: boolean;
   /** Active SQL dialect, owns transaction keywords, set_config, raw-SQL placeholders, capability flags. */
   private readonly dialect: Dialect;
+  /** Validated `plan_cache_mode` to pin on every owned connection, or undefined to issue nothing. */
+  private readonly planCacheMode: PlanCacheMode | undefined;
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private readonly middlewares: Middleware[] = [];
   private readonly queryListeners = new Set<QueryEventListener>();
@@ -1009,6 +1110,12 @@ export class TurbineClient {
     // Name any key on the config object that is not part of the config surface
     // (dev only, once per key, never throws). See warnUnknownConfigKeys.
     warnUnknownConfigKeys(config);
+    // ALL config validation runs before ANY process-global side effect below.
+    // A constructor that throws must leave the process exactly as it found it:
+    // settling the process-global parser mode and then rejecting the config
+    // would poison the next, valid, TurbineClient with a phantom conflict.
+    const dialect = config.dialect ?? postgresDialect;
+    const planCacheMode = TurbineClient.resolvePlanCacheMode(config.planCacheMode, dialect);
     /**
      * Parse int8 (bigint, OID 20) as JavaScript number instead of string.
      * Safe for values up to Number.MAX_SAFE_INTEGER (9,007,199,254,740,991).
@@ -1040,7 +1147,8 @@ export class TurbineClient {
       });
       TurbineClient.int8ParserRegistered = true;
     }
-    // Parse `timestamp` (OID 1114) as UTC instead of server-local time. The
+    // Parse the zone-less temporal types (`timestamp` OID 1114, `date` OID
+    // 1082, and their array forms 1115 / 1182) as UTC instead of local time. The
     // pg driver's default hands back a Date built in the process's local zone,
     // so the same row yields a different instant per deployment region. The
     // ORM convention (Prisma, Rails, Django), and the only interpretation
@@ -1051,17 +1159,24 @@ export class TurbineClient {
     // same flag is per client (query/writes.ts). Two clients disagreeing about
     // it therefore cannot both be served, so the disagreement is refused here
     // rather than resolved silently into a client that does not round-trip.
-    if (ownsAnyPool) {
-      const wantUtcTimestamps = config.utcTimestamps !== false;
-      TurbineClient.assertUtcTimestampsAgree(wantUtcTimestamps);
-      if (wantUtcTimestamps && TurbineClient.utcTimestampParserMode === undefined) {
-        pg.types.setTypeParser(1114, (val: string) => new Date(`${val.replace(' ', 'T')}Z`));
-      }
-      TurbineClient.utcTimestampParserMode = wantUtcTimestamps;
+    //
+    // The AGREEMENT check runs for EVERY client, owned pool or not. Only an
+    // owned pool ever REGISTERS the parsers, but once any client has registered
+    // them every client in the process reads through them, including one on an
+    // external pool: it would then read UTC while its own per-client write half
+    // still rendered local literals, which on a `date` column walks the stored
+    // calendar day backwards one day per read-modify-write cycle.
+    const wantUtcTimestamps = config.utcTimestamps !== false;
+    TurbineClient.assertUtcTimestampsAgree(wantUtcTimestamps);
+    if (ownsAnyPool && wantUtcTimestamps && !TurbineClient.utcTimestampParsersRegistered) {
+      registerUtcTemporalParsers();
+      TurbineClient.utcTimestampParsersRegistered = true;
     }
+    TurbineClient.utcTimestampParserMode = wantUtcTimestamps;
 
     this.logging = config.logging ?? false;
-    this.dialect = config.dialect ?? postgresDialect;
+    this.dialect = dialect;
+    this.planCacheMode = planCacheMode;
     this.schema = schema;
     // Respect env var kill switch
     const envDisablePrepared = typeof process !== 'undefined' && process.env?.TURBINE_DISABLE_PREPARED === '1';
@@ -1157,7 +1272,7 @@ export class TurbineClient {
         poolConfig.ssl = config.ssl;
       }
 
-      this.pool = new pg.Pool(poolConfig);
+      this.pool = new pg.Pool(TurbineClient.withPlanCacheMode(poolConfig, this.planCacheMode));
       this.ownsPool = true;
 
       this.pool.on('error', (err) => {
@@ -1178,13 +1293,18 @@ export class TurbineClient {
     this.ownedReplicaPools = [];
     for (const replica of config.replicas ?? []) {
       if (typeof replica === 'string') {
-        const replicaPool = new pg.Pool({
-          connectionString: replica,
-          max: config.poolSize ?? config.max ?? 10,
-          idleTimeoutMillis: config.idleTimeoutMs ?? config.idleTimeoutMillis ?? 30_000,
-          connectionTimeoutMillis: config.connectionTimeoutMs ?? config.connectionTimeoutMillis ?? 5_000,
-          ...(config.ssl !== undefined ? { ssl: config.ssl } : {}),
-        });
+        const replicaPool = new pg.Pool(
+          TurbineClient.withPlanCacheMode(
+            {
+              connectionString: replica,
+              max: config.poolSize ?? config.max ?? 10,
+              idleTimeoutMillis: config.idleTimeoutMs ?? config.idleTimeoutMillis ?? 30_000,
+              connectionTimeoutMillis: config.connectionTimeoutMs ?? config.connectionTimeoutMillis ?? 5_000,
+              ...(config.ssl !== undefined ? { ssl: config.ssl } : {}),
+            },
+            this.planCacheMode,
+          ),
+        );
         replicaPool.on('error', (err) => {
           console.error('[turbine] Unexpected replica pool error:', err.message);
         });
@@ -1192,6 +1312,30 @@ export class TurbineClient {
         this.ownedReplicaPools.push(replicaPool as unknown as PgCompatPool);
       } else {
         this.replicaPools.push(replica);
+      }
+    }
+    // `planCacheMode` reaches a pool only where Turbine opens the connections.
+    // Warned here rather than in the external-pool branch above because the
+    // owned string replicas are built after it: with an external primary and
+    // owned replicas the option is applied to the replicas and dropped on the
+    // primary, and a warning that said it was "ignored" would be false.
+    // Deliberate no-op rather than a throw: the option is a performance knob,
+    // and an app that moves from an owned pool to a serverless driver should
+    // not stop booting over it. Same ownership rule as the type parsers, which
+    // also skip external pools silently.
+    if (this.planCacheMode !== undefined && !this.ownsPool && process.env.NODE_ENV !== 'production') {
+      if (shouldWarnOnce(WARN_NS.planCacheModeIgnored, this.planCacheMode)) {
+        const replicaNote =
+          this.ownedReplicaPools.length > 0
+            ? ` It IS applied to the ${this.ownedReplicaPools.length} Turbine-owned read replica pool(s) on this ` +
+              'client, so reads and writes would run under different plan-cache policies until the primary is set too.'
+            : '';
+        console.warn(
+          `[turbine] planCacheMode: '${this.planCacheMode}' was not applied to the primary: this client was given an ` +
+            'external `pool`, whose connection lifecycle the caller owns, so Turbine never opens its connections. Set ' +
+            `\`plan_cache_mode\` in the driver's own connection setup (or run \`SET plan_cache_mode = ${this.planCacheMode}\` ` +
+            `on checkout) instead.${replicaNote}`,
+        );
       }
     }
     this.replicaTableCaches = this.replicaPools.map(() => new Map<string, QueryInterface<object>>());
@@ -1220,19 +1364,134 @@ export class TurbineClient {
   }
 
   /**
-   * Refuse a `utcTimestamps` value that contradicts the one the process-global
-   * OID 1114 read parser was already settled on.
+   * Validate a caller-supplied `planCacheMode` and refuse it on an engine that
+   * has no plan cache to pin.
+   *
+   * Two refusals, both at construction rather than at first query, so a
+   * misconfigured client never opens a connection:
+   *
+   *   - a value outside {@link PLAN_CACHE_MODES} throws `ValidationError`
+   *     (E003). This is the security boundary as well as the usability one: a
+   *     GUC value cannot be a bind parameter in either place it can be set (a
+   *     `SET` statement or the connection `options` string), so the returned
+   *     value is a MEMBER OF THE FROZEN LIST, never the caller's string, and
+   *     there is no path by which caller text reaches the connection or the SQL.
+   *   - a dialect that does not report `supportsPlanCacheMode` throws
+   *     `UnsupportedFeatureError` (E017), in the same style as the other
+   *     capability refusals.
+   */
+  private static resolvePlanCacheMode(mode: unknown, dialect: Dialect): PlanCacheMode | undefined {
+    if (mode === undefined || mode === null) return undefined;
+    const matched = PLAN_CACHE_MODES.find((m) => m === mode);
+    if (matched === undefined) {
+      throw new ValidationError(
+        `[turbine] Invalid planCacheMode: ${JSON.stringify(mode)}. Expected one of ${PLAN_CACHE_MODES.map(
+          (m) => `'${m}'`,
+        ).join(', ')}.`,
+      );
+    }
+    if (dialect.supportsPlanCacheMode !== true) {
+      throw new UnsupportedFeatureError(
+        `The planCacheMode option (plan_cache_mode = ${matched})`,
+        dialect.name,
+        '`plan_cache_mode` is a PostgreSQL plan-cache setting with no equivalent on this engine. Remove the option, ' +
+          'or set it only on the PostgreSQL client.',
+      );
+    }
+    return matched;
+  }
+
+  /**
+   * Pin `plan_cache_mode` on every connection an OWNED pool opens, by putting
+   * it in the pool's **connection parameters** rather than issuing a `SET`.
+   *
+   * PostgreSQL's `options` startup parameter (`-c plan_cache_mode=...`) is
+   * applied by the backend as it starts the session, so the setting is in force
+   * for the connection's very first statement and for its whole life: every
+   * pooled checkout, `$transaction`, stream and pipeline on it inherits it.
+   * There is no per-checkout reset, and none is wanted, that IS the intent.
+   *
+   * Why not `pool.on('connect', c => c.query('SET ...'))`, the obvious
+   * alternative: pg hands the fresh client to the waiting caller in the same
+   * tick it emits `connect`, so the caller's first query is issued while the
+   * `SET` is still the active query. That path works today only through pg's
+   * deprecated same-client query queueing (it logs a DeprecationWarning per new
+   * connection and is slated for removal in pg 9), and it costs an extra round
+   * trip on every connection. The startup parameter costs nothing and cannot
+   * race.
+   *
+   * Nothing the caller already set is discarded, in either of the two places
+   * pg reads `options` from. pg's `ConnectionParameters` lets a value parsed
+   * out of a `connectionString` OVERRIDE the explicit `options` field, so when
+   * the URL already carries `?options=...` the GUC is appended THERE; and the
+   * explicit field itself falls back to `process.env.PGOPTIONS` only while it
+   * is unset, so setting it blind would silently drop a deployment's
+   * `PGOPTIONS` (its `search_path` or `statement_timeout`, not merely a slower
+   * plan). Both are read first and the GUC is appended to whichever applies.
+   *
+   * One deployment caveat: an `options` startup parameter is a connection-time
+   * parameter, and a connection pooler in front of Postgres may reject
+   * parameters it is not configured to pass through (PgBouncer's
+   * `ignore_startup_parameters`). A `SET` on checkout would survive that, at
+   * the cost of the race and the round trip above. Callers behind such a pooler
+   * should set the GUC on the server or role instead
+   * (`ALTER ROLE ... SET plan_cache_mode = ...`).
+   */
+  private static withPlanCacheMode(poolConfig: pg.PoolConfig, mode: PlanCacheMode | undefined): pg.PoolConfig {
+    if (mode === undefined) return poolConfig;
+    // `mode` is a member of PLAN_CACHE_MODES, never caller text (see
+    // resolvePlanCacheMode), which is what makes this literal safe: a GUC value
+    // cannot be a bind parameter.
+    const setting = `-c plan_cache_mode=${mode}`;
+    const merged = poolConfig.connectionString
+      ? TurbineClient.mergeConnectionStringOptions(poolConfig.connectionString, setting)
+      : null;
+    if (merged) return { ...poolConfig, connectionString: merged };
+    // pg reads `config.options` when truthy and `process.env.PGOPTIONS`
+    // otherwise, so an unmerged setting would replace the caller's PGOPTIONS
+    // rather than add to it.
+    const existing = poolConfig.options || (typeof process !== 'undefined' ? process.env?.PGOPTIONS : undefined);
+    return { ...poolConfig, options: existing ? `${existing} ${setting}` : setting };
+  }
+
+  /**
+   * `connectionString` with `setting` appended to its existing `options` query
+   * parameter, or `null` when it carries no `options` (in which case the caller
+   * should use the `options` pool field, which is not overridden).
+   *
+   * Only the query string is rewritten, never the userinfo or host, so a
+   * percent-encoded password cannot be mangled by a round trip through `URL`.
+   * The split is on the first `?`, which is also where pg's own parser puts the
+   * query-string boundary: a connection string with an unencoded `?` inside the
+   * password is not parseable by pg either, so there is no shape this handles
+   * differently from the driver.
+   */
+  private static mergeConnectionStringOptions(connectionString: string, setting: string): string | null {
+    const q = connectionString.indexOf('?');
+    if (q === -1) return null;
+    const params = new URLSearchParams(connectionString.slice(q + 1));
+    const existing = params.get('options');
+    if (existing === null) return null;
+    params.set('options', `${existing} ${setting}`);
+    return connectionString.slice(0, q + 1) + params.toString();
+  }
+
+  /**
+   * Refuse a `utcTimestamps` value that contradicts the one an earlier client
+   * in this process settled the zone-less temporal read parsers (OIDs 1114,
+   * 1082, 1115, 1182) on.
    *
    * The flag has two halves. The WRITE half is per client: a bound `Date` on a
    * zone-less `date` / `timestamp` column is rewritten to a UTC literal unless
    * the owning client opted out (`coerceWriteValue` in query/writes.ts). The
-   * READ half is the pg type parser for OID 1114, and `pg.types.setTypeParser`
-   * installs ONE parser per OID for the whole process, shared by every pool,
-   * every raw query, and any other library using the same pg module. There is
-   * no per-pool parser hook to bind it to, and moving the coercion into
-   * `parseRow` instead would leave every non-ORM read (raw SQL, `client.sql`,
-   * a caller's own `pool.query`) on the driver's value while changing the
-   * default path's output type, so the read half stays process-wide.
+   * READ half is the pg type parsers for OIDs 1114 / 1082 / 1115 / 1182, and
+   * `pg.types.setTypeParser` installs ONE parser per OID for the whole process,
+   * shared by every pool, every raw query, and any other library using the same
+   * pg module. There is no per-pool parser hook to bind it to, and moving the
+   * coercion into `parseRow` instead would leave every non-ORM read (raw SQL,
+   * `client.sql`, a caller's own `pool.query`) on the driver's value while
+   * changing the default path's output type, so the read half stays
+   * process-wide.
    *
    * That makes the mixed shape unserveable rather than merely awkward: the
    * second client would write local calendar fields and read them back as UTC
@@ -1240,16 +1499,23 @@ export class TurbineClient {
    * A client that silently does not round-trip is the worst of the three
    * outcomes, so construction fails with the two ways out.
    *
-   * Only Turbine-owned pools take part. An external pool (Neon, Vercel
-   * Postgres, Hyperdrive) inherits the caller's parser configuration and
-   * Turbine never registers on its behalf, so it has no read half to contradict.
+   * EVERY client takes part, not only the ones on a Turbine-owned pool. Only an
+   * owned pool REGISTERS the parsers, but registration is process-global, so a
+   * client on an external pool (Neon, Vercel Postgres, Hyperdrive) constructed
+   * alongside an owned one reads through them too. It is exactly the pairing
+   * that produced a silent read/write disagreement: an external-pool client
+   * with `utcTimestamps: false` writing local `date` literals while reading UTC
+   * ones, which walks the stored calendar day back a day per read-modify-write
+   * cycle. An external-pool client ALONE in a process is unaffected: it settles
+   * the value, registers nothing, and keeps the caller's parser configuration.
    */
   private static assertUtcTimestampsAgree(want: boolean): void {
     const settled = TurbineClient.utcTimestampParserMode;
     if (settled === undefined || settled === want) return;
     throw new ValidationError(
       `[turbine] utcTimestamps: ${want} conflicts with utcTimestamps: ${settled}, which an earlier TurbineClient ` +
-        'in this process already applied. The timestamp READ parser (pg OID 1114) is process-global, so it cannot ' +
+        'in this process already applied. The zone-less temporal READ parsers (pg OIDs 1114, 1082, 1115, 1182) are ' +
+        'process-global, so they cannot ' +
         'differ per client, while the WRITE side is per client. Serving both values would give this client a ' +
         `${want ? 'UTC write' : 'local write'} and a ${settled ? 'UTC read' : 'local read'}, so every zone-less ` +
         '`timestamp` it writes would read back shifted by the process offset. Give every TurbineClient in this ' +

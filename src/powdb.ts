@@ -118,6 +118,7 @@ export const powdbDialect: Dialect = {
   // PowQL has no LATERAL construct; PowqlInterface refuses pick ordering
   // earlier, this override keeps the flag truthful if a future path consults it.
   supportsLateralJoin: false,
+  supportsPlanCacheMode: false,
   beginStatement: () => 'begin',
   commitStatement: () => 'commit',
   rollbackStatement: () => 'rollback',
