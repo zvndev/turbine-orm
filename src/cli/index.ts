@@ -76,6 +76,7 @@ import {
   type PlanDivergenceFinding,
   type PlanDivergenceReport,
 } from '../plan-divergence.js';
+import { applyFlipVerdicts, emptyFlipProbeResult, needsFlipProbe, probePlanFlips } from '../plan-flip-probe.js';
 import { type SchemaMetadata, snakeToCamel } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
@@ -2971,10 +2972,21 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
   // trustworthy stats_reset age because they normalize write counters by it;
   // this check reads no counter, only pg_stats, whose freshness is ANALYZE. A
   // cluster with a NULL stats_reset (the default) must still get the check.
-  const divergence: PlanDivergenceReport =
+  const scored: PlanDivergenceReport =
     divergenceOn && snapshot.available
       ? findPlanDivergence(schema, snapshot)
       : { findings: [], notices: [], candidatesConsidered: 0, consideredIndexed: 0, consideredUnindexed: 0 };
+
+  // Statistics can say how bad a flip WOULD be; only the planner can say whether
+  // it is reachable. The `unindexed-filter` branch shipped in 0.57 without that
+  // question answered and was right 6 times in 13 on a real schema, so every one
+  // of its findings is now put to a plan-only EXPLAIN. Nothing is executed, and a
+  // probe that fails keeps its finding rather than dropping it.
+  const flipProbe =
+    divergenceOn && scored.findings.some(needsFlipProbe)
+      ? await probePlanFlips({ connectionString: url, schema: config.schema, findings: scored.findings })
+      : emptyFlipProbeResult();
+  const divergence = applyFlipVerdicts(scored, flipProbe);
 
   if (jsonMode) {
     spinner?.stop();
@@ -3098,6 +3110,12 @@ function buildDoctorJson(ctx: {
     considered: ctx.divergence.candidatesConsidered,
     indexed: ctx.divergence.consideredIndexed,
     unindexed: ctx.divergence.consideredUnindexed,
+    // Whether the unindexed findings above were put to the planner, and how many
+    // it refuted. `flipProbed: false` means they are statistics-only and carry
+    // 0.57's precision, so a consumer can tell a verified list from an unverified
+    // one instead of inferring it from the count.
+    flipProbed: ctx.divergence.flipProbed === true,
+    flipRefuted: ctx.divergence.flipRefuted ?? 0,
   };
   return out;
 }
@@ -3525,6 +3543,22 @@ function renderDivergenceGates(divergence: PlanDivergenceReport): void {
   );
   console.log(`  ${dim('and leading-index columns only: a filter column that is neither is not covered. Skip this')}`);
   console.log(`  ${dim('section with --no-plan-divergence.')}`);
+  // Say whether the unindexed findings were verified, and what verification
+  // removed. Statistics can only say how bad a flip would be; a plan-only EXPLAIN
+  // says whether the planner can reach it at all.
+  if (divergence.flipProbed === true) {
+    const refuted = divergence.flipRefuted ?? 0;
+    const wereRefuted = refuted === 1 ? '1 was refuted' : `${refuted} were refuted`;
+    console.log(
+      `  ${dim(`Every unindexed finding was put to the planner (EXPLAIN, nothing executed); ${wereRefuted}`)}`,
+    );
+    console.log(`  ${dim('because the generic plan keeps the same sequential scan, so no flip is reachable.')}`);
+  } else if (divergence.consideredUnindexed > 0) {
+    console.log(
+      `  ${dim('Unindexed findings are UNVERIFIED here: the planner probe did not run, so some may name a')}`,
+    );
+    console.log(`  ${dim('divergence the planner would never choose.')}`);
+  }
 }
 
 /** Round to a whole number and group it, for the divergence report's estimates. */

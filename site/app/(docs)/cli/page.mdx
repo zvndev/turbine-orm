@@ -513,6 +513,33 @@ Three further limits, stated because a quiet report is easy to read as a clean b
 The report prints how many columns were scored, split by indexed and unindexed, rather than letting the finding count imply coverage.
 </Callout>
 
+#### The findings are checked against the planner (new in 0.58.0)
+
+Statistics can say how bad a flip would be. Only the planner can say whether it is **reachable**. In 0.57.0 the unindexed-filter branch reported on statistics alone, and on a real schema it was right 6 times in 13: every false positive had one signature, the generic plan keeping the same sequential scan the good plan chose, so there was nothing to diverge to.
+
+Each unindexed-filter finding now costs one `EXPLAIN` **without** `ANALYZE`, which plans and discards, executes nothing, and returns in microseconds:
+
+```sql
+PREPARE p AS SELECT * FROM t WHERE col = $1 ORDER BY ord LIMIT $2;
+SET LOCAL plan_cache_mode = force_generic_plan;
+EXPLAIN (FORMAT JSON) EXECUTE p(NULL, 20);
+```
+
+Only the generic plan is needed: the finding's claim is that a promoted plan abandons the seq scan, so a generic plan that *is* a seq scan refutes it whatever the custom plan does. That also removes the need for a representative rare value, which statistics do not carry. `--json` gains `planDivergenceScored.flipProbed` and `.flipRefuted`.
+
+**A probe that fails keeps its finding.** Errors, timeouts and unparseable plans leave the finding in place with a notice. A diagnostic that deletes findings when the database is uncooperative fails invisibly in exactly the environments where you are least able to check.
+
+<Callout type="note" title="Why a probe and not a formula">
+The natural gate is arithmetic: require the generic row estimate (`rows / n_distinct`) to exceed the assumed `LIMIT`, since Postgres discounts an ordered index walk by `min(1, limit / estimate)`. Measured, that rule is wrong. On a 247-page fixture the boundary sits between estimates **3 and 4**, not at 20:
+
+| generic estimate | 2 | 3 | 4 | 10 | 20 | 500 |
+| --- | --- | --- | --- | --- | --- | --- |
+| generic plan | seq | seq | index | index | index | index |
+| buffers | 250 | 250 | 20,074 | 20,074 | 19,071 | 765 |
+
+Estimates 4 through 20 are full-table walks such a gate would discard. The real limit fraction for a bound limit is `ceil(0.1 x estimate) / estimate`, which pins to 0.1 at estimates of 10 or more and rises to `1/estimate` below that; the plan is then chosen by a cost comparison, so the boundary moves with the table rather than sitting at a fixed number. A closed-form gate was attempted, failed its own out-of-sample prediction, and was dropped in favour of asking the planner.
+</Callout>
+
 ### `--json`
 
 `doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, workload-heat availability, and any degradation notices. `planDivergence` and `planDivergenceNotices` are always present as arrays (empty when the check found nothing or was skipped), and `planDivergenceScored` reports how large the scored population was (`considered` / `indexed` / `unindexed`) so a consumer can tell "considered and clean" from "never looked". Each finding carries a `branch` (`'sparse-value'` or `'unindexed-filter'`), and since 0.57.0 the branch-shaped fields are **optional**: `crossoverRows`, `crossoverRowsWide`, `valuesBelowCrossover`, `walkPages`, `walkFraction` and `approxAmplification` are absent on an `unindexed-filter` finding rather than zero-filled, and `tuplesWalked`, `worstCaseAmplification`, `orderColumnCorrelation` and `heapNearlyOrdered` are present only there. Branch on `branch` rather than reading them unconditionally. The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added. The `unused`, `redundant`, `audit`, and `invalid` arrays are ALWAYS present: they are empty when the corresponding scan did not run, and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`) so the key set never varies by flag. Each unused-index entry also carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the human-readable `caveat` string, so a consumer never has to parse prose.
