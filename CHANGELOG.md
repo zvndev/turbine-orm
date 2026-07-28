@@ -63,6 +63,8 @@
   an 89-page narrow one. A closed-form gate was attempted, failed its own
   out-of-sample prediction, and was dropped in favour of asking the planner.
 
+## 0.57.0 (2026-07-27)
+
 ### Fixed
 
 - **`turbine-orm/prisma-compat` silently dropped every Turbine-native query
