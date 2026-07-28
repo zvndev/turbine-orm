@@ -11,9 +11,9 @@ export const metadata = {
 
 Three-way head-to-head against **Prisma 7.9** (`@prisma/adapter-pg`, `relationJoins` preview on) and **Drizzle 0.45** (node-postgres relational API) on a **local PostgreSQL 17.9** database reached over a Unix socket, plus a **hand-written `pg` control arm** so you can read ORM overhead directly instead of inferring it.
 
-> **Measured 2026-07-25 against turbine-orm 0.50.0**, the current release ({TURBINE_VERSION} at time of writing), at the release commit `f8fec86`. Every arm runs once per round, the arm order rotates every round, and the reported figure is the median across 200 rounds, taken as the median of three full runs. See [Methodology](#methodology-and-why-the-harness-changed) for why that matters.
+> **Measured once, on 2026-07-25, against turbine-orm 0.50.0** at commit `f8fec86`. **The current release is {TURBINE_VERSION}, and this run has not been repeated since.** Nothing below has been adjusted to match a later version, because quoting a stale measurement is honest and inventing a fresh-looking one is not. Read the table as the *shape* of the result, who leads which scenario and by roughly how much, rather than as the latency you will see. Every arm ran once per round, the arm order rotated every round, and each figure is the median across 200 rounds, taken as the median of three full runs. See [Methodology](#methodology-and-why-the-harness-changed) for why that matters, and [Reproduce](#reproduce) to re-run it against the version you are actually installing.
 
-> **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and most numbers are sub-millisecond. The single most useful figure on this page: **Turbine runs at 1.07x hand-written `pg`, where Drizzle runs at 1.47x and Prisma at 1.84x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine is **1.87x faster than Prisma 7.9** and **1.36x faster than Drizzle 0.45** by geometric mean. Turbine takes seven scenarios, Drizzle takes three (L2 nested, L3 nested, and **streaming, which Drizzle wins outright by 27%**), and Prisma takes none. Two of the ten are genuine near-ties.
+> **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and most numbers are sub-millisecond. The single most useful figure on this page: **Turbine ran at 1.07x hand-written `pg`, where Drizzle ran at 1.47x and Prisma at 1.84x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine was **1.87x faster than Prisma 7.9** and **1.36x faster than Drizzle 0.45** by geometric mean. Turbine takes seven scenarios, Drizzle takes three (L2 nested, L3 nested, and **streaming, which Drizzle wins outright by 27%**), and Prisma takes none. Two of the ten are genuine near-ties.
 
 ## The one we lose, stated plainly
 
@@ -43,7 +43,7 @@ The previous numbers came from `bench.ts`, which measures each ORM in a contiguo
 - **Client.** Apple Silicon MacBook Pro (Apple M5 Max), macOS 26.5.1, Node v24.18.0. Client and database are the same host.
 - **Schema.** organizations / users / posts / comments.
 - **Data.** 5 orgs, 1,000 users, 10,000 posts, 50,000 comments, deterministic and identical for every ORM, `ANALYZE`d after load. Row counts are verified before any number is recorded and the harness refuses to report if they do not match.
-- **Versions.** turbine-orm **0.50.0** at commit `f8fec86`, `@prisma/client` 7.9.0 + `@prisma/adapter-pg` 7.9.0, `drizzle-orm` 0.45.2, `pg` 8.22.0. Every competitor package was checked against npm on the day of the run and every one is the current latest release.
+- **Versions.** turbine-orm **0.50.0** at commit `f8fec86`, `@prisma/client` 7.9.0 + `@prisma/adapter-pg` 7.9.0, `drizzle-orm` 0.45.2, `pg` 8.22.0. Every competitor package was checked against npm on the day of the run and every one was the latest release at that moment; all three have shipped since.
 - **Runs.** 200 rounds + 20 warmup per arm per scenario (streaming: 9 rounds + 1 warmup, each round drains 50K rows). Three full runs; the table is the median of the three medians.
 - **Pool.** Plain `pg.Pool` size 10 for Prisma, Drizzle and the raw control. Turbine uses its internal pool at default size.
 - **Relation strategy.** Turbine's default is `'auto'` (since 0.41). It does not engage anywhere in this suite: every scenario uses a limit of 50 or less, every relation used is to-many, and every FK in the fixture is indexed, so the plan is the byte-identical single-statement join on every scenario. Verified by statement counting.
@@ -159,7 +159,7 @@ Prisma 7 dropped its Rust engine, but the client still does meaningful per-query
 
 Raw data, the full writeup and both harnesses are committed to the repo:
 
-- **[`benchmarks/RESULTS-0.50.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.50.0.md)** the current run, including the per-run drift tables.
+- **[`benchmarks/RESULTS-0.50.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.50.0.md)** the 0.50.0 run in full, including the per-run drift tables.
 - **[`benchmarks/RESULTS.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS.md)** the historical runs.
 - **[`benchmarks/bench-interleaved.ts`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/bench-interleaved.ts)** the harness these numbers come from.
 

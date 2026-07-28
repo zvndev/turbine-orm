@@ -454,7 +454,15 @@ await db.posts.updateMany({
 });
 ```
 
-**Empty-where guard.** `updateMany({ data, where: {} })` or all-undefined `where` throws `ValidationError` (TURBINE_E003). To mass-mutate on purpose: `updateMany({ data, where: {}, allowFullTableScan: true })`.
+**Empty-where guard.** `updateMany({ data, where: {} })` or all-undefined `where` throws `ValidationError` (TURBINE_E003). To mass-mutate on purpose, import the `UNSAFE` symbol and pass it:
+
+```ts
+import { UNSAFE } from 'turbine-orm';
+
+await db.posts.updateMany({ data: { published: false }, where: {}, allowFullTableScan: UNSAFE });
+```
+
+`allowFullTableScan` is a **privilege option** and the symbol is the only value that enables it: a literal `true` throws `ValidationError` (TURBINE_E003), and does not typecheck. See [Privilege options](#privilege-options-skipglobalfilters-includepii-allowfulltablescan) below.
 
 ### `delete` / `deleteMany`
 
@@ -518,6 +526,47 @@ Available relation operations depend on the write:
 Beyond the depth cap Turbine throws `CircularRelationError` (`TURBINE_E007`) with the full relation path.
 
 On a **many-to-many** relation the supported nested operations are `connect` (create and update), plus `disconnect` and `set` (update only): Turbine writes the junction rows itself, inside the same transaction. `connect` is idempotent, `disconnect` is scoped by both the parent and the named targets, and `set: []` clears the parent's links. The remaining operations (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) would have to write the target row as well, so they throw `ValidationError` (`TURBINE_E003`) naming the supported set: write the target row on its own table and link it with `connect`, or write junction rows directly through the junction accessor, in the same `$transaction`. Composite junction keys are refused rather than partially written.
+
+### Privilege options: `skipGlobalFilters`, `includePii`, `allowFullTableScan`
+
+Three query options remove a safety boundary rather than change a result:
+
+| Option | What it removes | Where it applies |
+|---|---|---|
+| `skipGlobalFilters` | the configured tenant / soft-delete predicate | reads and mutations |
+| `includePii` | the exclusion of `pii: true` columns from the projection | reads, `groupBy`, `aggregate` |
+| `allowFullTableScan` | the empty-`where` guard | `update`, `updateMany`, `delete`, `deleteMany` |
+
+Each is enabled by **one** value, a symbol exported from the package. There is no boolean form:
+
+```ts
+import { UNSAFE } from 'turbine-orm';
+
+await db.posts.findMany({ skipGlobalFilters: UNSAFE });                    // skip every filter
+await db.users.findMany({                                                  // skip named tables only
+  with: { posts: true },
+  skipGlobalFilters: [UNSAFE, 'posts'],
+});
+await db.users.findFirst({ where: { id: 1 }, includePii: UNSAFE });
+await db.sessions.deleteMany({ where: {}, allowFullTableScan: UNSAFE });    // every row, on purpose
+```
+
+Any other value that asks for the privilege, including `true` and a bare `['posts']`, throws `ValidationError` (`TURBINE_E003`) naming the option and the import. The reason is that all three sit next to `where` on the same options object, so the idiomatic `db.users.findMany({ ...req.body })` used to let a request body drop the tenant predicate, unlock the PII columns, or disarm the mass-mutation guard. `JSON.parse` cannot produce a symbol, so no parsed input can put `UNSAFE` on an args object at all.
+
+A stale `true` **throws rather than being ignored** on purpose: ignoring it would trade an escalation bug for a silent one, where an admin tool quietly stops seeing soft-deleted rows or quietly returns objects with the PII columns missing.
+
+The options are typed `Unsafe`, so this is a compile error first and a runtime error second. Note that `allowFullTableScan: false` does not typecheck either, so a conditional call site is written by adding the key or not, rather than by passing a boolean:
+
+```ts
+await db.sessions.deleteMany({
+  where: {},
+  ...(purgeEverything ? { allowFullTableScan: UNSAFE } : {}),
+});
+```
+
+`where` itself stays **required** on `update` / `updateMany` / `delete` / `deleteMany`. `allowFullTableScan` permits an *empty* `where`; it does not let you omit the key.
+
+**Port note:** this rule is enforced in core, not per engine, so a PowDB or SQLite call site behaves identically. A TS client that reimplements these options should reimplement the symbol too, since the property that matters is "unreachable from parsed data", not "documented as dangerous".
 
 ---
 

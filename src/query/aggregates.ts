@@ -33,6 +33,7 @@ import type {
   OrderDirection,
   WhereClause,
 } from './types.js';
+import { assertOrderDirection, resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
 import { isTemporalInfinity, ownLookup } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -43,7 +44,7 @@ import * as whereMod from './where.js';
  * projection, and a value-returning aggregate is a projection by another name:
  * `groupBy({ by: ['email'] })` emits one row per distinct plaintext email, and
  * `_min`/`_max` return a stored cell verbatim. Both therefore REQUIRE the same
- * `includePii: true` opt-in reads use.
+ * `includePii` opt-in (the UNSAFE sentinel) that reads use.
  *
  * Deliberately NOT gated: `_count` (a count, never a value), `_sum` / `_avg`
  * (a computed total across many rows, not a stored cell), and `where` /
@@ -67,7 +68,8 @@ export function assertAggregatePiiOptIn(
   throw new ValidationError(
     `[turbine] ${usage} on column "${field}" of table "${table}" is refused: that column is ` +
       'PII-tagged (`pii: true`), and this aggregate returns its stored values, which are excluded ' +
-      'from every default projection. Pass `includePii: true` on this call to opt in. ' +
+      'from every default projection. Pass `includePii: UNSAFE` on this call to opt in ' +
+      "(import { UNSAFE } from 'turbine-orm'). " +
       '`_count` over a PII column (a count, not a value) and `where` / `orderBy` / `having` on PII ' +
       'columns need no opt-in.',
   );
@@ -85,7 +87,11 @@ export function buildGroupBy<T extends object>(
       }
     }
   }
-  qi.currentSkip = args.skipGlobalFilters;
+  qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
+  // Resolve the PII opt-in ONCE, here, so the sentinel check runs on every
+  // groupBy (including one whose `by` names no PII column) rather than only on
+  // the paths that happen to consult it.
+  const includePii = resolveUnsafeFlag(args.includePii, 'includePii');
   const gbWhere = whereMod.mergeGlobalFilter(qi, args.where as Record<string, unknown> | undefined);
   const { sql: whereSql, params } = gbWhere
     ? whereMod.buildWhere(qi, gbWhere as WhereClause<T>)
@@ -139,7 +145,7 @@ export function buildGroupBy<T extends object>(
   for (const entry of args.by) {
     if (typeof entry === 'string') {
       const col = qi.toColumn(entry);
-      assertAggregatePiiOptIn(qi.table, meta, entry, col, 'groupBy `by` key', args.includePii);
+      assertAggregatePiiOptIn(qi.table, meta, entry, col, 'groupBy `by` key', includePii);
       claimResultKey(entry, `column "${col}"`);
       // The emitted output column is the snake_case name; claim it too (when
       // it differs from the result key) so a JSON alias like 'created_at'
@@ -152,7 +158,7 @@ export function buildGroupBy<T extends object>(
       havingGroupKeys.set(entry, { kind: 'column', field: entry });
     } else {
       const col = resolveJsonPathTarget(qi, 'group key', entry.field, entry.path);
-      assertAggregatePiiOptIn(qi.table, meta, entry.field, col, 'groupBy JSON `by` key', args.includePii);
+      assertAggregatePiiOptIn(qi.table, meta, entry.field, col, 'groupBy JSON `by` key', includePii);
       params.push(whereMod.jsonPathParam(qi, entry.path));
       const extract = qi.dialect.buildJsonPathExtract(qi.q(col), qi.p(params.length));
       const alias = entry.alias ?? String(entry.path[entry.path.length - 1]);
@@ -221,7 +227,7 @@ export function buildGroupBy<T extends object>(
       if (target === true) {
         const col = qi.toColumn(key);
         if (aggKey === '_min' || aggKey === '_max') {
-          assertAggregatePiiOptIn(qi.table, meta, key, col, `groupBy ${aggKey}`, args.includePii);
+          assertAggregatePiiOptIn(qi.table, meta, key, col, `groupBy ${aggKey}`, includePii);
         }
         // Aggregate output aliases share the same output-name namespace as
         // the group keys: `_sum: { totalPrice: true, total_price: {json} }`
@@ -235,7 +241,7 @@ export function buildGroupBy<T extends object>(
       }
       const col = resolveJsonPathTarget(qi, `${aggKey} target "${key}"`, target.field, target.path);
       if (aggKey === '_min' || aggKey === '_max') {
-        assertAggregatePiiOptIn(qi.table, meta, target.field, col, `groupBy ${aggKey} JSON target`, args.includePii);
+        assertAggregatePiiOptIn(qi.table, meta, target.field, col, `groupBy ${aggKey} JSON target`, includePii);
       }
       const alwaysNumeric = aggKey === '_sum' || aggKey === '_avg';
       if (alwaysNumeric && target.type === 'text') {
@@ -423,6 +429,9 @@ export function buildGroupByOrderBy(
               `Orderable keys: ${validKeys()}.`,
           );
         }
+        // Refuse a direction that is neither asc nor desc BEFORE normalizeOrderBy,
+        // whose `=== 'desc' ? DESC : ASC` would silently sort ascending.
+        assertOrderDirection(value, `groupBy orderBy "_count" on table "${qi.table}"`);
         const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
         parts.push(`${expr} ${dir}${qi.nullsSuffix(nulls)}`);
         continue;
@@ -443,6 +452,7 @@ export function buildGroupByOrderBy(
               `that aggregate is not requested in this call. Orderable keys: ${validKeys()}.`,
           );
         }
+        assertOrderDirection(dirSpec, `groupBy orderBy "${key}.${field}" on table "${qi.table}"`);
         const { dir, nulls } = normalizeOrderBy(dirSpec);
         parts.push(`${expr} ${dir}${qi.nullsSuffix(nulls)}`);
       }
@@ -457,6 +467,7 @@ export function buildGroupByOrderBy(
           `Orderable keys: ${validKeys()}.`,
       );
     }
+    assertOrderDirection(value, `groupBy orderBy "${key}" on table "${qi.table}"`);
     const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
     parts.push(`${expr} ${dir}${qi.nullsSuffix(nulls)}`);
   }
@@ -553,6 +564,7 @@ export function buildDistinctOnSource<T extends object>(
       );
     }
     const col = qi.resolveOrderByColumn(qi.table, qi.tableMeta, key);
+    assertOrderDirection(value, `groupBy distinctOn.orderBy "${key}" on table "${qi.table}"`);
     const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
     orderParts.push(`${qi.q(col)} ${dir}${qi.nullsSuffix(nulls)}`);
   }
@@ -902,7 +914,9 @@ export function buildAggregate<T extends object>(
   qi: BuilderCtx,
   args: AggregateArgs<T>,
 ): DeferredQuery<AggregateResult<T>> {
-  qi.currentSkip = args.skipGlobalFilters;
+  qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
+  // Resolved once, up front: see buildGroupBy.
+  const includePii = resolveUnsafeFlag(args.includePii, 'includePii');
   const aggWhere = whereMod.mergeGlobalFilter(qi, args.where as Record<string, unknown> | undefined);
   const { sql: whereSql, params } = aggWhere
     ? whereMod.buildWhere(qi, aggWhere as WhereClause<T>)
@@ -975,7 +989,7 @@ export function buildAggregate<T extends object>(
     for (const [field, enabled] of Object.entries(args._min)) {
       if (enabled) {
         const col = qi.toColumn(field);
-        assertAggregatePiiOptIn(qi.table, meta, field, col, 'aggregate _min', args.includePii);
+        assertAggregatePiiOptIn(qi.table, meta, field, col, 'aggregate _min', includePii);
         selectExprs.push(`MIN(${qi.q(col)}) AS ${qi.q(`_min_${col}`)}`);
       }
     }
@@ -986,7 +1000,7 @@ export function buildAggregate<T extends object>(
     for (const [field, enabled] of Object.entries(args._max)) {
       if (enabled) {
         const col = qi.toColumn(field);
-        assertAggregatePiiOptIn(qi.table, meta, field, col, 'aggregate _max', args.includePii);
+        assertAggregatePiiOptIn(qi.table, meta, field, col, 'aggregate _max', includePii);
         selectExprs.push(`MAX(${qi.q(col)}) AS ${qi.q(`_max_${col}`)}`);
       }
     }

@@ -51,7 +51,20 @@ The rest of the surface exists so you can build your own tooling on the same res
 | `importExtension` | `'auto'` | Specifier style in the generated `index.ts`: `'js'` (`./types.js`), `'none'` (`./types`), or `'auto'`, which detects from your tsconfig and falls back to `'js'`. |
 | `keepColumnNames` | `false` | Keep raw database column names (snake_case) as generated field names instead of camelCasing them. |
 | `legacyToManyUniques` | `false` | Opt **out** of the unique-FK to one-to-one (`hasOne`) introspection flip, emitting the pre-0.41 `hasMany` shape for unique-covered child relations. |
-| `adapter` | none | A `DatabaseAdapter` for a PG-compatible database that needs dialect-specific behaviour, e.g. `cockroachdb`. See [Compatibility](/compatibility). |
+| `adapter` | none | A `DatabaseAdapter` for a PG-compatible database that needs dialect-specific behaviour, e.g. `cockroachdb`. **Type only, the bundled CLI does not read it yet.** See the note below. |
+
+<Callout type="warning" title="adapter is declared on the type but the bundled CLI ignores it">
+  `TurbineCliConfig.adapter` type-checks, and Turbine's internal migration
+  runner takes an adapter, but `turbine migrate` never forwards the config
+  field into it. So `adapter: cockroachdb` in `turbine.config.ts` changes
+  nothing: migrations still take the PostgreSQL path, including
+  `pg_try_advisory_lock()`, which CockroachDB does not implement. Until this
+  is wired, do not rely on the CLI to hold a cluster-wide migration lock on
+  CockroachDB or YugabyteDB. Serialize `turbine migrate up` yourself (one
+  runner, in a CI job that cannot overlap), or apply the generated `.sql`
+  files with a tool that supports the engine. The `adapter` value is otherwise
+  inert, not harmful. See [Compatibility](/compatibility).
+</Callout>
 
 `TurbineConfig` is exported as an alias of `TurbineCliConfig`. Both names refer to the same shape. Note that this is a **different type** from the runtime `TurbineConfig` exported from the package root, which configures a `TurbineClient` rather than the CLI.
 

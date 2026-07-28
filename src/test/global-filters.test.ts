@@ -22,6 +22,7 @@ import { describe, it } from 'node:test';
 import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import type { QueryInterfaceOptions, WithClause } from '../query/index.js';
+import { UNSAFE } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -161,13 +162,13 @@ describe('global filters, reads', () => {
     assert.deepEqual(second.params, ['b']);
   });
 
-  it('skipGlobalFilters: true bypasses all filters', () => {
-    const { sql } = qi('users', { users: softDelete }).buildFindMany({ skipGlobalFilters: true });
+  it('skipGlobalFilters: UNSAFE bypasses all filters', () => {
+    const { sql } = qi('users', { users: softDelete }).buildFindMany({ skipGlobalFilters: UNSAFE });
     assert.doesNotMatch(sql, /deleted_at/);
   });
 
-  it('skipGlobalFilters: [table] bypasses only the named table', () => {
-    const { sql } = qi('users', { users: softDelete }).buildFindMany({ skipGlobalFilters: ['users'] });
+  it('skipGlobalFilters: [UNSAFE, table] bypasses only the named table', () => {
+    const { sql } = qi('users', { users: softDelete }).buildFindMany({ skipGlobalFilters: [UNSAFE, 'users'] });
     assert.doesNotMatch(sql, /deleted_at/);
   });
 
@@ -229,7 +230,7 @@ describe('global filters, mutations', () => {
   it('allowFullTableScan still applies the filter to the compiled SQL', () => {
     const { sql, params } = qi('users', { users: softDelete }).buildDeleteMany({
       where: {},
-      allowFullTableScan: true,
+      allowFullTableScan: UNSAFE,
     });
     assert.match(sql, /"deleted_at" IS NULL/);
     assertParamsAligned(sql, params);
@@ -245,7 +246,7 @@ describe('global filters, mutations', () => {
   });
 
   it('skipGlobalFilters opts a mutation out', () => {
-    const { sql } = qi('users', { users: softDelete }).buildDelete({ where: { id: 1 }, skipGlobalFilters: true });
+    const { sql } = qi('users', { users: softDelete }).buildDelete({ where: { id: 1 }, skipGlobalFilters: UNSAFE });
     assert.doesNotMatch(sql, /deleted_at/);
   });
 

@@ -352,13 +352,28 @@
        ===================================================================== */
     .app {
       display: grid;
-      /* One `auto` track per banner (write / PII / demo), then the header, then
-         the body takes the rest. Declaring only two tracks made every visible
-         banner stretch into the implicit-row space and open a several-hundred-
-         pixel void above the app: `auto` sizes each banner to its content. */
-      grid-template-rows: auto auto auto var(--header-h) 1fr;
+      /* EXACTLY three grid items, always: the banner stack, the header, the
+         body. The banners are NOT direct grid children, and must never become
+         them again. They used to be, against one `auto` track each
+         (`auto auto auto var(--header-h) 1fr`), and a hidden banner is
+         `display: none`, so it is not a grid item at all: the item count moved
+         with the number of VISIBLE banners and every later child slid up a
+         track. At exactly two banners that put `.main` in the
+         `var(--header-h)` track, i.e. the entire app in a 48px-tall row, which
+         rendered as a completely blank page (`--write --show-pii`, and `--demo`
+         with PII toggled on). One `auto` track over a stack that is one item
+         whether it holds three banners or none cannot drift with the count. */
+      grid-template-rows: auto var(--header-h) 1fr;
       height: 100vh;
       width: 100vw;
+    }
+    /* The banner region. Collapses to zero height when every banner inside it
+       is hidden (no padding, no border, no gap of its own), so the `auto` track
+       above costs nothing in the default read-only Postgres session. */
+    .banner-stack {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
     }
 
     /* Header */
@@ -1123,6 +1138,12 @@
     }
     .col-ts {
       color: var(--green);
+    }
+    /* The query-key spelling of a column. Same weight as the column name it
+       sits beside, dimmer, because it is the derived one. */
+    .col-field {
+      color: var(--text-dim);
+      font-family: var(--mono);
     }
     .col-pg {
       color: var(--text-dim);
@@ -1951,30 +1972,45 @@
 </head>
 <body>
   <div class="app" id="app">
-    <!-- Write-mode banner (shown only when the server runs with --write) -->
-    <div class="write-banner" id="writeBanner" role="alert" hidden>
-      <span class="write-banner-dot" aria-hidden="true"></span>
-      <strong>WRITE MODE</strong>
-      <span>changes are committed directly to your database</span>
-    </div>
-    <!-- PII banner (shown only when the server runs with --show-pii) -->
-    <div class="pii-banner" id="piiBanner" role="alert" hidden>
-      <strong>PII SHOWN</strong>
-      <span id="piiBannerWhy">PII-tagged column values are displayed unredacted (--show-pii)</span>
-    </div>
-    <!-- Demo banner + live mode switcher (shown only in --demo mode) -->
-    <div class="demo-banner" id="demoBanner" role="note" hidden>
-      <strong>DEMO</strong>
-      <span class="demo-msg">Seeded sample data. Nothing you do here is saved anywhere; every launch starts fresh.</span>
-      <div class="demo-switcher" role="group" aria-label="Demo mode switcher">
-        <button class="demo-toggle" id="demoTogglePii" type="button" aria-pressed="false">
-          <span class="demo-toggle-dot" aria-hidden="true"></span>
-          <span id="demoTogglePiiLabel">PII: hidden</span>
-        </button>
-        <button class="demo-toggle" id="demoToggleWrite" type="button" aria-pressed="false">
-          <span class="demo-toggle-dot" aria-hidden="true"></span>
-          <span id="demoToggleWriteLabel">Writes: off</span>
-        </button>
+    <!-- Banner region: ONE grid row whatever it holds. Each banner is hidden
+         independently, and a hidden element is not a grid item, so keeping them
+         as direct children of `.app` made the row each later element landed in
+         depend on how many banners happened to be visible. -->
+    <div class="banner-stack">
+      <!-- Write-mode banner (shown only when the server runs with --write) -->
+      <div class="write-banner" id="writeBanner" role="alert" hidden>
+        <span class="write-banner-dot" aria-hidden="true"></span>
+        <strong>WRITE MODE</strong>
+        <span>changes are committed directly to your database</span>
+      </div>
+      <!-- PII-scan failure banner. Shown when the generated metadata exists but
+           its PII tags could not be read, so the server is failing closed and
+           redacting EVERY column. Without this, a screen full of redaction
+           markers reads like a bug rather than a deliberate posture. -->
+      <div class="write-banner" id="piiScanBanner" role="alert" hidden>
+        <span class="write-banner-dot" aria-hidden="true"></span>
+        <strong>PII TAGS UNREADABLE</strong>
+        <span id="piiScanBannerWhy">every column is redacted</span>
+      </div>
+      <!-- PII banner (shown only when the server runs with --show-pii) -->
+      <div class="pii-banner" id="piiBanner" role="alert" hidden>
+        <strong>PII SHOWN</strong>
+        <span id="piiBannerWhy">PII-tagged column values are displayed unredacted (--show-pii)</span>
+      </div>
+      <!-- Demo banner + live mode switcher (shown only in --demo mode) -->
+      <div class="demo-banner" id="demoBanner" role="note" hidden>
+        <strong>DEMO</strong>
+        <span class="demo-msg">Seeded sample data. Nothing you do here is saved anywhere; every launch starts fresh.</span>
+        <div class="demo-switcher" role="group" aria-label="Demo mode switcher">
+          <button class="demo-toggle" id="demoTogglePii" type="button" aria-pressed="false">
+            <span class="demo-toggle-dot" aria-hidden="true"></span>
+            <span id="demoTogglePiiLabel">PII: hidden</span>
+          </button>
+          <button class="demo-toggle" id="demoToggleWrite" type="button" aria-pressed="false">
+            <span class="demo-toggle-dot" aria-hidden="true"></span>
+            <span id="demoToggleWriteLabel">Writes: off</span>
+          </button>
+        </div>
       </div>
     </div>
     <!-- Header -->
@@ -2201,7 +2237,13 @@
                   <button class="btn" id="builderSqlCopy" hidden>Copy SQL</button>
                 </div>
                 <pre class="builder-sql" id="builderSql" hidden></pre>
-                <div class="data-scroll" id="builderResults" style="flex:1"></div>
+                <!-- Seeded with the same empty state `renderResults()` writes
+                     when there is no result. The panel is only ever rendered by
+                     a run, so before the first one it was a blank rectangle
+                     with a "Results" header and no explanation. -->
+                <div class="data-scroll" id="builderResults" style="flex:1">
+                  <div class="empty">Run the query to see rows here.</div>
+                </div>
               </div>
             </div>
           </div>
@@ -2336,6 +2378,9 @@
       writable: false,
       showPii: false,
       demo: false,
+      // { path, reason, columns } when the server could not read PII tags and
+      // is therefore redacting every column; null otherwise.
+      piiScanFailed: null,
       // data pane
       data: {
         rows: [],
@@ -2380,18 +2425,6 @@
         args: null,
       },
     };
-
-    function emptyBuilderArgs() {
-      return {
-        combinator: 'AND',
-        where: [],
-        with: [], // [{ relation, args: {...} }]
-        orderBy: { column: null, dir: 'asc' },
-        limit: 10,
-        select: [],
-        omit: [],
-      };
-    }
 
     // =====================================================================
     // Storage (localStorage wrapper)
@@ -2657,6 +2690,15 @@
       }
     }
 
+    // === BEGIN builder-args ===
+    // Everything between these markers is PURE: no DOM, no State, no network.
+    // src/test/studio-builder-roundtrip.test.ts extracts this exact region out
+    // of the served HTML and runs it, so the save -> disk -> hydrate round trip
+    // is tested as behaviour rather than as a regex over source text (which is
+    // what let a broken round trip ship: the assertions checked that a line of
+    // JavaScript existed, not that anything came back). Keep the region
+    // dependency-free, and pass collaborators (findTable) in as arguments.
+
     // Prefix matches: nullable columns arrive as e.g. 'number | null'.
     function isStringType(ts) {
       return typeof ts === 'string' && ts.indexOf('string') === 0;
@@ -2685,6 +2727,291 @@
     function isNullOp(op) {
       return op === 'isNull' || op === 'isNotNull';
     }
+
+    function emptyBuilderArgs() {
+      return {
+        combinator: 'AND',
+        where: [],
+        with: [], // [{ relation, args: {...} }]
+        orderBy: { column: null, dir: 'asc' },
+        limit: 10,
+        select: [],
+        omit: [],
+      };
+    }
+
+    /**
+     * The builder's args <-> Turbine args round trip.
+     *
+     * Two spellings are in play. The builder's own controls are labelled with
+     * the database COLUMN name (that is what the Data and Schema tabs show), so
+     * `State.builder.args` holds column names. A Turbine query addresses a
+     * column by its camelCase FIELD name: `orderBy: { created_at: 'asc' }` is a
+     * TS2353 against the generated types and a TURBINE_E003 at runtime.
+     *
+     * So the persisted / emitted form is FIELD-keyed, in both directions and at
+     * every depth. It is the same object the Copy TS snippet shows and the same
+     * object `/api/builder` receives, which means a saved query file is a
+     * pasteable query, and one shape is stored rather than two.
+     *
+     * `hydrate` accepts BOTH spellings, because `.turbine/studio-queries.json`
+     * files written before the emit side moved to field names are column-keyed
+     * and must keep loading. A key that matches NEITHER is kept as written and
+     * reported: it is never dropped, because a saved query that silently comes
+     * back with fewer WHERE clauses than it was saved with returns more rows
+     * than the user asked for, and nothing on screen says so.
+     */
+    const BuilderArgs = {
+      /** FIELD name for a database column; the column name if it is unknown. */
+      fieldName(tableMeta, columnName) {
+        const col = ((tableMeta && tableMeta.columns) || []).find((c) => c.name === columnName);
+        return (col && col.field) || columnName;
+      },
+
+      /**
+       * The inverse: database COLUMN name for an args key, matching the field
+       * spelling first (the format written today) and the column spelling
+       * second (legacy files). `null` when the key names neither, which callers
+       * must surface.
+       */
+      columnName(tableMeta, key) {
+        const cols = (tableMeta && tableMeta.columns) || [];
+        const byField = cols.find((c) => c.field === key);
+        if (byField) return byField.name;
+        const byName = cols.find((c) => c.name === key);
+        return byName ? byName.name : null;
+      },
+
+      coerceValue(val, tsType, op) {
+        if (val == null || val === '') return undefined;
+        if (op === 'in' || op === 'notIn') {
+          return String(val)
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .map((s) => (isNumericType(tsType) ? Number(s) : s));
+        }
+        if (isNumericType(tsType)) {
+          const n = Number(val);
+          return Number.isFinite(n) ? n : undefined;
+        }
+        if (isBoolType(tsType)) {
+          return val === 'true' || val === true;
+        }
+        return String(val);
+      },
+
+      assembleWhere(localArgs, tableMeta) {
+        if (!localArgs.where || !localArgs.where.length) return null;
+        const clauses = [];
+        for (const c of localArgs.where) {
+          const col = ((tableMeta && tableMeta.columns) || []).find((cc) => cc.name === c.column);
+          // An unknown column is emitted AS WRITTEN rather than skipped. It used
+          // to be skipped, so a clause could vanish between the pane and the
+          // query. The bad key now shows up in the preview and `validate()`
+          // refuses to Run or Save while it is there; the server validates
+          // identifiers itself, so an unknown key is a 400, never a silent
+          // unfiltered read.
+          const key = col ? col.field || c.column : c.column;
+          if (isNullOp(c.op)) {
+            clauses.push({ [key]: c.op === 'isNull' ? null : { not: null } });
+            continue;
+          }
+          // An empty value is the one skip left, and `validate()` already
+          // reports it ("enter a value, or remove the clause") and blocks Run.
+          const parsed = BuilderArgs.coerceValue(c.value, col ? col.tsType : 'string', c.op);
+          if (parsed === undefined) continue;
+          const inner =
+            c.op === 'equals'
+              ? parsed
+              : c.insensitive
+              ? { [c.op]: parsed, mode: 'insensitive' }
+              : { [c.op]: parsed };
+          clauses.push({ [key]: inner });
+        }
+        if (!clauses.length) return null;
+        if (clauses.length === 1 && localArgs.combinator === 'AND') return clauses[0];
+        if (localArgs.combinator === 'AND') {
+          // Two clauses on the SAME column used to be merged with
+          // Object.assign, where the later key overwrites the earlier one: a
+          // range like `age gte 18` AND `age lte 65` silently became `age lte
+          // 65` alone, so the pane showed two filters and the query applied
+          // one. Every clause is its own object under an explicit `AND` when
+          // any column repeats, which is the shape hydrate() already reads
+          // back, so a saved query still round-trips.
+          const keys = clauses.map((c) => Object.keys(c)[0]);
+          if (new Set(keys).size !== keys.length) return { AND: clauses };
+          return Object.assign({}, ...clauses);
+        }
+        if (localArgs.combinator === 'OR') return { OR: clauses };
+        if (localArgs.combinator === 'NOT') return { NOT: clauses.length === 1 ? clauses[0] : { AND: clauses } };
+        return null;
+      },
+
+      buildFindManyArgs(localArgs, tableMeta, findTable) {
+        const out = {};
+        const whereObj = BuilderArgs.assembleWhere(localArgs, tableMeta);
+        if (whereObj) out.where = whereObj;
+        if (localArgs.with && localArgs.with.length) {
+          out.with = {};
+          for (const w of localArgs.with) {
+            const rel = ((tableMeta && tableMeta.relations) || []).find((r) => r.name === w.relation);
+            if (!rel) continue;
+            const childMeta = findTable ? findTable(rel.to) : null;
+            const childArgs = childMeta ? BuilderArgs.buildFindManyArgs(w.args, childMeta, findTable) : null;
+            if (childArgs && Object.keys(childArgs).length) {
+              out.with[w.relation] = childArgs;
+            } else {
+              out.with[w.relation] = true;
+            }
+          }
+        }
+        if (localArgs.orderBy && localArgs.orderBy.column) {
+          out.orderBy = { [BuilderArgs.fieldName(tableMeta, localArgs.orderBy.column)]: localArgs.orderBy.dir };
+        }
+        if (localArgs.limit) out.limit = localArgs.limit;
+        if (localArgs.select && localArgs.select.length) {
+          out.select = Object.fromEntries(localArgs.select.map((c) => [BuilderArgs.fieldName(tableMeta, c), true]));
+        }
+        if (localArgs.omit && localArgs.omit.length) {
+          out.omit = Object.fromEntries(localArgs.omit.map((c) => [BuilderArgs.fieldName(tableMeta, c), true]));
+        }
+        return out;
+      },
+
+      /**
+       * Inverse of buildFindManyArgs. `issues` (optional array) collects a
+       * human-readable line for everything that could not be resolved, so the
+       * loader can say what happened instead of quietly loading less.
+       */
+      hydrate(argsObj, tableMeta, findTable, issues) {
+        const out = emptyBuilderArgs();
+        const note = (msg) => {
+          if (issues) issues.push(msg);
+        };
+        if (!tableMeta) return out;
+        const resolve = (key, where) => {
+          const col = BuilderArgs.columnName(tableMeta, key);
+          if (col) return col;
+          note(where + ': no column named "' + key + '" on ' + tableMeta.name);
+          // Kept, not dropped: validate() turns it into a visible refusal.
+          return key;
+        };
+        if (argsObj.limit) out.limit = argsObj.limit;
+        if (argsObj.orderBy) {
+          const k = Object.keys(argsObj.orderBy)[0];
+          if (k) out.orderBy = { column: resolve(k, 'orderBy'), dir: argsObj.orderBy[k] };
+        }
+        if (argsObj.where) {
+          const w = argsObj.where;
+          const collectInto = (obj) => {
+            for (const [key, val] of Object.entries(obj)) {
+              if (key === 'AND' || key === 'OR' || key === 'NOT') continue;
+              const column = resolve(key, 'where');
+              if (val === null) {
+                // { field: null } is IS NULL
+                out.where.push({ column, op: 'isNull', value: '', insensitive: false });
+              } else if (val && typeof val === 'object' && !Array.isArray(val)) {
+                const op = Object.keys(val).find((k) => k !== 'mode') || 'equals';
+                if (op === 'not' && val[op] === null) {
+                  // { field: { not: null } } is IS NOT NULL
+                  out.where.push({ column, op: 'isNotNull', value: '', insensitive: false });
+                } else {
+                  out.where.push({
+                    column,
+                    op,
+                    value: Array.isArray(val[op]) ? val[op].join(',') : val[op],
+                    insensitive: val.mode === 'insensitive',
+                  });
+                }
+              } else {
+                out.where.push({ column, op: 'equals', value: val, insensitive: false });
+              }
+            }
+          };
+          if (w.OR) {
+            out.combinator = 'OR';
+            for (const c of w.OR) collectInto(c);
+          } else if (w.NOT) {
+            out.combinator = 'NOT';
+            const inner = w.NOT;
+            if (inner && typeof inner === 'object' && Array.isArray(inner.AND)) {
+              for (const c of inner.AND) collectInto(c);
+            } else if (inner && typeof inner === 'object') {
+              collectInto(inner);
+            }
+          } else if (w.AND) {
+            for (const c of w.AND) collectInto(c);
+          } else {
+            collectInto(w);
+          }
+        }
+        if (argsObj.select) out.select = Object.keys(argsObj.select).map((k) => resolve(k, 'select'));
+        if (argsObj.omit) out.omit = Object.keys(argsObj.omit).map((k) => resolve(k, 'omit'));
+        if (argsObj.with) {
+          for (const [relName, v] of Object.entries(argsObj.with)) {
+            const rel = ((tableMeta.relations) || []).find((r) => r.name === relName);
+            if (!rel) {
+              note('with: no relation named "' + relName + '" on ' + tableMeta.name);
+              continue;
+            }
+            const childMeta = findTable ? findTable(rel.to) : null;
+            if (!childMeta) {
+              note('with.' + relName + ': table "' + rel.to + '" is not in this schema');
+              continue;
+            }
+            const childIssues = [];
+            const childArgs =
+              v === true ? emptyBuilderArgs() : BuilderArgs.hydrate(v, childMeta, findTable, childIssues);
+            for (const msg of childIssues) note(relName + '.' + msg);
+            out.with.push({ relation: relName, expanded: true, args: childArgs });
+          }
+        }
+        return out;
+      },
+
+      /**
+       * Every column key in the pane's own args that names no column, at any
+       * depth. Only a hydrated saved query can produce one (the controls
+       * themselves are built from metadata), and that is exactly the case that
+       * has to be loud rather than quietly re-emitted.
+       */
+      unresolvedColumns(localArgs, tableMeta, findTable, path) {
+        const at = path || [];
+        const out = [];
+        if (!tableMeta || !localArgs) return out;
+        const unknown = (key) => key && !BuilderArgs.columnName(tableMeta, key);
+        (localArgs.where || []).forEach((c, i) => {
+          if (unknown(c.column)) out.push({ kind: 'where', key: c.column, index: i, path: at });
+        });
+        if (localArgs.orderBy && unknown(localArgs.orderBy.column)) {
+          out.push({ kind: 'orderBy', key: localArgs.orderBy.column, path: at });
+        }
+        for (const kind of ['select', 'omit']) {
+          for (const key of localArgs[kind] || []) {
+            if (unknown(key)) out.push({ kind, key, path: at });
+          }
+        }
+        for (const w of localArgs.with || []) {
+          const rel = ((tableMeta.relations) || []).find((r) => r.name === w.relation);
+          const childMeta = rel && findTable ? findTable(rel.to) : null;
+          if (childMeta) {
+            for (const e of BuilderArgs.unresolvedColumns(w.args, childMeta, findTable, at.concat(w.relation))) {
+              out.push(e);
+            }
+          }
+        }
+        return out;
+      },
+
+      /** One wording for an unresolved key, shared by the toast and validate(). */
+      describeUnresolved(entry) {
+        const at = entry.path && entry.path.length ? entry.path.join('.') + ' ' : '';
+        const what = entry.kind === 'where' ? 'where clause ' + (entry.index + 1) : entry.kind;
+        return at + what + ': unknown column "' + entry.key + '" (remove it, or pick a column).';
+      },
+    };
+    // === END builder-args ===
 
     // =====================================================================
     // Sidebar
@@ -2723,7 +3050,19 @@
               },
               [
                 el('span', { class: 'sidebar-item-name', text: t.name }),
-                el('span', { class: 'sidebar-item-count', text: formatCount(t.estimatedRows) }),
+                // An ESTIMATE outside demo mode: it is pg_class.reltuples,
+                // which is whatever the last ANALYZE / autovacuum left behind
+                // and is -1 (served as 0) on a table that has never been
+                // analyzed. Unlabelled it read as a count and contradicted the
+                // Data tab, which runs a real COUNT(*). Demo counts ARE exact
+                // (COUNT(*) over the in-memory store), so no tilde there.
+                el('span', {
+                  class: 'sidebar-item-count',
+                  text: (State.demo ? '' : '~') + formatCount(t.estimatedRows),
+                  title: State.demo
+                    ? 'Exact row count'
+                    : 'Planner estimate (pg_class.reltuples), stale or 0 until the table is ANALYZEd. The Data tab counts for real.',
+                }),
               ]
             );
             tablesList.appendChild(item);
@@ -3998,8 +4337,12 @@
         colsSection.appendChild(el('h2', { text: 'Columns' }));
         const colTable = el('table', { class: 'col-table' });
         const colHead = el('thead');
+        // "Field" is the camelCase name a QUERY uses (`where: { createdAt: ... }`).
+        // The schema view showed the TS type but never the TS name, so the only
+        // spelling on screen was the database column one, which no query key
+        // accepts.
         colHead.appendChild(
-          el('tr', {}, ['Name', 'TS', 'PG', 'Attributes'].map((h) => el('th', { text: h })))
+          el('tr', {}, ['Column', 'Field', 'TS', 'PG', 'Attributes'].map((h) => el('th', { text: h })))
         );
         colTable.appendChild(colHead);
         const colBody = el('tbody');
@@ -4010,6 +4353,15 @@
               el('span', {
                 class: 'col-name' + (c.isPrimaryKey ? ' pk' : ''),
                 text: c.name,
+              }),
+            ])
+          );
+          tr.appendChild(
+            el('td', {}, [
+              el('span', {
+                class: 'col-field',
+                text: c.field || c.name,
+                title: 'The name to use in a query (where / orderBy / select)',
               }),
             ])
           );
@@ -4107,6 +4459,10 @@
         State.builder.error = null;
         State.builder.validation = {};
         BuilderPane.render();
+        // Clearing `result` alone left the PREVIOUS table's rows on screen (only
+        // a run repaints the grid), so the pane showed a query for one table
+        // above the rows of another.
+        BuilderPane.renderResults();
       },
 
       findTable(name) {
@@ -4401,7 +4757,7 @@
         const row = el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 120px 100px', gap: '8px' } });
 
         const colSel = el('select', { class: 'builder-select' });
-        colSel.appendChild(el('option', { value: '', text: ', none, ' }));
+        colSel.appendChild(el('option', { value: '', text: '(none)' }));
         for (const c of tableMeta.columns) {
           const opt = el('option', { value: c.name, text: c.name });
           if (args.orderBy && args.orderBy.column === c.name) opt.selected = true;
@@ -4508,82 +4864,24 @@
       },
 
       // ---------- Spec assembly / validation ----------
+
+      // Assembly lives in `BuilderArgs` (see the builder-args region above), so
+      // the emit side and the saved-query hydrate side are one implementation
+      // that cannot drift apart. These stay as the pane's call sites.
+      fieldName(tableMeta, columnName) {
+        return BuilderArgs.fieldName(tableMeta, columnName);
+      },
+
       buildFindManyArgs(localArgs, tableMeta) {
-        const out = {};
-        const whereObj = BuilderPane.assembleWhere(localArgs, tableMeta);
-        if (whereObj) out.where = whereObj;
-        if (localArgs.with && localArgs.with.length) {
-          out.with = {};
-          for (const w of localArgs.with) {
-            const rel = (tableMeta.relations || []).find((r) => r.name === w.relation);
-            if (!rel) continue;
-            const childMeta = BuilderPane.findTable(rel.to);
-            const childArgs = childMeta ? BuilderPane.buildFindManyArgs(w.args, childMeta) : null;
-            if (childArgs && Object.keys(childArgs).length) {
-              out.with[w.relation] = childArgs;
-            } else {
-              out.with[w.relation] = true;
-            }
-          }
-        }
-        if (localArgs.orderBy && localArgs.orderBy.column) {
-          out.orderBy = { [localArgs.orderBy.column]: localArgs.orderBy.dir };
-        }
-        if (localArgs.limit) out.limit = localArgs.limit;
-        if (localArgs.select && localArgs.select.length) {
-          out.select = Object.fromEntries(localArgs.select.map((c) => [c, true]));
-        }
-        if (localArgs.omit && localArgs.omit.length) {
-          out.omit = Object.fromEntries(localArgs.omit.map((c) => [c, true]));
-        }
-        return out;
+        return BuilderArgs.buildFindManyArgs(localArgs, tableMeta, BuilderPane.findTable);
       },
 
       assembleWhere(localArgs, tableMeta) {
-        if (!localArgs.where || !localArgs.where.length) return null;
-        const clauses = [];
-        for (const c of localArgs.where) {
-          const col = tableMeta.columns.find((cc) => cc.name === c.column);
-          if (!col) continue;
-          if (isNullOp(c.op)) {
-            clauses.push({ [c.column]: c.op === 'isNull' ? null : { not: null } });
-            continue;
-          }
-          const parsed = BuilderPane.coerceValue(c.value, col.tsType, c.op);
-          if (parsed === undefined) continue;
-          const inner =
-            c.op === 'equals'
-              ? parsed
-              : c.insensitive
-              ? { [c.op]: parsed, mode: 'insensitive' }
-              : { [c.op]: parsed };
-          clauses.push({ [c.column]: inner });
-        }
-        if (!clauses.length) return null;
-        if (clauses.length === 1 && localArgs.combinator === 'AND') return clauses[0];
-        if (localArgs.combinator === 'AND') return Object.assign({}, ...clauses);
-        if (localArgs.combinator === 'OR') return { OR: clauses };
-        if (localArgs.combinator === 'NOT') return { NOT: clauses.length === 1 ? clauses[0] : { AND: clauses } };
-        return null;
+        return BuilderArgs.assembleWhere(localArgs, tableMeta);
       },
 
       coerceValue(val, tsType, op) {
-        if (val == null || val === '') return undefined;
-        if (op === 'in' || op === 'notIn') {
-          return String(val)
-            .split(',')
-            .map((s) => s.trim())
-            .filter(Boolean)
-            .map((s) => (isNumericType(tsType) ? Number(s) : s));
-        }
-        if (isNumericType(tsType)) {
-          const n = Number(val);
-          return Number.isFinite(n) ? n : undefined;
-        }
-        if (isBoolType(tsType)) {
-          return val === 'true' || val === true;
-        }
-        return String(val);
+        return BuilderArgs.coerceValue(val, tsType, op);
       },
 
       validate() {
@@ -4592,6 +4890,19 @@
         if (State.builder.args.limit != null && State.builder.args.limit < 1) {
           errs.limit = 'Limit must be at least 1.';
         }
+        // Keys that name no column. The controls cannot produce one, a saved
+        // query can (a renamed or dropped column, or a file saved against a
+        // different schema), and the old behaviour was to drop the clause on
+        // the way to the server and run the query unfiltered. Run and Save are
+        // refused instead, at every depth, naming the key.
+        const tableMetaForValidation = BuilderPane.findTable(State.builder.table);
+        BuilderArgs.unresolvedColumns(
+          State.builder.args,
+          tableMetaForValidation,
+          BuilderPane.findTable,
+        ).forEach((entry, i) => {
+          errs['unknown' + i] = BuilderArgs.describeUnresolved(entry);
+        });
         State.builder.args.where.forEach((c, i) => {
           if (!c.column) {
             errs['where' + i] = 'where clause ' + (i + 1) + ': pick a column.';
@@ -4711,7 +5022,7 @@
         const r = State.builder.result;
         if (!r) {
           header.textContent = 'Results';
-          host.innerHTML = '<div class="empty">Run to see results.</div>';
+          host.innerHTML = '<div class="empty">Run the query to see rows here.</div>';
           return;
         }
         header.textContent =
@@ -4892,80 +5203,33 @@
             }
           }
           Router.selectTab('builder');
-          // Re-hydrating from a saved args object is tricky since our internal
-          // shape differs from the flat Turbine args object. For now we store
-          // the args alongside the builder table and render a hint.
+          // The pane's internal shape (column names, arrays) differs from the
+          // flat field-keyed args object on disk, so loading is a real inverse
+          // (BuilderArgs.hydrate) and anything it cannot resolve is REPORTED.
+          // A saved query that quietly loads without its WHERE clauses returns
+          // more rows than it did when it was saved.
           State.builder.table = q.table;
-          State.builder.args = SavedQueries.hydrateBuilderArgs(q.args || {}, q.table);
+          const issues = [];
+          State.builder.args = SavedQueries.hydrateBuilderArgs(q.args || {}, q.table, issues);
           BuilderPane.render();
-          toast('Loaded saved builder: ' + q.name, 'ok');
+          if (issues.length) {
+            toast(
+              'Loaded "' + q.name + '" with ' + issues.length + ' unresolved item(s): ' + issues.join(' · '),
+              'err'
+            );
+          } else {
+            toast('Loaded saved builder: ' + q.name, 'ok');
+          }
         }
       },
 
-      hydrateBuilderArgs(argsObj, tableName) {
-        // Best-effort inverse of buildFindManyArgs for a flat where obj
+      hydrateBuilderArgs(argsObj, tableName, issues) {
         const tableMeta = State.tablesByName.get(tableName);
-        const out = emptyBuilderArgs();
-        if (!tableMeta) return out;
-        if (argsObj.limit) out.limit = argsObj.limit;
-        if (argsObj.orderBy) {
-          const k = Object.keys(argsObj.orderBy)[0];
-          if (k) out.orderBy = { column: k, dir: argsObj.orderBy[k] };
+        if (!tableMeta) {
+          if (issues) issues.push('table "' + tableName + '" is not in this schema');
+          return emptyBuilderArgs();
         }
-        if (argsObj.where) {
-          const w = argsObj.where;
-          const collectInto = (obj) => {
-            for (const [col, val] of Object.entries(obj)) {
-              if (col === 'AND' || col === 'OR' || col === 'NOT') continue;
-              if (val === null) {
-                // { col: null } is IS NULL
-                out.where.push({ column: col, op: 'isNull', value: '', insensitive: false });
-              } else if (val && typeof val === 'object' && !Array.isArray(val)) {
-                const op = Object.keys(val).find((k) => k !== 'mode') || 'equals';
-                if (op === 'not' && val[op] === null) {
-                  // { col: { not: null } } is IS NOT NULL
-                  out.where.push({ column: col, op: 'isNotNull', value: '', insensitive: false });
-                } else {
-                  out.where.push({
-                    column: col,
-                    op,
-                    value: val[op],
-                    insensitive: val.mode === 'insensitive',
-                  });
-                }
-              } else {
-                out.where.push({ column: col, op: 'equals', value: val, insensitive: false });
-              }
-            }
-          };
-          if (w.OR) {
-            out.combinator = 'OR';
-            for (const c of w.OR) collectInto(c);
-          } else if (w.NOT) {
-            out.combinator = 'NOT';
-            const inner = w.NOT;
-            if (inner && typeof inner === 'object' && Array.isArray(inner.AND)) {
-              for (const c of inner.AND) collectInto(c);
-            } else if (inner && typeof inner === 'object') {
-              collectInto(inner);
-            }
-          } else if (w.AND) {
-            for (const c of w.AND) collectInto(c);
-          } else {
-            collectInto(w);
-          }
-        }
-        if (argsObj.select) out.select = Object.keys(argsObj.select);
-        if (argsObj.omit) out.omit = Object.keys(argsObj.omit);
-        if (argsObj.with) {
-          for (const [relName, v] of Object.entries(argsObj.with)) {
-            const rel = (tableMeta.relations || []).find((r) => r.name === relName);
-            if (!rel) continue;
-            const childArgs = v === true ? emptyBuilderArgs() : SavedQueries.hydrateBuilderArgs(v, rel.to);
-            out.with.push({ relation: relName, expanded: true, args: childArgs });
-          }
-        }
-        return out;
+        return BuilderArgs.hydrate(argsObj, tableMeta, BuilderPane.findTable, issues);
       },
 
       async remove(id) {
@@ -5117,11 +5381,11 @@
           let input;
           if (enumValues && enumValues.length) {
             input = el('select', {});
-            input.appendChild(el('option', { value: '', text: ', unset, ' }));
+            input.appendChild(el('option', { value: '', text: '(unset)' }));
             for (const ev of enumValues) input.appendChild(el('option', { value: ev, text: ev }));
           } else if (ts.indexOf('boolean') === 0) {
             input = el('select', {});
-            input.appendChild(el('option', { value: '', text: ', unset, ' }));
+            input.appendChild(el('option', { value: '', text: '(unset)' }));
             input.appendChild(el('option', { value: 'true', text: 'true' }));
             input.appendChild(el('option', { value: 'false', text: 'false' }));
           } else {
@@ -5519,6 +5783,17 @@
         $('#writeBanner').hidden = !State.writable;
         $('#dataInsert').hidden = !State.writable;
         $('#dataPaste').hidden = !State.writable;
+        // Fail-closed indicator: the server found a generated metadata file it
+        // could not read tags out of, so it tagged every column instead of
+        // trusting an empty result.
+        State.piiScanFailed = schema.piiScanFailed || null;
+        $('#piiScanBanner').hidden = !State.piiScanFailed;
+        if (State.piiScanFailed) {
+          $('#piiScanBannerWhy').textContent =
+            'could not read PII tags from ' + State.piiScanFailed.path + ' (' + State.piiScanFailed.reason + '), ' +
+            'so all ' + State.piiScanFailed.columns + ' columns are redacted, sort / search / filter are refused, ' +
+            'and the Query tab is disabled. Re-run `turbine generate`, or restart with --show-pii.';
+        }
         // Persistent unredacted-PII indicator. In demo mode the in-UI pill can
         // flip it, so the reason line must not blame a flag that was not passed.
         $('#piiBanner').hidden = !State.showPii;

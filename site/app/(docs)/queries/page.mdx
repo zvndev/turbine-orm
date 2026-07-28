@@ -93,9 +93,11 @@ const users = await db.users.findMany({
 
 ### PII fields: `includePii`
 
-Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) are excluded from every default projection: the top-level rows, relation subqueries, batched loads, and a write's returned row. They come back in two ways: name the column explicitly in `select` (the explicit request IS the opt-in), or pass `includePii: true` to return every PII column at the top level **and** at every nested `with` level of that query.
+Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) are excluded from every default projection: the top-level rows, relation subqueries, batched loads, and a write's returned row. They come back in two ways: name the column explicitly in `select` (the explicit request IS the opt-in), or pass `includePii: UNSAFE` to return every PII column at the top level **and** at every nested `with` level of that query.
 
 ```ts
+import { UNSAFE } from 'turbine-orm';
+
 // Default: email (pii) is absent
 const u = await db.users.findFirst({ where: { id: 1 } });
 u.email; // undefined
@@ -107,15 +109,17 @@ const withEmail = await db.users.findFirst({ where: { id: 1 }, select: { email: 
 const full = await db.users.findMany({
   where: { active: true },
   with: { posts: true },
-  includePii: true,
+  includePii: UNSAFE,
 });
 ```
+
+`includePii` is a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol): the `UNSAFE` symbol is the only value that enables it, and a literal `includePii: true` throws a `ValidationError` (`TURBINE_E003`). The reason is that `includePii` sits on the same options object as `where`, so a handler written as `db.users.findMany({ ...req.body })` used to let a request body ask for the PII columns; `JSON.parse` cannot produce a symbol. Read [Privilege options](/global-filters#privilege-options-and-the-unsafe-symbol) for the full rationale and the upgrade table.
 
 `includePii` is a read option (`findMany` / `findUnique` / `findFirst` and their `*OrThrow` forms, `findManyStream`, and the gated `groupBy` / `aggregate` shapes below); it is never a write option. Schemas with no PII-tagged columns are unaffected: the emitted SQL is byte-identical either way.
 
 The line the flag draws is **whether a stored PII value can reach your application**. `where`, `orderBy`, and `having` on a PII column are therefore always allowed, with or without the flag: they narrow, sort, or filter rows and return no PII value of their own.
 
-Aggregates are where this needs care, because some of them return stored cells. Two shapes are **refused** without `includePii: true`, throwing a `ValidationError` (`TURBINE_E003`) that names the column:
+Aggregates are where this needs care, because some of them return stored cells. Two shapes are **refused** without `includePii: UNSAFE`, throwing a `ValidationError` (`TURBINE_E003`) that names the column:
 
 - A PII-tagged column used as a `groupBy` **`by`** key, including a **JSON-path** group key. The group keys *are* the values.
 - **`_min` / `_max`** over a PII column, in **both** `groupBy` and `aggregate`, including JSON-path targets. Each returns one row's actual stored value.
@@ -134,8 +138,8 @@ await db.users.groupBy({ by: ['email'], _count: true });
 await db.users.aggregate({ _max: { email: true } });
 
 // Allowed: explicit opt-in on either args type
-await db.users.groupBy({ by: ['email'], _count: true, includePii: true });
-await db.users.aggregate({ _max: { email: true }, includePii: true });
+await db.users.groupBy({ by: ['email'], _count: true, includePii: UNSAFE });
+await db.users.aggregate({ _max: { email: true }, includePii: UNSAFE });
 
 // Allowed with no flag: no stored PII value is returned
 await db.users.groupBy({ by: ['role'], _count: true });
@@ -424,7 +428,17 @@ await db.users.deleteMany({
 });
 ```
 
-Empty `where` (or `where: {}`) throws `ValidationError`, Turbine blocks accidental mass deletes. Pass `{ allowFullTableScan: true }` if you really mean it.
+An empty `where` (`{}`, or one whose every value is `undefined`) throws `ValidationError`, Turbine blocks accidental mass deletes. To really mean it, import the sentinel and pass `allowFullTableScan: UNSAFE` alongside it:
+
+```ts
+import { UNSAFE } from 'turbine-orm';
+
+await db.sessions.deleteMany({ where: {}, allowFullTableScan: UNSAFE }); // every row
+```
+
+`where` itself is still required: `allowFullTableScan` disarms the guard on an *empty* `where`, it does not let you drop the key.
+
+`allowFullTableScan` is a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol): `true` throws (`TURBINE_E003`), because on an options object built from a request body a plain boolean turns "delete the rows I named" into "delete the table". The option is typed `Unsafe`, so a boolean does not compile at all, `false` included; write a conditional call site as `{ where, ...(flag ? { allowFullTableScan: UNSAFE } : {}) }`. (`false` / `null` / `undefined` are still accepted at *runtime* and mean "guard on", which keeps untyped callers working.) The same applies to `updateMany`.
 
 ## upsert
 
@@ -471,7 +485,7 @@ const stats = await db.posts.aggregate({
 ```
 
 On a **PII-tagged** column, `_min` / `_max` return stored values, so they require
-`includePii: true` and otherwise throw a `ValidationError` (`TURBINE_E003`).
+`includePii: UNSAFE` and otherwise throw a `ValidationError` (`TURBINE_E003`).
 `_count` needs no opt-in (it is a count, not a value), and neither does `where`.
 See [PII fields](#pii-fields-includepii).
 
@@ -490,7 +504,7 @@ const postsByUser = await db.posts.groupBy({
 ```
 
 Grouping **by** a PII-tagged column returns its stored values as the group keys,
-so that also requires `includePii: true` and otherwise throws `TURBINE_E003`. The
+so that also requires `includePii: UNSAFE` and otherwise throws `TURBINE_E003`. The
 same holds for `_min` / `_max` over a PII column, including JSON-path targets.
 `where` / `orderBy` / `having` on PII columns stay unrestricted, because none of
 them return the value. See [PII fields](#pii-fields-includepii).

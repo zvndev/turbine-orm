@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { defaultProjectionFields, includeKeysForBatching } from '../query/batched-loader.js';
+import { UNSAFE } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { mockTable } from './helpers.js';
@@ -87,7 +88,7 @@ describe('batched loader: a PII-tagged correlation key', () => {
     try {
       const rows = (await client.table('users').findMany({
         with: { posts: true },
-        includePii: true,
+        includePii: UNSAFE,
         orderBy: { id: 'asc' },
         relationLoadStrategy: 'batched',
       } as never)) as Record<string, unknown>[];

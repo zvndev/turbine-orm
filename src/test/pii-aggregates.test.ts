@@ -4,7 +4,7 @@
  * Row projections have always excluded PII-tagged columns; aggregates used to
  * leak them. `groupBy({ by: ['email'] })` emits one row per distinct plaintext
  * email, and `_min`/`_max` return a stored cell verbatim, so both now REQUIRE
- * the same `includePii: true` opt-in reads use and otherwise throw
+ * the same `includePii: UNSAFE` opt-in reads use and otherwise throw
  * `ValidationError` (E003).
  *
  * Deliberately still allowed with no opt-in: `_count` (a count, not a value),
@@ -19,6 +19,7 @@ import { describe, it } from 'node:test';
 import { ValidationError } from '../errors.js';
 import { PowqlInterface } from '../powql.js';
 import type { QueryInterface } from '../query/index.js';
+import { UNSAFE } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -55,7 +56,7 @@ function assertPiiRefusal(fn: () => unknown, column: string): void {
     assert.equal(err.code, 'TURBINE_E003');
     assert.match(err.message, new RegExp(`"${column}"`));
     assert.match(err.message, /PII-tagged/);
-    assert.match(err.message, /includePii: true/);
+    assert.match(err.message, /includePii: UNSAFE/);
     return true;
   });
 }
@@ -81,8 +82,8 @@ describe('groupBy on a PII column requires includePii', () => {
     );
   });
 
-  it('compiles with includePii: true and groups on the raw column', () => {
-    const { sql } = usersQuery().buildGroupBy({ by: ['email'], _count: true, includePii: true });
+  it('compiles with includePii: UNSAFE and groups on the raw column', () => {
+    const { sql } = usersQuery().buildGroupBy({ by: ['email'], _count: true, includePii: UNSAFE });
     assert.match(sql, /GROUP BY "email"/);
     assert.match(sql, /SELECT "email"/);
   });
@@ -112,7 +113,7 @@ describe('groupBy aggregates over a PII column', () => {
   });
 
   it('allows _min / _max with includePii', () => {
-    const { sql } = usersQuery().buildGroupBy({ by: ['name'], _min: { email: true }, includePii: true });
+    const { sql } = usersQuery().buildGroupBy({ by: ['name'], _min: { email: true }, includePii: UNSAFE });
     assert.match(sql, /MIN\("email"\)/);
   });
 
@@ -150,8 +151,8 @@ describe('aggregate _min / _max on a PII column requires includePii', () => {
     assertPiiRefusal(() => usersQuery().buildAggregate({ _max: { email: true } }), 'email');
   });
 
-  it('allows them with includePii: true', () => {
-    const { sql } = usersQuery().buildAggregate({ _min: { email: true }, _max: { email: true }, includePii: true });
+  it('allows them with includePii: UNSAFE', () => {
+    const { sql } = usersQuery().buildAggregate({ _min: { email: true }, _max: { email: true }, includePii: UNSAFE });
     assert.match(sql, /MIN\("email"\) AS "_min_email"/);
     assert.match(sql, /MAX\("email"\) AS "_max_email"/);
   });
@@ -187,7 +188,7 @@ describe('untagged schemas are byte-identical', () => {
 
   it('a PII schema with includePii emits that same SQL', () => {
     assert.equal(
-      usersQuery().buildGroupBy({ by: ['email'], _min: { email: true }, _count: true, includePii: true }).sql,
+      usersQuery().buildGroupBy({ by: ['email'], _min: { email: true }, _count: true, includePii: UNSAFE }).sql,
       usersQuery(false).buildGroupBy({ by: ['email'], _min: { email: true }, _count: true }).sql,
     );
   });
@@ -219,7 +220,7 @@ describe('PowQL aggregates apply the same PII policy', () => {
       (err: unknown) => {
         assert.ok(err instanceof ValidationError);
         assert.match(err.message, /"email"/);
-        assert.match(err.message, /includePii: true/);
+        assert.match(err.message, /includePii: UNSAFE/);
         return true;
       },
     );
@@ -231,9 +232,9 @@ describe('includePii cannot be served from a stale plan', () => {
     const q = usersQuery();
     // Compile the opt-in form first: if a plan were cached projection-blind,
     // the next (non-opt-in) call could be served from it.
-    assert.match(q.buildGroupBy({ by: ['email'], _count: true, includePii: true }).sql, /GROUP BY "email"/);
+    assert.match(q.buildGroupBy({ by: ['email'], _count: true, includePii: UNSAFE }).sql, /GROUP BY "email"/);
     assertPiiRefusal(() => q.buildGroupBy({ by: ['email'], _count: true }), 'email');
-    assert.match(q.buildAggregate({ _min: { email: true }, includePii: true }).sql, /MIN\("email"\)/);
+    assert.match(q.buildAggregate({ _min: { email: true }, includePii: UNSAFE }).sql, /MIN\("email"\)/);
     assertPiiRefusal(() => q.buildAggregate({ _min: { email: true } }), 'email');
   });
 });

@@ -31,8 +31,13 @@ const heroCode = `export default defineSchema({
 //  3. Studio renders it redacted, and refuses to filter,
 //     sort or page on it.
 
-await db.users.findMany();                     // no email
-await db.users.findMany({ includePii: true }); // email`;
+import { UNSAFE } from 'turbine-orm';
+
+await db.users.findMany();                       // no email
+await db.users.findMany({ includePii: UNSAFE }); // email
+// includePii: true throws. A privilege option cannot be
+// enabled by a value JSON.parse can produce, or a spread
+// request body would unlock it.`;
 
 const sqlCode = `SELECT "users".*,
   (SELECT COALESCE(json_agg(json_build_object(
@@ -63,7 +68,7 @@ const safetyFeatures = [
   {
     title: 'PII is a schema contract the SQL enforces',
     description:
-      'Tag a column pii: true and it is excluded from every default projection on every engine: top-level rows, with subqueries, batched loaders, write returns, and Studio. It is also refused as a groupBy key and as a _min / _max target, because both hand back a stored cell. includePii: true unlocks it explicitly, per read. A schema with no tagged column emits byte-identical SQL.',
+      'Tag a column pii: true and it is excluded from every default projection on every engine: top-level rows, with subqueries, batched loaders, write returns, and Studio. It is also refused as a groupBy key and as a _min / _max target, because both hand back a stored cell. includePii: UNSAFE unlocks it explicitly, per read, and the symbol is the only value that works: a request body spread into query args cannot escalate, because JSON.parse cannot produce a symbol. A schema with no tagged column emits byte-identical SQL.',
     stat: 'pii: true',
     statLabel: 'enforced in the projection',
   },
@@ -179,6 +184,20 @@ const capabilities = [
     cta: 'Pipeline docs',
   },
   {
+    title: 'Coming from Prisma? Keep your call sites.',
+    description:
+      'turbine migrate-from-prisma reads your schema.prisma and emits a typed mapping plus a migration report. Then createPrismaCompatClient wraps a TurbineClient in a PrismaClient-shaped surface: prisma.user.findMany({ include }) keeps working unchanged, so a port is measured in hours rather than in call sites. It is a runtime shim, not a codemod, so it never edits your source and you can move modules to the native API on your own schedule.',
+    href: '/migrate-from-prisma',
+    cta: 'Prisma migration guide',
+  },
+  {
+    title: 'Coming from Drizzle?',
+    description:
+      'The full API mapping, the schema translation, and the behavioural differences worth auditing before you cut over: the empty-where guard, relation declaration, and where the two query builders disagree about defaults.',
+    href: '/migrate-from-drizzle',
+    cta: 'Drizzle migration guide',
+  },
+  {
     title: 'MCP server for AI agents',
     description:
       'turbine mcp exposes your database to Claude Code, Cursor, or any MCP client over JSON-RPC stdio. Read-only tools only, no free-form SQL: schema overview, table detail, migrate status, doctor report, EXPLAIN, and sample rows, all inside BEGIN READ ONLY. The same safety stance as Studio.',
@@ -253,6 +272,22 @@ export default async function Home() {
               <CopyButton text="npm install turbine-orm" />
             </div>
           </div>
+
+          <p
+            className="animate-fade-in-up delay-4"
+            style={{
+              marginTop: '1rem',
+              marginBottom: '1.5rem',
+              color: 'var(--text-muted)',
+              fontSize: '0.875rem',
+            }}
+          >
+            Evaluating against Prisma, Drizzle or Kysely?{' '}
+            <Link href="/why-turbine" style={{ color: 'var(--accent)' }}>
+              Why Turbine
+            </Link>{' '}
+            says what is genuinely different, and what is table stakes in 2026.
+          </p>
 
           <div className="hero-code-window animate-slide-in-right delay-5 w-full">
             <div className="code-window-bar">
@@ -597,7 +632,12 @@ export default async function Home() {
             lineHeight: 1.7,
           }}
         >
-          Comparison as of July 2026, against Prisma 7 and Drizzle 0.45.
+          The longer, more honest version of this table, including what is{' '}
+          <em>not</em> a reason to switch, is on{' '}
+          <Link href="/why-turbine" style={{ color: 'var(--accent)' }}>
+            Why Turbine
+          </Link>
+          . Comparison as of July 2026, against Prisma 7 and Drizzle 0.45.
           Competitor features marked Preview or beta may change, and bundle
           sizes move release to release. Turbine&apos;s bundle-size and
           performance claims are measured on the{' '}
@@ -656,6 +696,9 @@ export default async function Home() {
           </a>
           <Link href="/queries" className="cta-btn cta-btn-secondary">
             API Reference
+          </Link>
+          <Link href="/why-turbine" className="cta-btn cta-btn-secondary">
+            Why Turbine
           </Link>
         </div>
       </section>

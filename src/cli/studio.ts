@@ -157,6 +157,15 @@ export interface StudioContext {
    * (saved queries persist to `<stateDir>/studio-queries.json`).
    */
   memorySavedQueries?: SavedQueriesFile;
+  /**
+   * Set when a generated metadata file was found but its PII tags could NOT be
+   * read (`PiiScan.ok === false`). Studio then fails CLOSED: every column of
+   * every table is marked `pii`, so the existing enforcement points redact
+   * everything, and this record drives the persistent UI banner explaining why.
+   * Absent when the scan succeeded, when there was no metadata file, or when
+   * `--show-pii` is on.
+   */
+  piiScanFailed?: { path: string; reason: string; columns: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +189,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
   let dialect: Dialect | undefined;
   let statementTimeout: { sql: string; params: unknown[] };
   let piiTags: { path: string; applied: number } | null = null;
+  let piiScanFailed: { path: string; reason: string; columns: number } | undefined;
 
   if (demo) {
     // Seeded in-memory SQLite store: no DATABASE_URL, no network. Each launch
@@ -230,7 +240,36 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     // what happened so the CLI can be explicit about it at startup.
     if (options.metadataDir) {
       const source = loadPiiTags(options.metadataDir);
-      if (source) piiTags = { path: source.path, applied: applyPiiTags(metadata, source.tags) };
+      if (source && !source.scan.ok) {
+        // FAIL CLOSED. The file exists and is meant to carry the tags, but the
+        // scanner could not prove anything about it (`ok: false` is "we do not
+        // know", never "no tagged columns"). Redacting nothing here and then
+        // reporting a clean tag count is the exact silent-failure shape this
+        // module was rewritten to end, and Studio is also the tool with a
+        // `--write` mode. So every column of every table is marked PII, which
+        // routes through the enforcement points that already exist (row
+        // redaction, builder rows, the write echo, and the orderBy / search /
+        // filter refusals) with no second code path. `--show-pii` is the
+        // override, and it overrides forced tags exactly as it overrides real
+        // ones.
+        piiScanFailed = {
+          path: source.path,
+          reason: source.scan.reason ?? 'unrecognized shape',
+          columns: forceTagAllColumnsPii(metadata),
+        };
+        // `applied` is the count of columns being redacted, which is what it
+        // means to the reader of the startup line. The warning below is what
+        // says these are forced, not declared.
+        piiTags = { path: source.path, applied: piiScanFailed.columns };
+        console.warn(
+          `[turbine studio] WARNING: ${source.path} exists but its PII tags could not be read ` +
+            `(${piiScanFailed.reason}). Failing closed: EVERY column of every table is redacted, sorting, ` +
+            'searching, and filtering on any column are refused, and the Query tab is disabled. Re-run ' +
+            '`turbine generate` to fix this, or pass --show-pii to run unredacted anyway.',
+        );
+      } else if (source) {
+        piiTags = { path: source.path, applied: applyPiiTags(metadata, source.tags) };
+      }
     }
 
     statementTimeout = options.adapter?.statementTimeout?.(30) ?? {
@@ -258,6 +297,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     // live. Non-demo honors the CLI flags.
     writable: demo ? false : options.write === true,
     showPii: demo ? false : options.showPii === true,
+    piiScanFailed,
     demo,
     dialect,
     // Demo never touches disk: saved queries live (and die) with the process,
@@ -560,6 +600,12 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
     showPii: ctx.showPii === true,
     // Demo flag drives the in-UI mode switcher + persistent demo banner.
     demo: ctx.demo === true,
+    // Present only when the PII tag scan failed and Studio is redacting
+    // everything as a result. Drives a persistent banner: a screen of redaction
+    // markers with no explanation reads like a bug, not like a safety posture.
+    piiScanFailed: ctx.piiScanFailed
+      ? { path: ctx.piiScanFailed.path, reason: ctx.piiScanFailed.reason, columns: ctx.piiScanFailed.columns }
+      : null,
   });
 }
 
@@ -1102,6 +1148,39 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
     return;
   }
 
+  // Fail-closed posture: the generated metadata exists but its PII tags could
+  // not be read, so every column is treated as PII. The Query tab is then
+  // REFUSED outright rather than half-served. A default projection that
+  // excludes every column emits `SELECT  FROM "t"`, which the database answers
+  // with a syntax error, and letting an explicit `select` through would be a
+  // way to name any column in a database whose sensitive columns are, by
+  // assumption, unknown. The Data tab still works and shows every cell
+  // redacted, so the shape of the database is still visible.
+  if (ctx.piiScanFailed && !ctx.showPii) {
+    sendJson(res, 400, {
+      error:
+        `The Query tab is disabled: PII tags could not be read from ${ctx.piiScanFailed.path} ` +
+        `(${ctx.piiScanFailed.reason}), so Studio treats every column as PII. Re-run \`turbine generate\`, or ` +
+        'restart Studio with --show-pii to query unredacted.',
+    });
+    return;
+  }
+
+  // The same empty-projection trap without the fail-closed posture: a schema
+  // that genuinely tags every column of a table. Explicit `select` is allowed
+  // here (the user named the columns, and the values are redacted on the way
+  // out); only the empty default projection is refused, with a reason instead
+  // of a syntax error.
+  const target = ctx.metadata.tables[tableName];
+  if (target && !ctx.showPii && args.select === undefined && target.columns.every((c) => c.pii === true)) {
+    sendJson(res, 400, {
+      error:
+        `Every column of "${tableName}" is PII-tagged, so the default projection is empty. Name the columns you ` +
+        'want in `select`, or run Studio with --show-pii.',
+    });
+    return;
+  }
+
   let deferred: ReturnType<QueryInterface<Record<string, unknown>>['buildFindMany']>;
   try {
     const qi = new QueryInterface<Record<string, unknown>>(
@@ -1141,17 +1220,30 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
     const elapsedMs = Date.now() - started;
     if (!ctx.demo) await client.query('COMMIT');
 
-    // Postgres auto-parses json/jsonb relation columns into JS values via its
-    // type parsers; the SQLite demo driver returns them as raw JSON strings. So
-    // in demo mode, parse relation columns back into arrays/objects (walking the
-    // `with` tree) to match the Postgres shape before redaction + serialization.
-    const rawRows = ctx.demo
-      ? parseDemoRelationRows(result.rows as Record<string, unknown>[], tableName, args.with, ctx.metadata)
-      : (result.rows as Record<string, unknown>[]);
-    const redactedRows = ctx.showPii ? rawRows : redactBuilderRows(rawRows, tableName, args.with, ctx.metadata);
+    // Run the driver rows through the QUERY'S OWN transform rather than reading
+    // `result.rows`. The transform is what turns a raw result into the entity
+    // shape the ORM contracts for: column names mapped to camelCase field names,
+    // dates coerced, and relation columns re-nested under the relation name at
+    // every depth (whatever encoding the plan chose, and whatever the driver
+    // handed back, pg's parsed json objects or the SQLite demo driver's raw JSON
+    // strings, which is why this also replaces the demo-only re-parse).
+    //
+    // SECURITY, not cosmetics: `relationLoadStrategy: 'flatten'` projects a
+    // to-one relation's columns FLAT onto the parent row under generated
+    // prefixed aliases (`f0__email`). `redactBuilderRows` redacts a relation's
+    // PII by walking the `with` tree into the NESTED object, so on flat rows it
+    // walked into nothing and every prefixed PII cell was served in the clear.
+    // `assertNoPiiPredicates` deliberately permits `select` on a PII column
+    // because "those values are redacted on the way out", and only the
+    // transform makes that true. The flat shape must never reach redaction.
+    const rows = deferred.transform(result as unknown as pg.QueryResult) as Record<string, unknown>[];
+    const redactedRows = ctx.showPii ? rows : redactBuilderRows(rows, tableName, args.with, ctx.metadata);
     sendJson(res, 200, {
       sql: deferred.sql,
-      columns: resultColumns(result, result.rows as Record<string, unknown>[]),
+      // Columns come from the TRANSFORMED rows: `result.fields` names raw SQL
+      // output columns (`created_at`, `f0__email`), which are neither what the
+      // rows are keyed by nor what a user would write in a query.
+      columns: entityResultColumns(redactedRows),
       rows: redactedRows.map((r) => serializeRow(r)),
       rowCount: result.rowCount ?? result.rows.length,
       elapsedMs,
@@ -1563,6 +1655,28 @@ export function apiDeleteSavedQuery(res: ServerResponse, ctx: StudioContext, id:
 /** The literal replacement value for a redacted PII cell. */
 export const PII_REDACTED = '•• redacted ••';
 
+/**
+ * Mark every column of every table `pii`, and return how many were touched.
+ *
+ * The fail-closed posture for "the generated metadata exists but its tags are
+ * unreadable". Deliberately expressed as data (tags on the metadata) rather
+ * than as a new flag threaded through the redaction code: every enforcement
+ * point in this file already asks `col.pii === true`, so there is no path that
+ * can forget to consult a separate switch.
+ */
+export function forceTagAllColumnsPii(metadata: SchemaMetadata): number {
+  let count = 0;
+  for (const table of Object.values(metadata.tables)) {
+    for (const col of table.columns) {
+      if (col.pii !== true) {
+        col.pii = true;
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
 /** Shared empty key set for the `--show-pii` fast path (no redaction). */
 const NO_PII_KEYS: ReadonlySet<string> = new Set<string>();
 
@@ -1643,51 +1757,23 @@ function redactBuilderRows(
 }
 
 /**
- * Demo-only: parse relation columns that arrive as raw JSON strings from the
- * SQLite driver back into arrays/objects, walking the `with` tree so nested
- * relations are parsed at every level. This mirrors what Postgres' json/jsonb
- * type parsers do automatically, so the builder response shape (and downstream
- * redaction) is identical across engines. Rows without the named relation, or
- * whose value is already a parsed object/array, pass through unchanged.
+ * Column descriptors for rows that have already been through a query's
+ * `transform`, i.e. entity rows keyed by camelCase FIELD name with relations
+ * nested under the relation name.
+ *
+ * Derived from the rows themselves rather than from `result.fields`, which
+ * names raw SQL output columns (`created_at`, or a flatten plan's `f0__email`)
+ * and so would label the grid with keys the rows do not have. Keys are unioned
+ * across every row in first-seen order: a `select` is uniform, but a null
+ * to-one relation and a JSON-shaped row can still differ, and a column missing
+ * from row 0 must not disappear from the header.
  */
-function parseDemoRelationRows(
-  rows: Record<string, unknown>[],
-  tableName: string,
-  withClause: unknown,
-  metadata: SchemaMetadata,
-): Record<string, unknown>[] {
-  const table = metadata.tables[tableName];
-  if (!table) return rows;
-  const relEntries =
-    withClause && typeof withClause === 'object'
-      ? Object.entries(withClause as Record<string, unknown>).filter(([, v]) => v)
-      : [];
-  if (relEntries.length === 0) return rows;
-
-  return rows.map((row) => {
-    const out: Record<string, unknown> = { ...row };
-    for (const [relName, relVal] of relEntries) {
-      const rel = table.relations[relName];
-      if (!rel) continue;
-      let child = out[relName];
-      if (typeof child === 'string') {
-        try {
-          child = JSON.parse(child);
-        } catch {
-          continue;
-        }
-      }
-      const nestedWith = relVal && typeof relVal === 'object' ? (relVal as { with?: unknown }).with : undefined;
-      if (Array.isArray(child)) {
-        out[relName] = parseDemoRelationRows(child as Record<string, unknown>[], rel.to, nestedWith, metadata);
-      } else if (child && typeof child === 'object') {
-        out[relName] = parseDemoRelationRows([child as Record<string, unknown>], rel.to, nestedWith, metadata)[0];
-      } else {
-        out[relName] = child;
-      }
-    }
-    return out;
-  });
+function entityResultColumns(rows: Record<string, unknown>[]): Array<{ name: string; dataTypeID: number }> {
+  const seen = new Set<string>();
+  for (const row of rows) {
+    for (const key of Object.keys(row)) seen.add(key);
+  }
+  return [...seen].map((name) => ({ name, dataTypeID: 0 }));
 }
 
 /**

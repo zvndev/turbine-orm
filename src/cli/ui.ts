@@ -259,13 +259,27 @@ export function stripAnsi(s: string): string {
 // Redact password from connection URL
 // ---------------------------------------------------------------------------
 
+/**
+ * A query-string parameter whose name ENDS in `password`: libpq's `password`
+ * and `sslpassword`, plus any vendor spelling of the same idea. Group 1 is
+ * `?`/`&` + the key, group 2 is the value, which runs to the next `&`, `#`, or
+ * the end of the string, and may be empty.
+ *
+ * Exported because "does this string carry a secret" and "redact the secret in
+ * this string" must agree on ONE definition. They did not: this redactor knew
+ * about `?password=` while `connectionStringHasPassword` in config.ts did not,
+ * so `turbine init --url` committed a query-form password into
+ * `turbine.config.ts` while printing the redacted spelling of the same string
+ * one line above. config.ts now matches with this exact pattern.
+ */
+export const PASSWORD_QUERY_PARAM_PATTERN = '([?&][^=&#]*password)=([^&#]*)';
+
+const PASSWORD_QUERY_PARAM_RE = new RegExp(PASSWORD_QUERY_PARAM_PATTERN, 'gi');
+
 export function redactUrl(url: string): string {
-  return (
-    redactUserinfo(url)
-      // Query-string password params: `password=`, `sslpassword=`, and similar,
-      // case-insensitive. Value runs up to the next `&`, `#`, or end of string.
-      .replace(/([?&][^=&#]*password)=([^&#]*)/gi, '$1=***')
-  );
+  // `String.replace` with a /g regex resets `lastIndex`, so sharing the compiled
+  // instance across calls is safe.
+  return redactUserinfo(url).replace(PASSWORD_QUERY_PARAM_RE, '$1=***');
 }
 
 /**

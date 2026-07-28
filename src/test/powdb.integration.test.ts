@@ -47,6 +47,7 @@ import {
   turbinePowDB,
 } from '../powdb.js';
 import { MAX_POWQL_DATETIME_TERMS } from '../powql.js';
+import { UNSAFE } from '../query/index.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
 
@@ -357,7 +358,7 @@ describe('powdb integration (embedded)', () => {
       assert.equal(g1.age, 111);
 
       // explicit opt-in still allowed
-      const all = await db.table('app_user').updateMany({ where: {}, allowFullTableScan: true, data: { age: 7 } });
+      const all = await db.table('app_user').updateMany({ where: {}, allowFullTableScan: UNSAFE, data: { age: 7 } });
       assert.equal(all.count, 3);
     });
   });
@@ -2109,7 +2110,7 @@ describe('powdb integration (embedded): nested projections (0.18 shaped results)
       const revealed = await db.nUser.findMany({
         where: { id: 'u1' },
         with: { posts: { orderBy: { views: 'asc' } } },
-        includePii: true,
+        includePii: UNSAFE,
       });
       assert.equal(revealed[0].posts[0].draftNotes, 'secret-a');
     });

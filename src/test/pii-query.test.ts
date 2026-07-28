@@ -4,7 +4,7 @@
  * The contract (from `ColumnMetadata.pii`'s JSDoc, which is normative): a
  * PII-tagged column is EXCLUDED from default projections. It comes back only
  * when it is named explicitly in `select`, or when the query passes
- * `includePii: true` (which opts in at the top level AND every nested `with`
+ * `includePii: UNSAFE` (which opts in at the top level AND every nested `with`
  * level). Untagged schemas behave byte-identically to before.
  *
  * These build-only tests assert the generated SQL and the write read-policy
@@ -31,6 +31,7 @@ import { mysqlDialect } from '../mysql.js';
 import { loadRelationsBatched, type RelationLoadContext } from '../query/batched-loader.js';
 import type { ReselectExecutor } from '../query/deferred.js';
 import type { QueryInterface } from '../query/index.js';
+import { UNSAFE } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -189,12 +190,12 @@ describe('pii: explicit select IS the opt-in', () => {
 
 describe('pii: includePii returns everything', () => {
   it('includePii collapses back to SELECT t.* (email available)', () => {
-    const { sql } = usersQuery().buildFindMany({ includePii: true });
+    const { sql } = usersQuery().buildFindMany({ includePii: UNSAFE });
     assert.match(sql, /"users"\.\*/, 'includePii with no select is the byte-identical `*` shape');
   });
 
   it('findUnique includePii returns SELECT t.*', () => {
-    const { sql } = usersQuery().buildFindUnique({ where: { id: 1 }, includePii: true });
+    const { sql } = usersQuery().buildFindUnique({ where: { id: 1 }, includePii: UNSAFE });
     assert.match(sql, /"users"\.\*/);
   });
 });
@@ -211,7 +212,7 @@ describe('pii: relation subqueries exclude the child PII column by default', () 
   });
 
   it('includePii reaches the relation subquery (secret present)', () => {
-    const { sql } = usersQuery().buildFindMany({ with: { posts: true }, includePii: true });
+    const { sql } = usersQuery().buildFindMany({ with: { posts: true }, includePii: UNSAFE });
     assert.match(sql, /'secret'/, 'includePii applies to nested with levels');
   });
 
@@ -224,7 +225,7 @@ describe('pii: relation subqueries exclude the child PII column by default', () 
     const base = usersQuery().buildFindMany({ with: { tags: true } });
     assert.match(base.sql, /'label'/);
     assert.doesNotMatch(base.sql, /'note'/, 'm2m target PII excluded by default');
-    const opted = usersQuery().buildFindMany({ with: { tags: true }, includePii: true });
+    const opted = usersQuery().buildFindMany({ with: { tags: true }, includePii: UNSAFE });
     assert.match(opted.sql, /'note'/, 'm2m target PII returned under includePii');
   });
 
@@ -234,7 +235,7 @@ describe('pii: relation subqueries exclude the child PII column by default', () 
     assert.doesNotMatch(sql, /'email'/, 'PII excluded at every nested level');
     const opted = usersQuery().buildFindMany({
       with: { posts: { with: { author: true } } },
-      includePii: true,
+      includePii: UNSAFE,
     });
     assert.match(opted.sql, /'email'/, 'includePii reaches deeply nested levels');
   });
@@ -248,7 +249,7 @@ describe('pii: the batched loader applies the same exclusion to its child fetch'
   it('default batched child fetch omits the child PII column', async () => {
     const schema = piiSchema();
     const captured: string[] = [];
-    const ctx = makeCtx(schema, captured, false);
+    const ctx = makeCtx(schema, captured, undefined);
     await loadRelationsBatched(ctx, [{ id: 1 }], { posts: true });
     const postFetch = captured.find((s) => s.includes('"posts"'));
     assert.ok(postFetch, 'a follow-up query against posts must run');
@@ -259,7 +260,7 @@ describe('pii: the batched loader applies the same exclusion to its child fetch'
   it('includePii threads into the batched child fetch (secret present)', async () => {
     const schema = piiSchema();
     const captured: string[] = [];
-    const ctx = makeCtx(schema, captured, true);
+    const ctx = makeCtx(schema, captured, UNSAFE);
     await loadRelationsBatched(ctx, [{ id: 1 }], { posts: true });
     const postFetch = captured.find((s) => s.includes('"posts"'));
     assert.ok(postFetch);
@@ -269,7 +270,11 @@ describe('pii: the batched loader applies the same exclusion to its child fetch'
 });
 
 /** A RelationLoadContext whose exec records SQL and returns no rows. */
-function makeCtx(schema: SchemaMetadata, captured: string[], includePii: boolean): RelationLoadContext {
+function makeCtx(
+  schema: SchemaMetadata,
+  captured: string[],
+  includePii: typeof UNSAFE | undefined,
+): RelationLoadContext {
   return {
     parentMeta: schema.tables.users!,
     schema,
@@ -524,7 +529,7 @@ describe('pii: includePii participates in the SQL-cache fingerprint', () => {
 
   it('same args ± includePii produce different SQL', () => {
     const off = fresh({ with: { posts: true } });
-    const on = fresh({ with: { posts: true }, includePii: true });
+    const on = fresh({ with: { posts: true }, includePii: UNSAFE });
     assert.notEqual(off, on, 'default and includePii SQL must differ');
     assert.doesNotMatch(off, /'secret'/);
     assert.match(on, /'secret'/);
@@ -535,16 +540,16 @@ describe('pii: includePii participates in the SQL-cache fingerprint', () => {
     // Warm the no-PII entry, then request the includePii variant on the same
     // interface: it must NOT be served the cached no-PII SQL.
     const cold = q.buildFindMany({ with: { posts: true } } as never) as { sql: string };
-    const hot = q.buildFindMany({ with: { posts: true }, includePii: true } as never) as { sql: string };
+    const hot = q.buildFindMany({ with: { posts: true }, includePii: UNSAFE } as never) as { sql: string };
     assert.doesNotMatch(cold.sql, /'secret'/);
     assert.match(hot.sql, /'secret'/);
-    assert.equal(hot.sql, fresh({ with: { posts: true }, includePii: true }));
+    assert.equal(hot.sql, fresh({ with: { posts: true }, includePii: UNSAFE }));
   });
 
   it('warm cache with includePii=true, then hit again: warm-hit stays correct', () => {
     const q = makeQuery('users', piiSchema());
-    const first = q.buildFindMany({ includePii: true } as never) as { sql: string };
-    const second = q.buildFindMany({ includePii: true } as never) as { sql: string };
+    const first = q.buildFindMany({ includePii: UNSAFE } as never) as { sql: string };
+    const second = q.buildFindMany({ includePii: UNSAFE } as never) as { sql: string };
     assert.equal(first.sql, second.sql);
     assert.match(second.sql, /"users"\.\*/);
   });
@@ -571,7 +576,7 @@ describe('pii: untagged schemas emit byte-identical SQL', () => {
   });
 
   it('a tagged schema under includePii matches the untagged control SQL', () => {
-    const tagged = usersQuery().buildFindMany({ includePii: true });
+    const tagged = usersQuery().buildFindMany({ includePii: UNSAFE });
     const control = (
       makeQuery('users', untaggedSchema()) as unknown as QueryInterface<Record<string, unknown>>
     ).buildFindMany({});

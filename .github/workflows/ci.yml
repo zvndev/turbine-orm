@@ -21,6 +21,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
+      # CHANGELOG heading contract. This check existed only in prepublishOnly,
+      # i.e. it fired at `npm publish` time, on the release engineer's machine,
+      # after the offending heading had already been reviewed and merged. Running
+      # it here makes the violation visible on the PR that introduces it, which
+      # is the only place it is cheap to fix.
+      - run: npm run check:changelog
 
   typecheck:
     runs-on: ubuntu-latest
@@ -84,6 +90,26 @@ jobs:
       - run: npm run test:coverage
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+
+  # Coverage gate for the three highest-consequence CLI files: cli/studio.ts
+  # (WRITE MODE executes mutations, plus the PII redaction path), cli/migrate.ts
+  # (runs destructive DDL) and cli/destructive.ts (decides what counts as
+  # destructive). `src/cli/**` is excluded from .c8rc.json wholesale, which hid
+  # the fact that these three are already well tested AND removed any ratchet on
+  # them, they could have decayed to zero coverage with every gate green. Its own
+  # job, and its own threshold set, so a regression here cannot hide behind the
+  # query runtime's aggregate. No database: these suites drive the exported
+  # request handlers and the migration runner directly, so this job is seconds.
+  coverage-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:coverage:cli
 
   # Integration tests run against a real Postgres service container, exercised
   # across a version matrix (PG 14/15/16/17). The service is seeded from
@@ -236,8 +262,21 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Run turbine-orm/mysql integration tests against MySQL 8
-        run: npx tsx --test src/test/mysql.test.ts
+      # Runs the WHOLE test directory with MYSQL_URL set, not just
+      # mysql.test.ts. Two reasons. First, a cross-engine regression in
+      # query/where.ts / relations.ts / writes.ts used to be caught only if
+      # someone REMEMBERED to duplicate the case into mysql.test.ts, a process
+      # guarantee rather than a gate; src/test/cross-engine-correctness.test.ts
+      # is the shared battery that closes that, and it runs from this env var.
+      # Second, running the directory means a future engine-aware test file is
+      # picked up here automatically, with no CI edit to forget. The
+      # dialect-agnostic majority of the suite runs too (it is build-only and
+      # costs ~80s), and DATABASE_URL is unset so the Postgres-gated tests skip
+      # rather than fail. cross-engine-correctness.test.ts uses its OWN database
+      # (turbine_cross), so it cannot race mysql.test.ts, which drops and
+      # recreates its tables in turbine_test.
+      - name: Run the suite against MySQL 8 (engine + cross-engine battery)
+        run: npm run test:unit
         env:
           MYSQL_URL: mysql://root:root@127.0.0.1:3306/turbine_test
 
@@ -299,8 +338,13 @@ jobs:
           EOF
           node create-mssql-db.cjs
           rm -f create-mssql-db.cjs
-      - name: Run turbine-orm/mssql integration tests against SQL Server 2022
-        run: npx tsx --test src/test/mssql.test.ts
+      # Whole test directory with MSSQL_URL set, same reasoning as the MySQL job
+      # above: the shared correctness battery in
+      # src/test/cross-engine-correctness.test.ts runs from this env var, and a
+      # future engine-aware file needs no CI edit. It uses its own
+      # `turbine_cross` database so it cannot race mssql.test.ts.
+      - name: Run the suite against SQL Server 2022 (engine + cross-engine battery)
+        run: npm run test:unit
         env:
           MSSQL_URL: mssql://sa:Turbine_Passw0rd!@127.0.0.1:1433/turbine_test
 
@@ -517,6 +561,14 @@ jobs:
         working-directory: ${{ env.SMOKE_DIR }}
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/adapters'); if (!m.cockroachdb || !m.yugabytedb || !m.postgresql) { console.error('adapters subpath broken'); process.exit(1); } console.log('adapters subpath OK', Object.keys(m).slice(0,8).join(','));"
+      - name: Verify prisma-compat subpath import
+        working-directory: ${{ env.SMOKE_DIR }}
+        # `./prisma-compat` is a published subpath that neither smoke path
+        # imported, so a broken exports entry or a missing dist file for it would
+        # have shipped green: it is the entry point every migrating Prisma user
+        # hits first.
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/prisma-compat'); if (typeof m.createPrismaCompatClient !== 'function' || !m.Prisma) { console.error('prisma-compat subpath broken, exports: ' + Object.keys(m).join(',')); process.exit(1); } console.log('prisma-compat subpath OK');"
 
   # Simulates the real first-run a brand-new user gets from npm 11 defaults and
   # runs the documented quickstart end-to-end against a real Postgres. This is

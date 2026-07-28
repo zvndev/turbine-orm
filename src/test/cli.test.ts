@@ -36,11 +36,20 @@ import { box, redactUrl, stripAnsi, table } from '../cli/ui.js';
 
 describe('CLI config', () => {
   describe('configTemplate()', () => {
-    it('generates template with a connection string', () => {
-      const result = configTemplate('postgres://user:pass@localhost:5432/mydb');
-      assert.ok(result.includes("url: 'postgres://user:pass@localhost:5432/mydb'"));
+    it('generates template with a password-free connection string', () => {
+      const result = configTemplate('postgres://user@localhost:5432/mydb');
+      assert.ok(result.includes("url: 'postgres://user@localhost:5432/mydb'"));
       assert.ok(result.includes('import type { TurbineCliConfig }'));
       assert.ok(result.includes('export default config'));
+    });
+
+    it('refuses to inline a connection string carrying a password', () => {
+      // turbine.config.ts is a committed file, so a `--url` password reads
+      // process.env.DATABASE_URL instead (turbine init writes the real value
+      // into a gitignored .env). See cli-init-secrets.test.ts.
+      const result = configTemplate('postgres://user:pass@localhost:5432/mydb');
+      assert.ok(!result.includes('pass@'), 'the password must not appear in the generated config');
+      assert.ok(result.includes('url: process.env.DATABASE_URL'));
     });
 
     it('generates template without connection string (uses process.env)', () => {
@@ -65,15 +74,16 @@ describe('CLI config', () => {
       assert.ok(result.includes("schemaFile: './turbine/schema.ts'"));
     });
 
-    it('preserves special characters in connection string', () => {
-      const url = "postgres://user:p@ss'w0rd@localhost:5432/db";
+    it('escapes a quote in an inlined (password-free) connection string', () => {
+      // Single quotes delimit the emitted string, so an unescaped one would
+      // produce a config file that does not parse.
+      const url = "postgres://localhost:5432/db?options='x'";
       const result = configTemplate(url);
-      // The string is embedded as-is inside single quotes
-      assert.ok(result.includes(url));
+      assert.ok(result.includes("url: 'postgres://localhost:5432/db?options=\\'x\\''"));
     });
 
-    it('handles connection string with ampersands and query params', () => {
-      const url = 'postgres://user:pass@localhost:5432/db?sslmode=require&timeout=30';
+    it('handles a password-free connection string with query params', () => {
+      const url = 'postgres://user@localhost:5432/db?sslmode=require&timeout=30';
       const result = configTemplate(url);
       assert.ok(result.includes(url));
     });

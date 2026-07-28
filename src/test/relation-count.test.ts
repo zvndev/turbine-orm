@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { RelationError, ValidationError } from '../errors.js';
-import { QueryInterface } from '../query/index.js';
+import { QueryInterface, UNSAFE } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -312,7 +312,7 @@ describe('relation _count, global filters', () => {
       posts: [{ k: 1, c: 5 }],
     });
     await usersQiFiltered(pool, 'batched', { posts: { title: { not: 'spam' } } }).findMany({
-      skipGlobalFilters: true,
+      skipGlobalFilters: UNSAFE,
       with: { _count: { posts: true } },
     } as never);
     const follow = calls.find((c) => /FROM "posts"/.test(c.sql))!;

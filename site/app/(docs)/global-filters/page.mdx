@@ -103,18 +103,85 @@ The filter still compiles into the `WHERE`, it just can't turn `{}` into an allo
 
 ## Opting out, `skipGlobalFilters`
 
-Any read or mutation accepts `skipGlobalFilters` to bypass filters for that call. Pass `true` to skip all of them, or an array of table names to skip only those:
+Any read or mutation accepts `skipGlobalFilters` to bypass filters for that call. It is a **privilege option**: it is unlocked by the `UNSAFE` symbol and by nothing else.
 
 ```ts
-// See a soft-deleted row (admin tooling)
-const all = await db.posts.findMany({ skipGlobalFilters: true });
+import { UNSAFE } from 'turbine-orm';
 
-// Skip only the `posts` filter, keep others
+// See a soft-deleted row (admin tooling): skip every filter on this call
+const all = await db.posts.findMany({ skipGlobalFilters: UNSAFE });
+
+// Skip only the `posts` filter, keep others. The array LEADS with the sentinel.
 const some = await db.users.findMany({
   with: { posts: true },
-  skipGlobalFilters: ['posts'],
+  skipGlobalFilters: [UNSAFE, 'posts'],
 });
 ```
+
+`skipGlobalFilters: true` and `skipGlobalFilters: ['posts']` throw a `ValidationError` ([`TURBINE_E003`](/errors)). See [Privilege options](#privilege-options-and-the-unsafe-symbol) below for why, and for the upgrade path if you are passing `true` today.
+
+## Privilege options and the `UNSAFE` symbol
+
+Three query options remove a safety boundary rather than change a result: `skipGlobalFilters` (drops the tenant or soft-delete predicate), [`includePii`](/queries#pii-fields-includepii) (drops the PII projection), and `allowFullTableScan` (drops the empty-`where` guard on a mutation). Each of them is enabled **only** by a symbol exported from the package:
+
+```ts
+import { UNSAFE } from 'turbine-orm';
+```
+
+### Why a symbol and not `true`
+
+Because all three are ordinary siblings of `where` on the same options object, and the idiomatic handler spreads a request body:
+
+```ts
+// The shape this closes. Do not ship this either way, but it used to be a breach.
+app.get('/users', (req, res) => db.users.findMany({ ...req.body }));
+```
+
+A client posting `{"where":{"name":"x"},"skipGlobalFilters":true}` got the same statement **minus the tenant predicate**: the documented multi-tenancy mechanism, removed over the wire by the person it was there to contain. `includePii: true` unlocked the PII projection through the same hole, and `allowFullTableScan: true` disarmed the guard that stops an unqualified `UPDATE` or `DELETE`.
+
+Typing the options `boolean` and writing "be careful" is not a fix. This is a mass-assignment shape, and mass assignment happens precisely because nobody enumerated the keys. `JSON.parse` cannot produce a symbol, and neither can a query string, a form body, or a `structuredClone` of parsed input. There is no untrusted-data path that puts `UNSAFE` on an args object at all, so the escalation stops being discouraged and becomes structurally impossible, which is the only version of the property that survives the next refactor.
+
+The array form is policed exactly as hard as the bare one, because `{"skipGlobalFilters":["users"]}` is the same breach with one extra step. `[UNSAFE, 'posts']` is accepted; `['posts']` is not.
+
+<Callout type="note" title="Symbol.for, not Symbol()">
+  `UNSAFE` is registered as `Symbol.for('turbine-orm.UNSAFE')`. Turbine ships
+  dual ESM and CJS builds, and a project can easily import `UNSAFE` from one
+  copy while the query interface it calls came from the other. A plain
+  `Symbol()` would be a different value in each copy and every privileged call
+  would throw. The global registry makes the two copies agree. That
+  `Symbol.for` is reachable from application code does not weaken anything:
+  the attacker's channel is parsed data, which cannot carry a symbol either
+  way.
+</Callout>
+
+### Upgrading from `true`
+
+This is a **breaking change** on those three options, and it is deliberately loud rather than quiet.
+
+| Before | After |
+|---|---|
+| `skipGlobalFilters: true` | `skipGlobalFilters: UNSAFE` |
+| `skipGlobalFilters: ['posts']` | `skipGlobalFilters: [UNSAFE, 'posts']` |
+| `includePii: true` | `includePii: UNSAFE` |
+| `allowFullTableScan: true` | `allowFullTableScan: UNSAFE` |
+
+**TypeScript finds every one of them for you.** The option types are now `Unsafe`, so each row of that table is a compile error before it is a runtime error: type-check the project and the compiler hands you the complete list of call sites to change.
+
+That includes the boolean shapes, which is the part worth reading twice. `allowFullTableScan: false` does **not** typecheck, and neither does `allowFullTableScan: someFeatureFlag`. A conditional call site is written by adding the key or not:
+
+```ts
+await db.sessions.deleteMany({
+  where: {},
+  ...(purgeEverything ? { allowFullTableScan: UNSAFE } : {}),
+});
+```
+
+Two rules govern what happens at *runtime*, which is what an untyped call site hits (plain JavaScript, or args that arrive as `any` from a boundary):
+
+- **`false`, `null` and `undefined` are accepted and mean "not enabled".** They never throw, because none of them *asks* for the privilege. This is a courtesy to untyped callers, not a supported way to write the option in TypeScript, where the type already rules them out.
+- **Everything else, `true` included, throws.** Ignoring a stale `true` would trade an escalation bug for a silent-failure bug: your admin tool would quietly stop seeing soft-deleted rows, or quietly return objects with the PII columns missing, with no signal anywhere. The error names the option and the import, and ends with the line worth grepping for in an incident: *"If you did not write this option, an untrusted object was spread into these query args."*
+
+If you use [`turbine-orm/prisma-compat`](/migrate-from-prisma), the same rule applies, because compat forwards these three options verbatim and core is the single judge.
 
 ## See also
 

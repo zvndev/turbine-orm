@@ -66,6 +66,7 @@ import type {
   QueryResult,
   RelationLoadStrategy,
   RelationPickOrderBy,
+  ResolvedSkipGlobalFilters,
   SkipGlobalFilters,
   TypedWithClause,
   UpdateArgs,
@@ -76,6 +77,7 @@ import type {
   WithOptions,
   WithOrderByObject,
 } from './types.js';
+import { resolveSkipGlobalFilters, resolveUnsafeFlag, UNSAFE, type Unsafe } from './types.js';
 import {
   isTemporalInfinity,
   LRUCache,
@@ -380,6 +382,49 @@ function maybeExpandCompoundUnique<A extends { where?: unknown }>(meta: TableMet
 }
 
 /**
+ * Bridge the nested-write engine's table handles onto the privilege sentinel.
+ *
+ * `nested-write.ts` clears a `set` relation by calling
+ * `updateMany({ where, data, allowFullTableScan: true })`: an INTERNAL,
+ * fully-derived predicate (the parent's own FK match, guarded there against a
+ * null reference key), not caller input, and the flag is what lets that
+ * unconditional-looking statement through the empty-`where` guard. Since
+ * `allowFullTableScan` now only accepts {@link UNSAFE}, that literal `true`
+ * would throw and every nested `set` would fail.
+ *
+ * Rather than hand the nested-write engine the sentinel (which would put the
+ * privilege value on a second, less obvious import path), the translation
+ * happens HERE, at the single seam where core hands it a table accessor. The
+ * rewrite is deliberately narrow: `updateMany` only, and only when the value is
+ * exactly `true`, so nothing else about the call is touched and no other
+ * operation gains an escape hatch.
+ *
+ * @internal Exported for its unit test; not part of the public surface.
+ */
+export function unlockNestedWriteTx<X extends { table(name: string): Record<string, unknown> }>(tx: X): X {
+  const wrapped = {
+    table(name: string): Record<string, unknown> {
+      const handle = tx.table(name);
+      // A Proxy rather than a copied object: the handle is a class instance
+      // whose methods live on the prototype, so a spread would produce an
+      // object with no methods, and re-listing them by hand would silently
+      // drop any method added later.
+      return new Proxy(handle, {
+        get(target, prop) {
+          const value = Reflect.get(target, prop, target);
+          if (typeof value !== 'function') return value;
+          const method = value as (args: Record<string, unknown>) => unknown;
+          if (prop !== 'updateMany') return method.bind(target);
+          return (args: Record<string, unknown>) =>
+            method.call(target, args?.allowFullTableScan === true ? { ...args, allowFullTableScan: UNSAFE } : args);
+        },
+      });
+    },
+  };
+  return wrapped as unknown as X;
+}
+
+/**
  * Whether a relation `with`-clause `orderBy` carries no actual ordering: an
  * empty array, or an object with no non-`undefined` own keys. Used by
  * {@link QueryInterface.applyStableRelationOrder} so an explicit (non-empty)
@@ -550,8 +595,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * `orderBy` all see it without threading it through dozens of signatures.
    * Only load-bearing when {@link globalFilters} is configured; build+collect are
    * synchronous per call, so this transient is never observed across an await.
+   *
+   * Holds the RESOLVED form ({@link ResolvedSkipGlobalFilters}), never the raw
+   * arg: every assignment goes through `resolveSkipGlobalFilters`, which is
+   * where a non-sentinel value (`true`, `['users']`, anything a JSON body can
+   * carry) is refused. Keeping the raw value here would push that decision out
+   * to each reader, and one reader forgetting it is the whole bug class.
    */
-  private currentSkip: SkipGlobalFilters | undefined;
+  private currentSkip: ResolvedSkipGlobalFilters | undefined;
 
   /**
    * The bound view of this instance passed to the shared WHERE walk
@@ -724,10 +775,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // row and so need the same infinity reading as `parseRow`.
       temporalInfinity: this.temporalInfinity,
       crossSchemaTypeColumns: this.crossSchemaTypeColumns,
-      get currentSkip(): SkipGlobalFilters | undefined {
+      get currentSkip(): ResolvedSkipGlobalFilters | undefined {
         return self.currentSkip;
       },
-      set currentSkip(v: SkipGlobalFilters | undefined) {
+      set currentSkip(v: ResolvedSkipGlobalFilters | undefined) {
         self.currentSkip = v;
       },
       q: (name) => this.q(name),
@@ -1501,12 +1552,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // on the batched subset up front.
     rejectNestedPickOrder(batchedWith);
     const skip = args.skipGlobalFilters;
+    // Resolve the sentinel HERE, not just in buildFindMany below: this method
+    // decides the base projection before it ever builds SQL, so a literal
+    // `true` would otherwise shape the projection (truthily) and only be
+    // refused one step later.
+    const includePii = resolveUnsafeFlag(args.includePii, 'includePii');
     const needed = neededParentKeyFields(this.tableMeta, batchedWith);
     const proj = includeKeysForBatching(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       needed,
-      defaultProjectionFields(this.tableMeta, args.includePii),
+      defaultProjectionFields(this.tableMeta, includePii),
     );
     const hasJoin = Object.keys(joinWith).length > 0;
     // Force the residual `with` onto the join plan so the base query never
@@ -1534,7 +1590,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const entities = single ? (rows ? [rows as Record<string, unknown>] : []) : (rows as Record<string, unknown>[]);
       if (entities.length > 0) {
         await loadRelationsBatched(
-          this.batchedContext(args.timeout, skip, args.includePii === true, args.forceCustomPlan === true),
+          this.batchedContext(args.timeout, skip, args.includePii, args.forceCustomPlan === true),
           entities,
           batchedWith,
           args.timeout,
@@ -1557,9 +1613,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private batchedContext(
     timeout: number | undefined,
     skip: SkipGlobalFilters | undefined,
-    includePii: boolean,
+    // BOTH privilege values stay in their RAW (sentinel) form here, and that is
+    // load-bearing rather than laziness: the batched loader re-enters
+    // `buildFindMany` one level down with these exact values on the child args,
+    // where they are resolved (and refused) again. Handing it a plain `true`
+    // would make every relation follow-up throw. The caller has already
+    // resolved them once for its own projection decisions, so an invalid value
+    // never reaches this point.
+    includePii: Unsafe | undefined,
     forceCustomPlan = false,
   ): RelationLoadContext {
+    // The loader's own global-filter callback below needs the RESOLVED form.
+    const resolvedSkip = resolveSkipGlobalFilters(skip);
     const childOptions: QueryInterfaceOptions = {
       ...this.options,
       defaultLimit: undefined,
@@ -1585,7 +1650,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // so a batched load excludes/includes PII exactly as the join strategy.
       includePii,
       tableGlobalFilter: (table, alias, precedingParams) => {
-        const gf = this.resolveGlobalFilter(table, skip);
+        const gf = this.resolveGlobalFilter(table, resolvedSkip);
         if (!gf) return null;
         const meta = this.schema.tables[table];
         if (!meta) return null;
@@ -1634,7 +1699,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const entities = deferred.transform(result) as Record<string, unknown>[];
     if (entities.length > 0) {
       await loadRelationsBatched(
-        this.batchedContext(args.timeout, skip, args.includePii === true, args.forceCustomPlan === true),
+        this.batchedContext(args.timeout, skip, args.includePii, args.forceCustomPlan === true),
         entities,
         withClause,
         args.timeout,
@@ -1658,7 +1723,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       needed,
-      defaultProjectionFields(this.tableMeta, args.includePii),
+      defaultProjectionFields(this.tableMeta, resolveUnsafeFlag(args.includePii, 'includePii')),
     );
     const baseArgs = {
       ...args,
@@ -2115,7 +2180,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       needed,
-      defaultProjectionFields(this.tableMeta, args.includePii),
+      defaultProjectionFields(this.tableMeta, resolveUnsafeFlag(args.includePii, 'includePii')),
     );
     const baseArgs = { ...args, with: undefined, select: proj.select, omit: proj.omit } as unknown as FindUniqueArgs<T>;
     const deferred = this.buildFindUnique(baseArgs as Parameters<QueryInterface<T, R>['buildFindUnique']>[0]);
@@ -2128,12 +2193,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const entity = deferred.transform(result) as Record<string, unknown> | null;
     if (!entity) return null;
     await loadRelationsBatched(
-      this.batchedContext(
-        args.timeout,
-        args.skipGlobalFilters,
-        args.includePii === true,
-        args.forceCustomPlan === true,
-      ),
+      this.batchedContext(args.timeout, args.skipGlobalFilters, args.includePii, args.forceCustomPlan === true),
       [entity],
       withClause,
       args.timeout,
@@ -2149,7 +2209,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
-    this.currentSkip = args.skipGlobalFilters;
+    this.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
     // Prisma compound-unique selector expansion (before global-filter merge and
     // fingerprinting, so the cache only ever sees the canonical expanded where).
     args = maybeExpandCompoundUnique(this.tableMeta, args);
@@ -2185,7 +2245,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const normalized = this.applyStableRelationOrder(args.with as WithClause, this.table);
       if (normalized !== args.with) args = { ...args, with: normalized as typeof args.with };
     }
-    const includePii = args.includePii === true;
+    // Resolved once, see buildFindMany.
+    const includePii = resolveUnsafeFlag(args.includePii, 'includePii');
     // findUnique is never flatten-planned: it reads ONE parent row, so the
     // correlated subquery already runs exactly once and a join buys nothing.
     // Say so, because the caller did ask for a strategy that is not running.
@@ -2317,7 +2378,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.collectWithParams(args.with as WithClause, params);
     this.crossCheckCache('findUnique', ck, entry, buildSql, params);
 
-    const parseWith = this.makeNestedParser(args.with as WithClause, args.includePii === true);
+    const parseWith = this.makeNestedParser(args.with as WithClause, includePii);
 
     return {
       sql: entry.sql,
@@ -2547,7 +2608,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>[]> {
-    this.currentSkip = args?.skipGlobalFilters;
+    this.currentSkip = resolveSkipGlobalFilters(args?.skipGlobalFilters);
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations BEFORE fingerprinting, so the two orderings get distinct cache
     // entries and every downstream path (SQL build, collect, parser) inherits it.
@@ -2588,7 +2649,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
     }
-    const includePii = args?.includePii === true;
+    // Resolve the PII opt-in ONCE, before any projection decision. The value is
+    // the UNSAFE sentinel or nothing: a literal `true` (what a spread request
+    // body carries) throws here rather than unlocking the projection.
+    const includePii = resolveUnsafeFlag(args?.includePii, 'includePii');
     const columnsList = this.resolveColumns(args?.select, args?.omit, includePii);
     const colKey = columnsList ? columnsList.join(',') : '*';
     // AND-merge this table's global filter into the user where; `hasWhere` gates
@@ -2873,9 +2937,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // function of the schema, the `with` shape and `includePii`, never of
     // `limit`, so the batch-size override the speculative fetch applies cannot
     // change it, and the stream's parser matches the emitted SQL.
-    const streamFlattenPlan = hasRelations ? this.planFlatten(args, args?.includePii === true) : null;
+    // Resolved once for the whole stream: the flatten plan and the row parser
+    // MUST agree with the SQL buildFindMany emits below, and reading the raw
+    // sentinel with `=== true` here would have quietly planned a no-PII parser
+    // over a with-PII statement.
+    const streamPii = resolveUnsafeFlag(args?.includePii, 'includePii');
+    const streamFlattenPlan = hasRelations ? this.planFlatten(args, streamPii) : null;
     const parseWith = hasRelations
-      ? this.makeNestedParser(args!.with as WithClause, args?.includePii === true, streamFlattenPlan)
+      ? this.makeNestedParser(args!.with as WithClause, streamPii, streamFlattenPlan)
       : null;
 
     // --- Speculative first fetch: try to satisfy the entire drain in one RTT ---
@@ -2925,7 +2994,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // connection, so `pool.query` already IS that connection. The stream rides
     // on it, is never released here, and the dialect is told to emit no
     // transaction control of its own (`ambientTransaction`).
-    const client = this.txScoped ? null : await this.pool.connect();
+    const client = this.txScoped ? null : await this.acquireConnection();
     const conn: StreamableConnection = client ?? {
       query: async (text: string, values?: unknown[]) =>
         (await this.pool.query(text, values)) as { rows: Record<string, unknown>[] },
@@ -3181,8 +3250,33 @@ export class QueryInterface<T extends object, R extends object = {}> {
     });
   }
 
+  /**
+   * Check out a pooled connection, translating a driver failure into a typed
+   * Turbine error.
+   *
+   * `pool.connect()` is where the first-run failures land: wrong password
+   * (SQLSTATE 28P01), no such database (3D000), nothing listening
+   * (ECONNREFUSED), an unverifiable TLS certificate. Unwrapped, every one of
+   * those surfaces from an ordinary `db.users.create({ data: { ...nested } })`
+   * as a raw pg `DatabaseError` whose `.code` is a SQLSTATE, on the same
+   * property Turbine puts `TURBINE_E0NN` in.
+   *
+   * client.ts has its own copy for `$transaction` / `connect()`; this one
+   * exists because `query/` must not import client.ts (circular dependency).
+   * The query paths need no equivalent: `pool.query()` opens the connection
+   * itself and rejects with the connect error, which the query boundary
+   * already wraps.
+   */
+  private async acquireConnection(): Promise<pg.PoolClient> {
+    try {
+      return await this.pool.connect();
+    } catch (err) {
+      throw wrapPgError(err);
+    }
+  }
+
   private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>): Promise<R> {
-    const client = await this.pool.connect();
+    const client = await this.acquireConnection();
     let began = false;
     try {
       await client.query(this.dialect.beginStatement());
@@ -3202,8 +3296,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // implicit transaction.
         this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
       );
-      // biome-ignore lint/suspicious/noExplicitAny: TransactionClient satisfies NestedWriteContext['tx'] at runtime
-      const ctx: NestedWriteContext = { schema: this.schema, tx: tx as any, scopedConnect: this.scopedConnect };
+      const ctx: NestedWriteContext = {
+        schema: this.schema,
+        // biome-ignore lint/suspicious/noExplicitAny: TransactionClient satisfies NestedWriteContext['tx'] at runtime
+        tx: unlockNestedWriteTx(tx as any),
+        scopedConnect: this.scopedConnect,
+      };
       const result = await fn(ctx);
       await client.query(this.dialect.commitStatement());
       return result;
@@ -3230,7 +3328,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const opts: QueryInterfaceOptions = { ...this.options, _txScoped: true };
     return {
       schema,
-      tx: this.makeTxProxy(pool, schema, middlewares, opts),
+      tx: unlockNestedWriteTx(this.makeTxProxy(pool, schema, middlewares, opts)),
     };
   }
 
@@ -3305,7 +3403,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildCount(args?: CountArgs<T>): DeferredQuery<number> {
-    this.currentSkip = args?.skipGlobalFilters;
+    this.currentSkip = resolveSkipGlobalFilters(args?.skipGlobalFilters);
     const effWhere = this.mergeGlobalFilter(args?.where as Record<string, unknown> | undefined);
     const hasWhere = effWhere !== undefined;
     const whereObj = (effWhere ?? {}) as Record<string, unknown>;
@@ -3617,7 +3715,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   private resolveGlobalFilter(
     table: string,
-    skip: SkipGlobalFilters | undefined = this.currentSkip,
+    skip: ResolvedSkipGlobalFilters | undefined = this.currentSkip,
   ): Record<string, unknown> | null {
     return whereMod.resolveGlobalFilter(this.ctx, table, skip);
   }

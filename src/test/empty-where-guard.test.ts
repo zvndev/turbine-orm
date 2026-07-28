@@ -4,7 +4,7 @@
  * Every mutation (`update`, `updateMany`, `delete`, `deleteMany`) must refuse
  * an empty predicate by default, throwing `ValidationError`. The guard only
  * lets the mutation through when the caller explicitly opts in with
- * `allowFullTableScan: true`.
+ * `allowFullTableScan: UNSAFE`.
  *
  * Build-only tests (no DB).
  */
@@ -12,6 +12,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ValidationError } from '../errors.js';
+import { UNSAFE } from '../query/index.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -110,47 +111,55 @@ describe('mutation guard: empty where refused', () => {
 });
 
 describe('mutation guard: allowFullTableScan opt-in', () => {
-  it('buildUpdate accepts where: {} when allowFullTableScan: true', () => {
+  it('buildUpdate accepts where: {} when allowFullTableScan: UNSAFE', () => {
     const q = makeQuery('users', buildSchema());
     const deferred = q.buildUpdate({
       where: {},
       data: { name: 'x' },
-      allowFullTableScan: true,
+      allowFullTableScan: UNSAFE,
     });
     // Should produce an UPDATE with no WHERE clause
     assert.match(deferred.sql, /^UPDATE "users" SET "name" = \$1 RETURNING \*$/);
     assert.deepEqual(deferred.params, ['x']);
   });
 
-  it('buildDelete accepts where: {} when allowFullTableScan: true', () => {
+  it('buildDelete accepts where: {} when allowFullTableScan: UNSAFE', () => {
     const q = makeQuery('users', buildSchema());
-    const deferred = q.buildDelete({ where: {}, allowFullTableScan: true });
+    const deferred = q.buildDelete({ where: {}, allowFullTableScan: UNSAFE });
     assert.match(deferred.sql, /^DELETE FROM "users" RETURNING \*$/);
     assert.deepEqual(deferred.params, []);
   });
 
-  it('buildUpdateMany accepts where: {} when allowFullTableScan: true', () => {
+  it('buildUpdateMany accepts where: {} when allowFullTableScan: UNSAFE', () => {
     const q = makeQuery('users', buildSchema());
     const deferred = q.buildUpdateMany({
       where: {},
       data: { active: false },
-      allowFullTableScan: true,
+      allowFullTableScan: UNSAFE,
     });
     assert.match(deferred.sql, /^UPDATE "users" SET "active" = \$1$/);
     assert.ok(!/WHERE/.test(deferred.sql));
     assert.ok(!/RETURNING/.test(deferred.sql));
   });
 
-  it('buildDeleteMany accepts where: {} when allowFullTableScan: true', () => {
+  it('buildDeleteMany accepts where: {} when allowFullTableScan: UNSAFE', () => {
     const q = makeQuery('users', buildSchema());
-    const deferred = q.buildDeleteMany({ where: {}, allowFullTableScan: true });
+    const deferred = q.buildDeleteMany({ where: {}, allowFullTableScan: UNSAFE });
     assert.match(deferred.sql, /^DELETE FROM "users"$/);
     assert.deepEqual(deferred.params, []);
   });
 
-  it('allowFullTableScan: false is the same as omitted (still throws)', () => {
+  it('allowFullTableScan: false is the same as omitted (still throws the empty-where error)', () => {
     const q = makeQuery('users', buildSchema());
-    assert.throws(() => q.buildUpdate({ where: {}, data: { name: 'x' }, allowFullTableScan: false }), ValidationError);
+    // `false` is no longer part of the declared type (the option takes the
+    // UNSAFE sentinel), but it stays accepted at RUNTIME as "not enabled": a
+    // caller passing an off flag must get the ordinary empty-where guard, not
+    // the privilege refusal. Cast, because this asserts runtime behaviour on a
+    // value TypeScript already rejects.
+    assert.throws(
+      () => q.buildUpdate({ where: {}, data: { name: 'x' }, allowFullTableScan: false as unknown as typeof UNSAFE }),
+      ValidationError,
+    );
   });
 });
 
@@ -299,14 +308,14 @@ describe('mutation guard: OR/AND all-undefined hardening', () => {
     assert.match(deferred.sql, /"id" = \$2/);
   });
 
-  it('allowFullTableScan: true bypasses the OR/AND hardening too', () => {
+  it('allowFullTableScan: UNSAFE bypasses the OR/AND hardening too', () => {
     // Belt-and-braces: a caller who explicitly opts in must still be able to
     // run an unconditional mutation even when the OR/AND happens to be empty.
     const q = makeQuery('users', buildSchema());
     const deferred = q.buildUpdate({
       where: { OR: [{ id: undefined }] },
       data: { name: 'x' },
-      allowFullTableScan: true,
+      allowFullTableScan: UNSAFE,
     });
     assert.match(deferred.sql, /^UPDATE "users" SET "name" = \$1 RETURNING \*$/);
     assert.deepEqual(deferred.params, ['x']);

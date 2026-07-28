@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.61.0",
+  "version": "0.62.0",
   "description": "Postgres-native TypeScript ORM, runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "//exports": "Each subpath declares its types PER CONDITION. A single shared top-level \"types\" resolves to the ESM declarations for `require` too, which is TS1479 (\"is an ES module ... cannot be require()d\") for any CJS consumer on moduleResolution node16/nodenext. The require condition points at dist/cjs, which ships its own {\"type\":\"commonjs\"} package.json, so those declarations are CJS declarations. Gated in CI by publint + @arethetypeswrong/cli + a real .cts consumer typecheck (see the package-types job in ci.yml).",
@@ -111,6 +111,7 @@
     "README.md"
   ],
   "sideEffects": false,
+  "//prepublishOnly": "The gate for a MANUAL LOCAL `npm publish`, which is the normal release flow here, so it is the ONLY gate on that path (release.yml runs on a pushed tag, and a local publish never triggers it). `check:package` joined it 2026-07-28: publint --strict + attw --pack, the two checks that catch a broken exports map or CJS declarations that resolve to ESM, which is a class of bug that shipped once already and is invisible to every other script here. `test:coverage:cli` joined at the same time (~3s) so a local publish cannot ship a Studio/migrate coverage regression. Still deliberately absent, because they need a live database or minutes of packing: the Postgres integration suite, the engine containers, and the tarball install smoke, all of which release.yml + ci.yml run.",
   "scripts": {
     "prebuild": "npm run gen:studio",
     "build": "rm -rf dist && tsc && tsc --project tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
@@ -122,13 +123,21 @@
     "test": "tsx --test --test-concurrency=1 src/test/*.test.ts",
     "test:unit": "DATABASE_URL= tsx --test src/test/*.test.ts",
     "test:coverage": "c8 tsx --test --test-concurrency=1 src/test/*.test.ts",
+    "//coverage:cli": "The CLI coverage gate, split into ONE collection run plus FOUR threshold checks. c8 enforces a single threshold set per invocation and its --per-file applies the SAME numbers to every file, neither of which can express 'destructive.ts holds 100 while migrate.ts holds 70'. An aggregate-only floor lets the least-covered file spend the whole slack the best-covered file earned: at the measured 3623/2951 lines, migrate.ts could fall from 70.3% to 66.6% with the aggregate still green. So each file gets its OWN floor, checked by re-reporting the coverage already on disk (c8 report re-reads ./coverage/tmp, so this costs no extra test run). The aggregate check is kept as well: it catches all three sagging together inside their individual margins. Per-file gates run FIRST because their failure names the file. DATABASE_URL is neutralized on the collection run: these test files include live migration tests that create and drop tables, and this script runs from prepublishOnly.",
+    "test:coverage:cli": "npm run coverage:cli:collect && npm run coverage:cli:gate:destructive && npm run coverage:cli:gate:studio && npm run coverage:cli:gate:migrate && npm run coverage:cli:gate:aggregate",
+    "coverage:cli:collect": "DATABASE_URL= c8 --all --reporter text --exclude 'src/test/**' --include src/cli/studio.ts --include src/cli/migrate.ts --include src/cli/destructive.ts tsx --test src/test/studio-write.test.ts src/test/studio-demo.test.ts src/test/studio.test.ts src/test/studio-security.test.ts src/test/migrate.test.ts src/test/migrate-deploy.test.ts src/test/migrate-smoke-fixes.test.ts src/test/destructive-migrations.test.ts src/test/backfill-recipe.test.ts src/test/cli.test.ts src/test/cli-diff-migration.test.ts src/test/cli-flags.test.ts src/test/cli-first-run.test.ts",
+    "coverage:cli:gate": "c8 report --all --exclude 'src/test/**' --reporter text --check-coverage",
+    "coverage:cli:gate:destructive": "npm run coverage:cli:gate -- --include src/cli/destructive.ts --lines 98 --statements 98 --branches 84 --functions 98",
+    "coverage:cli:gate:studio": "npm run coverage:cli:gate -- --include src/cli/studio.ts --lines 82 --statements 82 --branches 81 --functions 86",
+    "coverage:cli:gate:migrate": "npm run coverage:cli:gate -- --include src/cli/migrate.ts --lines 69 --statements 69 --branches 91 --functions 73",
+    "coverage:cli:gate:aggregate": "npm run coverage:cli:gate -- --include src/cli/studio.ts --include src/cli/migrate.ts --include src/cli/destructive.ts --lines 78 --statements 78 --branches 84 --functions 82",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
     "check:error-codes": "tsx scripts/check-error-codes.ts",
     "check:changelog": "node scripts/check-changelog-headings.mjs",
     "check:package": "publint --strict && attw --pack . --profile node16",
-    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run check:error-codes && npm run check:changelog && npm run size",
+    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:changelog && npm run check:package && npm run size",
     "prepare": "husky",
     "prepack": "node scripts/strip-prepare.mjs",
     "postpack": "node scripts/restore-prepare.mjs",
@@ -144,7 +153,8 @@
     "pretypecheck": "npm run gen:studio",
     "pretest": "npm run gen:studio",
     "pretest:unit": "npm run gen:studio",
-    "pretest:coverage": "npm run gen:studio"
+    "pretest:coverage": "npm run gen:studio",
+    "pretest:coverage:cli": "npm run gen:studio"
   },
   "engines": {
     "node": ">=20.0.0"

@@ -1,5 +1,131 @@
 # Changelog
 
+## 0.62.0 (2026-07-28)
+
+A hardening sprint off the back of a full product review. The theme is one
+class of bug: **an option the caller set that quietly did nothing**, and its
+mirror, **a value the caller asked to be hidden that came back anyway**. Nine
+of these shipped in previous versions. None threw, none logged, and most
+returned a plausible answer, which is why the suite did not have them.
+
+Every fix here was reproduced against the old code first, and every one is
+pinned by a regression test that was checked to FAIL before the fix and pass
+after. Two rounds of adversarial review ran over the sprint's own output; the
+first round refuted all seven tracks, and the defects that round found are in
+this release too, not deferred.
+
+### Security
+
+- **`skipGlobalFilters`, `includePii` and `allowFullTableScan` are now unlocked
+  by a symbol, not by `true`.** BREAKING. All three were ordinary boolean
+  siblings of `where` on the query-args object, so `findMany({ ...req.body })`
+  turned a request field named `includePii` into a real privilege escalation:
+  the tenant filter dropped, or the PII columns returned, from a body the
+  attacker wrote. Typing them `boolean` and documenting the risk is not a
+  boundary. They now take the exported `UNSAFE` sentinel
+  (`includePii: UNSAFE`), which `JSON.parse` cannot produce at any depth, so
+  mass assignment is structurally unable to set them. `true` THROWS rather
+  than being ignored, so a call site that had the privilege keeps it only
+  after a human edits it. The sentinel is registered with `Symbol.for`, so
+  the ESM and CJS halves of a dual-package install agree on it.
+
+- **`turbine init --url` no longer writes a password into `turbine.config.ts`.**
+  The scaffold inlined whatever `--url` carried, and `turbine.config.ts` is a
+  tracked file, so the first command a new user runs committed their database
+  password. A password-bearing URL now goes to `.env` as `DATABASE_URL`, the
+  config reads `process.env.DATABASE_URL`, and `.env` is appended to
+  `.gitignore` when the file does not already ignore it (parsed line by line,
+  honoring negations and anchors, not by substring). An existing
+  `DATABASE_URL` in `.env` is never overwritten.
+
+- **The MCP server no longer leaks index literals or opens a row-count
+  oracle.** `explain_query` refused a predicate only on a code-first `pii`
+  tag, while `sample_rows` also refuses to fetch a secret-NAMED column, so the
+  exact column `sample_rows` would not show was extractable one character at a
+  time through the planner's row estimate. `sanitizeIndex` now withholds an
+  expression index's key list in both the partial and non-partial branch,
+  finds the predicate boundary OUTSIDE string literals (a key list containing
+  the text `' WHERE '` used to split mid-literal and ship the literal), and
+  withholds a definition it cannot parse instead of passing it through. The
+  secret-name rule is anchored to identifier segments, so `secretary_id` and
+  other ordinary columns are no longer hard-refused.
+
+- **PII redaction fails closed when it cannot read the tags.** Studio and the
+  MCP server load PII tags out of the generated `metadata.ts`. A truncated
+  file (an interrupted `turbine generate`, a disk-full write, a merge
+  conflict) used to scan as "this schema tags nothing", which is
+  byte-identical to success and served every tagged column. The scanner is now
+  a real structural tokenizer that reports whether the object closed, an
+  unreadable file redacts EVERY column rather than none, and both surfaces say
+  so at startup.
+
+- **The driver error attached as `.cause` is redacted under
+  `errorMessages: 'safe'`.** Postgres puts the CONFLICTING ROW VALUES in a
+  constraint error's `detail` field and nowhere else (`Key
+  (email)=(alice@example.com) already exists.`). 'safe' mode kept those out of
+  Turbine's own message and then attached the raw driver error verbatim, so
+  the values still reached everywhere an error is rendered whole: Node's error
+  printer walks the cause chain, and Sentry and similar sinks serialize each
+  link. The cause is now a shallow clone with `detail` replaced, cloned rather
+  than mutated so the driver's own object is untouched, and constructed so it
+  stays a real native error with its `code`, prototype and stack intact.
+
+### Fixed
+
+- **`orderBy: { x: 'DESC' }` sorted the opposite way on some engines.** Every
+  direction consumer was spelled `String(v).toLowerCase() === 'desc'` in one
+  place and `v === 'desc'` in another, so an uppercase or misspelled direction
+  fell through to the default in some paths and was honored in others, giving
+  one query two sort orders across engines. One `assertOrderDirection` now
+  validates every site on every engine: any casing is accepted, anything else
+  throws E003 instead of silently sorting the other way.
+
+- **`omit` was dropped on prisma-compat writes, and its keys were never
+  validated.** `omit` is the idiom for a sensitive-but-untagged column, and it
+  demonstrably works on `findMany`, so a caller had positive evidence for
+  assuming it works on `create`. It was accepted and ignored. It now applies,
+  and a misspelled key throws instead of silently returning the column: this
+  projection is applied client-side and never reaches core, so core's E003 on
+  an unknown projection key could not fire.
+
+- **Studio's saved queries lost clauses on reload.** The builder pane holds
+  database COLUMN names and a Turbine query addresses a FIELD, and the loader
+  translated in neither direction, so on any snake_case schema a reloaded
+  saved query returned more rows than it did when it was saved, with no toast
+  and no error. Separately, two clauses on the SAME column under `AND` were
+  merged with `Object.assign`, so a range like `gte 18` AND `lte 65` became
+  `lte 65` alone: the pane showed two filters and the query applied one.
+
+- **A connection failure escaped as a raw driver error.** `pool.connect()` was
+  wrapped everywhere except the pipeline path, so a wrong password or refused
+  connection there arrived as a pg `DatabaseError` whose `.code` holds a
+  SQLSTATE, the same property Turbine puts `TURBINE_E0NN` in. Connection-class
+  failures now come back as typed `ConnectionError` (E004) carrying the driver
+  code and an actionable next step.
+
+- **An unusable connection string is refused at construction.** A typo'd or
+  truncated string was handed to pg, which resolved the missing parts from
+  libpq defaults and connected somewhere else entirely. The check replays the
+  parse pg itself performs rather than pattern-matching a scheme, so
+  Unix-socket and Cloud SQL strings that pg accepts are still accepted.
+
+### Added
+
+- **A CLI coverage gate with per-file floors.** `cli/studio.ts` (write mode
+  and PII redaction), `cli/migrate.ts` (destructive DDL) and
+  `cli/destructive.ts` (the scanner that decides what counts as destructive)
+  were excluded from coverage entirely, so there was no ratchet on the
+  highest-consequence code in the package. `npm run test:coverage:cli` gates
+  them with their own thresholds, per file rather than aggregate-only, and
+  runs in CI and in `prepublishOnly`.
+
+- **`check:package` and the missing subpath smoke tests on the release path.**
+  `publint --strict` and `attw --pack` now run before publish, catching a
+  broken exports map or CJS declarations that resolve to ESM. The release
+  workflow import-smokes the `mysql`, `mssql`, `powdb` and `prisma-compat`
+  subpaths with their optional peers absent; it previously checked fewer
+  published entry points than CI did.
+
 ## 0.61.0 (2026-07-28)
 
 Five defects found by a full product review of 0.60.1. Every one of them failed

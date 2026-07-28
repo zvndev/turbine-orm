@@ -120,6 +120,18 @@ export default {
 };
 ```
 
+<Callout type="warning" title="turbine migrate does not read config.adapter yet">
+  The `adapter` key type-checks on `TurbineCliConfig`, and the migration runner
+  underneath takes an adapter, but the `turbine migrate` command never passes
+  the config field into it. Setting it therefore changes nothing today: the CLI
+  still calls `pg_try_advisory_lock()`, which is exactly the per-node lock this
+  section is warning you about. Until it is wired, make sure only one migration
+  runner can be in flight at a time (a CI job that cannot overlap), rather than
+  relying on the database to arbitrate. The same applies to the CockroachDB
+  adapter below, and to its statement-timeout and row-estimate overrides:
+  the adapter objects are complete, the config wiring is not.
+</Callout>
+
 The YugabyteDB adapter replaces advisory locks with a `_turbine_lock` table using `SELECT ... FOR UPDATE NOWAIT`. Because YugabyteDB's row locks are distributed (backed by Raft consensus), this provides a true cluster-wide mutex.
 
 ### Connection
@@ -178,6 +190,8 @@ export default {
 | Statement timeout | `set_config('statement_timeout', …, true)` | `set_config('transaction_timeout', …, true)` (v23.1+) |
 | Index introspection | `pg_indexes` view | Same view (compatible since v22.1) |
 | Row estimates | `pg_class.reltuples` | `crdb_internal.table_row_statistics` |
+
+Every row above describes what the adapter **object** implements. None of it reaches you through `turbine.config.ts` today, because the CLI never reads the `adapter` key: see the warning in the YugabyteDB section. Read this table as the shape of the fix, and plan around the PostgreSQL behaviour in the meantime.
 
 ### Connection
 

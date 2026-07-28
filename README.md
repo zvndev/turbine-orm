@@ -8,16 +8,18 @@ Most query layers are designed for the shape of a laptop database: empty, dispos
 npm install turbine-orm
 ```
 
-**Full docs: [turbineorm.dev](https://turbineorm.dev)**, [Quick Start](https://turbineorm.dev/quickstart) · [API Reference](https://turbineorm.dev/queries) · [Relations](https://turbineorm.dev/relations) · [Transactions & Pipelines](https://turbineorm.dev/transactions) · [Serverless & Edge](https://turbineorm.dev/serverless) · [Typed Errors](https://turbineorm.dev/errors) · [Benchmarks](https://turbineorm.dev/benchmarks)
+**Full docs: [turbineorm.dev](https://turbineorm.dev)**, [Why Turbine](https://turbineorm.dev/why-turbine) · [Quick Start](https://turbineorm.dev/quickstart) · [API Reference](https://turbineorm.dev/queries) · [Relations](https://turbineorm.dev/relations) · [Transactions & Pipelines](https://turbineorm.dev/transactions) · [Serverless & Edge](https://turbineorm.dev/serverless) · [Typed Errors](https://turbineorm.dev/errors) · [Benchmarks](https://turbineorm.dev/benchmarks)
 
 ## Why Turbine?
+
+*(The same argument, laid out with the comparisons and the caveats, is at [turbineorm.dev/why-turbine](https://turbineorm.dev/why-turbine).)*
 
 First, what is **not** a reason. Resolving a nested `with` clause in one statement is table stakes in 2026: Drizzle has compiled relational queries to `LEFT JOIN LATERAL` plus JSON aggregation since 0.28, Prisma does the same under its `relationJoins` preview flag, and Kysely ships `jsonArrayFrom` / `jsonObjectFrom` helpers for it. Turbine does it too, it does it well, and it is documented under [How It Works](#how-it-works) as a correctness detail rather than a headline.
 
 The reason to reach for Turbine is that every layer between you and a production database is built on one assumption: **the rows are real**. That plays out in five concrete places.
 
 1. **The database UI is read-only, and writes are a per-launch decision.** `npx turbine studio` binds loopback, authenticates with a 192-bit per-process token, and runs every read inside `BEGIN READ ONLY`. In the default mode the write endpoints do not exist in the router at all (they 404), so there is nothing to bypass. `--write` opts a single launch in to edits, each addressed by its full primary key rather than a predicate, compiled by the same validated builder your app uses. There is no raw-SQL surface at all since v0.19.
-2. **PII is a schema contract, enforced in the SQL.** Tag a column `pii: true` and it is excluded from every default projection: top-level rows, `with` subqueries, batched loaders, write returns, and the Studio UI. On the SQL engines the exclusion is in the emitted statement, so the value never leaves the database. (PowDB is the one exception, and it is a weaker guarantee: its `returning` keyword takes no column list, so a write's PII is stripped in the client after crossing the wire. Its read projections are still column-explicit.) A tagged column is also **refused** as a `groupBy` key and as a `_min` / `_max` target, because both hand back a stored cell. `includePii: true` unlocks it explicitly per read. A schema with no tagged column emits byte-identical SQL.
+2. **PII is a schema contract, enforced in the SQL.** Tag a column `pii: true` and it is excluded from every default projection: top-level rows, `with` subqueries, batched loaders, write returns, and the Studio UI. On the SQL engines the exclusion is in the emitted statement, so the value never leaves the database. (PowDB is the one exception, and it is a weaker guarantee: its `returning` keyword takes no column list, so a write's PII is stripped in the client after crossing the wire. Its read projections are still column-explicit.) A tagged column is also **refused** as a `groupBy` key and as a `_min` / `_max` target, because both hand back a stored cell. `includePii: UNSAFE` unlocks it explicitly per read (see **Privilege options** below: a plain `true` throws). A schema with no tagged column emits byte-identical SQL.
 3. **Errors carry keys, never values.** A `NotFoundError` says `where: { id, email }`. A `UniqueConstraintError` names the column that conflicted. Neither prints the user's data, so the error is safe to send straight to Sentry with no scrubbing rule in front of it. The full `where` object stays available as `err.where` in code.
 4. **Data-destroying statements need consent.** `migrate up`, `migrate down` and `push` scan for `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, unqualified `DELETE` / `UPDATE`, and `ALTER COLUMN … TYPE`, print an itemized report, and refuse to run. Interactively you type `destroy my data` and then `yes`; in CI you pass `--allow-destructive`. A refused batch applies nothing.
 5. **The review a DBA would have given you, offline.** `npx turbine doctor` derives every column set the ORM's relation subqueries probe and reports the ones with no covering index, with a cost tier per finding. `--fix` writes the migration. No cloud service, no telemetry, no account: it reads your introspected schema.
@@ -31,9 +33,11 @@ Two more things worth knowing, which are about cost rather than safety:
 
 **Beyond the safety bundle, what ships today:** [global filters](https://turbineorm.dev/global-filters) for soft-delete and multi-tenancy · [read replicas](https://turbineorm.dev/read-replicas) with a `$primary()` escape hatch · a read-only [MCP server](https://turbineorm.dev/mcp) for AI agents · [seed-as-code](https://turbineorm.dev/seeding) and a non-interactive `migrate deploy` for CI · [Zod generation](https://turbineorm.dev/zod) · read-only [views & generated columns](https://turbineorm.dev/views) · [optional SQLite / MySQL / SQL Server / PowDB engines](https://turbineorm.dev/engines) behind subpath exports · a [Prisma migration toolkit](https://turbineorm.dev/migrate-from-prisma) (schema mapper plus a runtime compat adapter) · a cost-aware index advisor in [`turbine doctor`](https://turbineorm.dev/cli#turbine-doctor).
 
-Per-release detail lives in the [CHANGELOG](./CHANGELOG.md) and at [turbineorm.dev/changelog](https://turbineorm.dev/changelog).
+Per-release detail lives in the [CHANGELOG](https://github.com/zvndev/turbine-orm/blob/main/CHANGELOG.md) and at [turbineorm.dev/changelog](https://turbineorm.dev/changelog).
 
 ## Benchmarks
+
+> **These are a dated snapshot, not a live claim.** Every figure below comes from **one measurement run on 2026-07-25 against turbine-orm 0.50.0**. It has not been re-run since, and the package you are installing is several minor versions ahead of it. Nothing here has been adjusted to match a later release, because inventing numbers is worse than quoting old ones. Read the table as *the shape of the result* (who leads which scenario, and by roughly how much) rather than as the latency your deployment will see, and reproduce it with the command at the end of this section if the absolute values matter to you. The same reasoning applies to the bundle-size figure above: a precise number typed into prose goes stale silently, so prefer the claim that cannot rot.
 
 Measured **2026-07-25 against turbine-orm 0.50.0** (commit `f8fec86`), tested against **Prisma 7.9.0** (`@prisma/adapter-pg`, `relationJoins` preview on) and **Drizzle 0.45.2** (relational queries) on a **local PostgreSQL 17.9** database over a Unix socket, with a **hand-written `pg` control arm**. Node v24.18.0, Apple Silicon MacBook Pro (M5 Max). Same schema, same data (1K users, 10K posts, 50K comments), same pool config.
 
@@ -54,18 +58,18 @@ Prisma's nested scenarios run on its **`join`** load strategy, which is its favo
 | pipeline, 5-query batch | **0.206 ms** | 0.431 ms | 0.402 ms | 0.205 ms |
 | hot findUnique, 500x same shape | **0.029 ms** | 0.065 ms | 0.075 ms | 0.033 ms |
 
-**The number worth quoting: Turbine runs at 1.07x hand-written `pg`, where Drizzle runs at 1.47x and Prisma at 1.84x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine is **1.87x faster than Prisma 7.9** and **1.36x faster than Drizzle 0.45** by geometric mean.
+**The number worth quoting from that run: Turbine ran at 1.07x hand-written `pg`, where Drizzle ran at 1.47x and Prisma at 1.84x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine was **1.87x faster than Prisma 7.9** and **1.36x faster than Drizzle 0.45** by geometric mean, against those two competitor versions.
 
 - **Turbine takes seven scenarios**, Drizzle three, Prisma none. Prisma is behind Turbine on all ten. Two of the ten (L3 nested, atomic increment) are genuine near-ties and are not leads for either side.
 - **Drizzle wins streaming outright, by 27%** (50.18 ms vs Turbine's 63.87 ms), reproduced in every run. Drizzle sits exactly on the raw `pg` keyset control, which is where a thin builder should sit; Turbine's cursor carries about 25% overhead above hand-written keyset pagination on a full-table drain. That overhead buys cursor semantics keyset cannot offer (any `orderBy`, deterministic early break, nested `with` per batch), but on this shape it is a loss and it is an open optimization target. A previous version of this table showed Turbine fastest here and called it a near-tie; that rested on a Drizzle figure we could not reproduce, and it was wrong.
 - **Drizzle also leads nested reads (L2).** Turbine's `json_agg` nesting is close behind and **1.9x to 3.0x ahead of Prisma** on the same L2/L3 shapes.
 - **Pipeline batching is Turbine's clearest win**: one TCP flush for 5 queries runs the dashboard batch 2.09x faster than Prisma's and 1.95x faster than Drizzle's sequential transaction, level with the raw `pg` control.
 
-> **Read the drift floor before quoting a sub-millisecond figure.** The identical raw control arm drifts 1% to 14% between runs on the multi-millisecond scenarios but **21% to 47%** on the sub-0.15 ms ones (findUnique by PK, count, atomic increment, hot findUnique, pipeline). Those orderings are stable across all five runs; their absolute values carry roughly one third uncertainty. Full per-run drift tables in [`benchmarks/RESULTS-0.50.0.md`](./benchmarks/RESULTS-0.50.0.md).
+> **Read the drift floor before quoting a sub-millisecond figure.** The identical raw control arm drifts 1% to 14% between runs on the multi-millisecond scenarios but **21% to 47%** on the sub-0.15 ms ones (findUnique by PK, count, atomic increment, hot findUnique, pipeline). Those orderings are stable across all five runs; their absolute values carry roughly one third uncertainty. Full per-run drift tables in [`benchmarks/RESULTS-0.50.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.50.0.md).
 
-Net: Turbine is competitive-to-ahead across the board rather than a clean sweep, and the honest takeaway is unchanged: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only-by-default Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
+Net, as of that run: Turbine was competitive-to-ahead across the board rather than a clean sweep, and the takeaway is the part that does not go stale: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only-by-default Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
 
-> Full analysis, methodology and the drift floor: [`benchmarks/RESULTS-0.50.0.md`](./benchmarks/RESULTS-0.50.0.md). Historical runs: [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md).
+> Full analysis, methodology and the drift floor: [`benchmarks/RESULTS-0.50.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.50.0.md). Historical runs: [`benchmarks/RESULTS.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS.md).
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench-interleaved.ts`
 
 ## Quick Start
@@ -82,7 +86,7 @@ npx turbine init --url postgres://user:pass@localhost:5432/mydb
 npx turbine generate
 ```
 
-> **CLI prerequisites.** The `turbine` CLI loads your `turbine.config.ts` / `turbine/schema.ts` directly, so a fresh project needs `tsx` installed (otherwise `.ts` config loading fails with *"Loading .ts config / schema files requires tsx to be installed"*). Turbine ships both ESM and CommonJS builds, so the CLI loads your config and schema correctly in either an ESM (`"type": "module"`) or a CommonJS project; ESM is recommended but not required. See [USING-TURBINE-ORM.md §0](docs/USING-TURBINE-ORM.md) for details.
+> **CLI prerequisites.** The `turbine` CLI loads your `turbine.config.ts` / `turbine/schema.ts` directly, so a fresh project needs `tsx` installed (otherwise `.ts` config loading fails with *"Loading .ts config / schema files requires tsx to be installed"*). Turbine ships both ESM and CommonJS builds, so the CLI loads your config and schema correctly in either an ESM (`"type": "module"`) or a CommonJS project; ESM is recommended but not required. See [USING-TURBINE-ORM.md §0](https://github.com/zvndev/turbine-orm/blob/main/docs/USING-TURBINE-ORM.md) for details.
 
 The `turbine-orm` package ships real dual builds, so importing the package works from either module system:
 
@@ -534,7 +538,47 @@ await db.users.findMany({ where: { role: 'admin' } });
 // SELECT ... FROM "users" WHERE "role" = $1 AND "deleted_at" IS NULL
 ```
 
-Values are always parameterized. Opt a single query out with `skipGlobalFilters: true` (or a table-name array). Note that a global filter does **not** satisfy the empty-`where` guard: an `update` or `delete` with no `where` of its own still throws unless you pass `allowFullTableScan: true`.
+Values are always parameterized. Opt a single query out with `skipGlobalFilters: UNSAFE`, or skip named tables with `skipGlobalFilters: [UNSAFE, 'posts']`. Note that a global filter does **not** satisfy the empty-`where` guard: an `update` or `delete` with no `where` of its own still throws unless you pass `allowFullTableScan: UNSAFE`.
+
+### Privilege options and the `UNSAFE` symbol
+
+Three query options remove a safety boundary rather than change a result: `skipGlobalFilters` (drops the tenant or soft-delete predicate), `includePii` (drops the PII projection), and `allowFullTableScan` (drops the empty-`where` guard on a mutation). Each is enabled by **one** value, a symbol exported from the package:
+
+```typescript
+import { UNSAFE } from 'turbine-orm';
+
+await db.posts.findMany({ skipGlobalFilters: UNSAFE });            // skip every filter
+await db.users.findMany({ with: { posts: true }, skipGlobalFilters: [UNSAFE, 'posts'] });
+await db.users.findFirst({ where: { id: 1 }, includePii: UNSAFE });
+await db.sessions.deleteMany({ where: {}, allowFullTableScan: UNSAFE });  // every row, on purpose
+```
+
+`where` stays required on the mutations. `allowFullTableScan` permits an **empty** `where`; it does not let you omit the key.
+
+**Why a symbol.** All three sit on the same options object as `where`, and the idiomatic handler spreads a request body:
+
+```typescript
+app.get('/users', (req, res) => db.users.findMany({ ...req.body }));
+```
+
+A client posting `{"where":{"name":"x"},"skipGlobalFilters":true}` used to get the same statement minus the tenant predicate: the documented multi-tenancy mechanism, removed over the wire by the party it exists to contain. `includePii: true` reached the PII columns the same way, and `allowFullTableScan: true` disarmed the guard on an unqualified `UPDATE` or `DELETE`. Typing them `boolean` and writing "be careful" is not a fix, because this is a mass-assignment shape and mass assignment happens exactly when nobody enumerated the keys. `JSON.parse` cannot produce a symbol, and neither can a query string, a form body, or a `structuredClone` of parsed input, so there is no untrusted-data path that puts `UNSAFE` on an args object at all. The array form is policed just as hard, since `{"skipGlobalFilters":["users"]}` is the same breach with one extra step. (`UNSAFE` is `Symbol.for('turbine-orm.UNSAFE')`, not `Symbol()`, so the ESM and CJS copies of a dual-package install agree on one value.)
+
+**Upgrading.** This is breaking on those three options, deliberately loudly.
+
+| Before | After |
+|---|---|
+| `skipGlobalFilters: true` | `skipGlobalFilters: UNSAFE` |
+| `skipGlobalFilters: ['posts']` | `skipGlobalFilters: [UNSAFE, 'posts']` |
+| `includePii: true` | `includePii: UNSAFE` |
+| `allowFullTableScan: true` | `allowFullTableScan: UNSAFE` |
+
+The options are typed as the symbol's type, `Unsafe`, so **every** row of that table is a compile error before it is a runtime error, and so is `allowFullTableScan: false`. A conditional call site is written by adding the key or not, never by passing a boolean:
+
+```typescript
+await db.sessions.deleteMany({ where: {}, ...(purgeEverything ? { allowFullTableScan: UNSAFE } : {}) });
+```
+
+At runtime, `false`, `null` and `undefined` are still accepted and mean "not enabled", which keeps untyped call sites (plain JS, or args that arrive as `any`) from breaking on a value that never asked for the privilege. Everything else, `true` included, throws `ValidationError` (`TURBINE_E003`) naming the option and the import. Ignoring a stale `true` would trade an escalation bug for a silent-failure bug: an admin tool would quietly stop seeing soft-deleted rows, or quietly return objects with the PII columns missing. `turbine-orm/prisma-compat` forwards these three verbatim, so the same rule applies there and the adapter carries no second copy of it. Full rationale: [turbineorm.dev/global-filters](https://turbineorm.dev/global-filters#privilege-options-and-the-unsafe-symbol).
 
 ### Error handling
 
@@ -1068,13 +1112,13 @@ Everything is honest about what ports and what doesn't. Features marked **PG-onl
 |---|:---:|:---:|:---:|:---:|
 | Single-query nested `with` | ✓ `json_agg` | ✓ `json_group_array` | ✓ `JSON_ARRAYAGG` | ✓ `FOR JSON PATH` |
 | Transactions + savepoints | ✓ | ✓ (single-writer) | ✓ | ✓ |
-| Streaming (`findManyStream`) | ✓ | ✓ | ✓ | ✓ |
+| Streaming (`findManyStream`) | ✓ true cursor | ⚠ materializes | ⚠ materializes | ⚠ materializes |
 | Migrations (`turbine migrate` CLI) | ✓ | PG-only (CLI) | PG-only (CLI) | PG-only (CLI) |
 | pgvector distance / KNN | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 | LISTEN/NOTIFY realtime | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 | RLS `sessionContext` | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 
-✗ E017 = throws `UnsupportedFeatureError`. The full matrix (atomic updates, introspection, optimistic locking, per-cell mechanics) is on [turbineorm.dev/engines](https://turbineorm.dev/engines).
+✗ E017 = throws `UnsupportedFeatureError`. ⚠ materializes = the API works and returns the same rows, but the whole result set is held in memory first and then yielded in batches, so it does **not** give you constant memory (see Engine notes). The full matrix (atomic updates, introspection, optimistic locking, per-cell mechanics) is on [turbineorm.dev/engines](https://turbineorm.dev/engines).
 
 **Engine notes:** SQLite uses `RETURNING` (≥ 3.35) just like Postgres. MySQL has no `RETURNING`, so writes re-`SELECT` the affected row and **`createMany` returns `[]`** (the rows ARE inserted, re-query if you need them). SQL Server returns rows via `OUTPUT`/`MERGE`; `DISTINCT ON` is Postgres-only. Only Postgres streams via a true cursor (constant memory); the other engines' `findManyStream` materializes the result then yields it in batches. Optimistic locking throws `OptimisticLockError` on all engines (on MySQL the conflict is detected from the version-checked UPDATE's affected-row count). The `turbine` CLI (`generate`, `migrate`) is currently PostgreSQL-only, point the engine factories at a hand-written or programmatically introspected `SCHEMA`.
 
@@ -1162,17 +1206,17 @@ Turbine is focused and opinionated. Here's what it doesn't do:
 
 **Feature demos**
 
-- **[Thread Machine](./examples/thread-machine/)**, HN clone rendered from a single `findMany`. 4-level object graph (stories → comments → replies → author), every property autocompletes through the chain
-- **[Streaming CSV](./examples/streaming-csv/)**, Export 100K orders + line items to CSV with constant memory. PostgreSQL cursors, live heap meter, nested `with` inside `findManyStream`
-- **[Clickstorm](./examples/clickstorm/)**, Side-by-side atomic-increment vs read-modify-write load test. 10K concurrent clicks. The atomic path wins every time
+- **[Thread Machine](https://github.com/zvndev/turbine-orm/tree/main/examples/thread-machine/)**, HN clone rendered from a single `findMany`. 4-level object graph (stories → comments → replies → author), every property autocompletes through the chain
+- **[Streaming CSV](https://github.com/zvndev/turbine-orm/tree/main/examples/streaming-csv/)**, Export 100K orders + line items to CSV with constant memory. PostgreSQL cursors, live heap meter, nested `with` inside `findManyStream`
+- **[Clickstorm](https://github.com/zvndev/turbine-orm/tree/main/examples/clickstorm/)**, Side-by-side atomic-increment vs read-modify-write load test. 10K concurrent clicks. The atomic path wins every time
 
 **Runtime targets**
 
-- **[Next.js](./examples/nextjs/)**, Server-rendered app with nested relations, streaming, and live code demos
-- **[Neon Edge](./examples/neon-edge/)**, Vercel Edge route handler talking to Neon over HTTP via `@neondatabase/serverless`
-- **[Vercel Postgres](./examples/vercel-postgres/)**, Next.js app router route handler on `@vercel/postgres`
-- **[Cloudflare Worker](./examples/cloudflare-worker/)**, Worker `fetch` handler with `pg` over Cloudflare Hyperdrive
-- **[Supabase](./examples/supabase/)**, Standalone script over the standard `pg` driver against Supabase
+- **[Next.js](https://github.com/zvndev/turbine-orm/tree/main/examples/nextjs/)**, Server-rendered app with nested relations, streaming, and live code demos
+- **[Neon Edge](https://github.com/zvndev/turbine-orm/tree/main/examples/neon-edge/)**, Vercel Edge route handler talking to Neon over HTTP via `@neondatabase/serverless`
+- **[Vercel Postgres](https://github.com/zvndev/turbine-orm/tree/main/examples/vercel-postgres/)**, Next.js app router route handler on `@vercel/postgres`
+- **[Cloudflare Worker](https://github.com/zvndev/turbine-orm/tree/main/examples/cloudflare-worker/)**, Worker `fetch` handler with `pg` over Cloudflare Hyperdrive
+- **[Supabase](https://github.com/zvndev/turbine-orm/tree/main/examples/supabase/)**, Standalone script over the standard `pg` driver against Supabase
 
 ## Guides
 
@@ -1194,14 +1238,14 @@ Turbine is focused and opinionated. Here's what it doesn't do:
 
 ## Contributing
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the test strategy, and the PR checklist. Participants agree to the [Code of Conduct](CODE_OF_CONDUCT.md). The unit suite runs without a database:
+Contributions are welcome. See [CONTRIBUTING.md](https://github.com/zvndev/turbine-orm/blob/main/CONTRIBUTING.md) for development setup, the test strategy, and the PR checklist. Participants agree to the [Code of Conduct](https://github.com/zvndev/turbine-orm/blob/main/CODE_OF_CONDUCT.md). The unit suite runs without a database:
 
 ```bash
 npm install
 npm run test:unit
 ```
 
-Integration tests need a PostgreSQL instance via `DATABASE_URL` (see CONTRIBUTING.md for a one-command seeded setup).
+Integration tests need a PostgreSQL instance via `DATABASE_URL` (see [CONTRIBUTING.md](https://github.com/zvndev/turbine-orm/blob/main/CONTRIBUTING.md) for a one-command seeded setup).
 
 ## License
 

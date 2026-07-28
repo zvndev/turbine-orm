@@ -23,6 +23,7 @@ import {
   Prisma,
   type PrismaCompatOptions,
 } from '../prisma-compat.js';
+import { UNSAFE } from '../query/index.js';
 import { resetWarnOnce } from '../query/warn-registry.js';
 import type { PrismaCompatMap, SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -636,7 +637,7 @@ describe('prisma-compat, writes', () => {
     const { db, calls } = spyDb(schema);
     const compat = mkCompat(db, map);
     built(compat.User.deleteMany());
-    assert.equal(lastArgs(calls).allowFullTableScan, true);
+    assert.equal(lastArgs(calls).allowFullTableScan, UNSAFE);
   });
 });
 

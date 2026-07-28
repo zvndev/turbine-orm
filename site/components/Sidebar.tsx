@@ -12,6 +12,7 @@ const sections: NavSection[] = [
   {
     title: 'Getting Started',
     items: [
+      { href: '/why-turbine', label: 'Why Turbine' },
       { href: '/quickstart', label: 'Quick Start' },
       { href: '/neon', label: 'Turbine + Neon' },
       { href: '/batadb', label: 'Turbine + BataDB' },
@@ -38,7 +39,7 @@ const sections: NavSection[] = [
       { href: '/serverless', label: 'Serverless & Edge' },
       { href: '/read-replicas', label: 'Read Replicas' },
       { href: '/engines', label: 'Database Engines' },
-      { href: '/compatibility', label: 'Database Compatibility' },
+      { href: '/compatibility', label: 'Postgres-Compatible DBs' },
       { href: '/powdb', label: 'PowDB Module' },
       { href: '/dialects', label: 'Writing a Custom Dialect' },
       { href: '/cli', label: 'CLI' },

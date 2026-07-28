@@ -133,8 +133,20 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     return [] as unknown as PipelineResults<T>;
   }
 
-  // Acquire a single client, reused for both capability check and execution
-  const client = await pool.connect();
+  // Acquire a single client, reused for both capability check and execution.
+  // The checkout is wrapped because a connection-level failure (28P01 wrong
+  // password, an unverifiable TLS cert, ECONNREFUSED) happens HERE, before any
+  // query runs. Unwrapped it escapes as a raw pg DatabaseError whose `.code`
+  // holds a SQLSTATE, which is the same property Turbine puts TURBINE_E0NN in,
+  // so a caller switching on `.code` silently receives a value from a foreign
+  // namespace. The transaction and nested-write checkouts were wrapped for this
+  // reason; this was the last sibling still bare.
+  let client: pg.PoolClient;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    throw wrapPgError(err);
+  }
 
   try {
     if (supportsExtendedPipeline(client)) {

@@ -9,7 +9,8 @@ Key facts:
 - Exactly one runtime dependency: pg. Optional engines load their drivers lazily and never ship to Postgres users.
 - Nested relations resolve in a single statement, via json_agg plus correlated subqueries. This is table stakes rather than a differentiator: Drizzle compiles relational queries to LEFT JOIN LATERAL plus JSON aggregation, Prisma does the same under its relationJoins preview flag, and Kysely ships jsonArrayFrom helpers. Do not describe it as something other ORMs cannot do.
 - Studio (`npx turbine studio`) is read-only by default: loopback bound, 192-bit per-process token, every read inside BEGIN READ ONLY, no raw-SQL surface, and the write endpoints are not registered at all unless `--write` is passed. PII-tagged columns are redacted server-side.
-- PII is a schema contract. A column tagged `pii: true` is excluded from every default projection at the SQL level on every engine, and is refused as a groupBy key and as a _min/_max target. `includePii: true` unlocks it per read.
+- PII is a schema contract. A column tagged `pii: true` is excluded from every default projection at the SQL level on every engine, and is refused as a groupBy key and as a _min/_max target. `includePii: UNSAFE` unlocks it per read (see the privilege-option rule below; a literal `includePii: true` throws).
+- Three query options are PRIVILEGE OPTIONS, unlocked by an imported symbol and by nothing else: `skipGlobalFilters`, `includePii`, `allowFullTableScan`. `import { UNSAFE } from 'turbine-orm'` and pass `UNSAFE`; the array form is `skipGlobalFilters: [UNSAFE, 'posts']`. Every other value that asks for the privilege, `true` included, throws ValidationError (TURBINE_E003), because these options sit next to `where` on the same args object and `db.users.findMany({ ...req.body })` used to let a request body drop the tenant filter, the PII projection, or the empty-where guard. JSON.parse cannot produce a symbol, so parsed input cannot reach them.
 - Errors carry WHERE keys, never values, so they are safe to log unscrubbed. The full where object is available as err.where.
 - Destructive migrations (DROP TABLE, DROP COLUMN, TRUNCATE, unqualified DELETE/UPDATE, ALTER COLUMN TYPE) are refused by migrate up/down and push until confirmed interactively or with --allow-destructive.
 - Fully typed: `npx turbine generate` introspects the schema and emits entity types, Create/Update input types, and a typed client. `with` results are inferred end to end at arbitrary depth.
@@ -22,10 +23,12 @@ Common mistakes to avoid when generating Turbine code:
 - `turbine` is NOT exported from the `turbine-orm` package. It is emitted into the generated client; import it from your output directory (e.g. `./generated/turbine`). From the package itself, use `TurbineClient`.
 - There is no `tx.pipeline`, `tx.sql`, `tx.$use`, or `tx.$listen`. A TransactionClient has only table accessors, `table()`, `$transaction()`, `raw()` and `schema`. Use `db.$transaction([...])` for an atomic batch.
 - `schema` in turbine.config.ts is the Postgres NAMESPACE (default `public`), not a file path. The schema-builder file goes in `schemaFile`.
+- Never emit `allowFullTableScan: true`, `includePii: true`, `skipGlobalFilters: true`, or `skipGlobalFilters: ['posts']`. All four throw at runtime and are type errors: the option types are the symbol's type, `Unsafe`. Import `UNSAFE` and pass it, or leave the option off entirely.
 
 ## Docs
 
 - [Quick Start](https://turbineorm.dev/quickstart): Install, set DATABASE_URL, generate the typed client, run your first query and nested `with`.
+- [Why Turbine](https://turbineorm.dev/why-turbine): The checkable comparison against Prisma, Drizzle and Kysely: what is genuinely different (operational safety), what is table stakes in 2026, and what Turbine is not.
 - [Turbine for AI agents](https://turbineorm.dev/ai-agents): How to point a coding agent at Turbine, the deterministic codegen flow, and a drop-in agent-instructions snippet.
 - [API Reference](https://turbineorm.dev/queries): Every query method, WHERE operator, nested `with` option, the build* deferred builders, client configuration, and the escape hatches.
 - [Relations](https://turbineorm.dev/relations): hasMany / belongsTo / hasOne / manyToMany and how the json_agg nesting works.
@@ -44,7 +47,7 @@ Common mistakes to avoid when generating Turbine code:
 - [CLI Config Module](https://turbineorm.dev/cli-module): The importable turbine-orm/cli subpath: TurbineCliConfig, config discovery and loading, resolveConfig precedence, seed-file resolution.
 - [Database Engines](https://turbineorm.dev/engines): SQLite, MySQL, SQL Server, and PowDB behind the same typed API, and which features stay Postgres-only.
 - [Database Compatibility](https://turbineorm.dev/compatibility): PG-wire-compatible databases (CockroachDB, YugabyteDB, AlloyDB, TimescaleDB, Neon, Supabase) and their adapters.
-- [Benchmarks](https://turbineorm.dev/benchmarks): Three-way numbers against Prisma and Drizzle on a local PostgreSQL database. Measured once on 2026-07-21 against 0.39.0 and not re-run since; treat as a dated snapshot.
+- [Benchmarks](https://turbineorm.dev/benchmarks): Three-way numbers against Prisma and Drizzle on a local PostgreSQL database. Measured once on 2026-07-25 against 0.50.0 and not re-run since; treat as a dated snapshot.
 
 ## Optional
 

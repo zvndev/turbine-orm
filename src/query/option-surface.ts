@@ -38,6 +38,17 @@
  * column, or model NAME. If the value names anything in the schema, it is
  * `'prisma'`: a name-translating consumer has to walk it by hand.
  *
+ * ## The privilege options
+ *
+ * `skipGlobalFilters`, `includePii` and `allowFullTableScan` are `'native'` and
+ * MUST stay that way. Their values are the `UNSAFE` sentinel (plus, for
+ * skipGlobalFilters, table ACCESSOR names, which the rule above explicitly
+ * allows), and forwarding them verbatim is what lets core be the single place
+ * that decides whether a value is a real opt-in. Hand-translating them here
+ * would mean a second copy of that decision, and a consumer's
+ * `includePii: true` would then be judged by whichever copy it happened to
+ * reach first.
+ *
  * @module
  */
 
@@ -99,6 +110,8 @@ export const FIND_UNIQUE_OPTIONS: OptionTable<FindUniqueArgs<Row>> = {
   relationLoadStrategy: 'prisma',
   timeout: 'native',
   stableRelationOrder: 'native',
+  // Privilege options: forwarded verbatim, refused by core unless the value is
+  // the UNSAFE sentinel. See the note at the top of this file.
   skipGlobalFilters: 'native',
   includePii: 'native',
   forceCustomPlan: 'native',

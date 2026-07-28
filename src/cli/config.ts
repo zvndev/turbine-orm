@@ -8,6 +8,7 @@
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { PASSWORD_QUERY_PARAM_PATTERN } from './ui.js';
 
 // ---------------------------------------------------------------------------
 // Config types
@@ -342,9 +343,78 @@ export function resolveSeedFile(
 // Config file template (for `turbine init`)
 // ---------------------------------------------------------------------------
 
+/**
+ * Does this connection string carry a password?
+ *
+ * `turbine init --url` used to inline whatever it was given straight into
+ * `turbine.config.ts`, a file projects commit, so the documented one-liner
+ * (`turbine init --url postgres://user:PASSWORD@host/db`) committed a live
+ * database password. Everything that decides between "inline the string" and
+ * "read `process.env.DATABASE_URL`" asks this function, so there is exactly one
+ * definition of "this value is a secret".
+ *
+ * Three spellings carry a password, and libpq (and `pg-connection-string`,
+ * which is what `pg` actually parses with) accepts all three:
+ *
+ *  1. URL userinfo: `postgres://user:pass@host/db`.
+ *  2. URL query parameter: `postgres://user@host/db?password=pass`, and its
+ *     siblings such as `?sslpassword=`. This one was missed, on the reasoning
+ *     that a successful `new URL` ruled out the keyword form below, which is
+ *     true and irrelevant: the secret was in the query string.
+ *  3. libpq keyword form: `host=... password=...` (also `sslpassword=`), which
+ *     is not a URL at all.
+ *
+ * The query-parameter test reuses `PASSWORD_QUERY_PARAM_PATTERN`, the very
+ * regex `redactUrl` redacts with, so a spelling the terminal output hides can
+ * never be a spelling this function calls safe to commit. `pg-connection-string`
+ * itself would be the ideal oracle, but it is only a TRANSITIVE dependency (of
+ * `pg`), and importing an undeclared package would break on any strict,
+ * non-hoisting installer. Detection stays self-contained.
+ *
+ * @internal exported for tests.
+ */
+export function connectionStringHasPassword(connectionString: string): boolean {
+  const value = connectionString.trim();
+  if (!value) return false;
+
+  try {
+    const parsed = new URL(value);
+    // An empty password ("postgres://user@host/db", "?password=") is not a
+    // secret. decodeURIComponent is deliberately NOT applied: presence is all
+    // we need, and a percent-encoded value is still a non-empty one.
+    if (parsed.password !== '') return true;
+    for (const match of value.matchAll(new RegExp(PASSWORD_QUERY_PARAM_PATTERN, 'gi'))) {
+      if (match[2] !== '') return true;
+    }
+    // A string libpq parses as a URI is never re-parsed as the keyword form, so
+    // the check below genuinely cannot apply here.
+    return false;
+  } catch {
+    // Not a URL: fall through to the libpq keyword form.
+  }
+
+  // A keyword whose name ends in `password` (`password`, `sslpassword`) with a
+  // non-empty value, at the start of the string or after whitespace.
+  return /(^|\s)[^\s=]*password\s*=\s*\S/i.test(value);
+}
+
+/**
+ * The `turbine.config.ts` scaffold.
+ *
+ * A password-bearing `connectionString` is NEVER inlined: the emitted config
+ * reads `process.env.DATABASE_URL` instead, and `turbine init` scaffolds the
+ * `.env` that holds the real value. The refusal lives here rather than at the
+ * call site so no future caller can reintroduce the leak by passing the raw
+ * `--url` through.
+ */
 export function configTemplate(connectionString?: string): string {
-  const _url = connectionString ?? 'process.env.DATABASE_URL';
-  const urlLine = connectionString ? `  url: '${connectionString}',` : `  url: process.env.DATABASE_URL,`;
+  const inlineUrl = connectionString && !connectionStringHasPassword(connectionString) ? connectionString : undefined;
+  // Single quotes are the string delimiter in the emitted TS, so a connection
+  // string containing one would otherwise produce a config file that does not
+  // parse (a password-free URL can still carry a quote in a query parameter).
+  const urlLine = inlineUrl
+    ? `  url: '${inlineUrl.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}',`
+    : `  url: process.env.DATABASE_URL,`;
 
   return `import type { TurbineCliConfig } from 'turbine-orm/cli';
 

@@ -116,9 +116,34 @@ Atomic update operators on numeric columns (race-safe `col = col + $n`): `set`, 
 await db.posts.update({ where: { id: 1 }, data: { viewCount: { increment: 1 } } });
 ```
 
-Safety: `update`/`delete` with an empty `where` (`{}` or all-undefined) throws `ValidationError` (E003). Pass `{ allowFullTableScan: true }` to override.
+Safety: `update`/`delete` with an empty `where` (`{}` or all-undefined) throws `ValidationError` (E003). To mass-mutate on purpose, import the `UNSAFE` symbol and pass `{ allowFullTableScan: UNSAFE }`. A literal `true` throws, see Privilege options below.
 
 Nested writes: relation fields in `create`/`update` `data` support `create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert`, resolved in one transaction (depth-capped at 10).
+
+## Privilege options and the UNSAFE symbol
+
+Three query options remove a safety boundary rather than change a result:
+
+- `skipGlobalFilters`, drops the configured tenant / soft-delete predicate for that call.
+- `includePii`, returns columns tagged `pii: true` in `defineSchema`, which are otherwise excluded from every default projection at the SQL level (and refused as a `groupBy` key or a `_min`/`_max` target).
+- `allowFullTableScan`, drops the empty-`where` guard on `update`/`delete`/`updateMany`/`deleteMany`.
+
+Each is enabled by ONE value, a symbol exported from the package. This is the whole API; there is no boolean form.
+
+```ts
+import { UNSAFE } from 'turbine-orm';
+
+await db.posts.findMany({ skipGlobalFilters: UNSAFE });                            // skip every filter
+await db.users.findMany({ with: { posts: true }, skipGlobalFilters: [UNSAFE, 'posts'] }); // named tables only
+await db.users.findFirst({ where: { id: 1 }, includePii: UNSAFE });
+await db.sessions.deleteMany({ where: {}, allowFullTableScan: UNSAFE });           // every row, on purpose
+```
+
+`where` stays required on `delete` / `deleteMany` / `update` / `updateMany`; `allowFullTableScan` disarms the guard on an EMPTY `where`, it does not let you omit the key.
+
+Any other value that asks for the privilege, `true` and `['posts']` included, throws `ValidationError` (E003). The reason is that all three sit next to `where` on the same options object, so the idiomatic `db.users.findMany({ ...req.body })` used to let a request body drop the tenant predicate, the PII projection, or the mass-mutation guard. `JSON.parse` cannot produce a symbol, so no parsed input can put `UNSAFE` on an args object at all.
+
+The options are typed `Unsafe`, so a boolean is a compile error before it is a runtime one: even `allowFullTableScan: false` does not typecheck, and a conditional call site is written by adding the key or not, `{ where, ...(flag ? { allowFullTableScan: UNSAFE } : {}) }`. Do not generate `allowFullTableScan: true`, `includePii: true`, or `skipGlobalFilters: true`.
 
 ## Transactions, pipeline, raw SQL
 

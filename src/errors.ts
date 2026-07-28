@@ -47,7 +47,13 @@ export class TurbineError extends Error {
   readonly code: TurbineErrorCode;
 
   constructor(code: TurbineErrorCode, message: string, options?: { cause?: unknown }) {
-    super(formatErrorMessage(code, message), options);
+    // The cause is redacted in 'safe' mode (see redactCauseForMode). Only pass
+    // an options object through when the caller actually supplied a `cause`
+    // key: `new Error(msg, {})` defines no `cause` own property, while
+    // `new Error(msg, { cause: undefined })` defines one whose value is
+    // undefined, and error-serializing sinks tell those two apart.
+    const opts = options && 'cause' in options ? { ...options, cause: redactCauseForMode(options.cause) } : options;
+    super(formatErrorMessage(code, message), opts);
     this.name = 'TurbineError';
     this.code = code;
   }
@@ -76,6 +82,19 @@ let errorMessageMode: ErrorMessageMode = 'safe';
  *     clause (e.g. `where: { id, email }`). Values are redacted.
  *   - `'verbose'`: the message includes the full JSON-serialized where
  *     clause (e.g. `where: {"id":1,"email":"alice@x.com"}`).
+ *
+ * SCOPE, stated precisely because the useful version of this contract is the
+ * one that is true. 'safe' mode redacts row values from the surfaces Turbine
+ * OWNS: its own error messages, and the `detail` field of a driver error it
+ * wraps and attaches as `.cause` (see redactCauseForMode).
+ *
+ * It is NOT a blanket guarantee that no row value can be reached from a thrown
+ * error. A driver error whose SQLSTATE {@link wrapPgError} does not classify is
+ * returned UNCHANGED, and some of those carry a value in the `message` field
+ * itself, where nothing can be removed without destroying the diagnosis:
+ * `22P02 invalid input syntax for type integer: "alice@example.com"` is the
+ * common one. Treat 'safe' mode as removing Turbine's own contribution to the
+ * leak, not as a log-scrubbing boundary.
  */
 export function setErrorMessageMode(mode: ErrorMessageMode): void {
   errorMessageMode = mode;
@@ -84,6 +103,104 @@ export function setErrorMessageMode(mode: ErrorMessageMode): void {
 /** Returns the current NotFoundError message mode. Exported for tests. */
 export function getErrorMessageMode(): ErrorMessageMode {
   return errorMessageMode;
+}
+
+/**
+ * The marker left where a driver `detail` string was removed in 'safe' mode.
+ * Re-exported from the package root so tests and callers writing log
+ * assertions can match on it without hardcoding the wording.
+ */
+export const REDACTED_DETAIL = '[redacted by turbine errorMessages:"safe"]';
+
+/**
+ * Postgres puts the CONFLICTING ROW VALUES in the `detail` field of a
+ * constraint error, and nowhere else: `Key (email)=(alice@example.com) already
+ * exists.` for 23505, `Failing row contains (7, alice@example.com, …)` for
+ * 23502. The `message` field carries only relation/constraint/column NAMES.
+ *
+ * 'safe' mode keeps those values out of the Turbine error's own message, but
+ * the raw driver error used to be attached verbatim as `.cause`, so the values
+ * still reached every place an error object gets rendered whole:
+ *   - `console.error(err)` / an uncaught rejection: Node's error printer walks
+ *     the cause chain and prints `[cause]: … detail: 'Key (email)=(…)'`. Note
+ *     that `cause` is ALREADY non-enumerable (the Error constructor defines it
+ *     that way) and Node prints it anyway, so hiding the property is not a fix;
+ *   - Sentry and similar sinks link `cause` chains by default and serialize
+ *     each link's own properties.
+ *
+ * So in 'safe' mode the cause is replaced by a shallow clone with `detail`
+ * swapped for {@link REDACTED_DETAIL}. Cloning rather than mutating leaves the
+ * driver's own object untouched (a caller holding it from their own catch sees
+ * what the driver produced).
+ *
+ * The clone must remain a REAL error, which is the part that is easy to get
+ * wrong. `Object.create(proto, descriptors)` looks equivalent and is not: V8
+ * installs `stack` as an own ACCESSOR whose backing store is the internal
+ * [[ErrorData]] slot, and that slot is not a property, so it is not copied. The
+ * result reads `cause.stack === undefined`, `util.types.isNativeError(cause) ===
+ * false` and `Object.prototype.toString.call(cause) === '[object Object]'`, i.e.
+ * every log serializer that does `err.cause.stack.split('\n')` throws a
+ * TypeError and Sentry/pino drop the cause's frames. So the clone starts life
+ * as `new Error()` (which HAS the slot), is re-prototyped to the driver error's
+ * own prototype, and takes the original's stack as a plain string. That keeps
+ * `cause instanceof pg.DatabaseError`, `cause.code === '23505'`, the native
+ * brand, and the frames.
+ *
+ * In 'verbose' mode the cause passes through untouched: that mode's documented
+ * job is full-fidelity debugging.
+ */
+function redactCauseForMode(cause: unknown): unknown {
+  if (errorMessageMode === 'verbose') return cause;
+  if (!cause || typeof cause !== 'object') return cause;
+  const detail = (cause as { detail?: unknown }).detail;
+  // Nothing value-bearing to remove: return the original object so the common
+  // case (a non-pg cause, or a pg error without a detail) allocates nothing and
+  // keeps object identity with what the driver threw.
+  if (typeof detail !== 'string' || detail.length === 0) return cause;
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(cause);
+    // Replace the descriptor rather than assigning after the clone exists: a
+    // non-writable `detail` would make the assignment throw in strict mode
+    // (every module here is ESM, so it always would), and losing the cause is
+    // worse than paying for one descriptor literal.
+    descriptors.detail = {
+      value: REDACTED_DETAIL,
+      writable: true,
+      enumerable: descriptors.detail?.enumerable ?? true,
+      configurable: true,
+    };
+    // Brand check rather than `instanceof Error`, so a driver error thrown from
+    // another realm (a worker, a bundled duplicate of pg) is still recognized.
+    const isError = Object.prototype.toString.call(cause) === '[object Error]';
+    if (!isError) return Object.create(Object.getPrototypeOf(cause), descriptors);
+
+    // `new Error()` is the only way to obtain the [[ErrorData]] slot; the
+    // prototype is then pointed at the driver error's, so `instanceof` and
+    // `.name` behave exactly as before.
+    const clone = new Error();
+    Object.setPrototypeOf(clone, Object.getPrototypeOf(cause));
+    // The clone's own fresh `stack` accessor would otherwise describe THIS
+    // function's frames, and the original's accessor cannot be transplanted
+    // (it reads the receiver's slot). Copy the rendered string instead, and
+    // only when it is one: a driver that stashed a non-string there keeps its
+    // own descriptor rather than having a lie written over it.
+    const originalStack = (cause as { stack?: unknown }).stack;
+    if (typeof originalStack === 'string') {
+      descriptors.stack = { value: originalStack, writable: true, enumerable: false, configurable: true };
+    } else if (descriptors.stack && typeof descriptors.stack.get === 'function') {
+      // An own accessor bound to the ORIGINAL receiver would return undefined
+      // here; drop it and let the clone keep its own working one.
+      delete descriptors.stack;
+    }
+    Object.defineProperties(clone, descriptors);
+    return clone;
+  } catch {
+    // A cause whose descriptors cannot be replayed (an exotic proxy, a frozen
+    // prototype chain) must not turn a database error into a TypeError thrown
+    // from an error constructor. Dropping the cause entirely is the safe
+    // direction here: 'safe' mode's contract is that no row value escapes.
+    return undefined;
+  }
 }
 
 /**
@@ -229,13 +346,30 @@ export class ValidationError extends TurbineError {
 /** Thrown when a database connection fails */
 export class ConnectionError extends TurbineError {
   /**
+   * The driver code that produced this error: a Postgres SQLSTATE (`28P01`
+   * wrong password, `3D000` no such database, `08006` connection failure, ...)
+   * or a Node socket/TLS code (`ECONNREFUSED`, `CERT_HAS_EXPIRED`, ...).
+   *
+   * Exposed because E004 covers causes with very different remedies, and the
+   * alternative for a caller who needs to tell "wrong password" from "server
+   * down" is matching on `.message` text or reaching into `.cause`, both of
+   * which are exactly the untyped handling this error class exists to remove.
+   * Undefined when Turbine raised the error itself rather than wrapping a
+   * driver error (a malformed connection string, a subscription on an HTTP
+   * pool).
+   */
+  readonly sqlstate?: string;
+
+  /**
    * @param message human-readable connection failure description.
    * @param options optional pg/driver `cause` to preserve, used when wrapping a
-   *   connection-class driver error via `wrapPgError`.
+   *   connection-class driver error via `wrapPgError`, plus the driver `code`
+   *   that classified it.
    */
-  constructor(message: string, options?: { cause?: unknown }) {
+  constructor(message: string, options?: { cause?: unknown; sqlstate?: string }) {
     super(TurbineErrorCode.CONNECTION, message, options);
     this.name = 'ConnectionError';
+    this.sqlstate = options?.sqlstate;
   }
 }
 
@@ -307,9 +441,12 @@ export class UniqueConstraintError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only, the structured
-      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
-      // the full detail for programmatic use.
+      // message carries keys/constraint/column names only, and the same goes
+      // for `.cause`, whose `detail` is redacted by the TurbineError base
+      // constructor (see redactCauseForMode: an unredacted cause put the
+      // values straight back into any log line that prints the error object).
+      // The structured `.columns`/`.constraint`/`.column` fields survive in
+      // both modes, they carry NAMES, never values.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
@@ -342,9 +479,12 @@ export class ForeignKeyError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only, the structured
-      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
-      // the full detail for programmatic use.
+      // message carries keys/constraint/column names only, and the same goes
+      // for `.cause`, whose `detail` is redacted by the TurbineError base
+      // constructor (see redactCauseForMode: an unredacted cause put the
+      // values straight back into any log line that prints the error object).
+      // The structured `.columns`/`.constraint`/`.column` fields survive in
+      // both modes, they carry NAMES, never values.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
@@ -376,9 +516,12 @@ export class NotNullViolationError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only, the structured
-      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
-      // the full detail for programmatic use.
+      // message carries keys/constraint/column names only, and the same goes
+      // for `.cause`, whose `detail` is redacted by the TurbineError base
+      // constructor (see redactCauseForMode: an unredacted cause put the
+      // values straight back into any log line that prints the error object).
+      // The structured `.columns`/`.constraint`/`.column` fields survive in
+      // both modes, they carry NAMES, never values.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
@@ -490,9 +633,12 @@ export class CheckConstraintError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only, the structured
-      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
-      // the full detail for programmatic use.
+      // message carries keys/constraint/column names only, and the same goes
+      // for `.cause`, whose `detail` is redacted by the TurbineError base
+      // constructor (see redactCauseForMode: an unredacted cause put the
+      // values straight back into any log line that prints the error object).
+      // The structured `.columns`/`.constraint`/`.column` fields survive in
+      // both modes, they carry NAMES, never values.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
@@ -523,9 +669,12 @@ export class ExclusionConstraintError extends TurbineError {
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
-      // message carries keys/constraint/column names only, the structured
-      // `.columns`/`.constraint`/`.column` fields and `.cause` still expose
-      // the full detail for programmatic use.
+      // message carries keys/constraint/column names only, and the same goes
+      // for `.cause`, whose `detail` is redacted by the TurbineError base
+      // constructor (see redactCauseForMode: an unredacted cause put the
+      // values straight back into any log line that prints the error object).
+      // The structured `.columns`/`.constraint`/`.column` fields survive in
+      // both modes, they carry NAMES, never values.
       const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
@@ -685,10 +834,12 @@ function parseColumnsFromDetail(detail: string): string[] | undefined {
 }
 
 /**
- * Connection-class error codes. Covers both pg SQLSTATEs (class 08
- * connection_exception, plus a few class-53/57 admin/availability codes) and
- * Node driver-level error codes that arrive on the same `.code` field when the
- * socket never reaches Postgres. All map to {@link ConnectionError} (E004).
+ * Connection-class error codes. Covers pg SQLSTATEs (class 08
+ * connection_exception, class 28 authorization refusals, invalid_catalog_name,
+ * plus a few class-53/57 admin/availability codes) and Node driver-level socket
+ * and TLS error codes that arrive on the same `.code` field when the connection
+ * never reaches (or never gets past) Postgres. All map to
+ * {@link ConnectionError} (E004).
  *
  * `57014` (query_canceled, a server-side `statement_timeout` cancellation) is
  * intentionally NOT here: it maps to {@link TimeoutError} (E002) instead.
@@ -700,7 +851,22 @@ const CONNECTION_ERROR_CODES = new Set<string>([
   '08003', // connection_does_not_exist
   '08004', // sqlserver_rejected_establishment_of_sqlconnection
   '08006', // connection_failure
+  '08007', // transaction_resolution_unknown
   '08P01', // protocol_violation
+  // pg SQLSTATE class 28: the server answered and REFUSED us. These are the
+  // most common first-run failures there are (wrong password, a pg_hba rule
+  // that does not cover this user/host), and they used to fall through
+  // wrapPgError untouched: the caller got a raw pg `DatabaseError` whose
+  // `.code` was `28P01`, i.e. a value from the SQLSTATE namespace on the SAME
+  // property Turbine puts `TURBINE_E0NN` in. Every `err.code.startsWith
+  // ('TURBINE_')` check, every `instanceof ConnectionError` catch, and the
+  // README's "every error is typed" guarantee silently missed the single
+  // failure a new user is most likely to hit.
+  '28000', // invalid_authorization_specification
+  '28P01', // invalid_password
+  // The server answered but the database named in the connection string does
+  // not exist. Same class of first-run mistake, same escape.
+  '3D000', // invalid_catalog_name
   // pg SQLSTATE class 53/57 (server unavailable / shutting down)
   '53300', // too_many_connections
   '57P01', // admin_shutdown
@@ -711,8 +877,53 @@ const CONNECTION_ERROR_CODES = new Set<string>([
   'ECONNRESET',
   'ETIMEDOUT',
   'ENOTFOUND',
+  'EAI_AGAIN', // transient DNS failure
+  'EHOSTUNREACH',
+  'ENETUNREACH',
   'EPIPE',
+  // Node TLS handshake failures. They can only happen while OPENING a
+  // connection, so classifying them as connection errors cannot mis-tag a
+  // query failure, and a managed Postgres with a private CA is the other
+  // first-run wall people hit.
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'CERT_HAS_EXPIRED',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
 ]);
+
+/**
+ * Actionable next step per connection-class code, appended to the driver's own
+ * message. The driver message states WHAT happened ("password authentication
+ * failed for user \"postgres\""); these state what to do about it, which is the
+ * whole difference between a typed error and a raw one for a first-run failure.
+ *
+ * A code with no entry here simply gets no hint appended.
+ */
+const CONNECTION_ERROR_HINTS: Readonly<Record<string, string>> = {
+  '28P01':
+    'The server rejected the credentials. Check the password in your connection string (or DATABASE_URL), including any URL-encoding of special characters.',
+  '28000':
+    "The server refused this user/host combination. Check the user name and the server's pg_hba.conf rules for the client address.",
+  '3D000':
+    'The database named in the connection string does not exist. Check the path segment after the host, and create the database if needed.',
+  '53300': "The server has no free connection slots. Lower `poolSize` or raise the server's max_connections.",
+  '57P03': 'The server is still starting up (or shutting down) and is not accepting connections yet.',
+  ECONNREFUSED: 'Nothing is listening on that host and port. Check the server is running and the port is right.',
+  ENOTFOUND:
+    'The host in the connection string could not be resolved. Check the host name, and that the connection string itself is well formed.',
+  EAI_AGAIN: 'DNS lookup for the host failed temporarily. Check network/DNS availability, then retry.',
+  ETIMEDOUT:
+    'The connection attempt timed out before the server answered. Check firewall/security-group rules and `connectionTimeoutMs`.',
+  DEPTH_ZERO_SELF_SIGNED_CERT:
+    'The server presented a certificate Node cannot verify. Supply the CA via `ssl: { ca }`.',
+  SELF_SIGNED_CERT_IN_CHAIN: 'The server presented a certificate Node cannot verify. Supply the CA via `ssl: { ca }`.',
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE:
+    'The server presented a certificate Node cannot verify. Supply the CA via `ssl: { ca }`.',
+  CERT_HAS_EXPIRED: "The server's TLS certificate has expired. Renew it, or supply the correct CA via `ssl: { ca }`.",
+  ERR_TLS_CERT_ALTNAME_INVALID:
+    "The server's TLS certificate does not cover the host you connected to. Check the host name in the connection string.",
+};
 
 /**
  * Translate a pg driver error into a typed Turbine error.
@@ -727,6 +938,8 @@ const CONNECTION_ERROR_CODES = new Set<string>([
  *   40P01 (deadlock_detected)     -> DeadlockError       (retryable)
  *   40001 (serialization_failure) -> SerializationFailureError (retryable)
  *   57014 (query_canceled)        -> TimeoutError (server-side statement_timeout)
+ *   28P01 / 28000 (auth refused)  -> ConnectionError, with a remediation hint
+ *   3D000 (no such database)      -> ConnectionError, with a remediation hint
  *   connection-class codes        -> ConnectionError (see CONNECTION_ERROR_CODES)
  *
  * The original pg error is preserved as `.cause` on the wrapped error.
@@ -797,12 +1010,14 @@ export function wrapPgError(err: unknown): unknown {
     default:
       if (CONNECTION_ERROR_CODES.has(e.code)) {
         const pgMessage = typeof e.message === 'string' && e.message.length > 0 ? e.message : undefined;
-        return new ConnectionError(
-          pgMessage
-            ? `[turbine] Database connection error: ${pgMessage}`
-            : `[turbine] Database connection error (${e.code})`,
-          { cause: err },
-        );
+        // Own-property lookup only: `e.code` is driver-controlled text, and a
+        // plain-object map would happily resolve `constructor` or `toString`
+        // to a function and interpolate it into the message.
+        const hint = Object.hasOwn(CONNECTION_ERROR_HINTS, e.code) ? CONNECTION_ERROR_HINTS[e.code] : undefined;
+        const head = pgMessage
+          ? `[turbine] Database connection error: ${pgMessage}`
+          : `[turbine] Database connection error (${e.code})`;
+        return new ConnectionError(hint ? `${head} (${e.code}) ${hint}` : head, { cause: err, sqlstate: e.code });
       }
       return err;
   }

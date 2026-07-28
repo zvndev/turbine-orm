@@ -161,6 +161,14 @@ Turbine compiles the `with` clause to a single SQL statement using PostgreSQL's 
 
 ## Next steps
 
+**Migrating an existing app?** Start with one of these rather than the API reference:
+
+- **[Migrate from Prisma](/migrate-from-prisma)**, `turbine migrate-from-prisma` reads your `schema.prisma` and emits a typed mapping, and `createPrismaCompatClient` gives you a `PrismaClient`-shaped surface so your existing `include` / `take` / `cursor` call sites keep working while you port.
+- **[Migrate from Drizzle](/migrate-from-drizzle)**, the API mapping, the schema translation, and the behavioural differences worth auditing before you cut over.
+- **[Why Turbine](/why-turbine)**, if you are still deciding: what is genuinely different, and what is table stakes in 2026.
+
+Otherwise, keep going:
+
 - **[Vector Search](/vector)**, typed pgvector KNN ranking and distance filters, no raw SQL.
 - **[Realtime](/realtime)**, Postgres LISTEN/NOTIFY pub/sub with `$listen` / `$notify`.
 - **[Transactions & RLS Sessions](/transactions)**, SAVEPOINTs, isolation levels, and `sessionContext` for Row-Level Security multi-tenancy.

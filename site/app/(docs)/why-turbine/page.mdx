@@ -1,0 +1,97 @@
+export const metadata = {
+  title: 'Why Turbine',
+  description:
+    'An honest comparison of Turbine ORM against Prisma, Drizzle and Kysely. What is genuinely different (operational safety, not query speed), what is table stakes in 2026, and what is not a reason to switch.',
+  alternates: { canonical: '/why-turbine' },
+};
+
+# Why Turbine
+
+This page is the argument for choosing Turbine, written so you can check it rather than take it. It starts with the part most comparison pages leave out.
+
+## First, what is *not* a reason
+
+**Resolving a nested `with` clause in one statement is table stakes in 2026.** Drizzle has compiled relational queries to `LEFT JOIN LATERAL` plus JSON aggregation since 0.28. Prisma does the same under its `relationJoins` preview flag. Kysely ships `jsonArrayFrom` / `jsonObjectFrom` helpers for it. Turbine does it too, with correlated `json_agg` subqueries, and it does it well, but it is a correctness detail rather than a headline. If someone sells you "no N+1" as the differentiator in 2026, they are describing the floor.
+
+**Raw query speed is not the reason either.** Turbine is competitive-to-ahead across the [benchmark suite](/benchmarks), not a clean sweep, and Drizzle wins streaming outright. The honest summary of that page is that the four engines are close enough on a well-indexed schema that per-query overhead should not decide your choice.
+
+Two more things that are real but are about **cost**, not safety, so they belong here rather than in the argument proper:
+
+- **One runtime dependency (`pg`).** No engine binary, no WASM module, no adapter packages to keep in lockstep. Run `npm run size` in the repo for the current import-graph figure; a precise number quoted in prose goes stale silently, and this one did before a review caught it, so the ceiling lives in CI (`.size-limit.js`) instead of on this page.
+- **Real pipelining.** `db.pipeline(...)` uses the Postgres extended-query protocol (Parse/Bind/Execute/Sync) to put N independent queries in one TCP flush. Drizzle's `db.batch()` is an implicit transaction on specific drivers, which is a different thing.
+
+## The actual argument: operational safety
+
+Every layer between you and a production database is built on one assumption: **the rows are real**. Not seed data, not a laptop copy, not a fixture. Customer records, in a database that a person on your team will point a tool at on a Tuesday afternoon while distracted.
+
+That assumption produces four defaults that no other TypeScript ORM ships, and they are the reason to choose Turbine.
+
+### 1. `turbine doctor`: the review a DBA would have given you, offline
+
+`npx turbine doctor` derives every column set the ORM's relation subqueries actually probe, hasMany and hasOne child FKs, belongsTo reference keys, many-to-many junction keys, and reports the ones with no covering index, with a cost tier per finding. `--fix` writes the migration. It also runs a [cached-plan divergence check](/cli#turbine-doctor): columns whose value distribution makes a *named* prepared statement's generic plan unsafe, verified with a plan-only `EXPLAIN` rather than predicted.
+
+No cloud service, no telemetry, no account. It reads your introspected schema and your database's own statistics.
+
+**The checkable claim:** no TypeScript ORM CLI offers missing-index advice. Not the Prisma CLI, not `drizzle-kit`, not `kysely-ctl`, not the MikroORM / TypeORM / Sequelize CLIs. Prisma Optimize was **retired in March 2026** in favour of cloud-only Query Insights, which moves the capability further away from your terminal, not closer. Prior art exists outside TypeScript, notably Ruby's `active_record_doctor`, so the honest claim is "no TypeScript ORM", not "no ORM".
+
+This is the differentiator that most directly changes an outcome. The largest single number anywhere in these docs is on the [Prisma migration page](/migrate-from-prisma#before-anything-else-run-doctor): one missing FK index took a correlated plan from 17.8 s to 62 ms.
+
+### 2. PII is a schema contract, enforced in the emitted SQL
+
+Tag a column `pii: true` in [`defineSchema`](/schema#pii-fields) and it is excluded from every default projection: top-level rows, `with` subqueries, batched loaders, write returns, and the Studio UI.
+
+The word doing the work is **emitted**. On the SQL engines the exclusion is in the statement itself, a `RETURNING "id", "name"` rather than `RETURNING *`, so the value never leaves the database and there is no post-processing step to forget. A tagged column is also **refused** as a `groupBy` key and as a `_min` / `_max` target, because both hand back a stored cell. Predicates and ordering stay unrestricted, because they narrow and sort without returning anything.
+
+Getting it back is [`includePii: UNSAFE`](/global-filters#privilege-options-and-the-unsafe-symbol), a symbol, deliberately: an options object built from an untrusted request body must not be able to unlock it, and `JSON.parse` cannot produce a symbol. The same rule covers `skipGlobalFilters` and `allowFullTableScan`.
+
+A schema with no tagged column emits byte-identical SQL, so this costs nothing if you do not use it.
+
+**The related default:** errors carry keys, never values. A `NotFoundError` says `where: { id, email }`; it does not print the email. A `UniqueConstraintError` names the column that conflicted. That makes the error safe to forward to your error tracker with no scrubbing rule in front of it, and the full `where` object is still on `err.where` in code.
+
+### 3. The database UI is read-only, and writes are a per-launch decision
+
+`npx turbine studio` binds loopback, authenticates with a 192-bit per-process token, and runs every read inside `BEGIN READ ONLY`. In the default mode the write endpoints **do not exist in the router at all**: they 404, so there is nothing to bypass, misconfigure, or leave enabled. `--write` opts one launch in to edits, each addressed by its full primary key rather than a predicate, compiled by the same validated builder your application uses. There has been no raw-SQL surface at all since v0.19. PII cells are redacted server-side, before serialization.
+
+**The checkable claim:** no other TypeScript ORM ships a studio that is read-only by default or that redacts PII. Prisma Studio is open source (`@prisma/studio-core` is Apache-2.0) but has no read-only mode, and that request has been open since February 2021. Drizzle Studio is not open source, and self-hosting runs through the paid Drizzle Gateway. TypeORM, MikroORM, Kysely and Sequelize have no studio at all.
+
+### 4. Data-destroying statements need consent
+
+`migrate up`, `migrate down` and `push` scan for `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, unqualified `DELETE` / `UPDATE`, and `ALTER COLUMN … TYPE`, print an itemized report, and refuse to run. Interactively you type `destroy my data` and then `yes`. In CI you pass `--allow-destructive`. A refused batch applies nothing.
+
+## The architectural argument: nothing runs on your event loop
+
+This one is worth stating separately, because it does not go stale the way a bundle-size number does.
+
+Prisma 7 removed the Rust query engine, which was the right call for install size and for edge deployment. The replacement, though, is a **WebAssembly query compiler that runs on the JavaScript main thread**: in Prisma 6 the query was built in Rust, off your event loop; in Prisma 7 it is built in your event loop, in front of every other request the process is serving.
+
+You do not have to take that framing from a competitor. Prisma shipped an **LRU query-plan cache in 7.4.0** specifically to address it, normalizing each query into a shape key so a repeated shape reuses its compiled plan, and then added **`queryPlanCacheMaxSize` in 7.8.0** so you can tune or disable that cache. Those two releases are the acknowledgement, in their own changelog, that per-query compilation on the main thread is a load-bearing cost.
+
+Turbine compiles a query with plain string building and an FNV-1a shape fingerprint into a bounded LRU of SQL templates. There is no compiler, no WASM instance, and no plan cache to size, because there is no plan to cache: the artifact is a parameterized SQL string. That is a structural difference rather than a benchmark result, which is why it is a better argument than bundle size. It cannot be closed by a faster WASM build.
+
+## What Turbine is not
+
+Stated so you do not find out three weeks in:
+
+- **Postgres is the primary target.** SQLite, MySQL and SQL Server are real, tested [engines](/engines) behind subpath exports, but several flagship features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) are Postgres-only and throw a typed [`UnsupportedFeatureError`](/errors) rather than degrading silently. The `turbine generate` / `turbine migrate` CLI is Postgres-only.
+- **Only Postgres streams with a true cursor.** The other engines' `findManyStream` materializes the result and then yields it in batches. Same rows, same API, not constant memory.
+- **It is younger.** Fewer Stack Overflow answers, fewer blog posts, a smaller community. The mitigation is that the [migration paths](/migrate-from-prisma) are real and reversible, not that the gap does not exist.
+- **The nested-`with` type inference is deep, but the schema is code-first or introspected.** There is no `.prisma` DSL, which is a feature for some teams and a cost for others.
+
+## Coming from somewhere else
+
+- **[Migrate from Prisma](/migrate-from-prisma)**, including a runtime `PrismaClient`-shaped compat adapter, so the port is measured in hours rather than in call sites. `turbine migrate-from-prisma` reads your `schema.prisma` and emits the mapping.
+- **[Migrate from Drizzle](/migrate-from-drizzle)**, the API mapping and the behavioural differences worth auditing.
+
+## Then check it yourself
+
+Every claim above is meant to be verified rather than believed:
+
+```bash
+npx turbine doctor          # the index advice, on your own schema
+npx turbine studio          # read-only by default, no flag needed
+npx turbine studio --demo   # or with no database at all
+```
+
+- **[Benchmarks](/benchmarks)**, with the measurement noise floor published next to the numbers and the one scenario Turbine loses stated first.
+- **[Typed Errors](/errors)**, the full code table.
+- **[Quick Start](/quickstart)**, zero to a typed query.

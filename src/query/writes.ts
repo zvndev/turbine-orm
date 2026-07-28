@@ -27,6 +27,7 @@ import type {
   UpdateManyArgs,
   UpsertArgs,
 } from './types.js';
+import { resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
 import { coerceTemporalValue, resolveColumnName, type SqlCacheEntry } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -353,7 +354,7 @@ export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateMa
 
 export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T>): DeferredQuery<T> {
   assertWritable(qi, 'update');
-  qi.currentSkip = args.skipGlobalFilters;
+  qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   // `updatedAt`-tagged columns are filled in before anything reads `data`, so
   // the SET list, the fingerprint and the param collector all see one object.
   const dataObj = applyUpdatedAtColumns(qi, args.data as Record<string, unknown>);
@@ -366,7 +367,12 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
   // The empty-`where` guard checks the USER predicate only, a global filter
   // must never turn an unguarded mass update into an allowed one.
   const userHasPredicate = !whereMod.userPredicateIsEmpty(qi, userWhere) || !!lock;
-  whereMod.assertMutationHasPredicate(qi, 'update', userHasPredicate ? ' WHERE x' : '', args.allowFullTableScan);
+  whereMod.assertMutationHasPredicate(
+    qi,
+    'update',
+    userHasPredicate ? ' WHERE x' : '',
+    resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'),
+  );
   // The SQL is built from the global-filter-merged where (soft-delete keeps an
   // update from touching already-deleted rows).
   const whereObj = (whereMod.mergeGlobalFilter(qi, userWhere) ?? {}) as Record<string, unknown>;
@@ -507,7 +513,7 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
 
 export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T>): DeferredQuery<T> {
   assertWritable(qi, 'delete');
-  qi.currentSkip = args.skipGlobalFilters;
+  qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   // Prisma compound-unique selector → the column conjunction (before the guard).
   const userWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
   // Guard the USER predicate (a global filter must not satisfy the guard).
@@ -515,7 +521,7 @@ export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T
     qi,
     'delete',
     whereMod.userPredicateIsEmpty(qi, userWhere) ? '' : ' WHERE x',
-    args.allowFullTableScan,
+    resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'),
   );
   const whereObj = (whereMod.mergeGlobalFilter(qi, userWhere) ?? {}) as Record<string, unknown>;
   const whereFp = whereMod.fingerprintWhere(qi, whereObj);
@@ -573,7 +579,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   assertWritable(qi, 'upsert');
   assertNoGeneratedColumns(qi, args.create as Record<string, unknown>, 'upsert');
   assertNoGeneratedColumns(qi, args.update as Record<string, unknown>, 'upsert');
-  qi.currentSkip = args.skipGlobalFilters;
+  qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   // Prisma compound-unique selector on the conflict target → its member columns.
   const upsertWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
   // Build the INSERT part from create data
@@ -655,14 +661,14 @@ export function buildUpdateMany<T extends object>(
   args: UpdateManyArgs<T>,
 ): DeferredQuery<{ count: number }> {
   assertWritable(qi, 'updateMany');
-  qi.currentSkip = args.skipGlobalFilters;
+  qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   const dataObj = applyUpdatedAtColumns(qi, args.data as Record<string, unknown>);
   assertNoGeneratedColumns(qi, dataObj, 'updateMany');
   whereMod.assertMutationHasPredicate(
     qi,
     'updateMany',
     whereMod.userPredicateIsEmpty(qi, args.where as Record<string, unknown>) ? '' : ' WHERE x',
-    args.allowFullTableScan,
+    resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'),
   );
   const whereObj = (whereMod.mergeGlobalFilter(qi, args.where as Record<string, unknown>) ?? {}) as Record<
     string,
@@ -714,12 +720,12 @@ export function buildDeleteMany<T extends object>(
   args: DeleteManyArgs<T>,
 ): DeferredQuery<{ count: number }> {
   assertWritable(qi, 'deleteMany');
-  qi.currentSkip = args.skipGlobalFilters;
+  qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   whereMod.assertMutationHasPredicate(
     qi,
     'deleteMany',
     whereMod.userPredicateIsEmpty(qi, args.where as Record<string, unknown>) ? '' : ' WHERE x',
-    args.allowFullTableScan,
+    resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'),
   );
   const whereObj = (whereMod.mergeGlobalFilter(qi, args.where as Record<string, unknown>) ?? {}) as Record<
     string,

@@ -84,6 +84,7 @@ import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js
 import type { CliOverrides, ConfigLoadError, ResolvedConfig, TurbineCliConfig } from './config.js';
 import {
   configTemplate,
+  connectionStringHasPassword,
   DEFAULT_INIT_SEED_FILE,
   findConfigFile,
   loadConfigResult,
@@ -196,6 +197,12 @@ export interface CliArgs {
   yes?: boolean;
   /** `init --skip-schema`: don't scaffold the schema file. */
   skipSchema?: boolean;
+  /**
+   * `init --with-schema`: scaffold the starter schema file even when the
+   * database already has tables. The escape hatch for a code-first project
+   * bootstrapping against a populated database.
+   */
+  withSchema?: boolean;
   /** `init --skip-seed`: don't scaffold the seed file or offer to run it. */
   skipSeed?: boolean;
   /** `init --skip-push`: don't offer to push the schema to the database. */
@@ -237,6 +244,21 @@ export interface CliArgs {
    * not be turned into a failed install.
    */
   ifDb?: boolean;
+}
+
+/**
+ * Fail an argument-parse error the way every other CLI failure looks: banner,
+ * red error line, then indented hint lines. The flag validators used to call
+ * `console.error` directly, so a typo in `--recipe` printed one bare unstyled
+ * sentence with no banner and no hint, which reads like an internal crash
+ * rather than "you forgot the recipe name".
+ */
+function failArg(message: string, ...hints: string[]): never {
+  banner();
+  error(message);
+  for (const hint of hints) console.log(`  ${dim(hint)}`);
+  newline();
+  process.exit(1);
 }
 
 export function parseArgs(argv = process.argv.slice(2)): CliArgs {
@@ -303,6 +325,9 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
       case '--skip-schema':
         result.skipSchema = true;
         break;
+      case '--with-schema':
+        result.withSchema = true;
+        break;
       case '--skip-seed':
         result.skipSeed = true;
         break;
@@ -356,8 +381,10 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
       case '--import-ext':
       case '--import-extension':
         if (next !== 'js' && next !== 'none' && next !== 'auto') {
-          console.error(`--import-ext requires one of: js, none, auto (got ${next ?? '(nothing)'})`);
-          process.exit(1);
+          failArg(
+            `${cyan('--import-ext')} requires one of: js, none, auto ${dim(`(got ${next ?? 'nothing'})`)}`,
+            'Example: npx turbine generate --import-ext none',
+          );
         }
         result.importExtension = next;
         i++;
@@ -373,8 +400,11 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--recipe':
         if (next === undefined || next.startsWith('-')) {
-          console.error('--recipe requires a name (e.g. --recipe backfill)');
-          process.exit(1);
+          failArg(
+            `${cyan('--recipe')} requires a recipe name.`,
+            `Known recipes: ${Object.keys(MIGRATION_RECIPES).join(', ') || '(none)'}`,
+            'Example: npx turbine migrate create backfill_full_name --recipe backfill',
+          );
         }
         result.recipe = next;
         i++;
@@ -866,7 +896,9 @@ export type InitStepSkipReason =
   | 'unreachable'
   | 'no-seed-file'
   | 'non-interactive'
-  | 'default-no';
+  | 'default-no'
+  /** The database already has tables, so an EMPTY code-first schema file is wrong. */
+  | 'db-has-tables';
 
 export interface InitPlanStep {
   id: InitStepId;
@@ -883,6 +915,12 @@ export interface InitPlanState {
   seedFileExists: boolean;
   hasUrl: boolean;
   dbReachable: boolean;
+  /**
+   * The reachable database already contains user tables. Optional: absent means
+   * "not probed / unknown", which keeps the pre-0.62 plan for every caller that
+   * does not supply it.
+   */
+  dbHasTables?: boolean;
 }
 
 /** Effective flags for the planner. */
@@ -891,6 +929,11 @@ export interface InitPlanFlags {
   force: boolean;
   interactive: boolean;
   skipSchema: boolean;
+  /**
+   * `--with-schema`: scaffold the schema file even against a database that
+   * already has tables. Loses to `skipSchema`, which is the explicit "don't".
+   */
+  withSchema?: boolean;
   skipSeed: boolean;
   skipPush: boolean;
   skipGenerate: boolean;
@@ -929,6 +972,23 @@ export function planInitSteps(state: InitPlanState, flags: InitPlanFlags): InitP
   const scaffold = (id: InitStepId, exists: boolean, skipFlag: boolean): InitPlanStep => {
     if (skipFlag) return { id, action: 'skip', defaultYes: true, skipReason: 'flag' };
     if (exists) return { id, action: 'skip', defaultYes: true, skipReason: 'exists' };
+    // An EMPTY code-first schema file written next to a database that ALREADY
+    // has tables is what makes the very next `turbine push` announce "Schema
+    // defines 0 tables" and list every real table under "Extra tables in
+    // database (not dropped automatically)", which reads like imminent data
+    // loss. For these projects the database is the source of truth
+    // (`turbine generate`), so the default flips to "don't scaffold it":
+    // prompted (default no) on a TTY, skipped with an explanation otherwise.
+    //
+    // `--with-schema` opts back in and returns this step to the normal path. A
+    // code-first project bootstrapping in CI against a populated database is a
+    // real case, and a default that no flag can override is a behavior change
+    // with no way out, not a safety rail.
+    if (id === 'schema' && state.dbHasTables === true && !flags.withSchema) {
+      return mode === 'prompt'
+        ? { id, action: 'prompt', defaultYes: false }
+        : { id, action: 'skip', defaultYes: false, skipReason: 'db-has-tables' };
+    }
     return { id, action: mode === 'prompt' ? 'prompt' : 'run', defaultYes: true };
   };
   steps.push(scaffold('schema', state.schemaExists, flags.skipSchema));
@@ -988,16 +1048,46 @@ async function promptYesNo(question: string, defaultYes: boolean): Promise<boole
   }
 }
 
-/** Probe database reachability with a short-lived connection. Never throws. */
-async function probeDatabase(url: string): Promise<boolean> {
+/** What the one up-front `turbine init` connection learned about the database. */
+interface InitDatabaseProbe {
+  reachable: boolean;
+  /**
+   * User tables already in the configured schema. Turbine's own bookkeeping
+   * tables do not count: a database whose only table is `_turbine_migrations`
+   * is still an empty project, and calling it populated would suppress the
+   * starter schema file on exactly the project that wants one.
+   */
+  tableCount: number;
+}
+
+/**
+ * Probe database reachability (and how populated it is) with a short-lived
+ * connection. Never throws: an unreachable database is a normal init state.
+ */
+async function probeDatabase(url: string, schema: string): Promise<InitDatabaseProbe> {
   try {
     const { default: pg } = await import('pg');
     const client = new pg.Client({ connectionString: url });
     await client.connect();
+    let tableCount = 0;
+    try {
+      const res = await client.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM information_schema.tables
+          WHERE table_schema = $1
+            AND table_type = 'BASE TABLE'
+            AND table_name NOT LIKE '\\_turbine\\_%'`,
+        [schema],
+      );
+      tableCount = Number.parseInt(res.rows[0]?.count ?? '0', 10) || 0;
+    } catch {
+      // Reachable but the catalog read failed (permissions, odd engine). Treat
+      // it as "unknown", not "empty": tableCount 0 only suppresses a scaffold.
+    }
     await client.end();
-    return true;
+    return { reachable: true, tableCount };
   } catch {
-    return false;
+    return { reachable: false, tableCount: 0 };
   }
 }
 
@@ -1040,6 +1130,163 @@ export default defineSchema({
   // },
 });
 `;
+
+// ---------------------------------------------------------------------------
+// `turbine init --url <secret>`: keep the password out of the committed config
+// ---------------------------------------------------------------------------
+
+/** What the secret-handling scaffold decided to do with one file. */
+export type EnvScaffoldAction = 'created' | 'appended' | 'unchanged';
+
+/** Detected state of the three files the scaffold touches (all IO by the caller). */
+export interface EnvScaffoldState {
+  envExists: boolean;
+  /** `.env` already assigns DATABASE_URL (their value wins; we never rewrite it). */
+  envHasDatabaseUrl: boolean;
+  envExampleExists: boolean;
+  gitignoreExists: boolean;
+  gitignoreIgnoresEnv: boolean;
+}
+
+export interface EnvScaffoldPlan {
+  env: EnvScaffoldAction;
+  envExample: EnvScaffoldAction;
+  gitignore: EnvScaffoldAction;
+}
+
+/**
+ * Does this `.gitignore` text already ignore `.env`?
+ *
+ * Line-based rather than a substring search: a `.gitignore` mentioning
+ * `.env.example` (a very common line, since the example file is the one you DO
+ * commit) contains the text `.env` while ignoring nothing of the kind, and
+ * treating that as covered is how the password would stay committable.
+ * Negations (`!.env`) are honored as a later line overriding an earlier one,
+ * exactly as git resolves them.
+ *
+ * @internal exported for tests.
+ */
+export function gitignoreIgnoresEnv(content: string): boolean {
+  let ignored = false;
+  for (const raw of content.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    const negated = line.startsWith('!');
+    // A leading `/` anchors to the repo root, a trailing `/` means directory.
+    const pattern = (negated ? line.slice(1) : line).replace(/^\//, '').replace(/\/$/, '');
+    // The patterns that actually match a root-level `.env` file.
+    if (pattern === '.env' || pattern === '.env*' || pattern === '*.env' || pattern === '**/.env') {
+      ignored = !negated;
+    }
+  }
+  return ignored;
+}
+
+/**
+ * Decide what the `--url`-carries-a-password scaffold writes. Pure, so the whole
+ * matrix (fresh project, existing `.env`, existing `.gitignore`, re-run) is
+ * testable without a filesystem.
+ *
+ * An existing `DATABASE_URL` in `.env` is NEVER rewritten: it is the value the
+ * project already runs against, and silently repointing it at the `--url` from
+ * one command line is a worse failure than printing a notice.
+ *
+ * @internal exported for tests.
+ */
+export function planEnvScaffold(state: EnvScaffoldState): EnvScaffoldPlan {
+  return {
+    env: !state.envExists ? 'created' : state.envHasDatabaseUrl ? 'unchanged' : 'appended',
+    envExample: state.envExampleExists ? 'unchanged' : 'created',
+    // No `.gitignore` at all means nothing is ignored, so the `.env` we just
+    // wrote is committable. Create one rather than warn about it.
+    gitignore: !state.gitignoreExists ? 'created' : state.gitignoreIgnoresEnv ? 'unchanged' : 'appended',
+  };
+}
+
+const ENV_EXAMPLE_TEMPLATE = `# Copy this file to .env and fill in your own values.
+# This file is committed; .env is not.
+DATABASE_URL=postgres://user:password@localhost:5432/database
+`;
+
+/**
+ * Move a password-bearing `--url` out of `turbine.config.ts` and into `.env`.
+ *
+ * `turbine init --url postgres://user:PASSWORD@host/db` is the documented
+ * one-liner, and it used to inline that string verbatim into a file projects
+ * commit, with no `.gitignore` written at all. The config template now refuses
+ * to inline a secret (see `configTemplate`), so the real value has to land
+ * somewhere the config can read it from: this writes `.env`, scaffolds the
+ * committable `.env.example` next to it, and makes sure `.gitignore` covers
+ * `.env` BEFORE the secret is on disk long enough to be staged.
+ *
+ * Paths are cwd-relative, exactly like the rest of the init scaffold.
+ *
+ * @internal exported for tests.
+ */
+export function scaffoldEnvForUrl(url: string): EnvScaffoldPlan {
+  const envPath = '.env';
+  const envExamplePath = '.env.example';
+  const gitignorePath = '.gitignore';
+
+  const envExists = existsSync(envPath);
+  const plan = planEnvScaffold({
+    envExists,
+    envHasDatabaseUrl: envExists ? /^\s*(export\s+)?DATABASE_URL\s*=/m.test(readFileSync(envPath, 'utf-8')) : false,
+    envExampleExists: existsSync(envExamplePath),
+    gitignoreExists: existsSync(gitignorePath),
+    gitignoreIgnoresEnv: existsSync(gitignorePath) ? gitignoreIgnoresEnv(readFileSync(gitignorePath, 'utf-8')) : false,
+  });
+
+  // .gitignore FIRST: the ignore rule has to exist before the file holding the
+  // password does, or a `git add -A` in between commits it.
+  if (plan.gitignore === 'created') writeFileSync(gitignorePath, '# Local environment (secrets)\n.env\n', 'utf-8');
+  else if (plan.gitignore === 'appended') appendFileSync(gitignorePath, '\n# Local environment (secrets)\n.env\n');
+
+  if (plan.env === 'created') {
+    // 0600 on CREATION only. The whole point of this scaffold is moving a live
+    // password out of a committed file, and the default 0644 would leave it
+    // world-readable to every account on a shared box or CI runner. `mode` is
+    // applied by the OS only when the open() actually creates the file, so if
+    // one appeared since the existsSync above we write into it without widening
+    // or narrowing whatever mode its owner chose.
+    writeFileSync(envPath, `# Turbine database connection. Never commit this file.\nDATABASE_URL=${url}\n`, {
+      encoding: 'utf-8',
+      mode: 0o600,
+    });
+  } else if (plan.env === 'appended') {
+    appendFileSync(envPath, `\n# Added by turbine init\nDATABASE_URL=${url}\n`);
+  }
+
+  if (plan.envExample === 'created') writeFileSync(envExamplePath, ENV_EXAMPLE_TEMPLATE, 'utf-8');
+
+  return plan;
+}
+
+/** Say exactly what was written where, so nobody has to guess where the password went. */
+function reportEnvScaffold(plan: EnvScaffoldPlan, url: string): void {
+  warn(`The connection string passed to ${cyan('--url')} contains a password.`);
+  console.log(
+    `  ${dim('It was NOT written into')} ${cyan('turbine.config.ts')}${dim(': that file reads')} ${cyan('process.env.DATABASE_URL')}${dim('.')}`,
+  );
+  if (plan.env === 'created') success(`Wrote the connection string to ${cyan('.env')} ${dim(`(${redactUrl(url)})`)}`);
+  else if (plan.env === 'appended')
+    success(`Appended ${cyan('DATABASE_URL')} to your existing ${cyan('.env')} ${dim(`(${redactUrl(url)})`)}`);
+  else
+    info(
+      `Your ${cyan('.env')} already sets ${cyan('DATABASE_URL')}: left untouched. The ${cyan('--url')} value was not saved anywhere.`,
+    );
+
+  if (plan.envExample === 'created') success(`Created ${cyan('.env.example')} ${dim('(safe to commit)')}`);
+  if (plan.gitignore === 'created') success(`Created ${cyan('.gitignore')} ignoring ${cyan('.env')}`);
+  else if (plan.gitignore === 'appended') success(`Added ${cyan('.env')} to ${cyan('.gitignore')}`);
+  else info(`${cyan('.gitignore')} already ignores ${cyan('.env')}`);
+
+  if (plan.env !== 'unchanged') {
+    console.log(
+      `  ${dim('The password is now in')} ${cyan('.env')}${dim('. If it was ever pushed to a shared history, rotate it.')}`,
+    );
+  }
+}
 
 /** Create supporting directories + .gitignore entries (unconditional, unprompted). */
 function ensureInitScaffoldDirs(config: ResolvedConfig): void {
@@ -1196,16 +1443,39 @@ function reportInitSkip(step: InitPlanStep): void {
     case 'default-no':
       console.log(`  ${dim(`${symbols.dot} ${label} skipped (default no)`)}`);
       break;
+    case 'db-has-tables':
+      info(`${label} not created: your database already has tables ${dim('- skipped')}`);
+      console.log(
+        `  ${dim('An empty')} ${cyan('defineSchema()')} ${dim('file would make')} ${cyan('turbine push')} ${dim('report every existing')}`,
+      );
+      console.log(
+        `  ${dim('table as "extra". Your database is the source of truth here: run')} ${cyan('turbine generate')}`,
+      );
+      console.log(`  ${dim('to produce the typed client from it. For a code-first schema instead, re-run')}`);
+      console.log(
+        `  ${dim('with')} ${cyan('--with-schema')} ${dim('to scaffold')} ${cyan('turbine/schema.ts')} ${dim('anyway, then use')} ${cyan('turbine push')}${dim('.')}`,
+      );
+      break;
     default:
       console.log(`  ${dim(`${symbols.dot} ${label} skipped`)}`);
   }
 }
 
 /** The interactive prompt question for a promptable step. */
-function initPromptQuestion(step: InitPlanStep, config: ResolvedConfig, seedFilePath: string): string {
+function initPromptQuestion(
+  step: InitPlanStep,
+  config: ResolvedConfig,
+  seedFilePath: string,
+  dbTableCount = 0,
+): string {
   switch (step.id) {
     case 'schema':
-      return `Create a starter schema file (${config.schemaFile})?`;
+      // Ask the honest question when the database is already populated: the
+      // file would be EMPTY, and `turbine push` reports every existing table as
+      // extra until it is filled in by hand.
+      return dbTableCount > 0
+        ? `Your database already has ${dbTableCount} table(s). Create an EMPTY code-first schema file anyway (${config.schemaFile})?`
+        : `Create a starter schema file (${config.schemaFile})?`;
     case 'seed-file':
       return `Create a starter seed file (${seedFilePath})?`;
     case 'push':
@@ -1339,11 +1609,20 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   // Probe the database once, up front, so the planner can decide the DB steps.
   // Skip the probe entirely when every DB step is already flag-skipped.
   const anyDbStepPossible = !(args.skipPush && args.skipGenerate && args.skipSeed);
+  let dbTableCount = 0;
   if (hasUrl && anyDbStepPossible) {
     const probe = new Spinner('Checking database connection').start();
-    state.dbReachable = await probeDatabase(url);
-    if (state.dbReachable) probe.succeed('Database is reachable');
-    else probe.info('Database not reachable: push / generate / seed steps will be skipped');
+    const probed = await probeDatabase(url, config.schema);
+    state.dbReachable = probed.reachable;
+    dbTableCount = probed.tableCount;
+    state.dbHasTables = probed.tableCount > 0;
+    if (state.dbReachable) {
+      probe.succeed(
+        dbTableCount > 0
+          ? `Database is reachable ${dim(`(${dbTableCount} table(s) in schema "${config.schema}")`)}`
+          : 'Database is reachable',
+      );
+    } else probe.info('Database not reachable: push / generate / seed steps will be skipped');
   }
 
   const flags: InitPlanFlags = {
@@ -1351,6 +1630,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
     force: args.force === true,
     interactive,
     skipSchema: args.skipSchema === true,
+    withSchema: args.withSchema === true,
     skipSeed: args.skipSeed === true,
     skipPush: args.skipPush === true,
     skipGenerate: args.skipGenerate === true,
@@ -1372,18 +1652,27 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
       continue;
     }
     const shouldRun =
-      step.action === 'run' ? true : await promptYesNo(initPromptQuestion(step, config, seedFilePath), step.defaultYes);
+      step.action === 'run'
+        ? true
+        : await promptYesNo(initPromptQuestion(step, config, seedFilePath, dbTableCount), step.defaultYes);
     if (!shouldRun) {
       info(`Skipped ${initStepLabel(step.id)}`);
       continue;
     }
 
     switch (step.id) {
-      case 'config':
+      case 'config': {
         writeFileSync('turbine.config.ts', configTemplate(args.url ?? undefined), 'utf-8');
         success(state.configExists ? `Overwrote ${cyan('turbine.config.ts')}` : `Created ${cyan('turbine.config.ts')}`);
         tsFilesWritten.push('turbine.config.ts');
+        // A `--url` with a password is never inlined by configTemplate, so the
+        // real value has to be put somewhere the config can read it from.
+        if (args.url && connectionStringHasPassword(args.url)) {
+          newline();
+          reportEnvScaffold(scaffoldEnvForUrl(args.url), args.url);
+        }
         break;
+      }
       case 'schema':
         writeInitSchemaTemplate(config);
         if (needsTsLoader(config.schemaFile)) tsFilesWritten.push(config.schemaFile);
@@ -3937,11 +4226,11 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
       newline();
       process.exit(1);
     }
-    console.log(
-      warn(
-        `Studio is binding to ${yellow(host)}, this is NOT loopback. ` +
-          `Anyone on your network who can reach this port + guess the session token can read your database.`,
-      ),
+    // warn() prints; it returns void. Wrapping it in console.log() printed a
+    // literal grey "undefined" line under every one of these SAFETY warnings.
+    warn(
+      `Studio is binding to ${yellow(host)}, this is NOT loopback. ` +
+        `Anyone on your network who can reach this port + guess the session token can read your database.`,
     );
   }
 
@@ -3998,16 +4287,14 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
     // Loud startup warnings for the opt-in modes that widen Studio's surface.
     if (args.write) {
       newline();
-      console.log(
-        warn(
-          'WRITE MODE is ON. Studio can update, insert, and delete single rows in ' +
-            `${redactUrl(url)}. Every change is committed directly to your database.`,
-        ),
+      warn(
+        'WRITE MODE is ON. Studio can update, insert, and delete single rows in ' +
+          `${redactUrl(url)}. Every change is committed directly to your database.`,
       );
     }
     if (args.showPii) {
       newline();
-      console.log(warn('--show-pii is ON. PII-tagged column values are shown UNREDACTED in Studio.'));
+      warn('--show-pii is ON. PII-tagged column values are shown UNREDACTED in Studio.');
     }
 
     // PII tags are a code-first declaration; introspection never infers them.
@@ -4020,12 +4307,10 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
           `  ${dim('PII redaction:')} ${studio.piiTags.applied} tagged column(s) from ${dim(studio.piiTags.path)}`,
         );
       } else {
-        console.log(
-          warn(
-            'No PII-tagged columns found, so nothing will be redacted. Tags are declared in code ' +
-              `(defineSchema \`pii: true\`) and read from generated metadata in ${config.out}; ` +
-              'introspection alone never infers them. Run `turbine generate` after tagging.',
-          ),
+        warn(
+          'No PII-tagged columns found, so nothing will be redacted. Tags are declared in code ' +
+            `(defineSchema \`pii: true\`) and read from generated metadata in ${config.out}; ` +
+            'introspection alone never infers them. Run `turbine generate` after tagging.',
         );
       }
     }
@@ -4120,11 +4405,10 @@ async function cmdObserve(args: CliArgs): Promise<void> {
       newline();
       process.exit(1);
     }
-    console.log(
-      warn(
-        `Observe is binding to ${yellow(host)}, this is NOT loopback. ` +
-          `Anyone on your network who can reach this port + guess the session token can read your metrics.`,
-      ),
+    // warn() prints and returns void; see the same guard in cmdStudio.
+    warn(
+      `Observe is binding to ${yellow(host)}, this is NOT loopback. ` +
+        `Anyone on your network who can reach this port + guess the session token can read your metrics.`,
     );
   }
 
@@ -4172,7 +4456,14 @@ async function cmdObserve(args: CliArgs): Promise<void> {
 // Subcommand help
 // ---------------------------------------------------------------------------
 
-function showSubcommandHelp(command: string): boolean {
+/**
+ * Print `<command> --help` for a command that has real help, returning whether
+ * one existed. Falling through to the GLOBAL help is the failure mode this map
+ * guards against, and it is silent, so the coverage is asserted in tests.
+ *
+ * @internal exported for tests.
+ */
+export function showSubcommandHelp(command: string): boolean {
   const helpMap: Record<string, () => void> = {
     init: showInitHelp,
     generate: showGenerateHelp,
@@ -4183,6 +4474,8 @@ function showSubcommandHelp(command: string): boolean {
     migration: showMigrateHelp,
     seed: showSeedHelp,
     status: showStatusHelp,
+    doctor: showDoctorHelp,
+    studio: showStudioHelp,
     mcp: showMcpHelp,
   };
   const fn = helpMap[command];
@@ -4213,6 +4506,7 @@ function showInitHelp(): void {
   console.log(`    ${cyan('--force, -f')}        Overwrite existing config file`);
   console.log(`    ${cyan('--yes, -y')}          Accept every step's default (non-interactive)`);
   console.log(`    ${cyan('--skip-schema')}      Don't create the starter schema file`);
+  console.log(`    ${cyan('--with-schema')}      Create it even if the database already has tables`);
   console.log(`    ${cyan('--skip-seed')}        Don't create the seed file or run the seed`);
   console.log(`    ${cyan('--skip-push')}        Don't push the schema to the database`);
   console.log(`    ${cyan('--skip-generate')}    Don't generate the typed client`);
@@ -4402,6 +4696,97 @@ function showStatusHelp(): void {
   newline();
 }
 
+function showDoctorHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine doctor')}, Index + cached-plan triage`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine doctor ${dim('[options]')}`);
+  newline();
+  console.log(`  Introspects your schema and live statistics, then reports:`);
+  console.log(`    ${dim('•')} relation probes with no usable index ${dim('(ranked by estimated cost)')}`);
+  console.log(`    ${dim('•')} INVALID indexes ${dim('(left behind by a failed CREATE INDEX CONCURRENTLY)')}`);
+  console.log(`    ${dim('•')} columns whose value distribution can flip a cached plan`);
+  console.log(`    ${dim('•')} with ${cyan('--unused')}: never-scanned and redundant indexes, with DROP suggestions`);
+  newline();
+  console.log(`  ${dim('Read-only: doctor never writes to your database. Only')} ${cyan('--fix')} ${dim('writes')}`);
+  console.log(`  ${dim('anything at all, and only a migration FILE you review and run yourself.')}`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);
+  console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}   Postgres schema ${dim('(default: public)')}`);
+  console.log(`    ${cyan('--include')} ${dim('<tables>')}    Comma-separated tables to include`);
+  console.log(`    ${cyan('--exclude')} ${dim('<tables>')}    Comma-separated tables to exclude`);
+  console.log(`    ${cyan('--fix')}                 Write an add-index migration for the missing-index findings`);
+  console.log(
+    `    ${cyan('--no-concurrently')}     With ${cyan('--fix')}: emit plain CREATE INDEX ${dim('(default: CONCURRENTLY, no transaction)')}`,
+  );
+  console.log(`    ${cyan('--json')}                Emit the versioned machine-readable report and nothing else`);
+  console.log(
+    `    ${cyan('--unused')}              Also report never-scanned / redundant indexes ${dim('(no --fix)')}`,
+  );
+  console.log(`    ${cyan('--audit')}               Scope the unused report to doctor's own suggested index names`);
+  console.log(
+    `    ${cyan('--min-scans')} ${dim('<n>')}       idx_scan below this counts as never-scanned ${dim('(default: 1)')}`,
+  );
+  console.log(
+    `    ${cyan('--metrics-url')} ${dim('<url>')}   Read ${cyan('_turbine_metrics')} for the table-heat boost from a separate DB`,
+  );
+  console.log(
+    `    ${cyan('--no-plan-divergence')}  Skip the cached-plan divergence section ${dim('(and its pg_stats read)')}`,
+  );
+  newline();
+  console.log(`  ${bold('Examples:')}`);
+  console.log(`    ${dim('$')} npx turbine doctor`);
+  console.log(`    ${dim('$')} npx turbine doctor --fix`);
+  console.log(`    ${dim('$')} npx turbine doctor --unused --min-scans 5`);
+  console.log(`    ${dim('$')} npx turbine doctor --json > doctor.json`);
+  newline();
+}
+
+function showStudioHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine studio')}, Launch the local database UI`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine studio ${dim('[options]')}`);
+  newline();
+  console.log(`  A local web UI with Query / Data / Schema tabs. There is no raw-SQL`);
+  console.log(`  surface: the Query tab is a visual ${cyan('findMany')} builder and every`);
+  console.log(`  identifier is validated against the introspected schema.`);
+  newline();
+  console.log(`  ${bold('Defaults are the safe ones:')}`);
+  console.log(`    ${dim('•')} read-only ${dim('(reads run inside BEGIN READ ONLY)')}`);
+  console.log(`    ${dim('•')} PII-tagged column values redacted server-side`);
+  console.log(`    ${dim('•')} bound to 127.0.0.1, behind a random per-session token`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);
+  console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}   Postgres schema ${dim('(default: public)')}`);
+  console.log(`    ${cyan('--out, -o')} ${dim('<dir>')}       Generated-metadata dir, source of the PII tags`);
+  console.log(`    ${cyan('--include')} ${dim('<tables>')}    Comma-separated tables to include`);
+  console.log(`    ${cyan('--exclude')} ${dim('<tables>')}    Comma-separated tables to exclude`);
+  console.log(`    ${cyan('--port')} ${dim('<n>')}            HTTP port ${dim('(default: 4983)')}`);
+  console.log(`    ${cyan('--host')} ${dim('<addr>')}         Bind address ${dim('(default: 127.0.0.1)')}`);
+  console.log(`    ${cyan('--no-open')}             Don't auto-open the browser`);
+  console.log(
+    `    ${cyan('--allow-remote')}        Allow a non-loopback ${cyan('--host')} ${dim('(refused without it)')}`,
+  );
+  console.log(`    ${cyan('--write')}               Enable single-row update / insert / delete`);
+  console.log(`    ${cyan('--show-pii')}            Show PII-tagged values unredacted`);
+  console.log(`    ${cyan('--demo')}                Seeded in-memory sample database ${dim('(no DATABASE_URL)')}`);
+  newline();
+  console.log(`  ${bold('Examples:')}`);
+  console.log(`    ${dim('$')} npx turbine studio`);
+  console.log(`    ${dim('$')} npx turbine studio --demo`);
+  console.log(`    ${dim('$')} npx turbine studio --write --port 5000`);
+  newline();
+  console.log(`  ${dim('--write commits every change directly to the database, and')} ${cyan('--show-pii')}`);
+  console.log(`  ${dim('reveals values Studio otherwise never sends to the browser. Both print a')}`);
+  console.log(`  ${dim('startup warning and a persistent in-UI banner. Demo mode saves nothing.')}`);
+  newline();
+}
+
 function showMcpHelp(): void {
   banner();
   console.log(`  ${bold('turbine mcp')}, Start read-only MCP server over stdio`);
@@ -4489,6 +4874,7 @@ function showHelp(): void {
   console.log(`  ${bold('Init options:')}`);
   console.log(`    ${cyan('--yes, -y')}            Accept every step's default (non-interactive)`);
   console.log(`    ${cyan('--skip-schema')}        Don't scaffold the schema file`);
+  console.log(`    ${cyan('--with-schema')}        Scaffold it even if the database already has tables`);
   console.log(`    ${cyan('--skip-seed')}          Don't scaffold or run the seed file`);
   console.log(`    ${cyan('--skip-push')}          Don't offer to push the schema to the database`);
   console.log(`    ${cyan('--skip-generate')}      Don't offer to generate the typed client`);

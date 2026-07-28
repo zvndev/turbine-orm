@@ -70,6 +70,18 @@ jobs:
       - name: Unit tests
         run: npm run test:unit
 
+      # The CLI coverage gate (cli/studio.ts, cli/migrate.ts,
+      # cli/destructive.ts): write mode, destructive DDL, and the scanner that
+      # classifies DDL as destructive. Own thresholds, see .c8rc.json's
+      # //cli-gate note. No database, a few seconds.
+      - name: CLI coverage thresholds
+        run: npm run test:coverage:cli
+
+      # CHANGELOG heading contract. It lived only in prepublishOnly, so a tag
+      # push (which never runs prepublishOnly) could publish over a violation.
+      - name: CHANGELOG headings
+        run: npm run check:changelog
+
       - name: Build
         run: npm run build
 
@@ -184,6 +196,30 @@ jobs:
         working-directory: ${{ env.SMOKE_DIR }}
         run: |
           node --input-type=module -e "const m = await import('turbine-orm/adapters'); if (!m.cockroachdb || !m.yugabytedb || !m.postgresql) { console.error('adapters subpath broken'); process.exit(1); } console.log('adapters subpath OK', Object.keys(m).slice(0,8).join(','));"
+      # The three engine subpaths and prisma-compat. This job used to verify
+      # serverless/sqlite/adapters only, so the RELEASE path, the one that
+      # decides whether a version reaches npm, checked fewer published entry
+      # points than CI did. mysql/mssql/powdb must import with their optional
+      # peers ABSENT (this temp project never installs them): the peer is loaded
+      # by a dynamic import inside the factory, so a static import creeping into
+      # the module graph would break every Postgres user and is exactly what this
+      # catches. prisma-compat was import-smoked on NEITHER path.
+      - name: Verify mysql subpath import (mysql2 NOT installed, must not crash)
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/mysql'); if (m.mysqlDialect?.name !== 'mysql' || typeof m.turbineMysql !== 'function') { console.error('mysql subpath broken'); process.exit(1); } console.log('mysql subpath OK (no mysql2 needed to import)');"
+      - name: Verify mssql subpath import (mssql NOT installed, must not crash)
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/mssql'); if (m.mssqlDialect?.name !== 'mssql' || typeof m.turbineMssql !== 'function') { console.error('mssql subpath broken'); process.exit(1); } console.log('mssql subpath OK (no mssql needed to import)');"
+      - name: Verify powdb subpath import (peers NOT installed, must not crash)
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/powdb'); if (typeof m.turbinePowDB !== 'function') { console.error('powdb subpath broken'); process.exit(1); } console.log('powdb subpath OK (no peer needed to import)');"
+      - name: Verify prisma-compat subpath import
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          node --input-type=module -e "const m = await import('turbine-orm/prisma-compat'); if (typeof m.createPrismaCompatClient !== 'function' || !m.Prisma) { console.error('prisma-compat subpath broken, exports: ' + Object.keys(m).join(',')); process.exit(1); } console.log('prisma-compat subpath OK');"
 
   # Coverage gate: mirrors ci.yml's coverage job (same Postgres 16 service, same
   # seed, same DATABASE_URL wiring) so the thresholds in .c8rc.json are enforced

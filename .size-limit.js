@@ -17,6 +17,31 @@ const nodePlatform = (config) => {
 // regression (a new module pulled into a shared graph) trips it and has to be
 // re-baselined CONSCIOUSLY, with the reason recorded here.
 //
+// Measured 2026-07-28 at the 0.62.0 RELEASE COMMIT, `npm run build` then
+// `npx size-limit`: main 75.54 kB, serverless 60.51 kB, sqlite 63.09 kB,
+// mysql 64.37 kB, mssql 66.02 kB, powdb 80.95 kB, prisma-compat 12.09 kB.
+//
+// The gate went red on mssql (by 18 bytes) and prisma-compat (by 1.09 kB)
+// before this re-baseline. Growth from the 0.55.0 line is uniform across every
+// entry that carries the shared client/query graph: main +3.06, serverless
+// +3.06, sqlite +2.99, mysql +3.12, mssql +3.20, powdb +3.25 kB. That is the
+// signature of a shared-graph change, and it is accounted for: the privilege
+// sentinel and its resolvers plus `assertOrderDirection` (query/types.ts, called
+// from every direction site on every engine), the connection-string classifier
+// and the typed connection-error mapping with its per-code next steps
+// (client.ts + errors.ts), and the `.cause` detail redaction.
+//
+// prisma-compat moved +3.64 kB, MORE than the shared-graph delta, and that is
+// the one number here that is its own growth rather than inherited. It is real
+// code, not a leaked import: the runtime option surface it now drives
+// (query/option-surface.ts), `$extends` with its client + model components,
+// write projections with field-name validation, and the unknown-option
+// warnings. The property this budget exists to guard still holds and is the
+// thing to check first if this number moves again: at 12.09 kB it remains an
+// order of magnitude below the entries that bundle the core graph, so it is
+// still taking a TurbineClient by value and importing core TYPES. If it ever
+// jumps toward 60 kB, something started importing core values.
+//
 // Measured 2026-07-27 at the 0.55.0 RELEASE COMMIT, `npm run build` then
 // `npx size-limit`: main 72.48 kB, serverless 57.45 kB, sqlite 60.1 kB,
 // mysql 61.25 kB, mssql 62.82 kB, powdb 77.7 kB, prisma-compat 8.45 kB.
@@ -102,7 +127,7 @@ export default [
   {
     name: "main entry, import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
-    limit: '77 kB',
+    limit: '80 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
@@ -113,21 +138,21 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '61 kB',
+    limit: '64 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'sqlite entry, turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
-    limit: '64 kB',
+    limit: '67 kB',
     ignore: ['pg', 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'mysql entry, turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
     path: 'dist/mysql.js',
-    limit: '65 kB',
+    limit: '68 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
     // it is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mysql2', 'mysql2/promise'],
@@ -138,7 +163,7 @@ export default [
     path: 'dist/mssql.js',
     // Slightly larger than the other engines: the FOR JSON PATH relation generator
     // and the INFORMATION_SCHEMA/sys introspector add real code (no extra deps).
-    limit: '66 kB',
+    limit: '70 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mssql'],
@@ -149,7 +174,7 @@ export default [
     // The largest entry: it carries the whole client/query graph AND powql.ts,
     // a second, parallel query generator for a non-SQL language.
     path: 'dist/powdb.js',
-    limit: '82 kB',
+    limit: '85 kB',
     // Both PowDB drivers are optional peers behind dynamic imports (the
     // networked client and the embedded napi addon), so neither is in the
     // static graph.
@@ -162,7 +187,7 @@ export default [
     // graph is NOT bundled with it. If this number jumps toward the other
     // entries, something started importing core values instead of core types.
     path: 'dist/prisma-compat.js',
-    limit: '11 kB',
+    limit: '13 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },

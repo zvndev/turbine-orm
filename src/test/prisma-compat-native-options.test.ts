@@ -26,6 +26,7 @@ import { describe, it } from 'node:test';
 import type { TurbineClient } from '../client.js';
 import { TurbineError, TurbineErrorCode } from '../errors.js';
 import { type CompatTurbineClient, createPrismaCompatClient, type PrismaCompatOptions } from '../prisma-compat.js';
+import { UNSAFE } from '../query/index.js';
 import { resetWarnOnce } from '../query/warn-registry.js';
 import type { PrismaCompatMap, SchemaMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
@@ -189,20 +190,20 @@ describe('prisma-compat, turbine-native query options reach core', () => {
 
   it('skipGlobalFilters survives every read and every write that declares it', async () => {
     const cases: [string, (c: Any) => Promise<unknown>][] = [
-      ['findMany', (c) => c.User.findMany({ skipGlobalFilters: true })],
-      ['findUnique', (c) => c.User.findUnique({ where: { id: 1 }, skipGlobalFilters: true })],
-      ['count', (c) => c.User.count({ skipGlobalFilters: true })],
-      ['aggregate', (c) => c.User.aggregate({ _count: true, skipGlobalFilters: true })],
-      ['groupBy', (c) => c.User.groupBy({ by: ['id'], skipGlobalFilters: true })],
-      ['update', (c) => c.User.update({ where: { id: 1 }, data: { name: 'x' }, skipGlobalFilters: true })],
-      ['updateMany', (c) => c.User.updateMany({ where: { id: 1 }, data: { name: 'x' }, skipGlobalFilters: true })],
-      ['delete', (c) => c.User.delete({ where: { id: 1 }, skipGlobalFilters: true })],
-      ['deleteMany', (c) => c.User.deleteMany({ where: { id: 1 }, skipGlobalFilters: true })],
-      ['upsert', (c) => c.User.upsert({ where: { id: 1 }, create: { id: 1 }, update: {}, skipGlobalFilters: true })],
+      ['findMany', (c) => c.User.findMany({ skipGlobalFilters: UNSAFE })],
+      ['findUnique', (c) => c.User.findUnique({ where: { id: 1 }, skipGlobalFilters: UNSAFE })],
+      ['count', (c) => c.User.count({ skipGlobalFilters: UNSAFE })],
+      ['aggregate', (c) => c.User.aggregate({ _count: true, skipGlobalFilters: UNSAFE })],
+      ['groupBy', (c) => c.User.groupBy({ by: ['id'], skipGlobalFilters: UNSAFE })],
+      ['update', (c) => c.User.update({ where: { id: 1 }, data: { name: 'x' }, skipGlobalFilters: UNSAFE })],
+      ['updateMany', (c) => c.User.updateMany({ where: { id: 1 }, data: { name: 'x' }, skipGlobalFilters: UNSAFE })],
+      ['delete', (c) => c.User.delete({ where: { id: 1 }, skipGlobalFilters: UNSAFE })],
+      ['deleteMany', (c) => c.User.deleteMany({ where: { id: 1 }, skipGlobalFilters: UNSAFE })],
+      ['upsert', (c) => c.User.upsert({ where: { id: 1 }, create: { id: 1 }, update: {}, skipGlobalFilters: UNSAFE })],
     ];
     for (const [method, call] of cases) {
       const args = await argsOf(call, method);
-      assert.equal(args.skipGlobalFilters, true, `skipGlobalFilters dropped on ${method}`);
+      assert.equal(args.skipGlobalFilters, UNSAFE, `skipGlobalFilters dropped on ${method}`);
     }
   });
 
@@ -235,19 +236,19 @@ describe('prisma-compat, turbine-native query options reach core', () => {
 
   it('allowFullTableScan is forwarded, and compat’s implicit true still wins on a where-less mass mutation', async () => {
     const explicit = await argsOf(
-      (c) => c.User.updateMany({ where: { id: 1 }, data: { name: 'x' }, allowFullTableScan: true }),
+      (c) => c.User.updateMany({ where: { id: 1 }, data: { name: 'x' }, allowFullTableScan: UNSAFE }),
       'updateMany',
     );
-    assert.equal(explicit.allowFullTableScan, true);
+    assert.equal(explicit.allowFullTableScan, UNSAFE);
     // Prisma's where-less updateMany affects every row. An explicit `false`
     // must NOT be able to turn that parity into a thrown empty-where guard.
     const whereless = await argsOf(
       (c) => c.User.updateMany({ data: { name: 'x' }, allowFullTableScan: false }),
       'updateMany',
     );
-    assert.equal(whereless.allowFullTableScan, true);
+    assert.equal(whereless.allowFullTableScan, UNSAFE);
     const del = await argsOf((c) => c.User.deleteMany({ allowFullTableScan: false }), 'deleteMany');
-    assert.equal(del.allowFullTableScan, true);
+    assert.equal(del.allowFullTableScan, UNSAFE);
   });
 });
 
@@ -461,10 +462,10 @@ describe('prisma-compat, unknown query-option warnings', () => {
     const lines = await captureWarnings(() =>
       compat.User.findMany({
         timeout: 5,
-        includePii: true,
+        includePii: UNSAFE,
         forceCustomPlan: true,
         warnOnUnlimited: false,
-        skipGlobalFilters: true,
+        skipGlobalFilters: UNSAFE,
         stableRelationOrder: true,
       }),
     );

@@ -607,7 +607,13 @@ describe('wrapPgError', () => {
       assert.equal(wrapped.constraint, 'users_email_key');
       assert.deepEqual(wrapped.columns, ['email']);
       assert.equal(wrapped.table, 'users');
-      assert.equal(wrapped.cause, err);
+      // The cause is a redacted VIEW of the driver error in safe mode (the
+      // default): same prototype, same fields, with `detail` replaced because
+      // it carries the conflicting row VALUES. See error-cause-redaction.test.ts.
+      const cause = wrapped.cause as { code: string; constraint: string; detail: string };
+      assert.equal(cause.code, '23505');
+      assert.equal(cause.constraint, 'users_email_key');
+      assert.ok(!cause.detail.includes('foo@bar'));
     }
   });
 

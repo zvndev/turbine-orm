@@ -88,6 +88,7 @@ export {
   OptimisticLockError,
   PipelineError,
   type PipelineResultSlot,
+  REDACTED_DETAIL,
   ReadOnlyError,
   RelationError,
   SerializationFailureError,
@@ -128,6 +129,9 @@ export { executePipeline, type PipelineOptions, type PipelineResults, pipelineSu
 // Prisma-schema fingerprint (provenance on a generated PRISMA_MAP)
 export { fingerprintPrismaSchema } from './prisma-schema-fingerprint.js';
 // Query builder
+// The privilege sentinel. `skipGlobalFilters` / `includePii` /
+// `allowFullTableScan` are unlocked by THIS VALUE and nothing else, so a
+// request body spread into query args cannot enable them (JSON has no symbols).
 export {
   type AggregateArgs,
   type AggregateResult,
@@ -170,6 +174,7 @@ export {
   type OrderByClause,
   type OrderByObject,
   type OrderDirection,
+  type PrivilegeOption,
   type QueryEvent,
   type QueryEventListener,
   QueryInterface,
@@ -184,6 +189,8 @@ export {
   type TemporalInfinityReading,
   type TextSearchFilter,
   type TypedWithClause,
+  UNSAFE,
+  type Unsafe,
   type UpdateArgs,
   type UpdateDataInput,
   type UpdateInput,

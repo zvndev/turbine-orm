@@ -19,6 +19,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { CircularRelationError, RelationError } from '../errors.js';
 import { mssqlDialect } from '../mssql.js';
+import { UNSAFE } from '../query/index.js';
 import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -758,7 +759,7 @@ describe("relationLoadStrategy: 'flatten', PII contract", () => {
     // biome-ignore lint/suspicious/noExplicitAny: build-only args
     const off = q.buildFindMany({ with: { account: true }, ...FLATTEN } as any);
     // biome-ignore lint/suspicious/noExplicitAny: build-only args
-    const on = q.buildFindMany({ with: { account: true }, includePii: true, ...FLATTEN } as any);
+    const on = q.buildFindMany({ with: { account: true }, includePii: UNSAFE, ...FLATTEN } as any);
     assert.doesNotMatch(off.sql, /f0s\."email" AS "f0__email"/);
     assert.match(on.sql, /f0s\."email" AS "f0__email"/);
   });

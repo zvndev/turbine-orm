@@ -50,6 +50,7 @@ export type {
   RelationLoadStrategy,
   RelationPickBy,
   RelationPickOrderBy,
+  ResolvedSkipGlobalFilters,
   SelectResult,
   SkipGlobalFilters,
   TextSearchFilter,
@@ -111,6 +112,9 @@ export {
   UPDATE_OPTIONS,
   UPSERT_OPTIONS,
 } from './option-surface.js';
+export type { PrivilegeOption, Unsafe } from './types.js';
+// The privilege sentinel: a runtime value, not a type (see types.ts).
+export { assertOrderDirection, resolveSkipGlobalFilters, resolveUnsafeFlag, UNSAFE } from './types.js';
 export type { SqlCacheEntry } from './utils.js';
 export {
   buildCorrelation,

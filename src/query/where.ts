@@ -39,7 +39,7 @@ import type {
   GlobalFilters,
   JsonFilter,
   JsonPathOrderBy,
-  SkipGlobalFilters,
+  ResolvedSkipGlobalFilters,
   TextSearchFilter,
   VectorFilter,
   WhereClause,
@@ -94,7 +94,7 @@ export interface BuilderCtx {
    * synchronous SQL-build + param-collect tree reads it deep inside
    * `resolveGlobalFilter`.
    */
-  currentSkip: SkipGlobalFilters | undefined;
+  currentSkip: ResolvedSkipGlobalFilters | undefined;
   q(name: string): string;
   p(index: number): string;
   inParam(values: unknown): unknown;
@@ -533,7 +533,7 @@ export function buildWhere<T extends object>(
 export function resolveGlobalFilter(
   qi: BuilderCtx,
   table: string,
-  skip: SkipGlobalFilters | undefined = qi.currentSkip,
+  skip: ResolvedSkipGlobalFilters | undefined = qi.currentSkip,
 ): Record<string, unknown> | null {
   const filters = qi.globalFilters;
   if (!filters) return null;
@@ -665,13 +665,18 @@ export function assertMutationHasPredicate(
   qi: BuilderCtx,
   operation: 'update' | 'updateMany' | 'delete' | 'deleteMany',
   whereSql: string,
+  // Already RESOLVED by the caller (writes.ts) through `resolveUnsafeFlag`, so
+  // the sentinel check happens on every mutation, not only the guarded ones: a
+  // literal `allowFullTableScan: true` must throw even when the `where` is
+  // non-empty, or the escalation attempt goes unreported on most calls.
   allowFullTableScan: boolean | undefined,
 ): void {
   if (whereSql.length > 0) return;
   if (allowFullTableScan === true) return;
   throw new ValidationError(
     `[turbine] ${operation} on "${qi.table}" refused: the \`where\` clause is empty. ` +
-      `Pass \`allowFullTableScan: true\` to opt in, or check that your filter values are defined.`,
+      "Pass `allowFullTableScan: UNSAFE` to opt in (import { UNSAFE } from 'turbine-orm'), " +
+      'or check that your filter values are defined.',
   );
 }
 

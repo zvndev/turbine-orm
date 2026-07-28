@@ -684,8 +684,16 @@ Turbine looks for configuration in this order, stopping at the first match:
 
 1. CLI flags (`--url`, `--out`, `--schema`)
 2. Environment variables (`DATABASE_URL`)
-3. `turbine.config.ts` / `turbine.config.js` / `turbine.config.json` in the project root
+3. `turbine.config.ts`, `turbine.config.mts`, `turbine.config.js`, or `turbine.config.mjs` in the project root, in that order, stopping at the first that exists
 4. Built-in defaults
+
+<Callout type="warning" title="There is no turbine.config.json">
+  Those four filenames are the entire list. A `turbine.config.json` is not
+  looked for and not read, so a project that has one gets the built-in defaults
+  with no warning at all: `out` silently becomes `./generated/turbine` and any
+  `include` / `exclude` you wrote is ignored. Rename it to
+  `turbine.config.ts` and `export default`.
+</Callout>
 
 Example `turbine.config.ts`:
 

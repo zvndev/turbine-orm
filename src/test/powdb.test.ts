@@ -50,6 +50,7 @@ import {
 } from '../powdb.js';
 import { MAX_POWQL_DATETIME_TERMS, PowqlInterface } from '../powql.js';
 import type { DeferredQuery } from '../query/index.js';
+import { UNSAFE } from '../query/index.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
 // ---------------------------------------------------------------------------
@@ -961,7 +962,7 @@ describe('powdb: write generation', () => {
     assert.match(m.last().powql, /^app_user filter \.age >= \$1 update \{ age := \$2 \}$/);
 
     const m2 = mockPool();
-    await qi(m2).updateMany({ where: {}, allowFullTableScan: true, data: { age: 0 } });
+    await qi(m2).updateMany({ where: {}, allowFullTableScan: UNSAFE, data: { age: 0 } });
     assert.match(m2.last().powql, /^app_user update \{ age := \$1 \}$/);
   });
 });

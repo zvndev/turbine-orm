@@ -59,7 +59,7 @@ import { CircularRelationError, RelationError, UnsupportedFeatureError, Validati
 import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableMetadata } from '../schema.js';
 import type { ReselectExecutor } from './builder.js';
 import { isRelationPickOrderBy, sortedEntries } from './filters.js';
-import type { SkipGlobalFilters, WithClause, WithCount, WithOptions } from './types.js';
+import type { SkipGlobalFilters, Unsafe, WithClause, WithCount, WithOptions } from './types.js';
 import { ownLookup } from './utils.js';
 
 /**
@@ -124,9 +124,14 @@ export interface RelationLoadContext {
   /**
    * The query's `includePii` opt-in, threaded onto every child `buildFindMany`
    * so a batched relation load excludes (or includes) PII-tagged columns exactly
-   * as the join strategy does at every nested level. Default `false`.
+   * as the join strategy does at every nested level. Absent by default.
+   *
+   * Typed as the SENTINEL, not a boolean, and that is a contract not a style
+   * choice: this value is copied verbatim onto child `FindManyArgs`, where a
+   * plain `true` is refused as a privilege escalation. A boolean here would
+   * type-check and then throw on the first relation follow-up.
    */
-  includePii?: boolean;
+  includePii?: Unsafe;
   /**
    * Render `table`'s global filter against `alias` for a raw follow-up query
    * (the batched `_count`), numbering its `$n` placeholders AFTER
@@ -152,7 +157,9 @@ export interface RelationLoadContext {
  */
 export function defaultProjectionFields(
   meta: TableMetadata,
-  includePii: boolean | undefined,
+  // Either the already-resolved boolean (top-level callers) or the raw sentinel
+  // (the relation-load context); both are only ever tested for truthiness.
+  includePii: boolean | Unsafe | undefined,
 ): { hidden: ReadonlySet<string>; visible: string[] } | undefined {
   if (includePii) return undefined;
   const hidden = new Set<string>();

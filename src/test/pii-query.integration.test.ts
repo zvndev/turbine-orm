@@ -10,7 +10,7 @@
  *
  * The load-bearing property: a PII-tagged column is default-EXCLUDED from every
  * read (top-level, relation, both loader + join strategies), comes back only via
- * an explicit `select` or `includePii: true`, and is stripped from a write's
+ * an explicit `select` or `includePii: UNSAFE`, and is stripped from a write's
  * returned row while still being persisted (writes are unaffected).
  *
  * Run (embedded): npx tsx --test src/test/pii-query.integration.test.ts
@@ -25,6 +25,7 @@ import { describe } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { UnsupportedFeatureError } from '../errors.js';
 import { PowdbJsonParam, powqlSchemaDDL, turbinePowDB } from '../powdb.js';
+import { UNSAFE } from '../query/index.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
 
@@ -138,7 +139,7 @@ async function assertPiiSemantics(db: DB, authorId: unknown): Promise<void> {
 
   // (3) includePii returns everything, including the json PII column. (The exact
   // decoded json shape is a backend detail: assert presence, not bytes.)
-  const all = await db.table('app_user').findUnique({ where: { id: authorId }, includePii: true });
+  const all = await db.table('app_user').findUnique({ where: { id: authorId }, includePii: UNSAFE });
   assert.equal(all.email, 'ada@x.test');
   assert.ok('profile' in all && all.profile != null, 'includePii returns the json PII column');
 
@@ -155,7 +156,7 @@ async function assertPiiSemantics(db: DB, authorId: unknown): Promise<void> {
   // (5) includePii reaches the nested relation level.
   const withPostsPii = await db
     .table('app_user')
-    .findUnique({ where: { id: authorId }, with: { posts: { orderBy: { title: 'asc' } } }, includePii: true });
+    .findUnique({ where: { id: authorId }, with: { posts: { orderBy: { title: 'asc' } } }, includePii: UNSAFE });
   for (const p of withPostsPii.posts) {
     assert.equal(typeof p.secret, 'string', 'child PII column present under includePii');
   }
@@ -242,7 +243,7 @@ describe('pii integration (powdb embedded)', () => {
         where: { id: authorId },
         with: { posts: { orderBy: { title: 'asc' } } },
         relationLoadStrategy: 'join',
-        includePii: true,
+        includePii: UNSAFE,
       });
       for (const p of joinPii[0]!.posts as Record<string, unknown>[]) {
         assert.equal(typeof p.secret, 'string', 'includePii reaches the join path');

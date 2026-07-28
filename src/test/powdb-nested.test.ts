@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ALL_POWDB_CAPABILITIES, capabilitiesFromVersion, type PowdbCapabilities, type PowdbPool } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
+import { UNSAFE } from '../query/index.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
 // ---------------------------------------------------------------------------
@@ -254,7 +255,7 @@ describe('powdb nested projections: emission', () => {
     await qi(mock).findMany({ with: { posts: true } });
     assert.doesNotMatch(mock.first().powql, /email/);
     const mock2 = mockPool();
-    await qi(mock2).findMany({ with: { posts: true }, includePii: true });
+    await qi(mock2).findMany({ with: { posts: true }, includePii: UNSAFE });
     assert.match(mock2.first().powql, /email: t1\.email/);
   });
 

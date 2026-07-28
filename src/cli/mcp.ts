@@ -26,6 +26,7 @@ import {
 } from '../schema.js';
 import { listMigrationFiles } from './migrate.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
+import { redactUrl } from './ui.js';
 
 /**
  * Walk up from the running script to find turbine-orm's own package.json.
@@ -79,6 +80,13 @@ export interface McpServerOptions {
 export interface McpTransport {
   input?: Readable;
   output?: Writable;
+  /**
+   * Pre-built pool, used ONLY by the perimeter tests so they can drive the real
+   * JSON-RPC line handler and the real tool handlers with no database (the same
+   * reason Studio exports `handleRequest`). Production never sets it: the
+   * server builds its own pool from `options.url`.
+   */
+  pool?: pg.Pool;
 }
 
 export interface McpServerHandle {
@@ -103,6 +111,90 @@ type JsonObject = Record<string, unknown>;
 interface McpContext {
   options: McpServerOptions;
   pool: pg.Pool;
+}
+
+/**
+ * Marker written in place of a hidden cell. Never `null` and never the value,
+ * so the agent can tell "hidden" from "empty" (same string Studio uses).
+ */
+const REDACTED = '•• redacted ••';
+
+/**
+ * Column names treated as secret on NAME ALONE, on top of the code-first `pii`
+ * tags. Applies to BOTH value-bearing paths: `sample_rows` never fetches such a
+ * column, and `explain_query` refuses to filter or sort on one.
+ *
+ * `introspect.ts` deliberately never GUESSES that a column holds personal data,
+ * because a wrong guess there would write a durable tag into metadata. This
+ * list is the opposite trade and is why the rule differs: it never touches
+ * metadata, it only decides whether the raw value can reach an LLM context
+ * window. Over-redacting a column called `password_hash` costs an agent one
+ * uninteresting sample value; under-redacting it hands out a credential.
+ *
+ * It covers the two paths TOGETHER on purpose. Hiding the bytes in one tool
+ * while letting the other walk them out of the planner's row estimate is not a
+ * weaker perimeter, it is no perimeter: the oracle path is the cheaper of the
+ * two, since it needs no read privilege on the row and returns an answer per
+ * guessed character. Both tools report exactly what they refused, so neither
+ * redaction is silent.
+ */
+/**
+ * Column names that look like they hold a credential.
+ *
+ * Anchored to IDENTIFIER SEGMENT boundaries (start, end, or an underscore), not
+ * a bare substring. Unanchored, `secret` matched `secretary_id` and `token`
+ * matched a perfectly ordinary `token_count`, so the guard refused legitimate
+ * queries: a false refusal is not free here, it degrades the tool and trains
+ * people to route around it.
+ *
+ * Deliberately still conservative in the other direction. A column whose name
+ * genuinely carries a segment like `token` or `secret` is refused even when it
+ * holds nothing sensitive, because this gate decides whether raw bytes, or a
+ * row-count oracle over them, reach an LLM context. Renaming the column is a
+ * cheaper fix than the disclosure it prevents.
+ */
+const SECRET_WORDS = [
+  'passwd',
+  'password',
+  'secret',
+  'token',
+  'apikey',
+  'api_key',
+  'privatekey',
+  'private_key',
+  'credential',
+  'credentials',
+  'sessionid',
+  'session_id',
+  'otp',
+  'mfa',
+  'totp',
+];
+const SECRET_NAME_PATTERN = new RegExp(`(^|_)(${SECRET_WORDS.join('|')})(_|$)`, 'i');
+
+/**
+ * What the PII tag load produced, carried alongside the introspected metadata.
+ *
+ * `tags-unreadable` is the state this whole type exists for: a generated
+ * metadata file WAS found and could not be understood. Before, that returned an
+ * empty tag map, which is byte-identical to "this schema tags nothing", so the
+ * server reported `redactedColumns: []` and shipped every tagged column in
+ * clear. Anything reading this must fail CLOSED on `tags-unreadable`.
+ */
+type PiiTagStatus =
+  | { state: 'not-configured' }
+  | { state: 'no-metadata-file'; dir: string }
+  | { state: 'tags-unreadable'; path: string; reason: string }
+  | { state: 'ok'; path: string; taggedColumns: number };
+
+interface LoadedSchema {
+  metadata: SchemaMetadata;
+  piiTags: PiiTagStatus;
+}
+
+/** True when tags could not be read, so nothing may be assumed to be non-PII. */
+function tagsUnreadable(status: PiiTagStatus): status is Extract<PiiTagStatus, { state: 'tags-unreadable' }> {
+  return status.state === 'tags-unreadable';
 }
 
 interface ToolDefinition {
@@ -140,7 +232,7 @@ const TOOLS: ToolDefinition[] = [
   {
     name: 'explain_query',
     description:
-      'Run EXPLAIN (FORMAT JSON) for a schema-validated findMany query. Pass table + optional where/orderBy/limit/select, free-form SQL is rejected.',
+      'Run EXPLAIN (FORMAT JSON) for a schema-validated findMany query. Pass table + optional where/orderBy/limit/select, free-form SQL is rejected. A where or orderBy on a PII-tagged or secret-named column is refused: the planner row estimate would leak the value. Naming such a column in select is allowed, since EXPLAIN returns no rows.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -165,7 +257,8 @@ const TOOLS: ToolDefinition[] = [
   },
   {
     name: 'sample_rows',
-    description: 'Read up to 50 rows from a validated table.',
+    description:
+      'Read up to 50 rows from a validated table. PII-tagged and secret-named columns are never fetched; the reply lists exactly what was hidden and where the PII tags came from.',
     inputSchema: {
       type: 'object',
       properties: { table: { type: 'string' }, limit: { type: 'number', minimum: 1, maximum: 50 } },
@@ -185,8 +278,21 @@ export function startMcpServer(options: McpServerOptions, transport: McpTranspor
   registerUtcTemporalParsers();
   const ctx: McpContext = {
     options,
-    pool: new pg.Pool({ connectionString: options.url, max: 2, idleTimeoutMillis: 10_000 }),
+    pool: transport.pool ?? new pg.Pool({ connectionString: options.url, max: 2, idleTimeoutMillis: 10_000 }),
   };
+
+  // An idle pooled connection that dies (server restart, proxy idle timeout)
+  // emits 'error' on the POOL, which has no default listener: unhandled, it
+  // takes the whole CLI process down mid-session, and the agent sees the stdio
+  // transport vanish with no message. Log to stderr, never stdout: stdout is
+  // the JSON-RPC framing channel and one stray line desynchronizes the client.
+  // The message is redacted because pg echoes the connection string into some
+  // connection failures, and this text is written where a user can see it.
+  ctx.pool.on('error', (err: Error) => {
+    process.stderr.write(`[turbine] mcp pool error: ${redactUrl(err.message)}\n`);
+  });
+
+  announcePiiTags(options);
 
   let buffer = '';
   let disposed = false;
@@ -220,6 +326,42 @@ export function startMcpServer(options: McpServerOptions, transport: McpTranspor
       await ctx.pool.end();
     },
   };
+}
+
+/**
+ * Say, once at startup, what the redaction is actually running on.
+ *
+ * `turbine studio` prints its tag count and source path; this server printed
+ * nothing at all, so an operator had no way to notice that the tags they
+ * declared were not in force. Everything goes to STDERR, never stdout: stdout
+ * carries the JSON-RPC framing and one stray line desynchronizes the client.
+ */
+function announcePiiTags(options: McpServerOptions): void {
+  if (!options.metadataDir) {
+    process.stderr.write(
+      '[turbine] mcp: no metadata directory configured, so code-first PII tags are not loaded and ' +
+        'sample_rows redacts only on column name.\n',
+    );
+    return;
+  }
+  const source = loadPiiTags(options.metadataDir);
+  if (!source) {
+    process.stderr.write(
+      `[turbine] mcp: no generated metadata found in ${options.metadataDir}, so code-first PII tags are not ` +
+        'loaded. Run `turbine generate` if your schema tags PII columns.\n',
+    );
+    return;
+  }
+  if (!source.scan.ok) {
+    // Loud, because this is the state that used to look like success.
+    process.stderr.write(
+      `[turbine] mcp WARNING: ${source.path} exists but its PII tags could not be read (${source.scan.reason}). ` +
+        'Failing closed: sample_rows will redact EVERY column and explain_query will refuse where/orderBy. ' +
+        'Re-run `turbine generate` to fix this.\n',
+    );
+    return;
+  }
+  process.stderr.write(`[turbine] mcp: ${source.count} PII-tagged column(s) loaded from ${source.path}\n`);
 }
 
 async function handleLine(line: string, ctx: McpContext, write: (payload: unknown) => void): Promise<void> {
@@ -308,7 +450,7 @@ async function callTool(params: unknown, ctx: McpContext): Promise<unknown> {
 
 async function schemaOverview(ctx: McpContext): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
-    const metadata = await loadSchemaMetadata(client, ctx.options);
+    const { metadata } = await loadSchemaMetadata(client, ctx.options);
     const rowCounts = await estimateRows(client, ctx.options.schema);
     return {
       schema: ctx.options.schema,
@@ -327,7 +469,7 @@ async function schemaOverview(ctx: McpContext): Promise<unknown> {
 
 async function tableDetail(ctx: McpContext, tableName: string): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
-    const metadata = await loadSchemaMetadata(client, ctx.options);
+    const { metadata } = await loadSchemaMetadata(client, ctx.options);
     const table = requireTable(metadata, tableName);
     return {
       name: table.name,
@@ -343,7 +485,7 @@ async function tableDetail(ctx: McpContext, tableName: string): Promise<unknown>
         isArray: column.isArray,
         maxLength: column.maxLength,
       })),
-      indexes: table.indexes,
+      indexes: table.indexes.map(sanitizeIndex),
       relations: Object.values(table.relations).map((relation) => ({
         name: relation.name,
         type: relation.type,
@@ -357,13 +499,137 @@ async function tableDetail(ctx: McpContext, tableName: string): Promise<unknown>
   });
 }
 
+/**
+ * Index of the predicate-introducing ` WHERE `, ignoring any that sits INSIDE a
+ * single-quoted string literal.
+ *
+ * A plain `indexOf(' WHERE ')` matches the first occurrence anywhere, so an
+ * expression index whose key list embeds the text (`((email || ' WHERE '))`)
+ * gets cut mid-literal. The head then no longer contains a balanced quote, the
+ * literal check on it reads clean, and the literal ships. That is the exact
+ * failure this function exists to prevent, arriving through the parser rather
+ * than through the branch.
+ *
+ * Postgres escapes an embedded quote by doubling it, and a doubled quote toggles
+ * the flag twice, so it needs no special case.
+ */
+function predicateStart(definition: string): number {
+  let inLiteral = false;
+  for (let i = 0; i < definition.length; i++) {
+    if (definition[i] === "'") {
+      inLiteral = !inLiteral;
+      continue;
+    }
+    if (!inLiteral && definition.startsWith(' WHERE ', i)) return i;
+  }
+  return -1;
+}
+
+/**
+ * Strip literal values out of an index definition before returning it.
+ *
+ * `pg_indexes.indexdef` is raw DDL, and a PARTIAL index carries its predicate
+ * verbatim: `CREATE INDEX ... WHERE (email = 'ceo@example.com')` puts a real
+ * stored value in the reply, and an expression index can do the same inside the
+ * key list. Column names are already public in this tool's own output, so the
+ * useful part is kept and only the value-bearing tail is dropped. The predicate
+ * is reported as PRESENT, so the shape of the index is still legible.
+ */
+function sanitizeIndex(index: IndexMetadata): Record<string, unknown> {
+  const definition = index.definition ?? '';
+  // pg renders the predicate as a trailing ` WHERE ...` on one line, so the tail
+  // from the keyword onwards is the whole predicate. Matched case-sensitively
+  // and OUTSIDE string literals (see predicateStart): pg normalizes the keyword
+  // to upper case, so a lower-case `where` in a quoted identifier cannot trigger
+  // it, and an upper-case one inside a literal no longer can either.
+  const whereAt = predicateStart(definition);
+  const partial = whereAt !== -1;
+  // Everything before the predicate, which is where the KEY LIST lives. Checked
+  // for both index shapes: an expression index can embed a literal
+  // (`lower(email || 'x')`), and it can be partial at the same time, in which
+  // case dropping only the predicate still ships the literal in the key list.
+  // The key-list check used to sit in the non-partial branch alone, so exactly
+  // the combination this function was written for went out verbatim.
+  // Double quotes are NOT a trigger: those delimit an identifier, and
+  // identifiers are already returned in `columns`.
+  const head = partial ? definition.slice(0, whereAt) : definition;
+  const keys = keyList(head);
+  const keysHoldLiteral = keys === null || /[(']/.test(keys);
+  // `columns` is not a safe passthrough for an expression index: it is the key
+  // list split on commas, so for `((email || 'ceo@example.com'))` the "column"
+  // IS the literal. Only entries that are a bare identifier survive, and only
+  // on the expression path, so an ordinary index (including one with a quoted
+  // identifier holding a space) is untouched.
+  const columns = keysHoldLiteral ? index.columns.filter((column) => PLAIN_IDENTIFIER.test(column)) : index.columns;
+  return {
+    name: index.name,
+    columns,
+    columnsWithheld: columns.length !== index.columns.length,
+    unique: index.unique,
+    partial,
+    // Withholding is LABELLED, never expressed by dropping the field:
+    // `JSON.stringify` omits an `undefined` value, so the agent would see an
+    // index with no definition and no reason, which reads identically to an
+    // index whose definition was never collected. Every other withholding in
+    // this file names itself, and so does this one.
+    definitionWithheld: keysHoldLiteral,
+    definition: keysHoldLiteral
+      ? keys === null
+        ? '(definition withheld: the index definition could not be parsed, so it cannot be shown to hold no literal values)'
+        : '(definition withheld: the index key list is an expression that may embed literal values)'
+      : partial
+        ? `${head} WHERE (predicate withheld)`
+        : definition,
+  };
+}
+
+/** A key-list entry that is a bare column name, so it can hold no literal. */
+const PLAIN_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+
+/**
+ * The parenthesized key list of an index definition, or `null` when the
+ * definition does not parse as one.
+ *
+ * `null` is not the same answer as an empty key list, and the caller must not
+ * collapse them. This used to return `''`, which scanned clean for literals and
+ * shipped the whole definition verbatim: the ONE input this function cannot
+ * read is the one it waved through. Unparsable now means WITHHELD.
+ */
+function keyList(definition: string): string | null {
+  const open = definition.indexOf('(');
+  const close = definition.lastIndexOf(')');
+  return open === -1 || close <= open ? null : definition.slice(open + 1, close);
+}
+
 async function migrationStatus(ctx: McpContext): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
     const files = listMigrationFiles(ctx.options.migrationsDir);
-    const trackingExists = await client.query<{ exists: boolean }>(
-      `SELECT to_regclass($1)::text IS NOT NULL AS exists`,
+    // DELIBERATELY UNPINNED, unlike every other tool here.
+    //
+    // This tool's whole job is to report what `turbine migrate status` would
+    // report, and the runner in cli/migrate.ts names `_turbine_migrations`
+    // unqualified with no search_path of its own, so the tracking table lives
+    // wherever the connecting role's search_path put it, which is frequently
+    // `public` even for a project whose data schema is something else. Pinning
+    // `search_path` to `--schema` here does not harden that, it ANSWERS A
+    // DIFFERENT QUESTION: `turbine migrate status` would say "applied" while
+    // `migrate_status` said the tracking table did not exist. Between agreeing
+    // with the migration runner and imposing a rule the runner does not follow,
+    // agreeing is the only one that can be right.
+    //
+    // The resolution is DISCLOSED instead: the reply names the schema the
+    // tracking table actually resolved in, plus a note when that is not the
+    // configured schema, so the divergence is visible rather than silently
+    // decided either way. (`explain_query` and `sample_rows` still pin, because
+    // they read the schema's own tables, not the runner's bookkeeping.)
+    const trackingExists = await client.query<{ exists: boolean; table_schema: string | null }>(
+      `SELECT reg.oid IS NOT NULL AS exists, n.nspname AS table_schema
+       FROM (SELECT to_regclass($1) AS oid) reg
+       LEFT JOIN pg_class c ON c.oid = reg.oid
+       LEFT JOIN pg_namespace n ON n.oid = c.relnamespace`,
       [TRACKING_TABLE],
     );
+    const trackingSchema = trackingExists.rows[0]?.table_schema ?? null;
 
     const applied = new Map<string, { appliedAt: Date; checksum: string }>();
     if (trackingExists.rows[0]?.exists) {
@@ -389,6 +655,13 @@ async function migrationStatus(ctx: McpContext): Promise<unknown> {
     return {
       migrationsDir: ctx.options.migrationsDir,
       trackingTableExists: trackingExists.rows[0]?.exists ?? false,
+      trackingTableSchema: trackingSchema,
+      trackingTableNote:
+        trackingSchema !== null && trackingSchema !== ctx.options.schema
+          ? `Migrations are tracked in "${trackingSchema}", not the configured schema "${ctx.options.schema}". ` +
+            `This is what \`turbine migrate status\` reads too: the runner resolves the tracking table through ` +
+            `the connection's search_path rather than the --schema flag.`
+          : undefined,
       applied: statuses.filter((status) => status.applied).length,
       pending: statuses.filter((status) => !status.applied).length,
       drifted: statuses.filter((status) => status.checksumValid === false).length,
@@ -399,7 +672,7 @@ async function migrationStatus(ctx: McpContext): Promise<unknown> {
 
 async function doctorReport(ctx: McpContext): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
-    const metadata = await loadSchemaMetadata(client, ctx.options);
+    const { metadata } = await loadSchemaMetadata(client, ctx.options);
     const rowCounts = await estimateRows(client, ctx.options.schema);
     const missing = findMissingRelationIndexes(metadata).sort(
       (a, b) => (rowCounts.get(b.table) ?? 0) - (rowCounts.get(a.table) ?? 0),
@@ -438,8 +711,10 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
   const findManyArgs = parseExplainFindManyArgs(args);
 
   return withReadOnly(ctx, async (client) => {
-    const metadata = await loadSchemaMetadata(client, ctx.options);
+    const { metadata, piiTags } = await loadSchemaMetadata(client, ctx.options);
     const table = requireTable(metadata, tableName);
+
+    assertNoPiiPredicates(findManyArgs as Record<string, unknown>, table, metadata, piiTags);
 
     let deferred: ReturnType<QueryInterface<Record<string, unknown>>['buildFindMany']>;
     try {
@@ -465,6 +740,148 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
       plan: result.rows[0]?.['QUERY PLAN'] ?? null,
     };
   });
+}
+
+/** Relation-filter wrappers whose body is a clause against the relation's target. */
+const RELATION_FILTER_WRAPPERS = ['some', 'none', 'every', 'is', 'isNot'] as const;
+
+/**
+ * Recursion bound for the PII guard walk. Reaching it REFUSES the request, it
+ * is not a quiet stop: returning at the cap would mean a payload padded with
+ * enough nested `NOT` wrappers walks the guard off the end of its own recursion
+ * and then hands the untouched predicate to the builder. Sits far above the
+ * builder's own depth-10 relation cap, so nothing buildable is refused for
+ * depth alone.
+ */
+const PII_GUARD_MAX_DEPTH = 32;
+
+/**
+ * Refuse an `explain_query` that filters or sorts on a hidden column: one that
+ * is PII-tagged, or one whose NAME matches {@link SECRET_NAME_PATTERN}.
+ *
+ * The name half is not a second-best approximation of the tag half, it is the
+ * same rule `sample_rows` applies, applied to the other value-bearing path.
+ * Refusing to fetch `api_key` while planning `apiKey startsWith 'sk-a'` leaves
+ * the value extractable through a cheaper channel than the one that was closed.
+ *
+ * WHY REFUSE THE PREDICATE RATHER THAN SUPPRESS THE ESTIMATES. `EXPLAIN` on a
+ * PII predicate is a character-by-character extraction oracle: `startsWith: 'a'`
+ * plans 412 rows, `'aa'` plans 3, and the caller here is an LLM acting on
+ * attacker-influenceable input, with no execution and no rate limit to slow the
+ * walk down. Suppression was the other option and is strictly weaker: the row
+ * estimate is not one field to delete but the thing the whole plan is built out
+ * of, and it is recoverable from `Total Cost`, from `Plan Width` x rows, from
+ * the join order, and from whether the planner picked an index at all. Deleting
+ * all of that leaves a tool with nothing to report, so the narrower loss is to
+ * refuse the predicate. It matches the rule the rest of the codebase already
+ * states: predicates on PII are allowed IN THE ORM because they return no
+ * value, and that reasoning stops holding the moment the query's SELECTIVITY is
+ * itself the reply. Studio drew the same line for the same reason
+ * (`assertNoPiiPredicates`, and its `filters` param refuses even `isNull`,
+ * because null-ness is an oracle too).
+ *
+ * `select` is NOT refused: explain returns no rows, and naming a column reveals
+ * nothing about its contents.
+ *
+ * FAILS CLOSED when the tag scan failed: with no trustworthy tag list, no
+ * column can be shown to be safe, so every where/orderBy is refused rather than
+ * assumed harmless.
+ */
+function assertNoPiiPredicates(
+  args: Record<string, unknown>,
+  table: TableMetadata,
+  metadata: SchemaMetadata,
+  piiTags: PiiTagStatus,
+): void {
+  const hasPredicate = args.where !== undefined || args.orderBy !== undefined;
+  if (tagsUnreadable(piiTags) && hasPredicate) {
+    throw jsonRpcError(
+      -32602,
+      `PII tags could not be read from ${piiTags.path} (${piiTags.reason}), so explain_query cannot prove this ` +
+        `query does not filter or sort on a PII column, and row estimates on such a column are an extraction ` +
+        `oracle. Re-run \`turbine generate\`, or call explain_query without where/orderBy.`,
+    );
+  }
+
+  const assertWithinDepth = (depth: number): void => {
+    if (depth <= PII_GUARD_MAX_DEPTH) return;
+    throw jsonRpcError(
+      -32602,
+      `Query is nested more than ${PII_GUARD_MAX_DEPTH} levels deep, past the point where the PII guard can ` +
+        `prove it does not filter or sort on a tagged column, so it is refused. Flatten the query.`,
+    );
+  };
+
+  const refuse = (owner: TableMetadata, column: string, why: string): never => {
+    throw jsonRpcError(
+      -32602,
+      `Column "${column}" on "${owner.name}" ${why}, so it cannot be used in a where or orderBy here: ` +
+        `EXPLAIN reports the planner's row estimate, and the estimate for a predicate on a hidden value ` +
+        `reveals that value one character at a time. Filter on a visible column instead.`,
+    );
+  };
+
+  /**
+   * Why this column may not appear in a predicate, or null when it may.
+   *
+   * The two reasons are the two `sample_rows` already refuses to FETCH
+   * (`classifyHiddenColumns`), and they are deliberately the same set: a column
+   * whose bytes are too sensitive to sample is too sensitive to binary-search
+   * out of the planner. A column absent from the table is not judged here, the
+   * builder rejects it by name a moment later.
+   */
+  const hiddenReason = (owner: TableMetadata, column: string): string | null => {
+    if (owner.columns.some((col) => col.name === column && col.pii === true)) return 'is PII-tagged';
+    if (SECRET_NAME_PATTERN.test(column)) return 'has a secret-looking name';
+    return null;
+  };
+
+  const visitClause = (node: unknown, owner: TableMetadata | undefined, depth: number): void => {
+    assertWithinDepth(depth);
+    if (!owner || node === null || typeof node !== 'object') return;
+    // `orderBy` accepts an array of single-key objects, and so does a `NOT`
+    // list. Element order carries no nesting, so the depth is unchanged.
+    if (Array.isArray(node)) {
+      for (const item of node) visitClause(item, owner, depth);
+      return;
+    }
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === 'AND' || key === 'OR' || key === 'NOT') {
+        visitClause(value, owner, depth + 1);
+        continue;
+      }
+      const relation = Object.hasOwn(owner.relations, key) ? owner.relations[key] : undefined;
+      if (relation) {
+        visitRelationValue(value, metadata.tables[relation.to], depth + 1);
+        continue;
+      }
+      // A predicate may name a column by its camelCase field OR by its real
+      // column name; both compile to the same SQL, so both have to be checked.
+      const column = Object.hasOwn(owner.columnMap, key) ? owner.columnMap[key]! : key;
+      const why = hiddenReason(owner, column);
+      if (why) refuse(owner, column, why);
+    }
+  };
+
+  /**
+   * A relation predicate arrives either bare (`{ user: { email: {...} } }`) or
+   * wrapped in a cardinality operator (`{ user: { is: { email: {...} } } }`),
+   * and BOTH resolve against the relation's target. Walking the wrapper as if
+   * `is` were a column of the target would skip the inner clause entirely, so
+   * descend into every wrapper member AND into the node itself.
+   */
+  const visitRelationValue = (value: unknown, target: TableMetadata | undefined, depth: number): void => {
+    assertWithinDepth(depth);
+    if (!target || value === null || typeof value !== 'object') return;
+    const node = value as Record<string, unknown>;
+    for (const wrapper of RELATION_FILTER_WRAPPERS) {
+      if (Object.hasOwn(node, wrapper)) visitClause(node[wrapper], target, depth + 1);
+    }
+    visitClause(node, target, depth);
+  };
+
+  visitClause(args.where, table, 0);
+  visitClause(args.orderBy, table, 0);
 }
 
 /**
@@ -506,33 +923,81 @@ function parseExplainFindManyArgs(args: JsonObject): FindManyArgs<Record<string,
   return findManyArgs as FindManyArgs<Record<string, unknown>>;
 }
 
+/**
+ * Decide which of a table's columns must not leave the process, and why.
+ *
+ * Three independent reasons, all reported so nothing is hidden silently:
+ * `pii` (a code-first tag), `secret-name` (the name-only denylist above), and
+ * `tags-unreadable` (a generated metadata file exists and did not parse, so no
+ * column can be shown to be untagged and EVERY column is hidden). That last one
+ * is the fail-closed branch: the old code returned `redactedColumns: []` in
+ * exactly that situation, which reads identically to "this table has no PII".
+ */
+function classifyHiddenColumns(
+  table: TableMetadata,
+  piiTags: PiiTagStatus,
+): { hidden: Set<string>; reasons: Record<string, string> } {
+  const hidden = new Set<string>();
+  const reasons: Record<string, string> = {};
+  const unreadable = tagsUnreadable(piiTags);
+  for (const col of table.columns) {
+    const reason = unreadable
+      ? 'tags-unreadable'
+      : col.pii === true
+        ? 'pii'
+        : SECRET_NAME_PATTERN.test(col.name)
+          ? 'secret-name'
+          : null;
+    if (reason) {
+      hidden.add(col.name);
+      reasons[col.name] = reason;
+    }
+  }
+  return { hidden, reasons };
+}
+
 async function sampleRows(ctx: McpContext, tableName: string, limit: number): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
-    const metadata = await loadSchemaMetadata(client, ctx.options);
+    const { metadata, piiTags } = await loadSchemaMetadata(client, ctx.options);
     const table = requireTable(metadata, tableName);
     const qualifiedTable = `${quoteIdent(ctx.options.schema)}.${quoteIdent(table.name)}`;
-    const result = await client.query(`SELECT * FROM ${qualifiedTable} LIMIT $1`, [limit]);
-    // Sample rows go straight into an LLM context, so PII-tagged values are
-    // replaced before serialization, the same stance Studio's Data tab takes.
-    const piiColumns = new Set(table.columns.filter((c) => c.pii).map((c) => c.name));
+
+    // Sample rows go straight into an LLM context, so hidden values are never
+    // FETCHED, not merely masked after the fact. `SELECT *` used to pull every
+    // column into this process and mask on the way out, which meant one missed
+    // branch anywhere downstream (an error path echoing the row, a future
+    // serializer) leaked the real bytes. Projecting at the SQL level is the same
+    // stance `writeReturningColumns` takes for write returns.
+    const { hidden, reasons } = classifyHiddenColumns(table, piiTags);
+    const visible = table.columns.filter((col) => !hidden.has(col.name));
+    // Every column hidden: still report the row count, without selecting data.
+    const selectList = visible.length > 0 ? visible.map((col) => quoteIdent(col.name)).join(', ') : '1 AS "_"';
+    const result = await client.query(`SELECT ${selectList} FROM ${qualifiedTable} LIMIT $1`, [limit]);
+
+    // Rebuild each row in the table's own column order, so a hidden column is
+    // visibly present-and-withheld rather than absent (an absent key reads like
+    // "no such column" to the agent, which is a different and wrong claim).
+    const rows = result.rows.map((row) => {
+      const out: Record<string, unknown> = {};
+      for (const col of table.columns) {
+        out[col.name] = hidden.has(col.name) ? REDACTED : (row as Record<string, unknown>)[col.name];
+      }
+      return out;
+    });
+
     return {
       table: table.name,
       limit,
-      redactedColumns: [...piiColumns],
-      columns: result.fields.map((field) => ({ name: field.name, dataTypeID: field.dataTypeID })),
-      rows: piiColumns.size === 0 ? result.rows : result.rows.map((row) => redactRow(row, piiColumns)),
+      redactedColumns: [...hidden],
+      redactionReasons: reasons,
+      // Explicit so `redactedColumns: []` can never be read as "checked, and
+      // this table holds no PII" when the truth is "nothing was ever checked".
+      piiTagSource: piiTags,
+      columns: table.columns.map((col) => ({ name: col.name, pgType: col.pgType, redacted: hidden.has(col.name) })),
+      rows,
       rowCount: result.rowCount ?? result.rows.length,
     };
   });
-}
-
-/** Replace PII-tagged cells with a fixed marker (never the value, never null). */
-function redactRow(row: Record<string, unknown>, piiColumns: ReadonlySet<string>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(row)) {
-    out[key] = piiColumns.has(key) ? '•• redacted ••' : value;
-  }
-  return out;
 }
 
 async function withReadOnly<T>(ctx: McpContext, fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
@@ -555,7 +1020,7 @@ async function withReadOnly<T>(ctx: McpContext, fn: (client: pg.PoolClient) => P
   }
 }
 
-async function loadSchemaMetadata(client: pg.PoolClient, options: McpServerOptions): Promise<SchemaMetadata> {
+async function loadSchemaMetadata(client: pg.PoolClient, options: McpServerOptions): Promise<LoadedSchema> {
   const [tablesResult, columnsResult, pkResult, fkResult, uniqueResult, indexResult, enumResult] = await Promise.all([
     client.query<{ table_name: string }>(
       `SELECT table_name
@@ -755,11 +1220,24 @@ async function loadSchemaMetadata(client: pg.PoolClient, options: McpServerOptio
   const metadata: SchemaMetadata = { tables, enums };
   // Code-first PII tags, layered onto the live catalog. Without this the
   // redaction below has nothing to act on (introspection never infers a tag).
+  //
+  // The OUTCOME is returned, not discarded. The three no-tag outcomes are not
+  // interchangeable: "the user never generated metadata" is a normal state,
+  // while "a metadata file is sitting right there and did not parse" means the
+  // user believes tags are in force while nothing is being hidden. Callers fail
+  // closed on the latter (`tagsUnreadable`).
+  let piiTags: PiiTagStatus = { state: 'not-configured' };
   if (options.metadataDir) {
     const source = loadPiiTags(options.metadataDir);
-    if (source) applyPiiTags(metadata, source.tags);
+    if (!source) {
+      piiTags = { state: 'no-metadata-file', dir: options.metadataDir };
+    } else if (!source.scan.ok) {
+      piiTags = { state: 'tags-unreadable', path: source.path, reason: source.scan.reason ?? 'unrecognized shape' };
+    } else {
+      piiTags = { state: 'ok', path: source.path, taggedColumns: applyPiiTags(metadata, source.tags) };
+    }
   }
-  return metadata;
+  return { metadata, piiTags };
 }
 
 interface ForeignKeyRow {
@@ -893,8 +1371,14 @@ function isObject(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Error text for a JSON-RPC payload. Redacted because a connection failure from
+ * pg quotes the connection string back verbatim, and every byte returned here
+ * lands in an LLM context the operator does not control. The rest of the CLI
+ * already runs its printed errors through `redactUrl`; this path did not.
+ */
 function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return redactUrl(err instanceof Error ? err.message : String(err));
 }
 
 function jsonRpcError(code: number, message: string, data?: unknown): Error & { rpcError: JsonRpcErrorObject } {

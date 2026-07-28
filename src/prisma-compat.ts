@@ -40,6 +40,11 @@
  *   by this layer, and a key that is neither a Prisma arg nor a turbine option
  *   gets a dev-mode warning instead of vanishing (see
  *   {@link PRISMA_ARG_KEYS} and `warnUnknownQueryOptions`).
+ *   The three PRIVILEGE options among them (`skipGlobalFilters`, `includePii`,
+ *   `allowFullTableScan`) are forwarded VERBATIM, which is what makes them safe
+ *   here: core accepts only the `UNSAFE` sentinel, so a Prisma-shaped args
+ *   object carrying `includePii: true` reaches core and is refused there, and
+ *   this layer never needs its own copy of that rule.
  *
  * ## What it deliberately does NOT do (documented divergences)
  *
@@ -75,11 +80,16 @@
  * - **`limit` on `updateMany` / `deleteMany`** (Prisma 6.7+) throws. Turbine has
  *   no row-bounded mass mutation, and dropping a SAFETY BOUND with a warning
  *   would turn "change at most 10 rows" into "change every matching row".
- * - **Write projections** (`select` / `include` / `omit` on
- *   create/update/delete/upsert), **`select` on `count`**, and
- *   **`orderBy` / `cursor` / `take` / `skip` on `aggregate`** are accepted and
- *   IGNORED (they are legitimate Prisma, so they never warn); the full row / a
- *   plain number comes back.
+ * - **Write projections**: `select` / `omit` on create/update/delete/upsert
+ *   narrow the RETURNED OBJECT (see {@link resolveWriteProjection}); they do
+ *   NOT narrow the statement's `RETURNING` list, so the column still crosses
+ *   the wire, and `pii: true` remains the SQL-level control. A relation key in
+ *   either (or any `include` on a write) THROWS, since a write returns its own
+ *   row only. `omit` on READS is translated to core's own `omit`, see
+ *   {@link translateOmit}.
+ * - **`select` on `count`** and **`orderBy` / `cursor` / `take` / `skip` on
+ *   `aggregate`** are accepted and IGNORED (they are legitimate Prisma, so they
+ *   never warn); a plain number / the aggregate comes back.
  *
  * ## Type dependencies (0.41.0)
  *
@@ -131,6 +141,7 @@ import {
   GROUP_BY_OPTIONS,
   type OptionKind,
   optionKeysOfKind,
+  UNSAFE,
   UPDATE_MANY_OPTIONS,
   UPDATE_OPTIONS,
   UPSERT_OPTIONS,
@@ -807,20 +818,66 @@ function mapTake(take: number): number {
 
 interface Projection {
   select?: Record<string, boolean>;
+  omit?: Record<string, boolean>;
   with?: Record<string, unknown>;
 }
 
 /**
- * Translate Prisma `include` / `select` into Turbine `{ select, with }`.
- * `include` keeps all scalars and adds relations; `select` narrows scalars and
- * may also pull relations + `_count`. The two are mutually exclusive.
+ * Translate a Prisma `omit` (scalar field names → true) into Turbine's `omit`.
+ *
+ * This used to be DROPPED silently, which made it a data-exposure bug rather
+ * than an ergonomics one: `omit` is the idiom for a sensitive-but-untagged
+ * column (`passwordHash`, `resetToken`), so a caller who asked for it got the
+ * column back anyway, in a response they believed was already filtered. Turbine
+ * core has supported `omit` on reads all along; only this translation was
+ * missing.
+ *
+ * A relation name is refused rather than forwarded: core's `omit` narrows the
+ * SCALAR projection, so `omit: { posts: true }` would have compiled to nothing
+ * and dropped the caller's intent a second time. Prisma rejects it too.
+ */
+function translateOmit(
+  ctx: Ctx,
+  mm: PrismaModelMap,
+  omit: Record<string, unknown>,
+): Record<string, boolean> | undefined {
+  const out: Record<string, boolean> = {};
+  let any = false;
+  for (const [key, val] of Object.entries(omit)) {
+    if (val === false || val == null) continue;
+    if (mm.relations[key]) {
+      throw new ValidationError(
+        `[turbine] prisma-compat: \`omit\` on model "${modelName(ctx, mm)}" takes scalar fields, but "${key}" ` +
+          'is a relation. Leave the relation out of `include` instead.',
+      );
+    }
+    out[renameField(mm, key)] = true;
+    any = true;
+  }
+  return any ? out : undefined;
+}
+
+/**
+ * Translate Prisma `include` / `select` / `omit` into Turbine
+ * `{ select, omit, with }`. `include` keeps all scalars and adds relations;
+ * `select` narrows scalars and may also pull relations + `_count`. `include`
+ * and `select` are mutually exclusive, and so are `select` and `omit` (a
+ * narrowed projection minus fields is ambiguous; Prisma refuses the pair too).
  */
 function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, unknown>): Projection {
   const include = args.include as Record<string, unknown> | undefined;
   const select = args.select as Record<string, unknown> | undefined;
+  const omitArg = args.omit as Record<string, unknown> | undefined;
   if (include && select) {
     throw new ValidationError('[turbine] prisma-compat: `include` and `select` are mutually exclusive.');
   }
+  if (select && omitArg) {
+    throw new ValidationError(
+      '[turbine] prisma-compat: `select` and `omit` are mutually exclusive. ' +
+        'A `select` already lists exactly the fields you want.',
+    );
+  }
+  const omit = omitArg ? translateOmit(ctx, mm, omitArg) : undefined;
   const withClause: Record<string, unknown> = {};
   let hasWith = false;
 
@@ -841,7 +898,7 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
       withClause[rel.name] = translateWithOption(ctx, mm, rel.name, val);
       hasWith = true;
     }
-    return { with: hasWith ? withClause : undefined };
+    return { omit, with: hasWith ? withClause : undefined };
   }
 
   if (select) {
@@ -866,7 +923,156 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
     return { select: hasScalar ? scalar : undefined, with: hasWith ? withClause : undefined };
   }
 
-  return {};
+  return { omit };
+}
+
+/**
+ * A write's projection, resolved into PRISMA-spelled key sets (the returned row
+ * has already been through {@link reshapeRow}, so its keys are prisma names).
+ */
+interface WriteProjection {
+  /** Fields to drop from the returned row. */
+  omit?: ReadonlySet<string>;
+  /** Fields to keep; everything else is dropped. */
+  pick?: ReadonlySet<string>;
+}
+
+const NO_WRITE_PROJECTION: WriteProjection = {};
+
+/**
+ * Refuse a write-projection key that names no field on the model.
+ *
+ * Unlike a READ projection, this one never reaches core: `select` / `omit` on a
+ * write are applied to the already-returned object by
+ * {@link applyWriteProjection}, so nothing downstream can notice the name is
+ * wrong. A typo therefore failed silently in BOTH directions, and the `omit`
+ * direction is the one that matters: `omit: { ssn: true }` misspelled as
+ * `snn` returned the column, and the call site that asked for it hidden had no
+ * signal at all. (`pick` failed the other way, quietly dropping the field from
+ * the result.)
+ *
+ * The read path has never had this hole: core validates every projection key
+ * and throws E003 on an unknown one, which is the behaviour a caller has
+ * already observed on `findMany` before writing the same clause on `create`.
+ * So this is not a new rule, it is the read rule reaching the one surface that
+ * bypassed it. Errors match core's shape, including the suggestion.
+ */
+function assertWriteProjectionField(ctx: Ctx, mm: PrismaModelMap, op: string, clause: string, key: string): void {
+  if (Object.hasOwn(mm.fields, key)) return;
+  const known = Object.keys(mm.fields);
+  const suggestion = suggestKey(key, new Set(known));
+  throw new ValidationError(
+    `[turbine] prisma-compat: unknown field "${key}" in \`${clause}\` on ${modelName(ctx, mm)}.${op}().` +
+      (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+      ` Known fields: ${known.join(', ') || '(none)'}.`,
+  );
+}
+
+/**
+ * Resolve `select` / `omit` / `include` on create / update / delete / upsert.
+ *
+ * All three used to be accepted and IGNORED here. For `omit` that is the exact
+ * data-exposure bug that was fixed for reads: `omit` is the idiom for a
+ * sensitive-but-untagged column, and because it demonstrably WORKS on
+ * `findMany`, a caller has positive evidence for assuming it works on `create`
+ * too. `select` is the same class in the other spelling (the caller asked for
+ * three fields and got the whole row).
+ *
+ * SCOPE, stated exactly rather than implied: this narrows the OBJECT this
+ * adapter returns. Core's write args carry no projection, so the column is
+ * still in the statement's `RETURNING` list and still crosses the wire. The
+ * SQL-level control is `pii: true` on the column, which is enforced in core and
+ * is unaffected by any of this.
+ *
+ * A relation (or `_count`) key THROWS instead: a write returns its own row and
+ * nothing else, so serving it is impossible, and the alternative is handing
+ * back a row whose relation property is silently `undefined`, which is the
+ * failure mode this whole round exists to remove.
+ */
+function resolveWriteProjection(
+  ctx: Ctx,
+  mm: PrismaModelMap,
+  op: string,
+  args: Record<string, unknown> | undefined,
+): WriteProjection {
+  if (!args) return NO_WRITE_PROJECTION;
+  const include = args.include as Record<string, unknown> | undefined;
+  const select = args.select as Record<string, unknown> | undefined;
+  const omitArg = args.omit as Record<string, unknown> | undefined;
+  if (include && select) {
+    throw new ValidationError('[turbine] prisma-compat: `include` and `select` are mutually exclusive.');
+  }
+  if (select && omitArg) {
+    throw new ValidationError(
+      '[turbine] prisma-compat: `select` and `omit` are mutually exclusive. ' +
+        'A `select` already lists exactly the fields you want.',
+    );
+  }
+  if (include) {
+    for (const [key, val] of Object.entries(include)) {
+      if (val === false || val == null) continue;
+      throw new UnsupportedFeatureError(
+        `include ("${key}") on ${op}`,
+        'prisma-compat',
+        `a write on model "${modelName(ctx, mm)}" returns its own row only; read the relation back with a ` +
+          'separate findUnique inside the same $transaction.',
+      );
+    }
+  }
+  if (select) {
+    const pick = new Set<string>();
+    for (const [key, val] of Object.entries(select)) {
+      if (val === false || val == null) continue;
+      if (key === '_count' || mm.relations[key]) {
+        throw new UnsupportedFeatureError(
+          `select of "${key}" on ${op}`,
+          'prisma-compat',
+          `"${key}" is a relation on model "${modelName(ctx, mm)}"; a write returns its own row only, so read ` +
+            'it back with a separate findUnique inside the same $transaction.',
+        );
+      }
+      assertWriteProjectionField(ctx, mm, op, 'select', key);
+      pick.add(key);
+    }
+    // An all-false `select` names nothing. Reads treat that as "no projection"
+    // (translateProjection returns select: undefined), so writes do too rather
+    // than inventing a second rule for input Prisma rejects anyway.
+    return pick.size ? { pick } : NO_WRITE_PROJECTION;
+  }
+  if (omitArg) {
+    const omit = new Set<string>();
+    for (const [key, val] of Object.entries(omitArg)) {
+      if (val === false || val == null) continue;
+      if (mm.relations[key]) {
+        throw new ValidationError(
+          `[turbine] prisma-compat: \`omit\` on model "${modelName(ctx, mm)}" takes scalar fields, but "${key}" ` +
+            'is a relation.',
+        );
+      }
+      assertWriteProjectionField(ctx, mm, op, 'omit', key);
+      omit.add(key);
+    }
+    return omit.size ? { omit } : NO_WRITE_PROJECTION;
+  }
+  return NO_WRITE_PROJECTION;
+}
+
+/** Apply a {@link WriteProjection} to one already-reshaped write result row. */
+function applyWriteProjection(proj: WriteProjection, row: unknown): unknown {
+  if (!isPlainObject(row)) return row;
+  if (proj.pick) {
+    const out: Record<string, unknown> = {};
+    for (const key of proj.pick) {
+      if (key in row) out[key] = row[key];
+    }
+    return out;
+  }
+  if (proj.omit) {
+    const out: Record<string, unknown> = { ...row };
+    for (const key of proj.omit) delete out[key];
+    return out;
+  }
+  return row;
 }
 
 /** Translate a Prisma relation include payload into a Turbine `WithOptions`. */
@@ -885,9 +1091,12 @@ function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, v
       "Turbine's `with` clause has no offset, page the relation with a separate query.",
     );
   }
-  if (target && (val.select !== undefined || val.include !== undefined)) {
+  if (target && (val.select !== undefined || val.include !== undefined || val.omit !== undefined)) {
     const proj = translateProjection(ctx, target, val);
     if (proj.select) opt.select = proj.select;
+    // Same silent drop as the top level: a nested `omit` names the sensitive
+    // column on the CHILD rows, which are just as exposed.
+    if (proj.omit) opt.omit = proj.omit;
     if (proj.with) opt.with = proj.with;
   }
   return opt;
@@ -946,6 +1155,7 @@ function translateReadArgs(
   if (prismaArgs.orderBy !== undefined) t.orderBy = translateOrderBy(ctx, mm, prismaArgs.orderBy);
   const proj = translateProjection(ctx, mm, prismaArgs);
   if (proj.select) t.select = proj.select;
+  if (proj.omit) t.omit = proj.omit;
   if (proj.with) t.with = proj.with;
   if (Array.isArray(prismaArgs.distinct)) {
     t.distinct = (prismaArgs.distinct as string[]).map((f) => renameField(mm, f));
@@ -1965,22 +2175,28 @@ function makeDelegate(
         (qi, t) => qi.findUniqueOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindUniqueOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row']>,
-    create: (args) =>
-      defer(
+    create: (args) => {
+      // Resolved inside the translate thunk below (so it validates before the
+      // write runs and stays deferred), read back by every result path.
+      let proj: WriteProjection = NO_WRITE_PROJECTION;
+      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      return defer(
         'create',
         args,
         () => {
+          proj = resolveWriteProjection(ctx, mm, 'create', args as Args);
           const t: Args = { data: translateWriteData(ctx, mm, applyCreateDefaults(mm, (args as Args).data)) };
           applyNativeOptions(CREATE_OPTIONS, args as Args, t);
           return t;
         },
-        (qi, t) => qi.create(t).then((r) => reshapeRow(ctx, mm, r)),
+        (qi, t) => qi.create(t).then(shape),
         {
           build: (qi, t) => qi.buildCreate(t),
-          reshape: (raw) => reshapeRow(ctx, mm, raw),
+          reshape: shape,
           nested: (t) => hasNestedKeys(ctx, mm, t.data),
         },
-      ) as unknown as Promise<PrismaModelTypes['Row']>,
+      ) as unknown as Promise<PrismaModelTypes['Row']>;
+    },
     createMany: (args) =>
       defer(
         'createMany',
@@ -2013,12 +2229,15 @@ function makeDelegate(
           execInTx: (table, t) => createManyByRun(table(mm.table), t, createManyRunsOf(t)),
         },
       ) as unknown as Promise<{ count: number }>,
-    update: (args) =>
-      defer(
+    update: (args) => {
+      let proj: WriteProjection = NO_WRITE_PROJECTION;
+      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      return defer(
         'update',
         args,
         () => {
           const a = requireWhere(args, 'update');
+          proj = resolveWriteProjection(ctx, mm, 'update', a);
           const t: Args = {
             where: translateWhere(ctx, mm, a.where),
             data: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.data)),
@@ -2035,13 +2254,14 @@ function makeDelegate(
           }
           return t;
         },
-        (qi, t) => qi.update(t).then((r) => reshapeRow(ctx, mm, r)),
+        (qi, t) => qi.update(t).then(shape),
         {
           build: (qi, t) => qi.buildUpdate(t),
-          reshape: (raw) => reshapeRow(ctx, mm, raw),
+          reshape: shape,
           nested: (t) => hasNestedKeys(ctx, mm, t.data),
         },
-      ) as unknown as Promise<PrismaModelTypes['Row']>,
+      ) as unknown as Promise<PrismaModelTypes['Row']>;
+    },
     updateMany: (args) =>
       defer(
         'updateMany',
@@ -2057,25 +2277,29 @@ function makeDelegate(
           // LAST, so it wins: a Prisma updateMany with no `where` affects every
           // row, and an explicit `allowFullTableScan: false` must not be able to
           // turn that parity into a thrown empty-where guard.
-          if (a.where === undefined) t.allowFullTableScan = true;
+          if (a.where === undefined) t.allowFullTableScan = UNSAFE;
           return t;
         },
         (qi, t) => qi.updateMany(t),
         { build: (qi, t) => qi.buildUpdateMany(t), reshape: (raw) => raw },
       ) as unknown as Promise<{ count: number }>,
-    delete: (args) =>
-      defer(
+    delete: (args) => {
+      let proj: WriteProjection = NO_WRITE_PROJECTION;
+      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      return defer(
         'delete',
         args,
         () => {
           const a = requireWhere(args, 'delete');
+          proj = resolveWriteProjection(ctx, mm, 'delete', a);
           const t: Args = { where: translateWhere(ctx, mm, a.where) };
           applyNativeOptions(DELETE_OPTIONS, a, t);
           return t;
         },
-        (qi, t) => qi.delete(t).then((r) => reshapeRow(ctx, mm, r)),
-        { build: (qi, t) => qi.buildDelete(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
-      ) as unknown as Promise<PrismaModelTypes['Row']>,
+        (qi, t) => qi.delete(t).then(shape),
+        { build: (qi, t) => qi.buildDelete(t), reshape: shape },
+      ) as unknown as Promise<PrismaModelTypes['Row']>;
+    },
     deleteMany: (args = {}) =>
       defer(
         'deleteMany',
@@ -2086,18 +2310,21 @@ function makeDelegate(
           const t: Args = { where: translateWhere(ctx, mm, a.where ?? {}) };
           applyNativeOptions(DELETE_MANY_OPTIONS, a, t);
           // LAST, so it wins. See the same note on updateMany.
-          if (a.where === undefined) t.allowFullTableScan = true;
+          if (a.where === undefined) t.allowFullTableScan = UNSAFE;
           return t;
         },
         (qi, t) => qi.deleteMany(t),
         { build: (qi, t) => qi.buildDeleteMany(t), reshape: (raw) => raw },
       ) as unknown as Promise<{ count: number }>,
-    upsert: (args) =>
-      defer(
+    upsert: (args) => {
+      let proj: WriteProjection = NO_WRITE_PROJECTION;
+      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      return defer(
         'upsert',
         args,
         () => {
           const a = requireWhere(args, 'upsert');
+          proj = resolveWriteProjection(ctx, mm, 'upsert', a);
           const t: Args = {
             where: translateWhere(ctx, mm, a.where),
             create: translateWriteData(ctx, mm, applyCreateDefaults(mm, a.create)),
@@ -2111,25 +2338,23 @@ function makeDelegate(
           // key values equal the create values AND no nested write data is
           // present; otherwise emulate Prisma's lookup-first atomically.
           if (upsertKeysMatch(t) && !hasNestedKeys(ctx, mm, t.create) && !hasNestedKeys(ctx, mm, t.update)) {
-            return qi.upsert(t).then((r) => reshapeRow(ctx, mm, r));
+            return qi.upsert(t).then(shape);
           }
-          return runInTx(async (table) => {
-            const row = await upsertLookupFirst(table(mm.table), t);
-            return reshapeRow(ctx, mm, row);
-          });
+          return runInTx(async (table) => shape(await upsertLookupFirst(table(mm.table), t)));
         },
         {
           build: (qi, t) => qi.buildUpsert(t),
-          reshape: (raw) => reshapeRow(ctx, mm, raw),
+          reshape: shape,
           nested: (t) => !upsertKeysMatch(t) || hasNestedKeys(ctx, mm, t.create) || hasNestedKeys(ctx, mm, t.update),
           execInTx: async (table, t) => {
             if (upsertKeysMatch(t) && !hasNestedKeys(ctx, mm, t.create) && !hasNestedKeys(ctx, mm, t.update)) {
-              return reshapeRow(ctx, mm, await table(mm.table).upsert(t));
+              return shape(await table(mm.table).upsert(t));
             }
-            return reshapeRow(ctx, mm, await upsertLookupFirst(table(mm.table), t));
+            return shape(await upsertLookupFirst(table(mm.table), t));
           },
         },
-      ) as unknown as Promise<PrismaModelTypes['Row']>,
+      ) as unknown as Promise<PrismaModelTypes['Row']>;
+    },
     count: (args = {}) =>
       defer(
         'count',

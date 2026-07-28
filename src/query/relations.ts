@@ -38,6 +38,7 @@ import type {
   WithCount,
   WithOptions,
 } from './types.js';
+import { assertDirectionToken, assertOrderDirection } from './types.js';
 import { ownLookup } from './utils.js';
 import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
@@ -90,7 +91,7 @@ export function resolveColumns(
       .map(([k]) => qi.toColumn(k));
   }
   // Default / omit-only projection: PII-tagged columns are excluded unless the
-  // caller passed `includePii: true`. An empty set (untagged schema) keeps the
+  // caller opted in with `includePii: UNSAFE`. An empty set (untagged schema) keeps the
   // `null`/`*` fast path so the emitted SQL is byte-identical to before.
   const piiCols = includePii ? undefined : writesMod.piiColumns(qi, qi.tableMeta);
   const hasPii = piiCols !== undefined && piiCols.size > 0;
@@ -348,6 +349,14 @@ export function collectRelationSubqueryParams(
  * ORDER BY differs only in nulls placement, vector metric, or relation-count
  * vs relation-column never collide on one cached SQL string. Captures the
  * SQL-shaping bits (direction, nulls, metric, relation keys), never values.
+ *
+ * NOTE for the direction guard (see {@link assertOrderDirection}): every
+ * direction is embedded here BYTE-FOR-BYTE (`String(d)` for the plain form,
+ * `d.sort` / `d.direction` for the spec forms), never normalized to ASC/DESC.
+ * That is what lets the direction validation live on the BUILD side alone: a
+ * bad direction has a fingerprint no good direction can produce, so it can
+ * never be served by a warm cache entry whose build already validated. Do not
+ * "tidy" this into a normalized token.
  */
 export function orderByEntryFingerprint(qi: BuilderCtx, d: unknown, targetTable?: string): string {
   // Vector KNN ordering changes the emitted operator by metric and adds a
@@ -443,6 +452,7 @@ export function buildOrderBy(
         const rawColumn = qi.toColumn(key);
         const operator = whereMod.vectorOperator(qi, key, rawColumn, value.distance.metric);
         const placeholder = whereMod.pushVectorParam(qi, key, rawColumn, value.distance.to, params);
+        assertDirectionToken(value.distance.direction, `vector distance orderBy on "${key}"`);
         const safeDir = value.distance.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
         return `${qi.q(rawColumn)} ${operator} ${placeholder} ${safeDir}`;
       }
@@ -475,6 +485,10 @@ export function buildOrderBy(
             `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
         );
       }
+      // Refuse a direction that is neither asc nor desc. normalizeOrderBy is
+      // `=== 'desc' ? DESC : ASC`, so without this every typo sorted ASCENDING
+      // and returned a correct-looking page in the reverse order.
+      assertOrderDirection(value, `orderBy "${key}" on table "${qi.table}"`);
       const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
       return `${qi.toSqlColumn(key)} ${dir}${nullsSuffix(qi, nulls)}`;
     })
@@ -593,6 +607,7 @@ export function buildJsonPathOrderEntry(
   params.push(whereMod.jsonPathParam(qi, spec.path));
   const extract = qi.dialect.buildJsonPathExtract(`${prefix}${qi.q(col)}`, qi.p(params.length));
   const lhs = spec.type === 'numeric' ? whereMod.castJsonNumeric(qi, extract) : extract;
+  assertDirectionToken(spec.direction, `JSON-path orderBy on "${field}"`);
   const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
   // Rows whose document lacks the path extract to NULL. Without a nulls
   // clause, Postgres DESC defaults to NULLS FIRST, which both diverges from
@@ -705,6 +720,7 @@ function buildChainedToOneOrderBy(
         `[turbine] Unknown column "${key}" in orderBy on relation "${path.join('.')}" (table "${currentMeta.name}").`,
       );
     }
+    assertOrderDirection(entryValue, `orderBy on relation path "${path.join('.')}"`);
     const { dir, nulls } = normalizeOrderBy(entryValue as OrderDirection | OrderBySpec);
     let where = head.correlation;
     if (params) {
@@ -784,6 +800,7 @@ export function buildRelationOrderBy(
           `or a pick-row ordering ({ pick, by }) (got: ${keys.join(', ') || '(empty)'}).`,
       );
     }
+    assertOrderDirection(value._count, `orderBy { ${relName}: { _count } }`);
     const { dir } = normalizeOrderBy(value._count as OrderDirection);
     return `${buildRelationCountExpr(qi, relDef, parentRef, alias, params)} ${dir}`;
   }
@@ -832,6 +849,7 @@ export function buildRelationOrderBy(
           `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").${relationHint}`,
         );
       }
+      assertOrderDirection(dirValue, `orderBy "${col}" on relation "${relName}"`);
       const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
       // Target's global filter applies here too, otherwise ordering keys off
       // a soft-deleted / other-tenant related row's value (matches the with
@@ -972,6 +990,7 @@ export function buildRelationPickOrderBy(
   const targetMeta = qi.schema.tables[relDef.to];
   if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
 
+  assertDirectionToken(spec.direction, `pick-row orderBy on relation "${relName}"`);
   const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
   const limitOne = qi.buildPagination('1', undefined, true);
   // Parents with ZERO surviving related rows have no row to pick: the
@@ -1157,6 +1176,7 @@ export function buildRelationOrderClause(
         );
       }
       const col = resolveOrderByColumn(qi, targetTable, targetMeta, key);
+      assertOrderDirection(dirValue, `orderBy "${key}" in the \`with\` clause for "${targetTable}"`);
       const { dir, nulls } = normalizeOrderBy(dirValue as OrderDirection | OrderBySpec);
       return `${alias}.${qi.q(col)} ${dir}${nullsSuffix(qi, nulls)}`;
     })

@@ -139,7 +139,9 @@ These have no default. A dialect must supply all of them.
 
 **Transaction control**, because the keywords vary: `beginStatement(isolationLevel?)`, `commitStatement()`, `rollbackStatement()`, `savepointStatement(name)`, `releaseSavepointStatement(name)`, `rollbackToSavepointStatement(name)`, and `buildSetSessionConfig(name, value)` (both name and value bound as parameters).
 
-**Streaming**: `openStream(connection, sql, params, batchSize)`, an async generator of row batches. Postgres runs a `DECLARE CURSOR` / `FETCH` / `CLOSE` loop inside a transaction; other engines use their driver's native iterator. Only a true cursor gives constant memory, so if yours materializes first, say so.
+**Streaming**: `openStream(connection, sql, params, batchSize)`, an async generator of row batches. Postgres runs a `DECLARE CURSOR` / `FETCH` / `CLOSE` loop inside a transaction and is the only shipped dialect with constant memory.
+
+**None of the other three bundled dialects streams.** SQLite, MySQL and SQL Server all run the statement once, hold the entire result set in memory, and yield `batchSize` slices of it, so `findManyStream` on them is `findMany` with a different iteration shape and the same peak memory. That is a property of the seam, not of the drivers: `StreamableConnection` exposes only `query()`, so mysql2's `.stream()` and the `mssql` `request.stream` event API are simply not reachable from a dialect. If your engine can do better and you can reach its cursor, `openStream` is where that goes. If it materializes, say so in the dialect's own docs: a caller who reads "streaming: supported" and drains a 50M-row table will run the process out of memory.
 
 ## The additive hooks
 

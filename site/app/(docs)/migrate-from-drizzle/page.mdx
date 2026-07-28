@@ -190,7 +190,7 @@ await db.$transaction(async (tx) => {
 | Local Studio UI | Drizzle Studio (free; hosted Gateway paid) | `npx turbine studio` (free, read-only) |
 | Runtime deps | 0 (pg adapter separate) | 1 (`pg`) |
 | Select/omit type narrowing | Yes (via `.select()`) | Yes (via `select`/`omit` args) |
-| Empty-where guard | No protection | Rejects `{}` unless `allowFullTableScan: true` |
+| Empty-where guard | No protection | Rejects `{}` unless [`allowFullTableScan: UNSAFE`](/global-filters#privilege-options-and-the-unsafe-symbol) |
 
 ## What you'll lose
 

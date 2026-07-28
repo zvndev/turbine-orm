@@ -85,6 +85,10 @@ import type {
   UpsertArgs,
   WhereClause,
 } from './query/types.js';
+// The privilege sentinel and its resolver: `includePii` / `allowFullTableScan`
+// are unlocked ONLY by the UNSAFE symbol, on this engine exactly as on the SQL
+// engines, so a spread request body cannot turn either on here either.
+import { assertDirectionToken, resolveUnsafeFlag, UNSAFE } from './query/types.js';
 import { escapeLike } from './query/utils.js';
 import { assertJsonFilterKeys, jsonStringEntries } from './query/where.js';
 import {
@@ -1168,6 +1172,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * contract): for identical cross-engine results pass `nulls: 'last'`
    * explicitly on Postgres, which defaults nulls-first for `desc`.
    */
+  /**
+   * Validate one orderBy direction token and return the PowQL keyword.
+   *
+   * Every direction site on this engine used to be spelled
+   * `x === 'desc' ? 'desc' : 'asc'`, so `'DESC'`, a token the CORE explicitly
+   * accepts and honours, compiled to `asc` here: identical application code
+   * sorted one way on Postgres and silently the opposite way on PowDB. The rule
+   * is core's {@link assertDirectionToken}, reused rather than re-derived, so
+   * the two engines cannot drift again. `undefined` stays "not specified"
+   * (defaults asc); `null` is a VALUE and is refused like any other bad token.
+   */
+  private dirKeyword(value: unknown, context: string): 'asc' | 'desc' {
+    assertDirectionToken(value, context);
+    return typeof value === 'string' && value.toLowerCase() === 'desc' ? 'desc' : 'asc';
+  }
+
   private buildOrder(orderBy: OrderByClause | undefined, params: unknown[], alias?: string): string {
     if (!orderBy) return '';
     const keys = orderByEntries(orderBy).filter(([, dir]) => dir !== undefined);
@@ -1190,7 +1210,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
               `field "${field}": PowDB orders NULLs / missing keys LAST in both directions`,
             );
           }
-          return `${this.ref(field, alias)} ${spec.sort === 'desc' ? 'desc' : 'asc'}`;
+          return `${this.ref(field, alias)} ${this.dirKeyword(spec.sort, `orderBy on "${field}"`)}`;
         }
         // Name the actual feature in the refusal, a pick-row ordering
         // reported as "vector / distance ordering" sends users hunting for
@@ -1206,7 +1226,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
                 : 'object-valued ordering';
         throw new UnsupportedFeatureError(feature, 'PowDB', `field "${field}"`);
       }
-      return `${this.ref(field, alias)} ${dir === 'desc' ? 'desc' : 'asc'}`;
+      return `${this.ref(field, alias)} ${this.dirKeyword(dir, `orderBy on "${field}"`)}`;
     });
     return ` order ${parts.join(', ')}`;
   }
@@ -1229,7 +1249,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     // `type: 'numeric'` casts a JSON STRING number for numeric ordering; native
     // JSON numbers already order numerically without a cast.
     const expr = spec.type === 'numeric' ? `cast(${pathExpr}, "float")` : pathExpr;
-    return `${expr} ${spec.direction === 'desc' ? 'desc' : 'asc'}`;
+    return `${expr} ${this.dirKeyword(spec.direction, `JSON-path orderBy on "${field}"`)}`;
   }
 
   // -------------------------------------------------------------------------
@@ -1401,7 +1421,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           args.timeout,
           0,
           { args, resolvedWhere },
-          args.includePii === true,
+          resolveUnsafeFlag(args.includePii, 'includePii'),
         );
       }
       return entities;
@@ -1438,7 +1458,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const cols = this.projectedColumns(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
-      args.includePii === true,
+      resolveUnsafeFlag(args.includePii, 'includePii'),
     );
 
     // Partition the `with` clause: nested-projection blocks vs loader residue.
@@ -1456,7 +1476,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         if (!opt) continue;
         const rel = this.meta.relations[relName];
         const plan =
-          rel && !cols.includes(relName) ? this.planNestedRelation(relName, rel, opt, args.includePii === true) : null;
+          rel && !cols.includes(relName)
+            ? this.planNestedRelation(relName, rel, opt, resolveUnsafeFlag(args.includePii, 'includePii'))
+            : null;
         if (plan) {
           nestedPlans.push(plan);
           continue;
@@ -1467,7 +1489,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         // loaders.
         const linkPlan =
           rel && !cols.includes(relName)
-            ? await this.planLinkPathRelation(relName, rel, opt, args.includePii === true, cols, linkPlans.length + 1)
+            ? await this.planLinkPathRelation(
+                relName,
+                rel,
+                opt,
+                resolveUnsafeFlag(args.includePii, 'includePii'),
+                cols,
+                linkPlans.length + 1,
+              )
             : null;
         if (linkPlan) linkPlans.push(linkPlan);
         else residue[relName] = opt; // unknown relation: the loader raises its E003
@@ -1569,7 +1598,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (nestedPlans.length) this.attachNestedRows(entities, nestedPlans);
       if (linkPlans.length) this.attachLinkRows(entities, linkPlans, native);
       if (residualWith)
-        await this.loadRelations(entities, residualWith, args.timeout, 0, undefined, args.includePii === true);
+        await this.loadRelations(
+          entities,
+          residualWith,
+          args.timeout,
+          0,
+          undefined,
+          resolveUnsafeFlag(args.includePii, 'includePii'),
+        );
       return entities[0]!;
     });
   }
@@ -1586,7 +1622,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (nestedPlans.length) this.attachNestedRows(entities, nestedPlans);
       if (linkPlans.length) this.attachLinkRows(entities, linkPlans, native);
       if (residualWith)
-        await this.loadRelations(entities, residualWith, args.timeout, 0, undefined, args.includePii === true);
+        await this.loadRelations(
+          entities,
+          residualWith,
+          args.timeout,
+          0,
+          undefined,
+          resolveUnsafeFlag(args.includePii, 'includePii'),
+        );
       return entities[0]!;
     });
   }
@@ -1713,7 +1756,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           where: childWhere,
           with: options.with,
           timeout: options.timeout ?? timeout,
-          includePii,
+          // Re-entering the public findMany, so the opt-in has to be spelled
+          // in its PUBLIC form (the sentinel); a plain `true` is refused there.
+          includePii: includePii ? UNSAFE : undefined,
         } as FindManyArgs<object>)) as T[];
         for (const child of children) {
           const k = this.joinKey((child as Record<string, unknown>)[childKeyField]);
@@ -1827,7 +1872,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         where,
         with: options.with,
         timeout: options.timeout ?? timeout,
-        includePii,
+        // Public findMany, so the sentinel form. See loadRelation above.
+        includePii: includePii ? UNSAFE : undefined,
       } as FindManyArgs<object>)) as T[];
       for (const t of targets) targetByPk.set(String((t as Record<string, unknown>)[targetPkField]), t);
     }
@@ -2682,7 +2728,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
       const where = this.buildWhere(resolvedWhere, params);
-      this.assertCompiledWhere(where, args.allowFullTableScan, 'updateMany');
+      this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'updateMany');
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       const filter = where ? ` filter ${where}` : '';
       const { rowCount } = await this.exec(
@@ -2850,7 +2896,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
       const where = this.buildWhere(resolvedWhere, params);
-      this.assertCompiledWhere(where, args.allowFullTableScan, 'deleteMany');
+      this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'deleteMany');
       const filter = where ? ` filter ${where}` : '';
       const { rowCount } = await this.exec(`${this.qt}${filter} delete`, params, args.timeout, 'deleteMany');
       return { count: rowCount };
@@ -3009,7 +3055,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
               field,
               this.column(field).name,
               `aggregate ${fn}`,
-              args.includePii,
+              resolveUnsafeFlag(args.includePii, 'includePii'),
             );
           }
           acc[field] = await scalar(`${powfn}(${this.qt}${filter} { ${this.ref(field)} })`);
@@ -3077,7 +3123,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       for (const entry of args.by as ((keyof T & string) | JsonPathGroupKey)[]) {
         if (typeof entry === 'string') {
           const col = this.column(entry);
-          assertAggregatePiiOptIn(this.table, this.meta, entry, col.name, 'groupBy `by` key', args.includePii);
+          assertAggregatePiiOptIn(
+            this.table,
+            this.meta,
+            entry,
+            col.name,
+            'groupBy `by` key',
+            resolveUnsafeFlag(args.includePii, 'includePii'),
+          );
           claim(entry, `column "${col.name}"`);
           if (col.name !== entry) claim(col.name, `column "${col.name}"`);
           groupExprs.push(`.${col.name}`);
@@ -3097,7 +3150,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             entry.field,
             col.name,
             'groupBy JSON `by` key',
-            args.includePii,
+            resolveUnsafeFlag(args.includePii, 'includePii'),
           );
           this.assertJsonPath('group key', entry.field, entry.path);
           const pathExpr = this.jsonPathExpr(col, entry.path, params);
@@ -3148,7 +3201,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           if (target === true) {
             const col = this.column(key);
             if (fn === '_min' || fn === '_max') {
-              assertAggregatePiiOptIn(this.table, this.meta, key, col.name, `groupBy ${fn}`, args.includePii);
+              assertAggregatePiiOptIn(
+                this.table,
+                this.meta,
+                key,
+                col.name,
+                `groupBy ${fn}`,
+                resolveUnsafeFlag(args.includePii, 'includePii'),
+              );
             }
             claim(`${fn}_${col.name}`, `${fn} of column "${col.name}"`);
             const inner = `.${col.name}`;
@@ -3170,7 +3230,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
                 target.field,
                 col.name,
                 `groupBy ${fn} JSON target`,
-                args.includePii,
+                resolveUnsafeFlag(args.includePii, 'includePii'),
               );
             }
             this.assertJsonPath(`${fn} target "${key}"`, target.field, target.path);
@@ -3389,9 +3449,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           `groupBy orderBy "${keyForMsg}": PowDB orders NULLs / missing keys LAST in both directions`,
         );
       }
-      return spec.sort === 'desc' ? 'desc' : 'asc';
+      return this.dirKeyword(spec.sort, `groupBy orderBy "${keyForMsg}"`);
     }
-    return value === 'desc' ? 'desc' : 'asc';
+    return this.dirKeyword(value, `groupBy orderBy "${keyForMsg}"`);
   }
 
   // -------------------------------------------------------------------------
@@ -3436,7 +3496,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if (compiledWhere.length > 0) return;
     throw new ValidationError(
       `[turbine] ${action} on "${this.table}" refused: the \`where\` clause is empty. ` +
-        `Pass \`allowFullTableScan: true\` to opt in, or check that your filter values are defined.`,
+        "Pass `allowFullTableScan: UNSAFE` to opt in (import { UNSAFE } from 'turbine-orm'), " +
+        'or check that your filter values are defined.',
     );
   }
 }

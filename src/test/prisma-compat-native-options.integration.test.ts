@@ -29,6 +29,7 @@ import { describe } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { TurbineError, TurbineErrorCode } from '../errors.js';
 import { createPrismaCompatClient } from '../prisma-compat.js';
+import { UNSAFE } from '../query/index.js';
 import type { PrismaCompatMap, SchemaMetadata } from '../schema.js';
 import { mockTable, skipGate } from './helpers.js';
 
@@ -255,7 +256,7 @@ describe('prisma-compat, native query options at the wire', () => {
       const compat = compatOf(db);
       const filtered = await compat.Event.count({ where: { isArchived: true } });
       assert.equal(filtered, 0, 'the global filter must remove archived rows by default');
-      const unfiltered = await compat.Event.count({ where: { isArchived: true }, skipGlobalFilters: true });
+      const unfiltered = await compat.Event.count({ where: { isArchived: true }, skipGlobalFilters: UNSAFE });
       assert.ok(unfiltered > 0, `expected skipGlobalFilters to reveal archived rows, got ${unfiltered}`);
     } finally {
       await db.disconnect();
@@ -275,7 +276,7 @@ describe('prisma-compat, native query options at the wire', () => {
       const res = await compat.Event.updateMany({
         where: { tenantId: DENSE_TENANT },
         data: { payload: 'scoped' },
-        allowFullTableScan: true,
+        allowFullTableScan: UNSAFE,
       });
       assert.ok(res.count > 0);
     } finally {

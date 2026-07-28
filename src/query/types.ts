@@ -1,8 +1,235 @@
 /**
  * turbine-orm, Query builder types
  *
- * All exported type and interface definitions for the query builder module.
+ * All exported type and interface definitions for the query builder module,
+ * plus the small runtime guards that police the values those types describe
+ * (the {@link UNSAFE} sentinel and the orderBy-direction check). Those guards
+ * live here, next to the declarations they enforce, so a new privilege option
+ * or direction-bearing shape has one obvious place to be wired in.
  */
+
+import { ValidationError } from '../errors.js';
+
+// ---------------------------------------------------------------------------
+// The privilege sentinel
+// ---------------------------------------------------------------------------
+
+/**
+ * The value that unlocks a PRIVILEGE option: `skipGlobalFilters`,
+ * `includePii`, `allowFullTableScan`.
+ *
+ * ## The bug this closes
+ *
+ * All three of those options are ordinary siblings of `where` on the query-args
+ * object, so a handler written the idiomatic way,
+ *
+ * ```ts
+ * app.get('/users', (req, res) => db.users.findMany({ ...req.body }));
+ * ```
+ *
+ * used to let the REQUEST BODY turn them on. `{"where":{"name":"x"},
+ * "skipGlobalFilters":true}` compiled to the same statement minus the tenant
+ * predicate: the documented multi-tenancy mechanism, removed by an attacker
+ * over the wire. `includePii: true` unlocked the PII projection the same way,
+ * and `allowFullTableScan: true` disarmed the empty-`where` guard that stops a
+ * mass update or delete.
+ *
+ * Typing the options `boolean` and writing "be careful" in the docs is not a
+ * fix: the escalation is a mass-assignment shape, and mass assignment happens
+ * because nobody enumerated the keys.
+ *
+ * ## Why a symbol
+ *
+ * `JSON.parse` cannot produce a symbol. There is no JSON document, no query
+ * string, no form body and no `structuredClone` of untrusted input that yields
+ * this value, so an attacker cannot put it on an args object at all. The
+ * escalation stops being "discouraged" and becomes STRUCTURALLY impossible,
+ * which is the only property that survives a refactor.
+ *
+ * Registered via `Symbol.for` rather than `Symbol()` on purpose: this package
+ * ships dual ESM + CJS builds, and a consumer can easily import `UNSAFE` from
+ * one copy while the query interface it calls came from the other. A plain
+ * `Symbol()` would be a different value in each copy and every privileged call
+ * would throw. The global registry makes the two copies agree. (Reachability of
+ * `Symbol.for` from application code is irrelevant to the threat model here:
+ * the attacker's channel is parsed data, which cannot carry a symbol either
+ * way.)
+ *
+ * @example
+ * ```ts
+ * import { UNSAFE } from 'turbine-orm';
+ *
+ * // Deliberate, in a background job that legitimately crosses tenants:
+ * await db.users.findMany({ where: { active: true }, skipGlobalFilters: UNSAFE });
+ *
+ * // Skip the global filter on named tables only (the head element is the opt-in):
+ * await db.users.findMany({ with: { posts: true }, skipGlobalFilters: [UNSAFE, 'posts'] });
+ * ```
+ */
+export const UNSAFE: unique symbol = Symbol.for('turbine-orm.UNSAFE');
+
+/** The type of the {@link UNSAFE} sentinel. */
+export type Unsafe = typeof UNSAFE;
+
+/** Every privilege option, for the diagnostic below and for tests to enumerate. */
+export type PrivilegeOption = 'skipGlobalFilters' | 'includePii' | 'allowFullTableScan';
+
+/** The one message shape every privilege refusal uses. */
+function privilegeRefusal(option: string, received: unknown, extra = ''): ValidationError {
+  return new ValidationError(
+    `[turbine] \`${option}\` must be the \`UNSAFE\` symbol, received ${describeValue(received)}. ` +
+      `${option} is a privilege option: it removes a safety boundary (a tenant filter, the PII ` +
+      'projection, or the empty-`where` guard), so it cannot be enabled by a plain value that ' +
+      'JSON.parse can produce. Import the sentinel and pass it explicitly: ' +
+      `import { UNSAFE } from 'turbine-orm';  →  { ${option}: UNSAFE }.${extra ? ` ${extra}` : ''} ` +
+      'If you did not write this option, an untrusted object was spread into these query args.',
+  );
+}
+
+/** Short, non-leaking rendering of a rejected value for the diagnostic. */
+function describeValue(value: unknown): string {
+  if (typeof value === 'symbol') return 'a different symbol';
+  if (Array.isArray(value)) return 'an array';
+  if (value === null) return 'null';
+  if (typeof value === 'object') return 'an object';
+  if (typeof value === 'string') return `the string ${JSON.stringify(value)}`;
+  return String(value);
+}
+
+/**
+ * Resolve a boolean-shaped privilege option (`includePii`,
+ * `allowFullTableScan`) into the boolean the builders use.
+ *
+ * - absent / `undefined` / `null` / `false` → `false`. These are unambiguously
+ *   NOT a request for the privilege, and throwing on them would break the
+ *   ordinary `allowFullTableScan: someFlag` call whose flag is off (prisma-compat
+ *   relies on `allowFullTableScan: false` staying a no-op, see its updateMany).
+ * - {@link UNSAFE} → `true`.
+ * - ANYTHING else, `true` included → throws {@link ValidationError} (E003).
+ *
+ * The literal `true` throws rather than being ignored ON PURPOSE. Ignoring it
+ * would swap an escalation bug for a silent-failure bug: a legitimate caller
+ * who has not migrated would keep reading rows with the PII columns quietly
+ * missing, or keep expecting a cross-tenant read that no longer happens, with
+ * no signal anywhere. Throwing turns the attacker's spread into a 500 and the
+ * legitimate caller's stale code into an immediate, self-describing error.
+ */
+export function resolveUnsafeFlag(value: unknown, option: PrivilegeOption): boolean {
+  if (value === undefined || value === null || value === false) return false;
+  if (value === UNSAFE) return true;
+  throw privilegeRefusal(option, value);
+}
+
+/**
+ * The internal form of {@link SkipGlobalFilters}: `true` (skip every table) or
+ * the list of table accessors to skip. This is what the global-filter resolver
+ * consumes, and it is produced ONLY by {@link resolveSkipGlobalFilters}.
+ */
+export type ResolvedSkipGlobalFilters = true | readonly string[];
+
+/**
+ * Validate and normalize {@link SkipGlobalFilters}.
+ *
+ * The array form is policed exactly as hard as the bare form: an attacker who
+ * can post `{"skipGlobalFilters":["users"]}` drops the tenant predicate on the
+ * table they care about, which is the same breach with an extra step. So the
+ * array must LEAD with the sentinel (`[UNSAFE, 'posts']`) and the rest must be
+ * table-name strings.
+ */
+export function resolveSkipGlobalFilters(value: unknown): ResolvedSkipGlobalFilters | undefined {
+  if (value === undefined || value === null || value === false) return undefined;
+  if (value === UNSAFE) return true;
+  if (Array.isArray(value)) {
+    if (value[0] !== UNSAFE) {
+      throw privilegeRefusal(
+        'skipGlobalFilters',
+        value,
+        'The array form skips the named tables and must lead with the sentinel: [UNSAFE, "posts"].',
+      );
+    }
+    const tables = value.slice(1);
+    // `[UNSAFE]` names no table. It used to resolve to `[]`, which every
+    // consumer reads as "skip nothing", so the one shape that is an explicit,
+    // correctly-imported privilege request was ALSO the one shape that was
+    // silently a no-op. It is not read as "skip all" on purpose: that would let
+    // `[UNSAFE, ...tables]` ESCALATE to a global skip whenever `tables` happens
+    // to come back empty, which is the same accident with a much worse outcome.
+    if (tables.length === 0) {
+      throw new ValidationError(
+        '[turbine] `skipGlobalFilters: [UNSAFE]` names no table, so it would skip nothing. ' +
+          'Pass the tables to skip (`[UNSAFE, "posts"]`), or the bare sentinel (`UNSAFE`) to skip every table.',
+      );
+    }
+    for (const t of tables) {
+      if (typeof t !== 'string') {
+        throw new ValidationError(
+          '[turbine] `skipGlobalFilters: [UNSAFE, ...]` takes table accessor NAMES after the sentinel, ' +
+            `received ${describeValue(t)}.`,
+        );
+      }
+    }
+    return tables as readonly string[];
+  }
+  throw privilegeRefusal('skipGlobalFilters', value);
+}
+
+// ---------------------------------------------------------------------------
+// orderBy direction validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Refuse an orderBy direction that is neither `asc` nor `desc`.
+ *
+ * Every direction consumer used to be spelled `String(v).toLowerCase() ===
+ * 'desc' ? 'DESC' : 'ASC'`, so `'descending'`, `''`, `null`, `1` and every
+ * other typo all emitted `ASC`. TypeScript rejects them, but the value that
+ * reaches this code in practice is `orderBy: { [field]: req.query.dir }`, which
+ * is `any` at the boundary, and the failure is SILENT: the caller gets a
+ * correct-looking page sorted the exact opposite way, which is worse than an
+ * error and identical to a successful response.
+ *
+ * Accepts any casing (`'DESC'` already worked) and leaves `undefined` alone
+ * (every consumer treats an undefined entry as absent). Recursive/compound
+ * orderBy shapes are validated one node at a time by their own consumers.
+ */
+export function assertOrderDirection(value: unknown, context: string): void {
+  // `undefined` alone means "this entry carries no ordering" (every consumer
+  // skips it). `null` is a VALUE, and a measured silent-ASC case, so it is
+  // refused like any other bad token.
+  if (value === undefined) return;
+  if (typeof value === 'string') {
+    assertDirectionToken(value, context);
+    return;
+  }
+  if (typeof value === 'object' && value !== null) {
+    const v = value as Record<string, unknown>;
+    // `{ sort, nulls }` (OrderBySpec), `{ direction }` (JSON-path / pick-row),
+    // `{ distance: { metric, direction } }` (vector KNN).
+    if ('sort' in v) assertDirectionToken(v.sort, context);
+    if ('direction' in v) assertDirectionToken(v.direction, context);
+    const distance = v.distance;
+    if (distance !== null && typeof distance === 'object' && 'direction' in (distance as object)) {
+      assertDirectionToken((distance as Record<string, unknown>).direction, context);
+    }
+    return;
+  }
+  // A number or boolean is never a direction.
+  assertDirectionToken(value, context);
+}
+
+/** One direction token. `undefined` means "not specified", which defaults to asc. */
+export function assertDirectionToken(value: unknown, context: string): void {
+  if (value === undefined) return;
+  if (typeof value === 'string') {
+    const lowered = value.toLowerCase();
+    if (lowered === 'asc' || lowered === 'desc') return;
+  }
+  throw new ValidationError(
+    `[turbine] Invalid orderBy direction ${describeValue(value)} for ${context}. ` +
+      "Use 'asc' or 'desc'. An unrecognized direction used to sort ASCENDING silently, " +
+      'which returns a correct-looking page in the wrong order.',
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Public query argument types
@@ -227,13 +454,18 @@ export type GlobalFilters = {
 };
 
 /**
- * Per-query opt-out of the configured {@link GlobalFilters}. `true` skips the
- * global filter on the query's own table AND on every relation target it
- * touches; an array skips only the named table accessors (own table and/or
- * relation targets). Global filters never satisfy the empty-`where` guard for
- * `update`/`delete`, that guard always checks the user-supplied `where`.
+ * Per-query opt-out of the configured {@link GlobalFilters}. {@link UNSAFE}
+ * skips the global filter on the query's own table AND on every relation target
+ * it touches; `[UNSAFE, ...names]` skips only the named table accessors (own
+ * table and/or relation targets). Global filters never satisfy the empty-`where`
+ * guard for `update`/`delete`, that guard always checks the user-supplied
+ * `where`.
+ *
+ * PRIVILEGE OPTION: it removes the documented multi-tenancy boundary, so it is
+ * unlocked by the {@link UNSAFE} sentinel only. `true` / `['users']` throw
+ * (E003). See {@link UNSAFE} for why.
  */
-export type SkipGlobalFilters = true | readonly string[];
+export type SkipGlobalFilters = Unsafe | readonly [Unsafe, ...string[]];
 
 /**
  * Reserved key in a `with` clause that requests correlated relation counts.
@@ -618,8 +850,8 @@ export interface FindUniqueArgs<
   stableRelationOrder?: boolean;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
-  /** Include PII-tagged columns in the result. See {@link FindManyArgs.includePii}. */
-  includePii?: boolean;
+  /** Include PII-tagged columns (`includePii: UNSAFE`). See {@link FindManyArgs.includePii}. */
+  includePii?: Unsafe;
   /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
   forceCustomPlan?: boolean;
 }
@@ -681,8 +913,12 @@ export interface FindManyArgs<
    *
    * Referencing a PII column in `where` / `orderBy` / `groupBy` / aggregates is
    * always allowed regardless of this flag (the reference is explicit).
+   *
+   * PRIVILEGE OPTION: unlocked by the {@link UNSAFE} sentinel only
+   * (`includePii: UNSAFE`). A literal `true` throws (E003), because a request
+   * body spread into these args must not be able to unlock the PII projection.
    */
-  includePii?: boolean;
+  includePii?: Unsafe;
   /**
    * Plan THIS query with its actual parameter values, every execution.
    * PostgreSQL only (see the refusal below).
@@ -907,10 +1143,15 @@ export interface UpdateArgs<
    * Opt in to running this mutation when `where` resolves to an empty
    * predicate (e.g. `{}` or `{ id: undefined }`). Default `false`, an
    * empty predicate throws `ValidationError` to catch the common case of
-   * a filter value accidentally being `undefined`. Set this to `true` only
-   * when an unconditional mutation is the intended behaviour.
+   * a filter value accidentally being `undefined`.
+   *
+   * PRIVILEGE OPTION: unlocked by the {@link UNSAFE} sentinel only
+   * (`allowFullTableScan: UNSAFE`), and only when an unconditional mutation is
+   * genuinely the intent. A literal `true` throws (E003): this guard is the
+   * last thing standing between a spread request body and an unconditional
+   * `UPDATE` / `DELETE` over the whole table.
    */
-  allowFullTableScan?: boolean;
+  allowFullTableScan?: Unsafe;
   /**
    * Optimistic locking, prevents lost updates in concurrent scenarios.
    * Specify the version field and its expected value. The update adds a
@@ -940,7 +1181,7 @@ export interface UpdateManyArgs<T, R extends object = {}> {
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** See {@link UpdateArgs.allowFullTableScan}. */
-  allowFullTableScan?: boolean;
+  allowFullTableScan?: Unsafe;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
 }
@@ -951,7 +1192,7 @@ export interface DeleteArgs<T, R extends object = {}> {
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** See {@link UpdateArgs.allowFullTableScan}. */
-  allowFullTableScan?: boolean;
+  allowFullTableScan?: Unsafe;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
 }
@@ -962,7 +1203,7 @@ export interface DeleteManyArgs<T, R extends object = {}> {
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** See {@link UpdateArgs.allowFullTableScan}. */
-  allowFullTableScan?: boolean;
+  allowFullTableScan?: Unsafe;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
   skipGlobalFilters?: SkipGlobalFilters;
 }
@@ -1320,8 +1561,11 @@ export interface GroupByArgs<T, R extends object = {}> {
    * STORED VALUES, so without this they throw `ValidationError` (E003).
    * `_count` (a count, not a value), `_sum` / `_avg`, and `where` / `orderBy` /
    * `having` on PII columns stay allowed.
+   *
+   * PRIVILEGE OPTION: unlocked by the {@link UNSAFE} sentinel only. See
+   * {@link FindManyArgs.includePii}.
    */
-  includePii?: boolean;
+  includePii?: Unsafe;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
@@ -1422,8 +1666,11 @@ export interface AggregateArgs<T, R extends object = {}> {
    * `ValidationError` (E003) on a PII column. `_count` (a count, not a value)
    * and `_sum` / `_avg` (a computed total over many rows) stay allowed, as do
    * `where` filters on PII columns.
+   *
+   * PRIVILEGE OPTION: unlocked by the {@link UNSAFE} sentinel only. See
+   * {@link FindManyArgs.includePii}.
    */
-  includePii?: boolean;
+  includePii?: Unsafe;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */

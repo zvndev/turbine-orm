@@ -40,24 +40,27 @@ The fix is one command. Measured on a production-shaped dataset (659 parents, a 
 | Batched (`WHERE fk IN (…)`) | 92 ms |
 | Correlated, FK **indexed** | 62 ms |
 
-**Do not read the last two rows as "correlated beats batched once indexed."** An earlier version of this page made that argument, and it does not generalize: on a to-one relation over a local socket, the batched loader is measurably faster than the correlated plan at every parent-set size from about **25 rows** upward, and the gap widens with parent count. Turbine's own `'auto'` default no longer follows the correlated-wins advice either: above `autoToOneJoinMaxRows` (default 1000) it switches a to-one relation to the batched loader precisely because the correlated plan loses at scale.
+**Do not read the last two rows as "correlated beats batched once indexed."** An earlier version of this page made that argument, and it does not generalize: on a to-one relation over a local socket, the batched loader is measurably faster than the correlated plan from a few dozen parent rows upward (the arithmetic in [The real tradeoff](#the-real-tradeoff) puts the crossover in the tens), and the gap widens with parent count. Turbine's own `'auto'` default no longer follows the correlated-wins advice either: above `autoToOneJoinMaxRows` (default 1000) it switches a to-one relation to the batched loader precisely because the correlated plan loses at scale.
 
 ### The real tradeoff
 
 The two plans trade a different cost, and neither wins everywhere:
 
-- **Correlated (`'join'`) is one round-trip**, but the subquery is re-evaluated **once per parent row**. Its cost scales with parent-set size, even on a perfect index seek. Measured on a local socket, that per-parent cost is roughly **0.0016 ms per parent row**.
+- **Correlated (`'join'`) is one round-trip**, but the subquery is re-evaluated **once per parent row**. Its cost scales with parent-set size, even on a perfect index seek. Turbine's shipped constant for that per-parent cost is **0.0007 ms per parent row** (`AUTO_JOIN_PENALTY_MS_PER_ROW`), measured on PostgreSQL 17 over a `hasOne` on a `UNIQUE` FK. The measurement's most useful property is that the per-row penalty came out effectively identical (0.000711 ms and 0.000717 ms) on two links whose round-trip times differ by 23x: it is a property of the plan, not of the wire.
 - **Batched is two round-trips** (base query, then `WHERE fk = ANY($1)`), but each is a **single keyset lookup** whose cost is essentially flat in parent count. It pays one extra round-trip and nothing more.
 
-So the crossover is wherever one round-trip equals the correlated plan's per-parent cost, which makes it depend on **both** parent-set size and your round-trip time:
+So the crossover is `roundTripMs / 0.0007`, which depends on **both** parent-set size and your round-trip time. Every row below is that division, not a separate measurement:
 
 | Deployment | Round trip | Correlated wins below roughly |
 |---|---|---|
-| Local socket / same host | ~0.03 ms | 25 parent rows |
-| Same-region managed Postgres | ~1 ms | 600 parent rows |
-| Cross-region pooled connection | ~35 ms | 22,000 parent rows |
+| Local socket / same host | ~0.03 ms | 43 parent rows |
+| Loopback TCP | ~0.12 ms | 170 parent rows |
+| Same-region managed Postgres | ~1 ms | 1,400 parent rows |
+| Cross-region pooled connection | ~35 ms | 50,000 parent rows |
 
-The default threshold of 1000 is the right answer for a database about 1.6 ms away, which is a reasonable guess at same-region managed Postgres. It is far too high for a local socket and too low for a cross-region pooled connection. **If your database is on the same host or a very low-latency link, lower `autoToOneJoinMaxRows` substantially** (into the tens) or pin `relationLoadStrategy: 'batched'` on wide-parent queries. If it is far away, raise it.
+The two rows that were measured rather than derived agree with the arithmetic: on loopback TCP (0.118 ms) the observed crossover sat between 200 and 400 parent rows, and over a link with 1 ms added per direction (2.683 ms) between 3,000 and 5,000.
+
+The default threshold of 1000 corresponds to a database about **0.7 ms** away (`AUTO_ASSUMED_ROUND_TRIP_MS`), a reasonable guess at same-region managed Postgres, and it is what the `'auto'` strategy uses until the process has measured its own round-trip time. It is far too high for a local socket and too low for a cross-region pooled connection. **If your database is on the same host or a very low-latency link, lower `autoToOneJoinMaxRows` substantially** (into the tens) or pin `relationLoadStrategy: 'batched'` on wide-parent queries. If it is far away, raise it.
 
 The numbers above are measured on a to-one relation with a perfectly indexed correlation column, on a local socket. A to-many relation, a wider child row, or a real network moves the crossover. Measure your own shape before pinning a strategy; the results are deep-equal whichever plan runs, so switching is free.
 
@@ -261,7 +264,7 @@ A junction name that collides with a real Prisma model, or with a table some mod
 
 Two options. `prismaErrorCodes: true` sets `.code` on thrown `TurbineError`s to the nearest Prisma code (`P2002` for a unique violation, `P2025` for not-found, and so on) without pretending to be `instanceof PrismaClientKnownRequestError`; left off, Turbine's own `TURBINE_E0NN` codes are preserved. `stablePkOrder: true` loads every to-many `with` relation that has no explicit `orderBy` ordered by the target table's primary key ascending, which is closer to how Prisma's relation rows tend to arrive; an explicit per-relation `orderBy` always wins.
 
-One Turbine-only argument passes straight through: `includePii: true` on a read, a `groupBy`, or an `aggregate`. Prisma has no PII concept, so if your schema tags columns `pii: true` this is the only way a compat call site can ask for them (or run a `groupBy` keyed on one). Everything else about the tag behaves exactly as it does on the native API.
+One Turbine-only argument passes straight through: `includePii: UNSAFE` on a read, a `groupBy`, or an `aggregate`. Prisma has no PII concept, so if your schema tags columns `pii: true` this is the only way a compat call site can ask for them (or run a `groupBy` keyed on one). Everything else about the tag behaves exactly as it does on the native API.
 
 ### Client extensions: `$extends`
 
@@ -336,6 +339,26 @@ const rows = await compat.Order.findMany({
 ```
 
 The full set, by operation: `forceCustomPlan`, `warnOnUnlimited`, `skipGlobalFilters`, `allowFullTableScan`, `timeout`, `includePii`, `stableRelationOrder`, `optimisticLock` and `groupBy`'s `distinctOn`. The two that name schema fields (`optimisticLock.field`, `distinctOn.columns`) are translated through the same name map as the rest of the call, so you write them in **Prisma** field names like everything else.
+
+<Callout type="warning" title="Three of those are privilege options and need the UNSAFE symbol">
+  `skipGlobalFilters`, `includePii` and `allowFullTableScan` are
+  [privilege options](/global-filters#privilege-options-and-the-unsafe-symbol).
+  The adapter forwards them **verbatim**, on purpose, so core stays the single
+  judge and compat carries no second copy of the rule. That means a compat call
+  site written `{ skipGlobalFilters: true }` throws a `ValidationError`
+  (`TURBINE_E003`) exactly like a native one. Import the sentinel and pass it:
+
+  ```ts
+  import { UNSAFE } from 'turbine-orm';
+
+  await prisma.Post.findMany({ where: { authorId: 1 }, skipGlobalFilters: UNSAFE });
+  await prisma.Post.deleteMany({ allowFullTableScan: UNSAFE });
+  ```
+
+  This matters more here than on the native API, because a compat client is
+  usually reached from handlers that were written against Prisma, where every
+  query option is a plain JSON value.
+</Callout>
 
 <Callout type="warning" title="Before 0.57.0 these were silently dropped">
   This is the correction, stated plainly rather than as an improvement. Until
@@ -450,9 +473,9 @@ If you are doing a native port, this is the full mapping. Skip to [Side-by-side]
 | `prisma.user.create` | `db.users.create` | Same `data` shape. |
 | `prisma.user.createMany` | `db.users.createMany` | Single `INSERT ... UNNEST` under the hood. |
 | `prisma.user.update` | `db.users.update` | Supports atomic operators: `{ count: { increment: 1 } }`. |
-| `prisma.user.updateMany` | `db.users.updateMany` | Empty `where` rejected unless `allowFullTableScan: true`. |
+| `prisma.user.updateMany` | `db.users.updateMany` | Empty `where` rejected unless [`allowFullTableScan: UNSAFE`](/global-filters#privilege-options-and-the-unsafe-symbol). |
 | `prisma.user.delete` | `db.users.delete` | Same. |
-| `prisma.user.deleteMany` | `db.users.deleteMany` | Empty `where` rejected unless `allowFullTableScan: true`. |
+| `prisma.user.deleteMany` | `db.users.deleteMany` | Empty `where` rejected unless [`allowFullTableScan: UNSAFE`](/global-filters#privilege-options-and-the-unsafe-symbol). |
 | `prisma.user.upsert` | `db.users.upsert` | Same `where` / `create` / `update` shape. |
 | `prisma.user.count` | `db.users.count` | Same. |
 | `prisma.user.aggregate` | `db.users.aggregate` | `_sum` / `_avg` / `_min` / `_max` / `_count`. `_count: true` returns a number; `_count: { _all: true }` returns `{ _all: n }` (Prisma's shape). |
@@ -462,7 +485,7 @@ If you are doing a native port, this is the full mapping. Skip to [Side-by-side]
 | `select: { id: true, name: true }` | `select: { id: true, name: true }` | Same. |
 | `where: { name: { contains: 'a' } }` | `where: { name: { contains: 'a' } }` | All operators ported. |
 | `where: { posts: { some: ... } }` | `where: { posts: { some: ... } }` | Relation filters: `some` / `every` / `none`. |
-| `data: { posts: { create: [...] } }` | `data: { posts: { create: [...] } }` | Nested writes map unchanged on to-one and one-to-many relations: `create` / `connect` / `connectOrCreate` on create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on update. One transaction, depth cap 10. **Many-to-many relations have no nested-write support**: those throw a `ValidationError` (write the junction rows directly in the same transaction). See [Nested writes](/nested-writes). |
+| `data: { posts: { create: [...] } }` | `data: { posts: { create: [...] } }` | Nested writes map unchanged on to-one and one-to-many relations: `create` / `connect` / `connectOrCreate` on create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on update. One transaction, depth cap 10. **Many-to-many relations support the three junction-only operations** since 0.50: `connect`, `disconnect`, `set`. The rest (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) throw a `ValidationError` naming the supported set, because a junction's payload columns have no safe default. See [Nested writes](/nested-writes#many-to-many-relations) and [Notable differences](#notable-differences). |
 | `include: { _count: { select: { posts: true } } }` | `with: { _count: { posts: true } }` | No `select` wrapper. `_count: true` counts every to-many relation. |
 | `prisma.$queryRaw` | ``db.raw`...` `` | Typed form: ``db.sql<T>`...` `` returns `T[]` with `.one()` / `.scalar()`. |
 | `take: 10` | `take: 10` | Works as-is, `take` is an alias for `limit`. |
@@ -630,12 +653,24 @@ const active = await db.users.findMany({
 
 ### Cursor pagination
 
-Turbine's cursor is **exclusive**, the anchor row is *not* returned, which is the natural keyset semantics (`WHERE pk > $cursor`) and kills Prisma's `skip: 1` boilerplate. Two rules when porting:
+Turbine's cursor is **exclusive**, the anchor row is *not* returned, which is the natural keyset semantics (`WHERE pk > $cursor`) and kills Prisma's `skip: 1` boilerplate. This is a conscious divergence, not a gap: exclusive keyset pagination composes cleanly with `orderBy` and needs no offset math.
+
+The two paths handle the difference differently, so read the one you are on.
+
+#### On the native port
+
+Two rules when rewriting call sites by hand:
 
 - **Prisma `cursor: { id }` + `skip: 1`** (the common exclusive idiom) becomes just `cursor: { id }`. Drop the `skip`.
-- **Prisma `cursor: { id }` with no `skip`** is *inclusive*, Prisma returns the anchor row. Ported verbatim to Turbine, that call silently loses the anchor row. If you relied on inclusive behavior, fetch the anchor separately, or start the cursor at the previous row.
+- **Prisma `cursor: { id }` with no `skip`** is *inclusive*, Prisma returns the anchor row. Ported verbatim to Turbine, that call silently loses the anchor row. Nothing warns you. If you relied on inclusive behavior, fetch the anchor separately, or start the cursor at the previous row.
 
-This is a conscious divergence, not a gap: exclusive keyset pagination composes cleanly with `orderBy` and needs no offset math.
+#### On `turbine-orm/prisma-compat`
+
+The adapter does **not** silently drop the anchor row. It either reproduces Prisma's inclusive semantics exactly or refuses the call, because a silent off-by-one on a paginated endpoint is precisely the failure that is hardest to notice in production.
+
+- **`cursor` + `skip: n`** translates exactly, to an exclusive cursor plus `offset: n - 1`.
+- **A bare inclusive `cursor`** is translated exactly, as an inclusive `gte` / `lte` keyset predicate merged into the `where`, when the cursor names a **single field** and that field is either the single `orderBy` field or (with no `orderBy` at all) the single-column primary key. Those are the shapes where the anchor's sort-key value is known from the cursor itself.
+- **Every other bare inclusive cursor throws [`UnsupportedFeatureError`](/errors) (`TURBINE_E017`)**: a multi-field cursor, a cursor field that is not the sort key, and a cursor on a non-PK field with no `orderBy`. Translating those needs the anchor row's sort-key value, which the adapter does not have and will not guess. The fix is in the message: order by the cursor field, or pair the cursor with `skip: 1` (Prisma's own idiom) so it maps to the exact exclusive translation.
 
 ### Relation array order
 

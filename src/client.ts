@@ -25,6 +25,7 @@
 import pg from 'pg';
 import { type Dialect, postgresDialect } from './dialect.js';
 import {
+  ConnectionError,
   type ErrorMessageMode,
   setErrorMessageMode,
   TimeoutError,
@@ -751,6 +752,150 @@ function warnUnknownConfigKeys(config: TurbineConfig): void {
   }
 }
 
+/**
+ * Two bases that differ ONLY in host, used to detect whether the host pg ends
+ * up with came from the connection string or from pg's own placeholder base.
+ *
+ * pg-connection-string resolves a connection string as `new URL(str,
+ * 'postgres://base')`. A string with no scheme is therefore a RELATIVE url, and
+ * silently inherits the literal host `base`, which is where
+ * `getaddrinfo ENOTFOUND base` comes from. Parsing against two different bases
+ * and comparing the resulting hostnames identifies that case exactly, and
+ * cannot be fooled by a string that genuinely names a host called `base`.
+ */
+const CONNECTION_STRING_PROBE_BASES = ['postgres://turbine-probe-a', 'postgres://turbine-probe-b'] as const;
+
+/** What pg will do with a connection string, from pg's own parsing rules. */
+type ConnectionStringVerdict =
+  | { kind: 'usable' }
+  /** Relative URL: pg would connect to its internal placeholder host. */
+  | { kind: 'phantom-host' }
+  /** Not a URL at all under either attempt: pg's own parse throws. */
+  | { kind: 'unparseable' };
+
+/**
+ * Classify a connection string by replaying the parse pg itself performs.
+ *
+ * This is a deliberate mirror of `pg-connection-string`'s `parse()`, in the
+ * same order, because that function IS the oracle: anything it resolves to a
+ * real host/socket is a string pg will connect with, and a validator that
+ * refuses one of those breaks a working deployment. In particular all of these
+ * are usable and must pass:
+ *   - `/var/run/postgresql app` and `/cloudsql/proj:region:instance`, the
+ *     leading-slash unix-socket form (peer auth, Cloud SQL),
+ *   - `socket:/var/run/postgresql?db=app`, the explicit socket scheme,
+ *   - `postgresql:///db`, `postgres:/db`, `postgres://`, all empty-host forms
+ *     that fall back to pg's localhost default,
+ *   - `postgres://user:pw@/db` (the `@/` dummy-host retry) and
+ *     `?host=/var/run/postgresql` (host as a query parameter),
+ *   - anything else that parses as an absolute URL, `localhost:5432` included.
+ *
+ * Only two shapes are not usable: a string with no scheme (pg substitutes its
+ * placeholder host) and a string neither parse attempt can turn into a URL (pg
+ * throws `Invalid URL` from its own constructor).
+ */
+function classifyConnectionString(value: string): ConnectionStringVerdict {
+  // Leading slash: pg short-circuits to `{ host: <path>, database: <word 2> }`
+  // before any URL parsing. Unix-domain socket directory or Cloud SQL path.
+  if (value.charAt(0) === '/') return { kind: 'usable' };
+
+  // pg percent-encodes before parsing, so a string with spaces (or a stray
+  // half-written escape) reaches the URL constructor already encoded.
+  const encoded = / |%[^a-f0-9]|%[a-f0-9][^a-f0-9]/i.test(value)
+    ? encodeURI(value).replace(/%25(\d\d)/g, '%$1')
+    : value;
+
+  const parseAgainst = (base: string): { url: URL; dummyHost: boolean } | null => {
+    try {
+      return { url: new URL(encoded, base), dummyHost: false };
+    } catch {
+      // pg's own second attempt: `postgres://user:pw@/db` is not a valid URL,
+      // so it retries with a placeholder authority and treats the host as empty.
+      try {
+        return { url: new URL(encoded.replace('@/', '@___DUMMY___/'), base), dummyHost: true };
+      } catch {
+        return null;
+      }
+    }
+  };
+
+  const a = parseAgainst(CONNECTION_STRING_PROBE_BASES[0]);
+  const b = parseAgainst(CONNECTION_STRING_PROBE_BASES[1]);
+  if (!a || !b) return { kind: 'unparseable' };
+
+  // `socket:` is handled by its own branch in pg's parse: the pathname is the
+  // socket directory and the base never contributes.
+  if (a.url.protocol === 'socket:') return { kind: 'usable' };
+  // The dummy-host retry only happens for an absolute URL, so the host is
+  // empty by construction and pg falls back to its localhost default.
+  if (a.dummyHost) return { kind: 'usable' };
+  // A `host=` query parameter wins over the URL authority in pg's parse.
+  if (a.url.searchParams.get('host')) return { kind: 'usable' };
+
+  return a.url.hostname === b.url.hostname ? { kind: 'usable' } : { kind: 'phantom-host' };
+}
+
+/**
+ * Reject a connection string pg cannot connect with, at construction, naming
+ * the string as the problem.
+ *
+ * Without this, a typo'd or truncated string is handed to pg, which resolves it
+ * as a URL relative to its own `postgres://base`, so the string silently
+ * becomes a request for a host named `base`. The failure surfaces one query
+ * later as `[TURBINE_E004] Database connection error: getaddrinfo ENOTFOUND
+ * base`, and sends the reader looking for a DNS problem with a host they never
+ * configured.
+ *
+ * The oracle is pg itself (see {@link classifyConnectionString}), not a scheme
+ * pattern. An earlier scheme-matching version of this check refused
+ * `/var/run/postgresql app` and `/cloudsql/project:region:instance`, which are
+ * documented, working unix-socket connection strings, i.e. it broke peer-auth
+ * and Cloud SQL deployments at `new TurbineClient(...)`.
+ *
+ * The empty string never reaches here: the call sites skip a falsy value, which
+ * is exactly what the pool-building branch does with it, so
+ * `connectionString: process.env.DATABASE_URL ?? ''` keeps constructing.
+ */
+function assertUsableConnectionString(value: string, source: string): void {
+  // Whitespace-only is not empty: it is truthy, so pg WOULD take it, encode it
+  // to `%20%20%20`, and resolve it against its placeholder host. Naming it as
+  // empty is more useful than reporting the phantom host.
+  if (value.trim().length === 0) {
+    throw new ConnectionError(
+      `[turbine] The ${source} is empty. Expected a Postgres connection string such as ` +
+        '"postgresql://user:password@host:5432/database".',
+    );
+  }
+
+  const verdict = classifyConnectionString(value);
+  if (verdict.kind === 'usable') return;
+
+  // Never echo the value: it may carry a password, and it is malformed, so no
+  // redaction written against the URL grammar can be trusted on it.
+  const tail =
+    '(Check for a missing "//", a stray quote copied out of a .env file, or a shell-truncated value.) ' +
+    'The value is not included here because it may contain a password.';
+  if (verdict.kind === 'unparseable') {
+    throw new ConnectionError(
+      `[turbine] The ${source} cannot be parsed as a connection string, pg rejects it with "Invalid URL" ` +
+        '(most often a non-numeric port). Expected something like ' +
+        `"postgresql://user:password@host:5432/database". ${tail}`,
+    );
+  }
+  // libpq keyword/value strings land here, and deserve their own sentence:
+  // node-postgres does NOT implement that form, it feeds the whole string to
+  // the URL parser, so `host=localhost dbname=app` becomes a request for the
+  // host `base` with the database `host=localhost dbname=app`.
+  const keywordForm = /^[A-Za-z_][A-Za-z0-9_]*\s*=/.test(value.trimStart())
+    ? 'It looks like a libpq "host=… dbname=…" keyword/value string, which node-postgres does not support. '
+    : '';
+  throw new ConnectionError(
+    `[turbine] The ${source} names no host: it has no "postgres://" or "postgresql://" scheme, so pg would ` +
+      `resolve it as a relative URL and try to connect to its internal placeholder host. ${keywordForm}` +
+      `Expected something like "postgresql://user:password@host:5432/database". ${tail}`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Middleware types
 // ---------------------------------------------------------------------------
@@ -848,6 +993,29 @@ const ISOLATION_LEVELS: Record<string, string> = Object.assign(Object.create(nul
  * loops, and a loop keyed on it would never fire for the commit-time conflicts
  * that are the main reason to run SERIALIZABLE at all.
  */
+/**
+ * Check out a pooled connection, translating a driver failure into a typed
+ * Turbine error.
+ *
+ * `pool.connect()` is where the first-run failures actually land: wrong
+ * password (SQLSTATE 28P01), no such database (3D000), nothing listening
+ * (ECONNREFUSED), an unverifiable TLS certificate. Unwrapped, every one of
+ * those left `$transaction`, `transaction()` and `connect()` as a raw pg
+ * `DatabaseError` carrying a SQLSTATE in `.code`, the same property Turbine
+ * puts `TURBINE_E0NN` in, so the single error a new user is most likely to see
+ * was the one error the typed-error contract did not cover.
+ *
+ * Query paths need no equivalent: `pool.query()` opens the connection itself
+ * and rejects with the connect error, which the query boundary already wraps.
+ */
+async function acquireConnection(pool: pg.Pool): Promise<pg.PoolClient> {
+  try {
+    return await pool.connect();
+  } catch (err) {
+    throw wrapPgError(err);
+  }
+}
+
 async function runTxControl(client: PgCompatPoolClient, sql: string): Promise<void> {
   try {
     await client.query(sql);
@@ -1226,6 +1394,40 @@ export class TurbineClient {
     // would poison the next, valid, TurbineClient with a phantom conflict.
     const dialect = config.dialect ?? postgresDialect;
     const planCacheMode = TurbineClient.resolvePlanCacheMode(config.planCacheMode, dialect);
+    // Refuse a connection string that cannot address a database, before it
+    // reaches pg's permissive parser and comes back one query later as a DNS
+    // error about a fragment of itself. Only the strings this client will
+    // actually USE are checked: with an external pool the connection target is
+    // the caller's, and an explicit host/port/user config makes DATABASE_URL
+    // irrelevant (the same precedence the pool-building branch below applies).
+    // The truthiness checks here mirror the pool-building branch below EXACTLY.
+    // An empty `connectionString` is ignored there (pg ignores it too), so
+    // `connectionString: process.env.DATABASE_URL ?? ''` must keep constructing,
+    // and it still suppresses the DATABASE_URL fallback because
+    // `hasExplicitConnection` tests `!= null`, not truthiness.
+    if (!config.pool) {
+      if (config.connectionString) {
+        assertUsableConnectionString(config.connectionString, 'connectionString');
+      } else if (
+        config.connectionString == null &&
+        config.host == null &&
+        config.port == null &&
+        config.database == null &&
+        config.user == null &&
+        config.password == null &&
+        process.env.DATABASE_URL
+      ) {
+        assertUsableConnectionString(process.env.DATABASE_URL, 'DATABASE_URL environment variable');
+      }
+    }
+    for (const [i, replica] of (config.replicas ?? []).entries()) {
+      // Only string replicas are ours to open; a PgCompatPool entry is already
+      // connected by its owner. An empty string is skipped for the same reason
+      // as above: pg ignores a falsy connectionString and uses its defaults.
+      if (typeof replica === 'string' && replica) {
+        assertUsableConnectionString(replica, `replicas[${i}] connection string`);
+      }
+    }
     /**
      * Parse int8 (bigint, OID 20) as JavaScript number instead of string.
      * Safe for values up to Number.MAX_SAFE_INTEGER (9,007,199,254,740,991).
@@ -2022,7 +2224,7 @@ export class TurbineClient {
    * ```
    */
   async transaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+    const client = await acquireConnection(this.pool);
     /**
      * Only true once BEGIN has actually succeeded. If BEGIN itself throws
      * (e.g. a single-writer engine's transaction gate times out or rejects a
@@ -2118,7 +2320,7 @@ export class TurbineClient {
     // Resolve the isolation level BEFORE taking a pool slot: a bad argument is
     // the caller's bug and should not cost a connection to discover.
     const isolationSql = resolveIsolationLevel(options?.isolationLevel);
-    const client = await this.pool.connect();
+    const client = await acquireConnection(this.pool);
     const timeout = options?.timeout;
 
     /**
@@ -2482,7 +2684,7 @@ export class TurbineClient {
    * Throws if the connection fails.
    */
   async connect(): Promise<void> {
-    const client = await this.pool.connect();
+    const client = await acquireConnection(this.pool);
     try {
       await client.query('SELECT 1');
       if (this.logging) {
