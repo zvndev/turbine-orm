@@ -182,7 +182,17 @@ from the compat client. Re-run: turbine migrate-from-prisma
 
 It is a development aid and behaves like one. It is skipped entirely when `NODE_ENV=production`; a missing `schema.prisma` is silent, because not shipping `prisma/` to production is normal and is not evidence of anything; a bundled runtime with no filesystem is silent for the same reason; the read is asynchronous and unawaited, so client construction never waits on it; and it prints at most once per process. It cannot fail your app, and it cannot fail your build. A map generated before 0.60, or assembled by hand, carries no fingerprint and is skipped.
 
-The fingerprint ignores differences a checkout can introduce on its own (line endings, a byte-order mark, trailing whitespace at end of file) and nothing else. An edited comment counts as a change: a regeneration you did not strictly need costs you nothing, and a missed one is the whole failure this exists to end.
+The fingerprint ignores exactly three differences a checkout can introduce on its own, and nothing else:
+
+| Difference | Reported as drift? |
+|---|---|
+| CRLF or lone-CR line endings | No |
+| A leading byte-order mark | No |
+| Whitespace or blank lines at the **end of the file** | No |
+| Trailing whitespace on an **individual line** | Yes |
+| An edited comment | Yes |
+
+The last two are deliberate, and the end-of-file rule is not a per-line one. Nothing in a checkout puts trailing spaces on a line or rewrites a comment, so both got there because someone edited the file. A regeneration you did not strictly need costs you nothing; a missed one is the whole failure this exists to end.
 
 **Connection string.** The command resolves the URL in this order: `--url`, then `DATABASE_URL`, then `url` in `turbine.config.ts`, then the `datasource` block of the schema you pointed it at, including its `env("...")` indirection (`url` first, then `directUrl`). So a project whose schema declares `url = env("DATABASE_URL_STAGING")` needs no flag, as long as that variable is exported. The datasource is last on purpose: an explicit `--url` is never overridden by a value declared in a schema file. If nothing yields a URL, the error names the exact variable the datasource asked for.
 

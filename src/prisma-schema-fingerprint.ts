@@ -35,7 +35,13 @@
  *  - a leading UTF-8 BOM, which some editors add and remove without being asked;
  *  - CRLF and lone CR line endings, so a Windows checkout of an unchanged file
  *    is not reported as drift (`core.autocrlf` rewrites on checkout);
- *  - trailing whitespace at the very end of the file, for the same reason.
+ *  - whitespace at the very END of the file, for the same reason.
+ *
+ * Note the last one is end-of-FILE only, not per line. Trailing whitespace on an
+ * individual line is hashed, and changing it is reported as drift. That is the
+ * intended reading: nothing in a checkout rewrites it, so it got there because
+ * someone edited the line, and the cost of an unnecessary regeneration is lower
+ * than the cost of a missed one.
  *
  * Nothing else is normalized. Comments and blank lines are hashed as-is: a
  * "harmless" edit is still an edit, and reporting one costs a regeneration

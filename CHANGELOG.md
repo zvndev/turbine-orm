@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.60.1 (2026-07-28)
+
+### Changed
+
+- **Corrected what the Prisma schema fingerprint is documented to normalize.** No
+  behaviour change. 0.60.0 said "trailing whitespace", which reads as
+  per-line. The rule is end-of-FILE only: whitespace and blank lines after the
+  final newline are ignored, trailing whitespace on an individual line is hashed
+  and does count as a change. That is the intended behaviour, since nothing in a
+  checkout puts trailing spaces on a line, so it is an edit like any other. The
+  0.60.0 entry, the source comment and the migration page now say so, the site
+  page carries the full table, and five tests pin the boundary in both directions
+  so a later tidy-up of the normalizer cannot quietly widen it.
+
 ## 0.60.0 (2026-07-28)
 
 ### Added
@@ -20,9 +34,12 @@
   construction never waits on a file read; and once per process per path. A map
   generated before this release, or written by hand, carries no `source` and is
   skipped. The fingerprint is FNV-1a over the file with line endings, a leading
-  byte-order mark and trailing whitespace normalized away, so a Windows checkout of
-  an unchanged file is not reported as drift; nothing else is normalized, and an
-  edited comment counts as a change.
+  byte-order mark and end-of-FILE whitespace normalized away, so a Windows checkout
+  of an unchanged file is not reported as drift. Nothing else is normalized. That
+  end-of-file rule is not a per-line one: trailing whitespace on an individual line
+  is hashed and does count as a change, as does an edited comment, because nothing
+  in a checkout introduces either and an unnecessary regeneration costs less than a
+  missed one.
 
 - **`turbine migrate-from-prisma --if-db`**, so the command can live in
   `postinstall` next to `prisma generate` rather than depending on someone

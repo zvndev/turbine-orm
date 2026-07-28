@@ -68,9 +68,26 @@ describe('fingerprintPrismaSchema', () => {
     ['a leading BOM', `\uFEFF${SCHEMA}`],
     ['a missing final newline', SCHEMA.trimEnd()],
     ['extra blank lines at EOF', `${SCHEMA}\n\n`],
+    ['spaces after the final newline', `${SCHEMA}   `],
+    ['tabs and blank lines after the final newline', `${SCHEMA}\n\t \n`],
   ] as const) {
     it(`holds across ${what}`, () => {
       assert.equal(fingerprintPrismaSchema(same), fingerprintPrismaSchema(SCHEMA), what);
+    });
+  }
+
+  // The end-of-file rule above is NOT a per-line one, and the difference is easy
+  // to misread from the code (`/\s+$/` anchors to end of string, not end of
+  // line). Nothing in a checkout puts trailing whitespace on an individual line,
+  // so it is an edit, and it is hashed. These pin the boundary so a future
+  // "tidy-up" of the normalizer cannot quietly widen it.
+  for (const [what, edited] of [
+    ['trailing spaces on one line', SCHEMA.replace('model User {', 'model User {   ')],
+    ['a trailing tab on one line', SCHEMA.replace('model User {', 'model User {\t')],
+    ['trailing spaces on every line', SCHEMA.replace(/\n/g, '  \n')],
+  ] as const) {
+    it(`counts ${what} as a change (end-of-FILE rule is not per-line)`, () => {
+      assert.notEqual(fingerprintPrismaSchema(edited), fingerprintPrismaSchema(SCHEMA), what);
     });
   }
 });
