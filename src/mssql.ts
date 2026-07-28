@@ -244,8 +244,13 @@ function shapeResult(result: MssqlQueryResult): { rows: Record<string, unknown>[
  * returns bigint as number within the JS safe-integer range). The `mssql`/tedious
  * driver returns BIGINT as a string to avoid precision loss, so a BIGINT IDENTITY
  * `id` would otherwise surface as `'1'` instead of `1`. Values outside the safe
- * range are left as strings (same as the Postgres path). Nested relations are
- * unaffected, `FOR JSON PATH` already renders BIGINT as a JSON number.
+ * range are left as strings (same as the Postgres path).
+ *
+ * Nested relations reach the same policy by a different route: since 0.51 the
+ * join strategy casts BIGINT to text (`mssqlDialect.jsonWireRule`) so FOR JSON
+ * cannot round it through an IEEE double, and that rule's `decode` re-applies
+ * the narrowing this function performs. The two must stay in step; when they
+ * were not, a child key came back `'1'` under `with` and `1` everywhere else.
  */
 function coerceBigIntColumns(rows: Record<string, unknown>[], columns: MssqlColumnMeta | undefined): void {
   if (!columns || rows.length === 0) return;
@@ -609,12 +614,28 @@ export const mssqlDialect: Dialect = {
 
     // FOR JSON PATH renders BIGINT as a JSON number, which is an IEEE double:
     // a stored 9007199254740993 came back 9007199254740992 through the join
-    // strategy, while a top-level read and the batched loader both returned
-    // the exact decimal string. The tedious driver returns BIGINT as a STRING
-    // unconditionally (verified for both small and large values), so carrying
-    // text and keeping it reproduces the driver exactly.
+    // strategy. So the value is carried as text and re-decoded here.
+    //
+    // The DECODE re-applies the same safe-integer policy {@link
+    // coerceBigIntColumns} applies to the driver's own rows, which is what
+    // mysql and sqlite already do for their own 64-bit types. Keeping the text
+    // unconditionally (what this did before) reproduced the RAW driver value
+    // and not the value Turbine hands back: the driver returns BIGINT as a
+    // string, Turbine narrows a safe one to a number at the top level, and the
+    // batched loader goes through that same path. So a `with` under the join
+    // strategy was the ONE route that returned `'1'` where every other route
+    // returned `1`, i.e. the strategy silently changed the caller's value
+    // types. Above 2^53 all three keep the string, which is the point of
+    // carrying text at all.
     if (t === 'bigint') {
-      return { sql: (ref) => `CAST(${ref} AS NVARCHAR(50))`, decode: (value) => value };
+      return {
+        sql: (ref) => `CAST(${ref} AS NVARCHAR(50))`,
+        decode: (value) => {
+          if (typeof value !== 'string' || !/^-?\d+$/.test(value)) return value;
+          const asNumber = Number(value);
+          return Number.isSafeInteger(asNumber) ? asNumber : value;
+        },
+      };
     }
 
     // Binary columns come out of FOR JSON PATH as BASE64 text ("AQL/") rather
