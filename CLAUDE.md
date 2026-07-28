@@ -251,9 +251,23 @@ src/
                       silently ends the txn and every later SAVEPOINT fails (caught by the
                       savepoint-recovery test, not by review). Failure is NEVER a silent
                       drop: error/timeout/unparseable -> 'unknown' -> finding SURVIVES with
-                      a notice, and each probe is savepointed. Only a `Seq Scan` ON THE
-                      TARGET TABLE refutes; a seq scan of another relation in a join says
-                      nothing. DELIBERATELY not an arithmetic gate: the natural rule
+                      a notice, and each probe is savepointed. REFUTATION RULE (0.59, the
+                      0.58 one was half of it): the question is "is the generic plan the
+                      ordered index walk the finding claims", and there are TWO independent
+                      grounds for no: a `Sort` above the TARGET's scan (bounds cost by match
+                      count, not by walk distance, whatever access feeds it) OR a `Seq Scan`
+                      at the target itself. 0.58 shipped only the second, so every LOW-estimate
+                      column with ANY usable index survived, since those plan as
+                      `Limit > Sort > Bitmap Heap Scan` and never reach a seq scan (live case:
+                      `btree (col) WHERE col IS NOT NULL`, which an equality predicate
+                      IMPLIES, so the partial index is fully usable). NOT "exclude partial-index
+                      columns": a partial index whose predicate is NOT implied cannot serve the
+                      query and its column is a genuine finding (one measured at 19,961x); the
+                      plan already carries the answer and cannot drift from PG's implication
+                      rules. `Incremental Sort` does NOT refute (index supplies a PREFIX of the
+                      order, so still partly the bad shape) and a `Sort` elsewhere in the plan
+                      does not either; over-refuting deletes real findings INVISIBLY, so KEEP is
+                      the safe direction. DELIBERATELY not an arithmetic gate: the natural rule
                       (generic estimate must exceed assumedLimit) is measured WRONG, the
                       boundary sits between estimates 3 and 4 on a 247-page fixture and
                       moves with the table since it is a cost comparison; a closed-form gate

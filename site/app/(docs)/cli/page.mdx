@@ -525,7 +525,7 @@ SET LOCAL plan_cache_mode = force_generic_plan;
 EXPLAIN (FORMAT JSON) EXECUTE p(NULL, 20);
 ```
 
-Only the generic plan is needed: the finding's claim is that a promoted plan abandons the seq scan, so a generic plan that *is* a seq scan refutes it whatever the custom plan does. That also removes the need for a representative rare value, which statistics do not carry. `--json` gains `planDivergenceScored.flipProbed` and `.flipRefuted`.
+Only the generic plan is needed: the finding's claim is that a promoted plan performs an **ordered index walk**, so a generic plan that is not that walk refutes it whatever the custom plan does. Two independent grounds count as "not that walk": a `Sort` above the target table's scan (which bounds the cost by how many rows match rather than by how far the walk travels, whatever access feeds it), or a `Seq Scan` at the target itself. A `Sort` elsewhere in the plan, and an `Incremental Sort`, deliberately do not refute. That also removes the need for a representative rare value, which statistics do not carry. `--json` gains `planDivergenceScored.flipProbed` and `.flipRefuted`.
 
 **A probe that fails keeps its finding.** Errors, timeouts and unparseable plans leave the finding in place with a notice. A diagnostic that deletes findings when the database is uncooperative fails invisibly in exactly the environments where you are least able to check.
 
