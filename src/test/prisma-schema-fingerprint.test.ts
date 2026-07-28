@@ -145,8 +145,24 @@ describe('stale prisma-map warning', () => {
     }
   };
 
-  /** Build a compat client over a stub, capture anything it warns, settle the microtasks. */
-  const run = async (source: PrismaCompatMap['source']): Promise<string[]> => {
+  /**
+   * Build a compat client over a stub, capture anything it warns, and WAIT ON A
+   * DEADLINE rather than a fixed number of event-loop turns.
+   *
+   * The check is an unawaited `import('node:fs/promises')` plus a real file
+   * read, so the number of turns it needs is a property of the machine, not of
+   * this test. A fixed budget (20 `setImmediate`s) passed on every local run
+   * and failed on a loaded CI runner, which is a flake in the direction that
+   * wastes the most time: it reports a defect where there is none.
+   *
+   * A case that EXPECTS a warning polls until the line appears, so it is bounded
+   * by the read, not by a guess. A case that expects none has nothing to poll
+   * for and pays a fixed, deliberately generous settle instead; that is the safe
+   * direction, since the only thing a too-short wait can do there is miss a
+   * straggler, and the path filter below already keeps another case's straggler
+   * out of this one's window.
+   */
+  const run = async (source: PrismaCompatMap['source'], expect: 'warning' | 'silence'): Promise<string[]> => {
     resetWarnOnce(WARN_NS.stalePrismaMap);
     const { createPrismaCompatClient } = await import('../prisma-compat.js');
     const warned: string[] = [];
@@ -160,8 +176,12 @@ describe('stale prisma-map warning', () => {
         table: () => ({}),
       };
       createPrismaCompatClient(stub as never, { ...MAP, source });
-      // The read is a real async chain: yield until it has had a chance to run.
-      for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+      const mine = () => warned.filter((w) => w.includes('prisma-map') && (source ? w.includes(source.path) : true));
+      const deadline = Date.now() + (expect === 'warning' ? 10_000 : 1_000);
+      while (Date.now() < deadline) {
+        if (expect === 'warning' && mine().length) break;
+        await new Promise((r) => setTimeout(r, 5));
+      }
     } finally {
       console.warn = original;
     }
@@ -177,19 +197,19 @@ describe('stale prisma-map warning', () => {
 
   it('says nothing when the map has no source (pre-0.60 or hand-written)', async () => {
     await withEnv('development', async () => {
-      assert.deepEqual(await run(undefined), []);
+      assert.deepEqual(await run(undefined, 'silence'), []);
     });
   });
 
   it('says nothing when the file is missing, which is the normal deployed state', async () => {
     await withEnv('development', async () => {
-      assert.deepEqual(await run({ path: 'prisma/does-not-exist.prisma', hash: 'v1:0000000000000000' }), []);
+      assert.deepEqual(await run({ path: 'prisma/does-not-exist.prisma', hash: 'v1:0000000000000000' }, 'silence'), []);
     });
   });
 
   it('warns, naming the file and the fix, when the hash no longer matches', async () => {
     await withEnv('development', async () => {
-      const warned = await run({ path: stalePath, hash: 'v1:ffffffffffffffff' });
+      const warned = await run({ path: stalePath, hash: 'v1:ffffffffffffffff' }, 'warning');
       assert.equal(warned.length, 1);
       assert.match(warned[0]!, /fingerprint-schema-stale\.prisma has changed/);
       assert.match(warned[0]!, /turbine migrate-from-prisma/);
@@ -200,28 +220,28 @@ describe('stale prisma-map warning', () => {
     await withEnv('development', async () => {
       const { readFileSync } = await import('node:fs');
       const hash = fingerprintPrismaSchema(readFileSync(realPath, 'utf8'));
-      assert.deepEqual(await run({ path: realPath, hash }), []);
+      assert.deepEqual(await run({ path: realPath, hash }, 'silence'), []);
     });
   });
 
   it('is silent in production even when the map is stale', async () => {
     await withEnv('production', async () => {
-      assert.deepEqual(await run({ path: stalePath, hash: 'v1:ffffffffffffffff' }), []);
+      assert.deepEqual(await run({ path: stalePath, hash: 'v1:ffffffffffffffff' }, 'silence'), []);
     });
   });
 
   it('warns once per path, not once per client', async () => {
     await withEnv('development', async () => {
       resetWarnOnce(WARN_NS.stalePrismaMap);
-      const first = await runNoReset({ path: stalePath, hash: 'v1:ffffffffffffffff' });
-      const second = await runNoReset({ path: stalePath, hash: 'v1:ffffffffffffffff' });
+      const first = await runNoReset({ path: stalePath, hash: 'v1:ffffffffffffffff' }, 'warning');
+      const second = await runNoReset({ path: stalePath, hash: 'v1:ffffffffffffffff' }, 'silence');
       assert.equal(first.length, 1);
       assert.equal(second.length, 0, 'a second client must not repeat it');
     });
   });
 
   /** As {@link run}, minus the registry reset, so repeat calls are observable. */
-  async function runNoReset(source: PrismaCompatMap['source']): Promise<string[]> {
+  async function runNoReset(source: PrismaCompatMap['source'], expect: 'warning' | 'silence'): Promise<string[]> {
     const { createPrismaCompatClient } = await import('../prisma-compat.js');
     const warned: string[] = [];
     const original = console.warn;
@@ -234,7 +254,13 @@ describe('stale prisma-map warning', () => {
         table: () => ({}),
       };
       createPrismaCompatClient(stub as never, { ...MAP, source });
-      for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+      // Same deadline rule as `run`, and for the same reason.
+      const mine = () => warned.filter((w) => w.includes('prisma-map') && (source ? w.includes(source.path) : true));
+      const deadline = Date.now() + (expect === 'warning' ? 10_000 : 1_000);
+      while (Date.now() < deadline) {
+        if (expect === 'warning' && mine().length) break;
+        await new Promise((r) => setTimeout(r, 5));
+      }
     } finally {
       console.warn = original;
     }

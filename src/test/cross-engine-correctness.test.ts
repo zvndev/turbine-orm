@@ -799,6 +799,32 @@ function registerBattery(h: EngineHarness): void {
       assert.deepEqual(batched, join);
     });
 
+    it('a child row read through a relation equals the same row read directly', async () => {
+      // The TIEBREAKER for the test above. "The two strategies disagree" does
+      // not say WHICH one is wrong, and the answer is not a matter of taste:
+      // the driver's own value for a plain top-level read is the truth, and a
+      // relation load is the same row by a different route. Asserting against
+      // it names the side that diverged instead of leaving a diff to squint at.
+      const direct: PostRow[] = await posts().findMany({ orderBy: { id: 'asc' } });
+      const byId = new Map(direct.map((p) => [String(p.id), p]));
+      for (const strategy of ['join', 'batched'] as const) {
+        const parents: UserRow[] = await users().findMany({
+          orderBy: { id: 'asc' },
+          with: { posts: { orderBy: { id: 'asc' } } },
+          relationLoadStrategy: strategy,
+        });
+        for (const child of parents.flatMap((u) => u.posts ?? [])) {
+          const truth = byId.get(String(child.id));
+          assert.ok(truth, `relation returned a post id ${String(child.id)} that a direct read does not have`);
+          assert.deepEqual(
+            child,
+            truth,
+            `${h.name}: a post loaded via relationLoadStrategy '${strategy}' differs from the same post read directly`,
+          );
+        }
+      }
+    });
+
     // --- aggregates --------------------------------------------------------
 
     it('count honours the same where clause findMany does', async () => {
