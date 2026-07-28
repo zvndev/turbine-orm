@@ -1,6 +1,67 @@
 # Changelog
 
-## 0.57.0 (2026-07-27)
+## 0.58.0 (2026-07-27)
+
+### Fixed
+
+- **`turbine doctor`'s `unindexed-filter` findings are now put to the planner
+  before being reported, which removes most of them.** The branch shipped in
+  0.57.0 answering "IF this cached plan flips, how bad is it" without answering
+  "CAN it flip at all". On a real 118-model schema it produced 39 findings, and a
+  measured sample was right 6 times in 13. Every false positive had the same
+  signature: **the generic plan keeps the same sequential scan the good plan
+  chose**, so the amplification the finding printed described a plan the planner
+  would never pick.
+
+  Each such finding now costs one `EXPLAIN` **without** `ANALYZE`, which plans
+  and discards, executes nothing, and returns in microseconds:
+
+  ```sql
+  PREPARE p AS SELECT * FROM t WHERE col = $1 ORDER BY ord LIMIT $2;
+  SET LOCAL plan_cache_mode = force_generic_plan;
+  EXPLAIN (FORMAT JSON) EXECUTE p(NULL, 20);
+  ```
+
+  Only the generic plan is needed: the finding's whole claim is that a promoted
+  plan abandons the seq scan, so a generic plan that IS a seq scan refutes it
+  regardless of the custom plan. That also removes the need for a representative
+  rare value, which statistics do not carry. `NULL` is safe precisely because the
+  plan is generic, and the limit stays bound as `$2` because that is the shape
+  Turbine emits.
+
+  `doctor --json` gained `planDivergenceScored.flipProbed` and `.flipRefuted`, so
+  a consumer can tell a verified list from an unverified one instead of inferring
+  it from the count, and the human report states which it is.
+
+- **A probe that fails keeps its finding.** Errors, timeouts and unparseable
+  plans all yield `unknown`, the finding survives, and a notice says so. A
+  diagnostic that deletes findings when the database is uncooperative would fail
+  invisibly in exactly the environments (restricted roles, non-Postgres engines)
+  where a human is least able to notice. Each probe is savepointed, so one
+  unprobeable column does not cost the ones after it.
+
+### Changed
+
+- **The arithmetic gate this replaces was measured wrong and is NOT shipped.**
+  The natural rule is to require the generic row estimate (`rows / n_distinct`)
+  to exceed the assumed `LIMIT`, reasoning that Postgres discounts an ordered
+  index walk by `min(1, limit / estimate)` so an estimate at or below the limit
+  earns no discount. Measured on a 247-page fixture, the flip boundary sits
+  between estimates **3 and 4**, not at the limit of 20:
+
+  | generic estimate | 2 | 3 | 4 | 10 | 20 | 500 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | generic plan | seq | seq | index | index | index | index |
+  | buffers | 250 | 250 | 20,074 | 20,074 | 19,071 | 765 |
+
+  Estimates 4 through 20 are full-table walks that such a gate would discard. The
+  real limit fraction for a BOUND limit is `ceil(0.1 x estimate) / estimate`,
+  which pins to 0.1 at estimates of 10 or more but rises to `1/estimate` below
+  that; the plan is then chosen by comparing that fraction of the full index scan
+  against a seq scan plus sort. Because it is a cost comparison the boundary also
+  moves with the table, landing in a different place on a 1976-page table and on
+  an 89-page narrow one. A closed-form gate was attempted, failed its own
+  out-of-sample prediction, and was dropped in favour of asking the planner.
 
 ### Fixed
 

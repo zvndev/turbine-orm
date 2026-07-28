@@ -228,6 +228,37 @@ src/
                       and it gates on ANALYZE freshness (last_analyze), never on the
                       `stats_reset` counter gate the cost tiers use.
 
+  plan-flip-probe.ts, The REACHABILITY half of the divergence check (0.58). plan-divergence
+                      answers "IF it flips, how bad"; this answers "CAN it flip", which
+                      0.57 shipped without and got right 6 times in 13 on a real schema
+                      (39 findings). Every false positive had one signature: the generic
+                      plan keeps the same SEQ SCAN the good plan chose, so there is nothing
+                      to diverge to. Split like index-stats.ts: PURE half
+                      (`buildFlipProbeSql` / `verdictFromPlanJson` / `applyFlipVerdicts` /
+                      `needsFlipProbe`, no pg import) plus a COLLECTOR (`probePlanFlips`).
+                      Asks ONE question per finding, `EXPLAIN (FORMAT JSON)` with NO
+                      ANALYZE (plans and discards, executes nothing) under
+                      `force_generic_plan` only: the custom plan is not needed because a
+                      generic seq scan refutes the claim on its own, which also removes the
+                      need for a rare VALUE that statistics do not carry (`NULL` is safe
+                      precisely because a generic plan ignores the value). LIMIT stays bound
+                      as `$2`, the shape Turbine emits; an inlined limit takes a different
+                      planner path. `unindexed-filter` findings only (sparse-value was 6/6
+                      in 0.56, no measured precision problem to spend a round trip on).
+                      Uses a pg `Client`, NOT a one-connection Pool: this is ONE transaction
+                      over many statements, and node-postgres discards an errored connection
+                      and hands out a fresh one, so through a pool the first failing probe
+                      silently ends the txn and every later SAVEPOINT fails (caught by the
+                      savepoint-recovery test, not by review). Failure is NEVER a silent
+                      drop: error/timeout/unparseable -> 'unknown' -> finding SURVIVES with
+                      a notice, and each probe is savepointed. Only a `Seq Scan` ON THE
+                      TARGET TABLE refutes; a seq scan of another relation in a join says
+                      nothing. DELIBERATELY not an arithmetic gate: the natural rule
+                      (generic estimate must exceed assumedLimit) is measured WRONG, the
+                      boundary sits between estimates 3 and 4 on a 247-page fixture and
+                      moves with the table since it is a cost comparison; a closed-form gate
+                      was attempted and failed its own out-of-sample prediction.
+
   client.ts        , TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
                       ($transaction with SAVEPOINTs for nesting, isolation levels, timeouts,

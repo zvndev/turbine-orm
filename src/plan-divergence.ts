@@ -440,6 +440,21 @@ export interface PlanDivergenceReport {
    */
   consideredIndexed: number;
   consideredUnindexed: number;
+  /**
+   * True when every `unindexed-filter` finding was put to the planner via
+   * `plan-flip-probe.ts` rather than reported on statistics alone.
+   *
+   * Absent or false means the findings below are UNVERIFIED: the probe was
+   * skipped, the engine is not Postgres, or the connection refused it.
+   */
+  flipProbed?: boolean;
+  /**
+   * How many candidate findings the planner refuted, i.e. columns where the
+   * generic plan keeps the same sequential scan the good plan uses so there is
+   * no divergence to reach. Reported because a check that silently discards two
+   * thirds of what it found should say so.
+   */
+  flipRefuted?: number;
 }
 
 /** A (table, column) pair whose distribution statistics the collector should read. */
