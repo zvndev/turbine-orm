@@ -15,7 +15,7 @@
  *   - empty-where guard on the COMPILED filter (FIX 1)
  *   - transactions: single-level commit + rollback
  *   - nested `tx.$transaction` and re-entrant `db.$transaction` throw typed (FIX 2)
- *   - independent concurrent `db.$transaction` calls queue FIFO and all succeed (T-7)
+ *   - independent concurrent `db.$transaction` calls queue FIFO and all succeed
  *   - COLD-CLIENT same-tick `db.$transaction` burst: zero false E017
  *   - disconnect() really closes the owned pool
  *   - chunked relation load over > MAX_RELATION_KEYS parents (FIX 4)
@@ -187,7 +187,7 @@ async function withDb(fn: (db: DB) => Promise<void>): Promise<void> {
 // ---------------------------------------------------------------------------
 
 describe('powdb integration (embedded)', () => {
-  // KEEP THIS TEST FIRST. The cold-client bug (ITEM 3) only bit when NO
+  // KEEP THIS TEST FIRST. The cold-client bug only bit when NO
   // transaction had ever run in the process/context: acquire()'s enterWith()
   // planted call #1's live re-entrancy marker where sibling same-tick calls
   // could see it, so 9/10 were falsely rejected E017, and one warm-up

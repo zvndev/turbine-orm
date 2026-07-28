@@ -460,7 +460,7 @@ function captureWarnings<T>(fn: () => T): [T, string[]] {
   }
 }
 
-describe('schemaDefToMetadata, collision guard parity with introspection (N-4)', () => {
+describe('schemaDefToMetadata, collision guard parity with introspection', () => {
   it('renames a belongsTo that would shadow a concrete scalar column (posts.user text + userId FK)', () => {
     // The verified repro: relation 'user' shadowed the scalar text column, so
     // `where: { user: { contains: 'bob' } }` threw E003 at runtime. The shared
@@ -493,7 +493,7 @@ describe('schemaDefToMetadata, collision guard parity with introspection (N-4)',
     assert.match(withRel.sql, /"id" = "posts"\."user_id"/);
   });
 
-  it('keeps a legacy belongsTo that shadows ONLY a jsonb column (historical shadow, N-1b rule)', () => {
+  it('keeps a legacy belongsTo that shadows ONLY a jsonb column (historical jsonb-shadow rule)', () => {
     const def = defineSchema({
       users: { id: { type: 'serial', primaryKey: true } },
       posts: {
@@ -570,7 +570,7 @@ describe('schemaDefToMetadata, collision guard parity with introspection (N-4)',
   });
 });
 
-describe('schemaDefToMetadata, relation-name parity with buildRelationsFromForeignKeys (N-4)', () => {
+describe('schemaDefToMetadata, relation-name parity with buildRelationsFromForeignKeys', () => {
   it('derives IDENTICAL names to introspection-shaped FK entries for the divergent shapes', () => {
     // One logical schema exercising: (1) the posts.user/userId shadow shape,
     // (2) the two-FKs-to-one-target shape, (3) a pure junction m2m.

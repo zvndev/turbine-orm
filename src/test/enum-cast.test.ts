@@ -1,5 +1,5 @@
 /**
- * turbine-orm, Postgres enum column write casts (T-3)
+ * turbine-orm, Postgres enum column write casts
  *
  * Regression: inserting into a table with a PG enum column failed with
  * `column "type" is of type "FieldType" but expression is of type text`.
@@ -33,7 +33,7 @@ function buildSchema(enums: Record<string, string[]> = { FieldType: ['TEXT', 'NU
   return { tables, enums };
 }
 
-describe('Postgres enum write casts (T-3)', () => {
+describe('Postgres enum write casts', () => {
   it('create: enum column bind carries ::"FieldType", others unchanged', () => {
     const q = makeQuery('fields', buildSchema());
     const d = q.buildCreate({ data: { title: 'Name', type: 'TEXT' } as never });
@@ -144,7 +144,7 @@ describe('Postgres enum write casts (T-3)', () => {
 // keep the cast.
 // ---------------------------------------------------------------------------
 
-describe('Postgres enum write casts, cross-schema guard (N-5)', () => {
+describe('Postgres enum write casts, cross-schema guard', () => {
   function crossSchemaSchema(): SchemaMetadata {
     const tables: Record<string, TableMetadata> = {};
     tables.fields = mockTable('fields', [

@@ -775,7 +775,7 @@ interface ForeignKeyRow {
  * naming to the SHARED introspection builder (`buildRelationsFromForeignKeys`
  * + `addAutoManyToManyRelations` in ../introspect.ts). MCP previously carried
  * a stale copy of a retired naming scheme, so `turbine mcp` and `turbine
- * generate` derived DIFFERENT relation names from the same database (N-3).
+ * generate` derived DIFFERENT relation names from the same database.
  * Exported for the parity unit test.
  */
 export function buildRelations(

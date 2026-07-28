@@ -1,6 +1,6 @@
 /**
  * optional-peer-import.cts, unit tests for the dual-build dynamic-import
- * helper (T-5: `turbinePowDB` broken under CommonJS with ESM-only
+ * helper (`turbinePowDB` broken under CommonJS with ESM-only
  * `@zvndev/powdb-client` ≥ 0.9).
  *
  * These cover the helper's runtime contract from the source tree. The

@@ -299,7 +299,7 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
   // local reimplementation had NO collision guard, `posts.user` (text) +
   // `userId references users.id` produced a relation `user` that shadowed the
   // scalar, and two FKs deriving the same name silently clobbered each other
-  // (N-4).
+  //.
   //
   // Constraint names are synthesized in pg's default `<table>_<column>_fkey`
   // form; they only feed the referential-action lookup and composite-FK

@@ -62,7 +62,7 @@ const GENERATORS = [
   ['zod.ts', generateZod],
 ] as const;
 
-describe('generated file header timestamp (T-8b)', () => {
+describe('generated file header timestamp', () => {
   it('includes the Generated at: line by default (unchanged behavior)', () => {
     for (const [file, gen] of GENERATORS) {
       const out = gen(SCHEMA);

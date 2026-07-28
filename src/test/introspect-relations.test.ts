@@ -96,7 +96,7 @@ describe('buildRelationsFromForeignKeys, single-FK back-compat naming', () => {
   });
 });
 
-describe('buildRelationsFromForeignKeys, two FKs to the same target (T-4)', () => {
+describe('buildRelationsFromForeignKeys, two FKs to the same target', () => {
   it('derives each belongsTo name from its own column (snake_case _id)', () => {
     const [relations, warnings] = captureWarnings(() =>
       buildRelationsFromForeignKeys(
@@ -133,7 +133,7 @@ describe('buildRelationsFromForeignKeys, two FKs to the same target (T-4)', () =
     // legitimately changes (it was BROKEN, the legacy name collided with the
     // concrete-typed scalar), but the reverse hasMany side keeps the LEGACY
     // names (`documentsByCurrentVersionId`): those were collision-free
-    // and worked at runtime, so a regen must not rename them (N-1a).
+    // and worked at runtime, so a regen must not rename them.
     const [relations, warnings] = captureWarnings(() =>
       buildRelationsFromForeignKeys(
         [
@@ -269,7 +269,7 @@ describe('buildRelationsFromForeignKeys, referential actions', () => {
 // column, i.e. the shape was BROKEN on main and the rename is the fix).
 // ---------------------------------------------------------------------------
 
-describe('buildRelationsFromForeignKeys, main-parity table (N-1)', () => {
+describe('buildRelationsFromForeignKeys, main-parity table', () => {
   interface NamingCase {
     name: string;
     fks: ForeignKeyEntry[];
@@ -309,7 +309,7 @@ describe('buildRelationsFromForeignKeys, main-parity table (N-1)', () => {
       expectedWarnings: 0,
     },
     {
-      // MIXED, the camelCase two-FK regression shape (N-1a):
+      // MIXED, the camelCase two-FK regression shape:
       //   belongsTo LEGITIMATELY CHANGED: main derived 'authorId'/'editorId',
       //   which SHADOWED the concrete scalar FK fields (broken types) → the
       //   modern Id-stripped names apply.
@@ -388,7 +388,7 @@ describe('buildRelationsFromForeignKeys, main-parity table (N-1)', () => {
     });
   }
 
-  it('keeps a legacy belongsTo that shadows ONLY an unknown-typed (jsonb) column, with a warning (N-1b)', () => {
+  it('keeps a legacy belongsTo that shadows ONLY an unknown-typed (jsonb) column, with a warning', () => {
     // posts has a jsonb column `user` (tsType 'unknown') AND user_id → users.
     // On main the relation 'user' shadowed the column but COMPILED (`unknown`
     // absorbs anything) and worked at runtime, regen must keep the name.
@@ -435,7 +435,7 @@ describe('buildRelationsFromForeignKeys, main-parity table (N-1)', () => {
 // N-2, auto-m2m collision handling (shared addAutoManyToManyRelations)
 // ---------------------------------------------------------------------------
 
-describe('addAutoManyToManyRelations, column-shadow handling (N-2)', () => {
+describe('addAutoManyToManyRelations, column-shadow handling', () => {
   /** Junction fixture: post_tags(post_id, tag_id) linking posts ↔ tags. */
   function junctionSetup(extraPostFields: string[] = [], unknownPostFields: string[] = []) {
     const fks = [

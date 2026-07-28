@@ -1604,7 +1604,7 @@ describe('powdb: cross-pool re-entrancy (chained ALS marker)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// regression (ITEM 3): the re-entrancy marker is scoped to the
+// Regression: the re-entrancy marker is scoped to the
 // transaction CALLBACK's async subtree. acquire() used to enterWith() the
 // marker into the CALLER's context, so a context that merely had a begin in
 // its await chain was falsely flagged re-entrant: on a cold client, the first
@@ -1986,7 +1986,7 @@ describe('powdb: transaction queue timeout', () => {
 // table name OR camelCase accessor key, snake_case winning on conflict.
 // ---------------------------------------------------------------------------
 
-describe('powdb: warnOnUnlimited per-table map (N-6)', () => {
+describe('powdb: warnOnUnlimited per-table map', () => {
   const profilesSchema: SchemaMetadata = {
     enums: {},
     tables: {
@@ -2121,7 +2121,7 @@ describe('powdb: server tx-gate timeout maps to TimeoutError (PowDB ≥ 0.10)', 
 });
 
 // ---------------------------------------------------------------------------
-// regression (ITEM 1): owned-pool disconnect() must close every driver
+// Regression: owned-pool disconnect() must close every driver
 // client. client.ts treats TurbineConfig.pool as external (ownsPool = false)
 // and skips pool.end(), so turbinePowDB patches disconnect()/end() on owned
 // pools; and the driver Pool.close() only closes IDLE clients, so

@@ -169,7 +169,7 @@ describe('findMany unlimited-query warning', () => {
 // snake_case table name only.
 // ---------------------------------------------------------------------------
 
-describe('findMany unlimited-query warning, multi-word table key forms (N-6)', () => {
+describe('findMany unlimited-query warning, multi-word table key forms', () => {
   function multiWordSchema(): SchemaMetadata {
     const tables: Record<string, TableMetadata> = {};
     tables.user_profiles = mockTable('user_profiles', [

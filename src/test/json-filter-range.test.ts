@@ -1,5 +1,5 @@
 /**
- * turbine-orm, JsonFilter range operators gt/gte/lt/lte (T-2)
+ * turbine-orm, JsonFilter range operators gt/gte/lt/lte
  *
  * Numbers cast the `#>>` path extraction to numeric -
  * `("col" #>> $1::text[])::numeric > $2`, while strings compare as text.
@@ -48,7 +48,7 @@ function buildSchema(): SchemaMetadata {
   return { tables, enums: {} };
 }
 
-describe('JsonFilter range operators (T-2)', () => {
+describe('JsonFilter range operators', () => {
   it('gt with a number casts the extraction to numeric', () => {
     const q = makeQuery('events', buildSchema());
     const d = q.buildFindMany({ where: { payload: { path: ['score'], gt: 10 } } as never });
@@ -132,7 +132,7 @@ describe('JsonFilter range operators (T-2)', () => {
     assert.deepEqual(d.params, [['score'], 10, 'launch']);
   });
 
-  it('range op inside a relation some filter compiles (T-1 + T-2)', () => {
+  it('range op inside a relation some filter compiles', () => {
     const q = makeQuery('events', buildSchema());
     const d = q.buildFindMany({
       where: { metrics: { some: { data: { path: ['p95'], lt: 250 } } } } as never,

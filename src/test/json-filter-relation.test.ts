@@ -1,5 +1,5 @@
 /**
- * turbine-orm, JsonFilter / ArrayFilter inside relation filters (T-1)
+ * turbine-orm, JsonFilter / ArrayFilter inside relation filters
  *
  * Regression tests for the bug where a JsonFilter on a jsonb column
  * inside a relation `some`/`every`/`none` sub-where was silently dropped:
@@ -87,7 +87,7 @@ const JSON_WHERE = {
   },
 } as never;
 
-describe('JsonFilter inside relation filters (T-1)', () => {
+describe('JsonFilter inside relation filters', () => {
   it('some: compiles the #>> path extraction (the exact repro)', () => {
     const q = makeQuery('documents', buildSchema());
     const d = q.buildFindMany({ where: JSON_WHERE });

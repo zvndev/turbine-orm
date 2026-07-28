@@ -1,5 +1,5 @@
 /**
- * turbine-orm, `turbine mcp` relation-naming parity (N-3)
+ * turbine-orm, `turbine mcp` relation-naming parity
  *
  * The MCP server introspects the database itself (it cannot assume generated
  * metadata exists), so its relation derivation MUST match `turbine generate`
@@ -138,7 +138,7 @@ function introspectDerived(): Map<string, Record<string, unknown>> {
   return rels;
 }
 
-describe('turbine mcp, relation naming matches turbine generate (N-3)', () => {
+describe('turbine mcp, relation naming matches turbine generate', () => {
   it('derives deep-equal relation maps for the divergent fixture', () => {
     const mcpDerived = silenced(() => buildRelations(TABLES, COLUMNS, PKS, FK_ROWS));
     const generateDerived = silenced(() => introspectDerived());

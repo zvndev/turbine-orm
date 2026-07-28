@@ -96,7 +96,7 @@ export interface GenerateOptions {
   zod?: boolean;
   /**
    * Omit the `Generated at: <ISO timestamp>` line from every generated file
-   * header (T-8b, reproducible codegen). With this set, byte-identical
+   * header (reproducible codegen). With this set, byte-identical
    * schemas regenerate to byte-identical output, so regens produce empty
    * diffs. Default: `false` (timestamp included, unchanged behavior).
    */
@@ -335,7 +335,7 @@ export function stripJsonComments(text: string): string {
 // ---------------------------------------------------------------------------
 
 function generatedFileHeader(options?: GenerateFileOptions): string[] {
-  // `noTimestamp` omits the volatile line entirely (T-8b) so regenerating an
+  // `noTimestamp` omits the volatile line entirely so regenerating an
   // unchanged schema produces byte-identical files.
   return [
     '/**',
@@ -1183,7 +1183,7 @@ function serializeColumn(col: ColumnMetadata): string {
   ];
   // Cross-schema type marker, introspection records it only for types living
   // outside the introspected schema; it must survive codegen or the runtime
-  // enum-cast guard in query/builder.ts loses the signal (N-5).
+  // enum-cast guard in query/builder.ts loses the signal.
   if (col.pgTypeSchema !== undefined) parts.push(`pgTypeSchema: '${escSQ(col.pgTypeSchema)}'`);
   // Emit isGenerated only when set (server-generated serial/identity), so the
   // output stays byte-identical for the common client-default columns.

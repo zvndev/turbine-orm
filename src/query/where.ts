@@ -1283,7 +1283,7 @@ export function enumTypeForColumn(qi: BuilderCtx, column: string): string | null
   if (qi.dialect.name !== 'postgresql') return null;
   const enums = qi.schema.enums;
   if (!enums) return null;
-  // Cross-schema guard (N-5): introspection records pgTypeSchema ONLY when
+  // Cross-schema guard: introspection records pgTypeSchema ONLY when
   // the column's type lives OUTSIDE the introspected schema. A same-named
   // enum in another schema must not get this schema's cast, search_path
   // would resolve `::"status"` to the wrong type. Skipping the cast restores

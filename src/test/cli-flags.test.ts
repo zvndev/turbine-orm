@@ -132,7 +132,7 @@ describe('parseArgs, studio / observe flags', () => {
   });
 });
 
-describe('parseArgs, generate flags (T-8b)', () => {
+describe('parseArgs, generate flags, reproducible codegen', () => {
   it('parses --no-timestamp as a boolean flag', () => {
     const args = parseArgs(['generate', '--no-timestamp']);
     assert.equal(args.command, 'generate');
