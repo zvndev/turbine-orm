@@ -92,6 +92,25 @@ export type {
   UpsertStatementInput,
 } from '../dialect.js';
 export { postgresDialect } from '../dialect.js';
+export type { OptionKind, OptionTable } from './option-surface.js';
+export {
+  AGGREGATE_OPTIONS,
+  ALL_OPTION_TABLES,
+  applyNativeOptions,
+  COUNT_OPTIONS,
+  CREATE_MANY_OPTIONS,
+  CREATE_OPTIONS,
+  DELETE_MANY_OPTIONS,
+  DELETE_OPTIONS,
+  FIND_MANY_OPTIONS,
+  FIND_MANY_STREAM_OPTIONS,
+  FIND_UNIQUE_OPTIONS,
+  GROUP_BY_OPTIONS,
+  optionKeysOfKind,
+  UPDATE_MANY_OPTIONS,
+  UPDATE_OPTIONS,
+  UPSERT_OPTIONS,
+} from './option-surface.js';
 export type { SqlCacheEntry } from './utils.js';
 export {
   buildCorrelation,

@@ -218,10 +218,10 @@ describe('plan-divergence advisor (live Postgres)', () => {
       assert.equal(f.column, 'tenant_id');
       assert.equal(f.orderColumn, 'id');
       assert.equal(f.columnField, 'tenantId');
-      assert.ok(f.rarestBucket < f.crossoverRows);
-      assert.ok(f.genericEstimate >= f.crossoverRows);
-      assert.ok(f.walkPages >= f.thresholds.minWalkPages);
-      assert.ok(f.walkFraction >= f.thresholds.minWalkFraction);
+      assert.ok(f.rarestBucket < f.crossoverRows!);
+      assert.ok(f.genericEstimate >= f.crossoverRows!);
+      assert.ok(f.walkPages! >= f.thresholds.minWalkPages);
+      assert.ok(f.walkFraction! >= f.thresholds.minWalkFraction);
     }
 
     // The small table is flagged despite being far under the OLD 1,000-page
@@ -248,13 +248,13 @@ describe('plan-divergence advisor (live Postgres)', () => {
   it('estimates amplification without claiming it as a bound', () => {
     const f = findPlanDivergence(schema, snapshot).findings.find((x) => x.table === 'orders')!;
     const m = measured.orders!;
-    assert.ok(f.approxAmplification > 1);
+    assert.ok(f.approxAmplification! > 1);
     // Documented as a rough scale, so this asserts the ORDER of magnitude in the
     // direction the model is biased (it under-reports, because it cannot see
     // where in the heap a value sits), not equality.
     assert.ok(
-      m.generic / m.custom >= f.approxAmplification / 10,
-      `estimate ${f.approxAmplification} was more than 10x optimistic against the measured ${m.generic / m.custom}`,
+      m.generic / m.custom >= f.approxAmplification! / 10,
+      `estimate ${f.approxAmplification!} was more than 10x optimistic against the measured ${m.generic / m.custom}`,
     );
   });
 

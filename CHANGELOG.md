@@ -1,5 +1,207 @@
 # Changelog
 
+## 0.57.0 (2026-07-27)
+
+### Fixed
+
+- **`turbine-orm/prisma-compat` silently dropped every Turbine-native query
+  option, so 0.56.0's `forceCustomPlan` did nothing on that client.** The option
+  shipped, was documented, was measured at the wire on the core client, and
+  `turbine doctor`'s own remediation text told readers to reach for it. Through
+  the compat adapter it was accepted by the type-checker and dropped on the
+  floor. Measured before the fix on one pooled connection (`poolSize: 1`), the
+  same read executed 3 warmup + 12 measured times per row, reading
+  `pg_prepared_statements` on that same session afterwards:
+
+  ```txt
+  core,   default                 prepared: t_5109978894a0ccdd(g=10,c=5)
+  core,   forceCustomPlan: true   prepared: NONE
+  compat, default                 prepared: t_5109978894a0ccdd(g=10,c=5)
+  compat, forceCustomPlan: true   prepared: t_5109978894a0ccdd(g=10,c=5)   NO EFFECT
+  ```
+
+  After the fix the compat row reads `prepared: NONE` like the core one. The
+  `g=10` in the default rows is real generic-plan promotion, so the `NONE` is the
+  option taking effect and not an artifact of a quiet fixture.
+
+  It was never only `forceCustomPlan`. The translator built a fresh Turbine args
+  object and copied a hand-written allowlist of keys, so **every** Turbine-only
+  option added since that list was written was stranded the same way:
+  `warnOnUnlimited`, `skipGlobalFilters`, `allowFullTableScan`, `timeout` on
+  every write except `create`, `optimisticLock`, `stableRelationOrder`, and
+  `distinctOn` on `groupBy`. Each is now forwarded and each is covered by a live
+  test that asserts an observable consequence rather than the shape of an args
+  object (`optimisticLock` raising `TURBINE_E015` on a stale version,
+  `allowFullTableScan` getting a `where: {}` past the empty-where guard,
+  `skipGlobalFilters` returning rows a configured global filter removes, and so
+  on).
+
+- **The drift that caused it is now a build failure.** `src/query/option-surface.ts`
+  holds one `Record<keyof SomeArgs<Row>, OptionKind>` table per query-arg
+  interface, the same mechanism `TURBINE_CONFIG_KEYS` already used for the client
+  config. Adding an option to a core arg interface stops that file compiling
+  until a human classifies the new key, and listing a key that is not on the
+  interface fails as an excess property. It does not make one edit sufficient,
+  deliberately: two options carry field names in their values
+  (`optimisticLock.field`, `distinctOn.columns`), and a passthrough-by-default
+  translator would forward the Prisma spelling into core, which is correct on a
+  schema whose names coincide and broken on one that renames a column. What it
+  does guarantee is that the second edit can no longer be forgotten in silence.
+
+- **Unknown query-level options warn in compat instead of vanishing.**
+  `compat.User.findMany({ thisOptionDoesNotExist: true })` used to be accepted
+  and dropped as a class. It now logs one dev-only line per
+  `model.operation.key`, in the same spirit as the unknown-client-config warning
+  added in 0.53, with the nearest real option suggested:
+
+  ```txt
+  [turbine] prisma-compat: unknown option "customPlan" in User.findMany(), it is ignored. Did you mean "forceCustomPlan"?
+  [turbine] prisma-compat: "limit" is Turbine's spelling and is ignored here; prisma-compat takes Prisma's "take". (User.findMany)
+  ```
+
+  It warns, never throws: a stray key must not turn a working app into a failing
+  one on upgrade. Legitimate Prisma keys never warn (verified silent across 28
+  realistic Prisma call shapes), and neither do the Turbine-only options the
+  adapter hand-translates.
+
+- **`turbine doctor`'s plan-divergence remediation no longer assumes which
+  client you are holding.** Step 3 previously told every reader to scope the fix
+  with `forceCustomPlan`, which was a no-op advice for a compat integration, and
+  step 4 said "do NOT set `planCacheMode` on the client to fix this", which names
+  a Turbine-specific option to a reader who may not have it. Step 3 now names the
+  option first and prints both call shapes (compat's using Prisma's `take`, not
+  Turbine's `limit`), states which release the compat passthrough needs, and asks
+  for the same `pg_prepared_statements` confirmation rather than assuming the
+  option took effect. Step 4 now names the database-wide `plan_cache_mode`
+  mechanism and both ways of reaching it.
+
+- **The core-client snippet doctor prints named an accessor that does not
+  exist.** It printed `db.<raw table name>`, so on any snake_case schema the
+  suggested code was `db.inventory_location.findMany(...)`, which is `undefined`.
+  Both `TurbineClient` and the code generator define table accessors through
+  `snakeToCamel`, and the snippet now does too.
+
+- **`src/cli/index.ts` contained four literal NUL bytes**, from a map key written
+  as a raw `0x00` byte rather than a `\u0000` escape. Behaviour was correct, but
+  `grep` classified the largest file in the CLI as binary and skipped it, and
+  neither lint nor typecheck noticed.
+
+### Added
+
+- **`turbine doctor` scores unindexed filter columns for cached-plan divergence,
+  a THIRD mechanism.** Until now the check dropped every column with no index on
+  the filter column before it even counted it as considered, so that population
+  was outside the findings and outside the "not scored" notices alike. It is a
+  distinct mechanism from the two already discussed: not the sparse-value
+  direction the existing rule models, and not the dense-clustering direction that
+  was written, measured and removed in 0.56.0 for predicting the wrong sign. Here
+  **the good plan is a sequential scan that the generic plan will not choose**.
+  With no index on the filter column the custom planner takes a seq scan plus a
+  top-N sort, bounded by the table's pages; a promoted generic plan cannot see
+  the value is rare, keeps the ordered primary-key walk, and fetches nearly every
+  tuple before it fills the `LIMIT`.
+
+  Fixture, printed so every number below is checkable (PostgreSQL 16, warm cache,
+  `synchronize_seqscans`, `max_parallel_workers_per_gather` and `jit` off):
+
+  ```sql
+  CREATE TABLE t (id int PRIMARY KEY, organization_id int NOT NULL, payload text NOT NULL);
+  INSERT INTO t SELECT g, <bucket(g)>, repeat('p', 60)
+    FROM generate_series(1, 20000) g ORDER BY (g * 2654435761::bigint) % 1000003;
+  -- 247 relpages, buckets 10,000 / 6,000 / 3,998 / 2
+  -- read: WHERE organization_id = $1 ORDER BY id LIMIT $2, rarest value, limit 20
+  ```
+
+  `force_custom_plan` reads 250 buffers (Seq Scan), `force_generic_plan` reads
+  20,074 (Index Scan on the primary key), and under `auto` seven executions of
+  the rare value report `generic_plans 2, custom_plans 5`, so the promotion is
+  real and not hypothetical. The branch's gates are its own: the rarest value
+  must hold fewer rows than the assumed limit, and the promoted plan must walk at
+  least 10,000 tuples. It carries no generic-side gate, for a measured reason
+  recorded in the source.
+
+  A finding on an unindexed column has a different first remedy, so the report
+  renders it as **evidence attached to the missing-index finding** the same run
+  already produced, never as a second entry, and it never suggests
+  `forceCustomPlan` there. The leftover case, a column served only by a partial
+  or expression index, keeps its own entry.
+
+- **Findings carry the ordering column's correlation, and disclose the known
+  false positive.** The size of an unindexed-filter flip is decided by how
+  closely the heap tracks the column the generic plan walks, not by the filter
+  column's own correlation. Six fixtures identical except for INSERT ordering,
+  custom plan 250 buffers in all of them:
+
+  | heap order | `pg_stats.correlation` on `id` | generic buffers | ratio |
+  | --- | --- | --- | --- |
+  | exact `id` order | 1.00000 | 303 | 1.2x |
+  | shuffled within ~1 page | 0.99998 | 783 | 3.1x |
+  | shuffled within ~2 pages | 0.99993 | 10,303 | 41x |
+  | shuffled within ~4 pages | 0.99974 | 15,148 | 61x |
+  | shuffled within ~20 pages | 0.99372 | 19,046 | 76x |
+  | hash order | -0.00065 | 20,074 | 80x |
+
+  The plan flips in all six; only the magnitude differs, and an append-only table
+  with a serial primary key sits on the top row. `PlanDivergenceFinding` now
+  carries `orderColumnCorrelation` and a `heapNearlyOrdered` boolean, both in the
+  human report and in `doctor --json`, and the rendered text states the
+  condition alongside the ratio instead of printing one number for both cases.
+  Nothing is suppressed on it: the boundary sits between two adjacent sampled
+  values, so it qualifies a finding and never decides one.
+
+- **A column served only by a `brin` / `gin` / `gist` index is reported as not
+  scored**, with the reason, rather than being described by a model that does not
+  fit it. A **hash** index now counts as an equality path and routes the column
+  to the sparse-value rule: measured, a hash index gives the custom plan a
+  7-buffer Bitmap Heap Scan, so calling that column unindexed printed a 247-page
+  seq scan as the good plan.
+
+- `doctor --json` gained `planDivergenceScored` (`considered` / `indexed` /
+  `unindexed`), so a consumer can tell "considered and clean" from "never looked
+  at", and the divergence section of the human report prints the same split.
+
+### Changed
+
+- **`limit` on `updateMany` / `deleteMany` through prisma-compat now throws
+  `UnsupportedFeatureError` (`TURBINE_E017`).** It was previously accepted and
+  ignored, which silently dropped a safety bound on a mass mutation. This is the
+  one place the release throws rather than warns, deliberately.
+- **`relationLoadStrategy: 'query'` through prisma-compat now maps to Turbine's
+  `'batched'`.** It used to be forwarded verbatim into a resolver with no
+  `'query'` branch, so a caller asking for the per-relation plan silently got the
+  join. Statement counts change for anyone who passed it.
+- **`skipGlobalFilters` through prisma-compat goes from silently ignored to
+  honoured.** That is the correct behaviour and matches the core client, but it
+  is a real behaviour change on upgrade for a compat app that had the key present
+  and inert.
+- **Plan-divergence findings are sorted by estimated extra buffer accesses**
+  rather than by `approxAmplification`, so existing sparse-value findings can
+  change order. Both branches now report in the same units; that is not the same
+  as equal conservatism, and the source says so.
+- **`PlanDivergenceFinding.crossoverRows`, `crossoverRowsWide`,
+  `valuesBelowCrossover`, `walkPages`, `walkFraction` and `approxAmplification`
+  are now optional** and are absent on an `unindexed-filter` finding rather than
+  zero-filled. A `--json` consumer reading them unconditionally must branch on
+  `branch`.
+- Several calibration numbers in the plan-divergence source were re-measured and
+  corrected, including a page ladder that was about 8% high and a claim that one
+  page of local heap disorder already costs 25x (measured 3.1x; the transition is
+  between a one-page and a two-page window, because an index scan holds its heap
+  pin).
+
+### Known limits
+
+- The divergence check's population is still relation-probe columns and leading
+  index columns. A filter column that is neither an FK nor indexed is invisible
+  to it in either branch, and feeding the index advisor's recommendations in does
+  not change that: both derive from the same relation topology.
+- The unindexed-filter branch's first gate is a constant (rarest bucket below the
+  assumed limit), so it declines divergences whose absolute damage is larger than
+  the ones it reports. Measured on the same fixture shape at 200,000 rows with a
+  rarest bucket of 60: 2,473 buffers custom against 200,547 generic, an 81x flip
+  and 198,074 extra buffer accesses, declined. Deriving the boundary from pages,
+  rows and the cost constants is the honest fix and has not been done.
+
 ## 0.56.0 (2026-07-27)
 
 ### Added

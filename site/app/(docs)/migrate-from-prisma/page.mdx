@@ -272,6 +272,58 @@ The callback form is Prisma's, unchanged: `prisma.$extends(fn)` is `fn(prisma)`.
 
 Two more shapes throw `ValidationError` (`TURBINE_E003`): a `client` member whose name would shadow a delegate or a client-level method, and a `model` key that names no model on this client (the message lists the known models).
 
+### Turbine-native query options
+
+Prisma's argument shapes have no equivalent for a handful of Turbine-only query options, so the adapter forwards them verbatim when you pass them:
+
+```ts
+const rows = await compat.Order.findMany({
+  where: { tenantId },
+  orderBy: { id: 'asc' },
+  take: 20,
+  forceCustomPlan: true,   // Turbine-only, forwarded to the core client
+});
+```
+
+The full set, by operation: `forceCustomPlan`, `warnOnUnlimited`, `skipGlobalFilters`, `allowFullTableScan`, `timeout`, `includePii`, `stableRelationOrder`, `optimisticLock` and `groupBy`'s `distinctOn`. The two that name schema fields (`optimisticLock.field`, `distinctOn.columns`) are translated through the same name map as the rest of the call, so you write them in **Prisma** field names like everything else.
+
+<Callout type="warning" title="Before 0.57.0 these were silently dropped">
+  This is the correction, stated plainly rather than as an improvement. Until
+  0.57.0 the adapter built a fresh Turbine args object and copied a hand-written
+  allowlist of keys. Anything not on that list was accepted by the type-checker
+  and thrown away with no error, no warning and no test: `forceCustomPlan` (which
+  0.56.0 shipped and `turbine doctor` recommended), `warnOnUnlimited`,
+  `skipGlobalFilters`, `allowFullTableScan`, `timeout` on every write except
+  `create`, `optimisticLock`, `stableRelationOrder` and `distinctOn`.
+
+  Two of those changes are visible on upgrade even if you change nothing:
+  **`skipGlobalFilters` now takes effect** where it used to be inert, and
+  **`relationLoadStrategy: 'query'`** now maps to Turbine's `'batched'` instead of
+  being forwarded to a resolver that had no `'query'` branch and silently used the
+  join plan. `limit` on `updateMany` / `deleteMany` now throws
+  `UnsupportedFeatureError` (`TURBINE_E017`) rather than being dropped, because
+  silently ignoring a bound on a mass mutation is the worse failure.
+
+  The class of bug is closed rather than the instance: the option surface is now
+  runtime data (`src/query/option-surface.ts`) that the compiler checks against
+  the core arg interfaces, so adding an option to core **fails the build** in the
+  adapter until it is classified. It does not make one edit sufficient; it makes
+  the missing second edit loud.
+</Callout>
+
+### Unknown query options warn
+
+A key that is neither a Prisma argument nor a Turbine option used to disappear. Since 0.57.0 it logs one dev-only line per model, operation and key:
+
+```txt
+[turbine] prisma-compat: unknown option "customPlan" in User.findMany(), it is ignored. Did you mean "forceCustomPlan"?
+[turbine] prisma-compat: "limit" is Turbine's spelling and is ignored here; prisma-compat takes Prisma's "take". (User.findMany)
+```
+
+The second form covers the specific confusion of writing Turbine's spelling into a Prisma-shaped call (`limit`/`with`/`offset` instead of `take`/`include`/`skip`), where a nearest-name guess would be unhelpful.
+
+It is a **warning, never a throw**, for the same reason the client-config check added in 0.53 is: a stray key must not turn a working app into a failing one on upgrade. It is silent under `NODE_ENV=production`, fires once per key per process, and every legitimate Prisma argument is on the known set, including the ones Prisma itself accepts and ignores (`count({ take })`).
+
 ### What the adapter does *not* do
 
 Read this before you commit to the adapter path. These are verified against the implementation, not aspirational.
@@ -280,7 +332,7 @@ Read this before you commit to the adapter path. These are verified against the 
 
 **Present but inert.** `$connect()` and `$disconnect()` exist and resolve immediately without doing anything. The `TurbineClient` owns the pool, so shut down with `db.disconnect()`, not `prisma.$disconnect()`. A migration that relies on `$disconnect()` closing connections (tests, serverless teardown) will leak the pool.
 
-**`count()` silently ignores most of its options.** Only `where` and `timeout` are forwarded. Prisma's `select`, `cursor`, `take`, `skip`, `orderBy`, and `distinct` on `count` are dropped without error, so `count({ take: 10 })` returns the count of *all* matching rows, not 10. If you count with any of those, rewrite the call.
+**`count()` silently ignores most of its Prisma options.** Only `where`, plus the Turbine-native options above, are forwarded. Prisma's `select`, `cursor`, `take`, `skip`, `orderBy`, and `distinct` on `count` are dropped without error, so `count({ take: 10 })` returns the count of *all* matching rows, not 10. If you count with any of those, rewrite the call.
 
 **Throws rather than guessing.** Three shapes raise `UnsupportedFeatureError` instead of returning a subtly wrong result:
 

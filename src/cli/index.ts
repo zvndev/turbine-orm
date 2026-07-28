@@ -70,11 +70,13 @@ import {
 import { introspect } from '../introspect.js';
 import {
   collectDivergenceCandidateColumns,
+  collectDivergenceOrderColumns,
   findPlanDivergence,
   PLAN_DIVERGENCE_THRESHOLDS,
+  type PlanDivergenceFinding,
   type PlanDivergenceReport,
 } from '../plan-divergence.js';
-import type { SchemaMetadata } from '../schema.js';
+import { type SchemaMetadata, snakeToCamel } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
 import type { CliOverrides, ConfigLoadError, ResolvedConfig, TurbineCliConfig } from './config.js';
@@ -2905,8 +2907,14 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
   // one-connection snapshot rather than opening a second read.
   const divergenceOn = args.noPlanDivergence !== true;
   const divergenceColumns = divergenceOn ? collectDivergenceCandidateColumns(schema) : [];
+  // The columns a finding could ORDER BY, read alongside the candidates: the
+  // size of an unindexed-filter flip turns on the ORDER column's correlation,
+  // not the filter column's, and reading only the latter is how an earlier
+  // revision printed a statistic about the wrong column.
+  const divergenceOrderColumns = divergenceOn ? collectDivergenceOrderColumns(schema) : [];
   const probedTables = [...new Set(missing.map((m) => m.table))];
   const statsTables = [...new Set([...probedTables, ...divergenceColumns.map((c) => c.table)])];
+  const distributionColumns = [...divergenceColumns, ...divergenceOrderColumns];
 
   let snapshot: StatsSnapshot;
   try {
@@ -2915,7 +2923,7 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
       schema: config.schema,
       tables: statsTables,
       columns: probedColumns,
-      distributionColumns: divergenceColumns,
+      distributionColumns,
     });
   } catch (err) {
     snapshot = {
@@ -2966,7 +2974,7 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const divergence: PlanDivergenceReport =
     divergenceOn && snapshot.available
       ? findPlanDivergence(schema, snapshot)
-      : { findings: [], notices: [], candidatesConsidered: 0 };
+      : { findings: [], notices: [], candidatesConsidered: 0, consideredIndexed: 0, consideredUnindexed: 0 };
 
   if (jsonMode) {
     spinner?.stop();
@@ -3083,6 +3091,14 @@ function buildDoctorJson(ctx: {
   // just because the section was skipped or found nothing.
   out.planDivergence = ctx.divergence.findings;
   out.planDivergenceNotices = ctx.divergence.notices;
+  // How large the scored population was, and how it split. A consumer counting
+  // findings alone cannot tell "considered and clean" from "never looked", and
+  // the unindexed half of that population did not exist before.
+  out.planDivergenceScored = {
+    considered: ctx.divergence.candidatesConsidered,
+    indexed: ctx.divergence.consideredIndexed,
+    unindexed: ctx.divergence.consideredUnindexed,
+  };
   return out;
 }
 
@@ -3118,6 +3134,12 @@ async function renderDoctorHuman(ctx: {
     return;
   }
 
+  // One column, one place. An unindexed filter column that ALSO diverges is one
+  // problem with one remedy (the index), so the divergence evidence renders as
+  // an extra block on the missing-index finding rather than as a second,
+  // unrelated-looking entry in the cached-plan section.
+  const attached = attachDivergenceToMissingIndexes(findings, divergence);
+
   if (findings.length > 0) {
     warn(`Found ${bold(String(findings.length))} unindexed relation probe(s)`);
     newline();
@@ -3126,9 +3148,9 @@ async function renderDoctorHuman(ctx: {
     newline();
 
     if (usable) {
-      renderTiers(findings, snapshot, args);
+      renderTiers(findings, snapshot, args, attached);
     } else {
-      renderTopologyFallback(findings, snapshot);
+      renderTopologyFallback(findings, snapshot, attached);
     }
 
     // Heat honesty: one line when the workload-heat boost could not be sourced.
@@ -3139,7 +3161,7 @@ async function renderDoctorHuman(ctx: {
   }
 
   renderInvalidIndexes(invalid);
-  renderPlanDivergence(divergence);
+  renderPlanDivergence(divergence, attached);
 
   if (subtract.unusedRan) {
     renderUnusedIndexes(subtract.unused, subtract.minScans, snapshot);
@@ -3260,8 +3282,127 @@ function renderDoctorAudit(audit: DoctorIndexAudit[], minScans: number | undefin
   newline();
 }
 
+/**
+ * The `unindexed-filter` divergence findings that belong ON a missing-index
+ * finding, keyed by that finding's `table\u0000column`.
+ *
+ * A branch-B finding says "this column has no index AND the missing index is
+ * also a cached-plan hazard". Whenever the same run's index advisor already
+ * names the column, that is ONE problem with ONE remedy, so it is rendered as
+ * evidence on that finding. The rare leftovers (a column served only by a
+ * partial or expression index, so the advisor considers the probe covered while
+ * the planner has no plain btree path) keep their own entry in the cached-plan
+ * section, because there is no missing-index finding to hang them on.
+ */
+type AttachedDivergence = Map<string, PlanDivergenceFinding>;
+
+function attachDivergenceToMissingIndexes(
+  findings: DoctorFinding[],
+  divergence: PlanDivergenceReport,
+): AttachedDivergence {
+  const byColumn = new Map<string, PlanDivergenceFinding>();
+  for (const d of divergence.findings) {
+    if (d.branch !== 'unindexed-filter') continue;
+    byColumn.set(`${d.table}\u0000${d.column}`, d);
+  }
+  const attached: AttachedDivergence = new Map();
+  for (const f of findings) {
+    // Single-column probes only: a composite probe's index is not the thing the
+    // single-column divergence model reasons about.
+    if (f.missing.columns.length !== 1 || f.missing.columns[0] === undefined) continue;
+    const key = `${f.missing.table}\u0000${f.missing.columns[0]}`;
+    const d = byColumn.get(key);
+    if (d) attached.set(key, d);
+  }
+  return attached;
+}
+
+/** The key a missing-index finding is looked up by in {@link AttachedDivergence}. */
+function attachKey(f: DoctorFinding): string {
+  return `${f.missing.table}\u0000${f.missing.columns[0] ?? ''}`;
+}
+
+/**
+ * The cached-plan evidence block printed UNDER a missing-index finding.
+ *
+ * It never recommends `forceCustomPlan`: the remedy is the index the same
+ * finding already prints, and recommending a per-query plan-cache override for a
+ * missing index would be advice to paper over a table scan.
+ */
+/**
+ * How big an `unindexed-filter` flip is, and under what condition, as plain
+ * lines both branch-B renderers print.
+ *
+ * The condition is not decoration. The generic plan's cost is one heap fetch per
+ * index entry, so the ratio is the table's rows-per-page when the heap is not in
+ * `orderColumn` order and ~1x when it is: 80x and 1.2x on two fixtures identical
+ * in every scored input. An earlier revision printed the ratio unconditionally
+ * and quoted the FILTER column's correlation next to a sentence about the ORDER
+ * column's physical order, so the one field offered as the reader's escape hatch
+ * was measured on the wrong column.
+ */
+function divergenceAmplificationLines(d: PlanDivergenceFinding): string[] {
+  const amp = divInt(d.worstCaseAmplification ?? 0);
+  const corr = d.orderColumnCorrelation;
+  const corrLabel =
+    corr === null || corr === undefined
+      ? `no pg_stats correlation available for "${d.orderColumn}"`
+      : `correlation ${corr.toFixed(5)} on "${d.orderColumn}"`;
+  if (d.heapNearlyOrdered === true) {
+    return [
+      `The size of that flip turns on the heap's physical order, and THIS heap is in near-exact`,
+      `"${d.orderColumn}" order (${corrLabel}), so consecutive index entries hit the`,
+      `same pinned page: measured ~1x, not the ~${amp}x an unordered heap reads. Most likely this`,
+      `one is not costing you anything today. It is also one sampled statistic away from the`,
+      `much worse reading, so measure rather than assume in either direction.`,
+    ];
+  }
+  return [
+    `That costs ~${amp}x the buffers of the seq scan, because each index entry is its own heap`,
+    `fetch (${corrLabel}). The one shape that reads ~1x instead is a heap`,
+    `in near-exact "${d.orderColumn}" order; two pages of local disorder already reads ~41x.`,
+  ];
+}
+
+function renderDivergenceEvidence(d: PlanDivergenceFinding): void {
+  const tuples = divInt(d.tuplesWalked ?? d.rows);
+  console.log(
+    `    ${dim(symbols.tee)} ${yellow('cached-plan risk:')} this unindexed filter column can also flip a cached plan.`,
+  );
+  console.log(
+    `      ${dim(`${divInt(d.rows)} rows in ${divInt(d.pages)} pages, rarest value ~${divInt(d.rarestBucket)} rows, below the assumed LIMIT ${d.assumedLimit}.`)}`,
+  );
+  console.log(
+    `      ${dim(`Without the index the good plan is a seq scan (${divInt(d.pages)} pages); a promoted generic`)}`,
+  );
+  console.log(
+    `      ${dim(`plan cannot see the value is rare, keeps the ordered "${d.orderColumn}" walk, and reads`)}`,
+  );
+  console.log(`      ${dim(`up to ~${tuples} tuples before it fills the LIMIT.`)}`);
+  console.log(`      ${dim('Postgres promotes this shape exactly when the workload keeps asking for the rare')}`);
+  console.log(`      ${dim('value: that is the case where the custom plan is expensive enough for the generic')}`);
+  console.log(`      ${dim('estimate to look cheaper.')}`);
+  for (const line of divergenceAmplificationLines(d)) console.log(`      ${dim(line)}`);
+  console.log(`      ${dim('Adding the index above is the fix. Confirm first if you want to:')}`);
+  for (const line of d.diagnosticSql.split('\n')) {
+    console.log(`        ${green(line)}`);
+  }
+  console.log(`      ${dim('After adding this index, re-run doctor. This column is expected to reappear as a')}`);
+  console.log(`      ${dim('sparse-value finding in the cached-plan section. That later finding is exposure, not')}`);
+  console.log(`      ${dim('a regression: the index makes the good plan much cheaper, which is why the ratio it')}`);
+  console.log(`      ${dim('quotes is larger, and on a measured fixture it is also what stops Postgres from')}`);
+  console.log(`      ${dim('promoting the generic plan at all. Treat the reappearance as the normal end state;')}`);
+  console.log(`      ${dim("use the diagnostic block's generic_plans counter to decide whether anything more is")}`);
+  console.log(`      ${dim('warranted.')}`);
+}
+
 /** Cost-aware tiered output: three sections, each finding annotated with its numbers. */
-function renderTiers(findings: DoctorFinding[], snapshot: StatsSnapshot, _args: CliArgs): void {
+function renderTiers(
+  findings: DoctorFinding[],
+  snapshot: StatsSnapshot,
+  _args: CliArgs,
+  attached: AttachedDivergence,
+): void {
   const ageLabel = snapshot.statsAgeDays !== null ? `${Math.round(snapshot.statsAgeDays)}d` : 'unknown';
   console.log(
     `  ${dim(`Cost triage based on live statistics (stats reset ${ageLabel} ago). Thresholds: tiny < ${STATS_THRESHOLDS.tinyTableRows.toLocaleString()} rows,`)}`,
@@ -3286,13 +3427,17 @@ function renderTiers(findings: DoctorFinding[], snapshot: StatsSnapshot, _args: 
     console.log(`  ${bold(tierColor[tier](`${TIER_LABEL[tier]} (${inTier.length})`))}`);
     newline();
     for (const f of inTier) {
-      renderFinding(f, { concurrently: true, withReasons: true });
+      renderFinding(f, { concurrently: true, withReasons: true, divergence: attached.get(attachKey(f)) });
     }
   }
 }
 
 /** Degraded output: today's size-sorted topology report when stats are absent/young. */
-function renderTopologyFallback(findings: DoctorFinding[], snapshot: StatsSnapshot): void {
+function renderTopologyFallback(
+  findings: DoctorFinding[],
+  snapshot: StatsSnapshot,
+  attached: AttachedDivergence,
+): void {
   warn('Statistics unavailable or too young to score cost: showing size-sorted topology only.');
   for (const notice of snapshot.notices) console.log(`  ${dim(`- ${notice}`)}`);
   if (snapshot.statsAgeDays !== null && snapshot.statsAgeDays < STATS_THRESHOLDS.minStatsAgeDays) {
@@ -3304,12 +3449,15 @@ function renderTopologyFallback(findings: DoctorFinding[], snapshot: StatsSnapsh
 
   const sorted = [...findings].sort((a, b) => (b.score.metrics.rows ?? 0) - (a.score.metrics.rows ?? 0));
   for (const f of sorted) {
-    renderFinding(f, { concurrently: false, withReasons: false });
+    renderFinding(f, { concurrently: false, withReasons: false, divergence: attached.get(attachKey(f)) });
   }
 }
 
 /** Render one finding: table + columns, probing relations, reasons, and the create SQL. */
-function renderFinding(f: DoctorFinding, opts: { concurrently: boolean; withReasons: boolean }): void {
+function renderFinding(
+  f: DoctorFinding,
+  opts: { concurrently: boolean; withReasons: boolean; divergence?: PlanDivergenceFinding },
+): void {
   const m = f.missing;
   const rows = f.score.metrics.rows;
   const rowsLabel = rows !== null ? `~${rows.toLocaleString()} rows` : 'row count unknown';
@@ -3325,7 +3473,9 @@ function renderFinding(f: DoctorFinding, opts: { concurrently: boolean; withReas
       console.log(`    ${dim(symbols.tee)} ${dim(reason)}`);
     }
   }
-  console.log(`    ${dim(symbols.teeEnd)} ${green(doctorCreateSql(f, { concurrently: opts.concurrently }))}`);
+  const last = opts.divergence ? symbols.tee : symbols.teeEnd;
+  console.log(`    ${dim(last)} ${green(doctorCreateSql(f, { concurrently: opts.concurrently }))}`);
+  if (opts.divergence) renderDivergenceEvidence(opts.divergence);
   newline();
 }
 
@@ -3344,6 +3494,39 @@ function renderInvalidIndexes(invalid: ReturnType<typeof findInvalidIndexes>): v
   }
 }
 
+/**
+ * The release in which `turbine-orm/prisma-compat` began forwarding Turbine-only
+ * query options (`forceCustomPlan` among them) to the core client.
+ *
+ * Printed rather than assumed, and the sentence stays even after that release:
+ * doctor's audience routinely runs a CLI newer than the library pinned in the
+ * app, and on an older library the option is accepted and silently ignored.
+ */
+const COMPAT_PASSTHROUGH_VERSION = '0.57.0';
+
+/**
+ * The gates + scored-population footer. Split out because it is printed from two
+ * places: the normal section, and the case where every finding was attached to a
+ * missing-index finding instead.
+ */
+function renderDivergenceGates(divergence: PlanDivergenceReport): void {
+  const t = PLAN_DIVERGENCE_THRESHOLDS;
+  console.log(
+    `  ${dim(`Gates, indexed column: the wrong plan must walk >= ${t.minWalkPages} pages and >= ${Math.round(t.minWalkFraction * 100)}% of the table.`)}`,
+  );
+  console.log(
+    `  ${dim(`Gates, unindexed column: the rarest value must hold fewer rows than the limit, and the wrong`)}`,
+  );
+  console.log(
+    `  ${dim(`plan must walk >= ${t.minGenericTupleWalk.toLocaleString('en-US')} tuples. Assumed LIMIT ${t.assumedLimit} throughout.`)}`,
+  );
+  console.log(
+    `  ${dim(`${divergence.candidatesConsidered} column(s) were scored (${divergence.consideredIndexed} indexed, ${divergence.consideredUnindexed} unindexed). That population is relation-probe`)}`,
+  );
+  console.log(`  ${dim('and leading-index columns only: a filter column that is neither is not covered. Skip this')}`);
+  console.log(`  ${dim('section with --no-plan-divergence.')}`);
+}
+
 /** Round to a whole number and group it, for the divergence report's estimates. */
 function divInt(n: number): string {
   if (!Number.isFinite(n)) return 'unbounded';
@@ -3356,8 +3539,28 @@ function divInt(n: number): string {
  * application code (scope the plan-cache mode to the affected reads), and the
  * index that looks like a fix is measured NOT to be one.
  */
-function renderPlanDivergence(divergence: PlanDivergenceReport): void {
-  const { findings, notices } = divergence;
+function renderPlanDivergence(divergence: PlanDivergenceReport, attached: AttachedDivergence): void {
+  const { notices } = divergence;
+  // Anything already rendered as evidence on a missing-index finding is NOT
+  // repeated here: one column, one problem, one remedy.
+  const rendered = new Set(attached.values());
+  const findings = divergence.findings.filter((f) => !rendered.has(f));
+  // Every divergence finding was attached above, so this section has no entries
+  // of its own. The pointer, the gates and the scored population still belong in
+  // the report: they are output of THIS check, and a reader must be able to tell
+  // "considered and clean" from "never looked".
+  //
+  // Printed BEFORE the notices rather than inside an early return: an early
+  // return that also required `notices.length === 0` dropped both blocks
+  // whenever any candidate lacked a pg_stats row, which is the normal reason a
+  // notice exists.
+  if (findings.length === 0 && rendered.size > 0) {
+    console.log(
+      `  ${dim(`Cached-plan divergence: ${rendered.size} finding(s), shown with the index findings above.`)}`,
+    );
+    renderDivergenceGates(divergence);
+    newline();
+  }
   if (findings.length === 0 && notices.length === 0) return;
 
   if (findings.length > 0) {
@@ -3373,7 +3576,47 @@ function renderPlanDivergence(divergence: PlanDivergenceReport): void {
     newline();
   }
 
+  const analyzedLabel = (f: PlanDivergenceFinding): string =>
+    f.lastAnalyze === null
+      ? 'last ANALYZE unknown'
+      : `last analyzed ${Math.max(0, Math.round((Date.now() - f.lastAnalyze.getTime()) / 86_400_000))}d ago`;
+
   for (const f of findings) {
+    if (f.branch === 'unindexed-filter') {
+      // Only reached when the column has no missing-index finding to hang this
+      // on (an index that exists but cannot serve the equality: partial,
+      // expression, or non-btree). The remedy is still an index, not a
+      // plan-cache setting, so this entry never suggests forceCustomPlan.
+      console.log(
+        `  ${yellow(symbols.warning)} ${bold(cyan(`${f.table}.${f.column}`))}  ${gray('UNINDEXED-FILTER FLIP')}`,
+      );
+      console.log(
+        `    ${dim(symbols.tee)} ${divInt(f.rows)} rows in ${divInt(f.pages)} pages, rarest value ~${bold(divInt(f.rarestBucket))} rows, below the assumed LIMIT ${f.assumedLimit}`,
+      );
+      console.log(
+        `    ${dim(symbols.tee)} no index serves ${f.column} = $1, so the good plan is a seq scan (${divInt(f.pages)} pages);`,
+      );
+      console.log(
+        `      ${dim(`a promoted generic plan keeps the ordered "${f.orderColumn}" walk and reads up to ~${divInt(f.tuplesWalked ?? f.rows)} tuples`)}`,
+      );
+      console.log(`      ${dim('before it fills the LIMIT.')}`);
+      for (const line of divergenceAmplificationLines(f)) console.log(`      ${dim(line)}`);
+      console.log(
+        `    ${dim(symbols.tee)} ${dim(`filter-column correlation ${f.correlation.toFixed(2)}, ${analyzedLabel(f)}`)}`,
+      );
+      console.log(
+        `    ${dim(symbols.tee)} ${dim('the fix is an index that can serve this equality. A partial or expression index')}`,
+      );
+      console.log(`      ${dim('on the column does not: the planner has no path for the bare predicate. A hash')}`);
+      console.log(`      ${dim('index does, and a column served by one is scored by the other rule instead.')}`);
+      console.log(`    ${dim(symbols.teeEnd)} ${dim('confirm with YOUR values before changing anything:')}`);
+      for (const line of f.diagnosticSql.split('\n')) {
+        console.log(`      ${green(line)}`);
+      }
+      newline();
+      continue;
+    }
+
     console.log(`  ${yellow(symbols.warning)} ${bold(cyan(`${f.table}.${f.column}`))}  ${gray('SPARSE-VALUE FLIP')}`);
     console.log(
       `    ${dim(symbols.tee)} generic estimate ${bold(divInt(f.genericEstimate))} rows ${dim(`(${divInt(f.rows)} rows / ${divInt(f.distinctValues)} distinct values)`)}`,
@@ -3382,17 +3625,13 @@ function renderPlanDivergence(divergence: PlanDivergenceReport): void {
       `    ${dim(symbols.tee)} rarest value bucket ${bold(divInt(f.rarestBucket))} rows ${dim('(pg_stats most_common_freqs / residual bucket)')}`,
     );
     console.log(
-      `    ${dim(symbols.tee)} crossover ${bold(divInt(f.crossoverRows))} rows ${dim(`(sqrt(limit ${f.assumedLimit} x ${divInt(f.pages)} pages); ${divInt(f.crossoverRowsWide)} at limit ${f.thresholds.wideLimit})`)}`,
-    );
-    const analyzed =
-      f.lastAnalyze === null
-        ? 'last ANALYZE unknown'
-        : `last analyzed ${Math.max(0, Math.round((Date.now() - f.lastAnalyze.getTime()) / 86_400_000))}d ago`;
-    console.log(
-      `    ${dim(symbols.tee)} ${dim(`values below the crossover: ${divInt(f.valuesBelowCrossover)} of ${divInt(f.distinctValues)}, correlation ${f.correlation.toFixed(2)}, ${analyzed}`)}`,
+      `    ${dim(symbols.tee)} crossover ${bold(divInt(f.crossoverRows ?? 0))} rows ${dim(`(sqrt(limit ${f.assumedLimit} x ${divInt(f.pages)} pages); ${divInt(f.crossoverRowsWide ?? 0)} at limit ${f.thresholds.wideLimit})`)}`,
     );
     console.log(
-      `    ${dim(symbols.tee)} for such a value the generic plan walks ~${bold(divInt(f.walkPages))} of ${divInt(f.pages)} pages ${dim(`(${Math.round(f.walkFraction * 100)}% of the table)`)}`,
+      `    ${dim(symbols.tee)} ${dim(`values below the crossover: ${divInt(f.valuesBelowCrossover ?? 0)} of ${divInt(f.distinctValues)}, filter-column correlation ${f.correlation.toFixed(2)}, ${analyzedLabel(f)}`)}`,
+    );
+    console.log(
+      `    ${dim(symbols.tee)} for such a value the generic plan walks ~${bold(divInt(f.walkPages ?? 0))} of ${divInt(f.pages)} pages ${dim(`(${Math.round((f.walkFraction ?? 0) * 100)}% of the table)`)}`,
     );
     console.log(`      ${dim(`for reads shaped WHERE ${f.column} = $1 ORDER BY ${f.orderColumn} LIMIT $n,`)}`);
     console.log(`      ${dim("where the custom plan reads only that value's own rows.")}`);
@@ -3409,6 +3648,7 @@ function renderPlanDivergence(divergence: PlanDivergenceReport): void {
   }
 
   if (findings.length > 0) {
+    const first = findings.find((f) => f.branch === 'sparse-value');
     console.log(`  ${bold('What to do, in order:')}`);
     console.log(`    1. Check that this shape is promoted AT ALL. Step 1 of the block above: while`);
     console.log(`       ${dim('generic_plans is 0, Postgres is planning with your real values and there is nothing')}`);
@@ -3416,35 +3656,78 @@ function renderPlanDivergence(divergence: PlanDivergenceReport): void {
     console.log(`    2. If it does promote, compare the two plans. Both SETs matter: without them a`);
     console.log(`       ${dim('repeated seq scan resumes where the last one stopped and a catastrophic case reads')}`);
     console.log(`       ${dim('as harmless.')}`);
-    console.log(`    3. If the flip is real, scope the fix to those reads:`);
-    const first = findings[0]!;
-    console.log(
-      `       ${cyan(`db.${first.table}.findMany({ where: { ${first.columnField}: value }, orderBy: { ${first.orderColumnField}: 'asc' },`)}`,
-    );
-    console.log(`       ${cyan(`                     limit: 20, forceCustomPlan: true })`)}`);
-    console.log(`       ${dim('That withholds the prepared-statement NAME for that one query, so the driver')}`);
-    console.log(`       ${dim('re-parses it every execution and it is always planned with the real values. No')}`);
-    console.log(`       ${dim('GUC, no SET LOCAL, no transaction, no extra round trip.')}`);
-    console.log(`    4. Do NOT set planCacheMode on the client to fix this. There are measured shapes`);
-    console.log(`       ${dim('where a generic plan is dramatically better (an unordered LIMIT over a value whose')}`);
-    console.log(`       ${dim('rows are packed at the end of the heap: 4,262 buffers custom vs 71 generic on a')}`);
-    console.log(`       ${dim('reproducible fixture). A custom plan is not automatically the better plan.')}`);
-    console.log(`    5. A composite index on (${first.column}, ${first.orderColumn}) makes the GOOD plan better. It`);
-    console.log(
-      `       ${dim('does NOT stop the generic plan from choosing the other one, and it can widen the gap.')}`,
-    );
-    console.log(`       ${dim('Add it for the custom-plan win, not as a fix for this finding.')}`);
+    if (first) {
+      // The OPTION is named first and both call shapes follow, so no step
+      // assumes which client the reader is holding. The compat example uses
+      // Prisma's `take`: printing `limit` there would be a second wrong
+      // instruction, since `limit` is a Turbine spelling compat does not read.
+      console.log(`    3. If the flip is real, scope the fix to those reads with ${cyan('forceCustomPlan')}. It`);
+      console.log(`       ${dim('withholds the prepared-statement NAME for that one query, so the driver re-parses')}`);
+      console.log(`       ${dim('it every execution and it is always planned with the real values. No GUC, no SET')}`);
+      console.log(`       ${dim('LOCAL, no transaction, no extra round trip.')}`);
+      // Hanging indent rather than an alignment that pretends to line up: the
+      // call's own width depends on the table name, so a fixed padding column
+      // misaligns on every schema but the one it was written against.
+      const args = `where: { ${first.columnField}: value }, orderBy: { ${first.orderColumnField}: 'asc' },`;
+      // The accessor is the camelCase FIELD spelling, not the raw table name:
+      // TurbineClient and the code generator both define table accessors through
+      // snakeToCamel, so `db.inventory_location` is undefined on every
+      // snake_case schema. The finding's own `columnField` / `orderColumnField`
+      // are already field-space for the same reason.
+      console.log(`       ${dim('On the core client:')}`);
+      console.log(`         ${cyan(`db.${snakeToCamel(first.table)}.findMany({`)}`);
+      console.log(`           ${cyan(args)}`);
+      console.log(`           ${cyan('limit: 20, forceCustomPlan: true,')}`);
+      console.log(`         ${cyan('})')}`);
+      console.log(`       ${dim("Through turbine-orm/prisma-compat, the same option on the delegate call (Prisma's")}`);
+      console.log(`       ${dim('`take`, not `limit`). The Prisma MODEL name is not knowable from the schema side,')}`);
+      console.log(`       ${dim('so substitute your own:')}`);
+      console.log(`         ${cyan('compat.<Model>.findMany({')}`);
+      console.log(`           ${cyan(args)}`);
+      console.log(`           ${cyan('take: 20, forceCustomPlan: true,')}`);
+      console.log(`         ${cyan('})')}`);
+      console.log(
+        `       ${dim(`The compat passthrough requires turbine >= ${COMPAT_PASSTHROUGH_VERSION}. On an older version the option`)}`,
+      );
+      console.log(`       ${dim('is accepted and ignored there, so confirm at the wire with the same')}`);
+      console.log(`       ${dim('pg_prepared_statements check in step 1 rather than assuming it took effect.')}`);
+      console.log(`    4. Reaching for a database-wide plan_cache_mode is not the fix, whichever client you`);
+      console.log(`       ${dim('use. There are measured shapes where a generic plan is dramatically better: an')}`);
+      console.log(`       ${dim('unordered LIMIT over a value whose rows are packed at the end of the heap reads')}`);
+      console.log(`       ${dim('4,262 buffers under a custom plan against 71 under a generic one. That fixture is')}`);
+      console.log(`       ${dim('printed in full at turbineorm.dev/relations, so the number is checkable rather')}`);
+      console.log(`       ${dim('than asserted. Pinning every statement')}`);
+      console.log(
+        `       ${dim('in one direction trades this finding for its mirror image. That applies equally to')}`,
+      );
+      console.log(`       ${dim("Turbine's client-level `planCacheMode` and to a SET or ALTER ROLE applied outside")}`);
+      console.log(`       ${dim('Turbine.')}`);
+      console.log(`    5. A composite index on (${first.column}, ${first.orderColumn}) makes the GOOD plan better. It`);
+      console.log(
+        `       ${dim('does NOT stop the generic plan from choosing the other one, and it can widen the gap.')}`,
+      );
+      console.log(`       ${dim('Add it for the custom-plan win, not as a fix for this finding.')}`);
+    }
+    // Stated separately because the first remedy genuinely differs by branch: an
+    // UNINDEXED column's flip is fixed by the index, and a per-query plan-cache
+    // override there would only paper over a table scan.
+    if (findings.some((f) => f.branch === 'unindexed-filter')) {
+      console.log(
+        `    ${first ? 6 : 3}. A finding on an UNINDEXED column has a different FIRST remedy: add an index that`,
+      );
+      console.log(`       ${dim('serves the equality, then re-run doctor and re-score. The index moves the')}`);
+      console.log(`       ${dim('divergence in both directions at once (it makes the good plan much cheaper, which')}`);
+      console.log(
+        `       ${dim('widens the ratio, and on a measured fixture it also stopped Postgres promoting the')}`,
+      );
+      console.log(`       ${dim('generic plan at all), so do not assume the finding is closed by adding it.')}`);
+    }
     newline();
     console.log(`  ${dim('This finding is derived from statistics, not from your traffic: it says the DISTRIBUTION')}`);
-    console.log(`  ${dim('admits a damaging flip, not that a query is running one today. It models ONE shape,')}`);
-    console.log(`  ${dim('the rare value that loses its bitmap plan. It cannot see where a value physically')}`);
-    console.log(`  ${dim('sits in the heap, so a clean report is not evidence of immunity.')}`);
-    console.log(
-      `  ${dim(`Gates: the wrong plan must walk >= ${PLAN_DIVERGENCE_THRESHOLDS.minWalkPages} pages and >= ${Math.round(PLAN_DIVERGENCE_THRESHOLDS.minWalkFraction * 100)}% of the table, at an assumed`)}`,
-    );
-    console.log(
-      `  ${dim(`LIMIT ${PLAN_DIVERGENCE_THRESHOLDS.assumedLimit}. ${divergence.candidatesConsidered} column(s) were scored. Skip this section with --no-plan-divergence.`)}`,
-    );
+    console.log(`  ${dim('admits a damaging flip, not that a query is running one today. It cannot see where a')}`);
+    console.log(`  ${dim('value physically sits in the heap, so a clean report is not evidence of immunity, and')}`);
+    console.log(`  ${dim('a column that is neither an FK nor indexed is not in the scored population at all.')}`);
+    renderDivergenceGates(divergence);
     newline();
   }
 

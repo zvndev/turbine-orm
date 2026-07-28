@@ -13,9 +13,13 @@
  *     the generic estimate. It used to be flagged. It must now be SILENT: that
  *     rule predicted the wrong sign on live fixtures and was removed, and these
  *     tests exist so it cannot come back by accident.
- *   - Silence: uniform distributions, unindexed columns, tables with no
- *     alternative ordering index, unique columns, and the low-cardinality
- *     "3% / 97%" shape whose rare value is still far above the crossover.
+ *   - Silence: uniform distributions, tables with no alternative ordering index,
+ *     unique columns, and the low-cardinality "3% / 97%" shape whose rare value
+ *     is still far above the crossover.
+ *
+ * The OTHER scoring branch, `unindexed-filter`, has its own file:
+ * plan-divergence-unindexed.test.ts. An unindexed column is no longer silent
+ * here by exclusion; it is scored by that branch and declines on its own gates.
  *
  * Run: tsx --test src/test/plan-divergence.test.ts
  */
@@ -224,9 +228,12 @@ describe('findPlanDivergence - the modelled sparse-value flip', () => {
     const report = findPlanDivergence(schemaWith('orders'), longTail());
     assert.equal(report.findings.length, 1);
     const f = report.findings[0]!;
+    assert.equal(f.branch, 'sparse-value');
     assert.equal(f.table, 'orders');
     assert.equal(f.column, 'tenant_id');
     assert.equal(report.candidatesConsidered, 1);
+    assert.equal(report.consideredIndexed, 1);
+    assert.equal(report.consideredUnindexed, 0);
   });
 
   it('reproduces the planner generic estimate exactly (rows / n_distinct)', () => {
@@ -237,11 +244,11 @@ describe('findPlanDivergence - the modelled sparse-value flip', () => {
 
   it('places the generic estimate above and the rarest bucket below the crossover', () => {
     const f = findPlanDivergence(schemaWith('orders'), longTail()).findings[0]!;
-    assert.equal(Math.round(f.crossoverRows), 367);
-    assert.ok(f.genericEstimate >= f.crossoverRows);
-    assert.ok(f.rarestBucket < f.crossoverRows);
-    assert.ok(f.walkPages >= PLAN_DIVERGENCE_THRESHOLDS.minWalkPages);
-    assert.ok(f.walkFraction >= PLAN_DIVERGENCE_THRESHOLDS.minWalkFraction);
+    assert.equal(Math.round(f.crossoverRows!), 367);
+    assert.ok(f.genericEstimate >= f.crossoverRows!);
+    assert.ok(f.rarestBucket < f.crossoverRows!);
+    assert.ok(f.walkPages! >= PLAN_DIVERGENCE_THRESHOLDS.minWalkPages);
+    assert.ok(f.walkFraction! >= PLAN_DIVERGENCE_THRESHOLDS.minWalkFraction);
   });
 
   it('counts the values sitting on the wrong side of the crossover', () => {
@@ -279,7 +286,7 @@ describe('findPlanDivergence - the modelled sparse-value flip', () => {
     // residual = rows x (1 - sum(freqs)) / (48 - 39)
     assert.ok(f.rarestBucket > 0 && f.rarestBucket < 30);
     // The 9 non-MCV values are all counted as below the crossover.
-    assert.ok(f.valuesBelowCrossover >= 9);
+    assert.ok(f.valuesBelowCrossover! >= 9);
   });
 });
 
@@ -398,7 +405,12 @@ describe('findPlanDivergence - non-damaging shapes stay silent', () => {
     assert.deepEqual(findPlanDivergence(schemaWith('orders'), snapshot).findings, []);
   });
 
-  it('a column with NO index (that is the missing-index finding, not this one)', () => {
+  it('a column with NO index whose rarest value still holds more rows than the limit', () => {
+    // An unindexed column is no longer excluded: it is scored by the
+    // `unindexed-filter` branch instead (see plan-divergence-unindexed.test.ts).
+    // This fixture stays silent on that branch's own gate, because its rarest
+    // bucket is ~30 rows against an assumed LIMIT of 20, so the ordered walk
+    // fills the limit long before it reaches the end of the table.
     const snapshot = snapshotWith({
       tables: [tableStats('orders', 302_200, 6_720)],
       indexes: [idx('orders', 'orders_pkey', ['id'], { isPrimary: true, isUnique: true })],
@@ -410,7 +422,13 @@ describe('findPlanDivergence - non-damaging shapes stay silent', () => {
         }),
       ],
     });
-    assert.deepEqual(findPlanDivergence(schemaWith('orders'), snapshot).findings, []);
+    const report = findPlanDivergence(schemaWith('orders'), snapshot);
+    assert.deepEqual(report.findings, []);
+    // Considered and declined, and counted as unindexed. It used to be dropped
+    // before the counter, which put it outside the findings AND the notices.
+    assert.equal(report.candidatesConsidered, 1);
+    assert.equal(report.consideredUnindexed, 1);
+    assert.equal(report.consideredIndexed, 0);
   });
 
   it('a table with no ALTERNATIVE ordering index (nothing to flip to)', () => {
@@ -445,6 +463,9 @@ describe('findPlanDivergence - non-damaging shapes stay silent', () => {
   });
 
   it('an index that only serves the filter through an expression or a predicate', () => {
+    // The planner has no path for the bare `tenant_id = $1`, so this scores on
+    // the `unindexed-filter` branch, whose gate this fixture does not meet
+    // (rarest bucket ~30 rows against the assumed LIMIT of 20).
     const snapshot = snapshotWith({
       tables: [tableStats('orders', 302_200, 6_720)],
       indexes: [
