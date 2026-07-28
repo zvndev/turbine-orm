@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.60.0 (2026-07-28)
+
+### Added
+
+- **prisma-compat warns when its name map is stale.** Nothing re-runs
+  `turbine migrate-from-prisma`. When the Prisma schema changes and the map does
+  not, the adapter keeps translating the names it has: a model added last week is
+  simply not on the compat client, a renamed field is quietly absent from results.
+  Both read as adapter bugs, and neither produces any signal at all. The command
+  now writes a `source: { path, hash }` into the emitted map, and
+  `createPrismaCompatClient` compares that hash against the file on disk once per
+  process and warns, naming the file and the command that fixes it.
+
+  Subordinate to not breaking a working app, in every direction: skipped entirely
+  when `NODE_ENV=production`; silent when the file is missing, since not shipping
+  `prisma/` to production is normal and is not evidence of drift; silent in a
+  bundled runtime with no `node:fs`; asynchronous and unawaited, so client
+  construction never waits on a file read; and once per process per path. A map
+  generated before this release, or written by hand, carries no `source` and is
+  skipped. The fingerprint is FNV-1a over the file with line endings, a leading
+  byte-order mark and trailing whitespace normalized away, so a Windows checkout of
+  an unchanged file is not reported as drift; nothing else is normalized, and an
+  edited comment counts as a change.
+
+- **`turbine migrate-from-prisma --if-db`**, so the command can live in
+  `postinstall` next to `prisma generate` rather than depending on someone
+  remembering to run it. When no connection string resolves, it prints one line
+  saying nothing was regenerated and exits 0, instead of failing. An `npm ci`
+  inside a build image legitimately has no database, and without the flag that
+  would turn a missing `DATABASE_URL` into a failed install. Existing artifacts are
+  left untouched. Documented on the CLI and migration pages, along with the CI
+  check (`--no-timestamp` then `git diff --exit-code`) for projects that want the
+  map's freshness enforced rather than nudged.
+
+### Changed
+
+- **Test-case names and provenance wording.** Test and fixture names that carried
+  opaque external-report labels now state what they assert. `scripts/check-private-terms.mjs`
+  gained a tracked set of patterns for wording that attributes a change to who
+  reported it or identifies a system a measurement was taken on, so the check runs
+  in CI and in every clone rather than only where a local blocklist exists. No code
+  behaviour changes.
+
 ## 0.59.2 (2026-07-28)
 
 ### Changed
@@ -3425,7 +3468,7 @@ findings (including one critical) fixed pre-release.
 **Patch:** `turbine generate` output typechecks again.
 
 ### Fixed
-- **Generated client failed `tsc` with TS2415 ("incorrectly extends") since 0.26.** The base `TurbineClient.$transaction` gained the batch-array overload (`$transaction([...queries])`), but the generator's interface-merge for the typed client still emitted only the callback signature, and a merged member must be compatible with the base member on its own. The generated `TurbineClient` interface now redeclares both overloads (typed callback + batch array). Found dogfooding the BataDB demo app on 0.28.2.
+- **Generated client failed `tsc` with TS2415 ("incorrectly extends") since 0.26.** The base `TurbineClient.$transaction` gained the batch-array overload (`$transaction([...queries])`), but the generator's interface-merge for the typed client still emitted only the callback signature, and a merged member must be compatible with the base member on its own. The generated `TurbineClient` interface now redeclares both overloads (typed callback + batch array). Caught by type-checking a generated client on 0.28.2.
 - **New regression gate:** `generate-typecheck.test.ts` compiles freshly generated output with `tsc --noEmit` against the repo's own source types (path-mapped), so template ↔ client-type drift can never ship again, string-pin tests alone stayed green through this break.
 
 ## 0.28.2 (2026-07-10)
@@ -3534,11 +3577,11 @@ Identical to 0.27.0 with an internal lint cleanup in the destructive-statement s
 ## 0.25.0 (2026-07-06)
 
 ### Added
-- **`turbineHttp` now accepts your generated client type for fully typed accessors.** `turbineHttp(pool, SCHEMA)` returned the base `TurbineClient`, so the generated typed accessors (`db.users`, `db.posts`, …) were invisible to TypeScript on the serverless/edge path, you had to cast at the call site. It now takes a backward-compatible type parameter: `turbineHttp<TurbineClient>(pool, SCHEMA)` (passing your generated client type) gives the exact same typed accessors as the TCP-path `turbine()` factory, no cast. The runtime object is unchanged, the base constructor already materializes those accessors per schema table, and existing untyped calls keep working (default = base client). Found dogfooding the BataDB edge path. (#30)
+- **`turbineHttp` now accepts your generated client type for fully typed accessors.** `turbineHttp(pool, SCHEMA)` returned the base `TurbineClient`, so the generated typed accessors (`db.users`, `db.posts`, …) were invisible to TypeScript on the serverless/edge path, you had to cast at the call site. It now takes a backward-compatible type parameter: `turbineHttp<TurbineClient>(pool, SCHEMA)` (passing your generated client type) gives the exact same typed accessors as the TCP-path `turbine()` factory, no cast. The runtime object is unchanged, the base constructor already materializes those accessors per schema table, and existing untyped calls keep working (default = base client). Caught on the serverless/edge path. (#30)
 
 ## 0.24.0 (2026-07-06)
 
-**Dogfood fixes from building a fresh Next.js app on 0.23.2 (#28).** Five papercuts that made the first-run experience worse than it should be, a silent empty `generate`, two rejected column types, doc drift, undocumented prereqs, and an inaccurate `serial` type. All fixed; the only behavior change is the `serial` mapping (below), which is safe for existing databases.
+**First-run fixes from a fresh Next.js app on 0.23.2 (#28).** Five papercuts that made the first-run experience worse than it should be, a silent empty `generate`, two rejected column types, doc drift, undocumented prereqs, and an inaccurate `serial` type. All fixed; the only behavior change is the `serial` mapping (below), which is safe for existing databases.
 
 ### Changed
 - **`serial` now emits `SERIAL` (int4), not `BIGSERIAL` (int8), behavior change for NEW pushes.** A `serial` primary key was typed `number` but, being int8, read back over the wire as a **string** for large values, the generated type lied. `serial` now maps to `SERIAL` (int4), whose values fit in a JS `number` and are returned as numbers, so the type is accurate end-to-end. A new **`bigserial`** column type covers 64-bit auto-increment keys (int8; large values still read back as string, now documented). **Existing databases are unaffected:** `turbine push` / `migrate --auto` never auto-narrow a live column's integer width, so a `serial` column created as `BIGSERIAL` before 0.24.0 is left exactly as-is. Only brand-new `CREATE TABLE`s get `SERIAL`. (#28)

@@ -1131,6 +1131,11 @@ export function generatePrismaMap(map: PrismaCompatMap, options?: GenerateFileOp
   }
   lines.push('  },');
   lines.push(`  enums: ${serializeStringRecord(map.enums)},`);
+  if (map.source) {
+    // Provenance, so the runtime adapter can tell you this file is stale rather
+    // than behaving as if the schema never changed.
+    lines.push(`  source: { path: '${escSQ(map.source.path)}', hash: '${escSQ(map.source.hash)}' },`);
+  }
   lines.push('};');
   lines.push('');
 

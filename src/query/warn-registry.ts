@@ -148,6 +148,13 @@ export const WARN_NS = {
    */
   unknownQueryOption: 'unknownQueryOption',
   /**
+   * The `prisma-map.ts` driving a `turbine-orm/prisma-compat` client no longer
+   * matches the Prisma schema it was generated from (prisma-compat.ts
+   * `warnStalePrismaMap`). Keyed on the schema path, so a process that builds a
+   * compat client per request reports it once.
+   */
+  stalePrismaMap: 'stalePrismaMap',
+  /**
    * `planCacheMode` was set on a client given an EXTERNAL pool, where Turbine
    * runs no connection setup, so the option is a no-op (client.ts constructor).
    * Keyed on the requested mode.

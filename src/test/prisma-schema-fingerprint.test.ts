@@ -1,0 +1,248 @@
+/**
+ * turbine-orm - Prisma schema fingerprint + the stale-map warning it drives.
+ *
+ * Two claims are under test, and they fail in opposite directions:
+ *
+ *  1. The fingerprint MOVES on every real edit. A missed change is the whole
+ *     failure this feature exists to end, so the edits below are the smallest
+ *     ones that still change meaning (one character of a field name, a `?`, a
+ *     `@@unique` name), not obviously-different files.
+ *  2. The fingerprint HOLDS across differences a checkout can introduce on its
+ *     own. A warning that fires on every Windows clone is a warning people turn
+ *     off, and then claim 1 is worth nothing.
+ */
+
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+import { generatePrismaMap } from '../generate.js';
+import { fingerprintPrismaSchema } from '../prisma-schema-fingerprint.js';
+import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
+import type { PrismaCompatMap } from '../schema.js';
+
+const SCHEMA = `datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    Int     @id @default(autoincrement())
+  email String  @unique
+  name  String?
+  posts Post[]
+
+  @@unique([email, name], name: "email_name")
+}
+
+model Post {
+  id       Int  @id @default(autoincrement())
+  authorId Int
+  author   User @relation(fields: [authorId], references: [id])
+}
+`;
+
+describe('fingerprintPrismaSchema', () => {
+  it('is stable for identical input', () => {
+    assert.equal(fingerprintPrismaSchema(SCHEMA), fingerprintPrismaSchema(SCHEMA));
+  });
+
+  it('carries a version prefix so a future normalization change is recognizable', () => {
+    assert.match(fingerprintPrismaSchema(SCHEMA), /^v1:[0-9a-f]{16}$/);
+  });
+
+  for (const [what, edited] of [
+    ['a renamed field', SCHEMA.replace('name  String?', 'title String?')],
+    ['a field made nullable', SCHEMA.replace('email String  @unique', 'email String? @unique')],
+    ['a renamed compound-unique selector', SCHEMA.replace('name: "email_name"', 'name: "by_email"')],
+    ['a new model', `${SCHEMA}\nmodel Comment {\n  id Int @id\n}\n`],
+    ['a removed model', SCHEMA.slice(0, SCHEMA.indexOf('model Post'))],
+    ['an edited comment', SCHEMA.replace('model User {', '// the account\nmodel User {')],
+  ] as const) {
+    it(`changes on ${what}`, () => {
+      assert.notEqual(fingerprintPrismaSchema(edited), fingerprintPrismaSchema(SCHEMA), what);
+    });
+  }
+
+  for (const [what, same] of [
+    ['CRLF line endings', SCHEMA.replace(/\n/g, '\r\n')],
+    ['lone CR line endings', SCHEMA.replace(/\n/g, '\r')],
+    ['a leading BOM', `\uFEFF${SCHEMA}`],
+    ['a missing final newline', SCHEMA.trimEnd()],
+    ['extra blank lines at EOF', `${SCHEMA}\n\n`],
+  ] as const) {
+    it(`holds across ${what}`, () => {
+      assert.equal(fingerprintPrismaSchema(same), fingerprintPrismaSchema(SCHEMA), what);
+    });
+  }
+});
+
+const MAP: PrismaCompatMap = {
+  models: {
+    User: {
+      table: 'users',
+      accessor: 'users',
+      fields: { id: 'id', email: 'email' },
+      relations: {},
+      compoundUniques: {},
+    },
+  },
+  enums: {},
+};
+
+describe('generatePrismaMap provenance', () => {
+  it('omits `source` entirely when the map carries none', () => {
+    assert.ok(!generatePrismaMap(MAP, { noTimestamp: true }).includes('source:'));
+  });
+
+  it('emits the path and hash so the runtime can compare them', () => {
+    const out = generatePrismaMap(
+      { ...MAP, source: { path: 'prisma/schema.prisma', hash: fingerprintPrismaSchema(SCHEMA) } },
+      { noTimestamp: true },
+    );
+    assert.ok(out.includes(`source: { path: 'prisma/schema.prisma', hash: '${fingerprintPrismaSchema(SCHEMA)}' }`));
+  });
+
+  it('escapes a quote in the path rather than emitting a broken module', () => {
+    const out = generatePrismaMap(
+      { ...MAP, source: { path: "od'd/schema.prisma", hash: 'v1:0000000000000000' } },
+      { noTimestamp: true },
+    );
+    assert.ok(out.includes("path: 'od\\'d/schema.prisma'"));
+  });
+});
+
+/**
+ * The warning itself. It is async, unawaited and swallows everything, so the
+ * assertions are on the two observable effects: whether a line is printed, and
+ * whether the once-registry recorded the path.
+ */
+describe('stale prisma-map warning', () => {
+  const withEnv = async (nodeEnv: string | undefined, fn: () => Promise<void>): Promise<void> => {
+    const prev = process.env.NODE_ENV;
+    if (nodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = nodeEnv;
+    try {
+      await fn();
+    } finally {
+      if (prev === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = prev;
+    }
+  };
+
+  /** Build a compat client over a stub, capture anything it warns, settle the microtasks. */
+  const run = async (source: PrismaCompatMap['source']): Promise<string[]> => {
+    resetWarnOnce(WARN_NS.stalePrismaMap);
+    const { createPrismaCompatClient } = await import('../prisma-compat.js');
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (...a: unknown[]) => {
+      warned.push(a.join(' '));
+    };
+    try {
+      const stub = {
+        schema: { tables: { users: { name: 'users', columns: [], primaryKey: ['id'], relations: {} } } },
+        table: () => ({}),
+      };
+      createPrismaCompatClient(stub as never, { ...MAP, source });
+      // The read is a real async chain: yield until it has had a chance to run.
+      for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    } finally {
+      console.warn = original;
+    }
+    return warned.filter((w) => w.includes('prisma-map'));
+  };
+
+  const realPath = 'src/test/fixtures/fingerprint-schema.prisma';
+
+  it('says nothing when the map has no source (pre-0.60 or hand-written)', async () => {
+    await withEnv('development', async () => {
+      assert.deepEqual(await run(undefined), []);
+    });
+  });
+
+  it('says nothing when the file is missing, which is the normal deployed state', async () => {
+    await withEnv('development', async () => {
+      assert.deepEqual(await run({ path: 'prisma/does-not-exist.prisma', hash: 'v1:0000000000000000' }), []);
+    });
+  });
+
+  it('warns, naming the file and the fix, when the hash no longer matches', async () => {
+    await withEnv('development', async () => {
+      const warned = await run({ path: realPath, hash: 'v1:ffffffffffffffff' });
+      assert.equal(warned.length, 1);
+      assert.match(warned[0]!, /fingerprint-schema\.prisma has changed/);
+      assert.match(warned[0]!, /turbine migrate-from-prisma/);
+    });
+  });
+
+  it('says nothing when the hash still matches', async () => {
+    await withEnv('development', async () => {
+      const { readFileSync } = await import('node:fs');
+      const hash = fingerprintPrismaSchema(readFileSync(realPath, 'utf8'));
+      assert.deepEqual(await run({ path: realPath, hash }), []);
+    });
+  });
+
+  it('is silent in production even when the map is stale', async () => {
+    await withEnv('production', async () => {
+      assert.deepEqual(await run({ path: realPath, hash: 'v1:ffffffffffffffff' }), []);
+    });
+  });
+
+  it('warns once per path, not once per client', async () => {
+    await withEnv('development', async () => {
+      resetWarnOnce(WARN_NS.stalePrismaMap);
+      const first = await runNoReset({ path: realPath, hash: 'v1:ffffffffffffffff' });
+      const second = await runNoReset({ path: realPath, hash: 'v1:ffffffffffffffff' });
+      assert.equal(first.length, 1);
+      assert.equal(second.length, 0, 'a second client must not repeat it');
+    });
+  });
+
+  /** As {@link run}, minus the registry reset, so repeat calls are observable. */
+  async function runNoReset(source: PrismaCompatMap['source']): Promise<string[]> {
+    const { createPrismaCompatClient } = await import('../prisma-compat.js');
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (...a: unknown[]) => {
+      warned.push(a.join(' '));
+    };
+    try {
+      const stub = {
+        schema: { tables: { users: { name: 'users', columns: [], primaryKey: ['id'], relations: {} } } },
+        table: () => ({}),
+      };
+      createPrismaCompatClient(stub as never, { ...MAP, source });
+      for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    } finally {
+      console.warn = original;
+    }
+    return warned.filter((w) => w.includes('prisma-map'));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The postinstall flag
+// ---------------------------------------------------------------------------
+
+describe('parseArgs, migrate-from-prisma --if-db', () => {
+  it('parses --if-db alongside the other flags', async () => {
+    const { parseArgs } = await import('../cli/index.js');
+    const a = parseArgs(['migrate-from-prisma', '--if-db', '--allow-partial']);
+    assert.equal(a.command, 'migrate-from-prisma');
+    assert.equal(a.ifDb, true);
+    assert.equal(a.allowPartial, true);
+  });
+
+  it('leaves ifDb undefined when absent, so the default stays fail-on-missing-url', async () => {
+    const { parseArgs } = await import('../cli/index.js');
+    assert.equal(parseArgs(['migrate-from-prisma']).ifDb, undefined);
+  });
+
+  it('is distinct from --no-db: one skips the run, the other runs without a database', async () => {
+    const { parseArgs } = await import('../cli/index.js');
+    const a = parseArgs(['migrate-from-prisma', '--if-db']);
+    assert.equal(a.noDb, undefined);
+    const b = parseArgs(['migrate-from-prisma', '--no-db']);
+    assert.equal(b.ifDb, undefined);
+  });
+});

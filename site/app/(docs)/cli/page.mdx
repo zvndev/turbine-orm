@@ -39,6 +39,7 @@ Commands:
   doctor --no-plan-divergence    Skip the cached-plan divergence section
   migrate-from-prisma            Map a schema.prisma onto Turbine (report + typed name map)
   migrate-from-prisma --no-db    Parse-only: write the report without resolving names
+  migrate-from-prisma --if-db    Regenerate the name map, skipping when no database resolves
   studio                         Launch local read-only Studio web UI
   mcp                            Start read-only MCP server over JSON-RPC stdio
   observe                        Launch local metrics dashboard
@@ -561,6 +562,9 @@ DATABASE_URL=postgres://... npx turbine migrate-from-prisma --schema prisma/sche
 
 # Audit a schema with no database in reach
 npx turbine migrate-from-prisma --schema prisma/schema.prisma --no-db
+
+# Regenerate on install, skipping quietly when no database is reachable
+npx turbine migrate-from-prisma --if-db
 ```
 
 The parser is a zero-dependency subset parser: neither `prisma` nor `@prisma/client` needs to still be installed. Outputs land in the generate output directory (default `./generated/turbine`):
@@ -591,9 +595,26 @@ The datasource is deliberately last: an explicit `--url` is never overridden by 
 | `--out`, `-o <dir>` | Output directory (default `./generated/turbine`), which must resolve inside the directory you ran the command from. See [The `--out` directory guard](#the---out-directory-guard). |
 | `--no-db` | Parse-only. Writes the report and skips introspection, so no `prisma-map.ts` and no client are emitted. |
 | `--allow-partial` | Exit 0 even when items are unresolved. Without it an unresolved item exits 1. |
+| `--if-db` | Exit 0 without doing anything when no connection string resolves, instead of failing. Makes the command safe to run from `postinstall`. |
 | `--no-timestamp` | Omit the generated-at lines for byte-identical regeneration. |
 
 Unresolved items never block the generated client: it is built from live introspected metadata, so a partial run still produces a working `db`. See [Migrating from Prisma](/migrate-from-prisma#the-migration-toolkit) for the full workflow and the adapter's documented gaps.
+
+### Keeping `prisma-map.ts` current
+
+Nothing re-runs this command for you, and a `prisma-map.ts` that has fallen behind your schema fails silently: the adapter goes on translating the names it has, so a newly added model is simply not on the compat client. Put the command where you already regenerate, next to `prisma generate`:
+
+```json
+{
+  "scripts": {
+    "postinstall": "prisma generate && turbine migrate-from-prisma --if-db"
+  }
+}
+```
+
+`--if-db` is what makes that safe. An `npm ci` in a build image has no `DATABASE_URL`, and without the flag the missing database would fail the install; with it, the run prints one line saying nothing was regenerated and exits 0.
+
+Since 0.60 the emitted map also records a fingerprint of the `schema.prisma` it was generated from, and `createPrismaCompatClient` warns once at startup, in development only, when the file on disk no longer matches. See [Keeping the map current](/migrate-from-prisma#keeping-the-map-current).
 
 ### The `--out` directory guard
 

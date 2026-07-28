@@ -578,6 +578,31 @@ export interface PrismaCompatMap {
   models: Record<string, PrismaModelMap>;
   /** Prisma enum name → resolved database enum-type name. */
   enums: Record<string, string>;
+  /**
+   * The Prisma schema file this map was generated from. Present on maps emitted
+   * by `turbine migrate-from-prisma` since 0.60; absent on older ones, and on a
+   * map assembled by hand.
+   *
+   * `turbine-orm/prisma-compat` uses it for a once-per-process, dev-only staleness
+   * check: nothing re-runs the generator, so a map can silently fall behind the
+   * schema it describes and the adapter has no way to know. See
+   * {@link fingerprintPrismaSchema}.
+   */
+  source?: PrismaSchemaSource;
+}
+
+/** Provenance of a generated {@link PrismaCompatMap}. */
+export interface PrismaSchemaSource {
+  /**
+   * The Prisma schema file, POSIX-separated and relative to the directory the
+   * generator ran in (which for the documented workflow is the project root, so
+   * it resolves against `process.cwd()` at runtime). Relative rather than
+   * absolute so the value is identical for every developer and in CI, and so a
+   * generated file never carries someone's home directory into version control.
+   */
+  path: string;
+  /** {@link fingerprintPrismaSchema} of that file's contents at generation time. */
+  hash: string;
 }
 
 /** One Prisma model's resolved mapping onto a Turbine table + client accessor. */

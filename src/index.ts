@@ -125,6 +125,8 @@ export {
 } from './observe.js';
 // Pipeline
 export { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
+// Prisma-schema fingerprint (provenance on a generated PRISMA_MAP)
+export { fingerprintPrismaSchema } from './prisma-schema-fingerprint.js';
 // Query builder
 export {
   type AggregateArgs,
@@ -211,6 +213,7 @@ export type {
   PrismaCompatMap,
   PrismaModelMap,
   PrismaRelationMap,
+  PrismaSchemaSource,
   ReferentialAction,
   RelationDef,
   SchemaMetadata,

@@ -140,9 +140,49 @@ It parses `schema.prisma` with a zero-dependency subset parser (no `prisma` CLI,
 | `--out`, `-o <dir>` | Output directory (default `./generated/turbine`). Must resolve inside the directory you ran the command from, or the run exits 1 without writing anything. See [The `--out` directory guard](/cli#the---out-directory-guard) before scripting this into a temp dir. |
 | `--no-db` | Parse-only. Writes the report, skips introspection, and emits **no** `prisma-map.ts` and **no** client. Useful for auditing a schema before you have a database to point at. |
 | `--allow-partial` | Exit 0 even when items are unresolved. By default an unresolved item exits **1** so CI fails loudly. |
+| `--if-db` | Exit 0 without doing anything when no connection string resolves, instead of failing. For the `postinstall` hook below, where a build image legitimately has no database. |
 | `--no-timestamp` | Omit the generated-at lines, for byte-identical regeneration. |
 
 An unresolved item never blocks the client: it is generated from live introspected metadata, so a partial run still gives you a working `db`. Only the *map* entry is missing, which means the adapter will not know that one Prisma name.
+
+### Keeping the map current
+
+Nothing re-runs `migrate-from-prisma` for you. `prisma-map.ts` is a snapshot of your schema at the moment you last ran it, and once your schema moves past it, the adapter keeps translating the names it has: a model added last week is simply not on the compat client, and a renamed field is quietly absent from results. Both of those look like adapter bugs.
+
+Two things address this, and you want both.
+
+**Regenerate where you already regenerate.** The command belongs next to `prisma generate`:
+
+```json
+{
+  "scripts": {
+    "postinstall": "prisma generate && turbine migrate-from-prisma --if-db"
+  }
+}
+```
+
+`--if-db` is what makes that safe to put in `postinstall`. An `npm ci` inside a build image has no `DATABASE_URL`, and without the flag that would turn a missing database into a failed install. With it, the run prints one line saying nothing was regenerated and exits 0, leaving the committed `prisma-map.ts` exactly as it was.
+
+That does mean a build machine with no database silently uses the committed map, which is the right trade for an install hook but is not a guarantee. So keep the map in version control and regenerate it in the same commit as any `schema.prisma` change, the same way you would a lockfile. If you want CI to *enforce* that, run the command against a real database and fail on a dirty tree:
+
+```bash
+turbine migrate-from-prisma --no-timestamp
+git diff --exit-code generated/turbine/prisma-map.ts
+```
+
+`--no-timestamp` is required for that check: without it every run rewrites the generated-at line and the diff is never clean.
+
+**The adapter tells you when the map is stale.** Since 0.60, `migrate-from-prisma` records the path and a fingerprint of the `schema.prisma` it read into the map, and `createPrismaCompatClient` compares that fingerprint against the file on disk once per process at startup:
+
+```
+[turbine] prisma-compat: prisma/schema.prisma has changed since prisma-map.ts was generated,
+so any model, field, relation or compound-unique added or renamed since then is missing
+from the compat client. Re-run: turbine migrate-from-prisma
+```
+
+It is a development aid and behaves like one. It is skipped entirely when `NODE_ENV=production`; a missing `schema.prisma` is silent, because not shipping `prisma/` to production is normal and is not evidence of anything; a bundled runtime with no filesystem is silent for the same reason; the read is asynchronous and unawaited, so client construction never waits on it; and it prints at most once per process. It cannot fail your app, and it cannot fail your build. A map generated before 0.60, or assembled by hand, carries no fingerprint and is skipped.
+
+The fingerprint ignores differences a checkout can introduce on its own (line endings, a byte-order mark, trailing whitespace at end of file) and nothing else. An edited comment counts as a change: a regeneration you did not strictly need costs you nothing, and a missed one is the whole failure this exists to end.
 
 **Connection string.** The command resolves the URL in this order: `--url`, then `DATABASE_URL`, then `url` in `turbine.config.ts`, then the `datasource` block of the schema you pointed it at, including its `env("...")` indirection (`url` first, then `directUrl`). So a project whose schema declares `url = env("DATABASE_URL_STAGING")` needs no flag, as long as that variable is exported. The datasource is last on purpose: an explicit `--url` is never overridden by a value declared in a schema file. If nothing yields a URL, the error names the exact variable the datasource asked for.
 

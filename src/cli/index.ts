@@ -36,7 +36,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, extname, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generate, generatePrismaMap } from '../generate.js';
 import {
@@ -77,6 +77,7 @@ import {
   type PlanDivergenceReport,
 } from '../plan-divergence.js';
 import { applyFlipVerdicts, emptyFlipProbeResult, needsFlipProbe, probePlanFlips } from '../plan-flip-probe.js';
+import { fingerprintPrismaSchema } from '../prisma-schema-fingerprint.js';
 import { type SchemaMetadata, snakeToCamel } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
@@ -228,6 +229,13 @@ export interface CliArgs {
   allowPartial?: boolean;
   /** `migrate-from-prisma --no-db`: parse-only, skip database resolution. */
   noDb?: boolean;
+  /**
+   * `migrate-from-prisma --if-db`: when no connection string can be resolved,
+   * print a notice and exit 0 rather than failing. For the postinstall hook,
+   * where an `npm ci` in a build image legitimately has no database and must
+   * not be turned into a failed install.
+   */
+  ifDb?: boolean;
 }
 
 export function parseArgs(argv = process.argv.slice(2)): CliArgs {
@@ -410,6 +418,9 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--no-db':
         result.noDb = true;
+        break;
+      case '--if-db':
+        result.ifDb = true;
         break;
       default:
         if (!arg.startsWith('-')) {
@@ -1698,6 +1709,17 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
       const origin = variable ? `${cyan(variable)} via datasource "${dsName}"` : `datasource "${dsName}" ${key}`;
       info(`Using the connection string declared by your Prisma schema (${origin}).`);
     }
+    if (!resolvedUrl.url && args.ifDb) {
+      // `--if-db`: the caller is a postinstall hook. A build image with no
+      // database is the expected case there, and failing the install over it
+      // would make the hook worse than not having one. Leave every existing
+      // artifact untouched and say plainly that nothing was regenerated, so a
+      // stale map is never mistaken for a fresh one.
+      newline();
+      info(`No connection string resolved and ${cyan('--if-db')} was passed: skipping, nothing regenerated.`);
+      newline();
+      return;
+    }
     url = resolvedUrl.url ?? requireUrl(config, { datasourceVars: resolvedUrl.missingVariables });
     label('Database', redactUrl(url));
     const spinner = new Spinner('Introspecting database schema').start();
@@ -1748,6 +1770,14 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
   console.log(`  ${dim(symbols.teeEnd)} ${cyan(reportPath)} ${dim('(report)')}`);
 
   if (!args.noDb && schemaMeta) {
+    // Record WHAT WAS READ, so the runtime adapter can report a stale map
+    // instead of quietly translating names from a schema that has moved on.
+    // The path is stored relative to the directory this ran in: the runtime
+    // resolves it against `process.cwd()`, and an absolute path would both
+    // break for everyone else and commit a home directory to the repo.
+    const sourcePath = relative(process.cwd(), prismaPath).split(sep).join('/');
+    result.map.source = { path: sourcePath, hash: fingerprintPrismaSchema(source) };
+
     const mapPath = join(outDir, 'prisma-map.ts');
     writeFileSync(mapPath, generatePrismaMap(result.map, { noTimestamp: args.noTimestamp }), 'utf-8');
     console.log(`  ${dim(symbols.teeEnd)} ${cyan(mapPath)} ${dim('(typed name map)')}`);
@@ -4203,6 +4233,9 @@ function showMigrateFromPrismaHelp(): void {
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}     Postgres connection string ${dim('(unless --no-db)')}`);
   console.log(`    ${cyan('--out, -o')} ${dim('<dir>')}     Output directory ${dim('(default: ./generated/turbine)')}`);
   console.log(`    ${cyan('--no-db')}             Parse-only: write the report without resolving names`);
+  console.log(
+    `    ${cyan('--if-db')}             Skip (exit 0) when no connection string resolves ${dim('(postinstall)')}`,
+  );
   console.log(`    ${cyan('--allow-partial')}     Exit 0 even when some items are UNRESOLVED`);
   console.log(`    ${cyan('--no-timestamp')}      Omit the ${dim('Generated:')} lines ${dim('(reproducible output)')}`);
   newline();
@@ -4211,6 +4244,11 @@ function showMigrateFromPrismaHelp(): void {
     `    ${dim('$')} DATABASE_URL=postgres://... npx turbine migrate-from-prisma --schema prisma/schema.prisma`,
   );
   console.log(`    ${dim('$')} npx turbine migrate-from-prisma --schema prisma/schema.prisma --no-db`);
+  newline();
+  console.log(`  ${bold('Keeping it current:')}`);
+  console.log(`    ${dim('Nothing re-runs this for you, and a stale prisma-map.ts fails silently, so')}`);
+  console.log(`    ${dim('put it next to prisma generate:')}`);
+  console.log(`    ${dim('"postinstall": "prisma generate && turbine migrate-from-prisma --if-db"')}`);
   newline();
 }
 

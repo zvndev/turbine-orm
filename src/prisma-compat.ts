@@ -116,6 +116,7 @@
 import type { TurbineClient } from './client.js';
 import { TurbineError, TurbineErrorCode, UnsupportedFeatureError, ValidationError, wrapPgError } from './errors.js';
 import { createManyShapeRuns } from './nested-write.js';
+import { fingerprintPrismaSchema } from './prisma-schema-fingerprint.js';
 import {
   AGGREGATE_OPTIONS,
   applyNativeOptions,
@@ -634,6 +635,54 @@ function warnUnknownQueryOptions(model: string, op: CompatOperation, args: unkno
     // Key enumeration is the only thing that can fail here, and a diagnostic
     // must never be the reason a query fails.
   }
+}
+
+/**
+ * Dev-mode notice that the `prisma-map.ts` driving this client no longer matches
+ * the Prisma schema it was generated from.
+ *
+ * Nothing re-runs `turbine migrate-from-prisma`. When the schema moves on, the
+ * map does not, and the adapter keeps translating the names it has: a model
+ * added last week is simply not on the client, a renamed field is quietly
+ * absent from results. Both read as adapter bugs. This turns them into one line
+ * naming the file and the command that fixes it.
+ *
+ * Everything about the check is subordinate to "never break an app that works":
+ *
+ *  - **Async and unawaited.** Client construction does not wait on a file read;
+ *    the warning lands a tick later or not at all.
+ *  - **Any failure is silence.** A missing file is the NORMAL deployed state
+ *    (nobody ships `prisma/` to production) and so are a bundled runtime with no
+ *    `node:fs` and a read that is refused. None of them is evidence of drift.
+ *  - **Production is skipped entirely**, before anything is imported or read.
+ *  - **Once per process per path**, via the shared registry, so a process that
+ *    builds a client per request says it once.
+ *
+ * @param map - the map under test; a map with no `source` (hand-written, or
+ *   emitted before 0.60) is skipped, since absence carries no information.
+ */
+function warnStalePrismaMap(map: PrismaCompatMap): void {
+  const source = map.source;
+  if (!source || typeof source.path !== 'string' || typeof source.hash !== 'string') return;
+  if (typeof process === 'undefined' || process.env?.NODE_ENV === 'production') return;
+
+  void (async () => {
+    try {
+      // Dynamic so a bundle that never reaches this line never needs `node:fs`.
+      const { readFile } = await import('node:fs/promises');
+      const onDisk = await readFile(source.path, 'utf8');
+      if (fingerprintPrismaSchema(onDisk) === source.hash) return;
+      if (!shouldWarnOnce(WARN_NS.stalePrismaMap, source.path)) return;
+      console.warn(
+        `[turbine] prisma-compat: ${source.path} has changed since prisma-map.ts was generated,` +
+          ' so any model, field, relation or compound-unique added or renamed since then is missing' +
+          ' from the compat client. Re-run: turbine migrate-from-prisma',
+      );
+    } catch {
+      // No file, no `node:fs`, no permission. None of these means the map is
+      // stale, and a diagnostic must never be the reason a client fails.
+    }
+  })();
 }
 
 /**
@@ -2452,6 +2501,10 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
   // the real client satisfies it structurally (the cast just relaxes the strict
   // callback-param variance on `$transaction`).
   const db = client as unknown as CompatTurbineClient;
+
+  // Fire-and-forget, dev-only, once per process: is this map still describing
+  // the schema on disk? Nothing else in the system ever asks.
+  warnStalePrismaMap(map);
 
   const tableToModel = new Map<string, string>();
   for (const [prismaModel, mm] of Object.entries(map.models)) tableToModel.set(mm.table, prismaModel);

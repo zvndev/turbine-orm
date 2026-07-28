@@ -1038,6 +1038,13 @@ const prisma = createPrismaCompatClient(db, PRISMA_MAP);
 const users = await prisma.User.findMany({ include: { posts: { take: 5 } } });
 ```
 
+Because nothing re-runs the generator, the map records a fingerprint of the
+`schema.prisma` it was built from, and `createPrismaCompatClient` warns once at startup
+(development only, never in production, silent when the file is absent) if that file has
+since changed. Put `turbine migrate-from-prisma --if-db` in `postinstall` next to
+`prisma generate` so it does not depend on anyone remembering; `--if-db` exits 0 when no
+database is reachable, so a build image with no `DATABASE_URL` still installs.
+
 Turbine-only query options (`forceCustomPlan`, `skipGlobalFilters`, `allowFullTableScan`,
 `warnOnUnlimited`, `timeout`, `optimisticLock`, `distinctOn`, …) pass through the compat
 delegates, and an unrecognized query-level key logs a one-time dev warning naming the
