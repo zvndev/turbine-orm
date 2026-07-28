@@ -140,6 +140,14 @@ export const WARN_NS = {
    */
   parserOverwrite: 'parserOverwrite',
   /**
+   * A key on the args object passed to a `turbine-orm/prisma-compat` delegate
+   * call that is neither a Prisma arg for that operation nor a turbine-native
+   * query option (prisma-compat.ts `warnUnknownQueryOptions`). Keyed on
+   * `model.operation.key`, so the same typo on two models is two reports, and
+   * a million executions of one call site is one.
+   */
+  unknownQueryOption: 'unknownQueryOption',
+  /**
    * `planCacheMode` was set on a client given an EXTERNAL pool, where Turbine
    * runs no connection setup, so the option is a no-op (client.ts constructor).
    * Keyed on the requested mode.

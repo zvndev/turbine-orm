@@ -162,7 +162,7 @@ export default [
     // graph is NOT bundled with it. If this number jumps toward the other
     // entries, something started importing core values instead of core types.
     path: 'dist/prisma-compat.js',
-    limit: '9 kB',
+    limit: '11 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },

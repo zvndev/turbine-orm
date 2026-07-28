@@ -647,6 +647,29 @@ const rows = await db.orders.findMany({
 
 It is available on `findMany`, `findUnique`, `findFirst` (and the `OrThrow` forms), `count`, `aggregate`, `groupBy`, the streaming read, and the batched strategy's relation follow-ups. It is a **read** arg: writes do not take it.
 
+<Callout type="warning" title="On turbine-orm/prisma-compat this did nothing before 0.57.0">
+  Say it plainly, because the docs and `turbine doctor` both pointed readers at
+  it: from 0.56.0 until 0.57.0, `forceCustomPlan` passed through
+  `turbine-orm/prisma-compat` was accepted by the type-checker and **dropped on
+  the floor**. Measured at the wire, the compat call left the same named entry in
+  `pg_prepared_statements` with `generic_plans` climbing, exactly as if the option
+  had not been passed. The core client was never affected.
+
+  The cause was not specific to this option: the adapter copied a hand-written
+  allowlist of keys, so every Turbine-only query option added after that list was
+  written was stranded the same way (`warnOnUnlimited`, `skipGlobalFilters`,
+  `allowFullTableScan`, `timeout` on most writes, `optimisticLock`,
+  `stableRelationOrder`, `distinctOn`). 0.57.0 forwards all of them, warns on an
+  unrecognized query-level key instead of dropping it, and makes a newly added
+  core option a **build failure** in the adapter rather than a silent no-op. See
+  [Turbine-native query options](/migrate-from-prisma#turbine-native-query-options).
+
+  If you are on 0.56.0 with prisma-compat, confirm at the wire rather than
+  assuming: run the read six times on one pooled connection and look at
+  `SELECT name, generic_plans FROM pg_prepared_statements`. With the option
+  working there is no entry at all.
+</Callout>
+
 **How it works, stated as the mechanism really is.** `true` sends that one statement **unnamed**. It is *not* true that PostgreSQL treats an unnamed statement as a one-shot plan that never enters the plan cache; the backend builds and saves a `CachedPlanSource` for it too. It works one level up, in the driver: node-postgres only skips `Parse` for a statement it has already parsed **by name**, so an unnamed statement is re-parsed on every execution, each `Parse` replaces the unnamed cached plan source with a fresh one whose custom-plan counter is zero, and the five-execution threshold that precedes promotion is never reached. No GUC, no `SET LOCAL`, no transaction, no extra round trip.
 
 **Precedence, because one of these is the opposite of what the mechanism suggests.**

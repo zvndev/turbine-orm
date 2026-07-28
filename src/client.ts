@@ -45,10 +45,10 @@ import {
   type TemporalInfinityReading,
 } from './query/index.js';
 import {
-  closestName,
   markTurbineParser,
   quoteIdent,
   registerUtcTemporalParsers,
+  suggestKey,
   warnParserOverwrite,
 } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
@@ -705,45 +705,14 @@ const CONFIG_KEY_SET: ReadonlySet<string> = new Set(Object.keys(TURBINE_CONFIG_K
  */
 const NON_CONFIG_KEYS: ReadonlySet<string> = new Set(['queryInterfaceFactory', 'schema', 'url']);
 
-/** camelCase name → its lowercased words (`logQueryParams` → log, query, params). */
-function camelWords(name: string): string[] {
-  return name
-    .split(/(?=[A-Z])/)
-    .map((w) => w.toLowerCase())
-    .filter(Boolean);
-}
-
 /**
  * The real config key `key` most likely meant, or null when nothing is close.
  *
- * {@link closestName} (the same helper the unknown-COLUMN message uses) decides
- * first, so both diagnostics rank near-misses identically. It is bounded by edit
- * distance, which covers typos but not the miss this warning exists for: a
- * guessed name that omits a whole word. `logParams` is five edits from
- * `logQueryParams`, past the bound, yet it names the same words in the same
- * order, so a second pass accepts a candidate whose camelCase words CONTAIN the
- * guess's words in order, preferring the one that adds fewest words.
+ * {@link suggestKey} is shared with the prisma-compat query-option warner, so
+ * both diagnostics rank near-misses identically.
  */
 function suggestConfigKey(key: string): string | null {
-  const direct = closestName(key, CONFIG_KEY_SET);
-  if (direct) return direct;
-  const wanted = camelWords(key);
-  if (wanted.length < 2) return null;
-  let best: string | null = null;
-  let bestExtra = Number.POSITIVE_INFINITY;
-  for (const candidate of CONFIG_KEY_SET) {
-    const words = camelWords(candidate);
-    if (words.length <= wanted.length) continue;
-    let i = 0;
-    for (const w of words) if (w === wanted[i]) i++;
-    if (i !== wanted.length) continue;
-    const extra = words.length - wanted.length;
-    if (extra < bestExtra) {
-      bestExtra = extra;
-      best = candidate;
-    }
-  }
-  return best;
+  return suggestKey(key, CONFIG_KEY_SET);
 }
 
 /**

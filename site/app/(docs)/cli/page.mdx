@@ -434,6 +434,63 @@ The shape it models is narrow on purpose: a read shaped `WHERE col = $1 ORDER BY
 
 Each finding prints the statistics behind it (rows, distinct values, the generic estimate, the rarest bucket, the crossover at limit 20 and at limit 1000, correlation, and the last ANALYZE) plus **how many pages the wrong plan walks** and what fraction of the table that is. It deliberately does **not** print an amplification multiplier: the check can see how many rows a value has, not where they physically sit in the heap, and the second half moves the real cost by an order of magnitude.
 
+#### The unindexed-filter mechanism (new in 0.57.0)
+
+The rule above is one mechanism. 0.57.0 adds a second, and it is genuinely a **third** direction rather than a variation: it is not the sparse-value direction described above, and it is not the dense-clustering direction that was written, measured and **removed** in 0.56.0 for predicting the wrong sign. Here the filter column has **no index at all**, so the good plan is a *sequential scan that the generic plan will not choose*.
+
+With nothing serving `col = $1`, the custom planner's alternative is a seq scan plus a top-N sort, bounded by the table's pages. A promoted generic plan cannot see that the value is rare, keeps the ordered primary-key walk, and fetches nearly every tuple before it fills the `LIMIT`. Before 0.57.0 those columns were dropped **before** the check counted them as considered, so they appeared neither in the findings nor in the "not scored" notices: they were silently outside the population.
+
+The fixture, printed so the numbers below are checkable rather than asserted (PostgreSQL 16, warm cache, `synchronize_seqscans`, `max_parallel_workers_per_gather` and `jit` off):
+
+```sql
+CREATE TABLE t (id int PRIMARY KEY, organization_id int NOT NULL, payload text NOT NULL);
+INSERT INTO t SELECT g, <bucket(g)>, repeat('p', 60)
+  FROM generate_series(1, 20000) g ORDER BY (g * 2654435761::bigint) % 1000003;
+-- 247 relpages, buckets 10,000 / 6,000 / 3,998 / 2
+-- read: WHERE organization_id = $1 ORDER BY id LIMIT $2, on the rarest value, limit 20
+```
+
+| `plan_cache_mode` | plan | buffers |
+| --- | --- | --- |
+| `force_custom_plan` | Seq Scan | **250** |
+| `force_generic_plan` | Index Scan on the primary key | **20,074** |
+
+Under `auto`, seven executions of the rare value report `generic_plans 2, custom_plans 5`, so the promotion is real on that fixture and not a hypothetical.
+
+**The remedy is different, so the report is too.** An unindexed column's flip is fixed by adding the index, not by a plan-cache override, so when the same run's index advisor already names the column, the divergence is rendered as **evidence on that missing-index finding** rather than as a second entry, and it never suggests `forceCustomPlan` there. The leftover case (a column served only by a partial or expression index, where the planner has no path for the bare predicate) keeps its own entry. Adding the index moves the divergence in both directions at once, so re-run `doctor` after adding it rather than assuming the finding is closed: the column is expected to reappear on the sparse-value rule, and on the measured fixture the index also stopped `auto` promoting at all.
+
+<Callout type="warning" title="The known false positive, and why it is disclosed rather than filtered">
+  How much this flip costs is decided by how closely the heap tracks the column
+  the generic plan walks, because the generic plan pays one heap fetch per index
+  entry: when consecutive entries land on the same already-pinned page the fetch
+  is free. Six fixtures identical except for INSERT ordering, custom plan 250
+  buffers in every one:
+
+  | heap order | `pg_stats.correlation` on `id` | generic buffers | ratio |
+  | --- | --- | --- | --- |
+  | exact `id` order | 1.00000 | 303 | 1.2x |
+  | shuffled within ~1 page | 0.99998 | 783 | 3.1x |
+  | shuffled within ~2 pages | 0.99993 | 10,303 | 41x |
+  | shuffled within ~4 pages | 0.99974 | 15,148 | 61x |
+  | shuffled within ~20 pages | 0.99372 | 19,046 | 76x |
+  | hash order | -0.00065 | 20,074 | 80x |
+
+  The top row is a false positive worth naming, because it is not an exotic
+  table: `id serial PRIMARY KEY` inserted in order with a scattered tenant or
+  status column is the normal state of an append-mostly table. The plan flips in
+  all six; only the magnitude differs.
+
+  Nothing is suppressed on that statistic. The boundary sits between two adjacent
+  sampled values, so a gate would be fitted to the fifth decimal place of a
+  sample and would drop genuine 41x to 80x findings. Instead every finding
+  carries the **ordering column's** correlation and a `heapNearlyOrdered`
+  boolean, in the human report and in `--json`, and the printed text states the
+  condition next to the ratio rather than quoting one number for both cases.
+</Callout>
+
+**A hash index is an equality path**, so a column served by one is scored by the sparse-value rule rather than called unindexed (measured: with a hash index the custom plan is a 7-buffer Bitmap Heap Scan, not a 247-page seq scan). A column served only by `brin`, `gin` or `gist` is reported as **not scored**, with the reason, because neither rule describes what its custom plan does.
+
+
 Every finding ships a copy-pasteable diagnostic block, and its first step is not an `EXPLAIN`:
 
 ```sql
@@ -442,15 +499,23 @@ SELECT generic_plans, custom_plans FROM pg_prepared_statements WHERE name = 'tur
 
 A finding describes **exposure, not an incident**. `auto` promotes only when the generic plan's *estimated* cost is not worse than the average custom cost, and on many of these shapes it is worse, so the backend never promotes at all and there is nothing to fix. While `generic_plans` is 0 you are already getting custom plans. Only when it is climbing do the two `EXPLAIN`s below it mean anything. The block ends by resetting `plan_cache_mode`, `synchronize_seqscans` and `max_parallel_workers_per_gather` so a paste does not leave your session pinned.
 
-There is no `--fix`. The remedy is application code ([`forceCustomPlan`](/relations#a-per-query-lever-forcecustomplan) on the affected reads), and the index that looks like a fix is measured not to be one: a composite index on `(col, order_col)` makes the *good* plan better without stopping the generic plan from choosing the other one.
+There is no `--fix`. For a sparse-value finding the remedy is application code ([`forceCustomPlan`](/relations#a-per-query-lever-forcecustomplan) on the affected reads, available on the core client and, since 0.57.0, through `turbine-orm/prisma-compat`), and the index that looks like a fix is measured not to be one: a composite index on `(col, order_col)` makes the *good* plan better without stopping the generic plan from choosing the other one. For an unindexed-filter finding the first remedy is the index itself, and the report says so instead of suggesting the per-query lever.
 
 <Callout type="warning" title="What it cannot see">
-This check reads the value distribution, not the physical layout. It models one direction (a rare value that loses its bitmap plan) and deliberately does not model the opposite one (a physically clustered dominant value). A rule for that direction was written, measured against live fixtures, and **removed**: whether that flip helps or hurts turns on where in the heap the dominant band sits, `pg_stats.correlation` is identical whether it sits at the head or the tail, and the rule predicted the wrong *sign* on real tables. A clean report is not evidence of immunity.
+This check reads the value distribution, not the physical layout. It models two directions (a rare value that loses its bitmap plan, and an unindexed filter column whose good plan is a seq scan) and deliberately does not model a third (a physically clustered dominant value). A rule for that one was written, measured against live fixtures, and **removed**: whether that flip helps or hurts turns on where in the heap the dominant band sits, `pg_stats.correlation` is identical whether it sits at the head or the tail, and the rule predicted the wrong *sign* on real tables.
+
+Three further limits, stated because a quiet report is easy to read as a clean bill of health:
+
+- **The population is relation-probe columns and leading index columns.** A filter column that is neither an FK nor indexed (a `status`, a `deleted_at`, a tenant column with no FK constraint) is not scored in either branch. Feeding the index advisor's recommendations in does not change that: both derive from the same relation topology, and the advisor's only extra members are composite probes, which this check does not model. Closing it needs a workload source (`pg_stat_statements` or `_turbine_metrics`).
+- **The unindexed-filter branch's first gate is a constant** (the rarest value must hold fewer rows than the assumed limit), so it declines divergences whose absolute cost is larger than the ones it reports. Measured on the same fixture shape at 200,000 rows with a rarest bucket of 60: 2,473 buffers custom against 200,547 generic, an 81x flip and 198,074 extra buffer accesses, declined.
+- **A finding is exposure, not an incident**, and a clean report is not evidence of immunity.
+
+The report prints how many columns were scored, split by indexed and unindexed, rather than letting the finding count imply coverage.
 </Callout>
 
 ### `--json`
 
-`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, workload-heat availability, and any degradation notices. `planDivergence` and `planDivergenceNotices` are always present as arrays (empty when the check found nothing or was skipped). The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added. The `unused`, `redundant`, `audit`, and `invalid` arrays are ALWAYS present: they are empty when the corresponding scan did not run, and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`) so the key set never varies by flag. Each unused-index entry also carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the human-readable `caveat` string, so a consumer never has to parse prose.
+`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, workload-heat availability, and any degradation notices. `planDivergence` and `planDivergenceNotices` are always present as arrays (empty when the check found nothing or was skipped), and `planDivergenceScored` reports how large the scored population was (`considered` / `indexed` / `unindexed`) so a consumer can tell "considered and clean" from "never looked". Each finding carries a `branch` (`'sparse-value'` or `'unindexed-filter'`), and since 0.57.0 the branch-shaped fields are **optional**: `crossoverRows`, `crossoverRowsWide`, `valuesBelowCrossover`, `walkPages`, `walkFraction` and `approxAmplification` are absent on an `unindexed-filter` finding rather than zero-filled, and `tuplesWalked`, `worstCaseAmplification`, `orderColumnCorrelation` and `heapNearlyOrdered` are present only there. Branch on `branch` rather than reading them unconditionally. The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added. The `unused`, `redundant`, `audit`, and `invalid` arrays are ALWAYS present: they are empty when the corresponding scan did not run, and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`) so the key set never varies by flag. Each unused-index entry also carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the human-readable `caveat` string, so a consumer never has to parse prose.
 
 ### Where this fits
 

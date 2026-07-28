@@ -840,6 +840,51 @@ export function closestName(input: string, candidates: Iterable<string>): string
   return best;
 }
 
+/** camelCase name → its lowercased words (`logQueryParams` → log, query, params). */
+function camelWords(name: string): string[] {
+  return name
+    .split(/(?=[A-Z])/)
+    .map((w) => w.toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * The real option key `key` most likely meant, or null when nothing is close.
+ *
+ * Shared by every "unknown option" diagnostic (the client-config warner in
+ * client.ts and the prisma-compat query-option warner), so a reader who has
+ * seen one recognizes the ranking in the other.
+ *
+ * {@link closestName} decides first, which is bounded by edit distance and
+ * covers typos. It does not cover the miss these warnings exist for: a guessed
+ * name that omits a whole WORD. `logParams` is five edits from `logQueryParams`,
+ * past the bound, yet it names the same words in the same order; likewise
+ * `customPlan` for `forceCustomPlan`. So a second pass accepts a candidate whose
+ * camelCase words CONTAIN the guess's words in order, preferring the one that
+ * adds fewest words.
+ */
+export function suggestKey(key: string, candidates: Iterable<string>): string | null {
+  const direct = closestName(key, candidates);
+  if (direct) return direct;
+  const wanted = camelWords(key);
+  if (wanted.length < 2) return null;
+  let best: string | null = null;
+  let bestExtra = Number.POSITIVE_INFINITY;
+  for (const candidate of candidates) {
+    const words = camelWords(candidate);
+    if (words.length <= wanted.length) continue;
+    let i = 0;
+    for (const w of words) if (w === wanted[i]) i++;
+    if (i !== wanted.length) continue;
+    const extra = words.length - wanted.length;
+    if (extra < bestExtra) {
+      bestExtra = extra;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
 /**
  * The "unknown field" error text, listing RELATIONS as well as columns.
  *

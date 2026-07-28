@@ -31,6 +31,15 @@
  *   atomic.
  * - **Result reshaping**: `_count` objects keyed back to Prisma relation names,
  *   and to-one relations surfaced as `object | null`.
+ * - **Turbine-native query options** (`timeout`, `forceCustomPlan`,
+ *   `warnOnUnlimited`, `skipGlobalFilters`, `stableRelationOrder`,
+ *   `allowFullTableScan`, `includePii`, `optimisticLock`, `distinctOn`) reach
+ *   core on every operation whose arg surface declares them. The set is not a
+ *   hand-maintained list here: it comes from the compiler-checked tables in
+ *   `query/option-surface.ts`, so a new core option cannot be silently stranded
+ *   by this layer, and a key that is neither a Prisma arg nor a turbine option
+ *   gets a dev-mode warning instead of vanishing (see
+ *   {@link PRISMA_ARG_KEYS} and `warnUnknownQueryOptions`).
  *
  * ## What it deliberately does NOT do (documented divergences)
  *
@@ -63,6 +72,14 @@
  *   exclusive-cursor + `offset` translation.
  * - **Negative `take`** (take-from-end) and **`skip` on a nested relation
  *   include** throw, Turbine's `with` clause has no offset and no reverse-take.
+ * - **`limit` on `updateMany` / `deleteMany`** (Prisma 6.7+) throws. Turbine has
+ *   no row-bounded mass mutation, and dropping a SAFETY BOUND with a warning
+ *   would turn "change at most 10 rows" into "change every matching row".
+ * - **Write projections** (`select` / `include` / `omit` on
+ *   create/update/delete/upsert), **`select` on `count`**, and
+ *   **`orderBy` / `cursor` / `take` / `skip` on `aggregate`** are accepted and
+ *   IGNORED (they are legitimate Prisma, so they never warn); the full row / a
+ *   plain number comes back.
  *
  * ## Type dependencies (0.41.0)
  *
@@ -99,8 +116,26 @@
 import type { TurbineClient } from './client.js';
 import { TurbineError, TurbineErrorCode, UnsupportedFeatureError, ValidationError, wrapPgError } from './errors.js';
 import { createManyShapeRuns } from './nested-write.js';
-import type { DeferredQuery } from './query/index.js';
-import { shouldWarnOnce } from './query/warn-registry.js';
+import {
+  AGGREGATE_OPTIONS,
+  applyNativeOptions,
+  COUNT_OPTIONS,
+  CREATE_MANY_OPTIONS,
+  CREATE_OPTIONS,
+  DELETE_MANY_OPTIONS,
+  DELETE_OPTIONS,
+  type DeferredQuery,
+  FIND_MANY_OPTIONS,
+  FIND_UNIQUE_OPTIONS,
+  GROUP_BY_OPTIONS,
+  type OptionKind,
+  optionKeysOfKind,
+  UPDATE_MANY_OPTIONS,
+  UPDATE_OPTIONS,
+  UPSERT_OPTIONS,
+} from './query/index.js';
+import { suggestKey } from './query/utils.js';
+import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import type { PrismaCompatMap, PrismaModelMap, RelationDef, SchemaMetadata } from './schema.js';
 
 // ---------------------------------------------------------------------------
@@ -394,6 +429,244 @@ function renameField(mm: PrismaModelMap, prismaField: string): string {
   return mm.fields[prismaField] ?? prismaField;
 }
 
+// ---------------------------------------------------------------------------
+// The option surface: which keys each delegate operation understands
+//
+// Two halves, and they are deliberately kept apart.
+//
+//   1. TURBINE-NATIVE options come from the compiler-checked tables in
+//      query/option-surface.ts, so an option added to a core arg interface can
+//      no longer reach production stranded: the table stops compiling until
+//      someone classifies it, and everything classified `'native'` is copied
+//      through here by ONE helper rather than by a hand-maintained list of
+//      `if (args.x !== undefined)` lines that nobody remembers to extend.
+//   2. PRISMA arg keys are listed verbatim below. This is the PRISMA SURFACE,
+//      not the subset this adapter consumes, and that distinction is the whole
+//      safety argument for the unknown-key warning: `count({ select })`,
+//      `create({ data, select })`, `aggregate({ orderBy })` are all legitimate
+//      Prisma and all currently dropped by this adapter, so a known set derived
+//      from what the translator reads would warn about real, correct calls.
+// ---------------------------------------------------------------------------
+
+/** The delegate operations this adapter exposes. */
+export type CompatOperation =
+  | 'findMany'
+  | 'findFirst'
+  | 'findFirstOrThrow'
+  | 'findUnique'
+  | 'findUniqueOrThrow'
+  | 'create'
+  | 'createMany'
+  | 'update'
+  | 'updateMany'
+  | 'delete'
+  | 'deleteMany'
+  | 'upsert'
+  | 'count'
+  | 'aggregate'
+  | 'groupBy';
+
+/** The turbine arg surface each operation compiles into. */
+const OPERATION_TABLES: Record<CompatOperation, Readonly<Record<string, OptionKind>>> = {
+  findMany: FIND_MANY_OPTIONS,
+  findFirst: FIND_MANY_OPTIONS,
+  findFirstOrThrow: FIND_MANY_OPTIONS,
+  findUnique: FIND_UNIQUE_OPTIONS,
+  findUniqueOrThrow: FIND_UNIQUE_OPTIONS,
+  create: CREATE_OPTIONS,
+  createMany: CREATE_MANY_OPTIONS,
+  update: UPDATE_OPTIONS,
+  updateMany: UPDATE_MANY_OPTIONS,
+  delete: DELETE_OPTIONS,
+  deleteMany: DELETE_MANY_OPTIONS,
+  upsert: UPSERT_OPTIONS,
+  count: COUNT_OPTIONS,
+  aggregate: AGGREGATE_OPTIONS,
+  groupBy: GROUP_BY_OPTIONS,
+};
+
+/**
+ * Every argument key Prisma itself accepts, per operation.
+ *
+ * Extracted from a generated `@prisma/client` 7.9.0 `index.d.ts` (the
+ * `<Model><Op>Args` blocks). It must stay the UNION across the Prisma majors
+ * this adapter supports, never one version's set: a key a newer major
+ * introduces should degrade to one noisy dev line, never to a throw, and a key
+ * an older major had must keep working. The drift test in
+ * `src/test/prisma-compat-option-surface.test.ts` re-extracts from a generated
+ * client when one is present and asserts this stays a superset.
+ */
+export const PRISMA_ARG_KEYS: Record<CompatOperation, readonly string[]> = {
+  findMany: [
+    'select',
+    'omit',
+    'include',
+    'where',
+    'orderBy',
+    'cursor',
+    'take',
+    'skip',
+    'distinct',
+    'relationLoadStrategy',
+  ],
+  findFirst: [
+    'select',
+    'omit',
+    'include',
+    'where',
+    'orderBy',
+    'cursor',
+    'take',
+    'skip',
+    'distinct',
+    'relationLoadStrategy',
+  ],
+  findFirstOrThrow: [
+    'select',
+    'omit',
+    'include',
+    'where',
+    'orderBy',
+    'cursor',
+    'take',
+    'skip',
+    'distinct',
+    'relationLoadStrategy',
+  ],
+  findUnique: ['select', 'omit', 'include', 'where', 'relationLoadStrategy'],
+  findUniqueOrThrow: ['select', 'omit', 'include', 'where', 'relationLoadStrategy'],
+  create: ['select', 'omit', 'include', 'data', 'relationLoadStrategy'],
+  createMany: ['data', 'skipDuplicates'],
+  update: ['select', 'omit', 'include', 'data', 'where', 'relationLoadStrategy'],
+  updateMany: ['data', 'where', 'limit'],
+  delete: ['select', 'omit', 'include', 'where', 'relationLoadStrategy'],
+  deleteMany: ['where', 'limit'],
+  upsert: ['select', 'omit', 'include', 'where', 'create', 'update', 'relationLoadStrategy'],
+  count: ['where', 'orderBy', 'cursor', 'take', 'skip', 'select'],
+  aggregate: ['where', 'orderBy', 'cursor', 'take', 'skip', '_count', '_avg', '_sum', '_min', '_max'],
+  groupBy: ['where', 'orderBy', 'by', 'having', 'take', 'skip', '_count', '_avg', '_sum', '_min', '_max'],
+};
+
+/**
+ * Turbine spellings whose Prisma equivalent is spelled differently. A caller
+ * who reaches for one of these is not confused about the NAME, they are
+ * confused about which surface they are on, so they get a specific message
+ * rather than a fuzzy did-you-mean.
+ */
+const ALIAS_HINT: Readonly<Record<string, string>> = {
+  limit: 'take',
+  offset: 'skip',
+  with: 'include',
+};
+
+/**
+ * Known(op) = Prisma's own keys for that operation, plus every key the
+ * operation's turbine arg surface declares except the `'internal'` ones.
+ *
+ * The second half is NOT just the `'native'` keys. Two turbine-only options are
+ * classified `'prisma'` because their values carry field names and so must be
+ * hand-translated (`optimisticLock`, `distinctOn`); they are fully honoured, and
+ * warning about a key the adapter just acted on would be the worst possible
+ * diagnostic. `'nativeAlias'` members are in the set on purpose too: `limit` on
+ * `findMany` IS recognized, it simply gets the alias message rather than the
+ * generic one. Only `'internal'` is excluded, because nothing on this surface
+ * can reach it.
+ *
+ * A `Set` rather than an `in` test on a record, so an inherited
+ * `Object.prototype` name (`toString`, `constructor`) is treated as the unknown
+ * key it is.
+ */
+const KNOWN_KEYS: Record<CompatOperation, ReadonlySet<string>> = (() => {
+  const out = {} as Record<CompatOperation, ReadonlySet<string>>;
+  for (const op of Object.keys(OPERATION_TABLES) as CompatOperation[]) {
+    out[op] = new Set<string>([
+      ...PRISMA_ARG_KEYS[op],
+      ...optionKeysOfKind(OPERATION_TABLES[op], 'prisma', 'native', 'nativeAlias'),
+    ]);
+  }
+  return out;
+})();
+
+/**
+ * Dev-mode notice for a key on a delegate's args object that this operation has
+ * no meaning for.
+ *
+ * An unrecognized key is silently ignored (JavaScript objects have no schema),
+ * which makes a typo, a turbine spelling, and a genuinely missing feature all
+ * look identical: nothing happens. The client-config warner
+ * (`warnUnknownConfigKeys` in client.ts) exists for the same reason and this is
+ * its query-level twin, down to the ranking of the suggestion.
+ *
+ * Deliberately a WARNING, never an error. Throwing would turn a working app
+ * into a failing one on upgrade over one stray key, and a key from a Prisma
+ * major newer than {@link PRISMA_ARG_KEYS} would be exactly that key. The whole
+ * body is wrapped so a hostile or exotic args object (a Proxy whose `ownKeys`
+ * throws) can never be the reason a query fails. Dev-only and once per
+ * `model.operation.key` per process, like every other advisory here.
+ */
+function warnUnknownQueryOptions(model: string, op: CompatOperation, args: unknown): void {
+  if (process.env.NODE_ENV === 'production') return;
+  if (!isPlainObject(args)) return;
+  try {
+    const known = KNOWN_KEYS[op];
+    const table = OPERATION_TABLES[op];
+    for (const key of Object.keys(args)) {
+      // `{ ...maybeOptions }` routinely materializes keys with no value.
+      // Nothing is being dropped when the value is undefined.
+      if (args[key] === undefined) continue;
+      const alias = table[key] === 'nativeAlias' ? ALIAS_HINT[key] : undefined;
+      if (!alias && known.has(key)) continue;
+      if (!shouldWarnOnce(WARN_NS.unknownQueryOption, `${model}.${op}.${key}`)) continue;
+      if (alias) {
+        console.warn(
+          `[turbine] prisma-compat: "${key}" is Turbine's spelling and is ignored here;` +
+            ` prisma-compat takes Prisma's "${alias}". (${model}.${op})`,
+        );
+        continue;
+      }
+      const suggestion = suggestKey(key, known);
+      console.warn(
+        `[turbine] prisma-compat: unknown option "${key}" in ${model}.${op}(), it is ignored.` +
+          (suggestion ? ` Did you mean "${suggestion}"?` : ''),
+      );
+    }
+  } catch {
+    // Key enumeration is the only thing that can fail here, and a diagnostic
+    // must never be the reason a query fails.
+  }
+}
+
+/**
+ * Prisma 6.7+ accepts `limit` on `updateMany` / `deleteMany` to BOUND how many
+ * rows a mass mutation touches. Turbine has no row-bounded mass mutation, so
+ * this one is refused rather than warned about: everywhere else in this design
+ * a dropped option costs the caller a feature, but silently dropping a safety
+ * bound turns "change at most 10 rows" into "change every row".
+ */
+function refuseRowLimit(model: string, op: 'updateMany' | 'deleteMany', args: unknown): void {
+  if (!isPlainObject(args) || args.limit === undefined) return;
+  throw new UnsupportedFeatureError(
+    `\`limit\` on ${op} (row-bounded mass mutation)`,
+    'prisma-compat',
+    `Turbine has no row-bounded ${op}; select the rows you mean with \`where\`` +
+      ` (on ${model}.${op}), or page them and mutate by primary key.`,
+  );
+}
+
+/**
+ * Prisma's `relationLoadStrategy` and Turbine's share a name and NOT a value
+ * domain: Prisma has `'query' | 'join'`, Turbine has
+ * `'join' | 'batched' | 'auto' | 'flatten'`. Core's strategy resolution has no
+ * branch for `'query'` and returns the value unchanged, so forwarding it
+ * verbatim gave a caller who asked for the per-relation query plan the JOIN
+ * plan, the exact opposite of the request. Prisma's `'query'` IS Turbine's
+ * `'batched'` (one follow-up statement per relation); the turbine-only values
+ * pass through so a compat caller can still reach them.
+ */
+function mapRelationLoadStrategy(value: unknown): unknown {
+  return value === 'query' ? 'batched' : value;
+}
+
 /**
  * Translate a Prisma `where` (or nested relation where) into a Turbine `where`.
  * Renames scalar field keys and relation keys through the map, recurses into
@@ -614,6 +887,12 @@ function translateReadArgs(
   kind: ReadKind,
 ): Record<string, unknown> {
   const t: Record<string, unknown> = {};
+  // FIRST, so a per-call `stableRelationOrder` overrides it: the client-level
+  // option is a default, the arg is an instruction.
+  if (ctx.options.stablePkOrder) t.stableRelationOrder = true;
+  // Every turbine-native option the arg surface declares, in one line that
+  // cannot fall behind the interface (see the option-surface tables).
+  applyNativeOptions(kind === 'unique' ? FIND_UNIQUE_OPTIONS : FIND_MANY_OPTIONS, prismaArgs, t);
   if (prismaArgs.where !== undefined) t.where = translateWhere(ctx, mm, prismaArgs.where);
   if (prismaArgs.orderBy !== undefined) t.orderBy = translateOrderBy(ctx, mm, prismaArgs.orderBy);
   const proj = translateProjection(ctx, mm, prismaArgs);
@@ -622,13 +901,9 @@ function translateReadArgs(
   if (Array.isArray(prismaArgs.distinct)) {
     t.distinct = (prismaArgs.distinct as string[]).map((f) => renameField(mm, f));
   }
-  if (prismaArgs.relationLoadStrategy !== undefined) t.relationLoadStrategy = prismaArgs.relationLoadStrategy;
-  if (typeof prismaArgs.timeout === 'number') t.timeout = prismaArgs.timeout;
-  // Turbine-only passthrough. Prisma has no PII concept, so a compat caller
-  // whose schema tags columns needs SOME way to opt in; without this the
-  // adapter is a one-way door into redacted reads and refused aggregates.
-  if (prismaArgs.includePii !== undefined) t.includePii = prismaArgs.includePii;
-  if (ctx.options.stablePkOrder) t.stableRelationOrder = true;
+  if (prismaArgs.relationLoadStrategy !== undefined) {
+    t.relationLoadStrategy = mapRelationLoadStrategy(prismaArgs.relationLoadStrategy);
+  }
   // ORDER IS LOAD-BEARING: translateCursor MUST run BEFORE applyImplicitPkOrder.
   // The cursor translation reads `t.orderBy` to decide the seek direction and to
   // validate that a bare inclusive cursor names the sort key; it must see the
@@ -949,23 +1224,36 @@ function translateAggregateArgs(
   isGroupBy: boolean,
 ): Record<string, unknown> {
   const t: Record<string, unknown> = {};
+  applyNativeOptions(isGroupBy ? GROUP_BY_OPTIONS : AGGREGATE_OPTIONS, args, t);
   if (args.where !== undefined) t.where = translateWhere(ctx, mm, args.where);
   if (args._count !== undefined) t._count = renameAggBlock(mm, args._count, true);
   for (const block of AGG_FIELD_BLOCKS) {
     if (args[block] !== undefined) t[block] = renameAggBlock(mm, args[block], false);
   }
-  if (typeof args.timeout === 'number') t.timeout = args.timeout;
-  // Turbine-only passthrough: the PII gate on groupBy keys and _min/_max needs
-  // an opt-in that Prisma's arg shape has no equivalent for.
-  if (args.includePii !== undefined) t.includePii = args.includePii;
   if (isGroupBy) {
     if (Array.isArray(args.by)) t.by = (args.by as string[]).map((f) => renameField(mm, f));
     if (args.orderBy !== undefined) t.orderBy = translateOrderBy(ctx, mm, args.orderBy);
     if (args.having !== undefined) t.having = renameHaving(mm, args.having);
+    if (args.distinctOn !== undefined) t.distinctOn = translateDistinctOn(ctx, mm, args.distinctOn);
     if (typeof args.take === 'number') t.limit = mapTake(args.take);
     if (typeof args.skip === 'number') t.offset = args.skip;
   }
   return t;
+}
+
+/**
+ * Translate a turbine-native groupBy `distinctOn`. Both halves of its value
+ * (`columns`, `orderBy`) are FIELD NAMES, so this is the concrete reason the
+ * option surface refuses to copy unknown keys through by default: a blind
+ * passthrough is correct on a model whose Prisma and turbine names coincide and
+ * silently wrong on one with a `@map`.
+ */
+function translateDistinctOn(ctx: Ctx, mm: PrismaModelMap, val: unknown): unknown {
+  if (!isPlainObject(val)) return val;
+  const out: Record<string, unknown> = { ...val };
+  if (Array.isArray(val.columns)) out.columns = (val.columns as string[]).map((f) => renameField(mm, f));
+  if (val.orderBy !== undefined) out.orderBy = translateOrderBy(ctx, mm, val.orderBy);
+  return out;
 }
 
 /** Rename field keys inside an aggregate block; `_count`'s `_all` passes through. */
@@ -1504,6 +1792,7 @@ async function createManyByRun(
   for (const run of runs) {
     const args: Args = { data: run };
     if (t.skipDuplicates) args.skipDuplicates = true;
+    if (t.timeout !== undefined) args.timeout = t.timeout;
     count += (await qi.createMany(args)).length;
   }
   return { count };
@@ -1529,7 +1818,9 @@ function makeDelegate(
   // `qi.*` build into a rejection; the array `$transaction([...])` batch path
   // catches the same throw from `batch.build`.
   const defer = <T>(
-    translate: () => Args,
+    op: CompatOperation,
+    rawArgs: unknown,
+    translateRaw: () => Args,
     run: (qi: CompatQueryInterface, t: Args) => Promise<T>,
     batch?: {
       build: (qi: CompatQueryInterface, t: Args) => DeferredQuery<unknown>;
@@ -1540,6 +1831,13 @@ function makeDelegate(
       execInTx?: (table: (name: string) => CompatQueryInterface, t: Args) => Promise<unknown>;
     },
   ): CompatPromise<T> => {
+    // The unknown-key check rides the SAME deferred boundary as the translation
+    // itself, for the same reason (see the comment above): a compat promise that
+    // is built and never awaited must produce no output at all.
+    const translate = (): Args => {
+      warnUnknownQueryOptions(modelName(ctx, mm), op, rawArgs);
+      return translateRaw();
+    };
     const batchable: Batchable | undefined = batch
       ? {
           build: () => batch.build(getQI(), translate()),
@@ -1580,39 +1878,51 @@ function makeDelegate(
   return {
     findMany: (args = {}) =>
       defer(
+        'findMany',
+        args,
         () => translateReadArgs(ctx, mm, args, 'many'),
         (qi, t) => qi.findMany(t).then((r) => reshapeRows(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindMany(t), reshape: (raw) => reshapeRows(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row'][]>,
     findFirst: (args = {}) =>
       defer(
+        'findFirst',
+        args,
         () => translateReadArgs(ctx, mm, args, 'first'),
         (qi, t) => qi.findFirst(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindFirst(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
     findUnique: (args) =>
       defer(
+        'findUnique',
+        args,
         () => translateReadArgs(ctx, mm, requireWhere(args, 'findUnique'), 'unique'),
         (qi, t) => qi.findUnique(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindUnique(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
     findFirstOrThrow: (args = {}) =>
       defer(
+        'findFirstOrThrow',
+        args,
         () => translateReadArgs(ctx, mm, args, 'first'),
         (qi, t) => qi.findFirstOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindFirstOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     findUniqueOrThrow: (args) =>
       defer(
+        'findUniqueOrThrow',
+        args,
         () => translateReadArgs(ctx, mm, requireWhere(args, 'findUniqueOrThrow'), 'unique'),
         (qi, t) => qi.findUniqueOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
         { build: (qi, t) => qi.buildFindUniqueOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     create: (args) =>
       defer(
+        'create',
+        args,
         () => {
           const t: Args = { data: translateWriteData(ctx, mm, applyCreateDefaults(mm, (args as Args).data)) };
-          if (typeof (args as Args).timeout === 'number') t.timeout = (args as Args).timeout;
+          applyNativeOptions(CREATE_OPTIONS, args as Args, t);
           return t;
         },
         (qi, t) => qi.create(t).then((r) => reshapeRow(ctx, mm, r)),
@@ -1624,12 +1934,15 @@ function makeDelegate(
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     createMany: (args) =>
       defer(
+        'createMany',
+        args,
         () => {
           const data = (args as Args).data;
           const rows = Array.isArray(data)
             ? data.map((d) => translateWriteData(ctx, mm, applyCreateDefaults(mm, d)))
             : [];
           const t: Args = { data: rows };
+          applyNativeOptions(CREATE_MANY_OPTIONS, args as Args, t);
           if ((args as Args).skipDuplicates) t.skipDuplicates = true;
           return t;
         },
@@ -1653,12 +1966,25 @@ function makeDelegate(
       ) as unknown as Promise<{ count: number }>,
     update: (args) =>
       defer(
+        'update',
+        args,
         () => {
           const a = requireWhere(args, 'update');
-          return {
+          const t: Args = {
             where: translateWhere(ctx, mm, a.where),
             data: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.data)),
-          } as Args;
+          };
+          applyNativeOptions(UPDATE_OPTIONS, a, t);
+          // `optimisticLock.field` is a FIELD NAME, so it is renamed rather than
+          // copied: a blind passthrough would send the Prisma spelling into core
+          // and break on any model whose column is `@map`ped.
+          if (isPlainObject(a.optimisticLock)) {
+            t.optimisticLock = {
+              ...a.optimisticLock,
+              field: renameField(mm, String(a.optimisticLock.field)),
+            };
+          }
+          return t;
         },
         (qi, t) => qi.update(t).then((r) => reshapeRow(ctx, mm, r)),
         {
@@ -1669,12 +1995,19 @@ function makeDelegate(
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     updateMany: (args) =>
       defer(
+        'updateMany',
+        args,
         () => {
           const a = args as Args;
+          refuseRowLimit(modelName(ctx, mm), 'updateMany', a);
           const t: Args = {
             where: translateWhere(ctx, mm, a.where ?? {}),
             data: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.data)),
           };
+          applyNativeOptions(UPDATE_MANY_OPTIONS, a, t);
+          // LAST, so it wins: a Prisma updateMany with no `where` affects every
+          // row, and an explicit `allowFullTableScan: false` must not be able to
+          // turn that parity into a thrown empty-where guard.
           if (a.where === undefined) t.allowFullTableScan = true;
           return t;
         },
@@ -1683,18 +2016,27 @@ function makeDelegate(
       ) as unknown as Promise<{ count: number }>,
     delete: (args) =>
       defer(
+        'delete',
+        args,
         () => {
           const a = requireWhere(args, 'delete');
-          return { where: translateWhere(ctx, mm, a.where) } as Args;
+          const t: Args = { where: translateWhere(ctx, mm, a.where) };
+          applyNativeOptions(DELETE_OPTIONS, a, t);
+          return t;
         },
         (qi, t) => qi.delete(t).then((r) => reshapeRow(ctx, mm, r)),
         { build: (qi, t) => qi.buildDelete(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     deleteMany: (args = {}) =>
       defer(
+        'deleteMany',
+        args,
         () => {
           const a = args as Args;
+          refuseRowLimit(modelName(ctx, mm), 'deleteMany', a);
           const t: Args = { where: translateWhere(ctx, mm, a.where ?? {}) };
+          applyNativeOptions(DELETE_MANY_OPTIONS, a, t);
+          // LAST, so it wins. See the same note on updateMany.
           if (a.where === undefined) t.allowFullTableScan = true;
           return t;
         },
@@ -1703,13 +2045,17 @@ function makeDelegate(
       ) as unknown as Promise<{ count: number }>,
     upsert: (args) =>
       defer(
+        'upsert',
+        args,
         () => {
           const a = requireWhere(args, 'upsert');
-          return {
+          const t: Args = {
             where: translateWhere(ctx, mm, a.where),
             create: translateWriteData(ctx, mm, applyCreateDefaults(mm, a.create)),
             update: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.update)),
-          } as Args;
+          };
+          applyNativeOptions(UPSERT_OPTIONS, a, t);
+          return t;
         },
         (qi, t) => {
           // Native ON CONFLICT upsert is only Prisma-equivalent when the where
@@ -1737,10 +2083,12 @@ function makeDelegate(
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     count: (args = {}) =>
       defer(
+        'count',
+        args,
         () => {
           const t: Args = {};
+          applyNativeOptions(COUNT_OPTIONS, args as Args, t);
           if ((args as Args).where !== undefined) t.where = translateWhere(ctx, mm, (args as Args).where);
-          if (typeof (args as Args).timeout === 'number') t.timeout = (args as Args).timeout;
           return t;
         },
         (qi, t) => qi.count(t),
@@ -1748,12 +2096,16 @@ function makeDelegate(
       ) as unknown as Promise<number>,
     aggregate: (args) =>
       defer(
+        'aggregate',
+        args,
         () => translateAggregateArgs(ctx, mm, args as Args, false),
         (qi, t) => qi.aggregate(t).then((r) => reshapeAggregate(ctx, mm, r)),
         { build: (qi, t) => qi.buildAggregate(t), reshape: (raw) => reshapeAggregate(ctx, mm, raw) },
       ) as unknown as Promise<Record<string, unknown>>,
     groupBy: (args) =>
       defer(
+        'groupBy',
+        args,
         () => translateAggregateArgs(ctx, mm, args as Args, true),
         (qi, t) => qi.groupBy(t).then((rows) => (rows as unknown[]).map((r) => reshapeGroupRow(ctx, mm, r))),
         {

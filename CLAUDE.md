@@ -157,7 +157,22 @@ src/
                       closestName first then a camel-word-subsequence pass so `logParams`
                       still suggests `logQueryParams`; `url`/`schema`/queryInterfaceFactory
                       are exempt, and the whole check is try/caught so a diagnostic can
-                      never fail a constructor).
+                      never fail a constructor), and unknownQueryOption (0.57:
+                      prisma-compat's warnUnknownQueryOptions, once per
+                      model.operation.key, sharing suggestKey with the config check).
+
+    option-surface.ts, The query-arg OPTION SURFACE as runtime data (0.57). One
+                      `Record<keyof SomeArgs<Row>, OptionKind>` table per arg interface
+                      ('prisma' | 'native' | 'nativeAlias' | 'internal'), the
+                      TURBINE_CONFIG_KEYS pattern lifted from client config to query args,
+                      plus `applyNativeOptions` / `optionKeysOfKind` / `ALL_OPTION_TABLES`.
+                      Type-only imports from ./types.js, so no cycle. Adding an option to a
+                      core arg interface FAILS THE BUILD here until a human classifies it,
+                      which is what stops prisma-compat stranding it by omission; listing a
+                      key that is not on the interface fails as an excess property. THE ONE
+                      RULE: 'native' only when the value contains no field/relation/column/
+                      model NAME (`optimisticLock.field` and `distinctOn.columns` do, so they
+                      are 'prisma' and hand-translated).
 
     index.ts       , Barrel re-export (~65 LOC). All imports use `./query/index.js`.
 
@@ -170,16 +185,39 @@ src/
                       false positives on `defineSchema`-only metadata).
 
   plan-divergence.ts, Cached-plan divergence advisor (0.56), doctor's third question about a
-                      probe column: "this column IS indexed, and its distribution makes a
-                      NAMED prepared statement's generic plan unsafe". Pure (no pg import, no
-                      EXPLAIN): reads relpages/reltuples plus the pg_stats row collected by
+                      probe column: "this column's distribution makes a NAMED prepared
+                      statement's generic plan unsafe". Pure (no pg import, no
+                      EXPLAIN): reads relpages/reltuples plus the pg_stats rows collected by
                       index-stats.ts (`StatsSnapshot.columnStats`, gated on
-                      `options.distributionColumns`) and scores ONE shape,
-                      `WHERE col = $1 ORDER BY <other indexed column> LIMIT $n`, where the
+                      `options.distributionColumns`, which the CLI fills from
+                      `collectDivergenceCandidateColumns` + `collectDivergenceOrderColumns`)
+                      and scores ONE shape, `WHERE col = $1 ORDER BY <other indexed column>
+                      LIMIT $n`, on TWO branches (`PlanDivergenceFinding.branch`).
+                      `sparse-value` (0.56, an index serves the equality): the
                       generic estimate `rows / n_distinct` sits ABOVE the plan boundary
                       `crossoverRows = sqrt(limit x relpages)` while real values sit below it.
                       Gates: the wrong plan must walk >= `minWalkPages` (50) AND >=
-                      `minWalkFraction` (10%) of the table. Findings carry the diagnostic SQL
+                      `minWalkFraction` (10%) of the table.
+                      `unindexed-filter` (0.57, NO index serves the equality) is a THIRD
+                      mechanism, not a variant: the good plan is a SEQ SCAN the generic plan
+                      will not choose (custom seq scan + top-N sort bounded by pages, generic
+                      keeps the ordered PK walk and fetches ~every tuple). Gates: rarest
+                      bucket < assumedLimit AND `minGenericTupleWalk` (10,000) tuples, no
+                      generic-side gate (measured: an unknown LIMIT discounts the ordered scan
+                      10x whatever the child estimate is). It used to be dropped by a shape
+                      gate BEFORE the considered counter, so the whole unindexed population
+                      was outside both the findings and the notices. Branch-shaped fields are
+                      OPTIONAL, never zero-filled; both branches sort on estimated EXTRA
+                      BUFFER ACCESSES (a 0.57 reordering of existing sparse findings).
+                      "Served by an index" = valid, non-partial, non-expression, leading
+                      column, access method btree OR HASH (a hash index gives the same bitmap
+                      path, measured 7 buffers); brin/gin/gist leading the column is scored by
+                      neither rule and emits a notice. `orderColumnCorrelation` +
+                      `heapNearlyOrdered` (0.57) disclose the branch's known false positive: a
+                      heap in near-exact orderColumn order reads ~1.2x where a scattered one
+                      reads ~80x, and the two are one sampled fifth decimal apart, so the
+                      statistic QUALIFIES a finding and never suppresses one.
+                      Findings carry the diagnostic SQL
                       whose FIRST step reads `pg_prepared_statements.generic_plans` (a finding
                       is EXPOSURE, not an incident: `auto` promotes only when the generic plan
                       is not estimated to cost more, which on many of these shapes it is).
@@ -564,7 +602,21 @@ src/
                       reshaping, to-one array→object|null. $transaction in callback AND
                       lazy-array-batching forms, $queryRaw/$executeRaw (+Unsafe) with
                       Prisma.sql-style fragments, createMany skipDuplicates → core
-                      ON CONFLICT DO NOTHING (E017 on mssql/powdb). $extends (0.53):
+                      ON CONFLICT DO NOTHING (E017 on mssql/powdb). Turbine-native query
+                      options (0.57): every translator ends in one `applyNativeOptions` call
+                      driven by query/option-surface.ts, replacing the ad-hoc
+                      `if (typeof args.timeout === 'number')` allowlist that had silently
+                      dropped forceCustomPlan / warnOnUnlimited / skipGlobalFilters /
+                      allowFullTableScan / optimisticLock / stableRelationOrder / distinctOn
+                      and most writes' timeout. Ordering matters and is deliberate:
+                      stablePkOrder's default is written BEFORE the native copy (a per-call
+                      arg wins) and updateMany/deleteMany's implicit allowFullTableScan AFTER
+                      (Prisma parity cannot be turned into a thrown guard). `limit` on
+                      updateMany/deleteMany throws E017; relationLoadStrategy 'query' maps to
+                      'batched' (it used to be forwarded into a resolver with no 'query'
+                      branch, silently giving the join). warnUnknownQueryOptions warns once
+                      per model.operation.key on a key that is in neither PRISMA_ARG_KEYS[op]
+                      nor the operation's non-'internal' table; warn-never-throw. $extends (0.53):
                       the `client` + `model` components only, object form AND the
                       Prisma.defineExtension callback form (`$extends(fn)` IS
                       `fn(client)`). applyExtension folds a validated extension into a
@@ -675,7 +727,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 
 ## CLI Architecture
 
-The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration; cached-plan divergence section → `plan-divergence.ts`, finding-only, `--no-plan-divergence` skips it and its pg_stats read), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`.
+The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration; cached-plan divergence section → `plan-divergence.ts`, finding-only, `--no-plan-divergence` skips it and its pg_stats read; since 0.57 an `unindexed-filter` finding renders as EVIDENCE on the missing-index finding for the same column (`attachDivergenceToMissingIndexes` / `renderDivergenceEvidence`) rather than as a second entry, and the remediation text names `forceCustomPlan` without assuming the reader holds the core client or prisma-compat), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`.
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.mts` / `.js` / `.mjs`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 
