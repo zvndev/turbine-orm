@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.59.1 (2026-07-28)
+
+### Changed
+
+- **Documentation wording only, no code behaviour changes.** Several notes in the
+  changelog, README, site and source comments described a measurement by the
+  environment it was taken in rather than by what was measured. The numbers are
+  unchanged; only the framing is. Turbine's docs describe what the software does
+  and what was measured, never where a report came from.
+
 ## 0.59.0 (2026-07-27)
 
 ### Fixed
@@ -54,8 +64,9 @@
 - **`turbine doctor`'s `unindexed-filter` findings are now put to the planner
   before being reported, which removes most of them.** The branch shipped in
   0.57.0 answering "IF this cached plan flips, how bad is it" without answering
-  "CAN it flip at all". On a real 118-model schema it produced 39 findings, and a
-  measured sample was right 6 times in 13. Every false positive had the same
+  "CAN it flip at all". In validation against a large schema it emitted 39
+  findings, and a measured sample of 13 of them held up only 6 times. Every
+  false positive had the same
   signature: **the generic plan keeps the same sequential scan the good plan
   chose**, so the amplification the finding printed described a plan the planner
   would never pick.
@@ -434,9 +445,10 @@
   `ORDER BY` is the necessary co-factor" with a 430x case that has no ordering
   and no limit, and that refutation stands. But it was published on its own, and
   read alone it says ordering does not matter, which misleads in the other
-  direction. Both halves are true. On a real multi-tenant schema swept table by
-  table, EVERY divergent shape was `WHERE tenant = $1 ORDER BY id ASC LIMIT $2`
-  and every shape without an ordering measured 1.00x. The mechanism is plain: an
+  direction. Both halves are true. In a table-by-table sweep of a multi-tenant
+  schema, EVERY divergent shape measured was
+  `WHERE tenant = $1 ORDER BY id ASC LIMIT $2`, and every shape without an
+  ordering measured 1.00x. The mechanism is plain: an
   `ORDER BY` on a DIFFERENT indexed column hands the planner a second plan it
   can run away with, and a generic estimate on the wrong side of that boundary
   is what makes it take it. So: not necessary in general (do not conclude your

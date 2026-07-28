@@ -2979,7 +2979,8 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
 
   // Statistics can say how bad a flip WOULD be; only the planner can say whether
   // it is reachable. The `unindexed-filter` branch shipped in 0.57 without that
-  // question answered and was right 6 times in 13 on a real schema, so every one
+  // question answered, and a measured sample of 13 findings held up only 6 times,
+  // so every one
   // of its findings is now put to a plan-only EXPLAIN. Nothing is executed, and a
   // probe that fails keeps its finding rather than dropping it.
   const flipProbe =

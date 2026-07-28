@@ -6,8 +6,8 @@
  * `plan-divergence.ts` scores a column from statistics alone and answers "IF the
  * cached plan flips, how bad is it". Its `unindexed-filter` branch (0.57) shipped
  * without an answer to the prior question, "CAN it flip at all", and that turned
- * out to be the majority case: on a real 118-model schema the branch produced 39
- * findings of which a measured sample was right 6 times in 13.
+ * out to be the majority case: in validation against a large schema the branch
+ * emitted 39 findings, and a measured sample of 13 of them held up only 6 times.
  *
  * Every false positive had one signature: **the generic plan was not the ordered
  * index walk the finding claims.** There was no flip to be had, so the

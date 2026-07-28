@@ -515,7 +515,7 @@ The report prints how many columns were scored, split by indexed and unindexed, 
 
 #### The findings are checked against the planner (new in 0.58.0)
 
-Statistics can say how bad a flip would be. Only the planner can say whether it is **reachable**. In 0.57.0 the unindexed-filter branch reported on statistics alone, and on a real schema it was right 6 times in 13: every false positive had one signature, the generic plan keeping the same sequential scan the good plan chose, so there was nothing to diverge to.
+Statistics can say how bad a flip would be. Only the planner can say whether it is **reachable**. In 0.57.0 the unindexed-filter branch reported on statistics alone, and a measured sample of 13 such findings held up only 6 times: every false positive had one signature, the generic plan keeping the same sequential scan the good plan chose, so there was nothing to diverge to.
 
 Each unindexed-filter finding now costs one `EXPLAIN` **without** `ANALYZE`, which plans and discards, executes nothing, and returns in microseconds:
 
