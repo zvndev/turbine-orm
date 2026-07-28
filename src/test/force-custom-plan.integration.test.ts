@@ -125,6 +125,35 @@ async function prepareConnection(db: TurbineClient): Promise<void> {
   await db.pool.query('DEALLOCATE ALL');
 }
 
+/**
+ * Does the fixture still DISCRIMINATE, i.e. would a value-aware plan for the
+ * sparse tenant use the index?
+ *
+ * The two buffer-count cases below infer which plan ran from how much I/O it
+ * did, and that inference is only valid while the two plans cost visibly
+ * different amounts. If the planner's statistics do not currently show the
+ * sparse tenant as sparse, BOTH plans seq scan, both readings land on the same
+ * number, and the assertion reports a product defect that is really a fixture
+ * that has stopped carrying signal. Observed exactly once in CI as
+ * `pinned=19107 auto=19105`: two readings 0.01% apart, which is not a
+ * measurement of anything.
+ *
+ * So the precondition is re-established (ANALYZE) and then CHECKED against the
+ * planner's own answer rather than assumed. A case whose fixture cannot
+ * discriminate skips with the plan in the message, which is the honest report:
+ * the measurement was not available, not that the feature is broken.
+ */
+async function sparsePlanUsesIndex(db: TurbineClient): Promise<string | null> {
+  await db.pool.query(`ANALYZE ${TABLE}`);
+  const explained = await db.pool.query(
+    `EXPLAIN (FORMAT JSON) SELECT id, tenant_id, amount FROM ${TABLE} WHERE tenant_id = ${SPARSE_TENANT} ORDER BY id ASC LIMIT 100`,
+  );
+  const plan = JSON.stringify(explained.rows[0]?.['QUERY PLAN'] ?? explained.rows[0] ?? {});
+  return /Index (Only )?Scan|Bitmap Heap Scan/.test(plan)
+    ? null
+    : `the fixture no longer discriminates: a value-aware plan for the sparse tenant does not use an index (${plan.slice(0, 200)})`;
+}
+
 async function planRecord(db: TurbineClient): Promise<PlanRecord> {
   const res = await db.pool.query('SELECT name, generic_plans, custom_plans FROM pg_prepared_statements ORDER BY name');
   return {
@@ -262,6 +291,15 @@ describe('forceCustomPlan against a live plan cache', () => {
 
   gate.it('withholding the name does NOT escape a connection pinned to force_generic_plan', async (t) => {
     if (bufferStatsAvailable === false) return t.skip(NEEDS_BUFFER_STATS);
+    {
+      const probe = turbine();
+      try {
+        const why = await sparsePlanUsesIndex(probe);
+        if (why) return t.skip(why);
+      } finally {
+        await probe.disconnect();
+      }
+    }
     // THE MEASUREMENT BEHIND THE REFUSAL, and the reason the refusal exists.
     // The natural reading of the mechanism (a one-shot plan is always custom)
     // predicts that an unnamed statement escapes `plan_cache_mode`. It does
@@ -328,6 +366,15 @@ describe('forceCustomPlan against a live plan cache', () => {
 
   gate.it('under the default client, the opted-in query really is planned with its values', async (t) => {
     if (bufferStatsAvailable === false) return t.skip(NEEDS_BUFFER_STATS);
+    {
+      const probe = turbine();
+      try {
+        const why = await sparsePlanUsesIndex(probe);
+        if (why) return t.skip(why);
+      } finally {
+        await probe.disconnect();
+      }
+    }
     // The positive half of the same measurement: same fixture, same sparse
     // tenant, no client-level setting. The named statement is free to promote,
     // the unnamed one cannot, and the buffers say which plan actually ran.
