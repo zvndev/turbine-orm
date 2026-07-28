@@ -33,6 +33,7 @@ describe('findUnique refuses a where with no predicate', () => {
         { name: 'email', field: 'email', pgType: 'text' },
       ]),
     },
+    enums: {},
   };
   const q = makeQuery('users', schema);
 
@@ -78,7 +79,7 @@ describe('transaction isolation level is validated, not silently dropped', () =>
   // bare BEGIN, so `'serializable'` asked for SERIALIZABLE and got READ
   // COMMITTED: the caller believes it holds a guarantee it does not hold, and
   // the workload that needed it produces wrong data with no error anywhere.
-  const client = new TurbineClient({ connectionString: 'postgres://u:p@127.0.0.1:1/x' }, { tables: {} });
+  const client = new TurbineClient({ connectionString: 'postgres://u:p@127.0.0.1:1/x' }, { tables: {}, enums: {} });
 
   for (const bad of ['serializable', 'SERIALIZABLE', 'Serialisable', 'ReadCommited', '', 'constructor', 'toString']) {
     it(`refuses ${JSON.stringify(bad)}`, async () => {
@@ -134,14 +135,18 @@ describe('COMMIT-time errors are wrapped like every other query boundary', () =>
           { name: 'u', field: 'u' },
         ]),
       },
+      enums: {},
     };
     const db = new TurbineClient({ connectionString: URL }, schema);
     try {
       await assert.rejects(
         () =>
           db.$transaction(async (tx) => {
-            await tx.commitTimeProbe.create({ data: { id: 1, u: 1 } });
-            await tx.commitTimeProbe.create({ data: { id: 2, u: 1 } });
+            // The typed accessors come from a GENERATED client; this schema is
+            // built inline, so the table is reached through the runtime shape.
+            const probe = (tx as unknown as Record<string, { create(a: unknown): Promise<unknown> }>).commitTimeProbe!;
+            await probe.create({ data: { id: 1, u: 1 } });
+            await probe.create({ data: { id: 2, u: 1 } });
           }),
         (err: unknown) => {
           assert.ok(err instanceof TurbineError, `expected a TurbineError, got ${(err as object).constructor.name}`);
