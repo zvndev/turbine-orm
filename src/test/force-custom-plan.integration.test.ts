@@ -136,7 +136,17 @@ async function planRecord(db: TurbineClient): Promise<PlanRecord> {
   };
 }
 
-/** Buffers this table has served, cluster-wide, flushed so the read is current. */
+/**
+ * Buffers this table has served, cluster-wide, flushed so the read is current.
+ *
+ * `pg_stat_force_next_flush()` arrived with the shared-memory stats collector
+ * in PostgreSQL 15 and does not exist on 14, where calling it is a hard 42883
+ * that fails the test rather than the feature. On 14 the stats collector
+ * flushes on its own schedule, so there is nothing to force and nothing to
+ * substitute: the two cases that read buffer counts skip there (see
+ * {@link bufferStatsAvailable}), and this helper is only ever reached when they
+ * do not.
+ */
 async function tableBuffers(db: TurbineClient): Promise<number> {
   await db.pool.query('SELECT pg_stat_force_next_flush()');
   const res = await db.pool.query(
@@ -148,12 +158,26 @@ async function tableBuffers(db: TurbineClient): Promise<number> {
   return Number(res.rows[0]?.blks ?? 0);
 }
 
+/**
+ * Is the on-demand stats flush available (PostgreSQL >= 15)?
+ *
+ * Resolved in `before`, because the answer needs a connection, and consumed
+ * INSIDE the affected tests via `t.skip()` rather than through the `skip`
+ * option. The option is evaluated when the file is collected, which is before
+ * any `before` hook has run, so a gate written that way reads `undefined` on
+ * every server and fires on none of them.
+ */
+let bufferStatsAvailable: boolean | undefined;
+const NEEDS_BUFFER_STATS = 'pg_stat_force_next_flush() needs PostgreSQL 15 or newer';
+
 describe('forceCustomPlan against a live plan cache', () => {
   before(async () => {
     const db = turbine();
     try {
       await db.pool.query(SEED);
       await db.pool.query(`VACUUM (ANALYZE) ${TABLE}`);
+      const probe = await db.pool.query("SELECT to_regprocedure('pg_stat_force_next_flush()') IS NOT NULL AS ok");
+      bufferStatsAvailable = probe.rows[0]?.ok === true;
     } finally {
       await db.disconnect();
     }
@@ -236,7 +260,8 @@ describe('forceCustomPlan against a live plan cache', () => {
     }
   });
 
-  gate.it('withholding the name does NOT escape a connection pinned to force_generic_plan', async () => {
+  gate.it('withholding the name does NOT escape a connection pinned to force_generic_plan', async (t) => {
+    if (bufferStatsAvailable === false) return t.skip(NEEDS_BUFFER_STATS);
     // THE MEASUREMENT BEHIND THE REFUSAL, and the reason the refusal exists.
     // The natural reading of the mechanism (a one-shot plan is always custom)
     // predicts that an unnamed statement escapes `plan_cache_mode`. It does
@@ -301,7 +326,8 @@ describe('forceCustomPlan against a live plan cache', () => {
     }
   });
 
-  gate.it('under the default client, the opted-in query really is planned with its values', async () => {
+  gate.it('under the default client, the opted-in query really is planned with its values', async (t) => {
+    if (bufferStatsAvailable === false) return t.skip(NEEDS_BUFFER_STATS);
     // The positive half of the same measurement: same fixture, same sparse
     // tenant, no client-level setting. The named statement is free to promote,
     // the unnamed one cannot, and the buffers say which plan actually ran.
