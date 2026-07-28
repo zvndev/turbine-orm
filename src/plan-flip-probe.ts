@@ -9,10 +9,11 @@
  * out to be the majority case: on a real 118-model schema the branch produced 39
  * findings of which a measured sample was right 6 times in 13.
  *
- * Every false positive had one signature: **the generic plan kept the same
- * sequential scan the custom plan chose.** There was no flip to be had, so the
+ * Every false positive had one signature: **the generic plan was not the ordered
+ * index walk the finding claims.** There was no flip to be had, so the
  * amplification the finding printed described a plan the planner would never
- * pick.
+ * pick. See {@link verdictFromPlanJson} for the two ways a plan fails to be that
+ * walk; 0.58.0 shipped only one of them and 0.59.0 added the other.
  *
  * ## Why this is a probe and not another rule
  *
@@ -54,11 +55,10 @@
  * ```
  *
  * The custom plan is not needed. The finding's whole claim is that a promoted
- * generic plan abandons the seq scan for an ordered index walk, so if the generic
- * plan IS a seq scan on the target table, the claim is refuted no matter what the
- * custom plan does. Asking one question instead of two halves the work and
- * removes the need for a representative rare value, which statistics do not
- * carry.
+ * generic plan performs an ordered index walk, so a generic plan that is NOT that
+ * walk refutes it no matter what the custom plan does. Asking one question
+ * instead of two halves the work and removes the need for a representative rare
+ * value, which statistics do not carry.
  *
  * `NULL` is a safe argument precisely because the plan is generic: a generic plan
  * is built without looking at the value, which is the property the whole check is
@@ -83,11 +83,11 @@ import { quoteIdent } from './query/utils.js';
 /**
  * The planner's answer for one finding.
  *
- * - `'flip-reachable'`, the generic plan is NOT a plain seq scan of the target
+ * - `'flip-reachable'`, the generic plan IS an ordered index walk on the target
  *   table, so the divergence the finding describes is one the planner can
  *   actually choose.
- * - `'no-flip'`, the generic plan sequentially scans the target table, the same
- *   access the good plan uses. Nothing to diverge to.
+ * - `'no-flip'`, the generic plan is not that walk (a `Sort` bounds it, or the
+ *   access is a plain seq scan). Nothing to diverge to.
  * - `'unknown'`, the probe did not produce an answer. The finding is kept.
  */
 export type FlipVerdict = 'flip-reachable' | 'no-flip' | 'unknown';
@@ -163,36 +163,82 @@ interface PlanNode {
   Plans?: PlanNode[];
 }
 
-function* walkPlan(node: PlanNode): Generator<PlanNode> {
-  yield node;
-  for (const child of node.Plans ?? []) yield* walkPlan(child);
-}
-
 /**
  * Read a verdict out of one `EXPLAIN (FORMAT JSON)` payload.
  *
  * Exported for unit tests: the plan shapes this has to classify are exactly the
  * ones that are tedious to produce live.
  *
- * The rule is deliberately narrow. Only a `Seq Scan` ON THE TARGET TABLE refutes
- * a finding. A seq scan of some other relation in a more complex plan says
- * nothing about this column, and anything that is not a plain sequential scan of
- * the target (index scan, bitmap heap scan, index-only scan) leaves the flip
- * reachable.
+ * ## The question, stated exactly
+ *
+ * The finding claims the generic plan performs an ORDERED INDEX WALK along the
+ * `ORDER BY` column and fetches nearly every tuple before the `LIMIT` fills. So
+ * the refutation is not "the plan is a seq scan", it is **"the plan is not that
+ * ordered walk"**, and there are two ways for it not to be:
+ *
+ * 1. A `Sort` lies above the target table's scan. A sort materializes the whole
+ *    matched set and orders it, so the cost is bounded by how many rows match,
+ *    not by how far into the heap the ordered walk has to travel. Whatever feeds
+ *    it (seq scan, bitmap heap scan) the catastrophic shape is absent.
+ * 2. The target's own scan node is a `Seq Scan`. Kept as an independent ground
+ *    rather than folded into the first, so a hypothetical ordered seq scan with
+ *    no sort still refutes.
+ *
+ * 0.58.0 shipped only the second ground and therefore missed every LOW-estimate
+ * column that has ANY usable index, because those plan as `Limit > Sort > Bitmap
+ * Heap Scan`. The case that surfaced it was a column carrying
+ * `btree (col) WHERE col IS NOT NULL`: an equality predicate implies not-null, so
+ * that partial index is fully usable and the plan never reaches a seq scan.
+ * Reproduced, and the fixture is the pair below at the same estimate:
+ *
+ * ```txt
+ * partial index, est 1.9   Limit > Sort > Bitmap Heap Scan   <- 0.58 kept this
+ * no index,      est 1.9   Limit > Sort > Seq Scan           <- 0.58 refuted this
+ * either,        est 500   Limit > Index Scan (no Sort)      <- both keep, correctly
+ * ```
+ *
+ * ## Why this is not "exclude partial-index columns"
+ *
+ * Because a partial index whose predicate is NOT implied by the equality does not
+ * serve the query at all, and such a column produces a genuine finding: one was
+ * measured at 19,961x. The property that matters is whether the planner COULD
+ * use it, which is a proof obligation over predicates, and the plan already
+ * carries the answer. Reading the plan is cheaper and cannot drift from the
+ * planner's own implication rules.
+ *
+ * ## The safe direction is KEEP
+ *
+ * Over-refuting deletes real findings, which is invisible in the report;
+ * over-keeping only costs noise. So `Incremental Sort` does NOT refute: it means
+ * the index supplies a PREFIX of the ordering and the walk is still partly
+ * ordered, which is closer to the catastrophic shape than to the bounded one.
  */
 export function verdictFromPlanJson(payload: unknown, table: string): FlipVerdict {
   const root = Array.isArray(payload) ? (payload[0] as { Plan?: PlanNode } | undefined) : undefined;
   const plan = root?.Plan;
   if (!plan) return 'unknown';
-  for (const node of walkPlan(plan)) {
-    if (node['Relation Name'] !== table) continue;
+
+  // Walk root-downward, tracking whether a full Sort sits ABOVE the target's
+  // scan. Depth matters: a Sort somewhere else in a larger plan says nothing
+  // about how this table is reached.
+  const search = (node: PlanNode, sortedAbove: boolean): FlipVerdict | null => {
     const type = node['Node Type'];
-    if (type === undefined) continue;
-    return type === 'Seq Scan' ? 'no-flip' : 'flip-reachable';
-  }
-  // The target table is not in the plan at all, which should not happen for a
-  // statement that selects from it. Treated as unknown rather than as a refutation.
-  return 'unknown';
+    if (node['Relation Name'] === table && type !== undefined) {
+      if (sortedAbove) return 'no-flip';
+      return type === 'Seq Scan' ? 'no-flip' : 'flip-reachable';
+    }
+    // 'Incremental Sort' is deliberately excluded, see the header.
+    const nowSorted = sortedAbove || type === 'Sort';
+    for (const child of node.Plans ?? []) {
+      const found = search(child, nowSorted);
+      if (found !== null) return found;
+    }
+    return null;
+  };
+
+  // The target table not appearing at all should not happen for a statement that
+  // selects from it. Treated as unknown rather than as a refutation.
+  return search(plan, false) ?? 'unknown';
 }
 
 /**

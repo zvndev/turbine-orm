@@ -122,6 +122,60 @@ describe('verdictFromPlanJson', () => {
     assert.equal(verdictFromPlanJson(p, 't'), 'flip-reachable');
   });
 
+  it('refutes a Sort over a bitmap heap scan, the shape 0.58.0 missed', () => {
+    // A low-estimate column with ANY usable index plans as Limit > Sort > Bitmap
+    // Heap Scan. 0.58.0 refuted only on Seq Scan, so every such column survived
+    // as a false positive. The live case was a partial index `WHERE col IS NOT
+    // NULL`, which an equality predicate implies, so the index is fully usable.
+    const p = plan({
+      'Node Type': 'Limit',
+      Plans: [
+        {
+          'Node Type': 'Sort',
+          Plans: [{ 'Node Type': 'Bitmap Heap Scan', 'Relation Name': 't' }],
+        },
+      ],
+    });
+    assert.equal(verdictFromPlanJson(p, 't'), 'no-flip');
+  });
+
+  it('refutes a Sort over an index scan too, since a sort is bounded by the match count', () => {
+    const p = plan({
+      'Node Type': 'Limit',
+      Plans: [{ 'Node Type': 'Sort', Plans: [{ 'Node Type': 'Index Scan', 'Relation Name': 't' }] }],
+    });
+    assert.equal(verdictFromPlanJson(p, 't'), 'no-flip');
+  });
+
+  it('KEEPS an Incremental Sort, which still walks the index partly ordered', () => {
+    // The safe direction is keep: over-refuting deletes real findings invisibly.
+    const p = plan({
+      'Node Type': 'Limit',
+      Plans: [{ 'Node Type': 'Incremental Sort', Plans: [{ 'Node Type': 'Index Scan', 'Relation Name': 't' }] }],
+    });
+    assert.equal(verdictFromPlanJson(p, 't'), 'flip-reachable');
+  });
+
+  it('ignores a Sort that is not above the target table', () => {
+    // A sort on the other side of a join says nothing about how `t` is reached,
+    // and treating it as a refutation would drop findings on any joined table.
+    const p = plan({
+      'Node Type': 'Nested Loop',
+      Plans: [
+        { 'Node Type': 'Sort', Plans: [{ 'Node Type': 'Seq Scan', 'Relation Name': 'other' }] },
+        { 'Node Type': 'Index Scan', 'Relation Name': 't' },
+      ],
+    });
+    assert.equal(verdictFromPlanJson(p, 't'), 'flip-reachable');
+  });
+
+  it('still refutes a bare seq scan with no sort above it', () => {
+    // The 0.58.0 ground is kept as an independent one rather than folded into the
+    // sort rule, so a hypothetical ordered seq scan still refutes.
+    const p = plan({ 'Node Type': 'Limit', Plans: [{ 'Node Type': 'Seq Scan', 'Relation Name': 't' }] });
+    assert.equal(verdictFromPlanJson(p, 't'), 'no-flip');
+  });
+
   it('returns unknown rather than refuting on an unparseable payload', () => {
     assert.equal(verdictFromPlanJson(undefined, 't'), 'unknown');
     assert.equal(verdictFromPlanJson([], 't'), 'unknown');

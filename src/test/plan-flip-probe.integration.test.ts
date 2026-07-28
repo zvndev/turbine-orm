@@ -135,6 +135,48 @@ describe('plan-flip probe against a live planner', () => {
     }
   });
 
+  it('refutes a low-estimate column served by an implied partial index (the 0.58.0 miss)', async () => {
+    // `btree (fk) WHERE fk IS NOT NULL` is fully usable by `fk = $1`, because
+    // equality implies not-null. At a low estimate that plans as
+    // Limit > Sort > Bitmap Heap Scan, which 0.58.0's seq-scan-only rule kept.
+    await sql(`
+      DROP TABLE IF EXISTS flip_partial;
+      CREATE TABLE flip_partial (id int PRIMARY KEY, fk int, payload text NOT NULL);
+      INSERT INTO flip_partial
+        SELECT g, ((g-1) % 10500) + 1, repeat('p', 60)
+        FROM generate_series(1, 20000) g ORDER BY (g * 2654435761::bigint) % 1000003;
+      CREATE INDEX ON flip_partial (fk) WHERE fk IS NOT NULL;
+      ANALYZE flip_partial;
+    `);
+    try {
+      const result = await probePlanFlips({ connectionString: URL, findings: [finding('flip_partial')] });
+      assert.equal(result.verdicts[flipProbeKey('flip_partial', 'fk')], 'no-flip');
+    } finally {
+      await sql('DROP TABLE IF EXISTS flip_partial');
+    }
+  });
+
+  it('KEEPS a column whose partial index is predicated on a different column', async () => {
+    // `WHERE flag` is NOT implied by `fk = $1`, so the index cannot serve the
+    // query and the finding is genuine. A blanket "exclude partial-index columns"
+    // rule would have suppressed this; one such column measured at 19,961x.
+    await sql(`
+      DROP TABLE IF EXISTS flip_partial_other;
+      CREATE TABLE flip_partial_other (id int PRIMARY KEY, fk int NOT NULL, flag bool NOT NULL, payload text NOT NULL);
+      INSERT INTO flip_partial_other
+        SELECT g, ((g-1) % 40) + 1, false, repeat('p', 60)
+        FROM generate_series(1, 20000) g ORDER BY (g * 2654435761::bigint) % 1000003;
+      CREATE INDEX ON flip_partial_other (fk) WHERE flag;
+      ANALYZE flip_partial_other;
+    `);
+    try {
+      const result = await probePlanFlips({ connectionString: URL, findings: [finding('flip_partial_other')] });
+      assert.equal(result.verdicts[flipProbeKey('flip_partial_other', 'fk')], 'flip-reachable');
+    } finally {
+      await sql('DROP TABLE IF EXISTS flip_partial_other');
+    }
+  });
+
   it('keeps a finding whose table does not exist rather than dropping it', async () => {
     // The failure contract, live: an unprobeable column must survive.
     const result = await probePlanFlips({

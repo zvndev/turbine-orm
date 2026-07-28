@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.59.0 (2026-07-27)
+
+### Fixed
+
+- **The plan-flip probe missed every low-estimate column served by any usable
+  index.** 0.58.0 refuted a finding when the generic plan was a `Seq Scan` of the
+  target table. That is one of two ways a plan can fail to be the ordered index
+  walk a finding claims, and it is the wrong one to pick alone: a column whose
+  generic estimate is below the flip boundary plans as
+  `Limit > Sort > Bitmap Heap Scan` whenever an index is available, never
+  reaching a seq scan, so it survived as a false positive.
+
+  The case that surfaced it carried `btree (col) WHERE col IS NOT NULL`. An
+  equality predicate implies not-null, so that partial index is fully usable.
+  Reproduced as a pair at the same estimate, differing only in whether the index
+  exists:
+
+  ```txt
+  partial index, est 1.9   Limit > Sort > Bitmap Heap Scan   0.58.0 kept this
+  no index,      est 1.9   Limit > Sort > Seq Scan           0.58.0 refuted this
+  either,        est 500   Limit > Index Scan (no Sort)      both keep, correctly
+  ```
+
+  The refutation is now stated as the question actually being asked, **"is the
+  generic plan the ordered index walk"**, with two independent grounds: a `Sort`
+  above the target's scan (which bounds the cost by the match count rather than
+  by how far the walk travels, whatever access feeds it), or a `Seq Scan` at the
+  target itself. The second is kept as its own ground so a hypothetical ordered
+  seq scan still refutes.
+
+- **This is not "exclude columns with a partial index".** A partial index whose
+  predicate is NOT implied by the equality cannot serve the query, and such a
+  column produces a genuine finding: one was measured at 19,961x. The property
+  that matters is whether the planner *could* use the index, which is a proof
+  obligation over predicates, and the plan the probe already fetches carries the
+  answer. Reading it is cheaper than re-deriving it and cannot drift from
+  Postgres's own implication rules.
+
+- **`Incremental Sort` deliberately does not refute.** It means the index
+  supplies a prefix of the ordering, so the walk is still partly ordered and
+  closer to the catastrophic shape than to the bounded one. Over-refuting deletes
+  real findings invisibly; over-keeping only costs noise.
+
+- **A `Sort` elsewhere in the plan does not refute.** Only one above the target
+  table's own scan counts, so a sorted branch of a join cannot silently drop a
+  finding.
+
 ## 0.58.0 (2026-07-27)
 
 ### Fixed
