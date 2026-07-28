@@ -139,7 +139,7 @@ const capabilities = [
   {
     title: 'One dependency. No WASM.',
     description:
-      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. The main entry is ~60 KB brotli measured as an import graph with pg external, ~45 KB on the edge (measured 2026-07-25: 59.66 KB and 44.77 KB, budgeted in .size-limit.js). That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger.',
+      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. The main entry is held under 77 KB brotli as an import graph with pg external, under 61 KB on the edge, enforced by size-limit in CI rather than quoted from a past measurement. That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger.',
     href: '/benchmarks',
     cta: 'Benchmarks',
   },
@@ -287,11 +287,12 @@ export default async function Home() {
           >
             Each of these is checkable, so here is the checkable version, as of
             July 2026. No other TypeScript ORM ships a studio that is read-only
-            by default or that redacts PII: Prisma Studio is proprietary and its
-            read-only request has been open since February 2021, Drizzle Studio
-            is not open source and self-hosting runs through the paid Drizzle
-            Gateway, and TypeORM, MikroORM, Kysely and Sequelize have no studio
-            at all. No TypeScript ORM CLI offers missing-index advice, and
+            by default or that redacts PII: Prisma Studio is open source
+            (@prisma/studio-core is Apache-2.0) but offers no read-only mode,
+            its read-only request has been open since February 2021, Drizzle
+            Studio is not open source and self-hosting runs through the paid
+            Drizzle Gateway, and TypeORM, MikroORM, Kysely and Sequelize have no
+            studio at all. No TypeScript ORM CLI offers missing-index advice, and
             Prisma Optimize was retired in March 2026 in favour of cloud-only
             Query Insights. Prior art exists outside TypeScript, notably Ruby&apos;s
             active_record_doctor, so the honest claim is &quot;no TypeScript

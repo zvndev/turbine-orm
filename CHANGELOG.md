@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.61.0 (2026-07-28)
+
+Five defects found by a full product review of 0.60.1. Every one of them failed
+SILENTLY, and four of the five returned a plausible answer, which is why the
+suite did not have them: a test that asserts the happy path cannot see any of
+these. Each was reproduced before it was fixed and is pinned by a regression
+test in the direction that would have caught it.
+
+### Fixed
+
+- **`findUnique` returned an arbitrary row when its `where` had no predicate.**
+  BREAKING, and a security fix. `{ id: undefined }` is what
+  `{ id: req.params.id }` becomes when the parameter is missing or misspelled.
+  Undefined keys are dropped downstream, so the emitted SQL was
+  `SELECT … FROM t LIMIT 1`: no predicate at all, and a caller that would have
+  handled `null` silently received someone else's row. `findUniqueOrThrow` was
+  worse, promising to throw when nothing matched and returning a stranger's row
+  instead. Both now throw `ValidationError` (E003). The check runs against the
+  USER's `where`, before global filters merge, deliberately: a tenant filter is
+  not a unique selector, and letting it satisfy the check would still return an
+  arbitrary row from inside the tenant. `findFirst` is unchanged, since "the
+  first row matching an optional filter" is its contract.
+
+- **An unrecognized `isolationLevel` silently downgraded the transaction.**
+  BREAKING. The level was resolved by indexing a plain object, and a miss
+  produced `undefined`, which renders as a bare `BEGIN`. So
+  `isolationLevel: 'serializable'` (wrong case) asked for SERIALIZABLE and got
+  READ COMMITTED: the caller holds a guarantee it does not have, and the
+  workload that needed it produces wrong data with no error. The TypeScript
+  union never prevented this for a JavaScript consumer, a value from config or
+  an environment variable, or anything crossing an `as`. Now throws
+  `ValidationError` listing the accepted values, before a pool connection is
+  taken. The map is also null-prototype now: `isolationLevel: 'constructor'`
+  previously emitted `BEGIN ISOLATION LEVEL function Object() { [native code] }`.
+
+- **COMMIT-time database errors escaped the typed-error system.** BEGIN and
+  COMMIT were the only statements issued without `wrapPgError`. Postgres reports
+  DEFERRABLE constraint violations, and a good share of SERIALIZABLE conflicts,
+  at COMMIT rather than at the statement that caused them, so those surfaced as
+  a raw pg `DatabaseError` carrying a SQLSTATE in `.code`, the SAME property
+  Turbine puts `TURBINE_E0NN` in, with no `.cause`. A check for
+  `TURBINE_E008` silently missed them, and a retry loop keyed on
+  `SerializationFailureError.isRetryable` would never fire for exactly the
+  commit-time conflicts that are the main reason to run SERIALIZABLE.
+
+- **A throw in the pipeline send path wedged a pooled connection permanently.**
+  `valueMapper: prepareValue` runs synchronously inside `bind`, so a parameter
+  with a throwing `toPostgres`/`toJSON` (or a circular reference) escaped
+  mid-sequence with Parse/Bind bytes corked and no `Sync` ever sent. The
+  connection was then returned to the pool, which reported it idle and healthy;
+  the next borrower's first query hung forever, with nothing pointing back at
+  the pipeline call that caused it. `uncork()` now runs in a `finally` and the
+  socket is destroyed rather than returned.
+
+- **`turbine migrate up --dry-run` and `migrate down --dry-run` APPLIED the
+  migrations.** The flag was parsed and read by `push` and `deploy` only. On
+  `migrate up` it was inert: accepted, no warning, migrations applied. A flag
+  whose entire purpose is "show me what this would do to the database", pointed
+  at a production URL, ran it. Both now print the exact SQL, parsed through the
+  same `parseMigrationContent` the executor uses, and execute nothing.
+
+### Changed
+
+- **Corrected claims in the README and site that were wrong or stale.** The
+  bundle-size figure had drifted about 12% low over ten releases while naming a
+  version and date, so it read as precise; prose now states the CI-enforced
+  ceiling from `.size-limit.js` (under 77 kB main, under 61 kB edge) rather than
+  a measurement that goes stale silently. "Prisma Studio is proprietary" was
+  false, `@prisma/studio-core` is Apache-2.0; the accurate claim is that it has
+  no read-only mode. The note on Kysely rested on a linked issue whose state had
+  changed and now states the runtime behaviour directly. The comparison table
+  credited Prisma with single-query nested relations by default, which its own
+  Preview flag contradicts.
+
 ## 0.60.1 (2026-07-28)
 
 ### Changed

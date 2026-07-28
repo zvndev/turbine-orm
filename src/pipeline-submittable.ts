@@ -472,13 +472,34 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
           connection.sync();
         }
       }
-
+    } catch (err) {
+      // The send path threw PART WAY THROUGH an extended-query sequence, so the
+      // backend has Parse/Bind bytes for the preceding queries and will never
+      // receive their Sync. `valueMapper: prepareValue` runs synchronously
+      // inside `bind`, so any param with a throwing `toPostgres`/`toJSON`, or a
+      // circular reference, lands here.
+      //
+      // Returning that connection to the pool is what made this severe: the pool
+      // reports it idle and healthy, the NEXT borrower checks it out, and its
+      // first query hangs forever waiting on a ReadyForQuery for a sequence that
+      // was never completed. The failure surfaces in an unrelated query with
+      // nothing pointing back here. Destroy the connection instead: one dead
+      // socket is recoverable, a wedged pool slot is not.
+      //
+      // Destroying the socket is the same move the timeout path above already
+      // makes, and node-postgres drops a client whose stream errored rather than
+      // returning it to the pool.
+      if (connection.stream.destroy) {
+        connection.stream.destroy(err instanceof Error ? err : new Error(String(err)));
+      }
+      cleanup();
+      reject(err);
+    } finally {
+      // Always uncork, including on the throw path: leaving the stream corked
+      // strands the buffered bytes and the socket with them.
       if (connection.stream.uncork) {
         connection.stream.uncork();
       }
-    } catch (err) {
-      cleanup();
-      reject(err);
     }
   });
 }

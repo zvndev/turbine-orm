@@ -165,10 +165,15 @@ describe('stale prisma-map warning', () => {
     } finally {
       console.warn = original;
     }
-    return warned.filter((w) => w.includes('prisma-map'));
+    return warned.filter((w) => w.includes('prisma-map') && (source ? w.includes(source.path) : true));
   };
 
+  // Distinct fixture paths per case, and each assertion filters on its OWN
+  // path. The read is async and unawaited by design, so under full-suite load a
+  // straggler from one case can land inside the next case's capture window;
+  // sharing one path made that cross-talk indistinguishable from a real warning.
   const realPath = 'src/test/fixtures/fingerprint-schema.prisma';
+  const stalePath = 'src/test/fixtures/fingerprint-schema-stale.prisma';
 
   it('says nothing when the map has no source (pre-0.60 or hand-written)', async () => {
     await withEnv('development', async () => {
@@ -184,9 +189,9 @@ describe('stale prisma-map warning', () => {
 
   it('warns, naming the file and the fix, when the hash no longer matches', async () => {
     await withEnv('development', async () => {
-      const warned = await run({ path: realPath, hash: 'v1:ffffffffffffffff' });
+      const warned = await run({ path: stalePath, hash: 'v1:ffffffffffffffff' });
       assert.equal(warned.length, 1);
-      assert.match(warned[0]!, /fingerprint-schema\.prisma has changed/);
+      assert.match(warned[0]!, /fingerprint-schema-stale\.prisma has changed/);
       assert.match(warned[0]!, /turbine migrate-from-prisma/);
     });
   });
@@ -201,15 +206,15 @@ describe('stale prisma-map warning', () => {
 
   it('is silent in production even when the map is stale', async () => {
     await withEnv('production', async () => {
-      assert.deepEqual(await run({ path: realPath, hash: 'v1:ffffffffffffffff' }), []);
+      assert.deepEqual(await run({ path: stalePath, hash: 'v1:ffffffffffffffff' }), []);
     });
   });
 
   it('warns once per path, not once per client', async () => {
     await withEnv('development', async () => {
       resetWarnOnce(WARN_NS.stalePrismaMap);
-      const first = await runNoReset({ path: realPath, hash: 'v1:ffffffffffffffff' });
-      const second = await runNoReset({ path: realPath, hash: 'v1:ffffffffffffffff' });
+      const first = await runNoReset({ path: stalePath, hash: 'v1:ffffffffffffffff' });
+      const second = await runNoReset({ path: stalePath, hash: 'v1:ffffffffffffffff' });
       assert.equal(first.length, 1);
       assert.equal(second.length, 0, 'a second client must not repeat it');
     });
@@ -233,7 +238,7 @@ describe('stale prisma-map warning', () => {
     } finally {
       console.warn = original;
     }
-    return warned.filter((w) => w.includes('prisma-map'));
+    return warned.filter((w) => w.includes('prisma-map') && (source ? w.includes(source.path) : true));
   }
 });
 

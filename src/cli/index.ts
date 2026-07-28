@@ -110,6 +110,7 @@ import {
   migrateStatus,
   migrateUp,
   type OutOfOrderApply,
+  parseMigrationContent,
 } from './migrate.js';
 import { startObserve } from './observe.js';
 import { formatPrismaReport, summaryLines } from './prisma-report.js';
@@ -2259,6 +2260,40 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
   newline();
 }
 
+/**
+ * Print the SQL a `migrate up` / `migrate down` WOULD run, and execute nothing.
+ *
+ * `--dry-run` was parsed and then read by `push` and `deploy` only, so on
+ * `migrate up` it was silently inert: the flag was accepted, no warning was
+ * printed, and the migrations were applied. A flag whose whole purpose is
+ * "show me what this would do to the database" that instead does it, against
+ * whatever `--url` was passed, is the most dangerous shape a CLI bug can take.
+ *
+ * Reads through the same `parseMigrationContent` the executor uses, so what is
+ * printed is what would run, rather than a second rendering that can drift.
+ */
+function printMigrationDryRun(files: MigrationFile[], section: 'up' | 'down'): void {
+  const verb = section === 'up' ? 'apply' : 'roll back';
+  if (files.length === 0) {
+    info(`Dry run: nothing to ${verb}.`);
+    newline();
+    return;
+  }
+  info(`Dry run: would ${verb} ${bold(String(files.length))} migration(s). Nothing was executed.`);
+  newline();
+  for (const file of files) {
+    const parsed = parseMigrationContent(readFileSync(file.path, 'utf-8'));
+    const sql = section === 'up' ? parsed.up : parsed.down;
+    console.log(`  ${cyan(file.filename)}${parsed.noTransaction ? dim('  (no transaction)') : ''}`);
+    if (sql.trim().length === 0) {
+      console.log(`    ${dim(`(empty ${section.toUpperCase()} section)`)}`);
+    } else {
+      for (const line of sql.split('\n')) console.log(`    ${dim(line)}`);
+    }
+    newline();
+  }
+}
+
 async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
   const url = requireUrl(config);
@@ -2272,6 +2307,14 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
     warn('No migration files found.');
     console.log(`  ${dim('Create one with:')} ${cyan('npx turbine migrate create <name>')}`);
     newline();
+    return;
+  }
+
+  if (args.dryRun) {
+    const status = await migrateStatus(url, config.migrationsDir);
+    let pending = status.filter((st) => !st.applied).map((st) => st.file);
+    if (args.step != null && args.step > 0) pending = pending.slice(0, args.step);
+    printMigrationDryRun(pending, 'up');
     return;
   }
 
@@ -2527,6 +2570,15 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
   label('Database', redactUrl(url));
   label('Migrations', config.migrationsDir);
   newline();
+
+  if (args.dryRun) {
+    const status = await migrateStatus(url, config.migrationsDir);
+    // Rollback order is newest-applied first, and a migration whose file is
+    // missing has no DOWN section to show.
+    const applied = status.filter((st) => st.applied && !st.missingFile).map((st) => st.file);
+    printMigrationDryRun(applied.reverse().slice(0, args.step ?? 1), 'down');
+    return;
+  }
 
   const spinner = new Spinner('Rolling back migration(s)').start();
 

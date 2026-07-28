@@ -46,6 +46,7 @@ import {
 } from './query/index.js';
 import {
   markTurbineParser,
+  ownLookup,
   quoteIdent,
   registerUtcTemporalParsers,
   suggestKey,
@@ -805,13 +806,67 @@ export interface TransactionOptions {
   sessionContext?: Record<string, string | number | boolean>;
 }
 
-/** Maps isolation level names to SQL */
-const ISOLATION_LEVELS: Record<string, string> = {
+/**
+ * Maps isolation level names to SQL. Null-prototype and read through
+ * {@link resolveIsolationLevel}, never indexed directly: an inherited key
+ * (`constructor`, `toString`) would otherwise resolve to a function and be
+ * interpolated verbatim into `BEGIN ISOLATION LEVEL …`.
+ */
+const ISOLATION_LEVELS: Record<string, string> = Object.assign(Object.create(null), {
   ReadUncommitted: 'READ UNCOMMITTED',
   ReadCommitted: 'READ COMMITTED',
   RepeatableRead: 'REPEATABLE READ',
   Serializable: 'SERIALIZABLE',
-};
+});
+
+/**
+ * Resolve a requested isolation level, REFUSING anything not in the map.
+ *
+ * A miss used to yield `undefined`, which `beginStatement` renders as a plain
+ * `BEGIN`. So `isolationLevel: 'serializable'` (wrong case) asked for
+ * SERIALIZABLE and silently got READ COMMITTED, which is the worst available
+ * outcome for this option: the caller believes it has a guarantee it does not
+ * have, and the workload that depended on it produces wrong data with no error.
+ *
+ * The TypeScript union on `TransactionOptions.isolationLevel` does not prevent
+ * this. It is not enforced for a JavaScript consumer of a published package, for
+ * a value read from config or an environment variable, or across any `as`.
+ * Throwing costs a caller who was already broken one clear error.
+ */
+/**
+ * Run a transaction-control statement (BEGIN / COMMIT / ROLLBACK) with the same
+ * error translation every other query boundary gets.
+ *
+ * These four statements were the only ones issued raw, and COMMIT is the one
+ * that matters: Postgres reports DEFERRABLE constraint violations and a good
+ * share of SERIALIZABLE conflicts at COMMIT rather than at the statement that
+ * caused them. Unwrapped, those surfaced as a raw `DatabaseError` carrying a
+ * SQLSTATE in `.code`, which is the SAME property Turbine puts `TURBINE_E0NN`
+ * in, so `err.code === 'TURBINE_E008'` silently missed them and a `switch` on
+ * `.code` received a value from a foreign namespace. Worse for the retry case:
+ * `SerializationFailureError.isRetryable` exists so callers can build retry
+ * loops, and a loop keyed on it would never fire for the commit-time conflicts
+ * that are the main reason to run SERIALIZABLE at all.
+ */
+async function runTxControl(client: PgCompatPoolClient, sql: string): Promise<void> {
+  try {
+    await client.query(sql);
+  } catch (err) {
+    throw wrapPgError(err);
+  }
+}
+
+function resolveIsolationLevel(level: string | undefined): string | undefined {
+  if (level === undefined) return undefined;
+  const sql = ownLookup(ISOLATION_LEVELS, level);
+  if (sql === undefined) {
+    throw new ValidationError(
+      `[turbine] $transaction: unknown isolationLevel ${JSON.stringify(level)}. ` +
+        `Expected one of: ${Object.keys(ISOLATION_LEVELS).join(', ')} (case-sensitive).`,
+    );
+  }
+  return sql;
+}
 
 /**
  * Strict GUC (session variable) name: an optionally namespaced identifier such
@@ -1978,7 +2033,7 @@ export class TurbineClient {
      */
     let began = false;
     try {
-      await client.query(this.dialect.beginStatement());
+      await runTxControl(client, this.dialect.beginStatement());
       began = true;
       // Engine seam: single-writer engines scope their transaction re-entrancy
       // marker to the callback's async subtree (see
@@ -1986,7 +2041,7 @@ export class TurbineClient {
       const wrap = (client as unknown as PgCompatPoolClient).wrapTransactionCallback;
       // `.call` erases the generic, so the callback's Promise<T> is re-asserted.
       const result = wrap ? ((await wrap.call(client, () => fn(client))) as T) : await fn(client);
-      await client.query(this.dialect.commitStatement());
+      await runTxControl(client, this.dialect.commitStatement());
       return result;
     } catch (err) {
       if (began) {
@@ -2060,6 +2115,9 @@ export class TurbineClient {
       return this.transactionBatch(fnOrQueries);
     }
     const fn = fnOrQueries as (tx: TransactionClient) => Promise<unknown>;
+    // Resolve the isolation level BEFORE taking a pool slot: a bad argument is
+    // the caller's bug and should not cost a connection to discover.
+    const isolationSql = resolveIsolationLevel(options?.isolationLevel);
     const client = await this.pool.connect();
     const timeout = options?.timeout;
 
@@ -2093,8 +2151,7 @@ export class TurbineClient {
     try {
       // BEGIN with optional isolation level, the dialect owns the keyword and
       // BEGIN+isolation composition (Postgres appends ` ISOLATION LEVEL …`).
-      const isolationSql = options?.isolationLevel ? ISOLATION_LEVELS[options.isolationLevel] : undefined;
-      await client.query(this.dialect.beginStatement(isolationSql));
+      await runTxControl(client, this.dialect.beginStatement(isolationSql));
       began = true;
 
       // Apply transaction-local session context (RLS / multi-tenant GUCs).
@@ -2183,7 +2240,7 @@ export class TurbineClient {
         result = await runCallback();
       }
 
-      await client.query(this.dialect.commitStatement());
+      await runTxControl(client, this.dialect.commitStatement());
 
       if (this.logging) {
         console.log('[turbine] Transaction committed');

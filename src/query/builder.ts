@@ -2153,6 +2153,32 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Prisma compound-unique selector expansion (before global-filter merge and
     // fingerprinting, so the cache only ever sees the canonical expanded where).
     args = maybeExpandCompoundUnique(this.tableMeta, args);
+    // A findUnique whose `where` carries NO predicate must not run.
+    //
+    // `{ id: undefined }` is what `{ id: req.params.id }` becomes on a request
+    // that omitted the parameter, or on a typo'd one. Undefined keys are dropped
+    // downstream, so that used to emit `SELECT … FROM t LIMIT 1`: no predicate,
+    // and the caller gets an ARBITRARY row where it asked for a specific one and
+    // would have handled `null`. On an authorization check keyed by id that is a
+    // silent cross-record read, and `findUniqueOrThrow` made it worse by
+    // promising to throw when nothing matched and then returning a stranger's
+    // row instead.
+    //
+    // Checked against the USER's where, before the global-filter merge, and
+    // deliberately so: a tenant filter is not a unique selector, and letting it
+    // satisfy this would still hand back an arbitrary row from inside the tenant.
+    //
+    // `findFirst` is intentionally NOT guarded. "The first row matching an
+    // optional filter" is its whole contract and Prisma's `findFirst` behaves
+    // the same way; ask for one row by identity with `findUnique`.
+    if (whereMod.userPredicateIsEmpty(this.ctx, (args.where ?? {}) as Record<string, unknown>)) {
+      throw new ValidationError(
+        `[turbine] findUnique on "${this.table}" refused: the \`where\` clause has no predicate, ` +
+          'so this would return an arbitrary row rather than a specific one. ' +
+          'A key whose value is `undefined` does not count, check that the value you are looking up is defined. ' +
+          'If you meant "any row matching an optional filter", use `findFirst`.',
+      );
+    }
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations before fingerprinting (see buildFindMany).
     if (args.with && this.resolveStableOrder(args.stableRelationOrder)) {

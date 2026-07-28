@@ -1,0 +1,13 @@
+// Fixture for src/test/prisma-schema-fingerprint.test.ts. Its CONTENT is
+// irrelevant; the test only needs a file that exists so the stale-map check can
+// read something and compare a hash against it. Editing this file is harmless.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    Int    @id @default(autoincrement())
+  email String @unique
+}
