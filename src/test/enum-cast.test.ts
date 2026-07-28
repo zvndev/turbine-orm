@@ -1,7 +1,7 @@
 /**
  * turbine-orm, Postgres enum column write casts (T-3)
  *
- * Dogfood bug: inserting into a table with a PG enum column failed with
+ * Regression: inserting into a table with a PG enum column failed with
  * `column "type" is of type "FieldType" but expression is of type text`.
  * Mechanism: createMany's bulk-insert form is `UNNEST($1::text[], ...)` -
  * the generic text[] cast types the value as text, and Postgres refuses the

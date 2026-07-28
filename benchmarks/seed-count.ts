@@ -4,12 +4,12 @@
  * Shape mirrors the reported workload: a small-ish parent catalogue table and a
  * large child table whose FK back to the parent may or may not be indexed.
  *
- *   item_type      , PARENTS parent rows (default 10,000)
- *   inventory_item , CHILD_ROWS rows, UNIFORM spread over the parents
- *   inventory_hot  , CHILD_ROWS rows, SKEWED (top 10 parents hold ~50%)
+ *   category      , PARENTS parent rows (default 10,000)
+ *   product , CHILD_ROWS rows, UNIFORM spread over the parents
+ *   product_hot  , CHILD_ROWS rows, SKEWED (top 10 parents hold ~50%)
  *
  * Neither child FK is indexed at seed time. The benchmark creates and drops
- * `idx_inventory_item_type_id` / `idx_inventory_hot_type_id` itself so the
+ * `idx_product_category_id` / `idx_product_hot_category_id` itself so the
  * indexed and unindexed arms run against byte-identical data.
  *
  * Deterministic: every value derives from the row ordinal, no randomness, so
@@ -31,26 +31,26 @@ const PARENTS = Number(process.env['PARENTS'] ?? 10_000);
 const CHILD_ROWS = Number(process.env['CHILD_ROWS'] ?? 200_000);
 
 const SCHEMA_SQL = `
-DROP TABLE IF EXISTS inventory_hot CASCADE;
-DROP TABLE IF EXISTS inventory_item CASCADE;
-DROP TABLE IF EXISTS item_type CASCADE;
+DROP TABLE IF EXISTS product_hot CASCADE;
+DROP TABLE IF EXISTS product CASCADE;
+DROP TABLE IF EXISTS category CASCADE;
 
-CREATE TABLE item_type (
+CREATE TABLE category (
   id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   name  TEXT NOT NULL,
   code  TEXT NOT NULL
 );
 
-CREATE TABLE inventory_item (
+CREATE TABLE product (
   id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  type_id  BIGINT NOT NULL REFERENCES item_type(id),
+  category_id  BIGINT NOT NULL REFERENCES category(id),
   sku      TEXT NOT NULL,
   qty      INTEGER NOT NULL
 );
 
-CREATE TABLE inventory_hot (
+CREATE TABLE product_hot (
   id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  type_id  BIGINT NOT NULL REFERENCES item_type(id),
+  category_id  BIGINT NOT NULL REFERENCES category(id),
   sku      TEXT NOT NULL,
   qty      INTEGER NOT NULL
 );
@@ -63,27 +63,27 @@ async function main() {
   console.log('creating schema...');
   await pool.query(SCHEMA_SQL);
 
-  console.log(`seeding ${PARENTS.toLocaleString()} item_type rows...`);
+  console.log(`seeding ${PARENTS.toLocaleString()} category rows...`);
   await pool.query(
-    `INSERT INTO item_type (name, code)
+    `INSERT INTO category (name, code)
      SELECT 'Type ' || g, 'T' || lpad(g::text, 6, '0')
      FROM generate_series(1, $1) g`,
     [PARENTS],
   );
 
   // Uniform: child i belongs to parent ((i - 1) % PARENTS) + 1.
-  console.log(`seeding ${CHILD_ROWS.toLocaleString()} inventory_item rows (uniform)...`);
+  console.log(`seeding ${CHILD_ROWS.toLocaleString()} product rows (uniform)...`);
   await pool.query(
-    `INSERT INTO inventory_item (type_id, sku, qty)
+    `INSERT INTO product (category_id, sku, qty)
      SELECT ((g - 1) % $2) + 1, 'SKU' || lpad(g::text, 9, '0'), (g % 500)
      FROM generate_series(1, $1) g`,
     [CHILD_ROWS, PARENTS],
   );
 
   // Skewed: half the rows land on parents 1..10, the rest spread uniformly.
-  console.log(`seeding ${CHILD_ROWS.toLocaleString()} inventory_hot rows (skewed)...`);
+  console.log(`seeding ${CHILD_ROWS.toLocaleString()} product_hot rows (skewed)...`);
   await pool.query(
-    `INSERT INTO inventory_hot (type_id, sku, qty)
+    `INSERT INTO product_hot (category_id, sku, qty)
      SELECT CASE WHEN g <= $1 / 2 THEN ((g - 1) % 10) + 1 ELSE ((g - 1) % $2) + 1 END,
             'SKU' || lpad(g::text, 9, '0'), (g % 500)
      FROM generate_series(1, $1) g`,
@@ -91,7 +91,7 @@ async function main() {
   );
 
   console.log('analyzing...');
-  await pool.query('ANALYZE item_type; ANALYZE inventory_item; ANALYZE inventory_hot;');
+  await pool.query('ANALYZE category; ANALYZE product; ANALYZE product_hot;');
 
   const sizes = await pool.query<{ rel: string; rows: string; size: string }>(
     `SELECT relname AS rel, n_live_tup::text AS rows, pg_size_pretty(pg_total_relation_size(relid)) AS size

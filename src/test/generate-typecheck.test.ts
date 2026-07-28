@@ -73,11 +73,11 @@ function table(name: string, columns: ColumnMetadata[], primaryKey: string[]): T
   };
 }
 
-const MODEL_INSTANCES = table(
-  'model_instances',
+const DOCUMENTS = table(
+  'documents',
   [
     col('id', 'int8', 'number', { hasDefault: true }),
-    // Prisma-style quoted camelCase FK columns, both point at model_instance_versions.
+    // Prisma-style quoted camelCase FK columns, both point at document_versions.
     col('currentVersionId', 'int8', 'number | null', { nullable: true }),
     col('publishedVersionId', 'int8', 'number | null', { nullable: true }),
     // Scalar column whose field equals the stripped relation name of
@@ -87,26 +87,26 @@ const MODEL_INSTANCES = table(
   ['id'],
 );
 
-const MODEL_INSTANCE_VERSIONS = table(
-  'model_instance_versions',
+const DOCUMENT_VERSIONS = table(
+  'document_versions',
   [col('id', 'int8', 'number', { hasDefault: true }), col('body', 'text', 'string')],
   ['id'],
 );
 
 const T4_FOREIGN_KEYS: ForeignKeyEntry[] = [
   {
-    sourceTable: 'model_instances',
+    sourceTable: 'documents',
     sourceColumns: ['currentVersionId'],
-    targetTable: 'model_instance_versions',
+    targetTable: 'document_versions',
     targetColumns: ['id'],
-    constraintName: 'model_instances_currentVersionId_fkey',
+    constraintName: 'documents_currentVersionId_fkey',
   },
   {
-    sourceTable: 'model_instances',
+    sourceTable: 'documents',
     sourceColumns: ['publishedVersionId'],
-    targetTable: 'model_instance_versions',
+    targetTable: 'document_versions',
     targetColumns: ['id'],
-    constraintName: 'model_instances_publishedVersionId_fkey',
+    constraintName: 'documents_publishedVersionId_fkey',
   },
 ];
 
@@ -119,12 +119,12 @@ const T4_FOREIGN_KEYS: ForeignKeyEntry[] = [
     const derived = buildRelationsFromForeignKeys(
       T4_FOREIGN_KEYS,
       new Map([
-        ['model_instances', new Set(MODEL_INSTANCES.columns.map((c) => c.field))],
-        ['model_instance_versions', new Set(MODEL_INSTANCE_VERSIONS.columns.map((c) => c.field))],
+        ['documents', new Set(DOCUMENTS.columns.map((c) => c.field))],
+        ['document_versions', new Set(DOCUMENT_VERSIONS.columns.map((c) => c.field))],
       ]),
     );
-    MODEL_INSTANCES.relations = derived.get('model_instances') ?? {};
-    MODEL_INSTANCE_VERSIONS.relations = derived.get('model_instance_versions') ?? {};
+    DOCUMENTS.relations = derived.get('documents') ?? {};
+    DOCUMENT_VERSIONS.relations = derived.get('document_versions') ?? {};
   } finally {
     console.warn = originalWarn;
   }
@@ -135,15 +135,15 @@ const T4_FOREIGN_KEYS: ForeignKeyEntry[] = [
 const T4_USAGE = `
 import type { RelationDescriptor } from 'turbine-orm';
 import type {
-  ModelInstance,
-  ModelInstanceCreate,
-  ModelInstanceRelations,
-  ModelInstanceVersion,
-  ModelInstanceVersionRelations,
+  Document,
+  DocumentCreate,
+  DocumentRelations,
+  DocumentVersion,
+  DocumentVersionRelations,
 } from './types.js';
 
 // Scalar FK columns are still first-class writable fields.
-export const create: ModelInstanceCreate = {
+export const create: DocumentCreate = {
   currentVersionId: 1,
   publishedVersionId: null,
   currentVersion: 'draft',
@@ -151,25 +151,25 @@ export const create: ModelInstanceCreate = {
 
 // The belongsTo relations exist under their column-derived (suffix-stripped,
 // collision-disambiguated) names, never shadowing the scalars.
-export type CurrentVersionRel = ModelInstanceRelations['currentVersionRel'];
-export type PublishedVersionRel = ModelInstanceRelations['publishedVersion'];
-type AssertOne<T extends RelationDescriptor<ModelInstanceVersion, 'one', ModelInstanceVersionRelations>> = T;
+export type CurrentVersionRel = DocumentRelations['currentVersionRel'];
+export type PublishedVersionRel = DocumentRelations['publishedVersion'];
+type AssertOne<T extends RelationDescriptor<DocumentVersion, 'one', DocumentVersionRelations>> = T;
 export type _one = AssertOne<PublishedVersionRel>;
 
 // The reverse hasMany side gets one distinct relation per FK column. These
 // keep main's LEGACY derivation (the raw column with '_by_' composition -
 // collision-free, so it must survive a regen unchanged; N-1a).
-export type ByCurrent = ModelInstanceVersionRelations['modelInstancesByCurrentVersionId'];
-export type ByPublished = ModelInstanceVersionRelations['modelInstancesByPublishedVersionId'];
-type AssertMany<T extends RelationDescriptor<ModelInstance, 'many', ModelInstanceRelations>> = T;
+export type ByCurrent = DocumentVersionRelations['documentsByCurrentVersionId'];
+export type ByPublished = DocumentVersionRelations['documentsByPublishedVersionId'];
+type AssertMany<T extends RelationDescriptor<Document, 'many', DocumentRelations>> = T;
 export type _many = AssertMany<ByCurrent>;
 `;
 
 const SCHEMA: SchemaMetadata = {
   enums: {},
   tables: {
-    model_instances: MODEL_INSTANCES,
-    model_instance_versions: MODEL_INSTANCE_VERSIONS,
+    documents: DOCUMENTS,
+    document_versions: DOCUMENT_VERSIONS,
     users: {
       name: 'users',
       columns: [

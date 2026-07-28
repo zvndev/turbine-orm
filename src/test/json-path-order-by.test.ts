@@ -1,5 +1,5 @@
 /**
- * turbine-orm: JSON-path orderBy on same-table jsonb columns (dogfood report)
+ * turbine-orm: JSON-path orderBy on same-table jsonb columns (regression)
  *
  * `orderBy: { data: { path: ['weight'], direction: 'asc', type: 'numeric' } }`
  * compiles to `("data" #>> $n::text[])::numeric ASC`: the path bound as ONE

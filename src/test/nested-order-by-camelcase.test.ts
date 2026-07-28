@@ -1,5 +1,5 @@
 /**
- * turbine-orm: nested-relation orderBy columnMap resolution (dogfood item 2)
+ * turbine-orm: nested-relation orderBy columnMap resolution
  *
  * Regression: `findFirst({ with: { fields: { orderBy: { sortOrder: 'asc' } } } })`
  * threw [TURBINE_E003] Unknown column "sortOrder" whenever the DB column was

@@ -631,7 +631,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     // per-FK-column when several FKs point at the same target, and every name
     // is collision-checked against the table's scalar column fields so a
     // relation can never shadow a column (which generated unsound types and
-    // made both surfaces unusable, dogfood T-4).
+    // made both surfaces unusable).
     const columnFieldsByTable = new Map<string, Set<string>>();
     const unknownTypedFieldsByTable = new Map<string, Set<string>>();
     for (const [tbl, cols] of columnsByTable) {

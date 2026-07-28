@@ -22,8 +22,8 @@ import {
 function finding(over: Partial<PlanDivergenceFinding> = {}): PlanDivergenceFinding {
   return {
     branch: 'unindexed-filter',
-    table: 'inventory_location',
-    column: 'organization_id',
+    table: 'user_session',
+    column: 'tenant_id',
     rows: 20000,
     pages: 247,
     distinctValues: 40,
@@ -33,7 +33,7 @@ function finding(over: Partial<PlanDivergenceFinding> = {}): PlanDivergenceFindi
     correlation: 0.01,
     assumedLimit: 20,
     orderColumn: 'id',
-    columnField: 'organizationId',
+    columnField: 'tenantId',
     orderColumnField: 'id',
     ...over,
   } as PlanDivergenceFinding;
@@ -65,7 +65,7 @@ describe('buildFlipProbeSql', () => {
     const sql = buildFlipProbeSql(finding(), 'tpf_0');
     assert.equal(
       sql.prepare,
-      'PREPARE tpf_0 AS SELECT * FROM "inventory_location" WHERE "organization_id" = $1 ORDER BY "id" LIMIT $2',
+      'PREPARE tpf_0 AS SELECT * FROM "user_session" WHERE "tenant_id" = $1 ORDER BY "id" LIMIT $2',
     );
     assert.equal(sql.explain, 'EXPLAIN (FORMAT JSON) EXECUTE tpf_0(NULL, 20)');
     assert.equal(sql.deallocate, 'DEALLOCATE tpf_0');
@@ -73,7 +73,7 @@ describe('buildFlipProbeSql', () => {
 
   it('qualifies with the search schema when one is configured', () => {
     const sql = buildFlipProbeSql(finding(), 'tpf_1', 'reporting');
-    assert.match(sql.prepare, /FROM "reporting"\."inventory_location"/);
+    assert.match(sql.prepare, /FROM "reporting"\."user_session"/);
   });
 
   it('cannot be broken out of by a hostile identifier', () => {
@@ -188,7 +188,7 @@ describe('applyFlipVerdicts', () => {
   it('drops a refuted finding and counts it', () => {
     const out = applyFlipVerdicts(
       report([finding()]),
-      probe({ [flipProbeKey('inventory_location', 'organization_id')]: 'no-flip' }),
+      probe({ [flipProbeKey('user_session', 'tenant_id')]: 'no-flip' }),
     );
     assert.equal(out.findings.length, 0);
     assert.equal(out.flipRefuted, 1);
@@ -198,7 +198,7 @@ describe('applyFlipVerdicts', () => {
   it('keeps a confirmed finding', () => {
     const out = applyFlipVerdicts(
       report([finding()]),
-      probe({ [flipProbeKey('inventory_location', 'organization_id')]: 'flip-reachable' }),
+      probe({ [flipProbeKey('user_session', 'tenant_id')]: 'flip-reachable' }),
     );
     assert.equal(out.findings.length, 1);
     assert.equal(out.flipRefuted, 0);
@@ -209,7 +209,7 @@ describe('applyFlipVerdicts', () => {
     // database was uncooperative, since that is invisible in the output.
     const out = applyFlipVerdicts(
       report([finding()]),
-      probe({ [flipProbeKey('inventory_location', 'organization_id')]: 'unknown' }),
+      probe({ [flipProbeKey('user_session', 'tenant_id')]: 'unknown' }),
     );
     assert.equal(out.findings.length, 1);
     assert.equal(out.flipRefuted, 0);

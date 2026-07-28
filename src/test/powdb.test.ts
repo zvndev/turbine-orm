@@ -1604,7 +1604,7 @@ describe('powdb: cross-pool re-entrancy (chained ALS marker)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// the dogfood consumer regression (ITEM 3): the re-entrancy marker is scoped to the
+// regression (ITEM 3): the re-entrancy marker is scoped to the
 // transaction CALLBACK's async subtree. acquire() used to enterWith() the
 // marker into the CALLER's context, so a context that merely had a begin in
 // its await chain was falsely flagged re-entrant: on a cold client, the first
@@ -1612,7 +1612,7 @@ describe('powdb: cross-pool re-entrancy (chained ALS marker)', () => {
 // every sibling (9/10 rejected E017 in production).
 // ---------------------------------------------------------------------------
 
-describe('powdb: re-entrancy marker never leaks into the caller context (dogfood report)', () => {
+describe('powdb: re-entrancy marker never leaks into the caller context', () => {
   it('a context that opened a manual tx is not falsely re-entrant: $transaction queues FIFO', async () => {
     const { pool, seen } = fakeEmbeddedDb();
     const db = new TurbineClient({ pool, dialect: powdbDialect }, { tables: {}, enums: {} });
@@ -2121,7 +2121,7 @@ describe('powdb: server tx-gate timeout maps to TimeoutError (PowDB ≥ 0.10)', 
 });
 
 // ---------------------------------------------------------------------------
-// the dogfood consumer regression (ITEM 1): owned-pool disconnect() must close every driver
+// regression (ITEM 1): owned-pool disconnect() must close every driver
 // client. client.ts treats TurbineConfig.pool as external (ownsPool = false)
 // and skips pool.end(), so turbinePowDB patches disconnect()/end() on owned
 // pools; and the driver Pool.close() only closes IDLE clients, so

@@ -1,12 +1,12 @@
 /**
- * turbine-orm, Relation derivation from foreign keys (dogfood T-4)
+ * turbine-orm, Relation derivation from foreign keys
  *
  * Unit tests for `buildRelationsFromForeignKeys()` / `relationNameFromColumn()`
  * - the pure naming core extracted from `introspect()` so the FK→relation
  * naming rules are testable without a database.
  *
- * Regression context (dogfood report): `model_instances` carries TWO
- * FK columns to `model_instance_versions` (`current_version_id`,
+ * Regression context: `documents` carries TWO
+ * FK columns to `document_versions` (`current_version_id`,
  * `published_version_id`, or Prisma-style quoted camelCase `currentVersionId`
  * / `publishedVersionId`). The old naming derived both belongsTo names from
  * the target table, so one clobbered the other, and camelCase `…Id` columns
@@ -101,44 +101,29 @@ describe('buildRelationsFromForeignKeys, two FKs to the same target (T-4)', () =
     const [relations, warnings] = captureWarnings(() =>
       buildRelationsFromForeignKeys(
         [
-          fk(
-            'model_instances',
-            ['current_version_id'],
-            'model_instance_versions',
-            ['id'],
-            'model_instances_current_version_id_fkey',
-          ),
-          fk(
-            'model_instances',
-            ['published_version_id'],
-            'model_instance_versions',
-            ['id'],
-            'model_instances_published_version_id_fkey',
-          ),
+          fk('documents', ['current_version_id'], 'document_versions', ['id'], 'documents_current_version_id_fkey'),
+          fk('documents', ['published_version_id'], 'document_versions', ['id'], 'documents_published_version_id_fkey'),
         ],
         new Map([
-          ['model_instances', new Set(['id', 'currentVersionId', 'publishedVersionId'])],
-          ['model_instance_versions', new Set(['id', 'body'])],
+          ['documents', new Set(['id', 'currentVersionId', 'publishedVersionId'])],
+          ['document_versions', new Set(['id', 'body'])],
         ]),
       ),
     );
     assert.deepEqual(warnings, []);
 
-    const instances = relations.get('model_instances')!;
+    const instances = relations.get('documents')!;
     assert.deepEqual(Object.keys(instances).sort(), ['currentVersion', 'publishedVersion']);
     assert.equal(instances.currentVersion!.type, 'belongsTo');
     assert.equal(instances.currentVersion!.foreignKey, 'current_version_id');
     assert.equal(instances.publishedVersion!.foreignKey, 'published_version_id');
 
     // Reverse hasMany side gets DISTINCT per-column names.
-    const versions = relations.get('model_instance_versions')!;
-    assert.deepEqual(Object.keys(versions).sort(), [
-      'modelInstancesByCurrentVersion',
-      'modelInstancesByPublishedVersion',
-    ]);
-    assert.equal(versions.modelInstancesByCurrentVersion!.type, 'hasMany');
-    assert.equal(versions.modelInstancesByCurrentVersion!.foreignKey, 'current_version_id');
-    assert.equal(versions.modelInstancesByPublishedVersion!.foreignKey, 'published_version_id');
+    const versions = relations.get('document_versions')!;
+    assert.deepEqual(Object.keys(versions).sort(), ['documentsByCurrentVersion', 'documentsByPublishedVersion']);
+    assert.equal(versions.documentsByCurrentVersion!.type, 'hasMany');
+    assert.equal(versions.documentsByCurrentVersion!.foreignKey, 'current_version_id');
+    assert.equal(versions.documentsByPublishedVersion!.foreignKey, 'published_version_id');
   });
 
   it('strips camelCase Id suffixes so the relation never shadows the scalar FK field', () => {
@@ -147,34 +132,31 @@ describe('buildRelationsFromForeignKeys, two FKs to the same target (T-4)', () =
     // "currentVersionId", shadowing the scalar entirely. The belongsTo side
     // legitimately changes (it was BROKEN, the legacy name collided with the
     // concrete-typed scalar), but the reverse hasMany side keeps the LEGACY
-    // names (`modelInstancesByCurrentVersionId`): those were collision-free
+    // names (`documentsByCurrentVersionId`): those were collision-free
     // and worked at runtime, so a regen must not rename them (N-1a).
     const [relations, warnings] = captureWarnings(() =>
       buildRelationsFromForeignKeys(
         [
-          fk('model_instances', ['currentVersionId'], 'model_instance_versions', ['id'], 'mi_cv_fkey'),
-          fk('model_instances', ['publishedVersionId'], 'model_instance_versions', ['id'], 'mi_pv_fkey'),
+          fk('documents', ['currentVersionId'], 'document_versions', ['id'], 'mi_cv_fkey'),
+          fk('documents', ['publishedVersionId'], 'document_versions', ['id'], 'mi_pv_fkey'),
         ],
         new Map([
-          ['model_instances', new Set(['id', 'currentVersionId', 'publishedVersionId'])],
-          ['model_instance_versions', new Set(['id'])],
+          ['documents', new Set(['id', 'currentVersionId', 'publishedVersionId'])],
+          ['document_versions', new Set(['id'])],
         ]),
       ),
     );
     assert.deepEqual(warnings, []);
 
-    const instances = relations.get('model_instances')!;
+    const instances = relations.get('documents')!;
     assert.deepEqual(Object.keys(instances).sort(), ['currentVersion', 'publishedVersion']);
     // The scalar fields stay targetable, no relation carries their names.
     assert.equal(instances.currentVersionId, undefined);
     assert.equal(instances.publishedVersionId, undefined);
 
     // Legacy-preserved: exactly what main generated for this shape.
-    const versions = relations.get('model_instance_versions')!;
-    assert.deepEqual(Object.keys(versions).sort(), [
-      'modelInstancesByCurrentVersionId',
-      'modelInstancesByPublishedVersionId',
-    ]);
+    const versions = relations.get('document_versions')!;
+    assert.deepEqual(Object.keys(versions).sort(), ['documentsByCurrentVersionId', 'documentsByPublishedVersionId']);
   });
 });
 
@@ -185,17 +167,17 @@ describe('buildRelationsFromForeignKeys, collision fallback', () => {
     const [relations, warnings] = captureWarnings(() =>
       buildRelationsFromForeignKeys(
         [
-          fk('model_instances', ['current_version_id'], 'model_instance_versions', ['id'], 'mi_cv_fkey'),
-          fk('model_instances', ['published_version_id'], 'model_instance_versions', ['id'], 'mi_pv_fkey'),
+          fk('documents', ['current_version_id'], 'document_versions', ['id'], 'mi_cv_fkey'),
+          fk('documents', ['published_version_id'], 'document_versions', ['id'], 'mi_pv_fkey'),
         ],
         new Map([
-          ['model_instances', new Set(['id', 'currentVersionId', 'publishedVersionId', 'currentVersion'])],
-          ['model_instance_versions', new Set(['id'])],
+          ['documents', new Set(['id', 'currentVersionId', 'publishedVersionId', 'currentVersion'])],
+          ['document_versions', new Set(['id'])],
         ]),
       ),
     );
 
-    const instances = relations.get('model_instances')!;
+    const instances = relations.get('documents')!;
     assert.deepEqual(Object.keys(instances).sort(), ['currentVersionRel', 'publishedVersion']);
     assert.equal(instances.currentVersionRel!.foreignKey, 'current_version_id');
     assert.equal(warnings.length, 1);
@@ -313,21 +295,21 @@ describe('buildRelationsFromForeignKeys, main-parity table (N-1)', () => {
       // per-column derivation was already collision-free.
       name: 'two snake_case FKs to the same target',
       fks: [
-        fk('model_instances', ['current_version_id'], 'model_instance_versions', ['id'], 'mi_cv_fkey'),
-        fk('model_instances', ['published_version_id'], 'model_instance_versions', ['id'], 'mi_pv_fkey'),
+        fk('documents', ['current_version_id'], 'document_versions', ['id'], 'mi_cv_fkey'),
+        fk('documents', ['published_version_id'], 'document_versions', ['id'], 'mi_pv_fkey'),
       ],
       columnFields: {
-        model_instances: ['id', 'currentVersionId', 'publishedVersionId'],
-        model_instance_versions: ['id', 'body'],
+        documents: ['id', 'currentVersionId', 'publishedVersionId'],
+        document_versions: ['id', 'body'],
       },
       expected: {
-        model_instances: ['currentVersion', 'publishedVersion'],
-        model_instance_versions: ['modelInstancesByCurrentVersion', 'modelInstancesByPublishedVersion'],
+        documents: ['currentVersion', 'publishedVersion'],
+        document_versions: ['documentsByCurrentVersion', 'documentsByPublishedVersion'],
       },
       expectedWarnings: 0,
     },
     {
-      // MIXED, the the dogfood consumer camelCase two-FK regression shape (N-1a):
+      // MIXED, the camelCase two-FK regression shape (N-1a):
       //   belongsTo LEGITIMATELY CHANGED: main derived 'authorId'/'editorId',
       //   which SHADOWED the concrete scalar FK fields (broken types) → the
       //   modern Id-stripped names apply.

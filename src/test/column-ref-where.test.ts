@@ -1,5 +1,5 @@
 /**
- * turbine-orm: column-to-column where comparison (dogfood report)
+ * turbine-orm: column-to-column where comparison (regression)
  *
  * `{ currentVersionId: { equals: { col: 'publishedVersionId' } } }` compiles
  * to `"current_version_id" = "published_version_id"`: a ColumnRef marker
@@ -73,7 +73,7 @@ describe('column-ref where: operators', () => {
     });
   }
 
-  it('the exact the dogfood consumer "published_with_draft" filter shape', () => {
+  it('the two-column self-comparison filter shape', () => {
     const q = makeQuery('documents', schema());
     const { sql, params } = q.buildFindMany({
       where: {

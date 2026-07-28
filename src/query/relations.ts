@@ -2784,7 +2784,7 @@ export function buildRelationSubquery(
   // For hasMany/hasOne: TARGET has the FK (RelationDef.foreignKey is always
   // the child-side column), so alias.fk = parentRef.pk. hasOne is just
   // hasMany with a unique FK, treating it like belongsTo here silently
-  // correlated the wrong columns (caught dogfooding: uuid = varchar).
+  // correlated the wrong columns (the mismatch is silent: uuid = varchar).
   // For belongsTo: SOURCE has the FK, so alias.pk = parentRef.fk (reversed).
   // Supports composite foreign keys (string[]) via buildCorrelation.
   let whereClause: string;

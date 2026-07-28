@@ -68,19 +68,19 @@ async function main() {
   const admin = new pg.Pool({ connectionString: DATABASE_URL, max: 2 });
   const schema = await introspect({ connectionString: DATABASE_URL });
 
-  const parentMeta = schema.tables['item_type'];
-  if (!parentMeta) throw new Error('item_type not found, run seed-count.ts first');
+  const parentMeta = schema.tables['category'];
+  if (!parentMeta) throw new Error('category not found, run seed-count.ts first');
 
   // Discover the two hasMany relation names introspection derived.
   const relFor = (childTable: string): string => {
     for (const [name, rel] of Object.entries(parentMeta.relations)) {
       if (rel.type === 'hasMany' && rel.to === childTable) return name;
     }
-    throw new Error(`no hasMany relation from item_type to ${childTable}`);
+    throw new Error(`no hasMany relation from category to ${childTable}`);
   };
   const dists = [
-    { label: 'uniform', table: 'inventory_item', rel: relFor('inventory_item'), index: 'idx_inv_item_type_id' },
-    { label: 'skewed', table: 'inventory_hot', rel: relFor('inventory_hot'), index: 'idx_inv_hot_type_id' },
+    { label: 'uniform', table: 'product', rel: relFor('product'), index: 'idx_product_category_id' },
+    { label: 'skewed', table: 'product_hot', rel: relFor('product_hot'), index: 'idx_inv_hot_type_id' },
   ];
 
   const db = new TurbineClient({ connectionString: DATABASE_URL, poolSize: 4 }, schema);
@@ -100,7 +100,7 @@ async function main() {
   for (const dist of dists) {
     for (const indexed of [true, false]) {
       if (indexed) {
-        await admin.query(`CREATE INDEX IF NOT EXISTS ${dist.index} ON ${dist.table} (type_id)`);
+        await admin.query(`CREATE INDEX IF NOT EXISTS ${dist.index} ON ${dist.table} (category_id)`);
       } else {
         await admin.query(`DROP INDEX IF EXISTS ${dist.index}`);
       }
@@ -110,7 +110,7 @@ async function main() {
         const run = async (plan: Plan): Promise<{ ms: number; rows: number; stmts: number }> => {
           const before = stmts;
           const t = performance.now();
-          const rows = (await db.table('item_type').findMany({
+          const rows = (await db.table('category').findMany({
             limit: parents,
             orderBy: { id: 'asc' },
             with: { _count: { [dist.rel]: true } } as never,

@@ -573,7 +573,7 @@ describe('schemaDefToMetadata, collision guard parity with introspection (N-4)',
 describe('schemaDefToMetadata, relation-name parity with buildRelationsFromForeignKeys (N-4)', () => {
   it('derives IDENTICAL names to introspection-shaped FK entries for the divergent shapes', () => {
     // One logical schema exercising: (1) the posts.user/userId shadow shape,
-    // (2) the the dogfood consumer two-FKs-to-one-target shape, (3) a pure junction m2m.
+    // (2) the two-FKs-to-one-target shape, (3) a pure junction m2m.
     const def = defineSchema({
       users: { id: { type: 'serial', primaryKey: true } },
       posts: {
@@ -581,12 +581,12 @@ describe('schemaDefToMetadata, relation-name parity with buildRelationsFromForei
         user: { type: 'text' },
         userId: { type: 'integer', notNull: true, references: 'users.id' },
       },
-      modelInstances: {
+      documents: {
         id: { type: 'serial', primaryKey: true },
-        currentVersionId: { type: 'integer', references: 'modelInstanceVersions.id' },
-        publishedVersionId: { type: 'integer', references: 'modelInstanceVersions.id' },
+        currentVersionId: { type: 'integer', references: 'documentVersions.id' },
+        publishedVersionId: { type: 'integer', references: 'documentVersions.id' },
       },
-      modelInstanceVersions: { id: { type: 'serial', primaryKey: true } },
+      documentVersions: { id: { type: 'serial', primaryKey: true } },
       tags: { id: { type: 'serial', primaryKey: true } },
       postTags: {
         postId: { type: 'integer', references: 'posts.id' },
@@ -610,18 +610,18 @@ describe('schemaDefToMetadata, relation-name parity with buildRelationsFromForei
         constraintName: 'posts_user_id_fkey',
       },
       {
-        sourceTable: 'model_instances',
+        sourceTable: 'documents',
         sourceColumns: ['current_version_id'],
-        targetTable: 'model_instance_versions',
+        targetTable: 'document_versions',
         targetColumns: ['id'],
-        constraintName: 'model_instances_current_version_id_fkey',
+        constraintName: 'documents_current_version_id_fkey',
       },
       {
-        sourceTable: 'model_instances',
+        sourceTable: 'documents',
         sourceColumns: ['published_version_id'],
-        targetTable: 'model_instance_versions',
+        targetTable: 'document_versions',
         targetColumns: ['id'],
-        constraintName: 'model_instances_published_version_id_fkey',
+        constraintName: 'documents_published_version_id_fkey',
       },
       {
         sourceTable: 'post_tags',
@@ -641,29 +641,29 @@ describe('schemaDefToMetadata, relation-name parity with buildRelationsFromForei
     const columnFieldsByTable = new Map<string, Set<string>>([
       ['users', new Set(['id'])],
       ['posts', new Set(['id', 'user', 'userId'])],
-      ['model_instances', new Set(['id', 'currentVersionId', 'publishedVersionId'])],
-      ['model_instance_versions', new Set(['id'])],
+      ['documents', new Set(['id', 'currentVersionId', 'publishedVersionId'])],
+      ['document_versions', new Set(['id'])],
       ['tags', new Set(['id'])],
       ['post_tags', new Set(['postId', 'tagId'])],
     ]);
     const [introspected] = captureWarnings(() => {
       const rels = buildRelationsFromForeignKeys(fks, columnFieldsByTable);
       addAutoManyToManyRelations(
-        ['users', 'posts', 'model_instances', 'model_instance_versions', 'tags', 'post_tags'],
+        ['users', 'posts', 'documents', 'document_versions', 'tags', 'post_tags'],
         fks,
         new Map([
           ['users', ['id']],
           ['posts', ['id']],
-          ['model_instances', ['id']],
-          ['model_instance_versions', ['id']],
+          ['documents', ['id']],
+          ['document_versions', ['id']],
           ['tags', ['id']],
           ['post_tags', ['post_id', 'tag_id']],
         ]),
         new Map([
           ['users', ['id']],
           ['posts', ['id', 'user', 'user_id']],
-          ['model_instances', ['id', 'current_version_id', 'published_version_id']],
-          ['model_instance_versions', ['id']],
+          ['documents', ['id', 'current_version_id', 'published_version_id']],
+          ['document_versions', ['id']],
           ['tags', ['id']],
           ['post_tags', ['post_id', 'tag_id']],
         ]),
@@ -673,7 +673,7 @@ describe('schemaDefToMetadata, relation-name parity with buildRelationsFromForei
       return rels;
     });
 
-    for (const table of ['users', 'posts', 'model_instances', 'model_instance_versions', 'tags', 'post_tags']) {
+    for (const table of ['users', 'posts', 'documents', 'document_versions', 'tags', 'post_tags']) {
       assert.deepStrictEqual(
         Object.keys(meta.tables[table]!.relations).sort(),
         Object.keys(introspected.get(table) ?? {}).sort(),

@@ -1,5 +1,5 @@
 /**
- * turbine-orm, Reproducible codegen output (dogfood T-8b)
+ * turbine-orm, Reproducible codegen output
  *
  * `turbine generate --no-timestamp` must omit the volatile `Generated at:`
  * header line from EVERY emitted file so byte-identical schemas regenerate to

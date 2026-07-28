@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.59.2 (2026-07-28)
+
+### Changed
+
+- **Example and fixture naming, no code behaviour changes.** Doctor remediation
+  examples, source comments, unit-test fixtures and two benchmark seeds used
+  table and column names carried over from schemas Turbine was validated
+  against rather than synthetic ones. All are now generic (`documents` /
+  `document_versions`, `ledger_entries` / `ledger_lines`, `product` /
+  `category`, `user_session` / `tenant_id`). Test and benchmark identifiers are
+  synthetic by policy, and the regression shapes they pin are unchanged.
+
 ## 0.59.1 (2026-07-28)
 
 ### Changed
@@ -198,7 +210,7 @@
 
 - **The core-client snippet doctor prints named an accessor that does not
   exist.** It printed `db.<raw table name>`, so on any snake_case schema the
-  suggested code was `db.inventory_location.findMany(...)`, which is `undefined`.
+  suggested code was `db.user_session.findMany(...)`, which is `undefined`.
   Both `TurbineClient` and the code generator define table accessors through
   `snakeToCamel`, and the snippet now does too.
 
@@ -979,7 +991,7 @@ the coercion itself. It was in which spelling of a key reaches it.
 - **Scalar `having` filters, and `AND` / `OR` / `NOT` inside `having`.** A
   `groupBy` field entry previously accepted only an aggregate filter
   (`{ _sum: { gt: 100 } }`). It now also accepts a filter on the grouped value
-  itself (`{ typeId: { not: null } }`, `{ status: { in: ['a', 'b'] } }`, or a
+  itself (`{ categoryId: { not: null } }`, `{ status: { in: ['a', 'b'] } }`, or a
   bare value as equality shorthand), matching Prisma, and both forms may appear
   in the same object, ANDed. A scalar filter is legal only on a column listed in
   `by`, since a non-grouped column cannot be referenced in `HAVING` at all;
@@ -2321,7 +2333,7 @@ listed under Changed with the exact opt-in.
   that carry an extra payload column, are still never treated as junctions.
 - **Index column parsing no longer swallows a partial-index `WHERE` clause.** Introspection
   parsed the indexed columns with a greedy match that, for a partial index like
-  `CREATE UNIQUE INDEX ... (pos_id, pos_item_id) WHERE (pos_item_id IS NOT NULL)`, captured
+  `CREATE UNIQUE INDEX ... (ledger_id, line_id) WHERE (line_id IS NOT NULL)`, captured
   the trailing `WHERE (...)` as part of the column list. That garbage fragment then leaked
   into generated compound-unique selector names and produced a `types.ts` that failed to
   parse. Column parsing is now anchored on the `USING` clause, quoted identifiers are
@@ -3383,7 +3395,7 @@ findings (including one critical) fixed pre-release.
   or snake_case keys).
 - **PowDB 0.10 alignment:** reserved PowQL words (incl. the new `schema` /
   `describe` keywords) are backtick-quoted automatically in bare-identifier
-  positions of generated PowQL; the server's new "transaction gate timeout"
+  ledger_entries of generated PowQL; the server's new "transaction gate timeout"
   maps to `TimeoutError` E002.
 
 ## 0.29.0 (2026-07-12)
@@ -3517,7 +3529,7 @@ Identical to 0.27.0 with an internal lint cleanup in the destructive-statement s
 - **`relationLoadStrategy: 'join' | 'batched'`**, opt-in batched relation loading, as a client-level default (`TurbineConfig`) or per-query on `findMany`/`findFirst`/`findUnique`. `'batched'` runs the base query without `json_agg` subqueries, then one flat follow-up per relation (`WHERE fk = ANY($1)`, chunked at 1,000 keys) and stitches client-side, results are deep-equal to the join strategy (verified by integration tests running both). Useful when FK indexes are missing or result sets are huge (flat rows transfer leaner than nested JSON). Sibling relations and key chunks load concurrently (keys travel as one `ANY($1)` array parameter, chunked at 32K). Honors per-relation `where`/`select`/`omit`/`orderBy`/nested `with`; per-relation `limit` is applied client-side per parent. Transaction-safe (follow-ups run on the same connection). Measured on a production-shaped worst case (8,814 parents × 6 relation trees, unindexed FKs, WAN link): join strategy 6.5s, `batched` ~1.9s, roughly 2× faster than a leading batched-loader ORM's equivalent query (~3.7s) on the same data.
 - **Implicit `is` on bare to-one relation filters (Prisma-compatible).** `where: { vendor: { name: { contains: 'x' } } }` now works without the explicit `is` wrapper; `is: null` / `isNot: null` compile to NOT EXISTS / EXISTS. `WhereClause` types to-many relation props as `some`/`every`/`none` filters and to-one props as bare-or-`is`/`isNot`.
 - **Relation filters inside `with.where` and at any nesting depth.** A relation's `with … where` can now filter by the relation's own relations (`with: { items: { where: { stage: { is: { active: true } } } } }`), and relation filters recurse through `some`/`none`/`every`/`is`/`isNot` with `OR`/`AND`/`NOT` support at every level.
-- **`jsonEncoding: 'positional'`**, opt-in lean wire encoding for `with` relations (Postgres-only, default `'object'` unchanged). Relation subqueries emit `json_agg(json_build_array(…))` instead of `json_build_object('key', …)`, so key names stop being repeated in every nested object of every row; positions are mapped back to keys client-side and parsed output is **byte-identical** to the object encoding (integration tests assert deep-equality under both). Measured on a 14-column hasMany relation: **39% fewer wire bytes** and ~13% faster end-to-end `findMany`, the win grows with column count and result size. Composes with everything (`select`/`omit`, ordered/limited relations, hasOne/belongsTo, m2m, nested trees); `relationLoadStrategy: 'batched'` simply bypasses it (no JSON aggregation there). `benchmarks/json-encoding-bench.ts` reproduces the numbers.
+- **`jsonEncoding: 'positional'`**, opt-in lean wire encoding for `with` relations (Postgres-only, default `'object'` unchanged). Relation subqueries emit `json_agg(json_build_array(…))` instead of `json_build_object('key', …)`, so key names stop being repeated in every nested object of every row; ledger_entries are mapped back to keys client-side and parsed output is **byte-identical** to the object encoding (integration tests assert deep-equality under both). Measured on a 14-column hasMany relation: **39% fewer wire bytes** and ~13% faster end-to-end `findMany`, the win grows with column count and result size. Composes with everything (`select`/`omit`, ordered/limited relations, hasOne/belongsTo, m2m, nested trees); `relationLoadStrategy: 'batched'` simply bypasses it (no JSON aggregation there). `benchmarks/json-encoding-bench.ts` reproduces the numbers.
 
 ## 0.25.0 (2026-07-06)
 
@@ -3636,7 +3648,7 @@ There is no 0.20.0. The version was reserved for a product-review sprint whose w
 **Patch release from a full product review + gold-standard audit**, closes a HIGH silent-wrong-rows hole in the SQL cache, makes two documented-but-broken behaviors actually work, and brings the docs/site in line with what the library does.
 
 ### Fixed
-- **`where`-key order can no longer cross-bind parameters on a warm SQL cache (HIGH).** The cache fingerprint sorted `where` keys, but the SQL-build and cache-hit param-collect paths iterated object-insertion order, so two queries with the same fields in different key order shared one cached SQL string but pushed parameters in different positions. `findMany({ where: { tenantId, id } })` followed by `findMany({ where: { id, tenantId } })` could execute the cached SQL with the values swapped, silently returning the wrong row (a cross-tenant-leak class when the permuted fields are same-typed). Key enumeration is now canonicalized (sorted) across every fingerprint/build/collect triple, top-level `where`, relation-filter sub-wheres (`some`/`every`/`none`), alias wheres, nested `with` relation order, cursor, and the `findUnique` simple (plain-equality) path. 14 regression tests warm the cache then assert each column binds its own value. Array members (`OR`/`AND`/`NOT`) remain positional.
+- **`where`-key order can no longer cross-bind parameters on a warm SQL cache (HIGH).** The cache fingerprint sorted `where` keys, but the SQL-build and cache-hit param-collect paths iterated object-insertion order, so two queries with the same fields in different key order shared one cached SQL string but pushed parameters in different ledger_entries. `findMany({ where: { tenantId, id } })` followed by `findMany({ where: { id, tenantId } })` could execute the cached SQL with the values swapped, silently returning the wrong row (a cross-tenant-leak class when the permuted fields are same-typed). Key enumeration is now canonicalized (sorted) across every fingerprint/build/collect triple, top-level `where`, relation-filter sub-wheres (`some`/`every`/`none`), alias wheres, nested `with` relation order, cursor, and the `findUnique` simple (plain-equality) path. 14 regression tests warm the cache then assert each column binds its own value. Array members (`OR`/`AND`/`NOT`) remain positional.
 - **`{ equals: value }` works as plain equality on any column.** `where: { email: { equals: 'a@b.com' } }`, documented in the README and the most common operator a migrating Prisma user reaches for, previously threw `ValidationError` because `equals` was treated only as a JSONB filter key. It now compiles to `"col" = $n` (and `{ equals: null }` to `IS NULL`), parameterized, on the build path, the cache-hit path, and relation filters, while JSON/JSONB columns keep their existing containment behavior.
 - **Nested-write input types are now real.** The exported `NestedCreateOp` / `NestedUpdateOp` / `ConnectOrCreateOp` types were referenced by zero code, `create({ data })` was typed as `Partial<T>` so the `create`/`connect`/`connectOrCreate`/`update`/`upsert`/`disconnect`/`delete` relation ops the runtime already supported were invisible to TypeScript. `CreateArgs`/`UpdateArgs` are now generic over the target's relations and surface the full nested-write op palette (matching `nested-write.ts` exactly), recursively, via the same `RelationDescriptor` brand that powers `with` inference. Untyped clients collapse to the old `Partial<T>`, so nothing breaks; generated clients get typed nested writes with no generator changes.
 

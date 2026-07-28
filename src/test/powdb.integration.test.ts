@@ -16,8 +16,8 @@
  *   - transactions: single-level commit + rollback
  *   - nested `tx.$transaction` and re-entrant `db.$transaction` throw typed (FIX 2)
  *   - independent concurrent `db.$transaction` calls queue FIFO and all succeed (T-7)
- *   - COLD-CLIENT same-tick `db.$transaction` burst: zero false E017 (dogfood item 3)
- *   - disconnect() really closes the owned pool (dogfood item 1)
+ *   - COLD-CLIENT same-tick `db.$transaction` burst: zero false E017
+ *   - disconnect() really closes the owned pool
  *   - chunked relation load over > MAX_RELATION_KEYS parents (FIX 4)
  *   - E017 unsupported guards (vector / cursor stream)
  */
@@ -413,7 +413,7 @@ describe('powdb integration (embedded)', () => {
 
   it('T-7: 10 concurrent db.$transaction writers all succeed (FIFO queue, no E017)', async () => {
     await withDb(async (db) => {
-      // The dogfood failure shape: 10-way concurrent transactional creates
+      // The failure shape: 10-way concurrent transactional creates
       // used to fail ~54% of the time on the begin-while-active guard. They
       // now queue on the single-writer gate and run one at a time.
       const results = await Promise.all(

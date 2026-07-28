@@ -62,16 +62,16 @@ describe('generateTypes: compound-unique selector emission', () => {
     const schema: SchemaMetadata = {
       enums: {},
       tables: {
-        positions: table(
-          'positions',
-          [col('id', 'id'), col('pos_id', 'posId'), col('pos_item_id', 'posItemId')],
+        ledger_entries: table(
+          'ledger_entries',
+          [col('id', 'id'), col('ledger_id', 'ledgerId'), col('line_id', 'lineId')],
           [
             {
               name: 'positions_pos_id_pos_item_id_key',
-              columns: ['pos_id', 'pos_item_id'],
+              columns: ['ledger_id', 'line_id'],
               unique: true,
               definition:
-                'CREATE UNIQUE INDEX positions_pos_id_pos_item_id_key ON positions USING btree (pos_id, pos_item_id) WHERE (pos_item_id IS NOT NULL)',
+                'CREATE UNIQUE INDEX positions_pos_id_pos_item_id_key ON ledger_entries USING btree (ledger_id, line_id) WHERE (line_id IS NOT NULL)',
               partial: true,
             },
           ],
@@ -121,17 +121,17 @@ describe('generateTypes: compound-unique selector emission', () => {
     const schema: SchemaMetadata = {
       enums: {},
       tables: {
-        pos_items: table(
-          'pos_items',
-          [col('id', 'id'), col('pos_id', 'posId'), col('pos_item_id', 'posItemId')],
+        ledger_lines: table(
+          'ledger_lines',
+          [col('id', 'id'), col('ledger_id', 'ledgerId'), col('line_id', 'lineId')],
           [
             {
               name: 'pos_items_partial_key',
-              columns: ['pos_id', 'pos_item_id'],
+              columns: ['ledger_id', 'line_id'],
               unique: true,
               partial: true,
               definition:
-                'CREATE UNIQUE INDEX pos_items_partial_key ON public.pos_items USING btree (pos_id, pos_item_id) WHERE (pos_item_id IS NOT NULL)',
+                'CREATE UNIQUE INDEX pos_items_partial_key ON public.ledger_lines USING btree (ledger_id, line_id) WHERE (line_id IS NOT NULL)',
             },
           ],
         ),
@@ -143,15 +143,15 @@ describe('generateTypes: compound-unique selector emission', () => {
     const clean = generateMetadata({
       enums: {},
       tables: {
-        pos_items: table(
-          'pos_items',
-          [col('id', 'id'), col('pos_id', 'posId'), col('pos_item_id', 'posItemId')],
+        ledger_lines: table(
+          'ledger_lines',
+          [col('id', 'id'), col('ledger_id', 'ledgerId'), col('line_id', 'lineId')],
           [
             {
               name: 'pos_items_key',
-              columns: ['pos_id', 'pos_item_id'],
+              columns: ['ledger_id', 'line_id'],
               unique: true,
-              definition: 'CREATE UNIQUE INDEX pos_items_key ON public.pos_items USING btree (pos_id, pos_item_id)',
+              definition: 'CREATE UNIQUE INDEX pos_items_key ON public.ledger_lines USING btree (ledger_id, line_id)',
             },
           ],
         ),

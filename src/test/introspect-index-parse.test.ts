@@ -19,9 +19,9 @@ describe('parseIndexColumns', () => {
   });
 
   it('drops a PARTIAL index WHERE clause instead of splicing it into the columns', () => {
-    const def = 'CREATE UNIQUE INDEX u ON pos USING btree (pos_id, pos_item_id) WHERE (pos_item_id IS NOT NULL)';
+    const def = 'CREATE UNIQUE INDEX u ON pos USING btree (ledger_id, line_id) WHERE (line_id IS NOT NULL)';
     const cols = parseIndexColumns(def);
-    assert.deepEqual(cols, ['pos_id', 'pos_item_id']);
+    assert.deepEqual(cols, ['ledger_id', 'line_id']);
     // No WHERE / predicate garbage leaked into the column names.
     for (const c of cols) assert.doesNotMatch(c, /WHERE|IS NOT NULL|\)/i);
   });

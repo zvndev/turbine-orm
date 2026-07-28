@@ -3706,7 +3706,7 @@ function renderPlanDivergence(divergence: PlanDivergenceReport, attached: Attach
       const args = `where: { ${first.columnField}: value }, orderBy: { ${first.orderColumnField}: 'asc' },`;
       // The accessor is the camelCase FIELD spelling, not the raw table name:
       // TurbineClient and the code generator both define table accessors through
-      // snakeToCamel, so `db.inventory_location` is undefined on every
+      // snakeToCamel, so `db.user_session` is undefined on every
       // snake_case schema. The finding's own `columnField` / `orderColumnField`
       // are already field-space for the same reason.
       console.log(`       ${dim('On the core client:')}`);

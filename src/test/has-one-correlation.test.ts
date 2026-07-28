@@ -5,11 +5,11 @@ import { makeQuery, mockTable } from './helpers.js';
 // hasOne: the FK lives on the TARGET (child) side, exactly like hasMany but
 // unique. The with-subquery must correlate alias.fk = parent.pk, NOT the
 // belongsTo direction (alias.pk = parent.fk), which silently compares the
-// wrong columns (found dogfooding: uuid = character varying).
+// wrong columns (the mismatch is silent: uuid = character varying).
 const schema = {
   tables: {
-    pos_items: mockTable(
-      'pos_items',
+    ledger_lines: mockTable(
+      'ledger_lines',
       [
         { name: 'id', field: 'id', pgType: 'uuid' },
         { name: 'external_ref', field: 'external_ref', pgType: 'varchar' },
@@ -18,16 +18,16 @@ const schema = {
         group: {
           type: 'hasOne' as const,
           name: 'group',
-          from: 'pos_items',
+          from: 'ledger_lines',
           to: 'groups',
-          foreignKey: 'pos_item_id', // on groups (child)
-          referenceKey: 'id', // on pos_items (parent)
+          foreignKey: 'line_id', // on groups (child)
+          referenceKey: 'id', // on ledger_lines (parent)
         },
       },
     ),
     groups: mockTable('groups', [
       { name: 'id', field: 'id', pgType: 'uuid' },
-      { name: 'pos_item_id', field: 'pos_item_id', pgType: 'uuid' },
+      { name: 'line_id', field: 'line_id', pgType: 'uuid' },
       { name: 'label', field: 'label', pgType: 'text' },
     ]),
   },
@@ -35,9 +35,9 @@ const schema = {
 };
 
 test('hasOne with-subquery correlates child FK to parent PK', () => {
-  const q = makeQuery('pos_items', schema);
+  const q = makeQuery('ledger_lines', schema);
   const d = q.buildFindMany({ with: { group: true }, limit: 1 } as never);
-  assert.match(d.sql, /t0\."pos_item_id" = "pos_items"\."id"/);
-  assert.doesNotMatch(d.sql, /t0\."id" = "pos_items"\."pos_item_id"/);
+  assert.match(d.sql, /t0\."line_id" = "ledger_lines"\."id"/);
+  assert.doesNotMatch(d.sql, /t0\."id" = "ledger_lines"\."line_id"/);
   assert.match(d.sql, /LIMIT 1\)/); // still a single-object subquery
 });
