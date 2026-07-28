@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.62.0",
+  "version": "0.62.1",
   "description": "Postgres-native TypeScript ORM, runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "//exports": "Each subpath declares its types PER CONDITION. A single shared top-level \"types\" resolves to the ESM declarations for `require` too, which is TS1479 (\"is an ES module ... cannot be require()d\") for any CJS consumer on moduleResolution node16/nodenext. The require condition points at dist/cjs, which ships its own {\"type\":\"commonjs\"} package.json, so those declarations are CJS declarations. Gated in CI by publint + @arethetypeswrong/cli + a real .cts consumer typecheck (see the package-types job in ci.yml).",

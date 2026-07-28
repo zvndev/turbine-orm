@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.62.1 (2026-07-28)
+
+### Fixed
+
+- **SQL Server: a `BIGINT` child key came back as a string under the join
+  strategy.** Silently breaking for anyone who was reading that string.
+  Turbine narrows a safe `BIGINT` to a number on the driver's own rows, so a
+  top-level read and the batched loader both return `1`. Since 0.51 the join
+  strategy casts `BIGINT` to text so `FOR JSON PATH` cannot round it through an
+  IEEE double, and that rule kept the text unconditionally, reproducing the raw
+  driver value rather than the value Turbine hands back. So a `with` under the
+  join strategy was the one route returning `'1'`, which means switching
+  `relationLoadStrategy` for performance silently changed the caller's value
+  types. The decode now re-applies the same safe-integer narrowing, the policy
+  the mysql and sqlite dialects already use for their own 64-bit types; above
+  2^53 all three keep the string, which is why the text is carried at all.
+
+  Found by a new cross-engine battery that runs the identical fixture and the
+  identical assertions on every engine, plus a tiebreaker case that compares a
+  child row loaded through a relation against the same row read directly. "The
+  two strategies disagree" does not say which is wrong; the driver's own value
+  for a direct read does.
+
 ## 0.62.0 (2026-07-28)
 
 A hardening sprint off the back of a full product review. The theme is one
