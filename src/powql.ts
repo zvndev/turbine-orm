@@ -89,7 +89,7 @@ import type {
 // are unlocked ONLY by the UNSAFE symbol, on this engine exactly as on the SQL
 // engines, so a spread request body cannot turn either on here either.
 import { assertDirectionToken, resolveUnsafeFlag, UNSAFE } from './query/types.js';
-import { escapeLike } from './query/utils.js';
+import { escapeLike, ownLookup, relationInProjectionMessage } from './query/utils.js';
 import { assertJsonFilterKeys, jsonStringEntries } from './query/where.js';
 import {
   type ColumnMetadata,
@@ -1080,6 +1080,21 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * `includePii` is true; an explicit `select` naming a PII column IS the opt-in
    * and returns it regardless. Untagged tables project exactly as before.
    */
+  /**
+   * Resolve one projection field name, or throw. PowQL already refused an
+   * unresolvable name here (via {@link column}), unlike the SQL engines' join
+   * path, which filtered it out silently until 0.64. What this adds is the
+   * RELATION case: naming a relation inside `select` is a Prisma habit rather
+   * than a typo, and the generic "unknown column" text sends the reader looking
+   * for a misspelling that is not there. Same message as the SQL engines.
+   */
+  private projectionColumn(field: string, clause: 'select' | 'omit'): string {
+    if (ownLookup(this.meta.relations, field)) {
+      throw new ValidationError(relationInProjectionMessage(this.table, field, clause));
+    }
+    return this.column(field).name;
+  }
+
   private projectedColumns(
     select?: Record<string, boolean>,
     omit?: Record<string, boolean>,
@@ -1092,7 +1107,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const picked = new Set(
         Object.entries(select)
           .filter(([, v]) => v)
-          .map(([k]) => this.column(k).name),
+          .map(([k]) => this.projectionColumn(k, 'select')),
       );
       // Always keep the PK so reselect / relation stitching has a key to work with.
       for (const key of pk) picked.add(key);
@@ -1112,7 +1127,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const dropped = new Set(
         Object.entries(omit)
           .filter(([, v]) => v)
-          .map(([k]) => this.column(k).name),
+          .map(([k]) => this.projectionColumn(k, 'omit')),
       );
       // The PK survives `omit` too. This filter ran unconditionally and after
       // the `select` branch's force-add, so `omit: { id: true }` undid the very

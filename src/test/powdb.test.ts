@@ -651,6 +651,34 @@ describe('powdb: findMany generation', () => {
     assert.doesNotMatch(m2.last().powql, /\.name/, 'a non-key omit still applies');
   });
 
+  it('a relation named in select or omit is refused with the message that names the fix', async () => {
+    // PowQL already refused an unresolvable projection name (unlike the SQL
+    // join path before 0.64), so what this pins is the RELATION case: writing
+    // `select: { posts: true }` is a Prisma habit rather than a typo, and the
+    // generic "unknown column" text sends the reader hunting for a misspelling
+    // that is not there. Same message the SQL engines emit.
+    const m = mockPool();
+    await assert.rejects(
+      () => qi(m).findMany({ where: {}, select: { posts: true } } as never),
+      (err: Error & { code?: string }) =>
+        err.code === 'TURBINE_E003' &&
+        /"posts" is a relation on table "app_user", not a column/.test(err.message) &&
+        /Load it with `with:/.test(err.message),
+    );
+
+    await assert.rejects(
+      () => qi(m).findMany({ where: {}, omit: { posts: true } } as never),
+      (err: Error & { code?: string }) => /leave it out of `with`/.test(err.message),
+    );
+
+    // An ordinary misspelling still gets the ordinary message, so the special
+    // case is the relation and not a blanket rewrite of the error.
+    await assert.rejects(
+      () => qi(m).findMany({ where: {}, select: { nmae: true } } as never),
+      (err: Error) => /Unknown column "nmae"/.test(err.message),
+    );
+  });
+
   it('in / contains / insensitive / OR operators', async () => {
     const m = mockPool();
     await qi(m).findMany({ where: { name: { in: ['a', 'b'] } } });

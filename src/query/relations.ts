@@ -39,7 +39,7 @@ import type {
   WithOptions,
 } from './types.js';
 import { assertDirectionToken, assertOrderDirection } from './types.js';
-import { ownLookup } from './utils.js';
+import { ownLookup, relationInProjectionMessage, resolveColumnName, unknownFieldMessage } from './utils.js';
 import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -64,11 +64,60 @@ export interface RelationShape {
 }
 
 /**
- * Resolve select/omit options into a list of snake_case column names.
- * Returns null if neither is provided (meaning all columns).
+ * Turn ONE caller-supplied projection field name into a column, or throw.
+ *
+ * The whole point of this function is that it has no third outcome. The
+ * relation-side projection used to filter unresolvable names out
+ * (`.filter((col) => allColumns.includes(col))`) instead of rejecting them, and
+ * a filter that discards is exactly how a name typed by a human becomes SQL
+ * that no longer reflects what was asked for.
  */
-export function resolveColumns(
+function projectionColumn(table: string, meta: TableMetadata, field: string, clause: 'select' | 'omit'): string {
+  const column = resolveColumnName(meta, field);
+  if (column) return column;
+  // A relation named in a projection is a habit, not a typo, so it gets its own
+  // message pointing at `with`. Checked BEFORE the generic throw because the
+  // generic one degrades into "Did you mean <exactly what you typed>?".
+  if (ownLookup(meta.relations, field)) throw new ValidationError(relationInProjectionMessage(table, field, clause));
+  throw new ValidationError(unknownFieldMessage(table, field, meta));
+}
+
+/**
+ * Resolve `select` / `omit` into a list of snake_case column names, for the
+ * query's own table and for a relation target alike. `null` means "no
+ * projection", i.e. all columns, which keeps the `*` fast path.
+ *
+ * ## Why this is one function
+ *
+ * It used to be two, `resolveColumns` for the top level and
+ * `resolveTargetColumns` for a relation target, doing the same job against
+ * different metadata. They drifted, and the drift was invisible from either
+ * side: the top level resolved every name through a throwing lookup, while the
+ * relation side filtered unresolvable names out and emitted SQL for whatever
+ * survived. So the SAME key in the SAME query threw at the top and was silently
+ * ignored one level down, where `select: { titel: true }` returned `{}` rows
+ * and `omit: { titel: true }` returned the column it was asked to hide.
+ *
+ * It was worse than an inconsistency between depths. The batched loader runs
+ * each relation as a real query against the target table, so it went through
+ * the THROWING path, while the join plan went through the silent one. The two
+ * strategies therefore disagreed about whether the query was even valid, and
+ * under `relationLoadStrategy: 'auto'` which one runs is decided by a cost
+ * heuristic reading index coverage and table size. The same code threw on one
+ * table and quietly returned the wrong shape on another.
+ *
+ * Merging them is the fix that outlives this bug. Two functions that must agree
+ * are kept in step by whoever remembers; one function cannot disagree with
+ * itself. This mirrors `walkWhere` in where-compile.ts, which exists for the
+ * same reason after the top-level and relation-scoped WHERE walkers drifted
+ * twice, and it is why a new projection site is safe by default: PII exclusion,
+ * the `*` fast path and name resolution all live here, so reimplementing the
+ * name handling would mean reimplementing those too.
+ */
+export function resolveProjection(
   qi: BuilderCtx,
+  table: string,
+  meta: TableMetadata,
   select?: Record<string, boolean>,
   omit?: Record<string, boolean>,
   includePii?: boolean,
@@ -88,12 +137,12 @@ export function resolveColumns(
     // PII column IS the opt-in: it comes back regardless of `includePii`.
     return Object.entries(select)
       .filter(([, v]) => v)
-      .map(([k]) => qi.toColumn(k));
+      .map(([k]) => projectionColumn(table, meta, k, 'select'));
   }
   // Default / omit-only projection: PII-tagged columns are excluded unless the
   // caller opted in with `includePii: UNSAFE`. An empty set (untagged schema) keeps the
   // `null`/`*` fast path so the emitted SQL is byte-identical to before.
-  const piiCols = includePii ? undefined : writesMod.piiColumns(qi, qi.tableMeta);
+  const piiCols = includePii ? undefined : writesMod.piiColumns(qi, meta);
   const hasPii = piiCols !== undefined && piiCols.size > 0;
   if (omit) {
     if (Array.isArray(omit)) {
@@ -105,14 +154,27 @@ export function resolveColumns(
     const omitCols = new Set(
       Object.entries(omit)
         .filter(([, v]) => v)
-        .map(([k]) => qi.toColumn(k)),
+        .map(([k]) => projectionColumn(table, meta, k, 'omit')),
     );
-    return qi.tableMeta.allColumns.filter((col) => !omitCols.has(col) && !(hasPii && piiCols!.has(col)));
+    return meta.allColumns.filter((col) => !omitCols.has(col) && !(hasPii && piiCols!.has(col)));
   }
   if (hasPii) {
-    return qi.tableMeta.allColumns.filter((col) => !piiCols!.has(col));
+    return meta.allColumns.filter((col) => !piiCols!.has(col));
   }
   return null;
+}
+
+/**
+ * The query's own table. Thin wrapper over {@link resolveProjection} kept for
+ * the existing call sites in builder.ts.
+ */
+export function resolveColumns(
+  qi: BuilderCtx,
+  select?: Record<string, boolean>,
+  omit?: Record<string, boolean>,
+  includePii?: boolean,
+): string[] | null {
+  return resolveProjection(qi, qi.table, qi.tableMeta, select, omit, includePii);
 }
 
 /**
@@ -1434,37 +1496,23 @@ export function parseNestedRow(
  * Resolve the emitted column list for a relation, honoring `select` / `omit`.
  * Shared by {@link buildRelationSubquery} (json order) and
  * {@link buildRelationShape} (decode key order) so they can never diverge.
+ *
+ * A relation always projects SOMETHING, so the `null` that
+ * {@link resolveProjection} uses for the top level's `SELECT *` fast path
+ * becomes the target's full column list here. That is the only difference
+ * between the two, and it is why this is a four-line wrapper rather than a
+ * second implementation.
  */
 export function resolveTargetColumns(
   qi: BuilderCtx,
   spec: true | WithOptions,
   targetMeta: TableMetadata,
   includePii?: boolean,
+  targetTable: string = targetMeta.name,
 ): string[] {
-  if (spec !== true && spec.select) {
-    // Explicit `select` names the columns: a PII column named here IS the
-    // opt-in and comes back regardless of the query's `includePii`.
-    const selectedFields = Object.entries(spec.select)
-      .filter(([, v]) => v)
-      .map(([k]) => ownLookup(targetMeta.columnMap, k) ?? camelToSnake(k));
-    return selectedFields.filter((col) => targetMeta.allColumns.includes(col));
-  }
-  // Default / omit-only relation projection: PII columns are excluded unless
-  // the query opted in via `includePii`.
-  const piiCols = includePii ? undefined : writesMod.piiColumns(qi, targetMeta);
-  const hasPii = piiCols !== undefined && piiCols.size > 0;
-  if (spec !== true && spec.omit) {
-    const omittedFields = new Set(
-      Object.entries(spec.omit)
-        .filter(([, v]) => v)
-        .map(([k]) => ownLookup(targetMeta.columnMap, k) ?? camelToSnake(k)),
-    );
-    return targetMeta.allColumns.filter((col) => !omittedFields.has(col) && !(hasPii && piiCols!.has(col)));
-  }
-  if (hasPii) {
-    return targetMeta.allColumns.filter((col) => !piiCols!.has(col));
-  }
-  return targetMeta.allColumns;
+  const select = spec === true ? undefined : (spec.select as Record<string, boolean> | undefined);
+  const omit = spec === true ? undefined : (spec.omit as Record<string, boolean> | undefined);
+  return resolveProjection(qi, targetTable, targetMeta, select, omit, includePii) ?? targetMeta.allColumns;
 }
 
 /**
@@ -1637,7 +1685,7 @@ export function buildRelationShape(
   void parentMeta;
   const targetMeta = qi.schema.tables[relDef.to];
   if (!targetMeta) return { keys: [], nested: {}, cardinality: 'many' };
-  const targetColumns = resolveTargetColumns(qi, spec, targetMeta, includePii);
+  const targetColumns = resolveTargetColumns(qi, spec, targetMeta, includePii, relDef.to);
   const keys = targetColumns.map((col) => targetMeta.reverseColumnMap[col] ?? snakeToCamel(col));
   const nested: Record<string, RelationShape> = {};
   if (spec !== true && spec.with) {
@@ -1994,7 +2042,7 @@ function planFlattenNode(
   }
 
   const alias = `${FLATTEN_ALIAS_PREFIX}${counter.n++}`;
-  const cols = resolveTargetColumns(qi, spec, targetMeta, includePii);
+  const cols = resolveTargetColumns(qi, spec, targetMeta, includePii, relDef.to);
   const discAlias = `${alias}__${FLATTEN_DISCRIMINATOR}`;
 
   const node: FlattenNode = {
@@ -2685,7 +2733,7 @@ export function buildRelationSubquery(
   // `includePii` opt-in). Shared with the positional-shape builder so the
   // emitted json_build_array column order and the decode-side key order can
   // never drift apart.
-  const targetColumns = resolveTargetColumns(qi, spec, targetMeta, includePii);
+  const targetColumns = resolveTargetColumns(qi, spec, targetMeta, includePii, relDef.to);
 
   // Engine override seam (additive): a dialect whose JSON-aggregation shape does
   // not map onto buildJsonObject/buildJsonArrayAgg (SQL Server FOR JSON PATH) owns

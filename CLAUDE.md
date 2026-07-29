@@ -131,7 +131,28 @@ src/
                       relation _count / pick-row), relation _count expressions + their
                       global-filter params, and the with-clause fingerprint + param
                       collectors. Reuses where.ts (WHERE) and writes.ts (PII column set); the
-                      last and most connected module.
+                      last and most connected module. `resolveProjection` (0.64) is THE
+                      single select/omit -> column-list authority, for the query's own table
+                      and a relation target alike (`resolveColumns` / `resolveTargetColumns`
+                      are now wrappers; the only difference is that the top level's "no
+                      projection" is `null` for the `*` fast path while a relation gets
+                      allColumns). It was two hand-synced implementations and they drifted:
+                      the top level threw E003 on an unresolvable name while the relation side
+                      FILTERED it out, so `with: { posts: { select: { titel: true } } }`
+                      returned `[{}, {}]` and an `omit` typo returned the column it was asked
+                      to hide. Worse than a depth inconsistency: the batched loader queries the
+                      target table directly and so went through the THROWING path, meaning the
+                      two strategies disagreed about whether a query was VALID and `'auto'`
+                      picked between them on index coverage and table size. THE RULE, and it
+                      has no third outcome: a caller-supplied name resolves to a column or
+                      throws. A relation named in select/omit gets its own message
+                      (`relationInProjectionMessage` in utils.ts) pointing at `with`, because
+                      that is a Prisma habit rather than a typo and the generic text degrades
+                      into "Did you mean <exactly what you typed>?". Same rule and same message
+                      on PowDB (`PowqlInterface.projectionColumn`). Verified 0.64: EVERY other
+                      caller-name site (where, orderBy, distinct, groupBy `by`, aggregate
+                      targets, create/update `data`) already threw; projections were the only
+                      silent one.
     batched-loader.ts, The `relationLoadStrategy: 'batched'` path. Instead of the default
                       single-statement `json_agg` join, runs the base query without relation
                       subqueries, then ONE flat follow-up per relation

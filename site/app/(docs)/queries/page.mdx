@@ -91,6 +91,14 @@ const users = await db.users.findMany({
 });
 ```
 
+Both take **column** names. A name that does not resolve throws a
+`ValidationError` (`TURBINE_E003`) naming the table and suggesting the closest
+match, at the top level and inside a relation's `with` block alike. Before 0.64
+a relation-level typo was silently filtered out instead, so `select` returned
+`{}` rows and `omit` returned the column it was asked to hide; see the
+[errors page](/errors#unknown-field-names) for the relation-name case, which has
+its own message.
+
 ### PII fields: `includePii`
 
 Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) are excluded from every default projection: the top-level rows, relation subqueries, batched loads, and a write's returned row. They come back in two ways: name the column explicitly in `select` (the explicit request IS the opt-in), or pass `includePii: UNSAFE` to return every PII column at the top level **and** at every nested `with` level of that query.

@@ -913,3 +913,28 @@ export function unknownFieldMessage(
     (relations.length ? ` Known relations (valid in \`where\` and \`with\`): ${relations.join(', ')}.` : '')
   );
 }
+
+/**
+ * The error text for a RELATION named inside `select` / `omit`.
+ *
+ * Separate from {@link unknownFieldMessage} because the generic text degrades
+ * into nonsense here: `closestName` matches an exactly-spelled relation name at
+ * distance zero, so the message would read `Unknown field "comments". Did you
+ * mean "comments" (a relation)?`, which answers a question nobody asked and
+ * hides the actual fix.
+ *
+ * It is worth its own message for a second reason: this is not really a typo,
+ * it is a habit. Prisma nests a relation inside `select`, so writing
+ * `select: { comments: true }` is the natural first guess, and in Turbine a
+ * relation is loaded by `with`, which sits BESIDE `select` rather than inside
+ * it. Naming the fix costs one sentence and saves a search.
+ */
+export function relationInProjectionMessage(table: string, field: string, clause: 'select' | 'omit'): string {
+  const head = `[turbine] "${field}" is a relation on table "${table}", not a column, so it cannot be named in \`${clause}\`.`;
+  return clause === 'select'
+    ? `${head} Load it with \`with: { ${field}: true }\`, which is a sibling of \`select\`, not a member of it.` +
+        " To narrow the relation's own columns, put a `select` inside that relation's options:" +
+        ` \`with: { ${field}: { select: { … } } }\`.`
+    : `${head} A relation is only present when you ask for it in \`with\`, so leave it out of \`with\` to leave it` +
+        ' out of the result.';
+}

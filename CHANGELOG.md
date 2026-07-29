@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.64.0 (2026-07-29)
+
+**Breaking, and deliberately so.** A `select` or `omit` naming a field that does
+not exist now throws instead of being quietly ignored. Previously that was true
+only at the top level of a query; one level down, inside a relation, the same
+key was filtered out and the query ran anyway.
+
+This is the same class as 0.63.0's silent relation, seen from the other side:
+a projection is a list of NAMES a human typed, and a name that does not resolve
+has exactly two honest outcomes. It had a third.
+
+### Fixed
+
+- **A typo inside a relation's `select` or `omit` was silently ignored.** The
+  `select` form returned `{}` rows; the `omit` form returned the column it was
+  asked to hide.
+
+  ```ts
+  // before 0.64, no error either way
+  with: { posts: { select: { titel: true } } }   // -> posts: [{}, {}]
+  with: { posts: { omit:   { titel: true } } }   // -> title comes back
+  ```
+
+  The `omit` direction is the one worth staring at: a typo in the clause whose
+  entire job is suppression returned the value it was meant to suppress. It is
+  the idiom for a sensitive-but-untagged column (`passwordHash`, `resetToken`),
+  so the caller asked for the column to be withheld, got no error, and shipped
+  a response they believed was filtered.
+
+- **The two relation-load strategies disagreed about whether such a query was
+  valid at all.** The batched loader runs each relation as a real query against
+  the target table, so it went through the strict resolver and threw; the join
+  plan went through the silent one and returned rows. Under the `'auto'`
+  default, which plan runs is decided by a cost heuristic reading index coverage
+  and table size, so the same code threw on one table and quietly returned the
+  wrong shape on another, and adding an index could flip it. Same failure mode
+  as the nested `_count` disagreement fixed in 0.63.0, and both are now closed
+  the same way: the strategies must never disagree about validity.
+
+### Changed
+
+- **A relation named in `select` or `omit` gets its own error**, naming the fix
+  rather than hunting for a misspelling that is not there:
+
+  ```
+  [turbine] "comments" is a relation on table "post", not a column, so it
+  cannot be named in `select`. Load it with `with: { comments: true }`, which
+  is a sibling of `select`, not a member of it.
+  ```
+
+  This is a habit, not a typo: Prisma nests relations inside `select`, so it is
+  the natural first guess coming from there. The generic unknown-field text
+  degraded into `Did you mean "comments" (a relation)?` for a name spelled
+  exactly right, which answers a question nobody asked. Applies at every depth
+  and on every engine, PowDB included.
+
+### Internal
+
+- **The two projection resolvers are now one function.** They existed as
+  `resolveColumns` (the query's own table) and `resolveTargetColumns` (a
+  relation target), doing the same job against different metadata, and kept in
+  step by whoever remembered. That is what produced the split above. Merged into
+  a single `resolveProjection` that both call, which is the same move
+  `walkWhere` represents for WHERE compilation after the top-level and
+  relation-scoped walkers drifted twice. Two functions that must agree are a
+  standing liability; one function cannot disagree with itself.
+
+- **Audited every other place a caller-supplied name is resolved**: `where`,
+  `orderBy` (including relation and SQL Server paths), `distinct`, `groupBy`
+  `by` keys, aggregate targets, and create/update `data` keys. All of them
+  already threw. Projections were the only silent one, and there is now no site
+  in the codebase that filters an unresolvable name out instead of rejecting it.
+
+### Upgrading
+
+Nothing to do unless a query names a field that does not exist, in which case
+it was already not doing what it said. If an upgrade surfaces a throw, the key
+was being ignored before: check whether the intended column is spelled
+differently, or whether it is a relation that belongs in `with`. The error names
+both possibilities.
+
+Turbine-native code is usually protected before this ever runs, since a
+generated client types `select` / `omit` against the model. The paths this
+catches are the untyped ones: a projection assembled from request parameters, a
+compat layer, or plain JavaScript.
+
 ## 0.63.0 (2026-07-28)
 
 Two silent data-corruption bugs, both of the same shape: **a projection narrowed

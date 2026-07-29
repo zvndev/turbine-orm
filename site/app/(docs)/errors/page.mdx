@@ -65,6 +65,28 @@ try {
 }
 ```
 
+### Unknown field names
+
+Every name you supply is resolved against the schema, and one that does not
+resolve throws `TURBINE_E003` naming the table and, where it can, the column you
+probably meant. That holds for `where`, `orderBy`, `distinct`, `groupBy` keys,
+aggregate targets, create/update `data`, and (since 0.64) `select` and `omit` at
+every depth, including inside a relation. There is no partial mode: a name is
+never dropped and the query never runs without it.
+
+Naming a **relation** in `select` or `omit` gets its own message, because it is
+usually a habit carried over from Prisma rather than a typo:
+
+```
+[turbine] "comments" is a relation on table "post", not a column, so it cannot
+be named in `select`. Load it with `with: { comments: true }`, which is a
+sibling of `select`, not a member of it.
+```
+
+Relations live in [`with`](/relations), which sits beside `select` rather than
+inside it. To narrow a relation's own columns, put a `select` inside that
+relation's options: `with: { comments: { select: { body: true } } }`.
+
 ## `wrapPgError` translation
 
 Every query execution runs its pg error through `wrapPgError()`. The original driver error is preserved as `.cause` on the wrapped error.
