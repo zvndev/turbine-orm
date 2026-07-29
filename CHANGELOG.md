@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.63.0 (2026-07-28)
+
+Two silent data-corruption bugs, both of the same shape: **a projection narrowed
+for one purpose removed a column another purpose depended on, and the code that
+depended on it could not tell "absent" from "legitimately null".** Neither threw,
+neither logged, and both returned a well-formed answer that was wrong.
+
+One was reported against a 119-model application; the other was found while
+fixing it and is more serious. Both are pinned by regression tests verified to
+fail against the old code, and a 227-case matrix now enforces that the two
+relation-load strategies agree on every projection, cardinality and depth.
+
+### Fixed
+
+- **A relation nested inside a `select`-narrowed relation came back `null` or
+  `[]` under the batched strategy.** The batched loader stitches parents to
+  children in JS, so every level needs its correlation key in the rows it was
+  handed. The root call sites resolved that key set from the whole `with` clause;
+  the two NESTED call sites passed only the single key that stitches their own
+  level, so a child projection narrowed by `select` (or by an `omit` naming the
+  FK) dropped the key the next level down was about to correlate on. The loader
+  then saw zero keys and took its legitimate "no parent points anywhere" branch.
+
+  A reporting endpoint that summed a money column across such a relation
+  returned 0 for a large fraction of a page, with an HTTP 200 and nothing in the
+  payload, the logs or the status to distinguish it from the truth.
+
+  It needed three things at once, which is why it survived so long: the batched
+  strategy (which `'auto'` selects on its own for an unindexed correlation
+  column, so nobody has to ask for it), a `select` or `omit` on a to-many, and
+  another relation inside it. `include` projects every scalar so the key is
+  there, and `join` correlates in SQL and never reads a key off a row, so the
+  two shapes people reach for first are both clean.
+
+- **A PII-tagged column that is part of the primary key made rows unaddressable,
+  and writing one back mutated every row that shared the rest of the key.**
+  Found while fixing the above; worse, because it corrupts on the write path.
+  The PK exemption ("tag sensitive data, not keys, the returned row must stay
+  addressable") was stated in the docs and implemented at exactly one site, the
+  write `RETURNING` list. Every read projection missed it, and `parseWriteRow`
+  deleted the column the `RETURNING` list had deliberately kept.
+
+  So a row came back without part of its own key. Round-tripping it into an
+  `update` produced a PARTIAL predicate: the missing member is `undefined`,
+  which the where compiler drops, and the empty-where guard does not fire
+  because the other member is present. Measured on a composite `(org_id,
+  email)` PK: **three rows rewritten where one was asked for, no error.** The
+  exemption now lives inside the two PII helpers, so every projection inherits
+  it and no call site can miss it again.
+
+- **PowDB: `omit` could remove the primary key, emptying every many-to-many
+  relation.** The same class in the PowDB engine. `projectedColumns` force-adds
+  the PK under `select`, then applied `omit` afterwards and unconditionally,
+  undoing it. The m2m loader keys its target map on that PK, so every target
+  collapsed onto the string `"undefined"`, no parent matched, and the relation
+  came back `[]` for every row. A PII-tagged PK was dropped there too, with the
+  same consequence as above.
+
+### Changed
+
+- **A PII-tagged primary-key column is now returned by default reads.** Visible
+  behaviour change, and the deliberate half of the write-path fix above: a row
+  that cannot address itself is a silent-corruption hazard, and this is the
+  policy the project already documented. Tag sensitive data, not keys.
+
+- **Nested `_count` now throws on every strategy instead of only some.**
+  BREAKING for anyone pinned to `'batched'` and using it. `_count` inside a
+  nested `with` was refused by the join builder (E005) and accepted by the
+  batched loader, so one query with one set of args either threw or returned
+  populated counts depending purely on which plan ran, and under the `'auto'`
+  default that is decided by a cost heuristic reading index coverage and table
+  size. The same code therefore worked on a small table and threw on a large
+  one. Both strategies now refuse it, which is the behaviour the codebase
+  already documented in two places. Teaching the join path nested `_count` is
+  the right end state and is tracked separately: it means the four
+  `json_build_object` emission sites, the positional encoding, SQL Server's
+  `FOR JSON` override and PowDB's nested projections all learning it together.
+
+### Added
+
+- **The batched loader refuses a relation whose correlation key is missing from
+  every parent row**, instead of returning an empty one (E017, naming the
+  relation and the workaround). The two states are distinguishable and were not
+  being distinguished: an unprojected column is ABSENT from the parsed entity,
+  while a selected column holding SQL NULL is PRESENT with the value `null`.
+  This is the durable guard, because it fires on the class rather than on any
+  one shape. Both loaders check it, on both the parent and the child side.
+
+- **A 227-case strategy-equivalence matrix** (`select` / `omit` / bare x nested
+  to-one / to-many / `_count` x depth 1-3 x every cardinality x root
+  projection), asserting the join and batched strategies agree on both value
+  and key ORDER, with a per-case precondition that the fixture actually carries
+  data so a case cannot pass vacuously. The documented "byte-for-byte identical
+  output" contract had never been enforced across shapes, which is the reason
+  the first bug reached an application at all.
+
 ## 0.62.1 (2026-07-28)
 
 ### Fixed

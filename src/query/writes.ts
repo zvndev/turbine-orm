@@ -765,8 +765,25 @@ export function buildDeleteMany<T extends object>(
  */
 export function piiColumns(_qi: BuilderCtx, meta: TableMetadata): Set<string> {
   const out = new Set<string>();
+  const pk = new Set(meta.primaryKey);
   for (const col of meta.columns) {
-    if (col.pii) out.add(col.name);
+    // A PII-tagged PRIMARY KEY column is NEVER stripped. The exemption lives
+    // here, in the helper every projection reads, rather than at the call
+    // sites: it was written once at the write site (`|| pk.has(col)`) and no
+    // read path had it, so a table whose PK member is tagged returned rows
+    // that could not address themselves. Round-tripping such a row into an
+    // update produced a PARTIAL predicate (the missing PK member is
+    // `undefined`, which the where compiler drops, and the empty-where guard
+    // does not fire because the OTHER member is present), so `update` silently
+    // rewrote every row sharing the remaining key instead of one. Measured on
+    // a composite `(org_id, email)` PK: three rows changed where one was
+    // asked for, no error.
+    //
+    // The policy this implements is the one already stated on
+    // {@link writeReturningColumns}: tag sensitive data, not keys; a PII PK is
+    // out of scope for stripping because the returned row must stay
+    // addressable. Only the enforcement was missing.
+    if (col.pii && !pk.has(col.name)) out.add(col.name);
   }
   return out;
 }
@@ -780,8 +797,14 @@ export function piiColumns(_qi: BuilderCtx, meta: TableMetadata): Set<string> {
  */
 export function piiFields(_qi: BuilderCtx, meta: TableMetadata): string[] {
   const out: string[] = [];
+  const pk = new Set(meta.primaryKey);
+  // Same PK exemption as {@link piiColumns}, and it MATTERS here rather than
+  // being belt-and-braces: this strip runs on an already-fetched row, so
+  // without it the SQL kept the PK addressable and this deleted it again,
+  // which is the exact contradiction between this function's own "no-op"
+  // docstring and writeReturningColumns' "must stay addressable".
   for (const col of meta.columns) {
-    if (col.pii) out.push(col.field);
+    if (col.pii && !pk.has(col.name)) out.push(col.field);
   }
   return out;
 }
@@ -851,10 +874,11 @@ function namedColumns(meta: TableMetadata, data: Record<string, unknown>): Set<s
 }
 
 export function writeReturningColumns(qi: BuilderCtx): ReturningSelection {
+  // The PK exemption used to be re-stated here as `|| pk.has(col)`. It now
+  // lives in `piiColumns` so every projection inherits it and none can drift.
   const piiCols = piiColumns(qi, qi.tableMeta);
   if (piiCols.size === 0) return '*';
-  const pk = new Set(qi.tableMeta.primaryKey);
-  return qi.tableMeta.allColumns.filter((col) => !piiCols.has(col) || pk.has(col)).map((col) => qi.q(col));
+  return qi.tableMeta.allColumns.filter((col) => !piiCols.has(col)).map((col) => qi.q(col));
 }
 
 /**

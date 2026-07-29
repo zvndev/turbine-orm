@@ -501,7 +501,12 @@ describe('global filters, client level', () => {
   });
 
   it('the batched strategy applies the filter to child relation loads', async () => {
-    const pool = makeRecordingPool('primary', [{ id: 1, name: 'x' }]);
+    // `user_id` is on the canned row because ONE stub answers every statement,
+    // including the child posts follow-up whose rows the loader stitches by
+    // that key. Without it the loader refuses the relation outright rather
+    // than returning a silently empty one, which is the intended behaviour and
+    // means the fixture, not the library, was the unrealistic part.
+    const pool = makeRecordingPool('primary', [{ id: 1, name: 'x', user_id: 1 }]);
     const db = new TurbineClient(
       { pool, globalFilters: { posts: softDelete }, relationLoadStrategy: 'batched' },
       schema(),

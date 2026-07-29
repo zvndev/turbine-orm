@@ -137,7 +137,11 @@ describe('forceCustomPlan (per-query)', () => {
               : (textOrConfig as { name?: string; text: string });
           calls.push({ name: (cfg as { name?: string }).name, sql: cfg.text });
           return Promise.resolve({
-            rows: [{ id: 1, tenant_id: 7 }],
+            // `event_id` is here because the CHILD follow-up reads it to stitch:
+            // one stub answers every statement, so the row has to be shaped
+            // like something the real projection would return, or the loader
+            // now (correctly) refuses a relation it cannot correlate.
+            rows: [{ id: 1, tenant_id: 7, event_id: 1 }],
             rowCount: 1,
             command: 'SELECT',
             oid: 0,

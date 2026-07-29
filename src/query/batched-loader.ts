@@ -386,6 +386,33 @@ export async function loadRelationsBatched(
   const countSpec = (withClause as { _count?: WithCount })._count;
   const hasCount = Boolean(countSpec);
 
+  // NESTED `_count` is refused here so the two strategies answer alike.
+  //
+  // The join builder emits `_count` only for the TOP-LEVEL `with`; one level
+  // down, `buildRelationSubquery` looks `_count` up as an ordinary relation
+  // name, misses, and throws E005. This loader handled it at every depth, so
+  // one query with one set of args either threw or returned populated counts
+  // depending purely on which plan ran, and under the `'auto'` default that
+  // choice is made by a cost heuristic reading index coverage and table size.
+  // The same code therefore worked on a small table and threw on a large one.
+  //
+  // That is the same non-determinism as the correlation-key bug this module was
+  // just fixed for, only louder, so it is closed the same way: by agreement.
+  // Refusing is the direction that is a no-op for anyone on the default, since
+  // there the shape already fails whenever the relation is NOT demoted. Nested
+  // `_count` is a real feature (Prisma has it) and teaching the join path is
+  // the right end state, but that means the four json_build_object emission
+  // sites, the positional encoding, SQL Server's FOR JSON override and PowDB's
+  // nested projections all learning it together, which is a feature release,
+  // not a line in a correctness fix. Until then both strategies say no.
+  if (hasCount && depth > 0) {
+    throw new RelationError(
+      `[turbine] Unknown relation "_count" on table "${ctx.parentMeta.name}". ` +
+        `Available: ${Object.keys(ctx.parentMeta.relations).join(', ')}. ` +
+        '(`_count` is supported on the top-level `with` only, on every relationLoadStrategy.)',
+    );
+  }
+
   // Fix key order BEFORE anything is awaited: the loads below all write their
   // key on completion, and completion order is a race between concurrent
   // statements.
@@ -498,6 +525,7 @@ async function loadToOneOrMany(
   const parentKeyField = ctx.parentMeta.reverseColumnMap[parentKeyCol] ?? parentKeyCol;
   const childKeyField = targetMeta.reverseColumnMap[childKeyCol] ?? childKeyCol;
 
+  assertCorrelationKeyProjected(parents, parentKeyField, relName, ctx.parentMeta.name);
   const keys = uniqueKeys(parents, parentKeyField);
   const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
 
@@ -508,10 +536,19 @@ async function loadToOneOrMany(
 
   // The follow-up must project the child correlation key even if the caller's
   // select/omit excluded it; strip it back off afterwards so the shape matches join.
+  //
+  // AND the keys the child's OWN nested relations will correlate on. Passing
+  // only `childKeyField` here was the whole of the silent-null bug: this level
+  // stitched fine, then the recursion below asked the children for a key that
+  // this projection had just dropped. The root call sites in builder.ts have
+  // always resolved the full set through `neededParentKeyFields`; these nested
+  // ones did not, so the defect needed a `select` (or an `omit` of the FK) on a
+  // to-many with a to-one inside it, which is why `include` and `join` were both
+  // clean and seventeen rounds of parity capture missed it.
   const proj = includeKeysForBatching(
     options.select,
     options.omit,
-    [childKeyField],
+    [childKeyField, ...neededParentKeyFields(targetMeta, (options.with ?? {}) as WithClause)],
     defaultProjectionFields(targetMeta, ctx.includePii),
   );
   const child = ctx.makeChild(rel.to);
@@ -550,6 +587,12 @@ async function loadToOneOrMany(
     );
   }
 
+  // Symmetric to the parent-side assertion above. If the CHILD key were ever
+  // missing, `groupBy` would bucket every child under the string "undefined",
+  // no parent would match, and the relation would come back empty just as
+  // silently. `includeKeysForBatching` makes that unreachable, which is exactly
+  // what was true of the parent side until this week.
+  assertCorrelationKeyProjected(allChildren, childKeyField, relName, targetMeta.name);
   const byKey = groupBy(allChildren, childKeyField);
   const limit = options.limit;
   for (const parent of parents) {
@@ -603,6 +646,7 @@ async function loadManyToMany(
   const parentRefField = ctx.parentMeta.reverseColumnMap[sourceRefCol] ?? sourceRefCol;
   const targetPkField = targetMeta.reverseColumnMap[targetPkCol] ?? targetPkCol;
 
+  assertCorrelationKeyProjected(parents, parentRefField, relName, ctx.parentMeta.name);
   const parentKeys = uniqueKeys(parents, parentRefField);
   if (parentKeys.length === 0) {
     for (const parent of parents) parent[relName] = [];
@@ -641,10 +685,13 @@ async function loadManyToMany(
   }
 
   // (2) Target rows by PK, honouring the relation's own where/select/omit/orderBy.
+  // Plus the keys the target's own nested relations need, same rule and same
+  // reason as the to-many loader above: this level's PK is not the only key the
+  // recursion below will ask these rows for.
   const proj = includeKeysForBatching(
     options.select,
     options.omit,
-    [targetPkField],
+    [targetPkField, ...neededParentKeyFields(targetMeta, (options.with ?? {}) as WithClause)],
     defaultProjectionFields(targetMeta, ctx.includePii),
   );
   const child = ctx.makeChild(rel.to);
@@ -862,6 +909,56 @@ function mergeChildWhere(
   if (!where) return correlation;
   if (Object.hasOwn(where, keyField)) return { AND: [where, correlation] };
   return { ...where, ...correlation };
+}
+
+/**
+ * Refuse to stitch a relation whose correlation key was never projected.
+ *
+ * THE FAILURE THIS EXISTS TO REMOVE. `uniqueKeys` skips a row whose key is
+ * `null` OR `undefined`, and a column the projection left out is `undefined`
+ * for exactly the same reason it is for a genuinely null FK. So a loader that
+ * has lost its key cannot tell itself apart from a page of parents that
+ * legitimately point at nothing: both produce zero keys, and the empty-key
+ * branch hands back `null` / `[]` for every parent. That is a wrong answer with
+ * an HTTP 200 on it: a reporting endpoint summed a money column across the
+ * relation, every row of it read as absent, and the total came back 0 for a
+ * large fraction of a page. Nothing in the payload, the logs or the response
+ * status distinguished it from the right answer.
+ *
+ * The two states ARE distinguishable, just not by the value: a column that was
+ * not selected is ABSENT from the parsed entity (`'fk' in row === false`),
+ * while a selected column holding SQL NULL is PRESENT with the value `null`.
+ * Verified against a live database in both directions. So the discriminator is
+ * property presence (`Object.hasOwn`, not `in`: the rest of this file uses it,
+ * and a column named `constructor` or `toString` passes an `in` check on any
+ * plain object), and it is checked over ALL parents rather than the first:
+ * every row on one level shares one projection, so a field missing from every
+ * row is a projection fault, while a field missing from some rows is not a
+ * state this loader can produce at all.
+ *
+ * After {@link neededParentKeyFields} is applied at every nesting level this is
+ * an unreachable invariant, which is the point: if it ever fires it is a bug in
+ * Turbine, not in the caller's query, and the caller gets told so along with the
+ * one-line workaround. E017 with the same remedy as the composite-key refusal a
+ * few lines up, deliberately: to the caller both are "this strategy cannot serve
+ * this shape, use 'join'", and inventing a code for an unreachable state would
+ * be a new public error nobody can trigger.
+ */
+function assertCorrelationKeyProjected(
+  parents: Record<string, unknown>[],
+  field: string,
+  relName: string,
+  parentTable: string,
+): void {
+  if (parents.length === 0) return;
+  if (parents.some((parent) => Object.hasOwn(parent, field))) return;
+  throw new UnsupportedFeatureError(
+    `batched loading of relation "${relName}" on "${parentTable}"`,
+    'relationLoadStrategy: "batched"',
+    `the correlation key "${field}" is missing from every parent row, so the relation cannot be stitched and ` +
+      'would silently come back empty. This is a bug in turbine, please report it. ' +
+      `Workaround: pass \`relationLoadStrategy: 'join'\` on this query.`,
+  );
 }
 
 /** Distinct, non-null values of `field` across `rows`. */

@@ -632,6 +632,25 @@ describe('powdb: findMany generation', () => {
     assert.match(m.last().powql, /\{ \.id, \.name \}$/);
   });
 
+  it('omit cannot remove the primary key, which select is already forbidden to drop', async () => {
+    // The PK is force-added under `select` so a returned row can address
+    // itself (reselect, and the m2m loader's `targetByPk` map). The `omit`
+    // filter ran afterwards and unconditionally, so `omit: { id: true }` undid
+    // exactly that guarantee: every m2m target then keyed on the string
+    // "undefined", no parent matched any target, and the relation came back
+    // `[]` for every row with no error. Same rule as the SQL engines, where a
+    // PII-tagged PK is likewise exempt from stripping.
+    const m = mockPool();
+    await qi(m).findMany({ where: {}, omit: { id: true } } as never);
+    assert.match(m.last().powql, /\{ \.id,/, 'the PK must survive an omit naming it');
+
+    // A non-key column named in `omit` is still dropped, so the exemption is
+    // the PK and not a blanket refusal to honour `omit`.
+    const m2 = mockPool();
+    await qi(m2).findMany({ where: {}, omit: { name: true } } as never);
+    assert.doesNotMatch(m2.last().powql, /\.name/, 'a non-key omit still applies');
+  });
+
   it('in / contains / insensitive / OR operators', async () => {
     const m = mockPool();
     await qi(m).findMany({ where: { name: { in: ['a', 'b'] } } });

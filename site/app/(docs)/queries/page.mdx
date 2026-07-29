@@ -95,6 +95,8 @@ const users = await db.users.findMany({
 
 Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) are excluded from every default projection: the top-level rows, relation subqueries, batched loads, and a write's returned row. They come back in two ways: name the column explicitly in `select` (the explicit request IS the opt-in), or pass `includePii: UNSAFE` to return every PII column at the top level **and** at every nested `with` level of that query.
 
+One column is exempt: a PII-tagged column that is **part of the primary key** is returned anyway, on reads and writes alike (since 0.63). A row that cannot address itself is a correctness hazard, not a privacy win: with part of its key missing, feeding that row back into an `update` builds a partial predicate that matches more rows than you meant. Tag sensitive data, not keys.
+
 ```ts
 import { UNSAFE } from 'turbine-orm';
 

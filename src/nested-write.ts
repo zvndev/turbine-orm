@@ -324,6 +324,20 @@ function pkWhere(tableMeta: TableMetadata, row: Record<string, unknown>): Record
   const where: Record<string, unknown> = {};
   for (const col of tableMeta.primaryKey) {
     const field = tableMeta.reverseColumnMap[col] ?? col;
+    // A PARTIAL primary key here is not a filter, it is a mass mutation.
+    // `undefined` values are dropped when the where compiles, and the
+    // empty-where guard only fires when NOTHING survives, so a composite PK
+    // missing one member compiles to a predicate on the remaining member and
+    // the statement rewrites every row that shares it. The row is supposed to
+    // be one this engine just read, so a missing member is an internal fault,
+    // and the only safe response is to refuse rather than to run.
+    if (row[field] === undefined) {
+      throw new ValidationError(
+        `[turbine] Cannot address a row of "${tableMeta.name}" by primary key: "${field}" is missing from the ` +
+          'row this nested write is operating on, so the generated predicate would match more rows than intended. ' +
+          'This is a bug in turbine, please report it.',
+      );
+    }
     where[field] = row[field];
   }
   return where;

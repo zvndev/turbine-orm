@@ -499,7 +499,16 @@ src/
                       DEFAULT stays the batched loaders / nested projections (never inherits the
                       SQL-side default, 'join' pre-0.41 or 'auto' since). Join and
                       loader paths share one correlation-key normalizer (Date → micros; the old loader
-                      Date-identity Map bug and the select-omits-FK bug are fixed). **Readonly** (≥0.14):
+                      Date-identity Map bug and the select-omits-FK bug are fixed; SCOPE, since this
+                      line has already misdirected one audit: what is fixed is the loader forcing its
+                      OWN correlation column into the child fetch. Nested descendants are safe by a
+                      DIFFERENT mechanism, the loader hands `options.with` to the child's public
+                      findMany, so each level resolves its own keys, unlike the SQL batched loader
+                      which fetches flat and recurses over already-projected rows. Verified live on
+                      addon 0.20. Separately, `projectedColumns` keeps the PK through `omit` and the
+                      PII filter (0.63): the force-add under `select` used to be undone by the `omit`
+                      pass that ran after it, which emptied every m2m relation via `targetByPk`).
+                      **Readonly** (≥0.14):
                       `{ embedded, readonly: true }` opens via `openReadOnly`; client-level
                       `readonly: true` fails writes fast locally; both refusal shapes map to
                       `ReadOnlyError` E018 with `reason: 'snapshot' | 'rbac'` (0.15 spec split). The
@@ -830,7 +839,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 - Don't add runtime dependencies beyond `pg`. Root `dependencies` stays exactly `{ pg, @types/pg }`, `@types/pg` is required because published `.d.ts` files import `pg` types; moving it to `devDependencies` alone breaks consumer strict `tsc` (0.28.1 regression). Marketing "one dependency" means one **runtime** dep (`pg`); types packages that surface in public declarations stay in `dependencies`. The only sanctioned engine exception: `mysql2`, `mssql`, `@zvndev/powdb-client`, and `@zvndev/powdb-embedded` are **devDependencies + optional `peerDependencies`** (`peerDependenciesMeta.*.optional = true`), loaded lazily via dynamic `import()` from the `mysql`/`mssql`/`powdb` subpaths and never required for Postgres users; SQLite needs nothing at all (it uses the `node:sqlite` builtin). Those peer loads route through `src/optional-peer-import.cts`, the CJS build (`module: CommonJS`) lowers a plain `import()` to `require()`, which cannot load ESM-only peers (e.g. `@zvndev/powdb-client` ≥ 0.9, `ERR_PACKAGE_PATH_NOT_EXPORTED`); the `.cts` helper's NodeNext-built copy at `dist/optional-peer-import.cjs` keeps a REAL `import()` that the lowered copy falls back to. Don't replace it with a bare `import()` in the engine modules.
 - Don't use `eval`, `new Function`, or shell interpolation
-- Don't reference internal project names, client names, dogfood-source projects, or internal planning documents in ANY tracked file, code comments, test names, CHANGELOG, release notes, commit messages, site. This repo is public. Describe changes by what they do, never by who asked for them or where feedback came from. `docs/internal/` and `AGENTS.md` are gitignored (local-only); the pre-commit hook enforces a private blocklist via `scripts/check-private-terms.mjs` + `.private-terms`.
+- Don't reference internal project names, client names, the applications findings were reported from, or internal planning documents in ANY tracked file, code comments, test names, CHANGELOG, release notes, commit messages, site. This repo is public. Describe changes by what they do, never by who asked for them or where feedback came from. `docs/internal/` and `AGENTS.md` are gitignored (local-only); the pre-commit hook enforces a private blocklist via `scripts/check-private-terms.mjs` + `.private-terms`.
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings, always use `$N` parameterization
 - Don't import `client.ts` from `query/` (would create circular dependency)

@@ -419,7 +419,9 @@ const db = turbine({
 
 The result is **deep-equal** to the join strategy, same shape, same camelCase keys, same `Date` coercion, so you can flip the flag without touching the rest of your code. It honors per-relation `where` / `select` / `omit` / `orderBy` and nested `with`. The per-relation `limit` is applied **client-side per parent** (a `LIMIT` on a batched `= ANY($1)` would cap total children, not children-per-parent). And it's **transaction-safe**: the follow-up queries run on the same pinned connection, so batched loads inside `$transaction` see the transaction's own writes.
 
-> **Note.** Composite-key relations aren't supported by `'batched'`, use the `'join'` strategy for those (`'auto'` never batch-falls-back on a composite-key relation).
+> **Note.** Composite-key relations aren't supported by `'batched'`, use the `'join'` strategy for those (`'auto'` never batch-falls-back on a composite-key relation). A `_count` nested inside a `with` is refused on every strategy for the same reason it always was on `'join'`: the two must not disagree about whether a query is valid, since under `'auto'` which one runs is decided by a cost heuristic.
+
+Because the stitching happens in memory, the loader needs each level's correlation key present in the rows it was handed. It adds those keys to the projection itself and strips them again afterwards, so a `select` or `omit` that removes an FK is fine at any depth (fixed in 0.63 for keys below the first level, where the relation previously came back empty). If a correlation key is ever missing from every parent row, the loader now throws `UnsupportedFeatureError` (`TURBINE_E017`) naming the relation rather than returning an empty one, since an empty relation is indistinguishable from a true absence at the call site.
 
 ## `'flatten'`: to-one relations as a LEFT JOIN
 

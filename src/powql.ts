@@ -1085,6 +1085,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     omit?: Record<string, boolean>,
     includePii?: boolean,
   ): string[] {
+    const pk = new Set(this.meta.primaryKey);
     let cols = this.meta.columns.map((c) => c.name);
     const hasSelect = select && Object.keys(select).length;
     if (hasSelect) {
@@ -1094,14 +1095,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           .map(([k]) => this.column(k).name),
       );
       // Always keep the PK so reselect / relation stitching has a key to work with.
-      for (const pk of this.meta.primaryKey) picked.add(pk);
+      for (const key of pk) picked.add(key);
       cols = cols.filter((c) => picked.has(c));
     } else if (!includePii) {
       // Default / omit-only projection: drop PII columns (kept above only when a
-      // caller names them in `select`). PK is never PII in practice; if one is
-      // tagged it is still dropped here, so tag sensitive data, not keys.
+      // caller names them in `select`), EXCEPT a PK column. This used to drop a
+      // tagged PK, on the reasoning that keys should not be tagged in the first
+      // place. That is good advice and a bad guarantee: the row it returns
+      // cannot address itself, so writing it back builds a partial predicate
+      // and mutates every row sharing the rest of the key. Same rule and same
+      // reason as `piiColumns` on the SQL engines.
       const pii = this.piiColumnNames();
-      if (pii.size) cols = cols.filter((c) => !pii.has(c));
+      if (pii.size) cols = cols.filter((c) => !pii.has(c) || pk.has(c));
     }
     if (omit && Object.keys(omit).length) {
       const dropped = new Set(
@@ -1109,7 +1114,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           .filter(([, v]) => v)
           .map(([k]) => this.column(k).name),
       );
-      cols = cols.filter((c) => !dropped.has(c));
+      // The PK survives `omit` too. This filter ran unconditionally and after
+      // the `select` branch's force-add, so `omit: { id: true }` undid the very
+      // guarantee that force-add exists to provide: the m2m loader keys its
+      // target map on the PK (`targetByPk`), so every target collapsed onto the
+      // single bucket "undefined", no parent matched, and the relation came
+      // back `[]` for every row with no error.
+      cols = cols.filter((c) => !dropped.has(c) || pk.has(c));
     }
     return cols;
   }
