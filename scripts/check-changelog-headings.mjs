@@ -20,6 +20,21 @@
  * Tags are the source of truth for (1) because a published release is the thing
  * that cannot be quietly rewritten. When git is unavailable (a tarball, a fresh
  * clone with no tags) that check is skipped rather than failed.
+ *
+ * ## Prereleases
+ *
+ * A version may carry a prerelease suffix (`0.64.0-next.c4c43d6`, which the
+ * nightly workflow writes into package.json just before `npm publish --tag
+ * next`). That is a prerelease OF 0.64.0 and belongs to the `## 0.64.0` entry,
+ * so the suffix is stripped before anything is looked up. Treating it as a
+ * distinct version instead is what silently broke the @next publish for nine
+ * releases: this guard runs inside `prepublishOnly`, it demanded a heading
+ * named after a version that by construction can never have one, and the only
+ * symptom was a red nightly job nobody was watching.
+ *
+ * An explicit version may be passed as argv[2] instead of reading package.json,
+ * which is how the regression test drives it and is also useful for checking a
+ * version before bumping to it.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -36,6 +51,15 @@ const pkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
 const headings = [...changelog.matchAll(/^## (\d+\.\d+\.\d+)/gm)].map((m) => m[1]);
 const problems = [];
 
+/** `0.64.0-next.c4c43d6` -> `0.64.0`. A prerelease belongs to its base entry. */
+const releaseVersion = (v) => /^\d+\.\d+\.\d+/.exec(v)?.[0] ?? null;
+
+const rawVersion = process.argv[2] ?? pkg.version;
+const version = releaseVersion(rawVersion);
+if (version === null) {
+  problems.push(`"${rawVersion}" is not a version this guard can read (expected X.Y.Z, optionally with a suffix).`);
+}
+
 if (headings.length === 0) problems.push('CHANGELOG.md has no `## X.Y.Z` headings at all.');
 
 const seen = new Set();
@@ -44,10 +68,12 @@ for (const v of headings) {
   seen.add(v);
 }
 
-if (!seen.has(pkg.version)) {
+if (version !== null && !seen.has(version)) {
+  const source = process.argv[2] ? 'the requested version is' : 'package.json is';
+  const via = rawVersion === version ? '' : ` (${rawVersion}, a prerelease of ${version})`;
   problems.push(
-    `package.json is ${pkg.version} but CHANGELOG.md has no \`## ${pkg.version}\` heading. ` +
-      'A new entry was probably written over the previous version\'s heading.',
+    `${source} ${rawVersion}${via} but CHANGELOG.md has no \`## ${version}\` heading. ` +
+      "A new entry was probably written over the previous version's heading.",
   );
 }
 
@@ -76,7 +102,7 @@ try {
 for (const tag of tags) {
   // Only versions at or below the current one: a tag from a branch ahead of this
   // checkout is not this checkout's problem.
-  if (cmp(tag, pkg.version) < 0) continue;
+  if (version === null || cmp(tag, version) < 0) continue;
   if (!seen.has(tag)) {
     problems.push(`v${tag} is tagged and published but CHANGELOG.md has no \`## ${tag}\` heading.`);
   }

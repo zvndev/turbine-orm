@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.64.1 (2026-07-29)
+
+Maintenance. No API change, and the emitted JavaScript and type declarations are
+byte-identical to 0.64.0 (verified by diffing the whole build across the config
+change below).
+
+### Fixed
+
+- **The `@next` prerelease channel has been broken for nine releases.** The
+  nightly workflow sets the version to `<current>-next.<sha>` and publishes,
+  but the CHANGELOG-heading guard in `prepublishOnly` demanded a `## <version>`
+  heading for exactly that string, which by construction can never exist. So
+  every nightly publish failed and the `next` dist-tag sat months behind
+  `latest`: anyone who installed `turbine-orm@next` got something far older
+  than they had reason to expect, which is worse than having no prerelease
+  channel at all. A prerelease is now resolved to its base version, which is
+  the entry that actually describes it.
+
+  The failure was invisible for so long because the only symptom was a red
+  workflow. The guard now has its own regression cases, including one that
+  fails if stripping the suffix ever turns the check off entirely.
+
+- **A plan-cache measurement could fail under a loaded test run.** Its buffer
+  counters come from `pg_statio_user_tables`, and `pg_stat_force_next_flush()`
+  flushes only the calling backend, so counts from a neighbouring connection
+  could land inside a measurement window and inflate it. The baseline now waits
+  for the counter to go quiet, and skips with a reason if it never does: a
+  number measured on a moving counter proves nothing, and reporting it as a
+  product failure is how a suite teaches people to ignore its own red.
+
+### Changed
+
+- **Removed a dev-only warning for an unknown `orderBy` field.** It printed
+  `Unknown orderBy field "x" for table "y". This will cause a runtime error.`
+  and then let compilation continue into the code that throws for the same key
+  with a better message, one that names the table, suggests the closest column
+  and lists the valid relations. Every unknown-key shape was measured (plain
+  direction, `OrderBySpec`, JSON path, both relation-shaped values, array form)
+  and all of them warn and then throw, so nothing loses a signal. What it cost
+  was noise in dev logs and a second copy of the key-resolution rules that
+  could drift from the real one. The refusal itself is now pinned by tests.
+
+### Internal
+
+- **TypeScript 7 readiness.** The CJS build declared `moduleResolution: "Node"`
+  (node10), which TypeScript 6 deprecated and 7 removed outright: on 7 it fails
+  the whole build with TS5108 before reading a file. It now uses `bundler`, the
+  only resolver that pairs with `module: CommonJS` (the base config's
+  `NodeNext` cannot be inherited here, since it reads the root package.json and
+  would emit ESM into `dist/cjs`). Resolution mode is compile-time only, and
+  the emitted tree is byte-for-byte unchanged.
+
+  One test also imported the TypeScript compiler API to check that generated
+  code parses. TypeScript 7 moved that API (the package root is now a version
+  stub and the compiler lives under `unstable/*`), so the import pinned the
+  repo to TypeScript 6. It drives the `tsc` binary instead, which is what the
+  sibling generated-output test already did. That check turned out to be
+  passing vacuously even before the switch, since running it from the repo root
+  made `tsc` refuse the arguments and check nothing; it now asserts that `tsc`
+  actually reached the source.
+
 ## 0.64.0 (2026-07-29)
 
 **Breaking, and deliberately so.** A `select` or `omit` naming a field that does

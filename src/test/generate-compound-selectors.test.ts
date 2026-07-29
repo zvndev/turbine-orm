@@ -11,8 +11,12 @@
  */
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
-import ts from 'typescript';
+import { fileURLToPath } from 'node:url';
 import { generateMetadata, generateTypes } from '../generate.js';
 import type { ColumnMetadata, IndexMetadata, SchemaMetadata, TableMetadata } from '../schema.js';
 
@@ -46,15 +50,54 @@ function table(name: string, columns: ColumnMetadata[], indexes: IndexMetadata[]
   };
 }
 
-/** Assert a snippet is syntactically valid TypeScript via the compiler API. */
+/**
+ * Assert a snippet is syntactically valid TypeScript, by running the `tsc`
+ * BINARY over it rather than importing the compiler API.
+ *
+ * This used to be `ts.createSourceFile` from `import ts from 'typescript'`.
+ * TypeScript 7 moved that API: the package's root export is now a version stub
+ * (`"." -> "./lib/version.cjs"`) and the real compiler surface lives under
+ * `typescript/unstable/*`. So the import resolved, `ts.createSourceFile` was
+ * simply absent, and the file failed to typecheck. Importing the API therefore
+ * pins the whole repo to TypeScript 6, and following it to an `unstable/`
+ * subpath would pin it to a surface that is named for its instability.
+ *
+ * Driving the binary is version-stable, and it is what
+ * generate-typecheck.test.ts already does for the generated client. Only
+ * SYNTAX errors count here: this snippet is a fragment of a generated
+ * `types.ts` and its imports are not resolvable in a temp directory, so
+ * semantic diagnostics are expected and irrelevant. TypeScript's syntax errors
+ * are exactly the TS1xxx range, which is the question being asked.
+ */
 function assertParses(source: string): void {
-  const sf = ts.createSourceFile('types.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const diags = (sf as unknown as { parseDiagnostics?: ts.Diagnostic[] }).parseDiagnostics ?? [];
-  assert.equal(
-    diags.length,
-    0,
-    `expected valid TS, got: ${diags.map((d) => d.messageText).join('; ')}\n---\n${source}`,
-  );
+  const dir = mkdtempSync(join(tmpdir(), 'turbine-parse-'));
+  try {
+    writeFileSync(join(dir, 'types.ts'), source);
+    const tsc = resolve(dirname(fileURLToPath(import.meta.url)), '../../node_modules/.bin/tsc');
+    // `cwd: dir` matters. Run from the repo root, tsc finds the repo's own
+    // tsconfig.json, refuses the combination with `error TS5112: tsconfig.json
+    // is present but will not be loaded if files are specified on commandline`,
+    // and checks NOTHING. Every snippet then "parses", including a deliberately
+    // broken one. The temp directory has no tsconfig, so the file is checked on
+    // its own.
+    const result = spawnSync(tsc, ['--noEmit', '--skipLibCheck', 'types.ts'], {
+      cwd: dir,
+      encoding: 'utf-8',
+      timeout: 120_000,
+    });
+    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+    // Precondition, because the failure above was silent and this check is only
+    // worth having if it cannot pass vacuously: a TS5xxx/TS6xxx is a CLI or
+    // configuration error, which means tsc never got as far as the source.
+    assert.equal(result.error, undefined, `tsc did not run: ${result.error}`);
+    const setupErrors = output.split('\n').filter((line) => /error TS[56]\d{3}:/.test(line));
+    assert.deepEqual(setupErrors, [], `tsc failed before reading the source, so nothing was checked:\n${output}`);
+
+    const syntaxErrors = output.split('\n').filter((line) => /error TS1\d{3}:/.test(line));
+    assert.deepEqual(syntaxErrors, [], `expected valid TS, got:\n${syntaxErrors.join('\n')}\n---\n${source}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 describe('generateTypes: compound-unique selector emission', () => {

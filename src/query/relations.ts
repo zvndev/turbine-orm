@@ -478,22 +478,17 @@ export function buildOrderBy(
   params?: unknown[],
   lateralSink?: string[],
 ): string {
-  // Dev-only: validate that orderBy fields exist in the table schema. Relation
-  // orderBy keys (object values that are neither a vector nor an OrderBySpec)
-  // are validated in the relation branch below, so skip them here.
-  if (process.env.NODE_ENV !== 'production') {
-    for (const [key, value] of orderByEntries(orderBy)) {
-      if (isRelationOrderByValue(qi, value) && ownLookup(qi.tableMeta.relations, key)) continue;
-      const snakeKey = camelToSnake(key);
-      if (!qi.tableMeta.columns.some((c) => c.name === snakeKey) && !Object.hasOwn(qi.tableMeta.columnMap, key)) {
-        console.warn(
-          `[turbine] Unknown orderBy field "${key}" for table "${qi.tableMeta.name}". ` +
-            'This will cause a runtime error.',
-        );
-      }
-    }
-  }
-
+  // There used to be a dev-only pre-scan here that printed `Unknown orderBy
+  // field "x" for table "y". This will cause a runtime error.` and then let
+  // compilation continue into the code below, which throws for the same key
+  // with a better message (it names the table, suggests the closest column and
+  // lists the valid relations). Every unknown-key shape was measured: plain
+  // direction, OrderBySpec, JSON path, both relation-shaped values, and array
+  // form. All six warn-and-then-throw; none reaches the end of this function.
+  // A warning whose entire content is a prediction of the exception on the next
+  // line is noise in dev logs and a second place to keep the key-resolution
+  // rules in step, so it is gone. See orderby-unknown-field.test.ts, which pins
+  // the refusal itself across that surface.
   const meta = qi.schema.tables[qi.table];
   let relOrdCounter = 0;
   return orderByEntries(orderBy)

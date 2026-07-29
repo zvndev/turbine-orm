@@ -188,6 +188,36 @@ async function tableBuffers(db: TurbineClient): Promise<number> {
 }
 
 /**
+ * Wait until this table's buffer counter stops moving, then return it.
+ *
+ * `pg_stat_force_next_flush()` flushes the CALLING backend's pending stats and
+ * nobody else's; every other backend flushes on its own ~1s cadence. The cases
+ * below each open their own client on this same table, so an earlier case's
+ * counts can land inside a later case's measurement window and inflate the
+ * baseline-to-end delta by an unrelated amount. The `forced * 10 < plain` ratio
+ * survives a little of that and not a lot, which showed up as this file passing
+ * alone and failing about half the time inside the full parallel suite.
+ *
+ * Two equal consecutive reads mean nothing is still in flight. If it never
+ * settles, the caller SKIPS: a measurement taken on a moving counter proves
+ * nothing either way, and turning that into a failure is how a suite learns to
+ * ignore its own red.
+ */
+async function settledTableBuffers(db: TurbineClient): Promise<number | null> {
+  const deadline = Date.now() + 5_000;
+  let previous = await tableBuffers(db);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    const current = await tableBuffers(db);
+    if (current === previous) return current;
+    previous = current;
+  }
+  return null;
+}
+
+const UNSETTLED = 'table stats never went quiet, so a buffer delta would include reads from another backend';
+
+/**
  * Is the on-demand stats flush available (PostgreSQL >= 15)?
  *
  * Resolved in `before`, because the answer needs a connection, and consumed
@@ -319,7 +349,8 @@ describe('forceCustomPlan against a live plan cache', () => {
       assert.equal(mode.rows[0]!.plan_cache_mode, 'force_generic_plan', 'the connection really is pinned generic');
       const sql = `SELECT id, tenant_id, amount FROM ${TABLE} WHERE tenant_id = $1 ORDER BY id ASC LIMIT $2`;
 
-      const pinnedStart = await tableBuffers(db);
+      const pinnedStart = await settledTableBuffers(db);
+      if (pinnedStart === null) return t.skip(UNSETTLED);
       for (let i = 0; i < 5; i++) await db.pool.query(sql, [SPARSE_TENANT, 100]);
       const pinnedBuffers = (await tableBuffers(db)) - pinnedStart;
 
@@ -384,7 +415,8 @@ describe('forceCustomPlan against a live plan cache', () => {
       await prepareConnection(db);
       const rows = db.table<Row>(TABLE);
       const query = { where: { tenantId: SPARSE_TENANT }, orderBy: { id: 'asc' as const }, limit: 100 };
-      const forcedStart = await tableBuffers(db);
+      const forcedStart = await settledTableBuffers(db);
+      if (forcedStart === null) return t.skip(UNSETTLED);
       for (let i = 0; i < 12; i++) await rows.findMany({ ...query, forceCustomPlan: true });
       const forcedBuffers = (await tableBuffers(db)) - forcedStart;
       assert.deepEqual((await planRecord(db)).statements, [], 'none of the 12 cached a statement');
@@ -398,7 +430,8 @@ describe('forceCustomPlan against a live plan cache', () => {
       const plain = turbine();
       try {
         await prepareConnection(plain);
-        const plainStart = await tableBuffers(plain);
+        const plainStart = await settledTableBuffers(plain);
+        if (plainStart === null) return t.skip(UNSETTLED);
         for (let i = 0; i < 12; i++) await plain.table<Row>(TABLE).findMany(query);
         const plainBuffers = (await tableBuffers(plain)) - plainStart;
         const record = await planRecord(plain);

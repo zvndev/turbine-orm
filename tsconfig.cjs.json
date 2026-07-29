@@ -2,8 +2,22 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "module": "CommonJS",
-    "moduleResolution": "Node",
-    "ignoreDeprecations": "6.0",
+    // `bundler`, not `Node`/`node10`. node10 resolution was deprecated in
+    // TypeScript 6 (behind `ignoreDeprecations: "6.0"`, which is what used to be
+    // here) and REMOVED in 7, where it fails the whole build with TS5108 before
+    // a single file is read. The base config's `NodeNext` cannot be inherited
+    // here either: tsc requires `module` and `moduleResolution` to agree, and
+    // `module: NodeNext` reads the ROOT package.json (`"type": "module"`) to
+    // decide the emit format, so it would emit ESM into dist/cjs.
+    //
+    // `bundler` is the only remaining resolver that pairs with `module:
+    // CommonJS`. It is a compile-time resolution mode only, so the emitted
+    // JavaScript is byte-identical to what node10 produced (verified by diffing
+    // the whole dist/cjs tree across the switch); it is also strictly more
+    // permissive at resolution, so nothing that resolved before stops resolving.
+    // Source imports keep their explicit `.js` extensions regardless, which both
+    // modes accept.
+    "moduleResolution": "bundler",
     "outDir": "./dist/cjs",
     // Declarations ARE emitted here, and they are not redundant with dist/*.d.ts.
     // Under `moduleResolution: node16`/`nodenext` a CJS consumer that resolves the
