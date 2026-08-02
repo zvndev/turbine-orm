@@ -938,3 +938,28 @@ export function relationInProjectionMessage(table: string, field: string, clause
     : `${head} A relation is only present when you ask for it in \`with\`, so leave it out of \`with\` to leave it` +
         ' out of the result.';
 }
+
+/**
+ * The two projection SHAPE refusals (0.65), shared by the SQL engines' single
+ * resolver, the batched loader's raw-arg check, and PowDB, so every path that
+ * refuses these shapes does so with one message.
+ *
+ * Both checks look at TRUTHY keys, and the raw-arg check in the batched
+ * loader exists because the loader force-adds correlation keys to a `select`
+ * before the resolver sees it: evaluated after that adjustment, an all-falsy
+ * user `select` looks populated and the verdict flips between strategies,
+ * which is exactly the class 0.64/0.65 exist to kill.
+ */
+export function selectNamesNothingMessage(table: string): string {
+  return (
+    `[turbine] "select" names no fields (on table "${table}"): every value is false or it is empty. ` +
+    `Pass at least one field as true, or drop "select" to get the default projection.`
+  );
+}
+
+export function selectOmitExclusiveMessage(table: string): string {
+  return (
+    `[turbine] "select" and "omit" are mutually exclusive (on table "${table}"). ` +
+    `A select already lists exactly the fields you want.`
+  );
+}

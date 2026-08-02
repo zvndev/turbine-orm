@@ -26,6 +26,7 @@ import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import * as aggMod from './aggregates.js';
 import {
+  assertProjectionShape,
   type BatchedChildReader,
   defaultProjectionFields,
   includeKeysForBatching,
@@ -1558,6 +1559,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // refused one step later.
     const includePii = resolveUnsafeFlag(args.includePii, 'includePii');
     const needed = neededParentKeyFields(this.tableMeta, batchedWith);
+    assertProjectionShape(
+      this.table,
+      args.select as Record<string, boolean> | undefined,
+      args.omit as Record<string, boolean> | undefined,
+    );
     const proj = includeKeysForBatching(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
@@ -1588,14 +1594,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       );
       const rows = deferred.transform(result) as Record<string, unknown>[] | Record<string, unknown> | null;
       const entities = single ? (rows ? [rows as Record<string, unknown>] : []) : (rows as Record<string, unknown>[]);
-      if (entities.length > 0) {
-        await loadRelationsBatched(
-          this.batchedContext(args.timeout, skip, args.includePii, args.forceCustomPlan === true),
-          entities,
-          batchedWith,
-          args.timeout,
-        );
-      }
+      // Unconditionally, even for zero rows: with no parents the loader is a
+      // pure validation walk over the `with` tree (compile-only child builds),
+      // which is what keeps accept/reject identical to the join plan when the
+      // base query matches nothing.
+      await loadRelationsBatched(
+        this.batchedContext(args.timeout, skip, args.includePii, args.forceCustomPlan === true),
+        entities,
+        batchedWith,
+        args.timeout,
+      );
       stripFields(entities, proj.strip);
       return single ? (entities[0] ?? null) : entities;
     } finally {
@@ -1697,14 +1705,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
       this.preparedNameFor(args, deferred.preparedName),
     );
     const entities = deferred.transform(result) as Record<string, unknown>[];
-    if (entities.length > 0) {
-      await loadRelationsBatched(
-        this.batchedContext(args.timeout, skip, args.includePii, args.forceCustomPlan === true),
-        entities,
-        withClause,
-        args.timeout,
-      );
-    }
+    // Unconditionally, even for zero rows: see the 'auto' path above, the
+    // loader doubles as the compile-time validation walk of the `with` tree.
+    await loadRelationsBatched(
+      this.batchedContext(args.timeout, skip, args.includePii, args.forceCustomPlan === true),
+      entities,
+      withClause,
+      args.timeout,
+    );
     stripFields(entities, strip);
     return entities as T[];
   }
@@ -1719,6 +1727,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     withClause: WithClause,
   ): { baseArgs: FindManyArgs<T>; strip: string[] } {
     const needed = neededParentKeyFields(this.tableMeta, withClause);
+    assertProjectionShape(
+      this.table,
+      args.select as Record<string, boolean> | undefined,
+      args.omit as Record<string, boolean> | undefined,
+    );
     const proj = includeKeysForBatching(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
@@ -2176,6 +2189,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Same scope-rule parity as runFindManyBatched: reject before querying.
     rejectNestedPickOrder(withClause);
     const needed = neededParentKeyFields(this.tableMeta, withClause);
+    assertProjectionShape(
+      this.table,
+      args.select as Record<string, boolean> | undefined,
+      args.omit as Record<string, boolean> | undefined,
+    );
     const proj = includeKeysForBatching(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
@@ -2191,13 +2209,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       this.preparedNameFor(args, deferred.preparedName),
     );
     const entity = deferred.transform(result) as Record<string, unknown> | null;
-    if (!entity) return null;
+    // A miss still walks the `with` tree (compile-only child builds), so the
+    // same args throw or pass identically whether or not the row exists,
+    // matching the join plan which validates the whole statement up front.
     await loadRelationsBatched(
       this.batchedContext(args.timeout, args.skipGlobalFilters, args.includePii, args.forceCustomPlan === true),
-      [entity],
+      entity ? [entity] : [],
       withClause,
       args.timeout,
     );
+    if (!entity) return null;
     stripFields([entity], proj.strip);
     return entity as T;
   }

@@ -34,7 +34,7 @@ import type {
   WhereClause,
 } from './types.js';
 import { assertOrderDirection, resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
-import { isTemporalInfinity, ownLookup } from './utils.js';
+import { isTemporalInfinity, ownLookup, unknownFieldMessage } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 
@@ -83,7 +83,7 @@ export function buildGroupBy<T extends object>(
   if (meta) {
     for (const key of args.by) {
       if (typeof key === 'string' && !(key in meta.columnMap)) {
-        throw new ValidationError(`Unknown column "${key}" in groupBy for table "${qi.table}"`);
+        throw new ValidationError(unknownFieldMessage(qi.table, key, meta));
       }
     }
   }
@@ -928,7 +928,7 @@ export function buildAggregate<T extends object>(
       if (group && typeof group === 'object') {
         for (const key of Object.keys(group)) {
           if (!(key in meta.columnMap)) {
-            throw new ValidationError(`Unknown column "${key}" in aggregate for table "${qi.table}"`);
+            throw new ValidationError(unknownFieldMessage(qi.table, key, meta));
           }
         }
       }
@@ -938,7 +938,7 @@ export function buildAggregate<T extends object>(
         // `_all` is the reserved COUNT(*) selector, not a column.
         if (key === '_all') continue;
         if (!(key in meta.columnMap)) {
-          throw new ValidationError(`Unknown column "${key}" in aggregate for table "${qi.table}"`);
+          throw new ValidationError(unknownFieldMessage(qi.table, key, meta));
         }
       }
     }

@@ -349,6 +349,8 @@ If you'd rather have a JOIN (e.g. for a reporting query with a `GROUP BY`), drop
 
 When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41.0): it compiles the single-statement correlated-subquery plan (`'join'`) and moves individual relations to the batched loader when one of two rules fires. Everything else stays in the join, byte-identical. An explicit `'join'`, `'batched'` or `'flatten'` (client-wide or per query) always wins over `'auto'`, and the results are deep-equal whichever plan runs.
 
+The strategies also agree about whether a query is **valid**, independent of data (0.65). The batched loader used to skip validating the `with` tree when the base query matched no rows, so a misspelled relation field could throw in production and pass in an empty test database; now the whole tree is validated on every strategy even for zero-row results, with the same error codes. A seeded differential fuzz suite runs the same random queries through both plans on every release and nightly, asserting row equality and accept/reject agreement.
+
 <Callout type="note" title="Value fidelity across strategies">
 "Deep-equal whichever plan runs" is a guarantee that had to be *earned*, and on some engines it only became true in v0.51.
 

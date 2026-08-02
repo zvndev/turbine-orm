@@ -60,7 +60,7 @@ import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableM
 import type { ReselectExecutor } from './builder.js';
 import { isRelationPickOrderBy, sortedEntries } from './filters.js';
 import type { SkipGlobalFilters, Unsafe, WithClause, WithCount, WithOptions } from './types.js';
-import { ownLookup } from './utils.js';
+import { ownLookup, selectNamesNothingMessage, selectOmitExclusiveMessage } from './utils.js';
 
 /**
  * Max parent keys per follow-up query. On Postgres the whole key set travels as
@@ -181,6 +181,31 @@ export function defaultProjectionFields(
  * keys) so a caller's `select: { title: true }` on a relation still stitches even
  * though the FK was not requested, and the FK never appears in the output.
  */
+/**
+ * The two projection SHAPE rules from `resolveProjection`, checked on the RAW
+ * caller args BEFORE `includeKeysForBatching` adjusts them. The adjustment
+ * force-adds correlation keys to a `select`, so a shape that is invalid as
+ * written (an all-falsy select, or select + omit together) can look valid
+ * after it, and the batched plan would then accept a query the join plan
+ * refuses, with 'auto' picking between them on data. Same messages as the
+ * resolver so the two strategies refuse identically, word for word.
+ */
+export function assertProjectionShape(
+  table: string,
+  select: Record<string, boolean> | undefined,
+  omit: Record<string, boolean> | undefined,
+): void {
+  // Array shapes fall through: buildFindMany's resolver has their specific
+  // "must be an object" messages, and compiling is where they surface.
+  if (!select || Array.isArray(select)) return;
+  if (!Object.values(select).some(Boolean)) {
+    throw new ValidationError(selectNamesNothingMessage(table));
+  }
+  if (omit && !Array.isArray(omit) && Object.values(omit).some(Boolean)) {
+    throw new ValidationError(selectOmitExclusiveMessage(table));
+  }
+}
+
 export function includeKeysForBatching(
   select: Record<string, boolean> | undefined,
   omit: Record<string, boolean> | undefined,
@@ -362,10 +387,18 @@ export async function loadRelationsBatched(
   path: string[] = [ctx.parentMeta.name],
 ): Promise<void> {
   if (depth >= MAX_DEPTH) throw new CircularRelationError([...path, '…']);
-  // Scope-rule parity with the join strategy: validate the whole tree BEFORE
-  // the empty-parents early return, so accept/reject never depends on data.
+  // Scope-rule parity with the join strategy: the whole tree validates even
+  // with zero parents, so accept/reject never depends on data. There is
+  // DELIBERATELY no `parents.length === 0` early return here: one used to sit
+  // below this line, and it skipped relation-NAME resolution and every child
+  // compile whenever the base query matched nothing, so a typo'd relation or
+  // child select threw on populated data and passed silently on empty. The
+  // loaders below all compile their child query before their own
+  // data-dependent exits (one SQL string build per relation node; makeChild
+  // creates a fresh QueryInterface, so this is NOT a template-cache hit, and
+  // nothing executes), which keeps this path's acceptance byte-aligned with
+  // the join plan's compile-time validation.
   if (depth === 0) rejectNestedPickOrder(withClause);
-  if (parents.length === 0) return;
 
   // Resolve the relations to load in the SAME order the join plan emits their
   // columns (`sortedEntries` in buildSelectWithRelations), with the reserved
@@ -375,7 +408,10 @@ export async function loadRelationsBatched(
     if (!spec || relName === '_count') continue;
     const rel = ownLookup(ctx.parentMeta.relations, relName);
     if (!rel) {
-      throw new ValidationError(
+      // RelationError (E005), NOT ValidationError: the join strategy throws
+      // E005 for this exact shape (relations.ts), and under 'auto' the two
+      // must refuse identically or the error CODE depends on table size.
+      throw new RelationError(
         `[turbine] Unknown relation "${relName}" on table "${ctx.parentMeta.name}". ` +
           `Available: ${Object.keys(ctx.parentMeta.relations).join(', ')}`,
       );
@@ -529,11 +565,6 @@ async function loadToOneOrMany(
   const keys = uniqueKeys(parents, parentKeyField);
   const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
 
-  if (keys.length === 0) {
-    for (const parent of parents) parent[relName] = single ? null : [];
-    return;
-  }
-
   // The follow-up must project the child correlation key even if the caller's
   // select/omit excluded it; strip it back off afterwards so the shape matches join.
   //
@@ -545,6 +576,7 @@ async function loadToOneOrMany(
   // ones did not, so the defect needed a `select` (or an `omit` of the FK) on a
   // to-many with a to-one inside it, which is why `include` and `join` were both
   // clean and seventeen rounds of parity capture missed it.
+  assertProjectionShape(targetMeta.name, options.select, options.omit);
   const proj = includeKeysForBatching(
     options.select,
     options.omit,
@@ -552,6 +584,24 @@ async function loadToOneOrMany(
     defaultProjectionFields(targetMeta, ctx.includePii),
   );
   const child = ctx.makeChild(rel.to);
+  const buildChunk = (chunk: unknown[]) =>
+    child.buildFindMany({
+      where: mergeChildWhere(options.where, childKeyField, chunk),
+      select: proj.select,
+      omit: proj.omit,
+      orderBy: options.orderBy,
+      skipGlobalFilters: ctx.skipGlobalFilters,
+      includePii: ctx.includePii,
+    });
+
+  // Zero keys (no parents, or every parent's key is NULL): nothing to fetch,
+  // but the child query still COMPILES, because compiling is where the
+  // caller's select/omit/where/orderBy names are validated and the join plan
+  // validates them regardless of data. Skipping this made a typo'd child
+  // select throw or pass based on which rows the base query matched. Cost:
+  // one SQL string build (the child is a fresh QueryInterface with its own
+  // template LRU, so this is a build, not a cache hit); nothing executes.
+  if (keys.length === 0) buildChunk([]);
 
   const chunks: unknown[][] = [];
   for (let i = 0; i < keys.length; i += MAX_RELATION_KEYS) chunks.push(keys.slice(i, i + MAX_RELATION_KEYS));
@@ -561,22 +611,18 @@ async function loadToOneOrMany(
   // client-side per group after stitching (below).
   const chunkResults = await Promise.all(
     chunks.map(async (chunk) => {
-      const deferred = child.buildFindMany({
-        where: mergeChildWhere(options.where, childKeyField, chunk),
-        select: proj.select,
-        omit: proj.omit,
-        orderBy: options.orderBy,
-        skipGlobalFilters: ctx.skipGlobalFilters,
-        includePii: ctx.includePii,
-      });
+      const deferred = buildChunk(chunk);
       const result = await ctx.exec(deferred.sql, deferred.params, deferred.preparedName);
       return deferred.transform(result) as Record<string, unknown>[];
     }),
   );
   const allChildren: Record<string, unknown>[] = chunkResults.flat();
 
-  // Recurse for nested `with` BEFORE stripping keys (children carry their own keys).
-  if (options.with && allChildren.length > 0) {
+  // Recurse for nested `with` BEFORE stripping keys (children carry their own
+  // keys). Recursion runs even with zero children: it is the validation walk
+  // for the deeper levels of the tree (each level compiles its own child
+  // query above), so a typo three levels down throws with or without data.
+  if (options.with) {
     await loadRelationsBatched(
       { ...ctx, parentMeta: targetMeta },
       allChildren,
@@ -647,11 +693,11 @@ async function loadManyToMany(
   const targetPkField = targetMeta.reverseColumnMap[targetPkCol] ?? targetPkCol;
 
   assertCorrelationKeyProjected(parents, parentRefField, relName, ctx.parentMeta.name);
+  // No early return on zero parent keys: the code below flows through
+  // naturally (zero junction chunks, zero target chunks), and the compile-only
+  // build further down still validates the caller's names, same rule as the
+  // to-one/to-many loader.
   const parentKeys = uniqueKeys(parents, parentRefField);
-  if (parentKeys.length === 0) {
-    for (const parent of parents) parent[relName] = [];
-    return;
-  }
 
   // (1) Junction rows: sourceKeyVal → [targetKeyVal]. Raw SQL through the caller's
   // executor (the junction table has no relations we need, so no child reader).
@@ -688,6 +734,7 @@ async function loadManyToMany(
   // Plus the keys the target's own nested relations need, same rule and same
   // reason as the to-many loader above: this level's PK is not the only key the
   // recursion below will ask these rows for.
+  assertProjectionShape(targetMeta.name, options.select, options.omit);
   const proj = includeKeysForBatching(
     options.select,
     options.omit,
@@ -695,29 +742,36 @@ async function loadManyToMany(
     defaultProjectionFields(targetMeta, ctx.includePii),
   );
   const child = ctx.makeChild(rel.to);
+  const buildTargetChunk = (chunk: unknown[]) =>
+    child.buildFindMany({
+      where: mergeChildWhere(options.where, targetPkField, chunk),
+      select: proj.select,
+      omit: proj.omit,
+      orderBy: options.orderBy,
+      skipGlobalFilters: ctx.skipGlobalFilters,
+      includePii: ctx.includePii,
+    });
   const targetVals = [...targetValSet];
+  // Compile-only when there is nothing to fetch: validation of the caller's
+  // names lives in the build, and it must not depend on whether any junction
+  // row matched (same rule as the to-one/to-many loader).
+  if (targetVals.length === 0) buildTargetChunk([]);
   const tChunks: unknown[][] = [];
   for (let i = 0; i < targetVals.length; i += MAX_RELATION_KEYS) {
     tChunks.push(targetVals.slice(i, i + MAX_RELATION_KEYS));
   }
   const tResults = await Promise.all(
     tChunks.map(async (chunk) => {
-      const deferred = child.buildFindMany({
-        where: mergeChildWhere(options.where, targetPkField, chunk),
-        select: proj.select,
-        omit: proj.omit,
-        orderBy: options.orderBy,
-        skipGlobalFilters: ctx.skipGlobalFilters,
-        includePii: ctx.includePii,
-      });
+      const deferred = buildTargetChunk(chunk);
       const result = await ctx.exec(deferred.sql, deferred.params, deferred.preparedName);
       return deferred.transform(result) as Record<string, unknown>[];
     }),
   );
   const targetsInOrder: Record<string, unknown>[] = tResults.flat();
 
-  // Nested `with` on the target rows (before stripping their PK).
-  if (options.with && targetsInOrder.length > 0) {
+  // Nested `with` on the target rows (before stripping their PK). Runs even
+  // with zero targets: it is the validation walk for the deeper levels.
+  if (options.with) {
     await loadRelationsBatched(
       { ...ctx, parentMeta: targetMeta },
       targetsInOrder,
@@ -988,9 +1042,15 @@ function groupBy(rows: Record<string, unknown>[], field: string): Map<string, Re
   return map;
 }
 
-/** Resolve a table's metadata or throw a clear relation error. */
+/**
+ * Resolve a table's metadata or throw a clear relation error. E005
+ * (RelationError), matching the class the join path throws for its "Unknown
+ * relation target" twin in relations.ts: only corrupt/partial metadata can
+ * trigger either, but the error CODE must still not depend on which strategy
+ * ran (the same rule as the unknown relation NAME above).
+ */
 function requireTable(schema: SchemaMetadata, table: string, relName: string): TableMetadata {
   const meta = schema.tables[table];
-  if (!meta) throw new ValidationError(`[turbine] Relation "${relName}" targets unknown table "${table}".`);
+  if (!meta) throw new RelationError(`[turbine] Unknown relation target "${table}" (relation "${relName}").`);
   return meta;
 }

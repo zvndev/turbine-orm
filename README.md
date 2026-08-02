@@ -10,6 +10,8 @@ npm install turbine-orm
 
 **Full docs: [turbineorm.dev](https://turbineorm.dev)**, [Why Turbine](https://turbineorm.dev/why-turbine) · [Quick Start](https://turbineorm.dev/quickstart) · [API Reference](https://turbineorm.dev/queries) · [Relations](https://turbineorm.dev/relations) · [Transactions & Pipelines](https://turbineorm.dev/transactions) · [Serverless & Edge](https://turbineorm.dev/serverless) · [Typed Errors](https://turbineorm.dev/errors) · [Benchmarks](https://turbineorm.dev/benchmarks)
 
+**Contents:** [Why Turbine?](#why-turbine) · [Benchmarks](#benchmarks) · [Quick Start](#quick-start) · [Usage Examples](#usage-examples) · [Vector search](#vector-search-pgvector) · [WHERE Operators](#where-operator-reference) · [CLI](#cli) · [Studio](#studio) · [Observability](#observability) · [Serverless / Edge](#serverless--edge) · [Database engines](#database-engines) · [Configuration](#configuration) · [How It Works](#how-it-works) · [Type Mapping](#type-mapping) · [Comparison](#comparison) · [Limitations](#limitations) · [Examples](#examples) · [Guides](#guides) · [Requirements](#requirements) · [Contributing](#contributing)
+
 ## Why Turbine?
 
 *(The same argument, laid out with the comparisons and the caveats, is at [turbineorm.dev/why-turbine](https://turbineorm.dev/why-turbine).)*

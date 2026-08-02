@@ -61,6 +61,7 @@ import {
   type InsertStatementInput,
   type IntrospectOptions,
   type JsonWireRule,
+  type LimitOffsetInput,
   postgresDialect,
   type ReturningSelection,
   type StreamableConnection,
@@ -512,6 +513,20 @@ export const sqliteDialect: Dialect = {
 
   castAggregate(expr: string, target: 'int' | 'float'): string {
     return `CAST(${expr} AS ${target === 'int' ? 'INTEGER' : 'REAL'})`;
+  },
+
+  // SQLite's grammar only allows OFFSET after LIMIT, so `offset` without
+  // `limit` (valid on Postgres, which the default path is written for) is a
+  // syntax error here. A negative LIMIT is SQLite's documented "no upper
+  // bound", so that shape becomes `LIMIT -1 OFFSET n`. The other shapes emit
+  // byte-identically to the default path.
+  buildLimitOffset(input: LimitOffsetInput): string {
+    const { limitPlaceholder, offsetPlaceholder } = input;
+    if (limitPlaceholder === undefined && offsetPlaceholder === undefined) return '';
+    if (limitPlaceholder === undefined) return ` LIMIT -1 OFFSET ${offsetPlaceholder}`;
+    let s = ` LIMIT ${limitPlaceholder}`;
+    if (offsetPlaceholder !== undefined) s += ` OFFSET ${offsetPlaceholder}`;
+    return s;
   },
 
   // No `= ANY(array)` in SQLite. `json_each` expands a single JSON-array param

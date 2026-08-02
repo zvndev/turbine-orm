@@ -77,6 +77,7 @@ import {
   type InsertStatementInput,
   type IntrospectOptions,
   type JsonWireRule,
+  type LimitOffsetInput,
   postgresDialect,
   type StreamableConnection,
   type UpsertStatementInput,
@@ -555,6 +556,23 @@ export const mysqlDialect: Dialect = {
 
   castAggregate(expr: string, target: 'int' | 'float'): string {
     return `CAST(${expr} AS ${target === 'int' ? 'SIGNED' : 'DECIMAL(65,30)'})`;
+  },
+
+  // MySQL has no bare OFFSET: the grammar requires a LIMIT for OFFSET to
+  // attach to, so `offset` without `limit` (valid on Postgres, which the
+  // default path is written for) is a syntax error here. The MySQL manual's
+  // own idiom for "from this offset to the end" is a LIMIT of
+  // 18446744073709551615 (2^64-1). The other shapes emit byte-identically to
+  // the default path. Values arrive as inlined validated-integer literals
+  // (inlineLimitOffset), so this only concatenates text the builder already
+  // vetted.
+  buildLimitOffset(input: LimitOffsetInput): string {
+    const { limitPlaceholder, offsetPlaceholder } = input;
+    if (limitPlaceholder === undefined && offsetPlaceholder === undefined) return '';
+    if (limitPlaceholder === undefined) return ` LIMIT 18446744073709551615 OFFSET ${offsetPlaceholder}`;
+    let s = ` LIMIT ${limitPlaceholder}`;
+    if (offsetPlaceholder !== undefined) s += ` OFFSET ${offsetPlaceholder}`;
+    return s;
   },
 
   // No array params in MySQL. JSON_TABLE expands a single JSON-array param into a

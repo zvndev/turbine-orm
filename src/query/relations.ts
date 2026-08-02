@@ -39,7 +39,14 @@ import type {
   WithOptions,
 } from './types.js';
 import { assertDirectionToken, assertOrderDirection } from './types.js';
-import { ownLookup, relationInProjectionMessage, resolveColumnName, unknownFieldMessage } from './utils.js';
+import {
+  ownLookup,
+  relationInProjectionMessage,
+  resolveColumnName,
+  selectNamesNothingMessage,
+  selectOmitExclusiveMessage,
+  unknownFieldMessage,
+} from './utils.js';
 import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -122,6 +129,34 @@ export function resolveProjection(
   omit?: Record<string, boolean>,
   includePii?: boolean,
 ): string[] | null {
+  // Projection SHAPE refusals, in order (array shapes fall through to their
+  // own, more specific messages below):
+  //
+  // 1. A `select` naming no fields (empty, or every value false) is refused,
+  //    not resolved to an empty column list: at the top level that list used
+  //    to emit `SELECT  FROM`, invalid SQL, while a relation quietly returned
+  //    `[{}]` rows, two silent third outcomes of the kind this function was
+  //    merged to abolish.
+  // 2. `select` + `omit` together is refused, not half-resolved: a narrowed
+  //    projection minus fields is ambiguous, Prisma refuses the pair, and
+  //    prisma-compat here already did. Before this check the `select` branch
+  //    below returned early, so the `omit` names were never validated at all
+  //    (a typo in the `omit` half passed while the same typo alone threw).
+  //
+  // Check 1 runs first so both are PRESENCE-decided exactly like the branch
+  // below (`if (select)`): a truthiness-decided refusal here flipped verdicts
+  // between strategies when the batched loader force-added correlation keys
+  // to an all-falsy select (review-caught in 0.65). The batched loader
+  // asserts the same two rules on the RAW args (`assertProjectionShape`)
+  // before any adjustment, with these same messages.
+  if (select && !Array.isArray(select)) {
+    if (!Object.values(select).some(Boolean)) {
+      throw new ValidationError(selectNamesNothingMessage(table));
+    }
+    if (omit && !Array.isArray(omit) && Object.values(omit).some(Boolean)) {
+      throw new ValidationError(selectOmitExclusiveMessage(table));
+    }
+  }
   if (select) {
     // An array here means a caller wrote `select: ['id', 'name']` (Drizzle/SQL
     // style) instead of the object shape. Object.entries() would iterate the

@@ -1,0 +1,49 @@
+name: CodeQL
+
+# Static security analysis on the default branch, PRs into it, and a weekly
+# sweep (new queries ship upstream continuously, so a schedule catches issues
+# in code that has not changed). Free for public repos; findings land in the
+# repo's Security tab, never in CI noise.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+# Overlapping analyses of the same ref add nothing: a newer push supersedes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      # actions: read is part of CodeQL's documented permission set (it lets
+      # the action read the workflow run for accurate alert attribution).
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          # security-extended adds lower-confidence queries; for a library that
+          # builds SQL from user input, the extra recall is worth the triage.
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: '/language:javascript-typescript'

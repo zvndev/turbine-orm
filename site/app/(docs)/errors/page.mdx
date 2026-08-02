@@ -9,28 +9,30 @@ export const metadata = {
 
 Turbine throws typed errors you can catch with `instanceof`. Every error extends `TurbineError` and carries a stable `readonly code` field you can use for programmatic handling. Human-readable `.message` strings also start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable without structured field access, but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes automatically via `wrapPgError()`.
 
+Since 0.65 every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors#e008`, an anchor into the table below) and its message ends with the same link, so a raw log line is one click from its explanation and structured sinks get the URL as a field without parsing anything. A unit test asserts every code has its row and anchor here, so a new code cannot ship undocumented.
+
 ## Error code table
 
 | Code | Class | When thrown |
 |---|---|---|
-| `TURBINE_E001` | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, update/delete against a non-matching row |
-| `TURBINE_E002` | `TimeoutError` | Query or transaction exceeds its configured timeout |
-| `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) passed a plain `true` instead of the `UNSAFE` symbol, a `createMany` whose first data row names no column while a later row does |
-| `TURBINE_E004` | `ConnectionError` | Pool connection failure |
-| `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
-| `TURBINE_E006` | `MigrationError` | Checksum mismatch, migration-lock contention, or a failure while applying a migration |
-| `TURBINE_E007` | `CircularRelationError` | Relation nesting depth exceeds 10 |
-| `TURBINE_E008` | `UniqueConstraintError` | pg 23505, translated via `wrapPgError()` |
-| `TURBINE_E009` | `ForeignKeyError` | pg 23503, translated via `wrapPgError()` |
-| `TURBINE_E010` | `NotNullViolationError` | pg 23502, translated via `wrapPgError()` |
-| `TURBINE_E011` | `CheckConstraintError` | pg 23514, translated via `wrapPgError()` |
-| `TURBINE_E012` | `DeadlockError` | pg 40P01, **retryable**, exposes `isRetryable: true` |
-| `TURBINE_E013` | `SerializationFailureError` | pg 40001, **retryable**, exposes `isRetryable: true` |
-| `TURBINE_E014` | `PipelineError` | Non-transactional pipeline has partial failures |
-| `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update, the row was modified by another transaction |
-| `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01, translated via `wrapPgError()` |
-| `TURBINE_E017` | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on a non-Postgres engine, exposes `feature` and `dialect` |
-| `TURBINE_E018` | `ReadOnlyError` | A write refused because the database is read-only, exposes `reason: 'snapshot' \| 'rbac'` (PowDB snapshot serving / read-only role) |
+| <a id="e001" /> `TURBINE_E001` | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, update/delete against a non-matching row |
+| <a id="e002" /> `TURBINE_E002` | `TimeoutError` | Query or transaction exceeds its configured timeout |
+| <a id="e003" /> `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) passed a plain `true` instead of the `UNSAFE` symbol, a `createMany` whose first data row names no column while a later row does |
+| <a id="e004" /> `TURBINE_E004` | `ConnectionError` | Pool connection failure |
+| <a id="e005" /> `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
+| <a id="e006" /> `TURBINE_E006` | `MigrationError` | Checksum mismatch, migration-lock contention, or a failure while applying a migration |
+| <a id="e007" /> `TURBINE_E007` | `CircularRelationError` | Relation nesting depth exceeds 10 |
+| <a id="e008" /> `TURBINE_E008` | `UniqueConstraintError` | pg 23505, translated via `wrapPgError()` |
+| <a id="e009" /> `TURBINE_E009` | `ForeignKeyError` | pg 23503, translated via `wrapPgError()` |
+| <a id="e010" /> `TURBINE_E010` | `NotNullViolationError` | pg 23502, translated via `wrapPgError()` |
+| <a id="e011" /> `TURBINE_E011` | `CheckConstraintError` | pg 23514, translated via `wrapPgError()` |
+| <a id="e012" /> `TURBINE_E012` | `DeadlockError` | pg 40P01, **retryable**, exposes `isRetryable: true` |
+| <a id="e013" /> `TURBINE_E013` | `SerializationFailureError` | pg 40001, **retryable**, exposes `isRetryable: true` |
+| <a id="e014" /> `TURBINE_E014` | `PipelineError` | Non-transactional pipeline has partial failures |
+| <a id="e015" /> `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update, the row was modified by another transaction |
+| <a id="e016" /> `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01, translated via `wrapPgError()` |
+| <a id="e017" /> `TURBINE_E017` | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on a non-Postgres engine, exposes `feature` and `dialect` |
+| <a id="e018" /> `TURBINE_E018` | `ReadOnlyError` | A write refused because the database is read-only, exposes `reason: 'snapshot' \| 'rbac'` (PowDB snapshot serving / read-only role) |
 
 ## Catching typed errors
 

@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.64.1",
+  "version": "0.65.0",
   "description": "Postgres-native TypeScript ORM, runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "//exports": "Each subpath declares its types PER CONDITION. A single shared top-level \"types\" resolves to the ESM declarations for `require` too, which is TS1479 (\"is an ES module ... cannot be require()d\") for any CJS consumer on moduleResolution node16/nodenext. The require condition points at dist/cjs, which ships its own {\"type\":\"commonjs\"} package.json, so those declarations are CJS declarations. Gated in CI by publint + @arethetypeswrong/cli + a real .cts consumer typecheck (see the package-types job in ci.yml).",
@@ -111,7 +111,7 @@
     "README.md"
   ],
   "sideEffects": false,
-  "//prepublishOnly": "The gate for a MANUAL LOCAL `npm publish`, which is the normal release flow here, so it is the ONLY gate on that path (release.yml runs on a pushed tag, and a local publish never triggers it). `check:package` joined it 2026-07-28: publint --strict + attw --pack, the two checks that catch a broken exports map or CJS declarations that resolve to ESM, which is a class of bug that shipped once already and is invisible to every other script here. `test:coverage:cli` joined at the same time (~3s) so a local publish cannot ship a Studio/migrate coverage regression. Still deliberately absent, because they need a live database or minutes of packing: the Postgres integration suite, the engine containers, and the tarball install smoke, all of which release.yml + ci.yml run.",
+  "//prepublishOnly": "The gate for a MANUAL LOCAL `npm publish`, which is the normal release flow here, so it is the ONLY gate on that path (release.yml runs on a pushed tag, and a local publish never triggers it). `check:package` joined it 2026-07-28: publint --strict + attw --pack, the two checks that catch a broken exports map or CJS declarations that resolve to ESM, which is a class of bug that shipped once already and is invisible to every other script here. `test:coverage:cli` joined at the same time (~3s) so a local publish cannot ship a Studio/migrate coverage regression. Still deliberately absent, because they need containers or minutes of packing: the non-Postgres engine suites and the tarball install smoke, which release.yml + ci.yml run. check:cycles joined 2026-08-02 (the query/->client.ts acyclicity rule as a build failure instead of CLAUDE.md prose). check:release-tests joined at the same time and runs LAST because it is the expensive one: outside CI it runs the full DB-backed `npm test` (refusing to publish when no DATABASE_URL is reachable, escape hatch TURBINE_PUBLISH_WITHOUT_DB=1), which closes the old gap where the release path never executed a query against a real Postgres; in CI it self-skips since release.yml/nightly.yml run that suite as dedicated jobs. Known double-coverage: `npm test` re-runs the unit-lane files serially, so a local publish executes them twice; accepted, the second pass is the one with a real database behind it.",
   "scripts": {
     "prebuild": "npm run gen:studio",
     "build": "rm -rf dist && tsc && tsc --project tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
@@ -136,8 +136,10 @@
     "format": "biome format --write src/",
     "check:error-codes": "tsx scripts/check-error-codes.ts",
     "check:changelog": "node scripts/check-changelog-headings.mjs",
+    "check:cycles": "node scripts/check-import-cycles.mjs",
+    "check:release-tests": "node scripts/check-release-tests.mjs",
     "check:package": "publint --strict && attw --pack . --profile node16",
-    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:changelog && npm run check:package && npm run size",
+    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:changelog && npm run check:cycles && npm run check:package && npm run size && npm run check:release-tests",
     "prepare": "husky",
     "prepack": "node scripts/strip-prepare.mjs",
     "postpack": "node scripts/restore-prepare.mjs",

@@ -30,6 +30,7 @@ permissions:
 
 jobs:
   publish-next:
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     # Only publish when a CI run on main SUCCEEDED. Not on the nightly schedule,
     # and never off a red, cancelled or skipped CI run. `head_branch` is checked
@@ -93,6 +94,7 @@ jobs:
   # YSQL is Postgres-wire-compatible on port 5433, default user `yugabyte` with
   # no password in the single-node image.
   yugabytedb-integration:
+    timeout-minutes: 45
     name: yugabytedb-integration
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
@@ -142,3 +144,27 @@ jobs:
         env:
           DATABASE_URL: postgres://yugabyte@localhost:5433/turbine_test?sslmode=disable
           TURBINE_TEST_ENGINE: yugabytedb
+
+  # Extended run of the join/batched/auto differential fuzz (strategy-fuzz.test.ts).
+  # The unit lane runs its three fixed seeds on every push/publish, which keeps
+  # the lane deterministic but means the explored space never moves; this job
+  # derives the seed from the date so each night walks new query shapes. The
+  # seed and case count are printed first (and are in the failing assertion
+  # message too), so any red night is reproducible locally with
+  # TURBINE_FUZZ_SEED/TURBINE_FUZZ_CASES. In-memory sqlite: no service, fast.
+  strategy-fuzz-extended:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Differential fuzz, date-derived seed
+        run: |
+          SEED=$(date -u +%Y%m%d)
+          echo "Reproduce locally with: TURBINE_FUZZ_SEED=$SEED TURBINE_FUZZ_CASES=20000 npx tsx --test src/test/strategy-fuzz.test.ts"
+          TURBINE_FUZZ_SEED="$SEED" TURBINE_FUZZ_CASES=20000 npx tsx --test src/test/strategy-fuzz.test.ts

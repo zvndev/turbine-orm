@@ -266,7 +266,11 @@ export class ObserveEngine {
 
   constructor(config: ObserveConfig) {
     if (!config.sink && !config.connectionString) {
-      throw new ValidationError('ObserveEngine requires either a connectionString or a sink');
+      throw new ValidationError(
+        '[turbine] ObserveEngine: neither `connectionString` nor `sink` was provided, so there is nowhere to ' +
+          'flush metrics. Pass `connectionString` (a separate metrics database URL, often TURBINE_OBSERVE_URL) ' +
+          'or a custom `sink` implementing ObserveSink.',
+      );
     }
     this.sink =
       config.sink ??

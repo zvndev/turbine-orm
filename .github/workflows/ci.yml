@@ -12,6 +12,7 @@ concurrency:
 
 jobs:
   lint:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -27,8 +28,14 @@ jobs:
       # it here makes the violation visible on the PR that introduces it, which
       # is the only place it is cheap to fix.
       - run: npm run check:changelog
+      # Module-graph acyclicity: no static value import of client.ts from
+      # src/query/** or src/cli/**. Same rationale as above: the rule lived in
+      # CLAUDE.md prose, and a violation typechecks fine while executing a
+      # half-initialized module at runtime.
+      - run: npm run check:cycles
 
   typecheck:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -40,6 +47,7 @@ jobs:
       - run: npm run typecheck
 
   unit-tests:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -58,6 +66,7 @@ jobs:
   # unreachable, so the measurement (and the thresholds in .c8rc.json) would be
   # against a run that can never exercise execution paths, only SQL generation.
   coverage:
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -101,6 +110,7 @@ jobs:
   # query runtime's aggregate. No database: these suites drive the exported
   # request handlers and the migration runner directly, so this job is seconds.
   coverage-cli:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -121,6 +131,7 @@ jobs:
   # default statement_timeout path that was previously never integration-tested).
   # Failures gate PRs.
   integration-tests:
+    timeout-minutes: 30
     name: integration-tests (postgres ${{ matrix.postgres-version }})
     runs-on: ubuntu-latest
     strategy:
@@ -174,6 +185,7 @@ jobs:
   # TURBINE_TEST_ENGINE=cockroachdb so the CRDB-specific adapter SQL is the SQL
   # actually sent over the wire. Hard gate, engine integration regressions fail the PR.
   cockroachdb-integration:
+    timeout-minutes: 30
     name: cockroachdb-integration
     runs-on: ubuntu-latest
     services:
@@ -239,6 +251,7 @@ jobs:
   # the build-only + mock-driver tests still run. mysql2 is a devDep, so `npm ci`
   # installs it. Hard gate, engine integration regressions fail the PR.
   mysql-integration:
+    timeout-minutes: 30
     name: mysql-integration
     runs-on: ubuntu-latest
     services:
@@ -291,6 +304,7 @@ jobs:
   # the build-only + mock-driver tests still run. mssql is a devDep, so `npm ci` installs
   # it. Hard gate, engine integration regressions fail the PR.
   mssql-integration:
+    timeout-minutes: 30
     name: mssql-integration
     runs-on: ubuntu-latest
     services:
@@ -359,6 +373,7 @@ jobs:
   # prebuilt binary the suite's skipGate fires and every test skips cleanly, so
   # `npm run test:unit` stays green without the addon. Hard gate, embedded PowDB integration must pass on every PR.
   powdb-integration:
+    timeout-minutes: 20
     name: powdb-integration
     runs-on: ubuntu-latest
     steps:
@@ -378,6 +393,7 @@ jobs:
   # continue-on-error, so per-PR CI stays green and fast.
 
   build:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -415,6 +431,7 @@ jobs:
   #   3. A real .cts consumer typechecked against the packed tarball, which is
   #      the actual user-visible symptom rather than a proxy for it.
   package-types:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -478,6 +495,7 @@ jobs:
   # packaging regressions (missing dist files, broken exports map, bad bin
   # path) that `npm run build` alone can't.
   pack-smoke:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -581,6 +599,7 @@ jobs:
   # steps live in scripts/quickstart-smoke.sh so a developer can run the same
   # thing locally. Gates PRs.
   quickstart-smoke:
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -613,6 +632,7 @@ jobs:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
 
   security:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -632,6 +652,7 @@ jobs:
         continue-on-error: true
 
   error-codes:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

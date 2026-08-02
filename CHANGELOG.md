@@ -1,5 +1,132 @@
 # Changelog
 
+## 0.65.0 (2026-08-02)
+
+A hardening release built around one new instrument: a seeded differential
+fuzz suite that runs the same randomly generated query through the join and
+batched relation strategies and demands they agree, both about the rows and
+about whether the query is valid at all. It found three real bugs in its
+first minutes of existence; all three are fixed below. The release also adds
+error-docs links to every error, closes the last unguarded release path, and
+tightens CI.
+
+### Fixed
+
+- **`offset` without `limit` was a syntax error on SQLite and MySQL.** The
+  shared SQL path emits the Postgres shape, a bare ` OFFSET $n`, but SQLite's
+  grammar only allows `OFFSET` after a `LIMIT` and MySQL has no bare `OFFSET`
+  at all, so `findMany({ offset: 10 })` threw a driver syntax error on both
+  engines. Each dialect now supplies its documented idiom (`LIMIT -1` on
+  SQLite, `LIMIT 18446744073709551615` on MySQL); every other pagination shape
+  emits byte-identically to before. Found by the fuzz suite on its first run.
+
+- **A query's validity could depend on how many rows it matched.** The batched
+  relation loader returned early when the base query matched nothing, BEFORE
+  validating the `with` tree, so an unknown relation or a misspelled relation
+  `select` threw on populated data and passed silently on empty data. The join
+  strategy validates the whole statement at compile time regardless, and
+  `relationLoadStrategy: 'auto'` picks between the two on index coverage and
+  table size, so the same program could throw in production and pass in a
+  fresh test database. The loader now walks the whole `with` tree even with
+  zero parents: each level compiles its child query (one SQL string build,
+  nothing executes), so acceptance is decided by the query alone. The same
+  rule now holds on a `findUnique` miss. One disclosed consequence: a
+  composite-key relation under an explicit `relationLoadStrategy: 'batched'`
+  now throws its documented E017 even when the base query matches no rows
+  (it already threw on any non-empty result; `'auto'` never demotes
+  composite-key relations, so the default is unaffected).
+
+- **An unknown relation in `with` threw E003 under the batched strategy and
+  E005 under join.** E005 (`RelationError`) is the documented code for an
+  unknown relation; the batched loader now throws it too, with the same
+  message. Before this, an error handler catching `RelationError` worked or
+  missed depending on which plan the `'auto'` heuristic picked.
+
+- **`select` and `omit` together are now refused (E003) instead of silently
+  half-applied.** When both were passed, the SQL engines ignored the `omit`
+  half entirely, without even validating its names, so a typo there passed
+  while the same typo alone threw; PowDB meanwhile APPLIED select-minus-omit,
+  so one query projected different columns per backend. The pair is ambiguous
+  (a narrowed projection minus fields), Prisma refuses it, and prisma-compat
+  here already refused it; now every engine refuses it with the same message.
+  Studio's builder chips enforce the rule live (picking a `select` chip
+  switches modes and clears `omit`, and vice versa), and a saved query from
+  before the rule loads with `select` winning.
+
+  A `select` that names no fields (empty, or every value `false`) is refused
+  the same way. It used to resolve to an empty column list, which emitted
+  invalid SQL at the top level and quietly returned `[{}]` rows inside a
+  relation. Both refusals are decided on the args as written, before the
+  batched loader's internal key-forcing adjustments, so the verdict cannot
+  differ between load strategies (an adversarial review of this release
+  caught exactly that flip in the first version of the check, and the fuzz
+  generator now keeps these shapes in its domain permanently).
+
+### Added
+
+- **Every error links to its documentation.** `TurbineError` gains a
+  `docsUrl` property (`https://turbineorm.dev/errors#e003`-style), and every
+  error message is suffixed with that link once, idempotently, so a wrapped
+  and re-wrapped error never accumulates duplicates. The errors page has an
+  anchor per code, and a new sync test fails the build if a code is added
+  without a docs row, or a docs row outlives its code: a missing row is no
+  longer a docs gap but a broken link printed into the user's own logs.
+
+- **Differential strategy fuzz suite** (`src/test/strategy-fuzz.test.ts`).
+  Seeded (mulberry32), runs in the unit lane on fixed seeds against in-memory
+  SQLite with a deliberately skewed fixture, and asserts two properties per
+  generated query: the join and batched strategies accept or reject
+  identically (with the same error code), and when they accept, the rows are
+  deeply equal. About 15% of cases plant one invalid name and assert both
+  strategies refuse it. A nightly job runs 20,000 cases on a date-derived
+  seed so the explored space moves; every failure message carries the seed,
+  case index and full args for local reproduction via `TURBINE_FUZZ_SEED` /
+  `TURBINE_FUZZ_CASES`.
+
+- **The release path now runs the DB-backed suite.** `prepublishOnly` ends
+  with a new gate that, outside CI, runs the full `npm test` against
+  `DATABASE_URL` and refuses to publish when no database is reachable
+  (`TURBINE_PUBLISH_WITHOUT_DB=1` is the loud emergency escape). A manual
+  local publish is the normal release flow here and was the one path that
+  never executed the generated SQL against a real Postgres; in CI the gate
+  self-skips because the release workflow runs that suite as its own job.
+
+- **The module-graph acyclicity rule is now a build failure.**
+  `scripts/check-import-cycles.mjs` refuses any static value import of
+  `client.ts` from `src/query/**` or `src/cli/**` (type-only and dynamic
+  imports stay sanctioned), self-tests its own matcher before scanning, and
+  runs in CI's lint job and in `prepublishOnly`. The rule previously lived
+  only as prose in the contributor docs.
+
+- **Size budgets for the last two unmeasured subpaths.** `turbine-orm/cli`
+  (1.71 kB) and `turbine-orm/adapters` (1.13 kB) join `.size-limit.js`; both
+  budgets guard the same property as prisma-compat's, staying an order of
+  magnitude below the core-graph entries.
+
+### Changed
+
+- **Releases create their GitHub Release automatically.** The publish job now
+  extracts the version's CHANGELOG section and creates the GitHub Release
+  from it, idempotently (an existing release is left alone, and a re-run can
+  backfill one without republishing). Release runs also wait for each other
+  instead of racing, and a running release is never cancelled (`concurrency`
+  with a single group; GitHub holds at most one further run pending, which
+  fits the one-tag-at-a-time flow here).
+
+- **CI hardening.** Every job in every workflow now carries an explicit
+  `timeout-minutes` (the GitHub default is six hours, so one hung container
+  could previously burn a day of runner budget); a CodeQL workflow scans
+  pushes, PRs and a weekly schedule with the security-extended query pack;
+  `npm audit` is clean again (brace-expansion, dev-only, lockfile-only bump).
+
+- **SECURITY.md rewritten to describe the product that ships.** The old file
+  said Studio "is read-only" (write mode shipped in 0.36) and pinned a
+  supported-versions table that had drifted 36 minors; the new file states
+  the actual perimeter (write-mode routes, full-PK-only predicates, Origin
+  checks, PII redaction) and the real support rule: fixes land on the latest
+  minor. STABILITY.md's version examples were re-stamped the same way, and
+  `.docsUrl` joined its stable structured fields.
+
 ## 0.64.1 (2026-07-29)
 
 Maintenance. No API change, and the emitted JavaScript and type declarations are

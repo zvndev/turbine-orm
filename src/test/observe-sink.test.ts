@@ -250,7 +250,7 @@ describe('HttpJsonSink', () => {
 
 describe('ObserveConfig validation', () => {
   it('throws when neither connectionString nor sink is provided', () => {
-    assert.throws(() => new ObserveEngine({}), /connectionString or a sink/);
+    assert.throws(() => new ObserveEngine({}), /neither `connectionString` nor `sink`/);
   });
 
   it('accepts a sink alone', () => {

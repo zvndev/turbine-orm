@@ -45,12 +45,36 @@ describe('TurbineError', () => {
 
   it('sets .message from constructor', () => {
     const err = new TurbineError(TurbineErrorCode.VALIDATION, 'bad input');
-    assert.equal(err.message, '[TURBINE_E003] bad input');
+    assert.equal(err.message, '[TURBINE_E003] bad input (https://turbineorm.dev/errors#e003)');
   });
 
   it('sets .name to TurbineError', () => {
     const err = new TurbineError(TurbineErrorCode.CONNECTION, 'conn fail');
     assert.equal(err.name, 'TurbineError');
+  });
+
+  it('carries .docsUrl derived from the code, and the message ends with it', () => {
+    // The URL rides in BOTH places on purpose: the message so a raw log line
+    // is one click from the explanation, and the property so structured sinks
+    // (Sentry, pino) get it without parsing text.
+    const err = new TurbineError(TurbineErrorCode.CHECK_VIOLATION, 'row rejected');
+    assert.equal(err.docsUrl, 'https://turbineorm.dev/errors#e011');
+    assert.ok(err.message.endsWith('(https://turbineorm.dev/errors#e011)'), err.message);
+  });
+
+  it('does not double-append the docs link when a message is re-wrapped', () => {
+    // wrapPowdbError and similar paths construct a new TurbineError from an
+    // existing one's message. The suffix must be idempotent or every wrap
+    // layer grows the message by one URL.
+    const inner = new TurbineError(TurbineErrorCode.VALIDATION, 'bad input');
+    const outer = new TurbineError(TurbineErrorCode.VALIDATION, inner.message);
+    assert.equal(outer.message, inner.message);
+    assert.equal((outer.message.match(/turbineorm\.dev\/errors#/g) ?? []).length, 1);
+  });
+
+  it('an empty message still yields the tag and the link', () => {
+    const err = new TurbineError(TurbineErrorCode.TIMEOUT, '');
+    assert.equal(err.message, '[TURBINE_E002] (https://turbineorm.dev/errors#e002)');
   });
 
   it('extends Error', () => {
@@ -66,12 +90,12 @@ describe('TurbineError', () => {
 describe('NotFoundError', () => {
   it('has default message "Record not found" (back-compat, no args)', () => {
     const err = new NotFoundError();
-    assert.equal(err.message, '[TURBINE_E001] Record not found');
+    assert.equal(err.message, '[TURBINE_E001] Record not found (https://turbineorm.dev/errors#e001)');
   });
 
   it('accepts a custom string message (back-compat)', () => {
     const err = new NotFoundError('User 42 not found');
-    assert.equal(err.message, '[TURBINE_E001] User 42 not found');
+    assert.equal(err.message, '[TURBINE_E001] User 42 not found (https://turbineorm.dev/errors#e001)');
   });
 
   it('has .code === TURBINE_E001', () => {
@@ -121,7 +145,7 @@ describe('NotFoundError', () => {
       operation: 'findUniqueOrThrow',
       message: 'custom override',
     });
-    assert.equal(err.message, '[TURBINE_E001] custom override');
+    assert.equal(err.message, '[TURBINE_E001] custom override (https://turbineorm.dev/errors#e001)');
     // fields are still populated
     assert.equal(err.table, 'users');
     assert.equal(err.operation, 'findUniqueOrThrow');
@@ -135,7 +159,7 @@ describe('NotFoundError', () => {
 
   it('options object: empty object falls back to generic message', () => {
     const err = new NotFoundError({});
-    assert.equal(err.message, '[TURBINE_E001] [turbine] Record not found');
+    assert.equal(err.message, '[TURBINE_E001] [turbine] Record not found (https://turbineorm.dev/errors#e001)');
     assert.equal(err.table, undefined);
     assert.equal(err.where, undefined);
     assert.equal(err.operation, undefined);
@@ -167,12 +191,18 @@ describe('TimeoutError', () => {
 
   it('message includes timeout value and default context', () => {
     const err = new TimeoutError(3000);
-    assert.equal(err.message, '[TURBINE_E002] [turbine] Query timed out after 3000ms');
+    assert.equal(
+      err.message,
+      '[TURBINE_E002] [turbine] Query timed out after 3000ms (https://turbineorm.dev/errors#e002)',
+    );
   });
 
   it('message includes custom context', () => {
     const err = new TimeoutError(1500, 'Transaction');
-    assert.equal(err.message, '[TURBINE_E002] [turbine] Transaction timed out after 1500ms');
+    assert.equal(
+      err.message,
+      '[TURBINE_E002] [turbine] Transaction timed out after 1500ms (https://turbineorm.dev/errors#e002)',
+    );
   });
 
   it('has .code === TURBINE_E002', () => {
@@ -189,7 +219,7 @@ describe('TimeoutError', () => {
 describe('ValidationError', () => {
   it('passes message through', () => {
     const err = new ValidationError('Unknown column "foo"');
-    assert.equal(err.message, '[TURBINE_E003] Unknown column "foo"');
+    assert.equal(err.message, '[TURBINE_E003] Unknown column "foo" (https://turbineorm.dev/errors#e003)');
   });
 
   it('has .code === TURBINE_E003', () => {
@@ -212,7 +242,7 @@ describe('ConnectionError', () => {
 
   it('passes message through', () => {
     const err = new ConnectionError('could not connect to server');
-    assert.equal(err.message, '[TURBINE_E004] could not connect to server');
+    assert.equal(err.message, '[TURBINE_E004] could not connect to server (https://turbineorm.dev/errors#e004)');
   });
 });
 
@@ -229,7 +259,7 @@ describe('RelationError', () => {
 
   it('passes message through', () => {
     const err = new RelationError('No relation "foo" on model "bar"');
-    assert.equal(err.message, '[TURBINE_E005] No relation "foo" on model "bar"');
+    assert.equal(err.message, '[TURBINE_E005] No relation "foo" on model "bar" (https://turbineorm.dev/errors#e005)');
   });
 });
 
@@ -246,7 +276,7 @@ describe('MigrationError', () => {
 
   it('passes message through', () => {
     const err = new MigrationError('Column "age" already exists');
-    assert.equal(err.message, '[TURBINE_E006] Column "age" already exists');
+    assert.equal(err.message, '[TURBINE_E006] Column "age" already exists (https://turbineorm.dev/errors#e006)');
   });
 });
 
@@ -404,7 +434,10 @@ describe('UniqueConstraintError', () => {
 
   it('default message is generic when no fields are passed', () => {
     const err = new UniqueConstraintError();
-    assert.equal(err.message, '[TURBINE_E008] [turbine] Unique constraint violation');
+    assert.equal(
+      err.message,
+      '[TURBINE_E008] [turbine] Unique constraint violation (https://turbineorm.dev/errors#e008)',
+    );
   });
 
   it('default message includes constraint name when passed', () => {
@@ -460,7 +493,7 @@ describe('UniqueConstraintError', () => {
 
   it('honors explicit message override', () => {
     const err = new UniqueConstraintError({ message: 'custom message' });
-    assert.equal(err.message, '[TURBINE_E008] custom message');
+    assert.equal(err.message, '[TURBINE_E008] custom message (https://turbineorm.dev/errors#e008)');
   });
 });
 
@@ -827,7 +860,7 @@ describe('DeadlockError', () => {
 
   it('default message is generic when no cause is passed', () => {
     const err = new DeadlockError();
-    assert.equal(err.message, '[TURBINE_E012] [turbine] Deadlock detected');
+    assert.equal(err.message, '[TURBINE_E012] [turbine] Deadlock detected (https://turbineorm.dev/errors#e012)');
   });
 
   it('default message embeds pg cause message', () => {
@@ -845,7 +878,7 @@ describe('DeadlockError', () => {
 
   it('honors explicit message override', () => {
     const err = new DeadlockError({ message: 'custom' });
-    assert.equal(err.message, '[TURBINE_E012] custom');
+    assert.equal(err.message, '[TURBINE_E012] custom (https://turbineorm.dev/errors#e012)');
   });
 
   it('is instanceof TurbineError and Error', () => {
@@ -879,7 +912,10 @@ describe('SerializationFailureError', () => {
 
   it('default message is generic when no cause is passed', () => {
     const err = new SerializationFailureError();
-    assert.equal(err.message, '[TURBINE_E013] [turbine] Serializable transaction conflict');
+    assert.equal(
+      err.message,
+      '[TURBINE_E013] [turbine] Serializable transaction conflict (https://turbineorm.dev/errors#e013)',
+    );
   });
 
   it('default message embeds pg cause message', () => {
@@ -897,7 +933,7 @@ describe('SerializationFailureError', () => {
 
   it('honors explicit message override', () => {
     const err = new SerializationFailureError({ message: 'custom' });
-    assert.equal(err.message, '[TURBINE_E013] custom');
+    assert.equal(err.message, '[TURBINE_E013] custom (https://turbineorm.dev/errors#e013)');
   });
 
   it('is instanceof TurbineError and Error', () => {

@@ -679,6 +679,19 @@ describe('powdb: findMany generation', () => {
     );
   });
 
+  it('select + omit together is refused, matching the SQL engines (0.65)', async () => {
+    // This path used to APPLY select-minus-omit while the SQL engines ignored
+    // the omit half, so one query projected different columns per backend.
+    // The pair is ambiguous and now refused identically everywhere.
+    const m = mockPool();
+    await assert.rejects(
+      () => qi(m).findMany({ where: {}, select: { id: true }, omit: { name: true } } as never),
+      (err: Error & { code?: string }) => err.code === 'TURBINE_E003' && /mutually exclusive/.test(err.message),
+    );
+    // All-false values carry no projection intent and do not trip the check.
+    await qi(m).findMany({ where: {}, select: { id: true }, omit: { name: false } } as never);
+  });
+
   it('in / contains / insensitive / OR operators', async () => {
     const m = mockPool();
     await qi(m).findMany({ where: { name: { in: ['a', 'b'] } } });

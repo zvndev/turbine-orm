@@ -47,8 +47,21 @@ permissions:
   # Required for npm provenance attestation
   id-token: write
 
+# Releases queue, they never cancel each other MID-RUN: cancelling a
+# half-finished publish can leave npm updated with no tag-side follow-through
+# (GitHub Release, smoke test). One shared group means a second tag pushed
+# while a release is running waits its turn instead of racing it. Known
+# limit: GitHub keeps at most ONE run PENDING per group, so a third tag
+# pushed while one runs and one waits evicts the waiter; that tag then needs
+# a re-run (or a `workflow_dispatch`) to publish. Tags here are one at a
+# time, so the queue-of-one is accepted rather than worked around.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   test:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -97,6 +110,7 @@ jobs:
   # runs the full DB-backed suite so a tag can never publish SQL that a real
   # Postgres rejects. The 14/15/16/17 matrix stays in ci.yml on push.
   integration-postgres:
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -135,6 +149,7 @@ jobs:
   # package surface (ESM import, CJS require, CLI bin, and every subpath export)
   # so a tag can never publish a broken exports map or missing dist file.
   pack-smoke:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -226,6 +241,7 @@ jobs:
   # on the release path too, not only on push. A tag cannot publish under a
   # coverage regression.
   coverage:
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -264,6 +280,7 @@ jobs:
   # module-local class), so a release can never ship an error outside the
   # documented TURBINE_E* contract.
   error-codes:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -280,6 +297,7 @@ jobs:
   # CJS too (the TS1479 class of bug, invisible at runtime). publint + attw on
   # the packed tarball, then a real .cts consumer typechecked against it.
   package-types:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -335,6 +353,7 @@ jobs:
           echo "CJS consumer typecheck OK (nodenext + node16)"
 
   publish:
+    timeout-minutes: 30
     needs: [test, integration-postgres, pack-smoke, package-types, coverage, error-codes]
     runs-on: ubuntu-latest
     steps:
@@ -424,6 +443,41 @@ jobs:
           npx turbine --version
           npx turbine --version | grep -F "$PKG_VERSION"
           echo "Post-publish smoke test passed for turbine-orm@$PKG_VERSION"
+
+      # The GitHub Release used to be a manual `gh release create` after every
+      # publish, which meant it was sometimes late and could drift from the
+      # CHANGELOG. Now the same run that publishes to npm creates it, with the
+      # release notes extracted verbatim from the version's CHANGELOG section.
+      # Idempotent: an existing release (manual or from a re-run) is left alone.
+      # Runs even when the npm publish was skipped as already-published, so a
+      # re-run can backfill a missing release without republishing.
+      - name: Create GitHub Release from CHANGELOG
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PKG_VERSION=$(jq -r .version package.json)
+          TAG="v$PKG_VERSION"
+          if gh release view "$TAG" --json tagName >/dev/null 2>&1; then
+            echo "Release $TAG already exists, leaving it alone"
+            exit 0
+          fi
+          # Extract this version's section: from its `## <version> (date)`
+          # heading (exclusive) to the next `## ` heading or EOF. The version
+          # token is stripped of anything after the digits/dots, so a heading
+          # like `## 0.65.0, subtitle` still matches (the changelog-headings
+          # guard only requires the `## X.Y.Z` prefix, and this step must not
+          # be stricter than the guard that fronts it).
+          NOTES=$(awk -v ver="$PKG_VERSION" '
+            /^## / { v = $2; sub(/[^0-9.].*$/, "", v); if (found) exit; if (v == ver) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md)
+          if [ -z "$(echo "$NOTES" | tr -d '[:space:]')" ]; then
+            echo "::error::CHANGELOG.md has no section for $PKG_VERSION, cannot build release notes"
+            exit 1
+          fi
+          echo "$NOTES" | gh release create "$TAG" --title "$TAG" --notes-file - --verify-tag
+          echo "Created GitHub Release $TAG from the CHANGELOG section"
 
       - name: Dry run, verify package
         if: ${{ github.event.inputs.dry_run == 'true' }}

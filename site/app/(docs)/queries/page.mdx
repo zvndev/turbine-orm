@@ -77,7 +77,13 @@ It is **off by default in core**, deliberately: turning it on adds an `ORDER BY`
 
 ### select / omit
 
-Pick or drop columns at the query level. Either one, not both.
+Pick or drop columns at the query level. Either one, not both: passing both in
+the same block (each naming at least one field) throws a `ValidationError`
+(`TURBINE_E003`), since 0.65 enforced rather than implied. Before that, the
+`omit` half was silently ignored next to a `select` on the SQL engines, without
+even validating its names. A `select` that names no fields (empty, or every
+value `false`) is refused the same way rather than resolving to an empty
+column list.
 
 ```ts
 // Only return id and email
@@ -162,7 +168,7 @@ Writes enforce the same boundary at the SQL level. A write against a table with 
 
 ### Pagination, `limit` / `take`, `offset`, `cursor`
 
-Offset pagination uses `limit` + `offset`. `take` is a Prisma-compatible alias for `limit`, when both are passed, `take` wins (`take ?? limit`):
+Offset pagination uses `limit` + `offset`. `take` is a Prisma-compatible alias for `limit`, when both are passed, `take` wins (`take ?? limit`). `offset` also works alone, on every engine: SQLite and MySQL reject a bare `OFFSET` at the grammar level, so their dialects emit the engine's own offset-to-end idiom (fixed in 0.65; it was a driver syntax error before).
 
 ```ts
 const page2 = await db.posts.findMany({

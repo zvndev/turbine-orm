@@ -100,6 +100,18 @@ describe('turbine-orm/mysql, dialect conformance (no Postgres leakage)', () => {
     assert.deepEqual(d.params, ['%Ada%']);
   });
 
+  it('offset without limit gets the manual-sanctioned huge LIMIT (bare OFFSET is a syntax error)', () => {
+    // MySQL has no bare OFFSET: the keyword only attaches to a LIMIT, so the
+    // Postgres-shaped ` OFFSET n` alone does not parse. The MySQL manual's own
+    // idiom for "from this offset to the end" is LIMIT 2^64-1. Found by the
+    // strategy fuzz suite hitting the same bug on sqlite.
+    const d = q().buildFindMany({ where: { id: 1 }, offset: 3 });
+    assert.match(d.sql, /LIMIT 18446744073709551615 OFFSET 3$/);
+    assert.doesNotMatch(d.sql, FORBIDDEN);
+    // Both remain inline literals, not params (same reason as LIMIT above).
+    assert.deepEqual(d.params, [1]);
+  });
+
   it('escapeStringLiteral escapes backslashes as well as quotes (MySQL, unlike Postgres)', () => {
     // MySQL treats `\` as a string escape unless NO_BACKSLASH_ESCAPES is set, so
     // the inherited Postgres rule (double `'` only) would let a key ending in a

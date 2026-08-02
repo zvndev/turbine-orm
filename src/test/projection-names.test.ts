@@ -314,3 +314,163 @@ describe('projection field names: unresolvable names are refused, not filtered o
     await client.disconnect();
   });
 });
+
+describe('projection and relation validation is data-independent (0.65)', () => {
+  // Both found by the strategy differential fuzz (strategy-fuzz.test.ts) on
+  // its first runs; these pin the exact shapes deterministically.
+
+  dbIt('select + omit together is refused on every strategy, not half-ignored', async () => {
+    if (!DatabaseSync) return;
+    // Before 0.65 a `select` made resolveProjection return early, so the
+    // `omit` half was never validated at all: a typo there passed silently
+    // while the same typo alone threw. The pair is ambiguous (Prisma refuses
+    // it, prisma-compat here already did) and now every engine refuses it.
+    const { db, schema } = fixture();
+    const client = turbineSqlite(db, schema);
+    for (const strategy of STRATEGIES) {
+      const result = await attempt(client, {
+        select: { id: true },
+        omit: { name: true },
+        relationLoadStrategy: strategy,
+      });
+      assert.equal(result.ok, false, `'${strategy}' accepted select+omit together`);
+      if (result.ok === false) {
+        assert.equal(result.code, 'TURBINE_E003', `'${strategy}' threw the wrong code`);
+        assert.match(result.message, /mutually exclusive/);
+      }
+    }
+    // All-false values on the OMIT side carry no projection intent, so the
+    // pair check does not fire; the refusal is about actual ambiguity.
+    const benign = await attempt(client, { select: { id: true }, omit: { name: false } });
+    assert.equal(benign.ok, true, 'an all-false omit next to a select must not be refused');
+    await client.disconnect();
+  });
+
+  dbIt('a select that names no fields is refused on every strategy (review-caught)', async () => {
+    if (!DatabaseSync) return;
+    // The 0.65 review found the original refusal was truthiness-decided while
+    // the resolver's branch is presence-decided, and the batched loader
+    // force-adds correlation keys to a select BEFORE resolving: an all-falsy
+    // select therefore looked populated under batched and empty under join,
+    // flipping accept/reject between strategies (`{select: {}, omit: {...}}`
+    // ran under join and threw under batched). Both shapes are now refused on
+    // the RAW args, before any adjustment, everywhere.
+    const { db, schema } = fixture();
+    const client = turbineSqlite(db, schema);
+    const posts = relTo(schema, 'author', 'post');
+    for (const strategy of STRATEGIES) {
+      for (const projection of [{ select: {} }, { select: { name: false } }, { select: {}, omit: { name: true } }]) {
+        // Top level, and buried in a relation, with a `with` present so the
+        // batched key-forcing path is live.
+        const top = await attempt(client, { ...projection, with: { [posts]: true }, relationLoadStrategy: strategy });
+        assert.equal(top.ok, false, `'${strategy}' accepted ${JSON.stringify(projection)} at the top level`);
+        if (top.ok === false) assert.equal(top.code, 'TURBINE_E003');
+
+        const nested = await attempt(client, {
+          with: { [posts]: { ...projection, orderBy: [{ id: 'asc' }] } },
+          relationLoadStrategy: strategy,
+        });
+        assert.equal(nested.ok, false, `'${strategy}' accepted ${JSON.stringify(projection)} inside a relation`);
+        if (nested.ok === false) assert.equal(nested.code, 'TURBINE_E003');
+      }
+    }
+    await client.disconnect();
+  });
+
+  dbIt('an unknown relation in `with` is E005 on every strategy', async () => {
+    if (!DatabaseSync) return;
+    // The batched loader used to throw E003 for this while the join plan threw
+    // E005, so the error CODE depended on which plan the 'auto' heuristic
+    // picked. E005 is the documented code for an unknown relation.
+    const { db, schema } = fixture();
+    const client = turbineSqlite(db, schema);
+    for (const strategy of STRATEGIES) {
+      const result = await attempt(client, { with: { nope: true }, relationLoadStrategy: strategy });
+      assert.equal(result.ok, false, `'${strategy}' accepted an unknown relation`);
+      if (result.ok === false) assert.equal(result.code, 'TURBINE_E005', `'${strategy}' threw the wrong code`);
+    }
+    await client.disconnect();
+  });
+
+  dbIt('a bad `with` tree is refused even when the base query matches nothing', async () => {
+    if (!DatabaseSync) return;
+    // The batched path returned early on zero base rows BEFORE validating the
+    // `with` tree, so the same args threw on populated data and passed on
+    // empty: acceptance depended on data, which under 'auto' means on table
+    // size. The loader now walks the tree (compile-only) with zero parents.
+    const { db, schema } = fixture();
+    const client = turbineSqlite(db, schema);
+    const posts = relTo(schema, 'author', 'post');
+    const noMatch = { name: 'zzz-no-such-author' };
+
+    // Precondition: the where really matches nothing, or this test pins air.
+    const empty = await attempt(client, { where: noMatch });
+    assert.equal(empty.ok, true);
+    assert.deepEqual(empty.ok && empty.rows, [], 'fixture drift: the no-match where matched rows');
+
+    for (const strategy of STRATEGIES) {
+      const badField = await attempt(client, {
+        where: noMatch,
+        with: { [posts]: { select: { titel: true } } },
+        relationLoadStrategy: strategy,
+      });
+      assert.equal(badField.ok, false, `'${strategy}' accepted a bad relation select on an empty result`);
+      if (badField.ok === false) assert.equal(badField.code, 'TURBINE_E003');
+
+      const badRel = await attempt(client, {
+        where: noMatch,
+        with: { nope: true },
+        relationLoadStrategy: strategy,
+      });
+      assert.equal(badRel.ok, false, `'${strategy}' accepted an unknown relation on an empty result`);
+      if (badRel.ok === false) assert.equal(badRel.code, 'TURBINE_E005');
+
+      // Two levels down, still with zero rows: the recursion is the validation
+      // walk, so depth must not re-introduce the data-dependence.
+      const badNested = await attempt(client, {
+        where: noMatch,
+        with: { [posts]: { with: { [relTo(schema, 'post', 'tag', 'manyToMany')]: { omit: { labell: true } } } } },
+        relationLoadStrategy: strategy,
+      });
+      assert.equal(badNested.ok, false, `'${strategy}' accepted a bad nested omit on an empty result`);
+      if (badNested.ok === false) assert.equal(badNested.code, 'TURBINE_E003');
+    }
+    await client.disconnect();
+  });
+
+  dbIt('findUnique validates its `with` tree on a miss too', async () => {
+    if (!DatabaseSync) return;
+    const { db, schema } = fixture();
+    const client = turbineSqlite(db, schema);
+    const posts = relTo(schema, 'author', 'post');
+    for (const strategy of ['join', 'batched', 'auto'] as const) {
+      await assert.rejects(
+        () =>
+          client.table('author').findUnique({
+            where: { id: 999_999 },
+            with: { [posts]: { select: { titel: true } } },
+            relationLoadStrategy: strategy,
+          } as never),
+        (err: Error & { code?: string }) => err.code === 'TURBINE_E003',
+        `'${strategy}' accepted a bad relation select on a findUnique miss`,
+      );
+    }
+    await client.disconnect();
+  });
+
+  dbIt('offset without limit works on sqlite (fuzz-found syntax error)', async () => {
+    if (!DatabaseSync) return;
+    // SQLite's grammar only allows OFFSET after LIMIT, so the Postgres-shaped
+    // bare ` OFFSET ?` was a syntax error; the dialect now emits LIMIT -1.
+    const { db, schema } = fixture();
+    const client = turbineSqlite(db, schema);
+    const rows = (await client
+      .table('author')
+      .findMany({ orderBy: { id: 'asc' }, offset: 1, warnOnUnlimited: false } as never)) as Array<{ id: number }>;
+    assert.deepEqual(
+      rows.map((r) => r.id),
+      [2],
+    );
+    await client.disconnect();
+  });
+});

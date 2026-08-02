@@ -152,14 +152,37 @@ src/
                       on PowDB (`PowqlInterface.projectionColumn`). Verified 0.64: EVERY other
                       caller-name site (where, orderBy, distinct, groupBy `by`, aggregate
                       targets, create/update `data`) already threw; projections were the only
-                      silent one.
+                      silent one. 0.65, two projection SHAPE refusals (E003, shared messages
+                      in utils.ts): a `select` naming no fields (empty/all-false), and
+                      `select` + `omit` together. Both are PRESENCE-decided like the resolver
+                      branch itself, and the batched loader re-asserts them on the RAW args
+                      (`assertProjectionShape`, before includeKeysForBatching force-adds
+                      correlation keys), because evaluated after the force-add an all-falsy
+                      select looks populated and the verdict flipped between strategies
+                      (review-caught). PowDB: same checks in projectedColumns + the loader's
+                      force-add site. Before 0.65 the select branch returned early so the
+                      omit half was never even name-validated on SQL engines while PowDB
+                      APPLIED select-minus-omit. Studio's chips enforce the pair rule live
+                      (choosing select clears omit and vice versa) and its emit drops a
+                      stale saved query's omit when select is non-empty.
     batched-loader.ts, The `relationLoadStrategy: 'batched'` path. Instead of the default
                       single-statement `json_agg` join, runs the base query without relation
                       subqueries, then ONE flat follow-up per relation
                       (`WHERE fk = ANY($1)`, chunked at MAX_RELATION_KEYS=32_000) and stitches
                       client-side, output byte-for-byte equal to the join strategy. Runs on
                       the caller's executor/connection (tx-safe); per-relation `limit` applied
-                      client-side per parent; composite-key relations throw E017.
+                      client-side per parent; composite-key relations throw E017. Validation
+                      is DATA-INDEPENDENT (0.65): there is deliberately no early return on
+                      zero parents/keys/children anywhere in the tree walk; each level
+                      compiles its child findMany (one SQL string build, nothing executes)
+                      before its data-dependent exit, and builder.ts invokes the loader even
+                      for an empty base result (and a findUnique miss), so accept/reject
+                      matches the join plan's compile-time validation exactly. An unknown
+                      relation name is E005 (RelationError), same code and message as the
+                      join path. The differential fuzz suite (src/test/strategy-fuzz.test.ts,
+                      join-vs-batched acceptance agreement + deep row equality on seeded
+                      random args; nightly extended run with a date-derived seed) is the
+                      regression net for this whole class.
 
     compound-unique.ts, Compound-unique where selectors (0.41): derives selector names
                       (`orgId_userId` or a declared composite-unique index name) from
@@ -387,7 +410,9 @@ src/
                         `ISNULL(…, '[]')`), `aggSupportsInlineOrderBy` (forces the
                         inner-subquery rewrite for ordered to-many on MySQL/SQLite),
                         `castAggregate`, `buildInClause`/`inClauseParam`, `buildLimitOffset`
-                        (SQL Server `OFFSET/FETCH`), `buildUpdateStatement`/
+                        (SQL Server `OFFSET/FETCH`; since 0.65 also sqlite + mysql, whose
+                        grammars reject a bare `OFFSET` so offset-without-limit emits
+                        `LIMIT -1` / `LIMIT 2^64-1` respectively), `buildUpdateStatement`/
                         `buildDeleteStatement` (mid-statement `OUTPUT`), and
                         `buildRelationSubquery` (SQL Server's `FOR JSON PATH` override).
                         `openStream()` and the `DialectIntrospector` round out the seam.
@@ -570,11 +595,19 @@ src/
                       `docs/internal/strategy/powdb-parity-matrix.md` (local-only, untracked).
 
   errors.ts        , Error hierarchy rooted at TurbineError. Each error has a code
-                      (TURBINE_E001-E017). wrapPgError() translates pg driver errors
+                      (TURBINE_E001-E018). wrapPgError() translates pg driver errors
                       (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
                       Turbine errors. UnsupportedFeatureError (E017) is thrown directly
                       (not via wrapPgError) when a non-Postgres engine hits a Postgres-only
-                      feature.
+                      feature. 0.65: every TurbineError carries `.docsUrl`
+                      (`https://turbineorm.dev/errors#eNNN` via docsUrlForCode) and
+                      formatErrorMessage suffixes the message with that link ONCE,
+                      idempotently (skipped when a `turbineorm.dev/errors#` link is already
+                      in the text, so rewrapping never duplicates it). The errors page has an
+                      `<a id="eNNN">` anchor per code; src/test/error-docs-sync.test.ts fails
+                      the unit lane when a code has no docs row/anchor or a row outlives its
+                      code. Message TEXT stays non-contract (STABILITY.md); the code tag and
+                      `.docsUrl` are the stable parts.
 
   nested-write.ts  , Nested-write engine. Tree-walking create/update that resolves
                       relation fields in `data` (create, connect, connectOrCreate,
@@ -863,5 +896,5 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 - Don't reference internal project names, client names, the applications findings were reported from, or internal planning documents in ANY tracked file, code comments, test names, CHANGELOG, release notes, commit messages, site. This repo is public. Describe changes by what they do, never by who asked for them or where feedback came from. `docs/internal/` and `AGENTS.md` are gitignored (local-only); the pre-commit hook enforces a private blocklist via `scripts/check-private-terms.mjs` + `.private-terms`.
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings, always use `$N` parameterization
-- Don't import `client.ts` from `query/` (would create circular dependency)
+- Don't import `client.ts` from `query/` or `cli/` (would create a circular dependency). Since 0.65 this is machine-enforced by `scripts/check-import-cycles.mjs` (`npm run check:cycles`, in CI's lint job and prepublishOnly): no STATIC VALUE import; `import type` and the one sanctioned dynamic `await import('../client.js')` in query/builder.ts (interactive transactions need TransactionClient at call time) are allowed.
 - Don't register type parsers outside the TurbineClient constructor

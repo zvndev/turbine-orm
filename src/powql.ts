@@ -89,7 +89,13 @@ import type {
 // are unlocked ONLY by the UNSAFE symbol, on this engine exactly as on the SQL
 // engines, so a spread request body cannot turn either on here either.
 import { assertDirectionToken, resolveUnsafeFlag, UNSAFE } from './query/types.js';
-import { escapeLike, ownLookup, relationInProjectionMessage } from './query/utils.js';
+import {
+  escapeLike,
+  ownLookup,
+  relationInProjectionMessage,
+  selectNamesNothingMessage,
+  selectOmitExclusiveMessage,
+} from './query/utils.js';
 import { assertJsonFilterKeys, jsonStringEntries } from './query/where.js';
 import {
   type ColumnMetadata,
@@ -1100,6 +1106,23 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     omit?: Record<string, boolean>,
     includePii?: boolean,
   ): string[] {
+    // Same two shape refusals as `resolveProjection` on the SQL engines, with
+    // the shared messages, and for a live reason here: this path used to
+    // APPLY select-minus-omit while the SQL engines ignored the `omit` half,
+    // so one query meant different columns depending on the backend. And a
+    // zero-key/all-false select used to fall through to the DEFAULT
+    // projection here while the SQL engines emitted broken or empty rows;
+    // both shapes are ambiguous and now refused identically on every engine.
+    // Presence-decided, exactly like resolveProjection (see its comment for
+    // the strategy-flip this prevents).
+    if (select) {
+      if (!Object.values(select).some(Boolean)) {
+        throw new ValidationError(selectNamesNothingMessage(this.table));
+      }
+      if (omit && Object.values(omit).some(Boolean)) {
+        throw new ValidationError(selectOmitExclusiveMessage(this.table));
+      }
+    }
     const pk = new Set(this.meta.primaryKey);
     let cols = this.meta.columns.map((c) => c.name);
     const hasSelect = select && Object.keys(select).length;
@@ -1750,6 +1773,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // stitching (the join path already gets this for free via `__tpk`).
       const userSelect = options.select as Record<string, boolean> | undefined;
       const userOmit = options.omit as Record<string, boolean> | undefined;
+      // The RAW shape rules, before the force-add below: the forced key makes
+      // an all-falsy select look populated to the child's projectedColumns,
+      // which would accept here what the nested-projection path refuses. Same
+      // messages as the SQL engines' assertProjectionShape, same reason.
+      if (userSelect) {
+        if (!Object.values(userSelect).some(Boolean)) {
+          throw new ValidationError(selectNamesNothingMessage(targetMeta.name));
+        }
+        if (userOmit && Object.values(userOmit).some(Boolean)) {
+          throw new ValidationError(selectOmitExclusiveMessage(targetMeta.name));
+        }
+      }
       const fkProjected = userSelect ? Boolean(userSelect[childKeyField]) : userOmit ? !userOmit[childKeyField] : true;
       let fetchOptions: FindManyArgs<object> = options;
       if (!fkProjected) {

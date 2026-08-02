@@ -182,6 +182,30 @@ export default [
     modifyEsbuildConfig: nodePlatform,
   },
   {
+    name: 'cli entry: turbine-orm/cli (config helper only)',
+    // `turbine-orm/cli` exports defineConfig/loadConfig, not the CLI itself
+    // (the bin is dist/cli/index.js and ships whole either way). Measured
+    // 2026-08-02 at 1.71 kB. The budget guards the same property as
+    // prisma-compat's: this entry must stay an order of magnitude below the
+    // core-graph entries. A turbine.config.ts imports it, so if it ever pulls
+    // the client/query graph, every config load pays for the whole ORM.
+    path: 'dist/cli/config.js',
+    limit: '3 kB',
+    ignore: ['pg'],
+    modifyEsbuildConfig: nodePlatform,
+  },
+  {
+    name: 'adapters entry: turbine-orm/adapters (operation overrides only)',
+    // Thin per-engine operation overrides (cockroachdb/yugabytedb SQL swaps)
+    // with no core-graph import. Measured 2026-08-02 at 1.13 kB. Previously
+    // unmeasured, so a core import creeping in shipped invisibly; these two
+    // were the only published subpaths without a budget.
+    path: 'dist/adapters/index.js',
+    limit: '3 kB',
+    ignore: ['pg'],
+    modifyEsbuildConfig: nodePlatform,
+  },
+  {
     name: 'prisma-compat entry: turbine-orm/prisma-compat (adapter only)',
     // A pure shim: it wraps a TurbineClient the caller already has, so the core
     // graph is NOT bundled with it. If this number jumps toward the other

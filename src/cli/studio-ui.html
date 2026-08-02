@@ -2873,7 +2873,11 @@
         if (localArgs.select && localArgs.select.length) {
           out.select = Object.fromEntries(localArgs.select.map((c) => [BuilderArgs.fieldName(tableMeta, c), true]));
         }
-        if (localArgs.omit && localArgs.omit.length) {
+        // select + omit together is refused by the ORM (mutually exclusive),
+        // and the chips enforce that live; this guard covers a SAVED query
+        // from before the rule, where both lists survived on disk. select wins
+        // because it is the more explicit of the two.
+        if (localArgs.omit && localArgs.omit.length && !(localArgs.select && localArgs.select.length)) {
           out.omit = Object.fromEntries(localArgs.omit.map((c) => [BuilderArgs.fieldName(tableMeta, c), true]));
         }
         return out;
@@ -4825,7 +4829,10 @@
                 if (active) args.select = args.select.filter((x) => x !== c.name);
                 else {
                   args.select.push(c.name);
-                  args.omit = args.omit.filter((x) => x !== c.name);
+                  // select and omit are mutually exclusive on the ORM side, so
+                  // picking a select chip switches modes: the whole omit list
+                  // clears, not just this column.
+                  args.omit = [];
                 }
                 BuilderPane.render();
               },
@@ -4852,7 +4859,8 @@
                 if (active) args.omit = args.omit.filter((x) => x !== c.name);
                 else {
                   args.omit.push(c.name);
-                  args.select = args.select.filter((x) => x !== c.name);
+                  // Mirror of the select chips: omitting switches modes.
+                  args.select = [];
                 }
                 BuilderPane.render();
               },

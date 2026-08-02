@@ -1713,7 +1713,7 @@ export class TurbineClient {
     if (value === undefined) return undefined;
     if (value !== 'null' && value !== 'preserve') {
       throw new ValidationError(
-        `Invalid temporalInfinity: ${JSON.stringify(value)}. Expected 'preserve' (default: read a Postgres ` +
+        `[turbine] Invalid temporalInfinity: ${JSON.stringify(value)}. Expected 'preserve' (default: read a Postgres ` +
           'temporal `infinity` as the JS number `Infinity` / `-Infinity`, which round-trips through a write ' +
           "but breaks the declared `Date` type) or 'null' (read it as null, which serializes cleanly but " +
           'makes it indistinguishable from a stored NULL, so a read-modify-write destroys the value).',

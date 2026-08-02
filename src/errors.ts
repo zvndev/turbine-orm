@@ -30,21 +30,45 @@ export const TurbineErrorCode = {
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
 
 /**
+ * The docs page anchor for a code: `TURBINE_E003` -> `.../errors#e003`.
+ *
+ * Every code has a row on that page (enforced by a unit test that reads the
+ * MDX source, so a new code cannot ship without its docs entry). The URL is
+ * carried both in the message and as {@link TurbineError.docsUrl} so
+ * structured sinks (Sentry, pino) get it without parsing text.
+ */
+function docsUrlForCode(code: TurbineErrorCode): string {
+  return `https://turbineorm.dev/errors#${code.slice('TURBINE_'.length).toLowerCase()}`;
+}
+
+/**
  * Prefix a human message with its stable error code so logs are greppable
- * without requiring structured field access. Idempotent if the message already
- * starts with `[TURBINE_E0NN]`.
+ * without requiring structured field access, and suffix it with the docs URL
+ * for the code so a log line is one click from its explanation. Idempotent on
+ * both ends: a message already starting with `[TURBINE_E0NN]` keeps its tag,
+ * and one already carrying THIS code's link (a same-code re-wrap) does not
+ * gain a second. The check is code-specific on purpose: a message embedding a
+ * DIFFERENT code's error text (say an E003 wrapped into an E017) still gets
+ * its own code's link appended, so the trailing link always agrees with
+ * `.docsUrl` and the outermost code.
+ *
+ * STABILITY.md declares message TEXT non-contract (only the code tag is), so
+ * adding the suffix is not a breaking change; branch on `err.code`, never on
+ * the message.
  */
 function formatErrorMessage(code: TurbineErrorCode, message: string): string {
   const tag = `[${code}]`;
-  if (message.startsWith(tag)) return message;
+  const link = message.includes(docsUrlForCode(code)) ? '' : ` (${docsUrlForCode(code)})`;
   // Empty message → just the code (defensive; callers always pass text today).
-  if (!message) return tag;
-  return `${tag} ${message}`;
+  const body = message.startsWith(tag) ? message : message ? `${tag} ${message}` : tag;
+  return `${body}${link}`;
 }
 
 /** Base error class for all Turbine errors */
 export class TurbineError extends Error {
   readonly code: TurbineErrorCode;
+  /** Docs page for this code, e.g. `https://turbineorm.dev/errors#e003`. */
+  readonly docsUrl: string;
 
   constructor(code: TurbineErrorCode, message: string, options?: { cause?: unknown }) {
     // The cause is redacted in 'safe' mode (see redactCauseForMode). Only pass
@@ -56,6 +80,7 @@ export class TurbineError extends Error {
     super(formatErrorMessage(code, message), opts);
     this.name = 'TurbineError';
     this.code = code;
+    this.docsUrl = docsUrlForCode(code);
   }
 }
 
