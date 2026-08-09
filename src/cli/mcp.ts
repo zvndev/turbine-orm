@@ -4,15 +4,10 @@ import { dirname, resolve } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import pg from 'pg';
 import { findMissingRelationIndexes } from '../index-advisor.js';
-import {
-  addAutoManyToManyRelations,
-  buildRelationsFromForeignKeys,
-  type ForeignKeyEntry,
-  isUnknownTsType,
-} from '../introspect.js';
+import { deriveCatalogRelations, type ForeignKeyEntry } from '../introspect.js';
 import type { FindManyArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
-import { registerUtcTemporalParsers } from '../query/utils.js';
+import { ownLookup, registerUtcTemporalParsers } from '../query/utils.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -25,6 +20,7 @@ import {
   type TableMetadata,
 } from '../schema.js';
 import { listMigrationFiles } from './migrate.js';
+import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
 import { redactUrl } from './ui.js';
 
@@ -731,7 +727,11 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
     }
 
     // QueryInterface emits unqualified identifiers; pin search_path like Studio.
-    await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
+    // The bound value's CONTENTS are parsed as an identifier list, so the name
+    // has to carry its own quotes: a raw `My.Schema` pins search_path to nothing
+    // and the statement below fails with `relation "..." does not exist`, while
+    // a raw mixed-case name silently case-folds onto a different schema.
+    await client.query(`SELECT set_config('search_path', $1, true)`, [quoteIdent(ctx.options.schema)]);
     const result = await client.query(`EXPLAIN (FORMAT JSON) ${deferred.sql}`, deferred.params);
     return {
       table: table.name,
@@ -741,19 +741,6 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
     };
   });
 }
-
-/** Relation-filter wrappers whose body is a clause against the relation's target. */
-const RELATION_FILTER_WRAPPERS = ['some', 'none', 'every', 'is', 'isNot'] as const;
-
-/**
- * Recursion bound for the PII guard walk. Reaching it REFUSES the request, it
- * is not a quiet stop: returning at the cap would mean a payload padded with
- * enough nested `NOT` wrappers walks the guard off the end of its own recursion
- * and then hands the untouched predicate to the builder. Sits far above the
- * builder's own depth-10 relation cap, so nothing buildable is refused for
- * depth alone.
- */
-const PII_GUARD_MAX_DEPTH = 32;
 
 /**
  * Refuse an `explain_query` that filters or sorts on a hidden column: one that
@@ -776,9 +763,12 @@ const PII_GUARD_MAX_DEPTH = 32;
  * refuse the predicate. It matches the rule the rest of the codebase already
  * states: predicates on PII are allowed IN THE ORM because they return no
  * value, and that reasoning stops holding the moment the query's SELECTIVITY is
- * itself the reply. Studio drew the same line for the same reason
- * (`assertNoPiiPredicates`, and its `filters` param refuses even `isNull`,
- * because null-ness is an oracle too).
+ * itself the reply. Studio drew the same line for the same reason, which is why
+ * the WALK is now one shared module (`cli/pii-predicate-guard.ts`) rather than a
+ * second copy of it here: the two copies had the same job, the same name, and
+ * the same hole, and only a shared walk makes closing it once close it in both.
+ * What stays here is the part that is genuinely the MCP server's: the two
+ * reasons a column is hidden, and a JSON-RPC refusal.
  *
  * `select` is NOT refused: explain returns no rows, and naming a column reveals
  * nothing about its contents.
@@ -803,85 +793,46 @@ function assertNoPiiPredicates(
     );
   }
 
-  const assertWithinDepth = (depth: number): void => {
-    if (depth <= PII_GUARD_MAX_DEPTH) return;
-    throw jsonRpcError(
-      -32602,
-      `Query is nested more than ${PII_GUARD_MAX_DEPTH} levels deep, past the point where the PII guard can ` +
-        `prove it does not filter or sort on a tagged column, so it is refused. Flatten the query.`,
-    );
-  };
-
-  const refuse = (owner: TableMetadata, column: string, why: string): never => {
-    throw jsonRpcError(
-      -32602,
-      `Column "${column}" on "${owner.name}" ${why}, so it cannot be used in a where or orderBy here: ` +
-        `EXPLAIN reports the planner's row estimate, and the estimate for a predicate on a hidden value ` +
-        `reveals that value one character at a time. Filter on a visible column instead.`,
-    );
-  };
-
-  /**
-   * Why this column may not appear in a predicate, or null when it may.
-   *
-   * The two reasons are the two `sample_rows` already refuses to FETCH
-   * (`classifyHiddenColumns`), and they are deliberately the same set: a column
-   * whose bytes are too sensitive to sample is too sensitive to binary-search
-   * out of the planner. A column absent from the table is not judged here, the
-   * builder rejects it by name a moment later.
-   */
-  const hiddenReason = (owner: TableMetadata, column: string): string | null => {
-    if (owner.columns.some((col) => col.name === column && col.pii === true)) return 'is PII-tagged';
-    if (SECRET_NAME_PATTERN.test(column)) return 'has a secret-looking name';
-    return null;
-  };
-
-  const visitClause = (node: unknown, owner: TableMetadata | undefined, depth: number): void => {
-    assertWithinDepth(depth);
-    if (!owner || node === null || typeof node !== 'object') return;
-    // `orderBy` accepts an array of single-key objects, and so does a `NOT`
-    // list. Element order carries no nesting, so the depth is unchanged.
-    if (Array.isArray(node)) {
-      for (const item of node) visitClause(item, owner, depth);
-      return;
-    }
-    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-      if (key === 'AND' || key === 'OR' || key === 'NOT') {
-        visitClause(value, owner, depth + 1);
-        continue;
-      }
-      const relation = Object.hasOwn(owner.relations, key) ? owner.relations[key] : undefined;
-      if (relation) {
-        visitRelationValue(value, metadata.tables[relation.to], depth + 1);
-        continue;
-      }
-      // A predicate may name a column by its camelCase field OR by its real
-      // column name; both compile to the same SQL, so both have to be checked.
-      const column = Object.hasOwn(owner.columnMap, key) ? owner.columnMap[key]! : key;
-      const why = hiddenReason(owner, column);
-      if (why) refuse(owner, column, why);
-    }
-  };
-
-  /**
-   * A relation predicate arrives either bare (`{ user: { email: {...} } }`) or
-   * wrapped in a cardinality operator (`{ user: { is: { email: {...} } } }`),
-   * and BOTH resolve against the relation's target. Walking the wrapper as if
-   * `is` were a column of the target would skip the inner clause entirely, so
-   * descend into every wrapper member AND into the node itself.
-   */
-  const visitRelationValue = (value: unknown, target: TableMetadata | undefined, depth: number): void => {
-    assertWithinDepth(depth);
-    if (!target || value === null || typeof value !== 'object') return;
-    const node = value as Record<string, unknown>;
-    for (const wrapper of RELATION_FILTER_WRAPPERS) {
-      if (Object.hasOwn(node, wrapper)) visitClause(node[wrapper], target, depth + 1);
-    }
-    visitClause(node, target, depth);
-  };
-
-  visitClause(args.where, table, 0);
-  visitClause(args.orderBy, table, 0);
+  assertNoPiiPredicatesShared(args, table, {
+    metadata,
+    /**
+     * Why this column may not appear in a predicate, or null when it may.
+     *
+     * The two reasons are the two `sample_rows` already refuses to FETCH
+     * (`classifyHiddenColumns`), and they are deliberately the same set: a
+     * column whose bytes are too sensitive to sample is too sensitive to
+     * binary-search out of the planner. A column absent from the table is not
+     * judged here, the builder rejects it by name a moment later.
+     */
+    hiddenReason: (owner, column) => {
+      if (owner.columns.some((col) => col.name === column && col.pii === true)) return 'is PII-tagged';
+      if (SECRET_NAME_PATTERN.test(column)) return 'has a secret-looking name';
+      return null;
+    },
+    refuseColumn: (owner, column, why) => {
+      throw jsonRpcError(
+        -32602,
+        `Column "${column}" on "${owner.name}" ${why}, so it cannot be used in a where or orderBy here: ` +
+          `EXPLAIN reports the planner's row estimate, and the estimate for a predicate on a hidden value ` +
+          `reveals that value one character at a time. Filter on a visible column instead.`,
+      );
+    },
+    refuseDepth: (maxDepth) => {
+      throw jsonRpcError(
+        -32602,
+        `Query is nested more than ${maxDepth} levels deep, past the point where the PII guard can ` +
+          `prove it does not filter or sort on a tagged column, so it is refused. Flatten the query.`,
+      );
+    },
+    refuseShape: (owner, key) => {
+      throw jsonRpcError(
+        -32602,
+        `The PII guard does not recognize "${key}" in a query on "${owner.name}", so it cannot prove the ` +
+          `query does not filter or sort on a hidden column, and refuses it rather than guessing. ` +
+          `Remove it and explain the query without it.`,
+      );
+    },
+  });
 }
 
 /**
@@ -1047,42 +998,116 @@ async function loadSchemaMetadata(client: pg.PoolClient, options: McpServerOptio
       [options.schema],
     ),
     client.query<{ table_name: string; column_name: string }>(
+      // Joined on the table as well as the constraint name. Not because two
+      // primary keys can share a name (they cannot: a PK is backed by an INDEX,
+      // and index names ARE unique per schema, so Postgres itself refuses the
+      // second `CREATE TABLE ... CONSTRAINT pk_shared PRIMARY KEY` with
+      // `relation "pk_shared" already exists`, verified on PG 16) but because
+      // the join reads as if the name were the identity, which is what put the
+      // FOREIGN KEY query below one refactor away from a silent cross product.
+      // A foreign key has no backing index and so genuinely can collide.
       `SELECT tc.table_name, kcu.column_name
        FROM information_schema.table_constraints tc
        JOIN information_schema.key_column_usage kcu
-         ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+         ON tc.constraint_name = kcu.constraint_name
+        AND tc.table_schema = kcu.table_schema
+        AND tc.table_name = kcu.table_name
        WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1
        ORDER BY tc.table_name, kcu.ordinal_position`,
       [options.schema],
     ),
+    // Foreign keys come from pg_catalog, not information_schema, and the reason
+    // is the same one written up over `SQL_FOREIGN_KEYS` in ../introspect.ts
+    // (KEEP THE TWO IN LOCKSTEP: this is a second copy of that query because
+    // introspect.ts does not export it, and mcp reads through its own pooled
+    // client inside a read-only transaction rather than opening the pool
+    // `introspect()` owns). The information_schema formulation this replaces
+    // joined key_column_usage (constrained columns) to constraint_column_usage
+    // (referenced columns) on the constraint NAME, which is wrong twice:
+    //
+    //   1. Those two column lists have no positional link, so the join is an
+    //      N-by-N cross product: a two-column FK came back as four rows and
+    //      grouped into four AND-ed correlations, two of them pairing the wrong
+    //      columns. Every read through the relation silently returned nothing.
+    //   2. A constraint name is unique per TABLE (conrelid, conname), not per
+    //      schema, so two tables may both have a `shared_fk`. This is specific
+    //      to foreign keys: a PRIMARY KEY or UNIQUE constraint is backed by an
+    //      index and index names ARE schema-unique, so Postgres refuses that
+    //      collision outright, while an FK has no backing index and the
+    //      collision is legal. On the name alone the two cross: measured on PG
+    //      16, two tables with a `shared_fk` produced EIGHT rows instead of two,
+    //      which grouped by name into one entry, so one table lost its relation
+    //      entirely and the other pointed at a column its target does not have
+    //      (42703 at query time). Which one won depended on catalog row order.
+    //
+    // conkey and confkey are parallel arrays, so unnesting BOTH `WITH
+    // ORDINALITY` and joining on the ordinal IS the pairing, exactly; the OID is
+    // the grouping key because it is unique catalog-wide.
+    //
+    // The target is constrained to the SAME schema, which is what the old query
+    // did implicitly (it joined on ccu.table_schema). Keeping it explicit
+    // matters: `buildRelations` resolves targets by bare name against the
+    // introspected table set, so a cross-schema reference to a same-named table
+    // would silently bind to the local one.
+    //
+    // `conparentid = 0` (declared constraints only) and the by-NAME ordering are
+    // both part of the lockstep: one FK against a partitioned table otherwise
+    // yields an extra phantom relation per partition, and ordering by `con.oid`
+    // makes relation naming a function of DDL execution order rather than of the
+    // schema. Both are written up at length over SQL_FOREIGN_KEYS.
     client.query<{
+      constraint_oid: string;
       source_table: string;
       source_column: string;
       target_table: string;
       target_column: string;
       constraint_name: string;
     }>(
-      `SELECT tc.table_name AS source_table, kcu.column_name AS source_column,
-              ccu.table_name AS target_table, ccu.column_name AS target_column, tc.constraint_name
-       FROM information_schema.table_constraints tc
-       JOIN information_schema.key_column_usage kcu
-         ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-       JOIN information_schema.constraint_column_usage ccu
-         ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
-       WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1`,
+      `SELECT
+         con.oid::text AS constraint_oid,
+         con.conname AS constraint_name,
+         src.relname AS source_table,
+         src_att.attname AS source_column,
+         tgt.relname AS target_table,
+         tgt_att.attname AS target_column
+       FROM pg_catalog.pg_constraint con
+       JOIN pg_catalog.pg_class src ON src.oid = con.conrelid
+       JOIN pg_catalog.pg_namespace src_ns ON src_ns.oid = src.relnamespace
+       JOIN pg_catalog.pg_class tgt ON tgt.oid = con.confrelid
+       JOIN pg_catalog.pg_namespace tgt_ns ON tgt_ns.oid = tgt.relnamespace
+       JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS sk(attnum, ord) ON TRUE
+       JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS tk(attnum, ord) ON tk.ord = sk.ord
+       JOIN pg_catalog.pg_attribute src_att
+         ON src_att.attrelid = con.conrelid AND src_att.attnum = sk.attnum
+       JOIN pg_catalog.pg_attribute tgt_att
+         ON tgt_att.attrelid = con.confrelid AND tgt_att.attnum = tk.attnum
+       WHERE con.contype = 'f'
+         AND con.conparentid = 0
+         AND src_ns.nspname = $1
+         AND tgt_ns.nspname = src_ns.nspname
+       ORDER BY src.relname, con.conname, sk.ord`,
       [options.schema],
     ),
     client.query<{ table_name: string; constraint_name: string; column_name: string }>(
+      // Joined on the table too, same reasoning as the primary-key query above:
+      // a UNIQUE constraint is index-backed and therefore cannot collide, and
+      // the join says so.
       `SELECT tc.table_name, tc.constraint_name, kcu.column_name
        FROM information_schema.table_constraints tc
        JOIN information_schema.key_column_usage kcu
-         ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+         ON tc.constraint_name = kcu.constraint_name
+        AND tc.table_schema = kcu.table_schema
+        AND tc.table_name = kcu.table_name
        WHERE tc.constraint_type = 'UNIQUE' AND tc.table_schema = $1
        ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`,
       [options.schema],
     ),
     client.query<{ tablename: string; indexname: string; indexdef: string }>(
-      `SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = $1`,
+      // Ordered for the same reason SQL_INDEXES is: these rows feed the
+      // unique-set detection that decides hasOne-versus-hasMany, and they are
+      // reported verbatim by the schema tools, so physical catalog order must
+      // not leak into either answer. Index names are unique per schema.
+      `SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = $1 ORDER BY tablename, indexname`,
       [options.schema],
     ),
     client.query<{ typname: string; enumlabel: string }>(
@@ -1178,7 +1203,15 @@ async function loadSchemaMetadata(client: pg.PoolClient, options: McpServerOptio
     enums[row.typname] = labels;
   }
 
-  const relationsByTable = buildRelations(tableNames, columnsByTable, pkByTable, fkResult.rows, enums);
+  const relationsByTable = buildRelations(
+    tableNames,
+    columnsByTable,
+    pkByTable,
+    fkResult.rows,
+    uniqueByTable,
+    indexesByTable,
+    enums,
+  );
   const tables: Record<string, TableMetadata> = {};
   for (const tableName of tableNames) {
     const columns = columnsByTable.get(tableName) ?? [];
@@ -1241,6 +1274,14 @@ async function loadSchemaMetadata(client: pg.PoolClient, options: McpServerOptio
 }
 
 interface ForeignKeyRow {
+  /**
+   * `pg_constraint.oid` as text. THE grouping key: a constraint NAME is unique
+   * only per table (conrelid, conname), so two tables in one schema may both
+   * have a `shared_fk` and grouping on the name alone merges them, which loses
+   * one table's relation entirely and points the other at a column its target
+   * does not have. The OID is unique catalog-wide.
+   */
+  constraint_oid: string;
   source_table: string;
   source_column: string;
   target_table: string;
@@ -1249,25 +1290,43 @@ interface ForeignKeyRow {
 }
 
 /**
- * Group raw FK rows into constraint-level entries and delegate relation
- * naming to the SHARED introspection builder (`buildRelationsFromForeignKeys`
- * + `addAutoManyToManyRelations` in ../introspect.ts). MCP previously carried
- * a stale copy of a retired naming scheme, so `turbine mcp` and `turbine
- * generate` derived DIFFERENT relation names from the same database.
- * Exported for the parity unit test.
+ * Group raw FK rows into constraint-level entries and delegate relation naming
+ * to `deriveCatalogRelations` in ../introspect.ts, the SAME entry point
+ * `turbine generate` goes through. MCP introspects for itself (it cannot assume
+ * generated metadata exists), so any divergence here is a divergence a live MCP
+ * client trips over: it reads a relation name out of the MCP schema tool, passes
+ * it back in a query, and the core builder rejects it.
+ *
+ * MCP used to assemble the pipeline by hand and drifted twice over, both times
+ * by OMITTING an optional argument, which is silently type-correct and changes
+ * the answer: without `uniqueSetsByTable` a UNIQUE foreign key came back as
+ * `users.profiles` (hasMany) where generate said `users.profile` (hasOne), and
+ * without `uniqueIndexColsByTable` every Prisma-style PK-less junction lost its
+ * auto-m2m relations. Passing the whole input set to one shared function is what
+ * makes those two failures impossible rather than merely fixed.
+ *
+ * `uniqueByTable` and `indexesByTable` are therefore REQUIRED parameters, not
+ * optional ones: an optional catalog input is exactly how the hasOne flip went
+ * missing here in the first place. Exported for the parity unit test.
  */
 export function buildRelations(
   tableNames: string[],
   columnsByTable: Map<string, ColumnMetadata[]>,
   pkByTable: Map<string, string[]>,
   rows: ForeignKeyRow[],
+  uniqueByTable: Map<string, string[][]>,
+  indexesByTable: Map<string, IndexMetadata[]>,
   enums: Record<string, string[]> = {},
 ): Map<string, Record<string, RelationDef>> {
   const tableSet = new Set(tableNames);
   const groups = new Map<string, ForeignKeyEntry>();
   for (const row of rows) {
     if (!tableSet.has(row.source_table) || !tableSet.has(row.target_table)) continue;
-    const group = groups.get(row.constraint_name) ?? {
+    // Keyed on the constraint OID, never the name: see ForeignKeyRow. The query
+    // orders by (source table, constraint name, source ordinal), so the two
+    // column lists stay paired and the walk order does not depend on the order
+    // the constraints happened to be created in.
+    const group = groups.get(row.constraint_oid) ?? {
       sourceTable: row.source_table,
       sourceColumns: [],
       targetTable: row.target_table,
@@ -1276,38 +1335,18 @@ export function buildRelations(
     };
     group.sourceColumns.push(row.source_column);
     group.targetColumns.push(row.target_column);
-    groups.set(row.constraint_name, group);
-  }
-  const foreignKeys = [...groups.values()];
-
-  const columnFieldsByTable = new Map<string, Set<string>>();
-  const unknownTypedFieldsByTable = new Map<string, Set<string>>();
-  for (const [tbl, cols] of columnsByTable) {
-    columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
-    // Enum-typed columns also report tsType 'unknown', but the generated type
-    // layer gives them a concrete union, only json/jsonb qualify as shadows.
-    unknownTypedFieldsByTable.set(
-      tbl,
-      new Set(cols.filter((c) => isUnknownTsType(c.tsType) && !Object.hasOwn(enums, c.pgType)).map((c) => c.field)),
-    );
+    groups.set(row.constraint_oid, group);
   }
 
-  const relations = buildRelationsFromForeignKeys(
-    foreignKeys,
-    columnFieldsByTable,
-    undefined,
-    unknownTypedFieldsByTable,
-  );
-  addAutoManyToManyRelations(
+  return deriveCatalogRelations({
     tableNames,
-    foreignKeys,
+    foreignKeys: [...groups.values()],
     pkByTable,
-    new Map(Array.from(columnsByTable, ([tbl, cols]) => [tbl, cols.map((c) => c.name)])),
-    relations,
-    columnFieldsByTable,
-    unknownTypedFieldsByTable,
-  );
-  return relations;
+    columnsByTable,
+    uniqueByTable,
+    indexesByTable,
+    enums,
+  });
 }
 
 async function estimateRows(client: pg.PoolClient, schema: string): Promise<Map<string, number>> {
@@ -1324,7 +1363,7 @@ async function estimateRows(client: pg.PoolClient, schema: string): Promise<Map<
 }
 
 function requireTable(metadata: SchemaMetadata, tableName: string): TableMetadata {
-  const table = metadata.tables[tableName];
+  const table = ownLookup(metadata.tables, tableName);
   if (!table) {
     const available = Object.keys(metadata.tables).join(', ') || '(none)';
     throw jsonRpcError(-32602, `Unknown table "${tableName}". Available: ${available}`);

@@ -51,7 +51,19 @@ export interface CreateIndexSqlOptions {
    * it must also carry the `-- turbine:no-transaction` directive.
    */
   concurrently?: boolean;
-  /** Emit `IF NOT EXISTS` (default true, required for idempotent no-transaction migrations). */
+  /**
+   * Emit `IF NOT EXISTS`. Defaults to true for the plain (in-transaction) form
+   * and FALSE when `concurrently` is set.
+   *
+   * `IF NOT EXISTS` matches on the index NAME, never on its validity, so over
+   * the INVALID index a failed concurrent build leaves behind it silently
+   * no-ops: the migration records as applied, the index doctor reported is
+   * still missing, and the documented remedy (DROP INDEX CONCURRENTLY, then
+   * rerun) is unreachable through `migrate up` because the rerun no-ops too.
+   * The concurrent form gets its idempotency from a preceding
+   * `DROP INDEX CONCURRENTLY IF EXISTS` instead; see
+   * {@link buildCreateIndexStatements}, which is what the CLI emits.
+   */
   ifNotExists?: boolean;
   /**
    * Emit a partial index `... WHERE <col> IS NOT NULL`. Only applied for a
@@ -75,13 +87,48 @@ export function buildCreateIndexSql(
   options: CreateIndexSqlOptions = {},
 ): string {
   const concurrently = options.concurrently ? 'CONCURRENTLY ' : '';
-  const ifNotExists = options.ifNotExists === false ? '' : 'IF NOT EXISTS ';
+  // Default differs by form: the plain statement runs inside a transaction and
+  // can never leave an INVALID corpse, so IF NOT EXISTS is a pure win there.
+  // The CONCURRENTLY form can, and IF NOT EXISTS would then match that corpse
+  // by name and skip the rebuild forever (see CreateIndexSqlOptions).
+  const wantIfNotExists = options.ifNotExists ?? !options.concurrently;
+  const ifNotExists = wantIfNotExists ? 'IF NOT EXISTS ' : '';
   const cols = columns.map(quoteIdent).join(', ');
   let sql = `CREATE INDEX ${concurrently}${ifNotExists}${quoteIdent(indexName)} ON ${quoteIdent(table)} (${cols})`;
   if (options.partialNotNull && columns.length === 1 && columns[0] !== undefined) {
     sql += ` WHERE ${quoteIdent(columns[0])} IS NOT NULL`;
   }
   return `${sql};`;
+}
+
+/**
+ * The statement SEQUENCE that builds one fix index and converges on a VALID
+ * index however many times it is rerun.
+ *
+ * A no-transaction migration is recorded only after ALL its statements succeed,
+ * so a mid-file failure leaves earlier indexes built and the migration
+ * unrecorded: a rerun must be safe. The old answer was `CREATE INDEX
+ * CONCURRENTLY IF NOT EXISTS`, which is safe but not CONVERGENT: a concurrent
+ * build that fails partway leaves an INVALID index with the right name, and
+ * every subsequent run skips it. Measured: the index was INVALID before the fix
+ * migration, `migrate up` reported 1 applied and 0 errors, and the index was
+ * still INVALID after.
+ *
+ * So the concurrent form drops first instead. `DROP INDEX CONCURRENTLY IF
+ * EXISTS` is a no-op on the first run (the index is missing, which is why
+ * doctor proposed it), and on a rerun it clears the corpse so the CREATE
+ * actually rebuilds. Neither statement takes a blocking lock, and both are
+ * legal only outside a transaction, which this file already is.
+ */
+export function buildCreateIndexStatements(
+  table: string,
+  columns: string[],
+  indexName: string,
+  options: CreateIndexSqlOptions = {},
+): string[] {
+  const create = buildCreateIndexSql(table, columns, indexName, options);
+  if (!options.concurrently) return [create];
+  return [buildDropIndexSql(indexName, { concurrently: true, ifExists: true }), create];
 }
 
 /** Build the matching `DROP INDEX` statement. `concurrently` requires no-transaction execution. */

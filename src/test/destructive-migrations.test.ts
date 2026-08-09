@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { scanDestructiveSql } from '../cli/destructive.js';
-import { migrateDown, migrateUp } from '../cli/migrate.js';
+import { findTransactionControlStatements, migrateDown, migrateUp } from '../cli/migrate.js';
+import { splitSqlStatements } from '../cli/sql-statements.js';
 import { skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
@@ -225,6 +226,358 @@ test('multi-statement files report each offender once', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Shared tokenizer: the guard used to carry its own, and it was the wrong one
+// ---------------------------------------------------------------------------
+
+test('a NESTED block comment cannot hide the statement that follows it', () => {
+  // The guard ended a block comment at the FIRST `*/`, so `/* a /* b */ c */`
+  // reopened as code at ` c */` and the scanner resynchronised mid-file. The
+  // executor's tokenizer counted nesting depth and ran the DROP TABLE, so the
+  // two disagreed about what the file contained, and the guard was the wrong
+  // one. Postgres nests block comments.
+  assert.deepEqual(
+    scanDestructiveSql('/* a /* b */ c */ DROP TABLE users;').map((h) => [h.kind, h.target]),
+    [['drop-table', 'users']],
+  );
+  // Two levels deep, same answer.
+  assert.deepEqual(
+    scanDestructiveSql('/* x /* y /* z */ */ */ TRUNCATE events;').map((h) => h.kind),
+    ['truncate'],
+  );
+});
+
+test('a commented-out block containing a comment does not truncate the inventory', () => {
+  // The worst measured shape: the guard reported ONLY the DELETE, so the
+  // operator confirmed an inventory of one statement and the unlisted DROP
+  // TABLE ran under that confirmation.
+  const sql = [
+    '/* disabled for now',
+    '  ... /* slow */',
+    '*/',
+    'DROP TABLE legacy_users;',
+    'DELETE FROM audit_log;',
+  ].join('\n');
+  assert.deepEqual(
+    scanDestructiveSql(sql).map((h) => [h.kind, h.target]),
+    [
+      ['drop-table', 'legacy_users'],
+      ['delete', 'audit_log'],
+    ],
+  );
+});
+
+test('a semicolon inside a quoted identifier does not split a statement in half', () => {
+  // `split(';')` cut this into `DROP TABLE "we` and `ird"`, neither of which
+  // matched any rule, so a DROP TABLE was invisible to the guard.
+  assert.deepEqual(
+    scanDestructiveSql('DROP TABLE "we;ird";').map((h) => [h.kind, h.target]),
+    [['drop-table', 'we;ird']],
+  );
+  assert.deepEqual(
+    scanDestructiveSql('CREATE TABLE "a;b" (id int); DELETE FROM audit;').map((h) => h.kind),
+    ['delete'],
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Lexical agreement with the server. Every disagreement fails open, because the
+// guard then reads a file the server will not execute and the server executes a
+// file the guard never read. Each case below was verified BOTH ways: the wrong
+// inventory here, and the statement really running on PostgreSQL 16.14.
+// ---------------------------------------------------------------------------
+
+test('a `$` inside an identifier does not open a dollar-quoted body', () => {
+  // Postgres allows `$` in an identifier and lexes by longest match, so `x$y$`
+  // is ONE identifier and its `$` never reaches the dollar-quoting rule.
+  // Reading `$y$` as an opener starts a body whose tag never recurs, which
+  // swallows the rest of the file: the guard reported (none) for this input
+  // while the server returned the `x$y$` column and then dropped the table.
+  assert.deepEqual(
+    scanDestructiveSql('SELECT x$y$ FROM t;\nDROP TABLE users;').map((h) => [h.kind, h.target]),
+    [['drop-table', 'users']],
+  );
+  // Collapsing the file to ONE statement also breaks the
+  // one-statement-per-round-trip contract `-- turbine:no-transaction`
+  // migrations depend on, so the split is pinned alongside the inventory.
+  assert.deepEqual(splitSqlStatements('SELECT x$y$ FROM t;\nDROP TABLE users;'), [
+    'SELECT x$y$ FROM t',
+    'DROP TABLE users',
+  ]);
+  // Repeated `$`, and a run that merely looks like a keyword followed by a
+  // body: the server names each of these as one identifier token.
+  assert.deepEqual(
+    scanDestructiveSql('SELECT a$$b FROM t; DROP TABLE users;').map((h) => h.kind),
+    ['drop-table'],
+  );
+  assert.deepEqual(splitSqlStatements('SELECT$$x$$; DROP TABLE users;'), ['SELECT$$x$$', 'DROP TABLE users']);
+});
+
+test('under-splitting hides transaction control from the refusal gate too', () => {
+  // The tokenizer has a THIRD consumer: findTransactionControlStatements (in
+  // migrate.ts), which refuses a migration file carrying its own BEGIN/COMMIT/
+  // ROLLBACK. Collapsing the file to one statement left that gate looking at a
+  // single statement headed SELECT, so the embedded COMMIT was invisible and
+  // the file was ACCEPTED. That commits the runner's OWN wrapper mid-file:
+  // everything before the COMMIT becomes durable, everything after runs
+  // unprotected, and the migration is recorded nowhere, so every rerun fails
+  // on "already exists". Under-splitting is a silent accept in both
+  // directions, and this is the second one.
+  assert.deepEqual(findTransactionControlStatements('SELECT x$y$ FROM t;\nCOMMIT;\nDROP TABLE users;\n'), ['COMMIT']);
+  // The same file without the `$` identifier was always caught, which is what
+  // isolates the cause to the lexing rather than to anything about COMMIT.
+  assert.deepEqual(findTransactionControlStatements('SELECT 1;\nCOMMIT;\nDROP TABLE users;\n'), ['COMMIT']);
+});
+
+test('a non-ASCII identifier carries a `$` the same way', () => {
+  // ident_cont is `[A-Za-z\200-\377_0-9$]`, so every non-ASCII character is an
+  // identifier character. `naïve$col$` is one identifier: asked for it, the
+  // server answers `column "naïve$col$" does not exist`, naming the whole run.
+  assert.deepEqual(
+    scanDestructiveSql('SELECT naïve$col$ FROM t; DROP TABLE users;').map((h) => [h.kind, h.target]),
+    [['drop-table', 'users']],
+  );
+});
+
+test('a `$` that starts a token still opens a body', () => {
+  // The converse, and the reason the rule is stated as Postgres states it
+  // rather than as "ignore a `$` that follows anything": a digit cannot START
+  // an identifier, so `1$$...$$` IS a dollar-quoted string (the server reports
+  // its syntax error at `$$x$$`, the string, not at the number). These bodies
+  // are DATA, held by a non-procedural statement, and must stay out of the
+  // inventory or the guard cries wolf on every seed file.
+  assert.deepEqual(scanDestructiveSql('INSERT INTO t VALUES (1$$DROP TABLE users$$);'), []);
+  assert.deepEqual(scanDestructiveSql('INSERT INTO t VALUES ($y$DROP TABLE users$y$);'), []);
+  // Such a body hides its own semicolons too, so this is ONE statement and
+  // nothing inside it is ever offered to the rules. Widening the identifier
+  // rule to swallow `$` after a DIGIT as well would split here instead.
+  assert.deepEqual(splitSqlStatements('SELECT 1$$; DROP TABLE users; $$;'), ['SELECT 1$$; DROP TABLE users; $$']);
+  // An identifier ending in `$`, followed by a real dollar-quoted string.
+  assert.deepEqual(
+    scanDestructiveSql('SELECT f$($$DROP TABLE users$$); DROP TABLE audit;').map((h) => h.target),
+    ['audit'],
+  );
+  // A bind placeholder is not a tag: its first character is a digit.
+  assert.deepEqual(splitSqlStatements('UPDATE t SET x = $1 WHERE id = $2; DROP TABLE users;'), [
+    'UPDATE t SET x = $1 WHERE id = $2',
+    'DROP TABLE users',
+  ]);
+});
+
+test('a comment inside a procedural body is removed by the tokenizer, not by a regex', () => {
+  // The candidate scanner used to strip a body's comments with two regexes,
+  // the exact hand-written lexer this guard was rewritten to delete, left one
+  // level down on the path that exists specifically to catch dynamic SQL.
+  // Neither pattern respects string literals, so ONE earlier literal holding a
+  // comment marker blanked every destructive statement after it. Both of these
+  // reported an empty inventory and dropped the table on the real server.
+  assert.deepEqual(
+    scanDestructiveSql(`DO $$ DECLARE s text := 'x --'; BEGIN EXECUTE 'DROP TABLE users'; END $$;`).map((h) => [
+      h.kind,
+      h.target,
+    ]),
+    [['drop-table', 'users']],
+  );
+  assert.deepEqual(
+    scanDestructiveSql(
+      `DO $$ DECLARE s text := 'a /*'; BEGIN EXECUTE 'DROP TABLE users'; RAISE NOTICE '% b */', s; END $$;`,
+    ).map((h) => [h.kind, h.target]),
+    [['drop-table', 'users']],
+  );
+  // The `--` shape is the one that is reachable by ACCIDENT rather than by
+  // malice: any single-line body whose earlier literal contains a `--` (a date
+  // range, a separator, a placeholder) hid everything that followed it.
+});
+
+test('a genuinely commented-out statement inside a body stays out of the inventory', () => {
+  // Comments still have to come out, and the NESTING rule applies inside a body
+  // exactly as it does outside one. The lazy regex ended the block comment at
+  // the first `*/` and exposed the DROP, which is the tolerated direction but
+  // is still the guard describing a file the server does not see.
+  assert.deepEqual(scanDestructiveSql('DO $$ BEGIN -- DROP TABLE users\n PERFORM 1; END $$;'), []);
+  assert.deepEqual(scanDestructiveSql('DO $$ BEGIN /* a /* b */ DROP TABLE users; */ PERFORM 1; END $$;'), []);
+});
+
+test('a BEGIN ATOMIC routine body is one statement, and its contents are scanned', () => {
+  // A PG14+ SQL-standard body holds its own semicolons. Splitting there left
+  // the first fragment headed `CREATE FUNCTION`, which matches no rule, and the
+  // rest headless, so a function whose entire job is to empty a table reported
+  // a clean inventory (it creates, runs, and leaves zero rows on the server).
+  const sql = 'CREATE FUNCTION purge() RETURNS void LANGUAGE SQL BEGIN ATOMIC DELETE FROM users; END;';
+  assert.deepEqual(splitSqlStatements(sql), [sql.slice(0, -1)]);
+  const hits = scanDestructiveSql(sql);
+  assert.deepEqual(
+    hits.map((h) => [h.kind, h.target]),
+    [['delete', 'users']],
+  );
+  assert.match(hits[0]?.statement ?? '', /in block: DELETE FROM users/);
+});
+
+test('a CASE inside a BEGIN ATOMIC body does not end it early', () => {
+  // `CASE ... END` is the only other `END` a SQL-standard body can hold, and it
+  // nests, so the body's own `END` is found by counting rather than by taking
+  // the first one. Ending early would hand the rules headless fragments again.
+  const sql =
+    'CREATE OR REPLACE PROCEDURE p() LANGUAGE SQL BEGIN ATOMIC ' +
+    'SELECT CASE WHEN true THEN CASE WHEN false THEN 1 ELSE 2 END ELSE 3 END; ' +
+    'DELETE FROM users; END; DROP TABLE audit;';
+  assert.equal(splitSqlStatements(sql).length, 2);
+  assert.deepEqual(
+    scanDestructiveSql(sql).map((h) => [h.kind, h.target]),
+    [
+      ['delete', 'users'],
+      ['drop-table', 'audit'],
+    ],
+  );
+});
+
+test('a BEGIN ATOMIC body that never closes is still handed to the scanner', () => {
+  // A file that ends mid-routine. Dropping the body would be the fail-open
+  // direction: it is executable SQL and no other path scans it, whereas keeping
+  // it costs at most a confirmation prompt on a file that cannot run anyway.
+  assert.deepEqual(
+    scanDestructiveSql('CREATE FUNCTION purge() RETURNS void LANGUAGE SQL BEGIN ATOMIC DELETE FROM users;').map((h) => [
+      h.kind,
+      h.target,
+    ]),
+    [['delete', 'users']],
+  );
+});
+
+test('BEGIN and ATOMIC mean a body only when adjacent, and only after CREATE FUNCTION', () => {
+  // Both words are UNRESERVED: `RETURNS TABLE (begin int, atomic int)` is a
+  // legal header, verified on the server. Entering body mode there would stop
+  // treating semicolons as terminators until the next `END` and swallow every
+  // statement in between, which is the fail-OPEN direction. The guard for that
+  // is adjacency (whitespace and comments aside) plus the statement head.
+  const header =
+    'CREATE FUNCTION hdr() RETURNS TABLE (begin int, atomic int) LANGUAGE sql AS $$ SELECT 1, 2 $$; DROP TABLE users;';
+  assert.equal(splitSqlStatements(header).length, 2);
+  assert.deepEqual(
+    scanDestructiveSql(header).map((h) => h.kind),
+    ['drop-table'],
+  );
+  // ...and a statement that is not a routine definition never enters body mode
+  // however its words happen to line up.
+  assert.deepEqual(
+    scanDestructiveSql('SELECT begin ATOMIC FROM t; DROP TABLE users;').map((h) => h.kind),
+    ['drop-table'],
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Widened rule set
+// ---------------------------------------------------------------------------
+
+test('flags DROP <object> ... CASCADE, which takes dependent columns with it', () => {
+  assert.deepEqual(
+    scanDestructiveSql(`
+      DROP TYPE order_status CASCADE;
+      DROP DOMAIN us_postal_code CASCADE;
+      DROP EXTENSION postgis CASCADE;
+      DROP SEQUENCE order_seq CASCADE;
+      DROP FUNCTION calc(int) CASCADE;
+      DROP ROUTINE helper CASCADE;
+      DROP AGGREGATE median(numeric) CASCADE;
+      DROP PROCEDURE nightly() CASCADE;
+    `).map((h) => [h.kind, h.target]),
+    [
+      ['drop-cascade', 'TYPE order_status'],
+      ['drop-cascade', 'DOMAIN us_postal_code'],
+      ['drop-cascade', 'EXTENSION postgis'],
+      ['drop-cascade', 'SEQUENCE order_seq'],
+      ['drop-cascade', 'FUNCTION calc'],
+      ['drop-cascade', 'ROUTINE helper'],
+      ['drop-cascade', 'AGGREGATE median'],
+      ['drop-cascade', 'PROCEDURE nightly'],
+    ],
+  );
+});
+
+test('does NOT flag the same drops without CASCADE', () => {
+  // Without CASCADE, Postgres refuses the drop while a dependency exists, so
+  // nothing can be lost. The presence of CASCADE is the entire rule.
+  assert.deepEqual(
+    scanDestructiveSql(`
+      DROP TYPE order_status;
+      DROP SEQUENCE order_seq RESTRICT;
+      DROP FUNCTION IF EXISTS calc(int);
+    `),
+    [],
+  );
+});
+
+test('flags ALTER TABLE ... DETACH PARTITION', () => {
+  assert.deepEqual(
+    scanDestructiveSql('ALTER TABLE orders DETACH PARTITION orders_2024;').map((h) => [h.kind, h.target]),
+    [['detach-partition', 'orders.orders_2024']],
+  );
+  // ATTACH adds rows rather than removing them.
+  assert.deepEqual(scanDestructiveSql('ALTER TABLE orders ATTACH PARTITION orders_2026 FOR VALUES IN (2026);'), []);
+});
+
+test('flags EXPLAIN ANALYZE of a DML statement, which really executes it', () => {
+  assert.deepEqual(
+    scanDestructiveSql(`
+      EXPLAIN ANALYZE DELETE FROM users;
+      EXPLAIN (ANALYZE, BUFFERS) TRUNCATE events;
+      EXPLAIN ANALYZE VERBOSE UPDATE accounts SET balance = 0;
+      EXPLAIN ANALYSE DELETE FROM sessions;
+    `).map((h) => [h.kind, h.target]),
+    [
+      ['delete', 'users'],
+      ['truncate', 'events'],
+      ['update-without-where', 'accounts'],
+      ['delete', 'sessions'],
+    ],
+  );
+  // The inventory shows the operator what they actually wrote.
+  assert.match(scanDestructiveSql('EXPLAIN ANALYZE DELETE FROM users;')[0]?.statement ?? '', /^EXPLAIN ANALYZE DELETE/);
+});
+
+test('does NOT flag a plain EXPLAIN, which only plans', () => {
+  assert.deepEqual(
+    scanDestructiveSql(`
+      EXPLAIN DELETE FROM users;
+      EXPLAIN (COSTS OFF) UPDATE accounts SET balance = 0;
+      EXPLAIN SELECT * FROM users;
+    `),
+    [],
+  );
+});
+
+test('flags a table or column RENAME', () => {
+  assert.deepEqual(
+    scanDestructiveSql(`
+      ALTER TABLE my_table RENAME COLUMN old_col TO old_col_retired;
+      ALTER TABLE my_table RENAME new_col TO old_col;
+      ALTER TABLE ONLY public.my_table RENAME TO my_table_v2;
+    `).map((h) => [h.kind, h.target]),
+    [
+      ['rename', 'my_table.old_col'],
+      ['rename', 'my_table.new_col'],
+      ['rename', 'public.my_table'],
+    ],
+  );
+});
+
+test('does NOT flag RENAME CONSTRAINT, which no query names', () => {
+  assert.deepEqual(scanDestructiveSql('ALTER TABLE my_table RENAME CONSTRAINT ck_old TO ck_new;'), []);
+});
+
+test('an ADD COLUMN whose name contains "drop" is not a column drop', () => {
+  // A quoted identifier is kept verbatim in the stripped text, so the lazy
+  // wildcard could start its `DROP ` match INSIDE the name and report
+  // `t.me`: a pure false positive on a statement that only adds a column.
+  assert.deepEqual(scanDestructiveSql('ALTER TABLE t ADD COLUMN "drop me" int;'), []);
+  assert.deepEqual(scanDestructiveSql('ALTER TABLE t ADD COLUMN "alter this type" text;'), []);
+  // A real DROP COLUMN alongside one is still caught.
+  assert.deepEqual(
+    scanDestructiveSql('ALTER TABLE t ADD COLUMN "drop me" int, DROP COLUMN real_col;').map((h) => [h.kind, h.target]),
+    [['drop-column', 't.real_col']],
+  );
+});
+
+// ---------------------------------------------------------------------------
 // migrate up/down gate, integration (local scratch database ONLY; the suite
 // is skipped entirely unless DATABASE_URL is set by the runner)
 // ---------------------------------------------------------------------------
@@ -291,5 +644,81 @@ gated.it('migrateDown refuses destructive DOWN sections by default', async () =>
     assert.equal(down.errors.length, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Runtime-assembled dynamic DDL
+//
+// The rules all need a parseable object name, and dynamic SQL has none until it
+// runs, so a procedural body that BUILDS its statement matched nothing and the
+// operator was shown a clean inventory. All three shapes below were executed on
+// PostgreSQL 16 during the review that found this: the table was gone and the
+// guard had reported nothing. That is the module's defining failure, the
+// operator confirming what they were shown while something else runs under the
+// confirmation, so these are reported with an explicit unknown target.
+//
+// The gate is evidence of runtime ASSEMBLY (`||`, `format(`, `quote_ident(`, a
+// `%I` placeholder), not the verb alone. That is complete rather than
+// heuristic: a destructive statement with a literal object name already matches
+// a rule, so being dynamic REQUIRES concatenating or formatting. The negative
+// cases below are the reason the gate exists at all, since a guard that fires
+// on `RAISE NOTICE 'DROP the mic'` teaches operators to confirm without reading.
+// ---------------------------------------------------------------------------
+
+test('dynamic DDL: format() with an %I placeholder is reported', () => {
+  const hits = scanDestructiveSql(`DO $$ BEGIN EXECUTE format('DROP TABLE %I', 'users'); END $$;`);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0]!.kind, 'drop-table');
+  assert.match(hits[0]!.target, /run time/);
+});
+
+test('dynamic DDL: string concatenation is reported', () => {
+  const hits = scanDestructiveSql(`DO $$ BEGIN EXECUTE 'DROP TABLE ' || quote_ident('users'); END $$;`);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0]!.kind, 'drop-table');
+});
+
+test('dynamic DDL: a split verb reports the honest kind, not drop-cascade', () => {
+  // `'DROP ' || 'TABLE users'` hides the object KEYWORD in the expression, so
+  // what is dropped is unknowable. It must not borrow `drop-cascade`, whose
+  // label claims dependent objects go too: that would be a false factual claim
+  // about the operator's migration on a safety prompt.
+  const hits = scanDestructiveSql(`DO $$ BEGIN EXECUTE 'DROP ' || 'TABLE users'; END $$;`);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0]!.kind, 'dynamic-destructive');
+});
+
+test('dynamic DDL: a statement assembled into a variable before EXECUTE is reported', () => {
+  const hits = scanDestructiveSql(`DO $$ DECLARE s text; BEGIN s := 'DROP TABLE ' || 'users'; EXECUTE s; END $$;`);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0]!.kind, 'drop-table');
+});
+
+test('dynamic DDL: TRUNCATE and DELETE are covered too', () => {
+  assert.equal(scanDestructiveSql(`DO $$ BEGIN EXECUTE format('TRUNCATE %I', 't'); END $$;`)[0]?.kind, 'truncate');
+  assert.equal(
+    scanDestructiveSql(`DO $$ BEGIN EXECUTE 'DELETE FROM ' || quote_ident('t'); END $$;`)[0]?.kind,
+    'delete',
+  );
+});
+
+test('dynamic DDL: a literal object name still names its target exactly', () => {
+  // The control. The unknown-target path must never take over a case a rule can
+  // answer precisely, or every inventory degrades to "something, somewhere".
+  const hits = scanDestructiveSql(`DO $$ BEGIN EXECUTE 'DROP TABLE users'; END $$;`);
+  assert.equal(hits.length, 1);
+  assert.deepEqual([hits[0]!.kind, hits[0]!.target], ['drop-table', 'users']);
+});
+
+test('dynamic DDL: non-destructive and non-SQL uses of the verbs stay silent', () => {
+  for (const sql of [
+    `DO $$ BEGIN RAISE NOTICE 'DROP the mic'; END $$;`,
+    `DO $$ BEGIN EXECUTE format('SELECT * FROM %I', 'users'); END $$;`,
+    `DO $$ BEGIN EXECUTE 'REFRESH MATERIALIZED VIEW ' || quote_ident('mv'); END $$;`,
+    `DO $$ BEGIN EXECUTE 'UPDATE t SET a=1 WHERE id=' || 1; END $$;`,
+    `INSERT INTO t VALUES ($$DROP TABLE users$$);`,
+  ]) {
+    assert.deepEqual(scanDestructiveSql(sql), [], `should not flag: ${sql}`);
   }
 });

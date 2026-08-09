@@ -54,6 +54,7 @@ import {
   PowdbJsonParam,
   type PowdbPool,
   powqlColumnType,
+  quotePowqlDotted,
   quotePowqlIdent,
   requireCapability,
   rowToEntity,
@@ -191,6 +192,12 @@ interface NestedRelationPlan {
   single: boolean;
   /** Projected child columns (snake names, select/omit/PII already applied). */
   cols: string[];
+  /**
+   * PK columns in {@link cols} only because the projection forced them in for
+   * internal use; stripped back off each shaped child so a nested `select` /
+   * `omit` returns the same keys the loaders and the SQL engines return.
+   */
+  forcedPk: string[];
   /** Sub-plans for the relation's own `with` (every level proved eligible). */
   children: NestedRelationPlan[];
 }
@@ -352,19 +359,33 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * PowQL column reference for a field. Unqualified it is a dotted field
-   * reference (`.snake_name`), which bypasses keyword lookup. When an `alias`
-   * is supplied (the F2 join path) it is qualified (`alias.snake_name`) and the
-   * column name is backtick-quoted if it is a reserved word (a qualified
-   * `p.order` does NOT bypass keyword lookup, unlike the dotted `.order`).
+   * PowQL column reference for a field: a dotted field reference
+   * (`.snake_name`), or `alias.snake_name` when an `alias` is supplied (the F2
+   * join path).
    */
   private ref(field: string, alias?: string): string {
     return this.colRefName(this.column(field).name, alias);
   }
 
-  /** Render a raw column name as a PowQL reference, qualified with `alias` when given. */
+  /**
+   * Render a raw column name as a PowQL reference, qualified with `alias` when
+   * given.
+   *
+   * BOTH branches quote now; they just use different rules, because the two
+   * positions have different grammars. A QUALIFIED `p.col` does not bypass
+   * keyword lookup, so it needs the full {@link quotePowqlIdent}. An
+   * UNQUALIFIED `.col` does bypass it, so it uses {@link quotePowqlDotted},
+   * which quotes only a name outside the bare-identifier grammar and leaves
+   * keywords bare, preserving the ≤0.9 compatibility decision documented on
+   * `quotePowqlIdent` while still keeping a column NAME from carrying syntax
+   * into the statement. This branch used to interpolate the name RAW, the one
+   * identifier site in the engine with no boundary at all.
+   *
+   * Output is byte-identical for every name the grammar accepts bare, keywords
+   * included, so no existing schema sees a different statement.
+   */
   private colRefName(name: string, alias?: string): string {
-    return alias ? `${alias}.${quotePowqlIdent(name)}` : `.${name}`;
+    return alias ? `${alias}.${quotePowqlIdent(name)}` : `.${quotePowqlDotted(name)}`;
   }
 
   /**
@@ -482,7 +503,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   /** A predicate that is always false, the empty-`in` / contradiction sentinel. */
   private alwaysFalse(): string {
     const pk = this.meta.primaryKey[0] ?? this.meta.columns[0]?.name;
-    return `(.${pk} is null and .${pk} is not null)`;
+    const ref = pk === undefined ? '.__turbine_missing_pk' : this.colRefName(pk);
+    return `(${ref} is null and ${ref} is not null)`;
   }
 
   // -------------------------------------------------------------------------
@@ -1049,9 +1071,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       for (let i = 0; i < targetPks.length; i += junctionChunk) {
         const chunk = targetPks.slice(i, i + junctionChunk);
         const params: unknown[] = [];
-        const keyClause = this.inClause(`.${targetJCol}`, chunk, params, targetJColMeta);
+        const keyClause = this.inClause(this.colRefName(targetJCol), chunk, params, targetJColMeta);
         const { rows } = await this.exec(
-          `${quotePowqlIdent(through.table)} filter ${keyClause} { .${sourceJCol} }`,
+          `${quotePowqlIdent(through.table)} filter ${keyClause} { ${this.colRefName(sourceJCol)} }`,
           params,
           timeout,
           'findMany',
@@ -1101,11 +1123,36 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return this.column(field).name;
   }
 
-  private projectedColumns(
+  /**
+   * The projected column list, plus the PK columns that are in it ONLY because
+   * this method put them there.
+   *
+   * PowDB needs the PK in the FETCH even when the caller excluded it: `upsert`
+   * reselects by PK, the m2m loader keys its target map on it (`targetByPk`),
+   * and the join path correlates through it. That force-add is right and stays.
+   * What was missing is the other half, taking it back off the ENTITY, so
+   * `select: { name: true }` returned `{ id, name }` and `omit: { id: true }`
+   * returned the column the caller asked to hide. The SQL engines return
+   * neither, so this was a cross-engine divergence on a documented-as-shared
+   * surface, and it was UNIFORM within PowDB: all five paths leaked (top-level
+   * find, batched loader, native join, nested projection, link path). The link
+   * path was the only one that even tried, and its strip could never fire: it
+   * decided "did the caller ask for the PK" by testing the column list AFTER
+   * the force-add, which by construction always contains it. So there was one
+   * strip in the code, dead since it shipped, and no query anywhere got the
+   * projection it asked for.
+   *
+   * `forcedPk` is what the strip needs, and it is deliberately NARROW: only the
+   * `select` / `omit` force-adds are listed. A PII-tagged PK kept through the
+   * DEFAULT projection is NOT, because that one is a deliberate, documented
+   * decision the SQL engines make identically (a row that cannot address itself
+   * is worse than a key that leaks its own value).
+   */
+  private projectionPlan(
     select?: Record<string, boolean>,
     omit?: Record<string, boolean>,
     includePii?: boolean,
-  ): string[] {
+  ): { cols: string[]; forcedPk: string[] } {
     // Same two shape refusals as `resolveProjection` on the SQL engines, with
     // the shared messages, and for a live reason here: this path used to
     // APPLY select-minus-omit while the SQL engines ignored the `omit` half,
@@ -1125,6 +1172,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
     const pk = new Set(this.meta.primaryKey);
     let cols = this.meta.columns.map((c) => c.name);
+    const forcedPk: string[] = [];
     const hasSelect = select && Object.keys(select).length;
     if (hasSelect) {
       const picked = new Set(
@@ -1132,8 +1180,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           .filter(([, v]) => v)
           .map(([k]) => this.projectionColumn(k, 'select')),
       );
-      // Always keep the PK so reselect / relation stitching has a key to work with.
-      for (const key of pk) picked.add(key);
+      // Always keep the PK so reselect / relation stitching has a key to work
+      // with; record the ones the caller did NOT name so they can be taken back
+      // off the entity once the stitching is done.
+      for (const key of pk) {
+        if (!picked.has(key)) forcedPk.push(key);
+        picked.add(key);
+      }
       cols = cols.filter((c) => picked.has(c));
     } else if (!includePii) {
       // Default / omit-only projection: drop PII columns (kept above only when a
@@ -1158,9 +1211,26 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // target map on the PK (`targetByPk`), so every target collapsed onto the
       // single bucket "undefined", no parent matched, and the relation came
       // back `[]` for every row with no error.
+      for (const key of dropped) {
+        if (pk.has(key) && !forcedPk.includes(key)) forcedPk.push(key);
+      }
       cols = cols.filter((c) => !dropped.has(c) || pk.has(c));
     }
-    return cols;
+    return { cols, forcedPk };
+  }
+
+  /**
+   * Take the internally-forced PK columns back off the entities, so what the
+   * caller receives matches the `select` / `omit` they wrote. Called only after
+   * every consumer of the key (relation stitching, reselect) has finished with
+   * it. A no-op, and free, when nothing was forced.
+   */
+  private stripForcedPk(entities: object[], forcedPk: string[]): void {
+    if (forcedPk.length === 0 || entities.length === 0) return;
+    const fields = forcedPk.map((c) => this.meta.reverseColumnMap[c] ?? c);
+    for (const entity of entities) {
+      for (const field of fields) delete (entity as Record<string, unknown>)[field];
+    }
   }
 
   /**
@@ -1190,7 +1260,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * client-side strip of last resort, not defense-in-depth, for those paths; we
    * do NOT reverse-engineer an undocumented projection form. The upsert path is
    * different: it has no `returning` and reselects by PK through the read
-   * projection ({@link projectedColumns}), which already omits PII, so PII never
+   * projection ({@link projectionPlan}), which already omits PII, so PII never
    * crosses the wire there. If a future spec revision lets `returning` take a
    * projection, switch the write paths to emit the non-PII list and this strip
    * becomes a no-op like {@link parseWriteRow} on the SQL engines.
@@ -1205,7 +1275,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   /** `{ .c1, .c2, … }` projection clause. */
   private projection(cols: string[]): string {
-    return `{ ${cols.map((c) => `.${c}`).join(', ')} }`;
+    return `{ ${cols.map((c) => this.colRefName(c)).join(', ')} }`;
   }
 
   /**
@@ -1456,7 +1526,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // raises instead of falling through to a query.
       this.assertPagination(this.effectiveLimit(args), args.offset, 'findMany');
       if (this.effectiveLimit(args) === 0) return [];
-      const { rows, native, resolvedWhere, nestedPlans, linkPlans, residualWith } = await this.runFind(
+      const { rows, native, resolvedWhere, nestedPlans, linkPlans, residualWith, forcedPk } = await this.runFind(
         args,
         'findMany',
       );
@@ -1473,6 +1543,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           resolveUnsafeFlag(args.includePii, 'includePii'),
         );
       }
+      // LAST: every consumer of the internally-forced PK (relation stitching,
+      // the loaders' correlation) has finished with it by here.
+      this.stripForcedPk(entities, forcedPk);
       return entities;
     });
   }
@@ -1499,12 +1572,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     nestedPlans: NestedRelationPlan[];
     linkPlans: LinkPathPlan[];
     residualWith: Record<string, unknown> | undefined;
+    /** PK columns fetched for internal use only, see {@link projectionPlan}. */
+    forcedPk: string[];
   }> {
     if ((args as { cursor?: unknown }).cursor) {
       throw new UnsupportedFeatureError('cursor pagination', 'PowDB', 'use limit/offset instead');
     }
     const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
-    const cols = this.projectedColumns(
+    const { cols, forcedPk } = this.projectionPlan(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       resolveUnsafeFlag(args.includePii, 'includePii'),
@@ -1583,7 +1658,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       projection = this.projection(cols);
     }
     const powql = `${this.qt}${nest ? ' as t0' : ''}${distinct}${filter}${order}${limitClause}${offsetClause} ${projection}`;
-    return { powql, resolvedWhere, nestedPlans, linkPlans, residualWith };
+    return { powql, resolvedWhere, nestedPlans, linkPlans, residualWith, forcedPk };
   }
 
   /** Build + run the findMany select; returns raw rows, the serving wire, the resolved where, and the `with` partition. */
@@ -1597,11 +1672,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     nestedPlans: NestedRelationPlan[];
     linkPlans: LinkPathPlan[];
     residualWith: Record<string, unknown> | undefined;
+    forcedPk: string[];
   }> {
     const params: unknown[] = [];
-    const { powql, resolvedWhere, nestedPlans, linkPlans, residualWith } = await this.buildFind(args, params);
+    const { powql, resolvedWhere, nestedPlans, linkPlans, residualWith, forcedPk } = await this.buildFind(args, params);
     const { rows, native } = await this.exec(powql, params, args.timeout, action);
-    return { rows, native, resolvedWhere, nestedPlans, linkPlans, residualWith };
+    return { rows, native, resolvedWhere, nestedPlans, linkPlans, residualWith, forcedPk };
   }
 
   /**
@@ -1638,7 +1714,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (expanded !== args.where) args = { ...args, where: expanded as FindUniqueArgs<T>['where'] };
     }
     return this.withMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
-      const { rows, native, nestedPlans, linkPlans, residualWith } = await this.runFind(
+      const { rows, native, nestedPlans, linkPlans, residualWith, forcedPk } = await this.runFind(
         { ...args, limit: 1 } as FindManyArgs<T>,
         'findUnique',
       );
@@ -1655,6 +1731,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           undefined,
           resolveUnsafeFlag(args.includePii, 'includePii'),
         );
+      // See findMany: the strip is last, after every consumer of the key.
+      this.stripForcedPk(entities, forcedPk);
       return entities[0]!;
     });
   }
@@ -1662,7 +1740,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
     this.assertNoForceCustomPlan(args);
     return this.withMiddleware('findFirst', args as unknown as Record<string, unknown>, async () => {
-      const { rows, native, nestedPlans, linkPlans, residualWith } = await this.runFind(
+      const { rows, native, nestedPlans, linkPlans, residualWith, forcedPk } = await this.runFind(
         { ...args, limit: 1 } as FindManyArgs<T>,
         'findFirst',
       );
@@ -1679,6 +1757,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           undefined,
           resolveUnsafeFlag(args.includePii, 'includePii'),
         );
+      // See findMany: the strip is last, after every consumer of the key.
+      this.stripForcedPk(entities, forcedPk);
       return entities[0]!;
     });
   }
@@ -1774,7 +1854,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const userSelect = options.select as Record<string, boolean> | undefined;
       const userOmit = options.omit as Record<string, boolean> | undefined;
       // The RAW shape rules, before the force-add below: the forced key makes
-      // an all-falsy select look populated to the child's projectedColumns,
+      // an all-falsy select look populated to the child's projectionPlan,
       // which would accept here what the nested-projection path refuses. Same
       // messages as the SQL engines' assertProjectionShape, same reason.
       if (userSelect) {
@@ -1901,8 +1981,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (let i = 0; i < parentKeys.length; i += junctionChunk) {
       const chunk = parentKeys.slice(i, i + junctionChunk);
       const params: unknown[] = [];
-      const keyClause = this.inClause(`.${sourceJCol}`, chunk, params, sourceJColMeta);
-      const powql = `${quotePowqlIdent(through.table)} filter ${keyClause} { .${sourceJCol}, .${targetJCol} }`;
+      const keyClause = this.inClause(this.colRefName(sourceJCol), chunk, params, sourceJColMeta);
+      const powql =
+        `${quotePowqlIdent(through.table)} filter ${keyClause} ` +
+        `{ ${this.colRefName(sourceJCol)}, ${this.colRefName(targetJCol)} }`;
       const { rows } = await this.exec(powql, params, timeout, 'findMany');
       for (const row of rows) {
         const sv = String(row[sourceJCol]);
@@ -1917,6 +1999,40 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     // (2) Target rows by PK, honouring the relation's own where/with/select/…
     const options = (opt === true ? {} : opt) as FindManyArgs<object> & { with?: Record<string, unknown> };
     const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.options);
+    // This loader stitches on the TARGET's own primary key, so the PK has to be
+    // in the fetch even when the caller's select/omit excludes it, and has to
+    // come back off afterwards. Exactly the shape `loadRelation` uses for its
+    // correlation column: force it in here, strip it after stitching. It cannot
+    // be left to the projection's internal force-add, because that one is
+    // stripped before findMany returns (see projectionPlan) and the map would
+    // key every target on "undefined".
+    const userSelect = options.select as Record<string, boolean> | undefined;
+    const userOmit = options.omit as Record<string, boolean> | undefined;
+    // The RAW shape rules, before the force-add: same reason and same messages
+    // as `loadRelation`, since a forced key makes an all-falsy select look
+    // populated to the child's own projection check.
+    if (userSelect) {
+      if (!Object.values(userSelect).some(Boolean)) {
+        throw new ValidationError(selectNamesNothingMessage(targetMeta.name));
+      }
+      if (userOmit && Object.values(userOmit).some(Boolean)) {
+        throw new ValidationError(selectOmitExclusiveMessage(targetMeta.name));
+      }
+    }
+    const pkProjected = userSelect ? Boolean(userSelect[targetPkField]) : userOmit ? !userOmit[targetPkField] : true;
+    let fetchOptions: FindManyArgs<object> & { with?: Record<string, unknown> } = options;
+    if (!pkProjected) {
+      if (userSelect) {
+        fetchOptions = {
+          ...options,
+          select: { ...userSelect, [targetPkField]: true },
+        } as unknown as typeof fetchOptions;
+      } else if (userOmit) {
+        const omitWithoutPk = { ...userOmit };
+        delete omitWithoutPk[targetPkField];
+        fetchOptions = { ...options, omit: omitWithoutPk } as unknown as typeof fetchOptions;
+      }
+    }
     const targetByPk = new Map<string, T>();
     const targetValList = [...allTargetVals].map((v) =>
       targetPkColMeta ? coerceScalar(v, targetPkColMeta.tsType) : v,
@@ -1929,7 +2045,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         [targetPkField]: { in: chunk },
       } as WhereClause<object>;
       const targets = (await targetQi.findMany({
-        ...options,
+        ...fetchOptions,
         where,
         with: options.with,
         timeout: options.timeout ?? timeout,
@@ -1949,6 +2065,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         if (child) children.push(child);
       }
       (parent as Record<string, unknown>)[relName] = children;
+    }
+
+    // Stitching is done: take the forced PK back off. Iterating the map rather
+    // than the stitched lists is deliberate, one target can be linked from many
+    // parents and is the SAME object in each, so this touches each entity once.
+    if (!pkProjected) {
+      for (const target of targetByPk.values()) delete (target as Record<string, unknown>)[targetPkField];
     }
   }
 
@@ -2083,7 +2206,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const parentKeyField = this.meta.reverseColumnMap[parentKeyCol] ?? parentKeyCol;
 
     const params: unknown[] = [];
-    const childCols = this.joinChildCols(targetQi, options, includePii);
+    const { cols: childCols, forcedPk: childForcedPk } = this.joinChildCols(targetQi, options, includePii);
     const filter = await this.joinFilter(
       targetQi,
       parent.resolvedWhere,
@@ -2105,7 +2228,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const { rows, native } = await targetQi.exec(powql, params, timeout, 'findMany');
 
     const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
-    const byKey = this.bucketByTpk(targetQi, rows, native);
+    const byKey = this.bucketByTpk(targetQi, rows, native, childForcedPk);
     for (const p of parents) {
       const key = this.joinKey((p as Record<string, unknown>)[parentKeyField]);
       const matches = (key == null ? undefined : byKey.get(key)) ?? [];
@@ -2141,7 +2264,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const parentRefField = this.meta.reverseColumnMap[sourceRefCol] ?? sourceRefCol;
 
     const params: unknown[] = [];
-    const childCols = this.joinChildCols(targetQi, options, includePii);
+    const { cols: childCols, forcedPk: childForcedPk } = this.joinChildCols(targetQi, options, includePii);
     const filter = await this.joinFilter(
       targetQi,
       parent.resolvedWhere,
@@ -2158,7 +2281,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       `${filter} ${proj}`;
     const { rows, native } = await targetQi.exec(powql, params, timeout, 'findMany');
 
-    const byKey = this.bucketByTpk(targetQi, rows, native);
+    const byKey = this.bucketByTpk(targetQi, rows, native, childForcedPk);
     for (const p of parents) {
       const key = this.joinKey((p as Record<string, unknown>)[parentRefField]);
       (p as Record<string, unknown>)[relName] = (key == null ? undefined : byKey.get(key)) ?? [];
@@ -2170,19 +2293,23 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * with a loud guard: a real column named `__tpk` would collide with the
    * reserved correlation alias, so refuse rather than silently mis-stitch.
    */
-  private joinChildCols(targetQi: PowqlInterface<object>, options: FindManyArgs<object>, includePii = false): string[] {
-    const cols = targetQi.projectedColumns(
+  private joinChildCols(
+    targetQi: PowqlInterface<object>,
+    options: FindManyArgs<object>,
+    includePii = false,
+  ): { cols: string[]; forcedPk: string[] } {
+    const plan = targetQi.projectionPlan(
       options.select as Record<string, boolean> | undefined,
       options.omit as Record<string, boolean> | undefined,
       includePii,
     );
-    if (cols.includes('__tpk')) {
+    if (plan.cols.includes('__tpk')) {
       throw new ValidationError(
         `[turbine] relation target "${targetQi.table}" has a column named "__tpk", which collides with the reserved ` +
           `join correlation alias. Rename the column or load this relation with relationLoadStrategy: 'batched'.`,
       );
     }
-    return cols;
+    return plan;
   }
 
   /**
@@ -2227,12 +2354,16 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     targetQi: PowqlInterface<object>,
     rows: Record<string, unknown>[],
     native: boolean,
+    forcedPk: string[] = [],
   ): Map<string, object[]> {
     const byKey = new Map<string, object[]>();
     for (const raw of rows) {
       const tpk = this.joinKey(raw.__tpk);
       delete raw.__tpk;
       const child = targetQi.shape([raw], native)[0]!;
+      // The correlation runs on `__tpk` (the PARENT's key), so an internally
+      // forced child PK has no consumer past this point and comes straight off.
+      targetQi.stripForcedPk([child], forcedPk);
       if (tpk == null) continue;
       const bucket = byKey.get(tpk);
       if (bucket) bucket.push(child);
@@ -2317,7 +2448,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     this.assertPagination(options.limit, options.offset, `relation "${relName}"`);
     if (options.limit === 0) return null;
     const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
-    const cols = targetQi.projectedColumns(
+    const { cols, forcedPk } = targetQi.projectionPlan(
       options.select as Record<string, boolean> | undefined,
       options.omit as Record<string, boolean> | undefined,
       includePii,
@@ -2345,7 +2476,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (keys.has(child.relName)) return null;
       keys.add(child.relName);
     }
-    return { relName, rel, options, targetQi, single, cols, children };
+    return { relName, rel, options, targetQi, single, cols, forcedPk, children };
   }
 
   /**
@@ -2424,6 +2555,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (const child of shaped) {
       for (const sub of plan.children) plan.targetQi.attachOneNested(child, sub);
     }
+    // After the sub-blocks, for the same reason the top-level strip runs last.
+    plan.targetQi.stripForcedPk(shaped, plan.forcedPk);
     row[plan.relName] = plan.single ? (shaped[0] ?? null) : shaped;
   }
 
@@ -2532,7 +2665,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if (options.orderBy || options.limit !== undefined || options.offset) return null;
 
     const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
-    const userCols = targetQi.projectedColumns(
+    // `projectionPlan`, not `projectedColumns`: the plan is what carries
+    // `forcedPk`, and reading the column LIST alone is what made this path's
+    // strip dead. See the pkProjected line below.
+    const { cols: userCols, forcedPk } = targetQi.projectionPlan(
       options.select as Record<string, boolean> | undefined,
       options.omit as Record<string, boolean> | undefined,
       includePii,
@@ -2555,12 +2691,19 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if (!userCols.every((c) => this.isBareIdent(c))) return null;
 
     // Always project the target PK for presence detection (an absent to-one yields
-    // Empty at every hop; PK-Empty is the unambiguous "no linked row" signal). Add
-    // it if the user's projection dropped it, and remember to strip it back off.
+    // Empty at every hop; PK-Empty is the unambiguous "no linked row" signal).
+    // `projectionPlan` has already put it in `userCols`, so there is nothing to
+    // add; what is needed is knowing whether the CALLER asked for it.
+    //
+    // This is the line that was wrong. It read `userCols.includes(pkCol)`, and
+    // the projection force-adds the PK, so the answer was ALWAYS true and the
+    // strip in `attachLinkRows` never ran once. `forcedPk` is the caller's
+    // intent rather than the fetched list: it names the PK columns that are in
+    // `userCols` only because the projection put them there.
     const pkCol = targetMeta.primaryKey[0]!;
     if (!this.isBareIdent(pkCol)) return null;
-    const pkProjected = userCols.includes(pkCol);
-    const cols = pkProjected ? userCols : [...userCols, pkCol];
+    const pkProjected = !forcedPk.includes(pkCol);
+    const cols = userCols;
 
     // Synthetic flat result keys (`l<index>_<col>`) keep the hop fields from
     // colliding with real parent columns or each other. Refuse the (astronomically
@@ -2571,9 +2714,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return { relName, linkName: link.name, targetQi, cols, pkCol, pkProjected, keyPrefix };
   }
 
-  /** The flat `l<i>_<col>: t0.<linkName>.<col>` projection fields for one link plan. */
+  /**
+   * The flat `l<i>_<col>: t0.<linkName>.<col>` projection fields for one link
+   * plan. Both path segments and the synthetic result key go through
+   * `quotePowqlIdent`, the same identifier boundary every other emission site
+   * uses; verified against the engine that a quoted link hop and a quoted alias
+   * parse exactly like their bare forms and yield the same result-column names.
+   */
   private linkPathFields(plan: LinkPathPlan, parentAlias: string): string[] {
-    return plan.cols.map((c) => `${plan.keyPrefix}${c}: ${parentAlias}.${plan.linkName}.${c}`);
+    const link = quotePowqlDotted(plan.linkName);
+    return plan.cols.map(
+      (c) => `${quotePowqlIdent(`${plan.keyPrefix}${c}`)}: ${parentAlias}.${link}.${quotePowqlDotted(c)}`,
+    );
   }
 
   /**
@@ -2983,7 +3135,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // atomic insert-or-update, not two branches. So upsert alone keeps the
       // reselect-by-PK fetch; create/update/delete all use `returning`.
       await this.exec(
-        `upsert ${this.qt} on .${pkCol} { ${createBody} } on conflict { ${updateBody} }`,
+        `upsert ${this.qt} on ${this.colRefName(pkCol)} { ${createBody} } on conflict { ${updateBody} }`,
         params,
         args.timeout,
         'upsert',
@@ -3194,9 +3346,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           );
           claim(entry, `column "${col.name}"`);
           if (col.name !== entry) claim(col.name, `column "${col.name}"`);
-          groupExprs.push(`.${col.name}`);
-          proj.push(`.${col.name}`);
-          byOrderExprs.set(entry, `.${col.name}`);
+          groupExprs.push(this.colRefName(col.name));
+          proj.push(this.colRefName(col.name));
+          byOrderExprs.set(entry, this.colRefName(col.name));
           byReaders.push({ kind: 'plain', resultKey: entry, rowKey: col.name, col });
         } else {
           const col = this.column(entry.field);
@@ -3272,7 +3424,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
               );
             }
             claim(`${fn}_${col.name}`, `${fn} of column "${col.name}"`);
-            const inner = `.${col.name}`;
+            const inner = this.colRefName(col.name);
             proj.push(`${alias}: ${powfn}(${inner})`);
             aggReaders.push({ alias, outKey: `${fn}:${key}`, numeric: true });
             aggOrderExprs.set(`${fn}:${key}`, `.${alias}`);

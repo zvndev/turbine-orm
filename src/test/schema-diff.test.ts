@@ -21,6 +21,7 @@ import { TurbineError, ValidationError } from '../errors.js';
 import { defineSchema } from '../schema-builder.js';
 import {
   buildAddForeignKeyStatement,
+  type DbColumnType,
   type DbForeignKey,
   DestructivePushRefusal,
   type DiffResult,
@@ -29,6 +30,7 @@ import {
   diffEnumValues,
   diffReferentialAction,
   findDestructivePushStatements,
+  planTypeChange,
   schemaDiff,
   schemaPush,
   schemaToSQL,
@@ -256,21 +258,45 @@ describe('schemaDiff patterns, remove column (DROP COLUMN UP)', () => {
   });
 });
 
+/**
+ * These two used to build a SQL string inside the test and assert that the
+ * string matched itself, so they exercised no product code and could not fail
+ * for any change to the diff. They also documented the exact behaviour that was
+ * removed as a data-loss bug: a same-family `varchar` change carrying
+ * `USING "status"::VARCHAR(50)`, an EXPLICIT cast to a bounded type, which
+ * truncates every over-long value instead of letting Postgres refuse the
+ * migration. They now drive `planTypeChange`, which owns that decision.
+ */
 describe('schemaDiff patterns, modify column type (ALTER COLUMN TYPE)', () => {
-  it('ALTER COLUMN TYPE generates USING cast', () => {
-    // Pattern from schema-sql.ts line 465:
-    // ALTER TABLE "t" ALTER COLUMN "c" TYPE VARCHAR(255) USING "c"::VARCHAR(255);
-    const tableName = 'users';
-    const colName = 'status';
-    const newType = 'VARCHAR(50)';
-    const sql = `ALTER TABLE "${tableName}" ALTER COLUMN "${colName}" TYPE ${newType} USING "${colName}"::${newType};`;
-    assert.match(sql, /ALTER TABLE "users" ALTER COLUMN "status" TYPE VARCHAR\(50\) USING "status"::VARCHAR\(50\);/);
+  /** A ColumnConfig as `defineSchema` produces it. */
+  function column(overrides: Record<string, unknown>) {
+    return defineSchema({ t: { c: { type: 'text', ...overrides } as never } }).tables.t!.columns.c!;
+  }
+  function dbCol(overrides: Partial<DbColumnType> & { udtName: string }): DbColumnType {
+    return { maxLength: null, numericPrecision: null, numericScale: null, formattedType: null, ...overrides };
+  }
+
+  it('does NOT generate a USING cast within a type family', () => {
+    // text -> varchar(50) has an assignment cast, and letting Postgres apply it
+    // is the point: it raises "value too long" where an explicit cast silently
+    // amputates.
+    const plan = planTypeChange(column({ type: 'varchar', maxLength: 50 }), dbCol({ udtName: 'text' }), 'status');
+    assert.equal(plan.kind, 'alter');
+    assert.equal(plan.kind === 'alter' && plan.needsUsing, false);
   });
 
-  it('reverse ALTER COLUMN TYPE restores old type', () => {
-    const oldType = 'TEXT';
-    const reverseSql = `ALTER TABLE "users" ALTER COLUMN "status" TYPE ${oldType} USING "status"::${oldType};`;
-    assert.match(reverseSql, /TYPE TEXT USING "status"::TEXT/);
+  it('generates a USING cast only when the conversion crosses type families', () => {
+    const plan = planTypeChange(column({ type: 'uuid' }), dbCol({ udtName: 'text' }), 'status');
+    assert.equal(plan.kind, 'alter');
+    assert.equal(plan.kind === 'alter' && plan.needsUsing, true);
+  });
+
+  it('reports no change when the declared type already matches the column', () => {
+    assert.equal(
+      planTypeChange(column({ type: 'varchar', maxLength: 50 }), dbCol({ udtName: 'varchar', maxLength: 50 }), 'status')
+        .kind,
+      'none',
+    );
   });
 });
 

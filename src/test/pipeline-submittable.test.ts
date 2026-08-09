@@ -18,6 +18,7 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { describe, it } from 'node:test';
+import { PipelineError, TurbineErrorCode } from '../errors.js';
 import { type PgPoolClient, runPipelined, supportsExtendedPipeline } from '../pipeline-submittable.js';
 import type { DeferredQuery } from '../query/index.js';
 
@@ -450,6 +451,52 @@ describe('runPipelined, non-transactional mode', () => {
 
     // Two syncs (one per query)
     assert.equal(types.filter((t) => t === 'sync').length, 2, 'one sync per query in non-transactional mode');
+  });
+
+  /**
+   * A partial failure rejects with the typed E014 error the option's docstring
+   * promises. It used to reject with the first DRIVER error carrying a `results`
+   * property assigned onto it, so `err.results` read correctly while
+   * `err instanceof PipelineError` was false and `err.code` held whatever the
+   * driver error's code was. The driver error is now `.cause` and the failing
+   * slot's `error`.
+   */
+  it('rejects a partial failure with a real PipelineError carrying every slot', async () => {
+    const { client, connection } = createFakeClient();
+
+    connection.setupNonTransactionalResponses([
+      { fields: [{ name: 'a', dataTypeID: 23 }], rows: [['10']], command: 'SELECT 1' },
+      { error: { message: 'duplicate key value violates unique constraint', code: '23505' } },
+    ]);
+
+    const err = await runPipelined(
+      client,
+      [
+        defer('SELECT 10', [], (r) => (r.rows[0] as { a: number }).a),
+        defer('INSERT INTO t VALUES (1)', [], (r) => r.rows, 'users.create'),
+      ],
+      { transactional: false },
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    assert.ok(err instanceof PipelineError, `expected a PipelineError, got ${String(err)}`);
+    assert.equal(err.code, TurbineErrorCode.PIPELINE);
+    assert.equal(err.failedIndex, 1);
+    assert.equal(err.failedTag, 'users.create');
+    assert.deepEqual(
+      err.results.map((slot) => slot.status),
+      ['ok', 'error'],
+    );
+    const okSlot = err.results[0];
+    assert.equal(okSlot?.status === 'ok' ? okSlot.value : null, 10);
+    // wrapPgError still ran: 23505 is the typed unique-violation error, kept
+    // reachable as the slot's error rather than replaced by the batch error.
+    const failedSlot = err.results[1];
+    const slotError = failedSlot?.status === 'error' ? (failedSlot.error as Error & { code?: string }) : undefined;
+    assert.equal(slotError?.code, TurbineErrorCode.UNIQUE_VIOLATION);
+    assert.equal((err.cause as Error & { code?: string }).code, TurbineErrorCode.UNIQUE_VIOLATION);
   });
 });
 

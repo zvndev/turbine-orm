@@ -55,12 +55,19 @@
  */
 
 import type pg from 'pg';
+import type { PartitionLimitInput } from '../dialect.js';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableMetadata } from '../schema.js';
 import type { ReselectExecutor } from './builder.js';
-import { isRelationPickOrderBy, sortedEntries } from './filters.js';
+import { dedupeOrderEntries, isOrderBySpec, isRelationPickOrderBy, orderByEntries, sortedEntries } from './filters.js';
 import type { SkipGlobalFilters, Unsafe, WithClause, WithCount, WithOptions } from './types.js';
-import { ownLookup, selectNamesNothingMessage, selectOmitExclusiveMessage } from './utils.js';
+import {
+  markInternalCombinator,
+  ownLookup,
+  selectNamesNothingMessage,
+  selectOmitExclusiveMessage,
+  sqlToPreparedName,
+} from './utils.js';
 
 /**
  * Max parent keys per follow-up query. On Postgres the whole key set travels as
@@ -144,6 +151,155 @@ export interface RelationLoadContext {
     alias: string,
     precedingParams: number,
   ) => { clause: string; params: unknown[] } | null;
+  /**
+   * The active dialect's {@link Dialect.buildPartitionLimit}, when it has one.
+   * Absent means this engine cannot bound the follow-up per correlation key, so
+   * the loader falls back to fetching every child and slicing client-side. The
+   * same fallback runs, on every engine, for a relation whose ordering does not
+   * force which rows the limit keeps. See {@link partitionOrderBy} and
+   * {@link boundedChildQuery}.
+   */
+  buildPartitionLimit?: (input: PartitionLimitInput) => string;
+}
+
+/**
+ * Column the {@link Dialect.buildPartitionLimit} wrapper adds to carry the
+ * per-key row number. It is part of that statement's projection, so the loader
+ * removes it from every raw row before the child's own transform parses them,
+ * or it would surface as an extra field on every entity and break output
+ * equality with the join strategy.
+ */
+const PARTITION_RANK_COLUMN = '__turbine_rn';
+
+/**
+ * The relation `orderBy` expressed as plain column/direction/nulls triples for
+ * the window, or `null` when this pushdown cannot PROVE it would pick the same
+ * rows the join plan picks. `null` sends the whole relation back to the
+ * client-side slice, which is what every engine without the dialect hook does.
+ *
+ * ## Only a TOTAL order is eligible, and that is not a conservatism
+ *
+ * The join plan runs one correlated `… WHERE fk = parent ORDER BY … LIMIT n`
+ * per parent; the pushdown runs one flat statement over every parent and ranks
+ * with `ROW_NUMBER()`. When the ordering leaves TIES, "the first n" is not a
+ * defined set, so the two plans are each free to return different tied rows,
+ * and measured on PostgreSQL 16 (5 parents, 32 children, ties and NULLs on the
+ * sort column, `limit: 2`) they do:
+ *
+ *   relation shape                         old (client slice) == join   window == join
+ *   `orderBy: { sortKey: 'asc' }` w/ ties                        N                  N
+ *   no `orderBy`                                                 Y                  N
+ *   `{ sortKey: { sort:'asc', nulls:'first' } }`                 N                  N
+ *   `orderBy: [{ sortKey }, { id }]` (total)                     Y                  Y
+ *
+ * So the rule is not "the window is wrong", it is that WITHOUT A TOTAL ORDER
+ * neither implementation can be right, and the only shape where the pushdown
+ * demonstrably regressed something that used to hold is the unordered one. The
+ * bound is only taken where the answer is forced: the resolved column list must
+ * cover a NOT NULL unique key of the target (see {@link totallyOrdered}), which
+ * makes "the n smallest keys per parent" a single set in a single order that
+ * both plans must return. Everything else keeps the pre-existing behaviour
+ * rather than a silently different row set, because a wrong answer is worse
+ * than a slower query.
+ *
+ * A caller who wants the bound on an unordered relation has an existing,
+ * plan-symmetric way to ask for it: `stableRelationOrder` fills a primary-key
+ * ascending order into every to-many relation that declares none, on the join
+ * plan and the batched plan alike, which makes the shape totally ordered and
+ * therefore eligible here.
+ *
+ * ## What else disqualifies a shape
+ *
+ * Only the plain direction and {@link OrderBySpec} forms are accepted. A
+ * JSON-path, vector-distance, relation `_count` or pick-row ordering compiles
+ * to an expression (sometimes with its own bound params) that the loader cannot
+ * re-emit here. Same for a key that names no column: the child query build is
+ * what reports that, with the proper E003, so this must not throw its own error
+ * first.
+ *
+ * The entry list is DEDUPED first, with the same rule and the same metadata the
+ * inner statement's own `orderBy` goes through (the follow-up is compiled as a
+ * top-level `findMany` on the child table, which dedupes). Reading the RAW args
+ * here made the wrapper's text vary while the statement it wraps did not, which
+ * is a correctness divergence (`[{a:'asc'},{a:'desc'}]` sorts by `a ASC` inside
+ * and would have ranked by `a ASC, a DESC` outside) and, because the wrapper is
+ * named after its own text, an unbounded set of server-side prepared
+ * statements: measured, 25 requests that were semantically one sort key left 26
+ * named statements on one connection.
+ */
+function partitionOrderBy(
+  meta: TableMetadata,
+  orderBy: unknown,
+): { column: string; direction: 'ASC' | 'DESC'; nulls?: 'FIRST' | 'LAST' }[] | null {
+  // A child column spelled like the wrapper's rank alias would make the outer
+  // `WHERE … <= $n` reference ambiguous (Postgres 42702) and the strip below
+  // would delete a real value. It fails closed, but with a raw driver error
+  // carrying no TURBINE_ code, on a query the join plan serves fine, so the
+  // relation declines the pushdown instead.
+  if (meta.allColumns.includes(PARTITION_RANK_COLUMN)) return null;
+  const raw = orderByEntries(orderBy);
+  // `meta.name` is the table the child statement is compiled against, so a
+  // direction this refuses on a dropped term reads exactly as it does when the
+  // child's own compile path refuses it a few lines later.
+  const entries = dedupeOrderEntries(meta, raw, meta.name)?.entries ?? raw;
+  // No ordering at all is the extreme case of the tie rule above: an unordered
+  // window numbers each partition arbitrarily and the join plan's ORDER-BY-less
+  // `LIMIT` takes arbitrary rows, and those arbitrary choices are made by
+  // different plans over different row sets.
+  if (entries.length === 0) return null;
+  const out: { column: string; direction: 'ASC' | 'DESC'; nulls?: 'FIRST' | 'LAST' }[] = [];
+  for (const [key, value] of entries) {
+    const column = ownLookup(meta.columnMap, key);
+    if (!column || !meta.allColumns.includes(column)) return null;
+    let sort: unknown;
+    let nulls: 'FIRST' | 'LAST' | undefined;
+    if (isOrderBySpec(value)) {
+      // EXACTLY `{ sort, nulls? }` and nothing else. `isOrderBySpec` only tests
+      // for a `sort` key, and a JSON-path ordering can carry one too
+      // (`{ path: ['a'], sort: 'asc' }`), which would be read here as a plain
+      // column ordering and rank by the wrong expression. Anything with a key
+      // outside the pair falls back to the client-side slice.
+      for (const k of Object.keys(value)) if (k !== 'sort' && k !== 'nulls') return null;
+      sort = value.sort;
+      if (value.nulls === 'first') nulls = 'FIRST';
+      else if (value.nulls === 'last') nulls = 'LAST';
+      else if (value.nulls !== undefined) return null;
+    } else if (typeof value === 'object' && value !== null) {
+      // Relation `_count` / pick-row / vector orderings are objects too.
+      return null;
+    } else {
+      sort = value;
+    }
+    if (sort !== 'asc' && sort !== 'desc') return null;
+    out.push({ column, direction: sort === 'asc' ? 'ASC' : 'DESC', nulls });
+  }
+  return totallyOrdered(
+    meta,
+    out.map((o) => o.column),
+  )
+    ? out
+    : null;
+}
+
+/**
+ * True when sorting by `columns` can leave no two rows of `meta` tied: the list
+ * covers every column of the primary key, or of some unique constraint, and
+ * every column of that key is NOT NULL.
+ *
+ * The NOT NULL half is not decoration. A UNIQUE constraint over a nullable
+ * column admits any number of NULL rows in PostgreSQL (they are all distinct to
+ * the constraint and all equal to a sort), so such a key orders the non-null
+ * rows and leaves the NULL ones tied with each other, which is exactly the
+ * shape this rule exists to refuse. Primary-key columns are NOT NULL by
+ * definition, and are checked anyway: metadata that says otherwise is metadata
+ * this proof cannot rest on, and declining costs a bound rather than an answer.
+ */
+function totallyOrdered(meta: TableMetadata, columns: string[]): boolean {
+  const sorted = new Set(columns);
+  const nonNullable = (column: string): boolean => meta.columns.some((c) => c.name === column && c.nullable === false);
+  const covered = (key: readonly string[] | undefined): boolean =>
+    key !== undefined && key.length > 0 && key.every((c) => sorted.has(c) && nonNullable(c));
+  return covered(meta.primaryKey) || (meta.uniqueColumns ?? []).some(covered);
 }
 
 /**
@@ -577,10 +733,36 @@ async function loadToOneOrMany(
   // to-many with a to-one inside it, which is why `include` and `join` were both
   // clean and seventeen rounds of parity capture missed it.
   assertProjectionShape(targetMeta.name, options.select, options.omit);
+  // Decide the per-parent pushdown BEFORE resolving the projection: when it is
+  // on, the window's ORDER BY reads the order columns out of the derived table,
+  // so they have to be projected (and, like the correlation keys, stripped
+  // again afterwards). `null` means this relation keeps the client-side slice,
+  // which is the case for every shape whose ordering does not force WHICH rows
+  // the limit keeps. See {@link partitionOrderBy} and {@link boundedChildQuery}.
+  const windowOrder = single || options.limit === undefined ? null : partitionOrderBy(targetMeta, options.orderBy);
+  const pushDownLimit = windowOrder !== null && ctx.buildPartitionLimit !== undefined;
+  // THE ONE PII EXCEPTION IN THE READ PATH, recorded here because the contract
+  // in schema.ts says a PII column is excluded from every default projection
+  // "at the SQL level". Ordering a LIMITED relation by a PII column force-adds
+  // that column to this follow-up's SELECT list (the window reads it out of the
+  // derived table), and it is removed from the entities by `proj.strip` before
+  // anything returns. The join plan does the same thing in the same case: its
+  // wrapped subquery projects `targetMeta.allColumns` into the derived table
+  // whenever a relation carries a `limit` or an `orderBy`, and its
+  // `json_build_object` then emits only the resolved, PII-free column list. So
+  // the SQL-level statement is parity, and no PII value reaches a caller on
+  // either plan. What is NOT identical, and is the honest cost of the pushdown:
+  // on the join plan the value never leaves the server, while here it crosses
+  // the wire and is dropped client-side. A caller who cannot accept that should
+  // not order a limited relation by a PII column, which is a shape that already
+  // reveals the column's ordering.
+  const orderFields = pushDownLimit
+    ? (windowOrder ?? []).map((o) => targetMeta.reverseColumnMap[o.column] ?? o.column)
+    : [];
   const proj = includeKeysForBatching(
     options.select,
     options.omit,
-    [childKeyField, ...neededParentKeyFields(targetMeta, (options.with ?? {}) as WithClause)],
+    [childKeyField, ...orderFields, ...neededParentKeyFields(targetMeta, (options.with ?? {}) as WithClause)],
     defaultProjectionFields(targetMeta, ctx.includePii),
   );
   const child = ctx.makeChild(rel.to);
@@ -605,14 +787,20 @@ async function loadToOneOrMany(
 
   const chunks: unknown[][] = [];
   for (let i = 0; i < keys.length; i += MAX_RELATION_KEYS) chunks.push(keys.slice(i, i + MAX_RELATION_KEYS));
-  // Chunks run concurrently, results concatenated in chunk order. Per-relation
-  // `limit` is NOT pushed down here: `LIMIT` on a `fk = ANY($1)` query over the
-  // whole batch would cap TOTAL children, not children-per-parent. It is applied
-  // client-side per group after stitching (below).
+  // Chunks run concurrently, results concatenated in chunk order. A per-relation
+  // `limit` is bounded IN THE DATABASE when the dialect can express "at most N
+  // rows per correlation key" AND the relation's ordering forces which N those
+  // are (see partitionOrderBy / boundedChildQuery); a plain trailing `LIMIT`
+  // never can, because this one statement covers every parent. The client-side
+  // slice below still runs either way.
   const chunkResults = await Promise.all(
     chunks.map(async (chunk) => {
       const deferred = buildChunk(chunk);
-      const result = await ctx.exec(deferred.sql, deferred.params, deferred.preparedName);
+      const bounded = pushDownLimit
+        ? boundedChildQuery(ctx, deferred, childKeyCol, windowOrder ?? [], options.limit as number)
+        : deferred;
+      const result = await ctx.exec(bounded.sql, bounded.params, bounded.preparedName);
+      if (bounded !== deferred) stripRankColumn(result);
       return deferred.transform(result) as Record<string, unknown>[];
     }),
   );
@@ -651,6 +839,83 @@ async function loadToOneOrMany(
   }
 
   stripFields(allChildren, proj.strip);
+}
+
+/**
+ * Rewrite a compiled child follow-up so the ENGINE returns at most `limit` rows
+ * per correlation key, instead of returning every matching child and letting the
+ * loader throw most of them away.
+ *
+ * WHY IT IS WORTH THE WRAPPER. The follow-up is one flat statement covering
+ * every parent, so a trailing `LIMIT n` would cap the TOTAL, not the per-parent
+ * count, and would starve most parents; that is exactly why the limit was
+ * applied client-side and why the comment above used to say it could not be
+ * pushed down. What it could not do was push down a `LIMIT`. A window function
+ * expresses the actual requirement. Measured (200 posts, ~505 comments each,
+ * `with: { comments: { limit: 3 } }`, 600 rows kept):
+ *
+ *   strategy   rows over the wire   peak heap
+ *   join                      200      +0.5 MB
+ *   batched (before)      101,000     +52.9 MB
+ *
+ * and this is not an opt-in-only path: `'auto'`, the default since 0.41, routes
+ * a relation to the batched loader whenever its probe column is provably
+ * unindexed, so on a "posts with 10K comments each" shape the old behaviour is
+ * an OOM rather than a slowdown.
+ *
+ * WHAT IS DELIBERATELY NOT CHANGED. The mirror case is why this is a bound and
+ * not a strategy switch: with NO per-relation limit the batched plan beat the
+ * join plan 83 ms to 631 ms on the same data, so nothing here touches the
+ * unlimited path. The client-side slice also stays: it is a no-op once the
+ * engine has bounded each partition, and it is still the whole mechanism on an
+ * engine with no {@link Dialect.buildPartitionLimit}, and on every relation
+ * whose ordering leaves the choice of rows open ({@link partitionOrderBy}).
+ *
+ * WHAT THE CALLER GUARANTEES. `orderBy` is non-empty and totally orders the
+ * target, so the window's rank and the outer sort agree by construction and the
+ * n ranked rows per key are the n rows the join plan's per-parent
+ * `ORDER BY … LIMIT n` returns, in the same order. That is the whole reason
+ * this rewrite is allowed to change which rows come back over the wire.
+ *
+ * The prepared-statement name is REDERIVED from the wrapped text, never reused:
+ * the child's name is the hash of the INNER statement, and sending different
+ * text under a name the connection has already parsed would execute the old
+ * statement with these params. An unnamed child (a variable-arity where) stays
+ * unnamed.
+ */
+function boundedChildQuery(
+  ctx: RelationLoadContext,
+  deferred: Deferred,
+  partitionColumn: string,
+  orderBy: readonly { column: string; direction: 'ASC' | 'DESC'; nulls?: 'FIRST' | 'LAST' }[],
+  limit: number,
+): Deferred {
+  const wrap = ctx.buildPartitionLimit;
+  if (!wrap) return deferred;
+  const sql = wrap({
+    innerSql: deferred.sql,
+    partitionColumn,
+    orderBy,
+    limitPlaceholder: ctx.paramPlaceholder(deferred.params.length + 1),
+    rankColumn: PARTITION_RANK_COLUMN,
+  });
+  return {
+    sql,
+    params: [...deferred.params, limit],
+    preparedName: deferred.preparedName ? sqlToPreparedName(sql) : deferred.preparedName,
+    transform: deferred.transform,
+  };
+}
+
+/**
+ * Remove the window wrapper's rank column from every raw row, in place, before
+ * the child's own transform parses them. It is the LAST column of the wrapper's
+ * projection, so deleting it leaves the remaining key order untouched, which
+ * matters: object key order is observable output here (callers stringify
+ * results into HTTP bodies, ETags and cache keys).
+ */
+function stripRankColumn(result: pg.QueryResult): void {
+  for (const row of result.rows as Record<string, unknown>[]) delete row[PARTITION_RANK_COLUMN];
 }
 
 /**
@@ -788,6 +1053,18 @@ async function loadManyToMany(
   // (3) Stitch. Iterate `targetsInOrder` (already ordered by the relation's
   // orderBy) and pick the ones each parent links to, so per-parent order honours
   // orderBy; then apply the per-relation `limit` client-side.
+  //
+  // CLIENT-SIDE ON PURPOSE, and not an oversight of the per-parent pushdown the
+  // to-one/to-many loader uses. That pushdown ranks the follow-up rows with
+  // `ROW_NUMBER() OVER (PARTITION BY <correlation column>)`, and this query has
+  // no such column: step (2) reads TARGET rows by their own primary key, the
+  // parent correlation lives one hop back in the junction, and a single target
+  // row is legitimately linked to many parents, so it must be fetched once and
+  // attached several times. Partitioning by parent would mean joining the
+  // junction into the follow-up and returning one copy of the target row per
+  // link, which spends exactly the bytes the pushdown exists to save; and the
+  // bound would still have to respect a `limit` measured per parent, not per
+  // fetched row. So the m2m loader keeps the slice below, on every engine.
   const limit = options.limit;
   for (const parent of parents) {
     const linked = new Set((targetsBySource.get(keyOf(parent[parentRefField])) ?? []).map(keyOf));
@@ -961,7 +1238,11 @@ function mergeChildWhere(
 ): Record<string, unknown> {
   const correlation = { [keyField]: { in: chunk } };
   if (!where) return correlation;
-  if (Object.hasOwn(where, keyField)) return { AND: [where, correlation] };
+  // Branded: this `AND` is TURBINE's, always exactly two branches and decided
+  // here rather than by the caller, so it must not put the follow-up on the
+  // variable-arity (unnamed) prepared-statement path. Same rule and same
+  // reason as the global-filter merge in where.ts.
+  if (Object.hasOwn(where, keyField)) return markInternalCombinator({ AND: [where, correlation] });
   return { ...where, ...correlation };
 }
 

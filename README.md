@@ -30,8 +30,8 @@ The reason to reach for Turbine is that every layer between you and a production
 
 Two more things worth knowing, which are about cost rather than safety:
 
-- **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages in lockstep. The main entry's **import graph** is held under **77 kB brotli** (edge under 61 kB) with `pg` external. That is the ceiling `size-limit` enforces in CI from `.size-limit.js`, not a figure typed into this file: a measurement quoted in prose goes stale silently, and this one did, drifting ~12% low over ten releases before a review caught it. Run `npm run size` for the current number. That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger. Prisma 7 dropped its Rust query engine but its client still ships a TypeScript/WASM query compiler, a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
-- **Real pipelining, not a batch transaction.** `db.pipeline(...)` uses the Postgres extended-query protocol (Parse/Bind/Execute/Sync) to put N independent queries in one TCP flush. node-postgres does not expose pipelining in its pure-JS core ([brianc/node-postgres#2646](https://github.com/brianc/node-postgres/issues/2646) was still open as of July 2026), and Drizzle's `db.batch()` is an implicit transaction on specific drivers rather than independent-query pipelining.
+- **One runtime dependency (`pg`).** No engine binary, no WASM, no adapter packages in lockstep. The main entry's **import graph** is held under **85 kB brotli** (edge under 68 kB) with `pg` external. That is the ceiling `size-limit` enforces in CI from `.size-limit.js`, not a figure typed into this file: a measurement quoted in prose goes stale silently, and this one did, drifting ~12% low over ten releases before a review caught it, and again in 0.66.0 when the budget was re-baselined. Run `npm run size` for the current number. That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger. Prisma 7 dropped its Rust query engine but its client still ships a TypeScript/WASM query compiler, a ~1.6 MB bundle, down from the ~14 MB Rust-era client.
+- **Real pipelining at the protocol level.** `db.pipeline(...)` uses the Postgres extended-query protocol (Parse/Bind/Execute/Sync) to put N queries in one TCP flush, so the win is round-trips, not batching semantics. node-postgres does not expose pipelining in its pure-JS core ([brianc/node-postgres#2646](https://github.com/brianc/node-postgres/issues/2646) was still open as of July 2026), and Drizzle's `db.batch()` is a driver-specific implicit transaction rather than wire pipelining. The batch is atomic by default; `{ transactional: false }` makes the queries independent instead.
 
 **Beyond the safety bundle, what ships today:** [global filters](https://turbineorm.dev/global-filters) for soft-delete and multi-tenancy · [read replicas](https://turbineorm.dev/read-replicas) with a `$primary()` escape hatch · a read-only [MCP server](https://turbineorm.dev/mcp) for AI agents · [seed-as-code](https://turbineorm.dev/seeding) and a non-interactive `migrate deploy` for CI · [Zod generation](https://turbineorm.dev/zod) · read-only [views & generated columns](https://turbineorm.dev/views) · [optional SQLite / MySQL / SQL Server / PowDB engines](https://turbineorm.dev/engines) behind subpath exports · a [Prisma migration toolkit](https://turbineorm.dev/migrate-from-prisma) (schema mapper plus a runtime compat adapter) · a cost-aware index advisor in [`turbine doctor`](https://turbineorm.dev/cli#turbine-doctor).
 
@@ -39,39 +39,41 @@ Per-release detail lives in the [CHANGELOG](https://github.com/zvndev/turbine-or
 
 ## Benchmarks
 
-> **These are a dated snapshot, not a live claim.** Every figure below comes from **one measurement run on 2026-07-25 against turbine-orm 0.50.0**. It has not been re-run since, and the package you are installing is several minor versions ahead of it. Nothing here has been adjusted to match a later release, because inventing numbers is worse than quoting old ones. Read the table as *the shape of the result* (who leads which scenario, and by roughly how much) rather than as the latency your deployment will see, and reproduce it with the command at the end of this section if the absolute values matter to you. The same reasoning applies to the bundle-size figure above: a precise number typed into prose goes stale silently, so prefer the claim that cannot rot.
+> **These are a dated snapshot, not a live claim.** Every figure below comes from **one measurement run on 2026-08-09 against turbine-orm 0.66.0**, the release you are installing. Nothing here has been adjusted to match anything, because inventing numbers is worse than quoting old ones. Read the table as *the shape of the result* (who leads which scenario, and by roughly how much) rather than as the latency your deployment will see, and reproduce it with the command at the end of this section if the absolute values matter to you. The same reasoning applies to the bundle-size figure above: a precise number typed into prose goes stale silently, so prefer the claim that cannot rot.
 
-Measured **2026-07-25 against turbine-orm 0.50.0** (commit `f8fec86`), tested against **Prisma 7.9.0** (`@prisma/adapter-pg`, `relationJoins` preview on) and **Drizzle 0.45.2** (relational queries) on a **local PostgreSQL 17.9** database over a Unix socket, with a **hand-written `pg` control arm**. Node v24.18.0, Apple Silicon MacBook Pro (M5 Max). Same schema, same data (1K users, 10K posts, 50K comments), same pool config.
+Measured **2026-08-09 against turbine-orm 0.66.0**, tested against **Prisma 7.9.0** (`@prisma/adapter-pg`, `relationJoins` preview on) and **Drizzle 0.45.2** (relational queries) on a **local PostgreSQL 17.9** database over a Unix socket, with a **hand-written `pg` control arm**. Node v24.18.0, Apple Silicon MacBook Pro (M5 Max). Same schema, same data (1K users, 10K posts, 50K comments), same pool config.
 
 Every arm runs once per round, the arm order rotates every round, and each figure is the median over 200 rounds, taken as the median of three full runs. A local socket has no network round-trip, so these numbers are mostly sub-millisecond and isolate per-query overhead instead of hiding it behind network latency.
 
 Prisma's nested scenarios run on its **`join`** load strategy, which is its favorable configuration and is chosen deliberately.
 
-| Scenario | Turbine 0.50 | Prisma 7.9 | Drizzle 0.45 | raw pg |
+| Scenario | Turbine 0.66 | Prisma 7.9 | Drizzle 0.45 | raw pg |
 |---|---|---|---|---|
-| findMany, 100 users (flat) | **0.256 ms** | 0.358 ms | 0.330 ms | 0.210 ms |
-| findMany, 50 users + posts (L2) | 2.421 ms | 4.603 ms | **2.001 ms** | 1.953 ms |
-| findMany, 10 users → posts → comments (L3) *(near-tie)* | 1.255 ms | 3.735 ms | **1.214 ms** | n/a |
-| findUnique, single user by PK | **0.051 ms** | 0.105 ms | 0.108 ms | 0.060 ms |
-| findUnique, user + posts + comments (L3) | **0.217 ms** | 0.469 ms | 0.357 ms | n/a |
-| count, all users | **0.044 ms** | 0.081 ms | 0.061 ms | 0.045 ms |
-| stream, iterate 50K rows (batch 1000) | 63.87 ms | 71.08 ms | **50.18 ms** | 50.97 ms |
-| atomic increment, `view_count + 1` *(near-tie)* | **0.115 ms** | 0.174 ms | 0.123 ms | 0.095 ms |
-| pipeline, 5-query batch | **0.206 ms** | 0.431 ms | 0.402 ms | 0.205 ms |
-| hot findUnique, 500x same shape | **0.029 ms** | 0.065 ms | 0.075 ms | 0.033 ms |
+| findMany, 100 users (flat) | **0.189 ms** | 0.254 ms | 0.248 ms | 0.164 ms |
+| findMany, 50 users + posts (L2) *(contested, see below)* | 2.379 ms | 4.289 ms | **1.804 ms** | 1.779 ms |
+| findMany, 10 users → posts → comments (L3) | 1.436 ms | 3.990 ms | **1.223 ms** | n/a |
+| findUnique, single user by PK | **0.038 ms** | 0.083 ms | 0.085 ms | 0.037 ms |
+| findUnique, user + posts + comments (L3) | **0.197 ms** | 0.397 ms | 0.303 ms | n/a |
+| count, all users | **0.043 ms** | 0.076 ms | 0.058 ms | 0.044 ms |
+| stream, iterate 50K rows (batch 1000) | 54.01 ms | 57.93 ms | **40.81 ms** | 42.77 ms |
+| atomic increment, `view_count + 1` *(contested, see below)* | **0.073 ms** | 0.114 ms | 0.079 ms | 0.060 ms |
+| pipeline, 5-query batch | **0.183 ms** | 0.386 ms | 0.366 ms | 0.194 ms |
+| hot findUnique, 500x same shape | **0.029 ms** | 0.064 ms | 0.073 ms | 0.033 ms |
 
-**The number worth quoting from that run: Turbine ran at 1.07x hand-written `pg`, where Drizzle ran at 1.47x and Prisma at 1.84x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine was **1.87x faster than Prisma 7.9** and **1.36x faster than Drizzle 0.45** by geometric mean, against those two competitor versions.
+**The number worth quoting from that run: Turbine ran at 1.09x hand-written `pg`, where Drizzle ran at 1.49x and Prisma at 1.86x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine was **1.82x faster than Prisma 7.9** and **1.32x faster than Drizzle 0.45** by geometric mean, against those two competitor versions.
 
-- **Turbine takes seven scenarios**, Drizzle three, Prisma none. Prisma is behind Turbine on all ten. Two of the ten (L3 nested, atomic increment) are genuine near-ties and are not leads for either side.
-- **Drizzle wins streaming outright, by 27%** (50.18 ms vs Turbine's 63.87 ms), reproduced in every run. Drizzle sits exactly on the raw `pg` keyset control, which is where a thin builder should sit; Turbine's cursor carries about 25% overhead above hand-written keyset pagination on a full-table drain. That overhead buys cursor semantics keyset cannot offer (any `orderBy`, deterministic early break, nested `with` per batch), but on this shape it is a loss and it is an open optimization target. A previous version of this table showed Turbine fastest here and called it a near-tie; that rested on a Drizzle figure we could not reproduce, and it was wrong.
-- **Drizzle also leads nested reads (L2).** Turbine's `json_agg` nesting is close behind and **1.9x to 3.0x ahead of Prisma** on the same L2/L3 shapes.
-- **Pipeline batching is Turbine's clearest win**: one TCP flush for 5 queries runs the dashboard batch 2.09x faster than Prisma's and 1.95x faster than Drizzle's sequential transaction, level with the raw `pg` control.
+- **Turbine takes seven scenarios**, Drizzle three, Prisma none. Prisma is behind Turbine on all ten.
+- **Two scenarios are contested and are not claimed by either side.** This run used two independent harnesses (one interleaves the arms and rotates their order every round, one measures each ORM in a contiguous block), and they disagree about **L2 nested reads** and **atomic increment**. The table above reports the interleaved harness, which is the more rigorous of the two because drift over the life of the process is shared across arms rather than landing on whichever arm held that slice of wall clock. Where the two disagree, the honest reading is that measurement design decides the winner, so the scenario is a tie.
+- **Drizzle wins streaming outright, by 24%** (40.81 ms vs Turbine's 54.01 ms), reproduced in every run. Drizzle sits on the raw `pg` keyset control, which is where a thin builder should sit; Turbine's cursor carries about 26% overhead above hand-written keyset pagination on a full-table drain. That overhead buys cursor semantics keyset cannot offer (any `orderBy`, deterministic early break, nested `with` per batch), but on this shape it is a loss and it is an open optimization target.
+- **Drizzle leads L3 nested reads**, and L2 on the primary harness. Turbine's `json_agg` nesting is close behind and **1.8x to 2.8x ahead of Prisma** on the same L2/L3 shapes.
+- **The nested-relation gap to Drizzle widened since the 0.50.0 run** (L2 published at 1.21x, now 1.32x on the primary harness), and we have not yet found why. It is **not** this release: a direct interleaved A/B of 0.65.0 against 0.66.0 on the same database found 0.66.0 equal or marginally faster on every shape. Turbine's absolute L2 number barely moved between the two runs; the raw control and Drizzle both got about 10% faster and Turbine did not. Treat L2 as an open investigation rather than a result in either direction.
+- **Pipeline batching is Turbine's clearest win**: one TCP flush for 5 queries runs the dashboard batch 2.11x faster than Prisma's and 2.00x faster than Drizzle's sequential transaction, level with the raw `pg` control.
 
-> **Read the drift floor before quoting a sub-millisecond figure.** The identical raw control arm drifts 1% to 14% between runs on the multi-millisecond scenarios but **21% to 47%** on the sub-0.15 ms ones (findUnique by PK, count, atomic increment, hot findUnique, pipeline). Those orderings are stable across all five runs; their absolute values carry roughly one third uncertainty. Full per-run drift tables in [`benchmarks/RESULTS-0.50.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.50.0.md).
+> **Read the drift floor before quoting a sub-millisecond figure.** A `SELECT 1` probe at the head, middle and tail of each suite measured 0.0266 / 0.0107 / 0.0105 ms, a **153.8% spread**, nearly all of it process warmup between the head probe and the rest. The multi-millisecond scenarios (L2, L3, stream) are stable and their orderings are trustworthy. The sub-0.15 ms scenarios carry roughly one third uncertainty in their absolute values; their orderings held across all three runs but their **margins** should not be quoted. Full method, the 0.65-vs-0.66 A/B, and the harness-disagreement table in [`benchmarks/RESULTS-0.66.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.66.0.md).
 
-Net, as of that run: Turbine was competitive-to-ahead across the board rather than a clean sweep, and the takeaway is the part that does not go stale: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only-by-default Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
+Net, as of that run: Turbine is competitive-to-ahead across the board rather than a clean sweep, and the takeaway is the part that does not go stale: performance is close enough that the real reasons to choose Turbine are elsewhere. **One dependency and no WASM** (vs Prisma 7's ~1.6 MB TypeScript/WASM query compiler), the **only read-only-by-default Studio** in the TS ORM ecosystem, **PII-safe error messages** that never leak user data, and **SQL-first migrations** with SHA-256 drift detection. Deep type inference through `with` clauses works end-to-end: write `db.users.findMany({ with: { posts: { with: { comments: true } } } })` and `users[0].posts[0].comments[0].body` autocompletes, with no manual assertion and no helper annotation.
 
-> Full analysis, methodology and the drift floor: [`benchmarks/RESULTS-0.50.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.50.0.md). Historical runs: [`benchmarks/RESULTS.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS.md).
+> Full analysis, methodology and the drift floor: [`benchmarks/RESULTS-0.66.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.66.0.md). Previous run: [`benchmarks/RESULTS-0.50.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.50.0.md). Historical runs: [`benchmarks/RESULTS.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS.md).
 > Reproduce: `cd benchmarks && npm install && npx prisma generate && DATABASE_URL=... npx tsx bench-interleaved.ts`
 
 ## Quick Start
@@ -491,7 +493,7 @@ const [order, _items, updated] = await db.$transaction([
 
 The full set: `buildFindMany`, `buildFindUnique`, `buildFindFirst`, `buildFindUniqueOrThrow`, `buildFindFirstOrThrow`, `buildCount`, `buildAggregate`, `buildGroupBy`, `buildCreate`, `buildCreateMany`, `buildUpdate`, `buildUpdateMany`, `buildUpsert`, `buildDelete`, `buildDeleteMany`.
 
-Use `db.pipeline(...)` when the queries are independent and you want one round-trip with no transaction; use `db.$transaction([...])` when you want all-or-nothing. Nested writes (relation operations inside `data`) open their own transaction, so those methods stay `async` and have no `build*` twin.
+Use `db.pipeline(...)` when the queries are independent and you want them in one round-trip; use `db.$transaction([...])` when you also need interactive control or SAVEPOINT nesting. Both are atomic by default: a pipeline wraps the batch in one `BEGIN`/`COMMIT` unless you pass `{ transactional: false }`, and only that opt-out path can produce a `PipelineError` (TURBINE_E014) with per-slot results. Nested writes (relation operations inside `data`) open their own transaction, so those methods stay `async` and have no `build*` twin.
 
 ### Middleware
 
@@ -1177,11 +1179,11 @@ Turbine maps Postgres types to TypeScript:
 |---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
-| **Main bundle (brotli)** | under 77 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
+| **Main bundle (brotli)** | under 85 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
 | **Studio** | Read-only, 192-bit auth | Full CRUD, cloud-hosted | Free; hosted Gateway paid | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, under 61 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native |
+| **Edge runtime** | One import swap, under 68 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query per relation by default; single-query `relationJoins` is still Preview and whole-query only | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |
@@ -1200,7 +1202,7 @@ Reading the table: no engine binary and no WASM, just one runtime dependency (`p
 
 Turbine is focused and opinionated. Here's what it doesn't do:
 
-- **Postgres-first.** PostgreSQL is the default and primary target, going deep on one database is what enables the safety bundle and the edge-runtime story. SQLite, MySQL 8, and SQL Server engines are available as additive subpath exports (see [Database engines](#database-engines)), but several flagship features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`, full-text `search`, array-column filters, `groupBy({ distinctOn })`) are Postgres-only and throw `UnsupportedFeatureError` elsewhere.
+- **Postgres-first.** PostgreSQL is the default and primary target, going deep on one database is what enables the safety bundle and the edge-runtime story. SQLite, MySQL 8, and SQL Server engines are available as additive subpath exports (see [Database engines](#database-engines)), but several flagship features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`, full-text `search`, array-column filters, `findMany({ distinct })` and `groupBy({ distinctOn })`) are Postgres-only and throw `UnsupportedFeatureError` elsewhere.
 - **Full-text search** is available via a `search` filter, `where: { title: { search: 'hello & world', config: 'english' } }` compiles to a parameterized `to_tsvector(...) @@ to_tsquery(...)`. PostgreSQL only: the other engines throw `UnsupportedFeatureError` (`TURBINE_E017`) rather than degrade to a `LIKE`. For advanced ranking (`ts_rank`, weighted vectors) use `db.raw`.
 - **Large nested result sets.** Nested results are materialized server-side in PostgreSQL memory. For relations with 10K+ rows, always use `limit` in your `with` clause, or stream the parents with `findManyStream` and resolve children per-row.
 

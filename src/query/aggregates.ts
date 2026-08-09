@@ -14,6 +14,7 @@ import type { TableMetadata } from '../schema.js';
 import { snakeToCamel } from '../schema.js';
 import type { DeferredQuery } from './deferred.js';
 import {
+  dedupeColumnList,
   isJsonPathOrderBy,
   isUnmatchedPlainObject,
   isVectorOrderBy,
@@ -34,9 +35,10 @@ import type {
   WhereClause,
 } from './types.js';
 import { assertOrderDirection, resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
-import { isTemporalInfinity, ownLookup, unknownFieldMessage } from './utils.js';
+import { isTemporalInfinity, ownLookup, parseDbDate, unknownFieldMessage, warnRedundantSortTerm } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
+import { assertWhereDepth } from './where-compile.js';
 
 /**
  * Enforce the PII contract on the aggregate surface. A PII-tagged
@@ -416,6 +418,33 @@ export function buildGroupByOrderBy(
   };
 
   const parts: string[] = [];
+  // Redundant-sort-term dropping, groupBy's spelling of it (see
+  // `dedupeOrderEntries` in filters.ts for why this drops rather than refuses).
+  // The findMany rule compares the RESOLVED COLUMN because its keys are field
+  // names; here the keys are RESULT keys (by-fields, JSON group-key aliases,
+  // aggregate blocks) that have already been resolved into the exact SELECT
+  // expression they re-emit, so the expression IS the identity, and comparing
+  // it is both cheaper and stricter: an alias and a JSON group key that extract
+  // the same path collapse onto one term, which is what "sorts by the same
+  // thing" means. Direction is excluded for the same reason as in filters.ts: a
+  // second term on an expression the first already ordered by cannot move a row
+  // whichever way it points.
+  //
+  // Done in place rather than up front because groupBy does not go through the
+  // SQL-template cache at all, so there is no fingerprint for this to stay in
+  // step with; the compile path is the only path.
+  const seen = new Map<string, string>();
+  const pushOrderTerm = (expr: string, label: string, value: OrderDirection | OrderBySpec): void => {
+    const first = seen.get(expr);
+    if (first !== undefined) {
+      warnRedundantSortTerm(qi.table, 'groupBy orderBy', [{ key: label, first, resolved: expr }]);
+      return;
+    }
+    seen.set(expr, label);
+    const { dir, nulls } = normalizeOrderBy(value);
+    parts.push(`${expr} ${dir}${qi.nullsSuffix(nulls)}`);
+  };
+
   for (const [key, value] of orderByEntries(orderBy)) {
     if (value === undefined) continue;
 
@@ -432,8 +461,7 @@ export function buildGroupByOrderBy(
         // Refuse a direction that is neither asc nor desc BEFORE normalizeOrderBy,
         // whose `=== 'desc' ? DESC : ASC` would silently sort ascending.
         assertOrderDirection(value, `groupBy orderBy "_count" on table "${qi.table}"`);
-        const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
-        parts.push(`${expr} ${dir}${qi.nullsSuffix(nulls)}`);
+        pushOrderTerm(expr, '_count', value as OrderDirection | OrderBySpec);
         continue;
       }
       // `_sum` / `_avg` / `_min` / `_max`: an object of field → direction/spec.
@@ -453,8 +481,7 @@ export function buildGroupByOrderBy(
           );
         }
         assertOrderDirection(dirSpec, `groupBy orderBy "${key}.${field}" on table "${qi.table}"`);
-        const { dir, nulls } = normalizeOrderBy(dirSpec);
-        parts.push(`${expr} ${dir}${qi.nullsSuffix(nulls)}`);
+        pushOrderTerm(expr, `${key}.${field}`, dirSpec);
       }
       continue;
     }
@@ -468,8 +495,7 @@ export function buildGroupByOrderBy(
       );
     }
     assertOrderDirection(value, `groupBy orderBy "${key}" on table "${qi.table}"`);
-    const { dir, nulls } = normalizeOrderBy(value as OrderDirection | OrderBySpec);
-    parts.push(`${expr} ${dir}${qi.nullsSuffix(nulls)}`);
+    pushOrderTerm(expr, key, value as OrderDirection | OrderBySpec);
   }
   return parts.join(', ');
 }
@@ -548,7 +574,13 @@ export function buildDistinctOnSource<T extends object>(
         "column combination deterministically (e.g. orderBy: { createdAt: 'desc' }).",
     );
   }
-  const distinctCols = distinctOn.columns.map((c) => qi.q(qi.toColumn(c)));
+  // A repeated DISTINCT ON column is a no-op, so drop it rather than emit it
+  // twice (see `dedupeColumnList`). The orderBy below needs no equivalent: its
+  // keys come from an object, and the DISTINCT ON columns lead the ORDER BY, so
+  // a key repeating one of them is already merged by `orderParts`' construction.
+  const dedupedCols = dedupeColumnList(qi.tableMeta, distinctOn.columns);
+  if (dedupedCols) warnRedundantSortTerm(qi.table, 'groupBy distinctOn.columns', dedupedCols.dropped);
+  const distinctCols = (dedupedCols?.columns ?? distinctOn.columns).map((c) => qi.q(qi.toColumn(c)));
   // DISTINCT ON expressions must lead the ORDER BY; the user's orderBy then
   // decides which row survives per combination.
   const orderParts: string[] = [...distinctCols];
@@ -627,7 +659,9 @@ export function buildHavingClauses<T extends object>(
   params: unknown[],
   jsonAggExprs?: Map<string, string>,
   groupKeys?: Map<string, HavingGroupKey>,
+  depth = 0,
 ): string[] {
+  assertWhereDepth(depth, 'having');
   const clauses: string[] = [];
 
   for (const [key, value] of Object.entries(having)) {
@@ -641,7 +675,7 @@ export function buildHavingClauses<T extends object>(
 
     // AND / OR / NOT, mixing scalar and aggregate predicates at any depth.
     if (key === 'AND' || key === 'OR' || key === 'NOT') {
-      clauses.push(...buildHavingCombinator(qi, key, value, params, jsonAggExprs, groupKeys));
+      clauses.push(...buildHavingCombinator(qi, key, value, params, jsonAggExprs, groupKeys, depth));
       continue;
     }
 
@@ -728,8 +762,21 @@ function buildHavingCombinator<T extends object>(
   params: unknown[],
   jsonAggExprs?: Map<string, string>,
   groupKeys?: Map<string, HavingGroupKey>,
+  depth = 0,
 ): string[] {
   const conditions = Array.isArray(value) ? value : [value];
+  // Same variable-arity shape as the WHERE combinators: an ARRAY branch writes
+  // one parenthesized condition per element into the SQL text, so a
+  // caller-sized `having.OR` is a new statement per length.
+  //
+  // DEFENSIVE, not load-bearing, today: `buildGroupBy` and `buildAggregate`
+  // assemble their SQL directly and never go through `acquireSql`, so they
+  // carry no prepared-statement name for the mark to clear (asserted in
+  // prepared-statement-arity.test.ts). It is marked anyway so that routing
+  // them through the cache later cannot silently reopen the hole, and so the
+  // rule reads the same in both clause compilers. The DEPTH cap above is the
+  // half of this that bites here and now.
+  if (Array.isArray(value) && key !== 'NOT') qi.markVariableArity();
   const parts: string[] = [];
   for (const condition of conditions) {
     if (!isUnmatchedPlainObject(condition)) {
@@ -738,7 +785,7 @@ function buildHavingCombinator<T extends object>(
           `${key === 'OR' ? 'an array of having objects' : 'a having object (or an array of them)'}.`,
       );
     }
-    const sub = buildHavingClauses(qi, condition as HavingClause<T>, params, jsonAggExprs, groupKeys);
+    const sub = buildHavingClauses(qi, condition as HavingClause<T>, params, jsonAggExprs, groupKeys, depth + 1);
     if (sub.length === 0) continue;
     parts.push(sub.length === 1 ? sub[0]! : `(${sub.join(' AND ')})`);
   }
@@ -904,10 +951,27 @@ export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: 
  */
 function temporalAggValue(qi: BuilderCtx, col: string, value: unknown): unknown {
   if (!qi.tableMeta.dateColumns.has(col)) return value;
-  if (!isTemporalInfinity(value)) return value;
-  if (qi.temporalInfinity === 'null') return null;
-  if (typeof value === 'number') return value;
-  return value === '-infinity' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY;
+  if (isTemporalInfinity(value)) {
+    if (qi.temporalInfinity === 'null') return null;
+    if (typeof value === 'number') return value;
+    return value === '-infinity' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY;
+  }
+  // A STRING on a temporal column means the driver handed the value back
+  // untyped, which is what every engine without pg's OID-keyed type parsers
+  // does. Verified on SQLite: `findMany` returned a `Date` for `at` and
+  // `groupBy` returned a `Date` for the same column used as a group key, while
+  // `aggregate({ _max: { at: true } })` returned the raw string
+  // '2024-01-15 12:00:00', so ONE column disagreed with itself across three
+  // read paths and with the `Date` the generated types promise. `_min`/`_max`
+  // are assembled from the RAW row here (they cannot go through `parseRow`,
+  // whose snake→camel mapping would collide with the `_min_` alias), so the
+  // coercion `parseRow` applies has to be applied here as well, on the same
+  // terms: offset-less text is pinned to UTC unless `utcTimestamps: false`.
+  //
+  // On PostgreSQL this branch is unreachable and the emitted values are
+  // unchanged: the driver's date/timestamp parsers already produce a `Date`.
+  if (typeof value === 'string') return qi.utcTimestamps !== false ? parseDbDate(value) : new Date(value);
+  return value;
 }
 
 export function buildAggregate<T extends object>(

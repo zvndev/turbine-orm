@@ -209,6 +209,18 @@ const sample = await db.posts.findMany({
 
 Per `DISTINCT ON` semantics, which row survives per group is governed by `orderBy`, sort by the distinct fields first, then by whatever should decide the winner within each group.
 
+<Callout type="warning" title="PostgreSQL only">
+  `DISTINCT ON` is a PostgreSQL extension that no other engine parses. Since
+  0.66 `distinct` is refused on SQLite, MySQL and SQL Server with
+  `UnsupportedFeatureError` (`TURBINE_E017`), the same typed error the other
+  spelling of this feature (`groupBy({ distinctOn })`) has always thrown. Before
+  0.66 the clause was emitted with no dialect check at all, so those engines
+  answered with a raw driver parse error (`near "ON": syntax error`,
+  `ER_PARSE_ERROR`) carrying no `TURBINE_*` code. The PostgreSQL SQL is
+  unchanged. CockroachDB and YugabyteDB run on the PostgreSQL dialect, so the
+  gate does not fire for them and the clause is emitted as-is.
+</Callout>
+
 ### Ordering, direction and NULLS placement
 
 `orderBy` maps fields to a direction. A plain `'asc'` or `'desc'` works everywhere. To control where `NULL` values land, pass a spec object instead:

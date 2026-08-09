@@ -69,6 +69,13 @@ describe('yugabytedb adapter', () => {
     assert.ok(adapter.introspectionOverrides !== undefined);
   });
 
+  it('declares that its lock lives in an open transaction', () => {
+    // Read by the migration runner to decide the lock needs its own
+    // connection: a row lock dies with the transaction that took it, and the
+    // runner commits once per migration on its own connection.
+    assert.equal(yugabytedb.lockHoldsOpenTransaction, true);
+  });
+
   describe('acquireLock', () => {
     it('creates lock table, inserts row, and acquires FOR UPDATE lock', async () => {
       const client = createMockClient();
@@ -119,6 +126,25 @@ describe('yugabytedb adapter', () => {
       // Should have rolled back after the 55P03 error
       const rollbackCall = client.calls.find((c) => c.text === 'ROLLBACK');
       assert.ok(rollbackCall !== undefined, 'Should issue ROLLBACK on lock failure');
+    });
+
+    it('treats a serialization failure (40001) as lock-not-acquired', async () => {
+      // YugabyteDB's distributed transaction layer can abort the conflicting
+      // transaction rather than refuse the lock. That is the same contention,
+      // and rethrowing it replaced the clean "another migration is already
+      // running" message with a raw driver error.
+      const client = createMockClient();
+      client.query = mock.fn(async (text: string, _values?: unknown[]) => {
+        if (text.includes('FOR UPDATE NOWAIT')) {
+          const err = new Error('restart transaction: conflict') as Error & { code: string };
+          err.code = '40001';
+          throw err;
+        }
+        return { rows: [] };
+      });
+
+      // biome-ignore lint/suspicious/noExplicitAny: mock client
+      assert.equal(await yugabytedb.acquireLock(client as any, 99), false);
     });
 
     it('re-throws non-lock errors', async () => {

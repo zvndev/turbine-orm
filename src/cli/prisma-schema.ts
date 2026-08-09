@@ -38,6 +38,16 @@ export interface PrismaAttrArg {
 export interface PrismaAttr {
   /** Attribute name without the leading `@`/`@@` (e.g. `map`, `relation`, `id`, `unique`). */
   name: string;
+  /**
+   * The part after the dot in a namespaced attribute: `VarChar` for
+   * `@db.VarChar(320)`, `Text` for `@db.Text`.
+   *
+   * Kept because the head alone throws the native type away, and the arguments
+   * do not carry it back: `@db.VarChar(320)` retained only `320`, and
+   * `@db.Text` retained nothing at all, so `Text`, `Uuid`, `Money`, and
+   * `Citext` were indistinguishable from each other and from a bare `String`.
+   */
+  nativeType?: string;
   /** Parsed argument list (empty when the attribute took no parens). */
   args: PrismaAttrArg[];
   /** True for a block attribute (`@@name`), false for a field attribute (`@name`). */
@@ -50,8 +60,14 @@ export interface PrismaAttr {
 export interface PrismaField {
   /** Field name as declared (the Prisma API name). */
   name: string;
-  /** Base type with `[]` / `?` stripped (a scalar, enum, or model name). */
+  /**
+   * Base type with `[]` / `?` stripped (a scalar, enum, or model name).
+   * `Unsupported("...")` is normalized to the literal `Unsupported`, with the
+   * database type kept in {@link PrismaField.unsupported}.
+   */
   type: string;
+  /** The database type inside `Unsupported("...")`, when the field used that form. */
+  unsupported?: string;
   /** Trailing `?` - the field is optional/nullable. */
   optional: boolean;
   /** Trailing `[]` - the field is a list. */
@@ -366,8 +382,13 @@ function parseAttributes(fragment: string, line: number): PrismaAttr[] {
     } else {
       j = k;
     }
-    // `@db.VarChar(255)` etc. - keep only the head so `db` is the recorded name.
-    attrs.push({ name: rawName.split('.')[0]!, args, block, line });
+    // `@db.VarChar(255)` etc. The HEAD is the recorded name (so consumers keep
+    // matching on `db`), and everything after the first dot is kept as the
+    // native type rather than discarded.
+    const dot = rawName.indexOf('.');
+    const head = dot === -1 ? rawName : rawName.slice(0, dot);
+    const nativeType = dot === -1 ? undefined : rawName.slice(dot + 1);
+    attrs.push({ name: head, ...(nativeType ? { nativeType } : {}), args, block, line });
     i = j;
   }
   return attrs;
@@ -411,15 +432,30 @@ function matchBrace(s: string, open: number): number {
   return -1;
 }
 
-/** Scan the top level for `keyword Name { ... }` blocks via brace matching. */
-function scanBlocks(src: string): RawBlock[] {
+/**
+ * Scan the top level for `keyword Name { ... }` blocks via brace matching.
+ *
+ * A header whose keyword is not one we handle is skipped, and now RECORDED:
+ * the switch in `parsePrismaSchema` has a `default` branch that pushes an
+ * "unsupported block" warning, but nothing could ever reach it because the
+ * filter here dropped those blocks first. The body is deliberately still
+ * re-scanned (unchanged behaviour) so a recognized block nested under an
+ * unrecognized one is not lost.
+ */
+function scanBlocks(src: string, warnings: string[]): RawBlock[] {
   const blocks: RawBlock[] = [];
   const headerRe = /(^|\n)[ \t]*([a-zA-Z]+)[ \t]+([A-Za-z_]\w*)[ \t]*\{/g;
   let m: RegExpExecArray | null;
   // biome-ignore lint/suspicious/noAssignInExpressions: standard regex exec loop
   while ((m = headerRe.exec(src)) !== null) {
     const keyword = m[2]!;
-    if (!BLOCK_KEYWORDS.has(keyword)) continue;
+    if (!BLOCK_KEYWORDS.has(keyword)) {
+      warnings.push(
+        `Skipped unsupported block "${keyword} ${m[3]}" (line ${lineAt(src, m.index + m[1]!.length)}): the parser ` +
+          `understands model / view / type / enum / datasource / generator blocks only.`,
+      );
+      continue;
+    }
     const braceOpen = src.indexOf('{', m.index);
     const close = matchBrace(src, braceOpen);
     const headerLine = lineAt(src, m.index + m[1]!.length);
@@ -482,23 +518,66 @@ function truncate(s: string, n = 60): string {
   return s.length > n ? `${s.slice(0, n)}...` : s;
 }
 
+/**
+ * Field attributes that are RECOGNIZED but change what the model means, and
+ * that the name mapper does not act on. Each gets a warning naming what is
+ * being lost, so it surfaces in the report instead of being dropped in silence.
+ */
+const NOTED_FIELD_ATTRS: Record<string, string> = {
+  ignore:
+    '@ignore excludes the field from the Prisma client. Turbine generates from the DATABASE, so the column IS present on the generated client.',
+};
+
+/** Same, for block (`@@`) attributes. */
+const NOTED_BLOCK_ATTRS: Record<string, string> = {
+  ignore:
+    '@@ignore excludes the model from the Prisma client. Turbine generates from the DATABASE, so the table IS present on the generated client.',
+  schema:
+    '@@schema (multi-schema datasource) is not represented. Turbine introspects ONE Postgres namespace per run, and two models in different schemas can resolve to the same bare table name.',
+  fulltext: '@@fulltext indexes are not represented in the generated metadata.',
+};
+
 /** Parse a single field declaration line. Returns null for a non-field line. */
 function parseFieldLine(text: string, line: number, warnings: string[]): PrismaField | null {
-  // First token = field name, second token = type. Both are simple words; the
-  // type may carry a trailing `[]` and/or `?`.
-  const m = text.match(/^([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(\[\])?(\?)?/);
+  // First token = field name, second token = type. The type is a simple word or
+  // an `Unsupported("...")` call, and may carry a trailing `[]` and/or `?`.
+  //
+  // `Unsupported(...)` HAS to be matched here rather than left to the bare-word
+  // branch: `data Unsupported("tsvector")?` matched only up to `Unsupported`,
+  // so the `?` sat behind an unconsumed `(` and the field recorded
+  // `optional: false`. A nullable column read as required is a required/optional
+  // INVERSION, which is exactly the kind of thing a migration report exists to
+  // catch.
+  const m = text.match(/^([A-Za-z_]\w*)\s+(Unsupported\(\s*"(?:[^"\\]|\\.)*"\s*\)|[A-Za-z_]\w*)(\[\])?(\?)?/);
   if (!m) {
     // Not a field (e.g. a stray token); skip leniently.
     warnings.push(`Skipped unrecognized line ${line}: "${truncate(text)}"`);
     return null;
   }
   const name = m[1]!;
-  const type = m[2]!;
+  const rawType = m[2]!;
   const isList = m[3] === '[]';
   const optional = m[4] === '?';
   const rest = text.slice(m[0].length);
   const attrs = parseAttributes(rest, line);
-  return { name, type, optional, isList, attrs, line };
+
+  let type = rawType;
+  let unsupported: string | undefined;
+  if (rawType.startsWith('Unsupported')) {
+    type = 'Unsupported';
+    unsupported = unquote(rawType.slice(rawType.indexOf('(') + 1, rawType.lastIndexOf(')')).trim());
+    warnings.push(
+      `Line ${line}: field "${name}" is Unsupported("${unsupported}"). Prisma cannot read or write it; ` +
+        `Turbine generates the column from the database, so it IS present on the generated client.`,
+    );
+  }
+
+  for (const attr of attrs) {
+    const note = NOTED_FIELD_ATTRS[attr.name];
+    if (note) warnings.push(`Line ${line}: field "${name}": ${note}`);
+  }
+
+  return { name, type, ...(unsupported !== undefined ? { unsupported } : {}), optional, isList, attrs, line };
 }
 
 function parseModelBody(
@@ -529,8 +608,13 @@ function parseModelBody(
           model.map = arg.value;
         } else if (attr.name === 'id' || attr.name === 'unique') {
           model.compoundKeys.push(parseCompoundKey(attr, line));
+        } else {
+          // @@index and anything else: recorded in blockAttrs, unused. The
+          // few that change what the model MEANS get a warning rather than
+          // silence (see NOTED_BLOCK_ATTRS).
+          const note = NOTED_BLOCK_ATTRS[attr.name];
+          if (note) warnings.push(`Line ${line}: model "${block.name}": ${note}`);
         }
-        // @@index, @@schema, and anything else: recorded in blockAttrs, unused.
       }
       continue;
     }
@@ -549,7 +633,10 @@ function parseEnumBody(block: RawBlock, src: string): PrismaEnum {
     if (text.startsWith('@@')) {
       for (const attr of parseAttributes(text, line)) {
         if (attr.name === 'map') {
-          const arg = attr.args.find((a) => a.key === undefined);
+          // `@@map("x")` and `@@map(name: "x")` are both valid; reading only the
+          // positional form silently dropped the mapped enum-type name, matching
+          // the field-level `@map` bug in prisma-resolve.ts.
+          const arg = attr.args.find((a) => a.key === undefined || a.key === 'name');
           if (arg?.kind === 'string' && arg.value) en.map = arg.value;
         }
       }
@@ -683,13 +770,21 @@ export function parsePrismaSchema(source: string): PrismaSchemaAst {
   const src = stripComments(source);
   const ast: PrismaSchemaAst = { models: [], enums: [], datasources: [], warnings: [] };
 
-  for (const block of scanBlocks(src)) {
+  for (const block of scanBlocks(src, ast.warnings)) {
     switch (block.keyword) {
       case 'model':
         ast.models.push(parseModelBody(block, 'model', src, ast.warnings));
         break;
       case 'view':
         ast.models.push(parseModelBody(block, 'view', src, ast.warnings));
+        // A Prisma `view` is READ-ONLY in the Prisma client. Turbine resolves it
+        // against an introspected view and emits an ordinary delegate, so
+        // create/update/delete become reachable where Prisma refused them. Said
+        // out loud, because `type` blocks already warn and this one did not.
+        ast.warnings.push(
+          `Block "view ${block.name}" is read-only in Prisma; the generated Turbine delegate is not. ` +
+            `Writes through it will reach the database if the view is updatable.`,
+        );
         break;
       case 'type':
         // Composite/embedded types (MongoDB) are not tables. Parse leniently so
@@ -704,11 +799,10 @@ export function parsePrismaSchema(source: string): PrismaSchemaAst {
         // Not a table, but it declares the connection string the CLI can reuse.
         ast.datasources.push(parseDatasourceBody(block, src));
         break;
-      case 'generator':
-        // Configuration block - irrelevant to name mapping.
-        break;
       default:
-        ast.warnings.push(`Skipped unsupported block "${block.keyword} ${block.name}".`);
+        // 'generator': configuration, irrelevant to name mapping. Any other
+        // keyword never reaches here (scanBlocks filters and warns), so this
+        // stays a silent catch-all rather than a second warning site.
         break;
     }
   }

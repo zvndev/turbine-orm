@@ -147,7 +147,9 @@ function route(sql: string, searchPath: string): Record<string, unknown>[] {
   if (sql.includes('information_schema.tables')) return [{ table_name: 'users' }];
   if (sql.includes('information_schema.columns')) return COLUMNS as unknown as Record<string, unknown>[];
   if (sql.includes("'PRIMARY KEY'")) return [{ table_name: 'users', column_name: 'id' }];
-  if (sql.includes("'FOREIGN KEY'")) return [];
+  // Foreign keys now come from pg_catalog; matched on the contype predicate so
+  // this does not fall through to the `pg_class` branch below.
+  if (sql.includes("con.contype = 'f'")) return [];
   if (sql.includes("'UNIQUE'")) return [];
   if (sql.includes('pg_indexes')) return INDEX_ROWS as unknown as Record<string, unknown>[];
   if (sql.includes('pg_enum')) return [];

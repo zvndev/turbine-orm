@@ -21,7 +21,7 @@ import type { EventEmitter } from 'node:events';
 import type pg from 'pg';
 import Result from 'pg/lib/result';
 import { prepareValue } from 'pg/lib/utils';
-import { wrapPgError } from './errors.js';
+import { PipelineError, wrapPgError } from './errors.js';
 import type { DeferredQuery } from './query/index.js';
 
 // ---------------------------------------------------------------------------
@@ -260,7 +260,8 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
       }
 
       if (!transactional && pipelineError) {
-        // In non-transactional mode, attach partial results to the error
+        // In non-transactional mode, report every slot: what each query returned
+        // or the error it failed with.
         const partialResults: Array<{ status: 'ok'; value: unknown } | { status: 'error'; error: Error }> = [];
         for (let i = 0; i < queries.length; i++) {
           const qErr = queryErrors[i];
@@ -275,8 +276,23 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
             }
           }
         }
-        (pipelineError as Error & { results?: unknown }).results = partialResults;
-        reject(pipelineError);
+        // A REAL PipelineError, not the first driver error with a `results`
+        // property bolted onto it. The old shape happened to satisfy
+        // `err.results`, which is what the docs show callers reading, while
+        // leaving `err instanceof PipelineError` and `err.code ===
+        // 'TURBINE_E014'` permanently false: E014 was defined, documented, and
+        // never constructed. The driver error survives as `.cause` and as the
+        // first `error` slot, and `failedIndex` / `failedTag` (recorded on it by
+        // `onErrorMessage`) move onto the typed error's own fields.
+        const first = pipelineError as Error & { failedIndex?: number; failedTag?: string };
+        reject(
+          new PipelineError({
+            results: partialResults,
+            failedIndex: first.failedIndex,
+            failedTag: first.failedTag,
+            cause: pipelineError,
+          }),
+        );
         return;
       }
 

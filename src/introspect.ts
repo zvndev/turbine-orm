@@ -90,22 +90,88 @@ const SQL_PRIMARY_KEYS = `
   ORDER BY tc.table_name, kcu.ordinal_position
 `;
 
+// Foreign keys, read from pg_catalog rather than information_schema.
+//
+// This CANNOT be expressed against information_schema. The obvious formulation
+// joins key_column_usage (the constrained columns) to constraint_column_usage
+// (the referenced columns) on the constraint NAME, and that is wrong twice:
+//
+//   1. The two column lists have no positional link there, so the join is an
+//      N-by-N cross product. A composite FK cities(country, region_code) ->
+//      regions(country, code) came back as four rows, and grouping them gave
+//      foreignKey ['country','country','region_code','region_code'] against
+//      referenceKey ['country','code','country','code'] - four AND-ed
+//      correlations, two of them pairing the wrong columns. Every read through
+//      the relation silently returned nothing, with no error.
+//   2. Postgres only requires a constraint name to be unique per TABLE
+//      (conrelid, conname), so two tables in one schema may both have a
+//      `shared_fk`. Joining on the name alone crosses them: each table's FK
+//      picks up the other's referenced column, so one relation is lost and the
+//      other points at a column that does not exist on its target (42703 at
+//      query time). Which one won depended on catalog row order.
+//
+// conkey and confkey are parallel arrays, so unnesting BOTH `WITH ORDINALITY`
+// and joining on the ordinal is the pairing, exactly. The constraint OID is the
+// grouping key: it is unique catalog-wide, unlike the name.
+//
+// `target_schema` is selected so a cross-schema reference can be recognized
+// rather than mistaken for a same-named local table (see the FK grouping loop).
+// Referential actions come from the same row, which also removes the separate
+// name-keyed actions query that shared bug 2.
+//
+// `conparentid = 0` keeps only DECLARED constraints. Declaring one foreign key
+// against a PARTITIONED table makes Postgres materialize an extra constraint per
+// partition, each pointing at that partition rather than at the parent, and each
+// with `conparentid` set to the declared constraint's OID. Without this filter a
+// single `items(bucket_id) REFERENCES buckets(id)` against a two-partition
+// `buckets` introspected as THREE belongsTo relations (`bucket`, `bucketsLo`,
+// `bucketsHi`), measured on PG 16. The two extras are fully generated, typed and
+// autocompleting, and resolve to `null` for every row whose parent lives in the
+// other partition, so they read as an intermittently-empty relation rather than
+// as an error. The same clone exists when the REFERENCING side is partitioned
+// (verified: `conparentid` is set there too), where the partition inherits the
+// parent table's declared FK and needs no relation of its own.
+//
+// ORDER BY is (source table, constraint name), NOT `con.oid`. The OID is
+// ALLOCATION order, so it encodes the order the DDL happened to run in, and the
+// FK walk order decides which relation wins a contested NAME: relation naming in
+// buildRelationsFromForeignKeys accumulates `taken` names as it walks, and the
+// loser gets a `Rel` suffix. On a `users` table with both a `profiles` child
+// (UNIQUE FK, so hasOne) and a `profile` child (plain FK, so hasMany), both
+// derive the name `profile`, and the two creation orders produced
+// `users.profile = hasOne -> profiles` versus `users.profile = hasMany ->
+// profile`. Same logical schema, different cardinality and a different TABLE
+// behind the same relation name, so a database restored from a dump disagreed
+// with one built by running the migrations. Sorting by name makes the walk a
+// function of the schema instead of its history. (conrelid, conname) is unique
+// in Postgres and relname is unique per namespace, so the pair is a total order
+// here, and sk.ord still pairs conkey to confkey within a constraint.
 const SQL_FOREIGN_KEYS = `
   SELECT
-    tc.table_name AS source_table,
-    kcu.column_name AS source_column,
-    ccu.table_name AS target_table,
-    ccu.column_name AS target_column,
-    tc.constraint_name
-  FROM information_schema.table_constraints tc
-  JOIN information_schema.key_column_usage kcu
-    ON tc.constraint_name = kcu.constraint_name
-    AND tc.table_schema = kcu.table_schema
-  JOIN information_schema.constraint_column_usage ccu
-    ON tc.constraint_name = ccu.constraint_name
-    AND tc.table_schema = ccu.table_schema
-  WHERE tc.constraint_type = 'FOREIGN KEY'
-    AND tc.table_schema = $1
+    con.oid::text AS constraint_oid,
+    con.conname AS constraint_name,
+    src.relname AS source_table,
+    src_att.attname AS source_column,
+    tgt_ns.nspname AS target_schema,
+    tgt.relname AS target_table,
+    tgt_att.attname AS target_column,
+    con.confdeltype,
+    con.confupdtype
+  FROM pg_catalog.pg_constraint con
+  JOIN pg_catalog.pg_class src ON src.oid = con.conrelid
+  JOIN pg_catalog.pg_namespace src_ns ON src_ns.oid = src.relnamespace
+  JOIN pg_catalog.pg_class tgt ON tgt.oid = con.confrelid
+  JOIN pg_catalog.pg_namespace tgt_ns ON tgt_ns.oid = tgt.relnamespace
+  JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS sk(attnum, ord) ON TRUE
+  JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS tk(attnum, ord) ON tk.ord = sk.ord
+  JOIN pg_catalog.pg_attribute src_att
+    ON src_att.attrelid = con.conrelid AND src_att.attnum = sk.attnum
+  JOIN pg_catalog.pg_attribute tgt_att
+    ON tgt_att.attrelid = con.confrelid AND tgt_att.attnum = tk.attnum
+  WHERE con.contype = 'f'
+    AND con.conparentid = 0
+    AND src_ns.nspname = $1
+  ORDER BY src.relname, con.conname, sk.ord
 `;
 
 const SQL_UNIQUE_CONSTRAINTS = `
@@ -123,20 +189,19 @@ const SQL_UNIQUE_CONSTRAINTS = `
   ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position
 `;
 
+// Both of the next two queries are ordered for the same reason the FK query is:
+// their rows land in metadata.ts as ARRAYS (`indexes`, `checks`), so an unordered
+// read makes the generated file a function of physical catalog order rather than
+// of the schema. A `DROP INDEX` + `CREATE INDEX` of an unchanged index, or a
+// VACUUM FULL, is enough to permute them, which shows up as generated-file diff
+// noise between one developer's machine and CI and defeats the byte-identical
+// claim that makes a regenerate safe to commit. Index and check constraint names
+// are both unique per schema, so each sort is total.
 const SQL_INDEXES = `
   SELECT tablename, indexname, indexdef
   FROM pg_indexes
   WHERE schemaname = $1
-`;
-
-// Foreign-key referential actions (ON DELETE / ON UPDATE) live in pg_catalog,
-// not information_schema. Keyed by constraint name for join with SQL_FOREIGN_KEYS.
-const SQL_FK_ACTIONS = `
-  SELECT con.conname, con.confdeltype, con.confupdtype
-  FROM pg_constraint con
-  JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
-  WHERE con.contype = 'f'
-    AND n.nspname = $1
+  ORDER BY tablename, indexname
 `;
 
 // CHECK constraints (contype = 'c'). NOT NULL is stored as attnotnull, not a
@@ -148,6 +213,7 @@ const SQL_CHECKS = `
   JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
   WHERE con.contype = 'c'
     AND n.nspname = $1
+  ORDER BY rel.relname, con.conname
 `;
 
 // Views (relkind 'v'), column metadata comes free from information_schema.columns.
@@ -424,27 +490,17 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
 
   try {
     // Run all information_schema queries in parallel
-    const [
-      tablesResult,
-      columnsResult,
-      pkResult,
-      fkResult,
-      fkActionsResult,
-      uniqueResult,
-      indexResult,
-      checkResult,
-      enumResult,
-    ] = await Promise.all([
-      pool.query(SQL_TABLES, [schema]),
-      pool.query(SQL_COLUMNS, [schema]),
-      pool.query(SQL_PRIMARY_KEYS, [schema]),
-      pool.query(SQL_FOREIGN_KEYS, [schema]),
-      pool.query(SQL_FK_ACTIONS, [schema]),
-      pool.query(SQL_UNIQUE_CONSTRAINTS, [schema]),
-      pool.query(SQL_INDEXES, [schema]),
-      pool.query(SQL_CHECKS, [schema]),
-      pool.query(SQL_ENUMS, [schema]),
-    ]);
+    const [tablesResult, columnsResult, pkResult, fkResult, uniqueResult, indexResult, checkResult, enumResult] =
+      await Promise.all([
+        pool.query(SQL_TABLES, [schema]),
+        pool.query(SQL_COLUMNS, [schema]),
+        pool.query(SQL_PRIMARY_KEYS, [schema]),
+        pool.query(SQL_FOREIGN_KEYS, [schema]),
+        pool.query(SQL_UNIQUE_CONSTRAINTS, [schema]),
+        pool.query(SQL_INDEXES, [schema]),
+        pool.query(SQL_CHECKS, [schema]),
+        pool.query(SQL_ENUMS, [schema]),
+      ]);
 
     // Views + materialized views (opt-in). Regular-view columns are already in
     // columnsResult (information_schema.columns); matview columns need a separate
@@ -460,15 +516,6 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       for (const r of viewsResult.rows) viewNameSet.add(r.table_name);
       for (const r of matviewsResult.rows) viewNameSet.add(r.table_name);
       matviewColumnRows.push(...matviewColsResult.rows);
-    }
-
-    // constraint_name → { onDelete, onUpdate } referential actions.
-    const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
-    for (const row of fkActionsResult.rows) {
-      fkActions.set(row.conname, {
-        onDelete: pgConfActionToReferential(row.confdeltype),
-        onUpdate: pgConfActionToReferential(row.confupdtype),
-      });
     }
 
     // Filter tables by include/exclude + default bookkeeping-table exclusions
@@ -605,19 +652,39 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     }
 
     // ----- Build foreign key map -----
-    // Group FK rows by constraint_name to correctly handle multi-column composite FKs.
-    // Each constraint becomes one FKEntry with arrays of columns.
+    // Group FK rows by constraint OID, NOT by constraint name: Postgres only
+    // requires a name to be unique per table, so two tables in one schema may
+    // both own a `shared_fk` and grouping by name merges them into one entry
+    // (see SQL_FOREIGN_KEYS). Rows arrive ordered by (oid, ordinal), so pushing
+    // in arrival order preserves the column pairing the query established.
+    //
+    // A reference to a table in ANOTHER schema is skipped DELIBERATELY, and by
+    // its schema rather than by tableSet membership. Generated metadata keys
+    // tables by bare name and emits unqualified SQL, so a relation to
+    // `other.things` has no table to point at; worse, checking only
+    // `tableSet.has(target_table)` would bind it to a same-named table in THIS
+    // schema and generate a relation that reads the wrong table entirely.
+    // Skipped references are reported once, so they are visible rather than
+    // silently absent.
     const fkGroups = new Map<string, ForeignKeyEntry>();
+    const crossSchemaRefs: string[] = [];
     for (const row of fkResult.rows) {
-      if (!tableSet.has(row.source_table) || !tableSet.has(row.target_table)) continue;
-      const key = row.constraint_name as string;
+      if (!tableSet.has(row.source_table)) continue;
+      if (row.target_schema !== schema) {
+        crossSchemaRefs.push(
+          `${row.source_table}.${row.source_column} -> ${row.target_schema}.${row.target_table}.${row.target_column}`,
+        );
+        continue;
+      }
+      if (!tableSet.has(row.target_table)) continue;
+      const key = row.constraint_oid as string;
       if (!fkGroups.has(key)) {
         fkGroups.set(key, {
           sourceTable: row.source_table,
           sourceColumns: [],
           targetTable: row.target_table,
           targetColumns: [],
-          constraintName: key,
+          constraintName: row.constraint_name,
         });
       }
       const entry = fkGroups.get(key)!;
@@ -626,78 +693,47 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     }
     const foreignKeys = Array.from(fkGroups.values());
 
-    // ----- Build relations from foreign keys -----
-    // Delegated to the pure, unit-testable builder. Relation names are derived
-    // per-FK-column when several FKs point at the same target, and every name
-    // is collision-checked against the table's scalar column fields so a
-    // relation can never shadow a column (which generated unsound types and
-    // made both surfaces unusable).
-    const columnFieldsByTable = new Map<string, Set<string>>();
-    const unknownTypedFieldsByTable = new Map<string, Set<string>>();
-    for (const [tbl, cols] of columnsByTable) {
-      columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
-      // Enum-typed columns also report tsType 'unknown' here, but generate.ts
-      // gives them a concrete union type, a shadow of one was type-broken on
-      // main, so only genuine json/jsonb columns qualify as historical shadows.
-      unknownTypedFieldsByTable.set(
-        tbl,
-        new Set(cols.filter((c) => isUnknownTsType(c.tsType) && !Object.hasOwn(enums, c.pgType)).map((c) => c.field)),
+    if (crossSchemaRefs.length > 0) {
+      console.warn(
+        `[turbine] Skipped ${crossSchemaRefs.length} foreign key(s) referencing a table outside schema "${schema}": ` +
+          `${crossSchemaRefs.join(', ')}. Generated clients address tables by bare name within one schema, so no ` +
+          `relation is emitted for these. Introspect the other schema separately, or add the target table to this one.`,
       );
     }
-    // F2: unless the caller opts out, detect child FK column sets that a unique
-    // constraint / plain unique index exactly covers, so the reverse relation is
-    // emitted as a one-to-one (`hasOne`) instead of `hasMany`.
-    const uniqueSetsByTable = options.legacyToManyUniques
-      ? undefined
-      : detectUniqueForeignKeySets(pkByTable, uniqueByTable, indexesByTable);
-    const relationsByTable = buildRelationsFromForeignKeys(
-      foreignKeys,
-      columnFieldsByTable,
-      fkActions,
-      unknownTypedFieldsByTable,
-      uniqueSetsByTable,
-    );
 
-    // ----- Conservative many-to-many auto-detection (PURELY ADDITIVE) -----
-    //
-    // Auto-detecting m2m is a footgun: any table with two FKs *looks* like a
-    // junction, but a `enrollments(student_id, course_id, grade, enrolled_at)`
-    // table is a first-class entity, not a join table. Prisma and Drizzle both
-    // require explicit m2m declaration for exactly this reason.
-    //
-    // We only treat a table J as a PURE junction when ALL of these hold:
-    //   1. J's primary key is exactly two columns.
-    //   2. J has exactly two FKs, each single-column.
-    //   3. Each FK's source column is one of J's two PK columns (the PK *is* the
-    //      two FK columns, no surrogate PK, no extra identity).
-    //   4. The two FKs target two DISTINCT tables (A and B).
-    //   5. J has no columns beyond those two FK/PK columns (no payload columns
-    //      like `grade` or `created_at`).
-    //
-    // For such a J linking A and B we ADD a `manyToMany` relation on A → B and
-    // symmetrically on B → A, both routed `through` J. The existing belongsTo /
-    // hasMany relations derived from J's FKs are left untouched, this block
-    // never removes or renames anything. Naming/collision handling lives in the
-    // shared addAutoManyToManyRelations helper.
-    //
-    // Prisma's implicit m2m junctions have no primary key (just a two-column
-    // UNIQUE index over the FK columns), so pass the introspected two-column
-    // unique indexes as the fallback junction-key source.
-    const uniqueIndexColsByTable = new Map<string, string[][]>();
-    for (const [tbl, idxs] of indexesByTable) {
-      const twoColUniques = idxs.filter((idx) => idx.unique && idx.columns.length === 2).map((idx) => idx.columns);
-      if (twoColUniques.length > 0) uniqueIndexColsByTable.set(tbl, twoColUniques);
+    // Referential actions (ON DELETE / ON UPDATE) per constraint. Keyed
+    // "<table>::<constraint>" because the NAME alone is not unique (the same
+    // collision SQL_FOREIGN_KEYS documents); buildRelationsFromForeignKeys
+    // prefers that key and falls back to the bare name for callers that build
+    // the map from a code-first schema, where names are synthesized per table.
+    const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+    for (const row of fkResult.rows) {
+      fkActions.set(`${row.source_table}::${row.constraint_name}`, {
+        onDelete: pgConfActionToReferential(row.confdeltype),
+        onUpdate: pgConfActionToReferential(row.confupdtype),
+      });
     }
-    addAutoManyToManyRelations(
+
+    // ----- Build relations from foreign keys -----
+    // Delegated to the shared catalog derivation, which `turbine mcp` also
+    // calls. Relation names are derived per-FK-column when several FKs point at
+    // the same target, every name is collision-checked against the table's
+    // scalar column fields so a relation can never shadow a column (which
+    // generated unsound types and made both surfaces unusable), a UNIQUE FK
+    // flips the reverse side to `hasOne`, and pure junction tables additionally
+    // get a `manyToMany` on each side. See deriveCatalogRelations for why the
+    // whole pipeline is one function rather than a call site per surface.
+    const relationsByTable = deriveCatalogRelations({
       tableNames,
       foreignKeys,
       pkByTable,
-      new Map(Array.from(columnsByTable, ([tbl, cols]) => [tbl, cols.map((c) => c.name)])),
-      relationsByTable,
-      columnFieldsByTable,
-      unknownTypedFieldsByTable,
-      uniqueIndexColsByTable,
-    );
+      columnsByTable,
+      uniqueByTable,
+      indexesByTable,
+      enums,
+      fkActions,
+      legacyToManyUniques: options.legacyToManyUniques,
+    });
 
     // ----- Assemble TableMetadata for each table -----
     const tables: Record<string, TableMetadata> = {};
@@ -1097,7 +1133,25 @@ export function buildRelationsFromForeignKeys(
     assignedFor(fk.sourceTable).add(belongsToName);
 
     // Referential actions (omit the 'no action' default to keep metadata lean).
-    const actions = fkActions?.get(fk.constraintName);
+    // A constraint NAME is only unique per table in Postgres, so the catalog
+    // introspector keys this map "<table>::<constraint>". Callers that
+    // synthesize names from a code-first schema key it by bare name, so both
+    // spellings resolve.
+    //
+    // The bare-name fallback is LIVE, not defensive: `schemaDefToMetadata` keys
+    // its map by the synthesized `<table>_<column>_fkey` alone, so the qualified
+    // lookup always misses there and this second lookup is the ONLY thing that
+    // carries a `defineSchema` relation's onDelete/onUpdate into the metadata.
+    // Deleting it would silently drop referential actions from every code-first
+    // schema (verified: a `references: { onDelete: 'cascade' }` resolves through
+    // this branch and through no other). It is safe for that producer precisely
+    // because the name it synthesizes already embeds the source table, so a bare
+    // hit cannot belong to a different table's constraint. A future producer
+    // emitting TABLE-AGNOSTIC constraint names would break that property and
+    // could mis-attribute one table's ON DELETE to another's relation; such a
+    // producer must key the map "<table>::<constraint>" like the catalog reader.
+    const actions =
+      fkActions?.get(`${fk.sourceTable}::${fk.constraintName}`) ?? fkActions?.get(fk.constraintName) ?? undefined;
     const actionFields: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction } = {};
     if (actions?.onDelete && actions.onDelete !== 'no action') actionFields.onDelete = actions.onDelete;
     if (actions?.onUpdate && actions.onUpdate !== 'no action') actionFields.onUpdate = actions.onUpdate;
@@ -1278,6 +1332,104 @@ export function addAutoManyToManyRelations(
     addM2M(fkA, fkB); // A → B
     addM2M(fkB, fkA); // B → A
   }
+}
+
+/** Everything the catalog relation derivation reads. See {@link deriveCatalogRelations}. */
+export interface CatalogRelationInputs {
+  /** The introspected table set, post include/exclude filtering. */
+  tableNames: string[];
+  /** FK rows already grouped per constraint (one entry per declared constraint). */
+  foreignKeys: ForeignKeyEntry[];
+  /** Primary-key columns per table. */
+  pkByTable: Map<string, string[]>;
+  /** Column metadata per table (only name/field/tsType/pgType are read). */
+  columnsByTable: Map<string, Pick<ColumnMetadata, 'name' | 'field' | 'tsType' | 'pgType'>[]>;
+  /** UNIQUE-constraint column sets per table. */
+  uniqueByTable: Map<string, string[][]>;
+  /** Indexes per table, `definition` must be the raw `pg_indexes.indexdef`. */
+  indexesByTable: Map<string, IndexMetadata[]>;
+  /** Enum types in the schema, so an enum column is not mistaken for a json shadow. */
+  enums: Record<string, string[]>;
+  /** Referential actions keyed "<table>::<constraint>". Optional. */
+  fkActions?: Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>;
+  /** Opt out of the unique-FK → `hasOne` flip (F2), see {@link IntrospectOptions.legacyToManyUniques}. */
+  legacyToManyUniques?: boolean;
+}
+
+/**
+ * One-stop relation derivation for every surface that reads a live PostgreSQL
+ * CATALOG: `turbine generate` (via {@link introspectPostgresCatalog}) and the
+ * MCP server, which introspects for itself because it cannot assume generated
+ * metadata exists.
+ *
+ * THE REASON THIS IS ONE FUNCTION and not two call sites: the pipeline it drives
+ * is `buildRelationsFromForeignKeys` (five parameters, two optional) plus
+ * `addAutoManyToManyRelations` (eight parameters, three optional), and every
+ * optional one CHANGES THE ANSWER while omitting it stays silently type-correct.
+ * Hand-mirroring them drifted exactly that way: MCP passed four arguments and so
+ * never received `uniqueSetsByTable`, which meant a UNIQUE foreign key produced
+ * `users.profile` (hasOne) under `turbine generate` and `users.profiles`
+ * (hasMany) under `turbine mcp`, against the same database. An MCP client
+ * following its own schema tool then queried `with: { profiles: true }` and got
+ * `TURBINE_E005 Unknown relation`. MCP also omitted `uniqueIndexColsByTable`,
+ * losing every auto-m2m relation through a Prisma-style PK-less junction. Adding
+ * an argument here now reaches both surfaces or neither.
+ *
+ * The engine introspectors (SQLite / MySQL / MSSQL) keep their own
+ * {@link deriveEngineRelations} because they deliberately do NOT do the
+ * unique-FK → `hasOne` flip.
+ */
+export function deriveCatalogRelations(inputs: CatalogRelationInputs): Map<string, Record<string, RelationDef>> {
+  const { tableNames, foreignKeys, pkByTable, columnsByTable, uniqueByTable, indexesByTable, enums } = inputs;
+
+  const columnFieldsByTable = new Map<string, Set<string>>();
+  const unknownTypedFieldsByTable = new Map<string, Set<string>>();
+  for (const [tbl, cols] of columnsByTable) {
+    columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
+    // Enum-typed columns also report tsType 'unknown' here, but generate.ts
+    // gives them a concrete union type, so a shadow of one is type-broken and
+    // must NOT be preserved as a historical json/jsonb shadow.
+    unknownTypedFieldsByTable.set(
+      tbl,
+      new Set(cols.filter((c) => isUnknownTsType(c.tsType) && !Object.hasOwn(enums, c.pgType)).map((c) => c.field)),
+    );
+  }
+
+  // F2: unless the caller opts out, detect child FK column sets that a unique
+  // constraint / plain unique index exactly covers, so the reverse relation is
+  // emitted as a one-to-one (`hasOne`) instead of `hasMany`.
+  const uniqueSetsByTable = inputs.legacyToManyUniques
+    ? undefined
+    : detectUniqueForeignKeySets(pkByTable, uniqueByTable, indexesByTable);
+
+  const relationsByTable = buildRelationsFromForeignKeys(
+    foreignKeys,
+    columnFieldsByTable,
+    inputs.fkActions,
+    unknownTypedFieldsByTable,
+    uniqueSetsByTable,
+  );
+
+  // Prisma's implicit m2m junctions have no primary key (just a two-column
+  // UNIQUE index over the FK columns), so pass the introspected two-column
+  // unique indexes as the fallback junction-key source.
+  const uniqueIndexColsByTable = new Map<string, string[][]>();
+  for (const [tbl, idxs] of indexesByTable) {
+    const twoColUniques = idxs.filter((idx) => idx.unique && idx.columns.length === 2).map((idx) => idx.columns);
+    if (twoColUniques.length > 0) uniqueIndexColsByTable.set(tbl, twoColUniques);
+  }
+
+  addAutoManyToManyRelations(
+    tableNames,
+    foreignKeys,
+    pkByTable,
+    new Map(Array.from(columnsByTable, ([tbl, cols]) => [tbl, cols.map((c) => c.name)])),
+    relationsByTable,
+    columnFieldsByTable,
+    unknownTypedFieldsByTable,
+    uniqueIndexColsByTable,
+  );
+  return relationsByTable;
 }
 
 /**

@@ -34,6 +34,7 @@
  * step.
  */
 
+import { ValidationError } from '../errors.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
 import {
   findArrayUniqueKey,
@@ -41,6 +42,7 @@ import {
   fingerprintArrayFilterShape,
   fingerprintJsonFilterShape,
   fingerprintOperatorShape,
+  hasRelationFilterWrapper,
   isArrayFilter,
   isJsonFilter,
   isTextSearchFilter,
@@ -55,6 +57,47 @@ import { ownLookup } from './utils.js';
 
 /** A table-scoped WHERE object (or an `OR`/`AND`/`NOT` branch of one). */
 export type WhereRecord = Record<string, unknown>;
+
+/**
+ * Maximum nesting of `OR` / `AND` / `NOT` combinators and relation-filter
+ * descents in one WHERE clause (and in one groupBy `HAVING`).
+ *
+ * Every walker over a where clause, the fingerprint, the SQL build and the
+ * cache-hit param collect, and every one of them for the table-SCOPED sub-where
+ * too, is directly recursive on these three keys. Nothing bounded that
+ * recursion, so a request body could choose the JavaScript stack depth:
+ * measured with wire-realistic JSON, a 4,000-deep `NOT` chain built fine and an
+ * 8,000-deep one (a 64 KB body, comfortably under `express.json()`'s 100 KB
+ * default) threw `RangeError: Maximum call stack size exceeded`. A `RangeError`
+ * is not a {@link TurbineError}, so it walks straight past the typed-error
+ * surface callers catch on and lands as an unhandled rejection.
+ *
+ * 32 matches the depth cap Studio's fail-closed PII guard already uses, and
+ * sits an order of magnitude above anything a hand-written or
+ * query-builder-generated predicate reaches (`with` is capped at 10 for the
+ * same class of reason). Exceeding it is a {@link ValidationError} (E003), the
+ * same typed refusal every other malformed where shape gets.
+ */
+export const MAX_WHERE_DEPTH = 32;
+
+/**
+ * Refuse a where/having walk that has nested past {@link MAX_WHERE_DEPTH}.
+ *
+ * Called at the TOP of every recursive walker rather than at the recursion
+ * site, so a cap breach is caught on whichever walker runs first (on a cache
+ * HIT the SQL build never runs, so a check placed only there would be skipped
+ * exactly when the request is being served fastest).
+ */
+export function assertWhereDepth(depth: number, clause: 'where' | 'having' = 'where'): void {
+  if (depth <= MAX_WHERE_DEPTH) return;
+  throw new ValidationError(
+    `[turbine] \`${clause}\` clause nests more than ${MAX_WHERE_DEPTH} levels of AND / OR / NOT ` +
+      `(or relation filters) deep. That is far past anything a real predicate needs, and an unbounded ` +
+      `walk over caller-supplied nesting is a stack-overflow surface, so it is refused. If this is a ` +
+      `generated predicate, flatten it: a single \`AND\` / \`OR\` array of N conditions is one level, ` +
+      `not N.`,
+  );
+}
 
 /**
  * Everything the shared walk needs from the owning {@link QueryInterface}. Bound

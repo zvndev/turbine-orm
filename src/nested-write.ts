@@ -20,7 +20,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
-import { resolveColumnName } from './query/utils.js';
+import { markInternalCombinator, resolveColumnName } from './query/utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { normalizeKeyColumns } from './schema.js';
 
@@ -422,7 +422,12 @@ function scopeWhereToParent(
   correlation: Record<string, unknown>,
 ): Record<string, unknown> {
   for (const key of Object.keys(correlation)) {
-    if (Object.hasOwn(target, key)) return { AND: [target, correlation] };
+    // Branded as Turbine's own: this `AND` has a FIXED arity of two, chosen
+    // here rather than reachable from a request body, so it must not cost the
+    // statement its server-side prepared name the way a caller-written
+    // combinator array does. Same reason the global-filter merge and the
+    // batched loader's correlation merge are branded.
+    if (Object.hasOwn(target, key)) return markInternalCombinator({ AND: [target, correlation] });
   }
   return { ...target, ...correlation };
 }

@@ -20,6 +20,7 @@ import {
   formatChecksumMismatchError,
   listMigrationFiles,
   migrateDeploy,
+  migrateDown,
   migrateStatus,
   migrateUp,
   migrationTimestamp,
@@ -231,6 +232,131 @@ describe('migrations smoke fixes (live database)', () => {
       assert.equal(res.destructive[0]!.hits[0]!.kind, 'drop-table');
     } finally {
       await withClient((c) => c.query('DROP TABLE IF EXISTS sf_notice_target'));
+      await resetTracking();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * A rollback batch is LIFO with no gaps. The middle migration has no DOWN
+   * section, so the batch must stop after the newest and leave the OLDEST
+   * migration's table standing. Before the fix it skipped the gap and rolled
+   * back the oldest too, dropping a table whose rows the skipped migration had
+   * seeded, and left the tracking table claiming only the middle one applied.
+   */
+  dbIt('migrate down stops at a gap instead of rolling back past it', async () => {
+    await resetTracking();
+    const dir = freshDir('down-gap');
+    const base = `sf_gap_${Date.now()}`;
+    try {
+      writeFileSync(
+        join(dir, '20260401000001_first.sql'),
+        `-- UP\nCREATE TABLE "${base}_a" (id int);\n-- DOWN\nDROP TABLE "${base}_a";\n`,
+      );
+      writeFileSync(join(dir, '20260401000002_seed.sql'), `-- UP\nINSERT INTO "${base}_a" VALUES (1);\n-- DOWN\n`);
+      writeFileSync(
+        join(dir, '20260401000003_third.sql'),
+        `-- UP\nCREATE TABLE "${base}_c" (id int);\n-- DOWN\nDROP TABLE "${base}_c";\n`,
+      );
+
+      const up = await migrateUp(DATABASE_URL!, dir, { allowDestructive: true });
+      assert.equal(up.applied.length, 3, `expected 3 applied, got ${JSON.stringify(up.errors)}`);
+
+      const down = await migrateDown(DATABASE_URL!, dir, { step: 3, allowDestructive: true });
+
+      assert.deepEqual(
+        down.rolledBack.map((f) => f.filename),
+        ['20260401000003_third.sql'],
+      );
+      assert.equal(down.errors.length, 1);
+      assert.match(down.errors[0]!.file.filename, /_seed\.sql$/);
+      assert.match(down.errors[0]!.error, /No DOWN section/);
+
+      // The oldest migration's table, and its seeded row, survive.
+      const rows = await withClient((c) => c.query(`SELECT id FROM "${base}_a"`));
+      assert.equal(rows.rowCount, 1);
+    } finally {
+      await withClient(async (c) => {
+        await c.query(`DROP TABLE IF EXISTS "${base}_a"`);
+        await c.query(`DROP TABLE IF EXISTS "${base}_c"`);
+      });
+      await resetTracking();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /** Same rule on the way up: a file with an empty UP section stops the batch. */
+  dbIt('migrate up stops at a migration with an empty UP section', async () => {
+    await resetTracking();
+    const dir = freshDir('up-gap');
+    const base = `sf_upgap_${Date.now()}`;
+    try {
+      writeFileSync(join(dir, '20260402000001_first.sql'), `-- UP\nCREATE TABLE "${base}_a" (id int);\n-- DOWN\n`);
+      writeFileSync(join(dir, '20260402000002_empty.sql'), '-- UP\n-- DOWN\n');
+      writeFileSync(join(dir, '20260402000003_third.sql'), `-- UP\nCREATE TABLE "${base}_c" (id int);\n-- DOWN\n`);
+
+      const res = await migrateUp(DATABASE_URL!, dir, { allowDestructive: true });
+
+      assert.deepEqual(
+        res.applied.map((f) => f.filename),
+        ['20260402000001_first.sql'],
+      );
+      assert.equal(res.errors.length, 1);
+      assert.match(res.errors[0]!.file.filename, /_empty\.sql$/);
+
+      // The third migration must NOT have been applied over the gap.
+      const exists = await withClient((c) =>
+        c.query(`SELECT 1 FROM information_schema.tables WHERE table_name = $1`, [`${base}_c`]),
+      );
+      assert.equal(exists.rowCount, 0);
+    } finally {
+      await withClient(async (c) => {
+        await c.query(`DROP TABLE IF EXISTS "${base}_a"`);
+        await c.query(`DROP TABLE IF EXISTS "${base}_c"`);
+      });
+      await resetTracking();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * `migrate deploy` passes allowDestructive unconditionally, so the loose
+   * `--DOWN` spelling folded a rollback section into the UP body and applied a
+   * create-then-drop pair as one "successful" migration.
+   */
+  dbIt('migrate deploy does not run a --DOWN section as part of UP', async () => {
+    await resetTracking();
+    const dir = freshDir('marker');
+    const table = `sf_marker_${Date.now()}`;
+    try {
+      writeFileSync(
+        join(dir, '20260403000001_loose.sql'),
+        `-- UP\nCREATE TABLE "${table}" (id int);\n--DOWN\nDROP TABLE "${table}";\n`,
+      );
+
+      const res = await migrateDeploy(DATABASE_URL!, dir);
+      assert.equal(res.applied.length, 1);
+
+      const exists = await withClient((c) =>
+        c.query(`SELECT 1 FROM information_schema.tables WHERE table_name = $1`, [table]),
+      );
+      assert.equal(exists.rowCount, 1, 'the DOWN section must not have run as part of UP');
+    } finally {
+      await withClient((c) => c.query(`DROP TABLE IF EXISTS "${table}"`));
+      await resetTracking();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /** Concurrent status calls on a fresh database must not race on the create. */
+  dbIt('concurrent migrateStatus calls survive the tracking-table create race', async () => {
+    await resetTracking();
+    const dir = freshDir('race');
+    try {
+      const results = await Promise.allSettled(Array.from({ length: 12 }, () => migrateStatus(DATABASE_URL!, dir)));
+      const rejected = results.filter((r) => r.status === 'rejected');
+      assert.equal(rejected.length, 0, `all 12 should succeed, got: ${JSON.stringify(rejected.map(String))}`);
+    } finally {
       await resetTracking();
       rmSync(dir, { recursive: true, force: true });
     }

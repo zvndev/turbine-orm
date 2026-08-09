@@ -9,11 +9,13 @@
  *   - ROLLBACK on error
  *   - empty array short-circuits
  *   - non-transactional sequential mode (no BEGIN/COMMIT)
+ *   - non-transactional partial failure rejects with a real PipelineError
  *   - capability detection routing
  */
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { PipelineError, TurbineErrorCode } from '../errors.js';
 import { executePipeline } from '../pipeline.js';
 import type { DeferredQuery } from '../query/index.js';
 
@@ -237,11 +239,73 @@ describe('executePipeline', () => {
           [defer('SELECT BOOM', [], (r) => r.rows)],
           { transactional: false },
         ),
-      /explode/,
+      // The driver's own message is no longer the rejection's message: a
+      // non-transactional failure now rejects with the typed PipelineError the
+      // option's docstring promises, and the driver error is its `.cause`. The
+      // next test asserts that whole shape.
+      (err: unknown) => err instanceof PipelineError && (err.cause as Error)?.message === 'explode',
     );
 
     assert.ok(!calls.includes('BEGIN'), 'no BEGIN');
     assert.ok(!calls.includes('ROLLBACK'), 'no ROLLBACK in non-transactional mode');
+    assert.equal(released.value, 1, 'connection released');
+  });
+
+  /**
+   * `PipelineError` (E014) was defined in errors.ts, documented on the errors
+   * page with an `instanceof` example, and never CONSTRUCTED anywhere outside a
+   * test. The sequential path threw the raw driver error and the pipelined path
+   * bolted a `results` property onto it, so `err.results` happened to work while
+   * `err instanceof PipelineError` and `err.code === 'TURBINE_E014'` were both
+   * permanently false.
+   */
+  it('rejects a partly-failed non-transactional batch with a real PipelineError', async () => {
+    const released = { value: 0 };
+    const pool = {
+      async connect() {
+        return {
+          async query(text: string) {
+            if (text.includes('BOOM')) throw new Error('explode');
+            return { rows: [{ n: 7 }], rowCount: 1 };
+          },
+          release() {
+            released.value += 1;
+          },
+        };
+      },
+    };
+
+    const err = await executePipeline(
+      // biome-ignore lint/suspicious/noExplicitAny: mock pool shape
+      pool as any,
+      [
+        defer('SELECT 1 AS n', [], (r) => (r.rows[0] as { n: number }).n),
+        defer('SELECT BOOM', [], (r) => r.rows, 'posts.findMany'),
+        defer('SELECT 3 AS n', [], (r) => (r.rows[0] as { n: number }).n),
+      ],
+      { transactional: false },
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    assert.ok(err instanceof PipelineError, `expected a PipelineError, got ${String(err)}`);
+    assert.equal(err.code, TurbineErrorCode.PIPELINE);
+    assert.equal(err.failedIndex, 1);
+    assert.equal(err.failedTag, 'posts.findMany');
+    assert.equal((err.cause as Error).message, 'explode');
+
+    // Every query gets a slot, and the two AFTER the failure still ran: in
+    // non-transactional mode the queries are independent, which is what the
+    // option promises. The old code abandoned the batch at the first error.
+    assert.deepEqual(
+      err.results.map((slot) => slot.status),
+      ['ok', 'error', 'ok'],
+    );
+    assert.deepEqual(
+      err.results.filter((slot) => slot.status === 'ok').map((slot) => slot.value),
+      [7, 7],
+    );
     assert.equal(released.value, 1, 'connection released');
   });
 });

@@ -536,7 +536,6 @@ export type WithWhere<NestedT, NestedR extends object> = [unknown] extends [Nest
   ? Record<string, unknown>
   : WhereClause<NestedT & object, NestedR>;
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no nested relations", using object would break WithResult inference
 /**
  * A key-checked orderBy object over an entity and its relations.
  *
@@ -578,7 +577,20 @@ export type WithFieldFlags<NestedT> = [unknown] extends [NestedT]
   ? Record<string, boolean>
   : { [K in keyof NestedT]?: boolean };
 
-export interface WithOptions<NestedR extends object = {}, NestedT = unknown> {
+/**
+ * `Record<never, never>` rather than `{}` for the "no nested relations known"
+ * default, and the difference is load-bearing rather than cosmetic: the degrade
+ * branches in {@link TypedWithClause} and {@link TypedOrderByObject} test
+ * `[keyof R] extends [never]`, so the default has to be a type whose `keyof` IS
+ * `never`. `object` (biome's first suggestion) has `keyof object = never` too
+ * but admits any object, and `Record<string, never>` has `keyof = string`,
+ * which would silently flip every untyped `with` clause off the open escape
+ * hatch and onto key checking against no keys at all, i.e. reject everything. A
+ * mapped type over `never` resolves to exactly the empty object type, so this
+ * is the same type `{}` was, spelled in a way that says which property of it
+ * matters.
+ */
+export interface WithOptions<NestedR extends object = Record<never, never>, NestedT = unknown> {
   with?: TypedWithClause<NestedR>;
   /** Filter the related rows. Keys are checked against the relation target when it is known (see {@link WithWhere}). */
   where?: WithWhere<NestedT, NestedR>;

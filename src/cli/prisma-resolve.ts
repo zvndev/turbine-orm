@@ -144,12 +144,23 @@ function tableCandidates(modelName: string): string[] {
 // Field/column resolution
 // ---------------------------------------------------------------------------
 
-/** The database column a Prisma field maps to (`@map` wins, else the field name). */
+/**
+ * The database column a Prisma field maps to (`@map` wins, else the field name).
+ *
+ * BOTH `@map("legacy_name")` and `@map(name: "legacy_name")` are valid Prisma
+ * and mean the same thing; the model-level `@@map` handler in prisma-schema.ts
+ * has always accepted both. Reading only the positional form here discarded the
+ * column name on every named-argument field, and the resolver then fell back to
+ * the Prisma FIELD name, which in a legacy database is frequently a real column
+ * of its own: the resolution reported CLEAN while every read returned another
+ * column's data, every write landed in the wrong column, and the Prisma-owned
+ * column was never touched again.
+ */
 function fieldColumn(model: PrismaModel, fieldName: string): string {
   const f = model.fields.find((x) => x.name === fieldName);
   if (!f) return fieldName;
   const mapAttr = f.attrs.find((a) => a.name === 'map');
-  const arg = mapAttr?.args.find((a) => a.key === undefined);
+  const arg = mapAttr?.args.find((a) => a.key === undefined || a.key === 'name');
   return arg?.kind === 'string' && arg.value ? arg.value : f.name;
 }
 
@@ -293,8 +304,47 @@ export function resolvePrismaSchema(
     if (!noDb && r.status === 'resolved' && r.turbineName) result.map.enums[en.name] = r.turbineName;
   }
 
+  flagDuplicateTables(result);
   result.hasUnresolved = computeHasUnresolved(result);
   return result;
+}
+
+/**
+ * Two Prisma models must not resolve to ONE table.
+ *
+ * Nothing downstream can survive it: `prisma-compat` builds its
+ * table-to-model index last-writer-wins, so nested relation reshaping silently
+ * picks whichever model happened to be declared last, and the two models'
+ * field maps are different. The two ways to get here are a `@@map` typo (two
+ * models pointing at the same table by accident) and a genuine multi-schema
+ * setup, where `@@schema` is what distinguishes `auth.users` from
+ * `public.users` and this parser does not represent it.
+ *
+ * Both models are marked UNRESOLVED and dropped from the map. Guessing between
+ * them is not available: the resolver has no evidence for which one the call
+ * site meant, and a wrong pick reads and writes another model's columns.
+ */
+function flagDuplicateTables(result: ResolutionResult): void {
+  const byTable = new Map<string, ResolvedModel[]>();
+  for (const m of result.models) {
+    if (m.status !== 'resolved' || !m.table) continue;
+    const list = byTable.get(m.table);
+    if (list) list.push(m);
+    else byTable.set(m.table, [m]);
+  }
+  for (const [table, models] of byTable) {
+    if (models.length < 2) continue;
+    const names = models.map((m) => m.prismaName).join(', ');
+    for (const m of models) {
+      m.status = 'unresolved';
+      m.reason =
+        `${models.length} models resolve to table "${table}" (${names}). ` +
+        `The compat layer indexes relation targets BY TABLE, so it cannot tell them apart. ` +
+        `Fix the @@map, or, if these models live in different Postgres schemas (@@schema), ` +
+        `run migrate-from-prisma once per schema: this parser resolves one namespace at a time.`;
+      delete result.map.models[m.prismaName];
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +539,27 @@ function resolveRelation(
       const fk = Array.isArray(def.foreignKey) ? def.foreignKey : [def.foreignKey];
       return [...fk].sort().join(',') === want;
     });
-    if (byFk.length > 0) picked = byFk;
+    if (byFk.length === 0) {
+      // The schema PINNED the foreign-key columns and no relation in the
+      // database uses them. That is positive evidence of DISAGREEMENT, not a
+      // missing hint: falling through to "there is one candidate, take it" bound
+      // the field to an unrelated relation and reported the whole model clean.
+      // The shape is common: `relationMode = "prisma"` declares relations Prisma
+      // enforces in the client with no database constraint behind them, so a
+      // model can name FK columns that the catalog has never heard of, while a
+      // DIFFERENT column on the same table does carry a real FK. `include:
+      // { editor: true }` then returned the author.
+      return {
+        ...base,
+        reason:
+          `@relation(fields: [${fkColumns.join(', ')}]) names foreign-key column(s) that no relation on table ` +
+          `"${tableMeta.name}" uses. Candidates in the database: ` +
+          `${candidates.map((d) => `${d.name} (${Array.isArray(d.foreignKey) ? d.foreignKey.join('+') : d.foreignKey})`).join(', ') || '(none)'}. ` +
+          `If this relation is enforced only in Prisma (relationMode = "prisma"), the database has no foreign key ` +
+          `to resolve it against; add one, or map this field by hand.`,
+      };
+    }
+    picked = byFk;
   }
 
   if (picked.length === 1) {

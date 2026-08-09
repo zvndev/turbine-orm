@@ -28,7 +28,7 @@ import type {
   UpsertArgs,
 } from './types.js';
 import { resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
-import { coerceTemporalValue, resolveColumnName, type SqlCacheEntry } from './utils.js';
+import { canonicalWriteEntries, coerceTemporalValue, resolveColumnName, type SqlCacheEntry } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 
@@ -139,7 +139,7 @@ function buildDefaultValuesInsert(qi: BuilderCtx, rowCount: number, skipDuplicat
 export function buildCreate<T extends object>(qi: BuilderCtx, args: CreateArgs<T>): DeferredQuery<T> {
   assertWritable(qi, 'create');
   assertNoGeneratedColumns(qi, args.data as Record<string, unknown>, 'create');
-  const entries = Object.entries(args.data as Record<string, unknown>).filter(([, v]) => v !== undefined);
+  const entries = writeEntries(qi, args.data as Record<string, unknown>);
   const columns = entries.map(([k]) => qi.toSqlColumn(k));
   const params = entries.map(([k, v]) => coerceWriteValue(qi, k, v));
   // Enum columns get an explicit `::"EnumName"` cast (see enumTypeForColumn).
@@ -209,15 +209,43 @@ export function makeCreateReselect<T extends object>(
 }
 
 /**
- * The fields a write's `data` object actually names.
+ * The `[key, value]` pairs a write's `data` object actually names, in the
+ * table's own column order.
  *
  * A key whose value is `undefined` is NOT named: single-row {@link buildCreate}
  * filters those out of its column list, so the column takes its declared
- * default. `createMany` reads its rows through this same helper, so
- * `{ n: undefined }` and `{}` mean the identical thing on both paths.
+ * default. `createMany` reads its rows through {@link definedKeys}, which is
+ * this function's key half, so `{ n: undefined }` and `{}` mean the identical
+ * thing on both paths.
+ *
+ * THE ORDERING IS A SECURITY BOUND, not tidiness, and it is the whole reason
+ * this is one function rather than an `Object.entries` at each site. A write's
+ * column list is SQL TEXT: `SET "a" = $1, "b" = $2` and `SET "b" = $1, "a" = $2`
+ * are the same write and two different permanently-cached server-side prepared
+ * statements. `JSON.parse` preserves insertion order, so
+ * `update({ where, data: JSON.parse(reqBody) })` (an ordinary REST handler)
+ * lets the request body pick that order, with no array, no arity, and nothing
+ * the caller needs to know. Measured on PostgreSQL 16: 720 PATCH bodies
+ * carrying the SAME six keys in different orders left 720 prepared statements
+ * and 2.8 MB of CachedPlanSource on one connection. See
+ * {@link canonicalWriteEntries} for the ordering rule and why duplicates are
+ * deliberately preserved.
+ *
+ * Every consumer of this list must use THIS function: the SET-clause build, the
+ * cache fingerprint ({@link fingerprintSet}) and the param collector
+ * ({@link collectSetParams}) must enumerate one identical order or the cached
+ * statement and its params describe different writes.
  */
-function definedKeys(row: Record<string, unknown>): string[] {
-  return Object.keys(row).filter((k) => row[k] !== undefined);
+function writeEntries(qi: BuilderCtx, data: Record<string, unknown>): [string, unknown][] {
+  return canonicalWriteEntries(
+    qi.tableMeta,
+    Object.entries(data).filter(([, v]) => v !== undefined),
+  );
+}
+
+/** The key half of {@link writeEntries}, for the paths that need names only. */
+function definedKeys(qi: BuilderCtx, row: Record<string, unknown>): string[] {
+  return writeEntries(qi, row).map(([k]) => k);
 }
 
 /**
@@ -248,7 +276,7 @@ function definedKeys(row: Record<string, unknown>): string[] {
 function assertUniformCreateManyRows(qi: BuilderCtx, rows: Record<string, unknown>[], firstKeys: string[]): void {
   const expected = new Set(firstKeys);
   for (let i = 1; i < rows.length; i++) {
-    const rowKeys = definedKeys(rows[i]!);
+    const rowKeys = definedKeys(qi, rows[i]!);
     const unexpected = rowKeys.filter((k) => !expected.has(k));
     // No stranger and the same count means the same set (object keys are unique).
     if (unexpected.length === 0 && rowKeys.length === expected.size) continue;
@@ -289,7 +317,7 @@ export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateMa
     assertNoGeneratedColumns(qi, row as Record<string, unknown>, 'createMany');
   }
 
-  const keys = definedKeys(args.data[0] as Record<string, unknown>);
+  const keys = definedKeys(qi, args.data[0] as Record<string, unknown>);
   assertUniformCreateManyRows(qi, args.data as Record<string, unknown>[], keys);
 
   // No column named by the first row: every row is pure defaults (the bulk
@@ -413,7 +441,7 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
   const params: unknown[] = [];
 
   const buildSql = (freshParams: unknown[]): string => {
-    const setEntries = Object.entries(dataObj).filter(([, v]) => v !== undefined);
+    const setEntries = writeEntries(qi, dataObj);
     const setClauses = setEntries.map(([k, v]) => buildSetClause(qi, k, v, freshParams));
 
     if (lock) {
@@ -583,7 +611,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   // Prisma compound-unique selector on the conflict target → its member columns.
   const upsertWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
   // Build the INSERT part from create data
-  const createEntries = Object.entries(args.create as Record<string, unknown>).filter(([, v]) => v !== undefined);
+  const createEntries = writeEntries(qi, args.create as Record<string, unknown>);
   const columns = createEntries.map(([k]) => qi.toSqlColumn(k));
   const createParams = createEntries.map(([k, v]) => coerceWriteValue(qi, k, v));
   // Enum columns get an explicit `::"EnumName"` cast (see enumTypeForColumn).
@@ -594,7 +622,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   const conflictColumns = conflictKeys.map((k) => qi.toSqlColumn(k));
 
   // Build the UPDATE SET part
-  const updateEntries = Object.entries(args.update as Record<string, unknown>).filter(([, v]) => v !== undefined);
+  const updateEntries = writeEntries(qi, args.update as Record<string, unknown>);
   let paramIdx = createParams.length + 1;
   const setClauses = updateEntries.map(([k]) => {
     const clause = `${qi.toSqlColumn(k)} = ${qi.p(paramIdx)}${whereMod.enumCastSuffix(qi, qi.toColumn(k))}`;
@@ -694,7 +722,7 @@ export function buildUpdateMany<T extends object>(
   const params: unknown[] = [];
 
   const buildSql = (freshParams: unknown[]): string => {
-    const setEntries = Object.entries(dataObj).filter(([, v]) => v !== undefined);
+    const setEntries = writeEntries(qi, dataObj);
     const setClauses = setEntries.map(([k, v]) => buildSetClause(qi, k, v, freshParams));
     const whereClause = whereMod.buildWhereClause(qi, whereObj, freshParams);
     const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
@@ -1053,8 +1081,8 @@ export function assertBindableSetValue(qi: BuilderCtx, key: string, value: unkno
  * Fingerprint SET clauses for update/updateMany.
  * Captures key names + operator types (set/increment/etc) but not values.
  */
-export function fingerprintSet(_qi: BuilderCtx, data: Record<string, unknown>): string {
-  const entries = Object.entries(data).filter(([, v]) => v !== undefined);
+export function fingerprintSet(qi: BuilderCtx, data: Record<string, unknown>): string {
+  const entries = writeEntries(qi, data);
   const parts: string[] = [];
   for (const [k, v] of entries) {
     if (
@@ -1079,7 +1107,7 @@ export function fingerprintSet(_qi: BuilderCtx, data: Record<string, unknown>): 
  * Collect SET params for update/updateMany. Mirrors buildSetClause param order.
  */
 export function collectSetParams(qi: BuilderCtx, data: Record<string, unknown>, params: unknown[]): void {
-  const entries = Object.entries(data).filter(([, v]) => v !== undefined);
+  const entries = writeEntries(qi, data);
   for (const [k, v] of entries) {
     if (
       v !== null &&

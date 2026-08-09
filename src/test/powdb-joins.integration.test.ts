@@ -293,7 +293,12 @@ describe('powdb F2 integration: join vs loader parity (embedded)', () => {
         .findMany({ orderBy: { id: 'asc' }, with: { posts: { select: { title: true } } } });
       const ada = rows.find((r: { name: string }) => r.name === 'Ada');
       assert.equal(ada.posts.length, 3, 'Ada keeps her 3 posts even without the FK selected');
-      assert.deepEqual(Object.keys(ada.posts[0]).sort(), ['id', 'title'], 'only id + title, no leaked member_id');
+      // ONLY what was selected. The primary key is force-fetched for the same
+      // internal reasons the FK is (stitching, reselect) and is stripped off
+      // the entity exactly like it, so a PowDB `select` returns the same key
+      // set the SQL engines return. This used to read `['id', 'title']`, which
+      // is the divergence.
+      assert.deepEqual(Object.keys(ada.posts[0]).sort(), ['title'], 'only title, no leaked id or member_id');
     });
   });
 

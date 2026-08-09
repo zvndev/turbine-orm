@@ -70,7 +70,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # pgvector/pgvector: postgres:<major> plus the `vector` extension, so the
+        # KNN assertions in src/test/pgvector.test.ts run instead of skipping.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -140,7 +142,13 @@ jobs:
         postgres-version: [14, 15, 16, 17]
     services:
       postgres:
-        image: postgres:${{ matrix.postgres-version }}
+        # pgvector/pgvector, not stock postgres: the image is postgres:<major> with
+        # the `vector` extension available to CREATE. src/test/pgvector.test.ts
+        # probes for the extension and skips its live assertions when it is
+        # absent, so on stock postgres every KNN assertion in the suite had NEVER
+        # run: the SQL was only ever checked as a string. Nothing else about the
+        # image differs.
+        image: pgvector/pgvector:pg${{ matrix.postgres-version }}
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -603,7 +611,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # pgvector/pgvector: postgres:<major> plus the `vector` extension, so the
+        # KNN assertions in src/test/pgvector.test.ts run instead of skipping.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test

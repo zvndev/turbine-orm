@@ -24,6 +24,18 @@
  * and "which N children" are legitimately unspecified and a mismatch would be
  * noise, not a bug.
  *
+ * ...AND A SECOND ARM ON POSTGRESQL, because the sqlite arm alone has a blind
+ * spot that shipped a bug. The batched loader's per-parent `limit` pushdown
+ * (`ROW_NUMBER() OVER (PARTITION BY fk …)`) is gated on
+ * `dialect.name === 'postgresql'`, so on sqlite the generator's limited
+ * relations exercise the client-side slice and nothing else, and the pushdown
+ * went out changing which rows a DEFAULT-strategy query returned. The PG arm
+ * (gated on DATABASE_URL, read-only against the seeded fixture) therefore
+ * generates limited relations with and WITHOUT a total order, and asserts the
+ * property the sqlite arm cannot express: a relation whose ordering leaves
+ * ties is never rewritten, because with ties the two plans are each free to
+ * keep different rows. See `partitionOrderBy` in query/batched-loader.ts.
+ *
  * Reproduction: every assertion message carries the seed, case index, and the
  * full args JSON. Re-run a failure with:
  *   TURBINE_FUZZ_SEED=<seed> TURBINE_FUZZ_CASES=<cases> npx tsx --test src/test/strategy-fuzz.test.ts
@@ -35,10 +47,12 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { afterEach, beforeEach, describe, it as nodeIt } from 'node:test';
-import type { TurbineClient } from '../client.js';
+import { TurbineClient } from '../client.js';
 import { TurbineError } from '../errors.js';
+import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
+import { skipGate } from './helpers.js';
 
 // Same probe as sqlite.test.ts: load on Node < 22.5, skip cleanly.
 const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() => {
@@ -398,30 +412,17 @@ let db: DatabaseSyncType;
 let schema: SchemaMetadata;
 let client: TurbineClient;
 
-beforeEach(() => {
-  if (!DatabaseSync) return;
-  db = new DatabaseSync(':memory:');
-  db.exec('PRAGMA foreign_keys = ON');
-  db.exec(SCHEMA_SQL);
-  seedDatabase(db);
-  schema = introspectSqliteDatabase(db);
-  client = turbineSqlite(db, schema);
-});
-
-afterEach(async () => {
-  if (!DatabaseSync) return;
-  await client.disconnect();
-});
-
 type Outcome = { ok: true; rows: unknown[] } | { ok: false; code: string; message: string };
 
-async function runWith(
+/** Run `args` on `target` under one strategy, normalizing a TurbineError into a value. */
+async function runOn(
+  target: TurbineClient,
   table: string,
   args: Record<string, unknown>,
   strategy: 'join' | 'batched' | 'auto',
 ): Promise<Outcome> {
   try {
-    const rows = await client.table(table).findMany({ ...args, relationLoadStrategy: strategy } as never);
+    const rows = await target.table(table).findMany({ ...args, relationLoadStrategy: strategy } as never);
     return { ok: true, rows };
   } catch (err) {
     if (err instanceof TurbineError) return { ok: false, code: err.code, message: err.message };
@@ -429,7 +430,30 @@ async function runWith(
   }
 }
 
+async function runWith(
+  table: string,
+  args: Record<string, unknown>,
+  strategy: 'join' | 'batched' | 'auto',
+): Promise<Outcome> {
+  return runOn(client, table, args, strategy);
+}
+
 describe('strategy differential fuzz (join vs batched vs auto)', () => {
+  beforeEach(() => {
+    if (!DatabaseSync) return;
+    db = new DatabaseSync(':memory:');
+    db.exec('PRAGMA foreign_keys = ON');
+    db.exec(SCHEMA_SQL);
+    seedDatabase(db);
+    schema = introspectSqliteDatabase(db);
+    client = turbineSqlite(db, schema);
+  });
+
+  afterEach(async () => {
+    if (!DatabaseSync) return;
+    await client.disconnect();
+  });
+
   it('the fixture has the skew the generator assumes', async () => {
     // Precondition, so a silent seed change cannot hollow out the suite: there
     // must be parents with EMPTY relations and parents with many children.
@@ -516,6 +540,252 @@ describe('strategy differential fuzz (join vs batched vs auto)', () => {
         `seed ${seed}: fewer rejections (${rejected}) than planted corruptions (${planted})`,
       );
       assert.ok(rejected < CASES_PER_SEED, `seed ${seed}: every case was rejected; the equality half never ran`);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PostgreSQL arm: the same differential, on the engine where the batched
+// loader's per-parent `limit` is REWRITTEN rather than sliced client-side.
+// ---------------------------------------------------------------------------
+
+/**
+ * The seeded fixture's tables, as the generator sees them.
+ *
+ * `sortFields` is deliberately restricted to columns that are part of NO
+ * unique key, so whether a generated relation `orderBy` totally orders its
+ * target is decided by ONE thing: whether the PK tiebreaker was appended. The
+ * precondition test below re-derives that from the live metadata, so a fixture
+ * change that adds a unique constraint fails loudly instead of quietly turning
+ * every "non-total" case into a total one.
+ */
+interface PgModel {
+  filterFields: Record<string, 'int' | 'string' | 'bool'>;
+  sortFields: string[];
+  /** relation name -> [target model, 'many' | 'one'] */
+  relations: Record<string, [string, 'many' | 'one']>;
+}
+
+const PG_MODELS: Record<string, PgModel> = {
+  organizations: {
+    filterFields: { name: 'string', plan: 'string' },
+    sortFields: ['name', 'plan', 'createdAt'],
+    relations: { users: ['users', 'many'], posts: ['posts', 'many'] },
+  },
+  users: {
+    filterFields: { name: 'string', role: 'string', orgId: 'int' },
+    sortFields: ['name', 'role', 'orgId', 'lastLoginAt', 'createdAt'],
+    relations: { posts: ['posts', 'many'], comments: ['comments', 'many'], organization: ['organizations', 'one'] },
+  },
+  posts: {
+    filterFields: { title: 'string', published: 'bool', viewCount: 'int', userId: 'int' },
+    sortFields: ['title', 'published', 'viewCount', 'userId', 'createdAt'],
+    relations: { comments: ['comments', 'many'], user: ['users', 'one'], organization: ['organizations', 'one'] },
+  },
+  comments: {
+    filterFields: { body: 'string', postId: 'int', userId: 'int' },
+    sortFields: ['body', 'postId', 'userId', 'createdAt'],
+    relations: { post: ['posts', 'one'], user: ['users', 'one'] },
+  },
+};
+
+const PG_STRINGS = ['Alice Admin', 'member', 'admin', 'Hello World', 'Nice post!', 'pro', 'nope%_', "O'Brien"];
+
+function pgWhere(rng: () => number, model: PgModel): Record<string, unknown> {
+  const where: Record<string, unknown> = {};
+  const fields = Object.keys(model.filterFields);
+  const field = pick(rng, fields);
+  const kind = model.filterFields[field]!;
+  if (kind === 'bool') where[field] = chance(rng, 0.5);
+  else if (kind === 'int') {
+    const op = pick(rng, ['equals', 'gt', 'lt', 'in'] as const);
+    const v = 1 + Math.floor(rng() * 8);
+    where[field] = op === 'in' ? { in: [v, v + 1] } : op === 'equals' ? v : { [op]: v };
+  } else {
+    const op = pick(rng, ['equals', 'contains', 'startsWith', 'not'] as const);
+    where[field] = { [op]: pick(rng, PG_STRINGS) };
+  }
+  return where;
+}
+
+/**
+ * A relation `orderBy`, plus whether it TOTALLY orders the target. `total`
+ * cases append the primary key; the rest deliberately stop at a column that
+ * can repeat, which is the class the pushdown must decline.
+ */
+function pgOrderBy(rng: () => number, model: PgModel, total: boolean): Array<Record<string, unknown>> {
+  const orderBy: Array<Record<string, unknown>> = [];
+  const field = pick(rng, model.sortFields);
+  const dir = pick(rng, ['asc', 'desc'] as const);
+  // A third of the sorts spell the direction as `{ sort, nulls }`, which moves
+  // rows across the limit boundary and so must survive into the window.
+  orderBy.push(
+    chance(rng, 0.33) ? { [field]: { sort: dir, nulls: pick(rng, ['first', 'last'] as const) } } : { [field]: dir },
+  );
+  if (total) orderBy.push({ id: 'asc' });
+  return orderBy;
+}
+
+interface PgCase {
+  table: string;
+  args: Record<string, unknown>;
+  /** Limited relations whose ordering is total, so the pushdown MAY rewrite them. */
+  eligible: number;
+  /** Limited relations whose ordering is not total, so it must not. */
+  ineligible: number;
+}
+
+function pgWith(
+  rng: () => number,
+  model: PgModel,
+  depth: number,
+  tally: { eligible: number; ineligible: number },
+): Record<string, unknown> | undefined {
+  const withClause: Record<string, unknown> = {};
+  for (const [rel, [targetName, cardinality]] of Object.entries(model.relations)) {
+    if (!chance(rng, depth === 0 ? 0.55 : 0.3)) continue;
+    const target = PG_MODELS[targetName]!;
+    if (cardinality === 'one') {
+      // To-one relations take no limit; include them for stitching coverage.
+      withClause[rel] = chance(rng, 0.5) ? true : { where: pgWhere(rng, target) };
+      continue;
+    }
+    const options: Record<string, unknown> = {};
+    if (chance(rng, 0.3)) options.where = pgWhere(rng, target);
+    // 55% limited, and of those roughly half are deliberately NOT totally
+    // ordered: that is the population the pushdown has to refuse.
+    const limited = chance(rng, 0.55);
+    const total = !limited || chance(rng, 0.5);
+    if (limited) {
+      options.limit = 1 + Math.floor(rng() * 3);
+      if (total) tally.eligible += 1;
+      else tally.ineligible += 1;
+    }
+    options.orderBy = pgOrderBy(rng, target, total);
+    if (chance(rng, 0.25))
+      options.select = { id: true, ...(chance(rng, 0.5) ? { [pick(rng, target.sortFields)]: true } : {}) };
+    if (depth < 1) {
+      const nested = pgWith(rng, target, depth + 1, tally);
+      if (nested) options.with = nested;
+    }
+    withClause[rel] = options;
+  }
+  return Object.keys(withClause).length > 0 ? withClause : undefined;
+}
+
+function pgCase(rng: () => number): PgCase {
+  const table = pick(rng, ['organizations', 'users', 'posts'] as const);
+  const model = PG_MODELS[table]!;
+  const tally = { eligible: 0, ineligible: 0 };
+  // The TOP-LEVEL query keeps a total order: this arm is about which CHILDREN
+  // a relation limit keeps, and an unordered parent page would make the whole
+  // comparison noise for a reason that has nothing to do with the pushdown.
+  const args: Record<string, unknown> = { orderBy: [{ pick: 0 }] };
+  args.orderBy = [{ [pick(rng, model.sortFields)]: pick(rng, ['asc', 'desc'] as const) }, { id: 'asc' }];
+  if (chance(rng, 0.5)) args.where = pgWhere(rng, model);
+  if (chance(rng, 0.4)) args.limit = 2 + Math.floor(rng() * 6);
+  const withClause = pgWith(rng, model, 0, tally);
+  if (withClause) args.with = withClause;
+  return { table, args, eligible: tally.eligible, ineligible: tally.ineligible };
+}
+
+const PG_URL = process.env.DATABASE_URL;
+const pgGate = skipGate(!PG_URL, 'DATABASE_URL not set');
+if (!PG_URL) {
+  console.log('⚠ Skipping the PostgreSQL fuzz arm: DATABASE_URL not set');
+}
+const PG_CASES_PER_SEED = process.env.TURBINE_FUZZ_CASES ? Number(process.env.TURBINE_FUZZ_CASES) : 40;
+
+describe('strategy differential fuzz on PostgreSQL (the per-parent limit pushdown)', () => {
+  let pg: TurbineClient;
+  let pgSchema: SchemaMetadata;
+  let emitted: string[] = [];
+
+  pgGate.before(async () => {
+    pgSchema = await introspect({ connectionString: PG_URL! });
+    pg = new TurbineClient({ connectionString: PG_URL!, poolSize: 5, warnOnUnlimited: false }, pgSchema);
+    pg.$on('query', (e) => emitted.push(e.sql));
+    await pg.connect();
+  });
+
+  pgGate.after(async () => {
+    await pg.disconnect();
+  });
+
+  pgGate.it("the generator's sort columns are genuinely non-unique in the live schema", () => {
+    // The whole arm rests on "no PK tiebreaker means ties are possible". If a
+    // fixture change made one of these columns unique, the ineligible half of
+    // the domain would silently become eligible and the invariant below would
+    // stop testing anything.
+    for (const [table, model] of Object.entries(PG_MODELS)) {
+      const meta = pgSchema.tables[table];
+      assert.ok(meta, `fixture is missing table "${table}"`);
+      const uniqueSets = [meta.primaryKey, ...meta.uniqueColumns];
+      for (const field of model.sortFields) {
+        // Annotated: `assert.ok` is an assertion function, so leaving this to
+        // inference makes the type depend on a flow node that reads it back.
+        const column: string = meta.columnMap[field] ?? field;
+        assert.ok(meta.allColumns.includes(column), `${table}.${field} is not a column any more`);
+        for (const set of uniqueSets) {
+          assert.notDeepEqual(set, [column], `${table}.${field} became a unique key; it can no longer produce ties`);
+        }
+      }
+    }
+  });
+
+  for (const seed of SEEDS) {
+    pgGate.it(`seed ${seed}: pushdown eligibility + equality over ${PG_CASES_PER_SEED} cases`, async () => {
+      const rng = mulberry32(seed);
+      let eligibleCases = 0;
+      let ineligibleCases = 0;
+      let wrappersSeen = 0;
+      for (let i = 0; i < PG_CASES_PER_SEED; i++) {
+        const testCase = pgCase(rng);
+        const repro = () => `seed=${seed} case=${i} table=${testCase.table}\nargs=${JSON.stringify(testCase.args)}`;
+        const join = await runOn(pg, testCase.table, testCase.args, 'join');
+
+        for (const strategy of ['batched', 'auto'] as const) {
+          emitted = [];
+          const other = await runOn(pg, testCase.table, testCase.args, strategy);
+          const wrappers = emitted.filter((s) => s.includes('ROW_NUMBER'));
+          wrappersSeen += wrappers.length;
+
+          // 1. ACCEPTANCE AGREEMENT, the 0.64.0 property.
+          assert.equal(join.ok, other.ok, `join and ${strategy} disagree about validity: ${repro()}`);
+          if (!join.ok && !other.ok) {
+            assert.equal(join.code, other.code, `join and ${strategy} threw different codes: ${repro()}`);
+          }
+
+          // 2. THE ELIGIBILITY INVARIANT. One statement per limited relation
+          // node at most (a chunked follow-up would add more, but the fixture
+          // is far below MAX_RELATION_KEYS), so the count of rewritten
+          // statements can never exceed the number of TOTALLY ORDERED limited
+          // relations. Any excess is a relation whose ordering leaves ties
+          // being rewritten, which is exactly the shape that made the two
+          // plans return different children.
+          assert.ok(
+            wrappers.length <= testCase.eligible,
+            `${strategy} rewrote ${wrappers.length} follow-up(s) but only ${testCase.eligible} relation(s) are ` +
+              `totally ordered (${testCase.ineligible} are not): ${repro()}\n${wrappers.join('\n')}`,
+          );
+
+          // 3. RESULT EQUALITY, but only where the answer is determined: with
+          // an ineligible limited relation in the tree, WHICH children the
+          // limit keeps is not forced on EITHER plan, so a mismatch there
+          // would be noise rather than a defect. Assertion 2 is what covers
+          // that half of the domain.
+          if (join.ok && other.ok && testCase.ineligible === 0) {
+            assert.deepEqual(other.rows, join.rows, `result mismatch join vs ${strategy}: ${repro()}`);
+          }
+        }
+        if (testCase.eligible > 0) eligibleCases += 1;
+        if (testCase.ineligible > 0) ineligibleCases += 1;
+      }
+      // Vacuity guards, in the style of the sqlite arm: both halves of the
+      // eligibility rule must actually have been exercised.
+      assert.ok(ineligibleCases > 0, `seed ${seed}: no case carried a non-total limited relation; assertion 2 is idle`);
+      assert.ok(eligibleCases > 0, `seed ${seed}: no case carried a totally-ordered limited relation`);
+      assert.ok(wrappersSeen > 0, `seed ${seed}: the pushdown never engaged; the arm proves nothing about it`);
     });
   }
 });

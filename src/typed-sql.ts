@@ -103,19 +103,35 @@ export class TypedSqlQuery<T extends Record<string, unknown>> implements Promise
     private readonly sql: string,
     private readonly params: unknown[],
     private readonly logging: boolean,
+    /**
+     * Runs the execution under the owning client's `errorMessages` mode. Passed
+     * in rather than read here because this module must not import the client.
+     *
+     * It has to reach the EXECUTION, not the construction, and that is the whole
+     * reason it is a constructor parameter instead of a wrapper around
+     * `client.sql\`...\``: this builder is lazy, so a scope established around
+     * the tagged-template call is torn down before a single row is fetched.
+     * Wrapping the template call compiled, ran, and protected nothing.
+     *
+     * Defaults to calling through, so a `TypedSqlQuery` built outside a client
+     * behaves exactly as before.
+     */
+    private readonly runScoped: <R>(fn: () => R) => R = (fn) => fn(),
   ) {}
 
   /** Execute and return all rows. Internal; powers `then`, `one`, and `scalar`. */
-  private async run(): Promise<T[]> {
-    if (this.logging) {
-      console.log(`[turbine] Typed SQL: ${this.sql.trim().substring(0, 120)}...`);
-    }
-    try {
-      const result = await this.pool.query(this.sql, this.params);
-      return result.rows as T[];
-    } catch (err) {
-      throw wrapPgError(err);
-    }
+  private run(): Promise<T[]> {
+    return this.runScoped(async () => {
+      if (this.logging) {
+        console.log(`[turbine] Typed SQL: ${this.sql.trim().substring(0, 120)}...`);
+      }
+      try {
+        const result = await this.pool.query(this.sql, this.params);
+        return result.rows as T[];
+      } catch (err) {
+        throw wrapPgError(err);
+      }
+    });
   }
 
   /**

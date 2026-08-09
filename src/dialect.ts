@@ -238,6 +238,48 @@ export interface LimitOffsetInput {
 }
 
 /**
+ * Inputs for {@link Dialect.buildPartitionLimit}, the per-correlation-key row
+ * bound the batched relation loader pushes into its follow-up query.
+ *
+ * The follow-up is one flat `WHERE fk = ANY($1)` over EVERY parent's children,
+ * so a trailing `LIMIT n` would cap the TOTAL rather than the per-parent count.
+ * A window function is the portable-in-shape way to say "at most n rows per
+ * key": rank inside the partition, then keep the ranks at or below the bound.
+ *
+ * The loader hands over the compiled child SELECT and the pieces it cannot
+ * spell engine-independently; the dialect owns the SQL text (and its aliases),
+ * exactly like {@link buildLimitOffset} and {@link buildRelationSubquery}.
+ */
+export interface PartitionLimitInput {
+  /** The compiled child SELECT, to be wrapped as a derived table. */
+  innerSql: string;
+  /** RAW (unquoted) correlation column to partition by. */
+  partitionColumn: string;
+  /**
+   * The window's (and the outer result's) ordering, as RAW column names.
+   *
+   * NEVER EMPTY, and never a partial order: the loader only asks for this
+   * rewrite when the relation's `orderBy` covers a NOT NULL unique key of the
+   * target table, so no two rows of a partition can tie. That precondition is
+   * the whole licence for the rewrite. The join plan takes its `limit` with a
+   * per-parent `ORDER BY … LIMIT n` and this takes it with a rank over one flat
+   * result, and where ties exist the two are each free to keep different rows,
+   * which was measured happening (see `partitionOrderBy` in
+   * query/batched-loader.ts). Anything short of a total order therefore keeps
+   * the client-side slice instead of arriving here.
+   */
+  orderBy: readonly { column: string; direction: 'ASC' | 'DESC'; nulls?: 'FIRST' | 'LAST' }[];
+  /** SQL-ready placeholder for the bound (`$3`, `?`, …). */
+  limitPlaceholder: string;
+  /**
+   * RAW name of the rank column the wrapper adds. It is part of the projection
+   * (`SELECT <outer>.*`), so the CALLER must remove it from each raw row before
+   * parsing, or it would surface as an extra field on every child entity.
+   */
+  rankColumn: string;
+}
+
+/**
  * Everything an engine needs to OVERRIDE nested-relation subquery generation, for
  * dialects whose JSON-aggregation shape is fundamentally different from PostgreSQL's
  * `json_agg(json_build_object(...))` (SQL Server's `FOR JSON PATH` expresses the
@@ -380,6 +422,38 @@ export interface Dialect {
   readonly supportsVector: boolean;
 
   /**
+   * Whether this dialect/engine can actually answer JSON CONTAINMENT, i.e. the
+   * pathless `{ contains }` and `{ equals }` JSON filters that compile through
+   * {@link buildJsonContains}.
+   *
+   * A capability flag rather than a per-operand hook, because the answer turned
+   * out not to vary by operand. SQLite emulates containment as
+   * `EXISTS (SELECT 1 FROM json_each(col) WHERE value = $1)` while the param is
+   * bound as JSON TEXT, and `json_each.value` yields the DECODED SQL value, so
+   * the comparison is between two different encodings and never holds. Measured
+   * against a real in-process SQLite, every operand type returned zero rows:
+   *
+   *   stored              filter                PG        SQLite
+   *   ["gold"]            contains: 'gold'      match     none   ('gold' = '"gold"')
+   *   [1]                 contains: 1           match     none   (INTEGER 1 = TEXT '1')
+   *   {"a":1,"t":"gold"}  contains: { a: 1 }    match     none   (no structural walk)
+   *
+   * So the feature has never worked on that engine at all, and refusing it
+   * removes nothing that functioned. Fewer-rows-with-no-error is the exact
+   * degrade the capability contract exists to convert into a refusal.
+   *
+   * Repairing it rather than refusing it is possible and deliberately not done
+   * here: `json_each` exposes a `type` column ('text' / 'integer' / 'real' /
+   * 'true' / 'false' / 'null'), so a faithful scalar test is
+   * `type = $1 AND value IS $2`. That is a param-COUNT change on a path whose
+   * build and collect sides must stay in lockstep, which is a different change
+   * from this one. Until then the flag is honest and the error names the
+   * alternative that is exact today (`{ path: [...], equals }`, which compiles
+   * to `json_extract`).
+   */
+  readonly supportsJsonContains: boolean;
+
+  /**
    * Whether this dialect/engine supports the PostgreSQL full-text `search`
    * filter (`to_tsvector(...) @@ to_tsquery(...)`). Optional: absent is treated
    * as `false`, so only dialects that set it true admit a `search` filter and
@@ -500,6 +574,29 @@ export interface Dialect {
 
   /** Build a case-insensitive LIKE equivalent. */
   buildInsensitiveLike(column: string, paramRef: string): string;
+
+  /**
+   * Escape the LIKE metacharacters of this engine in a bound `contains` /
+   * `startsWith` / `endsWith` / `stringContains` operand. Optional: when a
+   * dialect omits it the shared {@link escapeLike} is used, which escapes the
+   * SQL-standard set (`\`, `%`, `_`) and pairs with the `ESCAPE '\'` clause the
+   * builders always emit.
+   *
+   * It exists because the standard set is not the whole set everywhere:
+   * T-SQL's `LIKE` also treats `[` as opening a character CLASS, so
+   * `{ contains: '[draft]' }` becomes "contains any one of d, r, a, f, t" on
+   * SQL Server, a silently over-broad predicate on an engine where every other
+   * dialect agrees the value is a literal. That is not injection (the operand
+   * is still bound), but it is a wrong answer, and the difference is a property
+   * of the ENGINE's pattern grammar, not of the SQL text, which is why it is a
+   * dialect hook rather than a branch in the where builder.
+   *
+   * Whatever a dialect returns MUST be escaped for the same `ESCAPE '\'`
+   * clause, i.e. a backslash prefix, and MUST be identical on the SQL-build and
+   * the cache-hit param-collect paths (both call this one hook, so they cannot
+   * drift).
+   */
+  escapeLikePattern?(value: string): string;
 
   /** JSON operator support level for this dialect. */
   readonly jsonPathSupport: 'native' | 'function' | 'limited';
@@ -699,6 +796,32 @@ export interface Dialect {
    * param-push-ordering contract the override must honor.
    */
   buildRelationSubquery?(ctx: RelationSubqueryContext): string;
+
+  /**
+   * Bound a batched relation follow-up to at most N rows per correlation key,
+   * by wrapping the compiled child SELECT in a `ROW_NUMBER() OVER (PARTITION
+   * BY …)` filter. See {@link PartitionLimitInput} for why a trailing `LIMIT`
+   * cannot express this.
+   *
+   * OPTIONAL, and absent means "no pushdown": the batched loader then fetches
+   * every matching child and applies the per-relation `limit` client-side, the
+   * behaviour every engine had before this hook existed. That fallback is
+   * correct but unbounded in bytes over the wire (200 parents x ~505 children
+   * with `limit: 3` measured 101,000 rows fetched to keep 600, +52.9 MB peak
+   * heap against +0.5 MB for the join plan), which is why PostgreSQL
+   * implements it. Only PostgreSQL does in this release; the other engines keep
+   * the client-side slice, so their emitted SQL is byte-identical to before.
+   *
+   * The client-side slice is NOT removed when a dialect implements this: it
+   * stays as the belt-and-braces bound, and is a no-op once the engine has
+   * already limited each partition. It is also still the whole mechanism for
+   * any relation whose `orderBy` does not TOTALLY order the target table, on
+   * every engine including this one: a rewrite that reaches here has to return
+   * the same rows the join plan's per-parent `ORDER BY … LIMIT n` returns, and
+   * with ties present neither plan's choice is forced. See
+   * {@link PartitionLimitInput.orderBy}.
+   */
+  buildPartitionLimit?(input: PartitionLimitInput): string;
 }
 
 export interface DialectIntrospector {
@@ -736,6 +859,7 @@ export const postgresDialect: Dialect = {
   nullJsonLiteral: 'NULL',
   aggSupportsInlineOrderBy: true,
   supportsVector: true,
+  supportsJsonContains: true,
   supportsFullTextSearch: true,
   supportsArrayColumns: true,
   supportsListenNotify: true,
@@ -1013,6 +1137,42 @@ export const postgresDialect: Dialect = {
       sql: `SELECT set_config(${this.paramPlaceholder(1)}, ${this.paramPlaceholder(2)}, true)`,
       params: [name, value],
     };
+  },
+
+  buildPartitionLimit(input: PartitionLimitInput): string {
+    // Two wrapper levels, and both are needed: `ROW_NUMBER()` is a window
+    // function, so it cannot appear in the same WHERE that filters on it.
+    // Aliases are deliberately not in the `t<n>` family the relation builder
+    // allocates, so a future caller that wraps a query carrying those aliases
+    // cannot shadow one.
+    const inner = this.quoteIdentifier('turbine_pl_src');
+    const outer = this.quoteIdentifier('turbine_pl_rank');
+    const rank = this.quoteIdentifier(input.rankColumn);
+    const order = (ref: string): string =>
+      input.orderBy
+        .map((o) => `${ref}.${this.quoteIdentifier(o.column)} ${o.direction}${o.nulls ? ` NULLS ${o.nulls}` : ''}`)
+        .join(', ');
+    // The empty-list branches are defensive only: the loader never asks for
+    // this rewrite without a total order (see the note on
+    // `PartitionLimitInput.orderBy`). An unordered window numbers each
+    // partition arbitrarily, and so does the join plan's ORDER-BY-less
+    // per-parent `LIMIT`, but they are different plans over different row sets
+    // and were measured choosing differently, so that shape keeps the loader's
+    // client-side slice rather than arriving here.
+    const windowOrder = input.orderBy.length > 0 ? ` ORDER BY ${order(inner)}` : '';
+    // The OUTER ordering is not cosmetic: the loader buckets children in result
+    // order, so without re-applying it here the relation array would come back
+    // in whatever order the rank filter happened to emit. It agrees with the
+    // window's own ordering by construction, since both are this one list and
+    // that list admits no ties, so the outer sort cannot pick a different order
+    // among the ranked rows than the rank did.
+    const outerOrder = input.orderBy.length > 0 ? ` ORDER BY ${order(outer)}` : '';
+    return (
+      `SELECT ${outer}.* FROM (SELECT ${inner}.*, ROW_NUMBER() OVER (PARTITION BY ` +
+      `${inner}.${this.quoteIdentifier(input.partitionColumn)}${windowOrder}) AS ${rank} ` +
+      `FROM (${input.innerSql}) AS ${inner}) AS ${outer} ` +
+      `WHERE ${outer}.${rank} <= ${input.limitPlaceholder}${outerOrder}`
+    );
   },
 
   async *openStream(

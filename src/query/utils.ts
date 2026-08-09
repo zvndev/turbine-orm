@@ -43,6 +43,12 @@ export interface ColumnNameSource {
   columnMap: Record<string, string>;
   reverseColumnMap?: Record<string, string>;
   allColumns?: string[];
+  /**
+   * The table's own name, present whenever the source is a real
+   * `TableMetadata`. Used for ERROR TEXT only, never for key resolution, so a
+   * hand-built source that omits it still resolves identically.
+   */
+  name?: string;
 }
 
 /**
@@ -77,6 +83,161 @@ export function resolveColumnName(meta: ColumnNameSource, key: string): string |
   return undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Caller-controlled key ORDER, canonicalized
+// ---------------------------------------------------------------------------
+
+/**
+ * THE canonical order for a caller-supplied set of columns: the table's own
+ * `allColumns` order, which is the order `omit` and the default projection
+ * already produce.
+ *
+ * ## The failure mode this exists to close, and it is NOT arity
+ *
+ * Every distinct SQL text Turbine emits is parsed on the server as a NAMED
+ * prepared statement and is never DEALLOCATEd. The arity rule
+ * (`markVariableArity`) bounds the shapes whose LENGTH the caller picks. It
+ * does nothing about the shapes whose length is fixed and whose ORDER the
+ * caller picks, and those grow the SQL text just as freely: `select: { a, b }`
+ * and `select: { b, a }` are the same query and two different statements.
+ *
+ * Measured against PostgreSQL 16 on a SEVEN-column table, one connection, with
+ * the arity fix already landed:
+ *
+ *   baseline                              prepared=    0   CachedPlanSource= 0.0 MB
+ *   after 5040 `select` permutations      prepared= 5040   CachedPlanSource=39.4 MB
+ *   after 300 varying-arity ORs           prepared= 5040   CachedPlanSource=39.4 MB
+ *   after 5040 `distinct` permutations    prepared=10080   CachedPlanSource=59.1 MB
+ *   720 reordered PATCH bodies (update)   prepared=  720   CachedPlanSource= 2.8 MB
+ *
+ * The write row is the realistic one: `JSON.parse` preserves insertion order,
+ * so `update({ where, data: JSON.parse(reqBody) })` hands a request body the
+ * SET-clause column order for free. No arrays, no unusual input, no opt-in.
+ *
+ * The reachable space is ORDERED subsets, sum over k of k! * C(n,k): 9.9e6 for
+ * 10 columns, 6.6e18 for 20. Canonicalizing collapses each permutation class to
+ * one statement, leaving the UNORDERED subsets (2^n) that `omit` has always
+ * had.
+ *
+ * ## Why ordering is the right remedy here rather than withholding the name
+ *
+ * A projection's SELECT-list order is not semantically meaningful to Turbine:
+ * rows are assembled by NAME (`parseRow`, `jsonScalarPairs` and
+ * `buildRelationShape` all key off the same resolved list), so reordering it
+ * changes no value. Where an order IS meaningful (`orderBy`, and `DISTINCT ON`,
+ * whose list is re-emitted as an ORDER BY prefix), the statement is sent
+ * unnamed instead. See `MAX_NAMED_ORDER_KEYS` in filters.ts and the `distinct`
+ * mark in builder.ts.
+ *
+ * Duplicates collapse, which is the other half of "canonical": two spellings of
+ * one column (`userId` and `user_id`, both legal on an introspected schema)
+ * used to emit that column twice in the SELECT list.
+ *
+ * Cost is one Set of the projected columns plus one pass over `allColumns`, on
+ * a path that already walks the caller's keys.
+ *
+ * @param meta the table the columns belong to; without `allColumns` there is no
+ *   canonical order to appeal to and the input is returned untouched.
+ * @param columns already-resolved snake_case column names.
+ */
+export function canonicalColumnOrder(meta: ColumnNameSource, columns: string[]): string[] {
+  const all = meta.allColumns;
+  if (all === undefined || columns.length < 2) return columns;
+  const wanted = new Set(columns);
+  const ordered: string[] = [];
+  for (const col of all) {
+    if (wanted.delete(col)) ordered.push(col);
+  }
+  // A resolved column absent from `allColumns` is only reachable from
+  // hand-built metadata whose maps disagree with each other. Keep it (in the
+  // caller's relative order) rather than silently dropping it from the
+  // projection: this function reorders, it never decides what is projected.
+  if (wanted.size > 0) {
+    for (const col of columns) {
+      if (wanted.delete(col)) ordered.push(col);
+    }
+  }
+  return ordered;
+}
+
+/**
+ * {@link canonicalColumnOrder} for a write's `data` entries: same order, same
+ * reason, two deliberate differences.
+ *
+ * DUPLICATES ARE KEPT. Two keys resolving to one column (`{ userId, user_id }`)
+ * is a caller error that PostgreSQL reports precisely ("multiple assignments to
+ * same column", 42701, and the INSERT equivalent). Collapsing them here would
+ * turn that error into a silent write of whichever value survived, so the entry
+ * list is REORDERED and never shortened. A stable sort keeps such a pair
+ * adjacent and in the caller's relative order, so the engine still sees, and
+ * still rejects, both assignments.
+ *
+ * THE KEY SPELLING IS PRESERVED. Everything downstream (`coerceWriteValue`,
+ * `buildSetClause`, `toSqlColumn`) re-resolves the caller's key itself, so only
+ * the ORDER of the entries changes here, never their content.
+ *
+ * A key that resolves to no column sorts LAST, in the caller's relative order.
+ * It is about to raise E003 from the SQL builder either way, and the builder is
+ * where that error belongs; ordering must not pre-empt it with a worse one.
+ */
+export function canonicalWriteEntries(meta: ColumnNameSource, entries: [string, unknown][]): [string, unknown][] {
+  const all = meta.allColumns;
+  if (all === undefined || entries.length < 2) return entries;
+  const index = new Map<string, number>();
+  for (let i = 0; i < all.length; i++) index.set(all[i]!, i);
+  const rank = (key: string): number => {
+    const column = resolveColumnName(meta, key);
+    const at = column === undefined ? undefined : index.get(column);
+    return at ?? Number.MAX_SAFE_INTEGER;
+  };
+  // Ranks are computed once per entry rather than inside the comparator, which
+  // would re-resolve every key O(k log k) times.
+  const ranked = entries.map((entry, at) => ({ entry, rank: rank(entry[0]), at }));
+  // `at` breaks ties explicitly rather than relying on sort stability, so two
+  // spellings of one column, and every unresolvable key, keep the order the
+  // caller wrote them in.
+  ranked.sort((a, b) => a.rank - b.rank || a.at - b.at);
+  return ranked.map((r) => r.entry);
+}
+
+// ---------------------------------------------------------------------------
+// Internally-synthesized combinator brand
+// ---------------------------------------------------------------------------
+
+/**
+ * Brands a WHERE object whose `AND` / `OR` array Turbine ITSELF synthesized,
+ * rather than one the caller wrote.
+ *
+ * The distinction matters for exactly one rule: a caller-written combinator
+ * array is treated as a VARIABLE-ARITY shape and its statement is sent unnamed
+ * (see `markVariableArity` in where.ts, and `acquireSql` in builder.ts).
+ * Turbine's own wrappers, the `{ AND: [userWhere, globalFilter] }` the
+ * global-filter merge produces and the `{ AND: [where, correlation] }` the
+ * batched loader produces, have a FIXED arity of two, decided by Turbine, not
+ * reachable from a request body. Counting them would have taken every query on
+ * a table with a configured global filter off named prepared statements, i.e.
+ * penalised precisely the multi-tenant setups the rule exists to protect.
+ *
+ * A `Symbol.for` key for the same cross-copy-identity reason the warn registry
+ * uses one (an ESM and a CJS copy of this module in one process must agree),
+ * and a SYMBOL rather than a string key so `Object.keys` (which is what every
+ * where walker enumerates) never sees it and no emitted SQL can change.
+ */
+export const INTERNAL_COMBINATOR = Symbol.for('turbine.internalCombinator');
+
+/** Tag `where` as carrying a Turbine-synthesized combinator, and return it. */
+export function markInternalCombinator<T extends object>(where: T): T {
+  Object.defineProperty(where, INTERNAL_COMBINATOR, { value: true, enumerable: false, configurable: true });
+  return where;
+}
+
+/** Was this WHERE object's combinator synthesized by Turbine? */
+export function isInternalCombinator(where: unknown): boolean {
+  return (
+    typeof where === 'object' && where !== null && (where as Record<symbol, unknown>)[INTERNAL_COMBINATOR] === true
+  );
+}
+
 /**
  * Escape single quotes for use as string keys in json_build_object().
  * Doubles single quotes per SQL quoting rules.
@@ -99,8 +260,15 @@ export function escapeLike(value: string): string {
 
 /**
  * Simple LRU (Least Recently Used) cache with a fixed maximum size.
- * When the cache exceeds maxSize, the oldest (least recently used) entry is evicted.
- * Uses Map insertion order for O(1) eviction.
+ * When the cache exceeds maxSize, the oldest (least recently used) entry is
+ * evicted. Uses Map insertion order, so EVICTION is O(1).
+ *
+ * The access-order reorder in {@link get} is not: `Map.delete` + `Map.set`
+ * leaves a tombstone, and V8 rehashes the whole table once live plus deleted
+ * entries reach capacity, so the reorder amortizes to O(capacity) per hit.
+ * At the 1,000-entry default that measured 1,356 ns against 2.6 ns for a plain
+ * `Map.get`, on the hottest lookup in the SQL build. See {@link get} for why
+ * skipping it below capacity is not merely an optimization but exact.
  */
 export class LRUCache<K, V> {
   private cache = new Map<K, V>();
@@ -108,7 +276,19 @@ export class LRUCache<K, V> {
 
   get(key: K): V | undefined {
     const value = this.cache.get(key);
-    if (value !== undefined) {
+    // Access order is only ever CONSUMED by eviction (`set` drops the first
+    // key once the cache is full), so while it is still filling, maintaining
+    // that order cannot change WHICH entries are present: nothing is evicted,
+    // and the reorder is pure cost. So it starts the moment the cache is full,
+    // and from then on every hit reorders exactly as before.
+    //
+    // What is traded, stated plainly: reads that happened while the cache was
+    // filling are not reflected in the order, so the first evictions after it
+    // fills can drop an entry that was hot early rather than the true
+    // least-recently-used one. Reads after that point are ordered normally, so
+    // the effect does not accumulate, and the worst case is one extra SQL
+    // rebuild on the next miss. This cache decides speed, never results.
+    if (value !== undefined && this.cache.size >= this.maxSize) {
       // Move to end (most recently used)
       this.cache.delete(key);
       this.cache.set(key, value);
@@ -139,6 +319,16 @@ export class LRUCache<K, V> {
 /** Cached SQL template paired with its prepared-statement name. */
 export interface SqlCacheEntry {
   sql: string;
+  /**
+   * The name this statement executes under, or `''` for "send it UNNAMED".
+   *
+   * The empty string is a real value here, not a missing one: a shape whose SQL
+   * text is a function of a caller-chosen ARITY (an `OR`/`AND` array) must never
+   * take a server-side prepared statement, because those are never DEALLOCATEd
+   * and the client's LRU bounds only the client. Storing the verdict on the
+   * ENTRY is what makes it survive the cache: a later HIT reuses this name, so
+   * a warmed template cannot regain one. See `buildCacheEntry` in builder.ts.
+   */
   name: string;
 }
 
@@ -937,6 +1127,43 @@ export function relationInProjectionMessage(table: string, field: string, clause
         ` \`with: { ${field}: { select: { … } } }\`.`
     : `${head} A relation is only present when you ask for it in \`with\`, so leave it out of \`with\` to leave it` +
         ' out of the result.';
+}
+
+/**
+ * Dev-only advisory for a sort/grouping term Turbine dropped as redundant
+ * (`filters.ts` `dedupeOrderEntries` / `dedupeColumnList`).
+ *
+ * Deliberately a WARNING and not an error, and deliberately not silent either.
+ * The dropped term provably cannot change a result, so failing the query would
+ * be a false alarm on a shape correct code produces (a caller-chosen sort key
+ * plus an unconditional primary-key tiebreak, which collide exactly when the
+ * caller sorts by the primary key). But a caller who wrote the duplicate by
+ * hand, or who believes a second key is doing something, should hear about it
+ * once. Dev-only for the usual reason: it describes the QUERY the application
+ * sends, which does not vary with the environment, so a production process
+ * learns nothing from repeating it.
+ *
+ * Keyed per dropped key, so a sort assembled per request from the same UI says
+ * it once rather than once per request.
+ */
+export function warnRedundantSortTerm(
+  table: string,
+  clause: string,
+  dropped: readonly { key: string; first: string; resolved: string }[],
+): void {
+  if (process.env.NODE_ENV === 'production') return;
+  for (const d of dropped) {
+    if (!shouldWarnOnce(WARN_NS.redundantSortTerm, `${table}|${clause}|${d.key}`)) continue;
+    const how =
+      d.first === d.key
+        ? `"${d.key}" is named twice`
+        : `"${d.key}" and the earlier "${d.first}" both target ${d.resolved}`;
+    console.warn(
+      `[turbine] ${clause} on table "${table}": ${how}, so the later one was dropped. It could not have ` +
+        'changed the result (the earlier term already orders those rows), and dropping it keeps the query on ' +
+        'a shared prepared statement. Remove it to silence this.',
+    );
+  }
 }
 
 /**

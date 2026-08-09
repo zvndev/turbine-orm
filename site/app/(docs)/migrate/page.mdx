@@ -133,17 +133,29 @@ SELECT count(*) FROM "orders" WHERE "total_cents" IS NULL;   -- expect 0
 SELECT "total", "total_cents" FROM "orders" LIMIT 20;        -- spot-check
 ```
 
-**Phase 2, contract.** Once the new column is fully populated and verified, enforce `NOT NULL` and swap the names atomically in one transaction, so no reader ever sees a half-renamed table:
+**Phase 2, contract.** Once the new column is fully populated and verified, enforce `NOT NULL` and swap the names, so no reader ever sees a half-renamed table:
 
 ```sql
--- Migration B (UP): enforce, then swap in a single transaction
+-- Migration B (UP): enforce, then swap.
+-- No BEGIN/COMMIT of your own: `turbine migrate` already wraps every file
+-- in exactly one transaction, so both renames are atomic as written.
 ALTER TABLE "orders" ALTER COLUMN "total_cents" SET NOT NULL;
-
-BEGIN;
 ALTER TABLE "orders" RENAME COLUMN "total" TO "total_old";
 ALTER TABLE "orders" RENAME COLUMN "total_cents" TO "total";
-COMMIT;
 ```
+
+<Callout type="warning" title="Do not write your own BEGIN/COMMIT in a migration">
+  Since 0.66, a migration file whose body contains `BEGIN`, `START TRANSACTION`,
+  `COMMIT`, `ROLLBACK` or `ABORT` is refused before anything runs. Earlier
+  versions accepted it, and that was the bug: the runner wraps each file in one
+  transaction, so an embedded `COMMIT` ended the runner's wrapper mid-file.
+  Everything before it became durable, everything after ran unprotected, and the
+  migration was recorded nowhere, so rerunning failed forever on "already
+  exists". If a migration genuinely cannot run inside a transaction (`CREATE
+  INDEX CONCURRENTLY`), put `-- turbine:no-transaction` in the file header and
+  manage it yourself. `ROLLBACK TO SAVEPOINT` is still allowed: it leaves the
+  wrapping transaction open.
+</Callout>
 
 **Drop the old column later**, in a separate migration deployed after the new column has been serving reads and writes long enough to be sure nothing depends on the old one:
 

@@ -109,6 +109,16 @@ export const WARN_NS = {
    */
   unknownConfigKey: 'unknownConfigKey',
   /**
+   * A caller-supplied `orderBy` (or `distinct` / `distinctOn.columns`) named one
+   * sort expression twice and Turbine dropped the redundant term
+   * (filters.ts `dedupeOrderEntries` / `dedupeColumnList`). Not an error: the
+   * dropped term provably cannot move a row, and the shape is produced by
+   * correct defensive code that appends a fixed tiebreak to a caller-chosen sort
+   * key. Keyed on `table|context|key`, so a per-request sort that always
+   * collides says it once rather than once per request.
+   */
+  redundantSortTerm: 'redundantSortTerm',
+  /**
    * `relationLoadStrategy: 'flatten'` was asked for but a relation stayed on the
    * correlated-subquery path (relations.ts `planFlattenWith`, builder.ts
    * `planFlatten`). An explicitly requested strategy that quietly does not

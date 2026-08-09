@@ -1544,3 +1544,311 @@ describe('Studio perimeter: prototype keys, throttling, cookie parsing', () => {
     assert.equal((await done).status, 401);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The PII predicate guard: pick-row relation ordering, and failing closed
+// ---------------------------------------------------------------------------
+
+/**
+ * A second schema, shaped for the pick-row ordering surface: `users` hasMany
+ * `posts`, and the HIDDEN columns live on the TARGET of that relation
+ * (`posts.secret`, `posts.secret_doc`). That is the geometry the guard missed.
+ *
+ * Its own fixture rather than an extra column on `buildSchema()`: that one is
+ * asserted on byte-for-byte by the write, projection and schema-payload tests
+ * above, and a new column would move all of them.
+ */
+function buildPickSchema(): SchemaMetadata {
+  const users = mockTable(
+    'users',
+    [
+      { name: 'id', field: 'id' },
+      { name: 'name', field: 'name', pgType: 'text' },
+      { name: 'email', field: 'email', pgType: 'text' },
+    ],
+    {
+      posts: { type: 'hasMany', name: 'posts', from: 'users', to: 'posts', foreignKey: 'user_id', referenceKey: 'id' },
+    },
+  );
+  markPii(users, 'email');
+
+  const posts = mockTable(
+    'posts',
+    [
+      { name: 'id', field: 'id' },
+      { name: 'user_id', field: 'userId' },
+      { name: 'title', field: 'title', pgType: 'text' },
+      { name: 'secret', field: 'secret', pgType: 'text' },
+      { name: 'secret_doc', field: 'secretDoc', pgType: 'jsonb' },
+    ],
+    {
+      author: {
+        type: 'belongsTo',
+        name: 'author',
+        from: 'posts',
+        to: 'users',
+        foreignKey: 'user_id',
+        referenceKey: 'id',
+      },
+    },
+  );
+  markPii(posts, 'secret');
+  markPii(posts, 'secret_doc');
+
+  return { tables: { users, posts }, enums: {} };
+}
+
+function pickCtx(pool: pg.Pool): StudioContext {
+  return { ...makeCtx(pool, {}), metadata: buildPickSchema() };
+}
+
+async function runBuilder(table: string, args: unknown): Promise<RecordedResponse> {
+  const { pool } = makePool([{ rows: [{ id: 1 }] }]);
+  const req = makeReq({ method: 'POST', url: '/api/builder', headers: authHeaders(), body: { table, args } });
+  const { res, done } = makeRes();
+  await handleRequest(req, res, pickCtx(pool));
+  return done;
+}
+
+function errorOf(r: RecordedResponse): string {
+  return (r.json as { error?: string })?.error ?? r.body;
+}
+
+/**
+ * `RelationPickOrderBy` (`orderBy: { rel: { pick: { orderBy, where }, by } }`)
+ * puts THREE column-naming positions under a relation key, and not one of them
+ * is a key of the relation's value: `pick.orderBy` and `pick.where` are clauses
+ * two levels down, and `by` names the column in its VALUE. The guard recursed
+ * only into `AND` / `OR` / `NOT` and relation keys, so `pick` was checked as if
+ * it were a COLUMN of the target, found not to be one, and waved through.
+ *
+ * What that bought, measured against a seeded store before the fix: a `by` on a
+ * redacted column returned 200 with the parent rows in exact hidden-value order,
+ * which recovers the full ordering of a column whose every cell is served as
+ * `•• redacted ••`; and a `pick.where` returned 200 for the rows matching
+ * `startsWith: 'a'`, which is the character-by-character probe the guard's own
+ * docstring says it exists to prevent.
+ */
+describe('Studio PII guard: pick-row relation ordering', () => {
+  it('CONTROL refuses a plain orderBy on a redacted column', async () => {
+    const r = await runBuilder('users', { orderBy: { email: 'asc' } });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /PII-tagged and redacted/);
+  });
+
+  it('CONTROL refuses an orderBy on a redacted column one relation down', async () => {
+    const r = await runBuilder('posts', { orderBy: { author: { email: 'asc' } } });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /PII-tagged and redacted/);
+  });
+
+  it('refuses `by` naming a redacted column on the pick target', async () => {
+    const r = await runBuilder('users', {
+      orderBy: { posts: { pick: { orderBy: { id: 'asc' } }, by: 'secret' } },
+    });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /"secret" on "posts" is PII-tagged and redacted/);
+  });
+
+  it('refuses `by` as a JSON path into a redacted json column', async () => {
+    const r = await runBuilder('users', {
+      orderBy: { posts: { pick: { orderBy: { id: 'asc' } }, by: { field: 'secretDoc', path: ['label'] } } },
+    });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /"secret_doc" on "posts" is PII-tagged and redacted/);
+  });
+
+  it('refuses a redacted column in `pick.orderBy`', async () => {
+    const r = await runBuilder('users', {
+      orderBy: { posts: { pick: { orderBy: { secret: 'desc' } }, by: 'id' } },
+    });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /"secret" on "posts" is PII-tagged and redacted/);
+  });
+
+  it('refuses a startsWith probe in `pick.where`', async () => {
+    const r = await runBuilder('users', {
+      orderBy: {
+        posts: { pick: { orderBy: { id: 'asc' }, where: { secret: { startsWith: 'a' } } }, by: 'id' },
+      },
+    });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /"secret" on "posts" is PII-tagged and redacted/);
+  });
+
+  it('still runs a pick-row ordering that names no hidden column', async () => {
+    const r = await runBuilder('users', {
+      orderBy: { posts: { pick: { orderBy: { id: 'desc' }, where: { title: 'x' } }, by: 'title' } },
+      limit: 5,
+    });
+    assert.equal(r.status, 200, r.body);
+    assert.match((r.json as { sql: string }).sql, /order by/i);
+  });
+});
+
+/**
+ * The three keys above are today's instance; the RULE is that a shape the walker
+ * does not recognize is refused. Each of these returned 200, or a 400 from the
+ * builder that says nothing about PII, before the walker started failing closed.
+ */
+describe('Studio PII guard: fails closed on shapes it does not recognize', () => {
+  it('refuses an unrecognized object-valued key under a relation in orderBy', async () => {
+    const r = await runBuilder('users', { orderBy: { posts: { _futureShape: { by: 'secret' } } } });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /does not recognize "_futureShape"/);
+  });
+
+  it('refuses an unrecognized object-valued key under a relation in where', async () => {
+    const r = await runBuilder('users', { where: { posts: { _futureShape: { secret: 'x' } } } });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /does not recognize "_futureShape"/);
+  });
+
+  it('refuses an unrecognized object-valued key inside `pick`', async () => {
+    const r = await runBuilder('users', {
+      orderBy: { posts: { pick: { orderBy: { id: 'asc' }, _futureShape: { secret: 'x' } }, by: 'id' } },
+    });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /does not recognize "pick\._futureShape"/);
+  });
+
+  it('refuses an unrecognized object-valued query-level arg', async () => {
+    // The builder IGNORES an arg it does not know, so this used to run as a
+    // plain unordered findMany and report 200.
+    const r = await runBuilder('users', { limit: 5, _futureArg: { email: 'asc' } });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /does not recognize "_futureArg"/);
+  });
+
+  it('leaves a scalar-valued typo to the builder, so it still reads as a typo', async () => {
+    // Only OBJECT-valued unknown keys are refused here. A scalar one names no
+    // nested structure and the builder rejects it by name, which is a better
+    // message than "the guard does not recognize this".
+    const r = await runBuilder('users', { orderBy: { posts: { titel: 'asc' } } });
+    assert.equal(r.status, 400, r.body);
+    assert.doesNotMatch(errorOf(r), /does not recognize/);
+    assert.match(errorOf(r), /titel/);
+  });
+});
+
+/**
+ * A `{ col }` reference names a column in the OPERAND position, so it reaches a
+ * hidden column without ever putting its name in a key. `WHERE "title" > "secret"`
+ * partitions the rows by a comparison against the hidden value, which is the
+ * same oracle as an ordinary predicate on it.
+ */
+describe('Studio PII guard: column references in operands', () => {
+  it('refuses a comparison against a redacted column', async () => {
+    const r = await runBuilder('posts', { where: { title: { gt: { col: 'secret' } } } });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /"secret" on "posts" is PII-tagged and redacted/);
+  });
+
+  it('allows a comparison between two visible columns', async () => {
+    const r = await runBuilder('posts', { where: { title: { gt: { col: 'id' } } }, limit: 2 });
+    assert.equal(r.status, 200, r.body);
+  });
+});
+
+/**
+ * The guard's own depth cap was bypassed by nested ARRAYS, because both array
+ * branches deliberately did not increment the depth.
+ *
+ * The reason they did not was sound: an `OR: [a, b, c]` is ONE logical level
+ * however long the list is, and its elements are siblings visited from the same
+ * stack frame, so charging a level per element would refuse a legal wide
+ * predicate. What it missed is that the same branch also recurses into an
+ * element that is ANOTHER ARRAY, and there the frames stack with the logical
+ * depth pinned. Measured against this route before the fix: `{"orderBy":[[[…]]]}`
+ * at 1,000 (a 2 KB body) was ALLOWED outright with no refusal at all, and at
+ * 10,000 (20 KB) the walk raised `RangeError: Maximum call stack size exceeded`
+ * inside the guard. That is the exact class the module header says it fixed
+ * ("padding a payload with enough nested `NOT` wrappers walked the guard off the
+ * end of its own recursion"), reintroduced through the array branch.
+ *
+ * `/api/builder` catches everything and renders 400, so the RangeError case is
+ * availability on an authenticated loopback tool rather than disclosure, and the
+ * status code alone cannot tell the two apart. The MESSAGE is what pins it: a
+ * depth refusal, never a stack-overflow report.
+ */
+describe('Studio PII guard: nested arrays cannot outrun the depth cap', () => {
+  /**
+   * POST /api/builder with a PRE-SERIALIZED body.
+   *
+   * `makeReq` stringifies whatever it is given, and `JSON.stringify` blows its
+   * OWN stack on a payload this deep, long before the route ever sees it. These
+   * cases hand the route the exact bytes a client would put on the wire, which
+   * is also the shape the finding was measured with.
+   */
+  async function runBuilderBody(bodyText: string): Promise<RecordedResponse> {
+    const { pool } = makePool([{ rows: [{ id: 1 }] }]);
+    const req = {
+      method: 'POST',
+      url: '/api/builder',
+      headers: authHeaders(),
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from(bodyText, 'utf8');
+      },
+    } as unknown as IncomingMessage;
+    const { res, done } = makeRes();
+    await handleRequest(req, res, pickCtx(pool));
+    return done;
+  }
+
+  /** `argsJson` with `depth` `[` brackets wrapped around `inner`. */
+  function nested(table: string, argsJson: (arrayLiteral: string) => string, inner: string, depth: number): string {
+    return `{"table":"${table}","args":${argsJson(`${'['.repeat(depth)}${inner}${']'.repeat(depth)}`)}}`;
+  }
+
+  it('refuses an orderBy nested 1,000 arrays deep (this used to be ALLOWED outright)', async () => {
+    const r = await runBuilderBody(nested('users', (a) => `{"orderBy":${a}}`, '{"id":"asc"}', 1000));
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /nested more than 32 levels deep/);
+  });
+
+  it('refuses a 20 KB nested-array orderBy as a DEPTH refusal, not a stack overflow', async () => {
+    const r = await runBuilderBody(nested('users', (a) => `{"orderBy":${a}}`, '{"id":"asc"}', 10_000));
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /nested more than 32 levels deep/);
+    assert.doesNotMatch(errorOf(r), /call stack/i);
+  });
+
+  it('refuses nested arrays under a RELATION key too (the second array branch)', async () => {
+    // `visitRelationValue` has its own array branch and had the identical hole.
+    // The review named only `orderBy`; this one is reached through `where`.
+    const r = await runBuilderBody(nested('users', (a) => `{"where":{"posts":${a}}}`, '{"title":"x"}', 10_000));
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /nested more than 32 levels deep/);
+    assert.doesNotMatch(errorOf(r), /call stack/i);
+  });
+
+  it('refuses nested arrays inside a pick-row `orderBy`', async () => {
+    const r = await runBuilderBody(
+      nested('users', (a) => `{"orderBy":{"posts":{"pick":{"orderBy":${a}},"by":"id"}}}`, '{"id":"asc"}', 10_000),
+    );
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /nested more than 32 levels deep/);
+    assert.doesNotMatch(errorOf(r), /call stack/i);
+  });
+
+  it('still runs a legal Prisma-style orderBy ARRAY (width is not nesting)', async () => {
+    const r = await runBuilder('users', { orderBy: [{ id: 'asc' }, { name: 'desc' }], limit: 5 });
+    assert.equal(r.status, 200, r.body);
+  });
+
+  it('still runs a wide OR array, which is one logical level however long', async () => {
+    const r = await runBuilder('users', {
+      where: { OR: Array.from({ length: 200 }, (_, i) => ({ id: i })) },
+      limit: 5,
+    });
+    assert.equal(r.status, 200, r.body);
+  });
+
+  it('still refuses a hidden column named inside a shallow nested array', async () => {
+    // Bounding the walk must not become the only reason a nested payload is
+    // stopped: the column check still runs at every level the walk reaches.
+    const r = await runBuilder('users', { orderBy: [[[[{ email: 'asc' }]]]] });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /"email" on "users" is PII-tagged and redacted/);
+  });
+});

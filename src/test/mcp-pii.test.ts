@@ -126,9 +126,15 @@ function route(sql: string): Record<string, unknown>[] {
       { table_name: 'posts', column_name: 'id' },
     ];
   }
-  if (sql.includes("'FOREIGN KEY'")) {
+  // Foreign keys are read from pg_catalog (`con.contype = 'f'`), not from
+  // information_schema: a constraint name is unique only per table, and the
+  // information_schema formulation also cross-joined composite keys. Matched on
+  // the contype predicate, and BEFORE the generic `pg_class` branch below, which
+  // the catalog query would otherwise fall through to.
+  if (sql.includes("con.contype = 'f'")) {
     return [
       {
+        constraint_oid: '40001',
         source_table: 'posts',
         source_column: 'user_id',
         target_table: 'users',

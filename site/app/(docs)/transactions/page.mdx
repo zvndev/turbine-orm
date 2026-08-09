@@ -173,7 +173,15 @@ The `as const` on `isRetryable` means `err.isRetryable` is the literal type `tru
 
 ## pipeline, N queries, 1 round-trip
 
-A pipeline bundles independent queries and sends them together using the Postgres extended-query pipeline protocol. Each query gets its own parsed SQL, own params, own typed result. **No transactional semantics**, if query 3 fails, queries 1, 2, 4, 5 still ran.
+A pipeline bundles independent queries and sends them together using the Postgres extended-query pipeline protocol. Each query gets its own parsed SQL, own params, own typed result. **The batch is transactional by default** (`transactional: true`): all of it is wrapped in one `BEGIN`/`COMMIT`, so if query 3 fails the whole batch rolls back and nothing is durable.
+
+Pass `{ transactional: false }` when you want the opposite, each query independent, a failure in one leaving the others untouched:
+
+```ts
+const results = await db.pipeline(queries, { transactional: false });
+```
+
+On that path a partial failure rejects with a `PipelineError` (TURBINE_E014) carrying a per-slot `.results` array, so you can see which queries succeeded. The transactional default never produces a `PipelineError`, it rethrows the underlying typed error after the rollback.
 
 ```ts
 const [user, posts, commentCount, orgs, latestLogin] = await db.pipeline([
@@ -209,9 +217,9 @@ const results = await executePipeline(pool, queries, options);
 
 ## When pipeline loses
 
-- **You need atomicity.** Use `$transaction`.
 - **One query depends on another's result.** Pipeline queries must be independent, they're all submitted before any response is read.
-- **A query might fail.** `PipelineError` (TURBINE_E014) wraps partial-success cases; decide how you want to handle them.
+- **You need interactive control.** A pipeline is one shot: no reading a row, branching, then writing. Use the callback form of `$transaction`.
+- **You opted out of the transaction and a query might fail.** With `{ transactional: false }`, `PipelineError` (TURBINE_E014) wraps the partial-success case; decide how you want to handle each slot.
 
 ## Batching inside a transaction
 

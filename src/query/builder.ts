@@ -39,6 +39,8 @@ import {
 } from './batched-loader.js';
 import { expandCompoundUniqueWhere } from './compound-unique.js';
 import {
+  dedupeColumnList,
+  dedupeOrderEntries,
   isJsonPathOrderBy,
   isOrderBySpec,
   isRelationPickOrderBy,
@@ -88,6 +90,7 @@ import {
   type SqlCacheEntry,
   sqlToPreparedName,
   unknownFieldMessage,
+  warnRedundantSortTerm,
 } from './utils.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
@@ -120,15 +123,56 @@ import * as writesMod from './writes.js';
  *   throws, same as dev. `0`, unset, or an unparseable value means never check.
  */
 function cacheCrossCheckMode(): 'dev' | 'sampled' | 'off' {
+  const env = crossCheckEnv ?? readCrossCheckEnv();
+  if (env.mode !== 'sampled') return env.mode;
+  // The SAMPLING decision, and only it, is genuinely per hit.
+  return env.rate >= 1 || Math.random() < env.rate ? 'sampled' : 'off';
+}
+
+/**
+ * The env-derived half of {@link cacheCrossCheckMode}, resolved ONCE per
+ * process and memoized.
+ *
+ * `process.env` is not a plain object: every property read crosses a C++
+ * interceptor. Measured at 112.7 ns per read against 3.6 ns for a module-level
+ * constant, and this function ran TWO reads on every cache hit, which put it
+ * at the top of the SQL-build CPU profile (12.53% self time, with a further
+ * ~12% inside the interceptor) for a value that does not change.
+ *
+ * It is memoized rather than hoisted to a `const` because the toggle IS
+ * observed at runtime, contrary to what a quick look suggests: the
+ * cross-check and sampling suites flip `NODE_ENV` /
+ * `TURBINE_DISABLE_CACHE_CHECK` / `TURBINE_CACHE_CHECK_SAMPLE` around a
+ * synchronous block in-process, not at spawn. So the read is deferred to first
+ * use and {@link resetCacheCrossCheckEnv} re-arms it; that is the entire
+ * contract, and the only thing lost versus reading every time is that a
+ * process which mutates these variables mid-run must say so.
+ */
+let crossCheckEnv: { mode: 'dev' | 'off' } | { mode: 'sampled'; rate: number } | undefined;
+
+function readCrossCheckEnv(): { mode: 'dev' | 'off' } | { mode: 'sampled'; rate: number } {
+  let resolved: { mode: 'dev' | 'off' } | { mode: 'sampled'; rate: number };
   if (process.env.NODE_ENV !== 'production') {
-    return process.env.TURBINE_DISABLE_CACHE_CHECK === '1' ? 'off' : 'dev';
+    resolved = { mode: process.env.TURBINE_DISABLE_CACHE_CHECK === '1' ? 'off' : 'dev' };
+  } else {
+    const raw = process.env.TURBINE_CACHE_CHECK_SAMPLE;
+    const rate = raw === undefined ? Number.NaN : Number.parseFloat(raw);
+    resolved = !Number.isFinite(rate) || rate <= 0 ? { mode: 'off' } : { mode: 'sampled', rate };
   }
-  const raw = process.env.TURBINE_CACHE_CHECK_SAMPLE;
-  if (raw === undefined) return 'off';
-  const rate = Number.parseFloat(raw);
-  if (!Number.isFinite(rate) || rate <= 0) return 'off';
-  if (rate >= 1) return 'sampled';
-  return Math.random() < rate ? 'sampled' : 'off';
+  crossCheckEnv = resolved;
+  return resolved;
+}
+
+/**
+ * Discard the memoized cross-check environment so the next cache hit re-reads
+ * `process.env`.
+ *
+ * @internal Exposed for the tests that toggle these variables in-process (see
+ * {@link crossCheckEnv}). Production code sets them before the first query and
+ * never again.
+ */
+export function resetCacheCrossCheckEnv(): void {
+  crossCheckEnv = undefined;
 }
 
 /**
@@ -480,6 +524,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * inline, not through the top-level cache).
    */
   private lastCacheHit = false;
+  /**
+   * Set while a build closure runs when the statement's WHERE (or HAVING)
+   * carries a caller-written `AND`/`OR` combinator array, i.e. when its SQL text
+   * is a function of an arity the caller chose. Read (and reset) by
+   * {@link acquireSql}, which brackets the single `build()` call, so the flag
+   * has no lifetime outside that synchronous window and cannot leak between
+   * queries. See {@link BuilderCtx.markVariableArity} for the unbounded
+   * server-side prepared-statement growth this exists to stop.
+   */
+  private variableArityShape = false;
   private readonly middlewares: MiddlewareFn[];
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
@@ -569,6 +623,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * to Date as well (otherwise nested dates leak through as strings).
    */
   private readonly camelDateFieldCache = new Map<string, Set<string>>();
+
+  /**
+   * Per-table memo of `Object.entries(meta.relations)`, consumed by the nested
+   * row parser (see `getRelationEntries` in relations.ts). Same rationale and
+   * same lifetime as {@link camelDateFieldCache}: the metadata is immutable, and
+   * the parser reads it once per row.
+   */
+  private readonly relationEntryCache = new Map<string, [string, RelationDef][]>();
+
+  /** Per-table memo of batched-loader child readers (see {@link batchedChild}). */
+  private readonly batchedChildCache = new Map<string, BatchedChildReader>();
+  /** The (option-invariant) options every batched child is built with. */
+  private batchedChildOptions?: QueryInterfaceOptions;
 
   /** True when this QI runs inside an active transaction (set via _txScoped option). */
   private readonly txScoped: boolean;
@@ -782,6 +849,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       set currentSkip(v: ResolvedSkipGlobalFilters | undefined) {
         self.currentSkip = v;
       },
+      markVariableArity: () => {
+        this.variableArityShape = true;
+      },
       q: (name) => this.q(name),
       p: (index) => this.p(index),
       inParam: (values) => this.inParam(values),
@@ -801,6 +871,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         this.crossCheckCache(op, cacheKey, entry, build, collectedParams),
       jsonEncoding: this.jsonEncoding,
       camelDateFieldCache: this.camelDateFieldCache,
+      relationEntryCache: this.relationEntryCache,
       limitOneClause: () => this.limitOneClause(),
       buildPagination: (limitPh, offsetPh, hasOrderBy) => this.buildPagination(limitPh, offsetPh, hasOrderBy),
       paginationRef: (value: unknown, params: unknown[], arg: string) => this.paginationRef(value, params, arg),
@@ -1633,16 +1704,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): RelationLoadContext {
     // The loader's own global-filter callback below needs the RESOLVED form.
     const resolvedSkip = resolveSkipGlobalFilters(skip);
-    const childOptions: QueryInterfaceOptions = {
-      ...this.options,
-      defaultLimit: undefined,
-      warnOnUnlimited: false,
-    };
     return {
       parentMeta: this.tableMeta,
       schema: this.schema,
-      makeChild: (table: string): BatchedChildReader =>
-        new QueryInterface<object>(this.pool, table, this.schema, [], childOptions) as unknown as BatchedChildReader,
+      makeChild: (table: string): BatchedChildReader => this.batchedChild(table),
       // The per-query `forceCustomPlan` opt-in covers the relation follow-ups
       // too: a batched load re-issues the SAME tenant-shaped predicate one
       // level down, so leaving those named would keep exactly the plan-cache
@@ -1653,6 +1718,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
       buildInClause: (expr, paramRef, negated) => this.inClause(expr, paramRef, negated),
       inClauseParam: (values) => this.inParam(values),
       paramPlaceholder: (index) => this.p(index),
+      // Bound each relation follow-up per correlation key when the engine can
+      // express it; absent leaves the loader on its client-side slice. Bound as
+      // a closure rather than passing `this.dialect` so the loader keeps
+      // needing nothing else from the dialect.
+      //
+      // The `dialect.name` test is NOT redundant with the hook's presence, and
+      // this is the same trap the `distinct` gate documents: every engine
+      // dialect is built by SPREADING `postgresDialect`, so an optional hook
+      // added there is INHERITED by sqlite / mysql / mssql, whose "absent"
+      // fallback would then never be taken. The wrapper is not portable as
+      // written either (T-SQL rejects an ORDER BY inside a derived table
+      // without TOP/OFFSET, and the compiled child query carries one), so the
+      // pushdown stays with the dialect that owns the implementation until
+      // another engine ships its own and asserts it.
+      buildPartitionLimit:
+        this.dialect.name === 'postgresql' && this.dialect.buildPartitionLimit
+          ? (input) => this.dialect.buildPartitionLimit!(input)
+          : undefined,
       skipGlobalFilters: skip,
       // Query-level opt-in threaded onto every follow-up child `buildFindMany`,
       // so a batched load excludes/includes PII exactly as the join strategy.
@@ -1670,6 +1753,43 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return { clause, params: seeded.slice(precedingParams) };
       },
     };
+  }
+
+  /**
+   * The child {@link QueryInterface} the batched loader uses for `table`,
+   * memoized per table for the lifetime of this accessor.
+   *
+   * It used to be constructed fresh for every relation of every query, which
+   * threw away that child's SQL template cache each time: a relation follow-up
+   * therefore MISSED the cache on every single request and rebuilt its SQL,
+   * which is the one thing the template cache exists to avoid, and it allocated
+   * a whole QueryInterface (column type maps, camel-date memo, the ctx literal)
+   * per relation per query. `childOptions` was likewise a fresh spread per
+   * query although it is a pure function of this instance's options.
+   *
+   * Safe to share across queries: a QueryInterface holds no per-query state
+   * beyond the transient build fields, which live and die inside one
+   * synchronous `build*` call, and every child is bound to THIS instance's pool
+   * (so it still joins an active transaction) with `defaultLimit` cleared and
+   * unlimited-warnings silenced, because a relation load must fetch every
+   * matching child. Per-query values (`skipGlobalFilters`, `includePii`,
+   * `timeout`, `forceCustomPlan`) are passed as ARGUMENTS by the loader, never
+   * baked into the child, which is what makes the memo sound.
+   */
+  private batchedChild(table: string): BatchedChildReader {
+    let child = this.batchedChildCache.get(table);
+    if (!child) {
+      this.batchedChildOptions ??= { ...this.options, defaultLimit: undefined, warnOnUnlimited: false };
+      child = new QueryInterface<object>(
+        this.pool,
+        table,
+        this.schema,
+        [],
+        this.batchedChildOptions,
+      ) as unknown as BatchedChildReader;
+      this.batchedChildCache.set(table, child);
+    }
+    return child;
   }
 
   /**
@@ -1781,9 +1901,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private acquireSql(cacheKey: string, build: (params: unknown[]) => string): SqlCacheEntry {
     if (!this.sqlCacheEnabled) {
       this.lastCacheHit = false;
-      const sql = build([]);
-      this.cacheMisses++;
-      return { sql, name: sqlToPreparedName(sql) };
+      return this.buildCacheEntry(build);
     }
 
     const cached = this.sqlTemplateCache.get(cacheKey);
@@ -1794,11 +1912,38 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
 
     this.lastCacheHit = false;
-    const sql = build([]);
-    const entry: SqlCacheEntry = { sql, name: sqlToPreparedName(sql) };
+    const entry = this.buildCacheEntry(build);
     this.sqlTemplateCache.set(cacheKey, entry);
-    this.cacheMisses++;
     return entry;
+  }
+
+  /**
+   * Run one build closure and pair its SQL with the prepared-statement name it
+   * should execute under.
+   *
+   * The `variableArityShape` flag is reset immediately BEFORE the build and read
+   * immediately AFTER it, so this method is the flag's entire lifetime: the
+   * build walk (`buildWhereClause` / `buildScopedWhere` / the HAVING combinator)
+   * is the only thing that can set it, nothing can observe a stale value, and a
+   * throw out of `build()` leaves nothing behind to affect the next query.
+   *
+   * An EMPTY name is how "send this unnamed" travels: `queryWithTimeout` tests
+   * the name for truthiness, so `''` takes the plain `(text, values)` form the
+   * driver never registers a named statement for. Doing it HERE rather than at
+   * the execute seam is what makes it survive the cache: the entry is created
+   * once, on the miss, and a later HIT reuses the same (empty) name, so a
+   * variable-arity shape can never acquire a name from a warmed template.
+   *
+   * See {@link BuilderCtx.markVariableArity} for what makes a shape
+   * variable-arity and the measured reason it must not be named.
+   */
+  private buildCacheEntry(build: (params: unknown[]) => string): SqlCacheEntry {
+    this.variableArityShape = false;
+    const sql = build([]);
+    const variableArity = this.variableArityShape;
+    this.variableArityShape = false;
+    this.cacheMisses++;
+    return { sql, name: variableArity ? '' : sqlToPreparedName(sql) };
   }
 
   /**
@@ -2223,7 +2368,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return entity as T;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
   buildFindUnique<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
@@ -2622,7 +2766,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return maxDepth;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
   buildFindMany<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
@@ -2647,12 +2790,65 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.orderBy !== undefined && isEmptyOrderBy(args.orderBy)) {
       args = { ...args, orderBy: undefined };
     }
+    // Drop `orderBy` terms that sort by an expression an earlier term already
+    // sorted by, and `distinct` columns named twice. HERE, before the
+    // fingerprint, for the reason every other normalization in this method is
+    // here: the fingerprint, the SQL build and the param collect must all see
+    // ONE list, or the cache key and the statement it caches describe different
+    // queries. Rewritten into the array form, which flattens through
+    // `orderByEntries` to the identical entry list the object form does, so a
+    // caller who wrote no duplicate is untouched down to the cache key (the
+    // helpers return null unless something was actually dropped).
+    if (args?.orderBy !== undefined) {
+      const deduped = dedupeOrderEntries(this.tableMeta, orderByEntries(args.orderBy), this.table);
+      if (deduped) {
+        warnRedundantSortTerm(this.table, 'orderBy', deduped.dropped);
+        args = {
+          ...args,
+          orderBy: deduped.entries.map(([k, v]) => ({ [k]: v })) as NonNullable<typeof args>['orderBy'],
+        };
+      }
+    }
+    if (args?.distinct && args.distinct.length > 0) {
+      const deduped = dedupeColumnList(this.tableMeta, args.distinct as string[]);
+      if (deduped) {
+        warnRedundantSortTerm(this.table, 'distinct', deduped.dropped);
+        args = { ...args, distinct: deduped.columns as NonNullable<typeof args>['distinct'] };
+      }
+    }
     // Deterministic pagination (opt-in): fill a PK-asc orderBy into a paginating
     // query that declares none, BEFORE fingerprinting so the ordered and
     // unordered shapes get distinct cache entries. No-op unless
     // `implicitPkOrdering` is enabled (see implicitPkOrderBy).
     const implicitOrder = this.implicitPkOrderBy(args);
     if (implicitOrder) args = { ...args, orderBy: implicitOrder as NonNullable<typeof args>['orderBy'] };
+    // `distinct` compiles to `SELECT DISTINCT ON (...)`, which is PostgreSQL
+    // syntax and nothing else's. Every other engine parsed it as far as the
+    // word `ON` and answered with a RAW driver error carrying no TURBINE_ code
+    // (SQLite: `near "ON": syntax error`; MySQL: ER_PARSE_ERROR), i.e. the one
+    // shape the typed-error surface exists to prevent. Refused with the same
+    // E017 the OTHER spelling of this feature already used, `groupBy({
+    // distinctOn })` in aggregates.ts, which was gated correctly all along.
+    //
+    // `dialect.name` rather than a new capability flag, deliberately, and this
+    // is the exception to the "capability flags, not engine names" rule the
+    // rest of the dialect follows: every engine dialect is built by SPREADING
+    // `postgresDialect`, so a flag defaulting to `true` would be inherited by
+    // all of them (which is the bug) and one defaulting to `false` would have
+    // to be re-declared on Postgres-compatible dialects that already work.
+    // The established precedent for exactly this feature is the `dialect.name`
+    // test in `buildDistinctOnSource`.
+    //
+    // Before the cache, like the two guards below, so a warmed template cannot
+    // serve the query the cold path refuses.
+    if (args?.distinct && args.distinct.length > 0 && this.dialect.name !== 'postgresql') {
+      throw new UnsupportedFeatureError(
+        'DISTINCT ON (findMany distinct)',
+        this.dialect.name,
+        'findMany({ distinct }) requires PostgreSQL: SELECT DISTINCT ON is not portable. Group in ' +
+          'application code, or use groupBy({ by }) for one row per combination.',
+      );
+    }
     // `distinct` + relation orderBy is refused up front (E003): the distinct
     // path re-orders in an outer wrapper (`... AS "<table>_distinct" ORDER BY
     // <userOrder>`) where a correlated relation subquery (pick-row, `_count`,
@@ -2752,6 +2948,29 @@ export class QueryInterface<T extends object, R extends object = {}> {
       if (args?.distinct && args.distinct.length > 0) {
         distinctCols = args.distinct.map((k) => this.toSqlColumn(k as string));
         distinctPrefix = `DISTINCT ON (${distinctCols.join(', ')}) `;
+        // A MULTI-column `distinct` gives up its server-side prepared-statement
+        // name, for the same reason a caller-written `OR` array does and by the
+        // same mechanism (see markVariableArity). The channel here is ORDER, not
+        // arity: the column list is written into the SQL text one term at a
+        // time, so the reachable statement set is the ORDERED subsets of the
+        // table's columns. Measured on PostgreSQL 16, a seven-column table:
+        // 5,040 `distinct` permutations left 5,040 further permanent statements
+        // and took CachedPlanSource from 39.4 MB to 59.1 MB on ONE connection.
+        //
+        // UNNAMED rather than canonicalized, which is what `select` and the
+        // write `data` list do, and the asymmetry is the point. This list is
+        // re-emitted as the leading terms of the inner ORDER BY a few lines
+        // below, and with no `orderBy` at all PostgreSQL's choice of
+        // representative row per group is explicitly unpredictable, so
+        // reordering it could hand a caller a different row. Withholding the
+        // name changes no SQL text and therefore cannot. The cost is one extra
+        // server-side parse per execution on an already-rare query shape.
+        //
+        // `length > 1` because a single column has exactly one ordering and so
+        // no permutation space: the common `distinct: ['tenantId']` keeps its
+        // name. Repeats are already dropped upstream (dedupeColumnList), so the
+        // list here is distinct columns and nothing else.
+        if (args.distinct.length > 1) this.ctx.markVariableArity();
       }
 
       // Join-sink for `relationLoadStrategy: 'flatten'`. Filled while the SELECT
@@ -3078,7 +3297,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<QueryResult<T, R, W, S, O> | null>;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
   buildFindFirst<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
@@ -3122,7 +3340,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<QueryResult<T, R, W, S, O>>;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
   buildFindFirstOrThrow<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
@@ -3171,7 +3388,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }) as Promise<QueryResult<T, R, W, S, O>>;
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
   buildFindUniqueOrThrow<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},

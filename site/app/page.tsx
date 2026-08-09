@@ -144,7 +144,7 @@ const capabilities = [
   {
     title: 'One dependency. No WASM.',
     description:
-      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. The main entry is held under 77 KB brotli as an import graph with pg external, under 61 KB on the edge, enforced by size-limit in CI rather than quoted from a past measurement. That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger.',
+      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. The main entry is held under 85 KB brotli as an import graph with pg external, under 68 KB on the edge, enforced by size-limit in CI rather than quoted from a past measurement. That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger.',
     href: '/benchmarks',
     cta: 'Benchmarks',
   },
@@ -172,7 +172,7 @@ const capabilities = [
   {
     title: 'Edge-native, one import swap',
     description:
-      'turbineHttp(pool, SCHEMA) gives you the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step. ~45 KB brotli as an import graph with the driver external.',
+      'turbineHttp(pool, SCHEMA) gives you the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step. ~64 KB brotli as an import graph with the driver external.',
     href: '/serverless',
     cta: 'Serverless docs',
   },
@@ -557,14 +557,14 @@ export default async function Home() {
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
                 [
                   'Main bundle (brotli)',
-                  '~60 KB import graph, pg external',
+                  '~81 KB import graph, pg external',
                   '~1.6 MB client (TS/WASM compiler)',
                   '~7 KB core',
                 ],
                 ['Studio', 'Read-only by default, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, ~45 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
+                ['Edge runtime', 'One import swap, ~64 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 [

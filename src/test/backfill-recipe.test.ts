@@ -14,7 +14,12 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
-import { createMigration, MIGRATION_RECIPES, parseMigrationContent } from '../cli/migrate.js';
+import {
+  createMigration,
+  findTransactionControlStatements,
+  MIGRATION_RECIPES,
+  parseMigrationContent,
+} from '../cli/migrate.js';
 
 describe('migrate --recipe backfill', () => {
   let dir: string;
@@ -64,6 +69,36 @@ describe('migrate --recipe backfill', () => {
     // DOWN reverses the rename swap.
     assert.match(down, /RENAME COLUMN "old_col" TO "new_col"/);
     assert.match(down, /RENAME COLUMN "old_col_retired" TO "old_col"/);
+  });
+
+  /**
+   * The scaffold used to hand the user `BEGIN; ... COMMIT;` around Phase 4.
+   * Those were both unnecessary (the runner already wraps each file in ONE
+   * transaction) and harmful: uncommenting them commits the WRAPPER, so the
+   * first half of the migration becomes durable, the rest runs unprotected, and
+   * the migration is recorded nowhere, after which every rerun fails on
+   * "already exists". The runner now refuses such a file, which would have made
+   * its own shipped scaffold unrunnable.
+   */
+  it('never scaffolds its own transaction control', () => {
+    const file = createMigration(dir, 'backfill_no_txn', undefined, { recipe: 'backfill' });
+    const content = readFileSync(file.path, 'utf-8');
+    const { up, down } = parseMigrationContent(content);
+
+    for (const [section, body] of [
+      ['UP', up],
+      ['DOWN', down],
+    ] as const) {
+      assert.doesNotMatch(body, /^\s*--\s*(BEGIN|COMMIT|ROLLBACK)\s*;/im, `${section} still scaffolds a transaction`);
+    }
+
+    // Uncommenting the whole scaffold must produce a file the runner accepts.
+    const uncomment = (body: string): string => body.replace(/^-- ?/gm, '');
+    assert.deepEqual(findTransactionControlStatements(uncomment(up)), []);
+    assert.deepEqual(findTransactionControlStatements(uncomment(down)), []);
+
+    // And the reason is stated where the author will read it.
+    assert.match(up, /ONE transaction/);
   });
 
   it('never emits an em-dash character in the scaffold', () => {

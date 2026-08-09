@@ -171,13 +171,20 @@ describe('uniform createMany is untouched', () => {
         { label: 'b', n: 2 },
       ] as never,
     });
+    // The emitted column list is the TABLE's order (`label` is declared before
+    // `n`), not the first row's key order, which is what makes the two rows
+    // above interchangeable rather than merely tolerated. A write's column list
+    // is SQL text, so taking it from the caller mints one permanent
+    // server-side prepared statement per key permutation of the same insert;
+    // see `canonicalWriteEntries` in query/utils.ts. Do not restore the
+    // first-row order here.
     assert.equal(
       d.sql,
-      'INSERT INTO "default_probe" ("n", "label") SELECT * FROM UNNEST($1::integer[], $2::text[]) RETURNING *',
+      'INSERT INTO "default_probe" ("label", "n") SELECT * FROM UNNEST($1::text[], $2::integer[]) RETURNING *',
     );
     assert.deepEqual(d.params, [
-      [1, 2],
       ['a', 'b'],
+      [1, 2],
     ]);
   });
 

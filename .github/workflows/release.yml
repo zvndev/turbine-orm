@@ -114,7 +114,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # pgvector/pgvector: postgres:<major> plus the `vector` extension, so the
+        # KNN assertions in src/test/pgvector.test.ts run instead of skipping.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -245,7 +247,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # pgvector/pgvector: postgres:<major> plus the `vector` extension, so the
+        # KNN assertions in src/test/pgvector.test.ts run instead of skipping.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test

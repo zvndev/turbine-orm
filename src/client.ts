@@ -27,6 +27,9 @@ import { type Dialect, postgresDialect } from './dialect.js';
 import {
   ConnectionError,
   type ErrorMessageMode,
+  errorMessageModesDiverged,
+  registerClientErrorMessageMode,
+  runWithErrorMessageMode,
   setErrorMessageMode,
   TimeoutError,
   UnsupportedFeatureError,
@@ -1294,6 +1297,15 @@ export class TurbineClient {
   private readonly queryListeners = new Set<QueryEventListener>();
   private queryOptions: QueryInterfaceOptions;
   private readonly errorMessagesSafe: boolean;
+  /**
+   * THIS client's error-message mode. Not the process default: see
+   * {@link registerClientErrorMessageMode}. Used to scope every operation
+   * issued through this client, but only once two clients in the process have
+   * asked for different modes.
+   */
+  private readonly errorMessageMode: ErrorMessageMode;
+  /** Per-table mode-scoping accessors, built lazily (see {@link table}). */
+  private readonly errorScopedTableCache = new Map<string, QueryInterface<object>>();
   /** Whether `$on('query')` events carry real params (see `logQueryParams`). */
   private readonly queryParamsVisible: boolean;
   /** True when Turbine created the pool and is responsible for tearing it down */
@@ -1333,6 +1345,7 @@ export class TurbineClient {
       this.logging = parent.logging;
       this.dialect = parent.dialect;
       this.errorMessagesSafe = parent.errorMessagesSafe;
+      this.errorMessageMode = parent.errorMessageMode;
       this.queryParamsVisible = parent.queryParamsVisible;
       this.queryOptions = parent.queryOptions;
       this.middlewares = parent.middlewares; // shared reference: $use on parent flows through
@@ -1497,7 +1510,8 @@ export class TurbineClient {
     // Respect env var kill switch
     const envDisablePrepared = typeof process !== 'undefined' && process.env?.TURBINE_DISABLE_PREPARED === '1';
 
-    this.errorMessagesSafe = (config.errorMessages ?? 'safe') === 'safe';
+    this.errorMessageMode = config.errorMessages ?? 'safe';
+    this.errorMessagesSafe = this.errorMessageMode === 'safe';
     // Query-event param visibility. One derived boolean, so the two config
     // spellings can never disagree: `logQueryParams` wins when set, otherwise
     // `errorMessages` keeps deciding exactly as it always has.
@@ -1544,6 +1558,16 @@ export class TurbineClient {
 
     // Apply NotFoundError message redaction mode (default: safe, values are
     // stripped from messages to avoid leaking PII into error logs).
+    //
+    // The process-wide default keeps being set here, unchanged, so a directly
+    // constructed error and any single-client process behave exactly as before.
+    // What is new is the REGISTRATION: a second client asking for a different
+    // mode makes both of them scope their own operations, instead of the last
+    // constructor silently deciding for everyone (see
+    // registerClientErrorMessageMode). Registration uses the client's effective
+    // mode, defaulted, because two clients only agree if their EFFECTIVE modes
+    // agree, and an omitted `errorMessages` is an effective 'safe'.
+    registerClientErrorMessageMode(this.errorMessageMode);
     if (config.errorMessages) {
       setErrorMessageMode(config.errorMessages);
     }
@@ -1918,6 +1942,11 @@ export class TurbineClient {
     this.tableCache.clear();
     this.routingProxyCache.clear();
     for (const cache of this.replicaTableCaches) cache.clear();
+    // The errorMessages accessors too: each proxy holds its target by closure,
+    // so a stale one keeps handing back the pre-$use QueryInterface. Every
+    // cache `table()` reads through has to be listed here, and this one is the
+    // OUTERMOST, so leaving it out silently defeats all three above.
+    this.errorScopedTableCache.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -1972,15 +2001,91 @@ export class TurbineClient {
    * With no replicas the original single-pool instance is returned directly.
    */
   table<T extends object = Record<string, unknown>>(name: string): QueryInterface<T> {
-    if (this.replicaPools.length === 0) {
-      return this.primaryTableQI(name) as QueryInterface<T>;
+    const base = this.replicaPools.length === 0 ? this.primaryTableQI(name) : this.routingAccessor(name);
+    // The errorMessages accessor is built ALWAYS, not only once two clients have
+    // diverged. It used to be conditional here, and the condition was wrong in
+    // the one direction that leaks: divergence is a property of the PROCESS over
+    // time, while a table accessor is handed out once and kept. An application
+    // that does `const users = db.users` at module load, then constructs a
+    // second client with `errorMessages: 'verbose'` later (an analytics client,
+    // a per-suite test harness), held a bare unscoped reference forever, so the
+    // safe client's `findUniqueOrThrow` misses started rendering row values.
+    // Building the proxy unconditionally is what makes the mode a property of
+    // the client rather than of the construction order.
+    //
+    // The divergence check did not disappear, it moved INSIDE the wrapper, so it
+    // is asked when the operation runs rather than when the accessor is minted.
+    // While every client agrees the wrapper still establishes no scope and the
+    // query path still pays nothing but one proxy trap.
+    let scoped = this.errorScopedTableCache.get(name);
+    if (!scoped) {
+      scoped = this.createErrorModeAccessor(base);
+      this.errorScopedTableCache.set(name, scoped);
     }
+    return scoped as QueryInterface<T>;
+  }
+
+  /** Get (and cache) the replica-routing accessor for a table. */
+  private routingAccessor(name: string): QueryInterface<object> {
     let proxy = this.routingProxyCache.get(name);
     if (!proxy) {
       proxy = this.createRoutingAccessor(name);
       this.routingProxyCache.set(name, proxy);
     }
-    return proxy as QueryInterface<T>;
+    return proxy;
+  }
+
+  /**
+   * Wrap a table accessor so every operation called through it runs with THIS
+   * client's `errorMessages` mode in force, whatever another client set as the
+   * process default.
+   *
+   * A proxy rather than a wrapper object: the QueryInterface mutates its own
+   * instance state during a query, so methods must run with the real instance
+   * as `this` (the same reason {@link createRoutingAccessor} is built this
+   * way). Method wrappers are memoized per property so a hot loop allocates one
+   * closure per operation NAME, not per call.
+   *
+   * The divergence test lives in the wrapper body, evaluated when the operation
+   * is CALLED. That placement is the point: an accessor minted before a second
+   * client diverges still scopes correctly once it does, and while no client has
+   * diverged the module default is already this client's mode, so the wrapper
+   * calls straight through and no AsyncLocalStorage scope is established at all.
+   */
+  private createErrorModeAccessor(target: QueryInterface<object>): QueryInterface<object> {
+    const mode = this.errorMessageMode;
+    const wrapped = new Map<string, unknown>();
+    return new Proxy(target, {
+      get(t, prop, receiver) {
+        const value = Reflect.get(t, prop, receiver);
+        if (typeof value !== 'function' || typeof prop !== 'string') return value;
+        let fn = wrapped.get(prop);
+        if (!fn) {
+          fn = (...args: unknown[]) => {
+            const call = () => (value as (...a: unknown[]) => unknown).apply(t, args);
+            return errorMessageModesDiverged() ? runWithErrorMessageMode(mode, call) : call();
+          };
+          wrapped.set(prop, fn);
+        }
+        return fn;
+      },
+    }) as QueryInterface<object>;
+  }
+
+  /**
+   * Run `fn` with this client's `errorMessages` mode in force, or directly when
+   * no other client in the process has diverged from it (the common case, which
+   * costs nothing). Used by the entry points that do not go through
+   * {@link table}: transactions, raw SQL, `pipeline`, and the typed-SQL builder.
+   *
+   * The typed-SQL builder is the one that cannot be covered by wrapping the
+   * call, because it is lazy: `sql` hands this function to `TypedSqlQuery` so
+   * the scope reaches the EXECUTION rather than the template. This docstring
+   * listed it as covered before 0.66 and it was not, which is the reason the
+   * mechanism is spelled out here instead of just named.
+   */
+  private withErrorMode<R>(fn: () => R): R {
+    return errorMessageModesDiverged() ? runWithErrorMessageMode(this.errorMessageMode, fn) : fn();
   }
 
   /** Get (and cache) the primary-pool-bound QueryInterface for a table. */
@@ -2118,7 +2223,14 @@ export class TurbineClient {
     if (this.logging) {
       console.log(`[turbine] Pipeline: ${queries.length} queries, ${queries.map((q) => q.tag).join(', ')}`);
     }
-    return executePipeline(this.pool, queries, options);
+    // Scoped like every other entry point. A pipeline builds NotFoundErrors (a
+    // `buildFindUniqueOrThrow` slot) and wraps driver errors into
+    // `PipelineError.results[i]`, and none of that went through a mode scope
+    // before, so a safe client's miss inside a pipeline rendered the caller's
+    // where VALUES as soon as any verbose client existed in the process. The
+    // scope is established around the await, so every continuation of the batch
+    // resolves this client's mode.
+    return this.withErrorMode(() => executePipeline(this.pool, queries, options));
   }
 
   /**
@@ -2166,7 +2278,7 @@ export class TurbineClient {
       const result = await this.pool.query(sql, values);
       return result.rows as T[];
     } catch (err) {
-      throw wrapPgError(err);
+      throw this.withErrorMode(() => wrapPgError(err));
     }
   }
 
@@ -2205,7 +2317,13 @@ export class TurbineClient {
     ...values: unknown[]
   ): TypedSqlQuery<T> {
     const { sql, params } = buildTypedSql(strings, values, this.dialect);
-    return new TypedSqlQuery<T>(this.pool, sql, params, this.logging);
+    // The scope has to be handed to the BUILDER, not wrapped around this call.
+    // `TypedSqlQuery` is lazy (it runs on `await` / `.one()` / `.scalar()`), so
+    // a scope opened here would close before any row was fetched. The
+    // `withErrorMode` docstring already claimed to cover the typed-SQL builder
+    // and did not, which left two raw-SQL entry points disagreeing about the
+    // same statement, since the adjacent `raw` tag WAS scoped.
+    return new TypedSqlQuery<T>(this.pool, sql, params, this.logging, <R>(fn: () => R): R => this.withErrorMode(fn));
   }
 
   // -------------------------------------------------------------------------
@@ -2308,6 +2426,16 @@ export class TurbineClient {
    */
   $transaction<T extends readonly DeferredQuery<unknown>[]>(queries: readonly [...T]): Promise<PipelineResults<T>>;
   async $transaction(
+    fnOrQueries: ((tx: TransactionClient) => Promise<unknown>) | readonly DeferredQuery<unknown>[],
+    options?: TransactionOptions,
+  ): Promise<unknown> {
+    // Scope the WHOLE call, so the transaction-scoped QueryInterfaces built
+    // inside TransactionClient.table() inherit this client's mode without
+    // needing their own accessor.
+    return this.withErrorMode(() => this.runTransaction(fnOrQueries, options));
+  }
+
+  private async runTransaction(
     fnOrQueries: ((tx: TransactionClient) => Promise<unknown>) | readonly DeferredQuery<unknown>[],
     options?: TransactionOptions,
   ): Promise<unknown> {

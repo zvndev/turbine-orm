@@ -441,7 +441,6 @@ describe('Studio demo: the builder refuses PII predicates', () => {
     ['isNull is an oracle too', { where: { phone: null } }],
     ['inside OR', { where: { OR: [{ name: 'x' }, { email: 'a@b.c' }] } }],
     ['orderBy', { orderBy: { email: 'asc' } }],
-    ['relation where one level down', { with: { posts: { where: { title: 'x' } } } }],
   ];
 
   for (const [label, args] of cases) {
@@ -453,15 +452,28 @@ describe('Studio demo: the builder refuses PII predicates', () => {
         headers: authHeaders(),
         body: { table: 'users', args },
       });
-      if (label === 'relation where one level down') {
-        // Control: a non-PII predicate on a relation still works.
-        assert.equal(r.status, 200, r.body);
-        return;
-      }
       assert.equal(r.status, 400, r.body);
       assert.match((r.json as { error: string }).error, /PII-tagged and redacted/);
     });
   }
+
+  // NOT a refusal. `posts.title` is not PII-tagged, so this is the control that
+  // says the guard narrows to hidden columns instead of refusing every relation
+  // predicate. It used to sit in the `cases` table above with a special case
+  // asserting 200, so the reporter printed "refuses: relation where one level
+  // down ✔" for a request that was ALLOWED, and a reader scanning the suite for
+  // relation coverage found a line that reads like it and is not it. The genuine
+  // nested-relation refusal is the test immediately below.
+  it('allows a NON-PII predicate on a relation one level down', async () => {
+    const ctx = makeDemoCtx();
+    const r = await dispatch(ctx, {
+      method: 'POST',
+      url: '/api/builder',
+      headers: authHeaders(),
+      body: { table: 'users', args: { with: { posts: { where: { title: 'x' } } } } },
+    });
+    assert.equal(r.status, 200, r.body);
+  });
 
   it('refuses a PII predicate nested inside a with clause', async () => {
     const ctx = makeDemoCtx();

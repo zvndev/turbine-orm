@@ -17,7 +17,30 @@ const nodePlatform = (config) => {
 // regression (a new module pulled into a shared graph) trips it and has to be
 // re-baselined CONSCIOUSLY, with the reason recorded here.
 //
-// Measured 2026-07-28 at the 0.62.0 RELEASE COMMIT, `npm run build` then
+// Measured 2026-08-09 at the 0.66.0 SPRINT COMMIT, `npm run build` then
+// `npx size-limit`: main 80.57 kB, serverless 64.16 kB, sqlite 67.11 kB,
+// mysql 68.24 kB, mssql 69.71 kB, powdb 85.03 kB, prisma-compat 12.42 kB.
+//
+// The gate went red on five entries before this re-baseline, which is the
+// convention working. Growth from the 0.62.0 line is uniform across every entry
+// carrying the shared client/query graph: serverless +3.65, mssql +3.69,
+// mysql +3.87, sqlite +4.02, powdb +4.08, main +5.03 kB. That is a shared-graph
+// change, and it is accounted for: the where/having depth caps
+// (query/where-compile.ts), the variable-arity statement marking and its
+// `INTERNAL_COMBINATOR` branding that keeps a query's prepared statement unnamed
+// when its SQL text can grow without bound, the order-key dedupe and its
+// resolved-expression identity, the `buildPartitionLimit` and
+// `escapeLikePattern` dialect hooks, the shared vector-threshold validator, the
+// per-client error-message mode, and the boolean/json wire rules. main carries
+// ~1 kB more than the engines because it also holds the Postgres dialect that
+// declares the two new hooks.
+//
+// prisma-compat moved +0.33 kB, an order of magnitude less than the shared
+// graph, which is the property this budget exists to guard: it still takes a
+// TurbineClient by value and imports only core TYPES. Its limit is left at
+// 13 kB rather than re-baselined, because it did not go red.
+//
+// Prior baseline 2026-07-28 at the 0.62.0 RELEASE COMMIT, `npm run build` then
 // `npx size-limit`: main 75.54 kB, serverless 60.51 kB, sqlite 63.09 kB,
 // mysql 64.37 kB, mssql 66.02 kB, powdb 80.95 kB, prisma-compat 12.09 kB.
 //
@@ -127,7 +150,7 @@ export default [
   {
     name: "main entry, import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
-    limit: '80 kB',
+    limit: '85 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
@@ -138,21 +161,21 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '64 kB',
+    limit: '68 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'sqlite entry, turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
-    limit: '67 kB',
+    limit: '71 kB',
     ignore: ['pg', 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'mysql entry, turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
     path: 'dist/mysql.js',
-    limit: '68 kB',
+    limit: '72 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
     // it is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mysql2', 'mysql2/promise'],
@@ -163,7 +186,7 @@ export default [
     path: 'dist/mssql.js',
     // Slightly larger than the other engines: the FOR JSON PATH relation generator
     // and the INFORMATION_SCHEMA/sys introspector add real code (no extra deps).
-    limit: '70 kB',
+    limit: '74 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mssql'],
@@ -174,7 +197,7 @@ export default [
     // The largest entry: it carries the whole client/query graph AND powql.ts,
     // a second, parallel query generator for a non-SQL language.
     path: 'dist/powdb.js',
-    limit: '85 kB',
+    limit: '90 kB',
     // Both PowDB drivers are optional peers behind dynamic imports (the
     // networked client and the embedded napi addon), so neither is in the
     // static graph.

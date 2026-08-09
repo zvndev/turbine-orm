@@ -30,9 +30,11 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -41,6 +43,7 @@ import { pathToFileURL } from 'node:url';
 import { generate, generatePrismaMap } from '../generate.js';
 import {
   buildCreateIndexSql,
+  buildCreateIndexStatements,
   buildDropIndexSql,
   collectDoctorProbeIndexNames,
   collectRelationProbeColumns,
@@ -1337,16 +1340,21 @@ async function runInitPush(config: ResolvedConfig, url: string): Promise<void> {
   }
   const schemaDef = await loadSchemaFile(config.schemaFile);
   const spinner = new Spinner('Computing schema diff').start();
-  const diff = await schemaDiff(schemaDef, url);
+  const diff = await schemaDiff(schemaDef, url, { schema: config.schema });
   if (diff.statements.length === 0) {
     spinner.succeed('Database already in sync: nothing to push');
     return;
   }
   spinner.succeed(`Found ${bold(String(diff.statements.length))} change(s) to apply`);
+  // Same as `push`: a type change carries a warning naming what it costs the
+  // existing rows, and it is worth no less here than on the standalone command.
+  if (diff.warnings && diff.warnings.length > 0) {
+    for (const w of diff.warnings) warn(w);
+  }
 
   const pushSpinner = new Spinner('Applying schema').start();
   try {
-    const result = await schemaPush(schemaDef, url, { precomputedDiff: diff });
+    const result = await schemaPush(schemaDef, url, { precomputedDiff: diff, schema: config.schema });
     pushSpinner.succeed(`Applied ${bold(String(result.statementsExecuted))} statement(s)`);
   } catch (err) {
     if (!(err instanceof DestructivePushRefusal)) throw err;
@@ -1355,7 +1363,11 @@ async function runInitPush(config: ResolvedConfig, url: string): Promise<void> {
       warn('Push aborted: no schema changes were applied.');
       return;
     }
-    const result = await schemaPush(schemaDef, url, { allowDestructive: true, precomputedDiff: diff });
+    const result = await schemaPush(schemaDef, url, {
+      allowDestructive: true,
+      precomputedDiff: diff,
+      schema: config.schema,
+    });
     success(`Applied ${bold(String(result.statementsExecuted))} statement(s)`);
   }
 }
@@ -1905,10 +1917,16 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
  * database (unless `--no-db`), and emit (a) a Markdown resolution report and
  * (b) a typed `prisma-map.ts` name map next to the generated client.
  *
- * NOTE: within THIS command `--schema` names the Prisma schema FILE (not the
- * Postgres namespace, which the rest of the CLI's `--schema` means). The
- * Postgres namespace is `public` here; multi-schema (`@@schema`) is unsupported
- * in v1 and listed as a parser note in the report.
+ * NOTE: within THIS command `--schema` names the Prisma schema FILE, or the
+ * DIRECTORY of a multi-file schema (Prisma >= 5.15), not the Postgres namespace
+ * that the rest of the CLI's `--schema` means. The Postgres namespace is
+ * `public` here.
+ *
+ * Multi-schema (`@@schema`) is unsupported: the parser emits a warning naming
+ * the attribute, which lands in the report's "Parser notes" section, and two
+ * models that resolve to the same bare table name are both marked UNRESOLVED
+ * rather than silently collapsed (see flagDuplicateTables in prisma-resolve.ts).
+ * This JSDoc used to claim the note existed before either half was written.
  */
 /** Outcome of {@link resolveMigrateFromPrismaUrl}. */
 export interface MigrateFromPrismaUrl {
@@ -1950,23 +1968,60 @@ export function resolveMigrateFromPrismaUrl(
   return { source: 'none', missingVariables: lookup.missingVariables };
 }
 
+/**
+ * Read a Prisma schema from a FILE or from a multi-file schema DIRECTORY
+ * (Prisma >= 5.15, GA). A directory used to reach `readFileSync` unchanged and
+ * die with a raw `EISDIR`, which is a stack trace rather than an answer.
+ *
+ * Prisma treats every `.prisma` file under the directory as one logical schema,
+ * so they are concatenated in sorted order (stable across machines) and parsed
+ * as a single source. Line numbers in any parse error then refer to that
+ * concatenation, so each file is introduced by a comment naming it.
+ */
+export function readPrismaSchemaSource(path: string): string {
+  if (!statSync(path).isDirectory()) return readFileSync(path, 'utf-8');
+  const files = readdirSync(path)
+    .filter((f) => f.endsWith('.prisma'))
+    .sort();
+  if (files.length === 0) {
+    throw new Error(`No .prisma files found in directory ${path}.`);
+  }
+  return files.map((f) => `// file: ${f}\n${readFileSync(join(path, f), 'utf-8')}`).join('\n');
+}
+
 async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
 
-  // `--schema` is the Prisma schema file path in this command.
-  const prismaPath = resolve(args.schema ?? 'prisma/schema.prisma');
+  // `--schema` is the Prisma schema file path in this command. It may also name
+  // a DIRECTORY (Prisma's multi-file schema, GA since 5.15), and the default
+  // `prisma/schema.prisma` falls back to `prisma/schema/` for the same reason.
+  const explicit = args.schema !== undefined;
+  let prismaPath = resolve(args.schema ?? 'prisma/schema.prisma');
+  if (!explicit && !existsSync(prismaPath) && existsSync(resolve('prisma/schema'))) {
+    prismaPath = resolve('prisma/schema');
+  }
   if (!existsSync(prismaPath)) {
-    error(`Prisma schema file not found: ${cyan(prismaPath)}`);
+    error(`Prisma schema not found: ${cyan(prismaPath)}`);
     newline();
     console.log(
-      `  ${dim('Point at it with')} ${cyan('--schema <path/to/schema.prisma>')} ${dim('(default: prisma/schema.prisma).')}`,
+      `  ${dim('Point at it with')} ${cyan('--schema <path>')} ${dim('(a .prisma file, or a directory of them;')}`,
     );
+    console.log(`  ${dim('default: prisma/schema.prisma, then prisma/schema/).')}`);
     newline();
     process.exit(1);
   }
 
   // Parse (fatal only on a construct we must understand).
-  const source = readFileSync(prismaPath, 'utf-8');
+  let source: string;
+  try {
+    source = readPrismaSchemaSource(prismaPath);
+  } catch (err) {
+    newline();
+    error(`Could not read ${cyan(prismaPath)}`);
+    console.log(`  ${red(err instanceof Error ? err.message : String(err))}`);
+    newline();
+    process.exit(1);
+  }
   let ast: ReturnType<typeof parsePrismaSchema>;
   try {
     ast = parsePrismaSchema(source);
@@ -2041,6 +2096,18 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
   }
   newline();
 
+  // Parser notes on the CONSOLE, not only in the Markdown report.
+  //
+  // `--no-db` is the first command anyone runs and the one place a parse
+  // problem should surface, and it was the one place that could not: resolution
+  // is skipped, `hasUnresolved` is false by construction, so the run printed a
+  // clean summary and exited 0 no matter what the parser had thrown away.
+  if (result.parseWarnings.length > 0) {
+    header('Parser notes');
+    for (const w of result.parseWarnings) console.log(`  ${yellow(symbols.warning)} ${w}`);
+    newline();
+  }
+
   // Write outputs into the generate outDir.
   const outDir = resolve(config.out);
   const rel = relative(process.cwd(), outDir);
@@ -2098,6 +2165,18 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
     process.exit(1);
   }
 
+  // `--no-db` has no resolution to fail on, so parser notes are the ONLY signal
+  // it can carry. Treated like an unresolved item, and cleared by the same
+  // `--allow-partial` opt-in, so "exit 0" means the same thing in both modes.
+  if (args.noDb && result.parseWarnings.length > 0 && !args.allowPartial) {
+    warn(
+      `${result.parseWarnings.length} parser note(s) above (also in the report). ` +
+        'Re-run with --allow-partial to accept them.',
+    );
+    newline();
+    process.exit(1);
+  }
+
   if (args.noDb) {
     info(`Parse-only report written. Re-run without ${cyan('--no-db')} against your database to resolve names.`);
   } else {
@@ -2124,7 +2203,7 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
 
   // Compute diff
   const diffSpinner = new Spinner('Computing schema diff').start();
-  const diff = await schemaDiff(schemaDef, url);
+  const diff = await schemaDiff(schemaDef, url, { schema: config.schema });
 
   if (diff.statements.length === 0 && diff.drop.length === 0) {
     diffSpinner.succeed('Database is already in sync');
@@ -2209,7 +2288,11 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const pushSpinner = new Spinner('Applying changes').start();
   let result: Awaited<ReturnType<typeof schemaPush>>;
   try {
-    result = await schemaPush(schemaDef, url, { allowDestructive: args.allowDestructive, precomputedDiff: diff });
+    result = await schemaPush(schemaDef, url, {
+      allowDestructive: args.allowDestructive,
+      precomputedDiff: diff,
+      schema: config.schema,
+    });
   } catch (err) {
     if (!(err instanceof DestructivePushRefusal)) throw err;
     pushSpinner.stop();
@@ -2219,7 +2302,11 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
       process.exit(1);
     }
     pushSpinner.start();
-    result = await schemaPush(schemaDef, url, { allowDestructive: true, precomputedDiff: diff });
+    result = await schemaPush(schemaDef, url, {
+      allowDestructive: true,
+      precomputedDiff: diff,
+      schema: config.schema,
+    });
   }
   pushSpinner.succeed(`Applied ${bold(String(result.statementsExecuted))} statement(s)`);
 
@@ -2345,7 +2432,7 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
 
     const schemaDef = await loadSchemaFile(config.schemaFile);
     const diffSpinner = new Spinner('Computing schema diff').start();
-    const diff = await schemaDiff(schemaDef, url);
+    const diff = await schemaDiff(schemaDef, url, { schema: config.schema });
 
     if (diff.statements.length === 0) {
       diffSpinner.succeed('Database is already in sync: nothing to migrate');
@@ -2437,7 +2524,7 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     const schemaDef = await loadSchemaFile(config.schemaFile);
 
     const diffSpinner = new Spinner('Computing schema diff').start();
-    const diff = await schemaDiff(schemaDef, url);
+    const diff = await schemaDiff(schemaDef, url, { schema: config.schema });
 
     if (diff.statements.length === 0) {
       diffSpinner.succeed('Database is already in sync: nothing to migrate');
@@ -3214,9 +3301,25 @@ const TIER_LABEL: Record<IndexTier, string> = {
   scrutinize: 'SCRUTINIZE',
 };
 
-/** Build the `CREATE INDEX` for a finding, honoring the partial-null suggestion. */
+/**
+ * The `CREATE INDEX` for a finding (display / JSON only), honoring the
+ * partial-null suggestion. The migration writer uses
+ * {@link buildCreateIndexStatements} instead, which adds the preceding
+ * `DROP INDEX CONCURRENTLY IF EXISTS` that makes a rerun converge.
+ */
 function doctorCreateSql(f: DoctorFinding, opts: { concurrently: boolean }): string {
   return buildCreateIndexSql(f.missing.table, f.missing.columns, f.missing.indexName, {
+    concurrently: opts.concurrently,
+    // The report line is advice a human may copy into psql, where the
+    // guard is genuinely useful and there is no corpse to skip.
+    ifNotExists: true,
+    partialNotNull: f.score.partialNotNull,
+  });
+}
+
+/** The statements the fix migration's UP body runs for one finding. */
+function doctorCreateStatements(f: DoctorFinding, opts: { concurrently: boolean }): string[] {
+  return buildCreateIndexStatements(f.missing.table, f.missing.columns, f.missing.indexName, {
     concurrently: opts.concurrently,
     partialNotNull: f.score.partialNotNull,
   });
@@ -3230,13 +3333,17 @@ const CONCURRENTLY_RECIPE_COMMENT = [
   '--',
   '--   1. Idempotency is required. This migration is recorded only after ALL',
   '--      statements succeed; a mid-file failure leaves earlier indexes built and',
-  '--      the migration unrecorded, so a rerun must be safe. IF NOT EXISTS keeps',
-  '--      each CREATE idempotent.',
-  '--   2. The INVALID-index trap. A CREATE INDEX CONCURRENTLY that fails partway',
-  '--      leaves an INVALID index behind. On rerun, IF NOT EXISTS SKIPS that',
-  '--      corpse (the name already exists), so the index is never actually built.',
-  '--      Fix: DROP INDEX CONCURRENTLY the invalid index, then rerun. Run',
-  '--      "turbine doctor" to list invalid indexes.',
+  '--      the migration unrecorded, so a rerun must be safe.',
+  '--   2. The INVALID-index trap, and why each CREATE is preceded by a DROP.',
+  '--      A CREATE INDEX CONCURRENTLY that fails partway leaves an INVALID index',
+  '--      behind, under the name it was asked for. IF NOT EXISTS matches on the',
+  '--      NAME and not on validity, so with it a rerun SKIPS the corpse and the',
+  '--      index is never actually built: the migration records as applied while',
+  '--      the index doctor reported is still missing. The DROP INDEX',
+  '--      CONCURRENTLY IF EXISTS line ahead of each CREATE is a no-op on the',
+  '--      first run (the index does not exist yet, which is why it was',
+  '--      proposed) and clears the corpse on a rerun, so rerunning converges on',
+  '--      a VALID index. Run "turbine doctor" to list invalid indexes.',
   '--   3. Locking. CREATE INDEX CONCURRENTLY waits for every transaction that can',
   '--      see the table to finish. A long-running transaction makes it wait and',
   '--      makes "migrate up" look hung. For bounded waits, SET lock_timeout /',
@@ -4149,7 +4256,7 @@ function renderPlanDivergence(divergence: PlanDivergenceReport, attached: Attach
 /** Write the --fix migration (CONCURRENTLY + directive by default; plain with --no-concurrently). */
 function renderFixMigration(findings: DoctorFinding[], config: ResolvedConfig, args: CliArgs): void {
   const concurrently = args.noConcurrently !== true;
-  const up = findings.map((f) => doctorCreateSql(f, { concurrently })).join('\n');
+  const up = findings.flatMap((f) => doctorCreateStatements(f, { concurrently })).join('\n');
   const down = findings.map((f) => buildDropIndexSql(f.missing.indexName, { concurrently })).join('\n');
 
   let file: MigrationFile;

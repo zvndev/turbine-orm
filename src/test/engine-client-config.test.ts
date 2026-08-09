@@ -70,7 +70,6 @@ async function captureQueryEvent(db: TurbineClient): Promise<QueryEvent> {
 // ---------------------------------------------------------------------------
 
 function openSqliteProbe(options?: Parameters<typeof turbineSqlite>[2]): TurbineClient {
-  // biome-ignore lint/style/noNonNullAssertion: guarded by sqliteIt's skip.
   const handle = new DatabaseSync!(':memory:');
   handle.exec('CREATE TABLE cfg_probe (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
   handle.exec("INSERT INTO cfg_probe (id, name) VALUES (1, 'probe')");

@@ -159,8 +159,14 @@ describe('create: Date on a time column', () => {
     const buf = Buffer.from('x');
     const arr = [1, 2, 3];
     const d = q().buildCreate({ data: { label: buf as unknown as string, id: arr as unknown as number } });
-    assert.equal(d.params[0], buf);
-    assert.equal(d.params[1], arr);
+    // Params follow the TABLE's column order (`id` is declared before `label`),
+    // not the order the keys were written: a write's column list is SQL text,
+    // and letting the caller pick it mints a permanent server-side prepared
+    // statement per permutation. See `canonicalWriteEntries` in query/utils.ts.
+    // What this test is actually about is untouched: both values arrive by
+    // identity, whichever slot they land in.
+    assert.equal(d.params[0], arr);
+    assert.equal(d.params[1], buf);
   });
 
   it('rewrites a Date[] on a time[] column element-wise', () => {
@@ -196,11 +202,18 @@ describe('createMany: Date on a temporal column', () => {
   });
 
   it('casts timetz and date correctly too, and leaves timestamptz binding Dates', () => {
+    // COLUMN ORDER IS THE TABLE'S, NOT THE CALLER'S, and that is deliberate:
+    // a write's column list is SQL text, so honouring the caller's key order
+    // would mint one permanent server-side prepared statement per permutation
+    // of the same write (see `canonicalWriteEntries` in query/utils.ts). The
+    // caller wrote timeTz, onDate, updatedAt; the table declares time_tz,
+    // updated_at, on_date, and the table wins. Do not "restore" the caller's
+    // order here.
     const d = q().buildCreateMany({ data: [{ timeTz: NINE_AM_UTC, onDate: A_TIMESTAMP, updatedAt: A_TIMESTAMP }] });
-    assert.match(d.sql, /UNNEST\(\$1::timetz\[\], \$2::date\[\], \$3::timestamptz\[\]\)/);
+    assert.match(d.sql, /UNNEST\(\$1::timetz\[\], \$2::timestamptz\[\], \$3::date\[\]\)/);
     assert.deepEqual(d.params[0], ['09:00:00+00:00']);
-    assert.deepEqual(d.params[1], [A_DATE_LITERAL]);
-    assert.equal((d.params[2] as unknown[])[0], A_TIMESTAMP);
+    assert.equal((d.params[1] as unknown[])[0], A_TIMESTAMP);
+    assert.deepEqual(d.params[2], [A_DATE_LITERAL]);
   });
 });
 

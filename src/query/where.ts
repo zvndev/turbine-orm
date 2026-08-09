@@ -13,7 +13,7 @@
 
 import type pg from 'pg';
 import type { Dialect } from '../dialect.js';
-import { UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { getErrorMessageMode, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { camelToSnake, normalizeKeyColumns } from '../schema.js';
 import type { TemporalInfinityReading } from './deferred.js';
@@ -45,8 +45,17 @@ import type {
   WhereClause,
   WhereOperator,
 } from './types.js';
-import { coerceTemporalValue, escapeLike, OPERATOR_KEYS, ownLookup, type SqlCacheEntry } from './utils.js';
 import {
+  coerceTemporalValue,
+  escapeLike,
+  isInternalCombinator,
+  markInternalCombinator,
+  OPERATOR_KEYS,
+  ownLookup,
+  type SqlCacheEntry,
+} from './utils.js';
+import {
+  assertWhereDepth,
   classifyScalarForSql,
   fingerprintScalarToken,
   type WhereHost,
@@ -95,6 +104,62 @@ export interface BuilderCtx {
    * `resolveGlobalFilter`.
    */
   currentSkip: ResolvedSkipGlobalFilters | undefined;
+  /**
+   * Record that the statement being COMPILED right now has a SQL text whose
+   * LENGTH is a function of an arity the caller chose, rather than of the
+   * application's code. Two shapes qualify:
+   *
+   *  1. a caller-written `AND` / `OR` combinator array (one parenthesised
+   *     branch per element), marked in {@link buildWhereClause} and its
+   *     table-scoped twin;
+   *  2. an `orderBy` longer than {@link MAX_NAMED_ORDER_KEYS} (one comma-
+   *     separated term per entry), marked in relations.ts' `buildOrderBy` and
+   *     `buildRelationOrderClause`.
+   *
+   * WHY THIS EXISTS, since it is the only "tell the builder something about the
+   * shape" callback on this interface. Every distinct SQL text Turbine emits is
+   * parsed on the server as a NAMED prepared statement (the name is a hash of
+   * the text) and is never DEALLOCATEd. The client-side template cache is an
+   * LRU bounded at 1,000 entries; the SERVER side has no bound at all, and each
+   * pooled connection accumulates its own. That is fine while the set of SQL
+   * texts is fixed by the application's code, which it is for every clause
+   * except these: a `where.OR` assembled from a UI multi-select, or an
+   * `orderBy` assembled from an "advanced sort" panel, lets a caller mint
+   * unbounded distinct statements with no identifier and no value under their
+   * control. Measured on PostgreSQL 16: 600 distinct `OR` arities left 600
+   * prepared statements and 20.9 MB of CachedPlan memory resident on ONE
+   * connection, and 200 further executions of an existing shape reclaimed none
+   * of it. The `orderBy` half was measured the same way and is worse in one
+   * respect: repeating a single key (`[{id:'asc'}, {id:'asc'}, ...]`) reached
+   * eight distinct statements from ONE column, so the arity was not even
+   * bounded by the table's width. That particular door is closed separately and
+   * more directly, by refusing duplicate sort keys outright
+   * ({@link dedupeOrderEntries}); this mark handles what remains, which is
+   * the PERMUTATION space of distinct columns.
+   *
+   * `in: [...]` is deliberately NOT this shape and is not marked: it binds
+   * `= ANY($1)`, one parameter whatever the list length, so a thousand-element
+   * `in` is still one statement.
+   *
+   * What the mark does: {@link acquireSql} reads it immediately after the build
+   * closure returns and gives the cache entry an EMPTY prepared-statement name,
+   * so every execution of that shape goes out unnamed. Unnamed is what bounds
+   * the server: node-postgres only skips `Parse` for a statement it has already
+   * parsed BY NAME, so an unnamed statement is re-parsed each execution and
+   * replaces the single unnamed cached plan source instead of adding to the
+   * named table. It is the same mechanism the per-query `forceCustomPlan`
+   * option uses, and it changes NO SQL text.
+   *
+   * The cost is honest and worth stating: a fixed two-branch `OR` (a search box
+   * over name and email, say) is not actually variable-arity, and it loses its
+   * named statement too, because the builder sees one call and cannot know
+   * whether the length varies across calls. It pays one server-side parse per
+   * execution and gives up generic-plan promotion, which for a skewed predicate
+   * is frequently the better plan anyway. The `orderBy` threshold is chosen so
+   * that this cost lands only on shapes that are already unusual: see
+   * {@link MAX_NAMED_ORDER_KEYS}.
+   */
+  markVariableArity(): void;
   q(name: string): string;
   p(index: number): string;
   inParam(values: unknown): unknown;
@@ -128,6 +193,13 @@ export interface BuilderCtx {
   // Shared primitives + state reached by the relation/orderBy module (relations.ts).
   readonly jsonEncoding: 'object' | 'positional';
   readonly camelDateFieldCache: Map<string, Set<string>>;
+  /**
+   * Per-table memo of `Object.entries(meta.relations)`. See
+   * `getRelationEntries` in relations.ts: the nested-row parser walks it once
+   * per ROW, so rebuilding the array there was the hottest allocation in the
+   * parse path.
+   */
+  readonly relationEntryCache: Map<string, [string, RelationDef][]>;
   limitOneClause(): string;
   buildPagination(limitPh: string | undefined, offsetPh: string | undefined, hasOrderBy: boolean): string;
   paginationRef(value: unknown, params: unknown[], arg?: string): string;
@@ -137,6 +209,43 @@ export interface BuilderCtx {
    * can never bind an unvalidated NaN (which Postgres reads as "no limit").
    */
   paginationValue(value: unknown, arg?: string): number;
+}
+
+/**
+ * LIKE-escape one bound operand through the ACTIVE dialect, falling back to the
+ * shared {@link escapeLike} (`\`, `%`, `_`) when the dialect declares no
+ * override. See {@link Dialect.escapeLikePattern} for why an engine would need
+ * one (T-SQL also treats `[` as a character-class opener, so the standard set
+ * leaves `{ contains: '[draft]' }` matching any title containing d, r, a, f or
+ * t).
+ *
+ * Every LIKE operand in this module goes through here, the scalar
+ * `contains`/`startsWith`/`endsWith` family and the JSON substring operators,
+ * on BOTH the SQL-build and the cache-hit param-collect side. That is the point
+ * of routing it through one function: the two sides must escape identically or
+ * a warmed template binds a differently-escaped value than the one its SQL was
+ * compiled for.
+ */
+function likeOperand(qi: BuilderCtx, value: string): string {
+  return qi.dialect.escapeLikePattern?.(value) ?? escapeLike(value);
+}
+
+/**
+ * Render a caller-supplied VALUE for an error message, or a neutral placeholder
+ * when the process is in the default `'safe'` error-message mode.
+ *
+ * SECURITY.md states that where-clause values are rendered as key names only.
+ * These JSON-operator diagnostics used to interpolate the operand verbatim, and
+ * the `path`-missing branch fires on a perfectly VALID value whose only problem
+ * is a missing `path`, so the leak was not limited to malformed input: a
+ * `stringContains` search term reached the error text (and from there a log
+ * aggregator or an API error body) on a query the caller merely wrote wrong.
+ *
+ * Same gate the `NotFoundError` where-rendering already uses, so one setting
+ * governs both.
+ */
+function valueForMessage(value: unknown): string {
+  return getErrorMessageMode() === 'verbose' ? JSON.stringify(value) : '<value>';
 }
 
 /**
@@ -193,22 +302,25 @@ interface WhereScope {
  *
  * @internal Exposed as package-private for testing via class access.
  */
-export function fingerprintWhere(qi: BuilderCtx, where: Record<string, unknown>): string {
+export function fingerprintWhere(qi: BuilderCtx, where: Record<string, unknown>, depth = 0): string {
+  assertWhereDepth(depth);
   const parts: string[] = [];
   for (const event of walkWhere(qi.whereHost, where)) {
     switch (event.kind) {
       case 'or':
-        parts.push(`OR[${event.conditions.map((cond) => fingerprintWhere(qi, cond)).join(',')}]`);
+        parts.push(`OR[${event.conditions.map((cond) => fingerprintWhere(qi, cond, depth + 1)).join(',')}]`);
         break;
       case 'and':
-        parts.push(`AND[${event.conditions.map((cond) => fingerprintWhere(qi, cond)).join(',')}]`);
+        parts.push(`AND[${event.conditions.map((cond) => fingerprintWhere(qi, cond, depth + 1)).join(',')}]`);
         break;
       case 'not':
-        parts.push(`NOT(${fingerprintWhere(qi, event.condition)})`);
+        parts.push(`NOT(${fingerprintWhere(qi, event.condition, depth + 1)})`);
         break;
       case 'relation':
         // { posts: { some: { published: true } } } → `posts:{some(...)}`
-        parts.push(`${event.key}:{${fingerprintRelationParts(qi, event.relDef, event.filterObj).join(',')}}`);
+        parts.push(
+          `${event.key}:{${fingerprintRelationParts(qi, event.relDef, event.filterObj, depth + 1).join(',')}}`,
+        );
         break;
       case 'scalar':
         // Column-blind scalar token (see fingerprintScalarToken): the value's
@@ -227,37 +339,42 @@ export function fingerprintWhere(qi: BuilderCtx, where: Record<string, unknown>)
  * {@link fingerprintRelFilter} so the FULL inner shape is captured (two
  * different sub-wheres must never collide on one cached SQL text).
  */
-export function fingerprintRelationParts(qi: BuilderCtx, relDef: RelationDef, filterObj: WhereRecord): string[] {
+export function fingerprintRelationParts(
+  qi: BuilderCtx,
+  relDef: RelationDef,
+  filterObj: WhereRecord,
+  depth = 0,
+): string[] {
   const relParts: string[] = [];
   if (filterObj.some !== undefined)
     relParts.push(
       filterObj.some === null
         ? 'some(null)'
-        : `some(${fingerprintRelFilter(qi, relDef.to, filterObj.some as Record<string, unknown>)})`,
+        : `some(${fingerprintRelFilter(qi, relDef.to, filterObj.some as Record<string, unknown>, depth + 1)})`,
     );
   if (filterObj.every !== undefined)
     relParts.push(
       filterObj.every === null
         ? 'every(null)'
-        : `every(${fingerprintRelFilter(qi, relDef.to, filterObj.every as Record<string, unknown>)})`,
+        : `every(${fingerprintRelFilter(qi, relDef.to, filterObj.every as Record<string, unknown>, depth + 1)})`,
     );
   if (filterObj.none !== undefined)
     relParts.push(
       filterObj.none === null
         ? 'none(null)'
-        : `none(${fingerprintRelFilter(qi, relDef.to, filterObj.none as Record<string, unknown>)})`,
+        : `none(${fingerprintRelFilter(qi, relDef.to, filterObj.none as Record<string, unknown>, depth + 1)})`,
     );
   if (filterObj.is !== undefined)
     relParts.push(
       filterObj.is === null
         ? 'is(null)'
-        : `is(${fingerprintRelFilter(qi, relDef.to, filterObj.is as Record<string, unknown>)})`,
+        : `is(${fingerprintRelFilter(qi, relDef.to, filterObj.is as Record<string, unknown>, depth + 1)})`,
     );
   if (filterObj.isNot !== undefined)
     relParts.push(
       filterObj.isNot === null
         ? 'isNot(null)'
-        : `isNot(${fingerprintRelFilter(qi, relDef.to, filterObj.isNot as Record<string, unknown>)})`,
+        : `isNot(${fingerprintRelFilter(qi, relDef.to, filterObj.isNot as Record<string, unknown>, depth + 1)})`,
     );
   return relParts;
 }
@@ -268,10 +385,15 @@ export function fingerprintRelationParts(qi: BuilderCtx, relDef: RelationDef, fi
  * unknown, an empty-relations host makes every key scalar (matching the old
  * `meta?.relations` short-circuit).
  */
-export function fingerprintRelFilter(qi: BuilderCtx, targetTable: string, subWhere: Record<string, unknown>): string {
+export function fingerprintRelFilter(
+  qi: BuilderCtx,
+  targetTable: string,
+  subWhere: Record<string, unknown>,
+  depth = 0,
+): string {
   const meta = qi.schema.tables[targetTable];
   const host = meta ? scopedWhereHost(qi, meta) : emptyRelationsHost(qi, targetTable);
-  return fingerprintScopedWhere(qi, host, subWhere);
+  return fingerprintScopedWhere(qi, host, subWhere, depth);
 }
 
 /**
@@ -281,20 +403,21 @@ export function fingerprintRelFilter(qi: BuilderCtx, targetTable: string, subWhe
  *
  * @internal Exposed as package-private for testing.
  */
-export function collectWhereParams(qi: BuilderCtx, where: Record<string, unknown>, params: unknown[]): void {
+export function collectWhereParams(qi: BuilderCtx, where: Record<string, unknown>, params: unknown[], depth = 0): void {
+  assertWhereDepth(depth);
   // ONE canonical walk (shared with fingerprintWhere + buildWhereClause), so
   // the key order + combinator structure cannot drift out of lockstep.
   for (const event of walkWhere(qi.whereHost, where)) {
     switch (event.kind) {
       case 'or':
       case 'and':
-        for (const cond of event.conditions) collectWhereParams(qi, cond, params);
+        for (const cond of event.conditions) collectWhereParams(qi, cond, params, depth + 1);
         break;
       case 'not':
-        collectWhereParams(qi, event.condition, params);
+        collectWhereParams(qi, event.condition, params, depth + 1);
         break;
       case 'relation':
-        collectRelationFilterParams(qi, event.relDef, event.filterObj, params);
+        collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth + 1);
         break;
       case 'scalar':
         collectScalarParams(qi, event.key, event.value, params);
@@ -370,31 +493,33 @@ export function collectRelationFilterParams(
   relDef: RelationDef,
   filterObj: Record<string, unknown>,
   params: unknown[],
+  depth = 0,
 ): void {
   const target = relDef.to;
   if (filterObj.some !== undefined && filterObj.some !== null) {
-    collectRelFilterParams(qi, target, filterObj.some as Record<string, unknown>, params);
+    collectRelFilterParams(qi, target, filterObj.some as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
   }
   if (filterObj.none !== undefined && filterObj.none !== null) {
-    collectRelFilterParams(qi, target, filterObj.none as Record<string, unknown>, params);
+    collectRelFilterParams(qi, target, filterObj.none as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
   }
   if (filterObj.every !== undefined && filterObj.every !== null) {
     // gf is only emitted (build) when the `every` sub-where compiles to a
     // filter, otherwise `every` is trivially true and no subquery is built.
-    if (buildSubWhereForRelation(qi, target, filterObj.every as Record<string, unknown>, []) !== null) {
-      collectRelFilterParams(qi, target, filterObj.every as Record<string, unknown>, params);
+    if (buildSubWhereForRelation(qi, target, filterObj.every as Record<string, unknown>, [], depth + 1) !== null) {
+      collectRelFilterParams(qi, target, filterObj.every as Record<string, unknown>, params, depth + 1);
       collectTargetGlobalFilterExists(qi, target, params);
     }
   }
   if (filterObj.is !== undefined) {
-    if (filterObj.is !== null) collectRelFilterParams(qi, target, filterObj.is as Record<string, unknown>, params);
+    if (filterObj.is !== null)
+      collectRelFilterParams(qi, target, filterObj.is as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
   }
   if (filterObj.isNot !== undefined) {
     if (filterObj.isNot !== null)
-      collectRelFilterParams(qi, target, filterObj.isNot as Record<string, unknown>, params);
+      collectRelFilterParams(qi, target, filterObj.isNot as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
   }
 }
@@ -404,10 +529,11 @@ export function collectRelFilterParams(
   targetTable: string,
   subWhere: Record<string, unknown>,
   params: unknown[],
+  depth = 0,
 ): void {
   const meta = qi.schema.tables[targetTable];
   if (!meta) return;
-  collectScopedWhereParams(qi, relationWhereScope(qi, targetTable, meta), subWhere, params);
+  collectScopedWhereParams(qi, relationWhereScope(qi, targetTable, meta), subWhere, params, depth);
 }
 
 /**
@@ -441,9 +567,9 @@ export function collectOperatorParams(
   if (op.not !== undefined && op.not !== null && !skipRef(op.not)) params.push(cv(op.not));
   if (op.in !== undefined) params.push(qi.inParam(cv(op.in)));
   if (op.notIn !== undefined) params.push(qi.inParam(cv(op.notIn)));
-  if (op.contains !== undefined) params.push(`%${escapeLike(op.contains)}%`);
-  if (op.startsWith !== undefined) params.push(`${escapeLike(op.startsWith)}%`);
-  if (op.endsWith !== undefined) params.push(`%${escapeLike(op.endsWith)}`);
+  if (op.contains !== undefined) params.push(`%${likeOperand(qi, op.contains)}%`);
+  if (op.startsWith !== undefined) params.push(`${likeOperand(qi, op.startsWith)}%`);
+  if (op.endsWith !== undefined) params.push(`%${likeOperand(qi, op.endsWith)}`);
 }
 
 /**
@@ -467,9 +593,14 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
     pushPathOnce();
     params.push(String(filter.equals));
   } else if (filter.equals !== undefined) {
+    // Mirrors the build path's refusal, and thrown before any param is pushed,
+    // like the text-search gate a few cases above. Not defensive: it is what
+    // stops a warmed template serving a shape the cold build refuses.
+    requireJsonContains(qi, 'equals');
     params.push(JSON.stringify(filter.equals));
   }
   if (filter.contains !== undefined) {
+    requireJsonContains(qi, 'contains');
     params.push(JSON.stringify(filter.contains));
   }
   if (filter.hasKey !== undefined) {
@@ -481,7 +612,7 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
   }
   for (const { pattern, value } of jsonStringEntries(filter, column)) {
     pushPathOnce();
-    params.push(pattern(escapeLike(value)));
+    params.push(pattern(likeOperand(qi, value)));
   }
 }
 
@@ -497,7 +628,9 @@ export function collectArrayFilterParams(qi: BuilderCtx, filter: ArrayFilter, pa
 /**
  * Collect params for a vector distance WHERE filter. Mirrors
  * {@link buildVectorFilterClauses}: the `$n::vector` query vector first, then
- * the comparison threshold(s).
+ * the comparison threshold(s), both enumerated AND validated by the shared
+ * {@link vectorThresholdEntries} (see there for the production-only bug that
+ * inlining the loop on both sides produced).
  */
 export function collectVectorFilterParams(
   qi: BuilderCtx,
@@ -508,10 +641,7 @@ export function collectVectorFilterParams(
 ): void {
   const dist = filter.distance;
   pushVectorParam(qi, field, rawColumn, dist.to, params);
-  for (const cmp of Object.keys(VECTOR_DISTANCE_COMPARATORS)) {
-    const threshold = (dist as unknown as Record<string, unknown>)[cmp];
-    if (threshold !== undefined) params.push(threshold);
-  }
+  for (const { threshold } of vectorThresholdEntries(filter, field)) params.push(threshold);
 }
 
 /** Build WHERE clause from a where object (supports operators, NULL, OR) */
@@ -562,7 +692,10 @@ export function mergeGlobalFilter(
   const gf = resolveGlobalFilter(qi, qi.table);
   if (!gf) return userWhere;
   if (userWhere === undefined) return gf;
-  return { AND: [userWhere, gf] };
+  // Branded: this `AND` is Turbine's, always exactly two branches, so it must
+  // not put the statement on the variable-arity (unnamed) path. See
+  // {@link markInternalCombinator}.
+  return markInternalCombinator({ AND: [userWhere, gf] });
 }
 
 /**
@@ -685,35 +818,51 @@ export function assertMutationHasPredicate(
  * Returns null if no conditions exist.
  * Supports: equality, operators, NULL, OR, AND, NOT, relation filters (some/every/none).
  */
-export function buildWhereClause(qi: BuilderCtx, where: Record<string, unknown>, params: unknown[]): string | null {
+export function buildWhereClause(
+  qi: BuilderCtx,
+  where: Record<string, unknown>,
+  params: unknown[],
+  depth = 0,
+): string | null {
+  assertWhereDepth(depth);
   const andClauses: string[] = [];
+  // A combinator ARRAY is the one shape whose branch COUNT is written into the
+  // SQL text, so the statement stops being a fixed shape (see
+  // markVariableArity). Marked here, on the BUILD walk, because the mark
+  // is read immediately after `build()` inside `acquireSql`, so it decides the
+  // prepared-statement name of the very entry being created. The internal
+  // wrapper the global-filter merge synthesizes is exempt, see
+  // INTERNAL_COMBINATOR.
+  const internal = isInternalCombinator(where);
 
   // ONE canonical walk (shared with fingerprintWhere + collectWhereParams).
   for (const event of walkWhere(qi.whereHost, where)) {
     switch (event.kind) {
       case 'or': {
+        if (!internal) qi.markVariableArity();
         const orClauses: string[] = [];
         for (const orCond of event.conditions) {
-          const sub = buildWhereClause(qi, orCond, params);
+          const sub = buildWhereClause(qi, orCond, params, depth + 1);
           if (sub) orClauses.push(sub);
         }
         if (orClauses.length > 0) andClauses.push(`(${orClauses.join(' OR ')})`);
         break;
       }
       case 'and':
+        if (!internal) qi.markVariableArity();
         for (const andCond of event.conditions) {
-          const sub = buildWhereClause(qi, andCond, params);
+          const sub = buildWhereClause(qi, andCond, params, depth + 1);
           if (sub) andClauses.push(sub);
         }
         break;
       case 'not': {
-        const sub = buildWhereClause(qi, event.condition, params);
+        const sub = buildWhereClause(qi, event.condition, params, depth + 1);
         if (sub) andClauses.push(`NOT (${sub})`);
         break;
       }
       case 'relation': {
         // { posts: { some: { published: true } } } → EXISTS / NOT EXISTS
-        const relClause = buildRelationFilter(qi, event.key, event.relDef, event.filterObj, params);
+        const relClause = buildRelationFilter(qi, event.key, event.relDef, event.filterObj, params, undefined, depth);
         if (relClause) andClauses.push(relClause);
         break;
       }
@@ -864,26 +1013,40 @@ export function buildScopedWhere(
   scope: WhereScope,
   where: Record<string, unknown>,
   params: unknown[],
+  depth = 0,
 ): string | null {
+  assertWhereDepth(depth);
   const clauses: string[] = [];
+  const internal = isInternalCombinator(where);
   for (const event of walkWhere(scope.host, where)) {
     switch (event.kind) {
       case 'or':
       case 'and': {
+        // Same variable-arity rule as the top level: a nested relation filter
+        // or a relation `with` where can carry a caller-sized OR just as easily.
+        if (!internal) qi.markVariableArity();
         const parts = event.conditions
-          .map((cond) => buildScopedWhere(qi, scope, cond, params))
+          .map((cond) => buildScopedWhere(qi, scope, cond, params, depth + 1))
           .filter((s): s is string => s !== null)
           .map((s) => `(${s})`);
         if (parts.length > 0) clauses.push(`(${parts.join(event.kind === 'or' ? ' OR ' : ' AND ')})`);
         break;
       }
       case 'not': {
-        const sub = buildScopedWhere(qi, scope, event.condition, params);
+        const sub = buildScopedWhere(qi, scope, event.condition, params, depth + 1);
         if (sub) clauses.push(`NOT (${sub})`);
         break;
       }
       case 'relation': {
-        const c = buildRelationFilter(qi, event.key, event.relDef, event.filterObj, params, scope.relationParent);
+        const c = buildRelationFilter(
+          qi,
+          event.key,
+          event.relDef,
+          event.filterObj,
+          params,
+          scope.relationParent,
+          depth,
+        );
         if (c) clauses.push(c);
         break;
       }
@@ -979,20 +1142,22 @@ export function collectScopedWhereParams(
   scope: WhereScope,
   where: Record<string, unknown>,
   params: unknown[],
+  depth = 0,
 ): void {
+  assertWhereDepth(depth);
   for (const event of walkWhere(scope.host, where)) {
     switch (event.kind) {
       case 'or':
       case 'and':
-        for (const cond of event.conditions) collectScopedWhereParams(qi, scope, cond, params);
+        for (const cond of event.conditions) collectScopedWhereParams(qi, scope, cond, params, depth + 1);
         break;
       case 'not':
-        collectScopedWhereParams(qi, scope, event.condition, params);
+        collectScopedWhereParams(qi, scope, event.condition, params, depth + 1);
         break;
       case 'relation':
         // Same some→none→every→is→isNot (each: sub-where params then target
         // global-filter params) as buildRelationFilter emits.
-        collectRelationFilterParams(qi, event.relDef, event.filterObj, params);
+        collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth);
         break;
       case 'scalar':
         collectScopedScalarParams(qi, scope, event.key, event.value, params);
@@ -1047,21 +1212,27 @@ export function collectScopedScalarParams(
  * may differ from the pre-unification walkers as long as collisions stay
  * impossible.
  */
-export function fingerprintScopedWhere(qi: BuilderCtx, host: WhereHost, where: Record<string, unknown>): string {
+export function fingerprintScopedWhere(
+  qi: BuilderCtx,
+  host: WhereHost,
+  where: Record<string, unknown>,
+  depth = 0,
+): string {
+  assertWhereDepth(depth);
   const parts: string[] = [];
   for (const event of walkWhere(host, where)) {
     switch (event.kind) {
       case 'or':
-        parts.push(`OR[${event.conditions.map((c) => fingerprintScopedWhere(qi, host, c)).join(',')}]`);
+        parts.push(`OR[${event.conditions.map((c) => fingerprintScopedWhere(qi, host, c, depth + 1)).join(',')}]`);
         break;
       case 'and':
-        parts.push(`AND[${event.conditions.map((c) => fingerprintScopedWhere(qi, host, c)).join(',')}]`);
+        parts.push(`AND[${event.conditions.map((c) => fingerprintScopedWhere(qi, host, c, depth + 1)).join(',')}]`);
         break;
       case 'not':
-        parts.push(`NOT(${fingerprintScopedWhere(qi, host, event.condition)})`);
+        parts.push(`NOT(${fingerprintScopedWhere(qi, host, event.condition, depth + 1)})`);
         break;
       case 'relation':
-        parts.push(`${event.key}:{${fingerprintRelationParts(qi, event.relDef, event.filterObj).join(',')}}`);
+        parts.push(`${event.key}:{${fingerprintRelationParts(qi, event.relDef, event.filterObj, depth).join(',')}}`);
         break;
       case 'scalar':
         parts.push(`${event.key}:${fingerprintScalarToken(event.value)}`);
@@ -1082,6 +1253,13 @@ export function buildRelationFilter(
   filterObj: Record<string, unknown>,
   params: unknown[],
   parentTable?: string,
+  /**
+   * Nesting depth of the WHERE walk that reached this relation filter. Each
+   * relation descent is a level too: `{ posts: { some: { comments: { some:
+   * … } } } }` recurses through here just as `NOT` does, and is exactly as
+   * unbounded without a cap (see {@link assertWhereDepth}).
+   */
+  depth = 0,
 ): string | null {
   const targetTable = relDef.to;
   const targetMeta = qi.schema.tables[targetTable];
@@ -1163,7 +1341,7 @@ export function buildRelationFilter(
   // which also skips null. Unreachable via normalization today, guarded anyway.
   if (filterObj.some !== undefined && filterObj.some !== null) {
     const subWhere = filterObj.some as Record<string, unknown>;
-    const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params);
+    const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
     const filterAnd = filterClause ? ` AND ${filterClause}` : '';
     clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
   }
@@ -1171,7 +1349,7 @@ export function buildRelationFilter(
   // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
   if (filterObj.none !== undefined && filterObj.none !== null) {
     const subWhere = filterObj.none as Record<string, unknown>;
-    const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params);
+    const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
     const filterAnd = filterClause ? ` AND ${filterClause}` : '';
     clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
   }
@@ -1179,7 +1357,7 @@ export function buildRelationFilter(
   // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND gf AND NOT (filter))
   if (filterObj.every !== undefined && filterObj.every !== null) {
     const subWhere = filterObj.every as Record<string, unknown>;
-    const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params);
+    const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
     if (filterClause) {
       // gf params pushed AFTER filter params (collect mirrors this order), but
       // placed textually inside the domain so it restricts which rows count.
@@ -1197,7 +1375,7 @@ export function buildRelationFilter(
       clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gfAnd()})`);
     } else {
       const subWhere = filterObj.is as Record<string, unknown>;
-      const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params);
+      const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
       const filterAnd = filterClause ? ` AND ${filterClause}` : '';
       clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
     }
@@ -1210,7 +1388,7 @@ export function buildRelationFilter(
       clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gfAnd()})`);
     } else {
       const subWhere = filterObj.isNot as Record<string, unknown>;
-      const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params);
+      const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
       const filterAnd = filterClause ? ` AND ${filterClause}` : '';
       clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
     }
@@ -1228,10 +1406,11 @@ export function buildSubWhereForRelation(
   targetTable: string,
   subWhere: Record<string, unknown>,
   params: unknown[],
+  depth = 0,
 ): string | null {
   const meta = qi.schema.tables[targetTable];
   if (!meta) return null;
-  return buildScopedWhere(qi, relationWhereScope(qi, targetTable, meta), subWhere, params);
+  return buildScopedWhere(qi, relationWhereScope(qi, targetTable, meta), subWhere, params, depth);
 }
 
 /**
@@ -1519,15 +1698,15 @@ export function buildOperatorClauses(
   const insensitive = op.mode === 'insensitive';
 
   if (op.contains !== undefined) {
-    params.push(`%${escapeLike(op.contains)}%`);
+    params.push(`%${likeOperand(qi, op.contains)}%`);
     clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
   }
   if (op.startsWith !== undefined) {
-    params.push(`${escapeLike(op.startsWith)}%`);
+    params.push(`${likeOperand(qi, op.startsWith)}%`);
     clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
   }
   if (op.endsWith !== undefined) {
-    params.push(`%${escapeLike(op.endsWith)}`);
+    params.push(`%${likeOperand(qi, op.endsWith)}`);
     clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
   }
 
@@ -1549,6 +1728,38 @@ export function requireFullTextSearch(qi: BuilderCtx): void {
     qi.dialect.name,
     'Full-text `search` compiles to PostgreSQL to_tsvector/to_tsquery. ' +
       'Use `contains` (LIKE) on this engine, or run the query on PostgreSQL.',
+  );
+}
+
+/**
+ * Gate the pathless JSON containment filters (`contains`, and the `equals`
+ * spelling that compiles to the same expression) on
+ * {@link Dialect.supportsJsonContains}.
+ *
+ * The engine this exists for is SQLite, whose emulation compares a decoded
+ * `json_each.value` against a param bound as JSON TEXT and therefore matched
+ * NOTHING, for every operand type: object, array, string and number alike all
+ * returned zero rows where PostgreSQL and MySQL returned the document (measured
+ * in-process, table in dialect.ts). Fewer rows with no error is precisely what
+ * the capability contract exists to convert into a refusal, and since the
+ * feature never worked there, refusing it removes nothing.
+ *
+ * Called from BOTH the build and the param-collect side, and here that is
+ * load-bearing rather than symmetric-for-its-own-sake: a {@link JsonFilter}
+ * fingerprints by which KEYS are present, not by what they hold, so every
+ * `contains` on a column shares one cache entry and a build-only gate would be
+ * skipped for the entire warm life of that entry.
+ */
+export function requireJsonContains(qi: BuilderCtx, clause: 'contains' | 'equals'): void {
+  if (qi.dialect.supportsJsonContains) return;
+  throw new UnsupportedFeatureError(
+    `JSON containment (\`${clause}\` without \`path\`)`,
+    qi.dialect.name,
+    `This engine has no equivalent of PostgreSQL's \`@>\`, and the emulation Turbine used for ` +
+      `\`${clause}\` matched no rows for any operand rather than failing, so it is refused instead. ` +
+      'Filter on the specific value instead: `{ path: [...], equals: ... }` compiles to a real JSON ' +
+      'extraction (`json_extract`) rather than an emulation. For structural containment, run the ' +
+      'query on PostgreSQL or MySQL.',
   );
 }
 
@@ -1801,12 +2012,15 @@ export function jsonStringEntries(
     if (filter.path === undefined) {
       throw new ValidationError(
         `[turbine] JSON operator '${op}' on ${column} requires a \`path\` ` +
-          `(e.g. { path: ['meta', 'title'], ${op}: ${JSON.stringify(value)} }).`,
+          `(e.g. { path: ['meta', 'title'], ${op}: ${valueForMessage(value)} }).`,
       );
     }
     if (typeof value !== 'string') {
+      // `typeof` rather than the value: it says everything the reader needs
+      // (they passed a number where a string belongs) and carries no data.
       throw new ValidationError(
-        `[turbine] JSON operator '${op}' on ${column} requires a string, got ${JSON.stringify(value)}.`,
+        `[turbine] JSON operator '${op}' on ${column} requires a string, got ${typeof value} ` +
+          `(${valueForMessage(value)}).`,
       );
     }
     entries.push({ op, pattern, value });
@@ -1826,13 +2040,13 @@ export function jsonRangeEntries(
     if (filter.path === undefined) {
       throw new ValidationError(
         `[turbine] JSON range operator '${op}' on ${column} requires a \`path\` ` +
-          `(e.g. { path: ['meta', 'score'], ${op}: ${JSON.stringify(value)} }).`,
+          `(e.g. { path: ['meta', 'score'], ${op}: ${valueForMessage(value)} }).`,
       );
     }
     if (typeof value !== 'number' && typeof value !== 'string') {
       throw new ValidationError(
         `[turbine] JSON range operator '${op}' on ${column} requires a number or string, ` +
-          `got ${JSON.stringify(value)}.`,
+          `got ${typeof value} (${valueForMessage(value)}).`,
       );
     }
     if (typeof value === 'number' && !Number.isFinite(value)) {
@@ -1877,13 +2091,19 @@ export function buildJsonFilterClauses(
     params.push(String(filter.equals));
     clauses.push(`${extract} = ${qi.p(params.length)}`);
   } else if (filter.equals !== undefined) {
-    // Containment equality: column @> $N::jsonb
+    // Containment equality: column @> $N::jsonb. A pathless `equals` compiles
+    // to the SAME containment expression `contains` does, so it inherits the
+    // same engine limitation and is refused under its own clause name (the two
+    // spellings are far enough apart that naming the wrong one would send the
+    // reader to the wrong line).
+    requireJsonContains(qi, 'equals');
     params.push(JSON.stringify(filter.equals));
     clauses.push(qi.dialect.buildJsonContains(column, qi.p(params.length)));
   }
 
   if (filter.contains !== undefined) {
     // Containment: column @> $N::jsonb
+    requireJsonContains(qi, 'contains');
     params.push(JSON.stringify(filter.contains));
     clauses.push(qi.dialect.buildJsonContains(column, qi.p(params.length)));
   }
@@ -1908,7 +2128,7 @@ export function buildJsonFilterClauses(
   // `_` matches literally instead of turning into a wildcard.
   for (const { pattern, value } of jsonStringEntries(filter, column)) {
     const extract = pathExtract();
-    params.push(pattern(escapeLike(value)));
+    params.push(pattern(likeOperand(qi, value)));
     clauses.push(buildLikeClause(qi, extract, qi.p(params.length), filter.mode === 'insensitive'));
   }
 
@@ -2015,25 +2235,52 @@ export function buildVectorFilterClauses(
   const distanceExpr = `${qi.q(rawColumn)} ${operator} ${placeholder}`;
 
   const clauses: string[] = [];
+  for (const { sqlOp, threshold } of vectorThresholdEntries(filter, field)) {
+    params.push(threshold);
+    clauses.push(`${distanceExpr} ${sqlOp} ${qi.p(params.length)}`);
+  }
+  return clauses;
+}
+
+/**
+ * Validate and enumerate the distance comparisons on a vector filter, in the
+ * fixed {@link VECTOR_DISTANCE_COMPARATORS} order. Shared by the SQL-build path
+ * ({@link buildVectorFilterClauses}) and the cache-hit param-collect path
+ * ({@link collectVectorFilterParams}), exactly like {@link jsonRangeEntries}.
+ *
+ * IT IS THE VALIDATION THAT MAKES THIS SHARED, not the enumeration. Both sides
+ * used to inline the same `for` loop, and only the build side checked the
+ * threshold. That build side does not run on a cache HIT, and outside dev the
+ * lockstep cross-check (which re-runs it, and is what masked this) is off, so a
+ * warmed template bound `lt: NaN`, `lt: '5'` or `lt: { a: 1 }` straight into
+ * the statement. NaN is the one that matters: Postgres sorts it above every
+ * real distance, so `distance < NaN` matches EVERY row, i.e. the predicate
+ * inverts, silently, in production only. Same bug class as the 0.19.2 /
+ * 0.32.1 cache-hit drifts, and the same fix: one function, both paths.
+ *
+ * The "at least one comparison" refusal lives here too, so the collect path
+ * cannot quietly accept a filter the build path rejects.
+ */
+export function vectorThresholdEntries(filter: VectorFilter, field: string): { sqlOp: string; threshold: number }[] {
+  const dist = filter.distance;
+  const entries: { sqlOp: string; threshold: number }[] = [];
   for (const [cmp, sqlOp] of Object.entries(VECTOR_DISTANCE_COMPARATORS)) {
     const threshold = (dist as unknown as Record<string, unknown>)[cmp];
     if (threshold === undefined) continue;
     if (typeof threshold !== 'number' || !Number.isFinite(threshold)) {
       throw new ValidationError(
         `[turbine] Vector distance threshold "${cmp}" on "${field}" must be a finite number; ` +
-          `got ${JSON.stringify(threshold)}.`,
+          `got ${typeof threshold} (${valueForMessage(threshold)}).`,
       );
     }
-    params.push(threshold);
-    clauses.push(`${distanceExpr} ${sqlOp} ${qi.p(params.length)}`);
+    entries.push({ sqlOp, threshold });
   }
-
-  if (clauses.length === 0) {
+  if (entries.length === 0) {
     throw new ValidationError(
       `[turbine] Vector distance filter on "${field}" requires at least one comparison (lt / lte / gt / gte).`,
     );
   }
-  return clauses;
+  return entries;
 }
 
 /**

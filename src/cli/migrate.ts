@@ -21,6 +21,15 @@ import { postgresql } from '../adapters/index.js';
 import { type Dialect, postgresDialect } from '../dialect.js';
 import { MigrationError } from '../errors.js';
 import { DESTRUCTIVE_KIND_LABEL, type DestructiveStatement, scanDestructiveSql } from './destructive.js';
+import { splitSqlStatements, tokenizeSql } from './sql-statements.js';
+
+/**
+ * Re-exported from `./sql-statements.js`, which owns the one tokenizer this
+ * module and `destructive.js` both speak. It used to live here, and the guard
+ * carried a second, subtly different copy: see that module's header for what
+ * they disagreed about and what it cost.
+ */
+export { splitSqlStatements };
 
 // ---------------------------------------------------------------------------
 // Types
@@ -97,6 +106,46 @@ export function migrationTimestamp(name: string): string | null {
   return m ? m[1]! : null;
 }
 
+/**
+ * Refuse any migration in the batch that manages its own transactions.
+ *
+ * `-- turbine:no-transaction` files are exempt: they were never wrapped, so
+ * theirs is a real (and supported) transaction to manage. Pre-flight over the
+ * WHOLE batch, before anything runs, so a bad file at position 3 does not leave
+ * migrations 1 and 2 applied.
+ *
+ * @internal exported for tests.
+ */
+export function assertNoEmbeddedTransactions(files: MigrationFile[], section: 'up' | 'down'): void {
+  const offenders: Array<{ file: string; statements: string[] }> = [];
+  for (const file of files) {
+    const parsed = parseMigrationSQL(file.path);
+    if (parsed.noTransaction) continue;
+    const statements = findTransactionControlStatements(section === 'up' ? parsed.up : parsed.down);
+    if (statements.length > 0) offenders.push({ file: file.filename, statements });
+  }
+  if (offenders.length === 0) return;
+
+  const lines = [
+    `[turbine] Refusing to run migrations that manage transactions themselves (${section.toUpperCase()} section):`,
+    '',
+  ];
+  for (const o of offenders) {
+    lines.push(`  ${o.file}`);
+    for (const s of o.statements) lines.push(`    - ${s}`);
+  }
+  lines.push('');
+  lines.push('`turbine migrate` already runs each migration file inside exactly ONE transaction.');
+  lines.push('An embedded COMMIT ends that wrapper: everything before it becomes durable,');
+  lines.push('everything after runs unprotected, and the migration is recorded nowhere, so a');
+  lines.push('rerun fails forever on "already exists".');
+  lines.push('');
+  lines.push('Delete the BEGIN/COMMIT/ROLLBACK statements (the runner supplies the transaction),');
+  lines.push('or, if this migration genuinely cannot run inside one (CREATE INDEX CONCURRENTLY),');
+  lines.push('add `-- turbine:no-transaction` to the file header and manage it yourself.');
+  throw new MigrationError(lines.join('\n'));
+}
+
 /** Scan a set of migration files' UP sections for data-destroying statements. */
 export function collectUpDestructive(files: MigrationFile[]): DestructiveOffender[] {
   const offenders: DestructiveOffender[] = [];
@@ -134,8 +183,33 @@ function quotedTrackingTable(dialect: Dialect): string {
   return dialect.quoteIdentifier(TRACKING_TABLE);
 }
 
+/**
+ * Postgres error codes that mean "someone else created this table between our
+ * existence check and our CREATE".
+ *
+ * `CREATE TABLE IF NOT EXISTS` is NOT race-free: the existence check and the
+ * catalog insert are separate steps, so two concurrent sessions can both pass
+ * the check and the loser gets a hard error rather than a quiet no-op. Measured
+ * on a fresh database with 12 concurrent `migrate status` calls: 1 succeeded and
+ * 11 crashed, on `duplicate key value violates unique constraint
+ * "pg_type_typname_nsp_index"` (23505) and `relation "_turbine_migrations"
+ * already exists` (42P07). `migrate up`/`down` hold the migration lock before
+ * they reach here, but `migrate status` and the deploy inspector deliberately do
+ * not, and read-only commands should not need a lock to survive each other.
+ */
+const TABLE_ALREADY_EXISTS_CODES = new Set(['23505', '42P07']);
+
 async function ensureTrackingTable(client: pg.Client, dialect: Dialect = postgresDialect): Promise<void> {
-  await client.query(dialect.buildMigrationTrackingTable(quotedTrackingTable(dialect)));
+  const sql = dialect.buildMigrationTrackingTable(quotedTrackingTable(dialect));
+  try {
+    await client.query(sql);
+  } catch (err) {
+    if (!TABLE_ALREADY_EXISTS_CODES.has(String((err as { code?: string }).code))) throw err;
+    // The winner has committed by the time we see its error, so the retry finds
+    // the table present and the statement really is a no-op. Retried ONCE: a
+    // second failure is not this race and must surface.
+    await client.query(sql);
+  }
 }
 
 async function getAppliedMigrations(
@@ -166,6 +240,28 @@ export function parseMigrationFilename(filename: string): MigrationFile | null {
     name: filename.replace(/\.sql$/, ''),
     timestamp: match[1]!,
   };
+}
+
+/**
+ * A migration name as it can safely appear in a file's `-- Migration:` header
+ * comment.
+ *
+ * The header sits ABOVE the `-- UP` marker, and the raw CLI argument used to be
+ * interpolated into it verbatim. A `--` comment ends at the first newline, so a
+ * name carrying one closes the comment and everything after it becomes file
+ * content: a name of `x\n-- turbine:no-transaction\n-- UP\nDROP TABLE users;`
+ * wrote both an execution directive and executable SQL into a migration the
+ * user never authored. Only the FILENAME was sanitized, which is the one place
+ * the injection could not reach.
+ *
+ * Collapsing every run of whitespace to a single space is the whole fix: the
+ * argument then cannot leave the one comment line it was written on, and `\s`
+ * covers `\r` and the Unicode line separators too, all of which Postgres also
+ * treats as ending a `--` comment. The readable spelling is preserved, unlike
+ * {@link sanitizeName}, because this is documentation for a human.
+ */
+export function headerSafeName(name: string): string {
+  return name.replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -232,6 +328,22 @@ export function listMigrationFiles(migrationsDir: string): MigrationFile[] {
  */
 const NO_TRANSACTION_DIRECTIVE = /^--\s*turbine:no-transaction\s*$/i;
 
+/**
+ * A section marker line.
+ *
+ * Matching the exact strings `-- UP` and `-- DOWN` was too strict for the ways
+ * people actually write them: `--DOWN`, `--  DOWN`, and `-- DOWN;` all read as
+ * ordinary comments, so the whole rollback section silently folded into the UP
+ * section and RAN as part of the migration. `migrate up` was saved from the
+ * worst of that by the destructive gate, but `migrate deploy` passes
+ * `allowDestructive: true` unconditionally, so a create-then-drop pair applied
+ * as one "successful" migration.
+ *
+ * Deliberately still anchored end-to-end: `-- UPDATE the widgets table` is a
+ * comment, not a marker.
+ */
+const SECTION_MARKER = /^--\s*(UP|DOWN)\s*;?\s*$/i;
+
 /** The parsed sections of a migration file plus its execution directives. */
 export interface ParsedMigration {
   up: string;
@@ -242,36 +354,56 @@ export interface ParsedMigration {
 
 /**
  * Parse migration content string into UP and DOWN sections plus directives.
+ *
+ * Throws `MigrationError` when the file carries no `-- UP` marker at all.
+ * Returning `{ up: '', down: '' }` there meant the entire file was treated as
+ * preamble and the migration recorded as applied having executed nothing, which
+ * is worse than any error: the database is missing the change and the history
+ * says it is present. `source` (a path) is only used to name the file.
+ *
  * Exported for unit testing.
  */
-export function parseMigrationContent(content: string): ParsedMigration {
+export function parseMigrationContent(content: string, source?: string): ParsedMigration {
   const lines = content.split('\n');
 
   let section: 'none' | 'up' | 'down' = 'none';
+  let sawUpMarker = false;
   let noTransaction = false;
   const upLines: string[] = [];
   const downLines: string[] = [];
 
   for (const line of lines) {
     const trimmed = line.trim();
-    const upper = trimmed.toUpperCase();
     // The directive is only honored in the header (before -- UP), so it can
     // never be smuggled in via a DOWN-section comment.
     if (section === 'none' && NO_TRANSACTION_DIRECTIVE.test(trimmed)) {
       noTransaction = true;
       continue;
     }
-    if (upper === '-- UP') {
-      section = 'up';
-      continue;
-    }
-    if (upper === '-- DOWN') {
-      section = 'down';
+    const marker = SECTION_MARKER.exec(trimmed);
+    if (marker) {
+      const isUp = marker[1]!.toUpperCase() === 'UP';
+      section = isUp ? 'up' : 'down';
+      sawUpMarker ||= isUp;
       continue;
     }
 
     if (section === 'up') upLines.push(line);
     else if (section === 'down') downLines.push(line);
+  }
+
+  if (!sawUpMarker) {
+    throw new MigrationError(
+      [
+        `[turbine] Migration file has no \`-- UP\` section marker${source ? `: ${source}` : '.'}`,
+        '',
+        'A migration must contain a line reading `-- UP` (a `-- DOWN` line is optional).',
+        'Without it the whole file is a header comment: nothing would run, and the',
+        'migration would still be recorded as applied.',
+        '',
+        'Accepted spellings: `-- UP`, `--UP`, `-- up`, `-- UP;` (leading/trailing spaces fine).',
+      ].join('\n'),
+    );
   }
 
   return {
@@ -282,172 +414,42 @@ export function parseMigrationContent(content: string): ParsedMigration {
 }
 
 /**
- * Split a SQL script into individual statements on top-level semicolons.
+ * Statements that end (or restart) the transaction the runner wraps a migration
+ * file in.
  *
- * A correct tokenizer, not a `split(';')`: a semicolon inside a single-quoted
- * string (including a backslash-escaping `E'...'` string), a double-quoted
- * identifier, a dollar-quoted body, a line comment
- * (`--`), or a block comment (`/* *\/`, which Postgres allows to nest) must NOT
- * split. This is the one production-destroying failure mode of no-transaction
- * migrations (a partial statement executed against production), so the behavior
- * is pinned by exhaustive unit tests.
+ * `runMigrationInTransaction` issues `BEGIN`, the file body, the tracking-table
+ * write, then `COMMIT`. An embedded `COMMIT;` in the body commits THAT wrapper:
+ * everything before it becomes durable, everything after runs unprotected, the
+ * tracking write happens outside any transaction the failure path can undo, and
+ * a mid-file error leaves the migration recorded nowhere. Rerunning then fails
+ * forever on "already exists". So the runner refuses the file instead.
  *
- * Comment-only fragments are dropped; every returned statement is trimmed and
- * carries no trailing semicolon.
+ * `END` is deliberately NOT in this list even though Postgres accepts it as a
+ * synonym for COMMIT: a PG14+ `CREATE FUNCTION ... BEGIN ATOMIC ... END;` body
+ * splits at its inner semicolons, leaving a bare `END` fragment, and refusing
+ * that would break working migrations to catch a spelling nobody writes.
+ * `ROLLBACK TO [SAVEPOINT] x` is excluded for the opposite reason: it is the one
+ * ROLLBACK form that leaves the wrapping transaction open, so it is legitimate.
  */
-export function splitSqlStatements(sql: string): string[] {
-  const statements: string[] = [];
-  let current = '';
-  let i = 0;
-  const n = sql.length;
-
-  while (i < n) {
-    const ch = sql[i]!;
-    const next = sql[i + 1];
-
-    // Line comment: consume to end of line (kept verbatim in the statement).
-    if (ch === '-' && next === '-') {
-      let j = i;
-      while (j < n && sql[j] !== '\n') j++;
-      current += sql.slice(i, j);
-      i = j;
-      continue;
-    }
-
-    // Block comment (Postgres allows nesting: /* /* */ */).
-    if (ch === '/' && next === '*') {
-      let depth = 1;
-      let j = i + 2;
-      current += '/*';
-      while (j < n && depth > 0) {
-        if (sql[j] === '/' && sql[j + 1] === '*') {
-          depth++;
-          current += '/*';
-          j += 2;
-        } else if (sql[j] === '*' && sql[j + 1] === '/') {
-          depth--;
-          current += '*/';
-          j += 2;
-        } else {
-          current += sql[j];
-          j++;
-        }
-      }
-      i = j;
-      continue;
-    }
-
-    // Single-quoted string ('' is an escaped quote, stays inside the string).
-    // An E-prefixed string (E'...') additionally honors backslash escapes, so
-    // `E'p\'q'` is ONE string: treating the `\'` as a terminator would close the
-    // string early and let the next quote swallow a real statement terminator.
-    if (ch === "'") {
-      const backslashEscapes = isEscapeStringPrefix(sql, i);
-      let j = i + 1;
-      current += "'";
-      while (j < n) {
-        if (backslashEscapes && sql[j] === '\\' && j + 1 < n) {
-          current += sql[j]! + sql[j + 1]!;
-          j += 2;
-          continue;
-        }
-        if (sql[j] === "'" && sql[j + 1] === "'") {
-          current += "''";
-          j += 2;
-          continue;
-        }
-        if (sql[j] === "'") {
-          current += "'";
-          j++;
-          break;
-        }
-        current += sql[j];
-        j++;
-      }
-      i = j;
-      continue;
-    }
-
-    // Double-quoted identifier ("" is an escaped quote).
-    if (ch === '"') {
-      let j = i + 1;
-      current += '"';
-      while (j < n) {
-        if (sql[j] === '"' && sql[j + 1] === '"') {
-          current += '""';
-          j += 2;
-          continue;
-        }
-        if (sql[j] === '"') {
-          current += '"';
-          j++;
-          break;
-        }
-        current += sql[j];
-        j++;
-      }
-      i = j;
-      continue;
-    }
-
-    // Dollar-quoted body ($tag$ ... $tag$; tag is empty or an identifier, never
-    // digit-leading, so a `$1` parameter placeholder is not mistaken for one).
-    if (ch === '$') {
-      const tagMatch = /^\$([A-Za-z_][A-Za-z_0-9]*)?\$/.exec(sql.slice(i));
-      if (tagMatch) {
-        const tag = tagMatch[0];
-        const end = sql.indexOf(tag, i + tag.length);
-        if (end === -1) {
-          current += sql.slice(i);
-          i = n;
-          continue;
-        }
-        current += sql.slice(i, end + tag.length);
-        i = end + tag.length;
-        continue;
-      }
-    }
-
-    // Top-level statement terminator.
-    if (ch === ';') {
-      const trimmed = current.trim();
-      if (trimmed) statements.push(trimmed);
-      current = '';
-      i++;
-      continue;
-    }
-
-    current += ch;
-    i++;
-  }
-
-  const tail = current.trim();
-  if (tail) statements.push(tail);
-
-  return statements.filter((s) => !isCommentOnlyStatement(s));
-}
+const TRANSACTION_CONTROL = /^(BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK|ABORT)\b/i;
+const ROLLBACK_TO_SAVEPOINT = /^ROLLBACK\s+TO\b/i;
 
 /**
- * True when the quote at `quoteAt` opens a Postgres escape string (`E'...'`),
- * whose body treats a backslash as an escape character.
+ * Top-level transaction-control statements in a migration body, as displayable
+ * text. Empty for a clean file. Comment- and literal-aware via the shared
+ * tokenizer, so a `COMMIT` inside a comment or a string is not flagged.
  *
- * The `E` must be a standalone token: an identifier that merely ends in `e`
- * (`some_table` cannot be followed by a quote in valid SQL, but the check keeps
- * the tokenizer honest) does not turn the following literal into an E-string.
- * Ordinary literals are left alone on purpose: with the modern
- * `standard_conforming_strings = on` default, `'a\'` IS a complete string.
+ * @internal exported for tests.
  */
-function isEscapeStringPrefix(sql: string, quoteAt: number): boolean {
-  const prev = sql[quoteAt - 1];
-  if (prev !== 'E' && prev !== 'e') return false;
-  const before = sql[quoteAt - 2];
-  return before === undefined || !/[A-Za-z0-9_$"]/.test(before);
-}
-
-/** True when a fragment contains nothing but comments and whitespace. */
-function isCommentOnlyStatement(stmt: string): boolean {
-  const withoutComments = stmt.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ');
-  return withoutComments.trim().length === 0;
+export function findTransactionControlStatements(body: string): string[] {
+  const found: string[] = [];
+  for (const statement of tokenizeSql(body)) {
+    if (statement.commentOnly) continue;
+    const head = statement.stripped;
+    if (!TRANSACTION_CONTROL.test(head) || ROLLBACK_TO_SAVEPOINT.test(head)) continue;
+    found.push(head.replace(/\s+/g, ' ').slice(0, 80));
+  }
+  return found;
 }
 
 /**
@@ -455,7 +457,7 @@ function isCommentOnlyStatement(stmt: string): boolean {
  */
 export function parseMigrationSQL(filePath: string): ParsedMigration {
   const content = readFileSync(filePath, 'utf-8');
-  return parseMigrationContent(content);
+  return parseMigrationContent(content, filePath);
 }
 
 /**
@@ -539,6 +541,12 @@ function buildBackfillRecipe(): { up: string; down: string } {
 -- your table, the new column, the old column, and the transform, then uncomment
 -- the phases you need and review before running \`npx turbine migrate up\`.
 --
+-- Do NOT add BEGIN/COMMIT of your own anywhere in this file. \`turbine migrate\`
+-- already runs each migration file inside exactly ONE transaction, so every
+-- statement here commits or rolls back together. An embedded COMMIT would end
+-- that wrapper early, leaving the first half durable and the migration recorded
+-- nowhere; the runner refuses a file that contains one.
+--
 -- Phase 1: add the new column as NULLABLE. This is a fast, non-blocking change
 -- (no table rewrite, no long lock), so it is safe to ship ahead of the backfill.
 -- ALTER TABLE "my_table" ADD COLUMN "new_col" text;
@@ -561,17 +569,15 @@ function buildBackfillRecipe(): { up: string; down: string } {
 -- ALTER TABLE "my_table" ALTER COLUMN "new_col" SET NOT NULL;
 --
 -- Phase 4 (optional atomic swap): retire the old column and rename the new one
--- into its place, in one transaction so readers never see a missing column.
--- BEGIN;
---   ALTER TABLE "my_table" RENAME COLUMN "old_col" TO "old_col_retired";
---   ALTER TABLE "my_table" RENAME COLUMN "new_col" TO "old_col";
--- COMMIT;`;
+-- into its place. Both renames land in the runner's single per-file
+-- transaction, so readers never see a missing column: no BEGIN/COMMIT needed.
+-- ALTER TABLE "my_table" RENAME COLUMN "old_col" TO "old_col_retired";
+-- ALTER TABLE "my_table" RENAME COLUMN "new_col" TO "old_col";`;
 
-  const down = `-- Reverse the Phase 4 atomic swap (only if you ran it).
--- BEGIN;
---   ALTER TABLE "my_table" RENAME COLUMN "old_col" TO "new_col";
---   ALTER TABLE "my_table" RENAME COLUMN "old_col_retired" TO "old_col";
--- COMMIT;
+  const down = `-- Reverse the Phase 4 atomic swap (only if you ran it). Same single
+-- transaction as the UP direction, so again no BEGIN/COMMIT of your own.
+-- ALTER TABLE "my_table" RENAME COLUMN "old_col" TO "new_col";
+-- ALTER TABLE "my_table" RENAME COLUMN "old_col_retired" TO "old_col";
 --
 -- If you stopped after phases 1 to 3, drop the added column instead:
 -- ALTER TABLE "my_table" DROP COLUMN "new_col";`;
@@ -723,6 +729,9 @@ export function createMigration(
   const now = new Date();
   const ts = formatTimestamp(now);
   const safeName = sanitizeName(name);
+  // The header comment is the ONLY place the caller's raw string reaches the
+  // file, and it sits above `-- UP`: see headerSafeName for what that allowed.
+  const headerName = headerSafeName(name);
 
   const filename = `${ts}_${safeName}.sql`;
   const filePath = join(migrationsDir, filename);
@@ -734,8 +743,10 @@ export function createMigration(
       const known = Object.keys(MIGRATION_RECIPES).join(', ') || '(none)';
       throw new MigrationError(`[turbine] Unknown migration recipe "${options.recipe}". Available recipes: ${known}`);
     }
-    const body = recipe.build(name);
-    template = `-- Migration: ${name} (${options.recipe} recipe scaffold)
+    // A recipe builds the BODY, below `-- UP`, where a newline is not merely a
+    // comment break but directly executable, so it gets the safe name too.
+    const body = recipe.build(headerName);
+    template = `-- Migration: ${headerName} (${options.recipe} recipe scaffold)
 -- Created: ${now.toISOString()}
 -- Fill in the placeholders and review before running: npx turbine migrate up
 
@@ -747,7 +758,7 @@ ${body.down}
 `;
   } else if (autoContent) {
     const headerBlock = options?.header ? `${options.header}\n` : '';
-    template = `-- Migration: ${name} (auto-generated)
+    template = `-- Migration: ${headerName} (auto-generated)
 -- Created: ${now.toISOString()}
 -- Review this file before running: npx turbine migrate up
 ${headerBlock}
@@ -758,7 +769,7 @@ ${autoContent.up}
 ${autoContent.down}
 `;
   } else {
-    template = `-- Migration: ${name}
+    template = `-- Migration: ${headerName}
 -- Created: ${now.toISOString()}
 
 -- UP
@@ -817,15 +828,107 @@ async function getCurrentDatabaseName(client: pg.Client): Promise<string> {
   return result.rows[0]?.current_database ?? '';
 }
 
-async function acquireLock(client: pg.Client, lockId: number, adapter?: DatabaseAdapter): Promise<boolean> {
-  const a = adapter ?? postgresql;
-  // pg.Client satisfies PgCompatPoolClient (query + release)
-  return a.acquireLock(client as unknown as import('../client.js').PgCompatPoolClient, lockId);
+/** Open the second, lock-only connection. Separated so tests can fake it. */
+async function openLockConnection(connectionString: string): Promise<MigrationLockClient> {
+  const client = new pg.Client({ connectionString });
+  await client.connect();
+  return client;
 }
 
-async function releaseLock(client: pg.Client, lockId: number, adapter?: DatabaseAdapter): Promise<void> {
+/**
+ * The connection surface the migration lock needs. `pg.Client` satisfies it;
+ * tests substitute a fake so the dedicated-connection wiring can be exercised
+ * without a database.
+ *
+ * @internal
+ */
+export interface MigrationLockClient {
+  query(sql: string, params?: unknown[]): Promise<unknown>;
+  end(): Promise<void>;
+}
+
+/** A held (or refused) migration lock, and whatever must be released with it. */
+export interface MigrationLock {
+  /** False when another migration already holds the lock. */
+  acquired: boolean;
+  lockId: number;
+  adapter: DatabaseAdapter;
+  /**
+   * The dedicated connection holding the lock, present only for adapters whose
+   * lock lives in an open transaction. Closed by {@link releaseMigrationLock}.
+   */
+  lockClient?: MigrationLockClient;
+}
+
+/**
+ * Take the migration lock, on a DEDICATED connection when the adapter needs one.
+ *
+ * The CockroachDB and YugabyteDB adapters lock a row in `_turbine_lock` with
+ * `SELECT ... FOR UPDATE NOWAIT` and deliberately leave that transaction OPEN,
+ * because a row lock only exists for as long as its transaction does. The runner
+ * then applies every migration on the SAME connection, and
+ * `runMigrationInTransaction` issues BEGIN ... COMMIT per file. That COMMIT ends
+ * the LOCK's transaction: from migration 2 onward the run was unprotected, a
+ * concurrent `turbine migrate` could take the lock and replay those files, and
+ * `releaseLock`'s later COMMIT was a no-op that warned rather than failed, so
+ * nothing surfaced. The same collision had a second face: a
+ * `-- turbine:no-transaction` migration running FIRST executed inside the still
+ * open lock transaction, so `CREATE INDEX CONCURRENTLY` failed with "cannot run
+ * inside a transaction block" while the identical file placed second succeeded.
+ *
+ * A second connection separates the two transaction scopes, which is the only
+ * thing that makes the lock outlive a migration. The advisory-lock path (plain
+ * Postgres, AlloyDB, Timescale) is session-scoped rather than
+ * transaction-scoped, opens NO second connection, and is byte-identical to what
+ * it has always done.
+ *
+ * @internal exported for tests.
+ */
+export async function acquireMigrationLock(
+  runner: MigrationLockClient,
+  lockId: number,
+  adapter: DatabaseAdapter | undefined,
+  openLockConnection: () => Promise<MigrationLockClient>,
+): Promise<MigrationLock> {
   const a = adapter ?? postgresql;
-  await a.releaseLock(client as unknown as import('../client.js').PgCompatPoolClient, lockId);
+  const lockClient = a.lockHoldsOpenTransaction ? await openLockConnection() : undefined;
+  try {
+    // pg.Client satisfies PgCompatPoolClient (query + release)
+    const acquired = await a.acquireLock(
+      (lockClient ?? runner) as unknown as import('../client.js').PgCompatPoolClient,
+      lockId,
+    );
+    if (!acquired && lockClient) await lockClient.end();
+    return { acquired, lockId, adapter: a, lockClient: acquired ? lockClient : undefined };
+  } catch (err) {
+    if (lockClient) {
+      try {
+        await lockClient.end();
+      } catch {
+        // Best effort: the acquire error below is what the user needs to see.
+      }
+    }
+    throw err;
+  }
+}
+
+/**
+ * Release a lock taken by {@link acquireMigrationLock}, and close the dedicated
+ * connection when there is one. A refused lock owns nothing, so releasing it is
+ * a no-op rather than an unlock of somebody else's lock.
+ *
+ * @internal exported for tests.
+ */
+export async function releaseMigrationLock(lock: MigrationLock, runner: MigrationLockClient): Promise<void> {
+  if (!lock.acquired) return;
+  try {
+    await lock.adapter.releaseLock(
+      (lock.lockClient ?? runner) as unknown as import('../client.js').PgCompatPoolClient,
+      lock.lockId,
+    );
+  } finally {
+    if (lock.lockClient) await lock.lockClient.end();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,10 +1189,12 @@ export async function migrateUp(
     const lockId = deriveLockId(dbName);
 
     // Acquire lock to prevent concurrent migrations.
-    // The adapter determines the strategy (advisory lock vs table lock).
+    // The adapter determines the strategy (advisory lock vs table lock), and a
+    // table-lock adapter gets its OWN connection so the per-migration
+    // BEGIN/COMMIT below cannot end the transaction the lock lives in.
     const adapter = options?.adapter;
-    const gotLock = await acquireLock(client, lockId, adapter);
-    if (!gotLock) {
+    const lock = await acquireMigrationLock(client, lockId, adapter, () => openLockConnection(connectionString));
+    if (!lock.acquired) {
       throw new MigrationError('[turbine] Could not acquire migration lock, another migration is already running');
     }
 
@@ -1126,6 +1231,11 @@ export async function migrateUp(
       if (options?.step != null && options.step > 0) {
         pending = pending.slice(0, options.step);
       }
+
+      // Structural check before any policy gate: a file that manages its own
+      // transactions cannot be run safely at all, so it is refused for everyone,
+      // deploy included. Pre-flight over the whole batch, so nothing is applied.
+      assertNoEmbeddedTransactions(pending, 'up');
 
       // Destructive statements in the pending batch, computed once. Returned in
       // the result regardless of the gate so `deploy` can print a notice even
@@ -1168,8 +1278,12 @@ export async function migrateUp(
         const parsed = parseMigrationSQL(file.path);
         const up = parsed.up;
         if (!up) {
+          // STOP, do not skip. Continuing applied later migrations over the gap
+          // this one left, which is the same hazard as continuing past a SQL
+          // failure: the batch is ordered, and a later file may depend on this
+          // one. The SQL-failure path below has always broken here.
           errors.push({ file, error: 'No UP section found in migration file' });
-          continue;
+          break;
         }
 
         const content = readFileSync(file.path, 'utf-8');
@@ -1214,7 +1328,7 @@ export async function migrateUp(
 
       return { applied: results, errors, destructive, outOfOrder, noTransaction: noTransactionApplied };
     } finally {
-      await releaseLock(client, lockId, adapter);
+      await releaseMigrationLock(lock, client);
     }
   } finally {
     await client.end();
@@ -1237,6 +1351,81 @@ export async function migrateDeploy(
     allowDestructive: true,
     adapter: options?.adapter,
   });
+}
+
+/**
+ * Roll back a prepared LIFO batch, newest first, stopping at the first
+ * migration that cannot be rolled back.
+ *
+ * A rollback batch is strictly LIFO and must have NO GAPS. The
+ * "file not found" and "no DOWN section" branches used to `continue`, so a
+ * `--step 3` whose middle migration had no DOWN section rolled back 3 and then
+ * 1: the oldest migration's schema was torn down while the data migration 2 had
+ * seeded into it was still expected to exist, and the tracking table was left
+ * claiming migration 2 alone was applied. The next `migrate up` then re-ran 1
+ * and 3 and never re-ran 2, so that data was gone permanently. Both branches
+ * now stop, which is what the SQL-failure branches have always done.
+ *
+ * Split out of {@link migrateDown} so the ordering contract is testable against
+ * a fake client, without a database.
+ *
+ * @internal exported for tests; not part of the CLI's public surface.
+ */
+export async function rollbackMigrations(
+  client: MigrationTxClient,
+  toRollback: Array<{ name: string }>,
+  fileMap: Map<string, MigrationFile>,
+  deleteApplied: string,
+): Promise<{ rolledBack: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
+  const results: MigrationFile[] = [];
+  const errors: Array<{ file: MigrationFile; error: string }> = [];
+
+  for (const migration of toRollback) {
+    const file = fileMap.get(migration.name);
+    if (!file) {
+      errors.push({
+        file: { filename: `${migration.name}.sql`, path: '', name: migration.name, timestamp: '' },
+        error: `Migration file not found for "${migration.name}"`,
+      });
+      break;
+    }
+
+    const parsed = parseMigrationSQL(file.path);
+    const down = parsed.down;
+    if (!down) {
+      errors.push({ file, error: 'No DOWN section found in migration file' });
+      break;
+    }
+
+    if (parsed.noTransaction) {
+      // Untransacted rollback (DROP INDEX CONCURRENTLY IF EXISTS), one
+      // statement per query() call: same contract as the untransacted UP.
+      try {
+        for (const stmt of splitSqlStatements(down)) {
+          await client.query(stmt);
+        }
+        await client.query(deleteApplied, [migration.name]);
+        results.push(file);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push({ file, error: msg });
+        break;
+      }
+      continue;
+    }
+
+    const failure = await runMigrationInTransaction(client, down, {
+      sql: deleteApplied,
+      params: [migration.name],
+    });
+    if (failure !== null) {
+      errors.push({ file, error: failure });
+      break;
+    }
+    results.push(file);
+  }
+
+  return { rolledBack: results, errors };
 }
 
 /**
@@ -1263,8 +1452,8 @@ export async function migrateDown(
     const lockId = deriveLockId(dbName);
 
     const adapter = options?.adapter;
-    const gotLock = await acquireLock(client, lockId, adapter);
-    if (!gotLock) {
+    const lock = await acquireMigrationLock(client, lockId, adapter, () => openLockConnection(connectionString));
+    if (!lock.acquired) {
       throw new MigrationError('[turbine] Could not acquire migration lock, another migration is already running');
     }
 
@@ -1281,6 +1470,13 @@ export async function migrateDown(
 
       // Reverse order, rollback most recent first
       const toRollback = applied.reverse().slice(0, options?.step ?? 1);
+
+      // Same structural pre-flight as migrateUp: a DOWN body is wrapped in the
+      // same single transaction, so it cannot manage its own either.
+      assertNoEmbeddedTransactions(
+        toRollback.map((m) => fileMap.get(m.name)).filter((f): f is MigrationFile => f !== undefined),
+        'down',
+      );
 
       // Same data-loss gate as migrateUp, DOWN sections routinely contain
       // DROP TABLE (the legitimate reverse of a CREATE), which still destroys
@@ -1310,59 +1506,14 @@ export async function migrateDown(
         }
       }
 
-      const results: MigrationFile[] = [];
-      const errors: Array<{ file: MigrationFile; error: string }> = [];
-
-      for (const migration of toRollback) {
-        const file = fileMap.get(migration.name);
-        if (!file) {
-          errors.push({
-            file: { filename: `${migration.name}.sql`, path: '', name: migration.name, timestamp: '' },
-            error: `Migration file not found for "${migration.name}"`,
-          });
-          continue;
-        }
-
-        const parsed = parseMigrationSQL(file.path);
-        const down = parsed.down;
-        if (!down) {
-          errors.push({ file, error: 'No DOWN section found in migration file' });
-          continue;
-        }
-
-        const deleteApplied = dialect.buildMigrationDeleteApplied(quotedTrackingTable(dialect));
-
-        if (parsed.noTransaction) {
-          // Untransacted rollback (DROP INDEX CONCURRENTLY IF EXISTS), one
-          // statement per query() call: same contract as the untransacted UP.
-          try {
-            for (const stmt of splitSqlStatements(down)) {
-              await client.query(stmt);
-            }
-            await client.query(deleteApplied, [migration.name]);
-            results.push(file);
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            errors.push({ file, error: msg });
-            break;
-          }
-          continue;
-        }
-
-        const failure = await runMigrationInTransaction(client, down, {
-          sql: deleteApplied,
-          params: [migration.name],
-        });
-        if (failure !== null) {
-          errors.push({ file, error: failure });
-          break;
-        }
-        results.push(file);
-      }
-
-      return { rolledBack: results, errors };
+      return await rollbackMigrations(
+        client,
+        toRollback,
+        fileMap,
+        dialect.buildMigrationDeleteApplied(quotedTrackingTable(dialect)),
+      );
     } finally {
-      await releaseLock(client, lockId, adapter);
+      await releaseMigrationLock(lock, client);
     }
   } finally {
     await client.end();

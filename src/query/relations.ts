@@ -24,6 +24,7 @@ import {
   isOrderBySpec,
   isRelationPickOrderBy,
   isVectorOrderBy,
+  MAX_NAMED_ORDER_KEYS,
   normalizeOrderBy,
   orderByEntries,
   sortedEntries,
@@ -40,6 +41,7 @@ import type {
 } from './types.js';
 import { assertDirectionToken, assertOrderDirection } from './types.js';
 import {
+  canonicalColumnOrder,
   ownLookup,
   relationInProjectionMessage,
   resolveColumnName,
@@ -170,9 +172,39 @@ export function resolveProjection(
     }
     // Only include columns where value is true. An explicit `select` naming a
     // PII column IS the opt-in: it comes back regardless of `includePii`.
-    return Object.entries(select)
-      .filter(([, v]) => v)
-      .map(([k]) => projectionColumn(table, meta, k, 'select'));
+    //
+    // Emitted in the TABLE's column order, not the caller's key order, which is
+    // the same order the `omit` and default branches below produce. Two reasons,
+    // and the first is a security bound:
+    //
+    // 1. The SELECT list is SQL TEXT, so a caller who reorders their `select`
+    //    keys mints a distinct, permanently-cached, server-side prepared
+    //    statement per permutation (measured: 5,040 statements and 39 MB of
+    //    CachedPlanSource from ONE seven-column table). That is the same
+    //    unbounded-statement failure the `markVariableArity` rule bounds for
+    //    caller-chosen ARITY, reached through caller-chosen ORDER instead, which
+    //    needs no array and no unusual input. `omit` never had it precisely
+    //    because it derives from `allColumns`. See `canonicalColumnOrder`.
+    // 2. It removes a real lockstep hazard. `withFingerprint` already SORTS a
+    //    relation's `select` keys, so the cache key was permutation-invariant
+    //    while the SQL was not: the second permutation was served the first
+    //    one's statement. Harmless for the keyed JSON encoding, NOT harmless for
+    //    `jsonEncoding: 'positional'`, where the emitted array order comes from
+    //    the cached SQL and the decoder (`buildRelationShape`) is rebuilt from
+    //    the current args, so values landed under the wrong keys.
+    //
+    // Order is safe to change here because nothing downstream reads the
+    // projection positionally except through THIS list: the SELECT list, the
+    // relation `json_build_object` pairs and the positional `RelationShape`
+    // keys are all derived from it, so they move together. The one observable
+    // consequence is that a projected row's KEY INSERTION order now follows the
+    // table rather than the `select` literal.
+    return canonicalColumnOrder(
+      meta,
+      Object.entries(select)
+        .filter(([, v]) => v)
+        .map(([k]) => projectionColumn(table, meta, k, 'select')),
+    );
   }
   // Default / omit-only projection: PII-tagged columns are excluded unless the
   // caller opted in with `includePii: UNSAFE`. An empty set (untagged schema) keeps the
@@ -525,8 +557,16 @@ export function buildOrderBy(
   // rules in step, so it is gone. See orderby-unknown-field.test.ts, which pins
   // the refusal itself across that surface.
   const meta = qi.schema.tables[qi.table];
+  const entries = orderByEntries(orderBy);
+  // A long ORDER BY writes one comma-separated term per entry into the SQL
+  // TEXT, so its length is an arity the caller chose and the statement gives up
+  // its server-side name. Marked HERE, on the compile path, because that is the
+  // window `buildCacheEntry` brackets; redundant terms have already been
+  // dropped upstream (buildFindMany), so this counts real ones. See
+  // MAX_NAMED_ORDER_KEYS in filters.ts for why the threshold is where it is.
+  if (entries.length > MAX_NAMED_ORDER_KEYS) qi.markVariableArity();
   let relOrdCounter = 0;
-  return orderByEntries(orderBy)
+  return entries
     .map(([key, value]) => {
       // Vector KNN ordering: { distance: { to, metric, direction? } }
       if (isVectorOrderBy(value)) {
@@ -1246,6 +1286,15 @@ export function buildRelationOrderClause(
   orderEntries: [string, unknown][],
   params: unknown[],
 ): string {
+  // Same length cap as the top-level `buildOrderBy`. A relation's orderBy comes
+  // from the same request body and its terms are written into the same
+  // statement, so it carries the same exposure. This is the shared choke point
+  // for both to-many shapes (the wrapped hasMany subquery and the m2m junction
+  // subquery). Redundant-term dropping is deliberately NOT mirrored here: it
+  // would have to happen before the `with` fingerprint to stay in lockstep with
+  // the collect path, and a no-op term inside a relation costs only itself
+  // while the cap already bounds what matters.
+  if (orderEntries.length > MAX_NAMED_ORDER_KEYS) qi.markVariableArity();
   let relOrdCounter = 0;
   const orders = orderEntries
     .map(([key, dirValue]) => {
@@ -1418,6 +1467,26 @@ export function collectRelationCountParams(qi: BuilderCtx, relDef: RelationDef, 
   }
 }
 
+/**
+ * Per-table memo of `[relationName, relDef]` pairs, alongside the existing
+ * camelCase-date memo and for the same reason.
+ *
+ * {@link parseNestedRow} walks every relation on the table for EVERY row, and
+ * `Object.entries(meta.relations)` allocates a fresh array of fresh two-element
+ * arrays each time it does. Measured at 227 ns per row on a 12-relation table
+ * against 2 ns for a hoisted list, in the single largest ORM function in the
+ * live CPU profile. The relation map is immutable metadata, so one array per
+ * table is all that is ever needed.
+ */
+export function getRelationEntries(qi: BuilderCtx, table: string, meta: TableMetadata): [string, RelationDef][] {
+  let entries = qi.relationEntryCache.get(table);
+  if (!entries) {
+    entries = Object.entries(meta.relations);
+    qi.relationEntryCache.set(table, entries);
+  }
+  return entries;
+}
+
 export function getCamelDateFields(qi: BuilderCtx, table: string, meta: TableMetadata): Set<string> {
   let camel = qi.camelDateFieldCache.get(table);
   if (!camel) {
@@ -1442,6 +1511,10 @@ export function getCamelDateFields(qi: BuilderCtx, table: string, meta: TableMet
  * hand this function driver rows, but any relation still nested INSIDE one of
  * those rows arrived as a correlated JSON subquery.
  */
+/** The reserved relation-`_count` column prefix, and its first char code. */
+const COUNT_PREFIX = '_count__';
+const UNDERSCORE_CHAR = 95;
+
 export function parseNestedRow(
   qi: BuilderCtx,
   row: Record<string, unknown>,
@@ -1454,17 +1527,28 @@ export function parseNestedRow(
 
   // Assemble reserved `_count__<rel>` scalar columns into a `_count` object.
   // parseRow copies these unknown columns through under their raw key.
+  //
+  // `for…in` with a first-character reject, rather than `Object.keys(...)`
+  // plus `startsWith`: the old form allocated a fresh key array for EVERY row
+  // of every query purely to discover that nothing started with `_count__`,
+  // which is the case for every query that did not ask for a relation `_count`
+  // (almost all of them). `for…in` allocates nothing, and `_` is a rare first
+  // character on a real field, so the common row costs one charCode compare
+  // per key. Deletion is deferred out of the loop so the scan stays on V8's
+  // enum-cache fast path; the resulting key order is unchanged (the same keys
+  // are removed, and `_count` is appended last either way).
   let countObj: Record<string, number> | undefined;
-  for (const key of Object.keys(parsed)) {
-    if (key.startsWith('_count__')) {
-      if (countObj === undefined) countObj = {};
-      countObj[key.slice('_count__'.length)] = Number(parsed[key]);
-      delete parsed[key];
-    }
+  for (const key in parsed) {
+    if (key.charCodeAt(0) !== UNDERSCORE_CHAR || !key.startsWith(COUNT_PREFIX)) continue;
+    if (countObj === undefined) countObj = {};
+    countObj[key.slice(COUNT_PREFIX.length)] = Number(parsed[key]);
   }
-  if (countObj) parsed._count = countObj;
+  if (countObj) {
+    for (const rel of Object.keys(countObj)) delete parsed[`${COUNT_PREFIX}${rel}`];
+    parsed._count = countObj;
+  }
 
-  for (const [relName, relDef] of Object.entries(meta.relations)) {
+  for (const [relName, relDef] of getRelationEntries(qi, table, meta)) {
     const rawValue = row[relName];
     if (rawValue === undefined) continue;
 

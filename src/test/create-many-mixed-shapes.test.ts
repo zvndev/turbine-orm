@@ -105,9 +105,15 @@ describe('createManyShapeRuns', () => {
     };
     const rows = [{ n: 1 }, { n: 2, label: 'x' }, { n: 3, label: 'y' }, { n: 4 }];
     const sql = createManyShapeRuns(rows).map((run) => makeQuery('probe', schema).buildCreateMany({ data: run }).sql);
+    // The two-column run emits `("label", "n")`, the TABLE's declared order,
+    // even though every row writes `n` first. A write's column list is SQL
+    // text, so taking the order from the caller mints one permanent
+    // server-side prepared statement per key permutation of the same insert;
+    // see `canonicalWriteEntries` in query/utils.ts. What this test asserts is
+    // unaffected: each run is still a batch createMany accepts.
     assert.deepEqual(sql, [
       'INSERT INTO "probe" ("n") SELECT * FROM UNNEST($1::integer[]) RETURNING *',
-      'INSERT INTO "probe" ("n", "label") SELECT * FROM UNNEST($1::integer[], $2::text[]) RETURNING *',
+      'INSERT INTO "probe" ("label", "n") SELECT * FROM UNNEST($1::text[], $2::integer[]) RETURNING *',
       'INSERT INTO "probe" ("n") SELECT * FROM UNNEST($1::integer[]) RETURNING *',
     ]);
   });
@@ -180,7 +186,13 @@ async function assertNestedMixedShapes(
     data: { email: 'd@b.c', mixedshapePosts: { create: [{ title: 'u1' }, { title: 'u2' }] } },
   });
   assert.equal(inserts().length, 1, 'a uniform nested array is still one createMany');
-  assert.match(inserts()[0]!, /INSERT INTO "mixedshape_posts" \("title", "user_id"\)/);
+  // `("user_id", "title")`, the TABLE's declared order, even though the nested
+  // write assembles `{ title, user_id }`. A write's column list is SQL text, so
+  // taking the order from whoever built the data object mints one permanent
+  // server-side prepared statement per permutation of the same insert; see
+  // `canonicalWriteEntries` in query/utils.ts. Both engines under this helper
+  // declare user_id before title.
+  assert.match(inserts()[0]!, /INSERT INTO "mixedshape_posts" \("user_id", "title"\)/);
 }
 
 /** node:sqlite is a builtin only on Node >= 22.5; probe without a static import. */

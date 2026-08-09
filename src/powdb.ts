@@ -64,6 +64,7 @@ import {
 import { type Dialect, postgresDialect } from './dialect.js';
 import {
   ConnectionError,
+  malformedConnectionStringMessage,
   NotNullViolationError,
   ReadOnlyError,
   TimeoutError,
@@ -263,7 +264,8 @@ export function parsePowdbUrl(connectionString: string): PowdbConnOptions {
   try {
     u = new URL(connectionString);
   } catch {
-    throw new ConnectionError(`[turbine] Invalid PowDB connection string: "${connectionString}"`);
+    // Never echo the value, see malformedConnectionStringMessage.
+    throw new ConnectionError(malformedConnectionStringMessage('PowDB', 'powdb://user:password@127.0.0.1:5433/app'));
   }
   if (u.protocol !== 'powdb:') {
     throw new ConnectionError(
@@ -824,6 +826,36 @@ export function quotePowqlIdent(name: string): string {
     throw new ValidationError(`[turbine] Identifier "${name}" contains a backtick, which PowQL cannot represent.`);
   }
   return POWQL_KEYWORDS.has(name) || !POWQL_BARE_IDENT.test(name) ? `\`${name}\`` : name;
+}
+
+/**
+ * The DOTTED-position spelling of {@link quotePowqlIdent}: quote a name that
+ * falls outside the bare-identifier grammar, and only that.
+ *
+ * A dotted reference (`.col` in a filter, projection, `order`, `group`, or an
+ * `upsert on`) bypasses keyword lookup, so `.order` parses on every engine
+ * version and stays bare here, which is the ≤0.9 compatibility decision
+ * {@link quotePowqlIdent} documents and which this must not undo.
+ *
+ * What it does NOT excuse is interpolating the name RAW, which is what these
+ * sites used to do. Keyword-ness is a parsing question; a name outside
+ * `POWQL_BARE_IDENT` is a statement-integrity one, and that name is the only
+ * thing that can carry PowQL syntax into a statement whose values are all bound
+ * as `$N` params. Reaching it needs a hostile column name (an introspected
+ * database, a generator, a migration authored elsewhere) since names come from
+ * schema metadata, but "the names are trusted" is not the invariant the rest of
+ * this engine is written to. So: bare when the grammar allows it (byte-identical
+ * output for every ordinary and every keyword name), quoted when it does not,
+ * where the bare form was a parse error anyway. Verified against the engine that
+ * a quoted dotted reference parses everywhere the bare one does and yields the
+ * same result-column name.
+ */
+export function quotePowqlDotted(name: string): string {
+  if (POWQL_BARE_IDENT.test(name)) return name;
+  if (name.includes('`')) {
+    throw new ValidationError(`[turbine] Identifier "${name}" contains a backtick, which PowQL cannot represent.`);
+  }
+  return `\`${name}\``;
 }
 
 /**

@@ -24,6 +24,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ValidationError } from '../errors.js';
+import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import type { QueryInterface } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -64,6 +65,12 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  // The cross-check resolves these variables ONCE and memoizes the answer
+  // (`process.env` reads are a C++ interceptor call, and this ran twice on
+  // every cache hit). Flipping them mid-process is a thing only these suites
+  // do, so they are also the ones that have to re-arm the read, on the way in
+  // and again on the way out.
+  resetCacheCrossCheckEnv();
   try {
     fn();
   } finally {
@@ -71,6 +78,7 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
       if (saved[key] === undefined) delete process.env[key];
       else process.env[key] = saved[key];
     }
+    resetCacheCrossCheckEnv();
   }
 }
 

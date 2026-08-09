@@ -66,6 +66,20 @@ CREATE INDEX idx_posts_user_id ON posts(user_id);
 CREATE INDEX idx_posts_org_id ON posts(org_id);
 CREATE INDEX idx_posts_created_at ON posts(created_at);
 
+-- Full-text search. Turbine's `search` filter compiles to
+--   to_tsvector('<config>', "<column>") @@ to_tsquery('<config>', $1)
+-- against the COLUMN, so these are EXPRESSION indexes over exactly that
+-- expression rather than a stored `tsvector` column: a stored column would
+-- never be consulted by the SQL the ORM emits, and adding one to `posts` would
+-- also move the column count that turbine.test.ts asserts. Two indexes because
+-- the filter is per-column, `english` because that is the filter's default.
+--
+-- Until these existed the whole to_tsvector/to_tsquery path had NEVER been run
+-- by a server: text-search.test.ts is build-only, and no seeded column carried
+-- searchable prose. src/test/text-search.integration.test.ts is the live half.
+CREATE INDEX idx_posts_title_fts ON posts USING GIN (to_tsvector('english', title));
+CREATE INDEX idx_posts_content_fts ON posts USING GIN (to_tsvector('english', content));
+
 -- ----------------------------------------------------------------------------
 -- comments (5 columns)
 -- ----------------------------------------------------------------------------

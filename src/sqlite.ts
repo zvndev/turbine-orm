@@ -70,6 +70,7 @@ import {
 import type { EngineClientConfig } from './engine-config.js';
 import { ConnectionError, UnsupportedFeatureError } from './errors.js';
 import { applyTableFilters, deriveEngineRelations } from './introspect.js';
+import { LRUCache } from './query/utils.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -168,13 +169,100 @@ function normalizeValue(value: null | number | bigint | string | Uint8Array): un
   return value;
 }
 
-/** Convert a `node:sqlite` null-prototype row into a normalized plain object. */
-function normalizeRow(row: Record<string, null | number | bigint | string | Uint8Array>): Record<string, unknown> {
+/**
+ * Convert a `node:sqlite` null-prototype row into a normalized plain object.
+ *
+ * `booleanKeys`, when present, names the result columns whose ORIGIN column is
+ * declared with a boolean affinity; their 1/0 storage is turned back into
+ * `true`/`false` (see {@link booleanResultColumns}). Anything else in such a
+ * column, and every column not listed, passes through untouched.
+ */
+function normalizeRow(
+  row: Record<string, null | number | bigint | string | Uint8Array>,
+  booleanKeys?: ReadonlySet<string>,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(row)) {
-    out[key] = normalizeValue(row[key] as null | number | bigint | string | Uint8Array);
+    const value = normalizeValue(row[key] as null | number | bigint | string | Uint8Array);
+    out[key] = booleanKeys?.has(key) && (value === 1 || value === 0) ? value === 1 : value;
   }
   return out;
+}
+
+/**
+ * The result columns of a prepared statement whose ORIGIN column is declared
+ * boolean, or `null` when there are none (the overwhelmingly common case).
+ *
+ * WHY THIS EXISTS. SQLite has no boolean storage class: a `BOOLEAN` column
+ * holds 1/0 integers. Turbine still generates `ok: boolean` for it
+ * ({@link sqliteTypeToTs} maps `/bool/` to `boolean`), so `row.ok === true` was
+ * false, `JSON.stringify(row)` emitted `1`, and a value the ORM itself wrote as
+ * `true` came back as a number. The declared type is the ONLY thing that says
+ * "this integer is a boolean", and it lives in the schema, not in the value.
+ *
+ * The decltype comes from the driver rather than from Turbine's metadata
+ * because the driver knows which TABLE each result column came from.
+ * `StatementSync.columns()` reports `type` as `sqlite3_column_decltype`, which
+ * is non-null only for a direct table-column reference and null for any
+ * expression, so a computed column can never be coerced by accident.
+ *
+ * Node gained `columns()` in 22.13 / 23.4 while this engine's floor is 22.5, so
+ * it is feature-detected: on the narrow band without it, booleans keep reading
+ * back as 1/0 exactly as before rather than the engine refusing to run.
+ */
+function booleanResultColumns(stmt: ReturnType<DatabaseSync['prepare']>): Set<string> | null {
+  const columnsFn = (stmt as { columns?: () => { name?: unknown; type?: unknown }[] }).columns;
+  if (typeof columnsFn !== 'function') return null;
+  let described: { name?: unknown; type?: unknown }[];
+  try {
+    described = columnsFn.call(stmt);
+  } catch {
+    // A statement the driver cannot describe (some PRAGMA forms) is not worth
+    // failing a query over; skip the coercion for it.
+    return null;
+  }
+  let out: Set<string> | null = null;
+  for (const c of described) {
+    if (typeof c.name !== 'string' || typeof c.type !== 'string') continue;
+    if (!/bool/i.test(c.type)) continue;
+    if (out === null) out = new Set();
+    out.add(c.name);
+  }
+  return out;
+}
+
+/**
+ * The `node:sqlite` namespace, looked up once, or `null` when this Node build
+ * has no such builtin. Deliberately separate from {@link loadDatabaseSync},
+ * which THROWS: this is a capability question asked from the pure dialect,
+ * which must stay importable on Node 20.
+ */
+let cachedSqliteNamespace: { StatementSync?: { prototype?: { columns?: unknown } } } | null | undefined;
+
+/**
+ * Can the driver report a result column's DECLARED type?
+ *
+ * This is the same capability {@link booleanResultColumns} feature-detects, and
+ * the two have to be asked the SAME question or they split: that helper is what
+ * turns 1/0 into `true`/`false` on every direct read, and the boolean
+ * `jsonWireRule` is what does it on the join path. On the Node band with
+ * `node:sqlite` but without `StatementSync.columns()` (>= 22.5, < 22.13 / 23.4)
+ * the helper returns `null` and every direct read keeps 1/0, so a join that
+ * still converted would produce exactly the strategy-dependent type flip the
+ * rule exists to prevent, on the one runtime where nothing else can catch it.
+ *
+ * The prototype property is re-read on each call rather than memoized as a
+ * boolean, so the answer cannot outlive the capability.
+ */
+function driverReportsDeclaredTypes(): boolean {
+  if (cachedSqliteNamespace === undefined) {
+    try {
+      cachedSqliteNamespace = createRequire(process.cwd())('node:sqlite') as typeof cachedSqliteNamespace;
+    } catch {
+      cachedSqliteNamespace = null;
+    }
+  }
+  return typeof cachedSqliteNamespace?.StatementSync?.prototype?.columns === 'function';
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +379,12 @@ function toNamedBinding(values: unknown[]): Record<string, SqliteParam> | undefi
   return named;
 }
 
-function runStatement(db: DatabaseSync, sql: string, values: unknown[]) {
+function runStatement(
+  db: DatabaseSync,
+  sql: string,
+  values: unknown[],
+  booleanCache?: LRUCache<string, Set<string> | null>,
+) {
   const binding = toNamedBinding(values);
   let stmt: ReturnType<DatabaseSync['prepare']>;
   try {
@@ -302,7 +395,17 @@ function runStatement(db: DatabaseSync, sql: string, values: unknown[]) {
   stmt.setReadBigInts(true);
   try {
     if (statementReturnsRows(sql)) {
-      const rows = (binding ? stmt.all(binding) : stmt.all()).map(normalizeRow);
+      // Describe each distinct statement ONCE. `null` (no boolean column) is a
+      // cached answer too, so the ordinary query pays a single Map hit per call
+      // and nothing per row.
+      let booleanKeys = booleanCache?.get(sql);
+      if (booleanKeys === undefined) {
+        booleanKeys = booleanResultColumns(stmt);
+        booleanCache?.set(sql, booleanKeys);
+      }
+      const rows = (binding ? stmt.all(binding) : stmt.all()).map((r) =>
+        normalizeRow(r as Record<string, null | number | bigint | string | Uint8Array>, booleanKeys ?? undefined),
+      );
       return { rows, rowCount: rows.length };
     }
     const info = binding ? stmt.run(binding) : stmt.run();
@@ -325,6 +428,12 @@ export class SqlitePool implements PgCompatPool {
   /** The underlying `node:sqlite` handle, exposed as an escape hatch (seed/DDL). */
   readonly db: DatabaseSync;
   private closed = false;
+  /**
+   * `sql -> declared-boolean result columns` (or `null` for none). Bounded like
+   * the query builder's SQL-template cache, since a caller can generate
+   * unbounded distinct statements (raw SQL, an IN-list that inlines).
+   */
+  private readonly booleanCache = new LRUCache<string, Set<string> | null>(1000);
 
   constructor(db: DatabaseSync) {
     this.db = db;
@@ -333,16 +442,17 @@ export class SqlitePool implements PgCompatPool {
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape; runStatement returns plain objects.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
     const { text: sql, params } = normalizeQueryArgs(text, values);
-    return runStatement(this.db, sql, params);
+    return runStatement(this.db, sql, params, this.booleanCache);
   }
 
   async connect(): Promise<PgCompatPoolClient> {
     const db = this.db;
+    const booleanCache = this.booleanCache;
     return {
       // biome-ignore lint/suspicious/noExplicitAny: see query() above.
       query: async (text: QueryArg, values?: unknown[]): Promise<any> => {
         const { text: sql, params } = normalizeQueryArgs(text, values);
-        return runStatement(db, sql, params);
+        return runStatement(db, sql, params, booleanCache);
       },
       release: () => {
         // Single shared connection, nothing to return to a pool.
@@ -419,6 +529,7 @@ export const sqliteDialect: Dialect = {
   supportsReturning: true,
   supportsILike: false,
   supportsVector: false,
+  supportsJsonContains: false,
   // FTS5 is a virtual-table feature with its own MATCH syntax, not the
   // `to_tsvector @@ to_tsquery` shape Turbine's `search` filter emits.
   supportsFullTextSearch: false,
@@ -495,6 +606,34 @@ export const sqliteDialect: Dialect = {
           const asNumber = Number(value);
           return Number.isSafeInteger(asNumber) ? asNumber : value;
         },
+      };
+    }
+
+    // A declared-boolean column is 1/0 in storage, and the driver shim turns
+    // that back into true/false on every direct read (see
+    // booleanResultColumns). `json_object` sees the raw integer and has no
+    // decltype to consult, so the join strategy alone would have kept handing
+    // back 1/0 while the top-level read, the batched loader and the flatten
+    // plan returned booleans, which is the same strategy-dependent type flip
+    // the bigint rule above exists to prevent. No cast is needed, only the
+    // decode: the JSON number IS the stored value, it just has to be read the
+    // same way.
+    //
+    // Gated on the SAME capability the direct-read half feature-detects (see
+    // driverReportsDeclaredTypes). Without it the shim cannot name a boolean
+    // result column, so 1/0 is the answer everywhere; converting here alone
+    // would put the flip back, pointing the other way.
+    if (t.includes('BOOL') && driverReportsDeclaredTypes()) {
+      return {
+        // Carried as TEXT because that is how the decode half is reached at
+        // all: the parser only runs `decode` on a string cell, so a rule that
+        // left the JSON number alone would never fire. The CASE narrows the
+        // carrier to EXACTLY the two values that mean true/false, so anything
+        // else a declared-boolean column happens to hold (SQLite does not
+        // enforce the type) stays in its own JSON form and reads back as the
+        // driver would have returned it, rather than being stringified.
+        sql: (ref) => `CASE WHEN ${ref} IN (0, 1) THEN CAST(${ref} AS TEXT) ELSE ${ref} END`,
+        decode: (value) => (value === '1' ? true : value === '0' ? false : value),
       };
     }
 
@@ -600,9 +739,14 @@ export const sqliteDialect: Dialect = {
     return `${column} LIKE ${paramRef} COLLATE NOCASE`;
   },
 
+  // UNREACHABLE while `supportsJsonContains` is false, and kept deliberately:
+  // it is the emulation this dialect would use if the encoding mismatch were
+  // repaired, and deleting it would delete the record of what was tried. The
+  // param is bound as JSON text (`'"gold"'`) while `json_each.value` yields the
+  // decoded SQL value (`gold`), so this predicate never holds for ANY operand.
+  // See `supportsJsonContains` in dialect.ts for the measurements and the shape
+  // a faithful version needs (`json_each.type` alongside the value).
   buildJsonContains(column: string, paramRef: string): string {
-    // Emulated containment: true when any top-level JSON value equals the param.
-    // Limited vs Postgres `@>` (no deep/object containment), jsonPathSupport='function'.
     return `EXISTS (SELECT 1 FROM json_each(${column}) WHERE json_each.value = ${paramRef})`;
   },
 
@@ -732,7 +876,12 @@ interface PragmaIndexColumn {
 function pragma<T>(db: DatabaseSync, sql: string): T[] {
   // PRAGMA / SELECT against sqlite_master, read-only, identifiers are SQLite
   // catalog names (never user input here), values normalized for safe ints.
-  return db.prepare(sql).all().map(normalizeRow) as T[];
+  // No boolean-key set: PRAGMA output columns are catalog metadata (`notnull`,
+  // `pk`, `unique`), which are 0/1 integers the introspector reads AS integers.
+  return db
+    .prepare(sql)
+    .all()
+    .map((r) => normalizeRow(r as Record<string, null | number | bigint | string | Uint8Array>)) as T[];
 }
 
 /**

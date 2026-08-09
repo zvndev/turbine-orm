@@ -287,7 +287,12 @@ describe('batched relation loading, SQL shape', () => {
     assert.match(followUp.sql, /WHERE "title" = \$\d+ AND "user_id" = ANY\(\$\d+\)/);
   });
 
-  it('per-relation limit is NOT pushed down (applied client-side)', async () => {
+  it('per-relation limit never becomes a trailing LIMIT (it would cap the TOTAL)', async () => {
+    // The follow-up covers every parent in one statement, so `LIMIT n` would
+    // bound the batch rather than each parent and starve most of them. On
+    // PostgreSQL the bound is pushed down as a `ROW_NUMBER() OVER (PARTITION
+    // BY fk)` filter instead (see batched-partition-limit.test.ts); what must
+    // never appear, on any engine, is a bare LIMIT.
     const { pool, calls } = makeFakePool(CANNED);
     await usersQi(pool, CANNED).findMany({ with: { posts: { limit: 1 } } });
     const followUp = calls.find((c) => /FROM "posts"/.test(c.sql))!;

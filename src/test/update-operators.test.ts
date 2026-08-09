@@ -106,11 +106,19 @@ describe('update operators: SQL build (no DB)', () => {
       where: { id: 5 },
       data: { viewCount: { increment: 1 }, title: 'New title' },
     });
-    // Both clauses present, plain value next to operator
-    assert.match(deferred.sql, /"view_count" = "view_count" \+ \$1/);
-    assert.match(deferred.sql, /"title" = \$2/);
+    // SET CLAUSES FOLLOW THE TABLE'S COLUMN ORDER, not the `data` key order, so
+    // `title` (declared before `view_count`) is $1 even though `viewCount` was
+    // written first. Deliberate: the SET list is SQL text, and `JSON.parse`
+    // preserves insertion order, so honouring the caller's order lets a
+    // forwarded PATCH body mint one permanent server-side prepared statement
+    // per permutation of the same update (measured: 720 bodies, 720
+    // statements). See `canonicalWriteEntries` in query/utils.ts. What this
+    // test is about is unchanged: both clauses are present and the params are
+    // numbered in the order they are bound.
+    assert.match(deferred.sql, /"title" = \$1/);
+    assert.match(deferred.sql, /"view_count" = "view_count" \+ \$2/);
     assert.match(deferred.sql, /WHERE "id" = \$3/);
-    assert.deepEqual(deferred.params, [1, 'New title', 5]);
+    assert.deepEqual(deferred.params, ['New title', 1, 5]);
   });
 
   it('WHERE clause param numbering continues after SET (multi-arg case)', () => {
@@ -119,15 +127,18 @@ describe('update operators: SQL build (no DB)', () => {
       where: { published: true, id: { gt: 10 } },
       data: { viewCount: { increment: 2 }, title: 'x' },
     });
-    // SET uses $1, $2; WHERE uses $3, $4 in some order
-    assert.match(deferred.sql, /"view_count" = "view_count" \+ \$1/);
-    assert.match(deferred.sql, /"title" = \$2/);
+    // SET uses $1, $2; WHERE uses $3, $4 in some order. The SET list is in the
+    // TABLE's column order (`title` before `view_count`), not the `data` key
+    // order, so the caller cannot vary the emitted statement by reordering a
+    // request body; see `canonicalWriteEntries` in query/utils.ts.
+    assert.match(deferred.sql, /"title" = \$1/);
+    assert.match(deferred.sql, /"view_count" = "view_count" \+ \$2/);
     // Both WHERE params should reference $3 and $4
     assert.ok(/\$3/.test(deferred.sql));
     assert.ok(/\$4/.test(deferred.sql));
     assert.equal(deferred.params.length, 4);
-    assert.equal(deferred.params[0], 2);
-    assert.equal(deferred.params[1], 'x');
+    assert.equal(deferred.params[0], 'x');
+    assert.equal(deferred.params[1], 2);
   });
 
   it('updateMany with increment works identically', () => {

@@ -148,6 +148,7 @@ import {
 } from './query/index.js';
 import { suggestKey } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
+import { assertWhereDepth, MAX_WHERE_DEPTH } from './query/where-compile.js';
 import type { PrismaCompatMap, PrismaModelMap, RelationDef, SchemaMetadata } from './schema.js';
 
 // ---------------------------------------------------------------------------
@@ -424,7 +425,72 @@ function relTargetModel(ctx: Ctx, mm: PrismaModelMap, turbineRel: string): Prism
 // ---------------------------------------------------------------------------
 
 const COMBINATORS = new Set(['AND', 'OR', 'NOT']);
+
+/**
+ * The to-many half of the relation-filter wrapper list.
+ *
+ * DRIFT RISK, and this is the third copy of that list in the tree. The canonical
+ * NAMED one is `RELATION_FILTER_WRAPPERS` in `cli/pii-predicate-guard.ts`
+ * (`some`/`none`/`every`/`is`/`isNot`), and a second is inlined in
+ * `query/where-compile.ts` as `'some' in x || 'every' in x || …`. This copy is
+ * the worst of the three because it is SPLIT: the to-many quantifiers are here,
+ * and `is` / `isNot` are two inline `k === …` tests in
+ * {@link translateRelationFilter}, so half of it does not read as a list and a
+ * grep for the list will not find it. A wrapper the compiler learns and this set
+ * does not is a relation body that reaches core untranslated, i.e. with Prisma
+ * field names still in it.
+ *
+ * The fix is an export from `query/filters.ts` that all three import; until that
+ * exists, these comments are what hold them in step.
+ */
 const RELATION_QUANTIFIERS = new Set(['some', 'every', 'none']);
+
+/**
+ * The caller-supplied arg trees this layer walks recursively, named for the
+ * refusal message. Each one is its own mutually-recursive family, and every one
+ * of them was unbounded.
+ */
+type TranslateClause = 'where' | 'having' | 'orderBy' | 'include' | 'data';
+
+/**
+ * Refuse a translation walk that has nested past {@link MAX_WHERE_DEPTH}.
+ *
+ * Core caps every WHERE / HAVING walk (`assertWhereDepth`), but this layer runs
+ * BEFORE core sees anything: `translateWhere` rebuilds the whole clause into
+ * turbine field names first, so on a deeply nested predicate the stack overflows
+ * HERE and core's guard is unreachable for every compat consumer. Measured on
+ * Node 24 against a wire-realistic body: a 1,000-deep `NOT` chain translated
+ * fine and a 4,000-deep one (a 32 KB body, comfortably under `express.json()`'s
+ * 100 KB default) threw `RangeError: Maximum call stack size exceeded`, which is
+ * not a {@link TurbineError} and so walks straight past the typed-error surface
+ * callers catch on.
+ *
+ * FIVE families needed the cap, not one. `where` and `having` have a core
+ * counterpart and DELEGATE to it, so a compat caller reads the byte-identical
+ * message a core caller reads at the byte-identical nesting. The other three
+ * have no core counterpart at all and are the sharper half:
+ *
+ *   - `orderBy` recurses on nested ARRAYS, and core ignores those entirely
+ *     (`normalizeOrderBy` reads one level), so there is no second line of
+ *     defense: `{"orderBy":[[[…]]]}` at 2,000 (a 4 KB body) was the cheapest
+ *     `RangeError` on the whole surface.
+ *   - `include` / `select` recurse through `translateWithOption`
+ *     (45 KB), and
+ *   - nested-write `data` recurses through `translateNestedWrite` (43 KB).
+ *
+ * The depth is core's, not a second convention: the same {@link MAX_WHERE_DEPTH}
+ * for all five, so nothing core would accept is refused here for depth alone.
+ */
+function assertTranslateDepth(depth: number, clause: TranslateClause): void {
+  if (depth <= MAX_WHERE_DEPTH) return;
+  // The two clauses core also walks raise core's own error, verbatim.
+  if (clause === 'where' || clause === 'having') assertWhereDepth(depth, clause);
+  throw new ValidationError(
+    `[turbine] \`${clause}\` nests more than ${MAX_WHERE_DEPTH} levels deep. That is far past anything a real ` +
+      `query needs, and an unbounded walk over caller-supplied nesting is a stack-overflow surface, so it is ` +
+      `refused. If this is a generated argument, flatten it: a single array of N entries is one level, not N.`,
+  );
+}
 
 /** Whether a value is a plain object usable as a compound-unique selector. */
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -734,13 +800,24 @@ function mapRelationLoadStrategy(value: unknown): unknown {
  * `none`) against the target model, and rewrites compound-unique selectors -
  * including custom `@@unique(name:)` names, into the core-derived selector form
  * so Turbine's `findUnique`-family expansion handles them uniformly.
+ *
+ * `depth` is incremented at exactly the two places core's `walkWhere` increments
+ * it, a combinator branch and a relation-filter descent (the wrapper body counts
+ * as its own level there, so it does here too). That is what makes the refusal
+ * land on the same clause at the same nesting whether a caller arrives through
+ * this layer or straight through core.
  */
-function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown): Record<string, unknown> | undefined {
+function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown, depth = 0): Record<string, unknown> | undefined {
+  assertTranslateDepth(depth, 'where');
   if (!isPlainObject(where)) return where as undefined;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(where)) {
     if (COMBINATORS.has(key)) {
-      out[key] = Array.isArray(val) ? val.map((v) => translateWhere(ctx, mm, v)) : translateWhere(ctx, mm, val);
+      // An `AND` / `OR` array of N conditions is ONE level, not N: the elements
+      // are siblings, so they all translate at the same incremented depth.
+      out[key] = Array.isArray(val)
+        ? val.map((v) => translateWhere(ctx, mm, v, depth + 1))
+        : translateWhere(ctx, mm, val, depth + 1);
       continue;
     }
     // Compound-unique selector (custom or default Prisma name).
@@ -757,7 +834,7 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown): Record<st
     const rel = mm.relations[key];
     if (rel) {
       const target = relTargetModel(ctx, mm, rel.name);
-      out[rel.name] = translateRelationFilter(ctx, target, val);
+      out[rel.name] = translateRelationFilter(ctx, target, val, depth + 1);
       continue;
     }
     // Scalar field, key renamed, value (literal or operator object) passes
@@ -767,7 +844,7 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown): Record<st
   return out;
 }
 
-function translateRelationFilter(ctx: Ctx, target: PrismaModelMap | undefined, val: unknown): unknown {
+function translateRelationFilter(ctx: Ctx, target: PrismaModelMap | undefined, val: unknown, depth: number): unknown {
   if (!isPlainObject(val)) return val;
   const keys = Object.keys(val);
   const hasQuantifier = keys.some((k) => RELATION_QUANTIFIERS.has(k) || k === 'is' || k === 'isNot');
@@ -775,17 +852,32 @@ function translateRelationFilter(ctx: Ctx, target: PrismaModelMap | undefined, v
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(val)) {
       out[k] =
-        target && (RELATION_QUANTIFIERS.has(k) || k === 'is' || k === 'isNot') ? translateWhere(ctx, target, v) : v;
+        target && (RELATION_QUANTIFIERS.has(k) || k === 'is' || k === 'isNot')
+          ? translateWhere(ctx, target, v, depth + 1)
+          : v;
     }
     return out;
   }
-  // A bare object filter on a to-one relation: translate its body.
-  return target ? translateWhere(ctx, target, val) : val;
+  // A bare object filter on a to-one relation: translate its body. Core wraps
+  // this shape in `{ is: … }` (`normalizeRelationFilter`) and charges it the
+  // same level the explicit wrapper above costs, so charge it here too.
+  return target ? translateWhere(ctx, target, val, depth + 1) : val;
 }
 
-/** Translate a Prisma `orderBy` (object / array) into a Turbine `orderBy`. */
-function translateOrderBy(ctx: Ctx, mm: PrismaModelMap, ob: unknown): unknown {
-  if (Array.isArray(ob)) return ob.map((o) => translateOrderBy(ctx, mm, o));
+/**
+ * Translate a Prisma `orderBy` (object / array) into a Turbine `orderBy`.
+ *
+ * The ARRAY branch is the reason this walker has its own cap rather than relying
+ * on core's: `normalizeOrderBy` reads ONE level of array and never recurses, so
+ * core has no second line of defense here at all, and `[[[…]]]` at 2,000 (a 4 KB
+ * body) overflowed the stack. Nesting is what counts, not width: the elements of
+ * one array are siblings and all translate at the same incremented depth, so a
+ * legal `orderBy: [{ a: 'asc' }, { b: 'desc' }]` of any length is one level and
+ * only an array INSIDE an array pays for another.
+ */
+function translateOrderBy(ctx: Ctx, mm: PrismaModelMap, ob: unknown, depth = 0): unknown {
+  assertTranslateDepth(depth, 'orderBy');
+  if (Array.isArray(ob)) return ob.map((o) => translateOrderBy(ctx, mm, o, depth + 1));
   if (!isPlainObject(ob)) return ob;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(ob)) {
@@ -796,7 +888,8 @@ function translateOrderBy(ctx: Ctx, mm: PrismaModelMap, ob: unknown): unknown {
     const rel = mm.relations[key];
     if (rel) {
       const target = relTargetModel(ctx, mm, rel.name);
-      out[rel.name] = isPlainObject(val) && !('_count' in val) && target ? translateOrderBy(ctx, target, val) : val;
+      out[rel.name] =
+        isPlainObject(val) && !('_count' in val) && target ? translateOrderBy(ctx, target, val, depth + 1) : val;
       continue;
     }
     out[renameField(mm, key)] = val;
@@ -863,8 +956,14 @@ function translateOmit(
  * `select` narrows scalars and may also pull relations + `_count`. `include`
  * and `select` are mutually exclusive, and so are `select` and `omit` (a
  * narrowed projection minus fields is ambiguous; Prisma refuses the pair too).
+ *
+ * Mutually recursive with {@link translateWithOption}, one level per relation
+ * hop, and it was unbounded: a 1,000-hop `include` chain (a 45 KB body) threw
+ * `RangeError` here, before core's own depth-10 relation cap
+ * (`CircularRelationError`) could ever see the `with` clause it was building.
  */
-function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, unknown>): Projection {
+function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, unknown>, depth = 0): Projection {
+  assertTranslateDepth(depth, 'include');
   const include = args.include as Record<string, unknown> | undefined;
   const select = args.select as Record<string, unknown> | undefined;
   const omitArg = args.omit as Record<string, unknown> | undefined;
@@ -895,7 +994,7 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
           `[turbine] prisma-compat: unknown relation "${key}" in include on model "${modelName(ctx, mm)}".`,
         );
       }
-      withClause[rel.name] = translateWithOption(ctx, mm, rel.name, val);
+      withClause[rel.name] = translateWithOption(ctx, mm, rel.name, val, depth + 1);
       hasWith = true;
     }
     return { omit, with: hasWith ? withClause : undefined };
@@ -913,7 +1012,7 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
       }
       const rel = mm.relations[key];
       if (rel) {
-        withClause[rel.name] = translateWithOption(ctx, mm, rel.name, val);
+        withClause[rel.name] = translateWithOption(ctx, mm, rel.name, val, depth + 1);
         hasWith = true;
         continue;
       }
@@ -1075,14 +1174,21 @@ function applyWriteProjection(proj: WriteProjection, row: unknown): unknown {
   return row;
 }
 
-/** Translate a Prisma relation include payload into a Turbine `WithOptions`. */
-function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, val: unknown): unknown {
+/**
+ * Translate a Prisma relation include payload into a Turbine `WithOptions`.
+ *
+ * `depth` is the relation hop count carried down from {@link translateProjection}
+ * and is charged to the nested `where` / `orderBy` too, so a payload that pads
+ * one arg with relation hops and then nests the other cannot spend two separate
+ * budgets to reach the same stack depth.
+ */
+function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, val: unknown, depth = 0): unknown {
   if (val === true) return true;
   if (!isPlainObject(val)) return true;
   const target = relTargetModel(ctx, mm, turbineRel);
   const opt: Record<string, unknown> = {};
-  if (val.where !== undefined) opt.where = target ? translateWhere(ctx, target, val.where) : val.where;
-  if (val.orderBy !== undefined) opt.orderBy = target ? translateOrderBy(ctx, target, val.orderBy) : val.orderBy;
+  if (val.where !== undefined) opt.where = target ? translateWhere(ctx, target, val.where, depth) : val.where;
+  if (val.orderBy !== undefined) opt.orderBy = target ? translateOrderBy(ctx, target, val.orderBy, depth) : val.orderBy;
   if (val.take !== undefined) opt.limit = mapTake(val.take as number);
   if (val.skip !== undefined) {
     throw new UnsupportedFeatureError(
@@ -1092,7 +1198,7 @@ function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, v
     );
   }
   if (target && (val.select !== undefined || val.include !== undefined || val.omit !== undefined)) {
-    const proj = translateProjection(ctx, target, val);
+    const proj = translateProjection(ctx, target, val, depth);
     if (proj.select) opt.select = proj.select;
     // Same silent drop as the top level: a nested `omit` names the sensitive
     // column on the CHILD rows, which are just as exposed.
@@ -1390,14 +1496,15 @@ const NESTED_WRITE_OPS = new Set([
  * renamed to their Turbine relation name and their nested-write payloads are
  * translated against the target model (op names match Prisma's).
  */
-function translateWriteData(ctx: Ctx, mm: PrismaModelMap, data: unknown): unknown {
+function translateWriteData(ctx: Ctx, mm: PrismaModelMap, data: unknown, depth = 0): unknown {
+  assertTranslateDepth(depth, 'data');
   if (!isPlainObject(data)) return data;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(data)) {
     const rel = mm.relations[key];
     if (rel && isPlainObject(val) && Object.keys(val).some((k) => NESTED_WRITE_OPS.has(k))) {
       const target = relTargetModel(ctx, mm, rel.name);
-      out[rel.name] = translateNestedWrite(ctx, target, val);
+      out[rel.name] = translateNestedWrite(ctx, target, val, depth + 1);
       continue;
     }
     out[renameField(mm, key)] = val;
@@ -1405,32 +1512,48 @@ function translateWriteData(ctx: Ctx, mm: PrismaModelMap, data: unknown): unknow
   return out;
 }
 
-function translateNestedWrite(ctx: Ctx, target: PrismaModelMap | undefined, ops: Record<string, unknown>): unknown {
+/**
+ * One relation's nested-write ops. `depth` is threaded into EVERY payload
+ * translator, the `where` ones included, so the budget is spent on total
+ * nesting rather than per-arg: a chain that alternates relation hops with
+ * combinator nesting reaches the same stack depth as either alone.
+ *
+ * Core's own nested-write engine caps at depth 10 (`nested-write.ts`), so this
+ * cap can only ever fire on a payload core was going to refuse anyway. What it
+ * changes is HOW: a typed refusal instead of a `RangeError` raised before core
+ * is reached at all (measured: a 1,000-hop `create` chain, a 43 KB body).
+ */
+function translateNestedWrite(
+  ctx: Ctx,
+  target: PrismaModelMap | undefined,
+  ops: Record<string, unknown>,
+  depth: number,
+): unknown {
   const out: Record<string, unknown> = {};
   for (const [op, payload] of Object.entries(ops)) {
     switch (op) {
       case 'create':
       case 'createMany':
-        out[op] = mapMaybeArray(payload, (p) => (target ? translateWriteData(ctx, target, p) : p));
+        out[op] = mapMaybeArray(payload, (p) => (target ? translateWriteData(ctx, target, p, depth + 1) : p));
         break;
       case 'connect':
       case 'disconnect':
       case 'delete':
       case 'set':
-        out[op] = mapMaybeArray(payload, (p) => (target ? translateWhere(ctx, target, p) : p));
+        out[op] = mapMaybeArray(payload, (p) => (target ? translateWhere(ctx, target, p, depth + 1) : p));
         break;
       case 'deleteMany':
       case 'updateMany':
-        out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, p));
+        out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, p, depth + 1));
         break;
       case 'update':
-        out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, p));
+        out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, p, depth + 1));
         break;
       case 'connectOrCreate':
-        out[op] = mapMaybeArray(payload, (p) => translateConnectOrCreate(ctx, target, p));
+        out[op] = mapMaybeArray(payload, (p) => translateConnectOrCreate(ctx, target, p, depth + 1));
         break;
       case 'upsert':
-        out[op] = mapMaybeArray(payload, (p) => translateUpsertNested(ctx, target, p));
+        out[op] = mapMaybeArray(payload, (p) => translateUpsertNested(ctx, target, p, depth + 1));
         break;
       default:
         out[op] = payload;
@@ -1444,31 +1567,31 @@ function mapMaybeArray(val: unknown, fn: (item: unknown) => unknown): unknown {
 }
 
 /** A `{ where?, data }` pair (nested update/updateMany), or a bare data object. */
-function translateWhereDataPair(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown): unknown {
+function translateWhereDataPair(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
   if (!isPlainObject(p)) return p;
   if ('data' in p || 'where' in p) {
     const out: Record<string, unknown> = {};
-    if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where) : p.where;
-    if (p.data !== undefined) out.data = target ? translateWriteData(ctx, target, p.data) : p.data;
+    if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
+    if (p.data !== undefined) out.data = target ? translateWriteData(ctx, target, p.data, depth) : p.data;
     return out;
   }
-  return target ? translateWriteData(ctx, target, p) : p;
+  return target ? translateWriteData(ctx, target, p, depth) : p;
 }
 
-function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown): unknown {
+function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
   if (!isPlainObject(p)) return p;
   const out: Record<string, unknown> = {};
-  if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where) : p.where;
-  if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create) : p.create;
+  if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
+  if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
   return out;
 }
 
-function translateUpsertNested(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown): unknown {
+function translateUpsertNested(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
   if (!isPlainObject(p)) return p;
   const out: Record<string, unknown> = {};
-  if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where) : p.where;
-  if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create) : p.create;
-  if (p.update !== undefined) out.update = target ? translateWriteData(ctx, target, p.update) : p.update;
+  if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
+  if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
+  if (p.update !== undefined) out.update = target ? translateWriteData(ctx, target, p.update, depth) : p.update;
   return out;
 }
 
@@ -1529,12 +1652,22 @@ function renameAggBlock(mm: PrismaModelMap, block: unknown, isCount: boolean): u
   return out;
 }
 
-function renameHaving(mm: PrismaModelMap, having: unknown): unknown {
+/**
+ * Rename a groupBy `having` into turbine field names.
+ *
+ * Capped for the same reason and at the same depth as {@link translateWhere}:
+ * core caps its own HAVING walk (`assertWhereDepth(depth, 'having')` in
+ * `query/aggregates.ts`), but this rename runs first and was unbounded, so a
+ * 8,000-deep `NOT` chain (a 64 KB body) overflowed here and core's guard never
+ * ran.
+ */
+function renameHaving(mm: PrismaModelMap, having: unknown, depth = 0): unknown {
+  assertTranslateDepth(depth, 'having');
   if (!isPlainObject(having)) return having;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(having)) {
     if (COMBINATORS.has(key)) {
-      out[key] = Array.isArray(val) ? val.map((v) => renameHaving(mm, v)) : renameHaving(mm, val);
+      out[key] = Array.isArray(val) ? val.map((v) => renameHaving(mm, v, depth + 1)) : renameHaving(mm, val, depth + 1);
       continue;
     }
     if (key === '_count') {

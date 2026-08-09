@@ -98,8 +98,24 @@ const SQL_ROW_ESTIMATES_YBDB = `
 // Adapter implementation
 // ---------------------------------------------------------------------------
 
+/**
+ * Error codes that mean "another session already holds the migration lock".
+ *
+ * `55P03` (lock_not_available) is what `NOWAIT` raises. `40001`
+ * (serialization_failure) is the same contention reported the other way round:
+ * YugabyteDB's distributed transaction layer can abort the conflicting
+ * transaction instead of refusing the lock, and treating that as a hard error
+ * crashed `turbine migrate` with a raw driver message in place of the clean
+ * "another migration is already running" one.
+ */
+const LOCK_CONTENTION_CODES = new Set(['55P03', '40001']);
+
 export const yugabytedb: DatabaseAdapter = {
   name: 'yugabytedb',
+
+  // Row lock, so it lives and dies with the transaction acquireLock leaves
+  // open, and the migration runner must give it a dedicated connection.
+  lockHoldsOpenTransaction: true,
 
   createLockTableSQL() {
     return CREATE_LOCK_TABLE_SQL;
@@ -122,12 +138,15 @@ export const yugabytedb: DatabaseAdapter = {
         `UPDATE "${LOCK_TABLE}" SET acquired_at = now(), acquired_by = current_user WHERE lock_id = $1`,
         [lockId],
       );
-      // Leave the transaction open, lock is held until releaseLock()
+      // Leave the transaction open, lock is held until releaseLock(). That is
+      // why this adapter sets `lockHoldsOpenTransaction`: on the runner's own
+      // connection, the first migration's COMMIT would end this transaction and
+      // release the lock with every later migration still to run.
       return true;
     } catch (err: unknown) {
       const pgErr = err as { code?: string };
-      // 55P03 = lock_not_available (NOWAIT couldn't acquire)
-      if (pgErr.code === '55P03') {
+      // Contention (see LOCK_CONTENTION_CODES) means somebody else is migrating.
+      if (LOCK_CONTENTION_CODES.has(String(pgErr.code))) {
         try {
           await client.query('ROLLBACK');
         } catch {

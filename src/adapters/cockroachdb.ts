@@ -109,8 +109,26 @@ const SQL_ENUMS_CRDB = `
 // Adapter implementation
 // ---------------------------------------------------------------------------
 
+/**
+ * Error codes that mean "another session already holds the migration lock".
+ *
+ * `55P03` (lock_not_available) is what `NOWAIT` raises, and was the only code
+ * treated as contention. CockroachDB runs SERIALIZABLE by default, so the very
+ * same contention can instead surface as `40001` (serialization_failure) when
+ * the conflicting transactions are ordered rather than blocked. That crashed
+ * `turbine migrate` with a raw driver error in place of the clean "another
+ * migration is already running" message, for exactly the situation the lock
+ * exists to describe.
+ */
+const LOCK_CONTENTION_CODES = new Set(['55P03', '40001']);
+
 export const cockroachdb: DatabaseAdapter = {
   name: 'cockroachdb',
+
+  // The lock is a row lock, so it lives and dies with the transaction
+  // acquireLock leaves open. The migration runner gives it a dedicated
+  // connection on the strength of this flag.
+  lockHoldsOpenTransaction: true,
 
   createLockTableSQL() {
     return CREATE_LOCK_TABLE_SQL;
@@ -133,12 +151,14 @@ export const cockroachdb: DatabaseAdapter = {
         [lockId],
       );
       // Note: we leave the transaction OPEN, the lock is held until
-      // releaseLock() commits or rolls back.
+      // releaseLock() commits or rolls back. That is why this adapter sets
+      // `lockHoldsOpenTransaction` and the runner hands it its own connection:
+      // on a shared one, the first migration's COMMIT would end this.
       return true;
     } catch (err: unknown) {
-      // NOWAIT throws error code 55P03 (lock_not_available) if the row is locked
+      // Contention (see LOCK_CONTENTION_CODES) means somebody else is migrating.
       const pgErr = err as { code?: string };
-      if (pgErr.code === '55P03') {
+      if (LOCK_CONTENTION_CODES.has(String(pgErr.code))) {
         try {
           await client.query('ROLLBACK');
         } catch {

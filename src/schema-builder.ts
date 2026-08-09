@@ -141,7 +141,8 @@ export interface ColumnDef {
    * `schemaDefToMetadata` / codegen, onto
    * {@link import('./schema.js').ColumnMetadata.pii}. A PII column is excluded
    * from default projections (read back only via an explicit `select` or
-   * `includePii: true`) and redacted by Studio. Introspection never auto-tags PII.
+   * `includePii: UNSAFE`, the imported sentinel symbol) and redacted by Studio.
+   * Introspection never auto-tags PII.
    */
   pii?: boolean;
   /**

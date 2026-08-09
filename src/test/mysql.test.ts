@@ -836,10 +836,14 @@ describe('turbine-orm/mysql, integration (real MySQL 8)', () => {
     assert.equal(updated.name, 'technology');
   });
 
-  gate.it('update returns the updated row (boolean coerces to 1)', async () => {
+  gate.it('update returns the updated row, and a TINYINT(1) reads back as a real boolean', async () => {
     const updated = await client.table('posts').update({ where: { id: 3 }, data: { published: true, viewCount: 5 } });
     assert.equal(updated.id, 3);
-    assert.equal(updated.published, 1);
+    // `published` is declared BOOLEAN (= TINYINT(1)) and the generated type
+    // says `boolean`, so the value the ORM wrote as `true` has to come back as
+    // `true`, not as the 1 MySQL stores. Strict equality on purpose: this used
+    // to assert `1`, which is what made `row.published === true` false.
+    assert.equal(updated.published, true);
     assert.equal(updated.viewCount, 5);
   });
 

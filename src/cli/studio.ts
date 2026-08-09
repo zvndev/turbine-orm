@@ -54,6 +54,7 @@ import { QueryInterface, quoteIdent } from '../query/index.js';
 // its defining leaf module rather than duplicated here.
 import { ownLookup, registerUtcTemporalParsers } from '../query/utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
+import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
 import { createDemoContext } from './studio-demo.js';
@@ -679,7 +680,7 @@ export function relationLinksForTable(
   const seenFkColumns = new Set<string>();
 
   for (const [name, rel] of Object.entries(table.relations)) {
-    const target = metadata.tables[rel.to];
+    const target = ownLookup(metadata.tables, rel.to);
     if (!target) continue;
 
     if (rel.type === 'belongsTo') {
@@ -1001,20 +1002,6 @@ function parseTableFilters(raw: string | null, table: TableMetadata, redactedPii
 // API: /api/builder: Turbine ORM findMany spec runner
 // ---------------------------------------------------------------------------
 
-/** Relation-filter wrappers whose body is a clause against the relation's target. */
-const RELATION_FILTER_WRAPPERS = ['some', 'none', 'every', 'is', 'isNot'] as const;
-
-/**
- * Recursion bound for the PII guard walk.
- *
- * This number is NOT the security boundary: reaching it REFUSES the request
- * (see `assertWithinDepth`). It only bounds the walk on a pathological payload.
- * It sits well above the query builder's own depth-10 relation cap
- * (`CircularRelationError`) and far above any hand-composed boolean nesting, so
- * nothing the builder would accept is refused here for depth alone.
- */
-const PII_GUARD_MAX_DEPTH = 32;
-
 /**
  * Refuse a builder query that FILTERS, SORTS, PAGES, or DE-DUPLICATES on a
  * redacted PII column.
@@ -1028,15 +1015,16 @@ const PII_GUARD_MAX_DEPTH = 32;
  * already refuses its own equivalents (`parseTableFilters`); the builder route
  * has to refuse all of them too.
  *
- * Walks the whole args tree: `where`, `orderBy` (object AND array form),
- * `cursor`, `distinct`, boolean combinators, relation filters, and each `with`
- * level against that relation's target table. `select` / `omit` are NOT
- * refused: they return values, and those values are redacted on the way out.
+ * The WALK lives in `cli/pii-predicate-guard.ts`, shared with the MCP server's
+ * `explain_query`, which asks the same question of the same arg tree. It used to
+ * be a second hand-written copy here, and the two drifted exactly the way copies
+ * do: a hole opened in both and could only have been closed in one. What stays
+ * here is the part that is genuinely Studio's: WHICH columns are hidden (a
+ * code-first `pii` tag, unless `--show-pii`), and what a refusal looks like (a
+ * `ValidationError`, which `/api/builder` renders as a 400).
  *
- * Every depth check FAILS CLOSED. Returning quietly at the cap (what this used
- * to do) meant padding a payload with, for example, eleven nested `NOT`
- * wrappers walked the guard off the end of its own recursion and then handed
- * the untouched predicate to the builder.
+ * `select` / `omit` are NOT refused: they return values, and those values are
+ * redacted on the way out.
  */
 function assertNoPiiPredicates(
   args: Record<string, unknown>,
@@ -1046,96 +1034,31 @@ function assertNoPiiPredicates(
 ): void {
   if (showPii) return;
 
-  const assertWithinDepth = (depth: number): void => {
-    if (depth <= PII_GUARD_MAX_DEPTH) return;
-    throw new ValidationError(
-      `[turbine] Query is nested more than ${PII_GUARD_MAX_DEPTH} levels deep, which is past the point where ` +
-        `Studio can prove it does not filter or sort on a PII-tagged and redacted column, so it is refused. ` +
-        `Flatten the query, or restart Studio with --show-pii.`,
-    );
-  };
-
-  const refuse = (table: TableMetadata, column: string): never => {
-    throw new ValidationError(
-      `[turbine] Column "${column}" on "${table.name}" is PII-tagged and redacted, so it cannot be used ` +
-        `in a where, orderBy, cursor, or distinct: filtering, sorting, paging, or de-duplicating on a hidden ` +
-        `value reveals it. Restart Studio with --show-pii to query it.`,
-    );
-  };
-
-  const visitClause = (node: unknown, table: TableMetadata | undefined, depth: number): void => {
-    assertWithinDepth(depth);
-    if (!table || node === null || typeof node !== 'object') return;
-    // `orderBy` accepts a Prisma-style array of single-key objects, and so does
-    // a `NOT` list. Element order carries no nesting, so the depth is unchanged.
-    if (Array.isArray(node)) {
-      for (const item of node) visitClause(item, table, depth);
-      return;
-    }
-    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-      if (key === 'AND' || key === 'OR' || key === 'NOT') {
-        visitClause(value, table, depth + 1);
-        continue;
-      }
-      const relation = Object.hasOwn(table.relations, key) ? table.relations[key] : undefined;
-      if (relation) {
-        visitRelationValue(value, metadata.tables[relation.to], depth + 1);
-        continue;
-      }
-      const column = ownLookup(table.columnMap, key) ?? key;
-      if (isRedactedColumn(table, column, showPii)) refuse(table, column);
-    }
-  };
-
-  /**
-   * A relation predicate arrives in one of two shapes, and BOTH resolve against
-   * the relation's target table: bare (`{ user: { email: {...} } }`) or wrapped
-   * in a cardinality / to-one operator (`{ user: { is: { email: {...} } } }`,
-   * likewise `some` / `none` / `every` / `isNot`). Handing the wrapper straight
-   * to `visitClause` walked its keys as if `is` were a column of the target, so
-   * the inner clause was never visited and a PII predicate slipped through.
-   * Descend into every wrapper member AND into the value itself.
-   */
-  const visitRelationValue = (value: unknown, target: TableMetadata | undefined, depth: number): void => {
-    assertWithinDepth(depth);
-    if (!target || value === null || typeof value !== 'object') return;
-    const node = value as Record<string, unknown>;
-    for (const wrapper of RELATION_FILTER_WRAPPERS) {
-      if (Object.hasOwn(node, wrapper)) visitClause(node[wrapper], target, depth + 1);
-    }
-    visitClause(node, target, depth);
-  };
-
-  /** Field-name lists (`distinct`) name columns directly rather than in a clause. */
-  const visitFieldList = (value: unknown, table: TableMetadata): void => {
-    if (!Array.isArray(value)) return;
-    for (const field of value) {
-      if (typeof field !== 'string') continue;
-      const column = ownLookup(table.columnMap, field) ?? field;
-      if (isRedactedColumn(table, column, showPii)) refuse(table, column);
-    }
-  };
-
-  const visitLevel = (level: Record<string, unknown>, table: TableMetadata | undefined, depth: number): void => {
-    assertWithinDepth(depth);
-    if (!table) return;
-    visitClause(level.where, table, depth);
-    visitClause(level.orderBy, table, depth);
-    // `cursor` is a flat `{ field: value }` seek key that the builder turns into
-    // a WHERE range comparison against the sort key, so it reads exactly like a
-    // where on the same column.
-    visitClause(level.cursor, table, depth);
-    visitFieldList(level.distinct, table);
-    const withClause = level.with;
-    if (!withClause || typeof withClause !== 'object') return;
-    for (const [relName, spec] of Object.entries(withClause as Record<string, unknown>)) {
-      const relation = Object.hasOwn(table.relations, relName) ? table.relations[relName] : undefined;
-      if (!relation || spec === true || spec === null || typeof spec !== 'object') continue;
-      visitLevel(spec as Record<string, unknown>, metadata.tables[relation.to], depth + 1);
-    }
-  };
-
-  visitLevel(args, metadata.tables[tableName], 0);
+  assertNoPiiPredicatesShared(args, ownLookup(metadata.tables, tableName), {
+    metadata,
+    hiddenReason: (table, column) => (isRedactedColumn(table, column, showPii) ? 'is PII-tagged and redacted' : null),
+    refuseColumn: (table, column, reason) => {
+      throw new ValidationError(
+        `[turbine] Column "${column}" on "${table.name}" ${reason}, so it cannot be used ` +
+          `in a where, orderBy, cursor, or distinct: filtering, sorting, paging, or de-duplicating on a hidden ` +
+          `value reveals it. Restart Studio with --show-pii to query it.`,
+      );
+    },
+    refuseDepth: (maxDepth) => {
+      throw new ValidationError(
+        `[turbine] Query is nested more than ${maxDepth} levels deep, which is past the point where ` +
+          `Studio can prove it does not filter or sort on a PII-tagged and redacted column, so it is refused. ` +
+          `Flatten the query, or restart Studio with --show-pii.`,
+      );
+    },
+    refuseShape: (table, key) => {
+      throw new ValidationError(
+        `[turbine] Studio does not recognize "${key}" in a query on "${table.name}", so it cannot prove the ` +
+          `query does not filter or sort on a PII-tagged and redacted column, and refuses it rather than ` +
+          `guessing. Remove it, or restart Studio with --show-pii.`,
+      );
+    },
+  });
 }
 
 export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
@@ -1171,7 +1094,7 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
   // here (the user named the columns, and the values are redacted on the way
   // out); only the empty default projection is refused, with a reason instead
   // of a syntax error.
-  const target = ctx.metadata.tables[tableName];
+  const target = ownLookup(ctx.metadata.tables, tableName);
   if (target && !ctx.showPii && args.select === undefined && target.columns.every((c) => c.pii === true)) {
     sendJson(res, 400, {
       error:
@@ -1213,7 +1136,17 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
       // the connection's search_path. Pin it to the configured --schema so the
       // Query tab reads the same schema as the Data tab (set_config is
       // transaction-local and fully parameterized). Demo has no schemas.
-      await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
+      //
+      // The VALUE is bound as a parameter, but Postgres parses the contents of
+      // search_path as an identifier LIST, so a name that needs quoting has to
+      // carry its own. Passing `My.Schema` raw makes Postgres read it as a
+      // two-part token that matches nothing: `current_schemas(false)` came back
+      // `{}` and the very next query died with `relation "widgets" does not
+      // exist` (measured on PG 16). A schema whose name merely differs in CASE
+      // is worse than that, because it silently folds to a DIFFERENT existing
+      // schema instead of failing. quoteIdent applies exactly the doubling rule
+      // the GUC parser expects.
+      await client.query(`SELECT set_config('search_path', $1, true)`, [quoteIdent(ctx.options.schema)]);
     }
     const started = Date.now();
     const result = await client.query(deferred.sql, deferred.params);
@@ -1428,7 +1361,11 @@ export async function apiRowWrite(
     await client.query('BEGIN');
     if (!ctx.demo) {
       await client.query(ctx.statementTimeout.sql, ctx.statementTimeout.params);
-      await client.query(`SELECT set_config('search_path', $1, true)`, [ctx.options.schema]);
+      // Quoted for the same reason as the read path above: the bound value is
+      // parsed as an identifier list, so an unquoted mixed-case or dotted schema
+      // name pins search_path to nothing. On THIS path that would mean a write
+      // aimed at a non-default schema resolving somewhere else entirely.
+      await client.query(`SELECT set_config('search_path', $1, true)`, [quoteIdent(ctx.options.schema)]);
     }
     const returnedRows: Record<string, unknown>[] = [];
     let rowCount = 0;
@@ -1604,7 +1541,7 @@ export async function apiCreateSavedQuery(
   const table = typeof body?.table === 'string' ? body.table : '';
   const name = typeof body?.name === 'string' ? body.name.trim() : '';
 
-  if (!table || !ctx.metadata.tables[table]) {
+  if (!table || !ownLookup(ctx.metadata.tables, table)) {
     sendJson(res, 400, { error: unknownTableMessage(table, ctx) });
     return;
   }
@@ -1726,7 +1663,7 @@ function redactBuilderRows(
   withClause: unknown,
   metadata: SchemaMetadata,
 ): Record<string, unknown>[] {
-  const table = metadata.tables[tableName];
+  const table = ownLookup(metadata.tables, tableName);
   if (!table) return rows;
   const piiKeys = piiKeysForTable(table);
   const relEntries =

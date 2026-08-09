@@ -1,5 +1,336 @@
 # Changelog
 
+## 0.66.0 (2026-08-09)
+
+The output of a full audit of 0.65.0 across security, performance, migrations,
+multi-engine parity and code quality. Almost every defect it found has one
+shape: a rule that lives in two places and drifted, or a rule that is
+documented and lives in none. The destructive-migration guard had its own SQL
+lexer that disagreed with the runner's. `DISTINCT ON` was gated in one of the
+two places that emit it. Vector validation ran on the build path and not the
+cache-hit path. Four PowDB relation paths disagreed about whether a projection
+keeps the primary key. Each fix below removes a copy rather than syncing one.
+
+### Fixed
+
+- **A nested block comment turned off the destructive-migration guard.**
+  PostgreSQL nests `/* */`; the guard's private lexer ended a block comment at
+  the first `*/`, and it split statements on a bare `;` while the runner used a
+  correct tokenizer. Both bugs fail OPEN. The worst case was not a total miss
+  but a PARTIAL inventory: for a file holding a commented-out block that itself
+  contained a comment, a `DROP TABLE` and a `DELETE`, the guard listed only the
+  `DELETE`, so the operator confirmed what they were shown and the unlisted
+  `DROP TABLE` ran under that confirmation. A semicolon inside a quoted
+  identifier (`DROP TABLE "we;ird"`) hid a statement the same way. There is now
+  exactly one tokenizer (`src/cli/sql-statements.ts`, a pure leaf) and both
+  callers consume it, returning per statement both the verbatim source that
+  executes and the comment-stripped source the rules match against, from a
+  single walk. Three more fail-opens in the same guard were found by scanning
+  for the CLASS rather than re-checking the reported instance, and each was
+  confirmed by executing it: `$` is legal INSIDE a PostgreSQL identifier, so
+  `SELECT x$y$ FROM t;` was read as opening a dollar-quoted block and swallowed
+  the rest of the file (the guard reported nothing and the following `DROP
+  TABLE` ran); the procedural path that exists to catch dynamic SQL was still
+  stripping comments with its own regex, so a `'x --'` literal earlier in a
+  one-line `DO` block hid every destructive statement after it, reachable by
+  accident rather than by intent; and `CREATE FUNCTION ... BEGIN ATOMIC DELETE
+  FROM users; END;` split on the wrong semicolons. The `$` case also defeated
+  the new embedded-transaction refusal, which reads the same tokenizer.
+
+- **Destructive SQL assembled at run time was reported as nothing.** The rules
+  need a parseable object name and dynamic SQL has none until it runs, so
+  `DO $$ BEGIN EXECUTE format('DROP TABLE %I', 'users'); END $$;` (and the
+  `'DROP TABLE ' || quote_ident(...)` and `'DROP ' || 'TABLE users'` spellings)
+  dropped the table live while the operator was shown a clean inventory. They
+  are now reported with an explicit unknown target. The trigger is evidence of
+  runtime assembly (`||`, `format(`, `quote_*(`, `%I`), which is complete rather
+  than a heuristic: a destructive statement whose object name is written out
+  literally already matches a rule, so being dynamic requires concatenating or
+  formatting. `RAISE NOTICE 'DROP the mic'` and a dynamic `SELECT` stay silent,
+  because a guard that fires on prose teaches operators to confirm without
+  reading.
+
+- **`migrate down` skipped a migration it could not reverse and kept rolling
+  back the ones underneath it.** Both failure branches continued where the SQL
+  failure path correctly stopped. A `--step 3` where the middle migration had
+  no `DOWN` section rolled back the third and then the FIRST, dropping a table
+  whose rows the skipped migration had seeded, and left the tracking table
+  claiming only that migration was applied. Rollback is now strictly LIFO with
+  no gaps.
+
+- **Query SHAPE could exhaust the database server.** Every distinct SQL shape
+  was parsed as a NAMED prepared statement and never deallocated, so a caller
+  who controlled only the ARITY of a boolean combinator (a `where.OR` array
+  built from a UI multi-select) grew the backend without limit: 600 distinct
+  shapes held 600 statements and 20.9 MB of cached plans on one connection,
+  none of it reclaimed by reuse, and each pooled connection accumulated its
+  own. A where clause containing a caller-written `AND`/`OR` array now compiles
+  to an UNNAMED statement, which the driver re-parses per execution and never
+  accumulates. Turbine's own synthesized wrappers stay named, so a table with a
+  global filter is unaffected. `in: [...]` was never affected: it binds one
+  parameter regardless of list length.
+
+- **`findMany({ distinct })` emitted PostgreSQL-only `DISTINCT ON` on every
+  engine.** The other spelling of the same feature, `groupBy({ distinctOn })`,
+  was gated correctly, so this path had no dialect check at all and reached the
+  driver as a raw syntax error carrying no Turbine code. It now throws
+  `UnsupportedFeatureError` (E017) on SQLite, MySQL and SQL Server.
+
+- **Composite foreign keys introspected as a cartesian product, and constraint
+  names were treated as globally unique.** The FK query joined
+  `key_column_usage` to `constraint_column_usage` on constraint name alone,
+  which is an N-by-N cross join, so a two-column foreign key became four
+  AND-ed correlations with two of them mispaired and the relation returned
+  nothing, with no error and no warning. Separately, PostgreSQL only requires
+  constraint-name uniqueness per table, so two tables sharing a name merged:
+  one lost its foreign key entirely and the other pointed at the wrong table.
+  A name collision in a different schema silently deleted relations from the
+  generated client. Both are one query now, reading `pg_constraint` and pairing
+  columns positionally with `unnest(conkey) WITH ORDINALITY`, keyed on the
+  constraint OID. Referential actions rode the same collision and are fixed
+  with it. Generated output is byte-identical for schemas that were already
+  correct.
+
+- **On MySQL, a `json` column's runtime type changed when you added a
+  `limit`.** The join strategy embeds the column in `JSON_OBJECT` so it arrives
+  parsed, while the batched and flatten plans read it directly so it arrives as
+  text, and the default `auto` strategy picks between them. `row.org.meta.tier`
+  worked on one query and threw on the same query one pagination argument
+  later. `json` now has a wire rule like the other divergent types, so all four
+  read paths agree.
+
+- **The CockroachDB and YugabyteDB migration lock was released by the first
+  migration's `COMMIT`.** The adapters hold a row lock and deliberately leave
+  its transaction open, but the runner applied every migration on the same
+  connection and committed per file, so migrations two onward ran unprotected
+  and a concurrent `turbine migrate` could take the lock and replay them. The
+  failure was silent, and a second face of it made a `-- turbine:no-transaction`
+  migration fail or succeed depending on its position in the batch. The lock is
+  now held on a dedicated connection. Serialization failures are treated as
+  contention rather than crashing with a raw driver error. The regression test
+  that previously passed BECAUSE of the bug has been rewritten.
+
+- **Studio and the MCP server leaked the ordering of redacted columns.** The
+  PII predicate guard recursed into `AND`/`OR`/`NOT` and relation keys, but a
+  pick-row relation ordering puts column names two levels deeper under
+  `pick.orderBy`, `pick.where` and `by`, none of which were visited, so a
+  read-only session with redaction on could recover a hidden column's full
+  ordering and run a character-by-character `startsWith` probe against it. A
+  column reference (`{ gt: { col: 'secret' } }`) was a second channel through
+  the operand rather than the key. Studio and MCP now share one guard
+  (`src/cli/pii-predicate-guard.ts`) that FAILS CLOSED on any unrecognized
+  structured shape, so the next ordering form is refused rather than waved
+  through.
+
+- **A per-relation `limit` under the batched strategy fetched every matching
+  child.** Measured at 200 parents with about 505 children each, the batched
+  plan pulled 101,000 rows over the wire to keep 600, at 52.9 MB of peak heap
+  against the join plan's 0.5 MB. Reachable without opting in, because `auto`
+  routes provably unindexed relations to batched. PostgreSQL now bounds it
+  server-side with `ROW_NUMBER() OVER (PARTITION BY ...)`; other engines keep
+  the client-side slice. The unlimited path, where batched legitimately beats
+  join, emits byte-identical SQL.
+
+- **Vector distance thresholds were validated on the build path only**, so a
+  warm SQL cache under `NODE_ENV=production` accepted `NaN`, a string, or an
+  object. PostgreSQL sorts NaN above everything, so `distance < NaN` matched
+  every row: the opposite of the intent, silently, and only in production.
+
+- **`turbine migrate create <name>` wrote raw argv into the migration body.**
+  The name was sanitized for the filename only, and the header sits above the
+  `-- UP` marker, so a newline-bearing name injected executable migration SQL
+  and could set `-- turbine:no-transaction` to defeat the transaction wrapper.
+
+- **Connection strings with passwords were echoed in errors** on MySQL, SQL
+  Server and PowDB, contradicting `SECURITY.md`. The trigger was a MALFORMED
+  DSN, which is exactly when someone pastes an error into a bug report.
+
+- **`errorMessages: 'safe'` still leaked row values on MySQL and SQL Server**,
+  because redaction hooked on a `detail` field those drivers never set while
+  they put the value in `message`, `sqlMessage` and `stack`. The mode was also
+  a process-global that the last constructed client won, so a second client
+  silently downgraded the first. It is now per-client.
+
+- **The where and having walkers had no depth cap**, so a 64 KB request body
+  (under `express.json()`'s default limit) raised a `RangeError` rather than a
+  typed error, bypassing the error surface entirely.
+
+- **`ALTER COLUMN ... TYPE` emitted an explicit `USING` cast for narrowing
+  conversions**, converting PostgreSQL's own refusal into silent truncation: a
+  25-character value became 10. Same-family narrowing now emits the plain
+  `ALTER`, so PostgreSQL's assignment cast decides. For a shortened `varchar`
+  that means the migration is refused rather than truncating. Numeric and
+  temporal narrowing still lose precision, because PostgreSQL's assignment cast
+  rounds and truncates rather than refusing; the destructive gate now names the
+  specific loss for each instead of the generic "cast may truncate or fail".
+
+- **`schemaDiff` hardcoded the `public` schema** in all eight catalog reads
+  while every other command honored `--schema`, so against a dedicated schema
+  it reported every table missing and emitted duplicates into `public`. Worse,
+  with a legacy copy in `public` it would `ALTER` and `DROP COLUMN` the wrong
+  table. `schemaPush` now also pins a transaction-local `search_path`.
+
+- **Column length and numeric precision changes were invisible** to the diff,
+  which compared `udt_name` alone, so `push` reported "already in sync" for a
+  schema that genuinely differed.
+
+- **`doctor --fix` wrote an index migration that could never succeed.**
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS` matches on name, not validity, so
+  over the INVALID index left by a failed concurrent build it silently no-oped
+  while recording the migration as applied.
+
+- **Prisma `@map(name: "...")` was ignored on fields**, though the model-level
+  handler accepted both forms. The column name was discarded and the field name
+  used instead, which in a legacy database is frequently a real column, so
+  every read returned another column's data and every write landed in the wrong
+  one, with a clean report. A `@relation(fields: [...])` matching no database
+  foreign key also fell through to "take the only candidate" instead of
+  reporting disagreement.
+
+- **SQLite's JSON `contains` never matched anything.** The reported symptom was
+  that object operands degraded; measurement showed scalars failed too, because
+  the parameter is bound as JSON text while `json_each.value` yields the
+  decoded value. It is now refused with E017 rather than silently returning
+  fewer rows.
+
+- **A `BOOLEAN` column typed `boolean` returned `1`/`0`** on SQLite and MySQL,
+  including a value Turbine itself had written as `true`. **`_min`/`_max` on a
+  date column returned a raw string** on SQLite while `findMany` and `groupBy`
+  returned a `Date`. **SQL Server's `LIKE` treats `[` as a wildcard**, so
+  `contains: '[draft]'` matched any title containing d, r, a, f or t.
+
+- **PowDB returned the primary key through `omit: { id: true }`**, and its four
+  relation paths disagreed about whether a projection keeps it. Also fixed:
+  unqualified PowQL column references were emitted unquoted (narrowly, so
+  keyword columns stay bare for pre-0.10 compatibility).
+
+- **`PipelineError` (E014) was defined, documented, and never constructed**, so
+  `err instanceof PipelineError` was permanently false and the documented
+  example could not work. The non-transactional path also now runs every query
+  and reports per slot, as its own option already promised.
+
+- Migration files containing their own `BEGIN;`/`COMMIT;` broke the runner's
+  wrapper and left the migration half-applied and unrecorded; they are now
+  refused, and the shipped `--recipe backfill` scaffold no longer teaches the
+  pattern. Section markers accept `--DOWN` and other loose spellings instead of
+  folding the rollback into the UP. The tracking table tolerates the
+  concurrent-create race that crashed 11 of 12 parallel `migrate status` calls.
+  `schemaPush`'s bare `ROLLBACK` no longer replaces the error it is unwinding.
+  The destructive rule set gained `DROP TYPE|DOMAIN|EXTENSION|SEQUENCE|FUNCTION
+  ... CASCADE`, `DETACH PARTITION`, `EXPLAIN ANALYZE <DML>` (which executes) and
+  a `rename` kind, and two quoted-identifier false positives are gone.
+
+### Added
+
+- `src/cli/sql-statements.ts` and `src/cli/pii-predicate-guard.ts`, both pure
+  leaves shared by two callers, each with its own coverage floor.
+- `check-error-codes` now asserts the REVERSE direction: every error code must
+  be constructed somewhere outside the tests. That is what found E014.
+- Redundant sort terms are dropped with a dev warning, and long sort lists lose
+  their prepared-statement name, which closes the same unbounded-shape vector
+  through `orderBy`, `distinct` and `distinctOn`.
+- CI's PostgreSQL services now use `pgvector/pgvector`, so the pgvector suite
+  executes for the first time instead of skipping itself, and the fixture
+  carries GIN expression indexes so full-text search has live coverage.
+
+### Changed
+
+- Non-transactional pipelines reject with `PipelineError` (E014) rather than
+  the raw driver error. `.results` keeps its shape and the driver error is
+  `.cause`.
+- `migrate up` now asks for confirmation on rename-only migrations, and refuses
+  a migration file with no recognized `-- UP` marker.
+- Studio and MCP refuse some previously-accepted structured query shapes.
+  Over-refusing is the intended direction for a redaction boundary.
+- The CockroachDB and YugabyteDB rows in the compatibility matrix now read
+  Experimental, matching `STABILITY.md`. Their inherited PostgreSQL capability
+  flags are documented for the first time.
+- The main entry's import graph grew by roughly 5 kB brotli, and `.size-limit.js`
+  was re-baselined to match, with the measurement and the reasoning recorded in
+  the file. The growth is the new shared leaves plus the widened guards; it is
+  not a new dependency, and the runtime dependency set is unchanged (`pg`).
+
+- **Benchmarks re-run and republished.** The README and site had been quoting a
+  2026-07-25 measurement of 0.50.0, sixteen releases stale. `RESULTS-0.66.0.md`
+  is a fresh three-run measurement on the same hardware, PostgreSQL and fixture,
+  with the competitor versions deliberately pinned to the previous run's so the
+  two are comparable. Turbine runs at **1.09x hand-written `pg`** (Drizzle 1.49x,
+  Prisma 1.86x) and is **1.82x faster than Prisma 7.9** / **1.32x faster than
+  Drizzle 0.45** by geometric mean. Two things are now disclosed that were not
+  before: the two harnesses disagree on **two** scenarios rather than one, so L2
+  nested reads and atomic increment are recorded as contested rather than as
+  wins; and the L2 gap to Drizzle widened since the 0.50.0 run (1.21x to 1.32x)
+  for reasons this release does not explain. A direct interleaved A/B of 0.65.0
+  against 0.66.0 on the same database rules out this release as the cause: 0.66.0
+  measured equal or marginally faster on every shape, including the two the
+  prepared-statement and projection changes could plausibly have slowed.
+
+### Upgrading
+
+Most of this release is a bug fix you do not have to act on. Four changes can
+be noticed, and all four are noticed at BUILD or DEPLOY time rather than in
+production, which is deliberate.
+
+**A migration file may no longer contain its own transaction control.** If any
+`.sql` migration in your repo contains `BEGIN`, `START TRANSACTION`, `COMMIT`,
+`ROLLBACK` or `ABORT` outside a comment or a string, `turbine migrate` now
+refuses it before running anything. This is the fix, not an inconvenience: the
+runner already wraps each file in exactly one transaction, so an embedded
+`COMMIT` ended that wrapper mid-file, made everything before it durable, ran
+everything after it unprotected, and recorded the migration nowhere, which left
+reruns failing forever on "already exists". Delete your own `BEGIN`/`COMMIT`
+(the statements between them are still atomic, the runner supplies the
+transaction), or put `-- turbine:no-transaction` in the file header if the
+migration genuinely cannot run inside one, such as `CREATE INDEX CONCURRENTLY`.
+`ROLLBACK TO SAVEPOINT` is still allowed: it leaves the wrapping transaction
+open.
+
+**A rename-only migration now prompts.** `RENAME COLUMN` and `RENAME TO` joined
+the destructive rule set, so a migration containing nothing but renames now
+requires the two-step typed confirmation. If such a migration runs unattended
+in CI, it will block until you add `--allow-destructive` (or use
+`turbine migrate deploy`, which is the no-prompt form). Worth checking before
+your next pipeline run rather than during it.
+
+**Relation names are now derived in a deterministic order.** Foreign keys used
+to be walked in creation order (`pg_constraint.oid`), so a database restored
+from a dump and one built from migrations could produce different relation
+names and even different CARDINALITIES for the same logical schema, which meant
+`with: { profile: true }` could read a different table depending on how the
+database was built. The walk is now ordered by (source table, constraint name).
+Two consequences on your next `turbine generate`: the relation key order in
+`metadata.ts` may shift once, a cosmetic one-time diff, and in the rare case
+where two relations competed for the same name, the winner can change. Read the
+generated diff rather than skimming it. Partition clones no longer produce
+phantom relations either, so one declared foreign key to a partitioned table now
+yields one relation instead of one per partition.
+
+**A migration that builds destructive SQL at run time now prompts.** If a
+`DO` block or function body assembles a `DROP` / `TRUNCATE` / `DELETE` by
+concatenation or `format()`, it appears in the confirmation inventory as
+`<name assembled at run time>` rather than not appearing at all. Same
+operational consequence as the rename change above: add `--allow-destructive`
+or use `turbine migrate deploy` if such a migration runs unattended. Statements
+with a literal object name are unaffected and still name their target exactly.
+
+**A `select` projection emits its columns in the table's own order.** The
+column list is now canonical rather than the order the caller wrote the keys in,
+so the KEY INSERTION ORDER of a projected row object changed. Nothing reads a
+projection positionally, and `omit` already worked this way, which is exactly
+why `omit` never had the bug: caller-chosen key ORDER minted a distinct,
+permanently cached, server-side prepared statement per permutation (measured at
+5,040 statements and 39 MB from one seven-column table, reachable from an
+ordinary `PATCH` body with no arrays and no opt-in). Only code that depends on
+`Object.keys(row)` ordering, or that hashes `JSON.stringify(row)`, will notice.
+Write `data` was canonicalized for the same reason and is not observable at all.
+
+**Some previously-accepted query shapes are now refused.** `findMany({ distinct })`
+throws `UnsupportedFeatureError` (`TURBINE_E017`) on SQLite, MySQL and SQL
+Server instead of emitting `DISTINCT ON` for the driver to reject with an
+untyped parse error. Studio and MCP refuse more structured argument shapes than
+before. In both cases the refusal replaces something that was already failing,
+just less legibly.
+
 ## 0.65.0 (2026-08-02)
 
 A hardening release built around one new instrument: a seeded differential

@@ -83,7 +83,12 @@ import {
   type UpsertStatementInput,
 } from './dialect.js';
 import type { EngineClientConfig } from './engine-config.js';
-import { ConnectionError, UnsupportedFeatureError } from './errors.js';
+import {
+  ConnectionError,
+  malformedConnectionStringMessage,
+  markValueBearingMessage,
+  UnsupportedFeatureError,
+} from './errors.js';
 import { applyTableFilters, deriveEngineRelations } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import {
@@ -179,15 +184,63 @@ function toNamedBinding(values: unknown[]): Record<string, MysqlParam> | undefin
 // Result shaping + error translation
 // ---------------------------------------------------------------------------
 
+/**
+ * mysql2's `MYSQL_TYPE_TINY`. A result field with this type and a display width
+ * of 1 IS the `BOOLEAN` / `TINYINT(1)` column; see {@link MYSQL_BOOLEAN_TYPE}.
+ */
+const MYSQL_FIELD_TYPE_TINY = 1;
+
+/**
+ * Turn `TINYINT(1)` cells back into real booleans, in place.
+ *
+ * MySQL stores a boolean as 1/0 and mysql2 returns the integer. Turbine still
+ * generates `ok: boolean` for the column ({@link mysqlTypeToTs}), so
+ * `row.ok === true` was false, `JSON.stringify(row)` emitted `1`, and a value
+ * the ORM itself wrote as `true` came back as a number.
+ *
+ * Done from the RESULT FIELDS rather than from mysql2's `typeCast` option on
+ * purpose. `typeCast` lives in {@link MYSQL_DRIVER_FLAGS}, which only applies
+ * to pools TURBINE builds; an injected mysql2 pool (a supported, documented
+ * entry point) would keep returning numbers at the top level while the join
+ * strategy's `jsonWireRule` returned booleans, i.e. fixing it there would have
+ * created exactly the strategy-dependent split this is meant to close. The
+ * field metadata is on every result from every pool.
+ *
+ * An expression column is never touched: `ok + 0` comes back as
+ * MYSQL_TYPE_LONGLONG with a different width, and only an exact
+ * (TINY, width 1) field is coerced.
+ */
+function coerceBooleanColumns(rows: Record<string, unknown>[], fields: unknown): void {
+  if (!Array.isArray(fields) || rows.length === 0) return;
+  const names: string[] = [];
+  for (const f of fields as { name?: unknown; columnType?: unknown; columnLength?: unknown }[]) {
+    if (!f || f.columnType !== MYSQL_FIELD_TYPE_TINY || f.columnLength !== 1) continue;
+    if (typeof f.name !== 'string') continue;
+    names.push(f.name);
+  }
+  if (names.length === 0) return;
+  for (const row of rows) {
+    for (const name of names) {
+      const v = row[name];
+      if (v === 1 || v === 0) row[name] = v === 1;
+    }
+  }
+}
+
 /** Shape a mysql2 `[result]` into a `pg.QueryResult`-like object. */
-function shapeResult(result: unknown): {
+function shapeResult(
+  result: unknown,
+  fields?: unknown,
+): {
   rows: Record<string, unknown>[];
   rowCount: number;
   insertId?: number;
   lastID?: number;
 } {
   if (Array.isArray(result)) {
-    return { rows: result as Record<string, unknown>[], rowCount: result.length };
+    const rows = result as Record<string, unknown>[];
+    coerceBooleanColumns(rows, fields);
+    return { rows, rowCount: rows.length };
   }
   // Write statement → ResultSetHeader (no rows). Expose insertId/lastID for the
   // `reselect` strategy to re-fetch the auto-increment row.
@@ -225,6 +278,19 @@ function augmentMysqlError(err: unknown): unknown {
         const parts = key.split('.');
         target.constraint = parts.length > 1 ? parts[parts.length - 1] : key;
       }
+      // THE conflicting row value is in that message, between the quotes after
+      // "Duplicate entry". MySQL has no `detail` field, so 'safe' mode had
+      // nothing to redact and returned this error verbatim as `.cause`, putting
+      // the value into every log line that renders the cause chain. Flag it so
+      // the message is withheld in 'safe' mode (see markValueBearingMessage);
+      // the constraint NAME survives on `target.constraint` and in the typed
+      // UniqueConstraintError's own message, so nothing diagnostic is lost.
+      //
+      // Deliberately only 1062: the other MySQL codes handled here report
+      // column/constraint NAMES only ("Column 'x' cannot be null", "Check
+      // constraint 'c' is violated", the FK constraint definition), so flagging
+      // them would withhold a message that never carried a value.
+      markValueBearingMessage(err);
       return err;
     }
     // ER_ROW_IS_REFERENCED_2 / ER_NO_REFERENCED_ROW_2 → foreign key violation
@@ -284,8 +350,8 @@ async function execOne(
 ): Promise<ReturnType<typeof shapeResult>> {
   const binding = toNamedBinding(params);
   try {
-    const [result] = binding ? await runner.execute(sql, binding) : await runner.query(sql);
-    return shapeResult(result);
+    const [result, fields] = binding ? await runner.execute(sql, binding) : await runner.query(sql);
+    return shapeResult(result, fields);
   } catch (err) {
     throw augmentMysqlError(err);
   }
@@ -370,7 +436,11 @@ export function mysqlTypeToTs(dialectType: string, nullable: boolean, columnType
   const t = dialectType.toLowerCase();
   const full = (columnType ?? '').toLowerCase();
   let base: string;
-  if (t === 'tinyint' && full === 'tinyint(1)') base = 'boolean';
+  // `tinyint(1)` can arrive either way: as (DATA_TYPE, COLUMN_TYPE) from the
+  // introspector's first pass, or as a single dialect type, because that is the
+  // spelling the introspector RECORDS for a boolean column (see the note there)
+  // and the `typeToTypeScript` dialect hook passes only the one string.
+  if (t === MYSQL_BOOLEAN_TYPE || (t === 'tinyint' && full === MYSQL_BOOLEAN_TYPE)) base = 'boolean';
   else if (/^(tinyint|smallint|mediumint|int|integer|bigint)$/.test(t)) base = 'number';
   else if (/^(decimal|numeric)$/.test(t)) base = 'string';
   else if (/^(float|double|real)$/.test(t)) base = 'number';
@@ -380,6 +450,64 @@ export function mysqlTypeToTs(dialectType: string, nullable: boolean, columnType
   else if (/(char|text|enum|set|time|year|bit)/.test(t)) base = 'string';
   else base = 'unknown';
   return nullable ? `${base} | null` : base;
+}
+
+/**
+ * The dialect-type spelling Turbine records for a MySQL boolean column.
+ *
+ * MySQL has no boolean type: `BOOLEAN` is an alias for `TINYINT(1)`, and
+ * `information_schema` reports DATA_TYPE `tinyint` for it, which is the same
+ * DATA_TYPE a genuine one-byte integer column has. The display width in
+ * COLUMN_TYPE is the ONLY thing that separates them, so the introspector keeps
+ * the full spelling for this one type rather than the bare DATA_TYPE. Anything
+ * reading a dialect type has to accept both spellings; the two places that
+ * matter are {@link mysqlTypeToTs} and {@link mysqlDialect.jsonWireRule}.
+ */
+const MYSQL_BOOLEAN_TYPE = 'tinyint(1)';
+
+/**
+ * Rewrite every boolean column's recorded dialect type to
+ * {@link MYSQL_BOOLEAN_TYPE}, returning a schema that is safe to key
+ * {@link mysqlDialect.jsonWireRule} on.
+ *
+ * WHY. Only the join strategy consults the recorded type, so a column whose
+ * type is spelled some other way reads as a boolean at the top level (the shim
+ * decides that from the RESULT FIELDS, which every pool has) and as 1/0 through
+ * a `with` join, which is the strategy-dependent split the boolean rule exists
+ * to close. Two schemas spell it differently and neither is wrong:
+ *
+ *  - a metadata file generated before Turbine started keeping the display width
+ *    records the bare DATA_TYPE `tinyint` (with `tsType: 'boolean'`, which is
+ *    what identifies it), so `turbine generate` is NOT required to get the fix;
+ *  - a code-first `defineSchema` column records the Postgres spelling
+ *    `boolean` / `bool`, which the DDL generator already emits as `TINYINT(1)`.
+ *
+ * A genuine one-byte integer column is never touched: it carries
+ * `tsType: 'number'`, and the `tsType` is the gate. Copy-on-write, because the
+ * argument is usually a shared exported constant and may also be handed to
+ * another engine's factory; an already-correct schema is returned unchanged and
+ * pays nothing.
+ */
+function normalizeBooleanDialectTypes(schema: SchemaMetadata): SchemaMetadata {
+  const needsFix = (col: ColumnMetadata): boolean => {
+    if (!/^boolean\b/.test(col.tsType)) return false;
+    const recorded = (col.dialectType ?? col.pgType ?? '').toLowerCase();
+    return recorded === 'tinyint' || recorded === 'bool' || recorded === 'boolean';
+  };
+  let tables: Record<string, TableMetadata> | undefined;
+  for (const [name, table] of Object.entries(schema.tables)) {
+    if (!table.columns.some(needsFix)) continue;
+    const columns = table.columns.map((col) =>
+      needsFix(col) ? { ...col, dialectType: MYSQL_BOOLEAN_TYPE, pgType: MYSQL_BOOLEAN_TYPE } : col,
+    );
+    if (!tables) tables = { ...schema.tables };
+    tables[name] = {
+      ...table,
+      columns,
+      pgTypes: Object.fromEntries(columns.map((c) => [c.name, c.pgType])),
+    };
+  }
+  return tables ? { ...schema, tables } : schema;
 }
 
 /** Is a MySQL declared type a date/time type (so values coerce back to `Date`)? */
@@ -540,6 +668,51 @@ export const mysqlDialect: Dialect = {
     if (t === 'decimal' || t === 'numeric') {
       return { sql: (ref) => `CAST(${ref} AS CHAR)`, decode: (value) => value };
     }
+
+    // A boolean is 1/0 on the wire, and the driver shim turns that back into
+    // true/false on every direct read (see coerceBooleanColumns). JSON_OBJECT
+    // renders the same column as a JSON number and has no column metadata to
+    // consult, so without this the join strategy alone would keep returning
+    // 1/0: the same strategy-dependent type flip the json rule below exists to
+    // prevent. Carried as text because the decode half only runs on a string
+    // cell, and a plain CAST is enough here (unlike SQLite, MySQL enforces the
+    // column type, so the value is always an integer and `Number` reproduces
+    // the driver's own reading of anything that is not 0 or 1).
+    if (t === MYSQL_BOOLEAN_TYPE) {
+      return {
+        sql: (ref) => `CAST(${ref} AS CHAR)`,
+        decode: (value) => {
+          if (value === '1') return true;
+          if (value === '0') return false;
+          if (typeof value !== 'string' || !/^-?\d+$/.test(value)) return value;
+          return Number(value);
+        },
+      };
+    }
+
+    // A `json` column gets NO rule, and that is the fix rather than the absence
+    // of one. It used to read differently depending on the relation strategy:
+    // the driver handed back text while JSON_OBJECT, which knows the column is
+    // JSON, embedded it as a real nested value, so parsing the row yielded an
+    // object. Under the default `'auto'` the strategy is decided per query by
+    // row counts and index coverage, so adding a `limit` to
+    // `findMany({ with: { org: true } })` flipped `org.meta` from a string to
+    // an object with no other change.
+    //
+    // A `CAST(… AS CHAR)` carrier closes that, but only for a pool Turbine
+    // built: the text half of it came from a `typeCast` override in
+    // MYSQL_DRIVER_FLAGS, and an injected mysql2 pool (a documented entry
+    // point) never sees those flags, so it read the column as an object at the
+    // top level and as a string through the join. That trades one split for
+    // another. So the agreement is built on what BOTH pool shapes already do:
+    // mysql2 parses a `json` column by default, JSON_OBJECT embeds it parsed,
+    // and with the `typeCast` override gone every read path lands on the same
+    // parsed value. It is also what `pg` returns for json/jsonb, so this is
+    // Postgres parity rather than a MySQL convention.
+    //
+    // Contrast SQLite and SQL Server, which return TEXT for the same schema:
+    // neither has a JSON column type, so the value there really is a string in
+    // a text column and there is nothing to parse it back from.
 
     // Binary columns are worse than lossy: JSON_OBJECT emits MySQL's internal
     // `base64:type15:…` marker string, so the caller got that text instead of
@@ -880,11 +1053,14 @@ export async function introspectMysqlWith(
       }
     }
     const maxLen = c.CHARACTER_MAXIMUM_LENGTH != null ? num(c.CHARACTER_MAXIMUM_LENGTH) : undefined;
+    // `tinyint(1)` is the one type whose DATA_TYPE is not enough to identify it
+    // (see MYSQL_BOOLEAN_TYPE); everything else keeps the bare DATA_TYPE.
+    const recordedType = c.COLUMN_TYPE.toLowerCase() === MYSQL_BOOLEAN_TYPE ? MYSQL_BOOLEAN_TYPE : dataType;
     const col: ColumnMetadata = {
       name: c.COLUMN_NAME,
       field: snakeToCamel(c.COLUMN_NAME),
-      dialectType: dataType,
-      pgType: dataType,
+      dialectType: recordedType,
+      pgType: recordedType,
       tsType: mysqlTypeToTs(dataType, nullable, c.COLUMN_TYPE),
       nullable,
       hasDefault: c.COLUMN_DEFAULT !== null || /auto_increment/i.test(c.EXTRA),
@@ -1061,12 +1237,18 @@ const MYSQL_DRIVER_FLAGS = {
   // DATETIME/TIMESTAMP → JS Date interpreted as UTC (matches Postgres).
   dateStrings: false,
   timezone: 'Z',
-  // Force JSON columns to raw strings so the nested-relation parser
-  // (parseNestedRow) always takes its well-tested JSON.parse path, instead of
-  // mysql2's auto-parsed objects or a Buffer. Top-level JSON columns therefore
-  // come back as strings (consistent with the SQLite engine; parse them yourself).
-  // biome-ignore lint/suspicious/noExplicitAny: mysql2 typeCast field shape (has .type and .string()).
-  typeCast: (field: any, next: () => unknown): unknown => (field.type === 'JSON' ? field.string() : next()),
+  //
+  // NOTE: deliberately NO `typeCast` JSON override here. There used to be one,
+  // pinning a `json` column to raw text so the nested-relation parser always
+  // took its JSON.parse path. It could only ever apply to pools TURBINE builds,
+  // and pool injection is a documented entry point, so it did not decide how a
+  // `json` column reads; it decided that the two pool shapes read it
+  // DIFFERENTLY (owned: string, injected: object). Every flag above is
+  // idempotent in that sense (a placeholder style, an integer policy, a time
+  // zone) and none of them changes a value's TYPE. Letting mysql2 parse a
+  // `json` column is what both pool shapes do by default, and it is also what
+  // `pg` does with json/jsonb, so the parsed value is the one answer that is
+  // reachable from every entry point. See `jsonWireRule` for the other half.
 } as const;
 
 interface MysqlConnectionConfig {
@@ -1091,7 +1273,8 @@ function parseMysqlConfig(connectionString: string): MysqlConnectionConfig {
     if (db) config.database = decodeURIComponent(db);
     return config;
   } catch {
-    throw new ConnectionError(`[turbine] Invalid MySQL connection string: "${connectionString}"`);
+    // Never echo the value, see malformedConnectionStringMessage.
+    throw new ConnectionError(malformedConnectionStringMessage('MySQL', 'mysql://user:password@localhost:3306/app'));
   }
 }
 
@@ -1175,8 +1358,11 @@ function isMysql2Pool(x: unknown): x is Mysql2Pool {
  *    `disconnect()` is a no-op, advanced config like SSL lives here).
  *
  * When Turbine builds the pool (string/config), it pins the correct mysql2 flags
- * (named placeholders, bignum, UTC dates, JSON-as-string), probes `SELECT VERSION()`
- * to reject MySQL < 8.0 / MariaDB, and `disconnect()` closes the pool it created.
+ * (named placeholders, bignum, UTC dates), probes `SELECT VERSION()` to reject
+ * MySQL < 8.0 / MariaDB, and `disconnect()` closes the pool it created. None of
+ * those flags changes a column's TYPE, so an injected pool reads every value
+ * the same way (see {@link MYSQL_DRIVER_FLAGS}); `namedPlaceholders: true` is
+ * the one an injected pool must set for itself.
  *
  * @example
  * ```ts
@@ -1238,7 +1424,10 @@ export async function turbineMysql(
       dialect: mysqlDialect,
       preparedStatements: false,
     },
-    schema,
+    // The join strategy is the only read path that consults a recorded dialect
+    // type, so a schema that spells a boolean any other way would read 1/0
+    // there and `true`/`false` everywhere else.
+    normalizeBooleanDialectTypes(schema),
   );
 
   if (owns) {

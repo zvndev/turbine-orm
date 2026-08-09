@@ -20,7 +20,7 @@
  */
 
 import type pg from 'pg';
-import { wrapPgError } from './errors.js';
+import { PipelineError, type PipelineResultSlot, wrapPgError } from './errors.js';
 import { type PipelineRunOptions, runPipelined, supportsExtendedPipeline } from './pipeline-submittable.js';
 import type { DeferredQuery } from './query/index.js';
 
@@ -70,9 +70,19 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
 ): Promise<PipelineResults<T>> {
   const { transactional = true } = options;
 
+  if (!transactional) return runIndependent(client, queries);
+
   try {
-    if (transactional) {
+    // Transaction control is wrapped too. It used to be bare, so a connection
+    // that died between checkout and BEGIN (or at COMMIT) surfaced the raw
+    // driver error while every statement between them surfaced a typed
+    // TurbineError, and a caller branching on `err.code` saw neither
+    // `TURBINE_E004` nor a retryable flag for the one failure that is most
+    // worth retrying.
+    try {
       await client.query('BEGIN');
+    } catch (err) {
+      throw wrapPgError(err);
     }
 
     const results: unknown[] = [];
@@ -86,21 +96,79 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
       results.push(q.transform(raw));
     }
 
-    if (transactional) {
+    try {
       await client.query('COMMIT');
+    } catch (err) {
+      throw wrapPgError(err);
     }
 
     return results as PipelineResults<T>;
   } catch (err) {
-    if (transactional) {
-      try {
-        await client.query('ROLLBACK');
-      } catch {
-        // Best-effort rollback
-      }
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Best-effort rollback
     }
     throw err;
   }
+}
+
+/**
+ * Sequential fallback for `{ transactional: false }`: each query is
+ * INDEPENDENT, which is what that option promises and what the real pipeline
+ * path already did. A failing query records its slot and the batch keeps going
+ * (there is no transaction to poison), and if anything failed the whole batch
+ * rejects with a `PipelineError` carrying every slot.
+ *
+ * It used to `throw wrapPgError(err)` on the first failure instead. That both
+ * abandoned the remaining queries, contradicting the option's own docstring,
+ * and rejected with the raw driver error, so `err instanceof PipelineError` and
+ * `err.code === 'TURBINE_E014'` were permanently false on the one path that
+ * documents them, and `err.results` did not exist at all. The first failure is
+ * still reachable, as `.cause` and as the first `error` slot.
+ */
+async function runIndependent<T extends readonly DeferredQuery<unknown>[]>(
+  client: SequentialClient,
+  queries: T,
+): Promise<PipelineResults<T>> {
+  const slots: PipelineResultSlot[] = [];
+  let firstError: Error | undefined;
+  let failedIndex: number | undefined;
+  let failedTag: string | undefined;
+
+  const fail = (index: number, error: Error): void => {
+    slots.push({ status: 'error', error });
+    if (firstError !== undefined) return;
+    firstError = error;
+    failedIndex = index;
+    failedTag = queries[index]?.tag;
+  };
+
+  for (let i = 0; i < queries.length; i++) {
+    const q = queries[i]!;
+    let raw: pg.QueryResult;
+    try {
+      raw = await client.query(q.sql, q.params);
+    } catch (err) {
+      const wrapped = wrapPgError(err);
+      fail(i, wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      continue;
+    }
+    // A transform throw is a slot failure too, not a batch abort: that is what
+    // the real pipeline path's `finalize` does with the same situation. It is
+    // deliberately NOT run through wrapPgError, since it never came from the
+    // driver.
+    try {
+      slots.push({ status: 'ok', value: q.transform(raw) });
+    } catch (err) {
+      fail(i, err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  if (firstError === undefined) {
+    return slots.map((slot) => (slot as { value: unknown }).value) as unknown as PipelineResults<T>;
+  }
+  throw new PipelineError({ results: slots, failedIndex, failedTag, cause: firstError });
 }
 
 // ---------------------------------------------------------------------------

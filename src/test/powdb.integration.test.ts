@@ -2123,11 +2123,11 @@ describe('powdb integration (embedded): nested projections (0.18 shaped results)
         with: { posts: { select: { title: true }, orderBy: { title: 'asc' } } },
       });
       assert.equal(sqls.length, 1);
-      assert.deepEqual(u.posts, [
-        { id: 'p1', title: 'Alpha' },
-        { id: 'p2', title: 'Beta' },
-        { id: 'p3', title: 'Gamma' },
-      ]);
+      // A `select` returns exactly the named fields. The primary key is still
+      // fetched (relation stitching and reselect need it) and stripped back off
+      // the entity, so the nested-projection path, the loaders and the SQL
+      // engines all return the same key set. This used to include `id`.
+      assert.deepEqual(u.posts, [{ title: 'Alpha' }, { title: 'Beta' }, { title: 'Gamma' }]);
       const viaLoader = await db.nUser.findUnique({
         where: { id: 'u1' },
         with: { posts: { select: { title: true }, orderBy: { title: 'asc' } } },

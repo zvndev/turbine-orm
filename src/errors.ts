@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 /**
  * turbine-orm, Error types
  *
@@ -100,6 +102,80 @@ export type ErrorMessageMode = 'safe' | 'verbose';
 let errorMessageMode: ErrorMessageMode = 'safe';
 
 /**
+ * The mode in force for the operation currently executing, when a client has
+ * established one. See {@link runWithErrorMessageMode}.
+ */
+const errorMessageModeScope = new AsyncLocalStorage<ErrorMessageMode>();
+
+/** The first mode a TurbineClient registered, used to detect divergence. */
+let firstRegisteredClientMode: ErrorMessageMode | undefined;
+let clientModesDiverged = false;
+
+/**
+ * The mode that applies right now: the scope a client established for this
+ * operation, else the process-wide default.
+ *
+ * The default is the fallback rather than the authority, which is the whole
+ * point. `errorMessageMode` is a module-level `let` that every TurbineClient
+ * constructor overwrote, so in a process with a primary client and an analytics
+ * or replica client, or a test harness building one client per suite, the LAST
+ * client constructed decided the mode for ALL of them, order-dependently. A
+ * client asking for `'safe'` could silently be running in `'verbose'`, which is
+ * the direction that leaks. (The dual ESM+CJS build makes it worse: the two
+ * copies hold separate `let`s.)
+ *
+ * An error constructed outside any client, directly or via
+ * {@link setErrorMessageMode}, still formats by the default, unchanged.
+ */
+function currentErrorMessageMode(): ErrorMessageMode {
+  return errorMessageModeScope.getStore() ?? errorMessageMode;
+}
+
+/**
+ * Register a client's configured mode and report whether per-operation scoping
+ * is now required.
+ *
+ * The gate is DIVERGENCE, not "has a client been built": while every client in
+ * the process agrees (the overwhelmingly common case, including every
+ * single-client app), the module default is already the right answer for all of
+ * them and no scope has to be established, so the query path pays exactly
+ * nothing. The moment two clients disagree, every client starts scoping, which
+ * is why this is read per call rather than latched per client.
+ *
+ * @internal Used by TurbineClient; not part of the public surface.
+ */
+export function registerClientErrorMessageMode(mode: ErrorMessageMode): void {
+  if (firstRegisteredClientMode === undefined) firstRegisteredClientMode = mode;
+  else if (firstRegisteredClientMode !== mode) clientModesDiverged = true;
+}
+
+/**
+ * Whether any two clients in this process have registered different modes, so
+ * the module default can no longer speak for all of them.
+ *
+ * @internal
+ */
+export function errorMessageModesDiverged(): boolean {
+  return clientModesDiverged;
+}
+
+/**
+ * Run `fn` with `mode` in force for everything it does, awaits included.
+ *
+ * Establishing the scope around the call (rather than threading a mode
+ * parameter into every error constructor) is what makes this reachable at all:
+ * the mode-sensitive errors are built deep inside the query executor, the write
+ * builders and the nested-write engine, none of which are handed the client.
+ * The async context is captured when the operation's promise chain is created
+ * INSIDE this call, so every continuation of it resolves the same mode.
+ *
+ * @internal
+ */
+export function runWithErrorMessageMode<R>(mode: ErrorMessageMode, fn: () => R): R {
+  return errorMessageModeScope.run(mode, fn);
+}
+
+/**
  * Set the global NotFoundError message mode. Called from the TurbineClient
  * constructor when `TurbineConfig.errorMessages` is provided.
  *
@@ -125,9 +201,16 @@ export function setErrorMessageMode(mode: ErrorMessageMode): void {
   errorMessageMode = mode;
 }
 
-/** Returns the current NotFoundError message mode. Exported for tests. */
+/**
+ * Returns the NotFoundError message mode in effect right now.
+ *
+ * Called inside an operation issued through a client whose mode differs from
+ * another client's in the same process, that is THAT client's mode; anywhere
+ * else it is the process default {@link setErrorMessageMode} last set, which is
+ * what it has always returned. Exported for tests.
+ */
 export function getErrorMessageMode(): ErrorMessageMode {
-  return errorMessageMode;
+  return currentErrorMessageMode();
 }
 
 /**
@@ -136,6 +219,70 @@ export function getErrorMessageMode(): ErrorMessageMode {
  * assertions can match on it without hardcoding the wording.
  */
 export const REDACTED_DETAIL = '[redacted by turbine errorMessages:"safe"]';
+
+/**
+ * Marks a driver error whose `message` (not only its `detail`) embeds row
+ * VALUES, so 'safe' mode has to withhold the message text too.
+ *
+ * Postgres splits this cleanly: `message` carries relation / constraint /
+ * column NAMES and `detail` carries the conflicting values, so redacting
+ * `detail` was enough. MySQL and SQL Server do not split it at all. mysql2's
+ * ER_DUP_ENTRY reads `Duplicate entry 'alice@example.com' for key
+ * 'users.email'` and SQL Server's 2627 ends `The duplicate key value is
+ * (alice@example.com).`, both on `message`, with no `detail` field anywhere.
+ * So `redactCauseForMode` took its "nothing value-bearing to remove" early
+ * return and handed back the driver error untouched, and the row value reached
+ * every log line, Sentry event and uncaught-rejection dump that renders the
+ * cause chain, in the mode whose entire job is to prevent exactly that.
+ *
+ * A flag rather than a code list, and set by the ENGINE that knows its own
+ * message grammar, for two reasons. It keeps Postgres byte-identical (pg never
+ * sets it, so its cause is returned exactly as before), and it puts "this
+ * engine's message embeds values" next to the code that reads that engine's
+ * messages instead of in a table here that would silently rot.
+ *
+ * `Symbol.for` so the ESM and CJS copies of this module agree on the key: a
+ * dual-package consumer can hand an error marked by one build to the other.
+ */
+const VALUE_BEARING_MESSAGE = Symbol.for('turbine.error.valueBearingMessage');
+
+/**
+ * Mark a driver error as carrying row values in its `message` (see
+ * {@link VALUE_BEARING_MESSAGE}). Called by the engine error augmenters for the
+ * exact driver codes whose message grammar embeds a value; every other code is
+ * left alone so nothing is withheld that did not need to be.
+ *
+ * Non-enumerable so the flag itself never shows up in a serialized error, and
+ * best-effort so a frozen or exotic driver error cannot turn a constraint
+ * violation into a TypeError.
+ */
+export function markValueBearingMessage<T>(err: T): T {
+  if (!err || typeof err !== 'object') return err;
+  try {
+    Object.defineProperty(err, VALUE_BEARING_MESSAGE, {
+      value: true,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+  } catch {
+    /* a frozen driver error keeps its message; the Turbine message is still safe */
+  }
+  return err;
+}
+
+/**
+ * The replacement for a withheld driver message. The whole message goes, not a
+ * pattern-matched part of it: three engines with three grammars and no
+ * guarantee a future driver keeps either, so "withhold it" is the only rule
+ * that stays true. Nothing diagnostic is lost, the constraint/column/table
+ * names are already on the typed Turbine error as structured fields and in its
+ * own message, and `errorMessages: 'verbose'` returns the driver text in full.
+ */
+function redactedDriverMessage(code: unknown): string {
+  const codePart = typeof code === 'string' && code.length > 0 ? ` (driver code ${code})` : '';
+  return `${REDACTED_DETAIL}${codePart}: this engine reports the conflicting row values in the message text, so errorMessages:"safe" withholds it. Use errorMessages:"verbose" to see it.`;
+}
 
 /**
  * Postgres puts the CONFLICTING ROW VALUES in the `detail` field of a
@@ -173,27 +320,62 @@ export const REDACTED_DETAIL = '[redacted by turbine errorMessages:"safe"]';
  *
  * In 'verbose' mode the cause passes through untouched: that mode's documented
  * job is full-fidelity debugging.
+ *
+ * ENGINES WHOSE MESSAGE CARRIES THE VALUE. MySQL and SQL Server do not have a
+ * `detail` field at all and put the conflicting value in `message`, so the
+ * early return below used to hand the raw driver error straight back (see
+ * {@link markValueBearingMessage}). When the engine set that flag the clone
+ * also withholds `message`, `sqlMessage` (mysql2's copy, which is the field
+ * mysql2 formats `message` FROM, so leaving it would put the value straight
+ * back) and the message text embedded in the rendered `stack` string. The stack
+ * substitution is an exact replacement of the known message string, never a
+ * grammar guess, so the frames survive intact.
  */
 function redactCauseForMode(cause: unknown): unknown {
-  if (errorMessageMode === 'verbose') return cause;
+  if (currentErrorMessageMode() === 'verbose') return cause;
   if (!cause || typeof cause !== 'object') return cause;
   const detail = (cause as { detail?: unknown }).detail;
+  const hasDetail = typeof detail === 'string' && detail.length > 0;
+  const valueBearingMessage = (cause as Record<PropertyKey, unknown>)[VALUE_BEARING_MESSAGE] === true;
   // Nothing value-bearing to remove: return the original object so the common
   // case (a non-pg cause, or a pg error without a detail) allocates nothing and
   // keeps object identity with what the driver threw.
-  if (typeof detail !== 'string' || detail.length === 0) return cause;
+  if (!hasDetail && !valueBearingMessage) return cause;
   try {
     const descriptors = Object.getOwnPropertyDescriptors(cause);
     // Replace the descriptor rather than assigning after the clone exists: a
     // non-writable `detail` would make the assignment throw in strict mode
     // (every module here is ESM, so it always would), and losing the cause is
     // worse than paying for one descriptor literal.
-    descriptors.detail = {
-      value: REDACTED_DETAIL,
-      writable: true,
-      enumerable: descriptors.detail?.enumerable ?? true,
-      configurable: true,
-    };
+    if (hasDetail) {
+      descriptors.detail = {
+        value: REDACTED_DETAIL,
+        writable: true,
+        enumerable: descriptors.detail?.enumerable ?? true,
+        configurable: true,
+      };
+    }
+    // The exact message strings to scrub out of the rendered stack, collected
+    // BEFORE the descriptors are overwritten.
+    const withheldTexts: string[] = [];
+    if (valueBearingMessage) {
+      const code = (cause as { code?: unknown }).code;
+      const replacement = redactedDriverMessage(code);
+      for (const key of ['message', 'sqlMessage'] as const) {
+        const current = (cause as Record<string, unknown>)[key];
+        if (typeof current !== 'string' || current.length === 0) continue;
+        withheldTexts.push(current);
+        descriptors[key] = {
+          value: replacement,
+          writable: true,
+          // `message` is non-enumerable on a native Error and mysql2's
+          // `sqlMessage` is enumerable; keep whichever the driver chose so the
+          // clone serializes with the same key set as the original.
+          enumerable: descriptors[key]?.enumerable ?? false,
+          configurable: true,
+        };
+      }
+    }
     // Brand check rather than `instanceof Error`, so a driver error thrown from
     // another realm (a worker, a bundled duplicate of pg) is still recognized.
     const isError = Object.prototype.toString.call(cause) === '[object Error]';
@@ -211,7 +393,13 @@ function redactCauseForMode(cause: unknown): unknown {
     // own descriptor rather than having a lie written over it.
     const originalStack = (cause as { stack?: unknown }).stack;
     if (typeof originalStack === 'string') {
-      descriptors.stack = { value: originalStack, writable: true, enumerable: false, configurable: true };
+      // V8 renders the stack as `<name>: <message>\n    at …`, so a withheld
+      // message is still sitting in it. Substitute the exact strings that were
+      // withheld (split/join, so a message repeated in a nested frame goes
+      // too); everything else, the frames included, is untouched.
+      let stackText = originalStack;
+      for (const text of withheldTexts) stackText = stackText.split(text).join(REDACTED_DETAIL);
+      descriptors.stack = { value: stackText, writable: true, enumerable: false, configurable: true };
     } else if (descriptors.stack && typeof descriptors.stack.get === 'function') {
       // An own accessor bound to the ORIGINAL receiver would return undefined
       // here; drop it and let the clone keep its own working one.
@@ -239,7 +427,7 @@ function redactCauseForMode(cause: unknown): unknown {
  * connect/update failures which historically embedded the raw values.
  */
 export function describeTargetForMessage(target: unknown): string {
-  if (errorMessageMode === 'verbose') {
+  if (currentErrorMessageMode() === 'verbose') {
     try {
       return JSON.stringify(target);
     } catch {
@@ -323,11 +511,11 @@ export class NotFoundError extends TurbineError {
     if (!message) {
       if (operation && table) {
         const wherePart =
-          where !== undefined ? ` matching where: ${renderWhereForMessage(where, errorMessageMode)}` : '';
+          where !== undefined ? ` matching where: ${renderWhereForMessage(where, currentErrorMessageMode())}` : '';
         message = `[turbine] ${operation} on "${table}" found no record${wherePart}`;
       } else if (table) {
         const wherePart =
-          where !== undefined ? ` matching where ${renderWhereForMessage(where, errorMessageMode)}` : '';
+          where !== undefined ? ` matching where ${renderWhereForMessage(where, currentErrorMessageMode())}` : '';
         message = `[turbine] No record found in "${table}"${wherePart}`;
       } else {
         message = '[turbine] Record not found';
@@ -396,6 +584,34 @@ export class ConnectionError extends TurbineError {
     this.name = 'ConnectionError';
     this.sqlstate = options?.sqlstate;
   }
+}
+
+/**
+ * The message for "this engine's connection string could not be parsed".
+ *
+ * The one rule it exists to enforce: NEVER echo the value. A DSN carries a
+ * password, and the trigger for this error is a MALFORMED DSN, which is exactly
+ * when someone pastes the failure into a bug report, a CI log, or an error
+ * tracker. No redaction written against the URL grammar can be trusted on a
+ * string that just failed to parse as a URL, so the only safe amount of it to
+ * include is none: not the password, not the host, not a prefix.
+ *
+ * This mirrors the Postgres path (`assertUsableConnectionString` in client.ts),
+ * which reached the same conclusion first and stated the same reason; the
+ * engines used to interpolate the raw string instead, so SECURITY.md's claim of
+ * redaction "in all CLI error output" was true for one engine out of four.
+ * Shared rather than copied so the three engines cannot drift back apart.
+ *
+ * @param engine  the human engine label ("MySQL", "SQL Server", "PowDB").
+ * @param example a well-formed connection string for that engine, with a
+ *   placeholder password. Never derived from the caller's value.
+ */
+export function malformedConnectionStringMessage(engine: string, example: string): string {
+  return (
+    `[turbine] The ${engine} connection string could not be parsed as a URL. Expected something like "${example}". ` +
+    '(Check for a missing "//", a stray quote copied out of a .env file, or a shell-truncated value.) ' +
+    'The value is not included here because it may contain a password.'
+  );
 }
 
 /** Thrown when a relation reference is invalid */
@@ -472,7 +688,7 @@ export class UniqueConstraintError extends TurbineError {
       // values straight back into any log line that prints the error object).
       // The structured `.columns`/`.constraint`/`.column` fields survive in
       // both modes, they carry NAMES, never values.
-      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
+      const detail = currentErrorMessageMode() === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.UNIQUE_VIOLATION, message, { cause });
@@ -510,7 +726,7 @@ export class ForeignKeyError extends TurbineError {
       // values straight back into any log line that prints the error object).
       // The structured `.columns`/`.constraint`/`.column` fields survive in
       // both modes, they carry NAMES, never values.
-      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
+      const detail = currentErrorMessageMode() === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.FOREIGN_KEY_VIOLATION, message, { cause });
@@ -547,7 +763,7 @@ export class NotNullViolationError extends TurbineError {
       // values straight back into any log line that prints the error object).
       // The structured `.columns`/`.constraint`/`.column` fields survive in
       // both modes, they carry NAMES, never values.
-      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
+      const detail = currentErrorMessageMode() === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.NOT_NULL_VIOLATION, message, { cause });
@@ -664,7 +880,7 @@ export class CheckConstraintError extends TurbineError {
       // values straight back into any log line that prints the error object).
       // The structured `.columns`/`.constraint`/`.column` fields survive in
       // both modes, they carry NAMES, never values.
-      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
+      const detail = currentErrorMessageMode() === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.CHECK_VIOLATION, message, { cause });
@@ -700,7 +916,7 @@ export class ExclusionConstraintError extends TurbineError {
       // values straight back into any log line that prints the error object).
       // The structured `.columns`/`.constraint`/`.column` fields survive in
       // both modes, they carry NAMES, never values.
-      const detail = errorMessageMode === 'verbose' ? detailFromCause(cause) : undefined;
+      const detail = currentErrorMessageMode() === 'verbose' ? detailFromCause(cause) : undefined;
       if (detail) message += `: ${detail}`;
     }
     super(TurbineErrorCode.EXCLUSION_VIOLATION, message, { cause });

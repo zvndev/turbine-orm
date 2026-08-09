@@ -123,7 +123,9 @@ export interface ColumnMetadata {
    * Tagged in `defineSchema` (`pii: true`) and carried through generated
    * metadata. A PII column is EXCLUDED from default projections: it comes back
    * only when explicitly named in `select` or when the query passes
-   * `includePii: true` (full opt-in). Studio redacts PII cells by default.
+   * `includePii: UNSAFE` (full opt-in, the imported sentinel symbol, since a
+   * literal `true` is what a stray JSON body deserializes to). Studio redacts
+   * PII cells by default.
    * Optional / defaults to `false`; untagged schemas behave exactly as before.
    * Introspection never auto-tags PII (it is a code-first declaration).
    */

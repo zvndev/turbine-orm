@@ -23,7 +23,7 @@ The core insight: instead of N+1 queries for nested relations, Turbine generates
 ```
 src/
   query/           , The heart, split into submodules:
-    types.ts       , All public query arg types (~785 LOC): WhereClause, WithClause,
+    types.ts       , All public query arg types: WhereClause, WithClause,
                       FindManyArgs, RelationDescriptor, WithResult, UpdateOperatorInput,
                       AggregateArgs, JsonFilter, ArrayFilter, HavingClause /
                       HavingFieldFilter (0.53: a groupBy `having` field entry is
@@ -32,7 +32,7 @@ src/
                       share one object; plus AND/OR/NOT at any depth. _min/_max
                       operands are the column's own type, not numeric-only),
                       VectorFilter/VectorOrderBy (pgvector distance ops), etc.
-    utils.ts       , Pure utility functions (~130 LOC): quoteIdent(), escapeLike(),
+    utils.ts       , Pure utility functions: quoteIdent(), escapeLike(),
                       LRUCache (1K entry cap), fnv1a64Hex(), sqlToPreparedName(),
                       OPERATOR_KEYS constant, resolveColumnName() (0.53: THE
                       key->column rule in one place, field map first then
@@ -61,7 +61,7 @@ src/
                       isJsonFilter/isArrayFilter/isVectorFilter, sortedKeys/sortedEntries,
                       normalizeOrderBy). Kept out of builder.ts so the class stays about
                       SQL assembly rather than filter-shape bookkeeping.
-    where-compile.ts, The canonical where-clause enumeration (~300 LOC, added 0.36):
+    where-compile.ts, The canonical where-clause enumeration (added 0.36):
                       walkWhere() is THE single key-ordering/branch authority that
                       fingerprintWhere/buildWhereClause/collectWhereParams in builder.ts
                       all consume (kills the 3-way hand-sync drift class behind the
@@ -77,8 +77,47 @@ src/
                       builder.ts: 'dev' (always-on NODE_ENV guard) | 'sampled'
                       (TURBINE_CACHE_CHECK_SAMPLE env, rate in (0,1], log-once-per-
                       fingerprint then throw) | 'off'.
+
+    prepared-statement naming, A where (or having) clause containing a
+                      CALLER-WRITTEN `AND` / `OR` ARRAY produces an UNNAMED prepared
+                      statement (0.66). Load-bearing for `acquireSql`, not an
+                      implementation detail: a named statement is never deallocated and
+                      each pooled connection accumulates its own, which is fine while
+                      the set of SQL texts is fixed by the application's code. A
+                      combinator array's LENGTH is written into the text, one
+                      parenthesized branch per element, so a `where.OR` assembled from a
+                      UI multi-select lets a caller mint unbounded distinct statements
+                      with no identifier and no value under their control. Measured on
+                      PostgreSQL 16: 600 distinct arities left 600 prepared statements
+                      and 20.9 MB of resident CachedPlan memory on ONE connection, and
+                      200 further executions of an existing shape reclaimed none of it.
+                      The mechanism: `markVariableArity()` on the BuilderCtx sets a
+                      flag that `buildCacheEntry` reads immediately after the build
+                      closure returns and turns into an EMPTY prepared-statement name,
+                      so the entry is unnamed at CREATION and a later cache HIT can
+                      never hand a warmed template a name. Unnamed is what bounds the
+                      server (node-postgres skips `Parse` only for a statement already
+                      parsed BY NAME), it is the same mechanism per-query
+                      `forceCustomPlan` uses, and it changes NO SQL text. `in: [...]` is
+                      deliberately NOT this shape: it binds `= ANY($1)`, one param
+                      whatever the list length. Turbine's OWN synthesized wrappers
+                      (`mergeGlobalFilter`'s `{ AND: [userWhere, globalFilter] }` and the
+                      batched loader's `mergeChildWhere`, and nested-write.ts's
+                      `scopeWhereToParent`) have a fixed arity of two and
+                      are BRANDED via `markInternalCombinator` / `isInternalCombinator`
+                      (query/utils.ts, a `Symbol.for('turbine.internalCombinator')` key:
+                      `Symbol.for` for ESM/CJS cross-copy identity like the warn
+                      registry, a SYMBOL so the `Object.keys` every where walker
+                      enumerates never sees it and no emitted SQL can change), so they
+                      stay NAMED. Without the brand every query on a table with a
+                      configured global filter would lose its name, i.e. the rule would
+                      have penalized precisely the multi-tenant setups it exists to
+                      protect. The honest cost: a genuinely fixed two-branch `OR` (a
+                      search box over name and email) loses its name too, because the
+                      builder sees one call and cannot know whether the length varies
+                      across calls.
     deferred.ts    , DeferredQuery, QueryInterfaceOptions, middleware/event types.
-    builder.ts      - QueryInterface class + the execute FACADE (~2.4K LOC). Owns the
+    builder.ts      - QueryInterface class + the execute FACADE. Owns the
                       constructor, connection/middleware/timeout execution, the SQL-template
                       cache (acquireSql + crossCheckCache), findMany/findUnique/findFirst +
                       streaming assembly, count, the async create/update/delete/upsert
@@ -94,13 +133,13 @@ src/
                       bound method members. Each module's functions are `export function
                       f(qi: BuilderCtx, …)` and import each other directly; the class holds a
                       `private readonly ctx: BuilderCtx`.
-    where.ts        - The whole WHERE web (~1.8K LOC): the top-level and table-scoped
+    where.ts        - The whole WHERE web: the top-level and table-scoped
                       build/collect/fingerprint trios, leaf JSON/array/vector/text-search
                       clause builders, operator-clause + column-reference compilation, and
                       the client-level global-filter helpers. Owns the `BuilderCtx`
                       interface. Depends on nothing else in query/ (relation filters build
                       EXISTS inline), so it is the base module the others build on.
-    aggregates.ts   - buildAggregate + buildGroupBy and helpers (~900 LOC): HAVING clauses,
+    aggregates.ts   - buildAggregate + buildGroupBy and helpers: HAVING clauses,
                       groupBy ordering, DISTINCT-ON sources, JSON-path aggregate targets.
                       Reuses where.ts for WHERE compilation; shared orderBy / row-parse
                       primitives stay class-resident via the ctx. HAVING (0.53) is
@@ -118,13 +157,13 @@ src/
                       buildHavingCombinator does AND/OR/NOT recursively, mirroring
                       buildWhereClause's shapes. buildHavingNumericClauses is
                       operand-type-agnostic now (equals/not/gt/gte/lt/lte/in/notIn).
-    writes.ts       - Mutation SQL builders (~750 LOC): create / createMany / update /
+    writes.ts       - Mutation SQL builders: create / createMany / update /
                       delete / upsert / updateMany / deleteMany plus the write-projection
                       helpers (writeReturningColumns / writeReselectSelection / parseWriteRow,
                       the PII column set, optimistic-lock + atomic-operator SET clauses,
                       reselect-by-where). Reuses where.ts; the async execute wrappers stay in
                       builder.ts.
-    relations.ts    - Relation + orderBy compilation (~2.1K LOC): the json_agg nested-relation
+    relations.ts    - Relation + orderBy compilation: the json_agg nested-relation
                       machinery (buildSelectWithRelations, buildRelationSubquery,
                       buildManyToManySubquery), the positional-encoding shapes + nested-row
                       parser, the full orderBy surface (plain / JSON-path / vector KNN /
@@ -184,6 +223,34 @@ src/
                       random args; nightly extended run with a date-derived seed) is the
                       regression net for this whole class.
 
+    flatten (strategy), `relationLoadStrategy: 'flatten'` has no module of its own: the
+                      plan is built by `planFlatten` (query/builder.ts) over
+                      `planFlattenWith` / `planFlattenNode` (query/relations.ts) and read
+                      back by `makeFlattenParser`. An eligible TO-ONE relation compiles to a
+                      `LEFT JOIN` with a PREFIXED SCALAR projection (`f0__email`) plus a
+                      non-null discriminator column, instead of a correlated
+                      `json_build_object` subquery, and the nested object is assembled
+                      client-side. Rows are byte-identical to the join strategy's.
+                      Eligibility is per relation and every refusal falls back to the
+                      default correlated subquery SILENTLY and byte-identically (with a
+                      once-only dev warning, WARN_NS.flattenFallback): to-one only, a
+                      PROVABLY UNIQUE target key, no per-relation `limit` / `orderBy`, no
+                      `_count` in the nested `with`, no alias collision or over-length alias,
+                      and depth < FLATTEN_MAX_DEPTH (10, mirroring the join cap). Four
+                      QUERY-level gates turn the whole plan off: `jsonEncoding: 'positional'`
+                      (a flattened relation emits no JSON to encode), a dialect that
+                      generates relation subqueries itself (SQL Server's `FOR JSON PATH`),
+                      `distinct`, and the findUnique family (one parent row means the
+                      correlated subquery already runs once). Pagination needs no gate: a
+                      unique-key join matches at most one row per parent, so it cannot change
+                      the parent row count. The SQL-template cache key carries a `|fl=` +
+                      plan-signature segment so a join-planned statement can never be served
+                      to a flatten-planned call. SECURITY NOTE: the flat shape must never
+                      reach Studio's PII redaction, which walks the NESTED object, see the
+                      transform comment in cli/studio.ts's apiBuilder. Tests:
+                      src/test/flatten-strategy.test.ts (build-only) and
+                      src/test/flatten-parity.integration.test.ts.
+
     compound-unique.ts, Compound-unique where selectors (0.41): derives selector names
                       (`orgId_userId` or a declared composite-unique index name) from
                       primaryKey + uniqueColumns + IndexMetadata and normalizes
@@ -218,7 +285,7 @@ src/
                       model NAME (`optimisticLock.field` and `distinctOn.columns` do, so they
                       are 'prisma' and hand-translated).
 
-    index.ts       , Barrel re-export (~65 LOC). All imports use `./query/index.js`.
+    index.ts       , Barrel re-export. All imports use `./query/index.js`.
 
   index-advisor.ts , Missing-FK-index advisor. Derives every column set relations probe
                       (hasMany/hasOne child FKs, belongsTo reference keys, m2m junction keys)
@@ -332,7 +399,7 @@ src/
                       is supplied, Turbine does NOT call pg.types.setTypeParser and
                       disconnect() becomes a no-op (caller owns lifecycle). TurbineConfig also
                       carries the relation/wire tuning added in 0.26.0:
-                      `relationLoadStrategy: 'auto' | 'join' | 'batched'` (client default,
+                      `relationLoadStrategy: 'join' | 'batched' | 'auto' | 'flatten'` (client default,
                       overridable per query → query/batched-loader.ts; 'auto' is the 0.41.0
                       implicit default: join plan with per-relation batched fallback on
                       proven-unindexed correlation columns, event tag 'auto-batched',
@@ -374,7 +441,7 @@ src/
                       validation now runs BEFORE any process-global side effect, so a throwing
                       constructor cannot leave the parser mode settled.
 
-  adapters/        , Database adapter layer (~530 LOC) for Postgres-compatible engines.
+  adapters/        , Database adapter layer for Postgres-compatible engines.
                       cockroachdb.ts + yugabytedb.ts override the operations with
                       compatibility gaps (migration locking, introspection SQL); alloydb
                       and timescale are pass-through adapters defined in index.ts.
@@ -416,6 +483,47 @@ src/
                         `buildDeleteStatement` (mid-statement `OUTPUT`), and
                         `buildRelationSubquery` (SQL Server's `FOR JSON PATH` override).
                         `openStream()` and the `DialectIntrospector` round out the seam.
+                      • `escapeLikePattern` (0.66), per-engine LIKE metacharacter
+                        escaping for a bound `contains` / `startsWith` / `endsWith`
+                        operand, defaulting to the shared `escapeLike` (the
+                        SQL-standard `\` `%` `_`, paired with the `ESCAPE '\'` clause
+                        the builders always emit). SQL Server overrides it because
+                        T-SQL's `LIKE` ALSO treats `[` as opening a character class,
+                        so `{ contains: '[draft]' }` silently means "contains any one
+                        of d, r, a, f, t" there while every other engine reads the
+                        value literally. Not injection (the operand stays bound), a
+                        WRONG ANSWER, and a property of the engine's pattern grammar
+                        rather than of the SQL text, which is what makes it a dialect
+                        hook. Whatever a dialect returns must be escaped for the same
+                        `ESCAPE '\'` clause; the build and cache-hit param-collect
+                        paths call the one hook, so they cannot drift.
+                      • `buildPartitionLimit` (0.66), the per-correlation-key row bound
+                        the batched relation loader pushes DOWN into its follow-up
+                        query. That follow-up is one flat `WHERE fk = ANY($1)` over
+                        every parent's children, so a trailing `LIMIT n` would cap the
+                        TOTAL rather than the per-parent count; the hook wraps the
+                        compiled child SELECT in `ROW_NUMBER() OVER (PARTITION BY fk
+                        ORDER BY …) <= $n` instead. OPTIONAL, and absent means the
+                        loader fetches every matching child and slices client-side,
+                        which is what every engine did before: correct, but unbounded
+                        in bytes over the wire (measured, 200 parents x ~505 children
+                        with `limit: 3`, 101,000 rows fetched to keep 600, +52.9 MB
+                        peak heap against +0.5 MB for the join plan). PostgreSQL only
+                        in this release; the other engines' emitted SQL is unchanged.
+                        The client-side slice is KEPT as the belt-and-braces bound and
+                        is a no-op once the engine has already limited each partition.
+                      • THE INHERITANCE TRAP, and the rule that follows from it: EVERY
+                        engine dialect is built by SPREADING `postgresDialect`
+                        (`...postgresDialect` in sqlite.ts / mysql.ts / mssql.ts /
+                        powdb.ts), so an optional hook added to the Postgres dialect is
+                        INHERITED by all of them and an "is the hook absent" fallback
+                        NEVER FIRES. Hit live: the first `buildPartitionLimit` silently
+                        enabled the window wrapper on SQLite. It is the same trap
+                        behind the `DISTINCT ON` blocker. So gate a Postgres-only hook
+                        on `dialect.name === 'postgresql'`, never on hook presence (see
+                        the `buildPartitionLimit` wiring in query/builder.ts); a
+                        capability FLAG that each engine sets explicitly is the other
+                        sound shape.
 
   sqlite.ts        , `turbine-orm/sqlite` engine. `turbineSqlite(path | ':memory:' |
                       DatabaseSync, schema, options?)`, synchronous, zero new dependency
@@ -623,10 +731,10 @@ src/
                       row projection (top-level, `with` subqueries, batched loader,
                       positional encoding, PowQL loaders + native joins, and write
                       returns), and comes back only when named explicitly in `select`
-                      or unlocked by the `includePii: true` read arg. Enforced AT THE
+                      or unlocked by the `includePii: UNSAFE` read arg. Enforced AT THE
                       SQL LEVEL on every engine (see the write projection below), with
                       parseWriteRow's strip as defense-in-depth.
-                      (2) AGGREGATES: two shapes are REFUSED without `includePii: true`
+                      (2) AGGREGATES: two shapes are REFUSED without `includePii: UNSAFE`
                       (ValidationError E003 naming the column): a PII column used as a
                       groupBy `by` key INCLUDING a JSON-path group key (the keys ARE the
                       values), and _min/_max over a PII column in BOTH groupBy and
@@ -634,9 +742,19 @@ src/
                       cell). ALLOWED with no opt-in: _count (a count, not a value) and
                       _sum/_avg (computed across many rows, not a stored cell; the
                       single-row group is a known theoretical edge, the gate is
-                      deliberately narrow). `includePii?: boolean` is a field on BOTH
-                      GroupByArgs and AggregateArgs (query/types.ts); with it set the
-                      emitted SQL is byte-identical to an untagged schema. Applies on
+                      deliberately narrow). `includePii?: Unsafe` is a field on
+                      FOUR arg interfaces: FindManyArgs, FindUniqueArgs, GroupByArgs
+                      and AggregateArgs
+                      (query/types.ts); with it set the emitted SQL is byte-identical to an
+                      untagged schema. IT IS NOT A BOOLEAN: like `skipGlobalFilters` and
+                      `allowFullTableScan` it is a PRIVILEGE option and its only accepted
+                      value is the `UNSAFE` symbol exported from the package root
+                      (`Symbol.for('turbine-orm.UNSAFE')`); `includePii: true` throws E003.
+                      The reason is mass assignment: all three options are ordinary
+                      siblings of `where`, so `findMany({ ...req.body })` let a REQUEST
+                      BODY turn them on, and JSON.parse cannot produce a symbol. Two JSDoc
+                      blocks still describe the old boolean form (`src/schema.ts` and
+                      `src/schema-builder.ts`, on the `pii` field). Applies on
                       PowDB as well as the SQL engines.
                       (3) PREDICATES AND ORDERING: where / orderBy / having on a PII
                       column are ALWAYS permitted, with or without the flag: they return
@@ -658,6 +776,12 @@ src/
   schema-builder.ts, defineSchema() API for code-first schema definitions. Produces
                       SchemaDef objects consumed by schema-sql.ts for DDL generation.
 
+  schema-metadata.ts, `defineSchema()` -> `SchemaMetadata` bridge (`schemaDefToMetadata`).
+                      The pure-function equivalent of introspect + generate, for the paths
+                      that have a SchemaDef and no live SQL database: PowDB, in-memory
+                      SQLite bootstraps, tests. Same output shape the query builder,
+                      TurbineClient and the non-SQL engines already consume.
+
   schema-sql.ts    , DDL generation from SchemaDef. All identifiers quoted via quoteIdent().
                       0.36 additions: schemaPush refuses destructive statements without
                       `allowDestructive` (ValidationError listing offenders; scanner lives
@@ -674,6 +798,22 @@ src/
 
   introspect.ts    , Reads information_schema + pg_catalog to produce SchemaMetadata.
                       Discovers tables, columns, types, relations, indexes, enums.
+                      DETERMINISM IS A CORRECTNESS REQUIREMENT HERE, not tidiness
+                      (0.66): every catalog query carries an explicit ORDER BY, and the
+                      FK query orders by (source table, constraint name), never
+                      `con.oid`. Relation NAMES are resolved by walking FKs and claiming
+                      names as they go, so creation order used to decide which of two
+                      competing relations won a name AND its cardinality, meaning a
+                      database restored from a dump and one built from migrations
+                      disagreed about what `with: { profile: true }` returned. The FK
+                      query also filters `con.conparentid = 0`: a partition CLONE of a
+                      declared FK is a real `pg_constraint` row, so one declared foreign
+                      key to a 2-partition table used to emit three belongsTo relations,
+                      two of which resolve to null for most rows. `deriveCatalogRelations`
+                      is THE single derivation seam, consumed by both `turbine generate`
+                      and `cli/mcp.ts`, and its catalog inputs are REQUIRED parameters:
+                      they were optional, MCP omitted two of them, and the two surfaces
+                      silently disagreed about cardinality and about m2m entirely.
 
   generate.ts      , Code generator that emits three files from introspected schema:
                       types.ts (entity interfaces, Create/Update input types),
@@ -699,7 +839,7 @@ src/
                       Hyperdrive, etc.). Pure TypeScript shim, no extra runtime deps.
                       Published as the `turbine-orm/serverless` subpath export.
 
-  prisma-compat.ts , `turbine-orm/prisma-compat` subpath (0.41, ~2.3K LOC): typed
+  prisma-compat.ts , `turbine-orm/prisma-compat` subpath (0.41): typed
                       PrismaClient-surface adapter over TurbineClient, driven by the
                       PrismaCompatMap that `turbine migrate-from-prisma` emits. Model
                       delegates under BOTH the Prisma model name (compat.User) and
@@ -745,6 +885,26 @@ src/
                       is the identity function; `$name` is runtime-only, not on the type.
                       Pure shim: zero new deps, never imported by core.
 
+  errorMessages scoping, `errorMessages: 'safe' | 'verbose'` is a property of the
+                      CLIENT, not of the last constructor to run (0.66). The mechanism is
+                      an AsyncLocalStorage scope carrying that client's mode, established
+                      around each operation, with a process-wide `clientModesDiverged`
+                      fast path so a single-client app establishes no scope at all. TWO
+                      rules keep it honest, and both were violated by the first cut.
+                      (1) The divergence test belongs at CALL time, inside the accessor
+                      wrapper, never at accessor-CREATION time: divergence is a property
+                      of the process over TIME, so a delegate hoisted at module load
+                      (`const users = db.users`) before a second client is constructed
+                      stayed unscoped forever, and the SAFE client was the one that
+                      leaked. The `table()` proxy is therefore built unconditionally.
+                      (2) The scope must reach the EXECUTION, not the call. `client.sql`
+                      returns a LAZY `TypedSqlQuery`, so wrapping the tagged-template
+                      call opened and closed the scope before a row was fetched: it
+                      compiled, ran, and protected nothing. The mode is passed to the
+                      builder as the `runScoped` constructor parameter instead. Entry
+                      points that must scope: table accessors, `$transaction`, `raw`,
+                      `pipeline`, and `sql`.
+
   typed-sql.ts     , Typed raw SQL escape hatch (Turbine's TypedSQL). buildTypedSql()
                       turns a tagged template into a parameterized (sql, params) pair -
                       every ${value} becomes $N, impossible to string-concat a value in.
@@ -758,6 +918,45 @@ src/
                       / client.$notify() (pg_notify($1,$2)). Subscriptions are tracked and
                       force-released on disconnect(); serverless HTTP pools (no persistent
                       connection) throw a clear error instead of hanging.
+
+  engine-config.ts , The client-config seam for the non-Postgres engine factories
+                      (`turbine-orm/sqlite`, `turbine-orm/mysql`, `turbine-orm/mssql`).
+                      Each builds its own driver pool and then hands a TurbineConfig to
+                      TurbineClient; each used to list the keys it forwarded BY HAND, which
+                      made the forwarded set an allowlist and quietly stranded every option
+                      added afterwards on three engines (that is how `errorMessages` and
+                      later `logQueryParams` became Postgres-only). `EngineClientConfig`
+                      inverts the default: every TurbineConfig field is forwarded unless
+                      named as excluded. Type declarations only, so it emits no runtime code
+                      and is excluded from coverage.
+
+  seed.ts          , `defineSeed()` and the runner behind `turbine seed`. Loads the user's
+                      seed module, opens a TurbineClient for it, and awaits the callback.
+
+  prisma-schema-fingerprint.ts, Staleness detector for the `PRISMA_MAP` that
+                      `turbine migrate-from-prisma` emits and `turbine-orm/prisma-compat` is
+                      driven by. Nothing re-runs the generator, so a model added or a field
+                      renamed in schema.prisma leaves the map describing a schema that no
+                      longer exists, and the adapter simply has no entry for the new names.
+                      The fingerprint makes that drift detectable instead of surfacing as
+                      "this model is not on the compat client".
+
+  cli/sql-statements.ts, THE one SQL tokenizer (0.66), a pure leaf with ZERO imports,
+                      shared by the destructive-migration guard, `schemaPush`, the
+                      statement splitter, and the embedded-transaction refusal. Returns
+                      per statement three views from ONE walk: `raw` (verbatim, what
+                      executes), `stripped` (comments removed AND literals emptied, what
+                      the destructive RULES match), and `code` (comments removed,
+                      literals kept, which is what dynamic SQL needs since the payload
+                      lives IN a literal). Two lexers is how the guard came to disagree
+                      with the runner about what a file contained, so a second one is
+                      never the answer. It must lex the way PostgreSQL does, and the
+                      three places that turned out not to: block comments NEST; `$` is a
+                      legal identifier CHARACTER, so `x$y$` is one identifier and not a
+                      dollar-quote opener (getting this wrong swallowed whole files);
+                      and `BEGIN ATOMIC` bodies do not end at their inner semicolons.
+                      Every ambiguity resolves toward SHOWING MORE, because both
+                      consumers are refusal gates and under-splitting is a silent accept.
 
   cli/             , CLI entry point and commands (see CLI Architecture below).
 ```
@@ -835,7 +1034,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 
 ## CLI Architecture
 
-The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|down|status`, `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration; cached-plan divergence section → `plan-divergence.ts`, finding-only, `--no-plan-divergence` skips it and its pg_stats read; since 0.57 an `unindexed-filter` finding renders as EVIDENCE on the missing-index finding for the same column (`attachDivergenceToMissingIndexes` / `renderDivergenceEvidence`) rather than as a second entry, and the remediation text names `forceCustomPlan` without assuming the reader holds the core client or prisma-compat), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`.
+The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|deploy|down|status` (`deploy` is `up` with no prompts, for CI), `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration; cached-plan divergence section → `plan-divergence.ts`, finding-only, `--no-plan-divergence` skips it and its pg_stats read; since 0.57 an `unindexed-filter` finding renders as EVIDENCE on the missing-index finding for the same column (`attachDivergenceToMissingIndexes` / `renderDivergenceEvidence`) rather than as a second entry, and the remediation text names `forceCustomPlan` without assuming the reader holds the core client or prisma-compat), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`, `mcp` (read-only MCP server over JSON-RPC stdio -> `cli/mcp.ts`), `observe` (metrics dashboard, requires TURBINE_OBSERVE_URL -> `cli/observe.ts`).
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.mts` / `.js` / `.mjs`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 
@@ -843,7 +1042,11 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 **Studio** (`cli/studio.ts`): Local web UI served over Node's built-in `http` module, no new runtime deps, read-only by default. ORM-native since v0.19: there is NO raw-SQL surface. The Query tab (default) is a visual `findMany` builder; `POST /api/builder` validates every identifier (table/relation/field/orderBy) against the introspected schema and compiles the args with `QueryInterface.buildFindMany` (`sqlCache: false`, all values as `$N` params). Saved queries are builder-kind only, legacy raw-SQL entries are dropped on load with a console notice. Binds `127.0.0.1` by default (warns loudly on non-loopback hosts), authenticates via a random 24-byte hex token (constant-time check on every `/api/*` route), per-session rate limiting (100 req/60s), refuses cross-origin requests, and ships nonce-based CSP + security headers (`script-src 'self' 'nonce-...'`, no unsafe-inline in script-src since 0.36; style-src keeps it; `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`). Every read runs inside `BEGIN READ ONLY` with `SELECT set_config('statement_timeout', $1, true)` (NOT `SET LOCAL ... = $1`, which Postgres rejects, that was the 0.17.0 critical bug) and `set_config('search_path', $1, true)` pinned to the configured `--schema`. **Write mode (0.36, `--write`; bulk since 0.38):** `/api/row/update|insert|delete` POST routes exist ONLY when writable (404 otherwise, deliberately not 403); each rebuilds the predicate from the FULL primary key alone via `extractPkWhere` (extra where keys dropped, operator objects refused, PK-addressed by construction), validates table/columns against metadata, compiles via buildUpdate/buildCreate/buildDelete (`sqlCache: false`), runs in a plain BEGIN txn with the same parameterized timeout + search_path, and requires a matching `Origin` (absent OR mismatched → 403). insert/delete also accept `rows: [...]` (MAX_BULK_ROWS=500): per-row validation up front, one statement per row in ONE all-or-nothing txn (any no-match → ROLLBACK + 404); bulk update refused; predicate-based mutations never exist. Views and PK-less tables refused. Loud startup warning + persistent red WRITE MODE banner. **PII redaction:** PII-tagged cells are redacted SERVER-SIDE ("•• redacted ••") before serialization, table rows, builder rows, nested `with` rows (redactBuilderRows walks the tree against each relation's target table), and the post-write echo; redacted columns are also excluded from the Data-tab ILIKE search OR-set, orderBy, AND the per-column `filters` param (even isNull, null-ness is an oracle too; parseTableFilters 400s). The Data tab's `filters` (JSON array, max 10, ops equals/not/contains/gt/gte/lt/lte/isNull/notNull) compile via a param-counter buildWhere shared with search, engine-aware placeholders. `--show-pii` reveals (terminal warning + persistent PII SHOWN banner). DB-less perimeter tests drive the exported `handleRequest` (src/test/studio-write.test.ts). **Temporal parity (0.54):** Studio builds a RAW pg pool and never constructs a TurbineClient, so it used to keep the driver's local-zone parsers and render a `date` cell as the previous evening east of UTC, which in `--write` is also the value an edit echoes BACK into the column; the Postgres path (never demo, which is sqlite) now calls `registerUtcTemporalParsers()` from query/utils.ts, the same helper client.ts uses. `cli/mcp.ts` does the same for its sampled rows. **Demo mode (0.37, `--demo`):** boots with NO DATABASE_URL against a seeded in-memory store (`cli/studio-demo.ts`: DEMO_SCHEMA users/posts/comments/orgs with pii-tagged email/phone + deterministic seed) backed by the sqlite engine over `node:sqlite` `:memory:` (Node >= 22.5, dynamic import with a clear error). `StudioContext.demo` + `dialect` branch the few PG-isms (pg_class counts → COUNT(*), ILIKE → LOWER LIKE, no BEGIN READ ONLY/set_config/search_path, `:pN` placeholders, `parseDemoRelationRows` re-parses sqlite's JSON-string relation columns); `POST /api/demo/mode` (demo-only, token+Origin gated) flips ctx.writable/ctx.showPii live for the UI's two toggle pills; boots read-only + redacted; each launch pristine, nothing persisted (saved queries too: demo routes them to ctx.memorySavedQueries, never .turbine/studio-queries.json, and never reads the real file). Postgres path byte-identical when off; tests in src/test/studio-demo.test.ts drive the REAL in-memory store through handleRequest. UI is an embedded single-file HTML/CSS/JS (`studio-ui.html`, prebuilt into `studio-ui.generated.ts` by `npm run gen:studio`) with Query / Data / Schema tabs matching the turbineorm.dev dark theme.
 
+**PII predicate guard** (`cli/pii-predicate-guard.ts`): a pure leaf module (same role as `cli/rate-limit.ts` and `cli/destructive.ts`), the ONE walker that decides whether caller-supplied `findMany` args filter, sort, page, or de-duplicate on a hidden column. Studio's `/api/builder` and the MCP server's `explain_query` both run their args through it before the builder sees them; they supply only what genuinely differs, a `hiddenReason(table, column)` policy (Studio: a code-first `pii` tag unless `--show-pii`; MCP: that plus a secret-looking column NAME) and `refuseColumn` / `refuseDepth` / `refuseShape` callbacks that throw their own error type. It was two independently written copies with the same name and the same job, and they had drifted into the same hole. Walks `where` / `orderBy` (object AND array form) / `cursor` / `distinct`, boolean combinators, the relation-filter wrappers (`some`/`none`/`every`/`is`/`isNot`), the pick-row ordering shape (`pick.orderBy`, `pick.where` and the target column named in `by`'s VALUE, including the `{ field, path }` JSON form), `{ col }` column references in operator OPERANDS, and each `with` level against that relation's target. `select` / `omit` are deliberately allowed: they return values, and the values are redacted on the way out. It FAILS CLOSED in three places, and that posture, not the individual keys, is the rule: past `PII_GUARD_MAX_DEPTH` (32), on an unrecognized OBJECT-VALUED key under a relation, and on an unrecognized object-valued query-level arg. A scalar-valued unknown key is deliberately left to the builder, so a plain typo still reads as a typo (E003 by name). `isPickShape` MIRRORS `isRelationPickOrderBy` in `query/filters.ts` exactly, including its requirement that `pick` be an object carrying `orderBy`, because the builder branches on that predicate and a guard that answered it differently would be guarding a different query than the one that runs.
+
 **UI module** (`cli/ui.ts`): Terminal formatting helpers, colors, spinners, tables, boxes. Imported throughout CLI but never by library code.
+
+**Other CLI leaves**: `cli/loader.ts` registers a TypeScript loader (prefers `tsx/esm/api`'s `register()`, probed from the user's CWD) before the CLI `import()`s a user-supplied `turbine.config.ts` / schema file, which plain Node rejects with `ERR_UNKNOWN_FILE_EXTENSION`. `cli/pii-tags.ts` reads `ColumnMetadata.pii` out of the generated `metadata.ts` and applies it to a LIVE introspected schema: `pii` is a code-first declaration that `introspect.ts` never sets, so without this Studio's and the MCP server's redaction would be inert against a real database; it distinguishes "this file declares no PII" from "this file could not be parsed" (`PiiScan.ok === false`), and the latter fails closed by tagging every column. `cli/rate-limit.ts` is the fixed-window limiter (100 requests / 60s) both local servers share. `cli/observe.ts` is the read-only metrics dashboard over the `_turbine_metrics` table written by `observe.ts`, with Studio's security model (loopback, random token, HttpOnly cookie, CSP, read-only transactions); its UI is the hand-authored embedded HTML in `cli/observe-ui.ts` (same pattern as `studio-ui.generated.ts` but with no build step).
 
 ## Testing
 
@@ -851,7 +1054,7 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 **Integration tests** need a PostgreSQL instance with seeded data. Set `DATABASE_URL` env var. The small correctness fixture is `src/test/fixtures/seed.sql` (8 users / 10 posts / 20 comments / 5 orgs). The larger benchmark seed lives in `benchmarks/seed-neon.ts` and defaults to 1K users / 10K posts / 50K comments (override via `USERS`/`POSTS_PER_USER`/`COMMENTS_PER_POST`). Tests that require a database are gated via the `skipGate()` helper in `src/test/helpers.ts` when `DATABASE_URL` is absent, each test registers with `{ skip }` so the reporter shows real skipped counts, not silent passes.
 
-**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, and `src/index.ts`. Thresholds: 80% lines, 82% functions, 82% branches, 80% statements.
+**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, `src/index.ts`, and the three type-only modules that emit no runtime code (`src/query/types.ts`, `src/query/deferred.ts`, `src/engine-config.ts`, each compiles to `export {};` and only counted as permanently-uncovered denominator). Thresholds: 75% lines, 59% functions, 85% branches, 75% statements. Those are MEASURED floors, re-baselined 2026-07-24 from aspirational numbers (80/82/82/80) that had been failing continuously, which is how a permanently-red gate got normalized. `.c8rc.json` carries the measurements and the rule in its own `//` keys: raise as coverage improves, never lower one without recording why. `src/cli/**` is excluded HERE but has its own per-file gate, `npm run test:coverage:cli`, over `cli/studio.ts`, `cli/migrate.ts`, `cli/destructive.ts`, `cli/sql-statements.ts` and `cli/pii-predicate-guard.ts`, each with its own floor; a new test file for any of those five must be added to `coverage:cli:collect` in package.json or its coverage does not count.
 
 ## Key Patterns
 

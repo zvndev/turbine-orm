@@ -1,7 +1,26 @@
 #!/usr/bin/env tsx
 /**
- * Error code enforcement, verifies all thrown errors in src/ use
- * known TurbineError subclasses from src/errors.ts.
+ * Error code enforcement. Two checks, in opposite directions:
+ *
+ *  1. NO UNTRACKED CLASSES. Every `throw new X(...)` in src/ names a known
+ *     TurbineError subclass from src/errors.ts (or one of the narrow, explicitly
+ *     listed exceptions below).
+ *
+ *  2. NO UNREACHABLE CODES. Every error class that carries a TURBINE_E* code is
+ *     CONSTRUCTED somewhere in production code. `PipelineError` (E014) was
+ *     defined, exported, listed in the error table, and documented on the errors
+ *     page with a runnable `instanceof` example, while the only `new
+ *     PipelineError(` in the whole repo lived in a test: the two pipeline paths
+ *     that were supposed to raise it threw the raw driver error instead, one of
+ *     them with a `results` property assigned onto it so the DOCUMENTED FIELD
+ *     worked and the documented TYPE CHECK never could. Check 1 cannot see that,
+ *     because it only ever looks at classes that ARE thrown. This one closes it.
+ *
+ * Production code here means all of src/ except src/test/**. errors.ts COUNTS:
+ * `wrapPgError` is the production construction site for every driver-mapped code
+ * (E008-E013, E016), which is exactly how those codes are meant to be reached,
+ * and a rule that excluded errors.ts would flag five reachable codes to catch
+ * one unreachable one.
  *
  * Run: tsx scripts/check-error-codes.ts
  * Used in CI to prevent untracked error types from shipping.
@@ -118,7 +137,78 @@ for (const file of files) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Check 2: every declared error code is actually reachable
+// ---------------------------------------------------------------------------
+
+const errorsSource = readFileSync(join(srcDir, 'errors.ts'), 'utf-8');
+
+/** `NOT_FOUND: 'TURBINE_E001',` -> member name -> code. */
+const declaredCodes = new Map<string, string>();
+for (const m of errorsSource.matchAll(/^\s{2}([A-Z0-9_]+):\s*'(TURBINE_E\d+)',/gm)) {
+  declaredCodes.set(m[1]!, m[2]!);
+}
+
+/**
+ * Class -> the code it passes to `super(...)`. Read by walking errors.ts and
+ * remembering the most recent `export class X extends`, then taking the first
+ * `TurbineErrorCode.MEMBER` that follows: the super call that names the code
+ * sits several lines into the constructor and is often split across lines, so
+ * matching `super(` and the member on ONE line silently misses those (it missed
+ * three, which then reported as "declared code with no class").
+ *
+ * `TurbineError` itself is skipped, by the `extends Error` test: it takes the
+ * code as a CONSTRUCTOR PARAMETER rather than naming one, so the first member
+ * reference after it belongs to the next class down.
+ */
+const classCodes = new Map<string, string>();
+let currentClass: string | null = null;
+for (const line of errorsSource.split('\n')) {
+  const decl = /^export class (\w+) extends (\w+)/.exec(line);
+  if (decl) {
+    currentClass = decl[2] === 'Error' ? null : decl[1]!;
+    continue;
+  }
+  if (!currentClass) continue;
+  const member = /TurbineErrorCode\.([A-Z0-9_]+)/.exec(line);
+  if (member) {
+    classCodes.set(currentClass, declaredCodes.get(member[1]!) ?? member[1]!);
+    currentClass = null;
+  }
+}
+
+/** Count `new X(` across all of src/ except the tests. */
+const constructionCounts = new Map<string, number>();
+for (const file of files) {
+  const relPath = relative(process.cwd(), file);
+  if (relPath.includes('/test/') || relPath.endsWith('.test.ts')) continue;
+  const content = readFileSync(file, 'utf-8');
+  for (const m of content.matchAll(/\bnew\s+(\w+)\s*\(/g)) {
+    const name = m[1]!;
+    if (classCodes.has(name)) constructionCounts.set(name, (constructionCounts.get(name) ?? 0) + 1);
+  }
+}
+
+const unreachable = [...classCodes]
+  .filter(([cls]) => (constructionCounts.get(cls) ?? 0) === 0)
+  .map(([cls, code]) => `${code} (${cls})`);
+
+// A code declared in TurbineErrorCode that no class ever passes to super() can
+// never appear on a thrown error either, so it is the same failure one step
+// earlier.
+const claimedCodes = new Set(classCodes.values());
+const unclaimed = [...declaredCodes.entries()]
+  .filter(([, code]) => !claimedCodes.has(code))
+  .map(([member, code]) => `${code} (TurbineErrorCode.${member})`);
+
+// ---------------------------------------------------------------------------
+// Report
+// ---------------------------------------------------------------------------
+
+let failed = false;
+
 if (violations.length > 0) {
+  failed = true;
   console.error(`\n Found ${violations.length} untracked error class(es):\n`);
   for (const v of violations) {
     console.error(`  ${v.file}:${v.line} -- throw new ${v.errorClass}(...)`);
@@ -128,7 +218,39 @@ if (violations.length > 0) {
     'Fix: Use a known TurbineError subclass from src/errors.ts,\n' +
     'or add the new class to KNOWN_ERRORS in scripts/check-error-codes.ts.\n'
   );
-  process.exit(1);
-} else {
-  console.log('All thrown errors use known TurbineError subclasses.');
 }
+
+if (classCodes.size === 0 || declaredCodes.size === 0) {
+  failed = true;
+  console.error(
+    `\n Could not read the error codes out of src/errors.ts ` +
+    `(${declaredCodes.size} codes, ${classCodes.size} classes).\n` +
+    ' The reachability check would pass vacuously, so it fails instead.\n'
+  );
+}
+
+if (unreachable.length > 0) {
+  failed = true;
+  console.error(`\n Found ${unreachable.length} error code(s) that are never constructed:\n`);
+  for (const entry of unreachable) console.error(`  ${entry}`);
+  console.error(
+    '\nFix: throw it from the code path it documents, or delete it.\n' +
+    'A code that no production path constructs cannot be caught by `instanceof`\n' +
+    'or matched on `.code`, however completely it is documented.\n'
+  );
+}
+
+if (unclaimed.length > 0) {
+  failed = true;
+  console.error(`\n Found ${unclaimed.length} declared code(s) with no error class:\n`);
+  for (const entry of unclaimed) console.error(`  ${entry}`);
+  console.error('\nFix: add the class that passes this code to super(), or remove the code.\n');
+}
+
+if (failed) {
+  process.exit(1);
+}
+
+console.log(
+  `All thrown errors use known TurbineError subclasses, and all ${classCodes.size} error codes are constructed.`,
+);

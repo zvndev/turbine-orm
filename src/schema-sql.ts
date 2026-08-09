@@ -779,25 +779,55 @@ export function diffCheckConstraints(
   return { statements, reverseStatements };
 }
 
+/** Options for {@link schemaDiff} and {@link schemaPush}. */
+export interface SchemaDiffOptions {
+  /**
+   * Postgres NAMESPACE the diff reads (default `public`).
+   *
+   * Every catalog read here used to hardcode `'public'` while `generate`,
+   * `pull`, `doctor`, and `studio` all honored the configured schema. Against a
+   * table in a non-public schema the diff therefore saw nothing and emitted
+   * `CREATE TABLE "users"` (a duplicate in public); worse, when a legacy copy of
+   * the table still sat in `public` (the usual state after moving to a dedicated
+   * schema) it read THAT one and emitted ALTER / DROP COLUMN against the wrong
+   * table. Defaults to `public`, so a project with no schema configured emits
+   * byte-identical SQL.
+   */
+  schema?: string;
+}
+
 /**
  * Compare a SchemaDef against a live Postgres database and return the diff.
  *
- * Connects to the database, inspects the public schema, and computes what
- * DDL is needed to make the database match the schema definition.
+ * Connects to the database, inspects `options.schema` (default `public`), and
+ * computes what DDL is needed to make the database match the schema definition.
  */
-export async function schemaDiff(schema: SchemaDef, connectionString: string): Promise<DiffResult> {
+export async function schemaDiff(
+  schema: SchemaDef,
+  connectionString: string,
+  options: SchemaDiffOptions = {},
+): Promise<DiffResult> {
   const dialect = postgresDialect;
+  // The Postgres namespace every catalog read below is scoped to. Named
+  // `pgSchema` because `schema` is already the SchemaDef in this function.
+  const pgSchema = options.schema ?? 'public';
   const client = new pg.Client({ connectionString });
   await client.connect();
 
   try {
-    // Get existing tables in the public schema
+    // Get existing tables in the target schema
     const tableResult = await client.query<{ tablename: string }>(
-      `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`,
+      `SELECT tablename FROM pg_tables WHERE schemaname = $1`,
+      [pgSchema],
     );
     const existingTables = new Set(tableResult.rows.map((r) => r.tablename));
 
-    // Get existing columns for all tables
+    // Get existing columns for all tables. `numeric_precision` / `numeric_scale`
+    // ride along with `character_maximum_length` so a length- or precision-only
+    // change is visible (see typeDifference); comparing `udt_name` alone
+    // reported "already in sync" for VARCHAR(255) against a declared
+    // varchar(10), and the widening direction of that produced runtime
+    // "value too long" errors the diff had said were impossible.
     const columnResult = await client.query<{
       table_name: string;
       column_name: string;
@@ -806,26 +836,44 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
       is_nullable: string;
       column_default: string | null;
       character_maximum_length: number | null;
+      numeric_precision: number | null;
+      numeric_scale: number | null;
     }>(
-      `SELECT table_name, column_name, data_type, udt_name, is_nullable, column_default, character_maximum_length
+      `SELECT table_name, column_name, data_type, udt_name, is_nullable, column_default,
+              character_maximum_length, numeric_precision, numeric_scale
        FROM information_schema.columns
-       WHERE table_schema = 'public'
+       WHERE table_schema = $1
        ORDER BY table_name, ordinal_position`,
+      [pgSchema],
     );
 
-    const dbColumns: Record<
-      string,
-      Record<
-        string,
-        {
-          dataType: string;
-          udtName: string;
-          isNullable: boolean;
-          columnDefault: string | null;
-          maxLength: number | null;
-        }
-      >
-    > = {};
+    // The type EXACTLY as Postgres writes it, for the modifiers
+    // information_schema structurally cannot report: an array's element length
+    // (`character varying(255)[]`, where character_maximum_length is NULL) and a
+    // pgvector dimension count (`vector(3)`, which has no column at all). Both
+    // were invisible to the diff, so both reported "already in sync" for a
+    // schema that differed. It doubles as the reverse-ALTER spelling of any type
+    // this generator has no keyword for. Restricted to ordinary and partitioned
+    // tables to match the pg_tables read above.
+    const formattedResult = await client.query<{
+      table_name: string;
+      column_name: string;
+      formatted_type: string;
+    }>(
+      `SELECT cl.relname AS table_name, a.attname AS column_name,
+              format_type(a.atttypid, a.atttypmod) AS formatted_type
+       FROM pg_attribute a
+       JOIN pg_class cl ON cl.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = cl.relnamespace
+       WHERE n.nspname = $1 AND cl.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped`,
+      [pgSchema],
+    );
+    const formattedTypes = new Map<string, string>();
+    for (const row of formattedResult.rows) {
+      formattedTypes.set(`${row.table_name}.${row.column_name}`, row.formatted_type);
+    }
+
+    const dbColumns: Record<string, Record<string, DbColumn>> = {};
     for (const row of columnResult.rows) {
       if (!dbColumns[row.table_name]) {
         dbColumns[row.table_name] = {};
@@ -836,6 +884,9 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         isNullable: row.is_nullable === 'YES',
         columnDefault: row.column_default,
         maxLength: row.character_maximum_length,
+        numericPrecision: row.numeric_precision,
+        numericScale: row.numeric_scale,
+        formattedType: formattedTypes.get(`${row.table_name}.${row.column_name}`) ?? null,
       };
     }
 
@@ -850,15 +901,16 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
        JOIN information_schema.key_column_usage kcu
          ON tc.constraint_name = kcu.constraint_name
          AND tc.table_schema = kcu.table_schema
-       WHERE tc.table_schema = 'public'
+       WHERE tc.table_schema = $1
          AND tc.constraint_type = 'UNIQUE'
          AND tc.constraint_name IN (
            SELECT constraint_name
            FROM information_schema.key_column_usage
-           WHERE table_schema = 'public'
+           WHERE table_schema = $1
            GROUP BY constraint_name
            HAVING COUNT(*) = 1
          )`,
+      [pgSchema],
     );
 
     // Map: table → column → constraint_name for single-col uniques
@@ -874,8 +926,9 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
        FROM pg_type t
        JOIN pg_enum e ON t.oid = e.enumtypid
        JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-       WHERE n.nspname = 'public'
+       WHERE n.nspname = $1
        ORDER BY t.typname, e.enumsortorder`,
+      [pgSchema],
     );
     const dbEnums: Record<string, string[]> = {};
     for (const row of enumResult.rows) {
@@ -902,8 +955,9 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
        JOIN pg_catalog.pg_class tgt ON tgt.oid = con.confrelid
        JOIN pg_catalog.pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = con.conkey[1]
        JOIN pg_catalog.pg_attribute tatt ON tatt.attrelid = con.confrelid AND tatt.attnum = con.confkey[1]
-       WHERE con.contype = 'f' AND n.nspname = 'public'
+       WHERE con.contype = 'f' AND n.nspname = $1
          AND array_length(con.conkey, 1) = 1`,
+      [pgSchema],
     );
     const dbForeignKeys: Record<string, Record<string, DbForeignKey>> = {};
     for (const row of fkResult.rows) {
@@ -924,7 +978,8 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
        FROM pg_constraint con
        JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
-       WHERE con.contype = 'c' AND n.nspname = 'public'`,
+       WHERE con.contype = 'c' AND n.nspname = $1`,
+      [pgSchema],
     );
     const dbChecks: Record<string, CheckSpec[]> = {};
     for (const row of checkResult.rows) {
@@ -936,7 +991,8 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
     // unique-constraint, FK, and user indexes alike; the diff only ADDs declared
     // indexes whose name is missing and never auto-drops any (see below).
     const indexResult = await client.query<{ tablename: string; indexname: string; indexdef: string }>(
-      `SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'`,
+      `SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = $1`,
+      [pgSchema],
     );
     const dbIndexes: Record<string, Map<string, string>> = {};
     for (const row of indexResult.rows) {
@@ -1021,17 +1077,49 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
         // (a downcast on a PK loses data / breaks the sequence). This also
         // preserves back-compat for DBs whose `serial` columns were created as
         // BIGSERIAL (int8) before 0.24.0, `push` won't try to shrink them.
-        const expectedUdt = schemaTypeToUdt(config);
-        if (expectedUdt && !isSerialType(config.type) && dbCol.udtName !== expectedUdt) {
+        // planTypeChange owns the whole decision: whether the types differ at
+        // all (including length / precision modifiers), whether the conversion
+        // needs an explicit USING, and what the conversion costs.
+        const typePlan = planTypeChange(config, dbCol, snakeName);
+        if (typePlan.kind === 'warn') {
+          result.warnings!.push(`column "${tableName}"."${snakeName}": ${typePlan.reason}`);
+        } else if (typePlan.kind === 'alter') {
           // resolveDdlType handles enum names, vector(n), arrays, and VARCHAR(n) -
           // config.type alone would emit the internal ENUM/VECTOR sentinels here.
           const sqlType = resolveDdlType(config, dialect, snakeName);
-          const oldSqlType = udtToSqlType(dbCol.udtName, dbCol.maxLength);
-          const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${sqlType} USING ${dialect.quoteIdentifier(snakeName)}::${sqlType};`;
-          const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} TYPE ${oldSqlType} USING ${dialect.quoteIdentifier(snakeName)}::${oldSqlType};`;
+          const oldSqlType = udtToSqlType(dbCol);
+          const col = dialect.quoteIdentifier(snakeName);
+          // `USING` only where the conversion needs one. Within a type family
+          // Postgres has an assignment cast, and letting IT decide is the whole
+          // point: an explicit `::VARCHAR(10)` truncates a 27-character value,
+          // while the plain ALTER raises "value too long" and the migration
+          // stops. See planTypeChange.
+          //
+          // Where a USING IS needed (the conversion crosses type families and
+          // has no assignment cast), the cast targets the UNBOUNDED base type
+          // rather than the declared one, because an explicit cast amputates
+          // wherever it lands. Dropping the USING was only half the fix: every
+          // cross-family conversion INTO a bounded string still carried
+          // `USING col::VARCHAR(n)` and still truncated, silently and on every
+          // engine-side value shape (jsonb, integer, uuid, an enum label, bytea,
+          // a timestamp). Casting to the unbounded base keeps the conversion
+          // Postgres cannot do implicitly while leaving the LENGTH check to the
+          // assignment into the column, which raises "value too long" and stops.
+          const using = typePlan.needsUsing ? ` USING ${col}::${unboundedCastType(sqlType)}` : '';
+          const reverseUsing = typePlan.needsUsing ? ` USING ${col}::${unboundedCastType(oldSqlType)}` : '';
+          const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${col} TYPE ${sqlType}${using};`;
+          const reverseSql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${col} TYPE ${oldSqlType}${reverseUsing};`;
           alterDef.columns.push({ column: snakeName, action: 'alter_type', sql, reverseSql });
           result.statements.push(sql);
           result.reverseStatements.unshift(reverseSql);
+          // The destructive gate sees the statement and refuses by default; its
+          // label is necessarily generic ("cast may truncate or fail"). This
+          // warning names what THIS conversion does to THESE rows.
+          if (typePlan.loss) {
+            result.warnings!.push(
+              `column "${tableName}"."${snakeName}" changes type from ${oldSqlType} to ${sqlType}: ${typePlan.loss}`,
+            );
+          }
         }
 
         // Check NOT NULL mismatch
@@ -1256,6 +1344,356 @@ export async function schemaDiff(schema: SchemaDef, connectionString: string): P
   }
 }
 
+// ---------------------------------------------------------------------------
+// Column type comparison
+// ---------------------------------------------------------------------------
+
+/** One database column as the diff reads it out of information_schema. */
+interface DbColumn {
+  dataType: string;
+  udtName: string;
+  isNullable: boolean;
+  columnDefault: string | null;
+  maxLength: number | null;
+  numericPrecision: number | null;
+  numericScale: number | null;
+  formattedType: string | null;
+}
+
+/** The type-relevant subset of {@link DbColumn}, so {@link planTypeChange} stays testable. */
+export interface DbColumnType {
+  udtName: string;
+  maxLength: number | null;
+  numericPrecision: number | null;
+  numericScale: number | null;
+  /**
+   * `format_type(atttypid, atttypmod)` from pg_catalog: the type exactly as
+   * Postgres would write it, e.g. `character varying(255)[]`, `vector(3)`,
+   * `numeric(10,2)`, `app."Probe"`. Read alongside information_schema because
+   * information_schema cannot express an array element's length modifier or a
+   * pgvector dimension count, and because it is the only spelling of an
+   * unmapped type that is guaranteed to be valid, correctly quoted and
+   * correctly schema-qualified DDL. Null only when a caller builds the value by
+   * hand (the live diff always populates it).
+   */
+  formattedType: string | null;
+}
+
+/**
+ * What the diff should do about one column's type.
+ *
+ * `alter` carries `needsUsing` (see {@link planTypeChange}) and, when the
+ * conversion can lose or reject data, a `loss` sentence naming the SPECIFIC
+ * loss. `warn` is for a difference the code-first schema cannot express, where
+ * emitting DDL would destroy an intentional database-side constraint.
+ */
+export type TypeChangePlan =
+  | { kind: 'none' }
+  | { kind: 'alter'; needsUsing: boolean; loss?: string }
+  | { kind: 'warn'; reason: string };
+
+/**
+ * Rough type families. Within a family Postgres has an ASSIGNMENT cast between
+ * every pair the schema builder can produce, which is what lets the diff emit a
+ * plain `ALTER ... TYPE` with no `USING` (see {@link planTypeChange}). That
+ * sentence is the family's whole contract, and two things used to break it:
+ *
+ *   - ARRAYS returned null, so every array-to-array change was treated as a
+ *     cross-family conversion and got an explicit `USING col::VARCHAR(5)[]`,
+ *     which truncates each element exactly as the scalar form does. Postgres
+ *     has the same assignment casts between array types as between their
+ *     elements (verified pair by pair for every type the schema builder can
+ *     produce), so an array's family is its ELEMENT's family with `[]`
+ *     appended. The suffix matters: `text` and `varchar(5)[]` must NOT come out
+ *     the same family, because there is no automatic cast between a scalar and
+ *     an array and the plain ALTER would be unrunnable.
+ *   - `time` / `timetz` were listed as `temporal` alongside date and the
+ *     timestamps, and the contract simply is not true there: pg_cast has NO
+ *     entry between `time` and `date`, `timestamp` or `timestamptz` in EITHER
+ *     direction, so `ALTER COLUMN c TYPE DATE` on a `time` column fails with
+ *     "cannot be cast automatically". They are their own family, which makes a
+ *     time-to-date change cross-family: still not something Turbine can apply,
+ *     but now it says so in the loss warning instead of asserting a cast that
+ *     does not exist. (`{date, timestamp, timestamptz}` and `{time, timetz}`
+ *     are each internally complete.)
+ */
+function udtFamily(udt: string): string | null {
+  if (udt.startsWith('_')) {
+    const element = udtFamily(udt.slice(1));
+    return element === null ? null : `${element}[]`;
+  }
+  switch (udt) {
+    case 'text':
+    case 'varchar':
+    case 'bpchar':
+    case 'char':
+      return 'string';
+    case 'int2':
+    case 'int4':
+    case 'int8':
+    case 'numeric':
+    case 'float4':
+    case 'float8':
+      return 'numeric';
+    case 'date':
+    case 'timestamp':
+    case 'timestamptz':
+      return 'temporal';
+    case 'time':
+    case 'timetz':
+      return 'time-of-day';
+    case 'json':
+    case 'jsonb':
+      return 'json';
+    case 'bool':
+      return 'boolean';
+    default:
+      return null; // uuid, bytea, enums, vector: no intra-family conversions
+  }
+}
+
+/** Drop the array marker from a family name, so the per-family rules apply to both. */
+function elementFamily(family: string | null): string | null {
+  if (family === null) return null;
+  return family.endsWith('[]') ? family.slice(0, -2) : family;
+}
+
+/** Drop Postgres's array prefix from a udt name (`_int4` → `int4`). */
+function elementUdt(udt: string): string {
+  return udt.startsWith('_') ? udt.slice(1) : udt;
+}
+
+/** Render a udt name the way a reader writes it (`_varchar` → `varchar[]`). */
+function describeUdt(udt: string): string {
+  return udt.startsWith('_') ? `${udt.slice(1)}[]` : udt;
+}
+
+/**
+ * The type a `USING` cast should name so the cast itself cannot lose data.
+ *
+ * Only `VARCHAR(n)` (and its array form) carries a bound that an explicit cast
+ * silently enforces by TRUNCATING; `TEXT` is the same type family with no bound,
+ * so `col::TEXT` converts exactly as `col::VARCHAR(n)` would and then the
+ * assignment into the declared column applies the length check properly. Every
+ * other type this generator emits either has no length modifier or refuses the
+ * conversion outright (pgvector's dimension count), so it is returned unchanged.
+ */
+function unboundedCastType(sqlType: string): string {
+  const bounded = /^VARCHAR\(\d+\)(\[\])?$/i.exec(sqlType);
+  return bounded ? `TEXT${bounded[1] ?? ''}` : sqlType;
+}
+
+/** Rank within the integer/real widening order, for the narrowing checks. */
+const NUMERIC_RANK: Record<string, number> = { int2: 1, int4: 2, int8: 3, float4: 4, float8: 5, numeric: 6 };
+/**
+ * Rank within the temporal detail order (a lower rank carries less
+ * information). Covers the `temporal` family only: `time` / `timetz` are a
+ * separate family with no cast to or from these, so ranking them against a
+ * date would compare two values that never meet.
+ */
+const TEMPORAL_RANK: Record<string, number> = { date: 1, timestamp: 3, timestamptz: 4 };
+
+/**
+ * The single numeric modifier in a `format_type` rendering, or null when the
+ * type carries none. `character varying(255)[]` → 255, `vector(3)` → 3,
+ * `numeric(10,2)` → 10, `text` → null.
+ *
+ * This exists because information_schema cannot express these: it reports
+ * `character_maximum_length` NULL for an ARRAY of varchar (the length belongs to
+ * the element type) and has no column at all for a pgvector dimension count. A
+ * diff reading it alone therefore saw `varchar(255)[]` and a declared
+ * `varchar(5)[]` as identical, and `vector(3)` and a declared 1536 dimensions as
+ * identical, and reported "already in sync" for both.
+ */
+function typeModifier(formattedType: string | null | undefined): number | null {
+  if (!formattedType) return null;
+  const match = /\((\d+)(?:\s*,\s*\d+)?\)/.exec(formattedType);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * The length bound on a string column, from whichever source carries it:
+ * information_schema for a scalar varchar, the `format_type` modifier for an
+ * array of varchar. Null means unbounded (`text`, a bare `VARCHAR`), which for
+ * the loss checks reads as "could be longer than any target bound".
+ */
+function stringLengthOf(col: DbColumnType): number | null {
+  return col.maxLength ?? typeModifier(col.formattedType);
+}
+
+/**
+ * A sentence naming what this specific conversion does to existing rows, or
+ * undefined when nothing is lost. Deliberately says whether Postgres REFUSES
+ * the row or silently changes it: those are very different operational events,
+ * and the generic "cast may truncate or fail" told the reader neither.
+ */
+function describeTypeLoss(from: DbColumnType, toUdt: string, toMaxLength: number | null, column: string): string {
+  const q = `"${column}"`;
+  const fromFamily = udtFamily(from.udtName);
+  const toFamily = udtFamily(toUdt);
+  // Within one family the rules are the same for a scalar and for an array of
+  // it; only the noun changes, since an array's bound applies per element.
+  const sameFamily = fromFamily !== null && fromFamily === toFamily;
+  const family = elementFamily(toFamily);
+  const fromUdt = elementUdt(from.udtName);
+  const toElementUdt = elementUdt(toUdt);
+  const isArray = toFamily?.endsWith('[]') ?? false;
+  const subject = isArray ? `array elements in ${q}` : `values in ${q}`;
+
+  // A bounded string TARGET enforces its bound on every value, whatever the
+  // source type was, because the conversion renders the value as text first.
+  // Only the same-family case can prove the bound is already satisfied.
+  if (family === 'string' && toMaxLength != null) {
+    const fromLen = sameFamily ? stringLengthOf(from) : null;
+    if (fromLen === null || fromLen > toMaxLength) {
+      const rendered = sameFamily ? '' : 'whose text form is ';
+      return `${subject} ${rendered}longer than ${toMaxLength} characters make this statement FAIL (Postgres refuses the conversion; it does not truncate). Shorten or migrate those rows first.`;
+    }
+  }
+  if (family === 'numeric' && sameFamily) {
+    const fromRank = NUMERIC_RANK[fromUdt] ?? 0;
+    const toRank = NUMERIC_RANK[toElementUdt] ?? 0;
+    const toIsInteger = toElementUdt === 'int2' || toElementUdt === 'int4' || toElementUdt === 'int8';
+    const fromIsInteger = fromUdt === 'int2' || fromUdt === 'int4' || fromUdt === 'int8';
+    if (toIsInteger && !fromIsInteger) {
+      return `fractional ${subject} are ROUNDED to whole numbers (silently, row by row).`;
+    }
+    if (toIsInteger && fromIsInteger && toRank < fromRank) {
+      return `${subject} outside the ${toElementUdt} range make this statement FAIL ("integer out of range").`;
+    }
+    if (toRank < fromRank) {
+      return `${subject} lose precision (silently rounded to what ${toElementUdt} can represent).`;
+    }
+  }
+  if (family === 'temporal' && sameFamily) {
+    const fromRank = TEMPORAL_RANK[fromUdt] ?? 0;
+    const toRank = TEMPORAL_RANK[toElementUdt] ?? 0;
+    if (toElementUdt === 'date' && fromRank > 1) return `the time-of-day component of ${q} is DROPPED (silently).`;
+    if (toRank < fromRank) return `${q} loses its time-zone offset (converted to the session time zone).`;
+  }
+  if (elementFamily(fromFamily) === 'time-of-day' && family === 'temporal') {
+    // Not "fails for some rows": pg_cast has no entry between `time`/`timetz`
+    // and `date`/`timestamp`/`timestamptz` in either direction, implicit,
+    // assignment or explicit, so the statement cannot run at all, on an empty
+    // table included. Saying "must be a valid date literal" would send the
+    // reader off to clean data that was never the problem.
+    return `Postgres has NO cast from ${describeUdt(from.udtName)} to ${describeUdt(toUdt)}, in either direction, so this statement ALWAYS FAILS (a time of day carries no date to convert). Add the new column and backfill it in a manual migration instead.`;
+  }
+  if (!sameFamily) {
+    return `every existing value in ${q} must be a valid ${describeUdt(toUdt)} literal or this statement FAILS.`;
+  }
+  return '';
+}
+
+/**
+ * Decide what the diff should emit for one column's type.
+ *
+ * Two things this deliberately does that the previous `udtName !== expectedUdt`
+ * check did not:
+ *
+ *   1. It compares LENGTH and NUMERIC PRECISION, not just the UDT name. A
+ *      declared `varchar(10)` against a database `VARCHAR(255)` produced no
+ *      statement and no warning, so `push` printed "Database is already in
+ *      sync" for a schema that genuinely differed. The widening direction is
+ *      the operationally painful one: the schema says 255, the column is 10,
+ *      push says in sync, and writes fail at runtime with "value too long".
+ *   2. It reports `needsUsing` FALSE for a same-family conversion. The old
+ *      statement always appended `USING col::type`, and an EXPLICIT cast to
+ *      `varchar(n)` TRUNCATES where the plain assignment cast raises "value too
+ *      long". Postgres refuses that migration on its own; the generated `USING`
+ *      converted the refusal into silent data amputation. Same shape for
+ *      `numeric -> integer` and `timestamptz -> date`. `USING` is emitted only
+ *      where the conversion genuinely needs it (text to uuid, text to an enum,
+ *      anything crossing a type family), where no assignment cast exists.
+ *
+ * Numeric PRECISION drift gets a warning rather than a statement: `defineSchema`
+ * has no way to declare `numeric(10, 2)`, so every such column would otherwise
+ * get a table-rewriting `ALTER ... TYPE NUMERIC` on every push, discarding a
+ * constraint the schema never had the vocabulary to ask for.
+ */
+export function planTypeChange(config: ColumnConfig, dbCol: DbColumnType, column: string): TypeChangePlan {
+  const expectedUdt = schemaTypeToUdt(config);
+  if (expectedUdt === null) {
+    return {
+      kind: 'warn',
+      reason: `schema type "${config.type}" has no known Postgres type mapping, so its type is not diffed.`,
+    };
+  }
+  if (isSerialType(config.type)) return { kind: 'none' };
+
+  if (dbCol.udtName !== expectedUdt) {
+    const loss = describeTypeLoss(dbCol, expectedUdt, config.maxLength, column);
+    const sameFamily = udtFamily(dbCol.udtName) !== null && udtFamily(dbCol.udtName) === udtFamily(expectedUdt);
+    return { kind: 'alter', needsUsing: !sameFamily, ...(loss ? { loss } : {}) };
+  }
+
+  // Same UDT: the remaining differences are the type MODIFIERS. Some are in
+  // information_schema, some only in the catalog's format_type rendering.
+  if (expectedUdt === 'varchar') {
+    // `maxLength: null` on a varchar column is a real declaration (unbounded
+    // VARCHAR), not an omission: schemaToSQL emits a bare `VARCHAR` for it.
+    const want = config.maxLength ?? null;
+    if (want !== dbCol.maxLength) {
+      const loss = describeTypeLoss(dbCol, expectedUdt, want, column);
+      return { kind: 'alter', needsUsing: false, ...(loss ? { loss } : {}) };
+    }
+    return { kind: 'none' };
+  }
+
+  if (expectedUdt === '_varchar') {
+    // The same length comparison for `varchar(n)[]`. It needs a different
+    // source because information_schema reports character_maximum_length NULL
+    // for an array (the modifier belongs to the element type), so comparing it
+    // saw `varchar(255)[]` and a declared `varchar(5)[]` as identical and
+    // reported "already in sync" for a schema that genuinely differed, with no
+    // statement and no warning. The plain ALTER carries the change on this path
+    // too: Postgres has the same assignment cast between the array types as
+    // between their elements, and enforces the bound per element.
+    const want = config.maxLength ?? null;
+    if (want !== typeModifier(dbCol.formattedType)) {
+      const loss = describeTypeLoss(dbCol, expectedUdt, want, column);
+      return { kind: 'alter', needsUsing: false, ...(loss ? { loss } : {}) };
+    }
+    return { kind: 'none' };
+  }
+
+  if (expectedUdt === 'vector') {
+    // pgvector's dimension count is a type modifier, invisible to
+    // information_schema, so a `vector(3)` column against a declared 1536
+    // dimensions produced no statement and no warning; the app then failed on
+    // its first write with "expected 3 dimensions, not 1536". Same shape as the
+    // varchar(255)-against-varchar(10) bug above. A dimension change cannot be
+    // applied to populated rows at all (pgvector rejects it with or without an
+    // explicit cast), which is what the loss sentence has to say.
+    const want = config.vectorDimensions ?? null;
+    const have = typeModifier(dbCol.formattedType);
+    if (want !== have) {
+      const loss =
+        want == null
+          ? `existing vectors in "${column}" keep their dimension count; an unbounded vector column cannot be produced from a bounded one while rows exist, so this statement FAILS.`
+          : `every existing vector in "${column}" must already have exactly ${want} dimensions or this statement FAILS (pgvector refuses the conversion; it does not pad or truncate).`;
+      return { kind: 'alter', needsUsing: false, loss };
+    }
+    return { kind: 'none' };
+  }
+
+  if (expectedUdt === 'numeric' && dbCol.numericPrecision !== null) {
+    // Guarded on `numeric` alone: information_schema reports a precision for
+    // every integer and float type too (int4 -> 32), which is not a modifier
+    // anyone declared.
+    const stored =
+      dbCol.numericScale === null
+        ? `numeric(${dbCol.numericPrecision})`
+        : `numeric(${dbCol.numericPrecision}, ${dbCol.numericScale})`;
+    return {
+      kind: 'warn',
+      reason: `the database column is ${stored} but the schema declares a bare NUMERIC. defineSchema cannot express numeric precision/scale, so Turbine leaves the column alone rather than rewriting away a constraint it cannot represent. Change it in a manual migration if that is intended.`,
+    };
+  }
+
+  return { kind: 'none' };
+}
+
 /**
  * Map a schema column type to its expected PostgreSQL UDT name.
  */
@@ -1289,15 +1727,35 @@ function schemaTypeToUdt(config: ColumnConfig): string | null {
 }
 
 /**
- * Reverse map: PostgreSQL UDT name → SQL type (for generating reverse ALTER TYPE).
+ * Reverse map: a database column's type → the SQL type token that restores it
+ * (used for the reverse ALTER TYPE, and to name the old type in a warning).
+ *
+ * Two rules, and the second one is why this takes the whole column:
+ *
+ *   1. A type this generator itself emits gets its own uppercase spelling back,
+ *      so a reverse statement reads like the forward one. `numeric` now carries
+ *      its precision and scale: a `numeric(10, 2)` column changed to INTEGER
+ *      reversed to a bare `NUMERIC`, quietly discarding the constraint the DOWN
+ *      was supposed to restore.
+ *   2. ANYTHING ELSE is not a keyword and must not be treated as one. The old
+ *      fallback was `udtName.toUpperCase()`, which produces an unquoted
+ *      identifier: correct only by accident for an all-lowercase name, and
+ *      wrong for every enum, domain or extension type with a capital in it
+ *      (`"Probe"` became `PROBE`, which Postgres folds back to `probe` and then
+ *      fails with `type "probe" does not exist`). The catalog's own
+ *      `format_type` rendering is the answer: already quoted where quoting is
+ *      needed, already schema-qualified when the type is not in the search_path,
+ *      and already carrying its modifiers (`vector(3)`, `citext`,
+ *      `character varying(255)[]`). Quoting the bare udt name is the fallback
+ *      for a hand-built column with no catalog rendering.
  */
-function udtToSqlType(udtName: string, maxLength: number | null): string {
+function udtToSqlType(dbCol: DbColumnType): string {
   const map: Record<string, string> = {
     int8: 'BIGINT',
     int4: 'INTEGER',
     int2: 'SMALLINT',
     text: 'TEXT',
-    varchar: maxLength ? `VARCHAR(${maxLength})` : 'VARCHAR',
+    varchar: dbCol.maxLength ? `VARCHAR(${dbCol.maxLength})` : 'VARCHAR',
     bool: 'BOOLEAN',
     timestamptz: 'TIMESTAMPTZ',
     date: 'DATE',
@@ -1305,10 +1763,19 @@ function udtToSqlType(udtName: string, maxLength: number | null): string {
     uuid: 'UUID',
     float4: 'REAL',
     float8: 'DOUBLE PRECISION',
-    numeric: 'NUMERIC',
+    numeric: numericSqlType(dbCol),
     bytea: 'BYTEA',
   };
-  return map[udtName] ?? udtName.toUpperCase();
+  const mapped = map[dbCol.udtName];
+  if (mapped) return mapped;
+  return dbCol.formattedType ?? postgresDialect.quoteIdentifier(dbCol.udtName);
+}
+
+/** `NUMERIC`, `NUMERIC(10)` or `NUMERIC(10, 2)`, whichever the column actually is. */
+function numericSqlType(dbCol: DbColumnType): string {
+  if (dbCol.numericPrecision == null) return 'NUMERIC';
+  if (dbCol.numericScale == null) return `NUMERIC(${dbCol.numericPrecision})`;
+  return `NUMERIC(${dbCol.numericPrecision}, ${dbCol.numericScale})`;
 }
 
 /**
@@ -1356,6 +1823,78 @@ export function findDestructivePushStatements(statements: readonly string[]): De
   const hits: DestructiveStatement[] = [];
   for (const stmt of statements) hits.push(...scanDestructiveSql(stmt));
   return hits;
+}
+
+/**
+ * Quote a schema name for use INSIDE a `search_path` GUC value. The value is
+ * bound as a parameter to set_config, but Postgres parses its contents as an
+ * identifier list, so a name needing quotes (mixed case, a dot, a space) has to
+ * carry them itself. Doubling `"` follows the same rule as quoteIdent.
+ */
+function quoteSearchPathIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Pin the transaction's `search_path` so the unqualified identifiers in the
+ * generated DDL resolve in the SAME namespace the diff read, and refuse a
+ * target schema that does not exist.
+ *
+ * Three separate failures live here, which is why it is one function:
+ *
+ *   1. The pin used to be applied only for a non-public target, on the reasoning
+ *      that the default path is already public. It is not: `search_path` is a
+ *      role/database/connection-string setting, so a role with
+ *      `search_path = app, public` and NO configured schema had the diff reading
+ *      `public` (unconditional, it binds the name as a parameter) while the DDL
+ *      landed in `app`. The push reports success, and the second push fails with
+ *      `relation "..." already exists` forever after, because the diff still
+ *      cannot see the table it created. Skipping the pin for `public` protected
+ *      the byte-identity of the SQL TEXT, which is not the thing that has to
+ *      stay identical; the EFFECT is, and the effect of pinning `"public"` on a
+ *      connection that already resolved to public is nil.
+ *   2. Postgres does not validate schema names in `search_path`: setting it to a
+ *      namespace that does not exist succeeds, and name resolution simply skips
+ *      the missing entry. So a typo in `schema` silently redirected every
+ *      CREATE into whatever came next in the path (public), reported success,
+ *      and wedged the second push exactly as (1) does. `to_regnamespace`
+ *      returns NULL for a missing namespace, which is the check.
+ *   3. Pinning `"<target>", public` REPLACED the caller's path rather than
+ *      extending it, so an extension installed in its own schema stopped
+ *      resolving. On the common managed-Postgres layout (`"$user", public,
+ *      extensions`) a `vector` / `citext` / `hstore` / `postgis` column, an
+ *      extension opclass in a CREATE INDEX, or a CHECK calling an extension
+ *      function all failed with `type "..." does not exist` under a pin that the
+ *      same DDL did not need without it. The caller's entries are appended
+ *      verbatim (they are already valid GUC syntax, and `SHOW` renders them with
+ *      whatever quoting they need), so the only change to resolution is that the
+ *      target schema is consulted FIRST, which is the whole point: an
+ *      unqualified CREATE uses the first entry.
+ *
+ * `set_config(..., true)` is transaction-local, so none of this can leak onto a
+ * pooled backend, and the value is BOUND rather than interpolated.
+ */
+async function pinSearchPath(client: pg.Client, pgSchema: string): Promise<void> {
+  const present = await client.query<{ present: boolean }>(`SELECT to_regnamespace($1) IS NOT NULL AS present`, [
+    pgSchema,
+  ]);
+  if (!present.rows[0]?.present) {
+    throw new ValidationError(
+      `[turbine] Schema "${pgSchema}" does not exist in this database. ` +
+        `Postgres accepts a missing namespace in search_path without complaint, so pushing anyway would ` +
+        `create every table in whichever schema resolves next (usually public) and report success. ` +
+        `Create the schema first (CREATE SCHEMA "${pgSchema}") or correct the configured schema name.`,
+    );
+  }
+
+  // Read the path the connection would otherwise use, so the pin EXTENDS it
+  // instead of discarding it. An empty value is possible (`SHOW` renders it as
+  // an empty identifier) and would leave a trailing comma, so it is dropped.
+  const shown = await client.query<{ search_path: string }>('SHOW search_path');
+  const inherited = (shown.rows[0]?.search_path ?? '').trim();
+  const target = quoteSearchPathIdent(pgSchema);
+  const value = inherited ? `${target}, ${inherited}` : target;
+  await client.query(`SELECT set_config('search_path', $1, true)`, [value]);
 }
 
 /** Format the destructive-push refusal message (mirrors the migrate gate copy). */
@@ -1412,17 +1951,33 @@ export class DestructivePushRefusal extends ValidationError {
  * `allowDestructive: true` is passed. The CLI (`turbine push`) catches this and
  * prompts for the same typed confirmation as `migrate up`; programmatic callers
  * must opt in explicitly.
+ *
+ * `options.schema` (default `public`) scopes BOTH halves: the diff reads that
+ * namespace, and the generated DDL (which names tables unqualified) is executed
+ * with a transaction-local `search_path` pinned so the target schema resolves
+ * FIRST. Without the second half a diff that correctly found nothing in `app`
+ * would still emit `CREATE TABLE "users"` into whatever the connection's
+ * search_path happens to resolve to. The pin is unconditional (`public` is a
+ * target like any other, since a role's own search_path may not lead there),
+ * refuses a schema that does not exist, and APPENDS the connection's existing
+ * path so types living elsewhere still resolve. See {@link pinSearchPath}.
  */
 export async function schemaPush(
   schema: SchemaDef,
   connectionString: string,
-  options: { dryRun?: boolean; allowDestructive?: boolean; precomputedDiff?: DiffResult } = {},
+  options: {
+    dryRun?: boolean;
+    allowDestructive?: boolean;
+    precomputedDiff?: DiffResult;
+    schema?: string;
+  } = {},
 ): Promise<PushResult> {
+  const pgSchema = options.schema ?? 'public';
   // Accept a precomputed diff so a caller (the CLI) can diff ONCE, show the
   // plan, confirm, and apply the EXACT statements it displayed. Without this,
   // schemaPush would re-diff on the post-confirmation retry, so a concurrent
   // schema change between confirm and apply could alter the applied set (TOCTOU).
-  const diff = options.precomputedDiff ?? (await schemaDiff(schema, connectionString));
+  const diff = options.precomputedDiff ?? (await schemaDiff(schema, connectionString, { schema: pgSchema }));
 
   const result: PushResult = {
     statementsExecuted: 0,
@@ -1449,13 +2004,29 @@ export async function schemaPush(
 
   try {
     await client.query('BEGIN');
+    // Unconditional: the diff's read side is unconditional too, and the two
+    // halves disagreeing about which namespace they mean is what wedges a
+    // project permanently. See pinSearchPath for all three failure modes.
+    await pinSearchPath(client, pgSchema);
     for (const sql of diff.statements) {
       await client.query(sql);
       result.statementsExecuted++;
     }
     await client.query('COMMIT');
   } catch (err) {
-    await client.query('ROLLBACK');
+    // The ROLLBACK is best-effort, and its own failure must never REPLACE the
+    // error being unwound. The common way to get here is a connection that has
+    // already died: the DDL fails, the ROLLBACK then fails too, and an
+    // unguarded `await` throws the connection error out of this catch block, so
+    // the caller is shown a dead socket instead of the constraint violation or
+    // syntax error that actually caused the push to fail. There is also nothing
+    // to do about a failed ROLLBACK: a broken connection is discarded below and
+    // the server rolls the transaction back on its own.
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // swallowed on purpose, see above
+    }
     throw err;
   } finally {
     await client.end();

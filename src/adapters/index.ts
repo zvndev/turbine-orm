@@ -50,6 +50,22 @@ export interface DatabaseAdapter {
   readonly name: string;
 
   /**
+   * True when this adapter's lock lives in a transaction that `acquireLock`
+   * deliberately leaves OPEN on the connection it was given (the
+   * `SELECT ... FOR UPDATE NOWAIT` table-lock strategy: a row lock exists only
+   * for as long as its transaction does).
+   *
+   * The migration runner reads this to decide whether the lock needs its own
+   * connection. It does: the runner wraps every migration in BEGIN/COMMIT, so
+   * sharing one connection means the first migration's COMMIT ends the LOCK's
+   * transaction and every later migration runs unprotected, silently, because
+   * the eventual `releaseLock` COMMIT only warns. Leave it unset for a
+   * session-scoped lock (`pg_try_advisory_lock`), which survives COMMIT on its
+   * own and must keep using the runner's connection unchanged.
+   */
+  readonly lockHoldsOpenTransaction?: boolean;
+
+  /**
    * Acquire a concurrency lock for migrations.
    * PostgreSQL uses `pg_try_advisory_lock`. CockroachDB uses a lock table.
    *

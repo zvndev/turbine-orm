@@ -113,7 +113,14 @@ import {
   type UpsertStatementInput,
 } from './dialect.js';
 import type { EngineClientConfig } from './engine-config.js';
-import { ConnectionError, RelationError, UnsupportedFeatureError, ValidationError } from './errors.js';
+import {
+  ConnectionError,
+  malformedConnectionStringMessage,
+  markValueBearingMessage,
+  RelationError,
+  UnsupportedFeatureError,
+  ValidationError,
+} from './errors.js';
 import { applyTableFilters, deriveEngineRelations } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import {
@@ -298,6 +305,16 @@ function augmentMssqlError(err: unknown): unknown {
       // "...constraint 'UQ_users_email'..." or "...index 'IX_users_email'..."
       const m = /(?:constraint|index)\s+'([^']+)'/i.exec(msg) ?? /'([^']+)'/.exec(msg);
       if (m?.[1]) target.constraint = m[1];
+      // The message ends `The duplicate key value is (alice@example.com).`, i.e.
+      // SQL Server reports the conflicting ROW VALUE in the message text and has
+      // no `detail` field for 'safe' mode to redact, so this error used to reach
+      // `.cause` verbatim. Flag it so the message is withheld in 'safe' mode
+      // (see markValueBearingMessage); the constraint NAME is already captured
+      // above and survives in both modes.
+      //
+      // Deliberately only 2627/2601: 547 (FK/CHECK conflict) and 515 (NULL into
+      // a non-nullable column) name the database/table/column and never a value.
+      markValueBearingMessage(err);
       return err;
     }
     // 547 = FOREIGN KEY / CHECK constraint conflict (message distinguishes them).
@@ -608,6 +625,27 @@ export const mssqlDialect: Dialect = {
     return `[${name.replace(/]/g, ']]')}]`;
   },
 
+  /**
+   * T-SQL's `LIKE` has a FOURTH metacharacter the SQL-standard set does not:
+   * `[` opens a character class (`[abc]`, `[a-z]`, `[^x]`). So the shared
+   * `escapeLike` left `contains: '[draft]'` meaning "contains any one of d, r,
+   * a, f or t" here, while PostgreSQL, MySQL and SQLite all read the value as a
+   * literal (verified: none of the other three treat `[` specially). Not
+   * injection, the operand is still a bound parameter; a wrong ANSWER, and one
+   * that gets broader the longer the bracketed text is.
+   *
+   * Only `[` needs escaping. A `]` outside a class is a literal to T-SQL, and
+   * escaping the opener is enough to stop a class from ever being opened, so
+   * `]` is deliberately left alone (escaping it would be harmless but is not
+   * required, and the smaller pattern is the one that stays obviously correct).
+   * The prefix is the same backslash the emitted `ESCAPE '\'` clause names, and
+   * the backslash pass runs FIRST so an escape character in the value is itself
+   * escaped before any is added.
+   */
+  escapeLikePattern(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_').replace(/\[/g, '\\[');
+  },
+
   // SQL Server aggregate casts: COUNT → INT, AVG/float → FLOAT.
   jsonWireRule(columnType: string): JsonWireRule | undefined {
     const t = columnType.toLowerCase();
@@ -638,6 +676,17 @@ export const mssqlDialect: Dialect = {
       };
     }
 
+    // NO json rule here, and that is a checked answer rather than an omission.
+    // SQL Server on the supported floor (2016 through 2022) has no JSON column
+    // type: `mssqlColumnType` maps JSON/JSONB to NVARCHAR(MAX), and
+    // introspection reports the carrier as `nvarchar`. FOR JSON PATH escapes an
+    // nvarchar cell as a JSON *string* (only `buildRelationSubquery`'s nested
+    // relations are JSON_QUERY-wrapped, never a scalar column), so parsing the
+    // row hands back exactly the string the driver returns for a top-level
+    // read. Both routes already agree, and casting would only add noise. This
+    // is the divergence MySQL DOES have, where JSON_OBJECT embeds a real JSON
+    // column as a nested value while the driver hands back text.
+    //
     // Binary columns come out of FOR JSON PATH as BASE64 text ("AQL/") rather
     // than bytes. Style 2 converts to bare hex, which rebuilds exactly.
     if (t === 'binary' || t === 'varbinary' || t === 'image') {
@@ -1476,7 +1525,10 @@ function parseMssqlConfig(connectionString: string): MssqlConnectionConfig {
     if (db) config.database = decodeURIComponent(db);
     return config;
   } catch {
-    throw new ConnectionError(`[turbine] Invalid MSSQL connection string: "${connectionString}"`);
+    // Never echo the value, see malformedConnectionStringMessage.
+    throw new ConnectionError(
+      malformedConnectionStringMessage('SQL Server', 'mssql://user:password@localhost:1433/app'),
+    );
   }
 }
 
