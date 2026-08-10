@@ -178,6 +178,22 @@ async function probeVerdict(
  * legitimate environment difference is reported as a broken feature. That is why
  * this file passed on one machine and failed on another for a month.
  *
+ * AND THEN IT ASKED THE RIGHT PLAN THE WRONG QUESTION. When the generic half
+ * was rewritten onto the verdict reader, the custom half was left as a plan-TEXT
+ * match for `/Index (Only )?Scan|Bitmap Heap Scan/`, on the reasoning that an
+ * index is what makes the custom plan cheap. But the expensive plan this whole
+ * fixture is built to catch, the ordered walk up the primary key discarding
+ * non-matching rows, IS an `Index Scan`, so the regex matched the one plan it
+ * existed to exclude. Both halves then passed while both plans were the ordered
+ * walk, the two buffer counts came out equal, and the case failed claiming the
+ * product was broken: `pinned=19107 auto=19105` again, at release time, having
+ * survived a full green suite ten minutes earlier. The two halves now ask the
+ * SAME question through the SAME reader and differ only in the answer they
+ * require: the generic plan must be the ordered walk (`flip-reachable`) and the
+ * custom plan must not be. A bitmap scan cannot return rows in `id` order, so a
+ * genuinely cheap custom plan carries a Sort and reads `no-flip`, which is
+ * exactly the distinction a plan-text match cannot make.
+ *
  * Asking the generic plan requires a PREPARED STATEMENT: a generic plan is by
  * definition the plan chosen without looking at the parameter values, so no
  * EXPLAIN over an inlined literal can produce one. `NULL` is a safe stand-in
@@ -213,13 +229,17 @@ async function sparseFixtureDiverges(db: TurbineClient): Promise<string | null> 
         `(verdict=${generic.verdict}) ${generic.plan.slice(0, 200)}`
       );
     }
-    // And the custom plan must still be the cheap one. An index is what makes it
-    // cheap, so this half stays a plan-text question rather than a verdict.
+    // And the custom plan must be a DIFFERENT plan, asked through the same
+    // reader: anything but the ordered walk. `no-flip` is a Sort bounding the
+    // work or a seq scan at the table, either of which costs what it costs
+    // whatever the parameter is; `unknown` means the plan could not be read at
+    // all, and inferring a plan from buffer counts on top of a plan we could not
+    // parse is not a measurement.
     const custom = await probeVerdict(db, 'force_custom_plan', String(SPARSE_TENANT));
-    if (!/Index (Only )?Scan|Bitmap Heap Scan/.test(custom.plan)) {
+    if (custom.verdict !== 'no-flip') {
       return (
-        `the fixture no longer discriminates: a value-aware plan for the sparse tenant does not use an index ` +
-        `${custom.plan.slice(0, 200)}`
+        `the fixture no longer discriminates: a value-aware plan for the sparse tenant is the same ordered walk ` +
+        `the generic plan takes (verdict=${custom.verdict}) ${custom.plan.slice(0, 200)}`
       );
     }
     return null;
@@ -445,8 +465,14 @@ describe('forceCustomPlan against a live plan cache', () => {
       // pinned generic and this half measured the generic plan under a label
       // that says `auto`. That produces two nearly equal large numbers and a
       // failure that reads like the mechanism under test broke, when nothing
-      // did. Observed once in a full-suite run at pinned=19107 auto=19105, and
-      // never in isolation.
+      // did.
+      //
+      // This check was added against a `pinned=19107 auto=19105` failure and
+      // did NOT stop the next one, because that signature has a second and
+      // likelier cause: BOTH plans being the ordered walk, which the fixture
+      // precondition was accepting (see `sparseFixtureDiverges`). The guard is
+      // kept because the hazard it describes is real and cheap to exclude, not
+      // because it was ever the diagnosis. Two symptoms can share a number.
       //
       // Re-reading the setting is the direct check, and a null result is
       // explained rather than asserted through: the claim is about the PLAN,

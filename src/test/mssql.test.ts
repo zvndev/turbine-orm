@@ -750,9 +750,32 @@ describe('turbine-orm/mssql, integration (real SQL Server)', () => {
   }
 
   gate.it('introspection discovers tables, PKs, relations, m2m', () => {
+    // A SUPERSET, deliberately, not an exact list.
+    //
+    // This file shares one SQL Server database with every other test file in
+    // the mssql lane, and node runs those files in PARALLEL:
+    // engine-value-fidelity.test.ts creates `mx_orgs` / `mx_items` in `dbo` for
+    // its own fixture. An exact list therefore asserted something this test
+    // neither owns nor can observe deterministically, and it failed on two
+    // consecutive release commits with nothing in the diff but the other
+    // file's tables. Adding a cleanup there would not fix it either, since the
+    // race is against the CREATE and not the leftover.
+    //
+    // The claim being made here is that introspection FINDS this file's
+    // fixture and reads its shape. A table some other file created is not
+    // evidence against that.
+    const found = new Set(Object.keys(dbSchema.tables));
+    for (const t of ['comments', 'organizations', 'post_tags', 'posts', 'tags', 'users']) {
+      assert.ok(t in dbSchema.tables, `introspection missed "${t}"; found ${[...found].sort().join(', ')}`);
+    }
+    // The half of the exact list worth keeping: introspection must not hand
+    // back SQL Server's own objects. These live in `sys` rather than `dbo`, so
+    // seeing one means the schema filter stopped working, which an exact
+    // fixture list would have caught and a bare superset would not.
     assert.deepEqual(
-      Object.keys(dbSchema.tables).sort(),
-      ['comments', 'organizations', 'post_tags', 'posts', 'tags', 'users'].sort(),
+      [...found].filter((t) => /^(sys|spt_|MSrepl|filestream|queue_messages)/i.test(t)),
+      [],
+      'introspection returned SQL Server system tables',
     );
     assert.deepEqual(dbSchema.tables.post_tags!.primaryKey, ['post_id', 'tag_id']);
     assert.equal(dbSchema.tables.users!.relations.posts?.type, 'hasMany');
