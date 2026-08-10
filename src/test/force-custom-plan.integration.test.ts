@@ -437,6 +437,29 @@ describe('forceCustomPlan against a live plan cache', () => {
       for (let i = 0; i < 5; i++) await db.pool.query(sql, [SPARSE_TENANT, 100]);
       const autoBuffers = (await tableBuffers(db)) - autoStart;
 
+      // The `auto` half is SESSION state, set on one pooled connection, while
+      // the pin is a CONNECTION PARAMETER carried by every connection this pool
+      // opens. So if node-postgres replaced the connection at any point between
+      // the `SET` and here (it discards a client on error and hands out a fresh
+      // one, and an idle timeout does the same), the replacement came back
+      // pinned generic and this half measured the generic plan under a label
+      // that says `auto`. That produces two nearly equal large numbers and a
+      // failure that reads like the mechanism under test broke, when nothing
+      // did. Observed once in a full-suite run at pinned=19107 auto=19105, and
+      // never in isolation.
+      //
+      // Re-reading the setting is the direct check, and a null result is
+      // explained rather than asserted through: the claim is about the PLAN,
+      // and if the session that was supposed to hold `auto` no longer does,
+      // there is no measurement here to make a claim from.
+      const autoMode = await db.pool.query('SHOW plan_cache_mode');
+      if (autoMode.rows[0]!.plan_cache_mode !== 'auto') {
+        return t.skip(
+          `the session lost 'auto' before the measurement completed (now ` +
+            `'${autoMode.rows[0]!.plan_cache_mode}'), so the second half did not measure a custom plan`,
+        );
+      }
+
       assert.deepEqual((await planRecord(db)).statements, [], 'both runs were unnamed');
       assert.ok(
         autoBuffers * 10 < pinnedBuffers,

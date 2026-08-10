@@ -349,6 +349,36 @@ interface AutoSplit {
 }
 
 /**
+ * How many distinct `parseRow` column shapes one QueryInterface remembers.
+ * Deliberately far smaller than the 1,000-entry SQL template cache: a shape is
+ * a `select` / `omit` projection rather than a where-clause fingerprint, so the
+ * realistic population is single digits per table, and the cost of a miss is
+ * one rebuild rather than a re-parse on the server.
+ */
+const ROW_PLAN_CACHE_SIZE = 128;
+
+/**
+ * The largest `findManyStream` batch size for which the speculative first fetch
+ * is still worth attempting. Equal to the default batch size, so the default
+ * and everything below it behaves exactly as it always has. See the comment at
+ * the speculation itself for why the bound is on `batchSize` rather than on the
+ * probe's own limit.
+ */
+const STREAM_SPECULATION_MAX_BATCH = 1000;
+
+/**
+ * A `parseRow` decode plan: for one table and one exact column list, the
+ * destination field name and whether temporal decoding applies, per column, in
+ * the row's own key order. Parallel arrays rather than an array of records so
+ * the hot loop reads three indexed slots and dereferences nothing.
+ */
+interface RowDecodePlan {
+  readonly cols: readonly string[];
+  readonly fields: readonly string[];
+  readonly dates: readonly boolean[];
+}
+
+/**
  * Strict structural equality for a single SQL parameter value. Handles the
  * value shapes Turbine binds: primitives (incl. `NaN` and `bigint`), `null`/
  * `undefined`, `Date` (by time), `Buffer`/typed arrays (by bytes), arrays
@@ -584,6 +614,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly autoRoundTripMs: number | undefined;
   /** Nested-relation JSON encoding: 'object' (default) or 'positional'. */
   private readonly jsonEncoding: 'object' | 'positional';
+  /**
+   * `parseRow` decode plans, keyed by table plus the exact column list. Bounded
+   * like the SQL template cache and for the same reason: the shapes come from
+   * `select` / `omit`, which is usually a handful of literals in the caller's
+   * source but can be assembled per request from user input, so the key space
+   * is not provably finite. Eviction only ever costs a rebuild.
+   */
+  private readonly rowPlanCache = new LRUCache<string, RowDecodePlan>(ROW_PLAN_CACHE_SIZE);
+  /**
+   * The most recent plan per table, which is the entry `parseRow` actually
+   * probes. One result set is one shape, so this hits for every row after the
+   * first without hashing a cache key per row.
+   */
+  private readonly rowPlanLast = new Map<string, RowDecodePlan>();
   /**
    * Client-level automatic WHERE filters keyed by table accessor (soft-delete /
    * multi-tenancy). AND-merged into every query on the keyed table and every
@@ -3187,41 +3231,72 @@ export class QueryInterface<T extends object, R extends object = {}> {
       ? this.makeNestedParser(args!.with as WithClause, streamPii, streamFlattenPlan)
       : null;
 
-    // --- Speculative first fetch: try to satisfy the entire drain in one RTT ---
-    const speculativeDeferred = this.buildFindMany({
-      ...args,
-      limit: batchSize + 1,
-    } as FindManyArgs<
-      T,
-      R,
-      TypedWithClause<R>,
-      Record<string, boolean> | undefined,
-      Record<string, boolean> | undefined
-    >);
-
     this.currentAction = 'findManyStream';
     // Streaming is ALREADY immune to the generic-plan cliff: the speculative
     // fetch has never passed a prepared name, and the cursor path runs through
     // DECLARE, so neither statement enters the plan cache. `preparedNameFor` is
-    // still called with no name so that `forceCustomPlan: true` is VALIDATED on
+    // still called, with no name, so that `forceCustomPlan: true` is VALIDATED on
     // an engine that cannot honour it here either, rather than being quietly
-    // satisfied by an accident of this code path.
-    const speculativeResult = await this.queryWithTimeout(
-      speculativeDeferred.sql,
-      speculativeDeferred.params,
-      args?.timeout,
-      this.preparedNameFor(args, undefined),
-    );
+    // satisfied by an accident of this code path. It is called OUTSIDE the
+    // speculation branch below: it used to be the speculative fetch's own
+    // argument, which would have made that validation conditional on a batch
+    // size the moment the speculation became conditional.
+    const streamPreparedName = this.preparedNameFor(args, undefined);
 
-    if (speculativeResult.rows.length <= batchSize) {
-      // Small drain, yield all rows and return, no cursor needed
-      for (const row of speculativeResult.rows) {
-        yield (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as QueryResult<T, R, W, S, O>;
+    // --- Speculative first fetch: try to satisfy the entire drain in one RTT ---
+    //
+    // A drain that fits in one batch needs no cursor, and skipping it saves the
+    // four extra round trips BEGIN / DECLARE / CLOSE / COMMIT cost. That is the
+    // whole point of this fetch, and it is a good trade while the statement is
+    // cheap to throw away.
+    //
+    // On OVERFLOW it is thrown away: these rows were read outside the cursor's
+    // transaction, so yielding them and then continuing from the cursor would
+    // splice two snapshots together, and resuming past them would need an
+    // ORDER BY the caller never asked for. Both are unsound, so the cursor
+    // re-reads from row one and this fetch cost `batchSize + 1` rows for
+    // nothing.
+    //
+    // That waste is proportional to `batchSize`, which is the one number the
+    // caller raises when they expect MORE rows, so the optimization used to get
+    // most expensive exactly where it was least likely to pay off: raising
+    // `batchSize` for throughput made every large drain slower, and the stream
+    // was the only thing here that got slower as `batchSize` went up. So the
+    // speculation is now bounded BY `batchSize` rather than scaled by it. At or
+    // below the default it is unchanged; above it, a caller asking for large
+    // batches has told us not to expect a one-batch result, and we go straight
+    // to the cursor and waste nothing. The cost of being wrong about that is
+    // four round trips on a drain that would have fit, never any transferred
+    // rows.
+    if (batchSize <= STREAM_SPECULATION_MAX_BATCH) {
+      const speculativeDeferred = this.buildFindMany({
+        ...args,
+        limit: batchSize + 1,
+      } as FindManyArgs<
+        T,
+        R,
+        TypedWithClause<R>,
+        Record<string, boolean> | undefined,
+        Record<string, boolean> | undefined
+      >);
+
+      const speculativeResult = await this.queryWithTimeout(
+        speculativeDeferred.sql,
+        speculativeDeferred.params,
+        args?.timeout,
+        streamPreparedName,
+      );
+
+      if (speculativeResult.rows.length <= batchSize) {
+        // Small drain, yield all rows and return, no cursor needed
+        for (const row of speculativeResult.rows) {
+          yield (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as QueryResult<T, R, W, S, O>;
+        }
+        return;
       }
-      return;
     }
 
-    // --- Overflow: fall back to cursor path from scratch ---
+    // --- Overflow, or speculation declined: cursor path from scratch ---
     const deferred = this.buildFindMany(args as unknown as FindManyArgs<T, R, W, S, O>);
 
     // Acquire a dedicated connection: cursors require a single connection in a
@@ -4184,66 +4259,125 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return value === '-infinity' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY;
   }
 
-  private parseRow(row: Record<string, unknown>, table: string): Record<string, unknown> {
-    const parsed: Record<string, unknown> = {};
-    const meta = this.schema.tables[table];
+  /**
+   * The decode work for ONE cell of a date-bearing column, extracted so the
+   * planned and unplanned row paths cannot drift apart. `null` and an
+   * already-parsed `Date` are returned untouched, which is the same guard the
+   * pre-plan code spelled inline.
+   */
+  private decodeTemporalCell(value: unknown, table: string, field: string): unknown {
+    if (value === null || value instanceof Date) return value;
+    if (isTemporalInfinity(value)) {
+      // Postgres `infinity` / `-infinity`. No JS Date means either, so both
+      // readings cost something and the default is the one that is not lossy.
+      // `'preserve'` hands back the JS number, which breaks the declared `Date`
+      // type at runtime (`.toISOString()` throws) and still serializes as null
+      // because JSON has no infinity literal, but binds straight back, so a
+      // read-modify-write stores `infinity` again. `'null'` reads nicer and
+      // DESTROYS the value on that same write, because a stored infinity and a
+      // stored NULL become indistinguishable. Whichever is configured, it is
+      // the SAME on every read strategy: the driver hands back the number,
+      // `json_build_object` hands back the string "infinity", and both land
+      // here (see `isTemporalInfinity`).
+      //
+      // The warning fires once per column when the option was left unset, on a
+      // row that actually held an infinity, and describes the reading in force
+      // rather than gating on which one it is.
+      this.warnTemporalInfinity(table, field);
+      return this.readTemporalInfinity(value);
+    }
+    if (Array.isArray(value)) {
+      // `dateColumns` includes array-of-date columns (`date[]`, `timestamp[]`,
+      // `timestamptz[]`), for which the driver already hands back a `Date[]`.
+      // Coercing the array itself ran `new Date(String(theArray))` and replaced
+      // the whole column with one Invalid Date. Its ELEMENTS get the same
+      // infinity mapping as a scalar (same declared element type, same JSON
+      // rendering); everything else is passed through by identity.
+      return this.mapArrayTemporalInfinity(value, table, field);
+    }
+    // Any other number on a date column is left alone rather than run through
+    // `parseDbDate(String(n))`, which would produce an Invalid Date.
+    if (typeof value === 'number') return value;
+    // Offset-less strings (Postgres `timestamp`, json_agg output) are pinned to
+    // UTC so results don't depend on the server's time zone.
+    return this.utcTimestamps ? parseDbDate(String(value)) : new Date(value as string);
+  }
 
-    if (meta) {
-      // Fast path: use pre-computed maps (avoids regex per column per row)
+  /**
+   * Build the decode plan for one exact column list, and remember it as this
+   * table's most recent shape so the next row of the same result set hits the
+   * fast path in {@link parseRow}.
+   */
+  private buildRowDecodePlan(table: string, meta: TableMetadata, keys: string[]): RowDecodePlan {
+    const shapeKey = `${table} ${keys.join(' ')}`;
+    let plan = this.rowPlanCache.get(shapeKey);
+    if (plan === undefined) {
       const reverseMap = meta.reverseColumnMap;
       const dateCols = meta.dateColumns;
       // camelCase-keyed date fields, so nested json_build_object rows (whose
       // keys are already camelCase) get the same Date coercion as top-level rows.
       const camelDateFields = this.getCamelDateFields(table, meta);
-
-      const keys = Object.keys(row);
-      for (let i = 0; i < keys.length; i++) {
-        const col = keys[i]!;
-        const value = row[col];
+      const cols = keys.slice();
+      const fields: string[] = [];
+      const dates: boolean[] = [];
+      for (const col of cols) {
         const field = reverseMap[col] ?? col; // fall back to raw col name, not regex
-        // Top-level rows are snake_case (dateCols); nested rows are camelCase (camelDateFields).
-        if ((dateCols.has(col) || camelDateFields.has(field)) && value !== null && !(value instanceof Date)) {
-          if (isTemporalInfinity(value)) {
-            // Postgres `infinity` / `-infinity`. No JS Date means either, so
-            // both readings cost something and the default is the one that is
-            // not lossy. `'preserve'` hands back the JS number, which breaks
-            // the declared `Date` type at runtime (`.toISOString()` throws) and
-            // still serializes as null because JSON has no infinity literal,
-            // but binds straight back, so a read-modify-write stores `infinity`
-            // again. `'null'` reads nicer and DESTROYS the value on that same
-            // write, because a stored infinity and a stored NULL become
-            // indistinguishable. Whichever is configured, it is the SAME on
-            // every read strategy: the driver hands back the number,
-            // `json_build_object` hands back the string "infinity", and both
-            // land here (see `isTemporalInfinity`).
-            //
-            // The warning below fires once per column when the option was left
-            // unset, on a row that actually held an infinity, and describes the
-            // reading in force rather than gating on which one it is.
-            this.warnTemporalInfinity(table, field);
-            parsed[field] = this.readTemporalInfinity(value);
-          } else if (Array.isArray(value)) {
-            // `dateColumns` includes array-of-date columns (`date[]`,
-            // `timestamp[]`, `timestamptz[]`), for which the driver already
-            // hands back a `Date[]`. Coercing the array itself ran
-            // `new Date(String(theArray))` and replaced the whole column with
-            // one Invalid Date. Its ELEMENTS get the same infinity mapping as a
-            // scalar (same declared element type, same JSON rendering);
-            // everything else is passed through by identity.
-            parsed[field] = this.mapArrayTemporalInfinity(value, table, field);
-          } else if (typeof value === 'number') {
-            // Any other number on a date column is left alone rather than run
-            // through `parseDbDate(String(n))`, which would produce an Invalid
-            // Date.
-            parsed[field] = value;
-          } else {
-            // Offset-less strings (Postgres `timestamp`, json_agg output) are
-            // pinned to UTC so results don't depend on the server's time zone.
-            parsed[field] = this.utcTimestamps ? parseDbDate(String(value)) : new Date(value as string);
-          }
-        } else {
-          parsed[field] = value;
-        }
+        fields.push(field);
+        // Top-level rows are snake_case (dateCols); nested rows are camelCase.
+        dates.push(dateCols.has(col) || camelDateFields.has(field));
+      }
+      plan = { cols, fields, dates };
+      this.rowPlanCache.set(shapeKey, plan);
+    }
+    this.rowPlanLast.set(table, plan);
+    return plan;
+  }
+
+  /**
+   * Whether a cached plan describes exactly this row's column list, in order.
+   * A pointer compare per column: both sides are the driver's own interned
+   * column-name strings, so this is far cheaper than the reverse-map lookup and
+   * two Set probes per column that it replaces, and unlike a length check or a
+   * fingerprint it CANNOT accept a different projection that happens to look
+   * similar. That matters more than the speed: a positional plan applied to the
+   * wrong column list would silently write each value under a neighbouring
+   * field's name, which is the one failure mode worth paying a full comparison
+   * to make impossible.
+   */
+  private static rowPlanMatches(plan: RowDecodePlan, keys: string[]): boolean {
+    const cols = plan.cols;
+    if (cols.length !== keys.length) return false;
+    for (let i = 0; i < keys.length; i++) {
+      if (cols[i] !== keys[i]) return false;
+    }
+    return true;
+  }
+
+  private parseRow(row: Record<string, unknown>, table: string): Record<string, unknown> {
+    const parsed: Record<string, unknown> = {};
+    const meta = this.schema.tables[table];
+
+    if (meta) {
+      // Every row of one result set has the same columns in the same order (a
+      // SQL result set has fixed field descriptors, and a nested row decoded
+      // from `json_build_object` has a fixed key list), so the per-column
+      // name resolution and date-column membership tests are the same answer
+      // recomputed for every row. Resolve them ONCE per column shape and keep
+      // the plan; the shape is verified against each row rather than assumed,
+      // so a caller that does hand this function heterogeneous rows gets a
+      // rebuilt plan instead of a mis-mapped one.
+      const keys = Object.keys(row);
+      const last = this.rowPlanLast.get(table);
+      const plan =
+        last !== undefined && QueryInterface.rowPlanMatches(last, keys)
+          ? last
+          : this.buildRowDecodePlan(table, meta, keys);
+
+      const { cols, fields, dates } = plan;
+      for (let i = 0; i < cols.length; i++) {
+        const field = fields[i]!;
+        const value = row[cols[i]!];
+        parsed[field] = dates[i] ? this.decodeTemporalCell(value, table, field) : value;
       }
     } else {
       // Fallback: no metadata, use regex conversion

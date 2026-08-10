@@ -286,7 +286,7 @@ export default async function Home() {
             <Link href="/why-turbine" style={{ color: 'var(--accent)' }}>
               Why Turbine
             </Link>{' '}
-            says what is genuinely different, and what is table stakes in 2026.
+            puts the three side by side, feature for feature.
           </p>
 
           <div className="hero-code-window animate-slide-in-right delay-5 w-full">
@@ -438,16 +438,22 @@ export default async function Home() {
             <div className="showcase-text">
               <h3>Your code writes one call. Turbine writes one query.</h3>
               <p>
-                This is table stakes, and it is here for correctness rather than
-                as a selling point. Drizzle has compiled relational queries to{' '}
-                <code>LEFT JOIN LATERAL</code> plus JSON aggregation since 0.28,
-                Prisma does the same under its <code>relationJoins</code>{' '}
-                preview flag, and Kysely ships{' '}
-                <code>jsonArrayFrom</code> / <code>jsonObjectFrom</code>{' '}
-                helpers. Turbine uses correlated <code>json_agg</code>{' '}
-                subqueries. What is worth reading below is how the nesting stays
-                correct at depth: empty relations, per-relation limits, and
-                types that survive the JSON round-trip.
+                A nested read is one statement, at any depth. Turbine compiles{' '}
+                <code>with</code> into correlated <code>json_agg</code> +{' '}
+                <code>json_build_object</code> subqueries, so ten users with
+                their posts and each post&apos;s comments is a single round
+                trip, not an N+1 cascade. Four load strategies are available and
+                the default picks between them per relation from your actual
+                index coverage.
+              </p>
+              <p>
+                The part that takes the work is staying correct at depth: an
+                empty relation returns <code>[]</code> and never{' '}
+                <code>null</code>, per-relation <code>limit</code> and{' '}
+                <code>orderBy</code> apply per parent rather than to the whole
+                result, and every type survives the JSON round trip, dates
+                included. Both strategies are held to byte-identical output by a
+                differential fuzz suite.
               </p>
 
               <ul className="showcase-list">

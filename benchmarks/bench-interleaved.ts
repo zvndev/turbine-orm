@@ -28,92 +28,15 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { eq, count as drizzleCount, gt, asc, sql } from 'drizzle-orm';
 import * as schema from './schema.js';
+import { Bench } from './bench-harness.js';
 
 const DATABASE_URL = process.env['DATABASE_URL'] ?? 'postgres://localhost:5432/turbine_bench';
 const ROUNDS = parseInt(process.env['ROUNDS'] ?? '200', 10);
 const WARMUP = parseInt(process.env['WARMUP'] ?? '20', 10);
 const STREAM_ROUNDS = parseInt(process.env['STREAM_ROUNDS'] ?? '9', 10);
 
-type Arm = { name: string; fn: (i: number) => Promise<unknown> };
-
-interface ArmStat {
-  name: string;
-  median: number;
-  avg: number;
-  p95: number;
-  min: number;
-  n: number;
-}
-
-function median(sorted: number[]): number {
-  const n = sorted.length;
-  if (n === 0) return NaN;
-  return n % 2 ? sorted[(n - 1) / 2]! : (sorted[n / 2 - 1]! + sorted[n / 2]!) / 2;
-}
-function pct(sorted: number[], p: number): number {
-  return sorted[Math.max(0, Math.ceil(sorted.length * p) - 1)]!;
-}
-
-const allResults: { scenario: string; stats: ArmStat[] }[] = [];
-
-/**
- * Run every arm once per round, rotating the starting arm each round so no arm
- * keeps a fixed position in the round and slow-drifting effects spread evenly.
- */
-async function interleave(scenario: string, arms: Arm[], rounds = ROUNDS, warmup = WARMUP): Promise<ArmStat[]> {
-  for (const arm of arms) {
-    for (let i = 0; i < warmup; i++) await arm.fn(i);
-  }
-
-  const samples = new Map<string, number[]>();
-  for (const a of arms) samples.set(a.name, []);
-
-  for (let r = 0; r < rounds; r++) {
-    const offset = r % arms.length; // flip / rotate arm order every round
-    for (let k = 0; k < arms.length; k++) {
-      const arm = arms[(k + offset) % arms.length]!;
-      const start = performance.now();
-      await arm.fn(r);
-      samples.get(arm.name)!.push(performance.now() - start);
-    }
-  }
-
-  const stats: ArmStat[] = arms.map((a) => {
-    const s = [...samples.get(a.name)!].sort((x, y) => x - y);
-    return {
-      name: a.name,
-      median: median(s),
-      avg: s.reduce((x, y) => x + y, 0) / s.length,
-      p95: pct(s, 0.95),
-      min: s[0]!,
-      n: s.length,
-    };
-  });
-
-  allResults.push({ scenario, stats });
-  print(scenario, stats);
-  return stats;
-}
-
-function print(scenario: string, stats: ArmStat[]) {
-  console.log(`\n-- ${scenario} --`);
-  console.log('  arm            median      avg      p95      min');
-  const ormStats = stats.filter((s) => s.name !== 'Raw');
-  const fastest = ormStats.reduce((a, b) => (a.median < b.median ? a : b));
-  for (const s of stats) {
-    const f = (n: number) => n.toFixed(3).padStart(8);
-    const mark = s === fastest ? ' <= fastest ORM' : '';
-    console.log(`  ${s.name.padEnd(12)} ${f(s.median)} ${f(s.avg)} ${f(s.p95)} ${f(s.min)}${mark}`);
-  }
-  const raw = stats.find((s) => s.name === 'Raw');
-  if (raw) {
-    for (const s of ormStats) {
-      console.log(`    ${s.name} overhead above raw pg: +${(s.median - raw.median).toFixed(3)} ms (${(s.median / raw.median).toFixed(2)}x)`);
-    }
-  }
-}
-
 async function main() {
+  const bench = new Bench({ rounds: ROUNDS, warmup: WARMUP });
   console.log('Interleaved harness: every arm once per round, order rotated per round, medians reported.');
   console.log(`ROUNDS=${ROUNDS} WARMUP=${WARMUP} STREAM_ROUNDS=${STREAM_ROUNDS} Node ${process.version}`);
 
@@ -139,24 +62,12 @@ async function main() {
 
   // Drift probe, run at the head and the tail of the suite. The difference
   // between the two is the residual drift floor for this process.
-  const driftProbe = async (label: string) => {
-    for (let i = 0; i < 500; i++) await rawPool.query('SELECT 1'); // warm, never measured
-    const s: number[] = [];
-    for (let i = 0; i < 500; i++) {
-      const t = performance.now();
-      await rawPool.query('SELECT 1');
-      s.push(performance.now() - t);
-    }
-    s.sort((a, b) => a - b);
-    const m = median(s);
-    console.log(`\n[drift probe ${label}] SELECT 1 median ${m.toFixed(4)} ms (n=500)`);
-    return m;
-  };
+  const driftProbe = (label: string) => bench.driftProbe(rawPool, label);
 
   const driftHead = await driftProbe('head');
 
   // 1. findMany flat
-  await interleave('findMany, 100 users (flat)', [
+  await bench.interleave('findMany, 100 users (flat)', [
     { name: 'Turbine', fn: () => turbine.users.findMany({ limit: 100 }) },
     { name: 'Prisma 7', fn: () => prisma.user.findMany({ take: 100 }) },
     { name: 'Drizzle', fn: () => drizzleDb.query.users.findMany({ limit: 100 }) },
@@ -171,7 +82,7 @@ async function main() {
         'viewCount', p.view_count, 'createdAt', p.created_at, 'updatedAt', p.updated_at))
       FROM posts p WHERE p.user_id = u.id), '[]'::json) AS posts
     FROM users u LIMIT 50`;
-  await interleave('findMany, 50 users + posts (L2)', [
+  await bench.interleave('findMany, 50 users + posts (L2)', [
     { name: 'Turbine', fn: () => turbine.users.findMany({ limit: 50, with: { posts: true } }) },
     { name: 'Prisma 7', fn: () => prisma.user.findMany({ take: 50, include: { posts: true } }) },
     { name: 'Drizzle', fn: () => drizzleDb.query.users.findMany({ limit: 50, with: { posts: true } }) },
@@ -179,14 +90,14 @@ async function main() {
   ]);
 
   // 3. findMany L3 (no hand-written raw equivalent, ORM arms only)
-  await interleave('findMany, 10 users -> posts -> comments (L3)', [
+  await bench.interleave('findMany, 10 users -> posts -> comments (L3)', [
     { name: 'Turbine', fn: () => turbine.users.findMany({ limit: 10, with: { posts: { with: { comments: true }, limit: 5 } } }) },
     { name: 'Prisma 7', fn: () => prisma.user.findMany({ take: 10, include: { posts: { take: 5, include: { comments: true } } } }) },
     { name: 'Drizzle', fn: () => drizzleDb.query.users.findMany({ limit: 10, with: { posts: { limit: 5, with: { comments: true } } } }) },
   ]);
 
   // 4. findUnique by PK
-  await interleave('findUnique, single user by PK', [
+  await bench.interleave('findUnique, single user by PK', [
     { name: 'Turbine', fn: () => turbine.users.findUnique({ where: { id: 1 } }) },
     { name: 'Prisma 7', fn: () => prisma.user.findUnique({ where: { id: BigInt(1) } }) },
     { name: 'Drizzle', fn: () => drizzleDb.query.users.findFirst({ where: eq(schema.users.id, 1) }) },
@@ -194,7 +105,7 @@ async function main() {
   ]);
 
   // 5. findUnique nested L3
-  await interleave('findUnique, user + posts + comments (L3)', [
+  await bench.interleave('findUnique, user + posts + comments (L3)', [
     { name: 'Turbine', fn: () => turbine.users.findUnique({ where: { id: 1 }, with: { posts: { with: { comments: true } } } }) },
     { name: 'Prisma 7', fn: () => prisma.user.findUnique({ where: { id: BigInt(1) }, include: { posts: { include: { comments: true } } } }) },
     { name: 'Drizzle', fn: () => drizzleDb.query.users.findFirst({ where: eq(schema.users.id, 1), with: { posts: { with: { comments: true } } } }) },
@@ -203,7 +114,7 @@ async function main() {
   const driftMid = await driftProbe('mid');
 
   // 6. count
-  await interleave('count, all users', [
+  await bench.interleave('count, all users', [
     { name: 'Turbine', fn: () => turbine.users.count() },
     { name: 'Prisma 7', fn: () => prisma.user.count() },
     { name: 'Drizzle', fn: () => drizzleDb.select({ value: drizzleCount() }).from(schema.users) },
@@ -212,7 +123,7 @@ async function main() {
 
   // 7. streaming 50K
   const BATCH = 1000;
-  await interleave(
+  await bench.interleave(
     'stream, iterate 50K comments (batch 1000)',
     [
       {
@@ -285,12 +196,11 @@ async function main() {
         },
       },
     ],
-    STREAM_ROUNDS,
-    1,
+    { rounds: STREAM_ROUNDS, warmup: 1 },
   );
 
   // 8. atomic increment
-  await interleave('atomic increment, posts.view_count + 1', [
+  await bench.interleave('atomic increment, posts.view_count + 1', [
     { name: 'Turbine', fn: () => turbine.posts.update({ where: { id: 1 }, data: { viewCount: { increment: 1 } } }) },
     { name: 'Prisma 7', fn: () => prisma.post.update({ where: { id: BigInt(1) }, data: { viewCount: { increment: 1 } } }) },
     { name: 'Drizzle', fn: () => drizzleDb.update(schema.posts).set({ viewCount: sql`${schema.posts.viewCount} + 1` }).where(eq(schema.posts.id, 1)) },
@@ -298,7 +208,7 @@ async function main() {
   ]);
 
   // 9. pipeline 5-query dashboard batch
-  await interleave('pipeline, 5-query dashboard batch', [
+  await bench.interleave('pipeline, 5-query dashboard batch', [
     {
       name: 'Turbine',
       fn: () =>
@@ -350,7 +260,7 @@ async function main() {
   ]);
 
   // 10. hot findUnique, rotating ids
-  await interleave('hot findUnique, rotating IDs', [
+  await bench.interleave('hot findUnique, rotating IDs', [
     { name: 'Turbine', fn: (i) => turbine.users.findUnique({ where: { id: (i % 50) + 1 } }) },
     { name: 'Prisma 7', fn: (i) => prisma.user.findUnique({ where: { id: BigInt((i % 50) + 1) } }) },
     { name: 'Drizzle', fn: (i) => drizzleDb.query.users.findFirst({ where: eq(schema.users.id, (i % 50) + 1) }) },
@@ -358,15 +268,11 @@ async function main() {
   ]);
 
   const driftTail = await driftProbe('tail');
-  const probes = [driftHead, driftMid, driftTail];
-  const driftPct = ((Math.max(...probes) - Math.min(...probes)) / Math.min(...probes)) * 100;
-  console.log(
-    `\n[drift floor] SELECT 1 median head ${driftHead.toFixed(4)} / mid ${driftMid.toFixed(4)} / tail ${driftTail.toFixed(4)} ms = ${driftPct.toFixed(1)}% spread over the suite`,
-  );
+  bench.reportDrift([driftHead, driftMid, driftTail]);
 
   // Machine-readable dump for the writeup.
   console.log('\n=== JSON ===');
-  console.log(JSON.stringify({ driftHead, driftMid, driftTail, results: allResults }, null, 2));
+  console.log(JSON.stringify({ driftHead, driftMid, driftTail, results: bench.results }, null, 2));
 
   await turbine.disconnect();
   await prisma.$disconnect();

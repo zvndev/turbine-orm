@@ -370,6 +370,29 @@ If you were reading a bigint, decimal or binary column through a `with` relation
 
 The unindexed rule needs index metadata that came from the database, so a `defineSchema`-only client can never prove a probe unindexed and that rule simply never fires. The cardinality rule does not depend on index metadata and applies either way.
 
+<Callout type="warning" title="Do not force 'batched' by benchmarking on localhost">
+  `'batched'` trades an **extra round trip per relation** for not building JSON
+  on the server. Whether that trade pays depends entirely on what a round trip
+  costs you, and a Unix socket or a container on the same host makes it look
+  free. Measured on one fixture (50 users with their posts) through a proxy that
+  injects latency:
+
+  | round trip | `'join'` | `'batched'` |
+  |---|---|---|
+  | 0 ms (unix socket) | 2.527 ms | **1.407 ms** |
+  | 1 ms | **5.115 ms** | 6.807 ms |
+  | 5 ms | **7.809 ms** | 11.343 ms |
+  | 25 ms | **29.487 ms** | 54.003 ms |
+
+  The ordering inverts by **1 ms** of round-trip time, and by 25 ms `'batched'`
+  is 1.83x slower. `'auto'` staying on the join here is the right call for
+  anything talking to a database over a network, which is nearly everything in
+  production. If your deployment is not on a socket, tell the client so with
+  `autoRoundTripMs` (see the tuning note below) rather than pinning a strategy,
+  and benchmark on a link that resembles production. Reproduce with
+  `benchmarks/bench-latency.ts`.
+</Callout>
+
 Both rules only ever move a relation that the batched loader can actually handle. Composite-key relations, and relations whose subtree the loader cannot express, always stay in the join. Engagement is visible: a once-per-relation dev note naming the reason, and query events carry `strategy: 'auto-batched'`.
 
 Relation `_count` follows the unindexed rule only, but on its own size rule, and that rule is far more aggressive than the two above.
@@ -388,7 +411,13 @@ So `auto` moves an unindexed `_count` to the follow-up statement from **two** pa
 
 Two ways to keep `_count` in the single statement: add the covering index the correlation needs (`npx turbine doctor` names it, which is the fix worth making either way), or pin `relationLoadStrategy: 'join'` on that query.
 
-> **Tuning note.** The two cardinality/indexing rules above are heuristics: the real parent count is unknown until the base query runs, and `limit` is the only bound available at plan time. If profiling disagrees with the choice, raise or lower `autoToOneJoinMaxRows` (which governs the to-one rule only), or pin `relationLoadStrategy` on that query. On endpoints that fan out to very large child sets (megabyte-scale JSON per request), the batched loader's flat rows can beat the join plan even with healthy indexes and a small parent set, so `'batched'` is still worth pinning there.
+> **Tuning note.** The two cardinality/indexing rules above are heuristics: the real parent count is unknown until the base query runs, and `limit` is the only bound available at plan time. If profiling disagrees with the choice, raise or lower `autoToOneJoinMaxRows` (which governs the to-one rule only), or pin `relationLoadStrategy` on that query.
+>
+> **`autoRoundTripMs`** is the other half of the same dial, and the one worth setting first. The to-one threshold is derived from it, because the whole question `'auto'` is answering is whether an extra round trip costs less than re-evaluating a correlated subquery per parent row, and that depends entirely on your link. Set it to what `ping` says between your app and your database: roughly `0.05` for a Unix socket, `0.5` to `2` for same-region managed Postgres, `30` to `60` cross-region. It defaults to `0.7` (same-region), which reproduces the historical 1000-row threshold exactly. An explicit `autoToOneJoinMaxRows` overrides it, and it is consulted only under `'auto'`. The break-even it governs moves about **17x** between a loopback link and a 2.7 ms one, so on anything that is not same-region this is the single highest-value line in your client config.
+>
+> ```ts
+> const db = turbine({ connectionString: process.env.DATABASE_URL, autoRoundTripMs: 1.2 });
+> ``` On endpoints that fan out to very large child sets (megabyte-scale JSON per request), the batched loader's flat rows can beat the join plan even with healthy indexes and a small parent set, so `'batched'` is still worth pinning there.
 
 <Callout type="note" title="Upgrading to 0.50">
   The to-one cardinality rule changes which plan an existing unbounded query
@@ -433,6 +462,8 @@ Because the stitching happens in memory, the loader needs each level's correlati
 </Callout>
 
 `relationLoadStrategy: 'flatten'` compiles an eligible **to-one** relation into a `LEFT JOIN` in the same statement, instead of a correlated subquery. One round-trip, no per-parent re-evaluation, and no client-side stitching.
+
+Because `'auto'` never selects it, this is the one strategy you have to ask for. On the benchmark fixture (500 posts each with their author) it is **1.53x faster than the default plan**: 1.734 ms against 2.658 ms. Unlike `'batched'` it spends **no extra round trip**, so that margin is not an artifact of measuring on a socket and does not erode as latency rises. If your hot query reads a to-one relation, this is worth trying.
 
 ```ts
 const posts = await db.posts.findMany({

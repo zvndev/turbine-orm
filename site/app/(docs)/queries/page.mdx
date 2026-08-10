@@ -753,7 +753,24 @@ for await (const user of db.users.findManyStream({
 }
 ```
 
-Under the hood Turbine issues a speculative `LIMIT batchSize + 1` first fetch, if the result fits in one batch, rows are yielded directly without `DECLARE CURSOR` overhead. Larger result sets escalate to a cursor. Safe to `break` early; the cursor and connection are cleaned up deterministically.
+Under the hood, a stream whose `batchSize` is at or below the default (1000) opens with a speculative `LIMIT batchSize + 1` first fetch: if the whole result fits in one batch, rows are yielded directly and the four round trips of `BEGIN` / `DECLARE` / `CLOSE` / `COMMIT` are skipped entirely. Larger results escalate to a cursor. Safe to `break` early; the cursor and connection are cleaned up deterministically.
+
+<Callout type="note" title="Why the speculative fetch stops above batchSize 1000">
+  When the result does **not** fit in one batch, those speculatively fetched
+  rows cannot be reused. They were read outside the cursor's transaction, so
+  yielding them and then continuing from the cursor would splice two snapshots
+  together, and resuming past them would need an `ORDER BY` you never asked
+  for. The cursor therefore re-reads from row one, and the speculative fetch
+  cost `batchSize + 1` rows for nothing.
+
+  That waste is proportional to `batchSize`, which is the one number you raise
+  when you expect **more** rows, so raising it for throughput used to make
+  large drains slower: over 50,000 rows, 56.98 ms at `batchSize: 1000` and
+  59.55 ms at 5000, while every other way of reading the same rows got faster.
+  Above the default the speculation is now skipped and the cursor is opened
+  directly, so nothing is fetched twice. The cost of being wrong about that is
+  four round trips on a drain that would have fit, never any transferred rows.
+</Callout>
 
 ## WHERE operators
 
@@ -1191,6 +1208,21 @@ It is deliberately a warning, never an error, so an app compiled against a newer
   most of them), the statement gets planned for the average value and never
   reverts. `planCacheMode: 'force_custom_plan'` re-plans every execution and
   removes that cliff.
+
+  **Deep pagination is the other common instance, and it surprises people
+  because there is no skewed column involved.** `limit`/`offset` are bound as
+  parameters, so a generic plan cannot know the offset is 9,000 rather than 40,
+  and it plans the page as if it were shallow. On the benchmark fixture, a
+  20-row page of filtered, sorted posts costs 0.212 ms at offset 40 and **0.549
+  ms at offset 9,000**; the same query with `forceCustomPlan: true` costs 0.292
+  ms, within 6% of hand-written `pg`. Nothing about the SQL changed. If you
+  paginate deeply on a hot endpoint, set `forceCustomPlan: true` on that query.
+
+  This is a property of naming prepared statements, not of Turbine: a
+  hand-written `pg` query with a statement `name` reproduces it exactly (0.541
+  ms named against 0.272 ms unnamed), and ORMs that never name statements never
+  see it, which is also why they do not get the `Parse` skip that makes repeated
+  point reads fast. `benchmarks/deepoffset.ts` runs all four arms.
 
   Turbine applies it as a **connection parameter** (`options=-c
   plan_cache_mode=...`) as the pool opens a connection, not as a `SET` after

@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.67.0 (2026-08-10)
+
+A streaming and row-decoding release, plus the benchmark suite that found the
+work. Two of the three named parts of the streaming gap are closed, `parseRow`
+stops recomputing the same answer once per row, and the suite that measured all
+of it grew from 10 scenarios to 24 with a latency axis attached. The additions
+paid for themselves immediately: they surfaced a loss the old set could not see
+(deep pagination hitting PostgreSQL's generic-plan cliff) and inverted a
+strategy recommendation that was only true on a Unix socket.
+
+### Fixed
+
+- **`findManyStream` got slower as `batchSize` got bigger.** It opens with a
+  speculative `LIMIT batchSize + 1` so a drain that fits in one batch never pays
+  for BEGIN / DECLARE / CLOSE / COMMIT. When the drain does NOT fit, those rows
+  cannot be reused: they were read outside the cursor's transaction, so yielding
+  them and continuing from the cursor would splice two snapshots together, and
+  resuming past them would need an `ORDER BY` the caller never asked for. So the
+  cursor re-read from row one and the speculative fetch had cost `batchSize + 1`
+  rows for nothing. The waste was therefore proportional to the one number a
+  caller raises when they expect MORE rows, and streaming was the only operation
+  in the benchmark suite that got slower as its batch size went up: measured
+  over 50,000 rows, 56.98 ms at `batchSize: 1000` and 59.55 ms at 5000, while
+  every other arm got faster. The speculation is now bounded BY `batchSize`
+  rather than scaled by it. At or below the default (1000) nothing changes;
+  above it, a caller asking for large batches has said not to expect a
+  one-batch result, and the cursor is used directly. The cost of being wrong
+  about that is four round trips on a drain that would have fit, never any
+  transferred rows.
+
+### Performance
+
+- **`parseRow` resolves its column mapping once per result set instead of once
+  per row.** It was recomputing the same answers for every row: a reverse-map
+  lookup and two Set membership tests per column, plus a Map lookup per row for
+  the camelCase date-field set. Every row of one result set has the same columns
+  in the same order, so this is now a cached per-(table, column-shape) plan. The
+  plan is VERIFIED against each row's key list rather than assumed, column by
+  column, because applying a plan to a column list it does not describe would
+  drop one column from the output and return another as `undefined`, silently;
+  the comparison is a pointer compare per column against the driver's own
+  interned column names, which is cheaper than the work it replaces. Measured
+  ~25% off `parseRow` in isolation. It is on every read path, so it shows up
+  wherever a result set is large: combined with the streaming fix above, a
+  50,000-row `findManyStream` drops from 56.98 ms to 52.49 ms at
+  `batchSize: 1000` and from 59.55 ms to 50.25 ms at 5000, against a
+  hand-written `DECLARE CURSOR` / `FETCH` control measuring 43.37 ms and
+  40.53 ms in the same runs. Output is unchanged, including each row's own key
+  order.
+
+### Benchmarks
+
+- **The suite went from 10 scenarios to 24, and the additions changed two
+  published conclusions.** The old set was skewed in a way worth naming: three
+  of its ten scenarios were `findUnique`, its largest non-stream result was 100
+  rows, and it measured no write other than one atomic increment. That flatters
+  small hot reads, which is not where applications spend their time. The new
+  `benchmarks/bench-extended.ts` adds large reads (5,000 and 50,000 rows, and a
+  deliberately 39-column table), writes (`createMany` at 1,000 rows, update,
+  upsert, delete), to-one and many-to-many relations, relation `_count`,
+  relation filters, `groupBy` with `having`, and pagination at both a shallow
+  and a deep offset. Turbine leads 17 of the 24. Both harnesses now share one
+  extracted `bench-harness.ts`, so the interleaving, arm rotation, median
+  handling and drift probe cannot drift apart between them.
+- **A loss the old suite could not see: deep pagination.** A filtered, sorted
+  20-row page costs 0.212 ms at offset 40 and 0.549 ms at offset 9,000, where
+  Prisma costs 0.318 and Drizzle 0.341. The cause is not Turbine's SQL: it is
+  that Turbine NAMES its prepared statements, which is what wins the repeated
+  hot reads, and PostgreSQL promotes a named statement to a value-blind generic
+  plan on its sixth execution, at which point a bound `OFFSET` is invisible to
+  the planner. The raw-`pg` control settles it, since the same hand-written
+  query costs 0.541 ms named and 0.272 ms unnamed. `forceCustomPlan: true`
+  (shipped in 0.56.0) takes that query to 0.292 ms. Documented on the
+  benchmarks page and in the `planCacheMode` section of the queries docs.
+- **A cross-latency axis, which inverted a recommendation the socket-only
+  numbers would have produced.** `benchmarks/bench-latency.ts` forwards to the
+  same PostgreSQL socket through an in-process TCP proxy that delays each chunk
+  by RTT/2, and reruns a subset at 0, 1, 5 and 25 ms. On a socket
+  `relationLoadStrategy: 'batched'` is the fastest nested strategy by 1.34x; by
+  **1 ms** of round-trip time it is already slower than the join, and at 25 ms
+  it is 1.83x slower, because it buys its win with an extra round trip per
+  relation. That is the behaviour `'auto'` already had, and `autoRoundTripMs`
+  is the dial for it, but the published numbers had no way to show it. In the
+  other direction, `pipeline`'s advantage over a transaction grows from 2.7x to
+  6.9x as the link lengthens, and every point read converges to within 0.3 ms
+  of raw `pg` at 25 ms. The proxy models latency only, not bandwidth or jitter.
+- **The nested-read gap is root-caused.** Roughly 34% of an L2 `json_agg`
+  payload is repeated JSON key strings (153.8 KB against 102.1 KB with
+  `jsonEncoding: 'positional'`), and with encoding held equal the server-side
+  and client-side costs both favour Turbine. Positional encoding wins both
+  nested scenarios. It stays opt-in for now, for the reason stated on the
+  benchmarks page.
+
 ## 0.66.0 (2026-08-09)
 
 The output of a full audit of 0.65.0 across security, performance, migrations,

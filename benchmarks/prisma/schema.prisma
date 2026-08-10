@@ -51,6 +51,7 @@ model Post {
   user         User         @relation(fields: [userId], references: [id])
   organization Organization @relation(fields: [orgId], references: [id])
   comments     Comment[]
+  postTags     PostTag[]
 
   @@index([userId])
   @@index([orgId])
@@ -71,4 +72,83 @@ model Comment {
   @@index([postId])
   @@index([userId])
   @@map("comments")
+}
+
+model Tag {
+  id   BigInt @id @default(autoincrement())
+  name String @unique
+  slug String @unique
+
+  postTags PostTag[]
+
+  @@map("tags")
+}
+
+model PostTag {
+  postId BigInt @map("post_id")
+  tagId  BigInt @map("tag_id")
+
+  post Post @relation(fields: [postId], references: [id])
+  tag  Tag  @relation(fields: [tagId], references: [id])
+
+  @@id([postId, tagId])
+  @@index([tagId])
+  @@map("post_tags")
+}
+
+model BenchWide {
+  id BigInt @id @default(autoincrement())
+  t01 String
+  t02 String
+  t03 String
+  t04 String
+  t05 String
+  t06 String
+  t07 String
+  t08 String
+  t09 String
+  t10 String
+  t11 String
+  t12 String
+  t13 String
+  t14 String
+  t15 String
+  t16 String
+  t17 String
+  t18 String
+  t19 String
+  t20 String
+  n01 Int
+  n02 Int
+  n03 Int
+  n04 Int
+  n05 Int
+  n06 Int
+  n07 Int
+  n08 Int
+  n09 Int
+  n10 Int
+  b01 Boolean
+  b02 Boolean
+  b03 Boolean
+  b04 Boolean
+  b05 Boolean
+  d01 DateTime @db.Timestamptz()
+  d02 DateTime @db.Timestamptz()
+  d03 DateTime @db.Timestamptz()
+
+  @@map("bench_wide")
+}
+
+model BenchWrite {
+  id        BigInt   @id @default(autoincrement())
+  orgId     BigInt   @map("org_id")
+  slug      String   @unique
+  label     String
+  amount    Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  @@index([orgId])
+  @@map("bench_writes")
 }

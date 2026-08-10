@@ -4,8 +4,12 @@
   "type": "module",
   "scripts": {
     "setup": "prisma generate",
+    "seed": "tsx seed-neon.ts",
     "bench": "tsx bench.ts",
     "bench:quick": "ITERATIONS=50 WARMUP=10 tsx bench.ts",
+    "bench:interleaved": "tsx bench-interleaved.ts",
+    "bench:extended": "tsx bench-extended.ts",
+    "bench:latency": "tsx bench-latency.ts",
     "parity": "tsx parity/seed.ts && tsx parity/run.ts"
   },
   "dependencies": {
